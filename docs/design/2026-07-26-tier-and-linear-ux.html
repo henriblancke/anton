@@ -641,7 +641,7 @@
           <span class="body">
             <span class="name">epic</span>
             <span class="what">A product outcome. Spans several features, carries one <code>area:</code> label.</span>
-            <span class="who">Read by people who don't read code. Lives in Linear as a top-level issue.</span>
+            <span class="who">Read by people who don't read code. Lives in Linear as a top-level issue — as does every synced tier; push carries no hierarchy.</span>
           </span>
         </div>
         <div class="tier" data-tier="feature">
@@ -1089,7 +1089,7 @@
               <button class="tchip" type="button" aria-pressed="false" data-type="bug" data-count="2"><span class="mk" aria-hidden="true">✓</span>bug</button>
               <button class="tchip" type="button" aria-pressed="false" data-type="chore" data-count="5"><span class="mk" aria-hidden="true">✓</span>chore</button>
             </div>
-            <p class="help">Epics land as top-level issues; features as sub-issues of their epic. Anything you leave off stays local.</p>
+            <p class="help">The push is flat: every tier you pick lands as a top-level issue, because bd sends no parent. Tier is carried by <code>--type</code>, grouping by the Linear project the <code>area:</code> routing sets. Anything you leave off stays local.</p>
           </div>
 
           <div class="field">
@@ -1167,7 +1167,9 @@
         <div class="note">
           <span class="note-label">Preview before push</span>
           <p>Every setting is reversible except a bad first push, which creates issues in someone
-             else's Linear. Dry-run is one click and reports counts, not a spinner.</p>
+             else's Linear. Dry-run is one click and reports counts, not a spinner — but it needs a
+             credential (bd reaches the live API before it previews) and reports one line per bead,
+             so anton derives the counts.</p>
         </div>
         <div class="note">
           <span class="note-label" data-kind="risk">Before the first push</span>
@@ -1176,10 +1178,11 @@
              the pr-ref migration has run.</p>
         </div>
         <div class="note">
-          <span class="note-label" data-kind="risk">Label churn</span>
-          <p>The run-lease is a label rewritten every 5 minutes on the run target — now a synced
-             feature. Either move it to metadata or confirm push ignores labels, or Linear gets an
-             activity feed of nothing.</p>
+          <span class="note-label" data-kind="risk">Lease churn</span>
+          <p>Settled 2026-09-05: push never sends labels, so the run-lease stays a label and nothing
+             moves to metadata. What it costs is API calls — one read per linked bead every push,
+             plus a write for the legacy third of the board carrying a structured
+             <code>acceptance_criteria</code>. That is what the debounce caps.</p>
         </div>
         <div class="note">
           <span class="note-label">Credentials</span>
