@@ -57,7 +57,7 @@ export const DEFAULT_REPAIR_AUTONOMY_POLICY: RepairAutonomyPolicy = {
 
 /**
  * The classes anton actually HAS a repair for — the factual pair, and the only two
- * `repairBlockedTicket` (jobs/execute-epic-ticket.ts) dispatches. The inventive pair have no
+ * `repairBlockedTicket` (jobs/execute-epic-ticket-repair.ts) dispatches. The inventive pair have no
  * implementation behind them, so no level above `propose` could ever be honoured for them.
  *
  * Named here rather than inferred from {@link DEFAULT_REPAIR_AUTONOMY_POLICY}: that the two sets

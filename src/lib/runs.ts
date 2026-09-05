@@ -351,12 +351,12 @@ export async function listRecentRunOutcomes(
  * it is not in the run window and no board read remembers it.
  *
  * TWO sources, because the run row cannot name every bead a run delivered (PR #223 review). It
- * carries one `ticketBeadId`, and a grouped run OVERWRITES it per child (jobs/execute-epic-ticket.ts
- * `openTicketSession`) — so on the rows alone a repaired child that succeeded, followed by any other
- * child, leaves no delivery at all, and its stamp goes on weighing later unrelated failures double
- * until the breaker disarms the picker early. So the rows answer for the run's TARGET and its final
- * ticket, and each ticket's own `execute` session — opened per child and settled `done` only once
- * that child's work committed — answers for the rest.
+ * carries one `ticketBeadId`, and a grouped run OVERWRITES it per child
+ * (jobs/execute-epic-ticket-bookends.ts `openTicketSession`) — so on the rows alone a repaired
+ * child that succeeded, followed by any other child, leaves no delivery at all, and its stamp goes
+ * on weighing later unrelated failures double until the breaker disarms the picker early. So the
+ * rows answer for the run's TARGET and its final ticket, and each ticket's own `execute` session —
+ * opened per child and settled `done` only once that child's work committed — answers for the rest.
  *
  * A ticket session settles `done` on its own commit, whatever becomes of the run around it: the
  * repair the child carried was PROVEN by that landing, which is the whole test this evidence exists
