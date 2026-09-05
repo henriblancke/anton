@@ -16,7 +16,7 @@ Three tiers, nested with `bd link --type parent-child`:
 
 | Tier | What it is | Who reads it |
 | --- | --- | --- |
-| `epic` | A product outcome spanning several features. Carries exactly one `area:` label. | Non-technical stakeholders. Syncs to Linear as a top-level issue. |
+| `epic` | A product outcome spanning several features. Carries exactly one `area:` label. | Non-technical stakeholders. Syncs to Linear as a top-level issue — like every synced tier, since push carries no hierarchy (hazard 3). |
 | `feature` | One shippable delivery unit — one worktree, one PR. **This is what anton runs.** | The board. Approved, claimed, run-leased, shipped. |
 | `task` / `bug` / `chore` | The working layer, executed as part of their feature's run. | Engineering only. Never leaves the board. |
 
@@ -91,7 +91,7 @@ command as you build it, so it never becomes a lossy abstraction over the CLI.
 | Team | Linear team id | — |
 | Project routing | table mapping each `area:` label → Linear project | — |
 | Extra arguments | free text, passed through verbatim | — |
-| Preview | dry-run showing counts, not a spinner | — |
+| Preview | dry-run counts, not a spinner. Needs a credential — bd's dry run calls the live API, and reports one line per bead, so anton derives the counts | — |
 
 The tier chips are the headline control — they drive `--type`. Toggling them rewrites the previewed
 command and the dry-run counts live (see the mock).
@@ -109,6 +109,9 @@ command and the dry-run counts live (see the mock).
   `anton.db` — same posture as `gh`. The panel reports what it found and stops there.
 - **Dry-run before the first push.** Every setting is reversible except a bad first push, which
   creates issues in someone else's Linear.
+- **The push is flat** (settled 2026-09-05, hazard 3). bd sends no parent, so tier lives in `--type`
+  and grouping lives in the Linear project — the `area:` routing above is the only hierarchy the
+  sync can express.
 
 ### Hazards that must be handled
 
@@ -123,11 +126,18 @@ command and the dry-run counts live (see the mock).
    (honoured as a fallback by `beads.getPrRef`, `bd.ts:547-552`) **loses them**. The sync job must
    refuse to push while `planPrRefMigration(list)` is non-empty.
 2. **Run-lease label churn.** The run-lease is a label rewritten every 5 minutes on the run target
-   (`RUN_LEASE_REFRESH_MS`, `execute-epic.ts:72`) — which is now a synced `feature`. Either move it
-   to metadata (as the PR pointer already was) or confirm bd's push ignores labels, or Linear gets an
-   activity feed of nothing.
-3. **Sub-issue nesting is unverified.** Confirm with `--dry-run` against a scratch team that bd maps
-   `parent-child` onto Linear sub-issues before committing to the epic→sub-issue shape.
+   (`RUN_LEASE_REFRESH_MS`, `execute-epic.ts:72`) — which is now a synced `feature`. **Settled
+   2026-09-05: push never sends labels**, so the lease stays on labels and nothing moves to metadata.
+   What remains is rate — every push is one API read per Linear-linked bead before any skip, capped
+   by the 5-minute debounce — and `status` transitions, which *do* cross.
+3. **Sub-issue nesting.** **Settled 2026-09-05 (anton-60oi): there is no nesting.** Push sends no
+   parent — hierarchy is pull-only — so the epic→sub-issue shape is dropped. The push is a flat list
+   of top-level issues: tier is carried by `--type`, grouping by the Linear project the per-area
+   routing already sets. Two alternatives were rejected — routing epics to projects and features to
+   issues (it consumes the project axis per-area routing owns), and writing a parent breadcrumb into
+   the pushed description (anton would mutate bead descriptions for a cosmetic gain). Note that
+   `--dry-run` could never have answered this: it reaches the live API before printing, and prints
+   one bare title per bead.
 
 ---
 
