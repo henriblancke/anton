@@ -45,8 +45,8 @@ import { reviewParkMessage } from "./execute-epic-review";
 import {
   claudeResumeDecision,
   continuationPrompt,
-  ticketBlockNote,
-} from "./execute-epic-ticket";
+} from "./execute-epic-ticket-claude";
+import { ticketBlockNote } from "./execute-epic-ticket-settle";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
 import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
