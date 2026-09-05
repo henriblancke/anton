@@ -50,7 +50,7 @@ import type { AntonDb } from "./queue";
 import type { JobContext } from "./runner";
 import type { ResolvedStep } from "./run-formula";
 import { runVerifyGates } from "./shell";
-import { truncateField, type StepContext } from "./step-registry";
+import { truncateField, type StepContext, type StepFacts } from "./step-registry";
 
 /** This ticket's own wall clock (anton-t1mo) — the deadline, and the abort the two of them share. */
 interface TicketBudget {
@@ -67,7 +67,7 @@ interface TicketBudget {
 }
 
 /** What the step walk learned — read by the close, and by every path that stops the ticket. */
-interface TicketProgress {
+export interface TicketProgress {
   /** Whether the commit step reported real evidence on the branch. */
   committed: boolean;
   /**
@@ -382,19 +382,21 @@ async function walkTicketSteps(args: {
       }
       continue;
     }
-    assertDelivered(ticket, result.facts?.committed === true, progress);
+    assertDelivered(ticket, result.facts ?? {}, progress);
   }
 }
 
 /**
- * The commit is the ticket's evidence of record — honor the step's `{ committed }` verdict.
+ * The commit is the ticket's evidence of record — honor the step's verdict on whether there is one,
+ * and on whose work it is.
  *
  * A clean agent exit that leaves NO diff delivered nothing: the exact false-success in issue #46
  * (root cause #1). Do NOT close/advance the ticket on empty delivery. {@link NoDeliveryError} is
  * poison, so the runner parks the run for a human instead of retrying claude to the same empty
  * result forever, and the ticket's own catch BLOCKS the bead rather than re-queueing it open.
  */
-function assertDelivered(ticket: Bead, committed: boolean, progress: TicketProgress): void {
+export function assertDelivered(ticket: Bead, facts: StepFacts, progress: TicketProgress): void {
+  const committed = facts.committed === true;
   progress.committed = committed;
   const { selfReport } = progress;
   if (!committed) {
@@ -420,6 +422,24 @@ function assertDelivered(ticket: Bead, committed: boolean, progress: TicketProgr
       `${ticket.id} was self-reported blocked by the agent (${formatAntonResult(selfReport)}) even ` +
         `though it committed changes. Blocking the ticket for operator review and halting the epic — ` +
         `the agent declared the work incomplete, so closing it would be a false success.`,
+    );
+  }
+  // The evidence is a PREVIOUS attempt's preserved `WIP` commit and this run's agent never said the
+  // ticket was finished (PR #228 review). That commit is explicitly incomplete — it was kept only
+  // so a timed-out attempt's work would survive — so a zero diff plus a missing or unparseable
+  // `ANTON-RESULT` is not delivery: nobody has claimed the work is done, and adopting it here ships
+  // it under a PR that lists the ticket as delivered. The same zero-diff agent outcome blocks any
+  // other ticket, and the presence of work someone else preserved is no reason to treat it as more
+  // finished than it says it is.
+  if (facts.preservedAdoption && selfReport?.outcome !== "delivered") {
+    throw new NoDeliveryError(
+      `${ticket.id} produced no delivery: claude left no changes to commit (zero diff) and no ` +
+        `\`ANTON-RESULT\` from this run says the ticket is finished, so the only work on the branch ` +
+        `is the explicitly incomplete commit a previous attempt PRESERVED when it ran out of time. ` +
+        `Blocking the ticket for operator ` +
+        `review and halting the epic — nothing this run did says that work is finished, so ` +
+        `adopting it as the delivery would be a false success. Finish it by hand or resume the run ` +
+        `with a raised ticketTimeoutMinutes.`,
     );
   }
 }
@@ -696,10 +716,11 @@ interface TicketFailureKinds {
  * while this was deciding, which outranks the timeout and leaves the ticket to the abort path
  * below; otherwise it always throws.
  */
-async function settleTicketTimeout(args: {
+export async function settleTicketTimeout(args: {
   run: Omit<StepContext, "tickets">;
   ticket: Bead;
-  session: Awaited<ReturnType<typeof startJobSession>>;
+  /** The ticket's open session — only its log is written here. */
+  session: { logPath: string };
   baseline: WorktreeState | null;
   progress: TicketProgress;
   timeoutMs: number;
@@ -747,6 +768,13 @@ async function settleTicketTimeout(args: {
     const leftovers = fresh
       ? await leftChangesBehind(worktreePath, null)
       : await rollbackTimedOutTicket(worktreePath, baseline, committed);
+    // Asked AGAIN, because the tree read above is the last await between the preserve's own abort
+    // check and the first board write (PR #228 review). A kill that lands in that window is still a
+    // kill: the ordinary abort path writes nothing to a board a human is deciding on, and the
+    // timeout's status/assignee/label/note would be a write it never authorised. The worktree work
+    // is already settled either way — kept or rolled back — so there is nothing left to lose by
+    // handing the ticket to the abort path below.
+    if (ctx.signal.aborted) return;
     const marked = await blockTimedOutTicket({
       repo,
       ticket,

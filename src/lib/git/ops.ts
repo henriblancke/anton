@@ -506,22 +506,35 @@ export function preservedCommitPrefix(ticketId: string): string {
  * an agent that finds nothing left to do has delivered it, not delivered nothing. Without this read
  * the code-finished/bookkeeping-cut-short case can never reach a pull request — every resume ends in
  * a zero diff and parks the run again.
+ *
+ * `strict` is for the caller whose SAFE answer is the other one (PR #228 review). "No preserved
+ * commit" lets the shape guard dispatch children onto this branch, so a `git log` that failed or
+ * timed out must not be read as proof of absence — it is no answer at all, and the guard is owed
+ * the failure rather than a permissive default.
  */
 export async function worktreeHasPreservedCommitFor(
   worktreePath: string,
   ticketId: string,
+  options: { strict?: boolean } = {},
 ): Promise<boolean> {
   const prefix = preservedCommitPrefix(ticketId);
-  return (await branchSubjects(worktreePath)).some((s) => s.startsWith(prefix));
+  return (await branchSubjects(worktreePath, options)).some((s) => s.startsWith(prefix));
 }
 
+/** How far back a subject scan reads. A run's own commits are always at the branch tip. */
+const BRANCH_SUBJECTS_ARGS = ["log", "--format=%s", "-n", "1000"];
+
 /**
- * The subjects at the tip of the branch checked out in `worktreePath`. A run's own commits are
- * always at that tip, so bounding the scan is safe. Fails closed to none (git error → treat as
- * absent) rather than risk a skip.
+ * The subjects at the tip of the branch checked out in `worktreePath`. Fails closed to none (git
+ * error → treat as absent) rather than risk a skip — except under `strict`, where absence is the
+ * permissive answer and the caller has asked to see the failure instead.
  */
-async function branchSubjects(worktreePath: string): Promise<string[]> {
-  const log = await git(worktreePath, ["log", "--format=%s", "-n", "1000"]).catch(() => "");
+async function branchSubjects(
+  worktreePath: string,
+  options: { strict?: boolean } = {},
+): Promise<string[]> {
+  if (options.strict) return (await git(worktreePath, BRANCH_SUBJECTS_ARGS)).split("\n");
+  const log = await git(worktreePath, BRANCH_SUBJECTS_ARGS).catch(() => "");
   return log.split("\n");
 }
 

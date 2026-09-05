@@ -193,6 +193,11 @@ function regateRefreshedBoard(run: EpicRun, leaseTarget: Bead): RunGates {
  *
  * Placed right after the checkout — the branch is the only place this fact lives — and before any
  * claim, so the park leaves the board untouched.
+ *
+ * The history read is STRICT (PR #228 review). Everywhere else a failed `git log` fails closed to
+ * "no such commit", which is the safe answer for a caller whose default is to re-run the ticket.
+ * Here it is the permissive one: it would clear the branch for the children whose pull request is
+ * the very thing this refuses. So a read that failed parks too, on its own message.
  */
 export async function assertPreservedWorkFitsShape(
   run: EpicRun,
@@ -200,7 +205,7 @@ export async function assertPreservedWorkFitsShape(
 ): Promise<void> {
   const { targetId } = run;
   if (run.standaloneRun) return;
-  if (!(await worktreeHasPreservedCommitFor(worktree.path, targetId))) return;
+  if (!(await readPreservedCommitPresence(run, worktree))) return;
   throw new PoisonEpic(
     `${targetId} has child tickets now, but branch \`${worktree.branch}\` still carries the ` +
       `\`${preservedCommitPrefix(targetId)}\` commit a timed-out attempt preserved while ` +
@@ -210,6 +215,23 @@ export async function assertPreservedWorkFitsShape(
       `into the child it belongs to) in ${worktree.path} — or run ${targetId} as a single ticket ` +
       `again with a raised ticketTimeoutMinutes — then resume the run`,
   );
+}
+
+/** The guard's one fact, and the park for the case where the branch would not say. */
+async function readPreservedCommitPresence(run: EpicRun, worktree: Worktree): Promise<boolean> {
+  const { targetId } = run;
+  try {
+    return await worktreeHasPreservedCommitFor(worktree.path, targetId, { strict: true });
+  } catch (e) {
+    throw new PoisonEpic(
+      `${targetId} has child tickets now, and anton could not read the history of ` +
+        `\`${worktree.branch}\` in ${worktree.path} to tell whether a timed-out attempt's ` +
+        `\`${preservedCommitPrefix(targetId)}\` commit is still on it ` +
+        `(${e instanceof Error ? e.message : String(e)}). Refusing to dispatch the children on an ` +
+        `unreadable branch — if that commit IS there, their pull request ships its unfinished work ` +
+        `into the trunk. Repair the worktree, then resume the run`,
+    );
+  }
 }
 
 /** Step 0b. Refuse a run whose tickets need a bundled specialist this project has disabled. */

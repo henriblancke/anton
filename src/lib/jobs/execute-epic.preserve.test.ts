@@ -13,7 +13,10 @@
  *   branch, whether it touched the tree or had its additions refused, so it must report that rather
  *   than "nothing was kept";
  * - a run that gained child tickets since the preserve may not start on a branch that still carries
- *   the parent's incomplete commit — the children's pull request would ship it.
+ *   the parent's incomplete commit — the children's pull request would ship it, and a branch whose
+ *   history cannot be READ proves nothing about whether it does;
+ * - a kill that lands after the preserve has decided but before the timeout writes the board still
+ *   owns the ticket — the abort path writes nothing, and neither may this one.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -31,7 +34,7 @@ import { isPoisonError } from "./errors";
 import { outOfTimeParkMessage } from "./execute-epic-dispatch";
 import { assertPreservedWorkFitsShape } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
-import { preserveTimedOutWork } from "./execute-epic-ticket";
+import { preserveTimedOutWork, settleTicketTimeout } from "./execute-epic-ticket";
 import type { Clock } from "./queue";
 import type { StepContext } from "./step-registry";
 
@@ -265,6 +268,77 @@ suite("preserveTimedOutWork (real git)", () => {
   });
 });
 
+// The board writes a kill must not make. `preserveTimedOutWork` asks whether the job was aborted,
+// but the caller keeps working after that answer — it reads the tree back — and a kill landing in
+// THAT window used to reach the board anyway (PR #228 review): status, assignee, labels and a note
+// on a bead a human is deciding about, contrary to the ordinary abort path, which writes nothing.
+suite("settleTicketTimeout — a kill after the preserve still owns the board", () => {
+  let sandbox: string;
+  let repo: string;
+  let logPath: string;
+  let tdb: TestDb;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  const run = (signal: AbortSignal): Omit<StepContext, "tickets"> => ({
+    db: tdb.db,
+    clock: new FixedClock(1_700_000_000_000),
+    ctx: { signal, heartbeat: async () => {}, report: () => {} },
+    projectId: randomUUID(),
+    runId: randomUUID(),
+    repoPath: repo,
+    worktreePath: repo,
+    branch: BRANCH,
+    baseBranch: "main",
+    baseRef: "origin/main",
+    target: ticket,
+    settings: {} satisfies ProjectSettings,
+  });
+
+  beforeEach(() => {
+    tdb = makeTestDb();
+    sandbox = mkdtempSync(join(tmpdir(), "anton-settle-abort-"));
+    repo = join(sandbox, "repo");
+    logPath = join(sandbox, "session.log");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", BRANCH]);
+  });
+
+  afterEach(() => {
+    tdb.close();
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  // The abort lands after the entry tie-break (evaluated synchronously, before the first await) and
+  // after the preserve's own check — exactly the window the tree read holds open. Settling here
+  // would block the bead and write the note; the kill's own path is the one entitled to decide.
+  it("hands the ticket to the abort path instead of writing the board", async () => {
+    const abort = new AbortController();
+    const baseline = await readWorktreeState(repo);
+
+    const settled = settleTicketTimeout({
+      run: run(abort.signal),
+      ticket,
+      session: { logPath },
+      baseline,
+      progress: { committed: false, selfReport: null },
+      timeoutMs: 60_000,
+      standalone: true,
+      ranOutOfTime: true,
+    });
+    abort.abort();
+
+    // No TicketTimeoutError, no poison: it returns, and the caller's abort path settles the ticket.
+    await expect(settled).resolves.toBeUndefined();
+  });
+});
+
 suite("assertPreservedWorkFitsShape — preserved work may only ride the shape that kept it", () => {
   let sandbox: string;
   let repo: string;
@@ -327,6 +401,25 @@ suite("assertPreservedWorkFitsShape — preserved work may only ride the shape t
 
   it("says nothing about a multi-ticket run whose branch carries no preserved commit", async () => {
     await expect(assertPreservedWorkFitsShape(epicRun(false), worktree())).resolves.toBeUndefined();
+  });
+
+  // "No preserved commit" is this guard's PERMISSIVE answer, so it may not be what a failed history
+  // read decays into (PR #228 review). A `git log` that cannot run proves nothing about the branch —
+  // and treating it as proof clears the children to dispatch onto a branch that may still carry the
+  // parent's incomplete commit, which is the one outcome this exists to prevent.
+  it("parks rather than dispatch when the branch history cannot be read at all", async () => {
+    const notARepo = join(sandbox, "not-a-repo");
+    mkdirSync(notARepo);
+
+    const err = await assertPreservedWorkFitsShape(epicRun(false), {
+      ...worktree(),
+      path: notARepo,
+    }).catch((e: unknown) => e);
+
+    expect(isPoisonError(err)).toBe(true);
+    expect((err as Error).message).toContain("could not read the history");
+    expect((err as Error).message).toContain(notARepo);
+    expect((err as Error).message).toMatch(/resume the run/);
   });
 });
 

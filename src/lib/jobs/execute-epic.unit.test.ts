@@ -43,9 +43,11 @@ import {
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage } from "./execute-epic-review";
 import {
+  assertDelivered,
   claudeResumeDecision,
   continuationPrompt,
   ticketBlockNote,
+  type TicketProgress,
 } from "./execute-epic-ticket";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
@@ -823,6 +825,71 @@ describe("reviewParkMessage (anton-3apm)", () => {
     expect(out).not.toContain("the findings are on the bead;");
     expect(out).toContain("AC-2 is not implemented");
     expect(out).toContain("Resolve them (or correct the ticket), then resume the run.");
+  });
+});
+
+/**
+ * The delivery-evidence gate's judgement on WHOSE work the commit is (anton-d967 / PR #228 review).
+ *
+ * A commit adopted from a previous attempt's preserved `WIP` is the one kind of evidence that says
+ * of itself that it is unfinished — it exists only because a timeout cut the ticket off. So it is
+ * delivery only when this run's agent affirms the ticket is done; a zero diff with no parseable
+ * `ANTON-RESULT` would otherwise turn an explicitly incomplete commit into a shipped ticket.
+ */
+describe("assertDelivered — an adopted preserve needs this run's agent to say it is finished", () => {
+  const ticket: Bead = {
+    id: "anton-d967",
+    title: "A ticket timeout destroys finished work",
+    status: "in_progress",
+    issue_type: "feature",
+  };
+  const progress = (selfReport: TicketProgress["selfReport"]): TicketProgress => ({
+    committed: false,
+    selfReport,
+  });
+
+  it("passes work THIS run committed, self-report or not", () => {
+    expect(() => assertDelivered(ticket, { committed: true }, progress(null))).not.toThrow();
+  });
+
+  it("blocks an adopted preserve the agent never affirmed", () => {
+    const err = (() => {
+      try {
+        assertDelivered(ticket, { committed: true, preservedAdoption: true }, progress(null));
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+
+    expect(err?.name).toBe("PoisonError");
+    expect(err?.message).toMatch(/produced no delivery/);
+    expect(err?.message).toMatch(/PRESERVED/);
+  });
+
+  it("passes an adopted preserve the agent reported delivered — the resume it exists for", () => {
+    expect(() =>
+      assertDelivered(
+        ticket,
+        { committed: true, preservedAdoption: true },
+        progress({ outcome: "delivered" }),
+      ),
+    ).not.toThrow();
+  });
+
+  it("still blocks on the agent's own word first when it reported blocked", () => {
+    expect(() =>
+      assertDelivered(
+        ticket,
+        { committed: true, preservedAdoption: true },
+        progress({ outcome: "blocked", reason: "the acceptance criteria contradict each other" }),
+      ),
+    ).toThrow(/self-reported blocked/);
+  });
+
+  it("records the commit verdict on the progress the ticket's exits read", () => {
+    const p = progress(null);
+    expect(() => assertDelivered(ticket, { committed: false }, p)).toThrow(/no delivery/);
+    expect(p.committed).toBe(false);
   });
 });
 

@@ -150,7 +150,10 @@ async function adoptAgentCommits(ctx: StepContext): Promise<StepResultWith<"comm
  *
  * This is not a free pass on the delivery gate: a ticket with no preserved commit still reports the
  * zero diff it always did, and an agent that self-reported `blocked` is still blocked by
- * `assertDelivered` on the strength of its own report.
+ * `assertDelivered` on the strength of its own report. Nor is the adoption a delivery on its own —
+ * the commit it adopts is EXPLICITLY incomplete, so `preservedAdoption` travels with it and
+ * `assertDelivered` requires this run's agent to have affirmed the ticket finished (PR #228
+ * review). This step reports what is on the branch; whether that counts as done is the gate's call.
  */
 async function adoptPreservedWork(ctx: StepContext): Promise<StepResultWith<"committed">> {
   const subject = stepSubject(ctx);
@@ -169,7 +172,7 @@ async function adoptPreservedWork(ctx: StepContext): Promise<StepResultWith<"com
     detail: recorded
       ? "a timed-out attempt's preserved work is the delivery — adopted, ticket attribution recorded"
       : "a timed-out attempt's preserved work is the delivery — adopted",
-    facts: { committed: true },
+    facts: { committed: true, preservedAdoption: true },
   };
 }
 

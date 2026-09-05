@@ -29,6 +29,12 @@ export interface StepFacts {
   selfReport?: AntonResult | null;
   /** `commit` — whether the worktree actually had a diff to commit (false ⇒ nothing delivered). */
   committed?: boolean;
+  /**
+   * `commit` — the evidence is a PREVIOUS attempt's preserved `WIP` commit rather than anything
+   * this run produced. The delivery gate needs the distinction: that commit is explicitly
+   * incomplete, so adopting it as delivered takes this run's agent saying the ticket is finished.
+   */
+  preservedAdoption?: boolean;
   /** `pr` — the PR that was opened or reused. */
   pr?: PullRequest;
   /** `review` — the gate's full verdict; the caller owns the park / advisory handling. */

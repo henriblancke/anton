@@ -142,6 +142,9 @@ suite("commitStep (real git)", () => {
 
     expect(result.ok).toBe(true);
     expect(result.facts.committed).toBe(true);
+    // The evidence is a PREVIOUS attempt's explicitly incomplete commit, so it travels labelled:
+    // the delivery gate reads `preservedAdoption` and asks this run's agent to affirm it is done.
+    expect(result.facts.preservedAdoption).toBe(true);
     // The preserved commit is untouched, and the ticket is now discoverable under its own id.
     expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
     expect(await worktreeHasCommitFor(repo, ticket.id)).toBe(true);
@@ -173,6 +176,8 @@ suite("commitStep (real git)", () => {
 
     expect(result.ok).toBe(true);
     expect(result.facts.committed).toBe(true);
+    // Work THIS run produced — no affirmation beyond the diff itself, unlike an adopted preserve.
+    expect(result.facts.preservedAdoption).toBeUndefined();
     // The agent's own commit is the delivery and is left exactly as it was.
     expect(subjects()).toContain("test(settings): cover the Automation surface");
     expect(out(["rev-parse", `${tip}`])).toBe(tip);
