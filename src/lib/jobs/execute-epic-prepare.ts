@@ -304,6 +304,13 @@ function assertTicketsClaimable(run: EpicRun, gates: RunGates): void {
  * Status-only: the drift and label questions are settled behind the lease (step 1c), and a status a
  * person wrote needs no adoption — a child absent from this board keeps the object the gates above
  * judged, since a set that changed is drift 1c already proved cannot happen unseen.
+ *
+ * PULLED as well as read (PR #227 review): on an embedded board `loadAllIssues` lists only the LOCAL
+ * database, so a status another machine wrote is invisible to it — while {@link publishRunClaim}, a
+ * line later, runs a full sync that PULLS before it pushes. Without the pull this check would judge
+ * the pre-pull board and publication would then import the very block it was asked about, which is
+ * the stale-read shape it exists to remove. `beads.pull` resolves for a board with no remote and for
+ * a shared server (nothing to reconcile in either), so only a real refresh failure rejects.
  */
 async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Promise<void> {
   const { repo, targetId: epicBeadId } = run;
@@ -316,12 +323,14 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
   // attempt reuses this worktree and re-takes the same idempotent reservations.
   let reservedBoard: Bead[];
   try {
+    await beads.pull(repo);
     reservedBoard = await loadAllIssues(repo, { strictGates: true });
   } catch (e) {
     throw new Error(
-      `${epicBeadId} could not re-read the board after reserving its tickets to confirm none of ` +
-        `them is held for a person — retrying rather than dispatching into a claim gate that ` +
-        `would stop the run mid-feature. (${e instanceof Error ? e.message : String(e)})`,
+      `${epicBeadId} could not refresh and re-read the board after reserving its tickets to ` +
+        `confirm none of them is held for a person — retrying rather than dispatching into a ` +
+        `claim gate that would stop the run mid-feature. ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
     );
   }
   const reserved = new Map(runTickets(reservedBoard, epicBeadId).map((t) => [t.id, t]));

@@ -24,6 +24,7 @@ const cascadeChildClaimsMock = vi.fn();
 const publishRunClaimMock = vi.fn();
 const preflightHumanTicketsMock = vi.fn();
 const loadAllIssuesMock = vi.fn();
+const pullMock = vi.fn();
 const updateRunMock = vi.fn();
 const validateRunFormulaMock = vi.fn();
 
@@ -43,6 +44,13 @@ vi.mock("./execute-epic-human-gate", async () => {
   const actual =
     await vi.importActual<typeof import("./execute-epic-human-gate")>("./execute-epic-human-gate");
   return { ...actual, preflightHumanTickets: (...args: unknown[]) => preflightHumanTicketsMock(...args) };
+});
+
+// Only `pull` is stubbed: the post-reservation check refreshes the shared board before reading it,
+// and a real pull would spawn bd.
+vi.mock("../beads/bd", async () => {
+  const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
+  return { ...actual, beads: { ...actual.beads, pull: (...args: unknown[]) => pullMock(...args) } };
 });
 
 vi.mock("../beads/issues", async () => {
@@ -157,6 +165,7 @@ beforeEach(() => {
   warmRunWorktreeMock.mockResolvedValue({ worktree: { path: "/tmp/wt" }, runStep: {} });
   claimRunTargetMock.mockResolvedValue(undefined);
   cascadeChildClaimsMock.mockResolvedValue(undefined);
+  pullMock.mockResolvedValue(undefined);
   publishRunClaimMock.mockResolvedValue(undefined);
   // No human work by default: nothing written, nothing adopted.
   preflightHumanTicketsMock.mockImplementation((args: { board: Bead[] }) =>
@@ -247,7 +256,43 @@ describe("prepareEpicRun — a held child is caught on every board the run adopt
 
     // Fails CLOSED but retryable: the next attempt reuses this worktree and its reservations.
     expect(error).not.toBeInstanceOf(PoisonEpic);
-    expect(error.message).toContain("could not re-read the board after reserving");
+    expect(error.message).toContain("could not refresh and re-read the board");
+    expect(publishRunClaimMock).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the shared board before that read, so a block another machine wrote is seen", async () => {
+    // PR #227 review: on an embedded board `loadAllIssues` lists only the local database, and the
+    // claim publication a line later pulls anyway — so reading without pulling first would clear a
+    // child that publication immediately imports as blocked. The pull below is what makes the
+    // second read differ, exactly as a remote block arriving with it would.
+    const all = board(ticket("t-1"), ticket("t-2"));
+    loadAllIssuesMock.mockResolvedValue(all);
+    pullMock.mockImplementation(() => {
+      loadAllIssuesMock.mockResolvedValue(board(ticket("t-1"), ticket("t-2", "blocked")));
+      return Promise.resolve();
+    });
+    preflightHumanTicketsMock.mockResolvedValue(preflight(all));
+
+    const error = await refusalFrom(all);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("t-2");
+    expect(error.message).toContain("blocked pending human review");
+    expect(publishRunClaimMock).not.toHaveBeenCalled();
+  });
+
+  it("retries rather than dispatching when that board can't be refreshed", async () => {
+    const all = board(ticket("t-1"), ticket("t-2"));
+    loadAllIssuesMock.mockResolvedValue(all);
+    pullMock.mockRejectedValue(new Error("fetch from origin/main: connection refused"));
+    preflightHumanTicketsMock.mockResolvedValue(preflight(all));
+
+    const error = await refusalFrom(all);
+
+    // Fails CLOSED but retryable: a run that cannot prove it is looking at the current board must
+    // not publish its claim and enter the loop.
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("could not refresh and re-read the board");
     expect(publishRunClaimMock).not.toHaveBeenCalled();
   });
 
