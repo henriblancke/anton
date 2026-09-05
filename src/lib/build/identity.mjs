@@ -1121,6 +1121,24 @@ const APP_DIRECTORIES = ["app", "src/app"];
 const ROUTE_SOURCE = /\.(?:m?[jt]sx?)$/;
 
 /**
+ * A colocated test, which sits in the route tree and is absent from the build (PR #217 review).
+ *
+ * Next routes on exact filenames — `page`, `route`, `layout` — so `route.test.ts` is routed by
+ * nothing and no route imports it; it is compiled into no artifact. Reading it anyway is not a
+ * harmless extra name, it is the failure this scan refuses the import closure to avoid: a test sets
+ * up the environment it runs under, so it names the RUNTIME variables that differ per shell.
+ * `route.integration.test.ts` in this checkout reads `process.env.USER`, which would move the digest
+ * for every operator on the machine and run a full `next build` on an artifact that is identical.
+ *
+ * `__tests__` and `__mocks__` are skipped whole, for the same reason and to spare the walk's budget:
+ * nothing under either is routed.
+ */
+const ROUTE_TEST_SOURCE = /\.(?:test|spec)\.(?:m?[jt]sx?)$/;
+
+/** Directories the route walk does not enter: dependencies, and test trees Next never routes. */
+const UNROUTED_DIRECTORIES = new Set(["node_modules", "__tests__", "__mocks__"]);
+
+/**
  * `env` for a build environment anton could only read PART of — the route scan ran past its ceiling,
  * so some build-evaluated route file went unread. A literal, so it can never collide with a digest.
  *
@@ -1194,8 +1212,8 @@ function walkRoutes(dir, budget, names) {
     budget.left -= 1;
     const path = join(dir, entry.name);
     if (entry.isDirectory()) {
-      if (entry.name !== "node_modules") walkRoutes(path, budget, names);
-    } else if (entry.isFile() && ROUTE_SOURCE.test(entry.name)) {
+      if (!UNROUTED_DIRECTORIES.has(entry.name)) walkRoutes(path, budget, names);
+    } else if (entry.isFile() && ROUTE_SOURCE.test(entry.name) && !ROUTE_TEST_SOURCE.test(entry.name)) {
       try {
         envNamesIn(readFileSync(path, "utf8"), names);
       } catch {}

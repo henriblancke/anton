@@ -1368,6 +1368,32 @@ describe("the build-time environment in an identity", () => {
     expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).toMatch(/^[0-9a-f]{12}$/);
   });
 
+  // A colocated test sits IN the route tree and is compiled into nothing: Next routes on exact
+  // filenames, so `route.test.ts` is routed by nothing and imported by no route. Reading it is the
+  // failure the import closure is refused to avoid, arriving by the front door — a test sets up the
+  // environment it runs under, so it names the runtime variables that differ per shell.
+  // `route.integration.test.ts` in this repo reads `process.env.USER`, which rebuilt an identical
+  // artifact for every operator on the machine (PR #217 review).
+  it("ignores a variable only a colocated test in the route tree reads", () => {
+    const dir = app();
+    const routes = join(dir, "src", "app", "api");
+    mkdirSync(join(routes, "__tests__"), { recursive: true });
+    writeFileSync(join(routes, "route.tsx"), "export const F = process.env.BUILD_FLAVOR;\n");
+    writeFileSync(join(routes, "route.test.ts"), "beforeEach(() => delete process.env.USER);\n");
+    writeFileSync(join(routes, "route.integration.test.ts"), "const h = process.env.HOME;\n");
+    writeFileSync(join(routes, "route.spec.tsx"), "const s = process.env.SHELL;\n");
+    writeFileSync(join(routes, "__tests__", "helper.ts"), "const p = process.env.PATH;\n");
+
+    // None of those four move the digest...
+    const base = { BUILD_FLAVOR: "one", USER: "alice", HOME: "/home/alice", SHELL: "/bin/zsh", PATH: "/usr/bin" };
+    const digest = readBuildIdentity(dir, base).env;
+    for (const shell of [{ USER: "bob" }, { HOME: "/home/bob" }, { SHELL: "/bin/bash" }, { PATH: "/opt/bin" }])
+      expect(readBuildIdentity(dir, { ...base, ...shell }).env).toBe(digest);
+
+    // ...while the real route beside them still does.
+    expect(readBuildIdentity(dir, { ...base, BUILD_FLAVOR: "two" }).env).not.toBe(digest);
+  });
+
   // The scope stops at the route tree on purpose. Most of an app's server code reads its environment
   // at RUNTIME, and folding those names in would rebuild whenever a shell set one differently — a
   // runner and an `ANTON_RUNNER=off` UI sharing an install would each rebuild over the other's `.next`.
