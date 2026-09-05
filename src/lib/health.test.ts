@@ -4,12 +4,32 @@
  * here), the attention/housekeeping split still comes straight from `rankAttention`, and the stopped
  * count is carried through untouched for the right rail's "answered on the board" line.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { projectHealthFromBoard } from "./health";
-import type { Board, HygieneFinding, HygieneReport, ReviewTrajectory } from "./types";
+import type { ServerDrift } from "./build/drift";
+import type { Board, HygieneFinding, HygieneReport, Project, ReviewTrajectory } from "./types";
 
 type BoardSlice = Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">;
+
+const project: Project = {
+  id: "p1",
+  slug: "anton",
+  name: "anton",
+  repoPath: "/tmp/anton",
+  defaultBranch: "main",
+  hasBeads: true,
+  createdAt: 1_700_000_000,
+};
+
+afterEach(() => {
+  vi.doUnmock("./board");
+  vi.doUnmock("./escalations");
+  vi.doUnmock("./build/drift");
+  vi.doUnmock("./picker-starts");
+  vi.doUnmock("./picker-veto");
+  vi.resetModules();
+});
 
 function finding(kind: HygieneFinding["kind"], id: string): HygieneFinding {
   return { kind, key: `${kind}:${id}`, detail: `${kind} on ${id}`, beadId: id };
@@ -104,5 +124,59 @@ describe("projectHealthFromBoard", () => {
     // An open escalation must not turn a project with no findings into a "not clean" one — it's a
     // different question, answered on the board, and this page never mixes the two.
     expect(health.worthALook).toEqual([]);
+  });
+});
+
+// The stale-process verdict is about the SERVERS, not this project, and the page is where it has to
+// be legible without a CLI (anton-pzfb) — so this composition carries them through untouched, and
+// carries nothing when every running build is the build on disk.
+describe("build drift on the health page", () => {
+  const board: BoardSlice = { hygiene: undefined, scanHealth: undefined, reviewTrajectory: undefined };
+
+  // One entry per drifting process, not one for the process that rendered the page: an install can
+  // serve its UI from an `ANTON_RUNNER=off` server while a second one executes the nightlies, and
+  // only the second explains a degraded scan (PR #217 review).
+  it("carries every drifting server through to the page", () => {
+    const servers: ServerDrift[] = [
+      {
+        pid: 4242,
+        self: false,
+        runner: true,
+        drift: {
+          state: "modified",
+          running: { version: "0.4.0", revision: "a".repeat(40) },
+          onDisk: { version: "0.4.0", revision: "b".repeat(40) },
+          bootedAt: null,
+        },
+      },
+    ];
+    expect(projectHealthFromBoard(board, 0, servers).staleServers).toBe(servers);
+  });
+
+  it("reports none when every running server started from the current checkout", () => {
+    expect(projectHealthFromBoard(board, 0).staleServers).toEqual([]);
+  });
+});
+
+// Every read behind the page degrades rather than throwing — `getBoard` returns undefined on a bad
+// anton.db, and drift detection has to match it: it shells out to the process table, so an EAGAIN
+// under load must cost the page its drift banner, not the whole page (PR #217 review).
+describe("getProjectHealth", () => {
+  it("renders without a drift banner when drift detection fails", async () => {
+    vi.doMock("./board", () => ({
+      getBoard: vi.fn().mockResolvedValue({ hygiene: hygiene([]), scanHealth: undefined, reviewTrajectory: undefined }),
+    }));
+    vi.doMock("./escalations", () => ({ openEscalations: vi.fn().mockResolvedValue([]) }));
+    vi.doMock("./build/drift", () => ({
+      serverBuildDrifts: vi.fn().mockRejectedValue(new Error("spawnSync lsof EAGAIN")),
+    }));
+    vi.doMock("./picker-starts", () => ({ latestPickerStarts: vi.fn().mockResolvedValue([]) }));
+    vi.doMock("./picker-veto", () => ({ latestPickerDeclines: vi.fn().mockResolvedValue([]) }));
+
+    const { getProjectHealth } = await import("./health");
+    const health = await getProjectHealth(project);
+
+    expect(health.staleServers).toEqual([]);
+    expect(health.hygiene).toBeDefined();
   });
 });

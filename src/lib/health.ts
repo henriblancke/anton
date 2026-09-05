@@ -18,6 +18,7 @@
  */
 import { rankAttention, type AttentionItem } from "./attention";
 import { getBoard } from "./board";
+import { serverBuildDrifts, type ServerDrift } from "./build/drift";
 import { openEscalations } from "./escalations";
 import { PICKER_LOG_LIMIT, pickerLogEntries, type PickerLogEntry } from "./picker-log";
 import { latestPickerStarts, type PickerStartRow } from "./picker-starts";
@@ -44,6 +45,15 @@ export interface ProjectHealth {
    * which the applied section reports by saying nothing, not by drawing an empty log.
    */
   pickerLog: PickerLogEntry[];
+  /**
+   * Every server of this install running something other than the code on disk (anton-pzfb), empty
+   * when they all match. Not a property of this project at all — these are the processes every
+   * project's jobs run under, which is exactly why they belong here: a nightly degraded by a stale
+   * build shows up as this page's findings, so this page is where the reason has to be legible
+   * without a CLI. One entry per process, because an install can run a UI-only server beside the
+   * one executing the jobs and only the second explains a degraded nightly.
+   */
+  staleServers: ServerDrift[];
 }
 
 /**
@@ -54,6 +64,7 @@ export interface ProjectHealth {
 export function projectHealthFromBoard(
   board: Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">,
   stoppedCount: number,
+  staleServers: ServerDrift[] = [],
   picker: { starts: PickerStartRow[]; verdicts: PickerVerdictRow[] } = { starts: [], verdicts: [] },
 ): ProjectHealth {
   const { items, housekeeping } = rankAttention({
@@ -68,6 +79,7 @@ export function projectHealthFromBoard(
     trajectory: board.reviewTrajectory,
     stoppedCount,
     pickerLog: pickerLogEntries(picker),
+    staleServers,
   };
 }
 
@@ -75,16 +87,23 @@ export function projectHealthFromBoard(
  * UI read path. Goes through {@link getBoard} rather than reading hygiene/scan-health directly, so a
  * failed anton.db read degrades to "never patrolled"/"never scanned" the same way the board itself
  * does (getBoard logs and returns undefined) instead of taking this page down with it. The board
- * read, the escalation read and the picker's two records are independent, so they run concurrently.
+ * read, the escalation read, the build-drift read and the picker's two records are independent, so
+ * they run concurrently.
  */
 export async function getProjectHealth(project: Project): Promise<ProjectHealth> {
-  const [board, escalations, starts, verdicts] = await Promise.all([
+  // Read the running builds live rather than from a stored report: which build is running is a fact
+  // about this instant, and a patrol row written by a since-restarted process would report drift
+  // that no longer exists.
+  const [board, escalations, staleServers, starts, verdicts] = await Promise.all([
     getBoard(project),
     openEscalations(project.id),
+    // Degrades to "no stale servers" like every other read here: drift detection shells out to the
+    // process table, and a transient failure there must not take the page down.
+    serverBuildDrifts().catch(() => [] as ServerDrift[]),
     latestPickerStarts(project.id),
     // Declines only, and no more of them than the log can show: the merge below keeps the newest
     // PICKER_LOG_LIMIT entries across both stores, so a wider read would only fetch rows it drops.
     latestPickerDeclines(project.id, PICKER_LOG_LIMIT),
   ]);
-  return projectHealthFromBoard(board, escalations.length, { starts, verdicts });
+  return projectHealthFromBoard(board, escalations.length, staleServers, { starts, verdicts });
 }

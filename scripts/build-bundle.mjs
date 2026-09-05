@@ -14,6 +14,8 @@
  *     src/lib/beads/tiers.mjs     shared tier rules behind `anton board-check`
  *     src/lib/beads/server-mode.mjs  shared server-mode config behind `anton server-mode`
  *     src/lib/claude/skill-stamp.mjs  shared skill version stamps (setup refresh + doctor drift)
+ *     src/lib/build/identity.mjs  shared build stamp (server boot record + doctor drift)
+ *     src/lib/build/servers.mjs   shared search for the running servers of this install
  *     src/prompts/                system-base.md + agents/ (read at runtime, cwd-rooted)
  *     skills/                     vendored SKILL.md assets (read at runtime, cwd-rooted)
  *     drizzle/                    migration SQL (applied in-process at setup — no drizzle-kit)
@@ -143,6 +145,13 @@ function main(argv) {
     // The skill stamps `anton setup` refreshes and `anton doctor` warns on (anton-gsyh) — same
     // pure-JS seam, so the launcher can import it before any build exists.
     join("src", "lib", "claude", "skill-stamp.mjs"),
+    // The build stamp a running server writes and `anton doctor` compares (anton-pzfb) — same
+    // pure-JS seam, and the bundle is exactly where it matters: `anton update` replaces the runtime
+    // dir under a live process, which keeps serving the version it booted with until a restart.
+    join("src", "lib", "build", "identity.mjs"),
+    // The servers a record cannot see — the pre-stamp process an upgrade leaves running (anton-pzfb).
+    // Shared by doctor and the health page precisely so the two cannot answer differently.
+    join("src", "lib", "build", "servers.mjs"),
     join("src", "prompts"),
     "bin",
   ]) {

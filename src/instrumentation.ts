@@ -7,7 +7,14 @@
  */
 export async function register(): Promise<void> {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
-  if (process.env.ANTON_RUNNER === "off") return;
+  // Stamp what this process is running before anything else (anton-pzfb). Boot is the only moment
+  // the answer is knowable — from here on the code on disk can move and this process cannot follow.
+  // Ahead of the runner gate on purpose: a UI-only server goes just as stale. The gate's own answer
+  // is recorded with it, so a reader can tell whether a stale build is costing the nightlies.
+  const runner = process.env.ANTON_RUNNER !== "off";
+  const { recordServerBuild } = await import("./lib/build/drift");
+  recordServerBuild({ runner });
+  if (!runner) return;
   const { startRunner } = await import("./lib/jobs/service");
   await startRunner();
 }

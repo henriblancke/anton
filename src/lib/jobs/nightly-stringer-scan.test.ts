@@ -34,6 +34,22 @@ vi.mock("../git/refresh", () => ({
   refreshCheckout: async () => ({ head: "abc1234" }),
 }));
 
+// What the process running this pass booted from — null (matching the checkout) unless a case says
+// otherwise. Real drift needs a real stale server, which no unit test can boot.
+const build = vi.hoisted(() => ({
+  drift: null as { state: string; running: unknown; onDisk: unknown; bootedAt: number | null } | null,
+  /** The checkouts the pass told drift had moved, in the order it said so. */
+  moved: [] as string[],
+}));
+
+// The verdict is gated on the invalidation, so a pass that asked BEFORE fast-forwarding reads as the
+// silence it is: drift caches the code on disk, and the cached copy predates the pull.
+vi.mock("../build/drift", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../build/drift")>()),
+  checkoutMoved: (repoPath: string) => build.moved.push(repoPath),
+  serverBuildDrift: () => (build.moved.length > 0 ? build.drift : null),
+}));
+
 const scanned = vi.hoisted(() => ({ restoreBaseline: async (): Promise<string | undefined> => undefined }));
 
 vi.mock("../stringer", async (importOriginal) => {
@@ -75,6 +91,8 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "anton-stringer-scan-"));
   logPath = join(dir, "session.log");
   failLogWrite = undefined;
+  build.drift = null;
+  build.moved = [];
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 
@@ -155,4 +173,45 @@ it("reports what the scan lost when the log is writable", async () => {
   // the only place the drop and the value that cleared it still exist.
   expect(log).toContain("dropped 1 committed-secret signal(s)");
   expect(log).toContain(`src/lib/beads/bd-env.test.ts:62`);
+});
+
+// A pass that ran under a stale process must say so where the run is reconstructed afterwards
+// (anton-pzfb): the three nightlies that re-filed an already-filtered signal left session logs whose
+// only tell was a line the running build was too old to write.
+it("names a stale server on the session, beside the line recording what it invoked", async () => {
+  build.drift = {
+    state: "modified",
+    running: { version: "0.4.0", revision: "a".repeat(40) },
+    onDisk: { version: "0.4.0", revision: "b".repeat(40) },
+    bootedAt: null,
+  };
+
+  await runScan();
+
+  const log = readFileSync(logPath, "utf8");
+  expect(log).toContain("[stringer] scan --delta /repo @ abc1234");
+  expect(log).toContain("[stringer] WARNING: the running anton server is 0.4.0 (aaaaaaa)");
+  expect(log).toContain("Restart the server");
+});
+
+// The stamp the verdict stands on is the one this pass just fast-forwarded to (PR #217 review): a
+// schedule firing within drift's 15s cache of boot would otherwise compare this server against the
+// commit the checkout held before the pull and call itself current.
+it("asks about the tree the fast-forward left, not the one the pass started on", async () => {
+  build.drift = {
+    state: "outdated",
+    running: { version: "0.4.0", revision: "a".repeat(40) },
+    onDisk: { version: "0.4.1", revision: "b".repeat(40) },
+    bootedAt: null,
+  };
+
+  await runScan();
+
+  expect(build.moved).toEqual([project.repoPath]);
+  expect(readFileSync(logPath, "utf8")).toContain("Restart the server");
+});
+
+it("says nothing when the pass runs under the build on disk", async () => {
+  await runScan();
+  expect(readFileSync(logPath, "utf8")).not.toContain("Restart the server");
 });

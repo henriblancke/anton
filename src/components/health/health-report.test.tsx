@@ -20,6 +20,7 @@ function health(over: Partial<ProjectHealth> = {}): ProjectHealth {
     scanHealth: undefined,
     trajectory: undefined,
     stoppedCount: 0,
+    staleServers: [],
     pickerLog: [],
     ...over,
   };
@@ -55,6 +56,37 @@ describe("HealthReport", () => {
       />,
     );
     expect(screen.queryByText("Nothing has checked this project yet")).toBeNull();
+  });
+
+  // The page is the surface a stale process has to reach without a CLI, so the banner rides above
+  // everything else it would make untrustworthy (anton-pzfb).
+  it("leads with the stale-server banner when the running build is not the one on disk", () => {
+    render(
+      <HealthReport
+        slug="anton"
+        health={health({
+          staleServers: [
+            {
+              pid: 4242,
+              self: true,
+              runner: true,
+              drift: {
+                state: "outdated",
+                running: { version: "0.3.9", revision: null },
+                onDisk: { version: "0.4.0", revision: null },
+                bootedAt: null,
+              },
+            },
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByText("This anton server is not running the build on disk")).toBeTruthy();
+  });
+
+  it("shows no such banner for a server started from the current checkout", () => {
+    render(<HealthReport slug="anton" health={health()} />);
+    expect(screen.queryByText("This anton server is not running the build on disk")).toBeNull();
   });
 
   it("always renders the vitals rail, even with nothing to report", () => {

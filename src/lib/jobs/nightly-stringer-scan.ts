@@ -9,6 +9,7 @@
  */
 import { join } from "node:path";
 import { appendSessionLog } from "../sessions";
+import { checkoutMoved, describeBuildDrift, serverBuildDrift } from "../build/drift";
 import { refreshCheckout } from "../git/refresh";
 import { describeCouplingFilter } from "../scan-coupling";
 import { describeDeadcodeFilter } from "../scan-deadcode";
@@ -158,6 +159,27 @@ async function reportScanDiagnostics(
 }
 
 /**
+ * Name the stale process on the session, beside the line recording what this pass invoked
+ * (anton-pzfb). The pass runs the code THIS SERVER booted with, not the code in the checkout it just
+ * fast-forwarded, so a guard that shipped days ago may simply not be in it — three nightlies in a
+ * row filed a signal two landed filters already dropped, and the only tell was a log line the
+ * running build was too old to write. The claim belongs on the log because that is where the run is
+ * reconstructed afterwards; the scan proceeds either way.
+ *
+ * The verdict has to stand on the tree the fast-forward just left, not on a read taken before it
+ * (PR #217 review): drift caches the code on disk for 15s, and a schedule firing that soon after
+ * boot would compare this server against the commit it started on and call itself current.
+ */
+async function reportStaleServer(project: Project, logPath: string): Promise<void> {
+  checkoutMoved(project.repoPath);
+  const drift = serverBuildDrift();
+  if (!drift) return;
+  const detail = describeBuildDrift(drift);
+  await appendSessionLog(logPath, `[stringer] WARNING: ${detail}\n`);
+  console.warn(`[nightly-stringer] ${project.slug}: ${detail}`);
+}
+
+/**
  * Measure the tree that SHIPPED (anton-qor2). anton pulls the BOARD before it reads it but never
  * the checkout, so the scan ran against whatever the last human left: the 2026-08-06 nightly
  * measured a tree 6 commits behind origin/main and spent 87% of its signals — and its whole
@@ -178,6 +200,7 @@ export async function scanShippedTree(opts: {
 
   const scanFile = scanFilePath(opts.sessionId);
   await appendSessionLog(logPath, `[stringer] scan --delta ${project.repoPath} @ ${scannedSha}\n`);
+  await reportStaleServer(project, logPath);
   const result = await scan({ repoPath: project.repoPath, scanFile, signal: opts.signal });
 
   // Nothing that can throw may run between the scan and this return: the scan has already consumed
