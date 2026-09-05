@@ -100,6 +100,157 @@ function gitBounded(
   });
 }
 
+/**
+ * Override the commit budget (tests shrink it so a hook that outlives the kill is reachable).
+ * Read per call, so a change lands without a module reload.
+ */
+export const COMMIT_TIMEOUT_ENV = "ANTON_GIT_COMMIT_TIMEOUT_MS";
+
+/** The same budget every other git call here runs under. */
+const DEFAULT_COMMIT_TIMEOUT_MS = 120_000;
+
+/** What a killed commit's group gets to tear itself down before SIGKILL follows. */
+const COMMIT_KILL_GRACE_MS = 5_000;
+
+/** How often a kill re-asks whether the commit's process group still has members. */
+const REAP_POLL_MS = 25;
+
+/**
+ * Ceiling on waiting for a SIGKILLed group to disappear. SIGKILL is uncatchable, so anything still
+ * standing past this is wedged in the kernel or has left the group by `setsid` — neither of which
+ * more waiting fixes, and a run must never hang on it.
+ */
+const REAP_CEILING_MS = 2_000;
+
+function commitTimeoutMs(): number {
+  const raw = Number(process.env[COMMIT_TIMEOUT_ENV]);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_COMMIT_TIMEOUT_MS;
+}
+
+/**
+ * Run a `git commit` and return only once it — and every hook it spawned — is GONE (PR #228 review).
+ *
+ * Committing is the one git command anton runs that executes PROJECT code: `pre-commit` and
+ * `commit-msg` hooks, run as children of git, free to write the worktree for as long as they like.
+ * Under `execFile`'s timeout Node signals the direct `git` process alone, so a hook that outlives it
+ * — one that traps SIGTERM, or that redirects the stdio it inherited and keeps going — is orphaned
+ * ALIVE at the moment the caller is told the commit failed. That caller is the ticket-timeout
+ * preserve, which reads the failure as a verdict and immediately hard-resets the worktree and checks
+ * it clean: a late hook write then lands after the check and is swept into the next ticket's commit,
+ * or is thrown away with the failed run's worktree.
+ *
+ * So the commit leads a process group of its own and a kill is delivered to the GROUP and waited
+ * on — SIGTERM, then SIGKILL after the grace, then poll until the group reports `ESRCH` — before any
+ * verdict is returned. The wait is bounded for the same reason `runShell`'s is: a group that cannot
+ * be reaped must not wedge the run, and the caller's own cleanliness check is what catches whatever
+ * such a survivor writes.
+ *
+ * Only the KILL path reaps. A commit that ends on its own already waited for its hooks — git runs
+ * them synchronously — so there is nothing left to wait for.
+ */
+function gitCommit(cwd: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // stdout is dropped rather than piped: nothing here reads it, and a chatty hook filling an
+    // unread pipe would block the commit outright.
+    const child = spawn("git", ["-C", cwd, ...args], {
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: process.platform !== "win32",
+    });
+
+    let stderr = "";
+    let settled = false;
+    let killing = false;
+    /** The budget, the SIGKILL escalation and the reap poll — all released on the way out. */
+    const timers: NodeJS.Timeout[] = [];
+    const after = (ms: number, fn: () => void) => {
+      timers.push(setTimeout(fn, ms));
+    };
+
+    const settle = (emit: () => void) => {
+      if (settled) return;
+      settled = true;
+      for (const t of timers) clearTimeout(t);
+      emit();
+    };
+
+    const killGroup = (sig: NodeJS.Signals) => {
+      if (process.platform !== "win32" && child.pid) {
+        try {
+          process.kill(-child.pid, sig);
+          return;
+        } catch {
+          // The group may never have formed (spawn failed); fall back to the direct child handle.
+        }
+      }
+      child.kill(sig);
+    };
+
+    /** Whether every member of the commit's group is gone — git AND the hooks it started. */
+    const groupGone = (): boolean => {
+      if (!child.pid) return true; // spawn failed — there is no group to wait on
+      if (process.platform === "win32") return child.exitCode !== null || child.signalCode !== null;
+      try {
+        process.kill(-child.pid, 0);
+        return false;
+      } catch (err) {
+        // EPERM means members we cannot signal are still there; only ESRCH proves the group empty.
+        return (err as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    };
+
+    const killAndReap = (emit: () => void) => {
+      if (killing) return;
+      killing = true;
+      killGroup("SIGTERM");
+      after(COMMIT_KILL_GRACE_MS, () => {
+        if (!groupGone()) killGroup("SIGKILL");
+      });
+      const deadline = Date.now() + COMMIT_KILL_GRACE_MS + REAP_CEILING_MS;
+      const wait = () => {
+        if (groupGone() || Date.now() >= deadline) {
+          settle(emit);
+          return;
+        }
+        after(REAP_POLL_MS, wait);
+      };
+      wait();
+    };
+
+    const timeoutMs = commitTimeoutMs();
+    after(timeoutMs, () => {
+      killAndReap(() =>
+        reject(
+          Object.assign(
+            new Error(
+              `git ${args[0]} timed out after ${timeoutMs}ms and was killed with everything it ` +
+                `spawned: ${stderr.trim()}`,
+            ),
+            { killed: true },
+          ),
+        ),
+      );
+    });
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderr.length < 4096) stderr += chunk.toString("utf8");
+    });
+    child.on("error", (err) => settle(() => reject(err)));
+    child.on("close", (code) => {
+      // A kill in flight owns the verdict: its group may still hold live writers.
+      if (killing) return;
+      settle(() =>
+        code === 0
+          ? resolve()
+          : reject(
+              Object.assign(new Error(`git ${args[0]} failed (exit ${code}): ${stderr.trim()}`), {
+                code,
+              }),
+            ),
+      );
+    });
+  });
+}
+
 /** The tree mode of a symlink. Its blob holds the TARGET PATHNAME, not the linked file's content. */
 const SYMLINK_MODE = "120000";
 
@@ -336,7 +487,7 @@ export async function commitAll(
     await git(worktreePath, ["diff", "--cached", "--quiet"]);
     return { committed: false };
   } catch {
-    await git(worktreePath, ["commit", "-m", message]);
+    await gitCommit(worktreePath, ["commit", "-m", message]);
     return { committed: true };
   }
 }
@@ -389,7 +540,7 @@ export async function commitMarker(
   options: { bypassHooks?: boolean } = {},
 ): Promise<void> {
   const bypass = options.bypassHooks ? ["--no-verify"] : [];
-  await git(worktreePath, ["commit", "--allow-empty", ...bypass, "-m", message]);
+  await gitCommit(worktreePath, ["commit", "--allow-empty", ...bypass, "-m", message]);
 }
 
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {

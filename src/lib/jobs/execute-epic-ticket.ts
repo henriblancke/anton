@@ -749,7 +749,7 @@ export async function settleTicketTimeout(args: {
   ranOutOfTime: boolean;
 }): Promise<void> {
   const { run, ticket, session, baseline, timeoutMs, standalone, ranOutOfTime } = args;
-  const { ctx, worktreePath } = run;
+  const { ctx, worktreePath, branch } = run;
   const repo = run.repoPath;
   const { logPath } = session;
   // Two different questions, and the deadline can land between their answers (PR #228 review).
@@ -865,6 +865,26 @@ export async function settleTicketTimeout(args: {
           `stopped here. Mark the branch tip by hand (an empty commit whose subject starts ` +
           `\`${preservedCommitPrefix(ticket.id)}\`) or take the commits off \`${unmarkedOn}\`, ` +
           `then resume the run`,
+      );
+    }
+    // A commit the delivery gate REFUSED stops the run, exactly as it would have without the
+    // deadline (PR #228 review). Without the timeout, `assertDelivered`'s refusal propagates and
+    // halts the epic; with it, the timeout takes over the settlement and the dispatch loop absorbs
+    // it — and that commit is on the branch, where no rollback may touch it. The board is told the
+    // truth (`not-delivered`, above), but the DIFF is not board state: the siblings behind this
+    // ticket carry on, and the one pull request they open physically contains work this run's own
+    // gate declared unfinished. Halting is what the refusal always meant; a person then finishes
+    // the ticket or takes the commit off the branch. Standalone runs halt here too, rather than at
+    // the park that follows: that park reads a refused commit as rolled back and tells the operator
+    // a resume starts the work over, when it is sitting on the branch.
+    if (committed && !delivered) {
+      throw new PoisonEpic(
+        `${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m ticket budget while this ` +
+          `run's delivery gate was REFUSING its commit — so its work is on \`${branch}\` and is ` +
+          `nobody's delivery. It was not rolled back (no branch carrying a commit is), and the run ` +
+          `stopped rather than carry that unfinished diff into the pull request the rest of the ` +
+          `work would open. Review the commit and finish ${ticket.id} by hand, or take it off ` +
+          `\`${branch}\`, then resume the run`,
       );
     }
     throw new TicketTimeoutError(ticket.id, timeoutMs, delivered, preservedOn);
@@ -1382,9 +1402,12 @@ async function blockTimedOutTicket(args: {
         `Split it into smaller tickets, or raise ticketTimeoutMinutes, then resume the run`,
     ),
   );
-  // Every halt the caller makes PARKS the run and tells the operator to resume it, so this ticket
-  // has to stay claimable (anton-67xj) — the unmarked adoption included (PR #228 review), since the
-  // resume that follows the operator's fix is what finishes it. The block above left it `blocked` —
+  // A halt whose fix is MECHANICAL parks the run and tells the operator to resume it, so this
+  // ticket has to stay claimable (anton-67xj) — the unmarked adoption included (PR #228 review),
+  // since the resume that follows the operator's fix is what finishes it. A commit the delivery
+  // gate REFUSED is the one halt that does not: its fix is a person reading the diff, exactly as
+  // when that refusal halts without a deadline, so it keeps the `blocked` below — and none of the
+  // three conditions here fire for it. The block above left it `blocked` —
   // or `in_progress` and unowned, if that best-effort status write failed — and runTicket's hard
   // claim gate refuses both, so the advertised resume would die on its own first step. Put it back
   // at `open`, the same restore the stale-marker path performs; the note above is what carries the

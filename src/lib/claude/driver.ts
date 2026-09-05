@@ -106,6 +106,15 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
     };
 
     const onAbort = () => {
+      // Cancellation is latched HERE, on the signal itself, rather than on the child's `error` (PR
+      // #228 review). Node emits that `error` only when it actually delivers the kill, so an abort
+      // landing after the direct process has already exited — while a descendant still holds its
+      // stdout and `close` is yet to fire — produces none at all, and the `close` below would then
+      // settle a CANCELLED session as an ordinary one. On a formula with no verify step nothing
+      // downstream consumes the signal, so the commit step would run and a cancelled ticket would
+      // commit and update its bead. A real `error` still overwrites this placeholder: callers
+      // discriminate cancellation by the rejection's shape, and both are `AbortError`s.
+      aborting ??= abortError();
       killTree(child, "SIGTERM");
       const grace = abortGraceMs();
       escalate = setTimeout(() => killTree(child, "SIGKILL"), grace);

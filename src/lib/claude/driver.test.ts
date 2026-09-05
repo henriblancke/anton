@@ -152,6 +152,33 @@ function writeFakeClaudeWithStubbornChild(name: string, pidPath: string): string
   return path;
 }
 
+/**
+ * A fake that finishes its turn and EXITS at once, leaving a descendant holding its stdout open —
+ * the window where the direct process is already gone but `close` has not fired yet. An abort that
+ * lands here is never delivered to anything (node kills only a live child), so it produces no
+ * `error` event and nothing but the signal itself says the session was cancelled.
+ */
+function writeFakeExitedClaudeHoldingPipe(name: string, holdMs: number): string {
+  const path = join(dir, name);
+  const events: FakeClaudeEvent[] = [
+    { type: "system", subtype: "init", session_id: "sess-exited" },
+    { type: "result", subtype: "success", result: "ANTON-RESULT: delivered", is_error: false },
+  ];
+  const body = [
+    "#!/usr/bin/env node",
+    "const { spawn } = require('node:child_process');",
+    `const lines = ${JSON.stringify(events.map((e) => JSON.stringify(e)))};`,
+    "for (const l of lines) { process.stdout.write(l + \"\\n\"); }",
+    // Inherits stdout, so the driver's pipe stays open after this process is gone.
+    `spawn(process.execPath, ['-e', 'setTimeout(() => {}, ${holdMs})'], { stdio: ['ignore', 1, 'ignore'] });`,
+    "process.exit(0);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
 /** A fake that emits each event `gapMs` apart — slow but demonstrably alive. */
 function writeFakeDripClaude(name: string, gapMs: number, events: FakeClaudeEvent[]): string {
   const path = join(dir, name);
@@ -1104,6 +1131,28 @@ describe("runClaude", () => {
       } finally {
         delete process.env[ABORT_GRACE_ENV];
       }
+    },
+  );
+
+  // PR #228 review: node delivers an abort only to a LIVE child, so one arriving after claude has
+  // exited — while a descendant still holds its stdout and `close` is pending — emits no `error`
+  // at all. Read from the `error` alone, the cancellation would vanish and the session would settle
+  // as an ordinary success: on a formula with no verify step nothing downstream consumes the
+  // signal, and the commit step would commit a cancelled ticket and update its bead.
+  it.runIf(process.platform !== "win32")(
+    "rejects a session cancelled after the process exited, with no child error to read it from",
+    async () => {
+      const bin = writeFakeExitedClaudeHoldingPipe("exited-claude", 3_000);
+      process.env[CLAUDE_BIN_ENV] = bin;
+      const control = new AbortController();
+
+      const run = runClaude({ cwd: dir, prompt: "cancel after exit", signal: control.signal });
+      // Long enough for the fake to have finished and exited, short enough that its descendant is
+      // still holding the pipe: the window where only the signal knows the run was cancelled.
+      await new Promise((r) => setTimeout(r, 500));
+      control.abort();
+
+      await expect(run).rejects.toMatchObject({ name: "AbortError" });
     },
   );
 

@@ -513,7 +513,10 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
 // attempt's adopted `WIP` this run never affirmed, or work the agent itself declared blocked (PR
 // #228 review). The timeout then settles the ticket from `progress` alone, and reading a bare
 // "something is committed" as delivery skips the `not-delivered` marker and hands the dispatch loop
-// a ticket it lists as delivered — shipping explicitly unfinished work under a pull request.
+// a ticket it lists as delivered — shipping explicitly unfinished work under a pull request. The
+// board is only half of it: the refused commit is on the branch and no rollback may touch it, so
+// the run must STOP rather than let the siblings behind this ticket open a pull request whose diff
+// physically contains it — which is what the refusal itself does when no deadline is racing it.
 suite("settleTicketTimeout — a commit the delivery gate refused is not a delivery", () => {
   let sandbox: string;
   let repo: string;
@@ -540,7 +543,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
   });
 
   /** Settle a timed-out ticket whose commit step reported evidence, and return what it threw. */
-  async function settle(delivered: boolean): Promise<TicketTimeoutError> {
+  async function settle(delivered: boolean): Promise<unknown> {
     const baseline = await readWorktreeState(repo);
     try {
       await settleTicketTimeout({
@@ -596,11 +599,16 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
     rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
-  it("marks the ticket undelivered and keeps it out of the run's delivered set", async () => {
+  it("marks the ticket undelivered and stops the run rather than absorb the timeout", async () => {
     const err = await settle(false);
 
-    expect(err).toBeInstanceOf(TicketTimeoutError);
-    expect(err.delivered).toBe(false); // the dispatch loop's delivered set reads this
+    // Not a TicketTimeoutError: that one the dispatch loop ABSORBS, carrying on to the pull request
+    // the rest of the run opens — over a branch that carries this refused commit.
+    expect(err).not.toBeInstanceOf(TicketTimeoutError);
+    expect(isPoisonError(err)).toBe(true);
+    expect((err as Error).message).toContain(BRANCH);
+    expect((err as Error).message).toMatch(/REFUSING/);
+    expect((err as Error).message).toMatch(/resume the run/);
     expect(tagged).toContainEqual([LABELS.notDelivered]);
     // The commit is still on the branch, and the note says so — the operator is owed both halves.
     expect(notes.join("\n")).toMatch(/committed on the branch/);
@@ -610,20 +618,23 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
   it("still leaves an ACCEPTED commit delivered — the deadline hit the bookkeeping", async () => {
     const err = await settle(true);
 
-    expect(err.delivered).toBe(true);
+    expect(err).toBeInstanceOf(TicketTimeoutError);
+    expect((err as TicketTimeoutError).delivered).toBe(true);
     expect(tagged).not.toContainEqual([LABELS.notDelivered]);
     expect(notes.join("\n")).toMatch(/stopped after the commit/);
   });
 
   // The refusal that lands on an ADOPTED preserved commit (PR #228 review). Nothing was rolled back
-  // — the commit is where the previous attempt left it — so the timeout must carry that branch out
-  // to the park, which decides from it whether a resume continues the work or starts it over.
-  it("carries the preserved branch out of a refusal that had nothing of its own to keep", async () => {
+  // — the commit is where the previous attempt left it — so the halt has to name the branch it is
+  // on: that is what tells the operator a resume continues the work rather than starting it over.
+  it("names the branch the work is still on when the refusal had nothing of its own to keep", async () => {
     g(["commit", "-q", "--allow-empty", "-m", `WIP ${ticket.id}: ${ticket.title}`]);
 
     const err = await settle(false);
 
-    expect(err.preservedOn).toBe(BRANCH);
+    expect(isPoisonError(err)).toBe(true);
+    expect((err as Error).message).toContain(BRANCH);
+    expect(notes.join("\n")).toMatch(/committed on the branch/);
   });
 });
 

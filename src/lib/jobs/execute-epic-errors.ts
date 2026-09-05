@@ -257,8 +257,11 @@ export class TicketTimeoutError extends Error {
      *
      * A commit alone is not enough (PR #228 review): a deadline can land while `assertDelivered` is
      * REFUSING one — a previous attempt's adopted `WIP`, or work the agent declared blocked — and
-     * that commit stays on the branch but is nobody's delivery, so this reads `false` and the
-     * ticket keeps its `not-delivered` marker like any other ticket the budget stopped short.
+     * that commit stays on the branch but is nobody's delivery. That case never reaches this error
+     * at all: the settlement raises {@link PoisonEpic} instead, because the refused diff is on the
+     * branch and absorbing the timeout would carry it into the pull request the run's other tickets
+     * open. So this is `true` for an ACCEPTED commit and `false` for a ticket the budget stopped
+     * before one, and both are safe for the loop to absorb.
      */
     readonly delivered: boolean,
     /**
