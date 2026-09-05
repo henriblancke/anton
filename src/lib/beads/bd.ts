@@ -2556,6 +2556,25 @@ export const beads = {
   /** A bead a human abandoned (closed + `abandoned`) — closed, but explicitly NOT delivered. */
   isAbandoned: (b: Bead) => b.labels?.includes(LABELS.abandoned) ?? false,
 
+  /**
+   * The bead that SUPERSEDED this one — the survivor `bd supersede <id> --with <survivor>` points
+   * its `supersedes` edge at — or undefined when the board records no such retirement. Read off the
+   * bead's own inline `dependencies` (bd carries the edge on the superseded side, `issue_id` ===
+   * this bead), so it costs nothing beyond the board read every caller already has.
+   *
+   * Closed is part of the question, not a separate check: the edge is written alongside the close,
+   * and a bead someone REOPENED is live work again whatever pointer it still carries.
+   *
+   * The distinction this exists for (anton-5bpd): a superseded bead has the same shape as an
+   * abandoned one — closed, with no commit under its own id on any branch — and anything that reads
+   * "closed with nothing on this branch" as a cross-machine resume must tell all three apart.
+   */
+  supersededBy: (b: Bead): string | undefined =>
+    b.status === "closed"
+      ? (b.dependencies ?? []).find((d) => d.issue_id === b.id && d.type === "supersedes")
+          ?.depends_on_id
+      : undefined,
+
   /** A bead a run reserved but never delivered (see LABELS.notDelivered) — open, and in no PR. */
   isNotDelivered: (b: Bead) => b.labels?.includes(LABELS.notDelivered) ?? false,
 

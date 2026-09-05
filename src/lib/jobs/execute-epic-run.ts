@@ -57,9 +57,10 @@ export interface EpicRun {
   /** Tickets this run had to stop, and whether each got its work committed before it was stopped. */
   timedOut: TicketTimeoutOutcome[];
   /**
-   * Tickets anton RETIRED mid-run as already shipped (anton-5bpd), and the bead each is now
-   * superseded by. The run carried on without them, so the target has to say what its pull request
-   * therefore does not contain.
+   * Tickets RETIRED as already shipped (anton-5bpd), and the bead each is now superseded by — the
+   * ones this attempt retired mid-run, plus the ones it found already retired on the board (an
+   * earlier attempt's, or a human's). The run carries on without them either way, so the target has
+   * to say what its pull request therefore does not contain.
    */
   retired: RetiredTicketOutcome[];
   /**

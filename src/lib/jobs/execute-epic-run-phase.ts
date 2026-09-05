@@ -143,14 +143,15 @@ async function finishRun(
     : null;
   if (timeoutNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${timeoutNotice}`));
 
-  // The tickets anton RETIRED as already shipped (anton-5bpd) — the founder reads the TARGET at the
-  // merge gate, and a ticket that is closed but in no diff would otherwise look like work this PR
-  // carries. Each bead already holds anton's evidence; this says, in one place, that the feature
-  // shipped minus these because they were already in the tree.
+  // The tickets RETIRED as already shipped (anton-5bpd) — this attempt's and any an earlier one
+  // left on the board. The founder reads the TARGET at the merge gate, and a ticket that is closed
+  // but in no diff would otherwise look like work this PR carries. Each bead carries its own record
+  // of where the work went; this says, in one place, that the feature shipped minus these because
+  // they were already in the tree.
   const retiredNotice = retired.length
     ? `${retired.length} ticket(s) had already shipped and were retired as superseded — ` +
       `${retired.map((r) => `${r.id} (superseded by ${r.replacedBy})`).join(", ")}. Each is closed ` +
-      `with the evidence anton verified on it, and none of them is in this PR.`
+      `on the board pointing at what shipped it, and none of them is in this PR.`
     : null;
   if (retiredNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${retiredNotice}`));
 

@@ -3,7 +3,7 @@
  * REAL job runner, REAL bd and git, a fake claude that delivers nothing for one ticket and does the
  * work for the other.
  *
- * Four claims:
+ * Five claims:
  *   • a VERIFIED claim retires the ticket as superseded — closed, pointing at the bead that shipped
  *     it, with anton's evidence in a note and the repair stamped on the bead;
  *   • THE EPIC CONTINUES: the run walks its remaining tickets, opens its one pull request and
@@ -12,12 +12,17 @@
  *   • a claim that does NOT verify retires nothing: today's behaviour exactly — poison park, blocked
  *     bead — plus an account of the failed check;
  *   • a project that armed nothing (the shipped `shadow` default) writes no fix: the ticket blocks
- *     and parks the run as before, with a note saying what `apply` would have done.
+ *     and parks the run as before, with a note saying what `apply` would have done;
+ *   • a RESUME of a run that retired a ticket leaves that ticket retired: a superseded bead is
+ *     closed with no commit under its own id on the branch — the shape the cross-machine resume path
+ *     reads as "regenerate it here" — so nothing may reopen or re-dispatch it.
  *
  * Deliberately its own sandbox, like the sibling repair suites: these cases seed extra beads and
  * settle epic children in ways the shared fixture's own assertions would collide with.
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { beads } from "../beads/bd";
 import { parseTicketNotes } from "../beads/notes";
 import { indexBoard } from "../gardener/board-index";
@@ -42,6 +47,7 @@ import {
 import { insertProject } from "@/lib/testing/project";
 
 describeBd("execute-epic e2e — the already-shipped repair (real handler · real bd/git · fake claude)", () => {
+  let sandbox: string;
   let repo: string;
   let binDir: string;
   let tdb: ExecuteEpicSandbox["tdb"];
@@ -52,7 +58,7 @@ describeBd("execute-epic e2e — the already-shipped repair (real handler · rea
 
   beforeAll(async () => {
     ctx = await createExecuteEpicSandbox();
-    ({ repo, binDir, tdb, clock } = ctx);
+    ({ sandbox, repo, binDir, tdb, clock } = ctx);
     // No verify gates, so what the run stops on is the zero-diff delivery gate and nothing else.
     // ARMED at `apply`: retiring a ticket is an unattended settlement of the founder's work, and the
     // shipped policy is `shadow`, so a project that wants it has to say so (R5.3).
@@ -257,6 +263,105 @@ process.exit(0);`),
       expect(shadow.split("\n")).toHaveLength(1);
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("a RESUME leaves the retired ticket retired — never reopened, never re-dispatched", async () => {
+    // A retired ticket is CLOSED with no commit under its own id on this branch (its work shipped
+    // under the survivor's) — the same shape an abandoned bead has, and the one the cross-machine
+    // resume path reads as "closed elsewhere, regenerate it here". Every ordinary park resumes into
+    // that read; this one is a usage limit. Reopened and re-dispatched, the ticket's agent can only
+    // report `already-shipped` again, into the repair's own loop guard: the bead ends up
+    // open-then-blocked and the feature parks — the exact false stall the retirement exists to end.
+    const shipper = await seedShipper("The bead that shipped the resumed one");
+    const { epic, shipped, work } = await seedEpic("Resumed already-shipped epic");
+    // The retirement has to land BEFORE the park, so the resume is the first attempt that reads a
+    // superseded ticket off the board. A `blocks` edge INSIDE the run is ordering rather than a gate
+    // (epic-graph's child readiness), so this fixes the dispatch order and nothing else.
+    await beads.link(repo, work, shipped, "blocks");
+
+    const resetSec = Math.floor(clock.now() / 1000) + 3600;
+    const quotaMark = join(sandbox, "resume-quota-hit");
+    const bodyDump = join(sandbox, "resume-pr-body.txt");
+    // Retire the first ticket, then hit the usage limit on the second — once. The sentinel lives
+    // OUTSIDE the worktree, which the resume reuses, so the second attempt does the work instead.
+    const resumeClaude = writeBin(
+      binDir,
+      "claude-shipped-resume",
+      fakeClaudeReadingStdin(`const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(prompt.includes(${JSON.stringify(shipped)})){
+e({type:'system',subtype:'init',session_id:'sr1'});
+e({type:'assistant',message:{content:[{type:'text',text:'nothing to do here'}]}});
+e({type:'result',subtype:'success',result:'ANTON-RESULT: blocked — already-shipped — Already implemented by ${shipper}',session_id:'sr1',num_turns:1,is_error:false});
+process.exit(0);}
+if(!fs.existsSync(${JSON.stringify(quotaMark)})){
+fs.writeFileSync(${JSON.stringify(quotaMark)},'1');
+e({type:'result',subtype:'error',result:'Claude AI usage limit reached|${resetSec}',is_error:true});
+process.exit(0);}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+' '+Math.random()+'\\n');
+e({type:'system',subtype:'init',session_id:'sr2'});
+e({type:'assistant',message:{content:[{type:'text',text:'done'}]}});
+e({type:'result',subtype:'success',result:'ANTON-RESULT: delivered',session_id:'sr2',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+    // Capture the PR body: the retired ticket is in no diff, so it must be in no PR either.
+    const bodyGh = writeBin(
+      binDir,
+      "gh-resume-body",
+      `const fs=require('fs');const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){console.log('[]');process.exit(0);}
+const i=a.indexOf('--body');if(i>=0){fs.writeFileSync(${JSON.stringify(bodyDump)},a[i+1]);}
+console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
+    );
+
+    const sessionsFor = async (id: string) =>
+      (await tdb.db.select().from(schema.sessions)).filter((s) => s.beadId === id);
+    const runner = makeEpicRunner(ctx, { quotaCooloffMs: 60_000 });
+    const prevClaude = process.env.ANTON_CLAUDE_BIN;
+    const prevGh = process.env.ANTON_GH_BIN;
+    process.env.ANTON_CLAUDE_BIN = resumeClaude;
+    process.env.ANTON_GH_BIN = bodyGh;
+    try {
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epic });
+
+      // Attempt 1: the ticket is retired, then the usage limit parks the run mid-feature.
+      await tickToIdle(runner);
+      expect((await getJob(tdb.db, jobId))?.status).toBe("queued"); // rescheduled past the reset
+      expect((await beads.show(repo, shipped)).status).toBe("closed");
+      expect(await sessionsFor(shipped)).toHaveLength(1);
+
+      // Attempt 2, past the reset window: the SAME run resumes and re-reads the board, where the
+      // retired ticket now sits closed with nothing of its own on the branch.
+      clock.set(resetSec * 1000 + 1);
+      await tickToIdle(runner);
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      const retired = await beads.show(repo, shipped);
+      expect(retired.status).toBe("closed"); // not reopened
+      expect(retired.assignee ?? null).toBeNull();
+      const board = await beads.list(repo, ["--status", "all"]);
+      expect(indexBoard(board).recordsSupersedes(shipped, shipper)).toBe(true);
+      expect(await sessionsFor(shipped)).toHaveLength(1); // not re-dispatched
+      // …and so never repaired a second time into the loop guard that would block it.
+      expect(
+        (retired.labels ?? []).filter((l) => l.startsWith("repair:already-shipped:")),
+      ).toHaveLength(1);
+
+      // The rest of the feature shipped, and the PR speaks for exactly what its diff contains.
+      expect((await beads.show(repo, work)).status).toBe("closed");
+      const body = readFileSync(bodyDump, "utf8");
+      expect(body).toContain(work);
+      expect(body).not.toContain(shipped);
+
+      // The retirement survives the resume in the one place the founder reads at the merge gate.
+      const notice = systemNotes((await beads.show(repo, epic)).notes).find((t) =>
+        t.includes("had already shipped"),
+      )!;
+      expect(notice).toContain(shipped);
+      expect(notice).toContain(shipper);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prevClaude;
+      process.env.ANTON_GH_BIN = prevGh;
     }
   });
 });

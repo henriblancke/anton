@@ -106,14 +106,34 @@ function partitionTickets(
   // of the done-on-board logic below: an abandoned bead IS closed, but its work was never
   // committed, so that logic would read "closed with no commit on this branch" as a
   // cross-machine resume, reopen it, and re-run the agent on work a human explicitly killed.
-  const live = orderTickets(tickets, all).filter((t) => !beads.isAbandoned(t));
+  // A ticket the board records as SUPERSEDED is dropped in the same breath and for the same reason
+  // (anton-5bpd): it too is closed with no commit under its own id on this branch, because the work
+  // shipped under the survivor's. Every resume of a run that retired one — a usage-limit park, a
+  // review-gate refusal, a held tail, a crash retry — would otherwise read it as a cross-machine
+  // resume, reopen it, and dispatch an agent that can only report `already-shipped` again, into the
+  // repair's own loop guard: the bead ends up open-then-blocked and the feature parks, the exact
+  // false stall the retirement exists to end. The `supersedes` edge is the durable signal (the one
+  // `bd supersede` writes beside the close), so a retirement an EARLIER attempt made reads the same
+  // as one this attempt is about to. Recorded on the run's retired ledger rather than dropped
+  // silently, so the pull request this attempt opens still says what it does not contain.
+  const live: Bead[] = [];
+  for (const ticket of orderTickets(tickets, all)) {
+    if (beads.isAbandoned(ticket)) continue;
+    const survivor = beads.supersededBy(ticket);
+    if (survivor) run.retired.push({ id: ticket.id, replacedBy: survivor });
+    else live.push(ticket);
+  }
   if (live.length === 0) {
-    // Every ticket abandoned but the epic left open — a contradiction only a human can settle
-    // (abandon the epic too, or add work to it). Park rather than open an empty PR or mark the
+    // Every ticket settled but the epic left open — a contradiction only a human can settle
+    // (settle the epic too, or add work to it). Park rather than open an empty PR or mark the
     // run done, either of which would read as a delivery that never happened.
+    const retirements = run.retired.map((r) => `${r.id} → superseded by ${r.replacedBy}`);
     throw new PoisonEpic(
-      `every ticket under ${epicBeadId} has been abandoned — nothing left to run; abandon the ` +
-        `epic itself or give it work, then resume the run`,
+      (retirements.length > 0
+        ? `every ticket under ${epicBeadId} has been abandoned or already shipped ` +
+          `(${retirements.join(", ")})`
+        : `every ticket under ${epicBeadId} has been abandoned`) +
+        ` — nothing left to run; settle the epic itself or give it work, then resume the run`,
     );
   }
   // A ticket a bead OUTSIDE this run still blocks is HELD, not run (anton-1two): its work depends
@@ -490,8 +510,13 @@ async function deliveredOrPark(
   //     and someone relabelled `agent:human` afterwards is still in this diff, and dropping it
   //     would hide work the reviewer must read — and, when it is the only ticket, make the
   //     no-delivery park below claim an empty branch that has commits on it.
+  //     A ticket RETIRED as already shipped (anton-5bpd) is out on the same rule: its work is in
+  //     this run's BASE, under the survivor's id, so no commit here carries it. One retired on an
+  //     EARLIER attempt never reached `live` at all (partitionTickets drops it); this covers the
+  //     one this attempt retired mid-loop, whose board snapshot still predates the supersede.
+  const retired = new Set(run.retired.map((r) => r.id));
   const delivered = await deliveredTickets(
-    live.filter((t) => !skipped.has(t.id)),
+    live.filter((t) => !skipped.has(t.id) && !retired.has(t.id)),
     rolledBack,
     (id) => worktreeHasCommitFor(worktree.path, id),
   );
