@@ -1081,6 +1081,62 @@ describe("anton start — the build it will serve", () => {
     }
   });
 
+  // `next build` rewrites `.next` IN PLACE, and a running `next start` loads its route chunks from
+  // there as requests arrive — so compiling underneath one breaks the responses it is mid-way through
+  // serving, and this process could not take the occupied port afterwards either (PR #217 review).
+  it("refuses to rebuild .next while a server is still serving out of it", async () => {
+    const dir = await checkout(EDITED);
+    const build = vi.fn(() => 0);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const code = ensureFreshBuild({
+        appRoot: dir,
+        isBundle: false,
+        build,
+        readIdentity: () => CHECKOUT,
+        liveServers: () => [{ path: join(dir, "server-build.4242.json"), record: { pid: 4242 } }],
+      });
+      expect(code).toBe(1);
+      expect(build).not.toHaveBeenCalled();
+      // The operator is told which process holds it, and left to stop it: a restart can kill a run.
+      expect(log.mock.calls.flat().join("\n")).toContain("4242");
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  // Two servers from one install stay supported — a UI-only `ANTON_RUNNER=off` one beside the runner
+  // — because the refusal is of the REBUILD, not of the start: a `.next` that already matches this
+  // checkout is one a second server can serve from without anything being rewritten under the first.
+  it("starts a second server against a .next that already matches, without building", async () => {
+    const dir = await checkout(CHECKOUT);
+    const build = vi.fn(() => 0);
+    const code = ensureFreshBuild({
+      appRoot: dir,
+      isBundle: false,
+      build,
+      readIdentity: () => CHECKOUT,
+      liveServers: () => [{ path: join(dir, "server-build.4242.json"), record: { pid: 4242 } }],
+    });
+    expect(code).toBe(0);
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  // ...and with nothing serving, the rebuild is exactly as it was.
+  it("rebuilds when the checkout moved and no server is serving from .next", async () => {
+    const dir = await checkout(EDITED);
+    const build = vi.fn(() => 0);
+    const code = ensureFreshBuild({
+      appRoot: dir,
+      isBundle: false,
+      build,
+      readIdentity: reads(CHECKOUT, CHECKOUT),
+      liveServers: () => [],
+    });
+    expect(code).toBe(0);
+    expect(build).toHaveBeenCalledTimes(1);
+  });
+
   it("starts without building when .next is already this checkout", async () => {
     const dir = await checkout(CHECKOUT);
     const build = vi.fn(() => 0);

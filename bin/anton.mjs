@@ -2133,17 +2133,45 @@ const MAX_BUILD_ATTEMPTS = 3;
  * and the release bundle compile with — uses; Next 16 defaults bare `next build` to Turbopack, so
  * omitting it would leave the server running an artifact no gate ever built (PR #217 review).
  *
- * `build` and `readIdentity` are injected so the loop is testable without spawning a real compile.
+ * A rebuild is REFUSED while a server from this install is still serving out of the same `.next`
+ * (PR #217 review). `next build` rewrites that directory in place, and a running `next start` loads
+ * route chunks from it lazily and by content hash — so compiling underneath one breaks or mixes the
+ * responses it is in the middle of serving, and the second process then fails to bind the occupied
+ * port anyway. Two servers from one install are otherwise supported (a UI-only `ANTON_RUNNER=off`
+ * one beside the runner), and they stay supported: this refuses only the REBUILD, so a second start
+ * against a `.next` that already matches the checkout returns above without ever reaching here.
+ *
+ * Named and left to the operator, like every other restart this CLI reports: stopping a server can
+ * kill an in-flight run, which is not anton's call to make. Liveness is `liveBuildRecords`, so a
+ * record whose birth time cannot be rechecked does not count as live and does not block the build —
+ * the same "unproven is not alive" this reads everywhere else, though it errs toward rebuilding
+ * here rather than away from it.
+ *
+ * `build`, `readIdentity` and `liveServers` are injected so the loop is testable without spawning a
+ * real compile or a real server.
  */
 function ensureFreshBuild({
   appRoot,
   isBundle,
   build = () => runLocal("next", ["build", "--webpack"]),
   readIdentity = readBuildIdentity,
+  liveServers = () => liveBuildRecords(resolveAntonDb(), appRoot),
 }) {
   let compiledFrom = isBundle ? null : readIdentity(appRoot);
   const built = existsSync(join(appRoot, ".next"));
   if (built && (compiledFrom === null || buildMatchesCheckout(appRoot, compiledFrom))) return 0;
+
+  const serving = built ? liveServers() : [];
+  if (serving.length) {
+    const pids = serving.map(({ record }) => record.pid);
+    console.log(c.red(`\n✗ .next needs rebuilding, but ${pids.length === 1 ? "a server is" : "servers are"} serving from it (pid ${pids.join(", ")}).`));
+    console.log(c.dim("  `next build` rewrites .next in place, and a running server loads its route chunks from"));
+    console.log(c.dim("  there as requests come in — rebuilding now would break the responses it is serving, and"));
+    console.log(c.dim("  this process could not take the port afterwards either."));
+    console.log(c.dim("  Stop that server, then re-run `anton start`. anton will not do it for you: a running"));
+    console.log(c.dim("  process may be mid-run."));
+    return 1;
+  }
 
   let why = built
     ? "the build in .next is not provably this checkout — rebuilding so the server runs what is here…"
