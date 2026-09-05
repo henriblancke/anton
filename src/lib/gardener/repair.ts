@@ -38,6 +38,9 @@
  * Pure values plus one write. Nothing here decides WHETHER a class is repairable in a given
  * situation or performs a repair — the factual repairs are anton-fzas (`ref-stale`) and anton-qg4h
  * (`dep-missing`), and both pass through {@link decideRepair} before they touch anything.
+ *
+ * `already-shipped` is a block class (see `claude/anton-result.ts`) with no repair yet: anton has no
+ * way to VERIFY the claim, so it escalates rather than being acted on.
  */
 import { createHash } from "node:crypto";
 import { beads } from "../beads/bd";

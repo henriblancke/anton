@@ -164,6 +164,22 @@ describe("parseAntonResult — block classification (anton-ie05)", () => {
     });
   });
 
+  it("parses `already-shipped` with the bead, commit and PR that shipped it (anton-ob1q)", () => {
+    // A class, never an outcome — `already-shipped` alone on the line parses as nothing.
+    expect(parseAntonResult("ANTON-RESULT: already-shipped")).toBeNull();
+    expect(
+      parseAntonResult("ANTON-RESULT: blocked — already-shipped — anton-9pkk (commit 9c51510, PR #85)"),
+    ).toEqual({
+      outcome: "blocked",
+      klass: "already-shipped",
+      reason: "anton-9pkk (commit 9c51510, PR #85)",
+    });
+    expect(parseAntonResult("ANTON-RESULT: blocked — already-shipped")).toEqual({
+      outcome: "blocked",
+      klass: "already-shipped",
+    });
+  });
+
   it("degrades an UNKNOWN class to `other`, text untouched", () => {
     expect(parseAntonResult("ANTON-RESULT: blocked — kaboom — the thing broke")).toEqual({
       outcome: "blocked",
@@ -224,6 +240,11 @@ describe("parseAntonResult — legacy prose is never mistaken for a class", () =
     "ref-stale-ish — a longer word that merely starts the same way",
     "dep-missing-thing — a hyphen inside a word is not a separator",
     "other things went wrong",
+    // The real prose that motivated `already-shipped` (anton-ob1q): unclassified, it still blocks.
+    "Already implemented by anton-9pkk (commit 9c51510, PR #85)",
+    "already implemented by anton-9pkk (commit 9c51510, PR #85)",
+    "already shipped, see anton-9pkk",
+    "already-shipped-ish — a longer word that merely starts the same way",
   ];
 
   it("parses each as class `other`, with the reason byte-identical to today's parse", () => {
@@ -240,7 +261,7 @@ describe("parseAntonResult — legacy prose is never mistaken for a class", () =
 describe("isBlockClass", () => {
   it("accepts exactly the enum, and nothing that merely resembles it", () => {
     for (const klass of BLOCK_CLASSES) expect(isBlockClass(klass)).toBe(true);
-    for (const notAClass of ["ref", "REF-STALE", "Ref-stale", "ref-stale-ish", "dep", "", undefined]) {
+    for (const notAClass of ["ref", "REF-STALE", "Ref-stale", "ref-stale-ish", "dep", "already shipped", "", undefined]) {
       expect(isBlockClass(notAClass)).toBe(false);
     }
   });
