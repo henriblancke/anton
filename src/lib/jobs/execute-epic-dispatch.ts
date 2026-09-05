@@ -353,6 +353,10 @@ async function dispatchTicket(
       run: runStep,
       steps: ticketSteps,
       ticket,
+      // The whole set this run holds, not just what is left to dispatch: a prerequisite that has
+      // ALREADY run is still this run's own work, and the ordering it names is about the dispatch
+      // order, which is a property of the run rather than of where the loop has got to.
+      runTicketIds: tickets.map((t) => t.id),
       operator,
       closeOnDone: !standaloneRun,
       timeoutMs: ticketTimeoutMs,

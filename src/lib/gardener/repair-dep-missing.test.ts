@@ -10,6 +10,8 @@
  *   • THE EDGE IS REVERSIBLE, and the repair uses that itself: a record it cannot write takes the
  *     edge back rather than leaving an ordering nothing on the board explains.
  *   • ONE REPAIR PER BEAD PER CLASS (R5.6) — the guard is repair.ts's, and it is asked first.
+ *   • THE REPAIR SAYS WHERE THE PREREQUISITE SITS (anton-0gm2) — work this run holds, or work
+ *     outside it — decided against the run's own ticket set rather than against parentage.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "../beads/bd";
@@ -50,6 +52,7 @@ vi.mock("../beads/bd", async () => {
 const { repairFingerprint, repairLabel, repairNote } = await import("./repair");
 const {
   namedPrereqs,
+  prereqSite,
   refusalNote,
   repairDepMissing,
   resolvePrereq,
@@ -61,7 +64,14 @@ const { indexBoard } = await import("./board-index");
 const REPO = "/repo";
 const TARGET = "anton-qg4h";
 const PREREQ = "anton-blkr";
+/** The feature both beads hang off in the shared-parentage case. */
+const EPIC = "anton-feat";
 const T0 = Date.UTC(2026, 8, 3, 11, 0, 0);
+
+/** The run as most cases hold it: the target alone, so the prerequisite is work outside the run. */
+const RUN_ALONE = [TARGET];
+/** The run that also carries the prerequisite — the sibling shape (anton-0gm2). */
+const RUN_WITH_PREREQ = [TARGET, PREREQ];
 
 const bead = (id: string, over: Partial<Bead> = {}): Bead =>
   ({ id, title: id, status: "open", issue_type: "task", ...over }) as Bead;
@@ -289,6 +299,7 @@ describe("repairDepMissing", () => {
       block: block(`the schema ${PREREQ} adds has to land first`),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
     });
 
     expect(outcome).toMatchObject({ action: "parked", blockerId: PREREQ });
@@ -310,6 +321,7 @@ describe("repairDepMissing", () => {
       block: block(`the schema ${PREREQ} adds has to land first`),
       now: T0,
       autonomy: "shadow",
+      runTicketIds: RUN_ALONE,
     });
 
     // The armed answer, minus the writes: the same blocker, so the record says what arming would
@@ -330,6 +342,7 @@ describe("repairDepMissing", () => {
       block: block(`the schema ${PREREQ} adds has to land first`),
       now: T0,
       autonomy: "propose",
+      runTicketIds: RUN_ALONE,
     });
 
     expect(outcome.action).toBe("escalate");
@@ -346,6 +359,7 @@ describe("repairDepMissing", () => {
       block: block("blocked on anton-ghost, which nobody filed"),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
     });
 
     expect(outcome.action).toBe("escalate");
@@ -363,6 +377,7 @@ describe("repairDepMissing", () => {
       block: block(undefined),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
     });
     expect(outcome).toMatchObject({
       action: "escalate",
@@ -378,6 +393,7 @@ describe("repairDepMissing", () => {
       block: block(`blocked on ${PREREQ}`),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
       board: board(),
     });
     expect(listMock).not.toHaveBeenCalled();
@@ -388,6 +404,7 @@ describe("repairDepMissing", () => {
       block: block(`blocked on ${PREREQ}`),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
     });
     expect(listMock).toHaveBeenCalledWith(REPO, ["--status", "all"]);
   });
@@ -407,6 +424,7 @@ describe("repairDepMissing", () => {
       block: block(`blocked on ${PREREQ}`),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
     });
 
     expect(outcome).toMatchObject({ action: "parked", blockerId: PREREQ });
@@ -425,6 +443,7 @@ describe("repairDepMissing", () => {
       block: block(`blocked on ${PREREQ}`),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
       board: board(),
     });
 
@@ -445,6 +464,7 @@ describe("repairDepMissing", () => {
       block: block(`blocked on ${PREREQ}`),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
       board: board(),
     });
 
@@ -466,6 +486,7 @@ describe("repairDepMissing", () => {
       block: block(`blocked on ${PREREQ}`),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
       board: board(),
     });
 
@@ -486,6 +507,7 @@ describe("repairDepMissing", () => {
       block: block(`blocked on ${PREREQ}`),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
     });
 
     // Rolling back here would remove the edge while leaving the suppression label behind, so every
@@ -504,6 +526,7 @@ describe("repairDepMissing", () => {
       block: block(`blocked on ${PREREQ}`),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
     });
 
     expect(linkMock).toHaveBeenCalledWith(REPO, TARGET, PREREQ, "blocks");
@@ -527,6 +550,7 @@ describe("repairDepMissing", () => {
       block: block(`blocked on ${PREREQ}`),
       now: T0,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
     });
 
     expect(outcome).toMatchObject({ action: "escalate" });
@@ -541,6 +565,7 @@ describe("repairDepMissing", () => {
       block: block(`still blocked on ${PREREQ}`),
       now: T0 + 60_000,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
     });
 
     expect(outcome.action).toBe("escalate");
@@ -550,6 +575,90 @@ describe("repairDepMissing", () => {
     // The guard is asked BEFORE the board read: a disproved diagnosis costs no bd call to refuse.
     expect(listMock).not.toHaveBeenCalled();
     expect(linkMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("where the prerequisite sits relative to the run (anton-0gm2)", () => {
+  it("calls a prerequisite the run holds a sibling, and any other one outside", () => {
+    expect(prereqSite(PREREQ, RUN_WITH_PREREQ)).toBe("sibling");
+    expect(prereqSite(PREREQ, RUN_ALONE)).toBe("outside");
+    expect(prereqSite(PREREQ, [])).toBe("outside");
+  });
+
+  // The membership question is about THIS run's dispatch, so it is answered from the set the run
+  // holds — not from the board's parentage. A bead under the same parent that this run is NOT
+  // carrying lands on nobody's schedule here, and reading it as a sibling would promise a re-order
+  // that never comes.
+  it("does not read shared parentage as membership", async () => {
+    const shared = [
+      bead(TARGET, { parent: EPIC } as Partial<Bead>),
+      bead(PREREQ, { parent: EPIC } as Partial<Bead>),
+      bead(EPIC, { issue_type: "feature" }),
+    ];
+
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`blocked on ${PREREQ}`),
+      now: T0,
+      autonomy: "apply",
+      board: shared,
+      runTicketIds: RUN_ALONE,
+    });
+
+    expect(outcome).toMatchObject({ action: "parked", blockerId: PREREQ, site: "outside" });
+  });
+
+  it("reports a sibling prerequisite as such on the parked outcome", async () => {
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`blocked on ${PREREQ}`),
+      now: T0,
+      autonomy: "apply",
+      runTicketIds: RUN_WITH_PREREQ,
+    });
+
+    expect(outcome).toMatchObject({ action: "parked", blockerId: PREREQ, site: "sibling" });
+  });
+
+  // The outside case is the one this repair already shipped, and it is unchanged: same edge, same
+  // stamp, same park — only now it says out loud which of the two it is.
+  it("reports an outside prerequisite as such, and repairs it exactly as before", async () => {
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`blocked on ${PREREQ}`),
+      now: T0,
+      autonomy: "apply",
+      runTicketIds: RUN_ALONE,
+    });
+
+    expect(outcome).toMatchObject({ action: "parked", blockerId: PREREQ, site: "outside" });
+    expect(linkMock).toHaveBeenCalledWith(REPO, TARGET, PREREQ, "blocks");
+    expect(tagMock).toHaveBeenCalledWith(REPO, TARGET, [repairLabel(TARGET, "dep-missing", T0)]);
+  });
+
+  it("answers it under `shadow` too, where the record is all there is", async () => {
+    const sibling = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`blocked on ${PREREQ}`),
+      now: T0,
+      autonomy: "shadow",
+      runTicketIds: RUN_WITH_PREREQ,
+    });
+    expect(sibling).toMatchObject({ action: "shadow", blockerId: PREREQ, site: "sibling" });
+
+    const outside = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`blocked on ${PREREQ}`),
+      now: T0,
+      autonomy: "shadow",
+      runTicketIds: RUN_ALONE,
+    });
+    expect(outside).toMatchObject({ action: "shadow", blockerId: PREREQ, site: "outside" });
   });
 });
 
@@ -577,6 +686,7 @@ describe("reversing the edge", () => {
       block: block(`blocked on ${PREREQ}`),
       now: T0 + 60_000,
       autonomy: "apply",
+      runTicketIds: RUN_ALONE,
     });
     expect(outcome.action).toBe("escalate");
     expect(linkMock).not.toHaveBeenCalled();

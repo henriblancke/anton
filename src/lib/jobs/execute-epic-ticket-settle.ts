@@ -67,6 +67,8 @@ interface TicketFailureKinds {
 export async function settleFailedTicket(args: {
   run: Omit<StepContext, "tickets">;
   ticket: Bead;
+  /** The run's own ticket set, ids only — passed through to the repair pass (see `prereqSite`). */
+  runTicketIds: readonly string[];
   session: JobSession;
   /** Whether this ticket's own DEADLINE fired, as opposed to the job's abort. */
   ranOutOfTime: boolean;
@@ -99,7 +101,14 @@ export async function settleFailedTicket(args: {
   // on. Before the release, because what the repair answers decides whether this bead is left
   // `blocked` for a person or `open` for the retry it just earned.
   const repair = repairableBlock(e, kinds)
-    ? await repairBlockedTicket({ run, ticket, logPath, selfReport: progress.selfReport, e })
+    ? await repairBlockedTicket({
+        run,
+        ticket,
+        runTicketIds: args.runTicketIds,
+        logPath,
+        selfReport: progress.selfReport,
+        e,
+      })
     : undefined;
   await releaseFailedTicket({ run, ticket, session, progress, e, kinds, repair });
   // The repaired bead goes back through the ordinary queue (R5.10): a non-poison error spends one of
