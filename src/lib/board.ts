@@ -113,9 +113,11 @@ export async function getBoardVersion(project: Project): Promise<string> {
     // holds. The two gates must stay identical or the poll's token and the served board's disagree
     // and every poll re-reads. The stance itself is covered separately by upNextVersion, which is
     // what makes a level change land on the next poll: moving between `propose` and `shadow`
-    // touches neither a bead, nor the plan row, nor the policy.
+    // touches neither a bead, nor the plan row, nor the policy. The clock rides there too, for the
+    // one input of the derived ranking that moves on its own — an age criterion's whole-day boundary
+    // (PR #226 review).
     provenanceVersion(picker.offers && picker.policyKnown ? plan : undefined, picker.policy),
-    upNextVersion(picker),
+    upNextVersion(picker, picker.policy, Date.now()),
     project.repoPath,
   );
 }
@@ -582,7 +584,10 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       scanHealthVersion(scan),
       deferralVersion(deferrals),
       provenanceVersion(armedPlan, picker.policy),
-      upNextVersion(picker),
+      // The instant the lane below was derived at, not a second clock read: the token must name the
+      // age bucket this board's ranking was decided in, or the poll that follows re-fetches a board
+      // the client already holds.
+      upNextVersion(picker, picker.policy, observedAtMs),
       project.repoPath,
     ),
     columns,

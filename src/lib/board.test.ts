@@ -1679,6 +1679,44 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
     projectSettings = { pickerPolicy: { types: ["bug"] } };
     expect(await getBoardVersion(project)).not.toBe(armed);
   });
+
+
+  it("moves the refresh token as a soak elapses, which no bead, plan row or setting records", async () => {
+    // A `minAgeDays` policy admits on whole days since the bead was filed, so the derivation's answer
+    // changes with the clock alone — every digest in the token stays byte-identical across the
+    // boundary (PR #226 review). Only Date is faked: the reads under test are all mocked promises.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const NOW = 1_770_000_000_000;
+      vi.setSystemTime(NOW);
+      listMock.mockResolvedValue([
+        makeBead({
+          id: "f-1",
+          title: "Filed today",
+          issue_type: "feature",
+          created_at: new Date(NOW - 12 * 3_600_000).toISOString(),
+          // A dated bead is contract-READABLE, so it must carry its Acceptance or the approve gate
+          // refuses it before any policy is consulted — and the soak would never be what withheld it.
+          description: "## Goal\nSoak before starting.\n\n## Acceptance\n- [ ] it works",
+        }),
+      ]);
+      projectSettings = { pickerPolicy: { minAgeDays: 1 }, pickerAutonomy: "shadow" };
+
+      // Still soaking: nothing the policy admits, so the lane says the board holds nothing claimable.
+      const soaking = await getBoard(project);
+      expect(soaking.upNext).toBeUndefined();
+      expect(soaking.upNextAbsence).toBe("no-claimable-work");
+      expect(await getBoardVersion(project)).toBe(soaking.version);
+
+      // Thirteen hours on, the bead has crossed its first whole day and nothing else has moved.
+      vi.setSystemTime(NOW + 13 * 3_600_000);
+      expect(await getBoardVersion(project)).not.toBe(soaking.version);
+      const soaked = await getBoard(project);
+      expect(soaked.upNext?.map((e) => e.beadId)).toEqual(["f-1"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 /**

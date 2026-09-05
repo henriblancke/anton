@@ -16,6 +16,7 @@
 import { unblockCounter } from "./beads/rank";
 import type { Bead } from "./beads/types";
 import type { PickerPlanEntry } from "./board-picker-plan";
+import type { Policy } from "./policy/types";
 import { issueTypeOf } from "./ticket-view";
 import type { UpNextAbsence, UpNextEntry } from "./types";
 
@@ -112,16 +113,47 @@ export function upNextAbsence(
  * The lane's half of the board's freshness token, so a poll sees the lane appear and disappear
  * instead of 304ing on a version that never moved.
  *
- * Only the STANCE: the ranking's own inputs already ride in the token — the beads through the
- * snapshot version, the armed policy through `provenanceVersion`, the vetoes through
+ * The STANCE and the CLOCK. The ranking's other inputs already ride in the token — the beads through
+ * the snapshot version, the armed policy through `provenanceVersion`, the vetoes through
  * `deferralVersion` — and the stance is the one change that moves the lane while touching none of
- * them. Both halves ride separately because they name DIFFERENT absences — collapsing them to on/off
- * would 304 an operator who disarmed a `propose` project back onto the header that names the level.
+ * them. Both of its halves ride separately because they name DIFFERENT absences — collapsing them to
+ * on/off would 304 an operator who disarmed a `propose` project back onto the header that names the
+ * level.
+ *
+ * The clock is the other (PR #226 review), and only where it can change the answer: a policy stating
+ * `minAgeDays`/`maxAgeDays` admits on whole days elapsed since a bead was filed, so a bead crosses
+ * into or out of the derived ranking while every bead, setting, plan row and hold sits still. A
+ * token blind to it would 304 the operator onto a lane — or onto the `no-claimable-work` that
+ * replaces it — that the next read would have changed.
  */
-export function upNextVersion(stance: UpNextStance): string {
+export function upNextVersion(
+  stance: UpNextStance,
+  policy: Policy | undefined,
+  nowMs: number,
+): string {
   if (!stance.scheduled) return "up:off:disarmed";
   // A recovered settings read brings the lane back, and it must not 304 on the way: the withheld
   // ranking and the one drawn from the same armed policy are otherwise the same token.
   if (!stance.policyKnown) return "up:off:unreadable";
-  return stance.levelOffers ? "up:on" : "up:off:proposes";
+  if (!stance.levelOffers) return "up:off:proposes";
+  return `up:on:${ageFence(policy, nowMs)}`;
+}
+
+/**
+ * How coarsely {@link ageFence} quantizes the clock — the longest a bead that has just crossed a
+ * whole-day boundary can stay out of a lane that claims to be derived live.
+ *
+ * Quantized rather than exact because the token is a 304 fence: carrying the raw clock would move it
+ * on every poll and no board would ever 304 again, while the exact transition instants are per-bead
+ * (`created_at + n days`) and reading them here would drag the whole bead snapshot onto the poll
+ * path, which derives nothing today. Five minutes against a criterion stated in DAYS is inside the
+ * rounding of its own unit, and costs one rebuild in ten polls (BOARD_POLL_MS) on an age-armed
+ * project — and none at all on any other, which is what {@link ageFence}'s constant is for.
+ */
+export const UP_NEXT_AGE_FENCE_MS = 300_000;
+
+/** Moves with the clock only for a policy that actually asserts an age bound — see the constant. */
+function ageFence(policy: Policy | undefined, nowMs: number): string {
+  const soaks = policy?.minAgeDays !== undefined || policy?.maxAgeDays !== undefined;
+  return soaks ? `age:${Math.floor(nowMs / UP_NEXT_AGE_FENCE_MS)}` : "age:static";
 }
