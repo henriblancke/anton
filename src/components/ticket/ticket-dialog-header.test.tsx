@@ -108,6 +108,16 @@ describe("who holds the ticket", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Take over" })).toBeDefined());
   });
 
+  it("withholds take-over once the target is past backlog — a run is already in flight", async () => {
+    // Rendered against a backlog sibling: its button is the proof the operator identity resolved,
+    // so the missing second one is the stage gate and not an unsettled render.
+    show({ id: "bd-backlog", assignee: "someone", stage: "backlog" }, { approved: true });
+    show({ id: "bd-implementing", assignee: "someone", stage: "implementing" }, { approved: true });
+    await waitFor(() =>
+      expect(screen.getAllByRole("button", { name: "Take over" })).toHaveLength(1),
+    );
+  });
+
   it("shows a child ticket's owner as inherited from its epic", () => {
     show({ epicId: "anton-epic", epicAssignee: "hb" });
     expect(screen.getByText("· inherited")).toBeDefined();
