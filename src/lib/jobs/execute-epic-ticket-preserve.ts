@@ -53,11 +53,17 @@ const PRESERVE_VERIFY_MAX_MS = 15 * 60_000;
  * of preserved work goes through, so no resume can find them. Reported apart from `branch` because
  * the difference is the whole meaning of the answer — "preserved" promises a resume that continues
  * from the work, and this one cannot make that promise. The caller halts on it for a person.
+ *
+ * `retainedUnknown` is that same doubt made STRUCTURAL (PR #228 review): a `retainedOn` of null
+ * means "nothing of a previous attempt is on the branch", and a history read that failed cannot say
+ * that. The reason string carries the caveat for a human, but the run's ledger and the park message
+ * it composes read fields, not prose — so the doubt travels as a field too, or the park tells the
+ * operator a resume starts work over that may still be sitting on the branch.
  */
 export type PreservedWork =
   | { branch: string; retained: boolean }
   | { unmarkedOn: string }
-  | { rolledBackWhy: string; retainedOn: string | null }
+  | { rolledBackWhy: string; retainedOn: string | null; retainedUnknown?: true }
   | { jobAborted: true };
 
 /**
@@ -129,6 +135,8 @@ export async function preserveTimedOutWork(args: {
       ? `; anton could not read \`${branch}\`'s history, so work a previous attempt preserved may ` +
         `still be on it`
       : ``;
+  const unknownRetention = (): { retainedUnknown?: true } =>
+    retainedUnreadable ? { retainedUnknown: true } : {};
   const rollBack = async (why: string): Promise<PreservedWork> => {
     const rolledBackWhy = why + unreadableCaveat();
     await logPreserve(
@@ -136,7 +144,7 @@ export async function preserveTimedOutWork(args: {
       `rolling back — ${rolledBackWhy}` +
         (retainedOn ? ` (a previous attempt's work stays on ${retainedOn})` : ``),
     );
-    return { rolledBackWhy, retainedOn };
+    return { rolledBackWhy, retainedOn, ...unknownRetention() };
   };
   const now = await readWorktreeState(worktreePath).catch(() => null);
   // "Nothing kept" is a verdict on THIS attempt, never on the branch (PR #228 review). A resume that
@@ -178,7 +186,11 @@ export async function preserveTimedOutWork(args: {
       );
       return { branch: retainedOn, retained: true };
     }
-    return { rolledBackWhy: `it left nothing in the worktree` + unreadableCaveat(), retainedOn };
+    return {
+      rolledBackWhy: `it left nothing in the worktree` + unreadableCaveat(),
+      retainedOn,
+      ...unknownRetention(),
+    };
   }
   if (!standalone) {
     return rollBack(

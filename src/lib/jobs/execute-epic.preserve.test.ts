@@ -604,6 +604,8 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(kept).toMatchObject({
       rolledBackWhy: expect.stringContaining("does not pass this project's verify gates"),
       retainedOn: null,
+      // …as a FIELD too, since the ledger and the park it composes read fields, not prose.
+      retainedUnknown: true,
     });
     expect((kept as { rolledBackWhy: string }).rolledBackWhy).toContain(
       `could not read \`${BRANCH}\`'s history`,
@@ -1052,13 +1054,20 @@ suite("assertPreservedWorkFitsShape — preserved work may only ride the shape t
 });
 
 describe("outOfTimeParkMessage — what the operator may safely do next (anton-d967)", () => {
-  const parkRun = (preserved: boolean): EpicRun =>
+  const parkRun = (preserved: boolean, preservedUnknown = false): EpicRun =>
     ({
       targetId: ticket.id,
       branch: BRANCH,
       standaloneRun: true,
       ticketTimeoutMs: 45 * 60_000,
-      timedOut: [{ id: ticket.id, delivered: false, ...(preserved ? { preserved: true } : {}) }],
+      timedOut: [
+        {
+          id: ticket.id,
+          delivered: false,
+          ...(preserved ? { preserved: true } : {}),
+          ...(preservedUnknown ? { preservedUnknown: true } : {}),
+        },
+      ],
     }) as unknown as EpicRun;
 
   it("warns that splitting means taking the preserved commit off the branch first", () => {
@@ -1076,5 +1085,18 @@ describe("outOfTimeParkMessage — what the operator may safely do next (anton-d
     expect(message).toContain(`split ${ticket.id} into child tickets`);
     expect(message).not.toMatch(/preserved commit/);
     expect(message).toMatch(/rolled back, so resuming starts it over/);
+  });
+
+  // The fate the flat preserved/rolled-back pair cannot say (PR #228 review). A rollback restores a
+  // baseline a previous attempt's preserved commit is part of, so an unreadable history leaves the
+  // branch's contents unknown — and "resuming starts it over" would send the operator to redo work
+  // that may be sitting right there, while the split advice would skip the commit it must clear.
+  it("says the fate is UNKNOWN when the branch's history could not be read", () => {
+    const message = outOfTimeParkMessage(parkRun(false, true), []);
+
+    expect(message).not.toMatch(/rolled back, so resuming starts it over/);
+    expect(message).toMatch(/UNKNOWN/);
+    expect(message).toContain(`could not read \`${BRANCH}\`'s history`);
+    expect(message).toContain(`checking \`${BRANCH}\` for a preserved commit first`);
   });
 });

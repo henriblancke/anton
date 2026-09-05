@@ -372,6 +372,7 @@ async function dispatchTicket(
       id: e.ticketId,
       delivered: e.delivered,
       ...(e.preservedOn ? { preserved: true } : {}),
+      ...(e.preservedUnknown ? { preservedUnknown: true } : {}),
     });
     if (e.delivered) onBranch.add(e.ticketId); // the deadline hit the bookkeeping, not the code
     console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
@@ -526,6 +527,9 @@ async function deliveredOrPark(
  *
  * And a park has to say what became of the work, because the answer decides what a resume IS: work
  * preserved on the branch means the resume continues from it, while a rollback means it starts over.
+ * When the preserve could not READ the branch it rolled back onto, that answer is unknown (PR #228
+ * review) — and an unknown fate is spoken as one here rather than folded into the rollback, which
+ * would tell the operator to expect a fresh start on a branch that may still carry the work.
  */
 export function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string {
   const { targetId, timedOut, branch, standaloneRun, ticketTimeoutMs } = run;
@@ -533,13 +537,22 @@ export function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string
     ? `${Math.round(ticketTimeoutMs / 60_000)}m`
     : "unbounded";
   const preserved = timedOut.filter((t) => t.preserved).map((t) => t.id);
-  const rolledBack = timedOut.filter((t) => !t.preserved && !t.delivered).map((t) => t.id);
+  const stopped = timedOut.filter((t) => !t.preserved && !t.delivered);
+  const unknown = stopped.filter((t) => t.preservedUnknown).map((t) => t.id);
+  const rolledBack = stopped.filter((t) => !t.preservedUnknown).map((t) => t.id);
   const fate = [
     preserved.length > 0
       ? `The work of ${preserved.join(", ")} is PRESERVED on branch \`${branch}\` as an ` +
         `explicitly incomplete commit — it passed this project's verify gates — so resuming ON ` +
         `THIS MACHINE continues from it rather than redoing it. A run branch is pushed only when ` +
         `its pull request is opened, so a resume elsewhere starts the ticket over instead.`
+      : null,
+    unknown.length > 0
+      ? `What ${unknown.join(", ")} added was rolled back, but anton could not read \`${branch}\`'s ` +
+        `history, so whether an earlier attempt's preserved commit is still on it is UNKNOWN — the ` +
+        `rollback restores a baseline such a commit would be part of. Check \`${branch}\` before ` +
+        `resuming: a resume continues from that commit if it is there and starts the ticket over ` +
+        `if it is not.`
       : null,
     rolledBack.length > 0
       ? `The work of ${rolledBack.join(", ")} was rolled back, so resuming starts it over.`
@@ -558,7 +571,14 @@ export function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string
         ? `, or split ${targetId} into child tickets that each fit the budget — taking the ` +
           `preserved commit off \`${branch}\` first, since no child delivers it and a resumed ` +
           `multi-ticket run refuses to start while it could ride into their pull request`
-        : `, or split ${targetId} into child tickets that each fit the budget`;
+        : // Same instruction, held to what anton actually knows: an unreadable history cannot rule
+          // a preserved commit out, and a split that leaves one behind hits the same refusal.
+          unknown.length > 0
+          ? `, or split ${targetId} into child tickets that each fit the budget — checking ` +
+            `\`${branch}\` for a preserved commit first and taking any off, since no child ` +
+            `delivers one and a resumed multi-ticket run refuses to start while it could ride ` +
+            `into their pull request`
+          : `, or split ${targetId} into child tickets that each fit the budget`;
     return (
       `${targetId} ran out of time (its ${budget} ticket budget) and nothing was delivered — it ` +
       `IS this run's whole target, so there is no sibling ticket to re-scope the work into. ` +

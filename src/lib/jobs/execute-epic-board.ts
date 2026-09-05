@@ -469,11 +469,19 @@ export interface SkipCause {
  * `delivered` is the delivery gate's verdict, never the bare tree fact (PR #228 review): a deadline
  * landing while `assertDelivered` REFUSES a commit leaves that commit on the branch but makes it
  * nobody's delivery, and every reader below — the reopen, the cascade, the operator's ledger — owes
- * that ticket the same treatment as one stopped short. */
+ * that ticket the same treatment as one stopped short.
+ *
+ * `preservedUnknown` is the fate a preserved/rolled-back pair cannot express (PR #228 review): the
+ * rollback restores a baseline a previous attempt's preserved commit is part of, and when the
+ * branch's history could not be read anton does not know whether one is there. Neither flag can
+ * carry that — `preserved` would promise a resume continues from work that may not exist, and its
+ * absence reads as a rollback that took the work off — so the doubt gets its own field, and the
+ * park message speaks it instead of claiming the work was removed. */
 export interface TicketTimeoutOutcome {
   id: string;
   delivered: boolean;
   preserved?: boolean;
+  preservedUnknown?: boolean;
 }
 
 /**

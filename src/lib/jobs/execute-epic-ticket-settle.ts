@@ -251,6 +251,11 @@ export async function settleTicketTimeout(args: {
     const preservedOn =
       "branch" in kept ? kept.branch : "retainedOn" in kept ? kept.retainedOn : null;
     const retained = preservedOn !== null && !fresh;
+    // A null `preservedOn` the preserve could not stand behind (PR #228 review): the branch's
+    // history was unreadable, so "nothing of a previous attempt is on it" is a guess. Carried to the
+    // run's ledger so the park it composes says the fate is unknown rather than claiming a rollback
+    // took work off a branch that may still carry it.
+    const preservedUnknown = "retainedUnknown" in kept && kept.retainedUnknown === true;
     // Asked BEFORE the tree is touched, not only after (PR #228 review). Only the preserve's gate
     // window and its own commit observe the job signal; every EARLY refusal — the strict history
     // read, the already-committed exit, the unchanged tree, a run with siblings, a project pinning
@@ -355,7 +360,7 @@ export async function settleTicketTimeout(args: {
           `\`${branch}\`, then resume the run`,
       );
     }
-    throw new TicketTimeoutError(ticket.id, timeoutMs, delivered, preservedOn);
+    throw new TicketTimeoutError(ticket.id, timeoutMs, delivered, preservedOn, preservedUnknown);
   }
 }
 

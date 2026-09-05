@@ -273,6 +273,14 @@ export class TicketTimeoutError extends Error {
      * continues from.
      */
     readonly preservedOn: string | null = null,
+    /**
+     * Whether that null `preservedOn` is a READ that failed rather than a branch anton looked at
+     * (PR #228 review). A rollback restores a baseline a previous attempt's preserved commit is part
+     * of, so when the history probe could not run, "nothing of this ticket is on the branch" is
+     * unproven — and every reader that turns this error into an operator's account owes the doubt
+     * rather than the claim that the work was removed.
+     */
+    readonly preservedUnknown: boolean = false,
   ) {
     super(
       `${ticketId} exceeded its ${Math.round(budgetMs / 60_000)}m ticket budget and was stopped. ` +
@@ -281,7 +289,10 @@ export class TicketTimeoutError extends Error {
           : preservedOn
             ? `Its work passed this project's verify gates, so it was PRESERVED on ` +
               `\`${preservedOn}\` as an explicitly incomplete commit — a resume continues from it`
-            : `Its partial work was rolled back`) +
+            : preservedUnknown
+              ? `What this attempt added was rolled back, but anton could not read the branch's ` +
+                `history, so work a previous attempt preserved may still be on it`
+              : `Its partial work was rolled back`) +
         ` and the ticket is blocked for review; the rest of the run continued. ` +
         `Split it into smaller tickets (or raise ticketTimeoutMinutes), then resume.`,
     );
