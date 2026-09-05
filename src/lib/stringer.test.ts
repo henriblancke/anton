@@ -2610,6 +2610,28 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("scripts/literal.sh");
     });
 
+    // A backquoted span spreads over payload lines exactly as `$(` does. Read one line at a time it
+    // ran to the end of its opener and left nothing behind, so every line under it was blanked as
+    // inert data and the call between the backquotes went unseen (PR #190 review).
+    it("counts a backtick substitution opened and closed on different heredoc lines", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/multiline.sh": "cat <<EOF > a.ts\ntext `\nneverCalled\n` more\nEOF\n",
+        // Not vacuous: the same shape under a QUOTED delimiter is literal, so it calls nothing.
+        "scripts/literal.sh": "cat <<'EOF' > b.ts\ntext `\nneverCalled\n` more\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/multiline.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/literal.sh");
+    });
+
     // A delimiter is an ordinary shell WORD, so it may be assembled from quoted and unquoted
     // pieces. Reading only the first piece leaves a terminator that never matches and blanks the
     // rest of the script; a spelling matched not at all leaves the payload read as executable,

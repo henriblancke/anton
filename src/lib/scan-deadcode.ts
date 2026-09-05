@@ -814,15 +814,43 @@ function heredocOpeners(line: string): { word: string; dash: boolean; quoted: bo
  * quoted payload is. `\$(` is escaped and expands to nothing, and `${name}` is a parameter — a
  * value, not a call — so neither opens a span. Nesting is counted, because `$(a $(b))` closes on
  * its second `)` and stopping at the first would blank the tail of the outer command.
+ *
+ * Both span shapes are carried out to the caller in `SubstitutionState`, because both can run past
+ * the end of a payload line. `$(` had its depth carried already; a backquoted span opened on one
+ * line and closed on a later one used to run to the end of its opener and leave NOTHING behind, so
+ * every line under it was blanked as inert data and a `Widget` call between the two backticks went
+ * unseen — the live symbol then stayed reported dead (PR #190 review).
+ *
+ * A backquoted span does not nest, so it ends at the next unescaped backquote; while one is open
+ * the `$(` grammar is not read, which is the mutual exclusion this already assumed on one line.
  */
-function unmaskedSubstitutions(line: string, from = 0): { text: string; depth: number } {
+interface SubstitutionState {
+  /** How many `$(` are open. */
+  depth: number;
+  /** Whether a backquoted span is open. */
+  backtick: boolean;
+}
+
+const NO_SUBSTITUTION: SubstitutionState = { depth: 0, backtick: false };
+
+function unmaskedSubstitutions(
+  line: string,
+  from: SubstitutionState = NO_SUBSTITUTION,
+): { text: string } & SubstitutionState {
   const out = blankAll(line).split("");
-  let depth = from;
+  let { depth, backtick } = from;
   for (let at = 0; at < line.length; at += 1) {
+    const inside = depth > 0 || backtick;
     if (line[at] === "\\") {
-      if (depth > 0) out[at] = line[at];
+      if (inside) out[at] = line[at];
       at += 1;
-      if (depth > 0 && at < line.length) out[at] = line[at];
+      if (inside && at < line.length) out[at] = line[at];
+      continue;
+    }
+    if (backtick) {
+      // The closing backquote is punctuation, not code, so it stays blank like the opening one.
+      if (line[at] === "`") backtick = false;
+      else out[at] = line[at];
       continue;
     }
     if (depth === 0 && line[at] === "$" && line[at + 1] === "(") {
@@ -831,11 +859,7 @@ function unmaskedSubstitutions(line: string, from = 0): { text: string; depth: n
       continue;
     }
     if (depth === 0 && line[at] === "`") {
-      // A backquoted span does not nest, so it runs to the next backquote.
-      const close = line.indexOf("`", at + 1);
-      const end = close === -1 ? line.length : close;
-      for (let i = at + 1; i < end; i += 1) out[i] = line[i];
-      at = end;
+      backtick = true;
       continue;
     }
     if (depth === 0) continue;
@@ -846,7 +870,7 @@ function unmaskedSubstitutions(line: string, from = 0): { text: string; depth: n
     }
     out[at] = line[at];
   }
-  return { text: out.join(""), depth };
+  return { text: out.join(""), depth, backtick };
 }
 
 /**
@@ -865,10 +889,11 @@ function unmaskedSubstitutions(line: string, from = 0): { text: string; depth: n
  */
 function maskHeredocs(text: string): string {
   const pending: { word: string; dash: boolean; quoted: boolean }[] = [];
-  // How deep the payload's command substitution stands as the next line begins. A `$(` opened on
-  // one payload line closes on a later one — `$(\n  Widget\n)` is one command — so the depth is
-  // carried rather than reset per line, which would blank the call inside it (anton-23xe).
-  let depth = 0;
+  // Where the payload's command substitution stands as the next line begins. A `$(` opened on one
+  // payload line closes on a later one — `$(\n  Widget\n)` is one command — so the state is carried
+  // rather than reset per line, which would blank the call inside it (anton-23xe). A backquoted
+  // span spreads over lines the same way and is carried with it (PR #190 review).
+  let substitution: SubstitutionState = NO_SUBSTITUTION;
   return text
     .split("\n")
     .map((line) => {
@@ -877,21 +902,21 @@ function maskHeredocs(text: string): string {
         const terminator = open.dash ? line.replace(/^\t+/, "") : line;
         if (terminator === open.word) {
           pending.shift();
-          depth = 0;
+          substitution = NO_SUBSTITUTION;
           return blankAll(line);
         }
         // A quoted delimiter makes the whole payload literal; a bare one leaves its command
         // substitutions running, and those are code however the rest of the payload reads.
         if (open.quoted) return blankAll(line);
-        const masked = unmaskedSubstitutions(line, depth);
-        depth = masked.depth;
+        const masked = unmaskedSubstitutions(line, substitution);
+        substitution = { depth: masked.depth, backtick: masked.backtick };
         return masked.text;
       }
       // Openers are read off the CODE part only. This pass runs before the comment grammar, so a
       // `# cat <<EOF` shown in a comment would otherwise queue a terminator that never arrives and
       // blank every line below it.
       const opened = heredocOpeners(shellCode(line));
-      if (opened.length > 0) depth = 0;
+      if (opened.length > 0) substitution = NO_SUBSTITUTION;
       pending.push(...opened);
       return line;
     })
