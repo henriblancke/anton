@@ -732,18 +732,21 @@ async function settleTicketTimeout(args: {
     // was kept, nothing is rolled back, and nothing goes to the board. Return so the abort path
     // below settles the ticket the way whoever stopped the run intends.
     if ("jobAborted" in kept) return;
-    const preservedOn = "branch" in kept ? kept.branch : null;
+    // A FRESH preserve is the only outcome that moved the branch; everything else — an attempt that
+    // wrote nothing, and a refusal whose rollback keeps a previous attempt's commit — leaves what is
+    // on the branch to a previous attempt, and the operator is owed that either way.
+    const fresh = "branch" in kept && !kept.retained;
+    const preservedOn = "branch" in kept ? kept.branch : kept.retainedOn;
+    const retained = preservedOn !== null && !fresh;
     // Both routes answer the SAME question — is anything of this ticket still loose in the tree —
     // and neither is trusted to have worked. A FRESH preserve re-reads the tree from scratch (`null`
     // baseline: dirt is dirt, whatever it was before), because the commit it just made moved the
-    // tree away from the baseline the rollback compares against. A RETAINED one did not move the
-    // tree at all, so it takes the ordinary rollback — which restores a baseline the preserved
-    // commit is already part of, keeping it on the branch while clearing anything loose.
-    const retained = "branch" in kept && kept.retained;
-    const leftovers =
-      preservedOn && !retained
-        ? await leftChangesBehind(worktreePath, null)
-        : await rollbackTimedOutTicket(worktreePath, baseline, committed);
+    // tree away from the baseline the rollback compares against. Everything else takes the ordinary
+    // rollback — which restores a baseline any preserved commit is already part of, keeping it on
+    // the branch while clearing anything loose.
+    const leftovers = fresh
+      ? await leftChangesBehind(worktreePath, null)
+      : await rollbackTimedOutTicket(worktreePath, baseline, committed);
     const marked = await blockTimedOutTicket({
       repo,
       ticket,
@@ -764,7 +767,7 @@ async function settleTicketTimeout(args: {
       throw new WorktreeDirtyError(
         `${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m ticket budget and its ` +
           `partial work could NOT be ` +
-          `${preservedOn && !retained ? "fully committed" : "rolled back"} — the ` +
+          `${fresh ? "fully committed" : "rolled back"} — the ` +
           `run's worktree (${worktreePath}) still carries changes that the next ticket would ` +
           `commit as its own, so the run stopped here. Clear the worktree by hand, then resume ` +
           `the run`,
@@ -777,7 +780,7 @@ async function settleTicketTimeout(args: {
     if (!marked) {
       throw new PoisonEpic(
         `${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m ticket budget and its ` +
-          `partial work was ${preservedOn ? `preserved on \`${preservedOn}\`` : "rolled back"}, ` +
+          `partial work was ${workFate(preservedOn, retained)}, ` +
           `but bd would not record \`${LABELS.notDelivered}\` on it — the run stopped rather than ` +
           `carry on to a pull request whose merge would close this undelivered ticket as shipped. ` +
           `Check the beads DB, then resume the run`,
@@ -785,6 +788,19 @@ async function settleTicketTimeout(args: {
     }
     throw new TicketTimeoutError(ticket.id, timeoutMs, committed, preservedOn);
   }
+}
+
+/**
+ * What became of a timed-out ticket's work, in one phrase for an operator reading a halt. The
+ * retained state is the one a flat preserved/rolled-back pair cannot say (PR #228 review): this
+ * attempt kept nothing of its own, but a previous one's commit is still on the branch and the resume
+ * continues from it rather than starting over.
+ */
+function workFate(preservedOn: string | null, retained: boolean): string {
+  if (!preservedOn) return "rolled back";
+  return retained
+    ? `rolled back onto the work a previous attempt PRESERVED on \`${preservedOn}\``
+    : `preserved on \`${preservedOn}\``;
 }
 
 /**
@@ -804,10 +820,15 @@ const PRESERVE_VERIFY_MAX_MS = 15 * 60_000;
  * tree; a retained one only reports what a previous attempt already preserved and this one did not
  * touch — the caller still rolls that tree back (the reset restores a baseline the commit is part
  * of), but the operator is owed the truth that the work is still on the branch.
+ *
+ * `retainedOn` carries that same truth through a REFUSAL (PR #228 review): a resume can start from a
+ * previous attempt's preserved commit, write more, and have the additions rejected — the rollback
+ * then drops only the additions, and reporting a bare rollback would tell the operator work that is
+ * still on the branch was thrown away.
  */
 type PreservedWork =
   | { branch: string; retained: boolean }
-  | { rolledBackWhy: string }
+  | { rolledBackWhy: string; retainedOn: string | null }
   | { jobAborted: true };
 
 /**
@@ -836,8 +857,9 @@ type PreservedWork =
  *
  * - the ticket already committed — there is nothing loose to keep;
  * - the run has other tickets — see above;
- * - the JOB was aborted while the gates ran — that abort outranks the timeout, so this reports it
- *   rather than a verdict, and the caller hands the work and the bead to whoever stopped the run;
+ * - the JOB was aborted while the gates ran, or while the commit itself was being made — that abort
+ *   outranks the timeout, so this reports it rather than a verdict, and the caller hands the work
+ *   and the bead to whoever stopped the run;
  * - no baseline was readable — the delta in the tree cannot be attributed to this ticket at all;
  * - the tree is unchanged — there is nothing to keep, and the rollback is a no-op;
  * - HEAD left the run's branch, or the branch no longer contains where the ticket started — the
@@ -860,36 +882,49 @@ export async function preserveTimedOutWork(args: {
 }): Promise<PreservedWork> {
   const { run, ticket, logPath, baseline, committed, timeoutMs, standalone } = args;
   const { worktreePath, branch, settings } = run;
+  // What a PREVIOUS attempt already preserved, read once below and carried by every refusal after
+  // it: the rollback a refusal asks for restores the baseline, which on a resume that started from
+  // that commit still contains it.
+  let retainedOn: string | null = null;
   const rollBack = async (why: string): Promise<PreservedWork> => {
-    await logPreserve(logPath, `rolling back — ${why}`);
-    return { rolledBackWhy: why };
+    await logPreserve(
+      logPath,
+      `rolling back — ${why}` +
+        (retainedOn ? ` (a previous attempt's work stays on ${retainedOn})` : ``),
+    );
+    return { rolledBackWhy: why, retainedOn };
   };
-  if (committed) return { rolledBackWhy: "its work was already committed" };
+  if (committed) return { rolledBackWhy: "its work was already committed", retainedOn };
   if (!baseline) {
     return rollBack(`anton could not read the worktree this ticket started from`);
   }
 
   const now = await readWorktreeState(worktreePath).catch(() => null);
   if (!now) return rollBack(`anton could not read the worktree back`);
+  // "Nothing kept" is a verdict on THIS attempt, never on the branch (PR #228 review). A resume that
+  // starts from a previous attempt's preserved commit leaves it wherever the ticket ends — untouched
+  // if nothing was written, and still there if what was written gets refused below, since the
+  // rollback restores a baseline the commit is part of. Read once, here, so every answer past this
+  // point tells the operator the truth about the branch; without it the bead note and the park say
+  // the work is gone and the next resume starts over, when in fact it continues from that commit.
+  // Only while HEAD is on the run's branch: off it, anton cannot say what the rollback puts back.
+  if (
+    now.ref === `refs/heads/${branch}` &&
+    (await worktreeHasPreservedCommitFor(worktreePath, ticket.id))
+  ) {
+    retainedOn = branch;
+  }
   // Asked before the sibling check below, so a ticket that left nothing is never told the reason it
   // could not keep work it never wrote.
   if (sameWorktreeState(now, baseline)) {
-    // …but "nothing new" is not "nothing kept" (PR #228 review). A resume that STARTS from a
-    // previous attempt's preserved commit and times out again without touching the tree leaves that
-    // commit exactly where it was — the rollback below restores a baseline it is part of. Reported
-    // as retained, or the bead note and the park would tell the operator the work is gone and the
-    // next resume starts over, when in fact it continues from it.
-    if (
-      now.ref === `refs/heads/${branch}` &&
-      (await worktreeHasPreservedCommitFor(worktreePath, ticket.id))
-    ) {
+    if (retainedOn) {
       await logPreserve(
         logPath,
-        `left the tree untouched — a previous attempt's work is still on ${branch}`,
+        `left the tree untouched — a previous attempt's work is still on ${retainedOn}`,
       );
-      return { branch, retained: true };
+      return { branch: retainedOn, retained: true };
     }
-    return { rolledBackWhy: "it left nothing in the worktree" };
+    return { rolledBackWhy: "it left nothing in the worktree", retainedOn };
   }
   if (!standalone) {
     return rollBack(
@@ -959,6 +994,23 @@ export async function preserveTimedOutWork(args: {
   const kept = await commitAll(worktreePath, preservedCommitMessage(ticket, timeoutMs)).catch(
     (error: unknown) => ({ committed: false as const, error }),
   );
+  // The abort outranks the timeout on THIS side of the commit too (PR #228 review). `commitAll` runs
+  // on no signal — a pre-commit hook can hold it for minutes — so an operator's kill, a lost lease or
+  // the no-progress timeout can land here just as it can in the gate window above, and neither
+  // outcome of the commit is a verdict once it has: a commit that landed simply stays on the branch,
+  // and one that did not must not be read as "unfit" and rolled back. Reported as the abort so the
+  // caller leaves the tree and the bead to whoever stopped the run.
+  if (run.ctx.signal.aborted) {
+    await logPreserve(
+      logPath,
+      kept.committed
+        ? `committed this ticket's work on ${branch}, then found the job aborted — leaving it and ` +
+            `the bead to whoever stopped the run`
+        : `the job was aborted while committing this ticket's work — leaving the tree and the bead ` +
+            `to whoever stopped the run`,
+    );
+    return { jobAborted: true };
+  }
   if (!kept.committed) {
     return rollBack(
       "error" in kept
@@ -1074,7 +1126,10 @@ async function blockTimedOutTicket(args: {
   leftovers: boolean;
   /** The branch its work was preserved on (anton-d967), or null when it was rolled back. */
   preservedOn: string | null;
-  /** Whether that preserved work is a PREVIOUS attempt's, which this one added nothing to. */
+  /**
+   * Whether that preserved work is a PREVIOUS attempt's — this one either added nothing to the tree
+   * or had what it added rolled back (`rolledBackWhy` tells the two apart).
+   */
   retained?: boolean;
   /** Why the work could NOT be kept — the operator is owed the reason, not just the verdict. */
   rolledBackWhy?: string;
@@ -1109,8 +1164,13 @@ async function blockTimedOutTicket(args: {
               `than let another ticket commit it — clear the worktree by hand before resuming. `
             : preservedOn
               ? (args.retained
-                  ? `This attempt added nothing to the tree, and the work a previous one PRESERVED ` +
-                    `on branch \`${preservedOn}\` is still there as an explicitly incomplete commit `
+                  ? (args.rolledBackWhy
+                      ? `What this attempt added was rolled back (${args.rolledBackWhy}), but the ` +
+                        `work a previous one PRESERVED on branch \`${preservedOn}\` is still there ` +
+                        `as an explicitly incomplete commit `
+                      : `This attempt added nothing to the tree, and the work a previous one ` +
+                        `PRESERVED on branch \`${preservedOn}\` is still there as an explicitly ` +
+                        `incomplete commit `)
                   : `Its work passed this project's verify gates, so it was PRESERVED on branch ` +
                     `\`${preservedOn}\` as an explicitly incomplete commit rather than deleted `) +
                 `— it is NOT delivered and is in no pull request, and resuming the run continues ` +

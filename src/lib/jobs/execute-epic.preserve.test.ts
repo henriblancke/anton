@@ -1,14 +1,17 @@
 /**
  * What a timed-out ticket's preserve DECIDES, against real git (anton-d967 / PR #228 review).
  *
- * Three facts the end-to-end budget suite cannot reach cheaply, and each one is a way the preserve
- * can lose work or lie about it:
+ * Facts the end-to-end budget suite cannot reach cheaply, and each one is a way the preserve can
+ * lose work or lie about it:
  *
  * - a job-level abort landing inside the verify window (up to 15 minutes) must not be read as a
  *   failed gate — that verdict hard-resets the worktree to the baseline and writes the board, which
  *   is exactly what an operator's kill must NOT do;
- * - a resume that starts FROM a preserved commit and times out again without touching the tree still
- *   has its work on the branch, so it must report that rather than "nothing was kept";
+ * - nor may one landing while the preserved commit is being made be read as a preserve — the commit
+ *   stays, but the board belongs to whoever stopped the run;
+ * - a resume that starts FROM a preserved commit and times out again still has that work on the
+ *   branch, whether it touched the tree or had its additions refused, so it must report that rather
+ *   than "nothing was kept";
  * - a run that gained child tickets since the preserve may not start on a branch that still carries
  *   the parent's incomplete commit — the children's pull request would ship it.
  */
@@ -201,7 +204,64 @@ suite("preserveTimedOutWork (real git)", () => {
       standalone: true,
     });
 
-    expect(kept).toEqual({ rolledBackWhy: "it left nothing in the worktree" });
+    expect(kept).toEqual({ rolledBackWhy: "it left nothing in the worktree", retainedOn: null });
+  });
+
+  // The same resume, one step further: it DID write something, and the gates refuse it. The rollback
+  // drops only what this attempt added — the commit it started from stays on the branch — so a bare
+  // "rolled back" would tell the operator work that is still there was thrown away, and send the
+  // next resume off to redo it.
+  it("keeps reporting the previous attempt's work when this one's additions are refused", async () => {
+    write("HALF_WRITTEN.md", "work preserved by the attempt before this one\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", `WIP ${ticket.id}: ${ticket.title}`]);
+    const baseline = await readWorktreeState(repo);
+    write("MORE.md", "what this attempt added, and the gates refuse\n");
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "exit 1" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toMatchObject({
+      rolledBackWhy: expect.stringContaining("does not pass this project's verify gates"),
+      retainedOn: BRANCH,
+    });
+    expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
+  });
+
+  // The abort's other landing spot: `commitAll` runs on no signal (a pre-commit hook can hold it for
+  // minutes), so a kill can arrive with the preserved commit already made. Read as an ordinary
+  // preserve it would write the board a human is deciding on; read as a failure it would roll the
+  // commit away. It is neither — the work stays on the branch and the bead belongs to the abort.
+  it("reports the JOB's abort that lands while the preserved commit is being made", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("HALF_WRITTEN.md", "finished work the kill must not delete\n");
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, "pre-commit"), "#!/bin/sh\nsleep 1\n", { mode: 0o755 });
+    const abort = new AbortController();
+    setTimeout(() => abort.abort(), 250);
+
+    const kept = await preserveTimedOutWork({
+      run: run(abort.signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ jobAborted: true });
+    // The commit landed before the kill was noticed — it stays, and the caller writes nothing.
+    expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
+    expect(head()).not.toBe(baseline.head);
   });
 });
 
