@@ -120,6 +120,23 @@ vi.mock("./projects", async () => {
   };
 });
 
+// The lane is DERIVED inside the board read now (anton-r0ew), so the picker's decision runs where a
+// throw used to be impossible — a pure map over a recorded plan. Stubbed so a test can make that
+// derivation fail (PR #226 review).
+let rankingFails = false;
+
+vi.mock("./jobs/picker-decision", async () => {
+  const actual =
+    await vi.importActual<typeof import("./jobs/picker-decision")>("./jobs/picker-decision");
+  return {
+    ...actual,
+    decideBoardPickerPlan: (input: Parameters<typeof actual.decideBoardPickerPlan>[0]) => {
+      if (rankingFails) throw new Error("rankTargets fell over");
+      return actual.decideBoardPickerPlan(input);
+    },
+  };
+});
+
 const { deriveStage, getBoard, getBoardVersion } = await import("./board");
 const { invalidateIssueSnapshot, resetIssueSnapshots } = await import("./beads/snapshot");
 const { contractBlocks, validateBeadContract } = await import("./beads/contract");
@@ -133,6 +150,7 @@ beforeEach(() => {
   deferrals = new Map();
   declined = new Set();
   pickerPlan = undefined;
+  rankingFails = false;
   pickerArmed = true;
   pickerRecord = { settled: 0, accepted: 0 };
   projectSettings = { pickerAutonomy: "shadow" };
@@ -1474,6 +1492,29 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
       expect(served.upNextPlanId).toBeUndefined();
       // Both halves of the freshness token agree on that, or every poll re-reads instead of 304ing.
       expect(await getBoardVersion(project)).toBe(served.version);
+    });
+
+    it("costs the LANE and not the board when deriving the ranking throws", async () => {
+      // Every other picker-derived read here degrades; this one runs the whole decision inside the
+      // board read, so a bug in `rankTargets` would otherwise take down the surface every run is
+      // approved from (PR #226 review). The silence is deliberate: a server bug is not a wait the
+      // operator can clear, and it is in the log.
+      const board = [feature()];
+      listMock.mockResolvedValue(board);
+      rankingFails = true;
+      const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      try {
+        const served = await getBoard(project);
+
+        expect(served.upNext).toBeUndefined();
+        expect(served.upNextAbsence).toBeUndefined();
+        // The board itself is whole — the cards, not just the lane, were what the throw threatened.
+        expect(served.columns.backlog.map((e) => e.id)).toEqual(["f-1"]);
+        expect(logged).toHaveBeenCalled();
+      } finally {
+        logged.mockRestore();
+      }
     });
 
     it("names nothing while a lane is drawn", async () => {

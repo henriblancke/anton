@@ -90,8 +90,9 @@ export function upNextEntries(
  * resolves them: a disarmed pass is why there is no ranking even when the level would offer one.
  * `undefined` is the silence left for a ranking withheld by neither — nothing the operator would act
  * on, so naming it would tell them to do something about a wait. Since the lane is DERIVED
- * (anton-r0ew) the board no longer reaches it: an armed, offering project always has a ranking, so
- * every withheld lane there has a name.
+ * (anton-r0ew) an armed, offering project reaches it in one case only: the derivation itself threw
+ * and the board read degraded rather than falling over (PR #226 review). That is a server bug, in
+ * the server log — not a wait, and not something the operator clears.
  */
 export function upNextAbsence(
   stance: UpNextStance,

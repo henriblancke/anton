@@ -23,7 +23,11 @@ import {
 } from "./board-picker-plan";
 import { boardProvenance, provenanceVersion } from "./board-provenance";
 import { getDb } from "./db";
-import { ADMIT_ALL_POLICY, decideBoardPickerPlan } from "./jobs/picker-decision";
+import {
+  ADMIT_ALL_POLICY,
+  decideBoardPickerPlan,
+  type BoardPickerDecision,
+} from "./jobs/picker-decision";
 import { armedPickerPolicy } from "./jobs/picker-policy";
 import {
   deferralVersion,
@@ -240,6 +244,26 @@ interface PickerLevel {
   offers: boolean;
   /** The read succeeded — so an absent `policy` means "none armed" rather than "unknown". */
   known: boolean;
+}
+
+/**
+ * The Up Next ranking, or nothing if deriving it throws (PR #226 review).
+ *
+ * Deriving the lane per read (anton-r0ew) put the picker's whole decision — `policyCandidates`,
+ * `rankTargets` — inside the board read, where projecting a recorded plan was a map that could not
+ * fail. So it degrades like every other picker-derived read here: a bug in the decision costs the
+ * LANE, which then says it has nothing to show, not the surface every run is approved from.
+ */
+function deriveRanking(
+  project: Project,
+  derive: () => BoardPickerDecision,
+): BoardPickerDecision | undefined {
+  try {
+    return derive();
+  } catch (err) {
+    console.error(`[board] up-next ranking failed for ${project.slug}`, err);
+    return undefined;
+  }
 }
 
 /** The settings half of {@link readPickerStance} — the armed policy and the resolved autonomy. */
@@ -499,14 +523,16 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // armed policy rejects. An unknown policy is not an absent one, so the lane says so instead
   // (`policy-unreadable`) rather than showing a ranking anton would not act on.
   const ranking = picker.offers && picker.policyKnown
-    ? decideBoardPickerPlan({
-        board: allBeads,
-        policy: picker.policy
-          ? armedPickerPolicy(picker.policy, allBeads, new Date(observedAtMs))
-          : ADMIT_ALL_POLICY,
-        ...(picker.policy ? { armedPolicy: picker.policy } : {}),
-        runtime: { observedAtMs, deferrals },
-      })
+    ? deriveRanking(project, () =>
+        decideBoardPickerPlan({
+          board: allBeads,
+          policy: picker.policy
+            ? armedPickerPolicy(picker.policy, allBeads, new Date(observedAtMs))
+            : ADMIT_ALL_POLICY,
+          ...(picker.policy ? { armedPolicy: picker.policy } : {}),
+          runtime: { observedAtMs, deferrals },
+        }),
+      )
     : undefined;
   const upNext = upNextEntries(allBeads, ranking);
   // The generation a verdict on those picks is RECORDED against — still the plan row, and still only

@@ -120,7 +120,12 @@ export function ChipBacklogActions({
   cardVeto?: (beadId: string, untilMs: number) => void;
 }) {
   const decision = usePickDecision();
-  const picked = isPickerPick(item.provenance) && item.notNowUntil === undefined;
+  const recorded = isPickerPick(item.provenance);
+  // The vetoes answer the live pick whether or not a pass wrote it down — mirrors the card, and the
+  // lane rows that offer both on an unrecorded row (PR #226 review). Only the START waits for the
+  // record; a target already set aside has answered.
+  const unconfirmed = useUnrecordedPick(item.id, recorded);
+  const answerable = (recorded || unconfirmed) && item.notNowUntil === undefined;
   return (
     <div className={cn("relative z-[1] flex flex-col gap-2", hasOverlay && "pointer-events-none")}>
       {/* Claim sits on its own line, above the action row. */}
@@ -137,7 +142,7 @@ export function ChipBacklogActions({
         <ApproveRunAction slug={slug} item={item} budgetAware={budgetAware} approval={approval} />
         {/* The two ways to disagree with the pick (R3.9), on the chip because this surface has no
             row to put them on. Same lock as the Release beside them: one answer per pick. */}
-        {cardVeto && picked && canOfferRun(item, approval.approved, approval.deferred) && (
+        {cardVeto && answerable && canOfferRun(item, approval.approved, approval.deferred) && (
           <VetoActions
             slug={slug}
             beadId={item.id}

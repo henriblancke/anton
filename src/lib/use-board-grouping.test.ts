@@ -27,6 +27,9 @@ function stored(slug: string): string | undefined {
     ?.split("=")[1];
 }
 
+/** The store the preference lived in before the server had to read it. */
+const LEGACY_KEY = "anton:board-grouping:";
+
 function forget(slug: string) {
   document.cookie = `${boardGroupingCookieName(slug)}=; path=/; max-age=0`;
 }
@@ -35,6 +38,7 @@ afterEach(() => {
   cleanup();
   forget("tmp");
   forget("other");
+  window.localStorage.clear();
   document.body.innerHTML = "";
 });
 
@@ -132,6 +136,55 @@ describe("useBoardGrouping post-mount adoption (anton-wds3)", () => {
       if (own) Object.defineProperty(document, "cookie", own);
       else Reflect.deleteProperty(document, "cookie");
     }
+  });
+});
+
+describe("useBoardGrouping legacy storage (PR #226 review)", () => {
+  it("carries a pre-cookie preference across the format change instead of resetting it", () => {
+    window.localStorage.setItem(LEGACY_KEY + "tmp", "epic");
+
+    const { result } = renderHook(() => useBoardGrouping("tmp"));
+
+    expect(result.current[0]).toBe("epic");
+    // Adopted into the store the SERVER reads, so the next load paints Epic without this rescue.
+    expect(stored("tmp")).toBe("epic");
+    expect(window.localStorage.getItem(LEGACY_KEY + "tmp")).toBeNull();
+  });
+
+  it("leaves a board alone whose choice was already made in the new format", () => {
+    document.cookie = `${boardGroupingCookieName("tmp")}=stage; path=/`;
+    window.localStorage.setItem(LEGACY_KEY + "tmp", "epic");
+
+    const { result } = renderHook(() => useBoardGrouping("tmp"));
+
+    expect(result.current[0]).toBe("stage");
+    expect(window.localStorage.getItem(LEGACY_KEY + "tmp")).toBeNull();
+  });
+
+  it("keeps the old key when the cookie it would migrate into cannot be written", () => {
+    window.localStorage.setItem(LEGACY_KEY + "tmp", "epic");
+    const own = Object.getOwnPropertyDescriptor(document, "cookie");
+    Object.defineProperty(document, "cookie", { configurable: true, get: () => "", set: () => {} });
+    try {
+      const { result } = renderHook(() => useBoardGrouping("tmp"));
+
+      expect(result.current[0]).toBe("epic");
+      // The only durable copy stays put rather than being traded for a session-only one.
+      expect(window.localStorage.getItem(LEGACY_KEY + "tmp")).toBe("epic");
+      act(() => result.current[1]("stage"));
+    } finally {
+      if (own) Object.defineProperty(document, "cookie", own);
+      else Reflect.deleteProperty(document, "cookie");
+    }
+  });
+
+  it("ignores an unrecognised stored value", () => {
+    window.localStorage.setItem(LEGACY_KEY + "tmp", "sideways");
+
+    const { result } = renderHook(() => useBoardGrouping("tmp"));
+
+    expect(result.current[0]).toBe("stage");
+    expect(window.localStorage.getItem(LEGACY_KEY + "tmp")).toBeNull();
   });
 });
 

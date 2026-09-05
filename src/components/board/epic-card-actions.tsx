@@ -114,6 +114,12 @@ export function EpicBacklogActions({
   // Asked of the pick OR of the surface: this same card renders in the lane, where its row answers
   // it, and in the epic swimlanes, where only the surface knows it is a pick at all (PR #226 review).
   const unconfirmed = useUnrecordedPick(epic.id, recorded);
+  // Which picks may be DISAGREED with — a wider set than the ones that may be started. An unrecorded
+  // pick has no generation to file an accept against, so it offers no run; the veto route needs none,
+  // records the decline against no pick and defers all the same, and the lane's own rows offer both
+  // vetoes on exactly this row (PR #226 review). Set aside is the one state that closes it: the hold
+  // it places is already the answer.
+  const answerable = (recorded || unconfirmed) && epic.notNowUntil === undefined;
 
   async function handleDelete() {
     const res = await fetch(`/api/projects/${slug}/epics/${epic.id}`, { method: "DELETE" });
@@ -146,7 +152,7 @@ export function EpicBacklogActions({
       />
       {/* The two ways to disagree with the pick (R3.9), on the card because this surface has no row
           to put them on. Same lock as the Release beside them: one answer per pick. */}
-      {cardVeto && picked && (
+      {cardVeto && answerable && (
         <VetoActions
           slug={slug}
           beadId={epic.id}

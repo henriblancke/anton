@@ -282,6 +282,22 @@ describe("board grouping (anton-9pkk.4)", () => {
     expect(screen.getAllByRole("button", { name: /^approve/i })).toHaveLength(1);
   });
 
+  it("keeps both vetoes on an unrecorded pick — the toggle takes the start, not the refusal", () => {
+    render(<EpicBoard slug="tmp" initialBoard={unrecorded()} />);
+
+    // The lane offers both on exactly these rows, and the swimlanes have to match: what the missing
+    // record withholds is the START, which needs a generation to file its accept against. A veto
+    // needs none — it records its decline against no pick and defers the target all the same — so
+    // dropping it here would make the toggle the thing that takes away the only way to say no
+    // (PR #226 review).
+    expect(screen.getAllByRole("button", { name: /not now/i })).toHaveLength(2);
+
+    toggleTo("Epic");
+
+    expect(screen.getAllByRole("button", { name: /not now/i })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Never" })).toHaveLength(2);
+  });
+
   it("names the generation on screen, so the decline answers the pick that was shown", async () => {
     const until = Date.now() + 24 * 60 * 60 * 1000;
     const fetchMock = vi.fn(async (input: RequestInfo | URL) =>

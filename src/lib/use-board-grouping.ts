@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 
-import type { BoardGrouping } from "@/components/board/board-utils";
+import { isBoardGrouping, type BoardGrouping } from "@/components/board/board-utils";
 import {
   BOARD_GROUPING_COOKIE_MAX_AGE,
   boardGroupingCookieName,
@@ -15,6 +15,9 @@ import {
  * else, so an entry here is deleted the moment a write succeeds.
  */
 const unwritable = new Map<string, BoardGrouping>();
+
+/** Where the preference lived before the server had to read it (anton-wds3). */
+const LEGACY_STORAGE_PREFIX = "anton:board-grouping:";
 
 const listeners = new Set<() => void>();
 
@@ -62,6 +65,43 @@ function writeGrouping(slug: string, next: BoardGrouping): boolean {
   return parseBoardGrouping(readCookie(name)) === next;
 }
 
+/** Take a choice as this tab's answer for the board, wherever it came from, and republish it. */
+function adopt(slug: string, next: BoardGrouping): void {
+  if (writeGrouping(slug, next)) unwritable.delete(slug);
+  else unwritable.set(slug, next);
+  for (const notify of listeners) notify();
+}
+
+/**
+ * Carry a preference stored under the pre-cookie key across the format change (PR #226 review).
+ *
+ * Without it the switch to cookies silently reset every board an operator had put on Epic grouping,
+ * back to the `stage` default, with nothing to say why. So the old value is read once and adopted as
+ * the cookie the server reads — and only then dropped, so a browser that refuses the cookie keeps
+ * the one durable copy it has rather than trading it for a session-only one.
+ */
+function adoptLegacyGrouping(slug: string): void {
+  const key = LEGACY_STORAGE_PREFIX + slug;
+  let stored: string | null;
+  try {
+    stored = window.localStorage.getItem(key);
+  } catch {
+    return; // Unreadable storage holds nothing to rescue.
+  }
+  if (stored === null) return;
+  // A cookie already answers for this board: the choice has been made in the new format, and the old
+  // key is dead rather than a preference to restore.
+  if (readCookie(boardGroupingCookieName(slug)) === undefined && isBoardGrouping(stored)) {
+    adopt(slug, stored);
+    if (unwritable.has(slug)) return;
+  }
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // Left behind; the cookie answers first, so the next load never reads it again.
+  }
+}
+
 /**
  * The board's grouping choice, remembered per project. It is a view preference, not board state —
  * it belongs to the person looking at the board — so it lives in a cookie rather than costing a
@@ -83,14 +123,11 @@ export function useBoardGrouping(
     () => initial,
   );
 
-  const choose = useCallback(
-    (next: BoardGrouping) => {
-      if (writeGrouping(slug, next)) unwritable.delete(slug);
-      else unwritable.set(slug, next);
-      for (const notify of listeners) notify();
-    },
-    [slug],
-  );
+  // One-time rescue of the pre-cookie choice (PR #226 review), in an effect rather than in the read
+  // above: the snapshot must stay pure, and this writes.
+  useEffect(() => adoptLegacyGrouping(slug), [slug]);
+
+  const choose = useCallback((next: BoardGrouping) => adopt(slug, next), [slug]);
 
   return [grouping, choose];
 }
