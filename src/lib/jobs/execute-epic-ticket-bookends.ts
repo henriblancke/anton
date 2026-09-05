@@ -9,7 +9,7 @@
 import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
 import { readWorktreeState, type WorktreeState } from "../git/ops";
 import { updateRun } from "../runs";
-import { endSession, startJobSession, type JobSession } from "../sessions";
+import { appendSessionLog, endSession, startJobSession, type JobSession } from "../sessions";
 import { PoisonEpic } from "./errors";
 import { mustPersist, safe } from "./execute-epic-persist";
 import type { JobContext } from "./runner";
@@ -182,10 +182,25 @@ export function readTicketBaseline(worktreePath: string): Promise<WorktreeState 
   return readWorktreeState(worktreePath).catch(() => null);
 }
 
-/** Arm this ticket's deadline, derived from the job's own signal. */
+/**
+ * How much of a ticket's budget is spent before the run says so (anton-d967). Late enough that a
+ * healthy ticket never trips it, early enough that an operator watching still has a fifth of the
+ * clock to raise the budget or stop the run themselves.
+ */
+const BUDGET_WARNING_FRACTION = 0.8;
+
+/**
+ * Arm this ticket's deadline, derived from the job's own signal — and the warning that precedes it.
+ *
+ * `onWarning` fires once at {@link BUDGET_WARNING_FRACTION} of the budget, while the ticket is still
+ * running: the deadline itself arrives as a kill and leaves no notice of its own, so this is the
+ * only account of the clock running down. Never armed for an unbounded budget, which has no
+ * fraction to be at.
+ */
 export function startTicketBudget(
   ctx: Pick<JobContext, "signal">,
   timeoutMs: number,
+  onWarning?: (remainingMs: number) => void,
 ): TicketBudget {
   // This ticket's wall clock (anton-t1mo). A DERIVED signal — the job's abort still propagates
   // through it — so every child process a step spawns dies on either. The job-level signal is left
@@ -196,22 +211,54 @@ export function startTicketBudget(
   ctx.signal.addEventListener("abort", abortTicket, { once: true });
   if (ctx.signal.aborted) ticketAbort.abort();
   let ranOutOfTime = false;
-  const deadline =
-    Number.isFinite(timeoutMs) && timeoutMs > 0
-      ? setTimeout(() => {
-          ranOutOfTime = true;
-          ticketAbort.abort();
-        }, timeoutMs)
-      : null;
+  const bounded = Number.isFinite(timeoutMs) && timeoutMs > 0;
+  const deadline = bounded
+    ? setTimeout(() => {
+        ranOutOfTime = true;
+        ticketAbort.abort();
+      }, timeoutMs)
+    : null;
   if (deadline && typeof deadline.unref === "function") deadline.unref();
+  const warnAt = timeoutMs * BUDGET_WARNING_FRACTION;
+  const warning = bounded && onWarning ? setTimeout(() => onWarning(timeoutMs - warnAt), warnAt) : null;
+  if (warning && typeof warning.unref === "function") warning.unref();
   return {
     signal: ticketAbort.signal,
     ranOutOfTime: () => ranOutOfTime,
     stop: () => {
       if (deadline) clearTimeout(deadline);
+      if (warning) clearTimeout(warning);
       ctx.signal.removeEventListener("abort", abortTicket);
     },
   };
+}
+
+/**
+ * The OPERATOR-facing record that precedes the deadline (anton-d967). It goes to the session log an
+ * operator tails and to the run's own record; the running agent cannot read either — the driver
+ * delivers its prompt on stdin and closes it (`writePrompt`), so there is no channel back into a
+ * live session and this is no instruction to it. What actually saves finished work is the timeout's
+ * own preserve, after the deadline. This is what lets a person see the clock running down in time to
+ * raise the budget or stop the run, instead of meeting the kill in the log.
+ */
+export function warnBudgetRunningOut(
+  logPath: string,
+  ticket: Bead,
+  timeoutMs: number,
+  remainingMs: number,
+): void {
+  const line =
+    `${ticket.id} has used ${Math.round(BUDGET_WARNING_FRACTION * 100)}% of its ` +
+    `${humanDuration(timeoutMs)} budget — about ${humanDuration(remainingMs)} left. ` +
+    `Work still uncommitted when the deadline lands is kept only if this project's verify gates ` +
+    `pass on it, and only when this ticket IS the whole run target.`;
+  console.warn(`[execute-epic] ${line}`);
+  void appendSessionLog(logPath, `[ticket-budget] ${line}\n`).catch(() => {});
+}
+
+/** A duration an operator reads at a glance — minutes once there is a minute to speak of. */
+function humanDuration(ms: number): string {
+  return ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.round(ms / 1000)}s`;
 }
 
 /**

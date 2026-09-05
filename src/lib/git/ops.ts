@@ -100,6 +100,157 @@ function gitBounded(
   });
 }
 
+/**
+ * Override the commit budget (tests shrink it so a hook that outlives the kill is reachable).
+ * Read per call, so a change lands without a module reload.
+ */
+export const COMMIT_TIMEOUT_ENV = "ANTON_GIT_COMMIT_TIMEOUT_MS";
+
+/** The same budget every other git call here runs under. */
+const DEFAULT_COMMIT_TIMEOUT_MS = 120_000;
+
+/** What a killed commit's group gets to tear itself down before SIGKILL follows. */
+const COMMIT_KILL_GRACE_MS = 5_000;
+
+/** How often a kill re-asks whether the commit's process group still has members. */
+const REAP_POLL_MS = 25;
+
+/**
+ * Ceiling on waiting for a SIGKILLed group to disappear. SIGKILL is uncatchable, so anything still
+ * standing past this is wedged in the kernel or has left the group by `setsid` — neither of which
+ * more waiting fixes, and a run must never hang on it.
+ */
+const REAP_CEILING_MS = 2_000;
+
+function commitTimeoutMs(): number {
+  const raw = Number(process.env[COMMIT_TIMEOUT_ENV]);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_COMMIT_TIMEOUT_MS;
+}
+
+/**
+ * Run a `git commit` and return only once it — and every hook it spawned — is GONE (PR #228 review).
+ *
+ * Committing is the one git command anton runs that executes PROJECT code: `pre-commit` and
+ * `commit-msg` hooks, run as children of git, free to write the worktree for as long as they like.
+ * Under `execFile`'s timeout Node signals the direct `git` process alone, so a hook that outlives it
+ * — one that traps SIGTERM, or that redirects the stdio it inherited and keeps going — is orphaned
+ * ALIVE at the moment the caller is told the commit failed. That caller is the ticket-timeout
+ * preserve, which reads the failure as a verdict and immediately hard-resets the worktree and checks
+ * it clean: a late hook write then lands after the check and is swept into the next ticket's commit,
+ * or is thrown away with the failed run's worktree.
+ *
+ * So the commit leads a process group of its own and a kill is delivered to the GROUP and waited
+ * on — SIGTERM, then SIGKILL after the grace, then poll until the group reports `ESRCH` — before any
+ * verdict is returned. The wait is bounded for the same reason `runShell`'s is: a group that cannot
+ * be reaped must not wedge the run, and the caller's own cleanliness check is what catches whatever
+ * such a survivor writes.
+ *
+ * Only the KILL path reaps. A commit that ends on its own already waited for its hooks — git runs
+ * them synchronously — so there is nothing left to wait for.
+ */
+function gitCommit(cwd: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // stdout is dropped rather than piped: nothing here reads it, and a chatty hook filling an
+    // unread pipe would block the commit outright.
+    const child = spawn("git", ["-C", cwd, ...args], {
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: process.platform !== "win32",
+    });
+
+    let stderr = "";
+    let settled = false;
+    let killing = false;
+    /** The budget, the SIGKILL escalation and the reap poll — all released on the way out. */
+    const timers: NodeJS.Timeout[] = [];
+    const after = (ms: number, fn: () => void) => {
+      timers.push(setTimeout(fn, ms));
+    };
+
+    const settle = (emit: () => void) => {
+      if (settled) return;
+      settled = true;
+      for (const t of timers) clearTimeout(t);
+      emit();
+    };
+
+    const killGroup = (sig: NodeJS.Signals) => {
+      if (process.platform !== "win32" && child.pid) {
+        try {
+          process.kill(-child.pid, sig);
+          return;
+        } catch {
+          // The group may never have formed (spawn failed); fall back to the direct child handle.
+        }
+      }
+      child.kill(sig);
+    };
+
+    /** Whether every member of the commit's group is gone — git AND the hooks it started. */
+    const groupGone = (): boolean => {
+      if (!child.pid) return true; // spawn failed — there is no group to wait on
+      if (process.platform === "win32") return child.exitCode !== null || child.signalCode !== null;
+      try {
+        process.kill(-child.pid, 0);
+        return false;
+      } catch (err) {
+        // EPERM means members we cannot signal are still there; only ESRCH proves the group empty.
+        return (err as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    };
+
+    const killAndReap = (emit: () => void) => {
+      if (killing) return;
+      killing = true;
+      killGroup("SIGTERM");
+      after(COMMIT_KILL_GRACE_MS, () => {
+        if (!groupGone()) killGroup("SIGKILL");
+      });
+      const deadline = Date.now() + COMMIT_KILL_GRACE_MS + REAP_CEILING_MS;
+      const wait = () => {
+        if (groupGone() || Date.now() >= deadline) {
+          settle(emit);
+          return;
+        }
+        after(REAP_POLL_MS, wait);
+      };
+      wait();
+    };
+
+    const timeoutMs = commitTimeoutMs();
+    after(timeoutMs, () => {
+      killAndReap(() =>
+        reject(
+          Object.assign(
+            new Error(
+              `git ${args[0]} timed out after ${timeoutMs}ms and was killed with everything it ` +
+                `spawned: ${stderr.trim()}`,
+            ),
+            { killed: true },
+          ),
+        ),
+      );
+    });
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderr.length < 4096) stderr += chunk.toString("utf8");
+    });
+    child.on("error", (err) => settle(() => reject(err)));
+    child.on("close", (code) => {
+      // A kill in flight owns the verdict: its group may still hold live writers.
+      if (killing) return;
+      settle(() =>
+        code === 0
+          ? resolve()
+          : reject(
+              Object.assign(new Error(`git ${args[0]} failed (exit ${code}): ${stderr.trim()}`), {
+                code,
+              }),
+            ),
+      );
+    });
+  });
+}
+
 /** The tree mode of a symlink. Its blob holds the TARGET PATHNAME, not the linked file's content. */
 const SYMLINK_MODE = "120000";
 
@@ -325,20 +476,45 @@ function exitedWith(error: unknown, code: number): boolean {
  * An empty index is NOT proof that nothing was delivered: an agent that committed its own work
  * (against the base contract, but it happens) leaves exactly the same empty index. Only HEAD tells
  * the two apart — see `commitStep`, which is the caller that has to.
+ *
+ * `bypassHooks` runs the commit with this project's hooks off, and a run's ordinary commits never
+ * ask for it: hooks are the project's own gate on content, and anton has no standing to skip them.
+ * Its one caller is the ticket-timeout preserve RETRYING a `WIP <id>:` commit that a hook refused
+ * before anything landed (PR #228 review) — a tree the project's own verify gates have already
+ * passed, on its way to a commit that is explicitly incomplete and in no pull request. That caller
+ * proves the tree is still the verified one first, via {@link stageAllAndHashTree}: a hook that
+ * EDITS before it rejects leaves a different tree, and `--no-verify` would commit those post-gate
+ * edits under a proof that never covered them.
  */
 export async function commitAll(
   worktreePath: string,
   message: string,
+  options: { bypassHooks?: boolean } = {},
 ): Promise<{ committed: boolean }> {
   await git(worktreePath, ["add", "-A"]);
+  const bypass = options.bypassHooks ? ["--no-verify"] : [];
   try {
     // Exits non-zero when there ARE staged changes → there is something to commit.
     await git(worktreePath, ["diff", "--cached", "--quiet"]);
     return { committed: false };
   } catch {
-    await git(worktreePath, ["commit", "-m", message]);
+    await gitCommit(worktreePath, ["commit", ...bypass, "-m", message]);
     return { committed: true };
   }
+}
+
+/**
+ * Stage the whole worktree and return the hash of the tree a commit would write from it.
+ *
+ * How a caller tells the tree it VERIFIED from the tree it is about to commit. A `pre-commit` hook
+ * that rewrites files and then rejects — lint-staged fixing one file and failing another — leaves
+ * the working tree changed while HEAD stays put, so neither HEAD nor a rejection tells the two
+ * apart; the tree hash does. Staging first because that is what `commitAll` commits from, and
+ * untracked files count.
+ */
+export async function stageAllAndHashTree(worktreePath: string): Promise<string> {
+  await git(worktreePath, ["add", "-A"]);
+  return git(worktreePath, ["write-tree"]);
 }
 
 /**
@@ -370,13 +546,28 @@ export async function isAncestor(
 /**
  * Record an EMPTY commit — a marker that carries a message and no diff.
  *
- * The one caller is `step:commit` adopting work an agent committed itself. Those commits are real
- * and keep their own messages, but they don't carry the `<ticketId>:` subject that
- * {@link worktreeHasCommitFor} reads, so without a marker a resume cannot see that the ticket's
- * work is already on the branch and re-runs it — onto a tree where there is nothing left to do.
+ * The callers are `step:commit` and the ticket-timeout preserve, both adopting work an agent
+ * committed itself. Those commits are real and keep their own messages, but they don't carry the
+ * `<ticketId>:` subject {@link worktreeHasCommitFor} reads (nor the `WIP <ticketId>:` one
+ * {@link worktreeHasPreservedCommitFor} reads), so without a marker a resume cannot see that the
+ * ticket's work is already on the branch and re-runs it — onto a tree where there is nothing left
+ * to do.
+ *
+ * This project's hooks are ALWAYS bypassed here (PR #228 review). The marker is EMPTY by
+ * construction, so there is no content for a `pre-commit` hook to have an opinion about and
+ * no subject a `commit-msg` hook enforcing its own convention is entitled to cost a whole ticket's
+ * work its only path back to a pull request. A hook that DID run could only do harm here: one that
+ * stages files of its own — a formatter, a generator — either ships them under a message saying the
+ * commit is empty, or leaves them loose in a worktree the NEXT ticket commits from, under a ticket
+ * that never wrote them.
  */
 export async function commitMarker(worktreePath: string, message: string): Promise<void> {
-  await git(worktreePath, ["commit", "--allow-empty", "-m", message]);
+  // `--allow-empty` PERMITS an empty commit; it does not FORCE one. Anything a caller happened to
+  // leave staged would ship under a message saying this commit is empty, so the index is pinned to
+  // HEAD first — the working tree is left alone, where a caller's cleanliness check can still see
+  // whatever is in it.
+  await git(worktreePath, ["reset", "--quiet", "--mixed", "HEAD"]);
+  await gitCommit(worktreePath, ["commit", "--allow-empty", "--no-verify", "-m", message]);
 }
 
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {
@@ -487,9 +678,55 @@ export async function worktreeHasCommitFor(
   worktreePath: string,
   ticketId: string,
 ): Promise<boolean> {
-  const subjects = await git(worktreePath, ["log", "--format=%s", "-n", "1000"]).catch(() => "");
-  const prefix = `${ticketId}:`;
-  return subjects.split("\n").some((s) => s.startsWith(prefix));
+  return (await branchSubjects(worktreePath)).some((s) => s.startsWith(`${ticketId}:`));
+}
+
+/**
+ * The subject prefix a timed-out ticket's PRESERVED work carries (anton-d967) — deliberately NOT
+ * `<ticketId>:`, the delivery attribution {@link worktreeHasCommitFor} reads. Preserved work is on
+ * the branch and is still nobody's delivery, so a resume must RUN the ticket rather than skip it.
+ */
+export function preservedCommitPrefix(ticketId: string): string {
+  return `WIP ${ticketId}:`;
+}
+
+/**
+ * True when the branch carries the commit a timed-out attempt preserved for this ticket.
+ *
+ * `step:commit` reads it on the resume that follows: the preserved commit IS this ticket's work, so
+ * an agent that finds nothing left to do has delivered it, not delivered nothing. Without this read
+ * the code-finished/bookkeeping-cut-short case can never reach a pull request — every resume ends in
+ * a zero diff and parks the run again.
+ *
+ * `strict` is for the caller whose SAFE answer is the other one (PR #228 review). "No preserved
+ * commit" lets the shape guard dispatch children onto this branch, so a `git log` that failed or
+ * timed out must not be read as proof of absence — it is no answer at all, and the guard is owed
+ * the failure rather than a permissive default.
+ */
+export async function worktreeHasPreservedCommitFor(
+  worktreePath: string,
+  ticketId: string,
+  options: { strict?: boolean } = {},
+): Promise<boolean> {
+  const prefix = preservedCommitPrefix(ticketId);
+  return (await branchSubjects(worktreePath, options)).some((s) => s.startsWith(prefix));
+}
+
+/** How far back a subject scan reads. A run's own commits are always at the branch tip. */
+const BRANCH_SUBJECTS_ARGS = ["log", "--format=%s", "-n", "1000"];
+
+/**
+ * The subjects at the tip of the branch checked out in `worktreePath`. Fails closed to none (git
+ * error → treat as absent) rather than risk a skip — except under `strict`, where absence is the
+ * permissive answer and the caller has asked to see the failure instead.
+ */
+async function branchSubjects(
+  worktreePath: string,
+  options: { strict?: boolean } = {},
+): Promise<string[]> {
+  if (options.strict) return (await git(worktreePath, BRANCH_SUBJECTS_ARGS)).split("\n");
+  const log = await git(worktreePath, BRANCH_SUBJECTS_ARGS).catch(() => "");
+  return log.split("\n");
 }
 
 /**

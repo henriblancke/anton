@@ -460,11 +460,28 @@ export interface SkipCause {
   stopped: string;
 }
 
-/** One entry in a run's timeout ledger: the ticket the budget stopped, and whether its work had
- * already been committed when it did. */
+/** One entry in a run's timeout ledger: the ticket the budget stopped, and what became of its work
+ * — DELIVERED before the deadline, PRESERVED on the branch as an explicitly incomplete commit
+ * (anton-d967 — only a childless run target can), or (neither flag) rolled back. Preserved and
+ * delivered are not the same thing anywhere downstream: preserved work is on the branch and is
+ * still nobody's delivery.
+ *
+ * `delivered` is the delivery gate's verdict, never the bare tree fact (PR #228 review): a deadline
+ * landing while `assertDelivered` REFUSES a commit leaves that commit on the branch but makes it
+ * nobody's delivery, and every reader below — the reopen, the cascade, the operator's ledger — owes
+ * that ticket the same treatment as one stopped short.
+ *
+ * `preservedUnknown` is the fate a preserved/rolled-back pair cannot express (PR #228 review): the
+ * rollback restores a baseline a previous attempt's preserved commit is part of, and when the
+ * branch's history could not be read anton does not know whether one is there. Neither flag can
+ * carry that — `preserved` would promise a resume continues from work that may not exist, and its
+ * absence reads as a rollback that took the work off — so the doubt gets its own field, and the
+ * park message speaks it instead of claiming the work was removed. */
 export interface TicketTimeoutOutcome {
   id: string;
-  committed: boolean;
+  delivered: boolean;
+  preserved?: boolean;
+  preservedUnknown?: boolean;
 }
 
 /**
@@ -529,7 +546,7 @@ export async function reopenAbsorbedTimeouts(
   timedOut: readonly TicketTimeoutOutcome[],
   board: ReopenBoard = beads,
 ): Promise<void> {
-  for (const stalled of timedOut.filter((t) => !t.committed)) {
+  for (const stalled of timedOut.filter((t) => !t.delivered)) {
     await withBeadWriteLock(repo, stalled.id, async () => {
       // Decided on a read taken HERE, not on the ledger (PR #199 review).
       const live = await board.show(repo, stalled.id).catch(() => undefined);
@@ -603,7 +620,7 @@ export function skippedDependents(
   const ids = new Set(tickets.map((t) => t.id));
   const adj = dependentEdges(tickets, all);
   const stoppedSet = new Set(
-    timedOut.filter((t) => !t.committed && ids.has(t.id)).map((t) => t.id),
+    timedOut.filter((t) => !t.delivered && ids.has(t.id)).map((t) => t.id),
   );
   const cause = new Map<string, SkipCause>();
   const queue = [...stoppedSet];
@@ -676,8 +693,12 @@ export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
  * What this run DELIVERED: the tickets whose work is actually on the branch, and the set every
  * run-level step speaks for — the review contract and the PR body.
  *
- * A ticket its budget ROLLED BACK contributed no commit (anton-t1mo). A HUMAN ticket normally
- * contributed none either (anton-mv70) — a person did that work outside this branch — but the
+ * A ticket its budget STOPPED before its commit step is not in it (anton-t1mo): its work was either
+ * rolled back, or preserved on the branch as an explicitly incomplete commit (anton-d967) — and
+ * preserved work is nobody's delivery, so listing it would advertise a ticket the PR body cannot
+ * honestly claim and hand the review gate acceptance criteria no diff in it satisfies.
+ *
+ * A HUMAN ticket normally contributed none either (anton-mv70) — a person did that work outside this branch — but the
  * label says who does the work, not what the diff contains: an agent ticket committed on an earlier
  * attempt and relabelled `agent:human` before the parked run resumed is still in the diff (PR #213
  * review). So the branch is asked, and only a human ticket with nothing on it is dropped; anything
@@ -685,12 +706,12 @@ export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
  */
 export async function deliveredTickets(
   live: Bead[],
-  rolledBack: Set<string>,
+  stopped: Set<string>,
   hasCommitFor: (ticketId: string) => Promise<boolean>,
 ): Promise<Bead[]> {
   const delivered: Bead[] = [];
   for (const ticket of live) {
-    if (rolledBack.has(ticket.id)) continue;
+    if (stopped.has(ticket.id)) continue;
     if (beads.isHumanWork(ticket) && !(await hasCommitFor(ticket.id))) continue;
     delivered.push(ticket);
   }

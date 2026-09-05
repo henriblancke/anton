@@ -27,6 +27,7 @@ const loadAllIssuesMock = vi.fn();
 const pullMock = vi.fn();
 const updateRunMock = vi.fn();
 const validateRunFormulaMock = vi.fn();
+const hasPreservedCommitMock = vi.fn();
 
 vi.mock("./execute-epic-recover", () => ({
   refreshRunBoard: (...args: unknown[]) => refreshRunBoardMock(...args),
@@ -71,6 +72,17 @@ vi.mock("../runs", async () => {
 vi.mock("./run-formula", async () => {
   const actual = await vi.importActual<typeof import("./run-formula")>("./run-formula");
   return { ...actual, validateRunFormula: (...args: unknown[]) => validateRunFormulaMock(...args) };
+});
+
+// The worktree here is a mock path, so the preserved-work shape gate (anton-d967) has no history to
+// read — stubbed to "no preserved commit", the answer that lets these board tests run. The gate
+// itself is proven against a real repo in execute-epic.preserve.test.ts.
+vi.mock("../git/ops", async () => {
+  const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
+  return {
+    ...actual,
+    worktreeHasPreservedCommitFor: (...args: unknown[]) => hasPreservedCommitMock(...args),
+  };
 });
 
 vi.mock("./formula-floor", () => ({ assertRunFormulaFloor: () => {} }));
@@ -167,6 +179,7 @@ beforeEach(() => {
   cascadeChildClaimsMock.mockResolvedValue(undefined);
   pullMock.mockResolvedValue(undefined);
   publishRunClaimMock.mockResolvedValue(undefined);
+  hasPreservedCommitMock.mockResolvedValue(false);
   // No human work by default: nothing written, nothing adopted.
   preflightHumanTicketsMock.mockImplementation((args: { board: Bead[] }) =>
     Promise.resolve({ ...preflight(args.board), armed: false }),

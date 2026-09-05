@@ -45,9 +45,14 @@ import {
 } from "./execute-epic-human-gate";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage } from "./execute-epic-review";
+import { assertDelivered } from "./execute-epic-ticket";
 import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
 import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
-import { ticketBlockNote, timedOutTicketNote } from "./execute-epic-ticket-settle";
+import {
+  ticketBlockNote,
+  timedOutTicketNote,
+  type TicketProgress,
+} from "./execute-epic-ticket-settle";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
 import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
@@ -909,8 +914,8 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
     ticket("d"),
   ];
   const ids = (beads: Bead[]) => beads.map((b) => b.id);
-  /** A ticket the budget stopped BEFORE its commit — the only kind whose skip cascades. */
-  const rolledBack = (...tickets: string[]) => tickets.map((id) => ({ id, committed: false }));
+  /** A ticket the budget stopped before it delivered — the only kind whose skip cascades. */
+  const rolledBack = (...tickets: string[]) => tickets.map((id) => ({ id, delivered: false }));
 
   it("dispatches a chain blocker-first, whatever order the board hands it back in", () => {
     const board = chain();
@@ -968,18 +973,18 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
     expect(ids(orderTickets(cyclic, cyclic))).toEqual(["a", "b", "c"]);
   });
 
-  it("does NOT cascade a timeout that landed after the ticket committed", () => {
+  it("does NOT cascade a timeout that landed after the ticket delivered", () => {
     const board = chain();
     // The deadline hit the bookkeeping, not the code: `a`'s work is on the branch, so everything
-    // written against it still has what it needs and must still run. Deleting the committed-ness
-    // check turns this into the whole chain being skipped for work that actually shipped.
-    expect(skippedDependents([{ id: "a", committed: true }], board, board).size).toBe(0);
+    // written against it still has what it needs and must still run. Deleting the delivered check
+    // turns this into the whole chain being skipped for work that actually shipped.
+    expect(skippedDependents([{ id: "a", delivered: true }], board, board).size).toBe(0);
     // …and in a run where BOTH happen, only the rolled-back one takes its dependents down: `a`
-    // committed, so `b` still ran; `b` did not, so only `c` behind it is skipped.
+    // delivered, so `b` still ran; `b` did not, so only `c` behind it is skipped.
     const mixed = skippedDependents(
       [
-        { id: "a", committed: true },
-        { id: "b", committed: false },
+        { id: "a", delivered: true },
+        { id: "b", delivered: false },
       ],
       board,
       board,
@@ -1223,6 +1228,95 @@ describe("reviewParkMessage (anton-3apm)", () => {
 });
 
 /**
+ * The delivery-evidence gate's judgement on WHOSE work the commit is (anton-d967 / PR #228 review).
+ *
+ * A commit adopted from a previous attempt's preserved `WIP` is the one kind of evidence that says
+ * of itself that it is unfinished — it exists only because a timeout cut the ticket off. So it is
+ * delivery only when this run's agent affirms the ticket is done; a zero diff with no parseable
+ * `ANTON-RESULT` would otherwise turn an explicitly incomplete commit into a shipped ticket.
+ */
+describe("assertDelivered — an adopted preserve needs this run's agent to say it is finished", () => {
+  const ticket: Bead = {
+    id: "anton-d967",
+    title: "A ticket timeout destroys finished work",
+    status: "in_progress",
+    issue_type: "feature",
+  };
+  const progress = (selfReport: TicketProgress["selfReport"]): TicketProgress => ({
+    committed: false,
+    delivered: false,
+    selfReport,
+  });
+
+  it("passes work THIS run committed, self-report or not", () => {
+    expect(() => assertDelivered(ticket, { committed: true }, progress(null))).not.toThrow();
+  });
+
+  it("blocks an adopted preserve the agent never affirmed", () => {
+    const err = (() => {
+      try {
+        assertDelivered(ticket, { committed: true, preservedAdoption: true }, progress(null));
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+
+    expect(err?.name).toBe("PoisonError");
+    expect(err?.message).toMatch(/produced no delivery/);
+    expect(err?.message).toMatch(/PRESERVED/);
+  });
+
+  it("passes an adopted preserve the agent reported delivered — the resume it exists for", () => {
+    expect(() =>
+      assertDelivered(
+        ticket,
+        { committed: true, preservedAdoption: true },
+        progress({ outcome: "delivered" }),
+      ),
+    ).not.toThrow();
+  });
+
+  it("still blocks on the agent's own word first when it reported blocked", () => {
+    expect(() =>
+      assertDelivered(
+        ticket,
+        { committed: true, preservedAdoption: true },
+        progress({ outcome: "blocked", reason: "the acceptance criteria contradict each other" }),
+      ),
+    ).toThrow(/self-reported blocked/);
+  });
+
+  it("records the commit verdict on the progress the ticket's exits read", () => {
+    const p = progress(null);
+    expect(() => assertDelivered(ticket, { committed: false }, p)).toThrow(/no delivery/);
+    expect(p.committed).toBe(false);
+    expect(p.delivered).toBe(false);
+  });
+
+  // The deadline can land while this gate is refusing, and the timeout then settles the ticket from
+  // `progress` alone (PR #228 review). It must find the tree fact and the delivery verdict apart:
+  // `committed` keeps the refused commit from being reset off the branch, `delivered` is what keeps
+  // it out of the `not-delivered` skip and out of the pull request's delivered list.
+  it("separates the commit on the branch from the delivery it was refused as", () => {
+    const accepted = progress(null);
+    assertDelivered(ticket, { committed: true }, accepted);
+    expect(accepted).toMatchObject({ committed: true, delivered: true });
+
+    const adopted = progress(null);
+    expect(() =>
+      assertDelivered(ticket, { committed: true, preservedAdoption: true }, adopted),
+    ).toThrow(/produced no delivery/);
+    expect(adopted).toMatchObject({ committed: true, delivered: false });
+
+    const declared = progress({ outcome: "blocked", reason: "the API it needs does not exist" });
+    expect(() => assertDelivered(ticket, { committed: true }, declared)).toThrow(
+      /self-reported blocked/,
+    );
+    expect(declared).toMatchObject({ committed: true, delivered: false });
+  });
+});
+
+/**
  * anton-vqql: a blocked ticket's note has to say WHY. The agent's reason is already parsed and
  * logged; these cases pin it to the bead, alongside the evidence an operator would otherwise dig
  * for — and pin the invariant that keeps the notes blob parseable: exactly one line per note.
@@ -1345,9 +1439,12 @@ describe("timedOutTicketNote (anton-t1mo)", () => {
   const HEAD = "0123456789abcdef0123456789abcdef01234567";
   const timedOut = (over: Partial<Parameters<typeof timedOutTicketNote>[0]> = {}) =>
     timedOutTicketNote({
+      ticketId: "anton-e1",
       timeoutMs: 30 * 60_000,
       committed: true,
+      delivered: true,
       leftovers: false,
+      preservedOn: null,
       worktreePath: "/tmp/wt",
       sessionId: "sess-1",
       branch: "anton/anton-e1",
@@ -1380,6 +1477,36 @@ describe("timedOutTicketNote (anton-t1mo)", () => {
     const out = timedOut({ committed: false, head: undefined });
     expect(out).toContain("rolled back");
     expect(latestBlockNoteCommit([out])).toEqual({ committed: false, branch: "anton/anton-e1" });
+  });
+
+  it("reports a commit the delivery gate REFUSED as kept but undelivered", () => {
+    const out = timedOut({ delivered: false });
+    expect(out).toContain("REFUSED");
+    expect(out).toContain("is in no pull request");
+    expect(latestBlockNoteCommit([out])).toEqual({
+      committed: true,
+      branch: "anton/anton-e1",
+      head: "0123456",
+    });
+  });
+
+  // A preserve is on the branch though the ticket committed nothing of its own (anton-d967). Read as
+  // a zero-diff block, the next park would tell the operator to redo the work the preserve kept.
+  it("reports PRESERVED work as committed evidence", () => {
+    const out = timedOut({ committed: false, delivered: false, preservedOn: "anton/anton-e1" });
+    expect(out).toContain("PRESERVED on branch `anton/anton-e1`");
+    expect(latestBlockNoteCommit([out])).toEqual({
+      committed: true,
+      branch: "anton/anton-e1",
+      head: "0123456",
+    });
+  });
+
+  it("names the marker a person must write for work anton could not mark", () => {
+    const out = timedOut({ committed: false, delivered: false, unmarkedOn: "anton/anton-e1" });
+    expect(out).toContain("could not record");
+    expect(out).toContain("`WIP anton-e1:`");
+    expect(latestBlockNoteCommit([out])?.committed).toBe(true);
   });
 
   it("still points at the worktree when the rollback failed — as ONE machine note", () => {
@@ -1726,14 +1853,14 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
   /** Drain the queue, so "did it read yet?" is answered after everything that could have run. */
   const settle = () => new Promise((r) => setTimeout(r, 0));
 
-  it("reopens a rolled-back timeout and leaves a committed one blocked", async () => {
+  it("reopens a rolled-back timeout and leaves a delivered one blocked", async () => {
     const bd = board();
-    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: false }], bd);
+    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", delivered: false }], bd);
     expect(bd.current.status).toBe("open");
 
-    const committed = board();
-    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: true }], committed);
-    expect(committed.current.status).toBe("blocked");
+    const delivered = board();
+    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", delivered: true }], delivered);
+    expect(delivered.current.status).toBe("blocked");
   });
 
   it("holds the lock across the read, so a claim cannot land between predicate and write", async () => {
@@ -1745,7 +1872,7 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
     const reading = defer(); // the reopen has entered its re-read
     const release = defer(); // …and is held there until the competing claim has been attempted
 
-    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", delivered: false }], {
       show: async () => {
         reading.resolve();
         await release.promise;
@@ -1783,7 +1910,7 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
     const claim = withBeadWriteLock(path, "t1", async () => {
       bd.claim("someone@else");
     });
-    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", delivered: false }], {
       show: bd.show,
       setStatus: async (cwd, id, status) => {
         writes.push(status);
@@ -1806,7 +1933,7 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
     let read = false;
     const gate = withBeadWriteLock(path, "t1", () => held.promise);
 
-    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", delivered: false }], {
       show: async () => {
         read = true;
         return bd.show();
@@ -1826,7 +1953,7 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
   it("leaves the ticket as it stands when the re-read fails, and never throws", async () => {
     const bd = board();
     await expect(
-      reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: false }], {
+      reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", delivered: false }], {
         show: async () => {
           throw new Error("bd unavailable");
         },

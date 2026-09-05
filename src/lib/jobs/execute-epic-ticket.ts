@@ -6,8 +6,9 @@
  * and in what order; this owns what happens inside one.
  *
  * What brackets the walk lives beside it (anton-owlx): the claim, session, clock and close in
- * execute-epic-ticket-bookends.ts, every way a ticket stops short in execute-epic-ticket-settle.ts,
- * and the resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
+ * execute-epic-ticket-bookends.ts, every way a ticket stops short in execute-epic-ticket-settle.ts
+ * — with the judgement on a timed-out ticket's work in execute-epic-ticket-preserve.ts — and the
+ * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
 import type { Bead } from "../beads/bd";
 import { formatAntonResult, type AntonOutcome } from "../claude/anton-result";
@@ -19,6 +20,7 @@ import {
   openTicketSession,
   readTicketBaseline,
   startTicketBudget,
+  warnBudgetRunningOut,
 } from "./execute-epic-ticket-bookends";
 import { resilientClaude } from "./execute-epic-ticket-claude";
 import {
@@ -27,7 +29,7 @@ import {
   type TicketProgress,
 } from "./execute-epic-ticket-settle";
 import type { ResolvedStep } from "./run-formula";
-import type { StepContext } from "./step-registry";
+import type { StepContext, StepFacts } from "./step-registry";
 
 /** One ticket: session → the formula's ticket phase (…→ commit) → close. */
 export async function runTicket(args: {
@@ -43,19 +45,30 @@ export async function runTicket(args: {
    * moves the bead to stage:in-review — the resume marker + board state. Defaults to true (an
    * epic's children close as their work lands). */
   closeOnDone?: boolean;
+  /**
+   * Whether this ticket IS the whole run target (a childless run target — `beads.groupsChildren`
+   * reads it as its own single ticket). Only the timeout path reads it, and only to decide whether
+   * work it had to stop can be kept on the branch (anton-d967): with no sibling ticket, a timeout
+   * here delivers nothing and the run parks, so there is no pull request the kept work could ride
+   * into. Defaults to false — the conservative answer, which is the rollback.
+   */
+  standalone?: boolean;
   /** This ticket's wall-clock budget (anton-t1mo); `Infinity` leaves it unbounded. */
   timeoutMs: number;
 }): Promise<void> {
   const { run, ticket, operator, timeoutMs } = args;
+  const standalone = args.standalone ?? false;
   const { ctx, worktreePath } = run;
   const closeOnDone = args.closeOnDone ?? true;
 
   await claimTicket(run, ticket, operator);
   const session = await openTicketSession(run, ticket);
-  const budget = startTicketBudget(ctx, timeoutMs);
+  const budget = startTicketBudget(ctx, timeoutMs, (remainingMs) =>
+    warnBudgetRunningOut(session.logPath, ticket, timeoutMs, remainingMs),
+  );
   const baseline = await readTicketBaseline(worktreePath);
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline);
-  const progress: TicketProgress = { committed: false, selfReport: null };
+  const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
 
   try {
     await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress });
@@ -69,6 +82,7 @@ export async function runTicket(args: {
       baseline,
       progress,
       timeoutMs,
+      standalone,
       e,
     });
   } finally {
@@ -154,20 +168,28 @@ async function walkTicketSteps(args: {
       }
       continue;
     }
-    assertDelivered(ticket, result.facts?.committed === true, progress);
+    assertDelivered(ticket, result.facts ?? {}, progress);
   }
 }
 
 /**
- * The commit is the ticket's evidence of record — honor the step's `{ committed }` verdict.
+ * The commit is the ticket's evidence of record — honor the step's verdict on whether there is one,
+ * and on whose work it is.
  *
  * A clean agent exit that leaves NO diff delivered nothing: the exact false-success in issue #46
  * (root cause #1). Do NOT close/advance the ticket on empty delivery. {@link NoDeliveryError} is
  * poison, so the runner parks the run for a human instead of retrying claude to the same empty
  * result forever, and the ticket's own catch BLOCKS the bead rather than re-queueing it open.
  */
-function assertDelivered(ticket: Bead, committed: boolean, progress: TicketProgress): void {
+export function assertDelivered(ticket: Bead, facts: StepFacts, progress: TicketProgress): void {
+  const committed = facts.committed === true;
+  // The TREE fact is recorded first and unconditionally — the timeout path reads it to know there
+  // is a commit it must not reset off the branch, and that is true of a refused commit too. The
+  // DELIVERY verdict is recorded at the bottom, once every gate below has accepted it (PR #228
+  // review): a deadline that fires while this is refusing takes over the settlement, and it decides
+  // what the board and the pull request are told from `delivered`, never from `committed`.
   progress.committed = committed;
+  progress.delivered = false;
   const { selfReport } = progress;
   if (!committed) {
     // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
@@ -194,6 +216,25 @@ function assertDelivered(ticket: Bead, committed: boolean, progress: TicketProgr
         `the agent declared the work incomplete, so closing it would be a false success.`,
     );
   }
+  // The evidence is a PREVIOUS attempt's preserved `WIP` commit and this run's agent never said the
+  // ticket was finished (PR #228 review). That commit is explicitly incomplete — it was kept only
+  // so a timed-out attempt's work would survive — so a zero diff plus a missing or unparseable
+  // `ANTON-RESULT` is not delivery: nobody has claimed the work is done, and adopting it here ships
+  // it under a PR that lists the ticket as delivered. The same zero-diff agent outcome blocks any
+  // other ticket, and the presence of work someone else preserved is no reason to treat it as more
+  // finished than it says it is.
+  if (facts.preservedAdoption && selfReport?.outcome !== "delivered") {
+    throw new NoDeliveryError(
+      `${ticket.id} produced no delivery: claude left no changes to commit (zero diff) and no ` +
+        `\`ANTON-RESULT\` from this run says the ticket is finished, so the only work on the branch ` +
+        `is the explicitly incomplete commit a previous attempt PRESERVED when it ran out of time. ` +
+        `Blocking the ticket for operator ` +
+        `review and halting the epic — nothing this run did says that work is finished, so ` +
+        `adopting it as the delivery would be a false success. Finish it by hand or resume the run ` +
+        `with a raised ticketTimeoutMinutes.`,
+    );
+  }
+  progress.delivered = true;
 }
 
 /**

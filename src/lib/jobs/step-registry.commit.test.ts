@@ -4,8 +4,9 @@
  * The delivery-evidence gate reads this step's verdict, and the verdict is a fact about a git
  * repository — whether the ticket's work exists on the run's branch. A fake git could be made to
  * say anything, so every case here runs against a real one: the honest empty tree, the agent that
- * committed its own work (which leaves an identical empty INDEX and a moved HEAD), and the agent
- * that committed somewhere the PR push will never look.
+ * committed its own work (which leaves an identical empty INDEX and a moved HEAD), the resume of a
+ * ticket whose timed-out work is already preserved on the branch (anton-d967 — an empty index AND a
+ * still HEAD), and the agent that committed somewhere the PR push will never look.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -127,6 +128,42 @@ suite("commitStep (real git)", () => {
     expect(result.detail).toBe("nothing to commit (zero diff)");
   });
 
+  // The RESUME of a ticket whose budget expired on a gate-passing tree (anton-d967). Its work is on
+  // the branch under a `WIP <id>:` subject — invisible to `worktreeHasCommitFor` by design — so an
+  // agent that finds the change already made leaves HEAD exactly where it was. Read as an empty
+  // tree, that parks the run, and the next resume does the same: work already earned, permanently
+  // one step short of its PR.
+  it("adopts the work a previous attempt's TIMEOUT preserved when nothing is left to do", async () => {
+    write("cadence-editor.tsx", "export const CadenceEditor = () => null;\n");
+    selfCommit(`WIP ${ticket.id}: ${ticket.title}`);
+    const preserved = head();
+
+    const result = await commitStep(context({ ticketStartHead: preserved }));
+
+    expect(result.ok).toBe(true);
+    expect(result.facts.committed).toBe(true);
+    // The evidence is a PREVIOUS attempt's explicitly incomplete commit, so it travels labelled:
+    // the delivery gate reads `preservedAdoption` and asks this run's agent to affirm it is done.
+    expect(result.facts.preservedAdoption).toBe(true);
+    // The preserved commit is untouched, and the ticket is now discoverable under its own id.
+    expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
+    expect(await worktreeHasCommitFor(repo, ticket.id)).toBe(true);
+    expect(out(["diff", "--stat", preserved, "HEAD"])).toBe("");
+  });
+
+  // The adoption is scoped to THIS ticket's preserved work: another bead's WIP commit is somebody
+  // else's, and reading it as delivery here would close a ticket on a diff it never wrote.
+  it("still reports zero diff when the preserved commit belongs to another ticket", async () => {
+    write("a.ts", "export const a = 1;\n");
+    selfCommit("WIP anton-other: another ticket's preserved work");
+
+    const result = await commitStep(context({ ticketStartHead: head() }));
+
+    expect(result.ok).toBe(false);
+    expect(result.facts.committed).toBe(false);
+    expect(await worktreeHasCommitFor(repo, ticket.id)).toBe(false);
+  });
+
   // The regression. Both this case and the one above leave an empty index; reading the index alone
   // read them as the same thing and threw away 775 lines of gate-passed work.
   it("adopts work the agent committed itself onto the run's branch", async () => {
@@ -139,6 +176,8 @@ suite("commitStep (real git)", () => {
 
     expect(result.ok).toBe(true);
     expect(result.facts.committed).toBe(true);
+    // Work THIS run produced — no affirmation beyond the diff itself, unlike an adopted preserve.
+    expect(result.facts.preservedAdoption).toBeUndefined();
     // The agent's own commit is the delivery and is left exactly as it was.
     expect(subjects()).toContain("test(settings): cover the Automation surface");
     expect(out(["rev-parse", `${tip}`])).toBe(tip);

@@ -238,31 +238,63 @@ export function askSettleError(raw: unknown, signal: AbortSignal): unknown {
  *
  * Deliberately NOT poison, and deliberately not fatal to the run: the ticket loop catches this one
  * error and moves to the next ticket, so a feature is never ended by a single ticket that couldn't
- * converge. runTicket has already blocked the bead and rolled its partial work back by the time this
- * is thrown, so nothing downstream needs to settle it — the loop only records which ticket it was.
+ * converge. runTicket has already blocked the bead and settled its partial work by the time this is
+ * thrown, so nothing downstream needs to settle it — the loop only records which ticket it was.
  *
- * Carrying on is safe only because the worktree is provably clean of this ticket: a rollback that
- * could not prove that raises {@link PoisonEpic} instead, halting the run so no later ticket commits
- * the leftovers as its own.
+ * Carrying on is safe only because the worktree is provably clean of this ticket, by one of two
+ * routes: its work was PRESERVED in a commit of its own (anton-d967), or it was rolled back. Either
+ * way the tree is re-read afterwards, and a settle that could not prove it raises {@link PoisonEpic}
+ * instead, halting the run so no later ticket commits the leftovers as its own.
  */
 export class TicketTimeoutError extends Error {
   constructor(
     readonly ticketId: string,
     readonly budgetMs: number,
     /**
-     * Whether this ticket's work made it into a commit before the clock ran out (the narrow case of
-     * a deadline landing on the bookkeeping AFTER the commit step). Its diff is on the branch, so
+     * Whether this ticket DELIVERED before the clock ran out (the narrow case of a deadline landing
+     * on the bookkeeping AFTER a commit the delivery gate accepted). Its diff is on the branch, so
      * the run still lists it as delivered — only its bead is left unfinished.
+     *
+     * A commit alone is not enough (PR #228 review): a deadline can land while `assertDelivered` is
+     * REFUSING one — a previous attempt's adopted `WIP`, or work the agent declared blocked — and
+     * that commit stays on the branch but is nobody's delivery. That case never reaches this error
+     * at all: the settlement raises {@link PoisonEpic} instead, because the refused diff is on the
+     * branch and absorbing the timeout would carry it into the pull request the run's other tickets
+     * open. So this is `true` for an ACCEPTED commit and `false` for a ticket the budget stopped
+     * before one, and both are safe for the loop to absorb.
      */
-    readonly committed: boolean,
+    readonly delivered: boolean,
+    /**
+     * The branch an UNDELIVERED ticket's work was preserved on (anton-d967), or null when it was
+     * rolled back. Only a CHILDLESS run target can preserve — with no sibling ticket there is no
+     * pull request its unfinished diff could ride into. Preserved work is on the branch but is NOT
+     * a delivery: the ticket stays blocked, keeps its `not-delivered` marker, and is in no PR's
+     * delivered list — what the branch carries is a verified-but-incomplete commit a resume
+     * continues from.
+     */
+    readonly preservedOn: string | null = null,
+    /**
+     * Whether that null `preservedOn` is a READ that failed rather than a branch anton looked at
+     * (PR #228 review). A rollback restores a baseline a previous attempt's preserved commit is part
+     * of, so when the history probe could not run, "nothing of this ticket is on the branch" is
+     * unproven — and every reader that turns this error into an operator's account owes the doubt
+     * rather than the claim that the work was removed.
+     */
+    readonly preservedUnknown: boolean = false,
   ) {
     super(
       `${ticketId} exceeded its ${Math.round(budgetMs / 60_000)}m ticket budget and was stopped. ` +
-        (committed
+        (delivered
           ? `Its work IS committed on the branch (only its bead was left unfinished)`
-          : `Its partial work was rolled back`) +
+          : preservedOn
+            ? `Its work passed this project's verify gates, so it was PRESERVED on ` +
+              `\`${preservedOn}\` as an explicitly incomplete commit — a resume continues from it`
+            : preservedUnknown
+              ? `What this attempt added was rolled back, but anton could not read the branch's ` +
+                `history, so work a previous attempt preserved may still be on it`
+              : `Its partial work was rolled back`) +
         ` and the ticket is blocked for review; the rest of the run continued. ` +
-        `Re-scope it (or raise ticketTimeoutMinutes), then resume.`,
+        `Split it into smaller tickets (or raise ticketTimeoutMinutes), then resume.`,
     );
     this.name = "TicketTimeoutError";
   }

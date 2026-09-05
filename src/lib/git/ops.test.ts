@@ -20,6 +20,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  COMMIT_TIMEOUT_ENV,
+  commitAll,
+  commitMarker,
   DEFAULT_DIFF_PATCH_CHARS,
   diffAgainstBase,
   findOpenPullRequest,
@@ -1224,5 +1227,148 @@ process.exit(r.status ?? 1);
     } finally {
       process.env.PATH = prevPath;
     }
+  });
+});
+
+// PR #228 review: `git commit` runs PROJECT code — the pre-commit and commit-msg hooks — and a kill
+// aimed at the direct `git` process leaves those hooks orphaned and still writing. The caller is the
+// ticket-timeout preserve, which reads the failure as a verdict and hard-resets the worktree at
+// once, so a write still in flight lands after the cleanliness check and rides into the next
+// ticket's commit. Nothing may be reported until the whole group is gone.
+suite("commitAll (real git · a hook that outlives the kill)", () => {
+  let sandbox: string;
+  let repo: string;
+  let started: string;
+  let marker: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-commit-hook-"));
+    repo = join(sandbox, "repo");
+    started = join(sandbox, "hook-started");
+    marker = join(sandbox, "late-hook-write");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+
+    // A hook that survives the kill exactly as the review describes: it hands back the stdio it
+    // inherited — so nothing about it holds the commit's pipes open — and keeps writing afterwards.
+    const hook = join(repo, ".git", "hooks", "pre-commit");
+    writeFileSync(
+      hook,
+      [
+        "#!/bin/sh",
+        `trap 'exec >/dev/null 2>&1; sleep 1; : > ${JSON.stringify(marker)}; exit 1' TERM`,
+        `: > ${JSON.stringify(started)}`,
+        "sleep 30 &",
+        "wait",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(hook, 0o755);
+    writeFileSync(join(repo, "work.ts"), "export const work = 1;\n");
+  });
+
+  afterEach(() => {
+    delete process.env[COMMIT_TIMEOUT_ENV];
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "reports the failed commit only once its hooks have gone",
+    async () => {
+      // Comfortably longer than git takes to reach its hook, so the kill lands on a hook that is
+      // actually running — the state the reap exists for.
+      process.env[COMMIT_TIMEOUT_ENV] = "2000";
+
+      await expect(commitAll(repo, "t1: work the hook is sitting on")).rejects.toThrow(
+        /timed out/,
+      );
+
+      expect(existsSync(started)).toBe(true);
+      // Asked the instant the caller is told, with no waiting: the write the hook made AFTER the
+      // signal is already on disk, so the rollback that follows cannot race it.
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+});
+
+// PR #228 review: the marker is EMPTY, so it is made with this project's hooks bypassed — the only
+// commit anton makes that may. A `pre-commit` that stages files of its own is the reason: run, it
+// either ships that content under a message saying the commit is empty, or leaves it loose in the
+// worktree the NEXT ticket commits from, under a ticket that never wrote it.
+suite("commitMarker (real git · a pre-commit hook that stages and succeeds)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-marker-hook-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+
+    // The formatter-shaped hook: it rewrites the tree, stages what it wrote, and lets the commit
+    // through. Nothing about it fails — a rejection is not what makes it dangerous here.
+    const hook = join(repo, ".git", "hooks", "pre-commit");
+    writeFileSync(
+      hook,
+      ["#!/bin/sh", "printf 'generated\\n' > generated.txt", "git add generated.txt", "exit 0", ""].join(
+        "\n",
+      ),
+      "utf8",
+    );
+    chmodSync(hook, 0o755);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "keeps the marker tree-identical to HEAD and the worktree clean",
+    async () => {
+      const before = g(["rev-parse", "HEAD"]);
+
+      await commitMarker(repo, "WIP anton-x1: preserved");
+
+      // One commit added, and it carries NOTHING: the hook's file is not in the marker's tree.
+      expect(g(["rev-parse", "HEAD~1"])).toBe(before);
+      expect(g(["rev-parse", "HEAD^{tree}"])).toBe(g(["rev-parse", `${before}^{tree}`]));
+      expect(g(["log", "-1", "--format=%s"])).toBe("WIP anton-x1: preserved");
+      // And the hook never ran at all, so there is no leftover for the next ticket's `git add -A`
+      // to sweep up under its own name — the dirt a bypassed hook cannot make.
+      expect(g(["status", "--porcelain"])).toBe("");
+    },
+  );
+
+  // PR #228 review: a `commit-msg` hook enforcing conventional subjects would otherwise refuse
+  // anton's `WIP <id>:` marker, costing a preserved ticket's work the only thing that makes it
+  // findable — to a resume, and to the guard that keeps it out of a child ticket's pull request.
+  it.runIf(process.platform !== "win32")("lands past a commit-msg hook that rejects it", async () => {
+    const hook = join(repo, ".git", "hooks", "commit-msg");
+    writeFileSync(
+      hook,
+      ["#!/bin/sh", 'grep -q "^feat" "$1" || exit 1', "exit 0", ""].join("\n"),
+      "utf8",
+    );
+    chmodSync(hook, 0o755);
+
+    await commitMarker(repo, "WIP anton-x1: preserved");
+
+    expect(g(["log", "-1", "--format=%s"])).toBe("WIP anton-x1: preserved");
   });
 });
