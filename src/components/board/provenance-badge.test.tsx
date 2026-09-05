@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BeadProvenance } from "@/lib/types";
+import { CHIP_WRAPPER } from "@/components/atoms";
 import { ProvenanceBadge, ProvenanceBadges } from "@/components/board/provenance-badge";
 
 const render = (provenance: BeadProvenance) =>
@@ -64,8 +65,8 @@ describe("the badge's own shape", () => {
     const html = render({ kind: "policy", ref: "types" });
     const anchorClass = /<a[^>]*class="([^"]*)"/.exec(html)?.[1] ?? "";
 
-    expect(anchorClass).toContain("inline-flex");
-    expect(anchorClass).toContain("leading-none");
+    // The same shape the PR link wears — one collapse, shared, not two class strings that can drift.
+    expect(anchorClass).toContain(CHIP_WRAPPER);
   });
 });
 

@@ -54,6 +54,15 @@ export function MetaChip({
 }
 
 /**
+ * The shape every wrapper around a meta chip wears. A wrapper left at its inherited metrics
+ * blockifies as a flex item and establishes a 24px text line box (16px/1.5) around a 16px chip; in a
+ * stretching row that sets the flex line's cross size and grows every chip beside it, so a card
+ * wears taller chips for no reason but having been linked (anton-ssks). One exported shape rather
+ * than a class string per wrapper, so the next wrapper cannot reintroduce the gap.
+ */
+export const CHIP_WRAPPER = "inline-flex leading-none";
+
+/**
  * Wraps a PR chip in a new-tab link when a URL is known, otherwise renders the chip inert. Safe
  * inside clickable cards/rows: `pointer-events-auto` + `stopPropagation` keep the click on the link
  * (opening the PR) instead of bubbling to a parent card link. `href` comes from an entity's `prUrl`.
@@ -68,7 +77,13 @@ export function PrLink({
   children: ReactNode;
 }) {
   if (!href) {
-    return className ? <span className={className}>{children}</span> : <>{children}</>;
+    // The inert wrapper collapses for the same reason the anchor does — a PR with a ref but no url
+    // still shows its chip, and it must measure what the linked one measures.
+    return className ? (
+      <span className={cn(CHIP_WRAPPER, className)}>{children}</span>
+    ) : (
+      <>{children}</>
+    );
   }
   return (
     <a
@@ -76,10 +91,7 @@ export function PrLink({
       target="_blank"
       rel="noopener noreferrer"
       onClick={(e) => e.stopPropagation()}
-      // Collapsed to the chip it wraps for the same reason the provenance badge is: a link around a
-      // chip must add no line box of its own, or it renders 24px tall around 16px of chip and drags
-      // its row with it (anton-ssks).
-      className={cn("pointer-events-auto inline-flex leading-none focus-visible:outline-none", className)}
+      className={cn("pointer-events-auto focus-visible:outline-none", CHIP_WRAPPER, className)}
       title="Open pull request"
     >
       {children}
