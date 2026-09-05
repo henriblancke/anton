@@ -527,7 +527,7 @@ async function deliveredOrPark(
  * And a park has to say what became of the work, because the answer decides what a resume IS: work
  * preserved on the branch means the resume continues from it, while a rollback means it starts over.
  */
-function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string {
+export function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string {
   const { targetId, timedOut, branch, standaloneRun, ticketTimeoutMs } = run;
   const budget = Number.isFinite(ticketTimeoutMs)
     ? `${Math.round(ticketTimeoutMs / 60_000)}m`
@@ -548,11 +548,20 @@ function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string {
     .join(" ");
 
   if (standaloneRun) {
+    // Splitting is only free when nothing was kept. A preserved commit belongs to the TARGET, and no
+    // child ticket will ever deliver it — so the split has to take it off the branch first, or the
+    // children's pull request carries its unfinished diff into the trunk. The resumed run refuses to
+    // start while it is there (execute-epic-prepare), and this is where the operator hears why.
+    const split =
+      preserved.length > 0
+        ? `, or split ${targetId} into child tickets that each fit the budget — taking the ` +
+          `preserved commit off \`${branch}\` first, since no child delivers it and a resumed ` +
+          `multi-ticket run refuses to start while it could ride into their pull request`
+        : `, or split ${targetId} into child tickets that each fit the budget`;
     return (
       `${targetId} ran out of time (its ${budget} ticket budget) and nothing was delivered — it ` +
       `IS this run's whole target, so there is no sibling ticket to re-scope the work into. ` +
-      `${fate} Raise this project's ticketTimeoutMinutes, or split ${targetId} into child ` +
-      `tickets that each fit the budget, then resume the run`
+      `${fate} Raise this project's ticketTimeoutMinutes${split}, then resume the run`
     );
   }
   return (

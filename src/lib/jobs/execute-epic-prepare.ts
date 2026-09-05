@@ -12,6 +12,7 @@ import { loadAllIssues } from "../beads/issues";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
+import { preservedCommitPrefix, worktreeHasPreservedCommitFor } from "../git/ops";
 import type { Worktree } from "../git/worktree";
 import { findRunFormulaForBranch, updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
@@ -84,6 +85,7 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   run.lease.startRefresh();
   await armHumanTicketWaits(run, gates);
   const { worktree, runStep } = await warmRunWorktree(run);
+  await assertPreservedWorkFitsShape(run, worktree);
   await claimRunTarget(run);
   await cascadeChildClaims(run);
   await publishRunClaim(run);
@@ -176,6 +178,38 @@ function regateRefreshedBoard(run: EpicRun, leaseTarget: Bead): RunGates {
   const isResumeSkipped = (t: Bead) => resumeSkipped(t, run.standaloneRun);
   run.target = target;
   return { readiness: freshReadiness, gated, children: freshChildren, isResumeSkipped };
+}
+
+/**
+ * Step 2-bis. Preserved work may only ride the run SHAPE that kept it (anton-d967 / PR #228 review).
+ *
+ * A timed-out tree is kept ONLY when the ticket IS the whole run target: that run delivers nothing
+ * and parks, so no pull request exists to carry the unfinished work anywhere. Splitting the target
+ * into child tickets — which the park itself advises — changes that: the resumed run dispatches the
+ * children on the SAME branch, and the first delivery among them opens a pull request whose diff
+ * carries the parent's explicitly incomplete commit into the trunk, under a delivery it is no part
+ * of and in no delivered list. That is precisely what the standalone-only limit exists to prevent,
+ * so the new shape is refused until a person reconciles the commit rather than silently accepted.
+ *
+ * Placed right after the checkout — the branch is the only place this fact lives — and before any
+ * claim, so the park leaves the board untouched.
+ */
+export async function assertPreservedWorkFitsShape(
+  run: EpicRun,
+  worktree: Worktree,
+): Promise<void> {
+  const { targetId } = run;
+  if (run.standaloneRun) return;
+  if (!(await worktreeHasPreservedCommitFor(worktree.path, targetId))) return;
+  throw new PoisonEpic(
+    `${targetId} has child tickets now, but branch \`${worktree.branch}\` still carries the ` +
+      `\`${preservedCommitPrefix(targetId)}\` commit a timed-out attempt preserved while ` +
+      `${targetId} WAS this run's whole target. No child ticket delivers that commit, so the pull ` +
+      `request they open from this branch would carry its unfinished work into the trunk under a ` +
+      `delivery it is no part of. Take it off \`${worktree.branch}\` first (drop it, or fold it ` +
+      `into the child it belongs to) in ${worktree.path} — or run ${targetId} as a single ticket ` +
+      `again with a raised ticketTimeoutMinutes — then resume the run`,
+  );
 }
 
 /** Step 0b. Refuse a run whose tickets need a bundled specialist this project has disabled. */
