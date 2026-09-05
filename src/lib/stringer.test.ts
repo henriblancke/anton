@@ -2941,6 +2941,52 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/widget/page.ts");
     });
 
+    // Resolution tries `src/widget.ts` before `src/widget/index.ts`, so an import of `./widget`
+    // where both exist names the FILE. Accepting the index as well credited that import to the
+    // index's own default and deleted its true finding (PR #190 review).
+    it("does not credit an import of a file module to the directory index beside it", async () => {
+      const repo = initRepo({
+        "src/widget.ts": "export default function Chosen() {\n  return null;\n}\n",
+        "src/widget/index.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from './widget';\nexport const page = () => Renamed();\n",
+        // Not vacuous: with no file beside it, the same import DOES name the index.
+        "src/panel/index.ts": "export default function Panel() {\n  return null;\n}\n",
+        "src/home.ts": "import Card from './panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget/index.ts", "Widget"),
+        unused("src/panel/index.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/home.ts");
+    });
+
+    // The sibling listing is a fallback for a specifier no grep can find, and it has to honour the
+    // same exclusions the grep does — they are caller-supplied and need not be whole trees, so a
+    // fixture stringer never scanned must not remove a finding (PR #190 review).
+    it("keeps an excluded sibling out of the index-import candidates", async () => {
+      const repo = initRepo({
+        "src/widget/index.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/widget/fixture.ts": "import Renamed from '.';\nexport const f = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget/index.ts", "Widget"),
+      ]);
+
+      const result = await scan({
+        repoPath: repo,
+        scanFile: join(dir, "scan.json"),
+        exclude: ["src/widget/fixture.ts"],
+      });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
     // A declaration broken after `export default` is still that module's default; the head has to
     // reach across the newline to find the name.
     it("counts a default export whose head is broken across lines", async () => {

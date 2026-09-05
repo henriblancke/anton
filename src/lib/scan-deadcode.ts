@@ -3071,10 +3071,15 @@ function specifierNames(
   spec: string,
   module: string,
   aliases: readonly AliasRule[],
+  shadowed: ReadonlySet<string> = new Set(),
 ): boolean {
   const target = withoutModuleExtension(posix(module));
+  // `./widget` names `src/widget.ts` where that file exists, and `src/widget/index.ts` only where
+  // it does not — resolution tries the file first. Accepting the index unconditionally credits an
+  // import of the FILE to the index's own default export, which deletes the index module's true
+  // finding (PR #190 review). `shadowed` holds the directories a file module outranks.
   const names = (resolved: string): boolean =>
-    resolved === target || `${resolved}/index` === target;
+    resolved === target || (!shadowed.has(resolved) && `${resolved}/index` === target);
   // `.` and `..` are relative specifiers in their own right — the directory's own index, and its
   // parent's — and testing only for the `./` and `../` spellings sent them to the alias branch,
   // where no rule claims them and the tail cannot read one, so a neighbour importing an index as
@@ -3102,46 +3107,43 @@ function specifierNames(
 const RELATIVE_SPECIFIER = /^\.\.?(?:\/|$)/;
 
 /**
- * The files that sit beside a directory's `index` module — the ones that can import it as `"."`,
- * a specifier carrying no word for a grep to find (PR #190 review).
+ * Every tracked file the scan's exclusions leave standing, or undefined when git could not say.
  *
- * `moduleWord` answers with the DIRECTORY's name for an index module, on the reasoning that every
- * specifier naming it writes that name. `import Renamed from "."` in a sibling writes nothing of
- * the kind, so the importer was never read and a live default export stayed reported dead. There is
- * no word to grep for here, so the candidates are listed instead.
+ * Read for two questions a grep cannot answer, both about a directory `index`: which files sit
+ * beside it (they can import it as `"."`, a specifier carrying no word to search for), and whether
+ * a file module of the directory's own name outranks it in resolution.
  *
- * One directory level only. A `".."` from a subdirectory names the same index and is still missed,
- * which under-covers — the signal stands, the side this filter errs on — where listing the whole
- * subtree would make one `src/index.ts` spend the entire file budget on a repo's worth of modules.
+ * The exclusions are passed WITHOUT a positive pathspec and the narrowing is done here, because
+ * `git ls-files` answers with nothing at all when the two are combined (verified on git 2.50.1),
+ * unlike `git grep`. Applying them matters: they are caller-supplied and need not be whole
+ * directory trees, so an `exclude: ['src/widget/fixture.ts']` the grep honours must be honoured
+ * here too, or a fixture stringer never scanned removes a real finding (PR #190 review).
  *
- * The scan's exclusions are NOT passed, and cannot be: `git ls-files` returns nothing at all when
- * an exclude pathspec is combined with a positive one (verified on git 2.50.1), unlike `git grep`.
- * They would say nothing here anyway — every exclusion is a directory tree, and a file beside the
- * index is in the index's own directory, which the scan already walked to raise the signal being
- * checked. Nothing an exclusion covers can sit there without the index sitting there too.
- *
- * A listing git cannot produce is no candidates, exactly as a failed grep is.
+ * One listing serves every declaring module in the call, and is read only when one of them is an
+ * index. A listing git cannot produce is no candidates, exactly as a failed grep is.
  */
-async function indexSiblings(
+async function trackedFiles(
   repoPath: string,
-  module: string,
+  pathspecs: string[],
   abort?: AbortSignal,
-): Promise<string[]> {
-  const dir = posix(dirname(module));
+): Promise<string[] | undefined> {
   try {
-    const { stdout } = await execFileAsync("git", ["-C", repoPath, "ls-files", "-z", "--", dir], {
+    const args = ["-C", repoPath, "ls-files", "-z", "--", ...pathspecs.slice(1)];
+    const { stdout } = await execFileAsync("git", args, {
       timeout: GREP_TIMEOUT_MS,
       maxBuffer: 64 * 1024 * 1024,
       signal: abort,
     });
-    return stdout
-      .split("\0")
-      .filter(Boolean)
-      .filter((file) => posix(dirname(file)) === dir);
+    return stdout.split("\0").filter(Boolean);
   } catch {
     abort?.throwIfAborted();
-    return [];
+    return undefined;
   }
+}
+
+/** Whether `module` is a directory's `index`, the shape both index questions are about. */
+function isDirectoryIndex(module: string): boolean {
+  return withoutModuleExtension(posix(module)).split("/").pop() === "index";
 }
 
 /**
@@ -3320,6 +3322,7 @@ function defaultBindingsOf(
   file: string,
   modules: ReadonlyMap<string, DefaultExport>,
   aliases: readonly AliasRule[],
+  shadowed: ReadonlySet<string>,
 ): string[] {
   // Read as one text rather than line by line: an import statement is what wraps, and a pattern
   // that never sees the local name beside its specifier misses the binding and reports a live
@@ -3336,7 +3339,8 @@ function defaultBindingsOf(
       const [, local, spec] = match;
       if (local === undefined || spec === undefined) continue;
       for (const [declared, how] of modules)
-        if (reachable(how) && specifierNames(file, spec, declared, aliases)) locals.push(bind(local));
+        if (reachable(how) && specifierNames(file, spec, declared, aliases, shadowed))
+          locals.push(bind(local));
     }
   };
   collect(DEFAULT_IMPORT, () => true);
@@ -3399,6 +3403,20 @@ async function defaultBindingCallers(
     const governing = await aliasesGoverning(repoPath, declared, aliases);
     for (const alias of exactAliasWords(declared, governing)) words.add(alias);
   }
+  // One tree listing answers both index questions, and is read only when a declaring module is an
+  // index: which files sit beside it, and whether a file module of the directory's own name
+  // outranks it (PR #190 review).
+  const indexes = [...modules.keys()].filter(isDirectoryIndex);
+  const tracked = indexes.length > 0 ? await trackedFiles(repoPath, pathspecs, abort) : undefined;
+  const shadowed = new Set<string>();
+  if (tracked) {
+    const stems = new Set(tracked.map((file) => withoutModuleExtension(posix(file))));
+    for (const index of indexes) {
+      const dir = posix(dirname(index));
+      if (stems.has(dir)) shadowed.add(dir);
+    }
+  }
+
   const callers = new Set<string>();
   let read = 0;
   let spent = false;
@@ -3417,6 +3435,7 @@ async function defaultBindingCallers(
       file,
       modules,
       await aliasesGoverning(repoPath, file, aliases),
+      shadowed,
     );
     const used = locals.some((local) =>
       entry.code.some((line, index) => entry.references(line, local, index)),
@@ -3437,10 +3456,11 @@ async function defaultBindingCallers(
     }
   }
   // A directory `index` can be imported as `"."`, which carries no word any grep could have found,
-  // so its neighbours are listed rather than searched for (PR #190 review).
-  for (const declared of modules.keys()) {
-    if (withoutModuleExtension(posix(declared)).split("/").pop() !== "index") continue;
-    for (const file of await indexSiblings(repoPath, declared, abort)) {
+  // so its neighbours are read off the listing rather than searched for (PR #190 review).
+  for (const index of indexes) {
+    const dir = posix(dirname(index));
+    for (const file of tracked ?? []) {
+      if (posix(dirname(file)) !== dir) continue;
       await judge(file);
       if (spent) return [...callers];
     }
