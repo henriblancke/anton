@@ -128,7 +128,7 @@ command and the dry-run counts live (see the mock).
 > **re-scoped, not closed** — bead labels never reach Linear, but every push still costs one read per
 > linked bead, plus a write for the majority of the *routed* population — the beads per-area routing
 > actually selects, on the *Open and closed* default — that carry a structured
-> `acceptance_criteria`/`notes` field; hazard 1 is confirmed and `--update-refs=false`
+> `acceptance_criteria`/`design`/`notes` field; hazard 1 is confirmed and `--update-refs=false`
 > cannot prevent it (the flag is declared but never read).
 
 1. **`external_ref` collision.** `bd linear sync --push` defaults to `--update-refs true`, writing
@@ -153,7 +153,9 @@ command and the dry-run counts live (see the mock).
    not, since 186 of 187 features carry no `area:` of their own (see *Per-area routing*, above).
    Budget N reads plus a write for the structured-field majority of N, and do **not** assume it
    decays — a closed bead never leaves a `--state all` population. The routing table sets N outright;
-   **Also include** set to *Open only* moves it again (N=40, 12 writes on the inherited reading). The
+   **Also include** set to *Open only* moves it again (N=44, 15 writes on the inherited reading —
+   `--state open` skips closed beads rather than selecting the literal `open` status, so
+   `in_progress` and `deferred` stay in the slice). The
    "a lease-only change syncs nothing" guarantee still has to be enforced at anton's seam (do not
    fire the push): bd's skip is not a guarantee we can lean on. And `status` transitions are genuine
    content changes that *do* cross.

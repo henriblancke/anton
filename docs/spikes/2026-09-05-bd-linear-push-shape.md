@@ -179,17 +179,19 @@ bd list --status all --json --limit 0 | jq '
            inh: (own_area // ($areaOf[.parent//""] // null)),        # inherit from parent epic
            new: (.created_at>"2026-08-15"), ac: ((.acceptance_criteria//"")!=""),
            no: ((.notes//"")!="")}] as $t |
+  def open_slice: .status!="closed";                                 # --state open skips closed only
   def pop(f): {selected:    ([$t[]|select(f)]|length),
                writes:      ([$t[]|select(f and .s)]|length),
-               open_only:   ([$t[]|select(f and .status=="open")]|length),
-               open_writes: ([$t[]|select(f and .status=="open" and .s)]|length)};
+               open_only:   ([$t[]|select(f and open_slice)]|length),
+               open_writes: ([$t[]|select(f and open_slice and .s)]|length)};
   {tier_chips_select: ($t|length),
    own_label_only: pop(.own!=null),
    parent_inherited: pop(.inh!=null),
    unreachable_either_way: ([$t[]|select(.inh==null)]|length),
    passes: ([$t[]|select(.inh!=null)|.inh]|group_by(.)|map({(.[0]):length})|add),
-   inherited_detail: {closed:            ([$t[]|select(.inh!=null and .status!="open")]|length),
-                      closed_writes:     ([$t[]|select(.inh!=null and .status!="open" and .s)]|length),
+   statuses: ([$t[]|select(.inh!=null)|.status]|group_by(.)|map({(.[0]):length})|add),
+   inherited_detail: {closed:            ([$t[]|select(.inh!=null and .status=="closed")]|length),
+                      closed_writes:     ([$t[]|select(.inh!=null and .status=="closed" and .s)]|length),
                       acceptance:        ([$t[]|select(.inh!=null and .ac)]|length),
                       notes:             ([$t[]|select(.inh!=null and .no)]|length),
                       since_contract:    ([$t[]|select(.inh!=null and .new)]|length),
@@ -198,12 +200,13 @@ bd list --status all --json --limit 0 | jq '
 # measured 2026-09-05:
 # {"tier_chips_select":197,
 #  "own_label_only":   {"selected": 11, "writes":  10, "open_only":  6, "open_writes":  5},
-#  "parent_inherited": {"selected":194, "writes": 120, "open_only": 40, "open_writes": 12},
+#  "parent_inherited": {"selected":194, "writes": 120, "open_only": 44, "open_writes": 15},
 #  "unreachable_either_way":3,
+#  "statuses":{"closed":150,"deferred":1,"in_progress":5,"open":38},
 #  "passes":{"area:agents":5,"area:autopilot":17,"area:board":38,"area:codehealth":56,
 #            "area:collaboration":9,"area:platform":13,"area:reliability":7,"area:runtime":20,
 #            "area:supervision":29},
-#  "inherited_detail":{"closed":154,"closed_writes":108,"acceptance":101,"notes":35,
+#  "inherited_detail":{"closed":150,"closed_writes":105,"acceptance":101,"notes":35,
 #                      "since_contract":76,"since_structured":17,"since_notes_only":16}}
 ```
 
@@ -220,7 +223,7 @@ a multiple of N must name which reading it assumes.
 inherited reading, the upper bound):
 
 - Closed beads never leave an *Open and closed* pass, so their writes are permanent rather than
-  decaying: 154 of the 194 are closed, and 108 of those carry a structured field. Closing a legacy
+  decaying: 150 of the 194 are closed, and 105 of those carry a structured field. Closing a legacy
   bead does not retire its cost; it freezes it.
 - `notes` keeps minting new members of the writing set. Of the 76 selected beads created since
   2026-08-15, well under the current contract, 17 carry a structured field — **16 of them
@@ -231,8 +234,10 @@ So the skip fires only for a bead that is description-only **and** has never bee
 been pushed at least once — and the writing set converges to a floor, not to zero. Two levers shrink
 it, and both are design choices for the sync ticket rather than bd behaviours, flagged here and not
 decided: the **routing table**, which sets N outright, and **Also include** — *Open only* takes the
-inherited population from 194 to 40 and its per-cycle writes from 120 to 12 (own-label: 11 → 6 and
-10 → 5).
+inherited population from 194 to 44 and its per-cycle writes from 120 to 15 (own-label: 11 → 6 and
+10 → 5). *Open only* is `--state open`, which skips **closed** rather than selecting the literal
+`open` status, so the slice keeps the 5 `in_progress` and 1 `deferred` beads alongside the 38 `open`
+ones — a predicate written as `status == "open"` undercounts it.
 
 bd's regression test does not cover either defeat: `TestBatchPush_SkipsUnchangedIssue`
 (`internal/linear/tracker_test.go:80-137`) uses an empty local description, no structured fields and
@@ -264,8 +269,9 @@ reads, plus a write for the structured-field majority of N**, per cycle — wher
 On this board with every area mapped: N=194 and 120 writes (~0.6N) if a feature inherits its parent
 epic's area, N=11 and 10 writes if it does not (§2) — for a change Linear cannot even represent.
 That tail does not decay: closed beads stay in the population forever and `bd note` keeps adding to
-it. The routing table sets N outright, and **Also include** moves it again (*Open only*: N=40, 12
-writes on the inherited reading), while the read floor alone still makes the debounce the only cap,
+it. The routing table sets N outright, and **Also include** moves it again (*Open only*: N=44, 15
+writes on the inherited reading — `--state open` drops only closed beads, so `in_progress` and
+`deferred` stay in), while the read floor alone still makes the debounce the only cap,
 not a nicety. And anton must not build the guarantee on bd's skip: a test asserting "an unchanged
 bead syncs nothing" has to assert it at anton's own seam (no push fired at all), because asserting
 it of bd holds only for a never-noted description-only bead, and only from its second push on.
