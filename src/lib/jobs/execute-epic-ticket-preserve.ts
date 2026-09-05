@@ -13,6 +13,7 @@ import {
   isAncestor,
   preservedCommitPrefix,
   readWorktreeState,
+  stageAllAndHashTree,
   sameWorktreeState,
   worktreeHasPreservedCommitFor,
   type WorktreeState,
@@ -246,6 +247,7 @@ export async function preserveTimedOutWork(args: {
   // rollback below is safe either way.
   const kept = await commitPreservedTree({
     worktreePath,
+    logPath,
     message: preservedCommitMessage(ticket, timeoutMs),
     before: now,
   });
@@ -423,30 +425,50 @@ function preservedCommitMessage(
 
 /**
  * Commit the preserved tree — retrying with this project's hooks BYPASSED when they rejected it
- * without landing anything (PR #228 review).
+ * without landing anything and without touching it (PR #228 review).
  *
  * A `commit-msg` hook enforcing conventional subjects refuses anton's `WIP <id>:` one, and without
  * this retry that refusal costs a gate-passing tree its only path back to a pull request: the caller
  * rolls the work back and reports "anton could not commit the work" on a ticket where every gate
  * passed — the exact loss anton-d967 exists to stop, reintroduced by a message check.
  *
- * Narrow on purpose. The retry runs ONLY when HEAD is exactly where it was before the attempt: a
- * commit that LANDED and was then rejected — a `post-commit` hook, which githooks(5) runs after the
- * commit is made — is already on the branch, and committing again would duplicate it. The caller
- * adopts that one instead. Bypassing the hooks cannot make the tree less fit to keep either: this
- * commit is reached only after the project's OWN verify gates have passed on it, and what it
- * produces is explicitly incomplete, blocked, and in no pull request.
+ * Narrow on purpose, and on two counts.
+ *
+ * HEAD must be exactly where it was before the attempt: a commit that LANDED and was then rejected
+ * — a `post-commit` hook, which githooks(5) runs after the commit is made — is already on the
+ * branch, and committing again would duplicate it. The caller adopts that one instead.
+ *
+ * And the tree must still be the one the gates passed on (PR #228 review). Bypassing the hooks is
+ * defensible only because this commit is reached after the project's OWN verify gates proved THAT
+ * tree sound — but a `pre-commit` hook can rewrite files before it rejects, which lint-staged does
+ * routinely when it fixes one file and fails another. HEAD does not move, so without this check the
+ * retry would stage the hook's post-gate edits with `git add -A` and commit them under `--no-verify`
+ * — a tree that passed neither the gates nor the hook, kept for a resume to adopt. Unprovable is
+ * treated as changed: the fallback is the rollback the refusal always meant.
  */
 async function commitPreservedTree(args: {
   worktreePath: string;
+  logPath: string;
   message: string;
   before: WorktreeState;
 }): Promise<{ committed: boolean } | { committed: false; error: unknown }> {
-  const { worktreePath, message, before } = args;
+  const { worktreePath, logPath, message, before } = args;
   const rejected = (error: unknown) => ({ committed: false as const, error });
+  // Hashed BEFORE the attempt, because after it a hook's edits are indistinguishable from the
+  // agent's own work.
+  const verified = await stageAllAndHashTree(worktreePath).catch(() => null);
   const first = await commitAll(worktreePath, message).catch(rejected);
   if (!("error" in first)) return first;
   const after = await readWorktreeState(worktreePath).catch(() => null);
   if (!after || after.head !== before.head) return first;
+  const retried = await stageAllAndHashTree(worktreePath).catch(() => null);
+  if (!verified || retried !== verified) {
+    await logPreserve(
+      logPath,
+      `a hook rejected this ticket's preserved commit and the tree is no longer provably the one ` +
+        `the verify gates passed on, so anton did not retry with the hooks bypassed`,
+    );
+    return first;
+  }
   return commitAll(worktreePath, message, { bypassHooks: true }).catch(rejected);
 }

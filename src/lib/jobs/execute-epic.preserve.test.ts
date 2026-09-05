@@ -510,6 +510,41 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(out(["status", "--porcelain"])).toBe("");
   });
 
+  // …and the bypass has to stay honest about WHAT it commits (PR #228 review). A `pre-commit` hook
+  // that REWRITES the tree before rejecting it — lint-staged fixing one file and failing another —
+  // leaves HEAD where it was, so the retry above cannot tell it from a message check. Committed with
+  // `--no-verify` it would ship the hook's post-gate edits under a proof that never covered them: a
+  // WIP a resume can adopt whose actual tree passed neither the verify gates nor the hook.
+  it("does not bypass a pre-commit hook that rewrote the tree before rejecting it", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("FINISHED.md", "gate-passing work\n");
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(
+      join(hooks, "pre-commit"),
+      '#!/bin/sh\necho "edited by the hook, after the gates ran" >> FINISHED.md\n' +
+        "git add FINISHED.md\nexit 1\n",
+      { mode: 0o755 },
+    );
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toMatchObject({
+      rolledBackWhy: expect.stringContaining("could not commit the work"),
+    });
+    // Nothing preserved, and above all nothing preserved that nobody verified.
+    expect(head()).toBe(baseline.head);
+    expect(subjects().some((line) => line.startsWith(`WIP ${ticket.id}:`))).toBe(false);
+  });
+
   // "No preserved commit on the branch" is what every refusal reports as work that is gone, so a
   // `git log` that could not RUN may not decay into it (PR #228 review). Read as proof of absence,
   // the bead note and the park tell the operator a resume starts the ticket over — while the

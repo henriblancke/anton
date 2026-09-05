@@ -479,9 +479,12 @@ function exitedWith(error: unknown, code: number): boolean {
  *
  * `bypassHooks` runs the commit with this project's hooks off, and a run's ordinary commits never
  * ask for it: hooks are the project's own gate on content, and anton has no standing to skip them.
- * Its one caller is the ticket-timeout preserve RETRYING a `WIP <id>:` commit that a `commit-msg`
- * hook refused before anything landed (PR #228 review) — a tree the project's own verify gates have
- * already passed, on its way to a commit that is explicitly incomplete and in no pull request.
+ * Its one caller is the ticket-timeout preserve RETRYING a `WIP <id>:` commit that a hook refused
+ * before anything landed (PR #228 review) — a tree the project's own verify gates have already
+ * passed, on its way to a commit that is explicitly incomplete and in no pull request. That caller
+ * proves the tree is still the verified one first, via {@link stageAllAndHashTree}: a hook that
+ * EDITS before it rejects leaves a different tree, and `--no-verify` would commit those post-gate
+ * edits under a proof that never covered them.
  */
 export async function commitAll(
   worktreePath: string,
@@ -498,6 +501,20 @@ export async function commitAll(
     await gitCommit(worktreePath, ["commit", ...bypass, "-m", message]);
     return { committed: true };
   }
+}
+
+/**
+ * Stage the whole worktree and return the hash of the tree a commit would write from it.
+ *
+ * How a caller tells the tree it VERIFIED from the tree it is about to commit. A `pre-commit` hook
+ * that rewrites files and then rejects — lint-staged fixing one file and failing another — leaves
+ * the working tree changed while HEAD stays put, so neither HEAD nor a rejection tells the two
+ * apart; the tree hash does. Staging first because that is what `commitAll` commits from, and
+ * untracked files count.
+ */
+export async function stageAllAndHashTree(worktreePath: string): Promise<string> {
+  await git(worktreePath, ["add", "-A"]);
+  return git(worktreePath, ["write-tree"]);
 }
 
 /**
