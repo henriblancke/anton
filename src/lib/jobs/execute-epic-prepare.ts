@@ -84,15 +84,18 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   assertTicketsClaimable(run, gates);
   const { ticketSteps, runSteps } = await resolveRunPipeline(run);
   await takeRunLease(run, preCheckTrusted, gates);
-  // Asked AGAIN on the board the lease confirmed (PR #227 review). The gates above ran on the
-  // pre-lease read, and step 1c adopts the confirmed children in their place — so a person blocking
-  // or deferring a child inside the lease window arrives unjudged, and the run would dispatch its
-  // earlier siblings before parking at that ticket's claim gate. Re-asking here is what makes "a
-  // held child stops the run before any dispatch" hold across that window too; it is pure and reads
-  // no board, so the second call costs nothing.
+  // Re-asked after EVERY board this run adopts past the read-only gates (PR #227 review). Step 1c
+  // swaps in the children the lease confirmed, and the arm below swaps in the ones ITS own refresh
+  // brought back — so a person blocking or deferring a child inside either window arrives unjudged,
+  // and the run would dispatch its earlier siblings before parking at that ticket's claim gate.
+  // Re-asking is what makes "a held child stops the run before any dispatch" hold across both
+  // windows; the gate is pure and reads no board, so the extra calls cost nothing. Both still park
+  // before any worktree, claim or session exists — the arm's own waits stand, which is the state a
+  // resume reuses.
   assertTicketsClaimable(run, gates);
   run.lease.startRefresh();
   await armHumanTicketWaits(run, gates);
+  assertTicketsClaimable(run, gates);
   const { worktree, runStep } = await warmRunWorktree(run);
   await claimRunTarget(run);
   await cascadeChildClaims(run);
@@ -257,8 +260,8 @@ function assertBeadContract(run: EpicRun, gates: RunGates): void {
 
 /**
  * Step 0c-bis. Refuse a run holding a ticket whose status only a person can clear. Pure and
- * board-free, so the caller asks it twice — once on the pre-lease read, once on the children the
- * lease confirmed.
+ * board-free, so the caller asks it once per board this run adopts — the pre-lease read, the
+ * children the lease confirmed, and the ones the human-ticket arm's refresh brought back.
  */
 function assertTicketsClaimable(run: EpicRun, gates: RunGates): void {
   // 0c-bis. A ticket in a status bd refuses `--claim` on cannot be dispatched by anyone

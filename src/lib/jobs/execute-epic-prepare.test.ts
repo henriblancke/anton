@@ -1,0 +1,228 @@
+/**
+ * anton-fude — WHEN {@link prepareEpicRun} asks whether a child is claimable, not just what the
+ * answer is.
+ *
+ * The gate itself is pure and covered in execute-epic.unit.test.ts (`humanHeldTickets`). What can
+ * only be proven here is that it is re-asked after every board this run ADOPTS: step 1c swaps in the
+ * children the run-lease confirmed, and the human-ticket arm swaps in the ones its own refresh
+ * brought back. A child a person blocks or defers inside either window is invisible to the pre-lease
+ * gate — and the run would then dispatch its earlier siblings before dying at that ticket's claim
+ * gate, which is the exact failure anton-fude exists to remove.
+ *
+ * Mocked at the module seam: the states under test are two board reads DISAGREEING inside one run,
+ * which a real board cannot be asked for on demand.
+ */
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Bead } from "../beads/bd";
+
+const refreshRunBoardMock = vi.fn();
+const settleCompletedRunMock = vi.fn();
+const warmRunWorktreeMock = vi.fn();
+const claimRunTargetMock = vi.fn();
+const cascadeChildClaimsMock = vi.fn();
+const publishRunClaimMock = vi.fn();
+const preflightHumanTicketsMock = vi.fn();
+const loadAllIssuesMock = vi.fn();
+const updateRunMock = vi.fn();
+const validateRunFormulaMock = vi.fn();
+
+vi.mock("./execute-epic-recover", () => ({
+  refreshRunBoard: (...args: unknown[]) => refreshRunBoardMock(...args),
+  settleCompletedRun: (...args: unknown[]) => settleCompletedRunMock(...args),
+}));
+
+vi.mock("./execute-epic-claim", () => ({
+  warmRunWorktree: (...args: unknown[]) => warmRunWorktreeMock(...args),
+  claimRunTarget: (...args: unknown[]) => claimRunTargetMock(...args),
+  cascadeChildClaims: (...args: unknown[]) => cascadeChildClaimsMock(...args),
+  publishRunClaim: (...args: unknown[]) => publishRunClaimMock(...args),
+}));
+
+vi.mock("./execute-epic-human-gate", async () => {
+  const actual =
+    await vi.importActual<typeof import("./execute-epic-human-gate")>("./execute-epic-human-gate");
+  return { ...actual, preflightHumanTickets: (...args: unknown[]) => preflightHumanTicketsMock(...args) };
+});
+
+vi.mock("../beads/issues", async () => {
+  const actual = await vi.importActual<typeof import("../beads/issues")>("../beads/issues");
+  return { ...actual, loadAllIssues: (...args: unknown[]) => loadAllIssuesMock(...args) };
+});
+
+// The lock serializes writes against other processes; inside one test there is nothing to serialize.
+vi.mock("../beads/claim-lock", () => ({
+  withBeadWriteLock: <T>(_repo: string, _id: string, fn: () => Promise<T>) => fn(),
+}));
+
+vi.mock("../runs", async () => {
+  const actual = await vi.importActual<typeof import("../runs")>("../runs");
+  return { ...actual, updateRun: (...args: unknown[]) => updateRunMock(...args) };
+});
+
+vi.mock("./run-formula", async () => {
+  const actual = await vi.importActual<typeof import("./run-formula")>("./run-formula");
+  return { ...actual, validateRunFormula: (...args: unknown[]) => validateRunFormulaMock(...args) };
+});
+
+vi.mock("./formula-floor", () => ({ assertRunFormulaFloor: () => {} }));
+
+vi.mock("./execute-epic-formula", () => ({
+  splitFormulaPhases: () => ({ ticketSteps: [], runSteps: [] }),
+}));
+
+const { prepareEpicRun } = await import("./execute-epic-prepare");
+const { PoisonEpic } = await import("./errors");
+import type { EpicRun } from "./execute-epic-run";
+
+const REPO = "/tmp/anton";
+const TARGET = "anton-fude";
+
+const feature = (): Bead => ({ id: TARGET, title: "Feature", issue_type: "feature", status: "open" }) as Bead;
+
+const ticket = (id: string, status = "open"): Bead =>
+  ({ id, title: id, issue_type: "task", status, parent: TARGET }) as Bead;
+
+/** The board every read in the run answers with, unless a test hands a later read a different one. */
+const board = (...tickets: Bead[]): Bead[] => [feature(), ...tickets];
+
+/** The minimal run `prepareEpicRun` reads — everything else it touches is mocked at its module. */
+function run(all: Bead[]): EpicRun {
+  const target = all.find((b) => b.id === TARGET)!;
+  return {
+    db: {},
+    clock: {},
+    ctx: { signal: undefined },
+    projectId: "p1",
+    repo: REPO,
+    targetId: TARGET,
+    branch: `anton/${TARGET}`,
+    runId: "run-1",
+    // A pinned formula, so the pipeline resolves without a branch lookup.
+    existing: { formula: "bundled:default", formulaVariant: null },
+    settings: { agents: undefined },
+    userAgentIds: [],
+    lease: {
+      refuseForeign: vi.fn(),
+      adopt: vi.fn(),
+      claim: vi.fn().mockResolvedValue(undefined),
+      startRefresh: vi.fn(),
+    },
+    all,
+    target,
+    standaloneRun: false,
+    tickets: all.filter((b) => b.id !== TARGET),
+    readiness: () => ({ blockers: [], gated: [], runnable: true }),
+  } as unknown as EpicRun;
+}
+
+/** What the arm hands back when it acted on human work and adopted the board its refresh returned. */
+function preflight(adopted: Bead[]) {
+  const target = adopted.find((b) => b.id === TARGET)!;
+  const children = adopted.filter((b) => b.id !== TARGET);
+  return {
+    board: adopted,
+    target,
+    children,
+    tickets: children,
+    answeredButBlocked: new Map<string, string[]>(),
+    armed: true,
+  };
+}
+
+/** Run the preparation and hand back the error it refused with (failing if it didn't refuse). */
+async function refusalFrom(all: Bead[]): Promise<Error> {
+  const caught = await prepareEpicRun(run(all)).then(
+    () => undefined,
+    (e: unknown) => e as Error,
+  );
+  expect(caught).toBeInstanceOf(Error);
+  return caught as Error;
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  refreshRunBoardMock.mockImplementation((r: EpicRun) =>
+    Promise.resolve({ preCheckTrusted: true, leaseTarget: r.target }),
+  );
+  settleCompletedRunMock.mockResolvedValue(false);
+  validateRunFormulaMock.mockResolvedValue({
+    source: "bundled:default",
+    recorded: "bundled:default",
+    variant: undefined,
+    cooked: {},
+    steps: [],
+  });
+  updateRunMock.mockResolvedValue(undefined);
+  warmRunWorktreeMock.mockResolvedValue({ worktree: { path: "/tmp/wt" }, runStep: {} });
+  claimRunTargetMock.mockResolvedValue(undefined);
+  cascadeChildClaimsMock.mockResolvedValue(undefined);
+  publishRunClaimMock.mockResolvedValue(undefined);
+  // No human work by default: nothing written, nothing adopted.
+  preflightHumanTicketsMock.mockImplementation((args: { board: Bead[] }) =>
+    Promise.resolve({ ...preflight(args.board), armed: false }),
+  );
+});
+
+describe("prepareEpicRun — a held child is caught on every board the run adopts (anton-fude)", () => {
+  it("parks on the pre-lease read when a child is already blocked", async () => {
+    const all = board(ticket("t-1"), ticket("t-2", "blocked"));
+    loadAllIssuesMock.mockResolvedValue(all);
+
+    const error = await refusalFrom(all);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("t-2");
+    expect(error.message).toContain("blocked pending human review");
+    // Read-only refusal: the lease was never taken, so the park leaves nothing behind.
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+  });
+
+  it("parks when the LEASE-confirmed board is the first to show the block", async () => {
+    // A person blocks the sibling between the pre-lease read and step 1c's confirmation, which
+    // adopts the confirmed children in place of the ones every gate above judged.
+    const all = board(ticket("t-1"), ticket("t-2"));
+    loadAllIssuesMock.mockResolvedValue(board(ticket("t-1"), ticket("t-2", "blocked")));
+
+    const error = await refusalFrom(all);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("t-2");
+    // Caught before the arm, and long before any checkout or claim exists.
+    expect(preflightHumanTicketsMock).not.toHaveBeenCalled();
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+    expect(claimRunTargetMock).not.toHaveBeenCalled();
+  });
+
+  it("parks when the HUMAN-TICKET arm's refresh is the first to show the block", async () => {
+    // The regression this test exists for: the arm's post-refresh adoption overwrites the children
+    // both gates above already judged, so a sibling deferred in that window arrived unjudged and the
+    // run dispatched t-1 before dying at t-2's claim gate.
+    const all = board(ticket("t-1"), ticket("t-2"));
+    loadAllIssuesMock.mockResolvedValue(all);
+    preflightHumanTicketsMock.mockResolvedValue(
+      preflight(board(ticket("t-1"), ticket("t-2", "deferred"))),
+    );
+
+    const error = await refusalFrom(all);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("t-2");
+    expect(error.message).toContain("is deferred");
+    // The arm ran (its waits stand for the resume to reuse), but nothing past it did.
+    expect(preflightHumanTicketsMock).toHaveBeenCalled();
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+    expect(claimRunTargetMock).not.toHaveBeenCalled();
+  });
+
+  it("prepares the run when every board it adopts leaves the children claimable", async () => {
+    const all = board(ticket("t-1"), ticket("t-2"));
+    loadAllIssuesMock.mockResolvedValue(all);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(all));
+
+    const prep = await prepareEpicRun(run(all));
+
+    expect(prep.done).toBe(false);
+    expect(warmRunWorktreeMock).toHaveBeenCalled();
+    expect(claimRunTargetMock).toHaveBeenCalled();
+  });
+});
