@@ -551,7 +551,15 @@
     letter-spacing: 0.02em;
     color: var(--muted-fg);
   }
-  .preview .cmd .skipped { color: var(--muted-fg); }
+  /* Overflow ids stay in the DOM so the command copies whole; only the emphasis
+     is folded away, and the count rides on ::after so it never enters a copy. */
+  .preview .cmd .fold { color: var(--muted-fg); }
+  .preview .cmd .fold::after {
+    content: " (+" attr(data-more) " more)";
+    font-family: var(--font-sans);
+    font-size: 0.72rem;
+    color: var(--muted-fg);
+  }
   .preview .out { font-size: 0.8rem; color: var(--muted-fg); margin: 0; }
   .preview .out strong { color: var(--fg); font-variant-numeric: tabular-nums; }
 
@@ -1074,7 +1082,9 @@
             <p class="help">
               Push-triggered syncs are debounced to one every 5 minutes — a single run writes to a bead
               dozens of times, and each write nudges a push. The schedule is the backstop for when a
-              push-triggered sync fails.
+              push-triggered sync fails. Both triggers can be on, but only one sync runs at a time:
+              routing mutates a single global project id, so an overlapping sync is skipped and
+              reported rather than interleaved.
             </p>
           </div>
 
@@ -1135,7 +1145,9 @@
             </div>
             <p class="help">
               bd holds one project id at a time, so anton runs one pass per area and restores the
-              setting afterwards. Unmapped areas are skipped and reported, never guessed.
+              setting afterwards. That project id is global, so the whole run — capture, every pass,
+              restore — is held under one sync lock; two routed syncs at once would push one area's
+              beads under the other's project. Unmapped areas are skipped and reported, never guessed.
               <strong>Routing applies at creation.</strong> bd sends the project only when it creates
               an issue — never on an update — so editing this table moves beads that have not been
               pushed yet and leaves already-linked issues in the project they were created in. Move
@@ -1156,10 +1168,13 @@
             <div class="preview">
               <div id="cmd"></div>
               <p class="out" id="dry"></p>
-              <p class="out">Each pass carries its own <code>--issues</code> list: with
+              <p class="out">Each pass carries its own <code>--issues</code> list — in full, every id,
+                because a trimmed list copies as a command that pushes the wrong beads. With
                 <code>linear.project_id</code> set, bd skips creating any bead that has no Linear
-                issue yet, so one unscoped command would report success and create nothing.
-                <code>linear.project_id</code> is restored after the last pass.</p>
+                issue yet, so one unscoped command would report success and create nothing. The
+                prior <code>linear.project_id</code> is captured before the first pass and put back
+                after the last; the <code>trap</code> restores it if a pass fails. Where there was
+                no prior value, the restore is <code>bd config unset linear.project_id</code>.</p>
             </div>
             <div class="row between">
               <div class="row">
@@ -1264,10 +1279,12 @@
     return out;
   }
 
+  // Every id renders. Trimming the list would put a truncation marker inside a
+  // command the panel invites you to copy, silently dropping most of the pass.
   function idList(ids) {
-    return ids.length > 6
-      ? ids.slice(0, 6).join(',') + '<span class="skipped">,…+' + (ids.length - 6) + ' more</span>'
-      : ids.join(',');
+    if (ids.length <= 6) return ids.join(',');
+    return ids.slice(0, 6).join(',') +
+      '<span class="fold" data-more="' + (ids.length - 6) + '">,' + ids.slice(6).join(',') + '</span>';
   }
 
   function refresh() {
@@ -1286,14 +1303,25 @@
       return { route: route, ids: ids };
     }).filter(function (p) { return p.ids.length; });
 
-    cmdEl.innerHTML = passes.map(function (p) {
+    // linear.project_id is one global setting: capture it before the first pass,
+    // put it back after the last, and trap so a failed pass restores it too —
+    // otherwise the next unscoped sync routes creates into the last area's project.
+    var preamble = '<div class="cmd"><span class="pass">under the sync lock · before the first pass</span>' +
+      'set -euo pipefail<br />' +
+      'prior=$(bd config get linear.project_id)<br />' +
+      'trap \'bd config set linear.project_id "$prior"\' EXIT</div>';
+    var restore = '<div class="cmd"><span class="pass">after the last pass · restore</span>' +
+      'bd config set linear.project_id "$prior"<br />' +
+      'trap - EXIT</div>';
+
+    cmdEl.innerHTML = preamble + passes.map(function (p) {
       return '<div class="cmd"><span class="pass">area:' + p.route.area + ' → ' + p.route.project +
              ' · ' + plural(p.ids.length, 'bead') + '</span>' +
              'bd config set linear.project_id ' + p.route.projectId + '<br />' +
              'bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> ' +
              types.join(',') + ' <span class="flag">--state</span> all ' +
              '<span class="flag">--issues</span> ' + idList(p.ids) + '</div>';
-    }).join('');
+    }).join('') + restore;
 
     var parts = on.map(function (c) { return '<strong>' + plural(Number(c.dataset.count), c.dataset.type) + '</strong>'; });
     var excluded = off.reduce(function (sum, c) { return sum + Number(c.dataset.count); }, 0);

@@ -114,6 +114,14 @@ command and the dry-run counts live (see the mock).
   186 of 187 on the board today — so routing on a bead's own label selects 11 beads where routing on
   its parent epic's selects 194. Settle this before
   `planLinearPushes` is written; it sets the whole cost budget in hazard 2.
+- **The whole set → push → restore sequence holds one exclusive sync lock** (settled 2026-09-05,
+  hazard 4). `linear.project_id` is a single global bd setting, and both triggers ship on by
+  default, so a scheduled sync and a push-triggered sync that interleave will push one area's ids
+  while the other job owns the project id — creating that area's issues in the wrong project. Since
+  routing binds at creation, no later sync repairs that. The lock is taken once around **all** the
+  passes, not per pass, and it covers the restore, so a crash cannot leave the setting pointing at
+  the last area's project. A sync that cannot take the lock is **skipped and reported, not queued**
+  — the debounce already establishes that a dropped push is fine and the schedule is the backstop.
 - **Credentials come from the environment** (`LINEAR_API_KEY`, or the OAuth pair), never stored in
   `anton.db` — same posture as `gh`. The panel reports what it found and stops there.
 - **Dry-run before the first push.** Every setting is reversible except a bad first push, which
@@ -180,6 +188,17 @@ command and the dry-run counts live (see the mock).
    title (both make anton mutate bead content for a cosmetic gain in a downstream tracker). Note that
    `--dry-run` could never have answered this: it reaches the live API before printing, and prints
    one bare title per bead.
+4. **Concurrent routed syncs corrupt project placement.** Per-area routing mutates the *global*
+   `linear.project_id` between planning and pushing, and the two triggers (after each beads push ·
+   on a schedule) are both on by default. Interleave two routed syncs and one job pushes its area's
+   ids while the other owns the setting — those issues are created in the wrong project, and
+   because routing binds at creation, **no later sync can move them**. The debounce does not help:
+   it caps the push-triggered rate, it does not order a push-triggered sync against a scheduled
+   one. Take one exclusive lock around the entire capture → set → push → restore sequence (all
+   passes, not per pass) and skip-and-report a sync that cannot take it. The restore must run on
+   the failure path too — `bd config set linear.project_id "$prior"`, or `bd config unset` when
+   there was no prior value — or an aborted routed sync leaves the last area's project id in place
+   for the next unscoped or manual sync to route creates into.
 
 ---
 
