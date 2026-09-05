@@ -1173,8 +1173,9 @@
                 <code>linear.project_id</code> set, bd skips creating any bead that has no Linear
                 issue yet, so one unscoped command would report success and create nothing. The
                 prior <code>linear.project_id</code> is captured before the first pass and put back
-                after the last; the <code>trap</code> restores it if a pass fails. Where there was
-                no prior value, the restore is <code>bd config unset linear.project_id</code>.</p>
+                after the last by the <code>restore</code> helper, which the <code>trap</code> also
+                runs if a pass fails. Where there was no prior value, it calls
+                <code>bd config unset linear.project_id</code> rather than writing an empty one.</p>
             </div>
             <div class="row between">
               <div class="row">
@@ -1308,10 +1309,12 @@
     // otherwise the next unscoped sync routes creates into the last area's project.
     var preamble = '<div class="cmd"><span class="pass">under the sync lock · before the first pass</span>' +
       'set -euo pipefail<br />' +
-      'prior=$(bd config get linear.project_id)<br />' +
-      'trap \'bd config set linear.project_id "$prior"\' EXIT</div>';
-    var restore = '<div class="cmd"><span class="pass">after the last pass · restore</span>' +
-      'bd config set linear.project_id "$prior"<br />' +
+      'prior=$(bd config get linear.project_id 2&gt;/dev/null || true)<br />' +
+      'restore() { if [ -n "$prior" ]; then bd config set linear.project_id "$prior"; ' +
+      'else bd config unset linear.project_id; fi; }<br />' +
+      'trap restore EXIT</div>';
+    var epilogue = '<div class="cmd"><span class="pass">after the last pass · restore</span>' +
+      'restore<br />' +
       'trap - EXIT</div>';
 
     cmdEl.innerHTML = preamble + passes.map(function (p) {
@@ -1321,7 +1324,7 @@
              'bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> ' +
              types.join(',') + ' <span class="flag">--state</span> all ' +
              '<span class="flag">--issues</span> ' + idList(p.ids) + '</div>';
-    }).join('') + restore;
+    }).join('') + epilogue;
 
     var parts = on.map(function (c) { return '<strong>' + plural(Number(c.dataset.count), c.dataset.type) + '</strong>'; });
     var excluded = off.reduce(function (sum, c) { return sum + Number(c.dataset.count); }, 0);
