@@ -641,7 +641,7 @@
           <span class="body">
             <span class="name">epic</span>
             <span class="what">A product outcome. Spans several features, carries one <code>area:</code> label.</span>
-            <span class="who">Read by people who don't read code. Lives in Linear as a top-level issue — as does every synced tier; push carries no hierarchy.</span>
+            <span class="who">Read by people who don't read code. Lives in Linear as a top-level issue, indistinguishable from a synced feature — push carries neither hierarchy nor tier.</span>
           </span>
         </div>
         <div class="tier" data-tier="feature">
@@ -1089,7 +1089,7 @@
               <button class="tchip" type="button" aria-pressed="false" data-type="bug" data-count="2"><span class="mk" aria-hidden="true">✓</span>bug</button>
               <button class="tchip" type="button" aria-pressed="false" data-type="chore" data-count="5"><span class="mk" aria-hidden="true">✓</span>chore</button>
             </div>
-            <p class="help">The push is flat: every tier you pick lands as a top-level issue, because bd sends no parent. Tier is carried by <code>--type</code>, grouping by the Linear project the <code>area:</code> routing sets. Anything you leave off stays local.</p>
+            <p class="help">The push is flat: every tier you pick lands as a top-level issue, because bd sends no parent. <code>--type</code> only chooses what gets pushed — it does not travel with the issue, so Linear cannot tell an epic from a feature. Grouping is the Linear project the <code>area:</code> routing sets. Anything you leave off stays local.</p>
           </div>
 
           <div class="field">
@@ -1181,8 +1181,10 @@
           <span class="note-label" data-kind="risk">Lease churn</span>
           <p>Settled 2026-09-05: push never sends labels, so the run-lease stays a label and nothing
              moves to metadata. What it costs is API calls — one read per linked bead every push,
-             plus a write for the legacy third of the board carrying a structured
-             <code>acceptance_criteria</code>. That is what the debounce caps.</p>
+             plus a write for every bead carrying a structured <code>acceptance_criteria</code> or
+             <code>notes</code> field: 123 of the 196 epics+features this panel's default
+             (<code>--state all</code>) pushes. It does not decay — closed beads never leave that
+             population and anton keeps writing <code>notes</code>. That is what the debounce caps.</p>
         </div>
         <div class="note">
           <span class="note-label">Credentials</span>

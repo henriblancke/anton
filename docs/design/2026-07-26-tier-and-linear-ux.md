@@ -16,7 +16,7 @@ Three tiers, nested with `bd link --type parent-child`:
 
 | Tier | What it is | Who reads it |
 | --- | --- | --- |
-| `epic` | A product outcome spanning several features. Carries exactly one `area:` label. | Non-technical stakeholders. Syncs to Linear as a top-level issue — like every synced tier, since push carries no hierarchy (hazard 3). |
+| `epic` | A product outcome spanning several features. Carries exactly one `area:` label. | Non-technical stakeholders. Syncs to Linear as a top-level issue, indistinguishable from a synced `feature` — push carries neither hierarchy nor tier (hazard 3). |
 | `feature` | One shippable delivery unit — one worktree, one PR. **This is what anton runs.** | The board. Approved, claimed, run-leased, shipped. |
 | `task` / `bug` / `chore` | The working layer, executed as part of their feature's run. | Engineering only. Never leaves the board. |
 
@@ -109,18 +109,23 @@ command and the dry-run counts live (see the mock).
   `anton.db` — same posture as `gh`. The panel reports what it found and stops there.
 - **Dry-run before the first push.** Every setting is reversible except a bad first push, which
   creates issues in someone else's Linear.
-- **The push is flat** (settled 2026-09-05, hazard 3). bd sends no parent, so tier lives in `--type`
-  and grouping lives in the Linear project — the `area:` routing above is the only hierarchy the
-  sync can express.
+- **The push is flat, and the tier does not survive it** (settled 2026-09-05, hazard 3). bd sends no
+  parent, and `--type` only *selects* which beads are pushed — the payload is title, description,
+  priority, state and project id, nothing else — so a pushed epic and a pushed feature are
+  indistinguishable in Linear. Grouping lives in the Linear project the `area:` routing sets; that
+  is the only structure the sync can express. **Tier is a documented loss**, accepted for the same
+  reason the parent breadcrumb was rejected: the only channels left are title and description, and
+  anton does not mutate bead content for a cosmetic gain in a downstream tracker.
 
 ### Hazards that must be handled
 
 > **Answered 2026-09-05** by [`docs/spikes/2026-09-05-bd-linear-push-shape.md`](../spikes/2026-09-05-bd-linear-push-shape.md)
-> (anton-ey0w.1): hazard 3 is settled — push never sends a parent, so the epic→sub-issue shape is
-> not available; hazard 2 is **re-scoped, not closed** — bead labels never reach Linear, but every
-> push still costs one read per linked bead, plus a write for the third of the board that carries a
-> structured `acceptance_criteria` field; hazard 1 is confirmed and `--update-refs=false` cannot
-> prevent it (the flag is declared but never read).
+> (anton-ey0w.1): hazard 3 is settled — push never sends a parent *or* the tier, so the epic→sub-issue
+> shape is not available and epics and features are indistinguishable in Linear; hazard 2 is
+> **re-scoped, not closed** — bead labels never reach Linear, but every push still costs one read per
+> linked bead, plus a write for the ~5-in-8 of the default *Open and closed* population that carries a
+> structured `acceptance_criteria`/`notes` field; hazard 1 is confirmed and `--update-refs=false`
+> cannot prevent it (the flag is declared but never read).
 
 1. **`external_ref` collision.** `bd linear sync --push` defaults to `--update-refs true`, writing
    the Linear ref into `external_ref`. A board still carrying legacy `gh-<n>` PR pointers there
@@ -136,18 +141,23 @@ command and the dry-run counts live (see the mock).
    strips), and then *permanently* for any bead carrying a structured
    `acceptance_criteria`/`design`/`notes` field, because the comparison re-runs the description
    builder on a copy that still has them and appends those sections twice. anton's contract keeps the
-   rubric in the description and forbids `--acceptance`, so beads written under it are unaffected —
-   but a third of the open board predates that rule (12 of 39 open epics+features on 2026-09-05) and
-   writes on every push. Budget N reads + ~N/3 writes per cycle, trending to N + 0. The "a lease-only
-   change syncs nothing" guarantee still has to be enforced at anton's seam (do not fire the push):
-   bd's skip is not a guarantee we can lean on. And `status` transitions are genuine content changes
-   that *do* cross.
+   rubric in the description and forbids `--acceptance` — but that only covers `acceptance_criteria`,
+   and **anton fills `notes` itself** via `bd note`, so new run targets keep joining the writing set.
+   Measured on the population this panel's own default pushes (`--state all`, so open *and* closed):
+   **123 of 196 epics+features write on every push** on 2026-09-05. Budget N reads + ~0.6N writes per
+   cycle, and do **not** assume it decays — a closed bead never leaves a `--state all` population.
+   Setting **Also include** to *Open only* is the lever that moves it (N=39, 12 writes). The
+   "a lease-only change syncs nothing" guarantee still has to be enforced at anton's seam (do not
+   fire the push): bd's skip is not a guarantee we can lean on. And `status` transitions are genuine
+   content changes that *do* cross.
 3. **Sub-issue nesting.** **Settled 2026-09-05 (anton-60oi): there is no nesting.** Push sends no
    parent — hierarchy is pull-only — so the epic→sub-issue shape is dropped. The push is a flat list
-   of top-level issues: tier is carried by `--type`, grouping by the Linear project the per-area
-   routing already sets. Two alternatives were rejected — routing epics to projects and features to
-   issues (it consumes the project axis per-area routing owns), and writing a parent breadcrumb into
-   the pushed description (anton would mutate bead descriptions for a cosmetic gain). Note that
+   of top-level issues that carry no tier marker either: `--type` selects the beads to push, it does
+   not travel in the payload, so nothing in Linear separates an epic from a feature. Grouping is the
+   Linear project the per-area routing already sets. Three alternatives were rejected — routing
+   epics to projects and features to issues (it consumes the project axis per-area routing owns),
+   writing a parent breadcrumb into the pushed description, and prefixing the tier onto the pushed
+   title (both make anton mutate bead content for a cosmetic gain in a downstream tracker). Note that
    `--dry-run` could never have answered this: it reaches the live API before printing, and prints
    one bare title per bead.
 

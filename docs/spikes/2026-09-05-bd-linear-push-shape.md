@@ -8,7 +8,7 @@ answers re-checked against 1.2.2 (latest stable) and unchanged.
 | # | Question | Answer |
 | --- | --- | --- |
 | 1 | Does push map `parent-child` onto Linear sub-issues? | **No.** Push never sends a parent. Hierarchy is import-only. |
-| 2 | Does push carry bead labels? | **No.** Push never sends `labelIds`, so the run-lease cannot reach Linear as a label — but a lease-only change is still **one read per linked bead**, plus a write for the ~1-in-3 that carry a structured `acceptance_criteria`/`design`/`notes` field, whose unchanged-issue skip never fires (§2). |
+| 2 | Does push carry bead labels? | **No.** Push never sends `labelIds`, so the run-lease cannot reach Linear as a label — but a lease-only change is still **one read per linked bead**, plus a write for the ~5-in-8 of the default population that carry a structured `acceptance_criteria`/`design`/`notes` field, whose unchanged-issue skip never fires (§2). |
 | 3 | What does `--update-refs` write into `external_ref`? | The **Linear issue URL verbatim, always** — the flag is declared but never read, so it cannot be turned off. |
 
 Consequences for the downstream tickets are at the bottom.
@@ -146,31 +146,64 @@ absent from that set. The description is in it, and two independent defects make
 
 anton's contract puts the whole rubric in `description` and **forbids `--acceptance`**
 (`skills/bd/SKILL.md:187-215`); graph-created beads have no acceptance field at all, deliberately
-(`src/lib/beads/bd.ts:1877-1891`). Beads written under that rule are description-only, so defeat 2
-cannot reach them. The board is not uniformly that shape, though — it still carries beads created
-before the rule:
+(`src/lib/beads/bd.ts:1877-1891`). A bead written under that rule alone is description-only, so
+defeat 2 cannot reach it. Two things break that assumption: the board still carries beads created
+before the rule, and **anton itself fills a structured field at runtime** — `bd note` is how job
+notes and human steering land on a run target (`beads.note`, `src/lib/beads/bd.ts:2315-2321`), and
+`notes` is one of the three fields `BuildLinearDescription` appends.
+
+Measure the population the sync actually processes, not a convenient slice of it. The design's
+default for **Also include** is *Open and closed* and the mock's previewed command is `--state all`,
+so the population is **every epic and feature on the board, open or closed** — a closed bead is
+fetched, compared and updated on every cycle exactly like an open one:
 
 ```bash
-bd list --status all --json --limit 0 | jq '
-  [.[] | select(.status=="open")] |
-  {open: length,
-   structured: ([.[] | select(((.acceptance_criteria//"")!="") or
-                              ((.design//"")!="") or
-                              ((.notes//"")!=""))] | length)}'
-# { "open": 148, "structured": 48 }     # measured 2026-09-05
+bd list --status all --json --limit 0 | jq -c '
+  def structured: ((.acceptance_criteria//"")!="") or ((.design//"")!="") or ((.notes//"")!="");
+  [.[] | select(.issue_type=="epic" or .issue_type=="feature")] as $t |
+  {default_state_all: {total: ($t|length), structured: ([$t[]|select(structured)]|length)},
+   if_open_only:      {total:      ([$t[]|select(.status=="open")]|length),
+                       structured: ([$t[]|select(.status=="open" and structured)]|length)},
+   by_field: {acceptance_criteria: ([$t[]|select((.acceptance_criteria//"")!="")]|length),
+              design:              ([$t[]|select((.design//"")!="")]|length),
+              notes:               ([$t[]|select((.notes//"")!="")]|length)},
+   since_the_contract: {total:      ([$t[]|select(.created_at>"2026-08-15")]|length),
+                        structured: ([$t[]|select(.created_at>"2026-08-15" and structured)]|length),
+                        notes_only: ([$t[]|select(.created_at>"2026-08-15" and (.notes//"")!=""
+                                                 and (.acceptance_criteria//"")=="")]|length)}}'
+# measured 2026-09-05:
+# {"default_state_all":{"total":196,"structured":123},
+#  "if_open_only":{"total":39,"structured":12},
+#  "by_field":{"acceptance_criteria":103,"design":0,"notes":36},
+#  "since_the_contract":{"total":75,"structured":17,"notes_only":16}}
 ```
 
-Restricted to the tier the design actually pushes (`--type epic,feature --state open`): **12 of
-39**. Roughly a third, all of it legacy, and the share falls with every bead the current contract
-creates. So the skip **does** fire for most of anton's beads, from their second push onward, and
-never fires for that legacy third.
+**Under the documented default, roughly five of every eight pushed beads write on every cycle** —
+123 of 196. The open-only slice (12 of 39) is the flattering one and does not describe the default:
+157 of the 196 are closed, 111 of those carry a structured field, and nothing removes a closed bead
+from a `--state all` population.
+
+**The write tail also does not trend to zero**, for two independent reasons:
+
+- Closed beads never leave the default population, so their writes are permanent rather than
+  decaying. Closing a legacy bead does not retire its cost; it freezes it.
+- `notes` keeps minting new members of the writing set. Of the 75 epics+features created since
+  2026-08-15, well under the current contract, 17 carry a structured field — **16 of them
+  `notes`-only**, with exactly one `acceptance_criteria`. The contract killed the acceptance field;
+  it cannot keep `bd note` off a run target, and anton notes its own run targets.
+
+So the skip fires only for a bead that is description-only **and** has never been noted **and** has
+been pushed at least once — and the writing set converges to a floor, not to zero. The lever that
+actually shrinks it is the **Also include** control: *Open only* takes the population from 196 to 39
+and the per-cycle writes from 123 to 12. That is a design choice for the sync ticket, not a bd
+behaviour, and it is flagged rather than decided here.
 
 bd's regression test does not cover either defeat: `TestBatchPush_SkipsUnchangedIssue`
 (`internal/linear/tracker_test.go:80-137`) uses an empty local description, no structured fields and
 a remote with no marker — the one shape where both defeats are absent — and builds the `Tracker`
 directly, bypassing `formatPushIssue`.
 
-### What hazard 2's residue actually is: a read per bead, plus a legacy write tail
+### What hazard 2's residue actually is: a read per bead, plus a write tail that does not decay
 
 Per push, per Linear-linked bead:
 
@@ -179,22 +212,25 @@ Per push, per Linear-linked bead:
    the read cost is a floor that does not shrink.
 2. **A write, conditionally.** An `issueUpdate` mutation whenever the skip misses — reported back as
    `Updated: N`, and carrying an `external_ref` re-write with it (`tracker.go:496`). It misses once
-   per bead after its create (defeat 1), then permanently for the ~1-in-3 carrying a structured
-   field (defeat 2), and for any bead whose title / description / priority / status genuinely moved.
+   per bead after its create (defeat 1), then permanently for the ~5-in-8 of the default population
+   carrying a structured field (defeat 2), and for any bead whose title / description / priority /
+   status genuinely moved.
 3. **Genuine content change only sometimes.** When an update does fire on an otherwise unchanged
    bead it re-sends title, description, priority and `stateId` at their existing values, so whether
    a stakeholder sees a feed entry is Linear's change detection, not bd's. What *is* a real change:
    the first push after a create (marker removal), and `status` — it is in the compared set and
-   pushed as `stateId`, so a run flipping its target `open → in_progress → closed` is three genuine
-   transitions.
+   pushed as `stateId`, so a run flipping its target `open → in_progress → closed` visits three
+   statuses across **two** genuine transitions.
 
 A push triggered by every run-lease refresh (5 min, `RUN_LEASE_REFRESH_MS`) therefore costs **N
-reads plus roughly N/3 writes per cycle** on today's board, trending to N reads and no writes as the
-legacy beads close out — for a change Linear cannot even represent. The read floor alone makes the
+reads plus roughly 0.6N writes per cycle** on the default *Open and closed* population (123 writes
+against N=196 today) — for a change Linear cannot even represent. That tail does not decay: closed
+beads stay in the population forever and `bd note` keeps adding to it. Switching **Also include** to
+*Open only* is what moves the number (N=39, 12 writes), and the read floor alone still makes the
 debounce the only cap, not a nicety. And anton must not build the guarantee on bd's skip: a test
 asserting "an unchanged bead syncs nothing" has to assert it at anton's own seam (no push fired at
-all), because asserting it of bd holds only for description-only beads and only from their second
-push on.
+all), because asserting it of bd holds only for a never-noted description-only bead, and only from
+its second push on.
 
 ## 3. `--update-refs`: declared, never read, always on
 
@@ -373,21 +409,25 @@ func TestSkipDefeat_StructuredFields(t *testing.T) {
 
 ## What this changes downstream
 
-- **anton-60oi (reshape the contracts):** the epic → sub-issue shape is not available. Either accept
-  a flat push (tier lives in `--type` and in the Linear project, not in the issue tree), carry the
-  parent as a line in the pushed description, or route epics to Linear **projects** and features to
-  issues within them — the routing machinery the design already plans for `area:` is the only
-  hierarchy bd can express today.
+- **anton-60oi (reshape the contracts):** the epic → sub-issue shape is not available, and **neither
+  is the tier**: `--type` only selects which beads are pushed, so the payload (title, description,
+  priority, state, project id) carries nothing that separates an epic from a feature in Linear.
+  Either accept a flat, tier-less push and say so, carry the parent or tier as text in the pushed
+  title/description, or route epics to Linear **projects** and features to issues within them — the
+  routing machinery the design already plans for `area:` is the only hierarchy bd can express today,
+  and it groups by area, not by tier.
 - **anton-ey0w.5 (keep run-lease churn out of Linear):** no longer a code change to move the lease off
   labels — bd cannot leak a label. What remains is a **read per linked bead per push, unconditional**,
   plus a write tail: bd's unchanged-issue skip misses once per bead after its create, and misses
-  forever for the third of the board still carrying a structured `acceptance_criteria`/`design`/
-  `notes` field (§2 — 12 of 39 open epics+features on 2026-09-05). Description-only beads, the shape
-  the current contract writes, do skip from their second push on. So the debounce is still the only
-  cap — the read floor alone justifies it — but the ticket should size the cost as N reads + ~N/3
-  writes, not N writes, and it need not chase the legacy field off the board on this ticket's budget.
-  The "a lease-only change syncs nothing" test must still assert *no push fired* at anton's seam:
-  asserting that bd skips is true only for description-only beads, and only after their first push.
+  forever for any bead carrying a structured `acceptance_criteria`/`design`/`notes` field — **123 of
+  the 196 epics+features in the default `--state all` population** on 2026-09-05 (§2). Only a
+  never-noted, description-only bead skips from its second push on, and `bd note` keeps moving beads
+  out of that set. So the debounce is still the only cap — the read floor alone justifies it — but
+  the ticket should size the cost as N reads + ~0.6N writes on the documented default, note that the
+  tail does not decay (closed beads never leave a `--state all` population), and treat *Open only*
+  as the lever if the cost has to come down. The "a lease-only change syncs nothing" test must still
+  assert *no push fired* at anton's seam: asserting that bd skips is true only for a never-noted
+  description-only bead, and only after its first push.
   Still to decide: whether per-run `status` transitions should reach Linear at all.
 - **anton-ey0w.2 (wrapper + `external_ref` guard):** the guard cannot delegate to `--update-refs`; it
   must be a pre-push refusal while any bead still holds a `gh-<n>` ref. The wrapper's ref reader must
