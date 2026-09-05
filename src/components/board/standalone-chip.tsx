@@ -5,7 +5,11 @@ import { cn } from "@/lib/utils";
 import { TYPE_RAIL, isPickerPick } from "@/components/board/board-utils";
 import { ChipHeader, ChipMeta } from "@/components/board/standalone-chip-parts";
 import { ChipBacklogActions } from "@/components/board/standalone-chip-actions";
-import { PickDecisionProvider, useCardVeto } from "@/components/board/pick-decision";
+import {
+  PickDecisionProvider,
+  useCardVeto,
+  useUnrecordedPick,
+} from "@/components/board/pick-decision";
 import { useStandaloneApproval } from "@/components/board/use-standalone-approval";
 
 type StandaloneChipProps = {
@@ -37,8 +41,11 @@ type StandaloneChipProps = {
 export function StandaloneChip(props: StandaloneChipProps) {
   const cardVeto = useCardVeto();
   const { item } = props;
+  const recorded = isPickerPick(item.provenance);
+  // The vetoes follow the LIVE pick, recorded or not — same reasoning as the card (PR #226 review).
+  const unrecorded = useUnrecordedPick(item.id, recorded);
   const answerable =
-    cardVeto !== undefined && isPickerPick(item.provenance) && item.notNowUntil === undefined;
+    cardVeto !== undefined && (recorded || unrecorded) && item.notNowUntil === undefined;
   if (!answerable) return <ChipBody {...props} />;
   return (
     <PickDecisionProvider>

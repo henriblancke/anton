@@ -11,7 +11,7 @@ import { conflictBody, ownerOf, stealRefused } from "@/lib/beads/claim";
 import { approveAndClaim, unwindApproveClaim } from "@/lib/beads/approve-claim";
 import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
 import { isProposalBead } from "@/lib/gardener/detections";
-import { getBoardPickerPlan, isPlanStale, stampBoard } from "@/lib/board-picker-plan";
+import { agedOutPicks, getBoardPickerPlan, isPlanStale, stampBoard } from "@/lib/board-picker-plan";
 import { getDb } from "@/lib/db";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { systemClock } from "@/lib/jobs/queue";
@@ -112,8 +112,9 @@ async function readApprovalBody(request: Request): Promise<{
  * let the record claim the operator agreed with a decision they were never shown. So the server
  * re-derives the very predicate the `[Release]` button is drawn from (`board.ts` → `isPickerPick`):
  * the picker is armed AND at a level that offers its picks, the plan carries this target as an
- * entry, the board and policy have not moved past that plan, and the operator has not since vetoed
- * it. Anything else releases exactly as an
+ * entry, the board and policy have not moved past that plan — including the age bounds the plan's
+ * digest cannot hold, which a pick crosses on a whole-day boundary with nothing else moving
+ * (`agedOutPicks`) — and the operator has not since vetoed it. Anything else releases exactly as an
  * approve does and records nothing — the run is the operator's to have, the evidence is not.
  *
  * Judged against `board` — the pre-write snapshot this request already read — not a fresh one: the
@@ -176,7 +177,18 @@ async function reserveRelease(
     // Keyed on the plan id the entry above came from, so this asks whether THIS generation has been
     // vetoed — including the pick whose hold lapsed with no pass to rewrite the plan (isPlanStale).
     const declined = await declinedPicks(db, projectId, plan.planId);
-    if (isPlanStale(plan, stampBoard(board, Date.now(), policy), deferrals, declined)) {
+    // One clock read for both halves of the fence, so the stamp and the age bounds it cannot carry
+    // (`agedOutPicks`) are judged at the same instant the board read judges them at.
+    const now = Date.now();
+    if (
+      isPlanStale(
+        plan,
+        stampBoard(board, now, policy),
+        deferrals,
+        declined,
+        agedOutPicks(plan, board, policy, now),
+      )
+    ) {
       return skip("the plan that picked it is no longer the decision anton stands behind");
     }
     // The store settles a veto that landed while this request was in flight — the deferral read above

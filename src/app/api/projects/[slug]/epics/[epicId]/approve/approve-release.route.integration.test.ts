@@ -282,6 +282,24 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
     expect(await verdictsFor(unpicked)).toHaveLength(0);
   });
 
+  it("records nothing for an unnamed pick even when the generation named is the current one", async () => {
+    // The lane is DERIVED (anton-r0ew): it ranks targets the recorded plan has not caught up with,
+    // so a release can arrive naming the very generation on screen for a bead that generation never
+    // picked. Naming the right plan is not agreeing with a decision it contains — the accept is
+    // refused on the entry, not on the id (anton-5axf). The board withholds the button on the same
+    // fact; this is the half a client cannot be trusted for.
+    actAs("anton-test");
+    const picked = await runTarget("Named by the plan");
+    const derived = await runTarget("Ranked ahead of the plan");
+    const planId = await planFor(picked);
+
+    const res = await approve(derived, { release: true, planId });
+    expect(res.status).toBe(200);
+    expect(await executeEpicJobs(derived)).toHaveLength(1);
+
+    expect(await verdictsFor(derived)).toHaveLength(0);
+  });
+
   it("records nothing when the board has moved past the plan that picked the target", async () => {
     // The lane's own standard, held on the server: a stale plan withholds `[Release]`, so a release
     // that arrives against one came from a client whose copy of the decision is provably behind.
@@ -293,6 +311,40 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
     expect(await executeEpicJobs(epic)).toHaveLength(1);
 
     expect(await verdictsFor(epic)).toHaveLength(0);
+  });
+
+  it("records nothing for a pick the policy's age bounds have moved past", async () => {
+    // The decision input the plan's digest structurally cannot hold (PR #226 review): a pick crosses
+    // a whole-day age boundary while every hashed field sits still. The board withdraws `[Release]`
+    // for it there, and this route — reachable by a tab drawn before the crossing — has to agree, or
+    // the click starts and credits a run the current policy refuses.
+    actAs("anton-test");
+    const epic = await runTarget("Soaking pick");
+    const project = await projectId();
+    // A soak the target has not served: filed seconds ago, so it is inside `minAgeDays` — the same
+    // shape as a pick that ages out of `maxAgeDays`, and the one a fresh bead can actually reach.
+    const policy = { minAgeDays: 1 };
+    await getDb()
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ pickerAutonomy: "shadow", pickerPolicy: policy }) })
+      .where(eq(schema.projects.id, project));
+
+    try {
+      // Stamped WITH the policy, so the digest half of the fence matches exactly: age is the only
+      // thing left that can retire this plan.
+      await planFor(epic, stampBoard(await loadAllIssues(repo), Date.now(), policy));
+
+      expect((await approve(epic, { release: true })).status).toBe(200);
+      expect(await executeEpicJobs(epic)).toHaveLength(1);
+
+      expect(await verdictsFor(epic)).toHaveLength(0);
+    } finally {
+      // Shared suite db: leave the project unarmed for whatever runs next.
+      await getDb()
+        .update(schema.projects)
+        .set({ settingsJson: JSON.stringify({ pickerAutonomy: "shadow" }) })
+        .where(eq(schema.projects.id, project));
+    }
   });
 
   it("records nothing for a pick the operator has vetoed", async () => {

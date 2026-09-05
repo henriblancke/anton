@@ -129,3 +129,59 @@ describe("a forced read queued behind an in-flight one", () => {
     expect(result.current.board?.version).toBe("2:sync");
   });
 });
+
+/**
+ * The optimistic veto's effect on the lane (anton-w579 / PR #226 review).
+ *
+ * Vetoing is the interaction that most often empties Up Next, so it is the one that must not undo
+ * the named absence: the lane going silent on the click that emptied it reads as "anton has nothing
+ * to start" for a whole poll, which is the very reading the absence copy exists to prevent.
+ */
+describe("vetoing the last pick", () => {
+  const ranked = (...ids: string[]): Board => ({
+    ...board(),
+    upNext: ids.map((beadId, i) => ({
+      beadId,
+      rank: i + 1,
+      type: "feature" as const,
+      unblocks: 0,
+      createdAt: "2026-01-01T00:00:00Z",
+    })),
+    upNextPlanId: "plan-1",
+  });
+
+  it("keeps the lane, naming the emptiness the veto just created", () => {
+    const seed = ranked("anton-1");
+    const { result } = renderHook(() => useBoardPoll("tmp", seed), { wrapper: strict });
+
+    act(() => result.current.vetoBead("anton-1", 2_000_000_000_000));
+
+    expect(result.current.board?.upNext).toBeUndefined();
+    expect(result.current.board?.upNextAbsence).toBe("no-claimable-work");
+    // No lane, no generation to answer against — the server's own contract for an absent lane.
+    expect(result.current.board?.upNextPlanId).toBeUndefined();
+  });
+
+  it("leaves the lane and its generation alone while picks remain", () => {
+    const seed = ranked("anton-1", "anton-2");
+    const { result } = renderHook(() => useBoardPoll("tmp", seed), { wrapper: strict });
+
+    act(() => result.current.vetoBead("anton-1", 2_000_000_000_000));
+
+    expect(result.current.board?.upNext?.map((e) => e.beadId)).toEqual(["anton-2"]);
+    expect(result.current.board?.upNextAbsence).toBeUndefined();
+    expect(result.current.board?.upNextPlanId).toBe("plan-1");
+  });
+
+  it("does not invent a lane for a board that never had one", () => {
+    // A disarmed pass draws no lane, and vetoing a Backlog card from its own row must not rewrite
+    // that into "nothing claimable" — a different absence with a different clearing condition.
+    const seed: Board = { ...board(), upNextAbsence: "disarmed" };
+    const { result } = renderHook(() => useBoardPoll("tmp", seed), { wrapper: strict });
+
+    act(() => result.current.vetoBead("anton-1", 2_000_000_000_000));
+
+    expect(result.current.board?.upNextAbsence).toBe("disarmed");
+    expect(result.current.board?.upNext).toBeUndefined();
+  });
+});

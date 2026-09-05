@@ -8,6 +8,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { makeTestDb, type TestDb } from "./db/testing";
 import * as schema from "./db/schema";
 import {
+  agedOutPicks,
   getBoardPickerPlan,
   isPlanStale,
   saveBoardPickerPlan,
@@ -308,6 +309,70 @@ describe("staleness", () => {
       expect(isPlanStale(plan, current, new Map(), new Set())).toBe(false);
       expect(isPlanStale(plan, current)).toBe(false);
     });
+  });
+
+  /**
+   * The fourth input, and the one `digestLine` structurally cannot hold (PR #226 review): age moves
+   * with the clock, so a pick crosses a policy's whole-day bound while every hashed field sits still.
+   * Without this the derived lane would have dropped the target while the card kept a non-stale
+   * `◈ policy` badge — and the `[Release]` derived from it would start, and record an accept for,
+   * work the current policy refuses.
+   */
+  describe("picks the policy's age bounds have moved past", () => {
+    const current = stampBoard([bead()], OBSERVED + 1);
+
+    it("retires the generation once one of its picks ages out", () => {
+      expect(isPlanStale(plan, current, new Map(), new Set(), new Set(["anton-a"]))).toBe(true);
+    });
+
+    it("ignores an aged-out bead this plan does not pick", () => {
+      expect(isPlanStale(plan, current, new Map(), new Set(), new Set(["anton-z"]))).toBe(false);
+      expect(isPlanStale(plan, current, new Map(), new Set(), new Set())).toBe(false);
+    });
+  });
+});
+
+/**
+ * The age re-judgement itself: whole days since the bead was filed, against the bounds in force NOW.
+ * Shared with the editor's own explanation (`policy/age.ts`), so a card can never be listed as
+ * matching by one rounding of "a day" and released under another.
+ */
+describe("agedOutPicks", () => {
+  const FILED = "2026-08-01T00:00:00Z";
+  const filedAt = Date.parse(FILED);
+  const board = [bead({ created_at: FILED })];
+  const plan = {
+    projectId: "p1",
+    planId: "plan-1",
+    generatedAt: Math.floor(NOW / 1000),
+    stamp: stampBoard(board, OBSERVED),
+    entries: [entry()],
+    exclusions: [],
+  };
+  const at = (days: number) => filedAt + days * 86_400_000;
+
+  it("names nothing when the policy asserts no age bound", () => {
+    expect(agedOutPicks(plan, board, { types: ["feature"] }, at(400))).toEqual(new Set());
+    expect(agedOutPicks(plan, board, undefined, at(400))).toEqual(new Set());
+  });
+
+  it("holds still while the pick is inside the ceiling", () => {
+    // Day 30 exactly: `maxAgeDays` admits up to and including its own bound.
+    expect(agedOutPicks(plan, board, { maxAgeDays: 30 }, at(30))).toEqual(new Set());
+  });
+
+  it("names the pick the moment it crosses the ceiling, with nothing else moved", () => {
+    expect(agedOutPicks(plan, board, { maxAgeDays: 30 }, at(31))).toEqual(new Set(["anton-a"]));
+  });
+
+  it("names a pick that fell back inside a soak the operator lengthened", () => {
+    // Only reachable by widening `minAgeDays`, which moves the policy digest too — but the fence
+    // must not depend on the other half firing first.
+    expect(agedOutPicks(plan, board, { minAgeDays: 10 }, at(3))).toEqual(new Set(["anton-a"]));
+  });
+
+  it("skips an entry whose bead has left the board — the digest is the stronger verdict there", () => {
+    expect(agedOutPicks(plan, [], { maxAgeDays: 30 }, at(400))).toEqual(new Set());
   });
 });
 

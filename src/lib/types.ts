@@ -360,6 +360,27 @@ export interface UpNextEntry {
   createdAt: string;
 }
 
+/**
+ * Why there is no ranking to draw, when the reason is one the operator can act on (anton-w579).
+ *
+ * Distinct nothings, and the lane must say which — "no plan" and "the pass is off" and "the board is
+ * empty of claimable work" ask for different things from the person reading it.
+ *
+ *   • `disarmed` — the `board-picker` schedule is off here, so no pass ranks anything.
+ *   • `proposes-only` — the pass runs and records a ranking, but the level promises nothing offered.
+ *   • `no-claimable-work` — the pass ran against this board and found nothing it may start.
+ *   • `policy-unreadable` — the settings read failed, so the armed policy is UNKNOWN and the board
+ *     refuses to rank as if none were armed (PR #226 review). The one absence that is about anton
+ *     rather than about the operator's board, and it is still named: a lane that ranked everything
+ *     structurally eligible would present targets the configured policy rejects as what anton would
+ *     start next.
+ */
+export type UpNextAbsence =
+  | "disarmed"
+  | "proposes-only"
+  | "no-claimable-work"
+  | "policy-unreadable";
+
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors
  * SyncStatus there — kept as a separate declaration so client components import types without the
  * server-only bd module. */
@@ -428,22 +449,35 @@ export interface Board {
    */
   operatorQueue: OperatorQueueItem[];
   /**
-   * The board-picker's recorded plan, ranked (anton-t9m4 / R3.1–R3.4) — the Up Next lane's whole
-   * input. The lane resolves each entry against the BACKLOG column and takes those cards out of it,
-   * so a bead never renders twice.
+   * What anton would start next, ranked (anton-t9m4 / R3.1–R3.4) — the Up Next lane's whole input,
+   * derived from THIS board read (anton-r0ew) rather than from the plan a pass wrote down. The lane
+   * resolves each entry against the BACKLOG column and takes those cards out of it, so a bead never
+   * renders twice.
    *
-   * ABSENT, never empty, whenever there is no projection to show: the picker is disarmed for this
-   * project, or it has never run here. An empty lane titled "Up Next" would read as "anton has
+   * ABSENT, never empty, whenever there is no ranking to show: the picker is disarmed for this
+   * project, or its level offers nothing. An empty lane titled "Up Next" would read as "anton has
    * nothing to start" on a board where the pass simply isn't running.
    */
   upNext?: UpNextEntry[];
   /**
-   * The GENERATION of the plan {@link upNext} was projected from — carried so a verdict can name the
-   * decision the operator actually looked at (PR #212 review). A veto posted from a tab a later pass
-   * has overtaken sends this id, and the server records no pick rather than one the operator was
-   * never shown. Absent exactly when the lane is.
+   * The recorded GENERATION a verdict on {@link upNext} is answered against — carried so a veto or a
+   * release names the decision anton has written down (PR #212 review). A veto posted from a tab a
+   * later pass has overtaken sends this id, and the server records no pick rather than one the
+   * operator was never shown.
+   *
+   * Absent while the lane has outrun that record — no pass has run here yet, or the board has moved
+   * past the one it wrote — because the ranking on screen is live and the ledger is not. The lane is
+   * still drawn: a verdict then records no pick rather than binding to a decision that is history.
    */
   upNextPlanId?: string;
+  /**
+   * WHICH absence it is, when {@link upNext} is missing for a reason the operator can clear
+   * (anton-w579). Absent alongside a lane that IS drawn, and absent for the one withheld state
+   * nothing on this screen clears — a plan the board has moved past, which the next pass fixes on
+   * its own. The lane keeps its column for a named absence: "Up Next" over nothing reads as "anton
+   * has nothing to start", but so does an empty space where the lane was.
+   */
+  upNextAbsence?: UpNextAbsence;
   /** Sync health for this project's beads workspace. */
   sync: SyncStatusView;
   /**

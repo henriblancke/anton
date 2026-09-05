@@ -10,6 +10,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 
 import { STAGES, type Board, type Epic, type StandaloneItem, type Stage } from "@/lib/types";
 import { makeEpicRow } from "@/components/board/epic.fixture";
+import { boardGroupingCookieName } from "@/lib/board-grouping";
+import { UP_NEXT_LABEL } from "@/components/board/board-utils";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), message: vi.fn() } }));
 
@@ -149,6 +151,14 @@ function picked(): Board {
   };
 }
 
+/**
+ * The same live ranking with NO recorded plan behind its picks — the ordinary state since the lane
+ * went derived (anton-r0ew): anton would start these next, and no pass has written that down yet.
+ */
+function unrecorded(): Board {
+  return { ...fixture(), upNext: picked().upNext, upNextPlanId: PLAN_ID };
+}
+
 /** The EpicCard root for a card — the element wrapping its full-card deep link. */
 function cardMarkup(cardId: string): string {
   const link = document.querySelector(`a[href="/projects/tmp/epics/${cardId}"]`);
@@ -167,7 +177,11 @@ function pressed(label: Grouping): boolean {
 }
 
 beforeEach(() => {
-  window.localStorage.clear();
+  // The preference is a cookie, so the server can render the chosen grouping itself (anton-wds3).
+  // Cleared between cases or a toggle in one suite decides the next one's first paint.
+  for (const slug of ["tmp", "other"]) {
+    document.cookie = `${boardGroupingCookieName(slug)}=; path=/; max-age=0`;
+  }
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => new Response(null, { status: 304 })) as unknown as typeof fetch,
@@ -243,6 +257,47 @@ describe("board grouping (anton-9pkk.4)", () => {
     expect(screen.getAllByRole("button", { name: "Never" })).toHaveLength(2);
   });
 
+  it("withholds an unrecorded pick's start here too, so the grouping toggle is no way around it", () => {
+    // The lane ranks live (anton-r0ew), so it draws picks no recorded plan names, and their start is
+    // withheld because the accept has nothing to answer (anton-5axf). The swimlanes have no lane row
+    // to carry that, so before this the toggle handed the start back — a click away from the very
+    // unevidenced start the guard exists to prevent (PR #226 review).
+    const board = unrecorded();
+    board.columns.backlog = [
+      ...board.columns.backlog,
+      epic("anton-9", { title: "Nothing ranks this", epic: OUTCOME }),
+    ];
+    render(<EpicBoard slug="tmp" initialBoard={board} />);
+
+    const withheld = () => screen.getAllByText(/anton confirms next pass/i).length;
+    expect(withheld()).toBe(2);
+
+    toggleTo("Epic");
+
+    // Both picks — the card and the chip — still say what they wait for, and neither offers a start.
+    expect(withheld()).toBe(2);
+    expect(screen.queryAllByRole("button", { name: /release/i })).toHaveLength(0);
+    // The backlog card the ranking never named is untouched: an ordinary Approve is nobody's
+    // agreement with anton, so nothing about it is waiting on a pass.
+    expect(screen.getAllByRole("button", { name: /^approve/i })).toHaveLength(1);
+  });
+
+  it("keeps both vetoes on an unrecorded pick — the toggle takes the start, not the refusal", () => {
+    render(<EpicBoard slug="tmp" initialBoard={unrecorded()} />);
+
+    // The lane offers both on exactly these rows, and the swimlanes have to match: what the missing
+    // record withholds is the START, which needs a generation to file its accept against. A veto
+    // needs none — it records its decline against no pick and defers the target all the same — so
+    // dropping it here would make the toggle the thing that takes away the only way to say no
+    // (PR #226 review).
+    expect(screen.getAllByRole("button", { name: /not now/i })).toHaveLength(2);
+
+    toggleTo("Epic");
+
+    expect(screen.getAllByRole("button", { name: /not now/i })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Never" })).toHaveLength(2);
+  });
+
   it("names the generation on screen, so the decline answers the pick that was shown", async () => {
     const until = Date.now() + 24 * 60 * 60 * 1000;
     const fetchMock = vi.fn(async (input: RequestInfo | URL) =>
@@ -300,6 +355,19 @@ describe("board grouping (anton-9pkk.4)", () => {
           .map((b) => b.hasAttribute("disabled")),
       ).toEqual([true, false]),
     );
+  });
+
+  it("opens on the grouping the server read, with no lane to un-paint (anton-wds3)", () => {
+    // The page reads the cookie and hands the board the SAME value the hook's server snapshot
+    // serves, so the first paint is already the swimlanes. Before this, every load of an
+    // Epic-grouped board painted stage columns with the Up Next lane and dropped both on mount.
+    document.cookie = `${boardGroupingCookieName("tmp")}=epic; path=/`;
+
+    render(<EpicBoard slug="tmp" initialBoard={picked()} initialGrouping="epic" />);
+
+    expect(pressed("Epic")).toBe(true);
+    expect(screen.getByRole("region", { name: `Epic ${OUTCOME.title}` })).toBeTruthy();
+    expect(screen.queryByLabelText(UP_NEXT_LABEL)).toBeNull();
   });
 
   it("remembers the grouping per project", () => {

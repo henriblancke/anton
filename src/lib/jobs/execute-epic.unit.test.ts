@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { LABELS, type Bead, type BeadDep, type Gate } from "../beads/bd";
+import { latestBlockNoteCommit } from "../beads/block-note";
 import { formatHumanNote, parseTicketNotes } from "../beads/notes";
 import {
   blockedTailReason,
@@ -18,6 +19,8 @@ import {
 import { splitFormulaPhases } from "./execute-epic-formula";
 import {
   deliveredTickets,
+  humanHeldPoison,
+  humanHeldTickets,
   inactiveAgentTickets,
   orderTickets,
   reopenAbsorbedTimeouts,
@@ -42,11 +45,9 @@ import {
 } from "./execute-epic-human-gate";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage } from "./execute-epic-review";
-import {
-  claudeResumeDecision,
-  continuationPrompt,
-} from "./execute-epic-ticket-claude";
-import { ticketBlockNote } from "./execute-epic-ticket-settle";
+import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
+import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
+import { ticketBlockNote, timedOutTicketNote } from "./execute-epic-ticket-settle";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
 import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
@@ -190,6 +191,401 @@ describe("inactiveAgentTickets", () => {
       { id: "t-1", agent: "docker" },
       { id: "t-2", agent: "alembic" },
     ]);
+  });
+});
+
+/**
+ * anton-fude: a child ticket in a status bd refuses `--claim` on is one NO run can dispatch — and
+ * the state that puts one there is anton's own no-delivery block. Every resume then re-derived the
+ * same child set and walked that ticket into runTicket's hard claim gate, which reported a foreign
+ * claim or a locked Dolt DB. What the board gate has to answer is: which tickets, and what does the
+ * operator do about each.
+ */
+describe("humanHeldTickets — the children only a person can release (anton-fude)", () => {
+  const held = (id: string, status: string, notes?: string): Bead =>
+    ({ id, title: id, status, ...(notes ? { notes } : {}) }) as Bead;
+
+  it("reports a blocked child with the note the run left on it", () => {
+    const note = "anton: run made no changes (clean agent exit, zero diff) — nothing was delivered.";
+    expect(humanHeldTickets([held("anton-od4", "blocked", note)])).toEqual([
+      { id: "anton-od4", status: "blocked", note },
+    ]);
+  });
+
+  it("reports a deferred child the same way — bd refuses that claim too", () => {
+    expect(humanHeldTickets([held("anton-od4", "deferred")])).toEqual([
+      { id: "anton-od4", status: "deferred" },
+    ]);
+  });
+
+  it("leaves the statuses a run settles for itself to the loop", () => {
+    // `open` is the only status bd claims; `closed` is skipped or reopened by the dispatch loop, and
+    // `in_progress` is an ownership question runTicket's own claim gate answers.
+    expect(
+      humanHeldTickets([
+        held("t-1", "open"),
+        held("t-2", "closed"),
+        held("t-3", "in_progress"),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("never reports an abandoned ticket — a human already settled it and the run drops it", () => {
+    const abandoned = { ...held("t-1", "blocked"), labels: [LABELS.abandoned] } as Bead;
+    expect(humanHeldTickets([abandoned])).toEqual([]);
+  });
+
+  it("carries anton's NEWEST note, not a human's steer and not a stale earlier verdict", () => {
+    // Machine notes live one per line in the blob (beads/notes.ts), newest last; a human's steer is
+    // written to the agent, so the operator reading this park is owed anton's own account instead.
+    const notes = [
+      "anton: skipped behind a timeout",
+      formatHumanNote("try the other helper", "Henri Blancke", new Date(0)),
+      "anton: blocked for review — zero diff",
+    ].join("\n");
+    expect(humanHeldTickets([held("t-1", "blocked", notes)])[0].note).toBe(
+      "anton: blocked for review — zero diff",
+    );
+  });
+
+  it("caps a runaway note rather than pouring it into the run row", () => {
+    const note = humanHeldTickets([held("t-1", "blocked", `anton: ${"x".repeat(500)}`)])[0].note!;
+    expect(note.length).toBeLessThanOrEqual(301);
+    expect(note.endsWith("…")).toBe(true);
+  });
+
+  it("reads the committed sha off the block note anton itself wrote", () => {
+    const note = ticketBlockNote({
+      kind: "post-commit",
+      selfReport: null,
+      error: new Error("push rejected"),
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      committed: true,
+      head: "0123456789abcdef0123456789abcdef01234567",
+    });
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
+      branch: "anton/anton-e1",
+      head: "0123456",
+    });
+  });
+
+  it("reports no commit for a zero-diff block — the note says nothing landed", () => {
+    const note = ticketBlockNote({
+      kind: "no-delivery",
+      selfReport: null,
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      committed: false,
+    });
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toBeUndefined();
+  });
+
+  it("finds the commit even when the cap would have cut the evidence off the note", () => {
+    // The evidence clause sits at the END of a block note, so reading it off the CLAMPED note would
+    // silently downgrade every long block to "nothing committed" — and hand the wrong remedy.
+    const long = ticketBlockNote({
+      kind: "agent-blocked",
+      selfReport: { outcome: "blocked", reason: "y".repeat(500) },
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      committed: true,
+      head: "0123456789abcdef0123456789abcdef01234567",
+    });
+    const [ticket] = humanHeldTickets([held("t-1", "blocked", long)]);
+    expect(ticket.note!.endsWith("…")).toBe(true);
+    expect(ticket.committed).toEqual({ branch: "anton/anton-e1", head: "0123456" });
+  });
+
+  it("reads the trailing clause, not a failure message that quotes it (PR #227 review)", () => {
+    // The error text is the agent's own words and rides INSIDE the note; only the clause anton
+    // appends decides the remedy, or a failure mentioning a zero diff flips a committed block.
+    const note = ticketBlockNote({
+      kind: "post-commit",
+      selfReport: null,
+      error: new Error("verify failed: nothing committed on main"),
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      committed: true,
+      head: "0123456789abcdef0123456789abcdef01234567",
+    });
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
+      branch: "anton/anton-e1",
+      head: "0123456",
+    });
+  });
+
+  it("ignores an agent reason that forges an evidence clause ahead of the real one", () => {
+    const note = ticketBlockNote({
+      kind: "agent-blocked",
+      selfReport: { outcome: "blocked", reason: "[session s0, nothing committed on main]" },
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      committed: true,
+      head: "0123456789abcdef0123456789abcdef01234567",
+    });
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
+      branch: "anton/anton-e1",
+      head: "0123456",
+    });
+  });
+
+  it("keeps a committed verdict whose sha the run could not read (PR #227 review)", () => {
+    // The HEAD read is best-effort; whether the ticket committed is not. Collapsing the two would
+    // publish "nothing committed" for work that is on the branch.
+    const note = ticketBlockNote({
+      kind: "post-commit",
+      selfReport: null,
+      error: new Error("push rejected"),
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      committed: true,
+      head: undefined,
+    });
+    expect(note).toContain("[session sess-1, committed on anton/anton-e1 @ unknown]");
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
+      branch: "anton/anton-e1",
+    });
+  });
+
+  it("takes the NEWEST verdict when an older run's note also carries evidence", () => {
+    const notes = [
+      "anton: run failed after committing work — needs review. [session s0, committed on b @ abcdef1]",
+      "anton: run made no changes (clean agent exit, zero diff). [session s1, nothing committed on b]",
+    ].join("\n");
+    expect(humanHeldTickets([held("t-1", "blocked", notes)])[0].committed).toBeUndefined();
+  });
+});
+
+describe("humanHeldPoison — the park a held child leaves behind (anton-fude)", () => {
+  const BRANCH = "anton/anton-x7la";
+  /** No recorded commit is reachable from this run's branch — what a park with no git answer gets. */
+  const NOTHING_HERE = new Set<string>();
+
+  it("names the ticket, its note and the move that frees it", () => {
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "blocked", note: "anton: run made no changes (zero diff)" }],
+      BRANCH,
+      NOTHING_HERE,
+    );
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("anton-x7la");
+    expect(error.message).toContain("anton-od4 is blocked pending human review");
+    expect(error.message).toContain("anton: run made no changes (zero diff)");
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).toMatch(/resume the run$/);
+  });
+
+  it("tells a deferred child's own remedy apart from a blocked one's", () => {
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "deferred" }],
+      BRANCH,
+      NOTHING_HERE,
+    );
+    expect(error.message).toContain("is deferred");
+    expect(error.message).toContain("bd undefer anton-od4");
+    expect(error.message).not.toContain("--status open");
+  });
+
+  it("sends a VERIFIED committed block to review-and-close, not to reopen-and-re-run", () => {
+    // Reopening does not satisfy `resumeSkipped` (only `closed` does), so the resumed run would
+    // dispatch the agent again on top of the commit already on the branch — straight back to the
+    // zero diff that blocked it. Closing is the move that actually lets the run walk past it.
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "blocked", committed: { branch: BRANCH, head: "0123456" } }],
+      BRANCH,
+      new Set(["anton-od4"]),
+    );
+    expect(error.message).toContain("ALREADY COMMITTED");
+    expect(error.message).toContain("@ 0123456");
+    expect(error.message).toContain("bd close anton-od4");
+    expect(error.message).toContain("stays in this run's pull request");
+    expect(error.message).not.toContain("drops the work from this run");
+  });
+
+  it("refuses the close remedy for a commit on ANOTHER branch (PR #227 review)", () => {
+    // A re-parented ticket keeps the note its ORIGINAL run wrote, naming that run's branch. Its
+    // commit is in no pull request this target opens, so "review and close" would settle the board
+    // over work this run never ships — and the abandon hint must not promise the commit rides along.
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [
+        {
+          id: "anton-od4",
+          status: "blocked",
+          committed: { branch: "anton/anton-fude", head: "0123456" },
+        },
+      ],
+      BRANCH,
+      NOTHING_HERE,
+    );
+    expect(error.message).toContain("committed on anton/anton-fude (@ 0123456)");
+    expect(error.message).toContain("NOT on this run's branch");
+    expect(error.message).toContain(BRANCH);
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toContain("ALREADY COMMITTED");
+    expect(error.message).not.toContain("bd close");
+    expect(error.message).toContain("drops the work from this run");
+  });
+
+  it("refuses the close remedy when the commit is not on THIS machine's branch (PR #227 review)", () => {
+    // anton's branch names are deterministic per target, so a run resumed on another machine derives
+    // the SAME name over a checkout that lacks the commit — the original machine committed and
+    // parked before pushing. Offering "abandon it, the commit stays in the PR" there drops the work:
+    // partitionTickets discards the abandoned ticket and an incomplete pull request proceeds.
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "blocked", committed: { branch: BRANCH, head: "0123456" } }],
+      BRANCH,
+      NOTHING_HERE,
+    );
+    expect(error.message).toContain("@ 0123456");
+    expect(error.message).toContain(`NOT on this machine's ${BRANCH}`);
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toContain("ALREADY COMMITTED");
+    expect(error.message).not.toContain("bd close");
+    expect(error.message).toContain("drops the work from this run");
+  });
+
+  it("neither closes nor redoes a commit whose sha was never recorded (PR #227 review)", () => {
+    // The run that blocked this ticket committed, then failed to read HEAD. Both settled remedies
+    // are wrong on the wrong guess — closing may settle the board over work in no pull request,
+    // reopening may redo work already on the branch — so the operator is sent to git to decide.
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "blocked", committed: { branch: BRANCH } }],
+      BRANCH,
+      NOTHING_HERE,
+    );
+    expect(error.message).toContain("its work WAS committed on");
+    expect(error.message).toContain("could not read the commit's sha");
+    expect(error.message).toContain(`git log --oneline ${BRANCH} | grep anton-od4`);
+    expect(error.message).toContain("bd close anton-od4");
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toContain("ALREADY COMMITTED");
+    // Unverified is not "here": the abandon hint must not promise the commit rides along.
+    expect(error.message).toContain("drops the work from this run");
+  });
+
+  it("keeps the reopen remedy for a block that committed nothing", () => {
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "blocked" }],
+      BRANCH,
+      NOTHING_HERE,
+    );
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toContain("bd close");
+    expect(error.message).toContain("drops the work from this run");
+  });
+
+  it("names WHICH commits survive an abandon when the held set is mixed (PR #227 review)", () => {
+    // One ticket's work is on this branch, the other's is on another machine's. An unqualified "a
+    // commit already on the branch stays in the pull request" reads as covering both, so an operator
+    // abandoning the pair would drop the work this checkout does not have.
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [
+        { id: "anton-od4", status: "blocked", committed: { branch: BRANCH, head: "0123456" } },
+        { id: "anton-9zz", status: "blocked", committed: { branch: BRANCH, head: "89abcde" } },
+      ],
+      BRANCH,
+      new Set(["anton-od4"]),
+    );
+    expect(error.message).toContain("only the commit already on this branch (anton-od4)");
+    expect(error.message).toContain("abandoning the rest drops that work from this run");
+  });
+
+  it("names every held ticket, not just the first", () => {
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [
+        { id: "anton-od4", status: "blocked" },
+        { id: "anton-9zz", status: "deferred" },
+      ],
+      BRANCH,
+      NOTHING_HERE,
+    );
+    expect(error.message).toContain("2 tickets");
+    expect(error.message).toContain("anton-od4");
+    expect(error.message).toContain("anton-9zz");
+  });
+});
+
+/**
+ * anton-fude: runTicket's claim gate used to give one answer — a foreign operator, or a locked DB —
+ * to every refusal, including the one it could not possibly be: a status bd will never accept.
+ */
+describe("ticketClaimFailure — why the ticket claim gate refused (anton-fude)", () => {
+  const bdRefusal = (stderr: string) =>
+    Object.assign(new Error(`Command failed: bd update t-1 --claim\n${stderr}`), { stderr });
+
+  it("parks on a status refusal, naming the status rather than a foreign claim or a locked DB", () => {
+    const error = ticketClaimFailure(
+      "anton-od4",
+      "alice",
+      bdRefusal("Error claiming anton-od4: issue not claimable: status blocked"),
+    );
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain('status is "blocked"');
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toMatch(/already claimed by another operator|beads DB is locked/);
+    // bd's own words survive into the park, so the operator sees what it actually said.
+    expect(error.message).toContain("issue not claimable: status blocked");
+  });
+
+  it("keeps the retryable answer for a foreign claim — an owner can still release it", () => {
+    const error = ticketClaimFailure(
+      "anton-od4",
+      "alice",
+      bdRefusal("Error claiming anton-od4: issue already claimed by bob"),
+    );
+
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("already claimed by another operator, or the beads DB is locked");
+    expect(error.message).toContain("alice");
+  });
+
+  it("keeps it retryable for a FOREIGN in_progress claim — the holder can still release it", () => {
+    // bd words somebody else's live claim as a status refusal too (`not claimable: status
+    // in_progress`), but it is an ownership conflict, not a decision written to the board: poisoning
+    // it would park the whole run permanently over a sibling run's ticket that clears on its own.
+    const error = ticketClaimFailure(
+      "anton-od4",
+      "alice",
+      bdRefusal("Error claiming anton-od4: issue not claimable: status in_progress"),
+    );
+
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("already claimed by another operator, or the beads DB is locked");
+  });
+
+  it("keeps it retryable when the ticket CLOSED under the run's snapshot", () => {
+    // PR #227 review: another actor closing the ticket between the board read and this claim is a
+    // stale snapshot, not a held status. A retry refreshes the board and the dispatch loop's own
+    // closed-ticket handling takes over — skipping a commit already on the branch, or reopening the
+    // bead to regenerate work this branch lacks. Poisoning it would ask a person to reopen a ticket
+    // anton reopens by itself.
+    const error = ticketClaimFailure(
+      "anton-od4",
+      "alice",
+      bdRefusal("Error claiming anton-od4: issue not claimable: status closed"),
+    );
+
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("closed after this run read the board");
+    expect(error.message).not.toMatch(/beads DB is locked/);
+  });
+
+  it("keeps it for a wedged DB too — the state a later attempt may find changed", () => {
+    const error = ticketClaimFailure("anton-od4", undefined, bdRefusal("Error 1105: database is locked"));
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("this operator");
   });
 });
 
@@ -839,6 +1235,7 @@ describe("ticketBlockNote (anton-vqql)", () => {
       selfReport: { outcome: "blocked", reason: "the migration this depends on does not exist yet" },
       sessionId: "sess-1",
       branch: "anton/anton-e1",
+      committed: true,
       head: HEAD,
       ...over,
     });
@@ -857,12 +1254,12 @@ describe("ticketBlockNote (anton-vqql)", () => {
   });
 
   it("says nothing was committed when the tree was empty", () => {
-    const out = note({ kind: "no-delivery", selfReport: null, head: undefined });
+    const out = note({ kind: "no-delivery", selfReport: null, committed: false, head: undefined });
     expect(out).toContain("[session sess-1, nothing committed on anton/anton-e1]");
   });
 
   it("reads a `delivered` claim on an empty tree as the false success it is", () => {
-    const out = note({ kind: "no-delivery", selfReport: { outcome: "delivered" }, head: undefined });
+    const out = note({ kind: "no-delivery", selfReport: { outcome: "delivered" }, committed: false, head: undefined });
     expect(out).toContain("run made no changes");
     expect(out).toContain("self-reported ANTON-RESULT: delivered — a false success on an unchanged tree");
   });
@@ -871,6 +1268,7 @@ describe("ticketBlockNote (anton-vqql)", () => {
     const out = note({
       kind: "no-delivery",
       selfReport: { outcome: "blocked", reason: "the acceptance criteria contradict each other" },
+      committed: false,
       head: undefined,
     });
     expect(out).toContain("the acceptance criteria contradict each other");
@@ -890,7 +1288,7 @@ describe("ticketBlockNote (anton-vqql)", () => {
       note({ selfReport: null }),
       note({ selfReport: { outcome: "blocked" } }),
       note({ selfReport: { outcome: "blocked", reason: "   " } }),
-      note({ kind: "no-delivery", selfReport: { outcome: "blocked", reason: "   " }, head: undefined }),
+      note({ kind: "no-delivery", selfReport: { outcome: "blocked", reason: "   " }, committed: false, head: undefined }),
       note({ kind: "post-commit", selfReport: null, error: undefined }),
     ]) {
       expect(out).not.toContain('""');
@@ -935,6 +1333,60 @@ describe("ticketBlockNote (anton-vqql)", () => {
     expect(entries[0]).toMatchObject({ source: "human", author: "Henri" });
     expect(entries[1]).toMatchObject({ source: "system", author: "anton" });
     expect(entries[1]!.text).toContain("the migration this depends on does not exist yet");
+  });
+});
+
+/**
+ * PR #227 review: a timeout the run ABSORBS leaves the ticket blocked, and the next run's park gate
+ * reads its note to choose a remedy. Without the shared evidence clause a committed timeout reads as
+ * "no commit" and gets told to reopen and redo work that is already on the branch.
+ */
+describe("timedOutTicketNote (anton-t1mo)", () => {
+  const HEAD = "0123456789abcdef0123456789abcdef01234567";
+  const timedOut = (over: Partial<Parameters<typeof timedOutTicketNote>[0]> = {}) =>
+    timedOutTicketNote({
+      timeoutMs: 30 * 60_000,
+      committed: true,
+      leftovers: false,
+      worktreePath: "/tmp/wt",
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      head: HEAD,
+      ...over,
+    });
+
+  it("records a committed timeout in the grammar the park gate reads", () => {
+    const out = timedOut();
+    expect(out).toContain("outlived its budget");
+    expect(out).toContain("Its work IS committed on the branch");
+    expect(out).toContain("[session sess-1, committed on anton/anton-e1 @ 0123456]");
+    expect(latestBlockNoteCommit([out])).toEqual({
+      committed: true,
+      branch: "anton/anton-e1",
+      head: "0123456",
+    });
+  });
+
+  it("keeps a committed timeout committed when the HEAD read failed (PR #227 review)", () => {
+    // `readWorktreeState` can fail on a tree that is momentarily unreadable. The sha is lost; the
+    // fact that this ticket's work is on the branch is not, and the park gate turns on it.
+    const out = timedOut({ head: undefined });
+    expect(out).toContain("Its work IS committed on the branch");
+    expect(out).toContain("[session sess-1, committed on anton/anton-e1 @ unknown]");
+    expect(latestBlockNoteCommit([out])).toEqual({ committed: true, branch: "anton/anton-e1" });
+  });
+
+  it("records a rolled-back timeout as the zero-diff block it is", () => {
+    const out = timedOut({ committed: false, head: undefined });
+    expect(out).toContain("rolled back");
+    expect(latestBlockNoteCommit([out])).toEqual({ committed: false, branch: "anton/anton-e1" });
+  });
+
+  it("still points at the worktree when the rollback failed — as ONE machine note", () => {
+    const out = timedOut({ committed: false, leftovers: true, head: undefined });
+    expect(out).toContain("/tmp/wt");
+    expect(out).not.toContain("\n");
+    expect(parseTicketNotes(out)).toHaveLength(1);
   });
 });
 
