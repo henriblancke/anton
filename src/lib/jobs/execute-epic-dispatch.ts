@@ -10,6 +10,7 @@
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { claimGuard } from "../beads/claim";
 import { contractGaps, formatContractGaps } from "../beads/contract";
+import { appendSessionLog } from "../sessions";
 import { resumeSkipped } from "../ticket-view";
 import { worktreeHasCommitFor } from "../git/ops";
 import { blockedTailReason, PoisonEpic } from "./errors";
@@ -18,11 +19,18 @@ import {
   inactiveAgentTickets,
   openHumanGateAsks,
   orderTickets,
+  reorderForPrereq,
+  reorderNote,
   skipNote,
   skippedDependents,
   type SkipCause,
 } from "./execute-epic-board";
-import { BlockedTailError, TicketTimeoutError } from "./execute-epic-errors";
+import {
+  BlockedTailError,
+  PrereqCycleError,
+  ReorderedOnPrereqError,
+  TicketTimeoutError,
+} from "./execute-epic-errors";
 import { mustPersist, mustRead, safe } from "./execute-epic-persist";
 import type { RunPreparation } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
@@ -68,8 +76,18 @@ export async function dispatchRunTickets(
   };
   const recordSkipped = makeSkipRecorder(run, ledger);
 
-  for (const ticket of dispatchable) {
-    await dispatchTicket(run, prep, ticket, ledger, recordSkipped);
+  // A QUEUE rather than a `for…of`, because the run may re-order what it has left mid-flight
+  // (anton-0gm2): a ticket that blocks on a prerequisite the run holds itself is a scheduling
+  // correction, and the corrected order is what the rest of this loop dispatches.
+  const queue = [...dispatchable];
+  while (queue.length > 0) {
+    const ticket = queue.shift()!;
+    try {
+      await dispatchTicket(run, prep, ticket, ledger, recordSkipped);
+    } catch (e) {
+      if (!(e instanceof ReorderedOnPrereqError)) throw e;
+      queue.splice(0, queue.length, ...(await reorderAroundPrereq(run, ticket, queue, e)));
+    }
   }
 
   // A ticket ROLLED BACK by its budget contributed no commit (anton-t1mo), so it is not part of
@@ -80,6 +98,37 @@ export async function dispatchRunTickets(
     delivered: await deliveredOrPark(run, prep, live, ledger, rolledBack),
     skipped: ledger.skipped,
   };
+}
+
+/**
+ * The run correcting its OWN dispatch order (anton-0gm2) — the answer to a `dep-missing` block whose
+ * prerequisite is one of this run's tickets.
+ *
+ * Nothing here is a failure and nothing is recorded as one: the ticket's bead is already back at
+ * `open` and unassigned (the repair's `parked` outcome keeps it claimable), the run carries on, and
+ * the consecutive-failure breaker never sees this case at all. What it costs is one dispatch — the
+ * ticket runs again after its prerequisite, and the repair's own one-per-bead-per-class guard is
+ * what stops a second block of the same class from re-ordering forever.
+ *
+ * A CYCLE stops the run instead. It is the one shape no order satisfies, and the fallback it would
+ * otherwise land in — {@link orderTickets}'s input order — would dispatch the blocked ticket first
+ * all over again.
+ */
+async function reorderAroundPrereq(
+  run: EpicRun,
+  ticket: Bead,
+  remaining: Bead[],
+  blocked: ReorderedOnPrereqError,
+): Promise<Bead[]> {
+  const { repo, targetId: epicBeadId, all } = run;
+  const { blockerId } = blocked;
+  const reorder = reorderForPrereq({ ticket, remaining, blockerId, all });
+  if (!reorder.ok) throw new PrereqCycleError(ticket.id, blockerId, reorder.cycle);
+  const account = reorderNote({ ticketId: ticket.id, blockerId, reorder });
+  await appendSessionLog(blocked.logPath, `[reorder] ${account}\n`).catch(() => {});
+  await safe(() => beads.note(repo, ticket.id, account));
+  console.warn(`[execute-epic] ${epicBeadId}: ${account}`);
+  return reorder.order;
 }
 
 /** The run's tickets, split into what it may dispatch now and what a blocker outside it holds. */

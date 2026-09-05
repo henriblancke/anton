@@ -652,14 +652,28 @@ export function skipNote(cause: SkipCause, movedOn = false): string {
  * among the epic's own members). Falls back to input order on a cycle.
  */
 export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
-  const adj = dependentEdges(tickets, all);
+  const placed = topoIds(tickets, dependentEdges(tickets, all));
+  if (placed.length !== tickets.length) return tickets; // cycle → original order
+  const byId = new Map(tickets.map((t) => [t.id, t]));
+  return placed.map((id) => byId.get(id)!);
+}
+
+/**
+ * Kahn's algorithm over a run's internal graph — the ticket ids it could place, in dispatch order.
+ * A result SHORTER than the input is the cycle: what is missing is what the sort could not place.
+ *
+ * Ready tickets are taken in INPUT order, which is what lets a caller state a preference the edges
+ * do not decide: {@link reorderForPrereq} puts the prerequisite first so it is dispatched next among
+ * everything equally ready. What a cycle then costs is the caller's call, so it is made out there —
+ * {@link orderTickets} falls back to input order, the re-order refuses.
+ */
+function topoIds(tickets: Bead[], adj: Map<string, string[]>): string[] {
   const indeg = new Map<string, number>(tickets.map((t) => [t.id, 0]));
   for (const dependents of adj.values()) {
     for (const d of dependents) indeg.set(d, (indeg.get(d) ?? 0) + 1);
   }
   const queue = tickets.filter((t) => (indeg.get(t.id) ?? 0) === 0).map((t) => t.id);
   const order: string[] = [];
-  const byId = new Map(tickets.map((t) => [t.id, t]));
   while (queue.length) {
     const id = queue.shift()!;
     order.push(id);
@@ -668,8 +682,100 @@ export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
       if ((indeg.get(next) ?? 0) === 0) queue.push(next);
     }
   }
-  if (order.length !== tickets.length) return tickets; // cycle → original order
-  return order.map((id) => byId.get(id)!);
+  return order;
+}
+
+/**
+ * What re-ordering a run around a prerequisite it holds itself answers (anton-0gm2).
+ *
+ * `prereqPending` is the difference between the two shapes the sibling case comes in: the
+ * prerequisite is still ahead of the loop (so the re-order genuinely schedules it), or the run
+ * already dispatched it (so the ordering is satisfied and the blocked ticket has earned its one
+ * retry, taken last). Both continue the run; only the caller's account of them differs.
+ */
+export type PrereqReorder =
+  | { ok: true; order: Bead[]; prereqPending: boolean }
+  /** The new edge closes a cycle: the ids the sort could not place, in input order. */
+  | { ok: false; cycle: string[] };
+
+/**
+ * Re-order what a run has LEFT to dispatch so a prerequisite the run holds ITSELF runs before the
+ * ticket that named it (anton-0gm2) — the scheduling correction that replaces parking the run
+ * behind its own work.
+ *
+ * The new edge is passed in rather than read off `all`, because it is not there: the run's board
+ * snapshot predates the write the repair just made. Everything else about the graph is the snapshot's
+ * ({@link dependentEdges}), so a re-order can only ever ADD the one ordering anton recorded.
+ *
+ * `ticket` goes back LAST in the input and the prerequisite FIRST, which is the whole preference
+ * this function expresses: among tickets the edges leave equally ready, the prerequisite is
+ * dispatched next and the ticket that has already failed once waits behind everything that hasn't.
+ * The edges still decide — a prerequisite with an unmet dependency of its own queues behind it.
+ *
+ * A CYCLE is refused rather than ordered. {@link orderTickets} falls back to input order, which for
+ * an ordinary run is a reasonable "we cannot tell, run them as given"; here it would be the run
+ * executing the very ordering the new edge says is impossible, with the ticket that just blocked
+ * first in line again.
+ */
+export function reorderForPrereq(args: {
+  /** The ticket that blocked — never dropped, always placed back in the order. */
+  ticket: Bead;
+  /** What the run has left to dispatch, in the order it would have run them, minus {@link ticket}. */
+  remaining: Bead[];
+  /** The prerequisite the repair's edge points at — one of the run's own tickets. */
+  blockerId: string;
+  /** The run's board snapshot: every edge except the one the repair just drew. */
+  all: Bead[];
+}): PrereqReorder {
+  const { ticket, remaining, blockerId, all } = args;
+  const prereq = remaining.find((t) => t.id === blockerId);
+  const input = [
+    ...(prereq ? [prereq] : []),
+    ...remaining.filter((t) => t.id !== blockerId),
+    ticket,
+  ];
+  const adj = dependentEdges(input, all);
+  // The edge the repair drew, added by hand for the reason above. Only when the prerequisite is
+  // still pending: an ordering against a ticket the loop has passed constrains nothing left to sort.
+  if (prereq) adj.get(blockerId)!.push(ticket.id);
+  const placed = topoIds(input, adj);
+  if (placed.length !== input.length) {
+    const sorted = new Set(placed);
+    return { ok: false, cycle: input.map((t) => t.id).filter((id) => !sorted.has(id)) };
+  }
+  const byId = new Map(input.map((t) => [t.id, t]));
+  return { ok: true, order: placed.map((id) => byId.get(id)!), prereqPending: Boolean(prereq) };
+}
+
+/**
+ * What the run re-ordered and why (anton-0gm2) — one account, written to this ticket's bead and to
+ * its session log.
+ *
+ * The bead needs it more than the log does, because the repair has already written the OTHER half:
+ * a `blocks` edge and a stamp whose note says the ticket was "parked until that lands". Left at
+ * that, the board would show a ticket parked behind a prerequisite the same run went on to land,
+ * with nothing saying so — the legibility a park used to give for free, which this case has to earn
+ * back explicitly.
+ */
+export function reorderNote(args: {
+  ticketId: string;
+  blockerId: string;
+  reorder: Extract<PrereqReorder, { ok: true }>;
+}): string {
+  const { ticketId, blockerId, reorder } = args;
+  const order = reorder.order.map((t) => t.id).join(" → ");
+  return (
+    `anton: re-ordered, not parked — ${ticketId} reported \`dep-missing\` naming \`${blockerId}\`, ` +
+    `and that is a ticket THIS run holds, so the edge anton drew is a fact about its own dispatch ` +
+    `order rather than a wait on somebody else. ` +
+    (reorder.prereqPending
+      ? `\`${blockerId}\` had not run yet, so the run dispatches it next and comes back to ` +
+        `${ticketId} behind it`
+      : `\`${blockerId}\` had already been dispatched by this run, so nothing is left to schedule ` +
+        `ahead of ${ticketId} — it goes back at the end of the queue for the one retry the repair ` +
+        `earned it`) +
+    `. Remaining order: ${order}.`
+  );
 }
 
 /**

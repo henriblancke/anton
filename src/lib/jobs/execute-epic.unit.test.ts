@@ -24,6 +24,8 @@ import {
   inactiveAgentTickets,
   orderTickets,
   reopenAbsorbedTimeouts,
+  reorderForPrereq,
+  reorderNote,
   reopenableAfterStop,
   runReadiness,
   runTargetDrift,
@@ -1009,6 +1011,130 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
     const transitive = skipNote({ waitingOn: "b", stopped: "a" });
     expect(transitive).toContain("depends on b, which was itself skipped behind a");
     expect(transitive).toMatch(/Re-scope a/);
+  });
+});
+
+describe("reorderForPrereq — a prerequisite the run holds itself (anton-0gm2)", () => {
+  const dep = (from: string, to: string): BeadDep => ({
+    issue_id: from,
+    depends_on_id: to,
+    type: "blocks",
+  });
+  const ids = (beads: Bead[]) => beads.map((b) => b.id);
+
+  it("dispatches the prerequisite NEXT and puts the blocked ticket back behind it", () => {
+    // `wiring` blocked naming `schema`, which the run has not reached yet. `other` is independent
+    // and equally ready — the prerequisite still goes first, because that is the whole correction.
+    const board = [ticket("wiring"), ticket("other"), ticket("schema")];
+    const reorder = reorderForPrereq({
+      ticket: ticket("wiring"),
+      remaining: [ticket("other"), ticket("schema")],
+      blockerId: "schema",
+      all: board,
+    });
+    expect(reorder.ok).toBe(true);
+    if (!reorder.ok) return;
+    expect(ids(reorder.order)).toEqual(["schema", "other", "wiring"]);
+    expect(reorder.prereqPending).toBe(true);
+  });
+
+  it("still obeys the edges already on the board — the prerequisite is a preference, not an override", () => {
+    // `schema` waits on `migration`, so it cannot go first however much the re-order wants it to.
+    const board = [
+      ticket("wiring"),
+      { ...ticket("schema"), dependencies: [dep("schema", "migration")] } as Bead,
+      ticket("migration"),
+    ];
+    const reorder = reorderForPrereq({
+      ticket: ticket("wiring"),
+      remaining: [ticket("schema"), ticket("migration")],
+      blockerId: "schema",
+      all: board,
+    });
+    expect(reorder.ok).toBe(true);
+    if (!reorder.ok) return;
+    expect(ids(reorder.order)).toEqual(["migration", "schema", "wiring"]);
+  });
+
+  it("takes the blocked ticket LAST when the run already dispatched the prerequisite", () => {
+    // Nothing is left to schedule ahead of it, so the retry the repair earned costs the tickets
+    // that have not failed yet nothing — they go first.
+    const board = [ticket("wiring"), ticket("other"), ticket("schema")];
+    const reorder = reorderForPrereq({
+      ticket: ticket("wiring"),
+      remaining: [ticket("other")],
+      blockerId: "schema",
+      all: board,
+    });
+    expect(reorder.ok).toBe(true);
+    if (!reorder.ok) return;
+    expect(ids(reorder.order)).toEqual(["other", "wiring"]);
+    expect(reorder.prereqPending).toBe(false);
+  });
+
+  it("keeps a ticket that depends on the blocked one behind it, wherever it lands", () => {
+    const board = [
+      ticket("wiring"),
+      { ...ticket("after"), dependencies: [dep("after", "wiring")] } as Bead,
+      ticket("schema"),
+    ];
+    const reorder = reorderForPrereq({
+      ticket: ticket("wiring"),
+      remaining: [ticket("after"), ticket("schema")],
+      blockerId: "schema",
+      all: board,
+    });
+    expect(reorder.ok).toBe(true);
+    if (!reorder.ok) return;
+    expect(ids(reorder.order)).toEqual(["schema", "wiring", "after"]);
+  });
+
+  it("REFUSES a cycle rather than falling through to input order", () => {
+    // `schema` already waits on `wiring`, so the new wiring→schema edge closes the loop. The
+    // fallback orderTickets takes here — hand the input back — would dispatch `wiring` first all
+    // over again, which is how a bad edge gets executed.
+    const board = [
+      ticket("wiring"),
+      { ...ticket("schema"), dependencies: [dep("schema", "wiring")] } as Bead,
+      ticket("other"),
+    ];
+    expect(ids(orderTickets([ticket("wiring"), ticket("schema")], board))).toEqual([
+      "wiring",
+      "schema",
+    ]);
+    const reorder = reorderForPrereq({
+      ticket: ticket("wiring"),
+      remaining: [ticket("schema"), ticket("other")],
+      blockerId: "schema",
+      all: board,
+    });
+    expect(reorder.ok).toBe(false);
+    if (reorder.ok) return;
+    expect(reorder.cycle.sort()).toEqual(["schema", "wiring"]);
+  });
+
+  it("says on the bead what was re-ordered and why, in both shapes", () => {
+    const pending = reorderNote({
+      ticketId: "wiring",
+      blockerId: "schema",
+      reorder: {
+        ok: true,
+        order: [ticket("schema"), ticket("wiring")],
+        prereqPending: true,
+      },
+    });
+    expect(pending).toContain("re-ordered, not parked");
+    expect(pending).toContain("`schema`");
+    expect(pending).toContain("dispatches it next");
+    expect(pending).toContain("Remaining order: schema \u2192 wiring.");
+
+    const already = reorderNote({
+      ticketId: "wiring",
+      blockerId: "schema",
+      reorder: { ok: true, order: [ticket("wiring")], prereqPending: false },
+    });
+    expect(already).toContain("had already been dispatched by this run");
+    expect(already).toContain("one retry");
   });
 });
 

@@ -26,6 +26,7 @@ import {
   NeedsHumanError,
   NoDeliveryError,
   ParkedOnPrereqError,
+  ReorderedOnPrereqError,
   RepairedBlockError,
   TicketTimeoutError,
   WorktreeDirtyError,
@@ -117,8 +118,14 @@ export async function settleFailedTicket(args: {
   if (repair?.action === "repaired") throw new RepairedBlockError(ticket.id, repair.attempted, e);
   // An ordering recorded is a WAIT, not a correction: the ticket cannot start until the blocker
   // lands, so the run parks behind the edge anton just drew instead of spending an attempt on it.
+  //
+  // Unless the run holds the blocker ITSELF (anton-0gm2), which is the same edge and a different
+  // wait: what lands that ticket is this run, so a park would be the run waiting on its own
+  // dispatch. That case re-orders and continues — see {@link ReorderedOnPrereqError}.
   if (repair?.action === "parked") {
-    throw new ParkedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, e);
+    throw repair.site === "sibling"
+      ? new ReorderedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, logPath, e)
+      : new ParkedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, e);
   }
   throw e;
 }
