@@ -514,6 +514,7 @@
     color: var(--fg);
     width: 100%;
   }
+  input[type="text"]::placeholder { color: var(--muted-fg); }
   input[type="text"]:focus-visible { outline: 2px solid var(--primary); outline-offset: -1px; }
 
   .status {
@@ -1131,8 +1132,8 @@
 
           <div class="field">
             <label for="extra-args">Extra arguments</label>
-            <input id="extra-args" type="text" value="--create-only" />
-            <p class="help">Passed through to <code>bd linear sync</code> verbatim. Anything the panel doesn't cover, you can still reach.</p>
+            <input id="extra-args" type="text" value="" placeholder="--flag value" />
+            <p class="help">Passed through to <code>bd linear sync</code> verbatim. Anything the panel doesn't cover, you can still reach. Empty by default: the sync updates the issues it has already linked, which is how status and completion travel back.</p>
           </div>
 
           <hr class="divider" />
@@ -1140,7 +1141,7 @@
           <div class="field">
             <span class="lab">Preview</span>
             <div class="preview">
-              <div class="cmd" id="cmd">bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> epic,feature <span class="flag">--state</span> all <span class="flag">--create-only</span></div>
+              <div class="cmd" id="cmd">bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> epic,feature <span class="flag">--state</span> all</div>
               <p class="out" id="dry">Would push <strong>3 epics</strong> and <strong>6 features</strong> across 3 projects. <strong>48</strong> beads excluded by the tier filter.</p>
             </div>
             <div class="row between">
@@ -1232,7 +1233,7 @@
 
     cmdEl.innerHTML = types.length
       ? 'bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> ' +
-        types.join(',') + ' <span class="flag">--state</span> all <span class="flag">--create-only</span>'
+        types.join(',') + ' <span class="flag">--state</span> all'
       : 'bd linear sync <span class="flag">--push</span> — no tiers selected';
 
     if (!types.length) {
