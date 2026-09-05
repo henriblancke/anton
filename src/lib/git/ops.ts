@@ -518,6 +518,71 @@ export async function branchContainsCommit(
   );
 }
 
+/** What git can say about a commit NAMED IN PROSE — see {@link readCommitReach}. */
+export type CommitReach =
+  /** The commit resolves here and `base`'s history contains it: the work it carries has landed. */
+  | { state: "reaches"; sha: string }
+  /** It resolves, and `base` does not contain it — it sits on some other line of history. */
+  | { state: "outside"; sha: string }
+  /** No single commit in this repository answers to that name (unknown, or an ambiguous prefix). */
+  | { state: "absent" }
+  /** The question itself failed — an unresolvable base, a broken object store, a killed process. */
+  | { state: "unreadable"; detail: string };
+
+/**
+ * Does `base`'s history contain `commit`? The raw read behind the `already-shipped` claim check
+ * (anton-9a4m). It reports; whether the answer proves a claim is `gardener/repair-already-shipped.ts`'s
+ * call.
+ *
+ * FOUR ANSWERS, not a boolean, because a checker that must fail closed needs to tell "the base does
+ * not contain it" (the claim is contradicted) from "git could not say" (the claim is unchecked) —
+ * {@link branchContainsCommit} deliberately folds both into `false`, which is right for a caller
+ * whose next move is the same either way and wrong for one that has to STATE what failed.
+ *
+ * The direction is "the base contains the commit", i.e. the commit is an ANCESTOR of the base. The
+ * opposite reading — a commit built on top of the base — proves nothing about work having landed: it
+ * holds for every commit on every unmerged branch cut from that base, including the one the run is
+ * standing on.
+ *
+ * `commit` must be a bare hex sha, which is what a prose citation ever is; anything else is
+ * `unreadable` rather than handed to git, so no revision expression, ref name or option-shaped
+ * string is resolved on a claim's say-so. Nothing here fetches: a commit this repository has not
+ * seen is `absent`, never a reason to go to the network mid-check.
+ */
+export async function readCommitReach(
+  repoPath: string,
+  commit: string,
+  base: string,
+): Promise<CommitReach> {
+  if (!/^[0-9a-f]{4,40}$/i.test(commit)) {
+    return { state: "unreadable", detail: `"${commit}" is not a commit sha` };
+  }
+  let sha: string;
+  try {
+    // `--verify --quiet` exits 1 with no output when the name resolves to nothing or is ambiguous,
+    // rather than echoing it back; `^{commit}` refuses a sha that is a tree or a blob.
+    sha = await git(repoPath, ["rev-parse", "--verify", "--quiet", `${commit}^{commit}`]);
+  } catch (error) {
+    if (exitedWith(error, 1)) return { state: "absent" };
+    return { state: "unreadable", detail: describeGitFailure(error) };
+  }
+  if (!sha) return { state: "absent" };
+  try {
+    await git(repoPath, ["merge-base", "--is-ancestor", sha, base]);
+    return { state: "reaches", sha };
+  } catch (error) {
+    if (exitedWith(error, 1)) return { state: "outside", sha };
+    return { state: "unreadable", detail: `${base}: ${describeGitFailure(error)}` };
+  }
+}
+
+/** A failed git call in one line — its own stderr where it wrote any, else the thrown message. */
+function describeGitFailure(error: unknown): string {
+  const stderr = (error as { stderr?: unknown } | null)?.stderr;
+  const written = typeof stderr === "string" ? stderr.trim() : "";
+  return written || (error instanceof Error ? error.message : String(error));
+}
+
 /**
  * What git's history says became of `path` on this branch — the raw read behind the `ref-stale`
  * repair (anton-fzas / R5.4). It reports; it does not judge. Whether a single destination is a

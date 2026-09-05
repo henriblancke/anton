@@ -37,6 +37,7 @@ import {
   sameWorktreeState,
   worktreeHasCommitFor,
   branchContainsCommit,
+  readCommitReach,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
 
@@ -398,6 +399,72 @@ suite("branchContainsCommit (real git)", () => {
     // in this clone.
     expect(await branchContainsCommit(repo, "anton/anton-x7la", "0123456")).toBe(false);
     expect(await branchContainsCommit(repo, "main", "0123456")).toBe(false);
+  });
+});
+
+/**
+ * anton-9a4m: the `already-shipped` check has to tell a contradicted claim ("the base does not
+ * contain that commit") from an unchecked one ("git could not say"), which is the whole reason this
+ * read answers with four states where branchContainsCommit answers with a boolean.
+ */
+suite("readCommitReach (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+  let landed: string;
+  let unmerged: string;
+
+  const g = (args: string[]) =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-reach-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    landed = g(["rev-parse", "HEAD"]);
+    g(["checkout", "-q", "-b", "side"]);
+    writeFileSync(join(repo, "side.md"), "side\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "side"]);
+    unmerged = g(["rev-parse", "HEAD"]);
+    g(["checkout", "-q", "main"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("reads a commit the base contains, and one it does not", async () => {
+    expect(await readCommitReach(repo, landed.slice(0, 7), "main")).toEqual({
+      state: "reaches",
+      sha: landed,
+    });
+    expect(await readCommitReach(repo, unmerged.slice(0, 7), "main")).toEqual({
+      state: "outside",
+      sha: unmerged,
+    });
+  });
+
+  it("reads a sha this repository does not hold as absent, never as unreachable", async () => {
+    expect(await readCommitReach(repo, "0123456789abcdef0123456789abcdef01234567", "main")).toEqual({
+      state: "absent",
+    });
+  });
+
+  it("fails closed on a base git cannot resolve, and on a name that is not a sha", async () => {
+    const badBase = await readCommitReach(repo, landed, "origin/nope");
+    expect(badBase.state).toBe("unreadable");
+    expect(badBase).toMatchObject({ detail: expect.stringContaining("origin/nope") });
+
+    // Never handed to git: a revision expression, a ref name, or an option-shaped string.
+    for (const notASha of ["HEAD", "main~1", "--upload-pack=touch /tmp/x"]) {
+      expect(await readCommitReach(repo, notASha, "main")).toMatchObject({ state: "unreadable" });
+    }
   });
 });
 

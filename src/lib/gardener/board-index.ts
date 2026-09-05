@@ -334,3 +334,49 @@ export function ageInDays(bead: Bead, nowMs: number): number | undefined {
   const at = stampMsOf(bead);
   return at === undefined ? undefined : Math.floor((nowMs - at) / DAY_MS);
 }
+
+/**
+ * bd ids as they appear in PROSE (`anton-qg4h`, `anton-287p.1`) — deliberately loose, because
+ * membership in a board is what decides which of these is real ({@link beadIdsNamedIn}) and the
+ * pattern only has to be wide enough not to miss one. The dotted suffix is part of the id: bd mints
+ * child ids that carry it, and a pattern that stopped at the dot would resolve `anton-287p.1` to its
+ * parent.
+ */
+const ID_PATTERN = /\b[a-z][a-z0-9]*-[a-z0-9]{2,12}(?:\.[a-z0-9]+)*\b/gi;
+
+/**
+ * Every bead id `text` mentions, lower-cased and de-duplicated in the order written.
+ *
+ * Order is how a caller REPORTS what it found; which id means what is never decided by position.
+ */
+export function namedBeadIds(text: string | undefined): string[] {
+  if (!text) return [];
+  const seen = new Set<string>();
+  for (const match of text.matchAll(ID_PATTERN)) seen.add(match[0].toLowerCase());
+  return [...seen];
+}
+
+/** The bit before the dash — `anton` in `anton-qg4h`; empty for a token shaped like neither. */
+function idPrefix(id: string): string {
+  const dash = id.indexOf("-");
+  return dash > 0 ? id.slice(0, dash) : "";
+}
+
+/**
+ * The ids in `text` that could be beads of THIS board — the ones whose prefix it actually mints,
+ * read off the snapshot rather than configured.
+ *
+ * Narrowed by prefix rather than by membership, because the two answers differ and both callers need
+ * the difference: {@link ID_PATTERN} is loose enough that ordinary hyphenated prose ("pre-existing",
+ * "zero-diff") reads as an id, and dropping every id the board does not hold would silently discard a
+ * MISTYPED one — the very reading a checker must refuse. The prefix is the cheapest line between the
+ * two: `anton-zzzz` is a bead id that missed, `pre-existing` was never one.
+ */
+export function beadIdsNamedIn(index: BoardIndex, text: string | undefined): string[] {
+  const prefixes = new Set<string>();
+  for (const id of index.byId.keys()) {
+    const prefix = idPrefix(id);
+    if (prefix) prefixes.add(prefix);
+  }
+  return namedBeadIds(text).filter((id) => prefixes.has(idPrefix(id)));
+}
