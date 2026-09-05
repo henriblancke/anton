@@ -72,12 +72,14 @@ export async function dispatchRunTickets(
     await dispatchTicket(run, prep, ticket, ledger, recordSkipped);
   }
 
-  // A ticket ROLLED BACK by its budget contributed no commit (anton-t1mo), so it is not part of
-  // what this run delivered — read by the tail's park and by the delivery verdict below.
-  const rolledBack = new Set(run.timedOut.filter((t) => !t.committed).map((t) => t.id));
-  await settleHeldTail(run, prep, { held, dispatchable, ledger, rolledBack, recordSkipped });
+  // A ticket its budget stopped BEFORE its commit step is not part of what this run delivered
+  // (anton-t1mo) — whether its work was rolled back or preserved on the branch as an explicitly
+  // incomplete commit (anton-d967), nobody finished it. Read by the tail's park and by the delivery
+  // verdict below.
+  const stoppedShort = new Set(run.timedOut.filter((t) => !t.committed).map((t) => t.id));
+  await settleHeldTail(run, prep, { held, dispatchable, ledger, stoppedShort, recordSkipped });
   return {
-    delivered: await deliveredOrPark(run, prep, live, ledger, rolledBack),
+    delivered: await deliveredOrPark(run, prep, live, ledger, stoppedShort),
     skipped: ledger.skipped,
   };
 }
@@ -355,17 +357,22 @@ async function dispatchTicket(
       ticket,
       operator,
       closeOnDone: !standaloneRun,
+      standalone: standaloneRun,
       timeoutMs: ticketTimeoutMs,
     });
     onBranch.add(ticket.id); // it committed, so nothing behind it is missing its mechanism
   } catch (e) {
     // A ticket that ran out of time is the ONE failure this loop absorbs (anton-t1mo). It has
-    // already blocked its own bead and rolled its partial work back, so the feature can carry
-    // on: the tickets behind it are independent work, and ending the run here would deliver
-    // none of them — the exact failure this budget exists to prevent. Every other failure
-    // still halts the run, unchanged.
+    // already blocked its own bead and settled its partial work — preserved in a commit of its
+    // own or rolled back (anton-d967) — so the feature can carry on: the tickets behind it are
+    // independent work, and ending the run here would deliver none of them — the exact failure
+    // this budget exists to prevent. Every other failure still halts the run, unchanged.
     if (!(e instanceof TicketTimeoutError)) throw e;
-    timedOut.push({ id: e.ticketId, committed: e.committed });
+    timedOut.push({
+      id: e.ticketId,
+      committed: e.committed,
+      ...(e.preservedOn ? { preserved: true } : {}),
+    });
     if (e.committed) onBranch.add(e.ticketId); // the deadline hit the bookkeeping, not the code
     console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
     // Recomputed over the whole ledger, which decides for itself what cascades: a timeout
@@ -403,12 +410,13 @@ async function settleHeldTail(
     held: Bead[];
     dispatchable: Bead[];
     ledger: DispatchLedger;
-    rolledBack: Set<string>;
+    /** Tickets the budget stopped before their commit — rolled back or preserved, never delivered. */
+    stoppedShort: Set<string>;
     recordSkipped: (t: Bead, c: SkipCause, doneOnBoard: boolean) => Promise<void>;
   },
 ): Promise<void> {
   const { targetId: epicBeadId, all } = run;
-  const { held, dispatchable, ledger, rolledBack, recordSkipped } = args;
+  const { held, dispatchable, ledger, stoppedShort, recordSkipped } = args;
   const { skipCause, skipped } = ledger;
   const freshReadiness = prep.readiness;
   const stillHeld = held.filter((t) => !skipCause.has(t.id));
@@ -424,7 +432,7 @@ async function settleHeldTail(
       // the operator reading the park is owed the whole tail rather than half of it.
       held: held.map((t) => t.id),
       ran: dispatchable
-        .filter((t) => !rolledBack.has(t.id) && !skipped.has(t.id))
+        .filter((t) => !stoppedShort.has(t.id) && !skipped.has(t.id))
         .map((t) => t.id),
     });
     throw new BlockedTailError(asks.length > 0 ? `${tail}. ${asks.join(" ")}` : tail);
@@ -447,7 +455,7 @@ async function deliveredOrPark(
   prep: Extract<RunPreparation, { done: false }>,
   live: Bead[],
   ledger: DispatchLedger,
-  rolledBack: Set<string>,
+  stoppedShort: Set<string>,
 ): Promise<Bead[]> {
   const { targetId: epicBeadId, timedOut } = run;
   const { skipped } = ledger;
@@ -455,10 +463,14 @@ async function deliveredOrPark(
   // What the RUN phase then speaks for (anton-lnkt): its steps read this run's whole diff and put
   //     these ids in the PR body, so the set has to be the work actually on the branch.
   //     `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
-  //     advertise work this run doesn't contain (anton-6xj0). A ticket ROLLED BACK by its budget
-  //     is dropped for the same reason (anton-t1mo) — leaving it in would put it in the PR body
-  //     as delivered and hand the reviewer a diff it isn't in. One stopped AFTER its commit
-  //     stays: its code is in the diff, so dropping it would hide work the reviewer must read.
+  //     advertise work this run doesn't contain (anton-6xj0). A ticket its budget STOPPED before
+  //     its commit step is dropped for the same reason (anton-t1mo) — leaving it in would put it
+  //     in the PR body as delivered and hand the reviewer a contract nobody finished. That holds
+  //     whether its work was rolled back or PRESERVED on the branch (anton-d967): the preserved
+  //     commit is in the diff, but it is explicitly incomplete and its bead stays blocked, so
+  //     claiming it as delivered is the false success the delivery gate exists to refuse. One
+  //     stopped AFTER its commit stays: its code is in the diff and its ticket did finish, so
+  //     dropping it would hide work the reviewer must read.
   //     A ticket SKIPPED behind a rolled-back one (anton-67xj) never ran at all, so it is out
   //     for the same reason — the PR body must not claim work that has no diff, so it never
   //     reaches the branch question below.
@@ -473,7 +485,7 @@ async function deliveredOrPark(
   //     no-delivery park below claim an empty branch that has commits on it.
   const delivered = await deliveredTickets(
     live.filter((t) => !skipped.has(t.id)),
-    rolledBack,
+    stoppedShort,
     (id) => worktreeHasCommitFor(worktree.path, id),
   );
 
@@ -483,15 +495,7 @@ async function deliveredOrPark(
   // refuses. Park instead: a whole feature timing out is a budget or a scoping problem, and a
   // human has to pick which.
   if (timedOut.length > 0 && delivered.length === 0) {
-    throw new PoisonEpic(
-      `every ticket under ${epicBeadId} ran out of time ` +
-        `(${timedOut.map((t) => t.id).join(", ")})` +
-        (skipped.size > 0
-          ? ` or was skipped behind one that did (${[...skipped.keys()].join(", ")})`
-          : "") +
-        ` — nothing was delivered. Re-scope them into ` +
-        `smaller tickets, or raise this project's ticketTimeoutMinutes, then resume the run`,
-    );
+    throw new PoisonEpic(outOfTimeParkMessage(run, [...skipped.keys()]));
   }
 
   // Nothing timed out and still nothing is left to show: every live ticket is human work a
@@ -508,4 +512,54 @@ async function deliveredOrPark(
     );
   }
   return delivered;
+}
+
+/**
+ * The park a run owes when its budget took everything (anton-t1mo), worded for the run it actually
+ * was (anton-d967).
+ *
+ * Two things were wrong with saying one thing here. A CHILDLESS run target IS its own single ticket
+ * (`beads.groupsChildren` reads it that way), so "every ticket under X ran out of time — re-scope
+ * them into smaller tickets" named a set of one and told the operator to do the impossible: there
+ * are no sibling tickets to redistribute the work across. What that operator can actually do is
+ * raise the budget or SPLIT the bead into children, so that is what it says.
+ *
+ * And a park has to say what became of the work, because the answer decides what a resume IS: work
+ * preserved on the branch means the resume continues from it, while a rollback means it starts over.
+ */
+function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string {
+  const { targetId, timedOut, branch, standaloneRun, ticketTimeoutMs } = run;
+  const budget = Number.isFinite(ticketTimeoutMs)
+    ? `${Math.round(ticketTimeoutMs / 60_000)}m`
+    : "unbounded";
+  const preserved = timedOut.filter((t) => t.preserved).map((t) => t.id);
+  const rolledBack = timedOut.filter((t) => !t.preserved && !t.committed).map((t) => t.id);
+  const fate = [
+    preserved.length > 0
+      ? `The work of ${preserved.join(", ")} is PRESERVED on branch \`${branch}\` as an ` +
+        `explicitly incomplete commit — it passed this project's verify gates — so resuming ` +
+        `continues from it rather than redoing it.`
+      : null,
+    rolledBack.length > 0
+      ? `The work of ${rolledBack.join(", ")} was rolled back, so resuming starts it over.`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  if (standaloneRun) {
+    return (
+      `${targetId} ran out of time (its ${budget} ticket budget) and nothing was delivered — it ` +
+      `IS this run's whole target, so there is no sibling ticket to re-scope the work into. ` +
+      `${fate} Raise this project's ticketTimeoutMinutes, or split ${targetId} into child ` +
+      `tickets that each fit the budget, then resume the run`
+    );
+  }
+  return (
+    `every ticket under ${targetId} ran out of time ` +
+    `(${timedOut.map((t) => t.id).join(", ")})` +
+    (skippedIds.length > 0 ? ` or was skipped behind one that did (${skippedIds.join(", ")})` : "") +
+    ` — nothing was delivered. ${fate} Re-scope them into smaller tickets, or raise this ` +
+    `project's ticketTimeoutMinutes, then resume the run`
+  );
 }

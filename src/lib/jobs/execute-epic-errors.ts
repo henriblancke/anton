@@ -238,12 +238,13 @@ export function askSettleError(raw: unknown, signal: AbortSignal): unknown {
  *
  * Deliberately NOT poison, and deliberately not fatal to the run: the ticket loop catches this one
  * error and moves to the next ticket, so a feature is never ended by a single ticket that couldn't
- * converge. runTicket has already blocked the bead and rolled its partial work back by the time this
- * is thrown, so nothing downstream needs to settle it — the loop only records which ticket it was.
+ * converge. runTicket has already blocked the bead and settled its partial work by the time this is
+ * thrown, so nothing downstream needs to settle it — the loop only records which ticket it was.
  *
- * Carrying on is safe only because the worktree is provably clean of this ticket: a rollback that
- * could not prove that raises {@link PoisonEpic} instead, halting the run so no later ticket commits
- * the leftovers as its own.
+ * Carrying on is safe only because the worktree is provably clean of this ticket, by one of two
+ * routes: its work was PRESERVED in a commit of its own (anton-d967), or it was rolled back. Either
+ * way the tree is re-read afterwards, and a settle that could not prove it raises {@link PoisonEpic}
+ * instead, halting the run so no later ticket commits the leftovers as its own.
  */
 export class TicketTimeoutError extends Error {
   constructor(
@@ -255,14 +256,26 @@ export class TicketTimeoutError extends Error {
      * the run still lists it as delivered — only its bead is left unfinished.
      */
     readonly committed: boolean,
+    /**
+     * The branch a NON-committed ticket's work was preserved on (anton-d967), or null when it was
+     * rolled back. Only a CHILDLESS run target can preserve — with no sibling ticket there is no
+     * pull request its unfinished diff could ride into. Preserved work is on the branch but is NOT
+     * a delivery: the ticket stays blocked, keeps its `not-delivered` marker, and is in no PR's
+     * delivered list — what the branch carries is a verified-but-incomplete commit a resume
+     * continues from.
+     */
+    readonly preservedOn: string | null = null,
   ) {
     super(
       `${ticketId} exceeded its ${Math.round(budgetMs / 60_000)}m ticket budget and was stopped. ` +
         (committed
           ? `Its work IS committed on the branch (only its bead was left unfinished)`
-          : `Its partial work was rolled back`) +
+          : preservedOn
+            ? `Its work passed this project's verify gates, so it was PRESERVED on ` +
+              `\`${preservedOn}\` as an explicitly incomplete commit — a resume continues from it`
+            : `Its partial work was rolled back`) +
         ` and the ticket is blocked for review; the rest of the run continued. ` +
-        `Re-scope it (or raise ticketTimeoutMinutes), then resume.`,
+        `Split it into smaller tickets (or raise ticketTimeoutMinutes), then resume.`,
     );
     this.name = "TicketTimeoutError";
   }

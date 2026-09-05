@@ -9,8 +9,12 @@
  *
  * 1. **A timed-out ticket is blocked alone.** It gets its own board state + note; every other
  *    ticket in the feature still runs, and the run still opens its PR.
- * 2. **Its partial work is rolled back.** What the agent left half-written never reaches the branch,
- *    so no later ticket can commit it as its own.
+ * 2. **Its partial work is rolled back — unless the ticket IS the run and its tree verifies**
+ *    (anton-d967). A childless run target's work is committed to the branch under an explicitly
+ *    incomplete subject instead of being deleted; a ticket with siblings is rolled back as before,
+ *    because the pull request they open would otherwise merge its unfinished diff. Either way the
+ *    tree comes back clean, so no later ticket can commit the leftovers as its own — and preserved
+ *    work is still nobody's delivery: blocked bead, `not-delivered` marker, no PR.
  * 3. **A feature where EVERY ticket times out parks.** Absorbing the timeouts is only honest while
  *    something landed; an empty PR is the false success the delivery gate already refuses.
  * 4. **A rollback that FAILS halts the run and keeps its worktree.** Carrying on past leftovers it
@@ -28,7 +32,11 @@
  * 8. **A held tail a rolled-back timeout ALSO skipped does not park the run** (anton-67xj). A
  *    cross-run blocker is no longer why that ticket cannot run, so parking on it would strand the
  *    independent commits behind a resume that could not dispatch it either.
- * 9. **A run that STOPS reopens the timeouts it absorbed** (anton-67xj). A blocked ticket is the
+ * 9. **A CHILDLESS run target keeps its work and parks with advice it can act on** (anton-d967).
+ *    The ticket IS the run, so the park names raising the budget or splitting the bead — never
+ *    re-scoping a set of siblings that does not exist — and says whether the work was preserved or
+ *    rolled back, which is what makes a resume a continuation or a redo.
+ * 10. **A run that STOPS reopens the timeouts it absorbed** (anton-67xj). A blocked ticket is the
  *    founder's cue only on a run that reaches its PR; on one that parks instead, it is a status bd
  *    refuses to claim — and the resume the park advertises dies on it at runTicket's claim gate.
  *
@@ -252,6 +260,199 @@ process.exit(0);`),
       }
     });
 
+    /**
+     * A claude that leaves work the project's verify gates PASS on and then never finishes — the
+     * shape of the loss anton-d967 exists to stop: a ticket that implemented and proved its change
+     * and was cut off during its closing bookkeeping. `AGENT_WORK.md` is what the sandbox's gate
+     * (`test -f AGENT_WORK.md`) checks, so writing it is what makes this tree verifiable;
+     * `HALF_WRITTEN.md` is the marker the assertions follow onto the branch.
+     */
+    const verifiableHangingClaude = (name: string, invLog: string, only: "first" | "always") =>
+      writeBin(
+        binDir,
+        name,
+        fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
+const id=m?m[1]:'unknown';
+fs.appendFileSync(${JSON.stringify(invLog)},id+'\\n');
+const nth=fs.readFileSync(${JSON.stringify(invLog)},'utf8').trim().split('\\n').filter(Boolean).length;
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(${only === "always" ? "true" : "nth===1"}){
+  fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+id+'\\n');
+  fs.appendFileSync(path.join(process.cwd(),'HALF_WRITTEN.md'),'partial '+id+'\\n');
+  e({type:'system',subtype:'init',session_id:'hang'});
+  setInterval(()=>{},1000); // never exits — only the ticket budget can stop it
+  return;
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+id+'\\n');
+e({type:'system',subtype:'init',session_id:'ok'});
+e({type:'assistant',message:{content:[{type:'text',text:'implemented the ticket'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'ok',num_turns:1,is_error:false});
+process.exit(0);`),
+      );
+
+    /** Every commit subject on the branch, newest first. */
+    const subjectsOnBranch = (branch: string): string[] =>
+      execFileSync("git", ["-C", repo, "log", "--format=%s", branch], { encoding: "utf8" })
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+
+    /** The paths the commit whose subject starts with `subjectPrefix` actually changed. */
+    const filesInCommit = (branch: string, subjectPrefix: string): string[] => {
+      const log = execFileSync("git", ["-C", repo, "log", "--format=%H\t%s", branch], {
+        encoding: "utf8",
+      }).trim();
+      const hit = log.split("\n").find((l) => l.split("\t")[1]?.startsWith(subjectPrefix));
+      if (!hit) return [];
+      return execFileSync(
+        "git",
+        ["-C", repo, "show", "--name-only", "--format=", hit.split("\t")[0]],
+        { encoding: "utf8" },
+      )
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+    };
+
+    it("still rolls back a VERIFIABLE tree when the run has other tickets (anton-d967)", async () => {
+      // The limit on preservation, and the reason for it. The verify gates prove a tree is not
+      // broken; they cannot prove a ticket is DONE — and on a multi-ticket run they mostly re-measure
+      // the siblings that already committed. Keeping this ticket's unfinished diff would put it in
+      // the pull request the OTHER tickets open, and merge it into the trunk under a delivery it is
+      // no part of. So the rollback stands here, exactly as it did before anton-d967, and the bead
+      // says why.
+      const epic = await approvedEpic("SiblingPr");
+      const invLog = join(sandbox, "sibling-inv.jsonl");
+      const claude = verifiableHangingClaude("claude-hang-sibling", invLog, "first");
+
+      const bodyDump = join(sandbox, "sibling-pr-body.txt");
+      const bodyGh = writeBin(
+        binDir,
+        "gh-body-sibling",
+        `const fs=require('fs');const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){console.log('[]');process.exit(0);}
+const i=a.indexOf('--body');if(i>=0){fs.writeFileSync(${JSON.stringify(bodyDump)},a[i+1]);}
+console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
+      );
+      const okGh = process.env.ANTON_GH_BIN!;
+
+      await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+      const runner = makeEpicRunner(ctx);
+      process.env.ANTON_CLAUDE_BIN = claude;
+      process.env.ANTON_GH_BIN = bodyGh;
+      try {
+        const jobId = await driveEpicRun(runner, { projectId, epicBeadId: epic.id });
+        const invoked = readFileSync(invLog, "utf8").trim().split("\n").filter(Boolean);
+        expect(invoked).toHaveLength(2);
+        const [stalledId, shippedId] = invoked;
+        expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+        const run = (await tdb.db.select().from(schema.runs)).find(
+          (r) => r.epicBeadId === epic.id,
+        )!;
+
+        // Nothing of the stalled ticket is on the branch — not as a delivery, and not as a kept
+        // incomplete commit either.
+        const files = filesOnBranch(run.branch!);
+        expect(files).not.toContain("HALF_WRITTEN.md");
+        expect(files).toContain("AGENT_WORK.md");
+        expect(subjectsOnBranch(run.branch!).some((x) => x.includes(stalledId))).toBe(false);
+
+        // The bead says WHY the work could not be kept, which is the operator's cue that a resume
+        // redoes it rather than continuing it.
+        const stalled = await beads.show(repo, stalledId);
+        expect(stalled.status).toBe("blocked");
+        expect(stalled.labels ?? []).toContain("not-delivered");
+        expect(JSON.stringify(stalled)).toMatch(/rolled back/i);
+        expect(JSON.stringify(stalled)).toMatch(/pull request/i);
+
+        // …and the run still shipped the independent ticket, alone, to a human.
+        expect((await beads.show(repo, shippedId)).status).toBe("closed");
+        const body = readFileSync(bodyDump, "utf8");
+        expect(body).toContain(shippedId);
+        expect(body).not.toContain(stalledId);
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+        process.env.ANTON_GH_BIN = okGh;
+        await patchSettings({ ticketTimeoutMinutes: undefined });
+      }
+    });
+
+    it("PRESERVES a childless run target's verified work, and parks with advice it can act on (anton-d967)", async () => {
+      // The loss this closes (observed 2026-08-17 on two childless features): the deadline landed on
+      // the bookkeeping AFTER the code was written, tested and verified, and the rollback deleted all
+      // of it — from a tree no commit, reflog or dangling object could recover it from.
+      //
+      // A childless feature IS its own single ticket (`beads.groupsChildren`), which is what makes
+      // keeping it safe (its timeout delivers nothing, so the run parks and no pull request can carry
+      // the work off) and what made the old park absurd: "every ticket under X ran out of time … re-
+      // scope them into smaller tickets" named a set of one and asked for a sibling that cannot
+      // exist. What this operator can do is raise the budget or split the bead.
+      const featureId = await beads.create(repo, {
+        title: "A feature shaped as one unit of work",
+        type: "feature",
+        acceptance: "work file exists",
+        description: "## Goal\nOne unit of work",
+      });
+      await beads.approve(repo, featureId);
+
+      const invLog = join(sandbox, "childless-inv.jsonl");
+      const claude = verifiableHangingClaude("claude-hang-childless", invLog, "always");
+      await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+      const runner = makeEpicRunner(ctx);
+      process.env.ANTON_CLAUDE_BIN = claude;
+      let jobId: string | undefined;
+      try {
+        jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
+        const run = (await tdb.db.select().from(schema.runs)).find(
+          (r) => r.epicBeadId === featureId,
+        )!;
+
+        // THE WORK SURVIVED, in a commit of its own on the run's branch.
+        expect(filesOnBranch(run.branch!)).toContain("HALF_WRITTEN.md");
+        expect(filesInCommit(run.branch!, `WIP ${featureId}:`)).toContain("HALF_WRITTEN.md");
+        // …and that commit is NOT the delivery attribution (`<id>:`) `worktreeHasCommitFor` reads:
+        // a resume that mistook it for one would skip a ticket nobody finished.
+        expect(
+          subjectsOnBranch(run.branch!).some((x) => x.startsWith(`${featureId}:`)),
+        ).toBe(false);
+
+        // Nothing was delivered, so the run parks — with advice this operator can follow, and with
+        // the one fact that decides whether resuming is a continuation or a redo.
+        const job = await getJob(tdb.db, jobId);
+        expect(job?.status).toBe("parked");
+        expect(job?.lastError).not.toMatch(/smaller tickets/i);
+        expect(job?.lastError).toMatch(/raise this project's ticketTimeoutMinutes/i);
+        expect(job?.lastError).toContain(`split ${featureId} into child tickets`);
+        expect(job?.lastError).toMatch(/PRESERVED on branch/);
+        expect(job?.lastError).toContain(`anton/${featureId}`);
+
+        // NOT A DELIVERY: no PR, the marker merge finalization reads is on the bead, and the bead is
+        // claimable again for the resume the park advertises.
+        const target = await beads.show(repo, featureId);
+        expect(beads.getPrRef(target) ?? null).toBeNull();
+        expect(target.status).toBe("open");
+        expect(ownerOf(target)).toBeUndefined();
+        expect(target.labels ?? []).toContain("not-delivered");
+        expect(JSON.stringify(target)).toMatch(/PRESERVED on branch/i);
+
+        // The session log carries both halves of the account: the WARNING that preceded the deadline
+        // — the ticket's one chance to commit what it had — and what the timeout then did.
+        const session = (await tdb.db.select().from(schema.sessions)).find(
+          (x) => x.beadId === featureId,
+        )!;
+        const log = readFileSync(session.logPath!, "utf8");
+        expect(log).toContain("[ticket-budget]");
+        expect(log).toMatch(/80% of its/);
+        expect(log).toMatch(/\[ticket-timeout\] work PRESERVED/);
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+        await patchSettings({ ticketTimeoutMinutes: undefined });
+        if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+      }
+    });
+
     it("parks the run when EVERY ticket runs out of time — no empty PR", async () => {
       const epic = await approvedEpic("AllStalled");
       const invLog = join(sandbox, "all-stalled-inv.jsonl");
@@ -270,6 +471,9 @@ process.exit(0);`),
         const job = await getJob(tdb.db, jobId);
         expect(job?.status).toBe("parked");
         expect(job?.lastError).toMatch(/every ticket .* ran out of time/i);
+        // …and it says what became of the work: nothing proved this tree fit to keep (the gate
+        // `test -f AGENT_WORK.md` fails on it), so it was rolled back and a resume starts over.
+        expect(job?.lastError).toMatch(/was rolled back, so resuming starts it over/i);
 
         const target = await beads.show(repo, epic.id);
         expect(beads.getPrRef(target) ?? null).toBeNull();
