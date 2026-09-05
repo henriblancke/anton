@@ -117,9 +117,10 @@ command and the dry-run counts live (see the mock).
 
 > **Answered 2026-09-05** by [`docs/spikes/2026-09-05-bd-linear-push-shape.md`](../spikes/2026-09-05-bd-linear-push-shape.md)
 > (anton-ey0w.1): hazard 3 is settled — push never sends a parent, so the epic→sub-issue shape is
-> not available; hazard 2 is narrowed — bead labels never reach Linear, so the churn to manage is
-> sync frequency and `status` transitions, not the lease label; hazard 1 is confirmed and
-> `--update-refs=false` cannot prevent it (the flag is declared but never read).
+> not available; hazard 2 is **re-scoped, not closed** — bead labels never reach Linear, but bd's
+> unchanged-issue skip never fires for a bead with acceptance criteria, so every push writes once
+> per linked bead; hazard 1 is confirmed and `--update-refs=false` cannot prevent it (the flag is
+> declared but never read).
 
 1. **`external_ref` collision.** `bd linear sync --push` defaults to `--update-refs true`, writing
    the Linear ref into `external_ref`. A board still carrying legacy `gh-<n>` PR pointers there
@@ -128,8 +129,15 @@ command and the dry-run counts live (see the mock).
 2. **Run-lease label churn.** The run-lease is a label rewritten every 5 minutes on the run target
    (`RUN_LEASE_REFRESH_MS`, `execute-epic.ts:72`) — which is now a synced `feature`. **Settled
    2026-09-05: push never sends labels**, so the lease stays on labels and nothing moves to metadata.
-   What remains is rate — every push is one API read per Linear-linked bead before any skip, capped
-   by the 5-minute debounce — and `status` transitions, which *do* cross.
+   What remains is **write amplification, not just read cost**. bd's unchanged-issue skip
+   (`PushFieldsEqual`) is defeated twice over for anton's beads — it compares a freshly built
+   description against a remote one that permanently carries bd's own idempotency marker, and it
+   re-runs the description builder on a copy whose `AcceptanceCriteria`/`Design`/`Notes` were never
+   cleared, appending those sections twice. So **every push is one read *and* one `issueUpdate` per
+   Linear-linked bead**, for every bead that has acceptance criteria — which is all of them. The
+   debounce is therefore the only cap on the write rate, not a nicety; and the "a lease-only change
+   syncs nothing" guarantee has to be enforced at anton's seam (do not fire the push), because bd
+   will not skip. On top of that, `status` transitions are genuine content changes and *do* cross.
 3. **Sub-issue nesting.** **Settled 2026-09-05 (anton-60oi): there is no nesting.** Push sends no
    parent — hierarchy is pull-only — so the epic→sub-issue shape is dropped. The push is a flat list
    of top-level issues: tier is carried by `--type`, grouping by the Linear project the per-area

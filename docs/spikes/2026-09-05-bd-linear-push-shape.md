@@ -8,7 +8,7 @@ answers re-checked against 1.2.2 (latest stable) and unchanged.
 | # | Question | Answer |
 | --- | --- | --- |
 | 1 | Does push map `parent-child` onto Linear sub-issues? | **No.** Push never sends a parent. Hierarchy is import-only. |
-| 2 | Does push carry bead labels? | **No.** Push never sends `labelIds`. Run-lease churn cannot reach Linear as a label. |
+| 2 | Does push carry bead labels? | **No.** Push never sends `labelIds`, so the run-lease cannot reach Linear as a label — but a lease-only change is still one read **and one write** per linked bead, because bd's unchanged-issue skip never fires for anton's beads (§2). |
 | 3 | What does `--update-refs` write into `external_ref`? | The **Linear issue URL verbatim, always** — the flag is declared but never read, so it cannot be turned off. |
 
 Consequences for the downstream tickets are at the bottom.
@@ -103,20 +103,68 @@ map has no label key at all. Bead labels never reach Linear, in either direction
 bd only on **pull**, where Linear's labels infer a bead *type* via `linear.label_type_map` —
 `mapping.go:456-480`.)
 
-**So run-lease churn does not write to Linear.** The skip check confirms it: an unchanged-but-relabelled
-bead compares equal on title / description / priority / status (`PushFieldsEqual`,
-`mapping.go:422-436`, called at `tracker.go:454`) and is skipped without an update mutation.
+**So no bead label can reach Linear, the run-lease included.** That is the whole of the label
+question, and it holds on the payload alone.
 
-Two caveats that keep hazard 2 from being fully closed:
+### It does not follow that a lease-only change writes nothing
 
-1. **The skip is not free.** Every Linear-linked bead costs one `IssueByIdentifier` read per push run
-   (`tracker.go:451`) plus one workflow-state fetch per team, *before* any skip decision. A push
-   triggered by each run-lease refresh (every 5 min, `RUN_LEASE_REFRESH_MS`) is therefore N+1 API
-   reads every 5 minutes even though it writes nothing. The design's 5-minute debounce is what caps
-   this — the label itself is harmless.
-2. **Status churn does cross.** `status` is in the compared set and is pushed as `stateId`. A run
-   flipping its target `open → in_progress → closed` is three real Linear updates. That is the
-   activity feed to reason about, not the lease label.
+The skip that would deliver that **does not fire for anton's beads**. Worth deriving in full,
+because the design leaned on it.
+
+`BatchPush` fetches the remote issue and skips when `PushFieldsEqual` finds title / description /
+priority / status all equal (`tracker.go:451-458`, `mapping.go:422-436`). Labels are correctly
+absent from that set. The description is in it, and it can never match, for two independent reasons:
+
+1. **Every issue bd created carries a marker the comparison does not know about.** Batch create
+   sends `AppendIdempotencyMarker(issue.Description, marker)` (`tracker.go:376-377`; the
+   single-create path does the same inside `CreateIssueIdempotent`, `client.go:829`), so the remote
+   description permanently ends in `\n<!-- bd-idempotency: <12 hex> -->`. `FetchIssueByIdentifier`
+   returns `description` verbatim (`client.go:1097-1105`), and the marker's only reader anywhere in
+   the tree is `extractIdempotencyMarker`, used to recover from an ambiguous batch (`client.go:986`,
+   `:1003`) — nothing strips it before the compare, while `BuildLinearDescription(local)` never
+   contains one. **This defeat is self-clearing:** the update it forces writes a marker-free
+   description (`fieldmapper.go:78-85`), so from the second push on the marker is gone.
+2. **The description is built twice.** The engine hands `BatchPush` *formatted copies*:
+   `formatPushIssue` sets `copy.Description = BuildLinearDescription(issue)` but leaves
+   `AcceptanceCriteria` / `Design` / `Notes` populated on the copy (`engine.go:1060-1067`, built at
+   `:1055`, passed to `BatchPush` at `:851`). `PushFieldsEqual` then calls `BuildLinearDescription`
+   on that copy, appending `## Acceptance Criteria` / `## Design` / `## Notes` a **second** time
+   (`mapping.go:23-35`). bd knows the hazard elsewhere — the create path carries a comment refusing
+   to re-format for exactly this reason (`tracker.go:196-200`), and `NormalizeIssueForLinearHash`
+   clears the three fields after merging them (`mapping.go:37-51`) — the guard was just never
+   applied to the push comparison. **This defeat does not clear:** the local string stays
+   structurally longer than anything the remote can hold, and the update it forces writes the
+   correctly single-appended description, so the next push mismatches again.
+
+The skip therefore fires only for a bead with no acceptance criteria, no design and no notes, and
+only after its first post-create push has stripped the marker. **Every contract-shaped anton bead
+carries acceptance criteria** — this spike's own ticket included — so on anton's board the skip
+never fires at all.
+
+bd's regression test does not cover either defeat: `TestBatchPush_SkipsUnchangedIssue`
+(`internal/linear/tracker_test.go:80-137`) uses an empty local description, no structured fields and
+a remote with no marker — the one shape where both defeats are absent — and builds the `Tracker`
+directly, bypassing `formatPushIssue`.
+
+### What hazard 2's residue actually is: per-push write amplification
+
+Per push, per Linear-linked bead:
+
+1. **One read.** `IssueByIdentifier` before any skip decision (`tracker.go:451`), plus one
+   workflow-state fetch per team.
+2. **One write.** An `issueUpdate` mutation, because the skip does not fire — reported back as
+   `Updated: N`, and carrying an `external_ref` re-write with it (`tracker.go:496`).
+3. **Genuine content change only sometimes.** After the first push the payload re-sends title,
+   description, priority and `stateId` at their existing values, so whether a stakeholder sees a
+   feed entry is Linear's change detection, not bd's. What *is* a real change: the first push after
+   a create (marker removal), and `status` — it is in the compared set and pushed as `stateId`, so a
+   run flipping its target `open → in_progress → closed` is three genuine transitions.
+
+A push triggered by every run-lease refresh (5 min, `RUN_LEASE_REFRESH_MS`) is thus **2N API calls
+per cycle, N of them writes**, for a change Linear cannot even represent. The debounce is not a
+nicety — it is the only cap. And anton must not build on the skip: a test asserting "an unchanged
+bead syncs nothing" has to assert it at anton's own seam (no push fired at all), because asserting
+it of bd would fail.
 
 ## 3. `--update-refs`: declared, never read, always on
 
@@ -171,7 +219,8 @@ anton's own code — there is no bd flag that buys safety here.
 - **Tier filtering works as the design assumes:** `--type epic,feature` filters on bead type,
   `--state open` skips closed, `--parent` limits to a subtree (`engine.go:1373-1403`, `:843-847`).
 - **Creates are idempotent** via a hash marker appended to the description
-  (`internal/linear/idempotency.go:20-36`), so an interrupted push does not duplicate issues.
+  (`internal/linear/idempotency.go:20-36`), so an interrupted push does not duplicate issues. The
+  same marker is what breaks the first unchanged-issue skip after every create (§2).
 
 ## Still open (needs a human)
 
@@ -193,6 +242,22 @@ grep -rn "parentId" --include="*.go" internal/linear              # nothing (Git
 grep -n "var labelIDs \[\]string" -A 2 internal/linear/tracker.go # nil labels on create
 grep -rn "update-refs" --include="*.go" .                         # declaration only, never read
 
+# 1b. Why the unchanged-issue skip never fires for an anton bead (§2), defeat by defeat
+grep -n "AppendIdempotencyMarker" internal/linear/tracker.go internal/linear/client.go
+#   tracker.go:377 / client.go:829 - every created issue's remote description ends in the marker
+grep -rn "extractIdempotencyMarker" --include="*.go" internal/ | grep -v _test.go
+#   client.go:986,1003 only - recovery search; nothing ever strips the marker back off
+grep -n "BuildLinearDescription(local) != remote.Description" internal/linear/mapping.go
+#   :429 - compares a marker-free local build against the raw remote description
+sed -n '1060,1067p' internal/tracker/engine.go
+#   formatPushIssue: sets copy.Description, does NOT clear AcceptanceCriteria/Design/Notes ...
+sed -n '37,51p' internal/linear/mapping.go
+#   ... unlike NormalizeIssueForLinearHash, which does - so PushFieldsEqual appends them twice
+sed -n '196,200p' internal/linear/tracker.go
+#   bd's own comment naming the double-append hazard on create; never applied to the comparison
+sed -n '80,137p' internal/linear/tracker_test.go
+#   the skip test: empty description, no structured fields, no marker - neither defeat present
+
 # 2. Live CLI behaviour on a throwaway board (no real Linear team touched)
 mkdir /tmp/linear-spike-board && cd /tmp/linear-spike-board && git init -q . && bd init --prefix spike
 bd create "Spike epic parent" -t epic -l area:board
@@ -212,6 +277,44 @@ LINEAR_API_KEY=bogus LINEAR_TEAM_ID=00000000-0000-0000-0000-000000000000 bd line
 #   ^ proves --dry-run calls the live API before it previews anything
 ```
 
+Where a Go toolchain is available, the two skip defeats are directly executable. Drop this into
+`internal/linear/` in the extracted module and run `go test ./internal/linear -run SkipDefeat -v`:
+
+```go
+package linear
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/steveyegge/beads/internal/types"
+)
+
+func TestSkipDefeat(t *testing.T) {
+	bead := &types.Issue{Title: "T", Description: "body", AcceptanceCriteria: "- [ ] a"}
+
+	// Mirrors Engine.formatPushIssue (engine.go:1060-1067): Description merged,
+	// AcceptanceCriteria left in place. This copy is what BatchPush receives.
+	pushed := *bead
+	pushed.Description = BuildLinearDescription(bead)
+
+	// PushFieldsEqual's description leg (mapping.go:429) re-runs the builder.
+	local := BuildLinearDescription(&pushed)
+	if strings.Count(local, "## Acceptance Criteria") != 2 {
+		t.Fatalf("expected the section appended twice, got %q", local)
+	}
+	// Defeat 1: the remote as bd created it, marker and all.
+	marked := AppendIdempotencyMarker(pushed.Description, "<!-- bd-idempotency: deadbeef1234 -->")
+	if local == marked {
+		t.Error("marker-carrying remote description compared equal")
+	}
+	// Defeat 2: the remote after an update stripped the marker. Still unequal.
+	if local == pushed.Description {
+		t.Error("byte-identical remote description compared equal")
+	}
+}
+```
+
 ## What this changes downstream
 
 - **anton-60oi (reshape the contracts):** the epic → sub-issue shape is not available. Either accept
@@ -220,8 +323,11 @@ LINEAR_API_KEY=bogus LINEAR_TEAM_ID=00000000-0000-0000-0000-000000000000 bd line
   issues within them — the routing machinery the design already plans for `area:` is the only
   hierarchy bd can express today.
 - **anton-ey0w.5 (keep run-lease churn out of Linear):** no longer a code change to move the lease off
-  labels — bd cannot leak a label. What remains is rate: debounce push-triggered syncs (each one is
-  N+1 reads) and decide whether per-run `status` transitions should reach Linear at all.
+  labels — bd cannot leak a label. What remains is **write** amplification, not just read cost: bd's
+  unchanged-issue skip never fires for a bead with acceptance criteria, so every push is one read
+  **and one `issueUpdate`** per linked bead (§2). Debounce is the only cap, and the "a lease-only
+  change syncs nothing" test must assert *no push fired* at anton's seam — asserting that bd skips
+  would fail. Still to decide: whether per-run `status` transitions should reach Linear at all.
 - **anton-ey0w.2 (wrapper + `external_ref` guard):** the guard cannot delegate to `--update-refs`; it
   must be a pre-push refusal while any bead still holds a `gh-<n>` ref. The wrapper's ref reader must
   accept both the slugged and canonical URL forms, and the per-area routing pass must pass
