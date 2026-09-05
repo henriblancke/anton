@@ -28,6 +28,7 @@ import {
   saveBoardPickerPlan,
   stampBoard,
   type BoardPickerPlan,
+  type PickerExclusionReason,
 } from "./board-picker-plan";
 import type { Bead } from "./beads/types";
 import { systemClock, type AntonDb } from "./jobs/queue";
@@ -203,6 +204,13 @@ async function rederiveRelease(
   const because = excluded
     ? `${excluded.reason}${excluded.detail ? ` — ${excluded.detail}` : ""}`
     : "it is no longer in the ranked set";
+  if (excluded && ALREADY_SETTLED_EXCLUSIONS.has(excluded.reason)) {
+    return {
+      refuse:
+        `${beadId} is already taken (${because}) — it was settled while this view was open. ` +
+        `Nothing new was approved or started; the board is catching up.`,
+    };
+  }
   return {
     refuse:
       `${beadId} is no longer one of anton's picks: the plan you released from was replaced, and ` +
@@ -210,6 +218,21 @@ async function rederiveRelease(
       `directly if you still want this run.`,
   };
 }
+
+/**
+ * The exclusions that mean the target was ALREADY SETTLED rather than retired (PR #236 review).
+ *
+ * A ranking drops `claimed` and `not-open` targets because somebody else got there — a parallel
+ * release from another tab, a teammate's claim, a run already in flight. The remedy for a retired
+ * pick, "approve it directly", is wrong for those: it invites a second approval on a start that
+ * exists. So they get the stale-surface reading instead, which is what the client's 409 handler
+ * already acts on (`release-action.tsx` → `router.refresh()`). Every genuinely-retired reason —
+ * `needs-human`, `policy`, `approval-gap`, `blocked` — keeps the approve-directly remedy.
+ */
+const ALREADY_SETTLED_EXCLUSIONS: ReadonlySet<PickerExclusionReason> = new Set([
+  "claimed",
+  "not-open",
+]);
 
 function pickOf(planId: string, rank: number, rule?: string): ReleasePick {
   return { planId, rank, ...(rule ? { rule } : {}) };

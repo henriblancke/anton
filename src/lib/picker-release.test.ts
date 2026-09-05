@@ -170,6 +170,31 @@ describe("a superseded generation", () => {
     expect(await listPickerVerdicts(test.db, PROJECT)).toHaveLength(0);
   });
 
+  it.each([
+    ["a claim landed first", { assignee: "another-operator" }, "held by another-operator"],
+    ["its run already started", { status: "in_progress" as const }, "in_progress"],
+  ])("refuses a target that was already settled — %s — without advising a second approval", async (
+    _case,
+    moved,
+    detail,
+  ) => {
+    // The other half of a refusal (PR #236 review): `claimed` and `not-open` do not mean the pick
+    // was retired, they mean someone else got there — often a release from another tab. Telling the
+    // operator to approve it directly would file a second approval on a start that already exists,
+    // so the copy names the stale surface instead, matching the client's 409 → `router.refresh()`.
+    const board = [BOARD[0]!, bead("target", { priority: 2, ...moved })];
+    const displayed = await record([{ beadId: "target", rank: 1, rule: "before it moved" }], board);
+    await record([{ beadId: "urgent", rank: 1, rule: "the pass that replaced it" }], board);
+
+    const verdict = await resolve(displayed, board);
+
+    const refusal = "refuse" in verdict ? verdict.refuse : "";
+    expect(refusal).toContain("already taken");
+    expect(refusal).toContain(detail);
+    expect(refusal).not.toContain("approve it directly");
+    expect(await listPickerVerdicts(test.db, PROJECT)).toHaveLength(0);
+  });
+
   it("skips rather than refuses a pick the operator has vetoed", async () => {
     // A veto excludes the target from any re-derivation, so without this ordering the operator's own
     // pacing would read back as "anton no longer picks this" — a different answer with a different
