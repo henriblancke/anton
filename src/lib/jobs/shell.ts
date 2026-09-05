@@ -41,6 +41,16 @@ const DEFAULT_MAX_OUTPUT = 32 * 1024 * 1024;
  */
 const DRAIN_AFTER_EXIT_MS = 2_000;
 
+/** How often a kill path re-asks whether the gate's process group still has members. */
+const REAP_POLL_MS = 25;
+
+/**
+ * Ceiling on waiting for a SIGKILLed group to disappear. SIGKILL is uncatchable, so anything still
+ * standing past this is wedged in the kernel (uninterruptible I/O) or has left the group by setsid —
+ * neither of which more waiting fixes, and a job run must never hang on it.
+ */
+const REAP_CEILING_MS = 2_000;
+
 function killGraceMs(): number {
   const raw = Number(process.env[KILL_GRACE_ENV]);
   return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_KILL_GRACE_MS;
@@ -73,8 +83,10 @@ export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promis
     let out = "";
     let exited = false;
     let settled = false;
+    let killing = false;
     let drainTimer: NodeJS.Timeout | undefined;
     let escalateTimer: NodeJS.Timeout | undefined;
+    let reapTimer: NodeJS.Timeout | undefined;
 
     const killGroup = (sig: NodeJS.Signals) => {
       if (process.platform !== "win32" && child.pid) {
@@ -88,41 +100,93 @@ export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promis
       child.kill(sig);
     };
 
+    /**
+     * Whether the gate's process GROUP still has members — the direct shell OR any descendant it
+     * forked. Signal 0 checks existence without delivering anything, and `ESRCH` on the group is the
+     * only proof that every member is gone; `EPERM` means members we cannot signal still exist.
+     */
+    const groupGone = (): boolean => {
+      if (!child.pid) return true; // spawn failed — there is no group to wait on
+      if (process.platform === "win32") return exited; // no process groups; the child is all there is
+      try {
+        process.kill(-child.pid, 0);
+        return false;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    };
+
     const settle = (emit: () => void) => {
       if (settled) return;
       settled = true;
       signal?.removeEventListener("abort", onAbort);
       if (drainTimer) clearTimeout(drainTimer);
+      if (escalateTimer) clearTimeout(escalateTimer);
+      if (reapTimer) clearTimeout(reapTimer);
       emit();
     };
 
-    // Node's built-in `signal` support only ever SIGTERMs the direct child, once. Cancellation is
-    // owned here instead: signal the whole group, then escalate for a command that traps SIGTERM.
-    // The escalation deliberately outlives the promise — the run unwinds immediately, while the
-    // group still gets killed — and is cleared as soon as the child actually exits.
-    const onAbort = () => {
-      if (!exited) {
-        killGroup("SIGTERM");
-        escalateTimer = setTimeout(() => killGroup("SIGKILL"), killGraceMs());
+    /**
+     * Kill the gate and settle only once its process tree is actually GONE (PR #228 review).
+     *
+     * Settling at SIGTERM would hand the caller a rejection while the group is still running: the
+     * timeout-preservation path reads that as a failed gate and hard-resets the worktree, so a write
+     * still in flight lands after the cleanliness check and is swept into the next ticket's commit.
+     * A kill is not a fact until the group is empty, so the promise waits for that — SIGTERM, then
+     * SIGKILL after the grace, then poll until the group reports ESRCH.
+     *
+     * The escalation no longer stops at the direct child's exit either: `sh -c` can fork, so the
+     * wrapper exiting says nothing about the workers it left behind. It is guarded by a liveness
+     * check instead, so a group that is already gone is never signalled through a recycled pid.
+     */
+    const killTree = (first: NodeJS.Signals, emit: () => void) => {
+      if (settled || killing) return;
+      killing = true;
+      // A drain already counting down would resolve the promise out from under the kill.
+      if (drainTimer) clearTimeout(drainTimer);
+      // Drop the pipes: nothing will read them again, and the overflow path must stop accumulating
+      // output while the group takes its grace to die.
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      killGroup(first);
+      const grace = first === "SIGKILL" ? 0 : killGraceMs();
+      if (first !== "SIGKILL") {
+        escalateTimer = setTimeout(() => {
+          if (!groupGone()) killGroup("SIGKILL");
+        }, grace);
       }
-      settle(() => reject(abortError()));
+      const deadline = Date.now() + grace + REAP_CEILING_MS;
+      const waitForGroup = () => {
+        if (groupGone() || Date.now() >= deadline) {
+          settle(emit);
+          return;
+        }
+        reapTimer = setTimeout(waitForGroup, REAP_POLL_MS);
+      };
+      waitForGroup();
+    };
+
+    // Node's built-in `signal` support only ever SIGTERMs the direct child, once. Cancellation is
+    // owned here instead: signal the whole group, and settle when it is gone (see killTree).
+    const onAbort = () => {
+      if (exited && groupGone()) {
+        settle(() => reject(abortError()));
+        return;
+      }
+      killTree("SIGTERM", () => reject(abortError()));
     };
 
     /** maxBuffer parity with bd.ts: kill the group and reject rather than buffer without bound. */
     const limit = maxOutput();
     const overflow = () => {
-      killGroup("SIGKILL");
-      settle(() => {
-        // Drop the pipes a leaked descendant is still holding — nothing will read them again.
-        child.stdout?.destroy();
-        child.stderr?.destroy();
+      killTree("SIGKILL", () =>
         reject(
           Object.assign(new Error(`gate output exceeded ${limit} bytes: ${cmd}`), {
             code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
             killed: true,
           }),
-        );
-      });
+        ),
+      );
     };
 
     const capture = (c: Buffer) => {
@@ -132,11 +196,13 @@ export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promis
     child.stdout?.on("data", capture);
     child.stderr?.on("data", capture);
     child.on("error", (err) => settle(() => reject(err)));
-    child.on("close", (code) => settle(() => resolve({ ok: code === 0, code, output: out })));
+    child.on("close", (code) => {
+      if (!killing) settle(() => resolve({ ok: code === 0, code, output: out }));
+    });
     child.on("exit", (code) => {
       exited = true;
-      if (escalateTimer) clearTimeout(escalateTimer);
-      if (settled) return;
+      // A kill in flight owns the settle, and its escalation still has descendants to reach.
+      if (killing || settled) return;
       drainTimer = setTimeout(() => {
         settle(() => {
           // Drop the pipes a leaked descendant is still holding — nothing will read them again.

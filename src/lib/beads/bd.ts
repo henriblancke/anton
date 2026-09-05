@@ -484,9 +484,10 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
 
     const budgetTimer = setTimeout(() => {
       killGroup("SIGTERM");
-      // The escalation deliberately outlives the promise (as in runShell): the caller unwinds now,
-      // while the group still gets killed. It is never disarmed — bd's own exit says nothing about
-      // the descendants the reap is actually for (see the `exit` handler).
+      // The escalation deliberately outlives the promise: the caller unwinds now, while the group
+      // still gets killed. It is never disarmed — bd's own exit says nothing about the descendants
+      // the reap is actually for (see the `exit` handler). Unlike runShell, which waits for the
+      // group before it settles: nothing here rolls a worktree back on this rejection.
       setTimeout(() => killGroup("SIGKILL"), killGraceMs());
       settle(() => {
         dropPipes();

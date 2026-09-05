@@ -54,7 +54,7 @@ export interface EpicRun {
   standaloneRun: boolean;
   tickets: Bead[];
 
-  /** Tickets this run had to stop, and whether each got its work committed before it was stopped. */
+  /** Tickets this run had to stop, and whether each DELIVERED before it was stopped. */
   timedOut: TicketTimeoutOutcome[];
   /**
    * What the review gate found on the branch when it failed with an error anton rethrows unchanged

@@ -226,13 +226,18 @@ export interface SkipCause {
 }
 
 /** One entry in a run's timeout ledger: the ticket the budget stopped, and what became of its work
- * — committed before the deadline, PRESERVED on the branch as an explicitly incomplete commit
+ * — DELIVERED before the deadline, PRESERVED on the branch as an explicitly incomplete commit
  * (anton-d967 — only a childless run target can), or (neither flag) rolled back. Preserved and
- * committed are not the same thing anywhere downstream: preserved work is on the branch and is
- * still nobody's delivery. */
+ * delivered are not the same thing anywhere downstream: preserved work is on the branch and is
+ * still nobody's delivery.
+ *
+ * `delivered` is the delivery gate's verdict, never the bare tree fact (PR #228 review): a deadline
+ * landing while `assertDelivered` REFUSES a commit leaves that commit on the branch but makes it
+ * nobody's delivery, and every reader below — the reopen, the cascade, the operator's ledger — owes
+ * that ticket the same treatment as one stopped short. */
 export interface TicketTimeoutOutcome {
   id: string;
-  committed: boolean;
+  delivered: boolean;
   preserved?: boolean;
 }
 
@@ -298,7 +303,7 @@ export async function reopenAbsorbedTimeouts(
   timedOut: readonly TicketTimeoutOutcome[],
   board: ReopenBoard = beads,
 ): Promise<void> {
-  for (const stalled of timedOut.filter((t) => !t.committed)) {
+  for (const stalled of timedOut.filter((t) => !t.delivered)) {
     await withBeadWriteLock(repo, stalled.id, async () => {
       // Decided on a read taken HERE, not on the ledger (PR #199 review).
       const live = await board.show(repo, stalled.id).catch(() => undefined);
@@ -372,7 +377,7 @@ export function skippedDependents(
   const ids = new Set(tickets.map((t) => t.id));
   const adj = dependentEdges(tickets, all);
   const stoppedSet = new Set(
-    timedOut.filter((t) => !t.committed && ids.has(t.id)).map((t) => t.id),
+    timedOut.filter((t) => !t.delivered && ids.has(t.id)).map((t) => t.id),
   );
   const cause = new Map<string, SkipCause>();
   const queue = [...stoppedSet];

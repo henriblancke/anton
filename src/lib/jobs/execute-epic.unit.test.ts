@@ -515,8 +515,8 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
     ticket("d"),
   ];
   const ids = (beads: Bead[]) => beads.map((b) => b.id);
-  /** A ticket the budget stopped BEFORE its commit — the only kind whose skip cascades. */
-  const rolledBack = (...tickets: string[]) => tickets.map((id) => ({ id, committed: false }));
+  /** A ticket the budget stopped before it delivered — the only kind whose skip cascades. */
+  const rolledBack = (...tickets: string[]) => tickets.map((id) => ({ id, delivered: false }));
 
   it("dispatches a chain blocker-first, whatever order the board hands it back in", () => {
     const board = chain();
@@ -574,18 +574,18 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
     expect(ids(orderTickets(cyclic, cyclic))).toEqual(["a", "b", "c"]);
   });
 
-  it("does NOT cascade a timeout that landed after the ticket committed", () => {
+  it("does NOT cascade a timeout that landed after the ticket delivered", () => {
     const board = chain();
     // The deadline hit the bookkeeping, not the code: `a`'s work is on the branch, so everything
-    // written against it still has what it needs and must still run. Deleting the committed-ness
-    // check turns this into the whole chain being skipped for work that actually shipped.
-    expect(skippedDependents([{ id: "a", committed: true }], board, board).size).toBe(0);
+    // written against it still has what it needs and must still run. Deleting the delivered check
+    // turns this into the whole chain being skipped for work that actually shipped.
+    expect(skippedDependents([{ id: "a", delivered: true }], board, board).size).toBe(0);
     // …and in a run where BOTH happen, only the rolled-back one takes its dependents down: `a`
-    // committed, so `b` still ran; `b` did not, so only `c` behind it is skipped.
+    // delivered, so `b` still ran; `b` did not, so only `c` behind it is skipped.
     const mixed = skippedDependents(
       [
-        { id: "a", committed: true },
-        { id: "b", committed: false },
+        { id: "a", delivered: true },
+        { id: "b", delivered: false },
       ],
       board,
       board,
@@ -1365,14 +1365,14 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
   /** Drain the queue, so "did it read yet?" is answered after everything that could have run. */
   const settle = () => new Promise((r) => setTimeout(r, 0));
 
-  it("reopens a rolled-back timeout and leaves a committed one blocked", async () => {
+  it("reopens a rolled-back timeout and leaves a delivered one blocked", async () => {
     const bd = board();
-    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: false }], bd);
+    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", delivered: false }], bd);
     expect(bd.current.status).toBe("open");
 
-    const committed = board();
-    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: true }], committed);
-    expect(committed.current.status).toBe("blocked");
+    const delivered = board();
+    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", delivered: true }], delivered);
+    expect(delivered.current.status).toBe("blocked");
   });
 
   it("holds the lock across the read, so a claim cannot land between predicate and write", async () => {
@@ -1384,7 +1384,7 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
     const reading = defer(); // the reopen has entered its re-read
     const release = defer(); // …and is held there until the competing claim has been attempted
 
-    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", delivered: false }], {
       show: async () => {
         reading.resolve();
         await release.promise;
@@ -1422,7 +1422,7 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
     const claim = withBeadWriteLock(path, "t1", async () => {
       bd.claim("someone@else");
     });
-    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", delivered: false }], {
       show: bd.show,
       setStatus: async (cwd, id, status) => {
         writes.push(status);
@@ -1445,7 +1445,7 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
     let read = false;
     const gate = withBeadWriteLock(path, "t1", () => held.promise);
 
-    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", delivered: false }], {
       show: async () => {
         read = true;
         return bd.show();
@@ -1465,7 +1465,7 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
   it("leaves the ticket as it stands when the re-read fails, and never throws", async () => {
     const bd = board();
     await expect(
-      reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: false }], {
+      reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", delivered: false }], {
         show: async () => {
           throw new Error("bd unavailable");
         },

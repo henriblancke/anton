@@ -600,7 +600,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
     const err = await settle(false);
 
     expect(err).toBeInstanceOf(TicketTimeoutError);
-    expect(err.committed).toBe(false); // the dispatch loop's delivered set reads this
+    expect(err.delivered).toBe(false); // the dispatch loop's delivered set reads this
     expect(tagged).toContainEqual([LABELS.notDelivered]);
     // The commit is still on the branch, and the note says so — the operator is owed both halves.
     expect(notes.join("\n")).toMatch(/committed on the branch/);
@@ -610,7 +610,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
   it("still leaves an ACCEPTED commit delivered — the deadline hit the bookkeeping", async () => {
     const err = await settle(true);
 
-    expect(err.committed).toBe(true);
+    expect(err.delivered).toBe(true);
     expect(tagged).not.toContainEqual([LABELS.notDelivered]);
     expect(notes.join("\n")).toMatch(/stopped after the commit/);
   });
@@ -815,7 +815,7 @@ describe("outOfTimeParkMessage — what the operator may safely do next (anton-d
       branch: BRANCH,
       standaloneRun: true,
       ticketTimeoutMs: 45 * 60_000,
-      timedOut: [{ id: ticket.id, committed: false, ...(preserved ? { preserved: true } : {}) }],
+      timedOut: [{ id: ticket.id, delivered: false, ...(preserved ? { preserved: true } : {}) }],
     }) as unknown as EpicRun;
 
   it("warns that splitting means taking the preserved commit off the branch first", () => {

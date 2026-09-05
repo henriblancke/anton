@@ -260,9 +260,9 @@ export class TicketTimeoutError extends Error {
      * that commit stays on the branch but is nobody's delivery, so this reads `false` and the
      * ticket keeps its `not-delivered` marker like any other ticket the budget stopped short.
      */
-    readonly committed: boolean,
+    readonly delivered: boolean,
     /**
-     * The branch a NON-committed ticket's work was preserved on (anton-d967), or null when it was
+     * The branch an UNDELIVERED ticket's work was preserved on (anton-d967), or null when it was
      * rolled back. Only a CHILDLESS run target can preserve — with no sibling ticket there is no
      * pull request its unfinished diff could ride into. Preserved work is on the branch but is NOT
      * a delivery: the ticket stays blocked, keeps its `not-delivered` marker, and is in no PR's
@@ -273,7 +273,7 @@ export class TicketTimeoutError extends Error {
   ) {
     super(
       `${ticketId} exceeded its ${Math.round(budgetMs / 60_000)}m ticket budget and was stopped. ` +
-        (committed
+        (delivered
           ? `Its work IS committed on the branch (only its bead was left unfinished)`
           : preservedOn
             ? `Its work passed this project's verify gates, so it was PRESERVED on ` +

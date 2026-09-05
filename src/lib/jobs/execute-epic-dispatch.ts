@@ -76,7 +76,7 @@ export async function dispatchRunTickets(
   // (anton-t1mo) — whether its work was rolled back or preserved on the branch as an explicitly
   // incomplete commit (anton-d967), nobody finished it. Read by the tail's park and by the delivery
   // verdict below.
-  const stoppedShort = new Set(run.timedOut.filter((t) => !t.committed).map((t) => t.id));
+  const stoppedShort = new Set(run.timedOut.filter((t) => !t.delivered).map((t) => t.id));
   await settleHeldTail(run, prep, { held, dispatchable, ledger, stoppedShort, recordSkipped });
   return {
     delivered: await deliveredOrPark(run, prep, live, ledger, stoppedShort),
@@ -370,10 +370,10 @@ async function dispatchTicket(
     if (!(e instanceof TicketTimeoutError)) throw e;
     timedOut.push({
       id: e.ticketId,
-      committed: e.committed,
+      delivered: e.delivered,
       ...(e.preservedOn ? { preserved: true } : {}),
     });
-    if (e.committed) onBranch.add(e.ticketId); // the deadline hit the bookkeeping, not the code
+    if (e.delivered) onBranch.add(e.ticketId); // the deadline hit the bookkeeping, not the code
     console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
     // Recomputed over the whole ledger, which decides for itself what cascades: a timeout
     // that landed AFTER its commit takes nothing down with it (anton-67xj). Walked over
@@ -533,7 +533,7 @@ export function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string
     ? `${Math.round(ticketTimeoutMs / 60_000)}m`
     : "unbounded";
   const preserved = timedOut.filter((t) => t.preserved).map((t) => t.id);
-  const rolledBack = timedOut.filter((t) => !t.preserved && !t.committed).map((t) => t.id);
+  const rolledBack = timedOut.filter((t) => !t.preserved && !t.delivered).map((t) => t.id);
   const fate = [
     preserved.length > 0
       ? `The work of ${preserved.join(", ")} is PRESERVED on branch \`${branch}\` as an ` +
