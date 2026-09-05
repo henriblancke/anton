@@ -12,6 +12,7 @@ import { loadAllIssues } from "../beads/issues";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
+import { branchContainsCommit } from "../git/ops";
 import type { Worktree } from "../git/worktree";
 import { findRunFormulaForBranch, updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
@@ -19,6 +20,7 @@ import {
   blockedRunPoison,
   humanHeldPoison,
   humanHeldTickets,
+  type HumanHeldTicket,
   inactiveAgentTickets,
   runTargetDrift,
   ticketSetDrift,
@@ -81,7 +83,7 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   const gates = regateRefreshedBoard(run, leaseTarget);
   assertAgentsEnabled(run, gates);
   assertBeadContract(run, gates);
-  assertTicketsClaimable(run, gates);
+  await assertTicketsClaimable(run, gates);
   const { ticketSteps, runSteps } = await resolveRunPipeline(run);
   await takeRunLease(run, preCheckTrusted, gates);
   // Re-asked after EVERY board this run adopts past the read-only gates (PR #227 review). Step 1c
@@ -89,14 +91,14 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   // brought back — so a person blocking or deferring a child inside either window arrives unjudged,
   // and the run would dispatch its earlier siblings before parking at that ticket's claim gate.
   // Re-asking is what makes "a held child stops the run before any dispatch" hold across both
-  // windows; the gate is pure and reads no board, so the extra calls cost nothing. Both still park
-  // before any worktree, claim or session exists — the arm's own waits stand, which is the state a
-  // resume reuses. The LAST window — between here and the reservation — is closed by
-  // {@link assertReservedTicketsClaimable}, which has to read a board of its own.
-  assertTicketsClaimable(run, gates);
+  // windows; the gate reads no board and only a park reads git, so the extra calls cost nothing on
+  // the path that matters. Both still park before any worktree, claim or session exists — the arm's
+  // own waits stand, which is the state a resume reuses. The LAST window — between here and the
+  // reservation — is closed by {@link assertReservedTicketsClaimable}, which reads a board of its own.
+  await assertTicketsClaimable(run, gates);
   run.lease.startRefresh();
   await armHumanTicketWaits(run, gates);
-  assertTicketsClaimable(run, gates);
+  await assertTicketsClaimable(run, gates);
   const { worktree, runStep } = await warmRunWorktree(run);
   await claimRunTarget(run);
   await cascadeChildClaims(run);
@@ -261,11 +263,12 @@ function assertBeadContract(run: EpicRun, gates: RunGates): void {
 }
 
 /**
- * Step 0c-bis. Refuse a run holding a ticket whose status only a person can clear. Pure and
- * board-free, so the caller asks it once per board this run adopts — the pre-lease read, the
- * children the lease confirmed, and the ones the human-ticket arm's refresh brought back.
+ * Step 0c-bis. Refuse a run holding a ticket whose status only a person can clear. Board-free, so
+ * the caller asks it once per board this run adopts — the pre-lease read, the children the lease
+ * confirmed, and the ones the human-ticket arm's refresh brought back. Only the PARK reads git
+ * ({@link commitsHere}); a run with nothing held costs nothing to ask.
  */
-function assertTicketsClaimable(run: EpicRun, gates: RunGates): void {
+async function assertTicketsClaimable(run: EpicRun, gates: RunGates): Promise<void> {
   // 0c-bis. A ticket in a status bd refuses `--claim` on cannot be dispatched by anyone
   // (anton-fude). The state that puts one there is anton's OWN: a zero-diff run blocks its ticket
   // for human review, and every resume of that target then re-derived the same child set, walked
@@ -281,7 +284,35 @@ function assertTicketsClaimable(run: EpicRun, gates: RunGates): void {
   // not judged here — its status is the epic claim's business (claimRunTarget), which already parks
   // on the same refusal with the target's own message.
   const held = humanHeldTickets(gates.children);
-  if (held.length > 0) throw humanHeldPoison(run.targetId, held, run.branch);
+  if (held.length === 0) return;
+  throw humanHeldPoison(run.targetId, held, run.branch, await commitsHere(run, held));
+}
+
+/**
+ * Which held tickets' recorded commits this machine can actually ship — the git answer
+ * {@link humanHeldPoison} needs before it may offer a remedy that settles the board over one
+ * (PR #227 review).
+ *
+ * A block note names the branch its run was on, and anton's branch names are deterministic per
+ * target: a run resumed on ANOTHER machine derives the same name over a checkout cut from origin,
+ * while the commit the note records was never pushed. Branch-name equality alone would then tell the
+ * operator that abandoning the ticket leaves its commit in this run's pull request — the advice that
+ * drops the work and lets an incomplete PR proceed. Asked of the repository rather than the
+ * worktree, so the same answer holds at every gate, including the ones that park before a checkout
+ * exists.
+ *
+ * Only reached on the park path — a run with nothing held pays nothing for it.
+ */
+async function commitsHere(run: EpicRun, held: HumanHeldTicket[]): Promise<Set<string>> {
+  const verified = await Promise.all(
+    held.map(async (h) =>
+      h.committed?.branch === run.branch &&
+      (await branchContainsCommit(run.repo, run.branch, h.committed.head))
+        ? h.id
+        : null,
+    ),
+  );
+  return new Set(verified.filter((id): id is string => id !== null));
 }
 
 /**
@@ -335,7 +366,8 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
   }
   const reserved = new Map(runTickets(reservedBoard, epicBeadId).map((t) => [t.id, t]));
   const held = humanHeldTickets(gates.children.map((c) => reserved.get(c.id) ?? c));
-  if (held.length > 0) throw humanHeldPoison(epicBeadId, held, run.branch);
+  if (held.length === 0) return;
+  throw humanHeldPoison(epicBeadId, held, run.branch, await commitsHere(run, held));
 }
 
 /** Step 0d. Cook, floor-check and pin the pipeline this run walks, then split it into its phases. */

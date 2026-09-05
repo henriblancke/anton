@@ -187,54 +187,78 @@ function clampNote(text: string | undefined): string | undefined {
 }
 
 /**
- * The commit a held ticket's block note records, but only when it landed on the branch THIS run
- * ships (PR #227 review).
+ * Where a held ticket's work stands relative to the pull request THIS run opens — the only thing its
+ * remedy turns on (PR #227 review).
  *
- * A block note names the branch its run was on, and a ticket outlives that run: re-parent a blocked
- * ticket onto another target and its note still points at the original target's branch, which this
- * run's pull request will never contain. Reading the sha without the branch turns that into the
- * confident and false claim that the work is already here.
+ * `here` is the sole verdict that licenses "review it and close", and it takes a git answer, never a
+ * branch NAME: anton's branches are deterministic per target, so a run resumed on another machine
+ * derives the same name over a checkout that lacks the commit its note records (the machine that
+ * made it parked before pushing) — the same cross-machine gap the dispatch loop closes with
+ * `worktreeHasCommitFor`. `elsewhere` is the note of a re-parented ticket, still pointing at its
+ * original run's branch. Both `elsewhere` and `absent` mean this run ships without that work.
  */
-function committedHere(held: HumanHeldTicket, branch: string): string | undefined {
-  return held.committed?.branch === branch ? held.committed.head : undefined;
+type HeldWork =
+  | { where: "none" }
+  | { where: "here"; head: string }
+  | { where: "elsewhere"; branch: string; head: string }
+  | { where: "absent"; head: string };
+
+/** Read {@link HeldWork} off the ticket's note plus `commitsHere` — see {@link humanHeldPoison}. */
+function heldWork(
+  held: HumanHeldTicket,
+  branch: string,
+  commitsHere: ReadonlySet<string>,
+): HeldWork {
+  const committed = held.committed;
+  if (!committed) return { where: "none" };
+  if (committed.branch !== branch) return { where: "elsewhere", ...committed };
+  return { where: commitsHere.has(held.id) ? "here" : "absent", head: committed.head };
 }
 
 /**
  * What one held ticket owes the operator: why no run may take it, and the move that frees it.
  *
- * A blocked ticket has THREE remedies, and which one applies turns on where its work landed
+ * A blocked ticket has FOUR remedies, and which one applies turns on where its work landed
  * (PR #227 review). Recommending `--status open` for a ticket that already committed HERE is wrong
  * twice over: reopening does not satisfy `resumeSkipped` (only `closed` does), so the resumed run
  * dispatches the agent again ON TOP of that commit and can block right back at the same zero diff —
  * and abandoning it drops the work from the board while its commit stays on the run branch. That
  * case is owed what the block note itself says: review the commit, then close.
  *
- * A commit on ANOTHER branch is owed the opposite of that: it is in no PR this run opens, so closing
- * or abandoning the ticket settles the board over work this target never ships. Reopening is the
- * move — the same one a zero-diff block gets — with the foreign commit named so the operator can
- * bring it across instead of redoing it.
+ * Work that is NOT here — committed on another branch, or on this branch but only in another
+ * machine's unpushed checkout — is owed the opposite of that: it is in no PR this run opens, so
+ * closing or abandoning the ticket settles the board over work this target never ships. Reopening is
+ * the move — the same one a zero-diff block gets — with the commit named so the operator can bring
+ * it across instead of redoing it.
  */
-function humanHeldClause(held: HumanHeldTicket, branch: string): string {
-  const here = committedHere(held, branch);
+function humanHeldClause(held: HumanHeldTicket, work: HeldWork, branch: string): string {
   const why =
     held.status === "deferred"
       ? `${held.id} is deferred — snoozed out of the queue, so no run may claim it (\`bd undefer ` +
         `${held.id}\` to bring it back)`
-      : here
+      : work.where === "here"
         ? `${held.id} is blocked pending human review with its work ALREADY COMMITTED on this ` +
-          `run's branch (@ ${here}) — review that commit and \`bd close ${held.id}\` if ` +
+          `run's branch (@ ${work.head}) — review that commit and \`bd close ${held.id}\` if ` +
           `it satisfies the ticket, which is what lets a resume walk past it; reopen it ` +
           `(\`bd update ${held.id} --status open\`) only to have an agent keep working on top of ` +
           `that commit`
-        : held.committed
+        : work.where === "elsewhere"
           ? `${held.id} is blocked pending human review and its work was committed on ` +
-            `${held.committed.branch} (@ ${held.committed.head}), NOT on this run's branch ` +
+            `${work.branch} (@ ${work.head}), NOT on this run's branch ` +
             `(${branch}) — so this run's pull request does not contain it, and closing or ` +
             `abandoning it would settle the board over work this target never ships. Reopen it ` +
             `(\`bd update ${held.id} --status open\`) to have an agent redo it here, or land that ` +
             `commit on ${branch} yourself before closing it`
-          : `${held.id} is blocked pending human review (\`bd update ${held.id} --status open\` once ` +
-            `it is resolved)`;
+          : work.where === "absent"
+            ? `${held.id} is blocked pending human review and its note records a commit on ` +
+              `${branch} (@ ${work.head}) that is NOT on this machine's ${branch} — the run that ` +
+              `made it parked before pushing, so this run's pull request does not contain it and ` +
+              `closing or abandoning it would settle the board over work this run never ships. ` +
+              `Reopen it (\`bd update ${held.id} --status open\`) to have an agent redo it here, ` +
+              `or push that commit from the machine holding it and land it on ${branch} before ` +
+              `closing it`
+            : `${held.id} is blocked pending human review (\`bd update ${held.id} --status open\` once ` +
+              `it is resolved)`;
   return held.note ? `${why}: "${held.note}"` : why;
 }
 
@@ -245,25 +269,34 @@ function humanHeldClause(held: HumanHeldTicket, branch: string): string {
  * and land it right back in `blocked` — the human-review gate answered by the machine that tripped
  * it — and skipping would open the target's single pull request missing work the board still shows
  * as open, the same reason the allowlist and contract gates park rather than narrow.
+ *
+ * `commitsHere` is the caller's git-verified answer to "which of these tickets' recorded commits are
+ * actually reachable from `branch` on this machine" (PR #227 review). It is an INPUT rather than a
+ * read of this module's own because the module is board-only, and it is required rather than
+ * optional because every remedy that settles the board over a commit depends on it: a caller that
+ * cannot verify passes the empty set and gets the answers that leave the work in the operator's
+ * hands.
  */
 export function humanHeldPoison(
   targetId: string,
   held: HumanHeldTicket[],
   branch: string,
+  commitsHere: ReadonlySet<string>,
 ): PoisonEpic {
   const one = held.length === 1;
   const it = one ? "it" : "them";
-  // Abandoning is a BOARD move, not a branch one: for a ticket whose work already landed ON THIS
+  const work = held.map((h) => [h, heldWork(h, branch, commitsHere)] as const);
+  // Abandoning is a BOARD move, not a branch one: for a ticket whose work is verifiably ON THIS
   // BRANCH it settles the bead and leaves the commit in the run's pull request, so it can't be
-  // offered as "drops the work". A commit on another branch buys none of that — this run ships
-  // without it, so abandoning really does drop the work here (PR #227 review).
-  const abandon = held.some((h) => committedHere(h, branch))
+  // offered as "drops the work". A commit this checkout does not have buys none of that — this run
+  // ships without it, so abandoning really does drop the work here (PR #227 review).
+  const abandon = work.some(([, w]) => w.where === "here")
     ? `or abandon ${it} to settle the board — a commit already on the branch stays in this run's ` +
       `pull request either way`
     : `or abandon ${it}, which drops the work from this run`;
   return new PoisonEpic(
     `${targetId} has ${one ? "a ticket" : `${held.length} tickets`} no agent can pick up: ` +
-      held.map((h) => humanHeldClause(h, branch)).join("; ") +
+      work.map(([h, w]) => humanHeldClause(h, w, branch)).join("; ") +
       `. bd refuses \`--claim\` on ${one ? "that status" : "those statuses"}, so the run stopped ` +
       `before dispatching anything rather than dying at the ticket's claim gate. Resolve ${it} — ` +
       `${abandon} — then resume the run`,

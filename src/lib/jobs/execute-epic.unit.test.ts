@@ -338,12 +338,15 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
 
 describe("humanHeldPoison — the park a held child leaves behind (anton-fude)", () => {
   const BRANCH = "anton/anton-x7la";
+  /** No recorded commit is reachable from this run's branch — what a park with no git answer gets. */
+  const NOTHING_HERE = new Set<string>();
 
   it("names the ticket, its note and the move that frees it", () => {
     const error = humanHeldPoison(
       "anton-x7la",
       [{ id: "anton-od4", status: "blocked", note: "anton: run made no changes (zero diff)" }],
       BRANCH,
+      NOTHING_HERE,
     );
 
     expect(error).toBeInstanceOf(PoisonEpic);
@@ -355,13 +358,18 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
   });
 
   it("tells a deferred child's own remedy apart from a blocked one's", () => {
-    const error = humanHeldPoison("anton-x7la", [{ id: "anton-od4", status: "deferred" }], BRANCH);
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "deferred" }],
+      BRANCH,
+      NOTHING_HERE,
+    );
     expect(error.message).toContain("is deferred");
     expect(error.message).toContain("bd undefer anton-od4");
     expect(error.message).not.toContain("--status open");
   });
 
-  it("sends a COMMITTED block to review-and-close, not to reopen-and-re-run", () => {
+  it("sends a VERIFIED committed block to review-and-close, not to reopen-and-re-run", () => {
     // Reopening does not satisfy `resumeSkipped` (only `closed` does), so the resumed run would
     // dispatch the agent again on top of the commit already on the branch — straight back to the
     // zero diff that blocked it. Closing is the move that actually lets the run walk past it.
@@ -369,6 +377,7 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
       "anton-x7la",
       [{ id: "anton-od4", status: "blocked", committed: { branch: BRANCH, head: "0123456" } }],
       BRANCH,
+      new Set(["anton-od4"]),
     );
     expect(error.message).toContain("ALREADY COMMITTED");
     expect(error.message).toContain("@ 0123456");
@@ -391,6 +400,7 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
         },
       ],
       BRANCH,
+      NOTHING_HERE,
     );
     expect(error.message).toContain("committed on anton/anton-fude (@ 0123456)");
     expect(error.message).toContain("NOT on this run's branch");
@@ -401,8 +411,32 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
     expect(error.message).toContain("drops the work from this run");
   });
 
+  it("refuses the close remedy when the commit is not on THIS machine's branch (PR #227 review)", () => {
+    // anton's branch names are deterministic per target, so a run resumed on another machine derives
+    // the SAME name over a checkout that lacks the commit — the original machine committed and
+    // parked before pushing. Offering "abandon it, the commit stays in the PR" there drops the work:
+    // partitionTickets discards the abandoned ticket and an incomplete pull request proceeds.
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "blocked", committed: { branch: BRANCH, head: "0123456" } }],
+      BRANCH,
+      NOTHING_HERE,
+    );
+    expect(error.message).toContain("@ 0123456");
+    expect(error.message).toContain(`NOT on this machine's ${BRANCH}`);
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toContain("ALREADY COMMITTED");
+    expect(error.message).not.toContain("bd close");
+    expect(error.message).toContain("drops the work from this run");
+  });
+
   it("keeps the reopen remedy for a block that committed nothing", () => {
-    const error = humanHeldPoison("anton-x7la", [{ id: "anton-od4", status: "blocked" }], BRANCH);
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "blocked" }],
+      BRANCH,
+      NOTHING_HERE,
+    );
     expect(error.message).toContain("bd update anton-od4 --status open");
     expect(error.message).not.toContain("bd close");
     expect(error.message).toContain("drops the work from this run");
@@ -416,6 +450,7 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
         { id: "anton-9zz", status: "deferred" },
       ],
       BRANCH,
+      NOTHING_HERE,
     );
     expect(error.message).toContain("2 tickets");
     expect(error.message).toContain("anton-od4");
