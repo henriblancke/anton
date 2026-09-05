@@ -1409,11 +1409,43 @@ export function recordFromInstall(record, appRoot) {
   return declared === appRoot || sameDirectory(declared, appRoot);
 }
 
-/** The record a running server left, or null when there is none (or it is unreadable/malformed). */
+/**
+ * The record fields that are a STRING or nothing — the identity half, which readers compare with
+ * `===` and print with `slice`. `pid` and `builtAt` are numbers by design and are left alone.
+ */
+const RECORD_STRING_FIELDS = ["version", "revision", "worktree", "source", "env", "startedAt", "appRoot"];
+
+/**
+ * The record a running server left, or null when there is none (or it is unreadable/malformed).
+ *
+ * This is the ONE boundary where a file becomes an identity — the boot record and the build stamp
+ * are both read through it — so it is where a field is checked rather than trusted (PR #217 review).
+ * `JSON.parse` returning an object proves nothing about what is IN it, and every reader downstream
+ * treats these fields as strings: `{"version":"0.0.1","revision":42}` reaches
+ * `describeBuildIdentity` and throws on `revision.slice`, which does not stay local — `anton doctor`
+ * aborts and the Health banner throws while rendering, so one hand-edited file takes out the whole
+ * drift surface. The same reasoning as the `startedAt` guard in `recordVerdict`, applied where every
+ * field arrives.
+ *
+ * A malformed field is DROPPED rather than the record rejected, because the two live in one file for
+ * different readers. Dropping leaves each field saying only what it can prove — the absence every
+ * comparison here already handles — while rejecting outright would answer `recordVerdict` with a
+ * record that does not exist, and the prune deletes those: a live server's own record, gone for a
+ * typo in a field that has nothing to do with whether it is running.
+ *
+ * What that leaves open is worth naming: a stamp whose VERSION survives but whose revision did not
+ * vouches on the version alone, exactly as a bundle install with no commit to name does. A corrupt
+ * version is the field that matters and fails closed on its own — `provesSameCheckout` requires one
+ * on both sides, so the build is compiled again.
+ */
 export function readBuildRecord(path) {
   try {
     const record = JSON.parse(readFileSync(path, "utf8"));
-    return record && typeof record === "object" ? record : null;
+    if (!record || typeof record !== "object") return null;
+    for (const field of RECORD_STRING_FIELDS) {
+      if (field in record && typeof record[field] !== "string") delete record[field];
+    }
+    return record;
   } catch {
     return null;
   }

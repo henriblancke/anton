@@ -1581,6 +1581,55 @@ describe("the record a running server leaves", () => {
     expect(listBuildRecords(db).map(({ record }) => record.pid)).toEqual([4242, 4243]);
   });
 
+  // `JSON.parse` returning an object proves nothing about what is IN it, and every reader downstream
+  // treats these fields as strings. A record carrying `revision: 42` reached `describeBuildIdentity`
+  // and threw on `revision.slice`, and the throw did not stay local: doctor aborted and the Health
+  // banner threw while rendering, so one hand-edited file took out the whole drift surface
+  // (PR #217 review).
+  it("drops a record field that is not the string every reader takes it for", () => {
+    const dir = tempDir();
+    const path = join(dir, "server-build.4242.json");
+    writeFileSync(
+      path,
+      JSON.stringify({ version: "0.0.1", revision: 42, worktree: 7, source: {}, env: [], startedAt: 9, pid: 4242 }),
+    );
+
+    // The identity fields go; the numbers that are numbers by design stay.
+    const record = readBuildRecord(path);
+    expect(record).toEqual({ version: "0.0.1", pid: 4242 });
+    expect(() => describeBuildIdentity(record)).not.toThrow();
+    expect(describeBuildIdentity(record)).toBe("0.0.1");
+  });
+
+  // Dropped rather than rejected, because the identity and the liveness half share one file: a
+  // record that does not exist is one the prune DELETES, and a live server would lose its own record
+  // over a typo in a field that says nothing about whether it is running (PR #217 review).
+  it("keeps a live record whose identity field was malformed instead of pruning it", () => {
+    const dir = tempDir();
+    const db = join(dir, "anton.db");
+    writeFileSync(
+      buildRecordPath(db, process.pid),
+      JSON.stringify({ version: "0.0.1", revision: 42, pid: process.pid }),
+    );
+    pruneBuildRecords(db, (record) => ({ alive: record.pid === process.pid, stale: record.pid !== process.pid }));
+    expect(listBuildRecords(db).map(({ record }) => record.pid)).toEqual([process.pid]);
+  });
+
+  // The version is the field that decides, and it fails closed on its own: a stamp that cannot name
+  // one vouches for nothing, so the build is compiled again rather than served on a corrupt claim.
+  it("refuses to vouch for a build whose stamp lost its version to a malformed field", () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    mkdirSync(join(dir, ".next"));
+    writeFileSync(buildStampPath(dir), JSON.stringify({ version: 42, revision: "a".repeat(40) }));
+    expect(buildMatchesCheckout(dir, RUNNING)).toBe(false);
+
+    // ...where the same stamp with a readable version does vouch, so the refusal is the field and
+    // not the fixture.
+    writeFileSync(buildStampPath(dir), JSON.stringify(RUNNING));
+    expect(buildMatchesCheckout(dir, RUNNING)).toBe(true);
+  });
+
   // Nothing deletes a record when a server exits — a crash could not — so without this every boot
   // would leave one more file beside anton.db forever.
   it("drops the records of processes that are gone, and only those", () => {
