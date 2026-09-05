@@ -17,8 +17,8 @@
 import { consumeLine, createLineReader, createStreamState, type ClaudeEvent } from "./driver-events";
 import { exitError, toClaudeResult, type ClaudeResult } from "./driver-exit";
 import {
-  abortGraceMs, buildClaudeArgs, createStallWatchdog, killTree, resolveClaudeBin, spawnClaude,
-  writePrompt, writeSystemPromptFile, type ClaudeCliOptions,
+  abortGraceMs, buildClaudeArgs, createStallWatchdog, groupAlive, killTree, resolveClaudeBin,
+  spawnClaude, writePrompt, writeSystemPromptFile, type ClaudeCliOptions,
 } from "./driver-spawn";
 
 export { ABORT_GRACE_ENV, CLAUDE_BIN_ENV } from "./driver-spawn";
@@ -56,6 +56,9 @@ export interface RunClaudeOptions extends ClaudeCliOptions {
  */
 export const DEFAULT_STALL_TIMEOUT_MS = 60 * 60_000;
 
+/** How often a cancelled session re-checks whether its process group has finally emptied. */
+const GROUP_EXIT_POLL_MS = 50;
+
 /**
  * The rejection a cancelled session settles with when its own abort produced none — shaped like
  * Node's `AbortError`, which is what callers discriminate cancellation by.
@@ -79,8 +82,9 @@ function abortError(): Error {
  * ticket-timeout path re-runs the verify gates and COMMITS that tree the moment this promise
  * settles, so settling on the signal hands it a snapshot still being written: the commit is
  * inconsistent, and whatever lands after the final cleanliness check is thrown away with the failed
- * run's worktree. So an abort holds its rejection until `close`, escalating SIGTERM → SIGKILL for
- * anything that traps or ignores the first signal.
+ * run's worktree. So an abort holds its rejection until the whole GROUP is gone — not merely until
+ * the direct child closes, which a descendant that traps the signal outlives — escalating
+ * SIGTERM → SIGKILL for anything that ignores the first one.
  */
 function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Promise<ClaudeResult> {
   return new Promise<ClaudeResult>((resolve, reject) => {
@@ -89,14 +93,16 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
     const stallMs = opts.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
     const watchdog = createStallWatchdog(stallMs, () => killTree(child, "SIGKILL"));
 
-    /** The abort's own rejection, held until `close` proves the process group is gone. */
+    /** The abort's own rejection, held until the whole process GROUP is proven gone. */
     let aborting: Error | null = null;
     let escalate: NodeJS.Timeout | undefined;
     let abandon: NodeJS.Timeout | undefined;
+    let groupWatch: NodeJS.Timeout | undefined;
     const clearTermination = () => {
       if (escalate) clearTimeout(escalate);
       if (abandon) clearTimeout(abandon);
-      escalate = abandon = undefined;
+      if (groupWatch) clearTimeout(groupWatch);
+      escalate = abandon = groupWatch = undefined;
     };
 
     const onAbort = () => {
@@ -104,9 +110,9 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
       const grace = abortGraceMs();
       escalate = setTimeout(() => killTree(child, "SIGKILL"), grace);
       escalate.unref?.();
-      // The last resort, and a bounded one. SIGKILL went to the whole GROUP, so anything still
-      // holding the pipes open past this is a leaked descendant rather than a live writer — waiting
-      // on it would wedge the run instead of protecting the tree.
+      // The last resort, and a bounded one — for the pipes and for the group wait alike. SIGKILL
+      // went to the whole GROUP, so anything still standing past this is unreapable rather than a
+      // live writer, and waiting on it would wedge the run instead of protecting the tree.
       abandon = setTimeout(() => settle(() => reject(aborting ?? abortError())), grace * 2);
       abandon.unref?.();
     };
@@ -157,20 +163,47 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
       }
       settle(() => reject(err));
     });
-    child.on("close", (code) =>
-      settle(() => {
-        lines.flush();
-        // A cancelled session keeps the abort's own rejection: callers discriminate cancellation by
-        // it, and the signal-kill exit it leaves behind is no verdict on the session's work.
-        if (aborting) {
-          reject(aborting);
+    /**
+     * Settle once the process GROUP is empty, not merely the direct child (PR #228 review). Claude
+     * exiting on SIGTERM proves nothing about the shell command it spawned: a descendant that traps
+     * the signal and holds none of claude's pipes lets `close` fire while it keeps writing the
+     * worktree, and the ticket-timeout path verifies and commits that tree the instant this promise
+     * settles. So the escalation is delivered NOW rather than waiting out its timer, and the
+     * rejection waits for the group to actually go — bounded by `abandon`, which stays armed: a
+     * group that cannot be reaped must not wedge the run.
+     */
+    const settleWhenGroupGone = (finish: () => void) => {
+      killTree(child, "SIGKILL");
+      if (escalate) clearTimeout(escalate);
+      escalate = undefined;
+      const poll = () => {
+        // `abandon` may have given up on this group already; without this the loop would outlive
+        // the settled promise, polling a group nothing is waiting on for the process's lifetime.
+        if (settled) return;
+        if (!groupAlive(child)) {
+          settle(finish);
           return;
         }
+        groupWatch = setTimeout(poll, GROUP_EXIT_POLL_MS);
+        groupWatch.unref?.();
+      };
+      poll();
+    };
+
+    child.on("close", (code) => {
+      lines.flush();
+      // A cancelled session keeps the abort's own rejection: callers discriminate cancellation by
+      // it, and the signal-kill exit it leaves behind is no verdict on the session's work.
+      if (aborting) {
+        settleWhenGroupGone(() => reject(aborting as Error));
+        return;
+      }
+      settle(() => {
         const error = exitError({ code, stalled: watchdog.stalled, stallMs, stderr, stream });
         if (error) reject(error);
         else resolve(toClaudeResult(stream));
-      }),
-    );
+      });
+    });
   });
 }
 

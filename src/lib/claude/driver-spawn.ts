@@ -176,6 +176,28 @@ export function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
 }
 
 /**
+ * Whether ANY process in the child's group is still alive (PR #228 review).
+ *
+ * `close` on the direct child does not answer this: a tool process claude spawned that ignores
+ * SIGTERM and holds none of claude's pipes leaves the group populated — and still writing the
+ * worktree — while the handle looks finished. Signal 0 tests for existence without delivering
+ * anything.
+ *
+ * `EPERM` counts as ALIVE: the group is there and merely out of reach, and reading it as gone is
+ * the false "it stopped" this exists to prevent. The caller must bound its own wait rather than
+ * treat this as eventually-false.
+ */
+export function groupAlive(child: ChildProcess): boolean {
+  if (process.platform === "win32" || !child.pid) return false;
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException | null)?.code === "EPERM";
+  }
+}
+
+/**
  * Deliver the task prompt on stdin, then close it. The 'error' listener swallows EPIPE for the case
  * the child exits before the prompt is fully written (a large prompt outlives a child that died
  * early / never read stdin) — without it that write would surface as an unhandled error and fail an

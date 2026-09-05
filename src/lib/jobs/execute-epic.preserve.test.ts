@@ -239,6 +239,88 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
   });
 
+  // The empty index that is NOT an empty ticket (PR #228 review): the agent committed its own work
+  // and the deadline landed before `step:commit` recorded it. `commitAll` finds nothing staged, and
+  // read as "nothing to commit" the rollback hard-resets to the baseline — deleting the finished,
+  // gate-passed commit this path exists to save.
+  it("keeps the work an agent committed itself when the index is empty", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("FINISHED.md", "work the agent committed itself, against the contract\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: the agent's own subject"]);
+    const selfCommitted = head();
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ branch: BRANCH, retained: false });
+    // The agent's commit is still on the branch, under a marker that makes it findable on resume —
+    // its own subject carries neither the ticket id nor the `WIP` prefix.
+    expect(out(["rev-list", "--count", `${selfCommitted}..HEAD`])).toBe("1");
+    expect(subjects()).toContain("feat: the agent's own subject");
+    expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
+  });
+
+  // …and the marker is written once. A resume that starts from a previous attempt's preserved
+  // commit, self-commits more work and times out again already has the prefix on the branch.
+  it("does not re-mark a branch that already carries this ticket's preserved commit", async () => {
+    write("HALF_WRITTEN.md", "work preserved by the attempt before this one\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", `WIP ${ticket.id}: ${ticket.title}`]);
+    const baseline = await readWorktreeState(repo);
+    write("MORE.md", "what this attempt added, and committed itself\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: more of the agent's own work"]);
+    const selfCommitted = head();
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ branch: BRANCH, retained: false });
+    expect(head()).toBe(selfCommitted);
+    expect(subjects().filter((s) => s.startsWith(`WIP ${ticket.id}:`))).toHaveLength(1);
+  });
+
+  // The genuinely empty case the branch above must not swallow: nothing staged AND HEAD never moved
+  // is still the rollback it always was.
+  it("still rolls back when the index is empty and HEAD never moved", async () => {
+    const baseline = await readWorktreeState(repo);
+    // The tree differs from the baseline, so the preserve runs — and the gate itself clears the only
+    // thing in it (a generated file a check regenerates or removes). `git add -A` then stages
+    // nothing while HEAD stands exactly where the ticket started: nobody committed anything.
+    write("GENERATED.md", "a file the project's own check removes\n");
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "rm -f GENERATED.md" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({
+      rolledBackWhy: "there was nothing for git to commit",
+      retainedOn: null,
+    });
+    expect(head()).toBe(baseline.head);
+  });
+
   // The abort's other landing spot: `commitAll` runs on no signal (a pre-commit hook can hold it for
   // minutes), so a kill can arrive with the preserved commit already made. Read as an ordinary
   // preserve it would write the board a human is deciding on; read as a failure it would roll the

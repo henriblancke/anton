@@ -18,6 +18,7 @@ import {
 import { refusalNote, repairRefStale, type RefStaleOutcome } from "../gardener/repair-ref-stale";
 import {
   commitAll,
+  commitMarker,
   isAncestor,
   preservedCommitPrefix,
   readWorktreeState,
@@ -925,8 +926,10 @@ type PreservedWork =
  * - the project pins NO verify gates — nothing can prove the tree sound, so the pre-anton-d967
  *   behaviour stands;
  * - the gates fail, error, or outrun their own budget — the tree is not fit to keep;
- * - `git add -A` finds nothing to commit, or git refuses the commit outright — either way nothing
- *   was preserved, and the reason says which.
+ * - git refuses the commit outright, or `git add -A` finds nothing to commit AND HEAD never moved —
+ *   either way nothing was preserved, and the reason says which. An empty index with a HEAD that
+ *   DID move is not that case: the agent committed its own work, and {@link adoptSelfCommittedWork}
+ *   keeps it.
  */
 export async function preserveTimedOutWork(args: {
   run: Omit<StepContext, "tickets">;
@@ -1069,13 +1072,60 @@ export async function preserveTimedOutWork(args: {
     return { jobAborted: true };
   }
   if (!kept.committed) {
-    return rollBack(
-      "error" in kept
-        ? `anton could not commit the work (${kept.error instanceof Error ? kept.error.message : String(kept.error)})`
-        : `there was nothing for git to commit`,
-    );
+    if ("error" in kept) {
+      return rollBack(
+        `anton could not commit the work (${kept.error instanceof Error ? kept.error.message : String(kept.error)})`,
+      );
+    }
+    // An empty index is not proof the ticket wrote nothing (PR #228 review). HEAD moved — and the
+    // checks above already proved it moved FORWARD on the run's branch — so the agent committed its
+    // own work, which is exactly what `step:commit` adopts rather than refuses. Rolling back here
+    // would hard-reset that commit off the branch: the deletion of finished work this whole path
+    // exists to stop, arriving through the one door that looks like an empty tree.
+    if (now.head !== baseline.head) {
+      return adoptSelfCommittedWork({
+        worktreePath, branch, ticket, timeoutMs, logPath, alreadyMarked: retainedOn !== null,
+      });
+    }
+    return rollBack(`there was nothing for git to commit`);
   }
   await logPreserve(logPath, `work PRESERVED on ${branch} as an explicitly incomplete commit`);
+  return { branch, retained: false };
+}
+
+/**
+ * The agent committed this ticket's work ITSELF and the deadline landed before `step:commit` could
+ * record it (PR #228 review). Against the operating contract, but it happens — and `step:commit`
+ * treats it as delivery for the same reason this must treat it as preserved: the commits are real,
+ * they are on the run's branch, and here they have just passed the project's verify gates.
+ *
+ * The marker is what keeps that work FINDABLE. The agent's own subjects carry no `WIP <id>:` prefix,
+ * so without one the resume's zero diff reads as "nothing landed" and parks the run one step from
+ * the pull request it already earned. A marker that cannot be written is still no reason to roll
+ * back — the work outranks its bookkeeping — so the failure is logged and the commits are kept.
+ */
+async function adoptSelfCommittedWork(args: {
+  worktreePath: string;
+  branch: string;
+  ticket: Bead;
+  timeoutMs: number;
+  logPath: string;
+  /** A previous attempt's marker is already on the branch; one is all a resume needs. */
+  alreadyMarked: boolean;
+}): Promise<PreservedWork> {
+  const { worktreePath, branch, ticket, timeoutMs, logPath, alreadyMarked } = args;
+  const marked =
+    alreadyMarked ||
+    (await safe(() =>
+      commitMarker(worktreePath, preservedCommitMessage(ticket, timeoutMs, { marker: true })),
+    ));
+  await logPreserve(
+    logPath,
+    marked
+      ? `the agent committed this ticket's work itself — KEPT on ${branch} rather than rolled back`
+      : `the agent committed this ticket's work itself — KEPT on ${branch}, but anton could not ` +
+          `record the marker a resume reads, so that resume may report a zero diff`,
+  );
   return { branch, retained: false };
 }
 
@@ -1109,13 +1159,22 @@ async function logPreserve(logPath: string, line: string): Promise<void> {
  * The resume still has to SEE it, or the work it kept can never reach a pull request — that read is
  * {@link worktreeHasPreservedCommitFor}, which `step:commit` asks before reporting a zero diff.
  */
-function preservedCommitMessage(ticket: Bead, timeoutMs: number): string {
+function preservedCommitMessage(
+  ticket: Bead,
+  timeoutMs: number,
+  options: { marker?: boolean } = {},
+): string {
   return (
     `${preservedCommitPrefix(ticket.id)} ${ticket.title}\n\n` +
     `INCOMPLETE — the ticket exceeded its ${Math.round(timeoutMs / 60_000)}m budget and was ` +
     `stopped before it finished. anton kept this work rather than deleting it because the ` +
     `project's verify gates passed on the tree; the ticket itself is blocked for review and is in ` +
-    `no pull request's delivered list. Resuming the run continues from this commit.`
+    `no pull request's delivered list. Resuming the run continues from this commit.` +
+    (options.marker
+      ? `\n\nThis commit is EMPTY: the agent committed the work itself, under subjects that name ` +
+        `neither this ticket nor its incompleteness. Those commits are the work; this one records ` +
+        `whose it is.`
+      : ``)
   );
 }
 

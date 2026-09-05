@@ -64,6 +64,16 @@ function writeFakeHangingClaudeWithChild(name: string, childPidPath: string): st
   return path;
 }
 
+/** Whether a pid is still around — asked with no grace period at all. */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -108,6 +118,32 @@ function writeFakeUnkillableClaude(name: string, pidPath: string): string {
     "process.on('SIGTERM', () => {});",
     `writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
     "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-kill' }) + '\\n');",
+    "setInterval(() => {}, 1 << 30);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
+/**
+ * A fake that exits promptly on SIGTERM but leaves behind a descendant that IGNORES it — the tool
+ * process (a test runner, a formatter) still writing the worktree after claude has gone. Its stdio
+ * is detached from claude's pipes, so nothing about it holds `close` back.
+ */
+function writeFakeClaudeWithStubbornChild(name: string, pidPath: string): string {
+  const path = join(dir, name);
+  const grandchild = [
+    "process.on('SIGTERM', () => {});",
+    `require('node:fs').writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+    "setInterval(() => {}, 1 << 30);",
+  ].join("");
+  const body = [
+    "#!/usr/bin/env node",
+    "const { spawn } = require('node:child_process');",
+    `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore' });`,
+    "process.on('SIGTERM', () => process.exit(0));",
+    "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-group' }) + '\\n');",
     "setInterval(() => {}, 1 << 30);",
     "",
   ].join("\n");
@@ -1036,6 +1072,35 @@ describe("runClaude", () => {
 
         await expect(run).rejects.toMatchObject({ name: "AbortError" });
         expect(await waitForProcessExit(Number(readFileSync(pidPath, "utf8")))).toBe(true);
+      } finally {
+        delete process.env[ABORT_GRACE_ENV];
+      }
+    },
+  );
+
+  // The same property one level down (PR #228 review): `close` on the direct child proves only that
+  // CLAUDE exited. A tool process it spawned that ignores SIGTERM and holds none of its pipes is
+  // still in the group, still writing the tree — so the rejection must wait for the group, not the
+  // handle, or the timeout path commits a snapshot under active edit.
+  it.runIf(process.platform !== "win32")(
+    "waits for claude's descendants, not just claude, before a cancellation settles",
+    async () => {
+      const pidPath = join(dir, "stubborn-descendant.pid");
+      const bin = writeFakeClaudeWithStubbornChild("group-claude", pidPath);
+      process.env[CLAUDE_BIN_ENV] = bin;
+      // Long enough that the grace timer cannot be what kills the descendant: only the escalation
+      // the close handler delivers itself can end this inside the window below.
+      process.env[ABORT_GRACE_ENV] = "5000";
+      const control = new AbortController();
+
+      try {
+        const run = runClaude({ cwd: dir, prompt: "cancel my tree", signal: control.signal });
+        await new Promise((r) => setTimeout(r, 400));
+        control.abort();
+
+        await expect(run).rejects.toMatchObject({ name: "AbortError" });
+        // Asked the instant the caller is told, with no waiting: by then the writer must be gone.
+        expect(alive(Number(readFileSync(pidPath, "utf8")))).toBe(false);
       } finally {
         delete process.env[ABORT_GRACE_ENV];
       }
