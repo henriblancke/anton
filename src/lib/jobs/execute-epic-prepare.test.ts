@@ -4,10 +4,11 @@
  *
  * The gate itself is pure and covered in execute-epic.unit.test.ts (`humanHeldTickets`). What can
  * only be proven here is that it is re-asked after every board this run ADOPTS: step 1c swaps in the
- * children the run-lease confirmed, and the human-ticket arm swaps in the ones its own refresh
- * brought back. A child a person blocks or defers inside either window is invisible to the pre-lease
- * gate — and the run would then dispatch its earlier siblings before dying at that ticket's claim
- * gate, which is the exact failure anton-fude exists to remove.
+ * children the run-lease confirmed, the human-ticket arm swaps in the ones its own refresh brought
+ * back, and the reservation cascade is followed by a board read of its own. A child a person blocks
+ * or defers inside any of those windows is invisible to the pre-lease gate — and the run would then
+ * dispatch its earlier siblings before dying at that ticket's claim gate, which is the exact failure
+ * anton-fude exists to remove.
  *
  * Mocked at the module seam: the states under test are two board reads DISAGREEING inside one run,
  * which a real board cannot be asked for on demand.
@@ -214,6 +215,42 @@ describe("prepareEpicRun — a held child is caught on every board the run adopt
     expect(claimRunTargetMock).not.toHaveBeenCalled();
   });
 
+  it("parks when only the board taken AFTER the reservation shows the block", async () => {
+    // PR #227 review: every ask above the reservation judges a board read before the worktree warm,
+    // which is minutes wide. A person blocking a LATER child inside it was invisible to all of them
+    // — the cascade reserves it regardless (assignment is not a claim), and the loop would dispatch
+    // t-1 before dying at t-2's claim gate.
+    const all = board(ticket("t-1"), ticket("t-2"));
+    loadAllIssuesMock
+      .mockResolvedValueOnce(all) // step 1c's confirmation: still clean
+      .mockResolvedValue(board(ticket("t-1"), ticket("t-2", "blocked")));
+    preflightHumanTicketsMock.mockResolvedValue(preflight(all));
+
+    const error = await refusalFrom(all);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("t-2");
+    expect(error.message).toContain("blocked pending human review");
+    // The reservation stands (the stopping path hands it back), but nothing was published or run.
+    expect(cascadeChildClaimsMock).toHaveBeenCalled();
+    expect(publishRunClaimMock).not.toHaveBeenCalled();
+  });
+
+  it("retries rather than dispatching when the post-reservation board can't be read", async () => {
+    const all = board(ticket("t-1"), ticket("t-2"));
+    loadAllIssuesMock
+      .mockResolvedValueOnce(all)
+      .mockRejectedValue(new Error("Error 1105: database is locked"));
+    preflightHumanTicketsMock.mockResolvedValue(preflight(all));
+
+    const error = await refusalFrom(all);
+
+    // Fails CLOSED but retryable: the next attempt reuses this worktree and its reservations.
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("could not re-read the board after reserving");
+    expect(publishRunClaimMock).not.toHaveBeenCalled();
+  });
+
   it("prepares the run when every board it adopts leaves the children claimable", async () => {
     const all = board(ticket("t-1"), ticket("t-2"));
     loadAllIssuesMock.mockResolvedValue(all);
@@ -224,5 +261,6 @@ describe("prepareEpicRun — a held child is caught on every board the run adopt
     expect(prep.done).toBe(false);
     expect(warmRunWorktreeMock).toHaveBeenCalled();
     expect(claimRunTargetMock).toHaveBeenCalled();
+    expect(publishRunClaimMock).toHaveBeenCalled();
   });
 });

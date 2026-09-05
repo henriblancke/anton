@@ -91,7 +91,8 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   // Re-asking is what makes "a held child stops the run before any dispatch" hold across both
   // windows; the gate is pure and reads no board, so the extra calls cost nothing. Both still park
   // before any worktree, claim or session exists — the arm's own waits stand, which is the state a
-  // resume reuses.
+  // resume reuses. The LAST window — between here and the reservation — is closed by
+  // {@link assertReservedTicketsClaimable}, which has to read a board of its own.
   assertTicketsClaimable(run, gates);
   run.lease.startRefresh();
   await armHumanTicketWaits(run, gates);
@@ -99,6 +100,7 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   const { worktree, runStep } = await warmRunWorktree(run);
   await claimRunTarget(run);
   await cascadeChildClaims(run);
+  await assertReservedTicketsClaimable(run, gates);
   await publishRunClaim(run);
   return {
     done: false,
@@ -280,6 +282,51 @@ function assertTicketsClaimable(run: EpicRun, gates: RunGates): void {
   // on the same refusal with the target's own message.
   const held = humanHeldTickets(gates.children);
   if (held.length > 0) throw humanHeldPoison(run.targetId, held);
+}
+
+/**
+ * Step 3b-bis. Ask 0c-bis one last time, on a board read AFTER the children are reserved
+ * (PR #227 review).
+ *
+ * Every ask above it judges a board taken before {@link cascadeChildClaims} ran, and the gap between
+ * the last of them and that reservation is wide — a worktree warm is minutes. A person blocking or
+ * deferring a LATER child inside it arrives unjudged: the cascade still reserves it (assignment is
+ * not a claim, so bd accepts it in any status), the loop dispatches its earlier siblings, and the run
+ * only discovers the held ticket at its own claim gate — the failure shape anton-fude removed
+ * everywhere else. Asked here, the reservation is already in place, so what this board says about a
+ * child is what the loop will find.
+ *
+ * Not a race this can WIN: nothing stops a person writing a status a millisecond later, and no
+ * reservation binds them. What it removes is the WIDE window — the minutes of setup between the last
+ * pre-lease ask and the loop — leaving only the moments after this read, where runTicket's claim gate
+ * (which now names the status itself) is the backstop.
+ *
+ * Status-only: the drift and label questions are settled behind the lease (step 1c), and a status a
+ * person wrote needs no adoption — a child absent from this board keeps the object the gates above
+ * judged, since a set that changed is drift 1c already proved cannot happen unseen.
+ */
+async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Promise<void> {
+  const { repo, targetId: epicBeadId } = run;
+  // A STANDALONE target has no working-layer subtree, so there is nothing here to re-read: its own
+  // status is claimRunTarget's business, which already parked on the same refusal. Same exclusion
+  // 0c-bis makes, made before the read rather than after it.
+  if (gates.children.length === 0) return;
+  // Fails CLOSED, like the confirmation read in step 1c and the cascade it follows: a run that
+  // cannot prove its reserved children are claimable must not enter the loop. Retryable — the next
+  // attempt reuses this worktree and re-takes the same idempotent reservations.
+  let reservedBoard: Bead[];
+  try {
+    reservedBoard = await loadAllIssues(repo, { strictGates: true });
+  } catch (e) {
+    throw new Error(
+      `${epicBeadId} could not re-read the board after reserving its tickets to confirm none of ` +
+        `them is held for a person — retrying rather than dispatching into a claim gate that ` +
+        `would stop the run mid-feature. (${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
+  const reserved = new Map(runTickets(reservedBoard, epicBeadId).map((t) => [t.id, t]));
+  const held = humanHeldTickets(gates.children.map((c) => reserved.get(c.id) ?? c));
+  if (held.length > 0) throw humanHeldPoison(epicBeadId, held);
 }
 
 /** Step 0d. Cook, floor-check and pin the pipeline this run walks, then split it into its phases. */

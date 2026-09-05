@@ -179,6 +179,9 @@ async function claimTicket(
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
 }
 
+/** The statuses bd refuses a claim on that a LATER attempt can still find changed — see below. */
+const RACED_CLAIM_STATUSES: ReadonlySet<string> = new Set(["in_progress", "closed"]);
+
 /**
  * Why the ticket claim gate refused, as the error the caller throws (anton-fude) — the same split
  * `claimRunTarget` makes for the run target (execute-epic-claim.ts), one tier down.
@@ -189,11 +192,18 @@ async function claimTicket(
  * beads over a ticket anton itself had blocked for human review. Everything else keeps its retry —
  * an operator's live claim and a wedged Dolt DB are both states a later attempt can find changed.
  *
- * `in_progress` is the one status bd words as a refusal that is NOT a decision (PR #227 review): bd
- * says `not claimable: status in_progress` when the bead is held by SOMEBODY ELSE, and that clears
- * the moment they finish — the same ownership conflict as `already claimed by`, which the retryable
- * branch below is written for. Poisoning it would park a whole run permanently over a sibling run's
- * live claim. (Our own claim never lands here at all: re-claiming as the same actor succeeds.)
+ * Two statuses are refusals bd words the same way but that are NOT decisions (PR #227 review), so
+ * they keep the retry:
+ *   • `in_progress` — bd says `not claimable: status in_progress` when the bead is held by SOMEBODY
+ *     ELSE, and that clears the moment they finish: the same ownership conflict as `already claimed
+ *     by`, which the retryable branch below is written for. Poisoning it would park a whole run
+ *     permanently over a sibling run's live claim. (Our own claim never lands here at all —
+ *     re-claiming as the same actor succeeds.)
+ *   • `closed` — the run's board snapshot is stale, not held: another actor closed the ticket after
+ *     the snapshot and before this claim. A retry re-reads the board and the loop's own
+ *     closed-ticket handling takes it from there (execute-epic-dispatch `dispatchTicket`), skipping
+ *     a commit already on the branch or reopening the bead to regenerate work this branch lacks.
+ *     Parking would demand a person reopen a ticket anton reopens by itself.
  */
 export function ticketClaimFailure(
   ticketId: string,
@@ -202,12 +212,22 @@ export function ticketClaimFailure(
 ): Error {
   const cause = e instanceof Error ? e.message : String(e);
   const status = unclaimableStatus(e);
-  if (status && status !== "in_progress") {
+  if (status && !RACED_CLAIM_STATUSES.has(status)) {
     return new PoisonEpic(
       `refusing to execute ${ticketId}: bd will not claim it while its status is "${status}", and ` +
         `no retry can change that — the run must not dispatch an agent on a ticket it does not own. ` +
         `Move ${ticketId} back to a claimable status (\`bd update ${ticketId} --status open\`) or ` +
         `abandon it, then resume the run. (${cause})`,
+    );
+  }
+  // A ticket CLOSED under the run's snapshot gets its own words — blaming a rival operator or a
+  // locked DB for a ticket somebody simply finished is the same misdirection as the park above.
+  // `in_progress` keeps the ownership wording below, which is exactly what bd means by it.
+  if (status === "closed") {
+    return new Error(
+      `refusing to execute ${ticketId}: it was closed after this run read the board — retrying so ` +
+        `the next attempt re-reads it and either skips the ticket or reopens it to regenerate the ` +
+        `work this branch is missing (${cause})`,
     );
   }
   return new Error(

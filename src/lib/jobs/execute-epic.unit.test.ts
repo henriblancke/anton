@@ -338,6 +338,23 @@ describe("ticketClaimFailure — why the ticket claim gate refused (anton-fude)"
     expect(error.message).toContain("already claimed by another operator, or the beads DB is locked");
   });
 
+  it("keeps it retryable when the ticket CLOSED under the run's snapshot", () => {
+    // PR #227 review: another actor closing the ticket between the board read and this claim is a
+    // stale snapshot, not a held status. A retry refreshes the board and the dispatch loop's own
+    // closed-ticket handling takes over — skipping a commit already on the branch, or reopening the
+    // bead to regenerate work this branch lacks. Poisoning it would ask a person to reopen a ticket
+    // anton reopens by itself.
+    const error = ticketClaimFailure(
+      "anton-od4",
+      "alice",
+      bdRefusal("Error claiming anton-od4: issue not claimable: status closed"),
+    );
+
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("closed after this run read the board");
+    expect(error.message).not.toMatch(/beads DB is locked/);
+  });
+
   it("keeps it for a wedged DB too — the state a later attempt may find changed", () => {
     const error = ticketClaimFailure("anton-od4", undefined, bdRefusal("Error 1105: database is locked"));
     expect(error).not.toBeInstanceOf(PoisonEpic);
