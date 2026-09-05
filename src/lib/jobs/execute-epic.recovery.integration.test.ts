@@ -10,9 +10,12 @@
  * files (anton-0oi).
  */
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beads } from "../beads/bd";
+import { proposalFingerprint } from "../gardener/detections";
+import { worktreePathFor } from "../git/worktree";
 import * as schema from "../db/schema";
 import { resetOperatorCache } from "../operator";
 import { updateRun } from "../runs";
@@ -194,6 +197,46 @@ process.exit(0);`,
     expect(await tdb.db.select().from(schema.sessions)).toHaveLength(0);
     const bead = await beads.show(repo, humanId);
     expect(bead.status).not.toBe("closed");
+    expect(bead.assignee ?? null).toBeNull();
+  });
+
+  it("refuses a PROPOSAL target terminally, before any worktree exists (anton-x37c)", async () => {
+    // A proposal is a decision about the board, not work on it — anton files one as a parentless
+    // task carrying a full contract, so it reads as an ordinary run target to every gate but this
+    // one. Reaching the runner at all means a Force run or an enqueue that predates the label; what
+    // must NOT follow is a worktree and an agent dispatched to "implement" a move anton applies
+    // itself the moment a person approves it.
+    const fingerprint = proposalFingerprint("stale", "t9");
+    const proposalId = createTicket(repo, {
+      title: "Retire anton-t9 — untouched for 90 days",
+      type: "task",
+      labels: [fingerprint],
+    });
+    await beads.approve(repo, proposalId);
+
+    const runner = makeEpicRunner(ctx);
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: proposalId });
+
+    const job = await expectJobStatus(tdb.db, jobId, "parked");
+    expect(job.lastError).toContain(proposalId);
+    expect(job.lastError).toContain(fingerprint);
+    expect(job.lastError).toMatch(/proposal, not work/i);
+    // Terminal, not a retry: no number of attempts turns a decision into work.
+    expect(job.attempts).toBe(1);
+    // Pre-flight: no run row, no worktree on disk or in git's list, no session, and the proposal is
+    // left exactly as its founder will find it.
+    expect(
+      (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === proposalId),
+    ).toBeUndefined();
+    expect(execFileSync("git", ["worktree", "list"], { cwd: repo, encoding: "utf8" })).not.toContain(
+      proposalId,
+    );
+    expect(existsSync(worktreePathFor(repo, `anton/${proposalId}`))).toBe(false);
+    expect(await tdb.db.select().from(schema.sessions)).toHaveLength(0);
+    const bead = await beads.show(repo, proposalId);
+    expect(bead.status).toBe("open");
     expect(bead.assignee ?? null).toBeNull();
   });
 
