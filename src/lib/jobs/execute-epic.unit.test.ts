@@ -45,13 +45,9 @@ import {
 } from "./execute-epic-human-gate";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage } from "./execute-epic-review";
-import {
-  claudeResumeDecision,
-  continuationPrompt,
-  ticketBlockNote,
-  ticketClaimFailure,
-  timedOutTicketNote,
-} from "./execute-epic-ticket";
+import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
+import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
+import { ticketBlockNote, timedOutTicketNote } from "./execute-epic-ticket-settle";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
 import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
