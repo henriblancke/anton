@@ -145,23 +145,39 @@ describe("importGraph", () => {
   // A rule whose target list lost its unmodellable substitutions keeps the ones it could read, and
   // those are not the ones tsc reaches first. Resolving through a surviving fallback draws an edge
   // to a module tsc never names, and a wrong edge is how a real cycle gets dropped (PR #190 review).
-  it("draws no alias edge through a rule whose targets are only partly modelled", async () => {
+  /** `@/*` with a mid-path substitution ahead of an ordinary one — tsc's own fallback order. */
+  const ORDERED_TARGETS = JSON.stringify({
+    compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/real/*/index", "./src/fallback/*"] } },
+  });
+  const ALIAS_IMPORTER = `import { x } from "@/x";\nexport const a = () => x();\n`;
+
+  // The first target that exists on disk wins, including one whose substitution sits mid-path —
+  // a shape the rule model could not express, so the whole rule was refused (PR #190 review).
+  it("resolves an alias through the first declared target that exists", async () => {
     const graph = await graphOf({
-      "tsconfig.json": JSON.stringify({
-        compilerOptions: {
-          baseUrl: ".",
-          // The first target puts its substitution mid-path, which this model cannot express.
-          paths: { "@/*": ["./src/real/*/index", "./src/fallback/*"] },
-        },
-      }),
-      "src/a.ts": `import { x } from "@/x";\nexport const a = () => x();\n`,
+      "tsconfig.json": ORDERED_TARGETS,
+      "src/a.ts": ALIAS_IMPORTER,
       "src/real/x/index.ts": `export const x = () => 1;\n`,
       "src/fallback/x.ts": `export const x = () => 2;\n`,
     });
 
-    // Not `src/fallback/x.ts`: tsc reads the first substitution, so claiming the second would be a
-    // module this import never names.
-    expect(await graph.edgesOf("src/a.ts")).toEqual([]);
+    expect(await graph.edgesOf("src/a.ts")).toEqual([
+      { file: "src/real/x/index.ts", typeOnly: false, relative: false },
+    ]);
+  });
+
+  // ...and the later target answers when the earlier one is simply absent. Refusing the rule lost
+  // this edge, and a lost runtime edge is how a real cycle gets dropped as a phantom.
+  it("falls back to a later target when the first names no file", async () => {
+    const graph = await graphOf({
+      "tsconfig.json": ORDERED_TARGETS,
+      "src/a.ts": ALIAS_IMPORTER,
+      "src/fallback/x.ts": `export const x = () => 2;\n`,
+    });
+
+    expect(await graph.edgesOf("src/a.ts")).toEqual([
+      { file: "src/fallback/x.ts", typeOnly: false, relative: false },
+    ]);
   });
 
   it("separates erased edges from the runtime ones", async () => {
@@ -258,7 +274,7 @@ describe("readAliases", () => {
 
     // `note` also proves strings are copied through untouched: a `//` and a `,`-before-`}` inside
     // one, eaten as syntax, would leave a document `JSON.parse` rejects and no rules at all.
-    expect(await readAliases(repo)).toEqual([{ prefix: "@/", targets: ["src"] }]);
+    expect(await readAliases(repo)).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
   });
 
   // `extends` comes off unvalidated JSON, so a config spelling it as anything but a string reaches
@@ -282,7 +298,7 @@ describe("readAliases", () => {
       "tsconfig.json": JSON.stringify({ extends: ["./tsconfig.base.json", null] }),
     });
 
-    expect(await readAliases(repo)).toEqual([{ prefix: "@/", targets: ["src"] }]);
+    expect(await readAliases(repo)).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
   });
 
   // A pattern with no `*` maps one module outright and tsc honours it. Skipped, the specifier falls
@@ -299,7 +315,7 @@ describe("readAliases", () => {
     });
 
     expect(await readAliases(repo)).toEqual([
-      { prefix: "@/", targets: ["src"] },
+      { prefix: "@/", targets: ["src/*"] },
       { prefix: "@/ui/widget", targets: ["vendor/special.ts"], exact: true },
     ]);
   });
@@ -312,7 +328,7 @@ describe("readAliases", () => {
 
     expect(aliasRemainder(rule, "@/ui/widget")).toBe("");
     expect(aliasRemainder(rule, "@/ui/widgetry")).toBeUndefined();
-    expect(aliasRemainder({ prefix: "@/", targets: ["src"] }, "@/ui/widget")).toBe("ui/widget");
+    expect(aliasRemainder({ prefix: "@/", targets: ["src/*"] }, "@/ui/widget")).toBe("ui/widget");
   });
 
   // A derived config writing `paths` overrides the base's entirely, so `{}` is how a nested project
@@ -338,7 +354,7 @@ describe("readAliases", () => {
     });
 
     expect(await readAliases(repo, "apps/app")).toEqual([]);
-    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src"] }]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
   });
 
   // tsc merges `compilerOptions` property by property, so a config declaring `paths` while
@@ -357,9 +373,9 @@ describe("readAliases", () => {
       "apps/heir/tsconfig.json": JSON.stringify({ compilerOptions: { paths: { "@/*": ["*"] } } }),
     });
 
-    expect(await readAliases(repo, "apps/app")).toEqual([{ prefix: "@/", targets: ["packages"] }]);
+    expect(await readAliases(repo, "apps/app")).toEqual([{ prefix: "@/", targets: ["packages/*"] }]);
     expect(await readAliases(repo, "apps/heir")).toEqual([
-      { prefix: "@/", targets: ["apps/heir"] },
+      { prefix: "@/", targets: ["apps/heir/*"] },
     ]);
   });
 
@@ -380,16 +396,18 @@ describe("readAliases", () => {
     });
 
     expect(await readAliases(repo, "apps/app")).toEqual([
-      { prefix: "@/", targets: ["apps/app/src"] },
+      { prefix: "@/", targets: ["apps/app/src/*"] },
     ]);
-    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src"] }]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
   });
 
   // A target whose substitution isn't its last segment, and one with no substitution at all, are
   // valid mappings this reader cannot resolve. Dropping the rule leaves the specifier to the
   // path-tail fallback, which names an unrelated module — so the rule claims and maps nothing
   // instead (PR #190 review).
-  it("claims a pattern whose targets it cannot resolve, mapping nothing", async () => {
+  // A substitution mid-path, and a target carrying none at all, are mappings tsc honours — they are
+  // templates like any other now, in the order the config declares them (PR #190 review).
+  it("keeps every target the config declares, in order, as a template", async () => {
     const repo = writeRepo({
       "tsconfig.json": JSON.stringify({
         compilerOptions: {
@@ -404,11 +422,31 @@ describe("readAliases", () => {
     });
 
     expect(await readAliases(repo)).toEqual([
+      { prefix: "@/", targets: ["src/*/index"] },
+      { prefix: "#/", targets: ["fixed.ts"] },
+      { prefix: "~/", targets: ["src/*", "legacy/*/index"] },
+    ]);
+  });
+
+  // What `unresolved` means now: a target tsc itself would refuse, or one the config did not spell
+  // as a string at all. The rule still claims, so the path-tail fallback cannot answer in its place.
+  it("claims but maps nothing for a target tsc would refuse", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          // Two substitutions in one target, and a target that is not a string.
+          paths: { "@/*": ["./src/*/*"], "#/*": [7], "~/*": ["./src/*", "./a/*/b/*"] },
+        },
+      }),
+    });
+
+    expect(await readAliases(repo)).toEqual([
       { prefix: "@/", targets: [], unresolved: true },
       { prefix: "#/", targets: [], unresolved: true },
       // A partial list is still a claim anton must not read as the whole mapping: the target tsc
       // would pick may be the one missing from it.
-      { prefix: "~/", targets: ["src"], unresolved: true },
+      { prefix: "~/", targets: ["src/*"], unresolved: true },
     ]);
   });
 
@@ -426,7 +464,7 @@ describe("readAliases", () => {
     });
 
     expect(await readAliases(repo, "apps/app")).toEqual([]);
-    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src"] }]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
   });
 
   // tsc takes a single `*` anywhere in a pattern, and this model can map only the ones ending
@@ -445,14 +483,14 @@ describe("readAliases", () => {
 
     expect(await readAliases(repo)).toEqual([
       { prefix: "@/", suffix: "/models", targets: [], unresolved: true },
-      { prefix: "@/ui/", targets: ["src/ui"] },
+      { prefix: "@/ui/", targets: ["src/ui/*"] },
     ]);
   });
 });
 
 describe("claimingRules", () => {
-  const broad = { prefix: "@/", targets: ["src"] };
-  const narrow = { prefix: "@/ui/", targets: ["vendor"] };
+  const broad = { prefix: "@/", targets: ["src/*"] };
+  const narrow = { prefix: "@/ui/", targets: ["vendor/*"] };
   const exact = { prefix: "@/ui/widget", targets: ["vendor/special.ts"], exact: true };
 
   // Declaration order must not decide: tsc picks the longest matching pattern either way.
@@ -485,8 +523,8 @@ describe("claimingRules", () => {
     expect(aliasRemainder(claim, "@/foo/models")).toBe("foo");
     expect(aliasRemainder(claim, "@/ui/widget")).toBeUndefined();
     expect(aliasRemainder(claim, "@/models")).toBeUndefined();
-    expect(claimingRules([claim, { prefix: "@/ui/", targets: ["src/ui"] }], "@/ui/widget")).toEqual([
-      { rule: { prefix: "@/ui/", targets: ["src/ui"] }, rest: "widget" },
+    expect(claimingRules([claim, { prefix: "@/ui/", targets: ["src/ui/*"] }], "@/ui/widget")).toEqual([
+      { rule: { prefix: "@/ui/", targets: ["src/ui/*"] }, rest: "widget" },
     ]);
   });
 });

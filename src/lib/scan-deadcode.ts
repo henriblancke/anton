@@ -25,7 +25,7 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { promisify } from "node:util";
-import { claimingRules, readDirAliases, type AliasRule } from "./scan-coupling";
+import { aliasTarget, claimingRules, readDirAliases, type AliasRule } from "./scan-coupling";
 import { collectorOf, type ScanSignal } from "./scan-severity";
 
 const execFileAsync = promisify(execFile);
@@ -3040,7 +3040,7 @@ function aliasedModules(
     // (PR #190 review).
     if (rule.unresolved || rule.targets.length > 1)
       return { mapped: [], claimed: claiming.length > 0 };
-    for (const target of rule.targets) mapped.push(posix(normalize(join(target, rest))));
+    for (const target of rule.targets) mapped.push(posix(normalize(aliasTarget(target, rest))));
   }
   return { mapped, claimed: claiming.length > 0 };
 }
@@ -3403,14 +3403,18 @@ async function defaultBindingCallers(
     const governing = await aliasesGoverning(repoPath, declared, aliases);
     for (const alias of exactAliasWords(declared, governing)) words.add(alias);
   }
-  // One tree listing answers both index questions, and is read only when a declaring module is an
-  // index: which files sit beside it, and whether a file module of the directory's own name
-  // outranks it (PR #190 review).
+  // Two listings, because the index questions are not the same kind of question (PR #190 review).
+  // Which files may be CALLERS is the scan's business, so the exclusions apply. Which module a
+  // specifier RESOLVES to is a fact about the disk that the scan's reading list cannot change: an
+  // excluded `src/widget.ts` still outranks `src/widget/index.ts` for every importer of
+  // `./widget`, and reading precedence off the filtered tree would credit those importers to the
+  // index and drop its true finding. Both are read only when a declaring module is an index.
   const indexes = [...modules.keys()].filter(isDirectoryIndex);
-  const tracked = indexes.length > 0 ? await trackedFiles(repoPath, pathspecs, abort) : undefined;
+  const candidates = indexes.length > 0 ? await trackedFiles(repoPath, pathspecs, abort) : undefined;
+  const resolvable = indexes.length > 0 ? await trackedFiles(repoPath, [], abort) : undefined;
   const shadowed = new Set<string>();
-  if (tracked) {
-    const stems = new Set(tracked.map((file) => withoutModuleExtension(posix(file))));
+  if (resolvable) {
+    const stems = new Set(resolvable.map((file) => withoutModuleExtension(posix(file))));
     for (const index of indexes) {
       const dir = posix(dirname(index));
       if (stems.has(dir)) shadowed.add(dir);
@@ -3422,6 +3426,12 @@ async function defaultBindingCallers(
   let spent = false;
   /** Whether one candidate file binds a declaring module's default to a name it then uses. */
   const judge = async (file: string): Promise<void> => {
+    // Prose and data are read as text wherever else a hit is weighed (`codeReferencingFiles`), and
+    // must be here too: a README beside an index showing `import Renamed from '.'` in an example is
+    // documentation, and parsing it as a default import invents a caller and deletes a true finding
+    // (PR #190 review). It guards the grep hits as much as the listed neighbours — this search
+    // greps by module name and never passed its hits through that filter either.
+    if (PROSE_FILE.test(file) || DATA_FILE.test(file)) return;
     if (declaring.has(file) || callers.has(file)) return;
     if ((read += 1) > DEFAULT_BINDING_FILE_BUDGET) {
       spent = true;
@@ -3459,7 +3469,7 @@ async function defaultBindingCallers(
   // so its neighbours are read off the listing rather than searched for (PR #190 review).
   for (const index of indexes) {
     const dir = posix(dirname(index));
-    for (const file of tracked ?? []) {
+    for (const file of candidates ?? []) {
       if (posix(dirname(file)) !== dir) continue;
       await judge(file);
       if (spent) return [...callers];

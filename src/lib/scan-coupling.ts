@@ -136,6 +136,20 @@ function parseEdges(source: string): RawEdge[] {
 export interface AliasRule {
   /** What a specifier must start with — the whole pattern when the rule is `exact`. */
   prefix: string;
+  /**
+   * The target TEMPLATES, in the order the config declares them, each already joined to the
+   * effective `baseUrl` and still spelling the pattern's substitution as `*`.
+   *
+   * Templates rather than trimmed directories, because tsc puts the substitution wherever the
+   * target says — at the end in `src/*`, mid-path in `src/…/index` (the `…` standing for the
+   * wildcard, which cannot be spelled before a slash here without closing this comment), or
+   * nowhere at all in a fixed `src/one` — and a model that could express only the first of those
+   * dropped the other two. Dropping them
+   * left a rule that mapped a SUBSET of what the config declared, which is wrong in both
+   * directions: following what survived draws an edge tsc never draws, and refusing the rule
+   * outright loses the edge tsc does draw when the earlier target is simply absent from the disk
+   * (PR #190 review). `aliasTarget` substitutes; the order here is tsc's own fallback order.
+   */
   targets: string[];
   /**
    * Whether `prefix` is the WHOLE specifier. tsc reads a pattern without a `*` as a mapping of one
@@ -155,11 +169,14 @@ export interface AliasRule {
    */
   suffix?: string;
   /**
-   * The pattern declares at least one target anton cannot resolve — a substitution that isn't at
-   * the end of the target, or a target the config spells in a shape this reader doesn't model. The
-   * rule still claims its specifiers so the path-tail fallback cannot answer in tsc's place, but
-   * what it maps is incomplete, so a resolver must not treat its targets as the whole answer
-   * (PR #190 review).
+   * The pattern declares at least one target anton cannot model AT ALL — one the config did not
+   * spell as a string, a substitution inside an exact pattern's target, or more than one `*` in a
+   * single target (tsc allows only one). The rule still claims its specifiers so the path-tail
+   * fallback cannot answer in tsc's place, but its template list is missing an entry the compiler
+   * would have tried, so a resolver must not read the survivors as tsc's ordered whole.
+   *
+   * A substitution merely sitting somewhere other than the end of the target is NOT this any more:
+   * those are templates like any other (see `targets`).
    */
   unresolved?: boolean;
 }
@@ -184,6 +201,18 @@ export function aliasRemainder(rule: AliasRule, spec: string): string | undefine
   return rest.length >= suffix.length && rest.endsWith(suffix)
     ? rest.slice(0, rest.length - suffix.length)
     : undefined;
+}
+
+/**
+ * Where one target TEMPLATE points once the pattern's `*` has stood for `rest`.
+ *
+ * A template carrying no substitution names one module however the specifier reads — `"@/*":
+ * ["src/one"]` sends every `@/x` to `src/one`, which is a mapping tsc honours and this reader used
+ * to drop (PR #190 review). Only the first `*` is substituted, since tsc allows a target no more
+ * than one and `rulesOf` refuses the rest.
+ */
+export function aliasTarget(target: string, rest: string): string {
+  return target.includes("*") ? target.replace("*", rest) : target;
 }
 
 /**
@@ -343,7 +372,9 @@ function rulesOf(baseDir: string, options: TsConfig["compilerOptions"]): AliasRu
     // can read — the rule claims and maps nothing rather than throwing out of the nightly pass.
     const targets = Array.isArray(declared) ? declared : [];
     const mapped = targets
-      .map((target) => (typeof target === "string" ? targetDir(baseDir, target, exact) : undefined))
+      .map((target) =>
+        typeof target === "string" ? targetTemplate(baseDir, target, exact) : undefined,
+      )
       .filter((target): target is string => target !== undefined);
     const rule: AliasRule = exact
       ? { prefix: pattern, targets: mapped, exact: true }
@@ -355,16 +386,20 @@ function rulesOf(baseDir: string, options: TsConfig["compilerOptions"]): AliasRu
 }
 
 /**
- * The directory one target stands for, or undefined when its shape is one anton does not resolve.
+ * One target as a TEMPLATE anchored at `baseDir` — its `*`, if it has one, left standing for
+ * `aliasTarget` to substitute — or undefined when its shape is one tsc itself would refuse.
  *
- * A wildcard target is the directory behind its `*` — `"*"` and `"./*"` being `baseUrl` itself,
- * which is how a project roots its own modules through `baseUrl` alone. An exact pattern's targets
- * name files rather than directories, so nothing is appended to them.
+ * `"*"` and `"./*"` are `baseUrl` itself, which is how a project roots its own modules through
+ * `baseUrl` alone; a target with the substitution mid-path (`src/…/index`, the `…` standing for
+ * the wildcard) is as valid, and a target with none (`src/one`) names one module for every
+ * specifier the pattern claims. An exact
+ * pattern has nothing to substitute, so a `*` in its target is meaningless; and tsc allows a target
+ * no more than one `*`, so two is a config it rejects outright.
  */
-function targetDir(baseDir: string, target: string, exact: boolean): string | undefined {
-  if (exact) return target.includes("*") ? undefined : normalize(join(baseDir, target));
-  if (target !== "*" && !target.endsWith("/*")) return undefined;
-  return normalize(join(baseDir, target.slice(0, -2)));
+function targetTemplate(baseDir: string, target: string, exact: boolean): string | undefined {
+  const wildcards = target.split("*").length - 1;
+  if (exact && wildcards > 0) return undefined;
+  return wildcards <= 1 ? normalize(join(baseDir, target)) : undefined;
 }
 
 /**
@@ -632,14 +667,15 @@ async function resolveFile(state: GraphState, base: string): Promise<string | un
  * (`claimingRules`). Within it the targets are an ORDERED fallback list and the first that exists
  * on disk wins, which is tsc's rule too — this pass reads the disk, so it can follow that order.
  *
- * An `unresolved` rule answers with nothing at all (PR #190 review). Its target list is missing the
- * substitutions this model cannot express, and those are the EARLIER ones as often as not: where
- * `"@/*"` lists `src/real/…/index` ahead of `src/fallback/*` (the `…` standing for the wildcard,
- * which cannot be spelled here without closing this comment), tsc resolves `@/x` through the first
- * target, while the only one left in this rule is the second. Following what survived draws an edge
- * to a module tsc never names — and a wrong edge is how a real cycle gets dropped as though nothing
- * closed it.
- * No edge only ever costs proof, which leaves the signal standing, so that is the side to fail on.
+ * Every target the config declared is tried, in its declared order, with the pattern's `*`
+ * substituted into each template (PR #190 review). Getting that order right is the whole job: a
+ * rule that could express only SOME of its targets was wrong in both directions — following the
+ * survivors drew an edge tsc never draws while an earlier target sits on disk, and refusing the
+ * rule lost the edge tsc does draw when that earlier target is simply absent. Either way a real
+ * cycle can be dropped as though nothing closed it, so neither is a safe side to fail on.
+ *
+ * An `unresolved` rule still answers with nothing, and now means what it says: a target anton
+ * cannot model at all, so this list is not tsc's whole list and its order proves nothing.
  *
  * The multi-target bail `aliasedModules` makes has no counterpart here, and deliberately: it reads
  * no disk and so cannot say which of an ordered list exists, where this loop can simply try them.
@@ -648,7 +684,7 @@ async function resolveAlias(state: GraphState, spec: string): Promise<string | u
   for (const { rule, rest } of claimingRules(state.aliases, spec)) {
     if (rule.unresolved) continue;
     for (const target of rule.targets) {
-      const file = await resolveFile(state, normalize(join(target, rest)));
+      const file = await resolveFile(state, normalize(aliasTarget(target, rest)));
       if (file) return file;
     }
   }

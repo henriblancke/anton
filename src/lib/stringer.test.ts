@@ -2987,6 +2987,52 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toEqual([]);
     });
 
+    // Which module a specifier RESOLVES to is a fact about the disk, not about the scan's reading
+    // list: an excluded `src/widget.ts` still outranks `src/widget/index.ts` for every importer of
+    // `./widget`, and reading precedence off the filtered tree credited them to the index and
+    // dropped its true finding (PR #190 review).
+    it("reads index shadowing off the tree, not off the scan's exclusions", async () => {
+      const repo = initRepo({
+        "src/widget.ts": "export default function Chosen() {\n  return null;\n}\n",
+        "src/widget/index.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from './widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget/index.ts", "Widget"),
+      ]);
+
+      const result = await scan({
+        repoPath: repo,
+        scanFile: join(dir, "scan.json"),
+        exclude: ["src/widget.ts"],
+      });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // Prose is documentation wherever it is found. A README beside an index showing the import in
+    // an example is not a caller, and parsing it as one deletes a true finding (PR #190 review).
+    it("does not read an example in a neighbouring README as a default-import caller", async () => {
+      const repo = initRepo({
+        "src/widget/index.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/widget/README.md": "Use it like this:\n\n    import Renamed from '.';\n    Renamed();\n",
+        "src/panel/index.ts": "export default function Panel() {\n  return null;\n}\n",
+        // Not vacuous: a real neighbour beside the other index is still found.
+        "src/panel/page.ts": "import Card from '.';\nexport const page = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget/index.ts", "Widget"),
+        unused("src/panel/index.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/panel/page.ts");
+    });
+
     // A declaration broken after `export default` is still that module's default; the head has to
     // reach across the newline to find the name.
     it("counts a default export whose head is broken across lines", async () => {
