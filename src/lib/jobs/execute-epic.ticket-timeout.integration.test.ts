@@ -32,10 +32,12 @@
  * 8. **A held tail a rolled-back timeout ALSO skipped does not park the run** (anton-67xj). A
  *    cross-run blocker is no longer why that ticket cannot run, so parking on it would strand the
  *    independent commits behind a resume that could not dispatch it either.
- * 9. **A CHILDLESS run target keeps its work and parks with advice it can act on** (anton-d967).
- *    The ticket IS the run, so the park names raising the budget or splitting the bead — never
- *    re-scoping a set of siblings that does not exist — and says whether the work was preserved or
- *    rolled back, which is what makes a resume a continuation or a redo.
+ * 9. **A CHILDLESS run target keeps its work — but only when its tree VERIFIES — and parks with
+ *    advice it can act on** (anton-d967). The gates are the whole licence to keep anything, so a
+ *    childless target whose work fails them is rolled back exactly like a ticket with siblings.
+ *    Either way the ticket IS the run, so the park names raising the budget or splitting the bead —
+ *    never re-scoping a set of siblings that does not exist — and says whether the work was
+ *    preserved or rolled back, which is what makes a resume a continuation or a redo.
  * 10. **A run that STOPS reopens the timeouts it absorbed** (anton-67xj). A blocked ticket is the
  *    founder's cue only on a run that reaches its PR; on one that parks instead, it is a status bd
  *    refuses to claim — and the resume the park advertises dies on it at runTicket's claim gate.
@@ -437,8 +439,9 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
         expect(target.labels ?? []).toContain("not-delivered");
         expect(JSON.stringify(target)).toMatch(/PRESERVED on branch/i);
 
-        // The session log carries both halves of the account: the WARNING that preceded the deadline
-        // — the ticket's one chance to commit what it had — and what the timeout then did.
+        // The session log carries both halves of the operator's account: the WARNING that preceded
+        // the deadline (the running agent cannot read this log — it is what lets a person see the
+        // clock running down) and what the timeout then did with the work.
         const session = (await tdb.db.select().from(schema.sessions)).find(
           (x) => x.beadId === featureId,
         )!;
@@ -446,6 +449,67 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
         expect(log).toContain("[ticket-budget]");
         expect(log).toMatch(/80% of its/);
         expect(log).toMatch(/\[ticket-timeout\] work PRESERVED/);
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+        await patchSettings({ ticketTimeoutMinutes: undefined });
+        if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+      }
+    });
+
+    it("ROLLS BACK a childless run target whose tree fails the verify gates (anton-d967)", async () => {
+      // The safety valve under the preserve, on the one run shape allowed to keep anything. The
+      // sibling case above never reaches a gate — it stops at the `!standalone` guard — so without
+      // this case, short-circuiting the gate check would keep a broken tree on the branch and no
+      // test would notice. Here the ticket IS the run target and its work does NOT verify (only
+      // `HALF_WRITTEN.md`, never the `test -f AGENT_WORK.md` the project pins), so the rollback
+      // stands and the bead says which gate refused it.
+      const featureId = await beads.create(repo, {
+        title: "A feature whose work never verifies",
+        type: "feature",
+        acceptance: "work file exists",
+        description: "## Goal\nOne unit of work that does not verify",
+      });
+      await beads.approve(repo, featureId);
+
+      const invLog = join(sandbox, "childless-unverified-inv.jsonl");
+      const claude = hangingClaude("claude-hang-childless-unverified", invLog, "always");
+      await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+      const runner = makeEpicRunner(ctx);
+      process.env.ANTON_CLAUDE_BIN = claude;
+      let jobId: string | undefined;
+      try {
+        jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
+        const run = (await tdb.db.select().from(schema.runs)).find(
+          (r) => r.epicBeadId === featureId,
+        )!;
+
+        // NOTHING was kept: no incomplete commit, and the branch carries none of the work.
+        expect(subjectsOnBranch(run.branch!).some((x) => x.includes(featureId))).toBe(false);
+        expect(filesOnBranch(run.branch!)).not.toContain("HALF_WRITTEN.md");
+
+        // The run parks on the ordinary out-of-time message — not the dirty-worktree halt: the
+        // rollback ran and left the tree clean, so nothing of this ticket can reach a later commit.
+        const job = await getJob(tdb.db, jobId);
+        expect(job?.status).toBe("parked");
+        expect(job?.lastError).not.toMatch(/could NOT be rolled back/i);
+        expect(job?.lastError).not.toMatch(/PRESERVED on branch/);
+        expect(job?.lastError).toMatch(/was rolled back, so resuming starts it over/i);
+
+        // …and the bead carries the REASON, which is what tells the operator a resume redoes the
+        // work rather than continuing it.
+        const target = await beads.show(repo, featureId);
+        expect(target.labels ?? []).toContain("not-delivered");
+        expect(JSON.stringify(target)).toMatch(/rolled back/i);
+        expect(JSON.stringify(target)).toMatch(/does not pass this project's verify gates/i);
+
+        // The gate ran and refused — on the session log, where the preserve keeps its own account.
+        const session = (await tdb.db.select().from(schema.sessions)).find(
+          (x) => x.beadId === featureId,
+        )!;
+        const log = readFileSync(session.logPath!, "utf8");
+        expect(log).toMatch(/\[ticket-timeout\] re-running 1 verify gate/);
+        expect(log).toMatch(/\[ticket-timeout\] rolling back — it does not pass/);
       } finally {
         process.env.ANTON_CLAUDE_BIN = successClaude;
         await patchSettings({ ticketTimeoutMinutes: undefined });
@@ -471,8 +535,9 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
         const job = await getJob(tdb.db, jobId);
         expect(job?.status).toBe("parked");
         expect(job?.lastError).toMatch(/every ticket .* ran out of time/i);
-        // …and it says what became of the work: nothing proved this tree fit to keep (the gate
-        // `test -f AGENT_WORK.md` fails on it), so it was rolled back and a resume starts over.
+        // …and it says what became of the work: this is a multi-ticket epic, so preserveTimedOutWork
+        // returns at the `!standalone` check before any gate runs — the work was rolled back and a
+        // resume starts it over.
         expect(job?.lastError).toMatch(/was rolled back, so resuming starts it over/i);
 
         const target = await beads.show(repo, epic.id);

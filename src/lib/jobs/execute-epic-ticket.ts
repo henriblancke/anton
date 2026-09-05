@@ -19,6 +19,7 @@ import { refusalNote, repairRefStale, type RefStaleOutcome } from "../gardener/r
 import {
   commitAll,
   isAncestor,
+  preservedCommitPrefix,
   readWorktreeState,
   restoreWorktreeState,
   sameWorktreeState,
@@ -227,9 +228,9 @@ async function openTicketSession(
 }
 
 /**
- * How much of a ticket's budget is spent before it is warned (anton-d967). A ticket cut off mid-
- * cleanup loses the minutes it needed to commit what it had, so the warning lands while there is
- * still a fifth of the clock left to act on it.
+ * How much of a ticket's budget is spent before the run says so (anton-d967). Late enough that a
+ * healthy ticket never trips it, early enough that an operator watching still has a fifth of the
+ * clock to raise the budget or stop the run themselves.
  */
 const BUDGET_WARNING_FRACTION = 0.8;
 
@@ -237,8 +238,9 @@ const BUDGET_WARNING_FRACTION = 0.8;
  * Arm this ticket's deadline, derived from the job's own signal — and the warning that precedes it.
  *
  * `onWarning` fires once at {@link BUDGET_WARNING_FRACTION} of the budget, while the ticket is still
- * running: the deadline itself arrives as a kill, so the only chance to say "commit what you have"
- * is before it. Never armed for an unbounded budget, which has no fraction to be at.
+ * running: the deadline itself arrives as a kill and leaves no notice of its own, so this is the
+ * only account of the clock running down. Never armed for an unbounded budget, which has no
+ * fraction to be at.
  */
 function startTicketBudget(
   ctx: Pick<JobContext, "signal">,
@@ -818,7 +820,8 @@ type PreservedWork = { branch: string } | { rolledBackWhy: string };
  * - the project pins NO verify gates — nothing can prove the tree sound, so the pre-anton-d967
  *   behaviour stands;
  * - the gates fail, error, or outrun their own budget — the tree is not fit to keep;
- * - `git add -A` finds nothing to commit — there is no diff to preserve after all.
+ * - `git add -A` finds nothing to commit, or git refuses the commit outright — either way nothing
+ *   was preserved, and the reason says which.
  */
 async function preserveTimedOutWork(args: {
   run: Omit<StepContext, "tickets">;
@@ -889,10 +892,20 @@ async function preserveTimedOutWork(args: {
     gateBudget.stop();
   }
 
+  // An empty index and a REFUSED commit are two different facts an operator repairs differently
+  // (PR #228 review), so the error is carried rather than flattened into "nothing to commit": a
+  // locked index, a rejecting pre-commit hook or a full disk is what they need to see, and the
+  // rollback below is safe either way.
   const kept = await commitAll(worktreePath, preservedCommitMessage(ticket, timeoutMs)).catch(
-    () => ({ committed: false }),
+    (error: unknown) => ({ committed: false as const, error }),
   );
-  if (!kept.committed) return rollBack(`there was nothing for git to commit`);
+  if (!kept.committed) {
+    return rollBack(
+      "error" in kept
+        ? `anton could not commit the work (${kept.error instanceof Error ? kept.error.message : String(kept.error)})`
+        : `there was nothing for git to commit`,
+    );
+  }
   await logPreserve(logPath, `work PRESERVED on ${branch} as an explicitly incomplete commit`);
   return { branch };
 }
@@ -920,13 +933,16 @@ async function logPreserve(logPath: string, line: string): Promise<void> {
 
 /**
  * The subject of a preserved commit — deliberately NOT `<ticketId>:`, which is the delivery
- * attribution {@link worktreeHasCommitFor} reads. This commit is the opposite of a delivery: the
+ * attribution `worktreeHasCommitFor` reads. This commit is the opposite of a delivery: the
  * ticket is blocked, marked `not-delivered` and in no PR body, and a run that read this commit as
  * its work would close a ticket nobody finished.
+ *
+ * The resume still has to SEE it, or the work it kept can never reach a pull request — that read is
+ * {@link worktreeHasPreservedCommitFor}, which `step:commit` asks before reporting a zero diff.
  */
 function preservedCommitMessage(ticket: Bead, timeoutMs: number): string {
   return (
-    `WIP ${ticket.id}: ${ticket.title}\n\n` +
+    `${preservedCommitPrefix(ticket.id)} ${ticket.title}\n\n` +
     `INCOMPLETE — the ticket exceeded its ${Math.round(timeoutMs / 60_000)}m budget and was ` +
     `stopped before it finished. anton kept this work rather than deleting it because the ` +
     `project's verify gates passed on the tree; the ticket itself is blocked for review and is in ` +
@@ -935,9 +951,12 @@ function preservedCommitMessage(ticket: Bead, timeoutMs: number): string {
 }
 
 /**
- * The warning that precedes the deadline (anton-d967) — the one chance to say "commit what you
- * have" while the ticket is still running. On the session log, which is what an operator tails and
- * what the run's own record keeps; the deadline itself leaves no such warning, only a kill.
+ * The OPERATOR-facing record that precedes the deadline (anton-d967). It goes to the session log an
+ * operator tails and to the run's own record; the running agent cannot read either — the driver
+ * delivers its prompt on stdin and closes it (`writePrompt`), so there is no channel back into a
+ * live session and this is no instruction to it. What actually saves finished work is
+ * {@link preserveTimedOutWork}, after the deadline. This is what lets a person see the clock running
+ * down in time to raise the budget or stop the run, instead of meeting the kill in the log.
  */
 function warnBudgetRunningOut(
   logPath: string,
@@ -948,8 +967,8 @@ function warnBudgetRunningOut(
   const line =
     `${ticket.id} has used ${Math.round(BUDGET_WARNING_FRACTION * 100)}% of its ` +
     `${humanDuration(timeoutMs)} budget — about ${humanDuration(remainingMs)} left. ` +
-    `Commit what is finished now: work still uncommitted when the deadline lands is only kept if ` +
-    `this project's verify gates pass on it.`;
+    `Work still uncommitted when the deadline lands is kept only if this project's verify gates ` +
+    `pass on it, and only when this ticket IS the whole run target.`;
   console.warn(`[execute-epic] ${line}`);
   void appendSessionLog(logPath, `[ticket-budget] ${line}\n`).catch(() => {});
 }

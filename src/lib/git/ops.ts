@@ -487,9 +487,42 @@ export async function worktreeHasCommitFor(
   worktreePath: string,
   ticketId: string,
 ): Promise<boolean> {
-  const subjects = await git(worktreePath, ["log", "--format=%s", "-n", "1000"]).catch(() => "");
-  const prefix = `${ticketId}:`;
-  return subjects.split("\n").some((s) => s.startsWith(prefix));
+  return (await branchSubjects(worktreePath)).some((s) => s.startsWith(`${ticketId}:`));
+}
+
+/**
+ * The subject prefix a timed-out ticket's PRESERVED work carries (anton-d967) — deliberately NOT
+ * `<ticketId>:`, the delivery attribution {@link worktreeHasCommitFor} reads. Preserved work is on
+ * the branch and is still nobody's delivery, so a resume must RUN the ticket rather than skip it.
+ */
+export function preservedCommitPrefix(ticketId: string): string {
+  return `WIP ${ticketId}:`;
+}
+
+/**
+ * True when the branch carries the commit a timed-out attempt preserved for this ticket.
+ *
+ * `step:commit` reads it on the resume that follows: the preserved commit IS this ticket's work, so
+ * an agent that finds nothing left to do has delivered it, not delivered nothing. Without this read
+ * the code-finished/bookkeeping-cut-short case can never reach a pull request — every resume ends in
+ * a zero diff and parks the run again.
+ */
+export async function worktreeHasPreservedCommitFor(
+  worktreePath: string,
+  ticketId: string,
+): Promise<boolean> {
+  const prefix = preservedCommitPrefix(ticketId);
+  return (await branchSubjects(worktreePath)).some((s) => s.startsWith(prefix));
+}
+
+/**
+ * The subjects at the tip of the branch checked out in `worktreePath`. A run's own commits are
+ * always at that tip, so bounding the scan is safe. Fails closed to none (git error → treat as
+ * absent) rather than risk a skip.
+ */
+async function branchSubjects(worktreePath: string): Promise<string[]> {
+  const log = await git(worktreePath, ["log", "--format=%s", "-n", "1000"]).catch(() => "");
+  return log.split("\n");
 }
 
 /**

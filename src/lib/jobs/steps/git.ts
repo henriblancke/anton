@@ -12,6 +12,7 @@ import {
   openPullRequest,
   readWorktreeState,
   worktreeHasCommitFor,
+  worktreeHasPreservedCommitFor,
   type WorktreeState,
 } from "../../git/ops";
 import { PoisonEpic } from "../errors";
@@ -36,7 +37,9 @@ import type { StepResultWith } from "./result";
  *
  * So HEAD is consulted whenever the index is empty, and four cases fall out:
  *
- * 1. **HEAD stood still** — nothing was delivered. The gate's original verdict, unchanged.
+ * 1. **HEAD stood still** — nothing was delivered, unless a previous attempt's TIMEOUT preserved
+ *    this ticket's work on the branch (anton-d967), in which case the work is here and this run
+ *    found nothing left to do. Adopted, with the same attribution marker as case 2.
  * 2. **HEAD moved FORWARD on the run's branch** — the agent committed its own work. That IS
  *    delivery, and it is already where the PR push will find it. Adopted, with a marker commit
  *    recording the ticket attribution the agent's own subjects lack (see {@link commitMarker}).
@@ -62,7 +65,7 @@ export async function commitStep(ctx: StepContext): Promise<StepResultWith<"comm
   // `commitAll` just ran `git add -A` here, so git is demonstrably working: a read that fails now is
   // a real fault and propagates, rather than being absorbed into a delivery verdict either way.
   const state = await readWorktreeState(ctx.worktreePath);
-  if (state.head === ctx.ticketStartHead) return nothingDelivered();
+  if (state.head === ctx.ticketStartHead) return adoptPreservedWork(ctx);
 
   assertHeadOnRunBranch(ctx, state);
   await assertTicketStartReachable(ctx, state, ctx.ticketStartHead);
@@ -119,24 +122,66 @@ async function assertTicketStartReachable(
  * write a conforming subject itself, so nothing is recorded twice.
  */
 async function adoptAgentCommits(ctx: StepContext): Promise<StepResultWith<"committed">> {
-  const subject = stepSubject(ctx);
-  const attributed = await worktreeHasCommitFor(ctx.worktreePath, subject.id);
-  if (!attributed) {
-    await commitMarker(
-      ctx.worktreePath,
-      `${subject.id}: ${subject.title}\n\n` +
-        `The implementing agent committed this ticket's work itself, against the operating contract ` +
-        `("anton commits your working-tree changes"). Its commits are the delivery and are left as they ` +
-        `are; this empty commit records the ticket they belong to, which their own subjects do not.`,
-    );
-  }
+  const recorded = await recordAttribution(
+    ctx,
+    `The implementing agent committed this ticket's work itself, against the operating contract ` +
+      `("anton commits your working-tree changes"). Its commits are the delivery and are left as they ` +
+      `are; this empty commit records the ticket they belong to, which their own subjects do not.`,
+  );
   return {
     ok: true,
-    detail: attributed
-      ? "the agent committed its own work — adopted as delivered"
-      : "the agent committed its own work — adopted as delivered, ticket attribution recorded",
+    detail: recorded
+      ? "the agent committed its own work — adopted as delivered, ticket attribution recorded"
+      : "the agent committed its own work — adopted as delivered",
     facts: { committed: true },
   };
+}
+
+/**
+ * Case 1 continued: HEAD stood still because there was nothing left to do. A ticket whose budget
+ * expired on a gate-passing tree has that tree PRESERVED on the branch as an explicitly incomplete
+ * `WIP <id>:` commit (anton-d967), and the resume re-runs the ticket from it — so an agent that
+ * finds the change already made delivers exactly that commit, not an empty tree.
+ *
+ * Without this the preserved case could never reach a pull request. The `WIP` subject is invisible
+ * to {@link worktreeHasCommitFor} by design, so the resume's zero diff read as "nothing landed",
+ * poison-parked the run, and the next resume did the same — the code-finished/bookkeeping-cut-short
+ * case, permanently stuck one step from the PR it had already earned.
+ *
+ * This is not a free pass on the delivery gate: a ticket with no preserved commit still reports the
+ * zero diff it always did, and an agent that self-reported `blocked` is still blocked by
+ * `assertDelivered` on the strength of its own report.
+ */
+async function adoptPreservedWork(ctx: StepContext): Promise<StepResultWith<"committed">> {
+  const subject = stepSubject(ctx);
+  if (!(await worktreeHasPreservedCommitFor(ctx.worktreePath, subject.id))) {
+    return nothingDelivered();
+  }
+  const recorded = await recordAttribution(
+    ctx,
+    `A previous attempt exceeded this ticket's budget and its work was PRESERVED on this branch as ` +
+      `an explicitly incomplete commit; this run found nothing left to do, so that work is the ` +
+      `delivery. This empty commit records the ticket it belongs to, which the \`WIP\` subject ` +
+      `deliberately does not.`,
+  );
+  return {
+    ok: true,
+    detail: recorded
+      ? "a timed-out attempt's preserved work is the delivery — adopted, ticket attribution recorded"
+      : "a timed-out attempt's preserved work is the delivery — adopted",
+    facts: { committed: true },
+  };
+}
+
+/**
+ * Record the ticket attribution a commit's own subject lacks — false when one is already there, so
+ * nothing is recorded twice.
+ */
+async function recordAttribution(ctx: StepContext, why: string): Promise<boolean> {
+  const subject = stepSubject(ctx);
+  if (await worktreeHasCommitFor(ctx.worktreePath, subject.id)) return false;
+  await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`);
+  return true;
 }
 
 /**

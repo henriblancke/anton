@@ -17,6 +17,7 @@ const ops = vi.hoisted(() => ({
   openPullRequest: vi.fn(),
   readWorktreeState: vi.fn(),
   worktreeHasCommitFor: vi.fn(),
+  worktreeHasPreservedCommitFor: vi.fn(),
 }));
 vi.mock("../../git/ops", () => ops);
 
@@ -28,6 +29,7 @@ beforeEach(async () => {
   sandbox = await openSandbox("steps-git");
   for (const fn of Object.values(ops)) fn.mockReset();
   ops.commitAll.mockResolvedValue({ committed: true });
+  ops.worktreeHasPreservedCommitFor.mockResolvedValue(false);
   ops.openPullRequest.mockResolvedValue({ url: "https://example.test/pr/7", ref: "gh-7" });
 });
 
