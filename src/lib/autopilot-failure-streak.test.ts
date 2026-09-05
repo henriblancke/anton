@@ -323,3 +323,49 @@ describe("what a failure point is compared modulo", () => {
     });
   }
 });
+
+/**
+ * Where the 140-character cut lands must not decide whether two failures are the same story
+ * (anton-tyk0). The signature is compared on the whole first line; the cut is a display budget, and
+ * the pair of tests either side of it is the whole claim.
+ */
+describe("the display cut", () => {
+  const EPIC = "anton-w0rk";
+
+  /** The module's display budget, restated because it is the boundary under test. */
+  const DISPLAY_CHARS = 140;
+
+  /** Exactly one display's worth of failure, so anything appended sits past the cut. */
+  const PREFIX = "test gate failed while checking ".padEnd(DISPLAY_CHARS, "migrations ");
+
+  const streakOf = (points: readonly string[]) =>
+    detectFailureStreak(
+      points.map((error, i) => run(`r${i}`, { epicBeadId: EPIC, error })).reverse(),
+      THREE,
+    )!;
+
+  it("reports no common point when the runs differ only past the cut", () => {
+    const streak = streakOf([
+      `${PREFIX}: relation "runs" is missing`,
+      `${PREFIX}: relation "beads" is missing`,
+      `${PREFIX}: relation "jobs" is missing`,
+    ]);
+    expect(streak.commonFailure).toBeUndefined();
+  });
+
+  it("reports one point when the runs agree past the cut", () => {
+    const point = `${PREFIX}: relation "runs" is missing`;
+    const streak = streakOf([point, point, point]);
+    expect(streak.commonFailure).toBe(PREFIX);
+  });
+
+  it("cuts what it prints, in the summary and in the evidence alike", () => {
+    const point = `${PREFIX}: relation "runs" is missing`;
+    const streak = streakOf([point, point, point]);
+    expect(streak.commonFailure).toHaveLength(DISPLAY_CHARS);
+    expect(describeFailureStreak(streak)).toBe(
+      `3 runs in a row ended without delivering, every one of them at the same point: ${PREFIX}`,
+    );
+    expect(failureStreakEvidence(streak)[0]).toBe(`r0 · ${EPIC} · failed · ${PREFIX}`);
+  });
+});

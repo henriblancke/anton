@@ -157,13 +157,22 @@ export function detectFailureStreak(
   };
 }
 
-/** Enough of the error to recognise it, short enough that a header can print N of them. */
+/**
+ * Enough of the error to recognise it, short enough that a header can print N of them. A DISPLAY
+ * budget only (anton-tyk0): comparing on the cut would let where the 140th character happens to
+ * land decide whether two failures are the same story, so the signature reads the whole line.
+ */
 const FAILURE_POINT_CHARS = 140;
 
-/** The first non-empty line of the run's error — where it stopped, without the stack behind it. */
+/** The whole first non-empty line of the run's error — where it stopped, without the stack. */
 function failurePoint(run: RunOutcome): string {
   const line = run.error?.split("\n").find((l) => l.trim().length > 0) ?? "";
-  return line.trim().slice(0, FAILURE_POINT_CHARS);
+  return line.trim();
+}
+
+/** A failure point cut to what an operator's header can hold. */
+function forDisplay(point: string): string {
+  return point.slice(0, FAILURE_POINT_CHARS);
 }
 
 /** What a run-specific fragment collapses to: a bead id the row named, or a quantity it printed. */
@@ -281,7 +290,7 @@ export function sharedFailurePoint(runs: readonly RunOutcome[]): string | undefi
   const signatures = runs.map((run, i) => signatureOf(run, points[i]!));
   const signature = signatures[0]!;
   if (!signature) return undefined;
-  return signatures.every((s) => s === signature) ? points[0] : undefined;
+  return signatures.every((s) => s === signature) ? forDisplay(points[0]!) : undefined;
 }
 
 /** Why the breaker fired, in one sentence — the disarm's `detail`. */
@@ -302,7 +311,7 @@ export function describeFailureStreak(streak: FailureStreak): string {
 export function failureStreakEvidence(streak: FailureStreak): string[] {
   return streak.runs.map((run) => {
     const how = run.abandoned ? "abandoned" : run.status;
-    const point = failurePoint(run);
+    const point = forDisplay(failurePoint(run));
     return [run.id.slice(0, 8), run.epicBeadId, how, point].filter(Boolean).join(" · ");
   });
 }
