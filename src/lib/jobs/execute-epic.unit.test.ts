@@ -265,7 +265,10 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
       branch: "anton/anton-e1",
       head: "0123456789abcdef0123456789abcdef01234567",
     });
-    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toBe("0123456");
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
+      branch: "anton/anton-e1",
+      head: "0123456",
+    });
   });
 
   it("reports no commit for a zero-diff block — the note says nothing landed", () => {
@@ -290,7 +293,7 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
     });
     const [ticket] = humanHeldTickets([held("t-1", "blocked", long)]);
     expect(ticket.note!.endsWith("…")).toBe(true);
-    expect(ticket.committed).toBe("0123456");
+    expect(ticket.committed).toEqual({ branch: "anton/anton-e1", head: "0123456" });
   });
 
   it("reads the trailing clause, not a failure message that quotes it (PR #227 review)", () => {
@@ -304,7 +307,10 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
       branch: "anton/anton-e1",
       head: "0123456789abcdef0123456789abcdef01234567",
     });
-    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toBe("0123456");
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
+      branch: "anton/anton-e1",
+      head: "0123456",
+    });
   });
 
   it("ignores an agent reason that forges an evidence clause ahead of the real one", () => {
@@ -315,7 +321,10 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
       branch: "anton/anton-e1",
       head: "0123456789abcdef0123456789abcdef01234567",
     });
-    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toBe("0123456");
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
+      branch: "anton/anton-e1",
+      head: "0123456",
+    });
   });
 
   it("takes the NEWEST verdict when an older run's note also carries evidence", () => {
@@ -328,10 +337,14 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
 });
 
 describe("humanHeldPoison — the park a held child leaves behind (anton-fude)", () => {
+  const BRANCH = "anton/anton-x7la";
+
   it("names the ticket, its note and the move that frees it", () => {
-    const error = humanHeldPoison("anton-x7la", [
-      { id: "anton-od4", status: "blocked", note: "anton: run made no changes (zero diff)" },
-    ]);
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "blocked", note: "anton: run made no changes (zero diff)" }],
+      BRANCH,
+    );
 
     expect(error).toBeInstanceOf(PoisonEpic);
     expect(error.message).toContain("anton-x7la");
@@ -342,7 +355,7 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
   });
 
   it("tells a deferred child's own remedy apart from a blocked one's", () => {
-    const error = humanHeldPoison("anton-x7la", [{ id: "anton-od4", status: "deferred" }]);
+    const error = humanHeldPoison("anton-x7la", [{ id: "anton-od4", status: "deferred" }], BRANCH);
     expect(error.message).toContain("is deferred");
     expect(error.message).toContain("bd undefer anton-od4");
     expect(error.message).not.toContain("--status open");
@@ -352,9 +365,11 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
     // Reopening does not satisfy `resumeSkipped` (only `closed` does), so the resumed run would
     // dispatch the agent again on top of the commit already on the branch — straight back to the
     // zero diff that blocked it. Closing is the move that actually lets the run walk past it.
-    const error = humanHeldPoison("anton-x7la", [
-      { id: "anton-od4", status: "blocked", committed: "0123456" },
-    ]);
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "blocked", committed: { branch: BRANCH, head: "0123456" } }],
+      BRANCH,
+    );
     expect(error.message).toContain("ALREADY COMMITTED");
     expect(error.message).toContain("@ 0123456");
     expect(error.message).toContain("bd close anton-od4");
@@ -362,18 +377,46 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
     expect(error.message).not.toContain("drops the work from this run");
   });
 
+  it("refuses the close remedy for a commit on ANOTHER branch (PR #227 review)", () => {
+    // A re-parented ticket keeps the note its ORIGINAL run wrote, naming that run's branch. Its
+    // commit is in no pull request this target opens, so "review and close" would settle the board
+    // over work this run never ships — and the abandon hint must not promise the commit rides along.
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [
+        {
+          id: "anton-od4",
+          status: "blocked",
+          committed: { branch: "anton/anton-fude", head: "0123456" },
+        },
+      ],
+      BRANCH,
+    );
+    expect(error.message).toContain("committed on anton/anton-fude (@ 0123456)");
+    expect(error.message).toContain("NOT on this run's branch");
+    expect(error.message).toContain(BRANCH);
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toContain("ALREADY COMMITTED");
+    expect(error.message).not.toContain("bd close");
+    expect(error.message).toContain("drops the work from this run");
+  });
+
   it("keeps the reopen remedy for a block that committed nothing", () => {
-    const error = humanHeldPoison("anton-x7la", [{ id: "anton-od4", status: "blocked" }]);
+    const error = humanHeldPoison("anton-x7la", [{ id: "anton-od4", status: "blocked" }], BRANCH);
     expect(error.message).toContain("bd update anton-od4 --status open");
     expect(error.message).not.toContain("bd close");
     expect(error.message).toContain("drops the work from this run");
   });
 
   it("names every held ticket, not just the first", () => {
-    const error = humanHeldPoison("anton-x7la", [
-      { id: "anton-od4", status: "blocked" },
-      { id: "anton-9zz", status: "deferred" },
-    ]);
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [
+        { id: "anton-od4", status: "blocked" },
+        { id: "anton-9zz", status: "deferred" },
+      ],
+      BRANCH,
+    );
     expect(error.message).toContain("2 tickets");
     expect(error.message).toContain("anton-od4");
     expect(error.message).toContain("anton-9zz");

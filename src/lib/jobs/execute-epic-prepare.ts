@@ -281,7 +281,7 @@ function assertTicketsClaimable(run: EpicRun, gates: RunGates): void {
   // not judged here — its status is the epic claim's business (claimRunTarget), which already parks
   // on the same refusal with the target's own message.
   const held = humanHeldTickets(gates.children);
-  if (held.length > 0) throw humanHeldPoison(run.targetId, held);
+  if (held.length > 0) throw humanHeldPoison(run.targetId, held, run.branch);
 }
 
 /**
@@ -335,7 +335,7 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
   }
   const reserved = new Map(runTickets(reservedBoard, epicBeadId).map((t) => [t.id, t]));
   const held = humanHeldTickets(gates.children.map((c) => reserved.get(c.id) ?? c));
-  if (held.length > 0) throw humanHeldPoison(epicBeadId, held);
+  if (held.length > 0) throw humanHeldPoison(epicBeadId, held, run.branch);
 }
 
 /** Step 0d. Cook, floor-check and pin the pipeline this run walks, then split it into its phases. */
