@@ -9,6 +9,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead, type BeadDep } from "../beads/bd";
 import type { PickerExclusionReason } from "../board-picker-plan";
+import { proposalFingerprint } from "../gardener/detections";
 import { eligibleTargets, ineligibility } from "./picker-targets";
 
 // Nothing in the decision may shell out: it is a pure function of a snapshot, and a `bd` spawn on
@@ -150,6 +151,25 @@ const cases: Case[] = [
     exclusions: [{ beadId: "t1", reason: "needs-human", detail: /agent:human/ }],
   },
   {
+    // The label is the whole difference: p1 is otherwise the same shape as t1, which stays eligible.
+    name: "a proposal is a decision, not work — a plain parentless task and a feature are untouched",
+    board: [
+      authored("p1", { labels: [proposalFingerprint("stale", "t9")] }),
+      authored("t1"),
+      authored("f1", { issue_type: "feature" }),
+    ],
+    eligible: ["t1", "f1"],
+    exclusions: [{ beadId: "p1", reason: "proposal", detail: /labelled gardener:stale:[0-9a-f]+/ }],
+  },
+  {
+    // Both producers file proposals; neither files work. The namespace comes from the kind, so a
+    // pm-namespaced fingerprint must refuse exactly as a gardener one does.
+    name: "a pm proposal is refused too — the fingerprint is what says `decision`, not the producer",
+    board: [authored("p1", { labels: [proposalFingerprint("low-value", "t9")] })],
+    eligible: [],
+    exclusions: [{ beadId: "p1", reason: "proposal", detail: /labelled pm:low-value:[0-9a-f]+/ }],
+  },
+  {
     name: "`agent:human` outranks a shaping gap — the reason is who owns it, not how it is written",
     board: [authored("t1", { acceptance_criteria: undefined, labels: [LABELS.agentHuman] })],
     eligible: [],
@@ -231,6 +251,21 @@ describe("ineligibility", () => {
       reason: "not-a-run-target",
     });
     expect(ineligibility(board[1], board)).toBeUndefined();
+  });
+
+  it("names a proposal as one, ahead of every shape and state test", () => {
+    // Claimed, unshaped and blocked all at once: whatever else is wrong with it, the answer the
+    // operator needs is that this bead is not work at all.
+    const board = [
+      bead("p1", {
+        labels: [proposalFingerprint("mispriority", "t9")],
+        assignee: "alice",
+        dependencies: [blockedBy("p1", "t1")],
+      }),
+      bead("t1"),
+    ];
+
+    expect(ineligibility(board[0], board)).toMatchObject({ beadId: "p1", reason: "proposal" });
   });
 
   it("reports the worst-scoped reason and carries every gap in the detail", () => {

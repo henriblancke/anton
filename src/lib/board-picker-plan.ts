@@ -33,6 +33,8 @@ import type { AntonDb, Clock } from "./jobs/queue";
  * answers "why not this one?" per bead (R2.6) and the lane groups the rest — both of which a
  * free-text sentence would force them to parse.
  *
+ *   • `proposal`         — a gardener/pm proposal: a decision the founder applies, not work an agent
+ *                          implements, even though it is shaped as a parentless task (anton-x37c).
  *   • `not-a-run-target` — not a feature, a parentless task/bug, or a childless epic, so nothing
  *     about it is a thing anton runs (`beads.isRunTarget`).
  *   • `not-open`         — closed, deferred, or already in flight.
@@ -48,6 +50,7 @@ import type { AntonDb, Clock } from "./jobs/queue";
  *                          they bought with it has not run out. Their answer, not a rule's.
  */
 export type PickerExclusionReason =
+  | "proposal"
   | "not-a-run-target"
   | "not-open"
   | "abandoned"
