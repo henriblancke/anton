@@ -22,6 +22,12 @@
  * IDEMPOTENT by construction. The plan is one row per project, replaced whole, so two overlapping
  * passes leave one row saying the same thing rather than a queue of events; and an empty plan is the
  * signal "decided, nothing to start", not "never ran".
+ *
+ * And no longer the only writer (anton-f12y): the board read decides the same question from the
+ * board it is already holding, and records it. So this pass writes as the FALLBACK — it decides and
+ * records exactly as before, but yields rather than replace a generation derived from a strictly
+ * fresher look at the board (anton-m4il). What it STARTS is untouched by that: the apply acts on the
+ * decision this pass just made, never on the row.
  */
 import { loadAllIssues } from "../beads/issues";
 import type { Bead } from "../beads/types";
@@ -183,7 +189,21 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
 
     // The job id goes on the row: "which pass decided this?" is the first question asked of a plan
     // an operator disagrees with, and the job carries the logs that answer it.
-    await saveBoardPickerPlan(db, clock, { projectId, jobId: ctx.jobId, ...decision });
+    //
+    // And the pass yields to a fresher one (anton-m4il). The board read records the same decision
+    // from the board it is holding, so this tick is the FALLBACK writer: it stamped its observation
+    // before a board read that costs seconds, and an operator looking at the project in that window
+    // has already written down a generation decided from a later board. Replacing it would retire
+    // the generation the Release button on screen names, and the accept filed against it would be
+    // refused. When no such read happened — the ordinary case, and every case on an unwatched
+    // project — nothing here is different: the row can only carry an earlier observation, so the
+    // pass records exactly as before.
+    await saveBoardPickerPlan(db, clock, {
+      projectId,
+      jobId: ctx.jobId,
+      yieldToFresher: true,
+      ...decision,
+    });
 
     // ARM (R1.5). Everything above decided; this is the only branch that writes to the board. The
     // three refusals are the brakes, in the order an operator would ask about them: a frozen project
@@ -324,7 +344,16 @@ async function restampAfterWrites(
     const board = await loadAllIssues(repoPath, { strictGates: true });
     const decision = await decideOver(db, { projectId, board, observedAtMs, armed });
     if (ctx.signal.aborted) return;
-    await saveBoardPickerPlan(db, clock, { projectId, jobId: ctx.jobId, ...decision });
+    // Still the pass, so still the fallback writer (anton-m4il): the correction this restamp exists
+    // to make is worth a cadence, never the generation a board read has since offered a start
+    // against. A read fresh enough to win here re-reads within its own snapshot window and records
+    // the claim itself, and the approve route's fence refuses a release the board has moved past.
+    await saveBoardPickerPlan(db, clock, {
+      projectId,
+      jobId: ctx.jobId,
+      yieldToFresher: true,
+      ...decision,
+    });
   } catch (err) {
     console.warn(
       `[board-picker] ${projectId}: the start landed but its plan could not be restamped — ` +

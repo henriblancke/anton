@@ -23,6 +23,11 @@
  * what is on screen rather than what a background tick last wrote. Both go through
  * {@link saveBoardPickerPlan}, which is idempotent per decision — restating one costs no new
  * generation.
+ *
+ * Two writers need an order, and it is the OBSERVATION, not the clock the write landed on
+ * (anton-m4il): the pass yields rather than replace a generation derived from a strictly fresher
+ * look at the board (`yieldToFresher`), so a slow tick cannot retire the plan an operator is
+ * looking at. The read never yields — see the field for why.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
@@ -368,6 +373,24 @@ export interface BoardPickerPlanInput {
   stamp: BoardStamp;
   entries: PickerPlanEntry[];
   exclusions: PickerExclusion[];
+  /**
+   * Stand down rather than replace a generation the row already holds from a STRICTLY FRESHER
+   * observation of the board (anton-m4il).
+   *
+   * Set by the scheduled pass, which is the FALLBACK writer. It stamps its observation before a
+   * board read that costs seconds, and may then spend an apply on top, so by the time it writes, an
+   * operator's board read can have decided the same question from a later look and recorded it.
+   * Overwriting that would retire — for a generation nobody is looking at — the one a surface is
+   * offering a start against, and the accept filed against it would be refused.
+   *
+   * Absent for the board read, which is the PRIMARY writer: what it records is what it drew, so a
+   * read that stood down would hand a surface a generation naming picks that are not on screen.
+   *
+   * Strictly fresher, never merely different: equal observations are not an ordering, and a pass
+   * that is in fact the only writer can only ever meet a row observed earlier — a restatement
+   * carries that instant forward, never back — so it goes on recording exactly as it always did.
+   */
+  yieldToFresher?: boolean;
 }
 
 /**
@@ -383,6 +406,10 @@ export interface BoardPickerPlanInput {
  * data. A restatement therefore keeps the generation id, its `generatedAt` and the writer that minted
  * it, and touches only the observation instant — and only forwards, so a slow pass carrying an older
  * snapshot cannot date the row backwards.
+ *
+ * A writer that decides DIFFERENTLY replaces the row — unless it asked to yield to a fresher
+ * observation ({@link BoardPickerPlanInput.yieldToFresher}), which is what orders the two writers by
+ * the board each of them looked at rather than by which one finished last.
  *
  * Read and write happen in ONE immediate transaction: the id is chosen by comparing against the row,
  * so two overlapping writers reading before either wrote would both mint a fresh generation and the
@@ -410,6 +437,9 @@ export async function saveBoardPickerPlan(
   return db.transaction(
     (tx) => {
       const prev = tx.select().from(schema.boardPickerPlans).where(where).limit(1).get();
+      // The fallback writer's one refusal (anton-m4il): a decision made from an older board never
+      // replaces one made from a newer one, whichever of them reached the row first.
+      if (prev && input.yieldToFresher && observedAtMs < prev.boardObservedAtMs) return rowToPlan(prev);
       if (prev && restatesDecision(prev, decided)) {
         if (observedAtMs <= prev.boardObservedAtMs) return rowToPlan(prev);
         tx.update(schema.boardPickerPlans).set({ boardObservedAtMs: observedAtMs }).where(where).run();

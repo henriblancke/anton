@@ -627,6 +627,95 @@ describe("plan storage", () => {
   });
 
   /**
+   * The fallback writer (anton-m4il). The scheduled pass stamps its observation before a board read
+   * that costs seconds, so it can land a decision made from an OLDER board after the operator's own
+   * read recorded one made from a newer one — and the generation it would retire is the one the
+   * Release button on screen names.
+   */
+  describe("a writer that yields to a fresher observation", () => {
+    const fresher = () => ({
+      projectId,
+      stamp: stamp({ observedAtMs: OBSERVED + 5_000, digest: "2222222222222222" }),
+      entries: [entry({ beadId: "anton-b" })],
+      exclusions: [],
+    });
+    /** The pass: an older look at the board, and a different answer about it. */
+    const older = () => ({
+      projectId,
+      jobId: "job-1",
+      stamp: stamp({ digest: "1111111111111111" }),
+      entries: [entry()],
+      exclusions: [excluded()],
+    });
+    /** …handed over as the pass hands it over, with the fallback writer's one refusal. */
+    const yielding = () => ({ ...older(), yieldToFresher: true });
+
+    it("keeps the standing generation whole rather than replacing it", async () => {
+      const standing = await saveBoardPickerPlan(tdb.db, clock, fresher());
+
+      const returned = await saveBoardPickerPlan(tdb.db, clock, yielding());
+
+      // The row is untouched — id, ranking, digest and observation — and the yielding writer is
+      // handed the generation that stands, not the one it decided.
+      expect(returned).toEqual(standing);
+      const stored = (await getBoardPickerPlan(tdb.db, projectId))!;
+      expect(stored).toEqual(standing);
+      expect((await tdb.db.select().from(schema.boardPickerPlans))[0].jobId).toBeNull();
+    });
+
+    // The pass is the fallback, not a lesser writer: with nothing fresher on the row it decides and
+    // records exactly as it always did.
+    it("records as before when the row holds an older observation, or the same one", async () => {
+      await saveBoardPickerPlan(tdb.db, clock, {
+        ...fresher(),
+        stamp: stamp({ observedAtMs: OBSERVED - 5_000, digest: "2222222222222222" }),
+      });
+
+      const written = await saveBoardPickerPlan(tdb.db, clock, yielding());
+      expect((await getBoardPickerPlan(tdb.db, projectId))!.planId).toBe(written.planId);
+      expect(written.entries.map((e) => e.beadId)).toEqual(["anton-a"]);
+
+      // Equal observations are not an ordering: two writers looking at the same instant race as
+      // they always have, last one wins.
+      const same = await saveBoardPickerPlan(tdb.db, clock, {
+        ...yielding(),
+        entries: [entry({ beadId: "anton-c" })],
+      });
+      expect((await getBoardPickerPlan(tdb.db, projectId))!.entries.map((e) => e.beadId)).toEqual([
+        "anton-c",
+      ]);
+      expect(same.planId).not.toBe(written.planId);
+    });
+
+    // The board read is the PRIMARY writer: what it records is what it drew, so it never yields.
+    it("leaves a writer that did not ask to yield replacing the row as before", async () => {
+      const standing = await saveBoardPickerPlan(tdb.db, clock, fresher());
+
+      const written = await saveBoardPickerPlan(tdb.db, clock, older());
+
+      expect(written.planId).not.toBe(standing.planId);
+      expect((await getBoardPickerPlan(tdb.db, projectId))!.entries.map((e) => e.beadId)).toEqual([
+        "anton-a",
+      ]);
+    });
+
+    // A restatement is not a replacement: the same decision from an older look leaves the row's
+    // observation where the fresher writer put it, exactly as it did before the guard existed.
+    it("leaves the observation forward when it restates what the row already holds", async () => {
+      const standing = await saveBoardPickerPlan(tdb.db, clock, fresher());
+
+      const restated = await saveBoardPickerPlan(tdb.db, clock, {
+        ...fresher(),
+        yieldToFresher: true,
+        stamp: stamp({ observedAtMs: OBSERVED, digest: "2222222222222222" }),
+      });
+
+      expect(restated.planId).toBe(standing.planId);
+      expect(restated.stamp.observedAtMs).toBe(OBSERVED + 5_000);
+    });
+  });
+
+  /**
    * The plan's own identity, which is what a verdict answers (PR #212 review). The board digest
    * cannot serve: it describes the decision INPUTS, so a pass that re-admits a target once its veto
    * expires stamps the same digest the decline was filed against, and the new pick would inherit the
