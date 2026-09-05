@@ -543,6 +543,15 @@
     line-height: 1.6;
   }
   .preview .cmd .flag { color: var(--primary); }
+  .preview .cmd + .cmd { margin-top: 0.5rem; }
+  .preview .cmd .pass {
+    display: block;
+    font-family: var(--font-sans);
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+    color: var(--muted-fg);
+  }
+  .preview .cmd .skipped { color: var(--muted-fg); }
   .preview .out { font-size: 0.8rem; color: var(--muted-fg); margin: 0; }
   .preview .out strong { color: var(--fg); font-variant-numeric: tabular-nums; }
 
@@ -1090,7 +1099,7 @@
               <button class="tchip" type="button" aria-pressed="false" data-type="bug" data-count="2"><span class="mk" aria-hidden="true">✓</span>bug</button>
               <button class="tchip" type="button" aria-pressed="false" data-type="chore" data-count="5"><span class="mk" aria-hidden="true">✓</span>chore</button>
             </div>
-            <p class="help">The push is flat: every tier you pick lands as a top-level issue, because bd sends no parent. <code>--type</code> only chooses what gets pushed — it does not travel with the issue, so Linear cannot tell an epic from a feature. Grouping is the Linear project the <code>area:</code> routing sets. Anything you leave off stays local.</p>
+            <p class="help">The push is flat: every tier you pick lands as a top-level issue, because bd sends no parent. <code>--type</code> only chooses what gets pushed — it does not travel with the issue, so Linear cannot tell an epic from a feature. Grouping is the Linear project the <code>area:</code> routing sets <em>when the issue is created</em>. Anything you leave off stays local.</p>
           </div>
 
           <div class="field">
@@ -1127,6 +1136,10 @@
             <p class="help">
               bd holds one project id at a time, so anton runs one pass per area and restores the
               setting afterwards. Unmapped areas are skipped and reported, never guessed.
+              <strong>Routing applies at creation.</strong> bd sends the project only when it creates
+              an issue — never on an update — so editing this table moves beads that have not been
+              pushed yet and leaves already-linked issues in the project they were created in. Move
+              those in Linear.
             </p>
           </div>
 
@@ -1141,8 +1154,12 @@
           <div class="field">
             <span class="lab">Preview</span>
             <div class="preview">
-              <div class="cmd" id="cmd">bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> epic,feature <span class="flag">--state</span> all</div>
-              <p class="out" id="dry">Would push <strong>3 epics</strong> and <strong>6 features</strong> across 3 projects. <strong>48</strong> beads excluded by the tier filter.</p>
+              <div id="cmd"></div>
+              <p class="out" id="dry"></p>
+              <p class="out">Each pass carries its own <code>--issues</code> list: with
+                <code>linear.project_id</code> set, bd skips creating any bead that has no Linear
+                issue yet, so one unscoped command would report success and create nothing.
+                <code>linear.project_id</code> is restored after the last pass.</p>
             </div>
             <div class="row between">
               <div class="row">
@@ -1168,9 +1185,10 @@
         <div class="note">
           <span class="note-label">Preview before push</span>
           <p>Every setting is reversible except a bad first push, which creates issues in someone
-             else's Linear. Dry-run is one click and reports counts, not a spinner — but it needs a
-             credential (bd reaches the live API before it previews) and reports one line per bead,
-             so anton derives the counts.</p>
+             else's Linear — and except the project each issue was created in, which no later change
+             to the routing table can move. Dry-run is one click and reports counts, not a spinner —
+             but it needs a credential (bd reaches the live API before it previews) and reports one
+             line per bead, so anton derives the counts.</p>
         </div>
         <div class="note">
           <span class="note-label" data-kind="risk">Before the first push</span>
@@ -1185,12 +1203,14 @@
              plus a write for every bead carrying a structured <code>acceptance_criteria</code>,
              <code>design</code> or <code>notes</code> field. Size it against what per-area routing
              selects, not the 197 epics+features the tier chips match: on this panel's
-             <code>--state all</code> default that was <strong>120 writes against N=194</strong> on
+             <code>--state all</code> default that was <strong>122 writes against N=194</strong> on
              2026-09-05 if a feature inherits its parent epic's <code>area:</code>, and
              <strong>10 against N=11</strong> if it does not — an open routing question that swings
-             the budget 18×. A partial routing table scales both down; <em>Open only</em> moves it
-             again (N=44, 15 writes on the inherited reading). It does not decay — closed beads never
-             leave an <em>Open and closed</em> population and anton keeps writing <code>notes</code>.
+             the budget 18×. <em>Open only</em> moves it again (N=44, 17 writes on the inherited
+             reading). A <em>partial</em> routing table is budgeted from its own areas' rows — the
+             per-area write share runs 18–100% — not by scaling that aggregate. It does not decay —
+             closed beads never leave an <em>Open and closed</em> population and anton keeps writing
+             <code>notes</code>.
              That is what the debounce caps.</p>
         </div>
         <div class="note">
@@ -1226,26 +1246,62 @@
   var dryEl = document.getElementById('dry');
   var plural = function (n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); };
 
+  // The routing table above, with the beads each area selects. bd holds one
+  // project id at a time, so the preview has to show the passes, not a single
+  // command — and each pass must name its ids or the creates are dropped.
+  var ROUTES = [
+    { area: 'ontology', project: 'Ontology',      projectId: 'prj_ontology',
+      counts: { epic: 1, feature: 3, task: 14, bug: 1, chore: 2 } },
+    { area: 'knowledge', project: 'Knowledge',    projectId: 'prj_knowledge',
+      counts: { epic: 1, feature: 2, task: 16, bug: 1, chore: 2 } },
+    { area: 'ingest', project: 'Ingest Engine',   projectId: 'prj_ingest',
+      counts: { epic: 1, feature: 1, task: 11, bug: 0, chore: 1 } }
+  ];
+
+  function beadIds(route, type, n) {
+    var out = [];
+    for (var i = 1; i <= n; i++) { out.push('lib-' + route.area[0] + type[0] + i); }
+    return out;
+  }
+
+  function idList(ids) {
+    return ids.length > 6
+      ? ids.slice(0, 6).join(',') + '<span class="skipped">,…+' + (ids.length - 6) + ' more</span>'
+      : ids.join(',');
+  }
+
   function refresh() {
     var on = chips.filter(function (c) { return c.getAttribute('aria-pressed') === 'true'; });
     var off = chips.filter(function (c) { return c.getAttribute('aria-pressed') !== 'true'; });
     var types = on.map(function (c) { return c.dataset.type; });
 
-    cmdEl.innerHTML = types.length
-      ? 'bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> ' +
-        types.join(',') + ' <span class="flag">--state</span> all'
-      : 'bd linear sync <span class="flag">--push</span> — no tiers selected';
-
     if (!types.length) {
+      cmdEl.innerHTML = '<div class="cmd">bd linear sync <span class="flag">--push</span> — no tiers selected</div>';
       dryEl.innerHTML = 'Nothing would sync. Pick at least one tier.';
       return;
     }
+
+    var passes = ROUTES.map(function (route) {
+      var ids = types.reduce(function (acc, t) { return acc.concat(beadIds(route, t, route.counts[t] || 0)); }, []);
+      return { route: route, ids: ids };
+    }).filter(function (p) { return p.ids.length; });
+
+    cmdEl.innerHTML = passes.map(function (p) {
+      return '<div class="cmd"><span class="pass">area:' + p.route.area + ' → ' + p.route.project +
+             ' · ' + plural(p.ids.length, 'bead') + '</span>' +
+             'bd config set linear.project_id ' + p.route.projectId + '<br />' +
+             'bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> ' +
+             types.join(',') + ' <span class="flag">--state</span> all ' +
+             '<span class="flag">--issues</span> ' + idList(p.ids) + '</div>';
+    }).join('');
+
     var parts = on.map(function (c) { return '<strong>' + plural(Number(c.dataset.count), c.dataset.type) + '</strong>'; });
     var excluded = off.reduce(function (sum, c) { return sum + Number(c.dataset.count); }, 0);
     var list = parts.length > 1
       ? parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1]
       : parts[0];
-    dryEl.innerHTML = 'Would push ' + list + ' across 3 projects.' +
+    dryEl.innerHTML = 'Would push ' + list + ' in <strong>' + plural(passes.length, 'pass') +
+      '</strong>, one per mapped area.' +
       (excluded ? ' <strong>' + excluded + '</strong> beads excluded by the tier filter.' : '');
   }
 

@@ -104,21 +104,30 @@ command and the dry-run counts live (see the mock).
 - **Per-area routing runs one pass per area.** bd holds a single `linear.project_id`, so anton sets
   it, pushes that area's ids, and restores it. Unmapped areas are skipped and reported, never
   guessed. Build it behind a pure `planLinearPushes(beads) → [{projectId, issueIds}]` so it swaps to
-  an upstream bd label→project mapping later. **Open: what a feature inherits.** Epics carry exactly
-  one `area:`, but features carry none — 186 of 187 on the board today — so routing on a bead's own
-  label selects 11 beads where routing on its parent epic's selects 194. Settle this before
+  an upstream bd label→project mapping later. **Routing binds at creation only** (settled 2026-09-05):
+  `projectId` rides on bd's create input, while an update sends only title, description, priority and
+  `stateId`, so re-pointing an area at another project — or changing a linked bead's `area:` — moves
+  only beads that have not been pushed yet and leaves every existing issue where it was created. v1
+  routes on first creation and says so in the panel; re-homing a linked issue is a Linear-side move,
+  and a `projectId`-on-update path is a separate ticket bd cannot serve today.
+  **Open: what a feature inherits.** Epics carry exactly one `area:`, but features carry none —
+  186 of 187 on the board today — so routing on a bead's own label selects 11 beads where routing on
+  its parent epic's selects 194. Settle this before
   `planLinearPushes` is written; it sets the whole cost budget in hazard 2.
 - **Credentials come from the environment** (`LINEAR_API_KEY`, or the OAuth pair), never stored in
   `anton.db` — same posture as `gh`. The panel reports what it found and stops there.
 - **Dry-run before the first push.** Every setting is reversible except a bad first push, which
-  creates issues in someone else's Linear.
+  creates issues in someone else's Linear — and except the project an issue was created in, which no
+  later setting change can move (see routing, above).
 - **The push is flat, and the tier does not survive it** (settled 2026-09-05, hazard 3). bd sends no
   parent, and `--type` only *selects* which beads are pushed — the payload is title, description,
   priority, state and project id, nothing else — so a pushed epic and a pushed feature are
   indistinguishable in Linear. Grouping lives in the Linear project the `area:` routing sets; that
   is the only structure the sync can express. **Tier is a documented loss**, accepted for the same
   reason the parent breadcrumb was rejected: the only channels left are title and description, and
-  anton does not mutate bead content for a cosmetic gain in a downstream tracker.
+  anton does not mutate bead content for a cosmetic gain in a downstream tracker. That grouping is
+  **fixed when the issue is created** — updates carry no `projectId` — so a re-mapped area regroups
+  nothing that is already linked.
 
 ### Hazards that must be handled
 
@@ -148,12 +157,14 @@ command and the dry-run counts live (see the mock).
    rubric in the description and forbids `--acceptance` — but that only covers `acceptance_criteria`,
    and **anton fills `notes` itself** via `bd note`, so new run targets keep joining the writing set.
    Measure it on the ids `planLinearPushes` selects, not on every bead the tier chips match. With
-   every area mapped and this panel's own `--state all` default, that was **120 writes against N=194**
+   every area mapped and this panel's own `--state all` default, that was **122 writes against N=194**
    on 2026-09-05 if a feature inherits its parent epic's `area:` — and **10 against N=11** if it does
    not, since 186 of 187 features carry no `area:` of their own (see *Per-area routing*, above).
-   Budget N reads plus a write for the structured-field majority of N, and do **not** assume it
-   decays — a closed bead never leaves a `--state all` population. The routing table sets N outright;
-   **Also include** set to *Open only* moves it again (N=44, 15 writes on the inherited reading —
+   Budget N reads plus a write for the structured-field majority of N — and budget a *partial*
+   routing table from its own areas' per-pass rows, whose write share runs from 18% to 100%, rather
+   than by scaling that aggregate (spike §2). Do **not** assume it decays — a closed bead never
+   leaves a `--state all` population. The routing table sets N outright;
+   **Also include** set to *Open only* moves it again (N=44, 17 writes on the inherited reading —
    `--state open` skips closed beads rather than selecting the literal `open` status, so
    `in_progress` and `deferred` stay in the slice). The
    "a lease-only change syncs nothing" guarantee still has to be enforced at anton's seam (do not

@@ -8,7 +8,7 @@ answers re-checked against 1.2.2 (latest stable) and unchanged.
 | # | Question | Answer |
 | --- | --- | --- |
 | 1 | Does push map `parent-child` onto Linear sub-issues? | **No.** Push never sends a parent. Hierarchy is import-only. |
-| 2 | Does push carry bead labels? | **No.** Push never sends `labelIds`, so the run-lease cannot reach Linear as a label — but a lease-only change is still **one read per linked bead**, plus a write for the majority of the beads the `area:` routing plan actually selects — those carrying a structured `acceptance_criteria`/`design`/`notes` field, whose unchanged-issue skip never fires (120 of the 194 selected under the widest routing reading; §2). |
+| 2 | Does push carry bead labels? | **No.** Push never sends `labelIds`, so the run-lease cannot reach Linear as a label — but a lease-only change is still **one read per linked bead**, plus a write for the majority of the beads the `area:` routing plan actually selects — those carrying a structured `acceptance_criteria`/`design`/`notes` field, whose unchanged-issue skip never fires (122 of the 194 selected under the widest routing reading — but the share runs 18–100% by area, so a partial routing table must be budgeted per area; §2). |
 | 3 | What does `--update-refs` write into `external_ref`? | The **Linear issue URL verbatim, always** — the flag is declared but never read, so it cannot be turned off. |
 
 Consequences for the downstream tickets are at the bottom.
@@ -200,24 +200,66 @@ bd list --status all --json --limit 0 | jq '
 # measured 2026-09-05:
 # {"tier_chips_select":197,
 #  "own_label_only":   {"selected": 11, "writes":  10, "open_only":  6, "open_writes":  5},
-#  "parent_inherited": {"selected":194, "writes": 120, "open_only": 44, "open_writes": 15},
+#  "parent_inherited": {"selected":194, "writes": 122, "open_only": 44, "open_writes": 17},
 #  "unreachable_either_way":3,
 #  "statuses":{"closed":150,"deferred":1,"in_progress":5,"open":38},
 #  "passes":{"area:agents":5,"area:autopilot":17,"area:board":38,"area:codehealth":56,
 #            "area:collaboration":9,"area:platform":13,"area:reliability":7,"area:runtime":20,
 #            "area:supervision":29},
-#  "inherited_detail":{"closed":150,"closed_writes":105,"acceptance":101,"notes":35,
-#                      "since_contract":76,"since_structured":17,"since_notes_only":16}}
+#  "inherited_detail":{"closed":150,"closed_writes":105,"acceptance":101,"notes":37,
+#                      "since_contract":76,"since_structured":19,"since_notes_only":18}}
 ```
 
 **The tier chips select 197 beads; the routing plan pushes at most 194 of them, and as few as 11.**
 Own-label routing selects the 10 epics — every one carries an `area:`, as the contract says — plus
 the *single* feature of 187 that carries one: 11 beads, 10 of which write every cycle.
 Parent-inherited routing selects 194 across nine passes (`area:codehealth` alone is 56), of which
-**120 write every cycle — roughly five in eight**; 3 beads are unreachable either way. A partial
-routing table scales both down. So the *ratio* is robust — a clear majority of whatever is selected
-writes on every cycle, under either reading — and it is **N that swings 18×**. Any budget stated as
-a multiple of N must name which reading it assumes.
+**122 write every cycle**; 3 beads are unreachable either way. So **N swings 18×** between the two
+readings, and any budget stated as a multiple of N must name which one it assumes.
+
+#### The aggregate ratio does not survive a partial table — budget per area
+
+The routing table is empty by default and partial mappings are the normal case, so the 122/194
+figure is a **ceiling for the fully mapped table, not a rate to scale down**. A route selects a
+whole `area:`, never a representative sample, and structured fields are not spread evenly across
+areas. Per pass, from the same board read (this snippet reproduces the table below verbatim):
+
+```bash
+bd list --status all --json --limit 0 | jq -r '
+  def structured: ((.acceptance_criteria//"")!="") or ((.design//"")!="") or ((.notes//"")!="");
+  def own_area: ((.labels//[])|map(select(startswith("area:")))|first);
+  . as $all | ([$all[]|{key:.id,value:own_area}]|from_entries) as $areaOf |
+  [$all[]|select(.issue_type=="epic" or .issue_type=="feature")
+        | {status, s: structured, own: own_area,
+           inh: (own_area // ($areaOf[.parent//""] // null))}]
+  | map(select(.inh!=null)) | group_by(.inh)
+  | map([.[0].inh, length, ([.[]|select(.s)]|length),
+         ([.[]|select(.status!="closed")]|length),
+         ([.[]|select(.status!="closed" and .s)]|length)] | @tsv)[]'
+```
+
+| Pass (`linear.project_id` set to that area's project) | Selected | Writes/cycle | Share | *Open only* selected | *Open only* writes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `area:agents` | 5 | 5 | 100% | 0 | 0 |
+| `area:autopilot` | 17 | 3 | 18% | 10 | 2 |
+| `area:board` | 38 | 31 | 82% | 4 | 2 |
+| `area:codehealth` | 56 | 21 | 38% | 13 | 3 |
+| `area:collaboration` | 9 | 5 | 56% | 5 | 1 |
+| `area:platform` | 13 | 9 | 69% | 0 | 0 |
+| `area:reliability` | 7 | 6 | 86% | 0 | 0 |
+| `area:runtime` | 20 | 18 | 90% | 2 | 2 |
+| `area:supervision` | 29 | 24 | 83% | 10 | 7 |
+| **all nine mapped** | **194** | **122** | **63%** | **44** | **17** |
+
+The share runs from **18% to 100%**, so mapping `area:autopilot` alone costs 17 reads and 3 writes,
+while mapping `area:runtime` alone costs 20 reads and 18 — a per-bead write rate five times apart on
+populations of the same size. **Read the budget off the rows of the areas actually mapped**; the
+63% belongs to the whole table and to nothing smaller. Under own-label routing the question is moot:
+each area contributes one or two beads (11 selected, 10 writing), because only one feature on the
+board carries an `area:` of its own.
+
+The measurement is a snapshot, and the population moves the way §2 predicts: this table's 122 was
+120 earlier the same day, the two additions being run targets that gained a `bd note`.
 
 **The write tail also does not trend to zero**, for two independent reasons (counts below are the
 inherited reading, the upper bound):
@@ -226,7 +268,7 @@ inherited reading, the upper bound):
   decaying: 150 of the 194 are closed, and 105 of those carry a structured field. Closing a legacy
   bead does not retire its cost; it freezes it.
 - `notes` keeps minting new members of the writing set. Of the 76 selected beads created since
-  2026-08-15, well under the current contract, 17 carry a structured field — **16 of them
+  2026-08-15, well under the current contract, 19 carry a structured field — **18 of them
   `notes`-only**, with exactly one `acceptance_criteria`. The contract killed the acceptance field;
   it cannot keep `bd note` off a run target, and anton notes its own run targets.
 
@@ -234,7 +276,7 @@ So the skip fires only for a bead that is description-only **and** has never bee
 been pushed at least once — and the writing set converges to a floor, not to zero. Two levers shrink
 it, and both are design choices for the sync ticket rather than bd behaviours, flagged here and not
 decided: the **routing table**, which sets N outright, and **Also include** — *Open only* takes the
-inherited population from 194 to 44 and its per-cycle writes from 120 to 15 (own-label: 11 → 6 and
+inherited population from 194 to 44 and its per-cycle writes from 122 to 17 (own-label: 11 → 6 and
 10 → 5). *Open only* is `--state open`, which skips **closed** rather than selecting the literal
 `open` status, so the slice keeps the 5 `in_progress` and 1 `deferred` beads alongside the 38 `open`
 ones — a predicate written as `status == "open"` undercounts it.
@@ -266,10 +308,11 @@ Per push, per Linear-linked bead:
 A push triggered by every run-lease refresh (5 min, `RUN_LEASE_REFRESH_MS`) therefore costs **N
 reads, plus a write for the structured-field majority of N**, per cycle — where N is the union
 `planLinearPushes` selects on the *Open and closed* default, **not** the 197 the tier chips match.
-On this board with every area mapped: N=194 and 120 writes (~0.6N) if a feature inherits its parent
-epic's area, N=11 and 10 writes if it does not (§2) — for a change Linear cannot even represent.
+On this board with every area mapped: N=194 and 122 writes (~0.6N) if a feature inherits its parent
+epic's area, N=11 and 10 writes if it does not (§2) — but that 0.6 is the whole-table figure, and a
+partial table must take its per-area rows instead (18–100%, §2) — for a change Linear cannot even represent.
 That tail does not decay: closed beads stay in the population forever and `bd note` keeps adding to
-it. The routing table sets N outright, and **Also include** moves it again (*Open only*: N=44, 15
+it. The routing table sets N outright, and **Also include** moves it again (*Open only*: N=44, 17
 writes on the inherited reading — `--state open` drops only closed beads, so `in_progress` and
 `deferred` stay in), while the read floor alone still makes the debounce the only cap,
 not a nicety. And anton must not build the guarantee on bd's skip: a test asserting "an unchanged
@@ -326,6 +369,13 @@ anton's own code — there is no bd flag that buys safety here.
   or `--issues` (`cmd/bd/linear.go:359`, `:732-742`). The per-area routing plan (set `project_id`,
   push that area's ids, restore) **must** pass `--issues`/`--parent` or it will create nothing and
   report success.
+- **Project membership is create-only.** `projectId` rides on the *create* input only; the update
+  path sends `{title, description, priority, stateId}` and nothing else (`fieldmapper.go:78-85`,
+  `tracker.go:461-474`, §1). So an already-linked issue never moves: re-pointing an `area:` at a
+  different Linear project, or changing a bead's `area:` after its first push, changes where *new*
+  issues land and leaves every existing one in the project it was created in. bd offers no flag that
+  re-homes it — the routing promise binds at creation, and the sync UX must say so rather than imply
+  the mapping is reversible.
 - **Tier filtering works as the design assumes:** `--type epic,feature` filters on bead type,
   `--state open` skips closed, `--parent` limits to a subtree (`engine.go:1373-1403`, `:843-847`).
 - **Creates are idempotent** via a hash marker appended to the description
@@ -465,8 +515,9 @@ func TestSkipDefeat_StructuredFields(t *testing.T) {
   plus a write tail: bd's unchanged-issue skip misses once per bead after its create, and misses
   forever for any bead carrying a structured `acceptance_criteria`/`design`/`notes` field. Size it
   against the beads `planLinearPushes` selects, not the 197 the tier chips match: with every area
-  mapped and the `--state all` default, that is **120 writes against N=194** if a feature inherits
-  its parent epic's `area:`, or **10 against N=11** if it does not — 186 of the 187 features carry
+  mapped and the `--state all` default, that is **122 writes against N=194** if a feature inherits
+  its parent epic's `area:`, or **10 against N=11** if it does not — and a *partial* table is budgeted
+  from its own areas' rows, whose write share runs 18–100%, not from that aggregate — 186 of the 187 features carry
   no `area:` of their own, so the two readings differ 18× and the ticket has to pick one (§2). Only
   a never-noted, description-only bead skips from its second push on, and `bd note` keeps moving
   beads out of that set. So the debounce is still the only cap — the read floor alone justifies it —
