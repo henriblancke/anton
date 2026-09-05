@@ -4,15 +4,17 @@ import { Fragment, useMemo } from "react";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { GripVerticalIcon } from "lucide-react";
+import Link from "next/link";
 
 import type { UpNextCard } from "@/components/board/board-utils";
-import { UP_NEXT_LABEL, upNextMetaLabel } from "@/components/board/board-utils";
+import { UP_NEXT_LABEL, isPickerPick, upNextMetaLabel } from "@/components/board/board-utils";
 import { BudgetDivider, BudgetWaiting, useBudgetSignal } from "@/components/board/budget-line";
 import { EpicCard } from "@/components/board/epic-card";
 import { PickDecisionProvider } from "@/components/board/pick-decision";
 import { StandaloneChip } from "@/components/board/standalone-chip";
 import { VetoActions } from "@/components/board/veto-actions";
 import { budgetLine } from "@/lib/budget-line";
+import type { UpNextAbsence } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
@@ -87,28 +89,13 @@ export function UpNextLane({
       aria-label={UP_NEXT_LABEL}
       className="flex min-h-0 min-w-0 flex-col gap-3"
     >
-      <div className="flex shrink-0 flex-col gap-1 px-0.5">
-        <div className="flex items-center gap-2">
-          {/* Hollow and dashed where the four stages are solid: the shape says "not a stage" before
-              the caption below has to. */}
-          <span
-            className="size-2.5 rounded-full border border-dashed border-subtle"
-            aria-hidden="true"
-          />
-          <h2 className="text-[13px] font-semibold text-foreground">{UP_NEXT_LABEL}</h2>
-          <span className="ml-auto rounded-full bg-card px-2 py-0.5 font-mono text-[11px] text-subtle">
-            {cards.length}
-          </span>
-        </div>
-        {/* R3.4, said in the operator's words: this ranking belongs to this machine. The tooltip
-            carries the rest — where it comes from, and that no teammate sees it. */}
-        <p
-          className="text-[11px] leading-snug text-subtle"
-          title="Up Next is this machine's own ranking over Backlog, recorded by the board-picker. It is not a bead state, it is not shared with your teammates, and moving a card is what changes the board."
-        >
-          This machine&rsquo;s plan — not shared board state.
-        </p>
-      </div>
+      <LaneHead
+        badge={String(cards.length)}
+        // R3.4, said in the operator's words: this ranking belongs to this machine. The tooltip
+        // carries the rest — where it comes from, and that no teammate sees it.
+        caption="This machine’s plan — not shared board state."
+        captionTitle="Up Next is this machine's own ranking over Backlog, recorded by the board-picker. It is not a bead state, it is not shared with your teammates, and moving a card is what changes the board."
+      />
 
       {/* Sortable, not droppable: the lane is a ranking, so the only drop it accepts is onto another
           of its own cards — which the board turns into a priority write (R3.8). */}
@@ -145,6 +132,133 @@ export function UpNextLane({
 }
 
 /**
+ * The lane's heading, shared by the ranking and by every absence that replaces it (anton-w579).
+ *
+ * One component because the two must read as the SAME lane: an operator who learns the dashed dot
+ * and the caption slot on a full lane should recognise the empty one as that lane, not as a new
+ * panel that appeared where their plan used to be.
+ */
+function LaneHead({
+  badge,
+  caption,
+  captionTitle,
+}: {
+  /** The count, or — on an absence — the state's own word in the count's place. */
+  badge: string;
+  caption: string;
+  captionTitle?: string;
+}) {
+  return (
+    <div className="flex shrink-0 flex-col gap-1 px-0.5">
+      <div className="flex items-center gap-2">
+        {/* Hollow and dashed where the four stages are solid: the shape says "not a stage" before
+            the caption below has to. */}
+        <span
+          className="size-2.5 rounded-full border border-dashed border-subtle"
+          aria-hidden="true"
+        />
+        <h2 className="text-[13px] font-semibold text-foreground">{UP_NEXT_LABEL}</h2>
+        <span className="ml-auto rounded-full bg-card px-2 py-0.5 font-mono text-[11px] text-subtle">
+          {badge}
+        </span>
+      </div>
+      <p
+        className="text-[11px] leading-snug text-subtle"
+        {...(captionTitle ? { title: captionTitle } : {})}
+      >
+        {caption}
+      </p>
+    </div>
+  );
+}
+
+/**
+ * What each genuine absence IS, and what clears it (anton-w579) — the lane's copy for the states
+ * where there is no ranking to draw.
+ *
+ * A count of `0` would be the one reading the lane must never give: "anton has nothing to start" is
+ * a claim about the BOARD, and all but one of these states say nothing about the board at all. So
+ * the count's place carries the state's own word instead, and the sentence under it is always the
+ * clearing condition — the rule anton-5c8h set for every stopped state on this screen.
+ *
+ * The link goes where the condition is actually cleared, so the operator never has to hunt for the
+ * control the sentence just named. `no-claimable-work` points at the policy rather than at the
+ * Backlog beside it: its other holds — a blocker, a thin contract — are cleared on the target
+ * itself, and a policy too narrow to admit anything is the half of that state nothing else on the
+ * board would explain.
+ */
+const ABSENCE_COPY: Record<
+  UpNextAbsence,
+  { badge: string; headline: string; clears: string; link: { label: string; hash: string } }
+> = {
+  disarmed: {
+    badge: "off",
+    headline: "No pass ranks work here — board-picker is switched off.",
+    clears: "Turn board-picker back on and the next pass fills this lane.",
+    link: { label: "Automation settings", hash: "automation" },
+  },
+  "proposes-only": {
+    badge: "propose",
+    headline: "The picker ranks in the background, but propose offers nothing.",
+    clears: "Raise picker autonomy to shadow and its picks appear here to release or veto.",
+    link: { label: "Picker autonomy", hash: "policy" },
+  },
+  "policy-unreadable": {
+    badge: "?",
+    headline: "anton can’t read this project’s work policy, so it won’t guess a ranking.",
+    // The only absence with no operator action to name: the next board read retries the settings on
+    // its own. So the sentence sends them to the same place the link does — the panel that says what
+    // is armed — rather than to a reload the board is already doing.
+    clears: "The next board read retries it — check the armed policy if this lane stays empty.",
+    link: { label: "Work policy", hash: "policy" },
+  },
+  "no-claimable-work": {
+    badge: "none",
+    // Never "approve one" (PR #226 review): the board's Approve STARTS the target rather than making
+    // it rankable, and a veto has no control that clears it early. The remedies named here are the
+    // ones that can actually put a target back in the ranking.
+    headline: "Nothing on this board is work anton may start right now.",
+    clears:
+      "Clear what holds a target back — a blocker, a thin contract, a policy too narrow — or wait out one you set aside, and this lane fills again.",
+    link: { label: "Work policy", hash: "policy" },
+  },
+};
+
+/**
+ * The lane when there is no ranking to draw, and the reason is one the operator can clear.
+ *
+ * It holds the lane's column on purpose. Removing the section is what the board did before, and an
+ * operator watching Up Next disappear learns nothing about which unrelated state they are in — a
+ * switched-off pass, a level that only proposes, a policy anton could not read, and a board with
+ * nothing claimable on it all looked identical, and only one of them is about their work.
+ */
+export function UpNextAbsenceLane({ slug, absence }: { slug: string; absence: UpNextAbsence }) {
+  const copy = ABSENCE_COPY[absence];
+
+  return (
+    <section
+      data-lane={UP_NEXT_LABEL}
+      data-absence={absence}
+      aria-label={UP_NEXT_LABEL}
+      className="flex min-h-0 min-w-0 flex-col gap-3"
+    >
+      <LaneHead badge={copy.badge} caption={copy.headline} />
+      <div className="flex flex-col items-start gap-2 rounded-xl border border-dashed border-border bg-muted/20 p-3">
+        {/* Emphasised over the headline above it, for the same reason the breaker band emphasises
+            its own: an operator reading an empty lane wants to know what to DO about it. */}
+        <p className="text-[11px] leading-snug font-medium text-foreground">{copy.clears}</p>
+        <Link
+          href={`/projects/${slug}/settings#${copy.link.hash}`}
+          className="inline-flex h-6 items-center rounded-lg border border-border bg-card px-2 text-[11px] text-muted-foreground transition-colors hover:text-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+        >
+          {copy.link.label}
+        </Link>
+      </div>
+    </section>
+  );
+}
+
+/**
  * One ranked pick: the lane's own facts above the card Backlog would have shown.
  *
  * The drag handle lives here rather than on the card, so a target registers exactly one draggable —
@@ -153,7 +267,8 @@ export function UpNextLane({
  * The row is also where the pick's ONE decision lives: `[Release]` renders inside the card and the
  * vetoes render above it, so nothing below could serialize them (PR #212 review). Scoped per row —
  * answering one pick never freezes the rest of the plan. The provider carries the generation on
- * screen with it, so the release inside the card names the same decision the vetoes above it do.
+ * screen with it, so the release inside the card names the same decision the vetoes above it do —
+ * or carries that there is none to name, which is what takes the start off the card (anton-5axf).
  */
 function UpNextRow({
   slug,
@@ -177,6 +292,13 @@ function UpNextRow({
   const { beadId } = card.entry;
   const title = card.kind === "epic" ? card.epic.title : card.item.title;
   const notNowUntil = card.kind === "epic" ? card.epic.notNowUntil : card.item.notNowUntil;
+  const provenance = card.kind === "epic" ? card.epic.provenance : card.item.provenance;
+  // Is there a RECORDED decision behind this pick? The lane is DERIVED (anton-r0ew), so it ranks
+  // targets the last pass never wrote down — and a verdict on one of those has no generation to
+  // name. Both halves are asked because both are what binds it: the `◈ policy` mark is the plan
+  // naming THIS target (isPickerPick, which a stale plan fails), and `planId` is the generation the
+  // accept is written against. Missing either, the card offers no start at all (anton-5axf).
+  const unconfirmed = planId === undefined || !isPickerPick(provenance);
 
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
     useSortable({
@@ -193,7 +315,7 @@ function UpNextRow({
   };
 
   return (
-    <PickDecisionProvider {...(planId === undefined ? {} : { planId })}>
+    <PickDecisionProvider unconfirmed={unconfirmed} {...(planId === undefined ? {} : { planId })}>
       <div
         ref={setNodeRef}
         style={style}

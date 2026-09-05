@@ -1,10 +1,12 @@
 import { Suspense } from "react";
+import { cookies } from "next/headers";
 
 import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
 import { EpicBoard } from "@/components/board/epic-board";
 import { BoardSkeleton } from "@/components/board/board-skeleton";
 import { Topbar } from "@/components/shell/topbar";
 import { getBoard } from "@/lib/board";
+import { boardGroupingCookieName, parseBoardGrouping } from "@/lib/board-grouping";
 import { openEscalations } from "@/lib/escalations";
 import { currentBreaker } from "@/lib/autopilot-state";
 import { unwatchedParksForProject } from "@/lib/unwatched-parks";
@@ -25,12 +27,17 @@ export default async function ProjectBoardPage({
   //   • escalations — stalls the unstick pass could not safely restart (anton-wvcy).
   //   • parks — parked work with nothing watching it (anton-kh98), which is what the escalation
   //     read CANNOT surface: with the watcher off it has no producer and comes back empty.
-  const [board, settings, escalations, parks] = await Promise.all([
+  //   • grouping — stage columns or epic swimlanes, the operator's own choice (anton-wds3). Read
+  //     here so the FIRST paint is already the layout they picked, instead of painting the default
+  //     and dropping the Up Next lane again once the client adopts the stored preference.
+  const [board, settings, escalations, parks, cookieStore] = await Promise.all([
     project ? getBoard(project) : null,
     getProjectSettingsBySlug(slug),
     project ? openEscalations(project.id) : [],
     project ? unwatchedParksForProject(project.id) : undefined,
+    cookies(),
   ]);
+  const grouping = parseBoardGrouping(cookieStore.get(boardGroupingCookieName(slug))?.value);
 
   // Whether the autopilot has stopped, and which kind: a quality disarm that needs a human
   // (anton-5c8h) or the self-clearing WIP hold (anton-wy9y).
@@ -59,6 +66,7 @@ export default async function ProjectBoardPage({
           <EpicBoard
             slug={slug}
             initialBoard={board}
+            initialGrouping={grouping}
             escalations={escalations}
             parks={parks}
             breaker={breaker}

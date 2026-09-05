@@ -11,7 +11,11 @@ import { ClaimControl } from "@/components/board/claim-control";
 import { ApproveBlocked } from "@/components/board/contract-mark";
 import { ApproveRunButtons } from "@/components/board/approve-run-buttons";
 import { VetoActions } from "@/components/board/veto-actions";
-import { usePickDecision } from "@/components/board/pick-decision";
+import {
+  PickAwaitingRecord,
+  usePickDecision,
+  useUnrecordedPick,
+} from "@/components/board/pick-decision";
 import { isPickerPick } from "@/components/board/board-utils";
 import type { StandaloneApproval } from "@/components/board/use-standalone-approval";
 
@@ -34,7 +38,8 @@ export function canOfferRun(item: StandaloneItem, approved: boolean, deferred: b
  *
  * A contract gap withholds the run the way an open blocker does, but asks for an edit rather than a
  * wait — so the affordance stays put and names the missing section instead of failing on click
- * (mirrors the card).
+ * (mirrors the card). An unrecorded pick withholds it ahead of both and offers nothing to click at
+ * all (anton-5axf) — also mirroring the card.
  */
 export function ApproveRunAction({
   slug,
@@ -52,16 +57,22 @@ export function ApproveRunAction({
   // would vanish on the next poll (PR #212 review). Reopen the affordance until a run actually
   // starts; approve re-enqueues for an already-approved target.
   const [unrun, setUnrun] = useState(false);
+  // A chip the picker chose starts with [Release] (anton-d2h6 / R3.5) — the same approve route and
+  // the same run, plus the accept that records the operator agreed with the pick. A target already
+  // set aside keeps the plain approve: offering [Release] there would re-offer the declined start.
+  const recorded = isPickerPick(item.provenance);
+  const picked = recorded && item.notNowUntil === undefined;
+  // This chip is anton's pick and nothing has recorded that decision: a start here would be one the
+  // accept ledger has no answer for, so the chip says what it is waiting for instead. Asked of the
+  // surface too, since the epic swimlanes have no lane row to answer it (PR #226 review).
+  const unconfirmed = useUnrecordedPick(item.id, recorded);
   if (!canOfferRun(item, approval.approved, approval.deferred) && !unrun) return null;
+
+  if (unconfirmed) return <PickAwaitingRecord />;
 
   if (contractBlocks(item.contract)) {
     return <ApproveBlocked violations={item.contract?.blocking ?? []} label="Approve & run" />;
   }
-
-  // A chip the picker chose starts with [Release] (anton-d2h6 / R3.5) — the same approve route and
-  // the same run, plus the accept that records the operator agreed with the pick. A target already
-  // set aside keeps the plain approve: offering [Release] there would re-offer the declined start.
-  const picked = isPickerPick(item.provenance) && item.notNowUntil === undefined;
 
   return (
     <ApproveRunButtons
@@ -109,7 +120,12 @@ export function ChipBacklogActions({
   cardVeto?: (beadId: string, untilMs: number) => void;
 }) {
   const decision = usePickDecision();
-  const picked = isPickerPick(item.provenance) && item.notNowUntil === undefined;
+  const recorded = isPickerPick(item.provenance);
+  // The vetoes answer the live pick whether or not a pass wrote it down — mirrors the card, and the
+  // lane rows that offer both on an unrecorded row (PR #226 review). Only the START waits for the
+  // record; a target already set aside has answered.
+  const unconfirmed = useUnrecordedPick(item.id, recorded);
+  const answerable = (recorded || unconfirmed) && item.notNowUntil === undefined;
   return (
     <div className={cn("relative z-[1] flex flex-col gap-2", hasOverlay && "pointer-events-none")}>
       {/* Claim sits on its own line, above the action row. */}
@@ -126,7 +142,7 @@ export function ChipBacklogActions({
         <ApproveRunAction slug={slug} item={item} budgetAware={budgetAware} approval={approval} />
         {/* The two ways to disagree with the pick (R3.9), on the chip because this surface has no
             row to put them on. Same lock as the Release beside them: one answer per pick. */}
-        {cardVeto && picked && canOfferRun(item, approval.approved, approval.deferred) && (
+        {cardVeto && answerable && canOfferRun(item, approval.approved, approval.deferred) && (
           <VetoActions
             slug={slug}
             beadId={item.id}

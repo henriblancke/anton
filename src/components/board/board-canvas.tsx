@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 import { BoardColumn } from "@/components/board/board-column";
 import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
 import { PlanGenerationProvider } from "@/components/board/pick-decision";
-import { UpNextLane } from "@/components/board/up-next-lane";
+import { UpNextAbsenceLane, UpNextLane } from "@/components/board/up-next-lane";
 import type { EpicLane } from "@/components/board/board-utils";
 import type { BoardView } from "@/components/board/use-board-view";
 
@@ -34,7 +34,7 @@ export function BoardCanvas({
   reordering: boolean;
 } & CardContext) {
   return view.lanes ? (
-    <BoardLanes lanes={view.lanes} planId={view.planId} {...cards} />
+    <BoardLanes lanes={view.lanes} planId={view.planId} ranked={view.ranked} {...cards} />
   ) : (
     <BoardStageGrid
       columns={view.columns}
@@ -42,6 +42,7 @@ export function BoardCanvas({
       upNext={view.upNext}
       upNextPlan={view.upNextPlan}
       {...(view.planId === undefined ? {} : { planId: view.planId })}
+      {...(view.upNextAbsence === undefined ? {} : { upNextAbsence: view.upNextAbsence })}
       reordering={reordering}
       {...cards}
     />
@@ -55,7 +56,10 @@ export function BoardCanvas({
  *
  * An empty lane is worse than none: with no plan recorded — or a picker the operator disarmed —
  * "Up Next" with nothing under it reads as "anton has nothing to start" rather than "no pass is
- * running here" (R3.4).
+ * running here" (R3.4). Which is why the lane holds its column for a NAMED absence (anton-w579) and
+ * only for a named one: the header then says which nothing it is and what clears it, instead of
+ * leaving the operator to read a bare count of zero — or a missing column — as a verdict on their
+ * board.
  */
 function BoardStageGrid({
   columns,
@@ -63,6 +67,7 @@ function BoardStageGrid({
   upNext,
   upNextPlan,
   planId,
+  upNextAbsence,
   reordering,
   onVetoed,
   ...cards
@@ -70,14 +75,17 @@ function BoardStageGrid({
   columns: Record<Stage, Epic[]>;
   standalone: Record<Stage, StandaloneItem[]>;
   reordering: boolean;
-} & Pick<BoardView, "upNext" | "upNextPlan" | "planId"> &
+} & Pick<BoardView, "upNext" | "upNextPlan" | "planId" | "upNextAbsence"> &
   CardContext) {
   const hasUpNext = upNext.length > 0;
+  // The section keeps its column while it has something to say — a ranking, or an absence it can
+  // name. Only the unnamed absence (a plan the board has moved past) drops back to four columns.
+  const showsLane = hasUpNext || upNextAbsence !== undefined;
   return (
     <div
       className={cn(
         "grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2",
-        hasUpNext ? "xl:grid-cols-5" : "xl:grid-cols-4",
+        showsLane ? "xl:grid-cols-5" : "xl:grid-cols-4",
       )}
     >
       {STAGES.map((stage) => (
@@ -98,6 +106,9 @@ function BoardStageGrid({
               {...cards}
             />
           )}
+          {stage === "backlog" && !hasUpNext && upNextAbsence !== undefined && (
+            <UpNextAbsenceLane slug={cards.slug} absence={upNextAbsence} />
+          )}
         </Fragment>
       ))}
     </div>
@@ -109,17 +120,20 @@ function BoardStageGrid({
  * under the single stage strip, at any width.
  *
  * The picks stay in their epic's Backlog slice here — no lane, so no row to carry the generation
- * they were drawn from, and none to carry the vetoes either. The surface supplies both: without the
- * generation `[Release]` would post an unnamed accept the server resolves against whatever plan is
- * current by then, and without the veto sink this layout would offer the operator no way to REFUSE
- * a pick at all (PR #212 review).
+ * they were drawn from, none to carry the vetoes, and none to say which cards are picks at all. The
+ * surface supplies all three: without the generation `[Release]` would post an unnamed accept the
+ * server resolves against whatever plan is current by then, without the veto sink this layout would
+ * offer the operator no way to REFUSE a pick (PR #212 review), and without the ranked ids a pick the
+ * recorded plan does not name would get its start back here — the one the lane withholds because
+ * nothing has written the decision down (anton-5axf / PR #226 review).
  */
 function BoardLanes({
   lanes,
   planId,
+  ranked,
   onVetoed,
   ...cards
-}: { lanes: EpicLane[]; planId?: string } & CardContext) {
+}: { lanes: EpicLane[]; planId?: string; ranked: ReadonlySet<string> } & CardContext) {
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-auto">
       <LaneStageStrip />
@@ -130,6 +144,7 @@ function BoardLanes({
       ) : (
         <PlanGenerationProvider
           {...(planId === undefined ? {} : { planId })}
+          ranked={ranked}
           onVetoed={onVetoed}
         >
           <div className="flex flex-col divide-y divide-border">

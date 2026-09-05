@@ -98,6 +98,10 @@ export function provenanceVersion(plan?: BoardPickerPlan, policy?: Policy): stri
  * freshness verdict rides along as {@link BeadProvenance.stale}, which the badge ignores and the
  * button obeys.
  *
+ * That makes this map the RECORD the Up Next lane binds its start to (anton-5axf). The lane ranks
+ * live, so it draws targets no plan here names; a pick without a mark of its own offers no start and
+ * says why, rather than starting against a generation nothing wrote down.
+ *
  * The criterion LINK is the one part of the mark that cannot survive staleness. It is derived from
  * the policy and board as they read now, and stale means precisely that those are no longer the
  * inputs the pass decided from — so the criterion it resolves is not provably the one that made the

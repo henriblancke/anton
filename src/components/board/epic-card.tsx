@@ -2,7 +2,11 @@
 
 import type { Epic } from "@/lib/types";
 import { isPickerPick, typeWord } from "@/components/board/board-utils";
-import { PickDecisionProvider, useCardVeto } from "@/components/board/pick-decision";
+import {
+  PickDecisionProvider,
+  useCardVeto,
+  useUnrecordedPick,
+} from "@/components/board/pick-decision";
 import { useApproveRun } from "@/components/board/use-approve-run";
 import {
   ActiveCardHeader,
@@ -41,8 +45,15 @@ type EpicCardViewProps = EpicCardProps & { overlay?: boolean };
 export function EpicCard(props: EpicCardViewProps) {
   const cardVeto = useCardVeto();
   const { epic } = props;
+  const recorded = isPickerPick(epic.provenance);
+  // A LIVE pick no recorded plan names is still anton's pick, and the lane offers both vetoes on one
+  // (PR #226 review). What the missing record withholds is the START, which needs a generation to
+  // file the accept against; disagreement needs none — the veto route records one against no pick
+  // and defers all the same. Withholding it here would make the grouping toggle the thing that takes
+  // away the only way to set the target aside.
+  const unrecorded = useUnrecordedPick(epic.id, recorded);
   const answerable =
-    cardVeto !== undefined && isPickerPick(epic.provenance) && epic.notNowUntil === undefined;
+    cardVeto !== undefined && (recorded || unrecorded) && epic.notNowUntil === undefined;
   if (!answerable) return <EpicCardBody {...props} />;
   return (
     <PickDecisionProvider>

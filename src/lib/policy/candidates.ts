@@ -21,6 +21,7 @@
 import { beads } from "../beads/bd";
 import { eligibleTargets } from "../jobs/picker-targets";
 import type { Bead } from "../beads/types";
+import { ageInDays } from "./age";
 import type { PolicyCandidate } from "./match";
 
 /** The startable set a policy chooses from, plus what never reaches it. */
@@ -51,7 +52,7 @@ export function policyCandidates(board: readonly Bead[], now: Date = new Date())
 
   const candidates = eligible.map((b) => {
     const depth = parentDepth(b, byId);
-    const ageDays = ageInDays(b, now);
+    const ageDays = ageInDays(b.created_at, now);
     return {
       id: b.id,
       title: b.title,
@@ -89,13 +90,4 @@ function parentDepth(bead: Bead, byId: ReadonlyMap<string, Bead>): number | unde
     parent = beads.parentOf(current);
   }
   return depth;
-}
-
-/** Whole days since the bead was filed, or `undefined` when it carries no usable creation date. */
-function ageInDays(bead: Bead, now: Date): number | undefined {
-  if (!bead.created_at) return undefined;
-  const created = Date.parse(bead.created_at);
-  if (Number.isNaN(created)) return undefined;
-  // Floored, so "at least 1 day old" means a full day has passed rather than a rounding of hours.
-  return Math.max(0, Math.floor((now.getTime() - created) / 86_400_000));
 }

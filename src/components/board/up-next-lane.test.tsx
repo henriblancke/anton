@@ -8,7 +8,7 @@
  * on this screen may call the lane "Ready", because `bd ready` already means *unblocked*.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { DragEndEvent } from "@dnd-kit/core";
 
 import type { BudgetSignal } from "@/lib/budget-line";
@@ -18,6 +18,7 @@ import {
   type Epic,
   type Stage,
   type StandaloneItem,
+  type UpNextAbsence,
   type UpNextEntry,
 } from "@/lib/types";
 
@@ -164,6 +165,19 @@ const PLAN = [
   entry("anton-pick1", 2, { priority: 2, unblocks: 0 }),
 ];
 
+/**
+ * The lane with the picker's `◈ policy` mark on the given picks — the recorded plan naming them,
+ * which is what binds `[Release]` to a generation. The lane is derived (anton-r0ew), so an unmarked
+ * card in it is an ordinary state: ranked live, not yet written down.
+ */
+function markedBoard(...ids: string[]): Board {
+  const board = fixture(PLAN);
+  board.columns.backlog = board.columns.backlog.map((e) =>
+    ids.includes(e.id) ? { ...e, provenance: [{ kind: "policy" as const }] } : e,
+  );
+  return board;
+}
+
 /** Every column heading on the board, left to right — the flow order R3.1 constrains. */
 function laneOrder(): string[] {
   return [...document.querySelectorAll("h2")].map((h) => h.textContent ?? "");
@@ -300,6 +314,102 @@ describe("Up Next lane (anton-t9m4)", () => {
 });
 
 /**
+ * A withheld lane that names its absence (anton-w579).
+ *
+ * The rule the suite above pins — absent, never empty — is about the lane the server could not
+ * draw. These are the states where it CAN say why: the pass is off, the level only proposes, or the
+ * board holds nothing claimable. Each keeps the section in the layout and each says, in its own
+ * words, what would clear it — the standing rule for every stopped state on this board (anton-5c8h).
+ */
+describe("a named absence in place of the lane (anton-w579)", () => {
+  const withAbsence = (absence: UpNextAbsence): Board => ({ ...fixture(), upNextAbsence: absence });
+
+  /** The absence panel's text, header included — what the operator actually reads in the column. */
+  function absenceLane(): HTMLElement {
+    return screen.getByRole("region", { name: "Up Next" });
+  }
+
+  it("holds its column between Backlog and Implementing instead of vanishing", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("disarmed")} />);
+
+    expect(laneOrder()).toEqual(["Backlog", "Up Next", "Implementing", "In-review", "Done"]);
+    // No ranking, so every backlog target is still exactly where Backlog left it.
+    expect(laneOf("anton-pick1")).toBe("Backlog");
+    expect(cardCount("anton-pick1")).toBe(1);
+  });
+
+  it("names a disarmed picker, and that turning it back on fills the lane", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("disarmed")} />);
+
+    const lane = absenceLane();
+    expect(lane.textContent).toContain("board-picker is switched off");
+    expect(lane.textContent).toContain("Turn board-picker back on and the next pass fills this lane.");
+    expect(lane.querySelector('a[href="/projects/tmp/settings#automation"]')).toBeTruthy();
+  });
+
+  it("names a level that only proposes, and that shadow is what offers the picks", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("proposes-only")} />);
+
+    const lane = absenceLane();
+    expect(lane.textContent).toContain("propose offers nothing");
+    expect(lane.textContent).toContain(
+      "Raise picker autonomy to shadow and its picks appear here to release or veto.",
+    );
+    expect(lane.querySelector('a[href="/projects/tmp/settings#policy"]')).toBeTruthy();
+  });
+
+  it("names a board with nothing claimable, and what would put something in the lane", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("no-claimable-work")} />);
+
+    const lane = absenceLane();
+    expect(lane.textContent).toContain("Nothing on this board is work anton may start right now.");
+    expect(lane.textContent).toContain(
+      "Clear what holds a target back — a blocker, a thin contract, a policy too narrow — or wait out one you set aside, and this lane fills again.",
+    );
+    // The remedy must not be an impossible one (PR #226 review): Approve starts a target rather than
+    // making it rankable, and nothing clears a veto before its window runs out.
+    expect(lane.textContent).not.toMatch(/approve/i);
+    expect(lane.querySelector('a[href="/projects/tmp/settings#policy"]')).toBeTruthy();
+  });
+
+  it("names an unreadable policy, and sends the operator where the sentence points", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("policy-unreadable")} />);
+
+    const lane = absenceLane();
+    expect(lane.textContent).toContain("can’t read this project’s work policy");
+    // The instruction and the link must name ONE action: an operator told to reload and handed a
+    // settings link is being sent away from the board they were just told to stay on.
+    expect(lane.textContent).toContain("check the armed policy");
+    expect(lane.textContent).not.toContain("Reload");
+    expect(lane.querySelector('a[href="/projects/tmp/settings#policy"]')?.textContent).toBe(
+      "Work policy",
+    );
+  });
+
+  it("says which nothing it is rather than counting zero picks", () => {
+    // A `0` in the count's place is the one reading this must never give: two of the three states
+    // say nothing at all about how much work the board holds.
+    for (const absence of [
+      "disarmed",
+      "proposes-only",
+      "policy-unreadable",
+      "no-claimable-work",
+    ] as const) {
+      cleanup();
+      render(<EpicBoard slug="tmp" initialBoard={withAbsence(absence)} />);
+      expect(absenceLane().textContent).not.toMatch(/(^|\s)0(\s|$)/);
+    }
+  });
+
+  it("keeps the lane absent when the server named no absence", () => {
+    // A plan the board has moved past is not a state the operator clears — naming it would ask them
+    // to act on a wait. It stays out of the layout, exactly as before.
+    render(<EpicBoard slug="tmp" initialBoard={fixture()} />);
+    expect(screen.queryByRole("region", { name: "Up Next" })).toBeNull();
+  });
+});
+
+/**
  * The budget line, composed into the lane it was built for (anton-vlom / R3.6, anton-7bzg.1). The
  * placement arithmetic is `budget-line.test.ts`'s; what is pinned here is that the LANE reads the
  * signal, draws the divider at the position it computes, and words the wait on every card below it.
@@ -391,18 +501,9 @@ describe("the budget line in the Up Next lane", () => {
  * inside the lane knows WHICH generation it was drawn from, exactly as the vetoes above it do.
  */
 describe("releasing a pick from the lane", () => {
-  /** The fixture with the picker's mark on rank 1 — what draws `[Release]` in place of Approve. */
-  function markedBoard(): Board {
-    const board = fixture(PLAN);
-    board.columns.backlog = board.columns.backlog.map((e) =>
-      e.id === "anton-pick2" ? { ...e, provenance: [{ kind: "policy" as const }] } : e,
-    );
-    return board;
-  }
-
   it("names the generation on screen, so the accept answers the pick that was shown", async () => {
     const fetchMock = stubFetch({ "/approve": json({ jobId: "job-1", run: "started" }) });
-    render(<EpicBoard slug="tmp" initialBoard={markedBoard()} />);
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
 
     fireEvent.click(screen.getByRole("button", { name: /release/i }));
 
@@ -421,7 +522,7 @@ describe("releasing a pick from the lane", () => {
     // ranking it just left. `takeUpNext` subtracts a started pick, but only a board UPDATE makes the
     // card actually move — which is the path a release triggers with `router.refresh()`.
     stubFetch({ "/approve": json({ jobId: "job-1", run: "started" }) });
-    const { rerender } = render(<EpicBoard slug="tmp" initialBoard={markedBoard()} />);
+    const { rerender } = render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
 
     fireEvent.click(screen.getByRole("button", { name: /release/i }));
 
@@ -451,6 +552,81 @@ describe("releasing a pick from the lane", () => {
 
     await waitFor(() => expect(screen.queryByRole("region", { name: "Up Next" })).toBeNull());
     expect(laneOf("anton-pick2")).toBe("Implementing");
+  });
+});
+
+/**
+ * The start is bound to the RECORD, not to the ranking (anton-5axf).
+ *
+ * Up Next is derived live (anton-r0ew), so it ranks targets the last pass never wrote down — and a
+ * release files an ACCEPT against a named generation, which is the evidence earned autonomy is
+ * granted on. A start offered on a pick no plan names would put an agreement to nothing into that
+ * record, so the card offers none and says what it is waiting for.
+ */
+describe("a lane pick the recorded plan has not caught up with (anton-5axf)", () => {
+  /** One pick's card in the lane — the shell the deep link opens, where its start affordance lives. */
+  function laneCard(beadId: string): HTMLElement {
+    const lane = screen.getByRole("region", { name: "Up Next" });
+    const card = lane.querySelector(`a[href="/projects/tmp/epics/${beadId}"]`)?.parentElement;
+    if (!card) throw new Error(`no lane card for ${beadId}`);
+    return card;
+  }
+
+  /** The whole row: the card plus the rank and the two vetoes the lane puts above it. */
+  const laneRow = (beadId: string) => laneCard(beadId).parentElement as HTMLElement;
+
+  const startButtons = (beadId: string) =>
+    within(laneCard(beadId))
+      .queryAllByRole("button")
+      .map((b) => b.textContent ?? "")
+      .filter((label) => /release|approve|queue/i.test(label));
+
+  it("keeps [Release] on the pick the recorded plan names, and withholds every start from the one it does not", () => {
+    // Rank 1 is in the plan the board still stands behind; rank 2 is the derived lane running ahead
+    // of it. Same lane, same read, two different bindings.
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
+
+    expect(startButtons("anton-pick2")).toEqual(["Release"]);
+    // Not even the plain Approve: it would start anton's own pick while recording no answer to it,
+    // which is the same missing evidence with the button relabelled.
+    expect(startButtons("anton-pick1")).toEqual([]);
+  });
+
+  it("still ranks the unnamed pick — it is unanswerable, not unranked", () => {
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
+
+    expect(laneOf("anton-pick1")).toBe("Up Next");
+    expect(screen.getByRole("group", { name: "Rank 2 — P2 · Feature · unblocks 0" })).toBeTruthy();
+    // And the ways to DISAGREE stay: a pick with no record to accept against is still one the
+    // operator can refuse, and that veto already binds itself to the generation (anton-jqvy).
+    expect(within(laneRow("anton-pick1")).getByRole("button", { name: /not now/i })).toBeTruthy();
+  });
+
+  it("says anton confirms the pick on the next pass, rather than leaving a bare gap", () => {
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
+
+    const waiting = within(laneCard("anton-pick1")).getByText(/anton confirms next pass/i);
+    expect(waiting.getAttribute("title")).toMatch(/no action needed/i);
+    // The confirmed pick says nothing of the sort — it has its button.
+    expect(within(laneCard("anton-pick2")).queryByText(/next pass/i)).toBeNull();
+  });
+
+  it("withholds the start when the lane has outrun the generation, mark or no mark", () => {
+    // The badge is history and outlives the plan it came from; the generation is what a verdict is
+    // written against. Without one there is nothing to answer, so the button goes.
+    const outrun: Board = { ...markedBoard("anton-pick2"), upNextPlanId: undefined };
+    render(<EpicBoard slug="tmp" initialBoard={outrun} />);
+
+    expect(startButtons("anton-pick2")).toEqual([]);
+    expect(within(laneCard("anton-pick2")).getByText(/next pass/i)).toBeTruthy();
+  });
+
+  it("leaves an ordinary Backlog card alone — it is not a pick, so it is not waiting on one", () => {
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
+
+    const backlog = document.querySelector<HTMLElement>('[data-lane="Backlog"]');
+    expect(within(backlog!).getByRole("button", { name: /approve/i })).toBeTruthy();
+    expect(within(backlog!).queryByText(/next pass/i)).toBeNull();
   });
 });
 
