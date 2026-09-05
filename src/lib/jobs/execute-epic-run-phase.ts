@@ -10,7 +10,7 @@
 import { beads, LABELS } from "../beads/bd";
 import { updateRun } from "../runs";
 import { releaseRunResources } from "./worktree-reaper";
-import type { SkipCause } from "./execute-epic-board";
+import type { RetiredTicketOutcome, SkipCause } from "./execute-epic-board";
 import type { DispatchOutcome } from "./execute-epic-dispatch";
 import { armMergeGate } from "./execute-epic-merge-gate";
 import { runReviewStep } from "./execute-epic-review-step";
@@ -148,10 +148,30 @@ async function finishRun(
   // but in no diff would otherwise look like work this PR carries. Each bead carries its own record
   // of where the work went; this says, in one place, that the feature shipped minus these because
   // they were already in the tree.
+  //
+  // Split by PROVENANCE, because only one half is anton's word (PR #238 review): the `this-run` ones
+  // anton checked against git and the board itself, the `pre-existing` ones it merely FOUND already
+  // superseded — by a human's scope call, a gardener dedup, an earlier attempt. Collapsing them
+  // would put anton's verification behind a decision it never made.
+  const names = (rs: RetiredTicketOutcome[]) =>
+    rs.map((r) => `${r.id} (superseded by ${r.replacedBy})`).join(", ");
+  const verified = retired.filter((r) => r.source === "this-run");
+  const preExisting = retired.filter((r) => r.source === "pre-existing");
   const retiredNotice = retired.length
-    ? `${retired.length} ticket(s) had already shipped and were retired as superseded — ` +
-      `${retired.map((r) => `${r.id} (superseded by ${r.replacedBy})`).join(", ")}. Each is closed ` +
-      `on the board pointing at what shipped it, and none of them is in this PR.`
+    ? [
+        verified.length
+          ? `${verified.length} ticket(s) had already shipped — anton verified that against the ` +
+            `repository and the board and retired them as superseded: ${names(verified)}.`
+          : null,
+        preExisting.length
+          ? `${preExisting.length} ticket(s) were already settled as superseded on the board when ` +
+            `this run read it: ${names(preExisting)}. anton did not verify those; each bead ` +
+            `carries the record of whoever did.`
+          : null,
+        `None of them is in this PR.`,
+      ]
+        .filter(Boolean)
+        .join(" ")
     : null;
   if (retiredNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${retiredNotice}`));
 

@@ -467,11 +467,20 @@ export interface TicketTimeoutOutcome {
   committed: boolean;
 }
 
-/** One entry in a run's RETIREMENT ledger (anton-5bpd): a ticket anton closed mid-run as already
- * shipped, and the bead the board now records it as superseded by. */
+/** One entry in a run's RETIREMENT ledger (anton-5bpd): a ticket closed as already shipped, and the
+ * bead the board now records it as superseded by. */
 export interface RetiredTicketOutcome {
   id: string;
   replacedBy: string;
+  /**
+   * WHO decided it, because only one of the two is anton's own verification (PR #238 review).
+   *
+   * `this-run` — this attempt's repair checked the claim against git and the board and retired the
+   * ticket itself. `pre-existing` — the board ALREADY carried the supersede when the run read it: a
+   * previous attempt's retirement, a human's `bd supersede`, a gardener dedup pass. anton performed
+   * no verification for those, so nothing anton says about them may assert one.
+   */
+  source: "this-run" | "pre-existing";
 }
 
 /**

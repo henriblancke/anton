@@ -186,6 +186,8 @@ process.exit(0);`),
       const notice = systemNotes(target.notes).find((t) => t.includes("had already shipped"))!;
       expect(notice).toContain(shipped);
       expect(notice).toContain(shipper);
+      // THIS run checked it, so the notice may say so — the half of the split that earns the claim.
+      expect(notice).toContain("anton verified that against the repository");
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
     }
@@ -353,12 +355,21 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       expect(body).toContain(work);
       expect(body).not.toContain(shipped);
 
-      // The retirement survives the resume in the one place the founder reads at the merge gate.
-      const notice = systemNotes((await beads.show(repo, epic)).notes).find((t) =>
-        t.includes("had already shipped"),
-      )!;
+      // The retirement survives the resume in the one place the founder reads at the merge gate —
+      // but worded for what THIS attempt actually knows (PR #238 review). Attempt 2 rebuilt its
+      // ledger from the board, where the supersede was already recorded; it ran no check of its own,
+      // so the notice says the ticket was already SETTLED rather than claiming anton verified it.
+      // The verification is real — attempt 1 did it — and it lives on the bead, which is where the
+      // notice points. The same sentence covers a human's `bd supersede` and a gardener dedup, which
+      // anton never verified at all.
+      const notes = systemNotes((await beads.show(repo, epic)).notes);
+      const notice = notes.find((t) => t.includes("already settled as superseded"))!;
       expect(notice).toContain(shipped);
       expect(notice).toContain(shipper);
+      expect(notice).toContain("anton did not verify those");
+      expect(notes.some((t) => t.includes("anton verified that against the repository"))).toBe(
+        false,
+      );
     } finally {
       process.env.ANTON_CLAUDE_BIN = prevClaude;
       process.env.ANTON_GH_BIN = prevGh;

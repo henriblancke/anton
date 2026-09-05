@@ -120,7 +120,8 @@ function partitionTickets(
   for (const ticket of orderTickets(tickets, all)) {
     if (beads.isAbandoned(ticket)) continue;
     const survivor = beads.supersededBy(ticket);
-    if (survivor) run.retired.push({ id: ticket.id, replacedBy: survivor });
+    if (survivor)
+      run.retired.push({ id: ticket.id, replacedBy: survivor, source: "pre-existing" });
     else live.push(ticket);
   }
   if (live.length === 0) {
@@ -392,7 +393,7 @@ async function dispatchTicket(
     // the false stall the class exists to end. Nothing cascades: the work it was waiting for is in
     // the run's BASE, so every ticket written against it still has its mechanism.
     if (e instanceof TicketRetiredError) {
-      run.retired.push({ id: e.ticketId, replacedBy: e.replacementId });
+      run.retired.push({ id: e.ticketId, replacedBy: e.replacementId, source: "this-run" });
       onBranch.add(e.ticketId);
       console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
       await ctx.heartbeat();
@@ -543,7 +544,13 @@ async function deliveredOrPark(
   // and no commit is on this branch. Carrying on would review nothing and hand `gh pr create` a
   // branch with no diff. Park instead, naming the retirements — the epic itself is the thing left to
   // settle, and only a person decides whether it is now empty or still wants work.
-  if (delivered.length === 0 && run.retired.length > 0) {
+  //
+  // EVERY live one, not merely one of them (PR #238 review): `run.retired.length > 0` is also true
+  // of a run that retired one ticket and had a person finish another outside the branch, and this
+  // message would then claim the whole feature had shipped while never naming the human ticket at
+  // all. That mix belongs to the `agent:human` park below, which names both halves.
+  const notRetired = live.filter((t) => !retired.has(t.id));
+  if (delivered.length === 0 && run.retired.length > 0 && notRetired.length === 0) {
     const retirements = run.retired.map((r) => `${r.id} → superseded by ${r.replacedBy}`).join(", ");
     throw new PoisonEpic(
       run.standaloneRun
@@ -552,23 +559,30 @@ async function deliveredOrPark(
           `Nothing was committed here, so there is no pull request to open and nothing is left to ` +
           `run; read the bead if you want to check what anton checked`
         : `every ticket under ${epicBeadId} that this run could dispatch had ALREADY SHIPPED ` +
-          `(${retirements}) — each is closed on the board with anton's evidence on it, and nothing ` +
-          `was committed here, so there is no pull request to open. Close ${epicBeadId} by hand to ` +
-          `settle it, or give it work that has not landed yet and resume the run`,
+          `(${retirements}) — each is closed as superseded on the board, pointing at what shipped ` +
+          `it, and nothing was committed here, so there is no pull request to open. Close ` +
+          `${epicBeadId} by hand to settle it, or give it work that has not landed yet and ` +
+          `resume the run`,
     );
   }
 
-  // Nothing timed out and still nothing is left to show: every live ticket is human work a
-  // person did outside this branch (anton-mv70) — the resume that closed the last answered gate
-  // lands here with an empty set. The run phase speaks for a diff, so carrying on would review
-  // nothing and hand `gh pr create` a branch with no commits between it and the base. Park
-  // instead, naming the one thing left to do: this target ships no code, so a person settles it.
+  // Nothing timed out and still nothing is left to show: every live ticket anton could dispatch is
+  // human work a person did outside this branch (anton-mv70) — the resume that closed the last
+  // answered gate lands here with an empty set. The run phase speaks for a diff, so carrying on
+  // would review nothing and hand `gh pr create` a branch with no commits between it and the base.
+  // Park instead, naming the one thing left to do: this target ships no code, so a person settles
+  // it. Any retirements are named alongside rather than folded in, so the operator sees which
+  // tickets a person finished and which were already in the tree.
   if (delivered.length === 0) {
+    const alsoRetired = run.retired.length
+      ? `, and ${run.retired.length} more had already shipped, closed as superseded ` +
+        `(${run.retired.map((r) => `${r.id} → superseded by ${r.replacedBy}`).join(", ")})`
+      : "";
     throw new PoisonEpic(
-      `every ticket under ${epicBeadId} is work a person does, not an agent ` +
-        `(${live.map((t) => t.id).join(", ")}) — they are done and nothing was committed on ` +
-        `this branch, so there is no pull request to open. Close ${epicBeadId} by hand to ` +
-        `settle it, or give it a ticket an agent can deliver and resume the run`,
+      `every ticket under ${epicBeadId} that is left to run is work a person does, not an agent ` +
+        `(${notRetired.map((t) => t.id).join(", ")})${alsoRetired} — they are done and nothing ` +
+        `was committed on this branch, so there is no pull request to open. Close ${epicBeadId} ` +
+        `by hand to settle it, or give it a ticket an agent can deliver and resume the run`,
     );
   }
   return delivered;

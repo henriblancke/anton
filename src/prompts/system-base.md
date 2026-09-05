@@ -134,10 +134,12 @@ exactly as written, followed by ` — ` and your one-line reason:
   written.
 - `oversized` — the ticket is too large to land as one coherent change.
 - `already-shipped` — the ticket's work is already in the tree, so there is nothing left to change.
-  Name what shipped it: the **bead id** (`anton-abcd`), the **commit** sha, or the **PR** number —
-  at least one, and as many as you know. anton VERIFIES what you name against the board and the
-  repository, so a claim naming nothing checkable reaches a human instead. Use it only when the
-  acceptance criteria are already satisfied as written, not when the work merely looks similar.
+  Name the **bead id** that shipped it (`anton-abcd`) — required, and exactly one: the retirement
+  closes this ticket as superseded by that bead, so anton will not pick between two ids or close a
+  ticket against prose. A **commit** sha or **PR** number strengthens the claim but cannot stand in
+  for the id. anton VERIFIES what you name against the board and the repository, so a claim naming
+  no resolvable bead reaches a human instead. Use it only when the acceptance criteria are already
+  satisfied as written, not when the work merely looks similar.
 - `env` — the toolchain or environment is broken in a way this ticket cannot fix: a missing
   dependency, a red build that isn't yours, a service that will not start.
 - `other` — anything else. **Use it whenever none of the above fits exactly.**
