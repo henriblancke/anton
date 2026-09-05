@@ -455,6 +455,15 @@ function preservedCommitMessage(
  * retry would stage the hook's post-gate edits with `git add -A` and commit them under `--no-verify`
  * — a tree that passed neither the gates nor the hook, kept for a resume to adopt. Unprovable is
  * treated as changed: the fallback is the rollback the refusal always meant.
+ *
+ * That proof is owed by the BYPASS and by nothing else (PR #228 review). A hook that edits, stages
+ * and then ACCEPTS — a formatter, a generator — also lands a tree the gates never saw, but it landed
+ * it the same way every ordinary `step:commit` does: `commitAll` with this project's hooks on,
+ * straight after `step:verify`, with no re-verification of what the hook staged. The hook is the
+ * project's own gate on content and it said yes, so the run has exactly the proof its normal commits
+ * carry, and the resume that adopts this commit re-runs the gates over that content before any pull
+ * request opens. Re-running them HERE could only be honoured by resetting a commit that has already
+ * landed — the one act this whole path exists to refuse.
  */
 async function commitPreservedTree(args: {
   worktreePath: string;
@@ -468,6 +477,8 @@ async function commitPreservedTree(args: {
   // agent's own work.
   const verified = await stageAllAndHashTree(worktreePath).catch(() => null);
   const first = await commitAll(worktreePath, message).catch(rejected);
+  // Accepted by this project's hooks — the same proof an ordinary commit ships on, so `verified` is
+  // not re-compared here; it exists for the bypass below, where no hook is left to say yes.
   if (!("error" in first)) return first;
   const after = await readWorktreeState(worktreePath).catch(() => null);
   if (!after || after.head !== before.head) return first;
