@@ -18,7 +18,7 @@
  * - a kill that lands after the preserve has decided but before the timeout writes the board still
  *   owns the ticket — the abort path writes nothing, and neither may this one.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -26,11 +26,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { makeTestDb, type TestDb } from "../db/testing";
-import type { Bead } from "../beads/bd";
+import { beads, LABELS, type Bead } from "../beads/bd";
 import type { Worktree } from "../git/worktree";
 import type { ProjectSettings } from "../projects";
 import { readWorktreeState } from "../git/ops";
 import { isPoisonError } from "./errors";
+import { TicketTimeoutError } from "./execute-epic-errors";
 import { outOfTimeParkMessage } from "./execute-epic-dispatch";
 import { assertPreservedWorkFitsShape } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
@@ -327,7 +328,7 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
       ticket,
       session: { logPath },
       baseline,
-      progress: { committed: false, selfReport: null },
+      progress: { committed: false, delivered: false, selfReport: null },
       timeoutMs: 60_000,
       standalone: true,
       ranOutOfTime: true,
@@ -336,6 +337,113 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
 
     // No TicketTimeoutError, no poison: it returns, and the caller's abort path settles the ticket.
     await expect(settled).resolves.toBeUndefined();
+  });
+});
+
+// The deadline can land while the delivery gate is REFUSING a commit that exists — a previous
+// attempt's adopted `WIP` this run never affirmed, or work the agent itself declared blocked (PR
+// #228 review). The timeout then settles the ticket from `progress` alone, and reading a bare
+// "something is committed" as delivery skips the `not-delivered` marker and hands the dispatch loop
+// a ticket it lists as delivered — shipping explicitly unfinished work under a pull request.
+suite("settleTicketTimeout — a commit the delivery gate refused is not a delivery", () => {
+  let sandbox: string;
+  let repo: string;
+  let logPath: string;
+  let tdb: TestDb;
+  let tagged: string[][];
+  let notes: string[];
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  const run = (): Omit<StepContext, "tickets"> => ({
+    db: tdb.db,
+    clock: new FixedClock(1_700_000_000_000),
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+    projectId: randomUUID(),
+    runId: randomUUID(),
+    repoPath: repo,
+    worktreePath: repo,
+    branch: BRANCH,
+    baseBranch: "main",
+    baseRef: "origin/main",
+    target: ticket,
+    settings: {} satisfies ProjectSettings,
+  });
+
+  /** Settle a timed-out ticket whose commit step reported evidence, and return what it threw. */
+  async function settle(delivered: boolean): Promise<TicketTimeoutError> {
+    const baseline = await readWorktreeState(repo);
+    try {
+      await settleTicketTimeout({
+        run: run(),
+        ticket,
+        session: { logPath },
+        baseline,
+        progress: { committed: true, delivered, selfReport: null },
+        timeoutMs: 60_000,
+        standalone: true,
+        ranOutOfTime: true,
+      });
+    } catch (e) {
+      return e as TicketTimeoutError;
+    }
+    throw new Error("settleTicketTimeout resolved instead of throwing");
+  }
+
+  beforeEach(() => {
+    tdb = makeTestDb();
+    sandbox = mkdtempSync(join(tmpdir(), "anton-settle-refused-"));
+    repo = join(sandbox, "repo");
+    logPath = join(sandbox, "session.log");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", BRANCH]);
+
+    // The board is stubbed rather than stood up: what is under test is WHICH writes the settlement
+    // makes, not bd itself.
+    tagged = [];
+    notes = [];
+    vi.spyOn(beads, "tag").mockImplementation(async (_repo, _id, labels) => {
+      tagged.push(labels);
+      return "";
+    });
+    vi.spyOn(beads, "note").mockImplementation(async (_repo, _id, body) => {
+      notes.push(body);
+      return "";
+    });
+    vi.spyOn(beads, "setStatus").mockResolvedValue("");
+    vi.spyOn(beads, "unassign").mockResolvedValue("");
+    vi.spyOn(beads, "untag").mockResolvedValue("");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    tdb.close();
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("marks the ticket undelivered and keeps it out of the run's delivered set", async () => {
+    const err = await settle(false);
+
+    expect(err).toBeInstanceOf(TicketTimeoutError);
+    expect(err.committed).toBe(false); // the dispatch loop's delivered set reads this
+    expect(tagged).toContainEqual([LABELS.notDelivered]);
+    // The commit is still on the branch, and the note says so — the operator is owed both halves.
+    expect(notes.join("\n")).toMatch(/committed on the branch/);
+    expect(notes.join("\n")).toMatch(/REFUSED/);
+  });
+
+  it("still leaves an ACCEPTED commit delivered — the deadline hit the bookkeeping", async () => {
+    const err = await settle(true);
+
+    expect(err.committed).toBe(true);
+    expect(tagged).not.toContainEqual([LABELS.notDelivered]);
+    expect(notes.join("\n")).toMatch(/stopped after the commit/);
   });
 });
 

@@ -68,8 +68,21 @@ interface TicketBudget {
 
 /** What the step walk learned — read by the close, and by every path that stops the ticket. */
 export interface TicketProgress {
-  /** Whether the commit step reported real evidence on the branch. */
+  /**
+   * Whether the commit step reported real evidence on the branch. This is a fact about the TREE,
+   * not a verdict: it is what stops the timeout path from resetting a commit off the branch, so it
+   * is recorded even when the delivery gate then refuses that commit.
+   */
   committed: boolean;
+  /**
+   * Whether that evidence is THIS ticket's delivery (PR #228 review) — `committed` AND every
+   * delivery gate in {@link assertDelivered} accepted it. The two part company exactly where the
+   * gate refuses a commit that exists: a previous attempt's adopted `WIP` this run never affirmed,
+   * or work the agent itself declared blocked. Settlement reads THIS one, because a refused commit
+   * owes the board the `not-delivered` marker and belongs in no pull request's delivered list —
+   * `committed` alone would let a deadline landing on the refusal ship it as finished.
+   */
+  delivered: boolean;
   /**
    * The agent's machine-readable self-report (anton-j5i8) — `delivered`, `blocked — <reason>` or an
    * ask — already recorded on the session log by the dispatching step. It CORROBORATES the
@@ -127,7 +140,7 @@ export async function runTicket(args: {
   // place. `step:commit` likewise falls back to reading the index alone.
   const baseline = await readWorktreeState(worktreePath).catch(() => null);
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline);
-  const progress: TicketProgress = { committed: false, selfReport: null };
+  const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
 
   try {
     await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress });
@@ -397,7 +410,13 @@ async function walkTicketSteps(args: {
  */
 export function assertDelivered(ticket: Bead, facts: StepFacts, progress: TicketProgress): void {
   const committed = facts.committed === true;
+  // The TREE fact is recorded first and unconditionally — the timeout path reads it to know there
+  // is a commit it must not reset off the branch, and that is true of a refused commit too. The
+  // DELIVERY verdict is recorded at the bottom, once every gate below has accepted it (PR #228
+  // review): a deadline that fires while this is refusing takes over the settlement, and it decides
+  // what the board and the pull request are told from `delivered`, never from `committed`.
   progress.committed = committed;
+  progress.delivered = false;
   const { selfReport } = progress;
   if (!committed) {
     // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
@@ -442,6 +461,7 @@ export function assertDelivered(ticket: Bead, facts: StepFacts, progress: Ticket
         `with a raised ticketTimeoutMinutes.`,
     );
   }
+  progress.delivered = true;
 }
 
 /** Persist this ticket's "code done" state the moment it commits. */
@@ -731,7 +751,12 @@ export async function settleTicketTimeout(args: {
   const { ctx, worktreePath } = run;
   const repo = run.repoPath;
   const { logPath } = session;
-  const { committed } = args.progress;
+  // Two different questions, and the deadline can land between their answers (PR #228 review).
+  // `committed` protects the TREE — never reset a branch that carries a commit. `delivered` is the
+  // VERDICT the board and the pull request are entitled to, and a commit the delivery gate refused
+  // has none: read that way, a timeout arriving while `assertDelivered` refuses would mask the
+  // refusal, skip the `not-delivered` marker and list explicitly unfinished work as shipped.
+  const { committed, delivered } = args.progress;
   // `!ctx.signal.aborted` breaks the tie when both fired: an operator's kill outranks the budget,
   // and the abort path is the one that writes nothing to a board a human is deciding on.
   if (ranOutOfTime && !ctx.signal.aborted) {
@@ -781,6 +806,7 @@ export async function settleTicketTimeout(args: {
       worktreePath,
       timeoutMs,
       committed,
+      delivered,
       leftovers,
       preservedOn,
       retained,
@@ -808,13 +834,13 @@ export async function settleTicketTimeout(args: {
     if (!marked) {
       throw new PoisonEpic(
         `${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m ticket budget and its ` +
-          `partial work was ${workFate(preservedOn, retained)}, ` +
+          `partial work was ${workFate(preservedOn, retained, committed && !delivered)}, ` +
           `but bd would not record \`${LABELS.notDelivered}\` on it — the run stopped rather than ` +
           `carry on to a pull request whose merge would close this undelivered ticket as shipped. ` +
           `Check the beads DB, then resume the run`,
       );
     }
-    throw new TicketTimeoutError(ticket.id, timeoutMs, committed, preservedOn);
+    throw new TicketTimeoutError(ticket.id, timeoutMs, delivered, preservedOn);
   }
 }
 
@@ -824,7 +850,10 @@ export async function settleTicketTimeout(args: {
  * attempt kept nothing of its own, but a previous one's commit is still on the branch and the resume
  * continues from it rather than starting over.
  */
-function workFate(preservedOn: string | null, retained: boolean): string {
+function workFate(preservedOn: string | null, retained: boolean, refusedCommit: boolean): string {
+  // A commit the delivery gate refused is the third state (PR #228 review): nothing was rolled back
+  // — the branch still carries it — but nobody delivered it either.
+  if (refusedCommit) return "left in a commit this run's delivery gate REFUSED";
   if (!preservedOn) return "rolled back";
   return retained
     ? `rolled back onto the work a previous attempt PRESERVED on \`${preservedOn}\``
@@ -1150,7 +1179,10 @@ async function blockTimedOutTicket(args: {
   ticket: Bead;
   worktreePath: string;
   timeoutMs: number;
+  /** Whether a commit exists on the branch — a fact about the tree, not a verdict on it. */
   committed: boolean;
+  /** Whether that commit is this ticket's DELIVERY, i.e. every gate in `assertDelivered` took it. */
+  delivered: boolean;
   leftovers: boolean;
   /** The branch its work was preserved on (anton-d967), or null when it was rolled back. */
   preservedOn: string | null;
@@ -1162,7 +1194,8 @@ async function blockTimedOutTicket(args: {
   /** Why the work could NOT be kept — the operator is owed the reason, not just the verdict. */
   rolledBackWhy?: string;
 }): Promise<boolean> {
-  const { repo, ticket, worktreePath, timeoutMs, committed, leftovers, preservedOn } = args;
+  const { repo, ticket, worktreePath, timeoutMs, committed, delivered, leftovers, preservedOn } =
+    args;
   await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
   await safe(() => beads.unassign(repo, ticket.id));
   await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
@@ -1170,12 +1203,14 @@ async function blockTimedOutTicket(args: {
   // lands (anton-67xj). Both the rolled-back and the PRESERVED ticket are marked (anton-d967):
   // preserved work is on the branch but is nobody's delivery — the ticket is in no PR body and
   // nobody finished it, so a merge that closed it would file half a ticket as shipped. Only a ticket
-  // stopped AFTER its commit goes unmarked — that work IS the diff a human merges. The marker is
-  // finalization's only input, so it is retried rather than best-effort; a run that still cannot
-  // record it must not reach its PR (the caller escalates, once the note below is on the bead — the
-  // operator needs the timeout's own account either way).
+  // stopped after a commit the delivery gate ACCEPTED goes unmarked — that work IS the diff a human
+  // merges. A commit that gate REFUSED is marked like any other undelivered ticket (PR #228 review):
+  // the deadline landing on the refusal does not turn work nobody affirmed into a delivery. The
+  // marker is finalization's only input, so it is retried rather than best-effort; a run that still
+  // cannot record it must not reach its PR (the caller escalates, once the note below is on the bead
+  // — the operator needs the timeout's own account either way).
   const marked =
-    committed || (await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])));
+    delivered || (await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])));
   await safe(() =>
     beads.note(
       repo,
@@ -1183,8 +1218,15 @@ async function blockTimedOutTicket(args: {
       `anton: stopped after ${Math.round(timeoutMs / 60_000)}m — the ticket outlived its ` +
         `budget, so the run blocked it and carried on with the rest of the feature. ` +
         (committed
-          ? `Its work IS committed on the branch (it was stopped after the commit) — review it ` +
-            `and close the ticket by hand if it is complete. `
+          ? delivered
+            ? `Its work IS committed on the branch (it was stopped after the commit) — review it ` +
+              `and close the ticket by hand if it is complete. `
+            : // The commit is on the branch and stays there, but nothing affirmed it finished, so
+              // the operator is owed both halves of that: the work is not lost, and it is also not
+              // delivered — no pull request lists it and no merge will close it.
+              `Its work IS committed on the branch, but this run's delivery gate REFUSED that ` +
+              `commit as this ticket's delivery — it is NOT delivered and is in no pull request. ` +
+              `Review the commit and finish the work, then close the ticket by hand. `
           : leftovers
             ? `Its partial work could NOT be ` +
               `${preservedOn && !args.retained ? "fully committed" : "rolled back"} ` +
@@ -1201,8 +1243,9 @@ async function blockTimedOutTicket(args: {
                         `incomplete commit `)
                   : `Its work passed this project's verify gates, so it was PRESERVED on branch ` +
                     `\`${preservedOn}\` as an explicitly incomplete commit rather than deleted `) +
-                `— it is NOT delivered and is in no pull request, and resuming the run continues ` +
-                `from that commit instead of redoing the work. `
+                `— it is NOT delivered and is in no pull request, and resuming the run on this ` +
+                `machine continues from that commit instead of redoing the work (a run branch is ` +
+                `pushed only at its pull request, so a resume elsewhere starts the ticket over). `
               : `Its partial work was rolled back (nothing from it is on the branch)` +
                 (args.rolledBackWhy ? ` — ${args.rolledBackWhy}` : ``) +
                 `. `) +

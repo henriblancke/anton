@@ -537,8 +537,9 @@ export function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string
   const fate = [
     preserved.length > 0
       ? `The work of ${preserved.join(", ")} is PRESERVED on branch \`${branch}\` as an ` +
-        `explicitly incomplete commit — it passed this project's verify gates — so resuming ` +
-        `continues from it rather than redoing it.`
+        `explicitly incomplete commit — it passed this project's verify gates — so resuming ON ` +
+        `THIS MACHINE continues from it rather than redoing it. A run branch is pushed only when ` +
+        `its pull request is opened, so a resume elsewhere starts the ticket over instead.`
       : null,
     rolledBack.length > 0
       ? `The work of ${rolledBack.join(", ")} was rolled back, so resuming starts it over.`

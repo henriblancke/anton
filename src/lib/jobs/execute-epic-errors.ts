@@ -251,9 +251,14 @@ export class TicketTimeoutError extends Error {
     readonly ticketId: string,
     readonly budgetMs: number,
     /**
-     * Whether this ticket's work made it into a commit before the clock ran out (the narrow case of
-     * a deadline landing on the bookkeeping AFTER the commit step). Its diff is on the branch, so
+     * Whether this ticket DELIVERED before the clock ran out (the narrow case of a deadline landing
+     * on the bookkeeping AFTER a commit the delivery gate accepted). Its diff is on the branch, so
      * the run still lists it as delivered — only its bead is left unfinished.
+     *
+     * A commit alone is not enough (PR #228 review): a deadline can land while `assertDelivered` is
+     * REFUSING one — a previous attempt's adopted `WIP`, or work the agent declared blocked — and
+     * that commit stays on the branch but is nobody's delivery, so this reads `false` and the
+     * ticket keeps its `not-delivered` marker like any other ticket the budget stopped short.
      */
     readonly committed: boolean,
     /**

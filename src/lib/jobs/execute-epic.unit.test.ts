@@ -845,6 +845,7 @@ describe("assertDelivered — an adopted preserve needs this run's agent to say 
   };
   const progress = (selfReport: TicketProgress["selfReport"]): TicketProgress => ({
     committed: false,
+    delivered: false,
     selfReport,
   });
 
@@ -890,6 +891,29 @@ describe("assertDelivered — an adopted preserve needs this run's agent to say 
     const p = progress(null);
     expect(() => assertDelivered(ticket, { committed: false }, p)).toThrow(/no delivery/);
     expect(p.committed).toBe(false);
+    expect(p.delivered).toBe(false);
+  });
+
+  // The deadline can land while this gate is refusing, and the timeout then settles the ticket from
+  // `progress` alone (PR #228 review). It must find the tree fact and the delivery verdict apart:
+  // `committed` keeps the refused commit from being reset off the branch, `delivered` is what keeps
+  // it out of the `not-delivered` skip and out of the pull request's delivered list.
+  it("separates the commit on the branch from the delivery it was refused as", () => {
+    const accepted = progress(null);
+    assertDelivered(ticket, { committed: true }, accepted);
+    expect(accepted).toMatchObject({ committed: true, delivered: true });
+
+    const adopted = progress(null);
+    expect(() =>
+      assertDelivered(ticket, { committed: true, preservedAdoption: true }, adopted),
+    ).toThrow(/produced no delivery/);
+    expect(adopted).toMatchObject({ committed: true, delivered: false });
+
+    const declared = progress({ outcome: "blocked", reason: "the API it needs does not exist" });
+    expect(() => assertDelivered(ticket, { committed: true }, declared)).toThrow(
+      /self-reported blocked/,
+    );
+    expect(declared).toMatchObject({ committed: true, delivered: false });
   });
 });
 
