@@ -7,6 +7,7 @@
  * reopenAbsorbedTimeouts}) — which is here because the verdict it acts on is this module's.
  */
 import { beads, gateReason, HUMAN_AGENT, labelValueOf, type Bead } from "../beads/bd";
+import { latestBlockNoteCommit } from "../beads/block-note";
 import { ownerOf } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { parseTicketNotes } from "../beads/notes";
@@ -127,6 +128,11 @@ export interface HumanHeldTicket {
   status: string;
   /** anton's newest note on the bead — why it blocked the ticket — when it left one. */
   note?: string;
+  /**
+   * Short sha of the work this ticket's block left ON the branch, when its note records a commit —
+   * the fact that decides which remedy it is owed ({@link humanHeldClause}).
+   */
+  committed?: string;
 }
 
 /**
@@ -145,8 +151,17 @@ export function humanHeldTickets(tickets: Bead[]): HumanHeldTicket[] {
   return tickets
     .filter((t) => HUMAN_HELD_STATUSES.has(t.status) && !beads.isAbandoned(t))
     .map((t) => {
-      const note = latestMachineNote(t);
-      return { id: t.id, status: t.status, ...(note ? { note } : {}) };
+      const notes = machineNotes(t);
+      const note = clampNote(notes.at(-1));
+      // Read off the FULL notes, never the clamped one: the evidence clause sits at the end of a
+      // block note, which is exactly what the cap above cuts off.
+      const commit = latestBlockNoteCommit(notes);
+      return {
+        id: t.id,
+        status: t.status,
+        ...(note ? { note } : {}),
+        ...(commit?.committed ? { committed: commit.head } : {}),
+      };
     });
 }
 
@@ -154,26 +169,45 @@ export function humanHeldTickets(tickets: Bead[]): HumanHeldTicket[] {
 const HELD_NOTE_CHARS = 300;
 
 /**
- * anton's newest note on a bead: its own account of why it stopped there. Machine notes only — a
- * human's steer is written to the AGENT, not to the operator reading this park.
+ * A bead's machine notes, oldest last: anton's own account of why it stopped there. Human notes are
+ * excluded — a person's steer is written to the AGENT, not to the operator reading this park.
  */
-function latestMachineNote(bead: Bead): string | undefined {
-  const text = parseTicketNotes(bead.notes)
+function machineNotes(bead: Bead): string[] {
+  return parseTicketNotes(bead.notes)
     .filter((n) => n.source === "system")
-    .at(-1)?.text;
+    .map((n) => n.text);
+}
+
+/** One note as the run row may carry it: flattened, and capped so a runaway can't bloat the park. */
+function clampNote(text: string | undefined): string | undefined {
   if (!text) return undefined;
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > HELD_NOTE_CHARS ? `${flat.slice(0, HELD_NOTE_CHARS).trimEnd()}…` : flat;
 }
 
-/** What one held ticket owes the operator: why no run may take it, and the move that frees it. */
+/**
+ * What one held ticket owes the operator: why no run may take it, and the move that frees it.
+ *
+ * A blocked ticket has TWO remedies, and which one applies turns on whether its work landed
+ * (PR #227 review). Recommending `--status open` for a ticket that already committed is wrong twice
+ * over: reopening does not satisfy `resumeSkipped` (only `closed` does), so the resumed run
+ * dispatches the agent again ON TOP of that commit and can block right back at the same zero diff —
+ * and abandoning it drops the work from the board while its commit stays on the run branch. The
+ * committed case is therefore owed what the block note itself says: review the commit, then close.
+ */
 function humanHeldClause(held: HumanHeldTicket): string {
   const why =
     held.status === "deferred"
       ? `${held.id} is deferred — snoozed out of the queue, so no run may claim it (\`bd undefer ` +
         `${held.id}\` to bring it back)`
-      : `${held.id} is blocked pending human review (\`bd update ${held.id} --status open\` once ` +
-        `it is resolved)`;
+      : held.committed
+        ? `${held.id} is blocked pending human review with its work ALREADY COMMITTED on this ` +
+          `run's branch (@ ${held.committed}) — review that commit and \`bd close ${held.id}\` if ` +
+          `it satisfies the ticket, which is what lets a resume walk past it; reopen it ` +
+          `(\`bd update ${held.id} --status open\`) only to have an agent keep working on top of ` +
+          `that commit`
+        : `${held.id} is blocked pending human review (\`bd update ${held.id} --status open\` once ` +
+          `it is resolved)`;
   return held.note ? `${why}: "${held.note}"` : why;
 }
 
@@ -187,13 +221,20 @@ function humanHeldClause(held: HumanHeldTicket): string {
  */
 export function humanHeldPoison(targetId: string, held: HumanHeldTicket[]): PoisonEpic {
   const one = held.length === 1;
+  const it = one ? "it" : "them";
+  // Abandoning is a BOARD move, not a branch one: for a ticket whose work already landed it settles
+  // the bead and leaves the commit in the run's pull request, so it can't be offered as "drops the
+  // work" (PR #227 review).
+  const abandon = held.some((h) => h.committed)
+    ? `or abandon ${it} to settle the board — a commit already on the branch stays in this run's ` +
+      `pull request either way`
+    : `or abandon ${it}, which drops the work from this run`;
   return new PoisonEpic(
     `${targetId} has ${one ? "a ticket" : `${held.length} tickets`} no agent can pick up: ` +
       held.map(humanHeldClause).join("; ") +
       `. bd refuses \`--claim\` on ${one ? "that status" : "those statuses"}, so the run stopped ` +
-      `before dispatching anything rather than dying at the ticket's claim gate. Resolve ` +
-      `${one ? "it" : "them"} — or abandon ${one ? "it" : "them"}, which drops the work from this ` +
-      `run — then resume the run`,
+      `before dispatching anything rather than dying at the ticket's claim gate. Resolve ${it} — ` +
+      `${abandon} — then resume the run`,
   );
 }
 

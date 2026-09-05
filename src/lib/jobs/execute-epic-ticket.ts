@@ -7,6 +7,7 @@
  * and in what order; this owns what happens inside one.
  */
 import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
+import { blockNoteEvidence } from "../beads/block-note";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import { shadowNote } from "../gardener/repair";
@@ -1163,10 +1164,9 @@ export function ticketBlockNote(args: {
         : `run failed after committing work — needs review.` +
           (failure ? ` It failed with: ${failure}` : "");
 
-  const evidence = head
-    ? `session ${sessionId}, committed on ${branch} @ ${head.slice(0, 7)}`
-    : `session ${sessionId}, nothing committed on ${branch}`;
-  return blockNoteOneLine(`anton: ${body} [${evidence}]`);
+  // Written through the shared grammar: the board's park gate reads this clause back to tell a
+  // committed block (review and close) from a zero-diff one (reopen and re-run) — see block-note.ts.
+  return blockNoteOneLine(`anton: ${body} [${blockNoteEvidence({ sessionId, branch, head })}]`);
 }
 
 /** The error's own words, or "" when there are none worth repeating. */

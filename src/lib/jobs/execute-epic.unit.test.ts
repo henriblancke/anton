@@ -255,6 +255,51 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
     expect(note.length).toBeLessThanOrEqual(301);
     expect(note.endsWith("…")).toBe(true);
   });
+
+  it("reads the committed sha off the block note anton itself wrote", () => {
+    const note = ticketBlockNote({
+      kind: "post-commit",
+      selfReport: null,
+      error: new Error("push rejected"),
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      head: "0123456789abcdef0123456789abcdef01234567",
+    });
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toBe("0123456");
+  });
+
+  it("reports no commit for a zero-diff block — the note says nothing landed", () => {
+    const note = ticketBlockNote({
+      kind: "no-delivery",
+      selfReport: null,
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+    });
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toBeUndefined();
+  });
+
+  it("finds the commit even when the cap would have cut the evidence off the note", () => {
+    // The evidence clause sits at the END of a block note, so reading it off the CLAMPED note would
+    // silently downgrade every long block to "nothing committed" — and hand the wrong remedy.
+    const long = ticketBlockNote({
+      kind: "agent-blocked",
+      selfReport: { outcome: "blocked", reason: "y".repeat(500) },
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      head: "0123456789abcdef0123456789abcdef01234567",
+    });
+    const [ticket] = humanHeldTickets([held("t-1", "blocked", long)]);
+    expect(ticket.note!.endsWith("…")).toBe(true);
+    expect(ticket.committed).toBe("0123456");
+  });
+
+  it("takes the NEWEST verdict when an older run's note also carries evidence", () => {
+    const notes = [
+      "anton: run failed after committing work — needs review. [session s0, committed on b @ abcdef1]",
+      "anton: run made no changes (clean agent exit, zero diff). [session s1, nothing committed on b]",
+    ].join("\n");
+    expect(humanHeldTickets([held("t-1", "blocked", notes)])[0].committed).toBeUndefined();
+  });
 });
 
 describe("humanHeldPoison — the park a held child leaves behind (anton-fude)", () => {
@@ -276,6 +321,27 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
     expect(error.message).toContain("is deferred");
     expect(error.message).toContain("bd undefer anton-od4");
     expect(error.message).not.toContain("--status open");
+  });
+
+  it("sends a COMMITTED block to review-and-close, not to reopen-and-re-run", () => {
+    // Reopening does not satisfy `resumeSkipped` (only `closed` does), so the resumed run would
+    // dispatch the agent again on top of the commit already on the branch — straight back to the
+    // zero diff that blocked it. Closing is the move that actually lets the run walk past it.
+    const error = humanHeldPoison("anton-x7la", [
+      { id: "anton-od4", status: "blocked", committed: "0123456" },
+    ]);
+    expect(error.message).toContain("ALREADY COMMITTED");
+    expect(error.message).toContain("@ 0123456");
+    expect(error.message).toContain("bd close anton-od4");
+    expect(error.message).toContain("stays in this run's pull request");
+    expect(error.message).not.toContain("drops the work from this run");
+  });
+
+  it("keeps the reopen remedy for a block that committed nothing", () => {
+    const error = humanHeldPoison("anton-x7la", [{ id: "anton-od4", status: "blocked" }]);
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toContain("bd close");
+    expect(error.message).toContain("drops the work from this run");
   });
 
   it("names every held ticket, not just the first", () => {
