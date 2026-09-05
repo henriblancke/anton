@@ -243,8 +243,9 @@ export function agedOutPicks(
  * re-admits a target while every hashed input sits still. A plan is therefore also stale once a
  * target it set aside as `deferred` is no longer held — otherwise the newly eligible bead would stay
  * out of Up Next until the next scheduled pass rewrote the plan. A veto ARRIVING needs no such fence:
- * the lane subtracts live deferrals from the plan it reads (`upNextEntries`), which is a narrower and
- * faster answer than withholding the whole ranking.
+ * the live derivation behind the lane subtracts held deferrals before it ranks
+ * (`decideBoardPickerPlan`, step 2), which is a narrower and faster answer than withholding the
+ * whole ranking.
  *
  * `declined` closes that same rule's gap when NO PASS RUNS (PR #212 review). The rule above reads the
  * exclusion a later pass wrote, so it fires only if a pass got to rewrite the plan; with the picker
@@ -253,7 +254,8 @@ export function agedOutPicks(
  * generation whose decline makes `recordPickerAccept` refuse the release's accept — a start with no
  * evidence, skewing the track record earned autonomy reads. So a decline recorded against THIS
  * generation retires it as soon as the hold it placed runs out, whether or not a pass observed the
- * veto. While the hold is live nothing changes: the lane still subtracts that one card.
+ * veto. While the hold is live nothing changes: `decideBoardPickerPlan` step 2 still subtracts that
+ * one card before the ranking ever reaches the lane.
  *
  * `agedOut` is the fourth, and the one the digest structurally cannot hold ({@link agedOutPicks}):
  * a pick the policy's age bounds have moved past. Retiring the WHOLE generation over one such entry
