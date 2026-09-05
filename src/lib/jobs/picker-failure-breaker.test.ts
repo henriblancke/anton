@@ -18,6 +18,7 @@ import {
 import { listOpenEscalations, toEscalationView } from "../escalations";
 import type { Bead } from "../beads/types";
 import type { Clock } from "./queue";
+import { repairLabel } from "../gardener/repair";
 import { checkFailureStreak } from "./picker-failure-breaker";
 import { insertProject } from "@/lib/testing/project";
 
@@ -41,18 +42,21 @@ function project(settings: Record<string, unknown> = {}): void {
 /**
  * A run that started `startedMinutes` in and settled ten minutes later. `job` names the job behind
  * it — omitted for a row written before that column existed, which is what pins the legacy join.
+ * `attemptMinutes` is when the attempt that settled it BEGAN: given only for a row a resume picked
+ * back up, and omitted (⇒ null, falling back to `startedAt`) for the same legacy reason.
  */
 async function run(input: {
   id: string;
   epic: string;
   status: string;
   startedMinutes: number;
+  attemptMinutes?: number;
   error?: string;
   ticket?: string;
   job?: string;
 }): Promise<void> {
   const startedAt = new Date(T0 + input.startedMinutes * MINUTE);
-  const endedAt = new Date(T0 + (input.startedMinutes + 10) * MINUTE);
+  const endedAt = new Date(T0 + ((input.attemptMinutes ?? input.startedMinutes) + 10) * MINUTE);
   await t.db.insert(schema.runs).values({
     id: input.id,
     projectId: PROJECT,
@@ -62,8 +66,26 @@ async function run(input: {
     status: input.status,
     error: input.error,
     startedAt,
+    attemptStartedAt:
+      input.attemptMinutes === undefined ? null : new Date(T0 + input.attemptMinutes * MINUTE),
     endedAt,
     updatedAt: endedAt,
+  });
+}
+
+/**
+ * A ticket's own `execute` session, settled `done` `atMinutes` in — the delivery evidence a run row
+ * cannot carry, since a child commits while the run around it goes on to review and PR.
+ */
+async function deliveredSession(beadId: string, atMinutes: number): Promise<void> {
+  await t.db.insert(schema.sessions).values({
+    id: `s-${beadId}-${atMinutes}`,
+    projectId: PROJECT,
+    kind: "execute",
+    beadId,
+    status: "done",
+    startedAt: new Date(T0 + atMinutes * MINUTE),
+    endedAt: new Date(T0 + atMinutes * MINUTE),
   });
 }
 
@@ -87,6 +109,11 @@ async function cancelledJob(epic: string, atMinutes: number): Promise<string> {
 
 function bead(id: string, labels: string[] = []): Bead {
   return { id, title: id, status: "closed", labels };
+}
+
+/** The bead as an auto-repair leaves it: the guard stamp, made `minutes` into the window. */
+function repairedBead(id: string, minutes: number): Bead {
+  return { id, title: id, status: "open", labels: [repairLabel(id, "ref-stale", T0 + minutes * MINUTE)] };
 }
 
 /** Three failing runs, ten minutes apart — a streak at the default threshold. */
@@ -434,6 +461,166 @@ describe("checkFailureStreak", () => {
     const again = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
     expect(again?.latched).toBe(true);
     expect(again?.streak.runs.map((r) => r.id)).toEqual(["r4", "r5", "r6"]);
+  });
+
+  /**
+   * The R5.8 half of the loop guard, end to end over real run rows: a run that failed AFTER anton
+   * repaired its bead is two failures, not one, so the breaker reaches the operator's threshold in
+   * fewer runs than a streak of honest parks would take.
+   */
+  describe("after an auto-repair", () => {
+    /** The block, then the failure that followed the repair — two runs on one bead. */
+    async function blockThenFailAgain(): Promise<void> {
+      await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "blocked: ref-stale" });
+      await run({ id: "r2", epic: "anton-a", status: "failed", startedMinutes: 15, error: "blocked: ref-stale" });
+    }
+
+    it("trips the breaker sooner than the same two failures unrepaired", async () => {
+      project();
+      await blockThenFailAgain();
+
+      // Two failures at the default threshold of 3: not yet a broken environment.
+      expect(
+        await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [bead("anton-a")] }),
+      ).toBeUndefined();
+
+      // The same two runs, with anton's repair stamped between them.
+      const outcome = await checkFailureStreak(t.db, clock, {
+        projectId: PROJECT,
+        board: [repairedBead("anton-a", 12)],
+      });
+      expect(outcome?.latched).toBe(true);
+      expect(outcome?.streak.weight).toBe(3);
+      expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r1", "r2"]);
+    });
+
+    it("prices a RESUMED attempt's failure against the repair that parked it", async () => {
+      project();
+      // What a `dep-missing` repair leaves behind: it parks the run behind the edge it drew, and
+      // the blocker-completion resume reuses that same row. The row started before the repair; the
+      // attempt that failed began after it, and that is the one being weighed.
+      await run({
+        id: "r1",
+        epic: "anton-a",
+        status: "failed",
+        startedMinutes: 0,
+        attemptMinutes: 20,
+        error: "blocked: dep-missing",
+      });
+      await run({ id: "r2", epic: "anton-b", status: "failed", startedMinutes: 35, error: "boom" });
+
+      const outcome = await checkFailureStreak(t.db, clock, {
+        projectId: PROJECT,
+        board: [repairedBead("anton-a", 12), bead("anton-b")],
+      });
+      expect(outcome?.latched).toBe(true);
+      expect(outcome?.streak.weight).toBe(3);
+    });
+
+    it("does not count the block that provoked the repair double", async () => {
+      project();
+      await blockThenFailAgain();
+
+      // Repaired AFTER both runs — nothing in this streak followed it, so nothing weighs double.
+      expect(
+        await checkFailureStreak(t.db, clock, {
+          projectId: PROJECT,
+          board: [repairedBead("anton-a", 90)],
+        }),
+      ).toBeUndefined();
+    });
+
+    it("prices a repair made on the TICKET a grouped run stopped inside", async () => {
+      project();
+      await run({ id: "r1", epic: "anton-epic", status: "failed", startedMinutes: 0, error: "boom" });
+      await run({
+        id: "r2",
+        epic: "anton-epic",
+        ticket: "anton-t1",
+        status: "failed",
+        startedMinutes: 15,
+        error: "boom",
+      });
+
+      const outcome = await checkFailureStreak(t.db, clock, {
+        projectId: PROJECT,
+        board: [bead("anton-epic"), repairedBead("anton-t1", 12)],
+      });
+      expect(outcome?.latched).toBe(true);
+      expect(outcome?.streak.weight).toBe(3);
+    });
+
+    it("stops weighing the repair once the bead has DELIVERED", async () => {
+      project();
+      // The block, the repair at minute 12, the delivery that proved it — then the ticket is
+      // reopened for rework (rework-modes.ts) and fails again. The rework failure is a new story:
+      // the streak behind it ended when the work landed.
+      await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "blocked: ref-stale" });
+      await run({ id: "r2", epic: "anton-a", status: "done", startedMinutes: 15 });
+      await run({ id: "r3", epic: "anton-a", status: "failed", startedMinutes: 30, error: "boom" });
+      await run({ id: "r4", epic: "anton-b", status: "failed", startedMinutes: 45, error: "boom" });
+
+      expect(
+        await checkFailureStreak(t.db, clock, {
+          projectId: PROJECT,
+          board: [repairedBead("anton-a", 12), bead("anton-b")],
+        }),
+      ).toBeUndefined();
+
+      // The same runs with the repair stamped AFTER the delivery: that one is still unanswered.
+      const outcome = await checkFailureStreak(t.db, clock, {
+        projectId: PROJECT,
+        board: [repairedBead("anton-a", 27), bead("anton-b")],
+      });
+      expect(outcome?.latched).toBe(true);
+      expect(outcome?.streak.weight).toBe(3);
+      expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r3", "r4"]);
+    });
+
+    it("spends the repair on a delivery the failing run itself made", async () => {
+      project();
+      // The retry did deliver the repaired ticket — its `execute` session settled `done` at minute
+      // 20, inside a run that started at 15 and settled at 25 — and the run failed afterwards in a
+      // review or PR step. Ordered against the run's START that delivery is invisible and the two
+      // runs weigh 3; ordered against its SETTLEMENT the repair is spent and they weigh 2.
+      await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "blocked: ref-stale" });
+      await run({ id: "r2", epic: "anton-a", status: "failed", startedMinutes: 15, error: "review failed" });
+      await deliveredSession("anton-a", 20);
+
+      expect(
+        await checkFailureStreak(t.db, clock, {
+          projectId: PROJECT,
+          board: [repairedBead("anton-a", 12)],
+        }),
+      ).toBeUndefined();
+    });
+
+    it("ignores a delivery from after the failing run settled", async () => {
+      project();
+      // The same two runs, with the delivery landing at minute 40 — well past r2's settlement at 25,
+      // so it belongs to some later attempt and answers nothing about this streak.
+      await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "blocked: ref-stale" });
+      await run({ id: "r2", epic: "anton-a", status: "failed", startedMinutes: 15, error: "review failed" });
+      await deliveredSession("anton-a", 40);
+
+      const outcome = await checkFailureStreak(t.db, clock, {
+        projectId: PROJECT,
+        board: [repairedBead("anton-a", 12)],
+      });
+      expect(outcome?.latched).toBe(true);
+      expect(outcome?.streak.weight).toBe(3);
+    });
+
+    it("leaves a board with no repairs weighing every failure once", async () => {
+      project();
+      await blockThenFailAgain();
+      expect(
+        await checkFailureStreak(t.db, clock, {
+          projectId: PROJECT,
+          board: [bead("anton-a"), repairedBead("anton-unrelated", 12)],
+        }),
+      ).toBeUndefined();
+    });
   });
 
   it("counts a failure double under the caller's weigher", async () => {

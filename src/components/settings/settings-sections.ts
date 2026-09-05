@@ -58,6 +58,14 @@ export const SECTIONS = [
     group: "While a run works",
     dirtyKeys: ["valueLabels"],
   },
+  // Beside the brakes rather than beside proposal autonomy: a repair happens when a RUN blocks, not
+  // on a pass's schedule, and the question it answers is what anton does next in that moment.
+  {
+    id: "repairs",
+    label: "Repair autonomy",
+    group: "While a run works",
+    dirtyKeys: ["repairAutonomy"],
+  },
   { id: "gates", label: "Verify gates", group: "Before the PR opens", dirtyKeys: ["gates"] },
   {
     id: "review",

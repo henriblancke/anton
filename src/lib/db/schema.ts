@@ -55,6 +55,14 @@ export const runs = sqliteTable("runs", {
   leaseExpiresAt: ts("lease_expires_at"),
   error: text("error"),
   startedAt: ts("started_at"),
+  // When the CURRENT attempt on this row began (anton-tebf) — equal to `started_at` on a fresh run,
+  // rewritten every time a resume picks a parked row back up. A row is not one attempt: a parked run
+  // resumes in place (`findOpenRunForEpic`), so `started_at` answers "when did this work first
+  // start", not "when did the attempt that failed start". The repair weigher needs the second — a
+  // `dep-missing` repair parks the run it repaired, and its failure after the resume must still be
+  // ordered AFTER the repair stamp to count double (gardener/repair.ts). Null on rows written
+  // before this column existed, which fall back to `started_at`.
+  attemptStartedAt: ts("attempt_started_at"),
   endedAt: ts("ended_at"),
   updatedAt: ts("updated_at").notNull().default(now),
   // A global counter stamped on every write to this row (anton-rgso), so the rows carry the one

@@ -39,11 +39,17 @@ export interface BoardIndex {
    */
   recordsBlocker(id: string, blockerId: string): boolean;
   /**
-   * Is `id` already blocked by `blockerId`, directly or through any chain of `blocks` edges?
+   * Is `id` already blocked by `blockerId`, directly or through any chain of BLOCKING edges?
    * DIRECTED, unlike {@link hasBlocksEdge}, and asked in the one place direction decides safety:
    * recording "X blocks Y" when X is itself already waiting on Y closes a dependency cycle, and bd
    * rejects cycles at every write path (bd-hygiene.integration.test.ts) — so a proposal that only
    * looked at the direct pair could be approved into a 500 and never apply.
+   *
+   * The walk follows `conditional-blocks` as well as `blocks` (PR #223 review): the question is
+   * whether work is HELD BACK, and the measured CLI matrix
+   * (docs/spikes/2026-07-28-bd-workflow-primitives.md) says both types block identically. Indexing
+   * the exact type alone would read a path that reaches the target through one conditional edge as
+   * safe, and the repair promising a park behind a prerequisite would close a real cycle instead.
    */
   isBlockedBy(id: string, blockerId: string): boolean;
   /**
@@ -61,6 +67,14 @@ export interface BoardIndex {
    * it, so a pair already carrying provenance can never also carry ordering.
    */
   recordsDiscovery(discoveredId: string, sourceId: string): boolean;
+  /**
+   * The type of the edge the board records FROM `fromId` TO `toId`, if the directed pair carries one
+   * at all. The catch-all behind {@link recordsBlocker} and {@link recordsDiscovery}: bd's one-edge-
+   * per-directed-pair rule applies to EVERY type it accepts, not just the three indexed by name, so
+   * a pair already carrying `conditional-blocks` or `related` refuses a `blocks` write exactly as a
+   * provenance pair does (PR #223 review). Asked last, so the named types keep their own refusals.
+   */
+  recordsEdge(fromId: string, toId: string): string | undefined;
   /** Is `ancestorId` this bead, or anywhere on its parent chain? Cycle-guarded. */
   isAncestor(ancestorId: string, id: string): boolean;
   /** An epic that groups run targets rather than being one (`beads.isContainer`, board-wide). */
@@ -81,21 +95,28 @@ export function indexBoard(all: Bead[]): BoardIndex {
 
   const blocks = new Set<string>();
   // The same edges, kept DIRECTED: `from` depends on `to` (bd's `blocks` edge points at the blocker,
-  // matching beads.unblocksCount), which is what makes reachability — and so cycle detection —
-  // answerable at all. A Set per bead so a direct-blocker lookup costs the same as every other edge
-  // question here.
+  // matching beads.unblocksCount). EXACTLY `blocks`, because this answers whether the board already
+  // records the very edge a write asks for. A Set per bead so a direct-blocker lookup costs what
+  // every other edge question here costs.
   const blockers = new Map<string, Set<string>>();
+  // Everything that actually HOLDS WORK BACK, which is what reachability — and so cycle detection —
+  // has to walk. A superset of `blockers` by one type; see {@link BoardIndex.isBlockedBy}.
+  const blocking = new Map<string, Set<string>>();
   // `bd supersede <id> --with <replacement>` writes (from = the superseded bead, to = the survivor).
   const supersedes = new Set<string>();
   // `bd link <discovered> <source> --type discovered-from` writes (from = the bead that was found,
   // to = the work it was found while doing).
   const discoveries = new Set<string>();
+  // Every directed pair the board has spent, whatever the type — the question a write has to ask
+  // before it draws a new edge over one.
+  const edgeTypes = new Map<string, string>();
   for (const edge of beads.edgesOf(all)) {
+    const pair = directedKey(edge.from, edge.to);
+    if (!edgeTypes.has(pair)) edgeTypes.set(pair, edge.type);
+    if (BLOCKING_EDGE_TYPES.has(edge.type)) addBlocker(blocking, edge.from, edge.to);
     if (edge.type === "blocks") {
       blocks.add(pairKey(edge.from, edge.to));
-      const known = blockers.get(edge.from);
-      if (known) known.add(edge.to);
-      else blockers.set(edge.from, new Set([edge.to]));
+      addBlocker(blockers, edge.from, edge.to);
     } else if (edge.type === "supersedes") {
       supersedes.add(directedKey(edge.from, edge.to));
     } else if (edge.type === "discovered-from") {
@@ -129,19 +150,20 @@ export function indexBoard(all: Bead[]): BoardIndex {
       // Walks blocker-ward from `id`; `seen` also guards a graph that ALREADY holds a cycle (a merge
       // can leave one, see beads.depCycles), which must not spin this walk forever.
       const seen = new Set<string>([id]);
-      const queue = [...(blockers.get(id) ?? [])];
+      const queue = [...(blocking.get(id) ?? [])];
       while (queue.length > 0) {
         const next = queue.shift() as string;
         if (next === blockerId) return true;
         if (seen.has(next)) continue;
         seen.add(next);
-        queue.push(...(blockers.get(next) ?? []));
+        queue.push(...(blocking.get(next) ?? []));
       }
       return false;
     },
     recordsSupersedes: (id, replacementId) => supersedes.has(directedKey(id, replacementId)),
     recordsDiscovery: (discoveredId, sourceId) =>
       discoveries.has(directedKey(discoveredId, sourceId)),
+    recordsEdge: (fromId, toId) => edgeTypes.get(directedKey(fromId, toId)),
     isAncestor: (ancestorId, id) => {
       const seen = new Set<string>();
       let current: string | undefined = id;
@@ -155,6 +177,20 @@ export function indexBoard(all: Bead[]): BoardIndex {
     },
     isContainer: (bead) => beads.isContainer(bead, all),
   };
+}
+
+/**
+ * The bd edge types that HOLD WORK BACK — measured, not assumed
+ * (docs/spikes/2026-07-28-bd-workflow-primitives.md): a bead on the `from` side of either shows up
+ * in `bd blocked`. Every other type bd accepts is a no-op for scheduling.
+ */
+const BLOCKING_EDGE_TYPES = new Set(["blocks", "conditional-blocks"]);
+
+/** Record `to` as something `from` waits on, in one of the directed blocker adjacency maps. */
+function addBlocker(map: Map<string, Set<string>>, from: string, to: string): void {
+  const known = map.get(from);
+  if (known) known.add(to);
+  else map.set(from, new Set([to]));
 }
 
 /** Undirected edge key — `a|b` and `b|a` are the same edge to every question asked here. */

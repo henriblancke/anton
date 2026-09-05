@@ -278,8 +278,12 @@ export interface GardenerDetection {
   evidence: string[];
 }
 
-/** How much of the digest the fingerprint carries — collision-safe at board scale, label-short. */
-const FINGERPRINT_HASH_LENGTH = 12;
+/**
+ * How much of the digest the fingerprint carries — collision-safe at board scale, label-short.
+ * Exported so the repair guard's own `repair:<class>:<hash>` stamps (gardener/repair.ts) are cut to
+ * the same width as every proposal fingerprint rather than to a second, drifting one.
+ */
+export const FINGERPRINT_HASH_LENGTH = 12;
 
 export interface DetectionInput {
   kind: GardenerDetectionKind;

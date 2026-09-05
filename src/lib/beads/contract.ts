@@ -129,15 +129,17 @@ interface OpenSection {
 const opensSection = (open: OpenSection | undefined, heading: Heading, keys: ReadonlySet<string>) =>
   !open || heading.depth <= open.depth || keys.has(heading.key);
 
-/** File a finished section under its key. A repeated heading concatenates rather than replaces. */
-function fileSection(out: Map<string, string>, section: OpenSection | undefined): void {
-  if (!section) return;
-  const text = [out.get(section.key), section.body.join("\n").trim()].filter(Boolean).join("\n");
-  out.set(section.key, text);
+/** One heading and the body under it, as WRITTEN — a repeated heading yields one entry per
+ * occurrence, in document order, so a reader that needs WHERE a section is finds the occurrence
+ * rather than the aggregate. */
+interface SectionOccurrence {
+  key: string;
+  body: string;
 }
 
 /**
- * Section bodies of a description, keyed by slugged heading. A repeated heading concatenates.
+ * Every section a description opens, in document order — the one parse {@link sectionsOf} and
+ * {@link formPlacements} both read.
  *
  * A section runs until a heading that starts ANOTHER section: one of `keys` at any depth, or any
  * heading at the current section's level or shallower. A DEEPER heading that names no contract
@@ -153,16 +155,33 @@ function fileSection(out: Map<string, string>, section: OpenSection | undefined)
  * Depth alone can't decide it: descriptions that open with a `# Title` put every `## Goal` below it,
  * and folding those in would lose the contract entirely. A contract heading always opens its section.
  */
-function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string, string> {
-  const out = new Map<string, string>();
+function sectionOccurrences(description: string, keys: ReadonlySet<string>): SectionOccurrence[] {
+  const out: SectionOccurrence[] = [];
   let open: OpenSection | undefined;
+  const close = () => {
+    if (open) out.push({ key: open.key, body: open.body.join("\n").trim() });
+  };
   for (const { text, heading } of scanMarkdown(description)) {
     if (heading && opensSection(open, heading, keys)) {
-      fileSection(out, open);
+      close();
       open = { key: heading.key, depth: heading.depth, body: [] };
     } else open?.body.push(text);
   }
-  fileSection(out, open);
+  close();
+  return out;
+}
+
+/**
+ * Section bodies of a description, keyed by slugged heading. A repeated heading concatenates — the
+ * whole of what a bead says under one name, for every reader that asks WHAT a section holds. A
+ * reader that also needs where it sits must go to {@link sectionOccurrences}: the aggregate has one
+ * position, and it is the first heading's whether or not that is the copy carrying the content.
+ */
+function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const { key, body } of sectionOccurrences(description, keys)) {
+    out.set(key, [out.get(key), body].filter(Boolean).join("\n"));
+  }
   return out;
 }
 
@@ -382,6 +401,19 @@ const EPIC_KEYS: ReadonlySet<string> = new Set([...OUTCOME_KEYS, ...SUCCESS_KEYS
  * has no tier to narrow by. Tier-aware judging and reading must pass {@link contractKeysOf}: only
  * headings applicable to the bead's tier may terminate a deeper section (see {@link sectionsOf}). */
 const CONTRACT_KEYS: ReadonlySet<string> = new Set([...TICKET_KEYS, ...EPIC_KEYS]);
+
+/**
+ * Does this heading name a contract section — any tier's? For a reader OUTSIDE the gate that must
+ * end a section exactly where {@link sectionOccurrences} does, at any depth: the `ref-stale` repair
+ * rewrites `## Context` and nothing else, and a `### Verify` nested under it is Verify's content to
+ * the gate (gardener/repair-ref-stale.ts).
+ *
+ * Merged rather than tiered for {@link sectionBody}'s reason — such a caller holds text, not a bead,
+ * so it has no tier to narrow by. The divergence is one-directional and harmless here: stopping at
+ * another tier's alias ends a section EARLIER than the gate would, so a reader rewrites less of a
+ * description than the gate calls Context, never more.
+ */
+export const isContractHeading = (heading: Heading): boolean => CONTRACT_KEYS.has(heading.key);
 
 /** The heading set {@link sectionsOf} sections a bead of this tier by. Exempt reads as ticket — the
  * same non-epic default {@link acceptanceKeysOf} and {@link goalKeysOf} apply. */
@@ -745,12 +777,21 @@ interface FormRule {
   preamble?: boolean;
 }
 
-/** A ticket's five, in {@link validateBeadContract}'s own reporting order. Derived from
- * {@link TICKET_RULES} so a section added to the gate cannot go unasked here. */
-const TICKET_FORM_RULES: readonly FormRule[] = [
-  { section: "Acceptance", keys: ACCEPTANCE_KEYS },
-  ...TICKET_RULES.map(({ section, keys }) => ({ section, keys })),
-];
+/**
+ * A ticket's five, in the order the CONTRACT states them — Goal → Acceptance Criteria → Context →
+ * Out of scope → Verify, "all five, in that order" (skills/bd/SKILL.md). This list is the order
+ * judgement's only definition of the sequence as well as the presence judgement's reporting order,
+ * so the two cannot disagree about what the contract's order is.
+ *
+ * Derived from {@link TICKET_RULES}, whose four already sit in that order around the rubric, so a
+ * section added to the gate cannot go unasked here. The rubric is the one section that list does
+ * not carry — it is blocking, and judged separately — and the contract seats it after Goal.
+ */
+const TICKET_FORM_RULES: readonly FormRule[] = TICKET_RULES.flatMap(({ section, keys }) =>
+  section === "Goal"
+    ? [{ section, keys }, { section: "Acceptance" as ContractSection, keys: ACCEPTANCE_KEYS }]
+    : [{ section, keys }],
+);
 
 /** An epic's two. The `area:` label is not a description section, so the form question is silent
  * on it — that gap is the gate's to report. */
@@ -778,23 +819,116 @@ const EPIC_FORM_RULES: readonly FormRule[] = [
  * for the same reason the gate treats it so ({@link stateOf}) — a heading cooked and never authored
  * carries no contract.
  *
+ * Presence only: each section's body is judged on its own, so a description carrying all five in a
+ * noncanonical order reports nothing here. That is {@link contractOrderGaps}' question.
+ *
  * Denominator note: an empty result means "carries the form" only for a bead
  * {@link isContractJudged} accepts. A rate must divide by that, exactly as the contract rate does.
  */
 export function contractFormGaps(bead: Bead): ContractSection[] {
+  return formPlacements(bead)
+    .filter((p) => p.at === undefined)
+    .map((p) => p.section);
+}
+
+/**
+ * Which contract sections this bead's description carries OUT OF the contract's order — empty when
+ * the sections it does carry read in sequence, and for a bead no tier judges.
+ *
+ * The form's other half (anton-um80). {@link contractFormGaps} asks presence alone, judging each
+ * section's body independently, so a description holding all five shuffled reported no gap at all —
+ * and shuffling is where the drift actually is: at shaping time 18 of 535 beads board-wide carried
+ * the canonical order, against 21 of 138 for presence. `bd create --context` produces it on its
+ * own, appending a trailing `## Context` after `## Verify` (skills/bd/SKILL.md).
+ *
+ * Reported SEPARATELY from the missing sections rather than merged into them, because the repairs
+ * differ: an absent section must be AUTHORED, a misplaced one only MOVED. Sections the description
+ * lacks are not judged here — they have no position, and {@link contractFormGaps} already names
+ * them.
+ *
+ * Never blocking and never in an exit code, exactly as the presence gap is.
+ */
+export function contractOrderGaps(bead: Bead): ContractSection[] {
+  const placed = formPlacements(bead).filter((p) => p.at !== undefined);
+  const ordered = longestOrderedRun(placed.map((p) => p.at as number));
+  return placed.filter((p, i) => p.split || !ordered.has(i)).map((p) => p.section);
+}
+
+/** One section the form question asks about: where the description carries it, or `undefined` when
+ * it does not. `at` is the ordinal of the LAST section OCCURRENCE supplying an authored body — or
+ * -1 for the preamble, the home that sits ahead of every heading and so is only the last one when
+ * no heading carries the section at all. `split` marks the section whose authored copies do not sit
+ * together, whatever `at` says: another section's body was written between them, so this one's
+ * content has to be consolidated before any position can describe it. */
+interface FormPlacement {
+  section: ContractSection;
+  at: number | undefined;
+  split: boolean;
+}
+
+/**
+ * Every section this bead's tier owes, in the contract's order, each with the place the description
+ * carries it. One parse serving both form questions, so presence and order can never read the same
+ * description two different ways.
+ *
+ * Placed by OCCURRENCE, not by key, and by the LAST occurrence that carries an authored body (PR
+ * #223 review). A repeated heading concatenates in {@link sectionsOf}, so EVERY authored copy is
+ * contract content and the position that has to read in order is where that content ends. Reading
+ * the first copy would call two arrangements ordered that are not: a canonical early `## Acceptance`
+ * holding nothing but the formula's TODO with the criteria authored after `## Verify`, and a
+ * canonical one whose criteria CONTINUE under a second authored `## Acceptance` after it. Both are
+ * the arrangement {@link contractOrderGaps} exists to catch.
+ *
+ * A section repeated back-to-back still reads ordered, and should: its content is contiguous and
+ * sits where the contract puts it — nothing has to MOVE, which is the only repair this gap asks for.
+ * A section whose copies are SPLIT by another section's body is the opposite case and is faulted on
+ * that alone (PR #223 review): criteria written ahead of `## Goal` and continued under the canonical
+ * `## Acceptance` place the section last and so read ordered, while the early copy — contract
+ * content all the same — still sits out of sequence and has to move down to join the rest.
+ *
+ * The preamble is the LAST home considered, not a short-circuit (PR #223 review). It sits ahead of
+ * every heading, so an epic that states its outcome in the opening line AND authors a `## Outcome`
+ * after its Success Criteria carries that section last, not first — placing it at -1 on the strength
+ * of the preamble alone reported that description ordered while its contract content continues past
+ * the rubric, the one arrangement this exists to catch.
+ */
+function formPlacements(bead: Bead): FormPlacement[] {
   if (!isContractJudged(bead)) return [];
   const tier = tierOf(bead);
 
   const description = typeof bead.description === "string" ? bead.description : "";
-  const sections = sectionsOf(description, contractKeysOf(tier));
+  const found = sectionOccurrences(description, contractKeysOf(tier));
+  const authored = found.flatMap((s, at) => (isAuthoredBody(s.body) ? [at] : []));
   const rules = tier === "epic" ? EPIC_FORM_RULES : TICKET_FORM_RULES;
-  return rules
-    .filter((rule) => {
-      const bodies = [
-        ...(rule.preamble ? [preambleOf(description)] : []),
-        ...rule.keys.map((k) => sections.get(k) ?? ""),
-      ];
-      return stateOf(bodies) !== "written";
-    })
-    .map((rule) => rule.section);
+  const preamble = isAuthoredBody(preambleOf(description));
+  return rules.map((rule) => {
+    const copies = authored.filter((at) => rule.keys.includes(found[at].key));
+    if (copies.length > 0) {
+      const at = copies[copies.length - 1];
+      const split = authored.some((o) => o > copies[0] && o < at && !copies.includes(o));
+      return { section: rule.section, at, split };
+    }
+    // The preamble sits ahead of every heading, so an epic's bare outcome line is placed first —
+    // and only when no LATER heading carries the section too.
+    return { section: rule.section, at: rule.preamble && preamble ? -1 : undefined, split: false };
+  });
+}
+
+/**
+ * The indices of a longest strictly increasing run through `positions` — the sections already
+ * sitting in the contract's order. Everything outside it is what must move, so one displaced
+ * section names itself rather than every section it stepped over.
+ *
+ * Ties keep the earliest such run, so two readings of one board report the same sections.
+ */
+function longestOrderedRun(positions: number[]): Set<number> {
+  const runs: number[][] = [];
+  for (let i = 0; i < positions.length; i++) {
+    let longest: number[] = [];
+    for (let j = 0; j < i; j++) {
+      if (positions[j] < positions[i] && runs[j].length > longest.length) longest = runs[j];
+    }
+    runs[i] = [...longest, i];
+  }
+  return new Set(runs.reduce((a, b) => (b.length > a.length ? b : a), []));
 }

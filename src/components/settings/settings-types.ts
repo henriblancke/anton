@@ -71,6 +71,13 @@ export interface EditableSettings {
    * can't read back to `propose` rather than rendering it.
    */
   proposalAutonomy?: Record<string, string>;
+  /**
+   * How far anton may go REPAIRING a block a run declared, per class (R5.3). Only the classes moved
+   * off their shipped level are stored. Typed loosely for the same reason the line above is, and
+   * floored the same way: `resolveRepairAutonomy` reads anything it cannot parse back to the class's
+   * shipped level rather than rendering it.
+   */
+  repairAutonomy?: Record<string, string>;
   /** Budget-aware execution master-switch (anton-7mpv.1); off by default. Gates the knobs below. */
   budgetAware?: boolean;
   /** Operator budget policy (anton-egrg); only the two exposed knobs round-trip through this form. */

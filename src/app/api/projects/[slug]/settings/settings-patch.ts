@@ -28,6 +28,7 @@ import {
   pickerAutonomySchema,
   pickerPolicySchema,
   proposalAutonomySchema,
+  repairAutonomySchema,
   runHealthThresholdsSchema,
   scanSeverityPolicySchema,
   valueLabelsSchema,
@@ -173,6 +174,7 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     settingsField("runHealth", schemaValue(runHealthThresholdsSchema, messageDetail("out of range"))),
     settingsField("scanSeverity", schemaValue(scanSeverityPolicySchema, pathDetail)),
     settingsField("proposalAutonomy", schemaValue(proposalAutonomySchema, pathDetail)),
+    settingsField("repairAutonomy", schemaValue(repairAutonomySchema, pathDetail)),
     settingsField(
       "valueLabels",
       schemaValue(valueLabelsSchema, messageDetail("invalid label"), { clearOnEmptyArray: true }),

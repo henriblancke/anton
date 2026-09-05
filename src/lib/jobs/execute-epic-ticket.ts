@@ -9,12 +9,20 @@
 import { beads, labelValueOf, LABELS, type Bead } from "../beads/bd";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
+import { shadowNote } from "../gardener/repair";
+import {
+  refusalNote as depRefusalNote,
+  repairDepMissing,
+  type DepMissingOutcome,
+} from "../gardener/repair-dep-missing";
+import { refusalNote, repairRefStale, type RefStaleOutcome } from "../gardener/repair-ref-stale";
 import {
   readWorktreeState,
   restoreWorktreeState,
   sameWorktreeState,
   type WorktreeState,
 } from "../git/ops";
+import { resolveRepairAutonomy } from "../projects";
 import { updateRun } from "../runs";
 import {
   appendSessionLog,
@@ -28,6 +36,8 @@ import {
   CancelledAskError,
   NeedsHumanError,
   NoDeliveryError,
+  ParkedOnPrereqError,
+  RepairedBlockError,
   TicketTimeoutError,
   WorktreeDirtyError,
 } from "./execute-epic-errors";
@@ -420,8 +430,167 @@ async function settleFailedTicket(args: {
   }
   await settleTicketTimeout({ run, ticket, session, baseline, progress, timeoutMs, ranOutOfTime });
   await settleAbortedTicket({ run, ticket, session, e });
-  await releaseFailedTicket({ run, ticket, session, progress, e, kinds });
+  // Attempted only AFTER the abort path has had its say: a ticket someone killed or abandoned is
+  // settled by whoever stopped it, and repairing its bead would write to a board a human is deciding
+  // on. Before the release, because what the repair answers decides whether this bead is left
+  // `blocked` for a person or `open` for the retry it just earned.
+  const repair = await repairBlockedTicket({ run, ticket, session, progress, e, kinds });
+  await releaseFailedTicket({ run, ticket, session, progress, e, kinds, repair });
+  // The repaired bead goes back through the ordinary queue (R5.10): a non-poison error spends one of
+  // the runner's own attempts, behind its own backoff and the picker's brakes. The block it replaces
+  // would have parked the run outright.
+  if (repair?.action === "repaired") throw new RepairedBlockError(ticket.id, repair.attempted, e);
+  // An ordering recorded is a WAIT, not a correction: the ticket cannot start until the blocker
+  // lands, so the run parks behind the edge anton just drew instead of spending an attempt on it.
+  if (repair?.action === "parked") {
+    throw new ParkedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, e);
+  }
   throw e;
+}
+
+/** What the repair pass answers, whichever class it ran for. */
+type TicketRepair = RefStaleOutcome | DepMissingOutcome;
+
+/**
+ * The FACTUAL repair pass on a blocked ticket (anton-fzas, anton-qg4h / R5.4) — the two repairs that
+ * invent nothing: a pointer rewritten to what it already meant, and an ordering that already exists
+ * in reality written down.
+ *
+ * Runs on the two block kinds that mean "the agent could not do the work": a zero-diff run
+ * ({@link NoDeliveryError}), and one the agent itself declared incomplete
+ * ({@link BlockedByAgentError}). It runs on no other failure — not on an ask (that is a person's to
+ * answer), not on a usage-limit park (not a failure at all), and not on any step failure that is
+ * neither of those two: a run that fell over in review, commit or PR stopped on something the
+ * bead's pointers and edges cannot explain.
+ *
+ * COMMITTED WORK IS NOT EXCLUDED, and that is deliberate (PR #223 review). `BlockedByAgentError` is
+ * raised precisely when the tree DID commit and the agent still reported `blocked` — a partial
+ * change plus an honest "this is not done". The block is the agent's own report, so what the repairs
+ * answer is unchanged by the diff: a `dep-missing` report naming a prerequisite still means the rest
+ * of the work cannot start until it lands, and a cited path that has moved is still stale whether or
+ * not something was committed against the old one. What the commit changes is the ticket's fate, and
+ * that is settled elsewhere — the bead is blocked for a human either way.
+ *
+ * WHICH REPAIR RUNS is decided by the agent's classified report (anton-ie05 / R5.1), and only
+ * `dep-missing` needs it: no fact about the bead can tell anton that other work has to land first,
+ * so that class is the whole trigger — and being unable to check it is exactly why the repair writes
+ * nothing it cannot resolve against the board.
+ *
+ * `ref-stale` keeps running on EVERY other block, class or none. Its trigger is evidence rather than
+ * the agent's word — the bead's cited paths are checked against the worktree, so it fires only where
+ * a pointer is provably stale and stays silent (`none`) everywhere else. That is strictly narrower
+ * than trusting a self-reported class, so narrowing it to one would only lose repairs. The cost is
+ * an audit trail that can read oddly (PR #223 review): a bead blocked on, say, `env` that ALSO
+ * cites a moved path gets its pointer fixed and stamped `repair:ref-stale`, on a run whose block was
+ * something else. The stamp is honest about what anton did — it rewrote a genuinely stale pointer —
+ * and the loop guard still holds, because the next block finds that stamp and escalates rather than
+ * repairing again.
+ *
+ * HOW FAR EITHER MAY GO is the project's call, not this function's (R5.3): each class carries its
+ * own autonomy level, and the guard consults it before anything is written (`decideRepair`). Shipped
+ * at `shadow`, so a project that has armed nothing gets the repair worked out and RECORDED — on the
+ * bead and in the session log — while the block escalates to a human exactly as it did before this
+ * feature existed. A shadowed repair is therefore not a repair: it leaves the ticket to the ordinary
+ * failure path below, which blocks the bead.
+ *
+ * Best-effort by construction: a repair that throws must never mask the block the run is settling.
+ * The block still stands; only the repair is lost.
+ */
+async function repairBlockedTicket(args: {
+  run: Omit<StepContext, "tickets">;
+  ticket: Bead;
+  session: Awaited<ReturnType<typeof startJobSession>>;
+  progress: TicketProgress;
+  e: unknown;
+  kinds: TicketFailureKinds;
+}): Promise<TicketRepair | undefined> {
+  const { run, ticket, session, e, kinds } = args;
+  const { clock, worktreePath } = run;
+  const repo = run.repoPath;
+  if (isUsageLimitError(e) || kinds.needsHuman) return undefined;
+  if (!kinds.noDelivery && !kinds.agentBlocked) return undefined;
+  const selfReport = args.progress.selfReport;
+  const klass = selfReport?.outcome === "blocked" ? selfReport.klass : undefined;
+  const autonomy = resolveRepairAutonomy(run.settings);
+  try {
+    // One instant for whichever repair runs — the arms are mutually exclusive, and the stamp is
+    // what the breaker orders a later failure against.
+    const now = clock.now();
+    // Read the bead fresh: the snapshot this run dispatched from predates the session, and the
+    // repair rewrites the description — or the edges — it is holding.
+    const fresh = await beads.show(repo, ticket.id);
+    // The self-report's reason FIRST for both repairs, and it is load-bearing for `dep-missing`:
+    // the prerequisite is named in the agent's own prose, and the run's error message names none.
+    const block = {
+      reason: selfReport?.reason ?? (e instanceof Error ? e.message : undefined),
+    };
+    if (klass === "dep-missing") {
+      const outcome = await repairDepMissing({
+        repoPath: repo,
+        bead: fresh,
+        block,
+        now,
+        autonomy: autonomy["dep-missing"],
+      });
+      if (outcome.action === "escalate") {
+        await safe(() => beads.note(repo, ticket.id, depRefusalNote(outcome)));
+      } else if (outcome.action === "shadow") {
+        await safe(() => beads.note(repo, ticket.id, shadowNote("dep-missing", outcome.attempted)));
+      }
+      await appendSessionLog(
+        session.logPath,
+        `[repair:dep-missing] ${repairLogLine(outcome)}\n`,
+      ).catch(() => {});
+      return outcome;
+    }
+    const outcome = await repairRefStale({
+      repoPath: repo,
+      worktreePath,
+      bead: fresh,
+      block,
+      now,
+      autonomy: autonomy["ref-stale"],
+    });
+    if (outcome.action === "escalate") {
+      await safe(() => beads.note(repo, ticket.id, refusalNote(outcome)));
+    } else if (outcome.action === "shadow") {
+      await safe(() => beads.note(repo, ticket.id, shadowNote("ref-stale", outcome.attempted)));
+    }
+    await appendSessionLog(session.logPath, `[repair:ref-stale] ${repairLogLine(outcome)}\n`).catch(
+      () => {},
+    );
+    return outcome;
+  } catch (failure) {
+    // The MODULE that ran and the block CLASS it ran on are two different facts (PR #223 review).
+    // Every non-`dep-missing` block falls through to `ref-stale`, so naming the class alone reads as
+    // if an `env` repair existed and threw, rather than that `ref-stale` refused an `env` block.
+    const repair = klass === "dep-missing" ? "dep-missing" : "ref-stale";
+    console.error(
+      `[execute-epic] ${repair} repair failed for ${ticket.id} (block class: ${klass ?? "unclassified"})`,
+      failure,
+    );
+    return undefined;
+  }
+}
+
+/** One line of the repair's own account, for the session log. */
+function repairLogLine(outcome: TicketRepair): string {
+  switch (outcome.action) {
+    case "repaired":
+      return `repaired — ${outcome.attempted}`;
+    case "parked":
+      return `parked — ${outcome.attempted}`;
+    case "shadow":
+      // The one line an operator reads a week of shadow off, so it says what the write WOULD have
+      // been, not merely that one was withheld.
+      return `shadow (not armed to write) — would have: ${outcome.attempted}`;
+    case "escalate":
+      return `escalated — ${[outcome.why, ...outcome.evidence].join(" ")}`;
+    // Named rather than left to `default`, so a future outcome shape without a `why` is a type error
+    // HERE instead of an `undefined` in the log line (PR #223 review).
+    case "none":
+      return `no repair — ${outcome.why}`;
+  }
 }
 
 /**
@@ -650,6 +819,8 @@ async function releaseFailedTicket(args: {
   progress: TicketProgress;
   e: unknown;
   kinds: TicketFailureKinds;
+  /** What the factual repair pass answered, when it ran — see {@link repairBlockedTicket}. */
+  repair?: TicketRepair;
 }): Promise<void> {
   const { run, ticket, session, e } = args;
   const { worktreePath } = run;
@@ -657,8 +828,20 @@ async function releaseFailedTicket(args: {
   const { sessionId } = session;
   const { committed, selfReport } = args.progress;
   const { noDelivery, agentBlocked, needsHuman } = args.kinds;
+  // A REPAIRED bead is not a human-review state, it is work with one retry coming (R5.10) — and
+  // `blocked` is a status bd refuses to claim, so blocking it here would kill that retry on its own
+  // first step. Left `open` like every other re-queued ticket; the repair's own note and stamp are
+  // what carry the account, not the status.
+  //
+  // A bead PARKED behind a new prerequisite (anton-qg4h) is left the same way, for the same reason
+  // one step further out: what holds it back is the `blocks` edge, and that edge already keeps it
+  // out of every ready query. Blocking the status on top would add nothing and would make the
+  // resume that follows the blocker landing impossible — `bd update --claim` refuses a `blocked`
+  // bead, so the wait would become permanent.
+  const staysClaimable =
+    args.repair?.action === "repaired" || args.repair?.action === "parked";
   if (!isUsageLimitError(e)) {
-    if ((committed || noDelivery || agentBlocked) && !needsHuman) {
+    if ((committed || noDelivery || agentBlocked) && !needsHuman && !staysClaimable) {
       await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
       // The tip this ticket's work landed on — the operator's route from the note straight to the
       // diff. Best-effort and only when something was committed: an unreadable worktree costs the

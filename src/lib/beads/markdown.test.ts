@@ -62,10 +62,23 @@ describe("scanMarkdown", () => {
   describe("fences", () => {
     it("flags the delimiters as punctuation and the content as literal, opening no section", () => {
       expect(scanMarkdown("```js\n## Acceptance\n```\nafter")).toEqual([
-        { text: "```js", fenced: true, delimiter: true, visible: "" },
-        { text: "## Acceptance", fenced: true, delimiter: false, visible: "## Acceptance" },
-        { text: "```", fenced: true, delimiter: true, visible: "" },
-        { text: "after", fenced: false, delimiter: false, visible: "after", heading: undefined },
+        { text: "```js", fenced: true, delimiter: true, visible: "", masked: "```js" },
+        {
+          text: "## Acceptance",
+          fenced: true,
+          delimiter: false,
+          visible: "## Acceptance",
+          masked: "## Acceptance",
+        },
+        { text: "```", fenced: true, delimiter: true, visible: "", masked: "```" },
+        {
+          text: "after",
+          fenced: false,
+          delimiter: false,
+          visible: "after",
+          masked: "after",
+          heading: undefined,
+        },
       ]);
     });
 
@@ -135,6 +148,24 @@ describe("scanMarkdown", () => {
     it("lets an unclosed comment swallow the rest of the body", () => {
       expect(visible("text <!-- x\n## Hidden")).toEqual(["text ", ""]);
       expect(headings("text <!-- x\n## Hidden")).toEqual([undefined, undefined]);
+    });
+
+    // What a caller that REWRITES a line reads: the comment is gone as content, but every byte of
+    // the line is still where the source put it, so an offset into `masked` is an offset into it.
+    it("blanks a commented span to spaces, keeping the line's own offsets", () => {
+      const source = "a <!-- x --> b <!-- y --> c";
+      const [line] = scanMarkdown(source);
+      expect(line!.masked).toBe("a            b            c");
+      expect(line!.masked.length).toBe(source.length);
+      expect(line!.masked.indexOf("b")).toBe(source.indexOf("b"));
+    });
+
+    it("blanks a multi-line comment on every line it covers, and an unclosed one to the end", () => {
+      const masked = (source: string) => scanMarkdown(source).map((l) => l.masked);
+      expect(masked("<!-- a\n## hidden\n--> tail")).toEqual(["      ", "         ", "    tail"]);
+      expect(masked("text <!-- x\n## Hidden")).toEqual(["text       ", "         "]);
+      // Inside a fence a `<!--` is content, so nothing there is blanked.
+      expect(masked("```\n<!-- x -->\n```")).toEqual(["```", "<!-- x -->", "```"]);
     });
   });
 });

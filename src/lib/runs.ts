@@ -2,7 +2,7 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { and, count, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 import {
@@ -84,6 +84,7 @@ function toDetail(row: typeof schema.runs.$inferSelect): RunDetail {
   return {
     ...toSummary(row),
     leaseExpiresAt: toEpoch(row.leaseExpiresAt),
+    attemptStartedAt: toEpoch(row.attemptStartedAt),
     error: row.error ?? undefined,
     jobId: row.jobId ?? undefined,
     reviewScore: row.reviewScore ?? undefined,
@@ -148,6 +149,7 @@ export async function createRun(db: AntonDb, clock: Clock, input: CreateRunInput
     agentTag: input.agentTag,
     status: input.status ?? "running",
     startedAt: secDate(nowMs),
+    attemptStartedAt: secDate(nowMs),
     updatedAt: secDate(nowMs),
     writeSeq: nextWriteSeq(),
   });
@@ -170,6 +172,8 @@ export type RunPatch = Partial<{
   error: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
   reviewScore: number | null;
+  /** ms; converted to seconds. Rewritten by a resume — see the column's own note. */
+  attemptStartedAt: number;
   endedAt: number; // ms; converted to seconds
 }>;
 
@@ -185,7 +189,7 @@ export async function updateRun(
     writeSeq: nextWriteSeq(),
   };
   for (const [k, v] of Object.entries(patch)) {
-    if (k === "endedAt" && typeof v === "number") set.endedAt = secDate(v);
+    if ((k === "endedAt" || k === "attemptStartedAt") && typeof v === "number") set[k] = secDate(v);
     else set[k] = v;
   }
   await db.update(schema.runs).set(set).where(eq(schema.runs.id, id));
@@ -337,6 +341,86 @@ export async function listRecentRunOutcomes(
   offset = 0,
 ): Promise<RunDetail[]> {
   return (await recentRunRows(db, projectId, limit, offset)).map(toDetail);
+}
+
+/**
+ * When work carrying each of these beads DELIVERED — in unix SECONDS, unordered.
+ *
+ * Read for the repair weigher alone (gardener/repair.ts): a repair's double weight lasts only until
+ * the repaired bead next delivers, and a delivery that old is behind the streak the breaker walks —
+ * it is not in the run window and no board read remembers it.
+ *
+ * TWO sources, because the run row cannot name every bead a run delivered (PR #223 review). It
+ * carries one `ticketBeadId`, and a grouped run OVERWRITES it per child (jobs/execute-epic-ticket.ts
+ * `openTicketSession`) — so on the rows alone a repaired child that succeeded, followed by any other
+ * child, leaves no delivery at all, and its stamp goes on weighing later unrelated failures double
+ * until the breaker disarms the picker early. So the rows answer for the run's TARGET and its final
+ * ticket, and each ticket's own `execute` session — opened per child and settled `done` only once
+ * that child's work committed — answers for the rest.
+ *
+ * A ticket session settles `done` on its own commit, whatever becomes of the run around it: the
+ * repair the child carried was PROVEN by that landing, which is the whole test this evidence exists
+ * to apply.
+ *
+ * Bounded by the ids handed in — the beads that actually carry a repair stamp — so an unrepaired
+ * board costs no query at all.
+ */
+export async function listDeliveriesByBead(
+  db: AntonDb,
+  projectId: string,
+  beadIds: readonly string[],
+): Promise<Map<string, number[]>> {
+  const out = new Map<string, number[]>();
+  if (beadIds.length === 0) return out;
+  const ids = [...new Set(beadIds)];
+  const wanted = new Set(ids);
+  const record = (id: string, at: number) => out.set(id, [...(out.get(id) ?? []), at]);
+  const rows = await db
+    .select({
+      epicBeadId: schema.runs.epicBeadId,
+      ticketBeadId: schema.runs.ticketBeadId,
+      endedAt: schema.runs.endedAt,
+      updatedAt: schema.runs.updatedAt,
+    })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.status, "done"),
+        or(inArray(schema.runs.epicBeadId, ids), inArray(schema.runs.ticketBeadId, ids)),
+      ),
+    );
+  for (const row of rows) {
+    // A settled row's `updatedAt` is when it settled — the fallback for rows written before
+    // `endedAt` was recorded, exactly as the breakers' own fence reads them.
+    const at = toEpoch(row.endedAt) ?? toEpoch(row.updatedAt);
+    if (at === undefined) continue;
+    for (const id of [row.epicBeadId, row.ticketBeadId]) {
+      if (id === null || !wanted.has(id)) continue;
+      record(id, at);
+    }
+  }
+
+  const ticketRows = await db
+    .select({ beadId: schema.sessions.beadId, endedAt: schema.sessions.endedAt })
+    .from(schema.sessions)
+    .where(
+      and(
+        eq(schema.sessions.projectId, projectId),
+        eq(schema.sessions.kind, "execute"),
+        eq(schema.sessions.status, "done"),
+        inArray(schema.sessions.beadId, ids),
+      ),
+    );
+  for (const row of ticketRows) {
+    // `endedAt` is written with the `done` status in one update (sessions.ts `endSession`), so a
+    // row without one is not a delivery this read can place in time — and a delivery it cannot
+    // place is not one it may spend a repair stamp on.
+    const at = toEpoch(row.endedAt);
+    if (at === undefined || row.beadId === null) continue;
+    record(row.beadId, at);
+  }
+  return out;
 }
 
 /**
