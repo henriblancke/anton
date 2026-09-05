@@ -27,7 +27,7 @@ import { beads } from "../beads/bd";
 import { parseTicketNotes } from "../beads/notes";
 import { indexBoard } from "../gardener/board-index";
 import { activeDisarm } from "../autopilot-disarm";
-import * as schema_ from "../db/schema";
+import * as schema from "../db/schema";
 import { getJob } from "./queue";
 import { checkFailureStreak } from "./picker-failure-breaker";
 import { resetOperatorCache } from "../operator";
@@ -171,7 +171,7 @@ process.exit(0);`),
 
       // One run row, done, with no error on it — and no OTHER row: a park and its resume would show
       // up here as the second half of a story this run is not supposed to have.
-      const runRows = await tdb.db.select().from(schema_.runs);
+      const runRows = await tdb.db.select().from(schema.runs);
       expect(runRows).toHaveLength(1);
       expect(runRows[0].status).toBe("done");
       expect(runRows[0].error ?? null).toBeNull();
@@ -209,5 +209,8 @@ process.exit(0);`),
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
     }
-  });
+    // Five real dispatches plus commits and the PR step — too close to the config's uniform 150s
+    // ceiling to survive a loaded box, so this case buys the same headroom the gardener and
+    // product-master integration cases take.
+  }, 180_000);
 });

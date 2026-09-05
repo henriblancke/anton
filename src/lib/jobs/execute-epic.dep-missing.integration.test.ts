@@ -30,7 +30,7 @@ import { parseTicketNotes } from "../beads/notes";
 import { indexBoard } from "../gardener/board-index";
 import { repairFingerprint } from "../gardener/repair";
 import { revertPrereqEdge } from "../gardener/repair-dep-missing";
-import * as schema_ from "../db/schema";
+import * as schema from "../db/schema";
 import { getJob } from "./queue";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
@@ -151,7 +151,7 @@ process.exit(0);`),
       expect(job?.lastError).toContain("anton drew that edge itself");
 
       // The run row parks too — the resume after the blocker lands continues in this same row.
-      const runRow = (await tdb.db.select().from(schema_.runs)).find((r) => r.epicBeadId === target)!;
+      const runRow = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === target)!;
       expect(runRow.status).toBe("parked");
 
       // The edge itself, in the direction bd reads as "the prerequisite blocks the target".
@@ -231,7 +231,7 @@ process.exit(0);`),
       // change: the same block used to raise `ParkedOnPrereqError`, which is poison, and three real
       // runs disarmed autopilot that way in one incident.
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
-      const runRow = (await tdb.db.select().from(schema_.runs)).find((r) => r.epicBeadId === epic)!;
+      const runRow = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic)!;
       expect(runRow.status).toBe("done");
 
       // Both tickets shipped, and the ordering anton drew is on the board exactly as the park would

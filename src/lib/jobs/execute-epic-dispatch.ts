@@ -25,6 +25,7 @@ import {
   skippedDependents,
   type PrereqEdge,
   type SkipCause,
+  type TicketTimeoutOutcome,
 } from "./execute-epic-board";
 import {
   BlockedTailError,
@@ -97,7 +98,7 @@ export async function dispatchRunTickets(
 
   // A ticket ROLLED BACK by its budget contributed no commit (anton-t1mo), so it is not part of
   // what this run delivered — read by the tail's park and by the delivery verdict below.
-  const rolledBack = new Set(run.timedOut.filter((t) => !t.committed).map((t) => t.id));
+  const rolledBack = rolledBackIds(run.timedOut);
   await settleHeldTail(run, prep, { held, dispatchable, ledger, rolledBack, recordSkipped });
   return {
     delivered: await deliveredOrPark(run, prep, live, ledger, rolledBack),
@@ -297,17 +298,32 @@ function makeSkipRecorder(
  * The tickets this run can still dispatch and LAND — what a `dep-missing` prerequisite is tested
  * against (`prereqSite`), and deliberately narrower than the run's whole ticket set (PR review).
  *
- * A prerequisite this run is HOLDING behind a blocker outside it, or has SKIPPED behind a rolled-back
- * timeout, is one this attempt will never run: the wait it names is genuine, so it must take the
- * outside-park path, whose message the run-health sweep reads the blocker id back out of. Calling it
- * a sibling would re-order the run around a ticket that cannot move, re-dispatch the blocked ticket
- * into the identical failure, and park on generic no-delivery poison instead.
+ * A prerequisite this run is HOLDING behind a blocker outside it, has SKIPPED behind a rolled-back
+ * timeout, or was itself ROLLED BACK when its own budget ran out, is one this attempt will never
+ * land: the wait it names is genuine, so it must take the outside-park path, whose message the
+ * run-health sweep reads the blocker id back out of. Calling it a sibling would re-order the run
+ * around a ticket that cannot move, re-dispatch the blocked ticket into the identical failure, and
+ * park on generic no-delivery poison instead.
  *
  * A prerequisite the loop has already PASSED stays in, because it landed: that ordering is satisfied,
- * and the blocked ticket has earned the one retry the re-order gives it.
+ * and the blocked ticket has earned the one retry the re-order gives it. So does a timeout that
+ * committed before the deadline hit — its work is on the branch.
  */
-function landableTicketIds(dispatchable: Bead[], ledger: DispatchLedger): string[] {
-  return dispatchable.filter((t) => !ledger.skipCause.has(t.id)).map((t) => t.id);
+export function landableTicketIds(
+  dispatchable: Bead[],
+  ledger: DispatchLedger,
+  /** Live, not a snapshot: the loop pushes to it as tickets run out of time. */
+  timedOut: readonly TicketTimeoutOutcome[],
+): string[] {
+  const rolledBack = rolledBackIds(timedOut);
+  return dispatchable
+    .filter((t) => !ledger.skipCause.has(t.id) && !rolledBack.has(t.id))
+    .map((t) => t.id);
+}
+
+/** The tickets whose deadline took their work with it — no commit, so nothing of theirs landed. */
+function rolledBackIds(timedOut: readonly TicketTimeoutOutcome[]): Set<string> {
+  return new Set(timedOut.filter((t) => !t.committed).map((t) => t.id));
 }
 
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
@@ -429,7 +445,7 @@ async function dispatchTicket(
       run: runStep,
       steps: ticketSteps,
       ticket,
-      runTicketIds: landableTicketIds(dispatchable, ledger),
+      runTicketIds: landableTicketIds(dispatchable, ledger, timedOut),
       operator,
       closeOnDone: !standaloneRun,
       timeoutMs: ticketTimeoutMs,

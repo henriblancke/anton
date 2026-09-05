@@ -576,6 +576,24 @@ describe("repairDepMissing", () => {
     expect(listMock).not.toHaveBeenCalled();
     expect(linkMock).not.toHaveBeenCalled();
   });
+
+  // A RE-ORDER is counted like any other repair (anton-0gm2). The guard runs before the site is
+  // decided, so this holds today by construction — pinned here because the sibling path is the one
+  // that would otherwise loop: a second block of the same class re-orders the run forever.
+  it("counts a re-order too: the second block on the SIBLING path escalates (R5.6)", async () => {
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: alreadyRepaired(`re-ordered ${TARGET} behind \`${PREREQ}\``),
+      block: block(`still blocked on ${PREREQ}`),
+      now: T0 + 60_000,
+      autonomy: "apply",
+      runTicketIds: RUN_WITH_PREREQ,
+    });
+
+    expect(outcome.action).toBe("escalate");
+    expect(listMock).not.toHaveBeenCalled();
+    expect(linkMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("where the prerequisite sits relative to the run (anton-0gm2)", () => {

@@ -45,6 +45,7 @@ import {
   humanGateReason,
   HUMAN_GATE_ARMED_LABEL,
 } from "./execute-epic-human-gate";
+import { landableTicketIds } from "./execute-epic-dispatch";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage } from "./execute-epic-review";
 import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
@@ -1194,6 +1195,36 @@ describe("reorderForPrereq — a prerequisite the run holds itself (anton-0gm2)"
     });
     expect(already).toContain("had already been dispatched by this run");
     expect(already).toContain("one retry");
+  });
+});
+
+describe("landableTicketIds — which prerequisites this run can still land (anton-0gm2)", () => {
+  const ledger = (skipped: string[] = []) => ({
+    skipCause: new Map(skipped.map((id) => [id, { waitingOn: "x", stopped: "x" }])),
+    skipped: new Map(),
+    onBranch: new Set<string>(),
+  });
+  const board = () => [ticket("schema"), ticket("api"), ticket("wiring")];
+
+  it("holds every ticket the run can still dispatch", () => {
+    expect(landableTicketIds(board(), ledger(), [])).toEqual(["schema", "api", "wiring"]);
+  });
+
+  it("drops one skipped behind a rolled-back timeout — its wait is genuine, so it parks", () => {
+    expect(landableTicketIds(board(), ledger(["schema"]), [])).toEqual(["api", "wiring"]);
+  });
+
+  // The stopped ticket itself is never in `skipCause` (that map holds only its DEPENDENTS), so
+  // reading the skip map alone would call it a sibling and re-order the run around work that
+  // already ran and rolled back — one dispatch, the identical block, then generic no-delivery.
+  it("drops the timed-out ticket itself when its own work rolled back", () => {
+    const timedOut = [{ id: "schema", committed: false }];
+    expect(landableTicketIds(board(), ledger(), timedOut)).toEqual(["api", "wiring"]);
+  });
+
+  it("keeps a timeout that committed before the deadline — its work is on the branch", () => {
+    const timedOut = [{ id: "schema", committed: true }];
+    expect(landableTicketIds(board(), ledger(), timedOut)).toContain("schema");
   });
 });
 
