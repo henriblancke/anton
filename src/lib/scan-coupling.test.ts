@@ -142,6 +142,28 @@ describe("importGraph", () => {
     ]);
   });
 
+  // A rule whose target list lost its unmodellable substitutions keeps the ones it could read, and
+  // those are not the ones tsc reaches first. Resolving through a surviving fallback draws an edge
+  // to a module tsc never names, and a wrong edge is how a real cycle gets dropped (PR #190 review).
+  it("draws no alias edge through a rule whose targets are only partly modelled", async () => {
+    const graph = await graphOf({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          // The first target puts its substitution mid-path, which this model cannot express.
+          paths: { "@/*": ["./src/real/*/index", "./src/fallback/*"] },
+        },
+      }),
+      "src/a.ts": `import { x } from "@/x";\nexport const a = () => x();\n`,
+      "src/real/x/index.ts": `export const x = () => 1;\n`,
+      "src/fallback/x.ts": `export const x = () => 2;\n`,
+    });
+
+    // Not `src/fallback/x.ts`: tsc reads the first substitution, so claiming the second would be a
+    // module this import never names.
+    expect(await graph.edgesOf("src/a.ts")).toEqual([]);
+  });
+
   it("separates erased edges from the runtime ones", async () => {
     const graph = await graphOf({
       "src/a.ts": [

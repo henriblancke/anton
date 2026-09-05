@@ -758,7 +758,14 @@ function shellCode(line: string): string {
       quote = char;
       continue;
     }
-    if (char === "#" && (at === 0 || /\s/.test(line[at - 1] as string))) return line.slice(0, at);
+    // A `#` opens a comment where a WORD may start, which is after a metacharacter as surely as
+    // after a space: `true;# cat <<EOF` is a comment, and reading it as code queues an `EOF` no
+    // later line answers and blanks the rest of the script (PR #190 review). Redirection operators
+    // are left out — `heredocOpeners` reads `<<` off this same text, and a `#` behind one is not a
+    // shape worth risking that on.
+    if (char === "#" && (at === 0 || /[\s;&|()]/.test(line[at - 1] as string))) {
+      return line.slice(0, at);
+    }
   }
   return line;
 }
@@ -3043,7 +3050,11 @@ function specifierNames(
   const target = withoutModuleExtension(posix(module));
   const names = (resolved: string): boolean =>
     resolved === target || `${resolved}/index` === target;
-  if (spec.startsWith("./") || spec.startsWith("../"))
+  // `.` and `..` are relative specifiers in their own right — the directory's own index, and its
+  // parent's — and testing only for the `./` and `../` spellings sent them to the alias branch,
+  // where no rule claims them and the tail cannot read one, so a neighbour importing an index as
+  // `"."` named nothing and its live default stayed reported dead (PR #190 review).
+  if (RELATIVE_SPECIFIER.test(spec))
     return names(withoutModuleExtension(posix(normalize(join(dirname(importer), spec)))));
   const path = posix(spec);
   const { mapped, claimed } = aliasedModules(aliases, path);
@@ -3060,6 +3071,52 @@ function specifierNames(
     target.endsWith(`/${tail}`) ||
     target.endsWith(`/${tail}/index`)
   );
+}
+
+/** A specifier resolved against the importing file's own directory: `.`, `..`, `./x`, `../x`. */
+const RELATIVE_SPECIFIER = /^\.\.?(?:\/|$)/;
+
+/**
+ * The files that sit beside a directory's `index` module — the ones that can import it as `"."`,
+ * a specifier carrying no word for a grep to find (PR #190 review).
+ *
+ * `moduleWord` answers with the DIRECTORY's name for an index module, on the reasoning that every
+ * specifier naming it writes that name. `import Renamed from "."` in a sibling writes nothing of
+ * the kind, so the importer was never read and a live default export stayed reported dead. There is
+ * no word to grep for here, so the candidates are listed instead.
+ *
+ * One directory level only. A `".."` from a subdirectory names the same index and is still missed,
+ * which under-covers — the signal stands, the side this filter errs on — where listing the whole
+ * subtree would make one `src/index.ts` spend the entire file budget on a repo's worth of modules.
+ *
+ * The scan's exclusions are NOT passed, and cannot be: `git ls-files` returns nothing at all when
+ * an exclude pathspec is combined with a positive one (verified on git 2.50.1), unlike `git grep`.
+ * They would say nothing here anyway — every exclusion is a directory tree, and a file beside the
+ * index is in the index's own directory, which the scan already walked to raise the signal being
+ * checked. Nothing an exclusion covers can sit there without the index sitting there too.
+ *
+ * A listing git cannot produce is no candidates, exactly as a failed grep is.
+ */
+async function indexSiblings(
+  repoPath: string,
+  module: string,
+  abort?: AbortSignal,
+): Promise<string[]> {
+  const dir = posix(dirname(module));
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", repoPath, "ls-files", "-z", "--", dir], {
+      timeout: GREP_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+      signal: abort,
+    });
+    return stdout
+      .split("\0")
+      .filter(Boolean)
+      .filter((file) => posix(dirname(file)) === dir);
+  } catch {
+    abort?.throwIfAborted();
+    return [];
+  }
 }
 
 /**
@@ -3319,6 +3376,29 @@ async function defaultBindingCallers(
   }
   const callers = new Set<string>();
   let read = 0;
+  let spent = false;
+  /** Whether one candidate file binds a declaring module's default to a name it then uses. */
+  const judge = async (file: string): Promise<void> => {
+    if (declaring.has(file) || callers.has(file)) return;
+    if ((read += 1) > DEFAULT_BINDING_FILE_BUDGET) {
+      spent = true;
+      return;
+    }
+    abort?.throwIfAborted();
+    const entry = await maskedFile(repoPath, file, masked, abort);
+    if (!entry) return;
+    const locals = defaultBindingsOf(
+      entry.program,
+      file,
+      modules,
+      await aliasesGoverning(repoPath, file, aliases),
+    );
+    const used = locals.some((local) =>
+      entry.code.some((line, index) => entry.references(line, local, index)),
+    );
+    if (used) callers.add(file);
+  };
+
   for (const word of words) {
     abort?.throwIfAborted();
     const hits = await grepWord(repoPath, word, pathspecs, abort);
@@ -3327,21 +3407,17 @@ async function defaultBindingCallers(
     // standing — the conservative direction — rather than voiding a pass that did search the tree.
     if (!(hits instanceof Map)) continue;
     for (const file of hits.keys()) {
-      if (declaring.has(file) || callers.has(file)) continue;
-      if ((read += 1) > DEFAULT_BINDING_FILE_BUDGET) return [...callers];
-      abort?.throwIfAborted();
-      const entry = await maskedFile(repoPath, file, masked, abort);
-      if (!entry) continue;
-      const locals = defaultBindingsOf(
-        entry.program,
-        file,
-        modules,
-        await aliasesGoverning(repoPath, file, aliases),
-      );
-      const used = locals.some((local) =>
-        entry.code.some((line, index) => entry.references(line, local, index)),
-      );
-      if (used) callers.add(file);
+      await judge(file);
+      if (spent) return [...callers];
+    }
+  }
+  // A directory `index` can be imported as `"."`, which carries no word any grep could have found,
+  // so its neighbours are listed rather than searched for (PR #190 review).
+  for (const declared of modules.keys()) {
+    if (withoutModuleExtension(posix(declared)).split("/").pop() !== "index") continue;
+    for (const file of await indexSiblings(repoPath, declared, abort)) {
+      await judge(file);
+      if (spent) return [...callers];
     }
   }
   return [...callers];

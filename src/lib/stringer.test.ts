@@ -2658,6 +2658,30 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("scripts/quoted.sh");
     });
 
+    // Bash starts a comment wherever a WORD may start, which is after a metacharacter as surely as
+    // after a space. Read as code, `true;# cat <<EOF` queues an `EOF` no later line answers and
+    // blanks every command below it — including the real call (PR #190 review).
+    it("does not open a heredoc from a comment following a shell metacharacter", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/inline.sh": "true;# cat <<EOF\nneverCalled\n",
+        "scripts/piped.sh": "echo hi |# cat <<EOF\nneverCalled\n",
+        // Not vacuous: `a#b` is one word, so this `#` opens nothing and the heredoc below is real.
+        "scripts/word.sh": "echo a#b\ncat <<'EOF' > a.ts\nneverCalled();\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/inline.sh");
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/piped.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/word.sh");
+    });
+
     // A heredoc opener cannot be written inside a literal, so quoted text must not queue one:
     // `echo "example <<EOF here"` names no redirection, and waiting for a terminator that never
     // arrives blanks the rest of the script.
@@ -2869,6 +2893,30 @@ describe("scan", () => {
       expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
       expect(result.deadcode.dropped[0].reason).toContain("src/lib/host.js");
+    });
+
+    // A directory index is imported as `"."` by its own neighbours, a specifier carrying no word
+    // for the discovery grep to find — `moduleWord` answers with the DIRECTORY's name, which such
+    // an importer never writes, so the caller went unread and a live default stayed dead (PR #190
+    // review).
+    it("finds a default-import caller that names a directory index as `.`", async () => {
+      const repo = initRepo({
+        "src/widget/index.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/widget/page.ts": "import Renamed from '.';\nexport const page = () => Renamed();\n",
+        // Not vacuous: a neighbour that binds the default and never uses it is still the stale half.
+        "src/panel/index.ts": "export default function Panel() {\n  return null;\n}\n",
+        "src/panel/stale.ts": "import Ignored from '.';\nexport const kept = 1;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget/index.ts", "Widget"),
+        unused("src/panel/index.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Panel" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/widget/page.ts");
     });
 
     // A declaration broken after `export default` is still that module's default; the head has to

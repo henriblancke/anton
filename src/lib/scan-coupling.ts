@@ -630,10 +630,23 @@ async function resolveFile(state: GraphState, base: string): Promise<string | un
  *
  * Only the most specific claiming rule is consulted, because that is the only one tsc consults
  * (`claimingRules`). Within it the targets are an ORDERED fallback list and the first that exists
- * on disk wins, which is tsc's rule too.
+ * on disk wins, which is tsc's rule too — this pass reads the disk, so it can follow that order.
+ *
+ * An `unresolved` rule answers with nothing at all (PR #190 review). Its target list is missing the
+ * substitutions this model cannot express, and those are the EARLIER ones as often as not: where
+ * `"@/*"` lists `src/real/…/index` ahead of `src/fallback/*` (the `…` standing for the wildcard,
+ * which cannot be spelled here without closing this comment), tsc resolves `@/x` through the first
+ * target, while the only one left in this rule is the second. Following what survived draws an edge
+ * to a module tsc never names — and a wrong edge is how a real cycle gets dropped as though nothing
+ * closed it.
+ * No edge only ever costs proof, which leaves the signal standing, so that is the side to fail on.
+ *
+ * The multi-target bail `aliasedModules` makes has no counterpart here, and deliberately: it reads
+ * no disk and so cannot say which of an ordered list exists, where this loop can simply try them.
  */
 async function resolveAlias(state: GraphState, spec: string): Promise<string | undefined> {
   for (const { rule, rest } of claimingRules(state.aliases, spec)) {
+    if (rule.unresolved) continue;
     for (const target of rule.targets) {
       const file = await resolveFile(state, normalize(join(target, rest)));
       if (file) return file;
