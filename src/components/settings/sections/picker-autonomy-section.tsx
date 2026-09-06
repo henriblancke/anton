@@ -3,32 +3,82 @@
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
+import { TriangleAlertIcon } from "lucide-react";
 
 import { PICKER_AUTONOMY_LEVELS, type PickerAutonomy } from "@/lib/policy/types";
+import { formatExactTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { SectionHeading } from "@/components/settings/settings-fields";
 
 /**
- * What the picker's own record has earned (anton-vkp9), as the form receives it — plain counts and a
- * reason, computed on the server (`gardener/autonomy.ts` `earnedPickerAutonomy`) off the same
- * verdicts the pass reads.
+ * The bar the picker's record has to clear, mirrored from `EARNED_AUTONOMY_BARS` — both halves,
+ * because they are different gates: `minSettled` is "have you seen enough picks to have an opinion",
+ * `minAppliedPct` is "and was the opinion yes".
+ */
+export interface PickerBar {
+  minSettled: number;
+  minAppliedPct: number;
+}
+
+/** An operator's signature on a bypass of the earned floor, mirrored from `DeliberateArming`. */
+export interface PickerSignature {
+  by: string;
+  at: string;
+}
+
+/** What allows `apply`: this project's own record, or an operator's explicit override of it. */
+export type PickerArming = "earned" | "deliberate";
+
+/**
+ * What the picker's own record has earned (anton-vkp9) and what — if anything — allows `apply`
+ * today, as the form receives it. Computed on the server (`gardener/autonomy.ts`
+ * `pickerApplyVerdict`) off the same verdicts and the same stored signature the pass reads, because
+ * this module never imports server code and the verdict is a fact about the project.
  *
- * The counts travel WITH the verdict, exactly as the proposal rows' do. A control that is merely
- * disabled is the failure this floor exists to stop repeating: an operator who finds `apply`
- * unavailable has to be told what it is locked ON and what would unlock it, in the row, at the
- * moment they are deciding.
+ * The counts and the BAR travel WITH the verdict. A control that is merely disabled is the failure
+ * this floor exists to stop repeating: an operator who finds `apply` unavailable has to be told what
+ * it is locked ON and what would unlock it, in the row, at the moment they are deciding — and an
+ * operator standing on a signature has to be told what they are standing in for.
  */
 export interface EarnedPicker {
   /** Picks released, out of picks answered — the record, in the operator's own acts. */
   accepted: number;
   settled: number;
-  eligible: boolean;
-  /** Why apply is unavailable, with the counts and the bar. Absent exactly when eligible. */
+  /** The two thresholds the counts above are read against. */
+  bar: PickerBar;
+  /**
+   * What allows `apply` — "earned" while the record clears the bar on its own, "deliberate" while
+   * only an operator's signature does, absent when nothing does. Never "earned" because of a
+   * signature: that is what keeps this surface from laundering an override into an achievement.
+   */
+  arming?: PickerArming;
+  /** The stored signature, whenever there is one — including after the record has caught up. */
+  deliberate?: PickerSignature;
+  /**
+   * Why the RECORD does not support `apply`, with the counts and the bar. Absent exactly when it
+   * does — so it is still present, and still shown, while a deliberate arming stands in for it.
+   */
   reason?: string;
 }
 
+/**
+ * The picker's bar, mirrored from `EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER]` and guarded against
+ * drift by this module's test. Only ever a fallback — every real render is handed the server's copy.
+ */
+export const PICKER_BAR: PickerBar = { minSettled: 20, minAppliedPct: 90 };
+
 /** A project with no answered picks — what every project starts on, and what an unreadable store yields. */
-export const NO_PICKER_RECORD: EarnedPicker = { accepted: 0, settled: 0, eligible: false };
+export const NO_PICKER_RECORD: EarnedPicker = { accepted: 0, settled: 0, bar: PICKER_BAR };
 
 const PICKER_LEVEL_HINT: Record<PickerAutonomy, string> = {
   propose: "ranks what could run next and records the plan · nothing is offered",
@@ -38,16 +88,21 @@ const PICKER_LEVEL_HINT: Record<PickerAutonomy, string> = {
 
 /**
  * Why `apply` is locked, always sayable — the same reasoning `lockedReason` uses for a detection
- * kind: `eligible` is the gate and `reason` only ever its label, so a verdict that arrives
- * ineligible with no reason still reads as locked instead of silently offering the level.
+ * kind: `arming` is the gate and `reason` only ever its label, so a verdict that arrives with
+ * neither still reads as locked instead of silently offering the level.
  */
 export function lockedPickerReason(earned: EarnedPicker): string {
   return earned.reason ?? "no record could be read for this project — apply stays locked";
 }
 
+/** The released share of what was answered, or undefined when nothing has been answered at all. */
+function releasedPct(earned: EarnedPicker): number | undefined {
+  return earned.settled > 0 ? Math.round((earned.accepted / earned.settled) * 100) : undefined;
+}
+
 /**
- * How far the picker may go with the plan it decides (anton-vkp9), and what this project's own
- * record has earned.
+ * How far the picker may go with the plan it decides (anton-vkp9), what this project's own record
+ * has earned, and — when an operator has signed for `apply` without it (anton-d1lk) — that they did.
  *
  * Sits under the work policy because the two answer halves of one question — the policy is what
  * anton MAY start, this is whether it starts it — and because `apply` is unreachable without an
@@ -76,7 +131,7 @@ export function PickerAutonomySection({
   // this yet" are different problems with different next steps.
   const blocked = !armed
     ? "accept a work policy first — anton will not start work off a policy that admits everything"
-    : earned.eligible
+    : earned.arming
       ? undefined
       : lockedPickerReason(earned);
   // What the pass will ACTUALLY do, not what is stored. A floored `apply` shown as selected would
@@ -153,42 +208,29 @@ export function PickerAutonomySection({
           <span className="font-mono">apply</span> returns the picker to{" "}
           <span className="font-mono">shadow</span> on its own.
         </span>
+        {/* The bypass, named at the top too (anton-z1lp): an operator who is going to reach for it
+            should meet it as a signed, revocable exception rather than discover it as a shortcut. */}
+        <span className="text-[11px] text-subtle">
+          You can also arm it <span className="text-risk-med">deliberately</span> — an explicit
+          bypass of that bar, signed with your name, revocable at any time, and labelled as an
+          override everywhere the level is shown. It is never reported as earned.
+        </span>
       </div>
 
       <div className="flex flex-col gap-2.5 rounded-[10px] border border-border bg-card px-3 py-3">
         <div className="flex items-center gap-3">
           <div className="flex min-w-0 flex-col gap-0.5">
             <span className="text-[12.5px] font-medium">This project&apos;s record</span>
-            {earned.eligible ? (
-              // Said out loud on the way UP too: the counts are what an operator is arming ON, and a
-              // bar that only ever speaks when it refuses gives them no way to know it was consulted.
-              <span className="text-[11px] text-subtle">
-                {earned.accepted}/{earned.settled} released — clears the bar
-              </span>
-            ) : (
-              <span className="text-[11px] text-risk-med">
-                apply locked · {lockedPickerReason(earned)}
-              </span>
-            )}
-            {/* The structural floor is stated separately from the record, and never instead of it:
-                an unarmed project still has a record, and hiding its counts behind "accept a policy
-                first" would leave the operator unable to see the second gate coming. */}
-            {!armed && (
-              <span className="text-[11px] text-risk-med">
-                apply also needs a work policy — anton will not start work off one that admits
-                everything.
-              </span>
-            )}
-            {floored && (
-              // The demotion, said where the setting is. An operator who chose `apply` and is
-              // getting `shadow` must not have to read the pass's logs to find that out.
-              <span className="text-[11px] text-risk-med">
-                You chose <span className="font-mono">apply</span>; anton is running this picker at{" "}
-                <span className="font-mono">shadow</span> until the record supports it. Nothing was
-                un-chosen — it takes effect on its own once the counts clear the bar. Select{" "}
-                <span className="font-mono">shadow</span> to drop that choice for good.
-              </span>
-            )}
+            {/* The level, and WHAT is holding it up, said in the same breath (anton-z1lp). */}
+            <span className="text-[11px] text-subtle">
+              running at <span className="font-mono text-primary">{resolved}</span>
+              {resolved === "apply" &&
+                (earned.arming === "deliberate" ? (
+                  <span className="text-risk-med"> · armed deliberately — not earned</span>
+                ) : (
+                  <span> · earned by the record below</span>
+                ))}
+            </span>
           </div>
           <span className="ml-auto shrink-0">
             <fieldset
@@ -235,11 +277,351 @@ export function PickerAutonomySection({
           </span>
         </div>
 
+        <PickerLadder earned={earned} />
+
+        <div className="flex flex-col gap-0.5">
+          {earned.arming === "earned" ? (
+            // Said out loud on the way UP too: the counts are what an operator is arming ON, and a
+            // bar that only ever speaks when it refuses gives them no way to know it was consulted.
+            <span className="text-[11px] text-subtle">
+              this record clears the bar — <span className="font-mono">apply</span> is earned
+            </span>
+          ) : (
+            <span className="text-[11px] text-risk-med">
+              {earned.arming === "deliberate" ? "record does not support apply" : "apply locked"} ·{" "}
+              {lockedPickerReason(earned)}
+            </span>
+          )}
+          {/* The structural floor is stated separately from the record, and never instead of it:
+              an unarmed project still has a record, and hiding its counts behind "accept a policy
+              first" would leave the operator unable to see the second gate coming. */}
+          {!armed && (
+            <span className="text-[11px] text-risk-med">
+              apply also needs a work policy — anton will not start work off one that admits
+              everything.
+            </span>
+          )}
+          {floored && (
+            // The demotion, said where the setting is. An operator who chose `apply` and is
+            // getting `shadow` must not have to read the pass's logs to find that out.
+            <span className="text-[11px] text-risk-med">
+              You chose <span className="font-mono">apply</span>; anton is running this picker at{" "}
+              <span className="font-mono">shadow</span> until the record supports it. Nothing was
+              un-chosen — it takes effect on its own once the counts clear the bar. Select{" "}
+              <span className="font-mono">shadow</span> to drop that choice for good.
+            </span>
+          )}
+        </div>
+
+        <DeliberateArming slug={slug} armed={armed} earned={earned} />
+
         <span className="text-[11px] text-subtle">
           Every unattended start is recorded in the decision log on this project&apos;s Health page,
           beside the picks you vetoed.
         </span>
       </div>
     </section>
+  );
+}
+
+/**
+ * Where this project stands on the ladder — both rungs, as counts against the bar they are read
+ * against (anton-z1lp).
+ *
+ * Two rungs rather than one number, because the bar is two gates and a project can be short of
+ * either: twelve answers at 100% released has not been seen enough to have an opinion, and forty at
+ * 60% has been. The meters are decorative — every number they draw is in the text beside them, so a
+ * screen reader loses nothing by skipping them.
+ */
+function PickerLadder({ earned }: { earned: EarnedPicker }) {
+  const { accepted, settled, bar } = earned;
+  const pct = releasedPct(earned);
+  return (
+    <dl className="flex flex-col gap-1">
+      <LadderRung
+        label="answered"
+        value={`${settled}/${bar.minSettled}`}
+        note="picks you released or vetoed"
+        filled={settled / bar.minSettled}
+        cleared={settled >= bar.minSettled}
+      />
+      <LadderRung
+        label="released"
+        value={pct === undefined ? `—/${bar.minAppliedPct}%` : `${pct}%/${bar.minAppliedPct}%`}
+        note={pct === undefined ? "nothing answered yet" : `${accepted} of ${settled} answered`}
+        filled={(pct ?? 0) / 100}
+        // Compared by cross multiplication like the floor itself, never on the rounded percentage:
+        // 26/29 is 89.66% and reads as 90, and a rung that called that cleared would disagree with
+        // the pass about the one thing this panel exists to explain.
+        cleared={settled > 0 && accepted * 100 >= bar.minAppliedPct * settled}
+      />
+    </dl>
+  );
+}
+
+function LadderRung({
+  label,
+  value,
+  note,
+  filled,
+  cleared,
+}: {
+  label: string;
+  value: string;
+  note: string;
+  /** How far along the rung this project is, 0–1. Clamped — a record past the bar is still full. */
+  filled: number;
+  cleared: boolean;
+}) {
+  const width = `${Math.min(100, Math.max(0, Math.round(filled * 100)))}%`;
+  return (
+    <div className="flex items-center gap-2.5">
+      <dt className="w-14 shrink-0 font-mono text-[10.5px] text-subtle">{label}</dt>
+      <dd className="flex min-w-0 flex-1 items-center gap-2.5">
+        <span
+          aria-hidden="true"
+          className="h-1 w-24 shrink-0 overflow-hidden rounded-full bg-border"
+        >
+          <span
+            className={cn("block h-full rounded-full", cleared ? "bg-primary" : "bg-risk-med")}
+            style={{ width }}
+          />
+        </span>
+        <span
+          className={cn("shrink-0 font-mono text-[10.5px]", cleared ? "text-primary" : "text-risk-med")}
+        >
+          {value}
+        </span>
+        <span className="truncate text-[11px] text-subtle">{note}</span>
+      </dd>
+    </div>
+  );
+}
+
+/**
+ * The signed bypass of the earned floor (anton-d1lk), and the one control that creates it.
+ *
+ * Shown only where it can mean something. A project with no work policy cannot reach `apply` however
+ * deliberately it is armed, so it is offered no button — the structural floor is stated above
+ * instead. A project whose record already clears the bar is offered none either: there is nothing to
+ * stand in for. What is always shown, once a signature exists, is WHO signed and WHEN — including
+ * after the record catches up, because the fact that this project once ran unattended on somebody's
+ * word rather than on evidence does not stop being true.
+ */
+function DeliberateArming({
+  slug,
+  armed,
+  earned,
+}: {
+  slug: string;
+  armed: boolean;
+  earned: EarnedPicker;
+}) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string>();
+  const [acknowledged, setAcknowledged] = useState(false);
+
+  const signature = earned.deliberate;
+  // Nothing signed, and nothing a signature would buy: an unarmed project cannot reach `apply` at
+  // all, and an earned one is already there.
+  if (!signature && (!armed || earned.arming === "earned")) return null;
+
+  async function send(method: "POST" | "DELETE") {
+    setPending(true);
+    setError(undefined);
+    try {
+      const res = await fetch(`/api/projects/${slug}/picker/arming`, { method });
+      const body = (await res.json().catch(() => null)) as
+        | { error?: string; armedBy?: string; autonomy?: string }
+        | null;
+      if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
+      if (method === "POST") {
+        toast.success("apply armed deliberately", {
+          description: body?.armedBy ? `Recorded as ${body.armedBy}.` : undefined,
+        });
+        setOpen(false);
+        setAcknowledged(false);
+      } else {
+        toast.success("Deliberate arming revoked", {
+          description: body?.autonomy ? `Picker is running at ${body.autonomy}.` : undefined,
+        });
+      }
+      // The level and the signature are both the server's answer — a refresh is what settles which
+      // of the two floors this project now stands on.
+      router.refresh();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Request failed";
+      setError(message);
+      toast.error(message);
+      // A refusal usually means the state moved under this tab (someone armed it, or the policy was
+      // removed) — re-read rather than leave a control that errors on every click.
+      router.refresh();
+    } finally {
+      setPending(false);
+    }
+  }
+
+  const signedAt = signature ? formatExactTime(signature.at) : null;
+  return (
+    <div className="flex items-center gap-3 rounded-[9px] border border-risk-med/30 bg-risk-med/5 px-2.5 py-2">
+      <div className="flex min-w-0 flex-col gap-0.5">
+        {signature ? (
+          <>
+            <span className="text-[11px] text-risk-med">
+              <span className="font-mono">apply</span> armed deliberately by{" "}
+              <span className="font-medium">{signature.by}</span>
+              {signedAt ? ` on ${signedAt}` : null}
+            </span>
+            <span className="text-[11px] text-subtle">
+              {earned.arming === "deliberate"
+                ? "It stands in for the record above. Revoking returns this picker to shadow until the record clears the bar on its own."
+                : "The record above now clears the bar on its own, so apply no longer rests on this signature. Revoking changes nothing while that holds."}
+            </span>
+          </>
+        ) : (
+          <>
+            <span className="text-[11px] font-medium">Arm apply deliberately</span>
+            <span className="text-[11px] text-subtle">
+              Sign for unattended starts before the record supports them. Your name is recorded on
+              it, and you can revoke it at any time.
+            </span>
+          </>
+        )}
+        {/* The dialog reports its own refusals; repeating one behind it would say it twice. */}
+        {error && !open && (
+          <span role="alert" className="text-[11px] text-risk-high">
+            {error}
+          </span>
+        )}
+      </div>
+      <span className="ml-auto shrink-0">
+        {signature ? (
+          <Button
+            type="button"
+            size="xs"
+            variant="outline"
+            disabled={pending}
+            onClick={() => void send("DELETE")}
+          >
+            {pending ? "Revoking…" : "Revoke arming"}
+          </Button>
+        ) : (
+          <Button
+            type="button"
+            size="xs"
+            variant="destructive"
+            disabled={pending}
+            onClick={() => setOpen(true)}
+          >
+            <TriangleAlertIcon aria-hidden="true" />
+            Arm deliberately
+          </Button>
+        )}
+      </span>
+
+      <Dialog
+        open={open}
+        onOpenChange={(next) => {
+          if (pending) return;
+          setOpen(next);
+          if (!next) {
+            setAcknowledged(false);
+            setError(undefined);
+          }
+        }}
+      >
+        <DialogContent showCloseButton={!pending}>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-risk-med">
+              <TriangleAlertIcon className="size-4" aria-hidden="true" />
+              Arm apply without the record
+            </DialogTitle>
+            <DialogDescription>
+              anton will approve, claim and start its top pick unattended, with nobody asked first.
+              Your name is recorded on that decision, and every surface that shows the level will say
+              it was armed deliberately rather than earned.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium">What this bypasses</span>
+            <ul className="flex list-disc flex-col gap-1 pl-4 text-xs text-muted-foreground">
+              <li>
+                The earned floor, and only that — the bar this project has not cleared:{" "}
+                <span className="text-foreground">{lockedPickerReason(earned)}</span>.
+              </li>
+              <li>
+                Until you revoke it, every unattended start rests on your judgement rather than on
+                evidence that anton&apos;s picks were worth starting.
+              </li>
+            </ul>
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium">What still protects this project</span>
+            <ul className="flex list-disc flex-col gap-1 pl-4 text-xs text-muted-foreground">
+              <li>
+                Your <span className="text-foreground">work policy</span> — anton can only start the
+                targets it admits, and it is re-checked at the moment of the start.
+              </li>
+              <li>
+                The <span className="text-foreground">brakes</span> — a disarm, the failure and
+                score-regression breakers, and your review-queue limit all still hold starts back.
+              </li>
+              <li>
+                The <span className="text-foreground">budget</span> still caps what a day of
+                unattended work spends.
+              </li>
+              <li>
+                Every unattended start is recorded in the decision log on this project&apos;s Health
+                page.
+              </li>
+              <li>
+                It stays <span className="text-foreground">revocable</span>: revoking drops the
+                picker back to <span className="font-mono">shadow</span> on the next pass unless the
+                record has caught up by then.
+              </li>
+            </ul>
+          </div>
+
+          <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-risk-med/30 bg-risk-med/5 px-2.5 py-2 text-xs leading-snug">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={acknowledged}
+              disabled={pending}
+              onChange={(e) => setAcknowledged(e.target.checked)}
+            />
+            <span>
+              I am arming <span className="font-mono">apply</span> without the record, and it is
+              recorded against my operator identity.
+            </span>
+          </label>
+
+          {error && (
+            <p role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+          )}
+
+          <DialogFooter>
+            <DialogClose render={<Button variant="ghost" size="sm" disabled={pending} />}>
+              Cancel
+            </DialogClose>
+            <Button
+              type="button"
+              variant="destructive"
+              size="sm"
+              disabled={!acknowledged || pending}
+              onClick={() => void send("POST")}
+            >
+              {pending ? "Arming…" : "Arm apply deliberately"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
   );
 }

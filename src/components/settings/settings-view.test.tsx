@@ -74,10 +74,12 @@ type PickerEarned = Parameters<typeof SettingsView>[0]["pickerEarned"];
  * The picker's own accept/veto record (anton-vkp9). The default is the project every operator
  * starts on — no pick answered either way, so `apply` is locked and has to say what on.
  */
+const PICKER_BAR: PickerEarned["bar"] = { minSettled: 20, minAppliedPct: 90 };
+
 const NO_PICKER_RECORD: PickerEarned = {
   accepted: 0,
   settled: 0,
-  eligible: false,
+  bar: PICKER_BAR,
   reason: "no answered picks yet — apply unlocks at 20 answered with 90% released",
 };
 
@@ -2229,13 +2231,16 @@ describe("SettingsView picker autonomy (anton-vkp9)", () => {
     renderView({ ...ARMED }, [], [], NO_RECORD, [], {
       accepted: 12,
       settled: 15,
-      eligible: false,
+      bar: PICKER_BAR,
       reason: "12/15 released — apply unlocks at 20 answered with 90% released",
     });
 
     expect(
       screen.getByText(/12\/15 released — apply unlocks at 20 answered with 90% released/),
     ).toBeTruthy();
+    // And where it stands on each rung of the ladder, against the bar that rung is read against.
+    expect(screen.getByText("15/20")).toBeTruthy();
+    expect(screen.getByText("80%/90%")).toBeTruthy();
     expect((screen.getByLabelText("picker · apply") as HTMLInputElement).disabled).toBe(true);
     // The levels that MAKE the record are never gated — that is where the counts come from.
     expect((screen.getByLabelText("picker · shadow") as HTMLInputElement).disabled).toBe(false);
@@ -2245,10 +2250,12 @@ describe("SettingsView picker autonomy (anton-vkp9)", () => {
     renderView({ ...ARMED }, [], [], NO_RECORD, [], {
       accepted: 19,
       settled: 20,
-      eligible: true,
+      bar: PICKER_BAR,
+      arming: "earned",
     });
 
-    expect(screen.getByText(/19\/20 released — clears the bar/)).toBeTruthy();
+    expect(screen.getByText(/this record clears the bar/)).toBeTruthy();
+    expect(screen.getByText("19 of 20 answered")).toBeTruthy();
     expect((screen.getByLabelText("picker · apply") as HTMLInputElement).disabled).toBe(false);
   });
 
@@ -2272,7 +2279,12 @@ describe("SettingsView picker autonomy (anton-vkp9)", () => {
 
   it("PATCHes the level as soon as it is chosen", async () => {
     const fetchMock = stubFetch();
-    renderView({ ...ARMED }, [], [], NO_RECORD, [], { accepted: 20, settled: 20, eligible: true });
+    renderView({ ...ARMED }, [], [], NO_RECORD, [], {
+      accepted: 20,
+      settled: 20,
+      bar: PICKER_BAR,
+      arming: "earned",
+    });
 
     fireEvent.click(screen.getByLabelText("picker · apply"));
 
