@@ -35,6 +35,7 @@ import {
   getProjectSettingsBySlug,
   type ProjectSettings,
 } from "@/lib/projects";
+import { QUOTA_SHARE_RANGE } from "@/lib/quota-share";
 import { resolveProject } from "../resolve-project";
 import {
   accept,
@@ -89,6 +90,9 @@ const JOB_POLICY_FIELDS: readonly FieldRule<ProjectSettings>[] = [
   settingsField("autopilotScoreFloor", integerInRange(AUTOPILOT_SCORE_FLOOR_RANGE)),
   settingsField("autopilotScoreWindow", integerInRange(AUTOPILOT_SCORE_WINDOW_RANGE)),
   settingsField("autopilotWipLimit", integerInRange(AUTOPILOT_WIP_LIMIT_RANGE)),
+  // A declared quota share (R6.1). `0` is a real value here too — it parks a repo's spend without
+  // disarming it — and a cleared field falls back to the equal split across governed projects.
+  settingsField("quotaSharePct", integerInRange(QUOTA_SHARE_RANGE)),
 ];
 
 /**
@@ -159,6 +163,8 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     // Cleared = not yet asked, so the next arm offers the weekly cadence again.
     settingsField("keepProductMasterWeekly", booleanValue),
     settingsField("budgetAware", booleanValue),
+    // `reserve my share` (R6.5) — cleared, the share flows to whoever has work.
+    settingsField("reserveQuotaShare", booleanValue),
 
     // Policy blobs. Each parsed partial is deep-merged into the stored policy by
     // updateProjectSettings, so a client that exposes one knob never wipes the others —

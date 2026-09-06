@@ -303,6 +303,19 @@ export interface ProjectSettings {
    */
   budgetPolicy?: ProjectBudgetPolicy;
   /**
+   * This project's declared cut of the shared weekly Claude quota, 0–100 (R6.1). Absent → an equal
+   * split across the projects with budget-aware execution on ({@link defaultQuotaSharePct}), so a
+   * machine that never declares anything still divides its quota rather than racing for it. Only
+   * consulted when {@link budgetAware} is on — an ungoverned project spends unpaced either way.
+   */
+  quotaSharePct?: number;
+  /**
+   * `reserve my share` (R6.5): hold this project's share out of renormalization even while it has no
+   * eligible work, for a repo touched irregularly. Absent → off, which is what lets an idle repo's
+   * share flow to the projects that can use it rather than resetting unspent.
+   */
+  reserveQuotaShare?: boolean;
+  /**
    * Per-label pipeline variants (anton-aa3m): bead label → the run formula a target carrying it
    * walks, in PRECEDENCE ORDER (first match wins — see `selectRunFormula`). Lets risk and size drive
    * process, so `risk:high` can carry a design step or a sign-off gate while a docs-only ticket

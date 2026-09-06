@@ -17,6 +17,8 @@ import { latestPickerTrackRecord } from "@/lib/picker-veto";
 import { bundledAgentIds, discoverAgents } from "@/lib/agents-discovery";
 import { DEFAULT_SCHEDULES, listSchedules } from "@/lib/schedules";
 import { loadBaseSystemPrompt } from "@/lib/claude/system-prompt";
+import { quotaShareProjects } from "@/lib/quota-spend";
+import type { QuotaShareProject } from "@/lib/quota-share";
 import { SettingsView } from "@/components/settings/settings-view";
 
 export const dynamic = "force-dynamic";
@@ -120,6 +122,29 @@ export default async function ProjectSettingsPage({
     ...(picker.reason ? { reason: picker.reason } : {}),
   };
 
+  // Every project's position in the quota split (R6) — declared share, live eligibility and what
+  // this week attributed to it. Cross-project because a share only reads against the others.
+  // Fail-soft to THIS project's own row rather than to nothing: an empty list would take the share
+  // and reserve controls off the page entirely, so a failed read of everyone else's position would
+  // cost the operator the one position they came here to set.
+  const quotaProjects = await quotaShareProjects().catch<QuotaShareProject[]>(() => [
+    {
+      id: project.id,
+      slug: project.slug,
+      name: project.name,
+      sharePct: settings.quotaSharePct ?? 100,
+      declared: settings.quotaSharePct !== undefined,
+      governed: settings.budgetAware === true,
+      reserved: settings.reserveQuotaShare === true,
+      // The read failed, so eligibility is unknown. "Can spend" is the weaker claim — reading it as
+      // idle would tell the operator their share is in use elsewhere, naming a beneficiary we did
+      // not manage to look up.
+      eligible: true,
+      spentWeeklyPct: null,
+      seeded: false,
+    },
+  ]);
+
   return (
     <SettingsView
       project={project}
@@ -138,6 +163,7 @@ export default async function ProjectSettingsPage({
       boardUnavailable={!board.ok}
       earned={earned}
       pickerEarned={pickerEarned}
+      quotaProjects={quotaProjects}
     />
   );
 }
