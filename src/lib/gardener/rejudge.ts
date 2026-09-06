@@ -170,7 +170,7 @@ function evidenceFor(
 ): string[] {
   const parked = index.openDescendants(bead.id);
   return [
-    `${bead.id} is deferred, last written ${stampOf(bead)} — ${ageDays} days ago, past the ${threshold}-day re-judgement window; nothing has touched it since, so that write is the parking itself`,
+    `${bead.id} is deferred, last written ${stampOf(bead)} — ${ageDays} days ago, past the ${threshold}-day re-judgement window`,
     `${describe(bead)} — ${homeOf(index, bead)}`,
     beads.isApproved(bead)
       ? "it still carries `approved`, so returning it to the board puts it straight into the claimable pool — the answer starts a run, it does not queue a decision"

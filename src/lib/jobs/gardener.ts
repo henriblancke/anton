@@ -191,9 +191,12 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
         closed > 0 && `closed ${closed} epic(s)`,
         actions.rowsRecomputed > 0 && `recomputed ${actions.rowsRecomputed} blocked row(s)`,
         findings.length > 0 && `${findings.length} finding(s)`,
-        // The asks the judgment tier left standing earn a clause of their own, because several kinds
-        // rest on no hygiene finding at all — a re-judgement (anton-30vo), a container orphan — so
-        // without this a patrol that filed three questions would settle as "board clean".
+        // The asks the judgment tier filed earn a clause of their own, because several kinds rest on
+        // no hygiene finding at all — a re-judgement (anton-30vo), a container orphan — so without
+        // this a patrol that filed three questions would settle as "board clean". It counts what was
+        // WRITTEN, so an armed kind the pass then applied itself still shows here rather than
+        // vanishing into a clean-looking night; which asks are still open is the armed walk's own
+        // record, by id, in this session's log.
         filed > 0 && `filed ${filed} proposal(s)`,
       ].filter((clause): clause is string => clause !== false);
       effect =

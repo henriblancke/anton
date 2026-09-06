@@ -1109,10 +1109,12 @@ describe("returning parked work to the board", () => {
   });
 
   // Un-parking by hand IS a write since the filing, so the idempotent branch has to be read before
-  // the fence — otherwise the ask refuses over the very state it wanted.
+  // the fence — otherwise the ask refuses over the very state it wanted. `warm`, not `cold`, is what
+  // makes that ordering visible: only a subject stamped AFTER the filing gives the fence something
+  // to fire on, so this passes for the right reason rather than because the fence was blind.
   it("writes nothing when the bead was un-parked between the decision and the lock", async () => {
     const proposal = proposalFor(UNDEFER);
-    liveBeads.set("anton-a", cold("anton-a"));
+    liveBeads.set("anton-a", warm("anton-a"));
 
     const result = await apply(proposal, [parked(), proposal]);
 

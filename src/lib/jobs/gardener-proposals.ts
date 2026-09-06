@@ -220,9 +220,14 @@ function armed(
  * File this patrol's proposals: fold the duplicates a rival patrol left standing, emit, withdraw the
  * twin another machine filed for the same claim, then record what an armed patrol would have done.
  *
- * Returns how many asks this pass LEFT STANDING on the board — what the patrol's own outcome line
- * reports (gardener.ts). A twin arbitration withdrew is not one: it is a closed bead nobody is being
- * asked about. The count is the pass's only account of its judgment tier, because a proposal is a
+ * Returns how many asks this pass FILED and kept — what the patrol's own outcome line reports
+ * (gardener.ts). A twin arbitration withdrew is not one: it is a closed bead nobody is ever asked
+ * about, so it would be a question this pass never really put on the board. An armed apply IS one
+ * even though it settles the proposal it answered (gardener/armed.ts): the count is what this tier
+ * WROTE, not what is left open at the end of it, and the armed walk records what it did to each ask
+ * by id in the same session log.
+ *
+ * That count is what stops the tier disappearing from the pass's outcome, because a proposal is a
  * bead this patrol wrote and several kinds rest on no hygiene finding at all — a pass that filed
  * three asks and reported "board clean" would tell an operator the silence they were promised on a
  * healthy board while three questions waited on the board for them.
@@ -291,6 +296,9 @@ export async function fileGardenerProposals(
     const standing = emission.created.filter((p) => !withdrawn.has(p.id));
     await shadow(scope, standing, input.observedAtMs, record);
     await armed(scope, standing, record);
+    // Counted as arbitration left it, not as arming did: an applied ask is a question this pass both
+    // asked and answered, and dropping it here would let a patrol that armed every kind report a
+    // clean board over a night of unattended writes.
     return standing.length;
   } catch (e) {
     // The proposals a stopped pass DID file are on the board like any other, so they get the same
