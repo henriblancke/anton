@@ -21,6 +21,7 @@ let resolveProjectBudgetPolicy: typeof import("./projects").resolveProjectBudget
 let resolveBudgetPolicy: typeof import("./projects").resolveBudgetPolicy;
 let DEFAULT_PROJECT_BUDGET_POLICY: typeof import("./projects").DEFAULT_PROJECT_BUDGET_POLICY;
 let updateProjectSettings: typeof import("./projects").updateProjectSettings;
+let updateProjectSettingsIf: typeof import("./projects").updateProjectSettingsIf;
 let getProjectSettingsBySlug: typeof import("./projects").getProjectSettingsBySlug;
 let isBudgetAwareEnabledAnywhere: typeof import("./projects").isBudgetAwareEnabledAnywhere;
 let resolveValueLabels: typeof import("./projects").resolveValueLabels;
@@ -55,6 +56,7 @@ beforeAll(async () => {
   resolveBudgetPolicy = mod.resolveBudgetPolicy;
   DEFAULT_PROJECT_BUDGET_POLICY = mod.DEFAULT_PROJECT_BUDGET_POLICY;
   updateProjectSettings = mod.updateProjectSettings;
+  updateProjectSettingsIf = mod.updateProjectSettingsIf;
   getProjectSettingsBySlug = mod.getProjectSettingsBySlug;
   isBudgetAwareEnabledAnywhere = mod.isBudgetAwareEnabledAnywhere;
   resolveValueLabels = mod.resolveValueLabels;
@@ -420,6 +422,45 @@ describe("updateProjectSettings is atomic against a concurrent write", () => {
     const settings = await getProjectSettingsBySlug(created.slug);
     expect(settings.model).toBe("claude-sonnet-5");
     expect(settings.pickerPolicy).toEqual({ types: ["bug"] });
+  });
+});
+
+/**
+ * A conditional writer decides against the settings its write lands on, not against a snapshot read
+ * before it. Anything that answers "already done, nothing changed" with a 409 — the deliberate
+ * arming of `apply`, say — is only telling the truth if the check and the write are one act.
+ */
+describe("updateProjectSettingsIf decides under the write lock", () => {
+  it("applies the first of two racing writers and refuses the second", async () => {
+    const created = await addProject({
+      name: "Conditional Write",
+      repoPath: makeRepoDir("conditional-write"),
+    });
+    const claim = (model: string) =>
+      updateProjectSettingsIf<string>(created.slug, (current) =>
+        current.model ? { refuse: `already ${current.model}` } : { write: { model } },
+      );
+    const results = await Promise.all([claim("claude-opus-5"), claim("claude-sonnet-5")]);
+
+    const applied = results.filter((r) => r.applied);
+    expect(applied).toHaveLength(1);
+    const stored = await getProjectSettingsBySlug(created.slug);
+    expect(stored.model).toBe(applied[0]!.settings.model);
+    // The loser sees the winner's state, which is what a 409 quotes back to the operator.
+    const refused = results.find((r) => !r.applied)!;
+    expect(refused).toMatchObject({ applied: false, refused: `already ${stored.model}` });
+    expect(refused.settings.model).toBe(stored.model);
+  });
+
+  it("writes nothing when the decision refuses", async () => {
+    const created = await addProject({
+      name: "Refused Write",
+      repoPath: makeRepoDir("refused-write"),
+    });
+    await updateProjectSettings(created.slug, { model: "claude-opus-5" });
+    const result = await updateProjectSettingsIf<"nope">(created.slug, () => ({ refuse: "nope" }));
+    expect(result.applied).toBe(false);
+    expect((await getProjectSettingsBySlug(created.slug)).model).toBe("claude-opus-5");
   });
 });
 

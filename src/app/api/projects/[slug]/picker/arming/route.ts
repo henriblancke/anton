@@ -6,10 +6,9 @@ import { resolveOperator } from "@/lib/operator";
 import { pickerTrackRecord } from "@/lib/picker-veto";
 import type { PickerAutonomy } from "@/lib/policy/types";
 import {
-  getProjectSettings,
   resolvePickerApplyOverride,
   resolvePickerAutonomy,
-  updateProjectSettings,
+  updateProjectSettingsIf,
   type ProjectSettings,
 } from "@/lib/projects";
 import { withProject } from "../../resolve-project";
@@ -39,29 +38,13 @@ export const dynamic = "force-dynamic";
  *     to accept the risk OF, and a stored arming would be a signature on nothing.
  *   • already armed — a second click, or a tab rendered before someone else armed it. Overwriting
  *     would silently rewrite who signed and when, which is the one thing this record is for.
+ *
+ * Both are decided INSIDE the settings write transaction rather than against a snapshot read first,
+ * which is what makes the second one true: two clicks landing together would otherwise both find an
+ * unarmed project, and the loser would replace the winner's signature while both were told they had
+ * armed it.
  */
 export const POST = withProject<{ slug: string }>(async (_request, { project }) => {
-  const db = getDb();
-  const settings = await getProjectSettings(db, project.id);
-
-  if (!settings.pickerPolicy) {
-    return NextResponse.json(
-      {
-        error:
-          "This project has no work policy, so apply cannot be armed — accept a policy first, " +
-          "then arm it",
-      },
-      { status: 409 },
-    );
-  }
-  const standing = resolvePickerApplyOverride(settings);
-  if (standing) {
-    return NextResponse.json(
-      { error: `apply is already armed deliberately, by ${standing.by} — nothing was changed` },
-      { status: 409 },
-    );
-  }
-
   const by = await resolveOperator();
   if (!by) {
     return NextResponse.json(
@@ -71,15 +54,28 @@ export const POST = withProject<{ slug: string }>(async (_request, { project }) 
   }
 
   const arming = { by, at: new Date(systemClock.now()).toISOString() };
-  const next = await updateProjectSettings(project.slug, {
-    pickerApplyOverride: arming,
-    pickerAutonomy: "apply",
+  const result = await updateProjectSettingsIf<string>(project.slug, (current) => {
+    if (!current.pickerPolicy) {
+      return {
+        refuse:
+          "This project has no work policy, so apply cannot be armed — accept a policy first, " +
+          "then arm it",
+      };
+    }
+    const standing = resolvePickerApplyOverride(current);
+    if (standing) {
+      return {
+        refuse: `apply is already armed deliberately, by ${standing.by} — nothing was changed`,
+      };
+    }
+    return { write: { pickerApplyOverride: arming, pickerAutonomy: "apply" } };
   });
+  if (!result.applied) return NextResponse.json({ error: result.refused }, { status: 409 });
 
   return NextResponse.json({
     armedBy: arming.by,
     armedAt: arming.at,
-    autonomy: await resolvedAutonomy(project.id, next),
+    autonomy: await resolvedAutonomy(project.id, result.settings),
   });
 });
 
@@ -92,17 +88,14 @@ export const POST = withProject<{ slug: string }>(async (_request, { project }) 
  * the operator was looking at.
  */
 export const DELETE = withProject<{ slug: string }>(async (_request, { project }) => {
-  const db = getDb();
-  const settings = await getProjectSettings(db, project.id);
-  if (!resolvePickerApplyOverride(settings)) {
-    return NextResponse.json(
-      { error: "apply is not deliberately armed on this project — nothing was changed" },
-      { status: 409 },
-    );
-  }
+  const result = await updateProjectSettingsIf<string>(project.slug, (current) =>
+    resolvePickerApplyOverride(current)
+      ? { write: { pickerApplyOverride: undefined } }
+      : { refuse: "apply is not deliberately armed on this project — nothing was changed" },
+  );
+  if (!result.applied) return NextResponse.json({ error: result.refused }, { status: 409 });
 
-  const next = await updateProjectSettings(project.slug, { pickerApplyOverride: undefined });
-  return NextResponse.json({ autonomy: await resolvedAutonomy(project.id, next) });
+  return NextResponse.json({ autonomy: await resolvedAutonomy(project.id, result.settings) });
 });
 
 /**

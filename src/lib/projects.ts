@@ -1121,19 +1121,32 @@ function mergeSettings(
   return next;
 }
 
+/** What a conditional writer decides once it can see the settings it is writing against. */
+export type SettingsWriteDecision<R> = { write: Partial<ProjectSettings> } | { refuse: R };
+
+/** The outcome of a conditional write. `settings` is the standing blob either way. */
+export type SettingsWriteResult<R> =
+  | { applied: true; settings: ProjectSettings }
+  | { applied: false; settings: ProjectSettings; refused: R };
+
 /**
- * Merge a settings patch into the project's settingsJson. Returns the merged settings.
+ * Merge a settings patch into the project's settingsJson, unless `decide` refuses once it has seen
+ * the settings as they stand AT WRITE TIME. Returns the merged blob, or the untouched one plus the
+ * refusal.
  *
- * The read, the merge and the write happen inside ONE immediate transaction, synchronously, because
- * every writer here rewrites the WHOLE blob and the settings page has several of them: the global
- * Save, the automation table (which saves on change) and the work-policy panel each PATCH on their
- * own. Two in flight at once would otherwise both read the pre-save row, and the later write would
- * silently erase the earlier one's keys while both requests reported success.
+ * The read, the decision, the merge and the write happen inside ONE immediate transaction,
+ * synchronously, for two reasons. Every writer here rewrites the WHOLE blob and the settings page
+ * has several of them — the global Save, the automation table (which saves on change) and the
+ * work-policy panel each PATCH on their own — so two in flight at once would both read the pre-save
+ * row and the later write would silently erase the earlier one's keys while both reported success.
+ * And a guard that ran BEFORE the transaction is only a hint: two callers can both read a state
+ * their guard admits and both write, which is how a conflict the caller reports as a 409 becomes a
+ * silent overwrite instead. Deciding under the write lock is what makes the refusal true.
  */
-export async function updateProjectSettings(
+export async function updateProjectSettingsIf<R>(
   slug: string,
-  patch: Partial<ProjectSettings>,
-): Promise<ProjectSettings> {
+  decide: (current: ProjectSettings) => SettingsWriteDecision<R>,
+): Promise<SettingsWriteResult<R>> {
   const db = getDb();
   const p = await getProjectBySlug(slug);
   if (!p) throw new Error(`Project not found: ${slug}`);
@@ -1145,19 +1158,32 @@ export async function updateProjectSettings(
         .where(eq(schema.projects.id, p.id))
         .limit(1)
         .get();
-      const next = mergeSettings(parseSettings(row?.settingsJson), patch);
+      const current = parseSettings(row?.settingsJson);
+      const decision = decide(current);
+      if ("refuse" in decision) {
+        return { applied: false as const, settings: current, refused: decision.refuse };
+      }
+      const next = mergeSettings(current, decision.write);
       tx
         .update(schema.projects)
         .set({ settingsJson: JSON.stringify(next) })
         .where(eq(schema.projects.id, p.id))
         .run();
-      return next;
+      return { applied: true as const, settings: next };
     },
     // The write lock is taken up front: a deferred transaction would read first and only then try to
     // upgrade, which is the shape that loses to SQLITE_BUSY under exactly the concurrency this
     // guards against.
     { behavior: "immediate" },
   );
+}
+
+/** Merge a settings patch into the project's settingsJson. Returns the merged settings. */
+export async function updateProjectSettings(
+  slug: string,
+  patch: Partial<ProjectSettings>,
+): Promise<ProjectSettings> {
+  return (await updateProjectSettingsIf(slug, () => ({ write: patch }))).settings;
 }
 
 /** What the shared beads config path reports back — the one seam the log helpers below read. */
