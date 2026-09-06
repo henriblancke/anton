@@ -496,11 +496,15 @@ async function commitPreservedTree(args: {
   if (!after || after.head !== before.head) return first;
   const retried = await stageAllAndHashTree(worktreePath).catch(() => null);
   if (!verified || retried !== verified) {
-    await logPreserve(
-      logPath,
-      `a hook rejected this ticket's preserved commit and the tree is no longer provably the one ` +
-        `the verify gates passed on, so anton did not retry with the hooks bypassed`,
-    );
+    // Two different failures reach here, and an operator reading the log has to be able to tell
+    // them apart: a hook that rewrote the tree, and a `git` that could not hash it at all.
+    const why =
+      !verified || retried === null
+        ? `anton could not hash this ticket's preserved tree, so it cannot prove the tree is the ` +
+          `one the verify gates passed on`
+        : `a hook rejected this ticket's preserved commit and rewrote the tree, so it is no ` +
+          `longer the one the verify gates passed on`;
+    await logPreserve(logPath, `${why} — anton did not retry with the hooks bypassed`);
     return first;
   }
   return commitAll(worktreePath, message, { bypassHooks: true }).catch(rejected);
