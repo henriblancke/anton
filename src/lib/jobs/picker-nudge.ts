@@ -21,6 +21,7 @@ import { eq } from "drizzle-orm";
 import { activeDisarm } from "../autopilot-disarm";
 import { onBoardChanged } from "../beads/snapshot";
 import * as schema from "../db/schema";
+import { scheduleEnabled } from "../schedules";
 import { queuedJobId, type AntonDb } from "./queue";
 import type { RunnerLogger } from "./runner";
 
@@ -119,11 +120,15 @@ export class BoardPickerNudge {
    * Enqueue the pass this window owes — unless something says not to decide at all.
    *
    * The refusals, in the order an operator would ask about them: a repo no project owns has nothing
-   * to decide for; a FROZEN project (the disarm latch — anton's word for it throughout the picker)
-   * needs a human to re-arm before its picks mean anything, and a nudge that kept ranking for it
-   * would spend the lock on a plan nothing may act on; and a pass already queued covers this change
-   * too. A `running` pass does NOT cover it — it may have read the board before this change landed —
-   * which is why the dedupe is on the queued row only.
+   * to decide for; a project whose `board-picker` SCHEDULE is switched off has had the picker turned
+   * off by hand, and this listener must not become the enqueuer that outlives that switch — at
+   * `apply` a pass writes `approved`, claims the target and starts a run, so a nudge past a disabled
+   * schedule autonomously starts the very run the operator switched it off to prevent; a FROZEN
+   * project (the disarm latch — anton's word for it throughout the picker) needs a human to re-arm
+   * before its picks mean anything, and a nudge that kept ranking for it would spend the lock on a
+   * plan nothing may act on; and a pass already queued covers this change too. A `running` pass does
+   * NOT cover it — it may have read the board before this change landed — which is why the dedupe is
+   * on the queued row only.
    *
    * Never throws: this runs off a timer with no caller to catch it, and a nudge that fails costs one
    * cadence of staleness, which is exactly what the cron backstop is for.
@@ -132,6 +137,7 @@ export class BoardPickerNudge {
     try {
       const project = projectByRepoPath(this.db, repoPath);
       if (!project) return;
+      if (!(await scheduleEnabled(this.db, project.id, "board-picker"))) return;
       if (await activeDisarm(this.db, project.id)) return;
       if (queuedJobId(this.db, "board-picker", project.id)) return;
       await this.enqueueJob(project.id);

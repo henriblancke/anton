@@ -470,6 +470,39 @@ describe("the decision's reachable set", () => {
     expect(stampBoard(after, OBSERVED).digest).not.toBe(stampBoard(before, OBSERVED).digest);
   });
 
+  /**
+   * The same clause one edge UP, and why the two run to a fixpoint together. `structureGaps` reads a
+   * candidate's ancestors — a parent's type decides `feature-under-non-epic`, an ancestor's feature
+   * children decide `ticket-under-container-epic` — and an ancestor may be closed, so the pool, the
+   * blocks closure and the feature-children clause all miss it. The closed feature below is reached
+   * only through the closed epic, which is itself reached only through the ticket's parent edge.
+   */
+  it("reaches the closed ancestors of the pool, and their feature children in turn", () => {
+    const board = [
+      shaped({ id: "anton-top", issue_type: "epic" }),
+      shaped({ id: "anton-mid", issue_type: "epic", status: "closed", parent: "anton-top" }),
+      shaped({ id: "anton-ticket", issue_type: "task", parent: "anton-mid" }),
+      shaped({ id: "anton-shipped", issue_type: "feature", status: "closed", parent: "anton-mid" }),
+      chore(),
+    ];
+
+    expect(reachableSet(board)).toEqual(
+      new Set(["anton-top", "anton-mid", "anton-ticket", "anton-shipped"]),
+    );
+  });
+
+  // The ancestor clause is UPWARD only: a closed sibling under a reached parent decides nothing —
+  // `isContainer` counts feature children, and `cardOf` walks up — so it stays outside the fence.
+  it("does not reach down from an ancestor to anything but its feature children", () => {
+    const board = [
+      shaped({ id: "anton-a", issue_type: "feature", parent: "anton-epic" }),
+      shaped({ id: "anton-epic", issue_type: "epic", status: "closed" }),
+      chore({ parent: "anton-epic" }),
+    ];
+
+    expect(reachableSet(board)).toEqual(new Set(["anton-a", "anton-epic"]));
+  });
+
   // Computed over the board being STAMPED, never carried on the plan: that is what makes the two
   // digests comparable, so a bead that has newly become a candidate is an honest mismatch rather
   // than a bead neither stamp was looking at.

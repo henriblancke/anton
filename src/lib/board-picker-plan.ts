@@ -378,11 +378,18 @@ function digestLine(bead: Bead): string {
  *      downstream is a decision input even though no policy would ever admit it. Walked both ways
  *      along each edge: what a candidate releases decides its rank, and what grips it decides
  *      whether it is a candidate at all.
- *   3. the FEATURE CHILDREN of everything in 1 and 2 — `beads.isContainer` counts a feature child of
- *      ANY status, so a closed one decides whether its parent epic is a run target. Without this
- *      clause, re-parenting a finished feature under an epic pick drops that pick from the plan with
- *      no bead entering the pool and no `blocks` edge moving, and the fence never fires (anton-icu6
- *      found it by sweeping the corpus; it is pinned as "a closed feature child").
+ *   3. the PARENT CLOSURE of everything in 1 and 2, and the FEATURE CHILDREN of everything in that
+ *      — taken together, to a fixpoint, because each clause feeds the other. `structureGaps` walks
+ *      UPWARD from a candidate (`feature-under-non-epic` reads the parent's type,
+ *      `ticket-under-container-epic` reads whether an ancestor is a container) and `beads.cardOf`
+ *      attributes a bead to its nearest card ANCESTOR, so an ancestor of any status is a decision
+ *      input; and `beads.isContainer` counts a feature child of ANY status, so each ancestor pulled
+ *      in brings its own feature children, which decide whether IT is a container. Neither clause
+ *      reaches a fixpoint alone. Without the feature-children half, re-parenting a finished feature
+ *      under an epic pick drops that pick from the plan with no bead entering the pool and no
+ *      `blocks` edge moving (anton-icu6 found it by sweeping the corpus; pinned as "a closed feature
+ *      child"). Without the parent half, re-typing a CLOSED epic ancestor, or re-parenting a closed
+ *      feature under a closed ancestor, does the same through the very same silence.
  *
  * Computed over the board being STAMPED rather than carried on the plan, which is what makes the two
  * digests comparable: a bead that has newly become a candidate is in this board's set and was not in
@@ -422,12 +429,29 @@ export function reachableSet(board: Bead[]): ReadonlySet<string> {
     }
   }
 
-  // Direct children only, matching `beads.isContainer`: a feature is a run target whatever sits
-  // under it, so what hangs off a feature child decides nothing further.
+  // Upward along every parent edge, downward along the FEATURE ones only — matching what the
+  // structure reads do. Walked as one closure, seeded from the set above, because an ancestor
+  // admitted here can itself be a container and a feature child admitted here can itself have an
+  // ancestor.
+  const kin = new Map<string, string[]>();
+  const relate = (from: string, to: string) => {
+    const known = kin.get(from);
+    if (known) known.push(to);
+    else kin.set(from, [to]);
+  };
   for (const bead of board) {
     const parent = beads.parentOf(bead);
-    if (bead.issue_type === "feature" && parent !== undefined && reached.has(parent)) {
-      reached.add(bead.id);
+    if (parent === undefined) continue;
+    relate(bead.id, parent);
+    if (bead.issue_type === "feature") relate(parent, bead.id);
+  }
+
+  const structure = [...reached];
+  for (let i = 0; i < structure.length; i++) {
+    for (const next of kin.get(structure[i]) ?? []) {
+      if (reached.has(next)) continue;
+      reached.add(next);
+      structure.push(next);
     }
   }
   return reached;

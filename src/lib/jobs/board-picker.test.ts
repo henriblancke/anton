@@ -14,6 +14,7 @@ import { PICKER_DEFER_WINDOW_MS, recordPickerVeto } from "../picker-veto";
 import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
 import { activeDisarm, disarmAutopilot, listDisarms, reArmAutopilot } from "../autopilot-disarm";
 import { listOpenEscalations } from "../escalations";
+import { createSchedule } from "../schedules";
 import { LABELS } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import type { Bead } from "../beads/types";
@@ -897,6 +898,24 @@ describe("BoardPickerNudge", () => {
     invalidateIssueSnapshot("/tmp/p1", true);
 
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS - 1);
+
+    expect(enqueued).toEqual([]);
+  });
+
+  // Switching the schedule off is how an operator STOPS the picker. Before anton-h32k the scheduler
+  // was its only enqueuer, so the switch was the whole answer; a listener that ignored it would
+  // re-decide 30s after any bd write — and at `apply` a pass writes `approved`, claims the target
+  // and starts the run the switch exists to prevent.
+  it("stays quiet while the board-picker schedule is switched off", async () => {
+    await createSchedule(t.db, clock, {
+      projectId: "p1",
+      type: "board-picker",
+      cron: "*/10 * * * *",
+      enabled: false,
+    });
+
+    invalidateIssueSnapshot("/tmp/p1", true);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
     expect(enqueued).toEqual([]);
   });

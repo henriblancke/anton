@@ -34,20 +34,27 @@
  *     top pick: 0 seconds of the hour, under both fences. That is the guard, and it is the number
  *     that had to stay at zero.
  *
- * THE HOLE THE SWEEP FOUND, and why {@link reachableSet} has three parts rather than two. The
- * epic specifies the reachable set as "the candidate pool plus the blocks-closure over it". That is
- * not sound on its own: `beads.isContainer` counts a feature child of ANY status, so re-parenting a
- * CLOSED feature under an epic pick turns that pick into a container and drops it from the plan —
- * with no bead entering the pool and no `blocks` edge moving, so a pool+blocks fence never fires.
- * Pinned below as "a closed feature child". Feature children of the set are therefore in the fence,
- * which widens it from 199 beads to 288 of 842 — some of the 85.8% above is paid for that, and it
- * is cheap at the price.
+ * THE HOLES THE SWEEP FOUND, and why {@link reachableSet} has three parts rather than two. The epic
+ * specifies the reachable set as "the candidate pool plus the blocks-closure over it". That is not
+ * sound on its own, and it fails in both directions along the parent graph:
+ *
+ *   • DOWNWARD — `beads.isContainer` counts a feature child of ANY status, so re-parenting a CLOSED
+ *     feature under an epic pick turns that pick into a container and drops it from the plan, with
+ *     no bead entering the pool and no `blocks` edge moving. Pinned below as "a closed feature
+ *     child". Feature children of the set widen the fence from 199 beads to 288 of 842 — some of
+ *     the 85.8% above is paid for that, and it is cheap at the price.
+ *   • UPWARD — `structureGaps` reads a candidate's ANCESTORS, and an ancestor may be closed and so
+ *     outside all three of the above. Re-typing that closed epic, or filing a closed feature under
+ *     it, drops its live descendant through the very same silence. Pinned below as "a closed epic
+ *     ancestor" and "a closed feature filed under a closed epic". Ancestors cost 0 further beads on
+ *     THIS board, which is a fact about anton's own grooming rather than about the clause — nothing
+ *     live on it stands under closed history ("has no live bead standing under closed history").
  *
  * SWEPT EXHAUSTIVELY AT CAPTURE, and sampled in the gate: every one of the 569 beads this fence
- * drops, mutated seven ways the decision reads (reopened, re-parented under the top pick, retyped
- * to `feature`, removed from the board, contract cleared, `approved` dropped, raised to P0) — 3983
- * probes, of which 21 moved the ranking and 0 escaped the fence. The suite keeps a fixed sample of
- * that sweep so the unit gate stays fast; re-run it in full when the fence changes.
+ * drops, mutated every way the decision reads (reopened, re-parented under the top pick and under
+ * closed history, re-typed to each tier, removed from the board, contract cleared, `approved`
+ * dropped, raised to P0), of which 21 moved the ranking and 0 escaped the fence. The suite keeps a
+ * fixed sample of that sweep so the unit gate stays fast; re-run it in full when the fence changes.
  *
  * THE CONTROL IS THE OLD FENCE. The narrowing has since landed in `stampBoard` (anton-t01f), so the
  * AFTER side of every measurement below is production and it is the BEFORE side that is restated
@@ -60,6 +67,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { beads } from "./beads/bd";
 import type { Bead } from "./beads/types";
 import {
   DIGEST_FIELDS,
@@ -422,6 +430,40 @@ describe("the hour", () => {
   });
 });
 
+/**
+ * A contract-clean bead with nothing for the approve gate to fault — an open, approved, eng epic
+ * until an override says otherwise. The three structure reproductions below all turn on WHERE a
+ * bead hangs and WHAT it is typed, so everything else about them has to be uninteresting.
+ */
+const shaped = (over: Partial<Bead>): Bead => ({
+  id: "anton-x",
+  title: "t",
+  status: "open",
+  issue_type: "epic",
+  labels: ["approved", "domain:eng"],
+  priority: 1,
+  created_at: "2026-01-01T00:00:00Z",
+  description: [
+    "## Goal",
+    "g",
+    "## Acceptance Criteria",
+    "- [ ] a",
+    "## Context",
+    "c",
+    "## Out of scope",
+    "o",
+    "## Verify",
+    "v",
+  ].join("\n\n"),
+  acceptance_criteria: "- [ ] a",
+  ...over,
+});
+
+/** Decided admit-all: the armed policy narrows to feature/task/bug, and these cases are about a
+ *  target losing its run-target IDENTITY rather than failing an operator's rule. */
+const admitAll = (board: Bead[]) =>
+  decideBoardPickerPlan({ board, policy: ADMIT_ALL_POLICY, runtime: { observedAtMs: OBSERVED } });
+
 describe("the beads the narrowed fence drops", () => {
   const DROPPED = ((): Bead[] => {
     const reached = reachableSet(BOARD);
@@ -430,23 +472,57 @@ describe("the beads the narrowed fence drops", () => {
 
   /**
    * A fixed sample of the capture-time sweep — see the module note. Every 14th dropped bead, mutated
-   * the three ways that actually moved a ranking or could reach one, and each mutation must either
-   * leave the queue exactly where it was or retire the generation. Sampled rather than exhaustive
-   * only so the unit gate stays under a second per assertion; the full 3983-probe sweep found the
-   * same answer.
+   * every way the decision reads that could reach a ranking, and each mutation must either leave the
+   * queue exactly where it was or retire the generation. Sampled rather than exhaustive only so the
+   * unit gate stays under a second per assertion; the full sweep found the same answer.
+   *
+   * TYPE and PARENT are swept per value rather than once, because the structure rules branch on
+   * both: `feature-under-non-epic` reads a parent's type, `ticket-under-container-epic` reads
+   * whether an ancestor has a feature child, and a closed bead is judged for neither while still
+   * deciding both for its descendants.
    */
   const SAMPLE = DROPPED.filter((_, i) => i % 14 === 0);
   const RANKING = ranking(BOARD).join();
   const FENCE = reachableStamp(BOARD).digest;
 
+  /** A closed epic on the corpus — the host for the "filed under closed history" probe. */
+  const CLOSED_EPIC = "anton-8h7y";
+
   const PROBES: [name: string, mutate: (bead: Bead) => Bead[]][] = [
     ["reopens", (bead) => patch(BOARD, bead.id, { status: "open" })],
     ["is re-parented under the top pick", (bead) => patch(BOARD, bead.id, { parent: TOP.beadId })],
+    ["is re-parented under a closed epic", (bead) => patch(BOARD, bead.id, { parent: CLOSED_EPIC })],
+    ["is re-typed to an epic", (bead) => patch(BOARD, bead.id, { issue_type: "epic" })],
+    ["is re-typed to a feature", (bead) => patch(BOARD, bead.id, { issue_type: "feature" })],
+    ["is re-typed to a task", (bead) => patch(BOARD, bead.id, { issue_type: "task" })],
     ["leaves the board", (bead) => BOARD.filter((b) => b.id !== bead.id)],
   ];
 
   it("samples the sweep across the whole dropped set", () => {
     expect({ dropped: DROPPED.length, sampled: SAMPLE.length }).toEqual({ dropped: 569, sampled: 41 });
+  });
+
+  /**
+   * Why the two ancestor cases below are fixtures rather than corpus probes, stated as a fact about
+   * the board instead of an excuse: anton's own board has no live bead standing under closed
+   * history, so no corpus mutation can exercise the parent closure and the reach is the same 288
+   * with it or without it. The clause is not free of consequence on a board that HAS that shape —
+   * which is what the two reproductions construct.
+   */
+  it("has no live bead standing under closed history", () => {
+    const byId = new Map(BOARD.map((bead) => [bead.id, bead]));
+    const up = (bead: Bead) => byId.get(beads.parentOf(bead) ?? "");
+    const underClosed = BOARD.filter((bead) => {
+      const seen = new Set<string>();
+      if (bead.status === "closed") return false;
+      for (let at = up(bead); at && !seen.has(at.id); at = up(at)) {
+        if (at.status === "closed") return true;
+        seen.add(at.id);
+      }
+      return false;
+    });
+
+    expect(underClosed).toEqual([]);
   });
 
   it.each(PROBES)("holds the ranking or fires when one of them %s", (_name, mutate) => {
@@ -469,29 +545,6 @@ describe("the beads the narrowed fence drops", () => {
    * {@link reachableSet} is what closes it, and this is the case that says so.
    */
   it("catches a closed feature child re-parented under an epic pick", () => {
-    const shaped = (over: Partial<Bead>): Bead => ({
-      id: "anton-x",
-      title: "t",
-      status: "open",
-      issue_type: "epic",
-      labels: ["approved", "domain:eng"],
-      priority: 1,
-      created_at: "2026-01-01T00:00:00Z",
-      description: [
-        "## Goal",
-        "g",
-        "## Acceptance Criteria",
-        "- [ ] a",
-        "## Context",
-        "c",
-        "## Out of scope",
-        "o",
-        "## Verify",
-        "v",
-      ].join("\n\n"),
-      acceptance_criteria: "- [ ] a",
-      ...over,
-    });
     const epic = shaped({ id: "anton-epic" });
     const before = [
       epic,
@@ -502,12 +555,56 @@ describe("the beads the narrowed fence drops", () => {
     // The write: the founder files the finished feature under the epic it belonged to all along.
     const after = patch(before, "anton-shipped", { parent: "anton-epic" });
 
-    // Decided admit-all: the armed policy above narrows to feature/task/bug, and this case is about
-    // an EPIC losing its run-target identity.
-    const admitAll = (board: Bead[]) =>
-      decideBoardPickerPlan({ board, policy: ADMIT_ALL_POLICY, runtime: { observedAtMs: OBSERVED } });
-
     expect(admitAll(before).entries.map((e) => e.beadId)).toEqual(["anton-epic"]);
+    expect(admitAll(after).entries).toEqual([]);
+    expect(reachableStamp(before).digest).not.toBe(reachableStamp(after).digest);
+  });
+
+  /**
+   * THE SAME HOLE ONE EDGE UP. `structureGaps` reads a candidate's ANCESTORS, and an ancestor may be
+   * closed — so it is outside the pool, outside the blocks closure, and (having no reached feature
+   * child) outside the feature-children clause too. Re-typing that closed epic makes its live
+   * feature child a `feature-under-non-epic` violation and drops the child from the plan, with no
+   * bead entering the pool and no edge moving. The parent closure of {@link reachableSet} is what
+   * closes it.
+   */
+  it("catches a closed epic ancestor re-typed out of being an epic", () => {
+    const before = [
+      shaped({ id: "anton-attic", status: "closed" }),
+      shaped({ id: "anton-child", issue_type: "feature", parent: "anton-attic" }),
+      shaped({ id: "anton-standalone", issue_type: "task" }),
+    ];
+    // The write: the founder decides the finished epic was really a chore-sized task all along.
+    const after = patch(before, "anton-attic", { issue_type: "task" });
+
+    expect(admitAll(before).entries.map((e) => e.beadId)).toEqual([
+      "anton-child",
+      "anton-standalone",
+    ]);
+    expect(admitAll(after).entries.map((e) => e.beadId)).toEqual(["anton-standalone"]);
+    expect(reachableStamp(before).digest).not.toBe(reachableStamp(after).digest);
+  });
+
+  /**
+   * Both clauses at once, which is why they run to a FIXPOINT rather than one after the other. The
+   * pick is an epic; the bead that decides its fate is its grandchild ticket; the write lands on a
+   * CLOSED epic in between, making it a container so the ticket becomes `ticket-under-container-epic`
+   * and the pick's subtree is blocked. Reaching the closed epic needs the parent clause; reaching
+   * the closed feature newly filed under it needs the feature-children clause applied to what the
+   * parent clause just admitted.
+   */
+  it("catches a closed feature filed under a closed epic between a pick and its ticket", () => {
+    const before = [
+      shaped({ id: "anton-top" }),
+      shaped({ id: "anton-mid", status: "closed", parent: "anton-top" }),
+      shaped({ id: "anton-ticket", issue_type: "task", parent: "anton-mid" }),
+      shaped({ id: "anton-attic", status: "closed" }),
+      shaped({ id: "anton-shipped", issue_type: "feature", status: "closed", parent: "anton-attic" }),
+    ];
+    // The write: the finished feature is filed under the finished epic it delivered.
+    const after = patch(before, "anton-shipped", { parent: "anton-mid" });
+
+    expect(admitAll(before).entries.map((e) => e.beadId)).toEqual(["anton-top"]);
     expect(admitAll(after).entries).toEqual([]);
     expect(reachableStamp(before).digest).not.toBe(reachableStamp(after).digest);
   });
