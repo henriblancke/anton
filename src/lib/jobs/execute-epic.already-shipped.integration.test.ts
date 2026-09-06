@@ -127,7 +127,7 @@ e({type:'system',subtype:'init',session_id:'sas'});
 const mine=prompt.includes(${JSON.stringify(blockedTicket)});
 if(!mine){fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+' '+Math.random()+'\\n');}
 e({type:'assistant',message:{content:[{type:'text',text:mine?'nothing to do here':'done'}]}});
-e({type:'result',subtype:'success',result:mine?'ANTON-RESULT: blocked — already-shipped — ${reason}':'ANTON-RESULT: delivered',session_id:'sas',num_turns:1,is_error:false});
+e({type:'result',subtype:'success',result:mine?'ANTON-RESULT: blocked — already-shipped — '+${JSON.stringify(reason)}:'ANTON-RESULT: delivered',session_id:'sas',num_turns:1,is_error:false});
 process.exit(0);`),
     );
   }
