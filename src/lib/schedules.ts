@@ -371,11 +371,21 @@ export async function ensureSchedule(
  * is not the operator switching the automation off, and a surface that treated it as a disable would
  * hide itself on an installation that simply predates the type.
  */
-export async function isScheduleEnabled(
+export function isScheduleEnabled(
   projectId: string,
   type: ScheduledJobType,
 ): Promise<boolean> {
-  const rows = await getDb()
+  return scheduleEnabled(getDb(), projectId, type);
+}
+
+/** {@link isScheduleEnabled} over an injected connection, so a caller already holding one — or a
+ *  test holding a temp db — asks the same question without reaching for the shared anton.db. */
+export async function scheduleEnabled(
+  db: AntonDb,
+  projectId: string,
+  type: ScheduledJobType,
+): Promise<boolean> {
+  const rows = await db
     .select({ enabled: schema.schedules.enabled })
     .from(schema.schedules)
     .where(and(eq(schema.schedules.projectId, projectId), eq(schema.schedules.type, type)))
