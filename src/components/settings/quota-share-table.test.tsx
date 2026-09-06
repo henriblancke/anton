@@ -157,6 +157,35 @@ describe("an idle project", () => {
     expect(within(rowFor("mine")).getByText("reserved while idle")).toBeTruthy();
   });
 
+  it("names whose share is in use elsewhere, and says it comes back on its own", () => {
+    // "Renormalized" is arithmetic; an operator needs the beneficiary and the horizon. Without the
+    // name, a cut reading higher than the number they typed looks like a bug in their own settings.
+    render(
+      <Harness
+        projects={[
+          project({ id: "mine", name: "mine", sharePct: 40 }),
+          project({ id: "other", name: "other", sharePct: 60, eligible: false }),
+        ]}
+        share={40}
+      />,
+    );
+
+    const line = screen.getByText(/in use elsewhere right now/);
+    expect(line.textContent).toContain("60% of the split");
+    expect(line.textContent).toContain("other has no eligible work");
+    expect(line.textContent).toContain("comes back on the next pass");
+  });
+
+  it("says nothing was observed rather than calling an unwatched project idle", () => {
+    // board-picker is opt-in: with no pass to read, "no eligible work" would be a claim about a
+    // question nobody asked, and it would move a share on the strength of it.
+    render(<Harness projects={[project({ id: "mine", name: "mine", eligible: null }), TWO[1]]} />);
+
+    expect(within(rowFor("mine")).getByText("eligibility not observed here")).toBeTruthy();
+    expect(within(rowFor("mine")).getByText("≈ 50%")).toBeTruthy();
+    expect(screen.queryByText("share in use elsewhere")).toBeNull();
+  });
+
   it("does not claim a share moved when no project can spend it", () => {
     render(
       <Harness

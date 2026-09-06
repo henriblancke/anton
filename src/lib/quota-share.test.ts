@@ -119,6 +119,18 @@ describe("resolveQuotaSplit", () => {
     ]);
     expect(partial.spentTotalPct).toBe(4);
   });
+
+  it("totals how much of the split is in use elsewhere, so the panel can name it", () => {
+    const split = resolveQuotaSplit([
+      project({ id: "a", sharePct: 40 }),
+      project({ id: "idle", sharePct: 35, eligible: false }),
+      project({ id: "quiet", sharePct: 25, eligible: false, reserved: true }),
+    ]);
+
+    // Only the unreserved idle share moved — a reserved one was never up for reallocation.
+    expect(split.reallocatedPct).toBe(35);
+    expect(resolveQuotaSplit([project({ id: "a" })]).reallocatedPct).toBe(0);
+  });
 });
 
 describe("resolveGovernedShare", () => {
@@ -179,6 +191,77 @@ describe("resolveGovernedShare", () => {
 
     expect(resolveGovernedShare("a", board).sharePct).toBe(0);
     expect(resolveGovernedShare("b", board).sharePct).toBe(100);
+  });
+
+  it("renormalizes an idle project out of the denominator (R6.4)", () => {
+    const board = [
+      { projectId: "busy", declaredPct: 50 },
+      { projectId: "idle", declaredPct: 50, eligible: false },
+    ];
+    const busy = resolveGovernedShare("busy", board);
+
+    // The idle 50 is not lent, it is simply absent from the divisor — quota that resets unused is
+    // wasted, so an idle share must not hold capacity hostage.
+    expect(busy.sharePct).toBe(100);
+    expect(busy.declaredPct).toBe(50);
+    expect(busy.participantTotalPct).toBe(50);
+    expect(busy.renormalized).toBe(true);
+  });
+
+  it("keeps a reserved project in the denominator while it is idle (R6.5)", () => {
+    const board = [
+      { projectId: "busy", declaredPct: 50 },
+      { projectId: "quiet", declaredPct: 50, eligible: false, reserved: true },
+    ];
+
+    // The repo touched irregularly keeps its allocation; the busy neighbour gains nothing.
+    expect(resolveGovernedShare("busy", board).sharePct).toBe(50);
+    expect(resolveGovernedShare("busy", board).renormalized).toBe(false);
+    expect(resolveGovernedShare("quiet", board).sharePct).toBe(50);
+  });
+
+  it("hands the share straight back on the pass after a project wakes up", () => {
+    const declared = [{ projectId: "busy", declaredPct: 50 }, { projectId: "waking" }];
+    const asleep = declared.map((p) =>
+      p.projectId === "waking" ? { ...p, declaredPct: 50, eligible: false } : p,
+    );
+    const awake = asleep.map((p) => ({ ...p, eligible: true }));
+
+    // No ledger to unwind: the next pass simply recomputes the divisor, with no operator action.
+    expect(resolveGovernedShare("busy", asleep).sharePct).toBe(100);
+    expect(resolveGovernedShare("busy", awake).sharePct).toBe(50);
+    expect(resolveGovernedShare("waking", awake).sharePct).toBe(50);
+  });
+
+  it("always counts the project it is resolving for", () => {
+    // Resolving a ceiling means this project is asking to spend, so it is not idle whatever the last
+    // picker pass recorded. Renormalizing it out would hand it 0% and defer its work forever.
+    const board = [
+      { projectId: "busy", declaredPct: 50 },
+      { projectId: "asking", declaredPct: 50, eligible: false },
+    ];
+
+    expect(resolveGovernedShare("asking", board).sharePct).toBe(50);
+    expect(resolveGovernedShare("asking", board).renormalized).toBe(false);
+  });
+
+  it("never renormalizes a share away on an eligibility it could not read", () => {
+    // Unset is UNKNOWN, not idle: mistaking a busy repo for an idle one hands its quota away.
+    const board = [{ projectId: "a", declaredPct: 50 }, { projectId: "b", declaredPct: 50 }];
+
+    expect(resolveGovernedShare("a", board).sharePct).toBe(50);
+    expect(resolveGovernedShare("a", board).renormalized).toBe(false);
+  });
+
+  it("leaves a parked project parked when everyone else goes idle", () => {
+    const board = [
+      { projectId: "parked", declaredPct: 0 },
+      { projectId: "idle", declaredPct: 100, eligible: false },
+    ];
+
+    // 0 is a declaration, not an absence — renormalization must not resurrect a repo the operator
+    // deliberately parked.
+    expect(resolveGovernedShare("parked", board).sharePct).toBe(0);
   });
 
   it("leaves a project that is not on the governed board holding the whole quota", () => {

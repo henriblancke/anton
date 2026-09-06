@@ -15,6 +15,7 @@ import { removeWorktree } from "./git/worktree";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
 import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./jobs/budget";
 import { resolveGovernedShare, type GovernedShare } from "./quota-share";
+import { eligibilityOf, observedWorkEligibility } from "./quota-eligibility";
 import { GARDENER_DETECTION_KINDS } from "./gardener/detections";
 import {
   earnedPickerAutonomy,
@@ -1051,18 +1052,35 @@ async function governedProjects(): Promise<{ projectId: string; settings: Projec
 }
 
 /**
- * The declared quota shares of every budget-aware project on this machine (R6.1) — the board one
- * project's share is proportioned against by `resolveGovernedShare` (./quota-share).
+ * The quota-share board of every budget-aware project on this machine (R6.1 / R6.4 / R6.5) — what
+ * one project's share is proportioned against by `resolveGovernedShare` (./quota-share).
  *
  * Ungoverned projects are absent by construction: they spend unpaced, so counting them in the
  * denominator would shrink everyone else's cut to fund a project no share binds. An undeclared
  * project carries no `declaredPct` (it rides the equal split), which is NOT the same as declaring 0
  * — that parks a repo.
+ *
+ * Live eligibility rides along so the denominator is recomputed per pass rather than fixed at the
+ * declarations: an idle repo drops out and its share is spent by the repos that have work, unless it
+ * reserved it. Read fresh on every call for the same reason — that is what makes a waking repo
+ * reclaim its cut on the next pass instead of after an operator action. An unobservable or failed
+ * read resolves to `null`, which reads as "can spend": nobody loses a share to a question this
+ * machine never managed to ask.
  */
 export async function budgetAwareQuotaShares(): Promise<GovernedShare[]> {
-  return (await governedProjects()).map(({ projectId, settings }) => ({
+  return governedQuotaBoard(await governedProjects());
+}
+
+/** The board above, over an already-read governed set — so a caller needing both reads once. */
+async function governedQuotaBoard(
+  governed: readonly { projectId: string; settings: ProjectSettings }[],
+): Promise<GovernedShare[]> {
+  const eligible = await observedWorkEligibility(getDb()).catch(() => null);
+  return governed.map(({ projectId, settings }) => ({
     projectId,
     declaredPct: settings.quotaSharePct,
+    eligible: eligibilityOf(eligible, projectId),
+    reserved: settings.reserveQuotaShare === true,
   }));
 }
 
@@ -1077,10 +1095,7 @@ export async function budgetAwareQuotaShares(): Promise<GovernedShare[]> {
  */
 export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
   const governed = await governedProjects();
-  const board = governed.map(({ projectId, settings }) => ({
-    projectId,
-    declaredPct: settings.quotaSharePct,
-  }));
+  const board = await governedQuotaBoard(governed);
   return governed.map(({ projectId, settings }) =>
     withQuotaShare(resolveBudgetPolicy(settings), resolveGovernedShare(projectId, board).sharePct),
   );

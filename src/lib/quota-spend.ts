@@ -20,6 +20,7 @@ import { getClaudeUsageCached, type ClaudeUsage } from "./claude/usage";
 import { getDb, schema } from "./db";
 import type { AntonDb, JobType } from "./jobs/queue";
 import { getProjectSettings, listProjects } from "./projects";
+import { eligibilityOf, observedWorkEligibility } from "./quota-eligibility";
 import { defaultQuotaSharePct, type QuotaShareProject } from "./quota-share";
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -59,17 +60,6 @@ async function completedJobsByProject(
   return byProject;
 }
 
-/** Which projects the picker currently ranks work for — the denominator of the live split (R6.4). */
-async function projectsWithEligibleWork(db: AntonDb): Promise<Set<string>> {
-  const rows = await db
-    .select({
-      projectId: schema.boardPickerPlans.projectId,
-      targetCount: schema.boardPickerPlans.targetCount,
-    })
-    .from(schema.boardPickerPlans);
-  return new Set(rows.filter((r) => r.targetCount > 0).map((r) => r.projectId));
-}
-
 /**
  * Every project's position in the quota split, resolved against this machine's own records.
  *
@@ -84,7 +74,9 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
 
   const [usage, eligible] = await Promise.all([
     getClaudeUsageCached().catch(() => null),
-    projectsWithEligibleWork(db).catch(() => new Set<string>()),
+    // A failed read leaves every project UNOBSERVED, not idle: nobody's share moves on a query that
+    // did not answer.
+    observedWorkEligibility(db).catch(() => null),
   ]);
   const jobsByProject = await completedJobsByProject(db, weeklyWindowStart(usage, now)).catch(
     () => new Map<string, Map<string, number>>(),
@@ -123,7 +115,7 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
       declared: stored.quotaSharePct !== undefined,
       governed: stored.budgetAware === true,
       reserved: stored.reserveQuotaShare === true,
-      eligible: eligible.has(project.id),
+      eligible: eligibilityOf(eligible, project.id),
       spentWeeklyPct,
       seeded,
     };

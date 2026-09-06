@@ -136,10 +136,10 @@ export default async function ProjectSettingsPage({
       declared: settings.quotaSharePct !== undefined,
       governed: settings.budgetAware === true,
       reserved: settings.reserveQuotaShare === true,
-      // The read failed, so eligibility is unknown. "Can spend" is the weaker claim — reading it as
-      // idle would tell the operator their share is in use elsewhere, naming a beneficiary we did
-      // not manage to look up.
-      eligible: true,
+      // The read failed, so eligibility is unknown — which is not idle. Reading it as idle would
+      // tell the operator their share is in use elsewhere, naming a beneficiary we did not manage
+      // to look up.
+      eligible: null,
       spentWeeklyPct: null,
       seeded: false,
     },

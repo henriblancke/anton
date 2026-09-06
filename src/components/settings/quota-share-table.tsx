@@ -61,6 +61,7 @@ export function QuotaShareTable({
   );
   const split = resolveQuotaSplit(staged);
   const governed = split.rows.filter((row) => row.governed).length;
+  const lending = split.rows.filter((row) => row.reallocated);
 
   return (
     <div className="flex flex-col gap-3">
@@ -121,6 +122,16 @@ export function QuotaShareTable({
             ? "no spend attributed to any project yet"
             : `${formatApproxPct(split.spentTotalPct, 1)} of the weekly quota attributed so far`}
         </span>
+        {/* Renormalization named rather than merely implied (R6.4): a cut that reads higher than the
+            number the operator typed must say whose share it is borrowing, and for how long. */}
+        {lending.length > 0 && (
+          <span role="status" className="text-[11px] text-subtle">
+            {Math.round(split.reallocatedPct)}% of the split is in use elsewhere right now:{" "}
+            {joinNames(lending.map((row) => row.name))} {lending.length === 1 ? "has" : "have"} no
+            eligible work and did not reserve {lending.length === 1 ? "its" : "their"} share. It
+            comes back on the next pass, with nothing to undo.
+          </span>
+        )}
         {/* Surfaced rather than silently normalized away: the shares below ARE renormalized, and an
             operator who declared 30/30/30 is owed the reason their cut reads 33. */}
         {split.imbalanced && (
@@ -138,6 +149,12 @@ export function QuotaShareTable({
       </div>
     </div>
   );
+}
+
+/** Project names as prose, so the reallocation line names who rather than counting them. */
+function joinNames(names: readonly string[]): string {
+  if (names.length <= 2) return names.join(" and ");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
 }
 
 /**
@@ -176,11 +193,15 @@ function QuotaShareTableRow({
               {current ? <span className="text-subtle"> · this project</span> : null}
             </span>
             <span className="font-mono text-[10.5px] text-subtle">
-              {row.governed
-                ? row.eligible
-                  ? "has work ready to start"
-                  : "no eligible work right now"
-                : "budget-aware execution off · spends unpaced"}
+              {!row.governed
+                ? "budget-aware execution off · spends unpaced"
+                : row.eligible === null
+                  ? // Nothing looked: the board-picker pass is not armed here, so this machine has
+                    // no reading to report. Claiming either answer would be inventing one.
+                    "eligibility not observed here"
+                  : row.eligible
+                    ? "has work ready to start"
+                    : "no eligible work right now"}
             </span>
           </div>
         </div>

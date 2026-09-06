@@ -31,8 +31,12 @@ export interface QuotaShareProject {
   governed: boolean;
   /** `reserve my share` (R6.5): held out of reallocation even while idle. */
   reserved: boolean;
-  /** The picker currently ranks startable work here — what puts a project in the denominator (R6.4). */
-  eligible: boolean;
+  /**
+   * The picker ranks startable work here, or quota-burning work is already in flight — what puts a
+   * project in the denominator (R6.4). `null` = nothing observed it (the picker pass is not armed
+   * here), which reads as "can spend": no share is renormalized away on a question nobody asked.
+   */
+  eligible: boolean | null;
   /**
    * Weekly quota attributed to this project, in the same percentage points the usage meter reads.
    * `null` when nothing on this machine is attributable to it yet — which is NOT zero spend, and
@@ -59,6 +63,11 @@ export interface QuotaSplit {
   rows: QuotaShareRow[];
   /** Σ declared shares across governed projects. */
   declaredTotalPct: number;
+  /**
+   * Σ declared shares of the governed projects that dropped out of this pass's denominator — how
+   * much of the split is currently being spent by somebody else. 0 when nothing was reallocated.
+   */
+  reallocatedPct: number;
   /**
    * The declared shares do not sum to 100. Surfaced rather than silently normalized away: the split
    * below IS normalized, and an operator who declared 30/30/30 is owed the reason their cut reads 33.
@@ -97,11 +106,19 @@ export interface GovernedShare {
   projectId: string;
   /** What the operator declared, or absent when this project has never declared a share. */
   declaredPct?: number;
+  /**
+   * The picker ranks startable work here, or quota-burning work is already in flight (R6.4).
+   * Absent/null means UNKNOWN, which reads as "can spend": a share is never renormalized away on a
+   * question this machine never asked.
+   */
+  eligible?: boolean | null;
+  /** `reserve my share` (R6.5): held in the denominator even while idle. */
+  reserved?: boolean;
 }
 
 /** The share in force for one project, plus the board-level facts that produced it. */
 export interface ResolvedQuotaShare {
-  /** The share that scales this project's weekly ceiling, 0–100 (R6.1). */
+  /** The share that scales this project's weekly ceiling, 0–100 (R6.1), after renormalization. */
   sharePct: number;
   /** The declaration it came from — the equal split when this project never declared one. */
   declaredPct: number;
@@ -109,8 +126,21 @@ export interface ResolvedQuotaShare {
   declared: boolean;
   /** Σ shares across every governed project. */
   declaredTotalPct: number;
+  /** Σ shares across the projects in this pass's denominator — the divisor `sharePct` came from. */
+  participantTotalPct: number;
+  /** Some project dropped out of the denominator this pass, so `sharePct` exceeds the declaration. */
+  renormalized: boolean;
   /** The declarations don't sum to 100. `sharePct` IS proportioned — say so, don't smooth it away. */
   imbalanced: boolean;
+}
+
+/**
+ * Whether a project belongs in this pass's denominator: it holds eligible work, or it reserves its
+ * share (R6.5), or its eligibility was never stated. Fail-open on the unknown is deliberate —
+ * mistaking a busy repo for an idle one hands its quota to a neighbour and defers its work.
+ */
+function canSpend(project: { eligible?: boolean | null; reserved?: boolean }): boolean {
+  return project.eligible !== false || project.reserved === true;
 }
 
 /**
@@ -121,6 +151,18 @@ export interface ResolvedQuotaShare {
  * same arithmetic {@link resolveQuotaSplit} shows the operator, so the governor and the panel can
  * never disagree about a project's cut — with {@link ResolvedQuotaShare.imbalanced} carrying the
  * fact so a caller can surface it rather than quietly rescaling behind the operator's back.
+ *
+ * The denominator is RENORMALIZED per pass over the projects that can actually spend (R6.4): an idle
+ * repo is simply absent from the divisor, so its share is spent by the repos that have work rather
+ * than resetting unused at the end of the week. There is no lending ledger to unwind — the next pass
+ * recomputes the divisor, so a repo that wakes up reclaims its cut with no operator action.
+ * `reserve my share` (R6.5) is the opt-out: a reserved project stays in the divisor while idle, so a
+ * repo touched irregularly keeps its allocation.
+ *
+ * The subject is ALWAYS in its own denominator. Resolving a ceiling for a project means that project
+ * is asking to spend, so it is not idle whatever the last picker pass recorded; renormalizing it out
+ * would hand it a 0% ceiling and defer its work forever — the opposite of the idle-fill this exists
+ * to serve.
  *
  * A project absent from `board` is ungoverned and resolves to the whole 100: no share binds it, and
  * scaling its ceiling by someone else's split would pace a project the operator never armed.
@@ -135,13 +177,27 @@ export function resolveGovernedShare(
   const imbalanced = isImbalanced(board.length, declaredTotalPct);
   const index = board.findIndex((p) => p.projectId === projectId);
   if (index < 0) {
-    return { sharePct: 100, declaredPct: 100, declared: false, declaredTotalPct, imbalanced };
+    return {
+      sharePct: 100,
+      declaredPct: 100,
+      declared: false,
+      declaredTotalPct,
+      participantTotalPct: declaredTotalPct,
+      renormalized: false,
+      imbalanced,
+    };
   }
+  const participantTotalPct = declared.reduce(
+    (sum, pct, i) => (i === index || canSpend(board[i]) ? sum + pct : sum),
+    0,
+  );
   return {
-    sharePct: proportionOf(declared[index], declaredTotalPct),
+    sharePct: proportionOf(declared[index], participantTotalPct),
     declaredPct: declared[index],
     declared: board[index].declaredPct !== undefined,
     declaredTotalPct,
+    participantTotalPct,
+    renormalized: participantTotalPct < declaredTotalPct,
     imbalanced,
   };
 }
@@ -160,11 +216,11 @@ export function resolveGovernedShare(
 export function resolveQuotaSplit(projects: readonly QuotaShareProject[]): QuotaSplit {
   const governed = projects.filter((p) => p.governed);
   const declaredTotalPct = governed.reduce((sum, p) => sum + p.sharePct, 0);
-  const participants = governed.filter((p) => p.eligible || p.reserved);
+  const participants = governed.filter(canSpend);
   const participantTotal = participants.reduce((sum, p) => sum + p.sharePct, 0);
 
   const rows = projects.map<QuotaShareRow>((project) => {
-    const participating = project.governed && (project.eligible || project.reserved);
+    const participating = project.governed && canSpend(project);
     const normalizedPct = project.governed ? proportionOf(project.sharePct, declaredTotalPct) : 0;
     const effectivePct = participating ? proportionOf(project.sharePct, participantTotal) : 0;
     return {
@@ -181,6 +237,7 @@ export function resolveQuotaSplit(projects: readonly QuotaShareProject[]): Quota
   return {
     rows,
     declaredTotalPct,
+    reallocatedPct: rows.reduce((sum, r) => (r.reallocated ? sum + r.sharePct : sum), 0),
     imbalanced: isImbalanced(governed.length, declaredTotalPct),
     seeded: projects.some((p) => p.seeded),
     spentTotalPct:

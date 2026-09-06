@@ -4,8 +4,9 @@ import { RUN_JOB_TYPE, type BudgetSignal } from "@/lib/budget-line";
 import { getBurnAverage } from "@/lib/burn";
 import { getClaudeUsageCached } from "@/lib/claude/usage";
 import { getDb } from "@/lib/db";
-import { budgetHeadroom } from "@/lib/jobs/budget";
-import { getProjectSettings, resolveBudgetPolicy } from "@/lib/projects";
+import { budgetHeadroom, withQuotaShare } from "@/lib/jobs/budget";
+import { budgetAwareQuotaShares, getProjectSettings, resolveBudgetPolicy } from "@/lib/projects";
+import { resolveGovernedShare } from "@/lib/quota-share";
 import { withProject } from "../../resolve-project";
 
 export const dynamic = "force-dynamic";
@@ -34,8 +35,14 @@ export const GET = withProject<{ slug: string }>(async (_request, { project }) =
   const settings = await getProjectSettings(db, project.id);
   if (settings.budgetAware !== true) return new NextResponse(null, { status: 204 });
 
+  // Scaled by the share in force RIGHT NOW (R6.1/R6.4), the same resolution the governor applies at
+  // lease time: a lane drawn against the unscaled ceiling would show headroom for work the governor
+  // is about to defer — and would hide the extra room an idle neighbour's renormalized share buys.
+  const share = resolveGovernedShare(project.id, await budgetAwareQuotaShares());
+  const policy = withQuotaShare(resolveBudgetPolicy(settings), share.sharePct);
+
   const usage = await getClaudeUsageCached();
-  const headroom = budgetHeadroom(usage, resolveBudgetPolicy(settings), Date.now());
+  const headroom = budgetHeadroom(usage, policy, Date.now());
   if (!headroom) return new NextResponse(null, { status: 204 });
 
   const average = await getBurnAverage(db, RUN_JOB_TYPE);

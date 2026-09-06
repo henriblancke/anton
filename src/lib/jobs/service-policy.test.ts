@@ -5,6 +5,7 @@
  * place deciding how much of this machine's single weekly Claude quota it may spend — so an
  * ungoverned project cannot be scaled by a share, and a governed one cannot escape it.
  */
+import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
@@ -30,6 +31,15 @@ function project(id: string, settings: ProjectSettings): string {
 }
 
 const armed = (extra: ProjectSettings = {}): ProjectSettings => ({ budgetAware: true, ...extra });
+
+/** What the picker pass leaves behind: a plan whose target count is the project's eligibility. */
+function plan(projectId: string, targetCount: number): void {
+  tdb.db
+    .insert(schema.boardPickerPlans)
+    .values({ projectId, boardDigest: "d", boardObservedAtMs: 1, targetCount })
+    .onConflictDoUpdate({ target: schema.boardPickerPlans.projectId, set: { targetCount } })
+    .run();
+}
 
 describe("resolveBudgetPolicy (quota share)", () => {
   beforeEach(() => {
@@ -90,6 +100,72 @@ describe("resolveBudgetPolicy (quota share)", () => {
     // opposite and let the parked repo run entirely unpaced.
     expect((await resolveBudgetPolicy("a"))?.weeklyTargetPct).toBe(0);
     expect((await resolveBudgetPolicy("b"))?.weeklyTargetPct).toBe(TARGET);
+  });
+
+  it("holds the declared split when no picker pass has observed anybody", async () => {
+    project("a", armed({ quotaSharePct: 60 }));
+    project("b", armed({ quotaSharePct: 40 }));
+
+    // board-picker ships disabled, so this is the ordinary machine. Renormalizing on the silence
+    // would hand every project the whole quota and take the split out of force entirely.
+    expect((await resolveBudgetPolicy("a"))?.weeklyTargetPct).toBeCloseTo(TARGET * 0.6, 6);
+    expect((await resolveBudgetPolicy("b"))?.weeklyTargetPct).toBeCloseTo(TARGET * 0.4, 6);
+  });
+
+  it("renormalizes an idle project's share onto the projects that have work (R6.4)", async () => {
+    project("busy", armed({ quotaSharePct: 50 }));
+    project("idle", armed({ quotaSharePct: 50 }));
+    plan("busy", 2);
+    plan("idle", 0);
+
+    // Quota that resets unused is wasted: the idle half is spendable by the repo that has work…
+    expect((await resolveBudgetPolicy("busy"))?.weeklyTargetPct).toBe(TARGET);
+    // …and the idle project keeps its own ceiling, because resolving one means it is asking to spend.
+    expect((await resolveBudgetPolicy("idle"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
+  });
+
+  it("holds a reserved project's share out of the reallocation (R6.5)", async () => {
+    project("busy", armed({ quotaSharePct: 50 }));
+    project("quiet", armed({ quotaSharePct: 50, reserveQuotaShare: true }));
+    plan("busy", 2);
+    plan("quiet", 0);
+
+    // The repo touched irregularly keeps its allocation, so the busy neighbour gains nothing.
+    expect((await resolveBudgetPolicy("busy"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
+  });
+
+  it("gives the share back on the next pass, with no operator action", async () => {
+    project("busy", armed({ quotaSharePct: 50 }));
+    project("waking", armed({ quotaSharePct: 50 }));
+    plan("busy", 2);
+    plan("waking", 0);
+    expect((await resolveBudgetPolicy("busy"))?.weeklyTargetPct).toBe(TARGET);
+
+    // A repo that wakes up on Friday must not wait a week: the next pass recomputes the divisor.
+    plan("waking", 1);
+
+    expect((await resolveBudgetPolicy("busy"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("waking"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
+  });
+
+  it("reads queued work as eligible, so reclaim does not wait for a picker pass", async () => {
+    project("busy", armed({ quotaSharePct: 50 }));
+    project("waking", armed({ quotaSharePct: 50 }));
+    plan("busy", 2);
+    plan("waking", 0);
+
+    tdb.db
+      .insert(schema.jobs)
+      .values({
+        id: randomUUID(),
+        projectId: "waking",
+        type: "execute-epic",
+        status: "queued",
+        payloadJson: "{}",
+      })
+      .run();
+
+    expect((await resolveBudgetPolicy("busy"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
   });
 
   it("says out loud when the declared shares do not sum to 100", async () => {
