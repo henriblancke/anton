@@ -16,7 +16,7 @@ Three tiers, nested with `bd link --type parent-child`:
 
 | Tier | What it is | Who reads it |
 | --- | --- | --- |
-| `epic` | A product outcome spanning several features. Carries exactly one `area:` label. | Non-technical stakeholders. Syncs to Linear as a top-level issue. |
+| `epic` | A product outcome spanning several features. Carries exactly one `area:` label. | Non-technical stakeholders. Syncs to Linear as a top-level issue, indistinguishable from a synced `feature` — push carries neither hierarchy nor tier (hazard 3). |
 | `feature` | One shippable delivery unit — one worktree, one PR. **This is what anton runs.** | The board. Approved, claimed, run-leased, shipped. |
 | `task` / `bug` / `chore` | The working layer, executed as part of their feature's run. | Engineering only. Never leaves the board. |
 
@@ -91,7 +91,7 @@ command as you build it, so it never becomes a lossy abstraction over the CLI.
 | Team | Linear team id | — |
 | Project routing | table mapping each `area:` label → Linear project | — |
 | Extra arguments | free text, passed through verbatim | — |
-| Preview | dry-run showing counts, not a spinner | — |
+| Preview | dry-run counts, not a spinner. Needs a credential — bd's dry run calls the live API, and reports one line per bead, so anton derives the counts | — |
 
 The tier chips are the headline control — they drive `--type`. Toggling them rewrites the previewed
 command and the dry-run counts live (see the mock).
@@ -104,24 +104,101 @@ command and the dry-run counts live (see the mock).
 - **Per-area routing runs one pass per area.** bd holds a single `linear.project_id`, so anton sets
   it, pushes that area's ids, and restores it. Unmapped areas are skipped and reported, never
   guessed. Build it behind a pure `planLinearPushes(beads) → [{projectId, issueIds}]` so it swaps to
-  an upstream bd label→project mapping later.
+  an upstream bd label→project mapping later. **Routing binds at creation only** (settled 2026-09-05):
+  `projectId` rides on bd's create input, while an update sends only title, description, priority and
+  `stateId`, so re-pointing an area at another project — or changing a linked bead's `area:` — moves
+  only beads that have not been pushed yet and leaves every existing issue where it was created. v1
+  routes on first creation and says so in the panel; re-homing a linked issue is a Linear-side move,
+  and a `projectId`-on-update path is a separate ticket bd cannot serve today.
+  **Open: what a feature inherits.** Epics carry exactly one `area:`, but features carry none —
+  186 of 187 on the board today — so routing on a bead's own label selects 11 beads where routing on
+  its parent epic's selects 194. Settle this before
+  `planLinearPushes` is written; it sets the whole cost budget in hazard 2.
+- **The whole set → push → restore sequence holds one exclusive sync lock** (settled 2026-09-05,
+  hazard 4). `linear.project_id` is a single global bd setting, and both triggers ship on by
+  default, so a scheduled sync and a push-triggered sync that interleave will push one area's ids
+  while the other job owns the project id — creating that area's issues in the wrong project. Since
+  routing binds at creation, no later sync repairs that. The lock is taken once around **all** the
+  passes, not per pass, and it covers the restore, so a crash cannot leave the setting pointing at
+  the last area's project. A sync that cannot take the lock is **skipped and reported, not queued**
+  — the debounce already establishes that a dropped push is fine and the schedule is the backstop.
 - **Credentials come from the environment** (`LINEAR_API_KEY`, or the OAuth pair), never stored in
   `anton.db` — same posture as `gh`. The panel reports what it found and stops there.
 - **Dry-run before the first push.** Every setting is reversible except a bad first push, which
-  creates issues in someone else's Linear.
+  creates issues in someone else's Linear — and except the project an issue was created in, which no
+  later setting change can move (see routing, above).
+- **The push is flat, and the tier does not survive it** (settled 2026-09-05, hazard 3). bd sends no
+  parent, and `--type` only *selects* which beads are pushed — the payload is title, description,
+  priority, state and project id, nothing else — so a pushed epic and a pushed feature are
+  indistinguishable in Linear. Grouping lives in the Linear project the `area:` routing sets; that
+  is the only structure the sync can express. **Tier is a documented loss**, accepted for the same
+  reason the parent breadcrumb was rejected: the only channels left are title and description, and
+  anton does not mutate bead content for a cosmetic gain in a downstream tracker. That grouping is
+  **fixed when the issue is created** — updates carry no `projectId` — so a re-mapped area regroups
+  nothing that is already linked.
 
 ### Hazards that must be handled
+
+> **Answered 2026-09-05** by [`docs/spikes/2026-09-05-bd-linear-push-shape.md`](../spikes/2026-09-05-bd-linear-push-shape.md)
+> (anton-ey0w.1): hazard 3 is settled — push never sends a parent *or* the tier, so the epic→sub-issue
+> shape is not available and epics and features are indistinguishable in Linear; hazard 2 is
+> **re-scoped, not closed** — bead labels never reach Linear, but every push still costs one read per
+> linked bead, plus a write for the majority of the *routed* population — the beads per-area routing
+> actually selects, on the *Open and closed* default — that carry a structured
+> `acceptance_criteria`/`design`/`notes` field; hazard 1 is confirmed and `--update-refs=false`
+> cannot prevent it (the flag is declared but never read).
 
 1. **`external_ref` collision.** `bd linear sync --push` defaults to `--update-refs true`, writing
    the Linear ref into `external_ref`. A board still carrying legacy `gh-<n>` PR pointers there
    (honoured as a fallback by `beads.getPrRef`, `bd.ts:547-552`) **loses them**. The sync job must
    refuse to push while `planPrRefMigration(list)` is non-empty.
 2. **Run-lease label churn.** The run-lease is a label rewritten every 5 minutes on the run target
-   (`RUN_LEASE_REFRESH_MS`, `execute-epic.ts:72`) — which is now a synced `feature`. Either move it
-   to metadata (as the PR pointer already was) or confirm bd's push ignores labels, or Linear gets an
-   activity feed of nothing.
-3. **Sub-issue nesting is unverified.** Confirm with `--dry-run` against a scratch team that bd maps
-   `parent-child` onto Linear sub-issues before committing to the epic→sub-issue shape.
+   (`RUN_LEASE_REFRESH_MS`, `execute-epic.ts:72`) — which is now a synced `feature`. **Settled
+   2026-09-05: push never sends labels**, so the lease stays on labels and nothing moves to metadata.
+   What remains is cost, not leakage. bd fetches every linked issue before it can decide to skip, so
+   **each push is one read per Linear-linked bead no matter what** — that floor is what the debounce
+   caps. On top of it, bd's unchanged-issue skip (`PushFieldsEqual`) misses and writes: once per bead
+   after its create (the remote still carries bd's idempotency marker, which the first update
+   strips), and then *permanently* for any bead carrying a structured
+   `acceptance_criteria`/`design`/`notes` field, because the comparison re-runs the description
+   builder on a copy that still has them and appends those sections twice. anton's contract keeps the
+   rubric in the description and forbids `--acceptance` — but that only covers `acceptance_criteria`,
+   and **anton fills `notes` itself** via `bd note`, so new run targets keep joining the writing set.
+   Measure it on the ids `planLinearPushes` selects, not on every bead the tier chips match. With
+   every area mapped and this panel's own `--state all` default, that was **122 writes against N=194**
+   on 2026-09-05 if a feature inherits its parent epic's `area:` — and **10 against N=11** if it does
+   not, since 186 of 187 features carry no `area:` of their own (see *Per-area routing*, above).
+   Budget N reads plus a write for the structured-field majority of N — and budget a *partial*
+   routing table from its own areas' per-pass rows, whose write share runs from 18% to 100%, rather
+   than by scaling that aggregate (spike §2). Do **not** assume it decays — a closed bead never
+   leaves a `--state all` population. The routing table sets N outright;
+   **Also include** set to *Open only* moves it again (N=44, 17 writes on the inherited reading —
+   `--state open` skips closed beads rather than selecting the literal `open` status, so
+   `in_progress` and `deferred` stay in the slice). The
+   "a lease-only change syncs nothing" guarantee still has to be enforced at anton's seam (do not
+   fire the push): bd's skip is not a guarantee we can lean on. And `status` transitions are genuine
+   content changes that *do* cross.
+3. **Sub-issue nesting.** **Settled 2026-09-05 (anton-60oi): there is no nesting.** Push sends no
+   parent — hierarchy is pull-only — so the epic→sub-issue shape is dropped. The push is a flat list
+   of top-level issues that carry no tier marker either: `--type` selects the beads to push, it does
+   not travel in the payload, so nothing in Linear separates an epic from a feature. Grouping is the
+   Linear project the per-area routing already sets. Three alternatives were rejected — routing
+   epics to projects and features to issues (it consumes the project axis per-area routing owns),
+   writing a parent breadcrumb into the pushed description, and prefixing the tier onto the pushed
+   title (both make anton mutate bead content for a cosmetic gain in a downstream tracker). Note that
+   `--dry-run` could never have answered this: it reaches the live API before printing, and prints
+   one bare title per bead.
+4. **Concurrent routed syncs corrupt project placement.** Per-area routing mutates the *global*
+   `linear.project_id` between planning and pushing, and the two triggers (after each beads push ·
+   on a schedule) are both on by default. Interleave two routed syncs and one job pushes its area's
+   ids while the other owns the setting — those issues are created in the wrong project, and
+   because routing binds at creation, **no later sync can move them**. The debounce does not help:
+   it caps the push-triggered rate, it does not order a push-triggered sync against a scheduled
+   one. Take one exclusive lock around the entire capture → set → push → restore sequence (all
+   passes, not per pass) and skip-and-report a sync that cannot take it. The restore must run on
+   the failure path too — `bd config set linear.project_id "$prior"`, or `bd config unset` when
+   there was no prior value — or an aborted routed sync leaves the last area's project id in place
+   for the next unscoped or manual sync to route creates into.
 
 ---
 

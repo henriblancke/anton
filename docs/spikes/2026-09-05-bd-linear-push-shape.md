@@ -1,0 +1,534 @@
+# Spike: what `bd linear sync --push` actually sends (anton-ey0w.1)
+
+**Date:** 2026-09-05 · **Feature:** anton-s8ob (Linear sync spike) · **bd:** 1.1.2 (installed);
+answers re-checked against 1.2.2 (latest stable) and unchanged.
+
+## Questions and answers
+
+| # | Question | Answer |
+| --- | --- | --- |
+| 1 | Does push map `parent-child` onto Linear sub-issues? | **No.** Push never sends a parent. Hierarchy is import-only. |
+| 2 | Does push carry bead labels? | **No.** Push never sends `labelIds`, so the run-lease cannot reach Linear as a label — but a lease-only change is still **one read per linked bead**, plus a write for the majority of the beads the `area:` routing plan actually selects — those carrying a structured `acceptance_criteria`/`design`/`notes` field, whose unchanged-issue skip never fires (122 of the 194 selected under the widest routing reading — but the share runs 18–100% by area, so a partial routing table must be budgeted per area; §2). |
+| 3 | What does `--update-refs` write into `external_ref`? | The **Linear issue URL verbatim, always** — the flag is declared but never read, so it cannot be turned off. |
+
+Consequences for the downstream tickets are at the bottom.
+
+## Method (read this before trusting the numbers)
+
+The ticket asked for `--dry-run` against a throwaway Linear team. That method cannot answer any of
+the three questions, and its throwaway-team half needs a credential this worktree does not have:
+
+- **`--dry-run` is not offline and not descriptive.** It hits the live API before printing anything
+  (workflow-state cache — `engine.go:815`, before the dry-run branch at `:850`), so it needs real
+  credentials. The Linear tracker does not implement `BatchPushDryRunner` (only Notion does —
+  `internal/notion/tracker.go:247`), so a Linear dry-run falls through to the per-issue loop, which
+  prints exactly one line per bead: `[dry-run] Would create in Linear: <title>` (`engine.go:928-937`).
+  No fields, no parent, no labels. It would have told us nothing about the payload.
+- **A live push needs a Linear API key**, which is a human-minted credential (see *Still open* below).
+
+So the evidence here is the **push payload itself**, read from bd's source at the exact version
+installed (`v1.1.2`, fetched from the Go module proxy), corroborated against the shipped binary's
+embedded GraphQL strings and against live CLI behaviour on a scratch board. Since the only channel
+from bd to Linear is the GraphQL mutation body, a field bd never puts in that body cannot appear in
+Linear — which is what makes the source-level answer definitive rather than indicative.
+
+```bash
+bd version                          # bd version 1.1.2 (20e493e56)
+curl -s -o v1.1.2.zip https://proxy.golang.org/github.com/steveyegge/beads/@v/v1.1.2.zip
+unzip -q v1.1.2.zip                 # -> github.com/steveyegge/beads@v1.1.2/
+strings -n 8 "$(which bd)" | grep -E 'mutation (CreateIssue|BatchCreateIssues|UpdateIssue)'
+# mutation CreateIssue($input: IssueCreateInput!) {
+# mutation BatchCreateIssues($input: IssueBatchCreateInput!) {
+# mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
+```
+
+All file:line references below are `github.com/steveyegge/beads@v1.1.2`.
+
+## 1. Parent-child → Linear sub-issues: **no**
+
+The push path takes the batch branch (`engine.go:850`, Linear implements `BatchPushTracker`), and
+every payload it can produce is enumerable:
+
+```go
+// internal/linear/types.go:391 — the create input struct. No ParentID field exists.
+type IssueCreateInput struct {
+	TeamID      string   `json:"teamId"`
+	Title       string   `json:"title"`
+	Description string   `json:"description,omitempty"`
+	Priority    int      `json:"priority,omitempty"`
+	StateID     string   `json:"stateId,omitempty"`
+	LabelIDs    []string `json:"labelIds,omitempty"`
+	ProjectID   string   `json:"projectId,omitempty"`
+}
+```
+
+- Batch create builds exactly `{teamId, title, description, priority, stateId(, projectId)}`
+  (`internal/linear/tracker.go:379-390`).
+- Single create (duplicate titles) goes through `buildIssueCreateInput`, same key set
+  (`internal/linear/client.go:691-710`).
+- Update sends `{title, description, priority}` plus `stateId`
+  (`internal/linear/fieldmapper.go:78-85`, `tracker.go:461-474`).
+
+No parent id, no `parentId`, no second pass that links issues after creation. `grep -rn parentId
+internal/linear` returns nothing; the only `parentId` in the whole tree belongs to the **GitLab**
+tracker, which does support it (`internal/gitlab/client.go:589`,
+`hierarchyWidget: { parentId: %q }`). Linear simply has not been given that treatment.
+
+The mapping is **one-way**: pull *does* read Linear's `parent` and record it as a bd `parent-child`
+dependency (`internal/linear/mapping.go:590-598`). So a hierarchy authored in Linear survives the
+trip into beads; a hierarchy authored in beads does not survive the trip out. Everything anton
+pushes lands as a **flat list of top-level issues** in the configured team.
+
+**What survives push:** title, description (with `## Acceptance Criteria` / `## Design` / `## Notes`
+appended — `mapping.go:23-35`), priority, workflow state, and project id. Nothing else. bd also does
+not push `blocks` edges: dependency mapping is pull-only, and only with `--relations`.
+
+## 2. Labels on push: **no**
+
+`labelIds` is a legal field on the create input, but nothing in the push path ever fills it:
+
+```go
+// internal/linear/tracker.go:347 — batch push, single-create branch
+var labelIDs []string   // declared nil, never populated
+created, _, createErr := client.CreateIssueIdempotent(ctx, issue.Title, issue.Description, priority, stateID, labelIDs, marker)
+
+// internal/linear/tracker.go:210 and :221 — non-batch create path
+client.CreateIssueIdempotent(ctx, issue.Title, description, priority, stateID, nil, marker)
+client.CreateIssue(ctx, issue.Title, description, priority, stateID, nil)
+```
+
+and `buildIssueCreateInput` only emits the key `if len(labelIDs) > 0` (`client.go:706`). The update
+map has no label key at all. Bead labels never reach Linear, in either direction of the push —
+`approved`, `stage:*`, `run-lease:*`, `agent:*`, `area:*` are all invisible there. (Labels matter to
+bd only on **pull**, where Linear's labels infer a bead *type* via `linear.label_type_map` —
+`mapping.go:456-480`.)
+
+**So no bead label can reach Linear, the run-lease included.** That is the whole of the label
+question, and it holds on the payload alone.
+
+### It does not follow that a lease-only change writes nothing
+
+The skip that would deliver that is defeated — **once for every bead, and permanently for some**.
+Worth deriving in full, because the design leaned on it.
+
+`BatchPush` fetches the remote issue and skips when `PushFieldsEqual` finds title / description /
+priority / status all equal (`tracker.go:451-458`, `mapping.go:422-436`). Labels are correctly
+absent from that set. The description is in it, and two independent defects make it mismatch:
+
+1. **Every issue bd created carries a marker the comparison does not know about.** Batch create
+   sends `AppendIdempotencyMarker(issue.Description, marker)` (`tracker.go:376-377`; the
+   single-create path does the same inside `CreateIssueIdempotent`, `client.go:829`), so the remote
+   description initially ends in `\n<!-- bd-idempotency: <12 hex> -->`. `FetchIssueByIdentifier`
+   returns `description` verbatim (`client.go:1097-1105`), and the marker's only reader anywhere in
+   the tree is `extractIdempotencyMarker`, used to recover from an ambiguous batch (`client.go:986`,
+   `:1003`) — nothing strips it before the compare, while `BuildLinearDescription(local)` never
+   contains one. **Applies to every bead, and self-clears:** the update it forces writes a
+   marker-free description (`fieldmapper.go:78-85`), so from the second push on the marker is gone.
+   Cost: exactly one extra write per bead, once, after its create.
+2. **The description is built twice — but this only bites a bead with structured fields.** The
+   engine hands `BatchPush` *formatted copies*: `formatPushIssue` sets
+   `copy.Description = BuildLinearDescription(issue)` but leaves `AcceptanceCriteria` / `Design` /
+   `Notes` populated on the copy (`engine.go:1060-1067`, built at `:1055`, passed to `BatchPush` at
+   `:851`). `PushFieldsEqual` then calls `BuildLinearDescription` on that copy, appending
+   `## Acceptance Criteria` / `## Design` / `## Notes` a **second** time (`mapping.go:23-35`). bd
+   knows the hazard elsewhere — the create path carries a comment refusing to re-format for exactly
+   this reason (`tracker.go:196-200`), and `NormalizeIssueForLinearHash` clears the three fields
+   after merging them (`mapping.go:37-51`) — the guard was just never applied to the push
+   comparison. **This defeat does not clear:** the update writes the *singly* appended description
+   (`IssueToTracker` sends `issue.Description`, which is already the merged copy —
+   `fieldmapper.go:77-84`), so the local build stays one append longer than anything the remote can
+   hold and the next push mismatches again. **But `BuildLinearDescription` reads only bd's three
+   *structured* fields — it never parses the description body** (`mapping.go:23-35`). A bead whose
+   rubric lives in the description body appends nothing on either pass, so the two builds agree and
+   this defeat cannot touch it.
+
+#### How many anton beads carry structured fields — the load-bearing number
+
+anton's contract puts the whole rubric in `description` and **forbids `--acceptance`**
+(`skills/bd/SKILL.md:187-215`); graph-created beads have no acceptance field at all, deliberately
+(`src/lib/beads/bd.ts:1877-1891`). A bead written under that rule alone is description-only, so
+defeat 2 cannot reach it. Two things break that assumption: the board still carries beads created
+before the rule, and **anton itself fills a structured field at runtime** — `bd note` is how job
+notes and human steering land on a run target (`beads.note`, `src/lib/beads/bd.ts:2315-2321`), and
+`notes` is one of the three fields `BuildLinearDescription` appends.
+
+Measure the population the sync actually processes — which is **not** every epic and feature. The
+routing plan runs **one pass per mapped `area:`**: anton sets `linear.project_id`, pushes that
+pass's ids, restores it, and **skips unmapped areas rather than guessing**
+(`docs/design/2026-07-26-tier-and-linear-ux.md:104-110`); each pass must hand bd its own selected
+ids or `project_id` silently suppresses every create (*Other findings*, below). The population is
+therefore the **union of the ids `planLinearPushes` emits**, and two things decide it:
+
+1. **Which areas the operator maps.** The routing table is per-install and empty by default, so a
+   fully mapped table is the *upper bound* — any real table selects a subset of what follows.
+2. **Whether a feature carrying no `area:` of its own is routed by its parent epic's.** The design
+   gives an epic exactly one `area:` (`:19`) and says an epic without one reads *"not synced — needs
+   `area:`"* (`:48`), but says nothing about a feature — 186 of the 187 on this board carry no
+   `area:` of their own. That is an 18× difference in N, so it is now an explicit open question on
+   the routing decision (`:107-110`) and `planLinearPushes` cannot be written until it is settled.
+
+Both readings, with the field breakdown, from one board read:
+
+```bash
+bd list --status all --json --limit 0 | jq '
+  def structured: ((.acceptance_criteria//"")!="") or ((.design//"")!="") or ((.notes//"")!="");
+  def own_area: ((.labels//[])|map(select(startswith("area:")))|first);
+  . as $all | ([$all[]|{key:.id,value:own_area}]|from_entries) as $areaOf |
+  [$all[]|select(.issue_type=="epic" or .issue_type=="feature")
+        | {status, s: structured, own: own_area,
+           inh: (own_area // ($areaOf[.parent//""] // null)),        # inherit from parent epic
+           new: (.created_at>"2026-08-15"), ac: ((.acceptance_criteria//"")!=""),
+           no: ((.notes//"")!="")}] as $t |
+  def open_slice: .status!="closed";                                 # --state open skips closed only
+  def pop(f): {selected:    ([$t[]|select(f)]|length),
+               writes:      ([$t[]|select(f and .s)]|length),
+               open_only:   ([$t[]|select(f and open_slice)]|length),
+               open_writes: ([$t[]|select(f and open_slice and .s)]|length)};
+  {tier_chips_select: ($t|length),
+   own_label_only: pop(.own!=null),
+   parent_inherited: pop(.inh!=null),
+   unreachable_either_way: ([$t[]|select(.inh==null)]|length),
+   passes: ([$t[]|select(.inh!=null)|.inh]|group_by(.)|map({(.[0]):length})|add),
+   statuses: ([$t[]|select(.inh!=null)|.status]|group_by(.)|map({(.[0]):length})|add),
+   inherited_detail: {closed:            ([$t[]|select(.inh!=null and .status=="closed")]|length),
+                      closed_writes:     ([$t[]|select(.inh!=null and .status=="closed" and .s)]|length),
+                      acceptance:        ([$t[]|select(.inh!=null and .ac)]|length),
+                      notes:             ([$t[]|select(.inh!=null and .no)]|length),
+                      since_contract:    ([$t[]|select(.inh!=null and .new)]|length),
+                      since_structured:  ([$t[]|select(.inh!=null and .new and .s)]|length),
+                      since_notes_only:  ([$t[]|select(.inh!=null and .new and .no and (.ac|not))]|length)}}'
+# measured 2026-09-05:
+# {"tier_chips_select":197,
+#  "own_label_only":   {"selected": 11, "writes":  10, "open_only":  6, "open_writes":  5},
+#  "parent_inherited": {"selected":194, "writes": 122, "open_only": 44, "open_writes": 17},
+#  "unreachable_either_way":3,
+#  "statuses":{"closed":150,"deferred":1,"in_progress":5,"open":38},
+#  "passes":{"area:agents":5,"area:autopilot":17,"area:board":38,"area:codehealth":56,
+#            "area:collaboration":9,"area:platform":13,"area:reliability":7,"area:runtime":20,
+#            "area:supervision":29},
+#  "inherited_detail":{"closed":150,"closed_writes":105,"acceptance":101,"notes":37,
+#                      "since_contract":76,"since_structured":19,"since_notes_only":18}}
+```
+
+**The tier chips select 197 beads; the routing plan pushes at most 194 of them, and as few as 11.**
+Own-label routing selects the 10 epics — every one carries an `area:`, as the contract says — plus
+the *single* feature of 187 that carries one: 11 beads, 10 of which write every cycle.
+Parent-inherited routing selects 194 across nine passes (`area:codehealth` alone is 56), of which
+**122 write every cycle**; 3 beads are unreachable either way. So **N swings 18×** between the two
+readings, and any budget stated as a multiple of N must name which one it assumes.
+
+#### The aggregate ratio does not survive a partial table — budget per area
+
+The routing table is empty by default and partial mappings are the normal case, so the 122/194
+figure is a **ceiling for the fully mapped table, not a rate to scale down**. A route selects a
+whole `area:`, never a representative sample, and structured fields are not spread evenly across
+areas. Per pass, from the same board read (this snippet reproduces the table below verbatim):
+
+```bash
+bd list --status all --json --limit 0 | jq -r '
+  def structured: ((.acceptance_criteria//"")!="") or ((.design//"")!="") or ((.notes//"")!="");
+  def own_area: ((.labels//[])|map(select(startswith("area:")))|first);
+  . as $all | ([$all[]|{key:.id,value:own_area}]|from_entries) as $areaOf |
+  [$all[]|select(.issue_type=="epic" or .issue_type=="feature")
+        | {status, s: structured, own: own_area,
+           inh: (own_area // ($areaOf[.parent//""] // null))}]
+  | map(select(.inh!=null)) | group_by(.inh)
+  | map([.[0].inh, length, ([.[]|select(.s)]|length),
+         ([.[]|select(.status!="closed")]|length),
+         ([.[]|select(.status!="closed" and .s)]|length)] | @tsv)[]'
+```
+
+| Pass (`linear.project_id` set to that area's project) | Selected | Writes/cycle | Share | *Open only* selected | *Open only* writes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `area:agents` | 5 | 5 | 100% | 0 | 0 |
+| `area:autopilot` | 17 | 3 | 18% | 10 | 2 |
+| `area:board` | 38 | 31 | 82% | 4 | 2 |
+| `area:codehealth` | 56 | 21 | 38% | 13 | 3 |
+| `area:collaboration` | 9 | 5 | 56% | 5 | 1 |
+| `area:platform` | 13 | 9 | 69% | 0 | 0 |
+| `area:reliability` | 7 | 6 | 86% | 0 | 0 |
+| `area:runtime` | 20 | 18 | 90% | 2 | 2 |
+| `area:supervision` | 29 | 24 | 83% | 10 | 7 |
+| **all nine mapped** | **194** | **122** | **63%** | **44** | **17** |
+
+The share runs from **18% to 100%**, so mapping `area:autopilot` alone costs 17 reads and 3 writes,
+while mapping `area:runtime` alone costs 20 reads and 18 — a per-bead write rate five times apart on
+populations of the same size. **Read the budget off the rows of the areas actually mapped**; the
+63% belongs to the whole table and to nothing smaller. Under own-label routing the question is moot:
+each area contributes one or two beads (11 selected, 10 writing), because only one feature on the
+board carries an `area:` of its own.
+
+The measurement is a snapshot, and the population moves the way §2 predicts: this table's 122 was
+120 earlier the same day, the two additions being run targets that gained a `bd note`.
+
+**The write tail also does not trend to zero**, for two independent reasons (counts below are the
+inherited reading, the upper bound):
+
+- Closed beads never leave an *Open and closed* pass, so their writes are permanent rather than
+  decaying: 150 of the 194 are closed, and 105 of those carry a structured field. Closing a legacy
+  bead does not retire its cost; it freezes it.
+- `notes` keeps minting new members of the writing set. Of the 76 selected beads created since
+  2026-08-15, well under the current contract, 19 carry a structured field — **18 of them
+  `notes`-only**, with exactly one `acceptance_criteria`. The contract killed the acceptance field;
+  it cannot keep `bd note` off a run target, and anton notes its own run targets.
+
+So the skip fires only for a bead that is description-only **and** has never been noted **and** has
+been pushed at least once — and the writing set converges to a floor, not to zero. Two levers shrink
+it, and both are design choices for the sync ticket rather than bd behaviours, flagged here and not
+decided: the **routing table**, which sets N outright, and **Also include** — *Open only* takes the
+inherited population from 194 to 44 and its per-cycle writes from 122 to 17 (own-label: 11 → 6 and
+10 → 5). *Open only* is `--state open`, which skips **closed** rather than selecting the literal
+`open` status, so the slice keeps the 5 `in_progress` and 1 `deferred` beads alongside the 38 `open`
+ones — a predicate written as `status == "open"` undercounts it.
+
+bd's regression test does not cover either defeat: `TestBatchPush_SkipsUnchangedIssue`
+(`internal/linear/tracker_test.go:80-137`) uses an empty local description, no structured fields and
+a remote with no marker — the one shape where both defeats are absent — and builds the `Tracker`
+directly, bypassing `formatPushIssue`.
+
+### What hazard 2's residue actually is: a read per bead, plus a write tail that does not decay
+
+Per push, per Linear-linked bead:
+
+1. **One read, always.** `IssueByIdentifier` before any skip decision (`tracker.go:451`), plus one
+   workflow-state fetch per team. No skip avoids this — the fetch is what feeds the comparison, so
+   the read cost is a floor that does not shrink.
+2. **A write, conditionally.** An `issueUpdate` mutation whenever the skip misses — reported back as
+   `Updated: N`, and carrying an `external_ref` re-write with it (`tracker.go:496`). It misses once
+   per bead after its create (defeat 1), then permanently for the majority of the **routed**
+   population that carries a structured field (defeat 2), and for any bead whose title /
+   description / priority / status genuinely moved.
+3. **Genuine content change only sometimes.** When an update does fire on an otherwise unchanged
+   bead it re-sends title, description, priority and `stateId` at their existing values, so whether
+   a stakeholder sees a feed entry is Linear's change detection, not bd's. What *is* a real change:
+   the first push after a create (marker removal), and `status` — it is in the compared set and
+   pushed as `stateId`, so a run flipping its target `open → in_progress → closed` visits three
+   statuses across **two** genuine transitions.
+
+A push triggered by every run-lease refresh (5 min, `RUN_LEASE_REFRESH_MS`) therefore costs **N
+reads, plus a write for the structured-field majority of N**, per cycle — where N is the union
+`planLinearPushes` selects on the *Open and closed* default, **not** the 197 the tier chips match.
+On this board with every area mapped: N=194 and 122 writes (~0.6N) if a feature inherits its parent
+epic's area, N=11 and 10 writes if it does not (§2) — but that 0.6 is the whole-table figure, and a
+partial table must take its per-area rows instead (18–100%, §2) — for a change Linear cannot even represent.
+That tail does not decay: closed beads stay in the population forever and `bd note` keeps adding to
+it. The routing table sets N outright, and **Also include** moves it again (*Open only*: N=44, 17
+writes on the inherited reading — `--state open` drops only closed beads, so `in_progress` and
+`deferred` stay in), while the read floor alone still makes the debounce the only cap,
+not a nicety. And anton must not build the guarantee on bd's skip: a test asserting "an unchanged
+bead syncs nothing" has to assert it at anton's own seam (no push fired at all), because asserting
+it of bd holds only for a never-noted description-only bead, and only from its second push on.
+
+## 3. `--update-refs`: declared, never read, always on
+
+```bash
+grep -rn "update-refs" --include="*.go" .
+# cmd/bd/linear.go:184:  linearSyncCmd.Flags().Bool("update-refs", true, "Update external_ref after creating Linear issues")
+```
+
+That is the **only** occurrence in the tree. The flag is never read — `cmd/bd/linear.go:212-227`
+pulls every other bool out of the flag set and never asks for this one. **`--update-refs=false` is
+silently ignored**; the write-back is unconditional.
+
+What gets written, exactly:
+
+- **Batch path (the one Linear takes):** `external_ref` = the `url` field Linear returned, trimmed,
+  **verbatim including the slug** — e.g. `https://linear.app/<workspace>/issue/TEAM-123/spike-child-feature`
+  (`tracker.go:358`, `:408`, `:496` → `engine.go:1069-1084`). Written for **updated** issues too, not
+  just created ones.
+- **Non-batch path** (other trackers, or Linear if the batch interface is ever dropped): `external_ref`
+  = `BuildExternalRef`, which **canonicalises the slug away** →
+  `https://linear.app/<workspace>/issue/TEAM-123`, falling back to `https://linear.app/issue/TEAM-123`
+  when the URL is empty (`tracker.go:520-530`, `client.go:1245-1267`, `engine.go:964-966`).
+- Both forms are read back through `ExtractLinearIdentifier` (first path segment after `issue/`,
+  `client.go:1233-1243`), so the slug difference is cosmetic for bd — but anton's own reader must
+  accept **both** shapes.
+- `--dry-run` writes nothing: the per-issue loop `continue`s before the create (`engine.go:928-937`).
+
+### Hazard 1 (`external_ref` collision) is confirmed, and worse than assumed
+
+A bead is classified as "needs creating" purely by `extRef == "" || !IsLinearExternalRef(extRef)`
+(`engine.go:925-926`, `tracker.go:303-313`), and `IsLinearExternalRef` is a substring test for
+`linear.app/` + `/issue/` (`client.go:1270-1272`). A bead carrying a legacy `gh-<n>` PR pointer in
+`external_ref` therefore does not read as "already linked" — bd **creates a brand-new Linear issue
+for it and overwrites the PR pointer with the Linear URL**. The pointer is not merely shadowed, it is
+gone, and `--update-refs=false` cannot prevent it. The design's rule stands and hardens: the sync job
+must refuse to push while `planPrRefMigration(list)` is non-empty. This is a pre-push guard in
+anton's own code — there is no bd flag that buys safety here.
+
+## Other findings worth carrying into the build
+
+- **Push gates, in order** (observed on a scratch board): auth configured → `linear.state_map`
+  explicitly configured (`bd linear link`) → live fetch of team workflow states. Each fails closed
+  with a distinct message; the third one is a network call, so nothing about push is testable offline.
+- **bd refuses to store the API key in a git-tracked config**: `bd config set linear.api_key …` is
+  rejected with a `--force-git-tracked` escape hatch. The environment-only credential posture in the
+  design is enforced by bd, not just by us.
+- **`linear.project_id` silently suppresses creates.** When a project id is configured, `ShouldPush`
+  drops every bead that has no `external_ref` yet, unless the invocation was scoped with `--parent`
+  or `--issues` (`cmd/bd/linear.go:359`, `:732-742`). The per-area routing plan (set `project_id`,
+  push that area's ids, restore) **must** pass `--issues`/`--parent` or it will create nothing and
+  report success.
+- **Project membership is create-only.** `projectId` rides on the *create* input only; the update
+  path sends `{title, description, priority, stateId}` and nothing else (`fieldmapper.go:78-85`,
+  `tracker.go:461-474`, §1). So an already-linked issue never moves: re-pointing an `area:` at a
+  different Linear project, or changing a bead's `area:` after its first push, changes where *new*
+  issues land and leaves every existing one in the project it was created in. bd offers no flag that
+  re-homes it — the routing promise binds at creation, and the sync UX must say so rather than imply
+  the mapping is reversible.
+- **Tier filtering works as the design assumes:** `--type epic,feature` filters on bead type,
+  `--state open` skips closed, `--parent` limits to a subtree (`engine.go:1373-1403`, `:843-847`).
+- **Creates are idempotent** via a hash marker appended to the description
+  (`internal/linear/idempotency.go:20-36`), so an interrupted push does not duplicate issues. The
+  same marker is what breaks the first unchanged-issue skip after every create (§2).
+
+## Still open (needs a human)
+
+A real push to a throwaway Linear team was **not** run: it needs a `LINEAR_API_KEY` for a scratch
+workspace, which only a person can mint. Nothing above depends on it — a field bd never sends cannot
+arrive — but a live run would additionally confirm the workspace-slug shape of the returned `url`
+and how a flat push *looks* to a stakeholder. If someone wants that leg: create a throwaway Linear
+team, export `LINEAR_API_KEY`, and re-run the reproduce block below against it.
+
+## Reproduce
+
+```bash
+# 1. Source at the installed version
+bd version
+curl -s -o /tmp/bd.zip https://proxy.golang.org/github.com/steveyegge/beads/@v/v1.1.2.zip
+unzip -q /tmp/bd.zip -d /tmp/bdsrc && cd /tmp/bdsrc/github.com/steveyegge/beads@v1.1.2
+grep -n "type IssueCreateInput" -A 9 internal/linear/types.go     # no ParentID
+grep -rn "parentId" --include="*.go" internal/linear              # nothing (GitLab has it, Linear doesn't)
+grep -n "var labelIDs \[\]string" -A 2 internal/linear/tracker.go # nil labels on create
+grep -rn "update-refs" --include="*.go" .                         # declaration only, never read
+
+# 1b. Why the unchanged-issue skip misses (§2), defeat by defeat
+grep -n "AppendIdempotencyMarker" internal/linear/tracker.go internal/linear/client.go
+#   tracker.go:377 / client.go:829 - every created issue's remote description ends in the marker
+grep -rn "extractIdempotencyMarker" --include="*.go" internal/ | grep -v _test.go
+#   client.go:986,1003 only - recovery search; nothing ever strips the marker back off
+grep -n "BuildLinearDescription(local) != remote.Description" internal/linear/mapping.go
+#   :429 - compares a marker-free local build against the raw remote description
+sed -n '1060,1067p' internal/tracker/engine.go
+#   formatPushIssue: sets copy.Description, does NOT clear AcceptanceCriteria/Design/Notes ...
+sed -n '37,51p' internal/linear/mapping.go
+#   ... unlike NormalizeIssueForLinearHash, which does - so PushFieldsEqual appends them twice
+sed -n '23,35p' internal/linear/mapping.go
+#   :23-35 - the builder reads only the STRUCTURED fields; a description-only bead is untouched
+sed -n '196,200p' internal/linear/tracker.go
+#   bd's own comment naming the double-append hazard on create; never applied to the comparison
+sed -n '80,137p' internal/linear/tracker_test.go
+#   the skip test: empty description, no structured fields, no marker - neither defeat present
+
+# 2. Live CLI behaviour on a throwaway board (no real Linear team touched)
+mkdir /tmp/linear-spike-board && cd /tmp/linear-spike-board && git init -q . && bd init --prefix spike
+bd create "Spike epic parent" -t epic -l area:board
+bd create "Spike child feature" -t feature -l run-lease:host-1,approved
+bd link spike-2dm spike-xz8 --type parent-child   # ids as generated by this run
+
+bd linear sync --push --dry-run
+#   Error: Linear authentication not configured
+bd config set linear.api_key "lin_api_SCRATCH"
+#   (refused: config.yaml is git-tracked; use --force-git-tracked)
+LINEAR_API_KEY=bogus LINEAR_TEAM_ID=00000000-0000-0000-0000-000000000000 bd linear sync --push --dry-run
+#   Error: linear.state_map is not configured. Run 'bd linear link' to configure status mapping first.
+for k in backlog:open unstarted:open started:in_progress completed:closed canceled:closed; do
+  bd config set linear.state_map.${k%%:*} ${k##*:}; done
+LINEAR_API_KEY=bogus LINEAR_TEAM_ID=00000000-0000-0000-0000-000000000000 bd linear sync --push --dry-run
+#   Error: fetching workflow states for team …: API error: … "AUTHENTICATION_ERROR" … (status 401)
+#   ^ proves --dry-run calls the live API before it previews anything
+```
+
+Where a Go toolchain is available, both defeats — and the boundary between them — are directly
+executable. Drop this into `internal/linear/` in the extracted module and run
+`go test ./internal/linear -run SkipDefeat -v`:
+
+```go
+package linear
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/steveyegge/beads/internal/types"
+)
+
+// Defeat 1 hits every bead once, then clears. This is anton's own bead shape:
+// the rubric lives in Description, the structured fields are empty.
+func TestSkipDefeat_DescriptionOnly(t *testing.T) {
+	bead := &types.Issue{Title: "T", Description: "body"}
+
+	// Mirrors Engine.formatPushIssue (engine.go:1060-1067) — the copy BatchPush receives.
+	pushed := *bead
+	pushed.Description = BuildLinearDescription(bead)
+
+	// PushFieldsEqual's description leg (mapping.go:429) re-runs the builder.
+	local := BuildLinearDescription(&pushed)
+
+	// The remote as bd created it. AppendIdempotencyMarker's second parameter is the
+	// WHOLE comment, wrapper included — that is what GenerateIdempotencyMarker returns
+	// (idempotency.go:20-36), not a bare hash — so this is the literal remote suffix.
+	marked := AppendIdempotencyMarker(pushed.Description, "<!-- bd-idempotency: deadbeef1234 -->")
+	if local == marked {
+		t.Error("marker-carrying remote description compared equal")
+	}
+	// ...and that first mismatch forces an update that writes `local` back. From the
+	// second push on the descriptions agree, so the skip fires: no further writes.
+	if local != pushed.Description {
+		t.Errorf("description-only bead should compare equal once the marker is gone: %q vs %q",
+			local, pushed.Description)
+	}
+}
+
+// Defeat 2 needs a STRUCTURED field, and never clears. Legacy anton beads only.
+func TestSkipDefeat_StructuredFields(t *testing.T) {
+	bead := &types.Issue{Title: "T", Description: "body", AcceptanceCriteria: "- [ ] a"}
+
+	// formatPushIssue merges Description but leaves AcceptanceCriteria populated...
+	pushed := *bead
+	pushed.Description = BuildLinearDescription(bead)
+
+	// ...so the builder appends the section a second time on the compare.
+	local := BuildLinearDescription(&pushed)
+	if strings.Count(local, "## Acceptance Criteria") != 2 {
+		t.Fatalf("expected the section appended twice, got %q", local)
+	}
+	// The update writes the singly-appended `pushed.Description` back (fieldmapper.go:77-84),
+	// so the local build stays one append longer forever. Every push writes.
+	if local == pushed.Description {
+		t.Error("byte-identical remote description compared equal")
+	}
+}
+```
+
+## What this changes downstream
+
+- **anton-60oi (reshape the contracts):** the epic → sub-issue shape is not available, and **neither
+  is the tier**: `--type` only selects which beads are pushed, so the payload (title, description,
+  priority, state, project id) carries nothing that separates an epic from a feature in Linear.
+  Either accept a flat, tier-less push and say so, carry the parent or tier as text in the pushed
+  title/description, or route epics to Linear **projects** and features to issues within them — the
+  routing machinery the design already plans for `area:` is the only hierarchy bd can express today,
+  and it groups by area, not by tier.
+- **anton-ey0w.5 (keep run-lease churn out of Linear):** no longer a code change to move the lease off
+  labels — bd cannot leak a label. What remains is a **read per linked bead per push, unconditional**,
+  plus a write tail: bd's unchanged-issue skip misses once per bead after its create, and misses
+  forever for any bead carrying a structured `acceptance_criteria`/`design`/`notes` field. Size it
+  against the beads `planLinearPushes` selects, not the 197 the tier chips match: with every area
+  mapped and the `--state all` default, that is **122 writes against N=194** if a feature inherits
+  its parent epic's `area:`, or **10 against N=11** if it does not — and a *partial* table is budgeted
+  from its own areas' rows, whose write share runs 18–100%, not from that aggregate — 186 of the 187 features carry
+  no `area:` of their own, so the two readings differ 18× and the ticket has to pick one (§2). Only
+  a never-noted, description-only bead skips from its second push on, and `bd note` keeps moving
+  beads out of that set. So the debounce is still the only cap — the read floor alone justifies it —
+  but the ticket should size the cost as N reads plus a write for the structured-field majority of
+  N over the *routed* union, note that the tail does not decay (closed beads never leave a
+  `--state all` population), and treat the routing table and *Open only* as the levers if the cost
+  has to come down. The "a lease-only change syncs nothing" test must still
+  assert *no push fired* at anton's seam: asserting that bd skips is true only for a never-noted
+  description-only bead, and only after its first push.
+  Still to decide: whether per-run `status` transitions should reach Linear at all.
+- **anton-ey0w.2 (wrapper + `external_ref` guard):** the guard cannot delegate to `--update-refs`; it
+  must be a pre-push refusal while any bead still holds a `gh-<n>` ref. The wrapper's ref reader must
+  accept both the slugged and canonical URL forms, and the per-area routing pass must pass
+  `--issues`/`--parent` or `linear.project_id` will silently suppress every create.

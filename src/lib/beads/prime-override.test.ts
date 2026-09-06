@@ -10,6 +10,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { proposalFingerprint } from "../gardener/detections";
 
 const read = (...parts: string[]): string => readFileSync(join(process.cwd(), ...parts), "utf8");
 
@@ -47,6 +48,15 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
           /credential, an account, a purchase, a signature, or a taste call/,
         );
         expect(flat(doc)).toMatch(/`human` resolves to none/);
+      });
+
+      // anton-x37c: isClaimable drops a proposal, so a doc that still offered one would teach a
+      // worker to claim a board move anton applies itself on approval.
+      it("excludes proposals from the claimable set, and says how one is recognised", () => {
+        expect(flat(doc)).toMatch(/\*\*not a proposal\*\*/);
+        expect(flat(doc)).toMatch(/\*\*A proposal is a decision, not work\.\*\*/);
+        // The fingerprint label is the predicate isProposalBead tests, in both namespaces.
+        expect(flat(doc)).toMatch(/`gardener:<kind>:<hash>` or `pm:<kind>:<hash>`/);
       });
 
       it("keeps that exclusion out of the pool query's flags", () => {
@@ -109,6 +119,22 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
     });
   }
 
+  // The docs teach a proposal by its LABEL, so the shape they teach must be the shape
+  // proposalFingerprint writes — a template that drifted would have a worker claim proposals it
+  // could not recognise. Both namespaces, because the namespace comes from the kind.
+  it("the fingerprint template both docs teach is the label anton actually writes", () => {
+    const asRegex = (template: string) =>
+      new RegExp(`^${template.replace("<kind>", "[a-z-]+").replace("<hash>", "[0-9a-f]+")}$`);
+    for (const [where, doc] of PROTOCOL_HOMES) {
+      const templates = [...flat(doc).matchAll(/`((?:gardener|pm):<kind>:<hash>)`/g)].map(
+        (m) => m[1],
+      );
+      expect(templates, where).toEqual(["gardener:<kind>:<hash>", "pm:<kind>:<hash>"]);
+      expect(proposalFingerprint("stale", "subject"), where).toMatch(asRegex(templates[0]));
+      expect(proposalFingerprint("low-value", "subject"), where).toMatch(asRegex(templates[1]));
+    }
+  });
+
   it("PRIME.md is self-sufficient: it carries the run-target rule it filters on", () => {
     // The override replaces bd's whole reference, so a rule it only cites is a rule a primed
     // session doesn't have.
@@ -130,7 +156,10 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
   // claimable set that still contains human work.
   it("AGENTS.md's pickup section agrees on the exclusion", () => {
     const agents = read("AGENTS.md");
-    expect(flat(agents)).toMatch(/drops anything labelled `agent:human`/);
+    expect(flat(agents)).toMatch(
+      /drops proposals — a bead carrying a `gardener:`\/`pm:` fingerprint/,
+    );
+    expect(flat(agents)).toMatch(/anything labelled `agent:human`/);
     expect(flat(agents)).toMatch(
       /credential, an account, a purchase, a signature, or a taste call/,
     );

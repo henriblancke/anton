@@ -20,6 +20,7 @@
     "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint",
+    "check:control-bytes": "bun scripts/check-control-bytes.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

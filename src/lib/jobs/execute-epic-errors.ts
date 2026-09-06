@@ -118,6 +118,63 @@ export class ParkedOnPrereqError extends BlockedTailError {
 }
 
 /**
+ * The same ordering, where the prerequisite is a ticket THIS RUN already holds (anton-0gm2) — a
+ * correction to the run's own dispatch order rather than a wait.
+ *
+ * Deliberately NOT a {@link ParkedOnPrereqError}, and not poison at all. That park's own argument —
+ * "retrying now would spend an attempt proving the edge anton just drew" — holds only while somebody
+ * ELSE lands the prerequisite. Here the run is the thing that lands it, so parking behind it parks
+ * the run against itself: three real runs did exactly that in one incident and tripped the
+ * consecutive-failure breaker. The dispatch loop catches this one error, re-orders what it has left
+ * so the prerequisite goes next, and carries on — so nothing about this case is a failure and
+ * nothing is counted as one.
+ *
+ * The only way it leaves that loop is {@link PrereqCycleError}.
+ */
+export class ReorderedOnPrereqError extends Error {
+  constructor(
+    readonly ticketId: string,
+    /** The prerequisite the new edge points at — a ticket of this run's own set. */
+    readonly blockerId: string,
+    /** What the repair did, in the words the bead's own note carries. */
+    readonly attempted: string,
+    /** This ticket's session log — where the loop's account of the re-order lands. */
+    readonly logPath: string,
+    /** The block this repair answered — kept so the account still states what stopped the ticket. */
+    readonly block: unknown,
+  ) {
+    super(
+      `${ticketId} blocked on \`${blockerId}\`, which is a ticket THIS run holds: ${attempted}. ` +
+        `The run re-orders itself to dispatch ${blockerId} first rather than parking behind its ` +
+        `own work. It stopped with: ` +
+        (block instanceof Error ? block.message : String(block)),
+    );
+    this.name = "ReorderedOnPrereqError";
+  }
+}
+
+/**
+ * The edge the `dep-missing` repair drew closes a CYCLE among the run's own tickets (anton-0gm2):
+ * no dispatch order satisfies it.
+ *
+ * Poison, because the alternative is the one thing a re-order must never do — fall through to
+ * {@link orderTickets}'s input-order fallback and dispatch an ordering anton has just recorded as
+ * impossible, which is how a bad edge gets executed. The edge is on the board and reversible
+ * (`bd dep remove`), so the message names it: a person decides which half of the cycle is wrong.
+ */
+export class PrereqCycleError extends PoisonEpic {
+  constructor(ticketId: string, blockerId: string, cycle: string[]) {
+    super(
+      `${ticketId} reported \`dep-missing\` naming \`${blockerId}\`, and anton drew that edge — but ` +
+        `it closes a dependency cycle inside this run's own tickets (${cycle.join(" → ")}), so no ` +
+        `dispatch order can satisfy it. The run stopped rather than run the tickets in an order the ` +
+        `board says is impossible. Take the wrong half back — ` +
+        `\`bd dep remove ${ticketId} ${blockerId}\` undoes the one anton drew — then resume the run`,
+    );
+  }
+}
+
+/**
  * The agent reported `ANTON-RESULT: needs-human — <ask>` (anton-287p): it stopped because only a
  * person can take the next step, not because it hit a broken state. Distinct from
  * {@link BlockedByAgentError} in what it COSTS the operator — a block is a defect to diagnose, an ask

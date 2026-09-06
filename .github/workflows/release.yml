@@ -16,7 +16,8 @@ permissions:
   contents: write # create the GitHub Release + upload assets
 
 jobs:
-  # Gate the tag on green lint/test/build and create the Release the bundle jobs attach to.
+  # Gate the tag on the same gates ci.yml's `check` job runs — control bytes, lint, typecheck,
+  # test, build — plus a CLI-launch smoke check, then create the Release the bundle jobs attach to.
   gates:
     runs-on: ubuntu-latest
     steps:
@@ -26,8 +27,12 @@ jobs:
           bun-version: "1.4.0" # match package.json `packageManager`
       - name: Install
         run: bun install --frozen-lockfile
+      - name: Control bytes
+        run: bun run check:control-bytes
       - name: Lint
         run: bun run lint
+      - name: Typecheck
+        run: bun run typecheck
       - name: Test
         # Integration suites that need bd/gh/stringer/claude self-skip when those CLIs are absent.
         run: bun run test

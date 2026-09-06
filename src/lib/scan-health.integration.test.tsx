@@ -233,6 +233,7 @@ process.stdin.on('end',()=>{
             scanHealth: health,
             trajectory: undefined,
             stoppedCount: 0,
+            staleServers: [],
             pickerLog: [],
           }}
         />
