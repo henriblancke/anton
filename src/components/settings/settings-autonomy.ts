@@ -143,8 +143,8 @@ export const AUTONOMY_GROUPS: {
   {
     id: "history",
     title: "Writes history",
-    does: "Closes the bead — a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it” — or grants the approve gate on one, which records the decision a run starts from in your name.",
-    undo: "Reopening a close is one write. Undoing a grant is two, in that order — withdraw the label, then release the reservation it took, because nothing will release a target the board still shows as approved — and a failure between them leaves the bead reserved with the gate already off. Either way the close or the grant stays in the board's history and in every report already taken from it.",
+    does: "Closes the bead — a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it” — grants the approve gate on one, which records the decision a run starts from in your name, or returns parked work to the board, where a bead that still carries approved re-enters the pool a run is picked from.",
+    undo: "Reopening a close is one write, and re-parking a returned bead is one write. Undoing a grant is two, in that order — withdraw the label, then release the reservation it took, because nothing will release a target the board still shows as approved — and a failure between them leaves the bead reserved with the gate already off. What none of them takes back is a run that has already started: the close or the grant stays in the board's history and in every report already taken from it.",
     armed:
       "Armed, a pass closes beads and grants approvals with nobody watching, and what it writes " +
       "outlives the undo. Arm this last, on a project whose shadow record you have actually read.",
@@ -156,6 +156,12 @@ export const AUTONOMY_GROUPS: {
         // The gate and the reservation are the whole write — nothing here enqueues a run
         // (anton-qlci), and a tier that promised one would promise spend that never happens.
         does: "grants the approve gate to work the board ranks next that nothing has approved, and reserves it for anton — the state a run starts from, not the run itself",
+      },
+      {
+        id: "aged-defer",
+        // Grouped by its WORST case, like every row: a parked bead keeps its labels, so returning an
+        // approved one puts it straight back in the claimable pool (gardener/autonomy.ts).
+        does: "returns a bead parked far past the re-judgement window to the board — declining leaves it parked, and a permanent won’t-do stays yours to record",
       },
     ],
   },

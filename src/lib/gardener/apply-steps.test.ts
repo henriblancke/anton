@@ -43,6 +43,7 @@ import {
   MISFILED,
   onWrite,
   ordered,
+  parked,
   planFor,
   proposalFor,
   record,
@@ -54,6 +55,7 @@ import {
   showBead,
   SUPERSEDE,
   ticket,
+  UNDEFER,
   warm,
 } from "./apply.fixture";
 
@@ -72,6 +74,7 @@ vi.mock("../beads/bd", async () => {
       close: (_cwd: string, id: string, reason?: string) => record("close", id, reason ?? ""),
       supersede: (_cwd: string, id: string, w: string) => record("supersede", id, w),
       defer: (_cwd: string, id: string) => record("defer", id),
+      undefer: (_cwd: string, id: string) => record("undefer", id),
       update: (_cwd: string, id: string, patch: { priority?: number }) =>
         record("update", id, `P${patch.priority}`),
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
@@ -1088,5 +1091,54 @@ describe("rolling back a cluster that failed part-way — the board must end unc
       "reparent anton-c anton-card",
     ]);
     expect(calls.some((c) => c.startsWith(`close ${proposal.id}`))).toBe(false);
+  });
+});
+
+/**
+ * The write half of a re-judgement (anton-rozm): `bd undefer`, and the two states the lock exists to
+ * catch — a founder who un-parked the bead themselves, and one who has merely been back to it.
+ */
+describe("returning parked work to the board", () => {
+  it("spawns bd's own undefer, and closes the proposal over it", async () => {
+    const proposal = proposalFor(UNDEFER);
+
+    const result = await apply(proposal, [parked(), proposal]);
+
+    expect(result.changed).toEqual(["anton-a"]);
+    expect(calls[0]).toBe("undefer anton-a");
+  });
+
+  // Un-parking by hand IS a write since the filing, so the idempotent branch has to be read before
+  // the fence — otherwise the ask refuses over the very state it wanted.
+  it("writes nothing when the bead was un-parked between the decision and the lock", async () => {
+    const proposal = proposalFor(UNDEFER);
+    liveBeads.set("anton-a", cold("anton-a"));
+
+    const result = await apply(proposal, [parked(), proposal]);
+
+    expect(calls.some((c) => c.startsWith("undefer"))).toBe(false);
+    expect(result.changed).toEqual([]);
+  });
+
+  it("refuses a bead somebody has been back to since the filing, writing nothing", async () => {
+    const proposal = proposalFor(UNDEFER);
+    liveBeads.set("anton-a", warm("anton-a", { status: "deferred" }));
+
+    await expect(apply(proposal, [parked(), proposal])).rejects.toMatchObject({
+      failure: "refused",
+    });
+    expect(calls.some((c) => c.startsWith("undefer"))).toBe(false);
+    expect(calls[0]).toMatch(/no longer the parked bead nobody had been back to/);
+  });
+
+  it("refuses to hand a bead back to a card whose run started since the snapshot", async () => {
+    const proposal = proposalFor(UNDEFER);
+    liveBeads.set("anton-run", runCard({ labels: [LABELS.runLease(Date.now() + 60_000, "run-9")] }));
+
+    await expect(
+      apply(proposal, [runCard(), parked({ parent: "anton-run" }), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+    expect(calls.some((c) => c.startsWith("undefer"))).toBe(false);
+    expect(calls[0]).toMatch(/anton-run is mid-run .* returning anton-a to its ticket set/);
   });
 });

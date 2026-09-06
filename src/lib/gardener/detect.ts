@@ -63,10 +63,13 @@ export {
   RETIRE_STALE_IN_PROGRESS_DAYS,
   RETIRE_STALE_OPEN_DAYS,
 } from "./retire";
-// Deliberately NOT part of {@link detectBoard}: this one produces a claim with no move attached
-// (see rejudge.ts), so the pass that chooses the verb composes it rather than the board sweep.
+// Deliberately NOT part of {@link detectBoard}: re-judgement asks about a decision the board's own
+// tiers made rather than about its shape, and it runs on its own cadence (anton-30vo) — so the pass
+// that schedules it composes `detectDeferredRejudgements`, which is the claim with its verb already
+// chosen. `detectDeferredRejudgement` is the claim alone, for a caller that wants the question.
 export {
   detectDeferredRejudgement,
+  detectDeferredRejudgements,
   REJUDGE_DEFERRED_DAYS,
   type DeferredRejudgement,
   type RejudgeOptions,

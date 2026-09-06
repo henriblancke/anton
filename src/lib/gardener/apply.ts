@@ -65,6 +65,8 @@ import {
   fingerprintLabelOf,
   GARDENER_OBSERVED_AT_KEY,
   isProposalBead,
+  kindOfFingerprint,
+  KINDS,
   readProposalPlan,
   type GardenerPlan,
 } from "./detections";
@@ -567,6 +569,19 @@ async function settledDrifted(
 export function declineNote(proposal: Bead): string | undefined {
   const fingerprint = fingerprintLabelOf(proposal);
   if (!fingerprint) return undefined;
+  // A kind whose decline EXPIRES says so, in days (detections.ts `REASK_AFTER_DAYS`). "Never again"
+  // is what every other decline buys, and promising it here would be the one thing this note cannot
+  // do: the pass comes back for parked work by design, and a founder who met that promise once would
+  // read every other decline as a suggestion.
+  const kind = kindOfFingerprint(fingerprint);
+  const reask = kind ? KINDS[kind].reask : undefined;
+  if (reask !== undefined) {
+    return (
+      `${fingerprint.split(":")[0]}: declined — it stays parked, and this pass will not file ` +
+      `\`${fingerprint}\` again for ${reask} days. After that it asks once more, because a decline ` +
+      `here answers for today. To end it for good, close the bead itself as ${LABELS.abandoned}.`
+    );
+  }
   // The `abandoned` label IS the suppression, so undoing a decline means dropping that label — not
   // reopening the bead, which would leave it suppressed and confuse the next reader.
   //

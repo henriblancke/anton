@@ -119,6 +119,7 @@ function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
     case "link":
     case "reparent":
     case "approve":
+    case "undefer":
       return { kind: step.kind, observedAtMs: step.observedAtMs };
     default:
       return undefined;
@@ -137,6 +138,7 @@ function ownerOf(step: ApplyStep): TicketOwner["owner"] {
     case "supersede":
     case "defer":
     case "reparent":
+    case "undefer":
       return step.owner;
     default:
       return undefined;
@@ -480,6 +482,11 @@ function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
   // picker's own pool expects it (approved and unassigned), which is why the proposal's acceptance
   // asserts the gate alone and never a reservation (emit.ts `appliedState`).
   if (step.verb === "approve") return beads.isApproved(subject);
+  // Somebody un-parked it by hand between the decision and this lock — the outcome the re-judgement
+  // wanted, so there is nothing to write. Ahead of the fence on purpose: un-parking IS a write since
+  // the filing, so an unguarded evidence check would refuse the very state the ask was after (the
+  // same order `planUndefer` reads its settled states in).
+  if (step.verb === "undefer") return !beads.isDeferred(subject);
   return false;
 }
 
@@ -825,6 +832,9 @@ async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
       return true;
     case "defer":
       await beads.defer(repo, step.id);
+      return true;
+    case "undefer":
+      await beads.undefer(repo, step.id);
       return true;
   }
 }

@@ -46,6 +46,12 @@ export const PROPOSAL_NAMESPACES: readonly ProposalNamespace[] = ["gardener", "p
  * verb re-shapes, parks or retires something; this one grants the founder's own gate, and what
  * follows it is a run that spends tokens and opens a PR. Taking the label back does not un-run that,
  * which is why it is priced at the dearest earned-autonomy tier (autonomy.ts `autonomyTierOf`).
+ *
+ * `undefer` is the only move that puts work BACK (anton-rozm) — the reverse of the `defer` every
+ * judgment tier retires with, and what makes that retirement reversible in practice rather than in
+ * principle. It is the whole answer to a re-judgement: approving returns the parked bead to the
+ * board, and declining leaves it where it is. The other conclusion — that the work is genuinely dead
+ * — has no move here on purpose, because a permanent won't-do is a human's act (see `RetireVerb`).
  */
 export type GardenerMove =
   | "reparent"
@@ -54,7 +60,8 @@ export type GardenerMove =
   | "reprioritize"
   | "split"
   | "unapprove"
-  | "approve";
+  | "approve"
+  | "undefer";
 
 /**
  * The claims the two producers know how to name.
@@ -89,6 +96,14 @@ export type GardenerMove =
  *                             `degraded-approval` and the only kind whose move STARTS work — until
  *                             this one, the judgment tier could withdraw a founder's approval but
  *                             never grant one.
+ *
+ * And the gardener's one RE-JUDGEMENT (anton-dsnr):
+ *   • `aged-defer`          — a bead parked far past the re-judgement window that nothing has looked
+ *                             at since. The only kind that asks about a decision anton's own tiers
+ *                             made: every kill here is a `defer` because a permanent won't-do is a
+ *                             human's act, and that reversibility is worth nothing unless something
+ *                             comes back to ask. Mechanical, like `stale`, and for the same reason —
+ *                             the claim is a duration, and a duration costs no session to measure.
  */
 export type GardenerDetectionKind =
   | "container-orphan"
@@ -103,7 +118,8 @@ export type GardenerDetectionKind =
   | "oversized"
   | "low-value"
   | "degraded-approval"
-  | "withheld-approval";
+  | "withheld-approval"
+  | "aged-defer";
 
 export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "container-orphan",
@@ -119,6 +135,7 @@ export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "low-value",
   "degraded-approval",
   "withheld-approval",
+  "aged-defer",
 ];
 
 /**
@@ -167,7 +184,23 @@ export interface KindSpec {
   detail?: DetailShape;
   /** Set when the subject list is not the claim's identity — see {@link ClaimIdentity}. */
   identity?: ClaimIdentity;
+  /** How long a DECLINE holds, in whole days — see {@link REASK_AFTER_DAYS}. Absent means forever. */
+  reask?: number;
 }
+
+/**
+ * How long a declined `aged-defer` holds before the claim may be made again — a quarter, the same
+ * silence the detector measures (rejudge.ts `REJUDGE_DEFERRED_DAYS`, bound to this by test).
+ *
+ * DECLINED STAYS DECLINED is the rule everywhere else (emit.ts), and it is right everywhere else: a
+ * declined re-parent is an answer about a board shape that will not change on its own. A declined
+ * re-judgement is not — it says "still parked", which is a decision about a MOMENT, and holding it
+ * forever would turn the one loop that exists to reopen `defer` into the same one-way valve it was
+ * built to undo. So this kind alone expires, and the window is stated on the proposal itself
+ * (emit.ts `descriptionOf`, apply.ts `declineNote`) rather than left for a founder to discover when
+ * the ask comes back.
+ */
+export const REASK_AFTER_DAYS = 90;
 
 /**
  * The one move each kind resolves to, and the producer it belongs to. A detection still STATES its
@@ -197,6 +230,7 @@ export const KINDS: Record<GardenerDetectionKind, KindSpec> = {
   "low-value": { namespace: "pm", move: "retire", retireAs: "defer" },
   "degraded-approval": { namespace: "pm", move: "unapprove" },
   "withheld-approval": { namespace: "pm", move: "approve" },
+  "aged-defer": { namespace: "gardener", move: "undefer", reask: REASK_AFTER_DAYS },
 };
 
 /** Which producer files this kind — the fingerprint's prefix and the proposal's `source:` label. */
@@ -586,6 +620,7 @@ const GARDENER_MOVES: readonly GardenerMove[] = [
   "split",
   "unapprove",
   "approve",
+  "undefer",
 ];
 const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
 

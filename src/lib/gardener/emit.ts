@@ -19,7 +19,10 @@
  *     proposal — anton's won't-do outcome (LABELS.abandoned) — suppresses forever, which is what
  *     makes declining meaningful. A PLAINLY closed proposal (one that was applied, anton-1t3n) does
  *     NOT suppress: the move landed, so the detector has nothing left to find, and if it somehow
- *     does the board really did regress.
+ *     does the board really did regress. The one exception is a kind whose decline is an answer
+ *     about a MOMENT rather than about the board — the re-judgement of parked work — which states a
+ *     window and expires with it ({@link declineExpired}). The window is written on the proposal
+ *     itself, so a founder learns it when they decide rather than when the ask comes back.
  *   • EVIDENCE TRAVELS WITH THE ASK. The detection's evidence lines and `discovered-from` edges to
  *     every bead the move concerns land on the proposal, so an approver can check the reasoning from
  *     the bead itself instead of re-deriving it from the board.
@@ -29,7 +32,7 @@
 import { beads, CLAIM_SETTLE_MS, LABELS, type Bead, type SyncOutcome } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
-import { isClaimed, isOpenWork } from "./board-index";
+import { ageInDays, isClaimed, isOpenWork } from "./board-index";
 import {
   canonicalFingerprintOf,
   concernedBeads,
@@ -38,9 +41,12 @@ import {
   GARDENER_PLAN_KEY,
   isManualProposal,
   isProposalBead,
+  kindOfFingerprint,
+  KINDS,
   namespaceOf,
   planOf,
   type GardenerDetection,
+  type GardenerDetectionKind,
   type GardenerPlan,
   type ProposalNamespace,
 } from "./detections";
@@ -91,25 +97,53 @@ export const MAX_APPLIES_PER_PASS = 3;
 
 /**
  * Fingerprints the board says NOT to propose again: every proposal still open, plus every one
- * declined (abandoned). A plainly-closed proposal is absent deliberately — see the module header.
+ * declined (abandoned) whose decline still holds. A plainly-closed proposal is absent deliberately —
+ * see the module header.
  *
  * A proposal answers for the claim its own PLAN makes as well as for the label it carries. The two
  * are the same string for everything this emitter filed; they differ for a `parentless-cluster`
  * filed before the claim moved to its target (anton-9hpp), and folding it onto the identity the
  * detector now derives is what keeps the rollout from filing a fresh-format twin of an ask the
  * board already carries.
+ *
+ * `nowMs` is only read for the kinds whose decline EXPIRES ({@link declineExpired}); every other
+ * fingerprint is suppressed on the label alone, whatever the clock says.
  */
-export function suppressedFingerprints(board: Bead[]): Set<string> {
+export function suppressedFingerprints(board: Bead[], nowMs: number = Date.now()): Set<string> {
   const out = new Set<string>();
   for (const bead of board) {
     const fingerprint = fingerprintLabelOf(bead);
     if (!fingerprint) continue;
-    if (!isOpenWork(bead) && !beads.isAbandoned(bead)) continue;
+    if (!isOpenWork(bead)) {
+      if (!beads.isAbandoned(bead)) continue;
+      if (declineExpired(fingerprint, bead, nowMs)) continue;
+    }
     out.add(fingerprint);
     const canonical = canonicalFingerprintOf(bead);
     if (canonical) out.add(canonical);
   }
   return out;
+}
+
+/**
+ * Has this DECLINE run out — the stated window for a kind that has one, elapsed since the proposal
+ * was settled?
+ *
+ * Only ever true for a kind {@link KINDS} gives a `reask` window (detections.ts
+ * `REASK_AFTER_DAYS`): declined stays declined everywhere else, and that is what makes declining
+ * mean anything. The one exception is the re-judgement of parked work, whose decline says "still
+ * parked" — an answer about a moment, which a quarter later is worth asking again.
+ *
+ * Fails CLOSED, twice over: an unreadable kind or an undated proposal keeps suppressing. The cost of
+ * a decline that never expires is a question nobody is asked; the cost of one that expires on a
+ * stamp we could not read is the founder answering the same question every night.
+ */
+function declineExpired(fingerprint: string, proposal: Bead, nowMs: number): boolean {
+  const kind = kindOfFingerprint(fingerprint);
+  const window = kind ? KINDS[kind].reask : undefined;
+  if (window === undefined) return false;
+  const since = ageInDays(proposal, nowMs);
+  return since !== undefined && since >= window;
 }
 
 export interface EmissionPlan {
@@ -147,7 +181,10 @@ export interface EmissionInput {
  */
 export function planEmission(input: EmissionInput): EmissionPlan {
   const limit = input.limit ?? MAX_PROPOSALS_PER_PASS;
-  const blocked = suppressedFingerprints(input.board);
+  // Judged against the moment the board was READ, not against wall-clock now: it is the same
+  // snapshot every proposal's evidence describes, so a pass decides suppression and files its asks
+  // off one clock. A caller with no snapshot to name falls back to now.
+  const blocked = suppressedFingerprints(input.board, input.observedAtMs ?? Date.now());
   const seen = new Set<string>();
   const fresh: GardenerDetection[] = [];
   const suppressed: GardenerDetection[] = [];
@@ -670,6 +707,8 @@ function moveClause(detection: GardenerDetection): string {
       return `fix ${subjects} or withdraw its approval`;
     case "approve":
       return `approve ${subjects} so a run can start on ${pronoun(detection)}`;
+    case "undefer":
+      return `return ${subjects} to the board, or leave ${pronoun(detection)} parked`;
   }
 }
 
@@ -715,6 +754,12 @@ function appliedState(detection: GardenerDetection): string {
       // answer, and approving after a repair records that rather than stripping the label off work
       // that is sound again (see apply.ts `planUnapprove`).
       return `${subjects} either meets the approve gate again, or no longer carries \`approved\` — with a note on the bead naming the gaps that withdrew it`;
+    case "undefer":
+      // The move is the whole assertion: `open` again, contract untouched. Not "a run has started on
+      // it" — nothing here enqueues one, and whether the board reaches this bead is the picker's
+      // ranking to decide. What the approver IS being told rides in the evidence instead: an
+      // approved bead re-enters the claimable pool the moment it leaves `deferred` (rejudge.ts).
+      return `${subjects} ${is} open again rather than deferred, with ${detection.subjects.length === 1 ? "its" : "their"} contract, notes and edges exactly as parked`;
     case "approve":
       // What the move WRITES, not what a later feature will do with it: the gate, and nothing here
       // enqueues a run (anton-qlci). An acceptance box promising a started run is one the approver
@@ -745,11 +790,68 @@ const MANUAL_INSTRUCTIONS: Partial<Record<GardenerDetection["move"], string[]>> 
 function acceptanceOf(detection: GardenerDetection): string {
   return [
     `- [ ] ${appliedState(detection)}`,
-    "- [ ] no other bead is re-parented, linked, reprioritized, retired, approved or unapproved — the move above is the whole change",
+    "- [ ] no other bead is re-parented, linked, reprioritized, retired, returned to the board, approved or unapproved — the move above is the whole change",
     isManualProposal(detection)
       ? "- [ ] this proposal is DECLINED once the move is made by hand — approving it is refused, so declining is what settles it"
       : "- [ ] this proposal is closed with a note naming what changed",
   ].join("\n");
+}
+
+/**
+ * How a kind whose DECLINE is itself an answer tells its reader to settle it — the shape a
+ * re-judgement needs and no other proposal does.
+ *
+ * Every other proposal declines to "no, leave the board alone", so the standard two lines say all
+ * there is to say. A re-judgement is asked the other way round: both answers are decisions about the
+ * subject, and the third one — that the work is genuinely dead — is a move anton will not make at
+ * all. Spelling that out is the difference between a founder recording a permanent won't-do and a
+ * founder assuming a decline did it for them.
+ */
+const REJUDGE_INSTRUCTIONS: Partial<Record<GardenerDetectionKind, string[]>> = {
+  "aged-defer": [
+    "This bead is a DECISION, not implementation work, and BOTH answers settle it. APPROVE returns",
+    "the parked bead to the board through the beads seam (`bd undefer`), with its contract intact.",
+    "DECLINE leaves it exactly where it is — parked, still reversible, and not re-asked for the",
+    "window below. If it is genuinely dead, that is the third answer and it is yours alone: record",
+    "the won't-do by hand (`bd close --reason abandoned`) and decline this proposal. anton proposes a",
+    "permanent retirement and never applies one, however far its autonomy is armed.",
+  ],
+};
+
+/** The settlement paragraph for this ask — manual, re-judged, or the ordinary approve/decline. */
+function settlementLines(detection: GardenerDetection): string[] {
+  if (isManualProposal(detection)) return MANUAL_INSTRUCTIONS[detection.move] ?? [];
+  return (
+    REJUDGE_INSTRUCTIONS[detection.kind] ?? [
+      "This bead is a DECISION, not implementation work: approving it applies the move through the",
+      "beads seam, declining it records the reason.",
+    ]
+  );
+}
+
+/**
+ * What the fingerprint BUYS the reader: how long this claim stays unasked, stated in days wherever
+ * the decline expires (detections.ts `REASK_AFTER_DAYS`). A proposal that promised silence forever
+ * and then re-appeared would teach a founder to distrust every other one.
+ */
+function suppressionLines(detection: GardenerDetection): string[] {
+  const window = KINDS[detection.kind].reask;
+  return window === undefined
+    ? [
+        `- fingerprint: \`${detection.fingerprint}\` — while this bead is open, or once it is declined,`,
+        "  the patrol makes this claim no second time",
+      ]
+    : [
+        `- fingerprint: \`${detection.fingerprint}\` — while this bead is open, and for ${window} days after`,
+        "  it is declined, the patrol makes this claim no second time; past that window it asks once more,",
+        "  because a decline here says \"still parked\", which is an answer about today",
+      ];
+}
+
+/** How long "the next patrol files nothing new" is true for — everything, unless the decline expires. */
+function reaskSuffix(detection: GardenerDetection): string {
+  const window = KINDS[detection.kind].reask;
+  return window === undefined ? "" : ` for the ${window} days this ask holds`;
 }
 
 function descriptionOf(detection: GardenerDetection): string {
@@ -762,19 +864,13 @@ function descriptionOf(detection: GardenerDetection): string {
     "",
     "## Context",
     `Filed by ${PRODUCER[namespaceOf(detection.kind)].filedBy.replace("%kind%", detection.kind)}.`,
-    ...(isManualProposal(detection)
-      ? (MANUAL_INSTRUCTIONS[detection.move] ?? [])
-      : [
-          "This bead is a DECISION, not implementation work: approving it applies the move through the",
-          "beads seam, declining it records the reason.",
-        ]),
+    ...settlementLines(detection),
     "",
     `- move: \`${detection.move}\`${detection.retireAs ? ` (\`${detection.retireAs}\`)` : ""}`,
     `- subjects: ${detection.subjects.join(", ")}`,
     ...(detection.target ? [`- target: ${detection.target}`] : []),
     ...(detection.detail ? [`- to: ${detection.detail}`] : []),
-    `- fingerprint: \`${detection.fingerprint}\` — while this bead is open, or once it is declined,`,
-    "  the patrol makes this claim no second time",
+    ...suppressionLines(detection),
     "",
     "## Out of scope",
     "- any board change beyond the move above",
@@ -783,6 +879,6 @@ function descriptionOf(detection: GardenerDetection): string {
     "",
     "## Verify",
     `- after the move, the board shows that ${appliedState(detection)}`,
-    `- the next patrol files nothing new for \`${detection.fingerprint}\``,
+    `- the next patrol files nothing new for \`${detection.fingerprint}\`${reaskSuffix(detection)}`,
   ].join("\n");
 }

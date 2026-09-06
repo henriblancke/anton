@@ -19,7 +19,7 @@
 import { beads, type Bead } from "../beads/bd";
 import { isPipelineArtifact } from "../beads/contract";
 import { ageInDays, isInFlight, stampOf, type BoardIndex } from "./board-index";
-import type { DetectionClaim } from "./detections";
+import { makeDetection, type DetectionClaim, type GardenerDetection } from "./detections";
 
 /**
  * How long a bead may sit deferred before its parking is worth re-asking — a quarter of silence.
@@ -83,6 +83,34 @@ export function detectDeferredRejudgement(
   }
 
   return found.sort(byOldestSilence);
+}
+
+/**
+ * The same claims with the VERB attached — what a pass files (anton-rozm).
+ *
+ * The verb is `undefer`, and choosing it is the whole judgment this module was split around. A
+ * re-judgement has two honest conclusions and only one of them is a move anton may make: approving
+ * returns the parked bead to the board, and DECLINING is how "it really is dead" is recorded —
+ * followed by the founder's own `bd close --reason abandoned` if they want the won't-do on the
+ * record. Proposing the retirement as the move instead would put a permanent close behind an
+ * approval a pass can be armed for, which is exactly the human act every retirement here defers to.
+ *
+ * Pure, like the detector: the pass supplies the clock, and emission (emit.ts) does the writing.
+ */
+export function detectDeferredRejudgements(
+  index: BoardIndex,
+  nowMs: number,
+  options: RejudgeOptions = {},
+): GardenerDetection[] {
+  return detectDeferredRejudgement(index, nowMs, options).map((claim) =>
+    makeDetection({
+      kind: "aged-defer",
+      move: "undefer",
+      subjects: claim.subjects,
+      summary: claim.summary,
+      evidence: claim.evidence,
+    }),
+  );
 }
 
 /** The stated window, or an operator's override once it is a number an age can be compared against. */

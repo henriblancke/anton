@@ -10,7 +10,13 @@ import { describe, expect, it } from "vitest";
 
 import { LABELS, type Bead } from "../beads/bd";
 import { indexBoard } from "./board-index";
-import { detectDeferredRejudgement, REJUDGE_DEFERRED_DAYS, type RejudgeOptions } from "./rejudge";
+import { KINDS, REASK_AFTER_DAYS } from "./detections";
+import {
+  detectDeferredRejudgement,
+  detectDeferredRejudgements,
+  REJUDGE_DEFERRED_DAYS,
+  type RejudgeOptions,
+} from "./rejudge";
 
 const NOW = Date.parse("2026-09-06T00:00:00Z");
 const daysAgo = (days: number) => new Date(NOW - days * 86_400_000).toISOString();
@@ -197,5 +203,52 @@ describe("order", () => {
 
     expect(subjects(board)).toEqual(["anton-c", "anton-a", "anton-b"]);
     expect(subjects(board)).toEqual(subjects([...board].reverse()));
+  });
+});
+
+/**
+ * The verb (anton-rozm). The detector states the question; this is the one answer anton is entitled
+ * to make into a move, and it travels as an ordinary detection so emission, dedup and apply need to
+ * know nothing about re-judgement at all.
+ */
+describe("the move the pass attaches", () => {
+  const proposed = (board: Bead[]) => detectDeferredRejudgements(indexBoard(board), NOW);
+
+  it("asks to UNDEFER — the reversible half; the permanent won't-do has no move here", () => {
+    const [detection] = proposed([parked("anton-a", 120)]);
+
+    expect(detection.kind).toBe("aged-defer");
+    expect(detection.move).toBe("undefer");
+    expect(detection.retireAs).toBeUndefined();
+    expect(detection.subjects).toEqual(["anton-a"]);
+  });
+
+  it("keeps the claim's evidence and summary intact, and its ordering", () => {
+    const board = [parked("anton-b", 100), parked("anton-c", 300)];
+    const [first, second] = proposed(board);
+
+    expect([first.subjects[0], second.subjects[0]]).toEqual(["anton-c", "anton-b"]);
+    expect(first.evidence).toEqual(rejudge(board)[0].evidence);
+    expect(first.summary).toBe(rejudge(board)[0].summary);
+  });
+
+  it("fingerprints one claim per parked bead, stably across passes", () => {
+    const board = [parked("anton-a", 120), parked("anton-b", 120)];
+    const [a, b] = proposed(board);
+
+    expect(a.fingerprint).not.toBe(b.fingerprint);
+    expect(proposed(board).map((d) => d.fingerprint)).toEqual([a.fingerprint, b.fingerprint]);
+  });
+
+  it("says nothing at all on a board with no aged parking", () => {
+    expect(proposed([parked("anton-a", REJUDGE_DEFERRED_DAYS - 1), bead("anton-b")])).toEqual([]);
+  });
+
+  // Two windows, one silence: the detector waits a quarter before asking, and a decline buys the
+  // same quarter before it asks again. Stated in two modules because they answer different
+  // questions; bound here so neither can drift into promising a silence the other does not keep.
+  it("re-asks a declined proposal after the same silence it waited for in the first place", () => {
+    expect(KINDS["aged-defer"].reask).toBe(REASK_AFTER_DAYS);
+    expect(REASK_AFTER_DAYS).toBe(REJUDGE_DEFERRED_DAYS);
   });
 });
