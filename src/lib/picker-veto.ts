@@ -21,7 +21,7 @@
  * read path goes through the shared anton.db.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { and, desc, eq, gt, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, ne, or } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { PolicyCriterionKey } from "./policy/types";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -559,8 +559,8 @@ export function latestDeclinedPicks(projectId: string, planId: string): Promise<
 }
 
 /**
- * How many of the picker's picks this operator has accepted and declined — the evidence base a floor
- * on unattended starts reads, exactly as `proposalTrackRecord` serves the gardener's kinds.
+ * How many of the picker's picks this operator has accepted and DISAGREED with — the evidence base a
+ * floor on unattended starts reads, exactly as `proposalTrackRecord` serves the gardener's kinds.
  *
  * A rolling window, newest first, for the same reason that one rolls: a picker whose ranking changed
  * must not be judged forever on the record of the ranking it replaced.
@@ -569,9 +569,29 @@ export const PICKER_RECORD_WINDOW = 20;
 
 export interface PickerTrackRecord {
   accepted: number;
+  /** Disagreements only — a `✕ not now` settles nothing about the ranking and is not counted. */
   declined: number;
   settled: number;
 }
+
+/**
+ * PACING IS NOT EVIDENCE (anton-gtcd). `✕ not now` answers a question about the operator's hour, not
+ * about the ranking, so a row that means pacing is not a vote either way and is dropped outright —
+ * counting it as a decline would let a busy week read as distrust of the picker.
+ *
+ * Dropped in the QUERY, before the window applies, for the same reason the decision log narrows in
+ * its own (PR #218 review): an operator who paced through a full window since their last real
+ * disagreement would otherwise fetch nothing but `not-now` rows and filter them all away, reporting
+ * an EMPTY record over a board that has both accepts and refusals to weigh. The window rolls over
+ * evidence, so it always holds the newest {@link PICKER_RECORD_WINDOW} verdicts that say something.
+ *
+ * Only an EXPLICIT pacing row is dropped. A decline nobody classified is kept and counted, matching
+ * how `0030_picker_veto_kind` reads an ambiguous row: the reading that cannot invent consent.
+ */
+const isRankingEvidence = or(
+  isNull(schema.pickerVerdicts.vetoKind),
+  ne(schema.pickerVerdicts.vetoKind, "pacing" satisfies PickerVetoKind),
+);
 
 export async function pickerTrackRecord(
   db: AntonDb,
@@ -581,7 +601,9 @@ export async function pickerTrackRecord(
   const rows = await db
     .select({ verdict: schema.pickerVerdicts.verdict })
     .from(schema.pickerVerdicts)
-    .where(eq(schema.pickerVerdicts.projectId, projectId))
+    .where(
+      and(eq(schema.pickerVerdicts.projectId, projectId), isRankingEvidence),
+    )
     // The id breaks a `decidedAt` tie (PR #212 review): the column is second-resolution, so two
     // verdicts settled in the same second would otherwise leave the window's composition — and the
     // counts read off it — up to SQLite's row order.

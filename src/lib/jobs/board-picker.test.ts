@@ -199,7 +199,10 @@ function answerPicks(t: TestDb, settled: number, accepted: number): void {
         projectId: "p1",
         beadId: `answered-${i}`,
         verdict: i < accepted ? "accepted" : "declined",
-        action: i < accepted ? "release" : "not-now",
+        // Declines are seeded as disagreement: pacing is not evidence about the ranking, so a
+        // `not-now` seed would leave `settled` counting rows the record does not read (anton-31gm).
+        action: i < accepted ? "release" : "never",
+        vetoKind: i < accepted ? null : "disagreement",
         planId: `plan-${i}`,
         decidedAt: new Date(NOW - (settled - i) * 60_000),
       })
@@ -807,8 +810,9 @@ describe("makeBoardPickerHandler", () => {
   });
 
   it("returns an armed picker to shadow once its record degrades", async () => {
-    // Re-asked on every pass over a rolling window, so vetoes the operator files after arming push
-    // the record back below the bar and the next pass starts nothing — no latch, nothing to clear.
+    // Re-asked on every pass over a rolling window, so the disagreements the operator files after
+    // arming push the record back below the bar and the next pass starts nothing — no latch, nothing
+    // to clear.
     board.current = [bead("t1")];
     arm(t, "apply");
     const pass = makeBoardPickerHandler({ db: t.db, clock });
@@ -820,12 +824,12 @@ describe("makeBoardPickerHandler", () => {
       recordPickerVeto(t.db, clock, {
         projectId: "p1",
         beadId: `late-${i}`,
-        action: "not-now",
+        action: "never",
         planId: `late-plan-${i}`,
       });
 
-    // One veto still clears the bar — the floor is a threshold, not a hair trigger, and a pass that
-    // stopped here would prove nothing about the one below.
+    // One refusal still clears the bar — the floor is a threshold, not a hair trigger, and a pass
+    // that stopped here would prove nothing about the one below.
     await veto(1);
     await pass(fakeCtx());
     expect(applyPickerPlan).toHaveBeenCalledTimes(2);
@@ -835,6 +839,27 @@ describe("makeBoardPickerHandler", () => {
     await veto(3);
     await pass(fakeCtx());
     expect(applyPickerPlan).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps applying through a week of `✕ not now` — pacing is not distrust (anton-31gm)", async () => {
+    // The counterpart to the degrade above. An operator who defers every pick for a week has said
+    // nothing about the RANKING, so a record that counted their schedule would disarm the picker for
+    // being asked at the wrong hour.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    for (let i = 0; i < PICKER_BAR.minSettled; i++) {
+      await recordPickerVeto(t.db, clock, {
+        projectId: "p1",
+        beadId: `paced-${i}`,
+        action: "not-now",
+        planId: `paced-plan-${i}`,
+      });
+    }
+    await pass(fakeCtx());
+
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
   });
 
   it("starts nothing while the project is disarmed, on this pass and every later one", async () => {
