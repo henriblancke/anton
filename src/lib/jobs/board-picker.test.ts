@@ -16,7 +16,11 @@ import {
   stampBoard,
 } from "../board-picker-plan";
 import { PICKER_DEFER_WINDOW_MS, recordPickerVeto } from "../picker-veto";
-import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
+import {
+  EARNED_AUTONOMY_BARS,
+  PICKER_AUTONOMY_TIER,
+  type DeliberateArming,
+} from "../gardener/autonomy";
 import { activeDisarm, listDisarms, reArmAutopilot } from "../autopilot-disarm";
 import { listOpenEscalations } from "../escalations";
 import { LABELS } from "../beads/bd";
@@ -174,11 +178,21 @@ function fakeCtx(over: Partial<JobContext> = {}): JobContext {
 function arm(
   t: TestDb,
   autonomy: string,
-  { policy = { types: ["task"] } as unknown, record = true }: { policy?: unknown; record?: boolean } = {},
+  {
+    policy = { types: ["task"] } as unknown,
+    record = true,
+    override,
+  }: { policy?: unknown; record?: boolean; override?: DeliberateArming } = {},
 ): void {
   t.db
     .update(schema.projects)
-    .set({ settingsJson: JSON.stringify({ pickerPolicy: policy, pickerAutonomy: autonomy }) })
+    .set({
+      settingsJson: JSON.stringify({
+        pickerPolicy: policy,
+        pickerAutonomy: autonomy,
+        ...(override ? { pickerApplyOverride: override } : {}),
+      }),
+    })
     .run();
   if (record) answerPicks(t, PICKER_BAR.minSettled, PICKER_BAR.minSettled);
 }
@@ -860,6 +874,33 @@ describe("makeBoardPickerHandler", () => {
     await pass(fakeCtx());
 
     expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts on a deliberate arming with no record, and the brakes still disarm it (anton-d1lk)", async () => {
+    // The signature stands in for the EVIDENCE and for nothing else. A project nobody has answered a
+    // single pick on starts work on it — and the pass names whose signature it is standing on, since
+    // that is the only place an unattended start off no record is legible. The failure breaker below
+    // it is untouched by the bypass and freezes the very next pass.
+    board.current = [bead("t1")];
+    arm(t, "apply", {
+      record: false,
+      override: { by: "Henri Blancke", at: "2026-09-06T10:00:00.000Z" },
+    });
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls.map((args) => String(args[0])).join("\n")).toContain(
+      "apply armed deliberately by Henri Blancke on 2026-09-06T10:00:00.000Z",
+    );
+
+    threeFailedRuns(t);
+    await pass(fakeCtx());
+
+    expect(await activeDisarm(t.db, "p1")).toBeDefined();
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+    info.mockRestore();
   });
 
   it("starts nothing while the project is disarmed, on this pass and every later one", async () => {
