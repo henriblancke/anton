@@ -384,7 +384,7 @@ describe("decision inputs", () => {
  *
  * Both directions, because a fence is only as good as both: an edit outside the reach must leave the
  * generation standing, and every edit inside it must retire the generation. The same property is
- * measured over anton's real board — 288 beads of 842, swept exhaustively for an escape — in
+ * measured over anton's real board — 289 beads of 842, swept exhaustively for an escape — in
  * `board-picker-plan.currency.test.ts`; what is pinned here is each clause of the set on its own.
  */
 describe("the decision's reachable set", () => {
@@ -491,8 +491,9 @@ describe("the decision's reachable set", () => {
     );
   });
 
-  // The ancestor clause is UPWARD only: a closed sibling under a reached parent decides nothing —
-  // `isContainer` counts feature children, and `cardOf` walks up — so it stays outside the fence.
+  // The ancestor clause is UPWARD only, and the ticket clause is scoped to the POOL: a closed
+  // sibling under a CLOSED parent decides nothing — `isContainer` counts feature children, `cardOf`
+  // walks up, and a closed target is refused on status before the gate reads its tickets.
   it("does not reach down from an ancestor to anything but its feature children", () => {
     const board = [
       shaped({ id: "anton-a", issue_type: "feature", parent: "anton-epic" }),
@@ -501,6 +502,30 @@ describe("the decision's reachable set", () => {
     ];
 
     expect(reachableSet(board)).toEqual(new Set(["anton-a", "anton-epic"]));
+  });
+
+  /**
+   * The clause below the pool, for the same reason the feature-children one sits above it.
+   * `contractGatedBeads` reads `beads.groupsChildren`, which counts a ticket child of ANY status, so
+   * a feature whose only ticket is CLOSED is gated on nothing — and grooming that finished ticket
+   * onto another card gates the feature on its own thin spec and drops it from the plan. No bead
+   * enters the pool, no edge above it moves: a fence of "pool plus blocks plus ancestry" reads
+   * current straight through it and goes on naming the feature at rank 1.
+   */
+  it("reaches the closed tickets of the pool, so grooming a finished one is never silent", () => {
+    const thin = bead({ id: "anton-f", description: "", acceptance_criteria: "" });
+    const done = bead({ id: "anton-t", issue_type: "task", status: "closed", parent: "anton-f" });
+    const before = [thin, done, shaped({ id: "anton-other", issue_type: "task" })];
+    const after = before.map((b) => (b.id === "anton-t" ? { ...b, parent: "anton-other" } : b));
+
+    // The flip the fence has to see: gated on nothing, then gated on a spec it does not have.
+    expect(eligibleTargets(before).eligible.map((b) => b.id)).toContain("anton-f");
+    expect(eligibleTargets(after)).toMatchObject({
+      exclusions: [{ beadId: "anton-f", reason: "approval-gap" }],
+    });
+
+    expect(reachableSet(before).has("anton-t")).toBe(true);
+    expect(stampBoard(after, OBSERVED).digest).not.toBe(stampBoard(before, OBSERVED).digest);
   });
 
   // Computed over the board being STAMPED, never carried on the plan: that is what makes the two

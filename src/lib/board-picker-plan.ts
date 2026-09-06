@@ -29,6 +29,7 @@ import { eligibleTargets } from "./jobs/picker-targets";
 import { ageBoundBreached, ageInDays } from "./policy/age";
 import { policyDigest } from "./policy/digest";
 import { namespaceOf, type Policy } from "./policy/types";
+import { boardCards, isRunTicket } from "./ticket-view";
 import type { AntonDb, Clock } from "./jobs/queue";
 
 /**
@@ -364,12 +365,12 @@ function digestLine(bead: Bead): string {
  * {@link DIGEST_FIELDS} narrows the fence per FIELD; this narrows it per BEAD, and both are the same
  * argument at a different granularity: the digest may cover a read the decision actually makes, and
  * nothing else. A fence over the whole snapshot retires a generation on every unrelated write there
- * is — on anton's own board the decision reaches 288 of 842 beads, and an hour of ordinary grooming
+ * is — on anton's own board the decision reaches 289 of 842 beads, and an hour of ordinary grooming
  * that left the whole-board fence naming the current top pick 50% of the time leaves this one
  * naming it 85.8% of the time, with the false-current share still at zero
  * (`board-picker-plan.currency.test.ts`, which measures both sides and the guard between them).
  *
- * Three parts, each one a read the pass makes:
+ * Four parts, each one a read the pass makes:
  *
  *   1. the CANDIDATE POOL — every bead {@link eligibleTargets} weighed, admitted or refused. On any
  *      board that is every non-closed bead, because a refusal is recorded for each of them.
@@ -390,6 +391,14 @@ function digestLine(bead: Bead): string {
  *      `blocks` edge moving (anton-icu6 found it by sweeping the corpus; pinned as "a closed feature
  *      child"). Without the parent half, re-typing a CLOSED epic ancestor, or re-parenting a closed
  *      feature under a closed ancestor, does the same through the very same silence.
+ *   4. the RUN TICKETS of every bead in 1 — the descendants `runTickets` attributes to it, at any
+ *      depth and ANY status. `contractGatedBeads` judges a candidate through
+ *      `beads.groupsChildren`, which counts a ticket child of any status, so the mere existence of a
+ *      CLOSED ticket under a feature decides whether that feature is contract-gated at all: groom
+ *      the finished ticket onto another card and the feature falls out of the plan with no bead
+ *      entering the pool and no edge above it moving. Scoped to the POOL, not to everything reached:
+ *      a bead reached only by 2 or 3 is closed, and a closed target is refused on status before the
+ *      gate ever reads its tickets.
  *
  * Computed over the board being STAMPED rather than carried on the plan, which is what makes the two
  * digests comparable: a bead that has newly become a candidate is in this board's set and was not in
@@ -400,10 +409,8 @@ function digestLine(bead: Bead): string {
  */
 export function reachableSet(board: Bead[]): ReadonlySet<string> {
   const { eligible, exclusions } = eligibleTargets(board);
-  const reached = new Set<string>([
-    ...eligible.map((b) => b.id),
-    ...exclusions.map((x) => x.beadId),
-  ]);
+  const pool = new Set<string>([...eligible.map((b) => b.id), ...exclusions.map((x) => x.beadId)]);
+  const reached = new Set<string>(pool);
 
   const neighbours = new Map<string, string[]>();
   const link = (from: string, to: string) => {
@@ -429,10 +436,11 @@ export function reachableSet(board: Bead[]): ReadonlySet<string> {
     }
   }
 
-  // Upward along every parent edge, downward along the FEATURE ones only — matching what the
-  // structure reads do. Walked as one closure, seeded from the set above, because an ancestor
-  // admitted here can itself be a container and a feature child admitted here can itself have an
-  // ancestor.
+  // Upward along every parent edge; downward along the FEATURE ones, and from a POOL bead to the
+  // run tickets attributed to it — matching what the structure and contract reads do. Walked as one
+  // closure, seeded from the set above, because an ancestor admitted here can itself be a container
+  // and a feature child admitted here can itself have an ancestor.
+  const cards = boardCards(board);
   const kin = new Map<string, string[]>();
   const relate = (from: string, to: string) => {
     const known = kin.get(from);
@@ -444,6 +452,12 @@ export function reachableSet(board: Bead[]): ReadonlySet<string> {
     if (parent === undefined) continue;
     relate(bead.id, parent);
     if (bead.issue_type === "feature") relate(parent, bead.id);
+    if (!isRunTicket(bead, cards)) continue;
+    const card = cards.cardOf(bead);
+    // Only a POOL card's tickets: `reached` also holds beads admitted by the walks above, and those
+    // are closed (every non-closed bead earns an eligibility answer, so the pool is exactly the
+    // non-closed board) — a closed target is refused on status long before the gate reads a ticket.
+    if (card !== undefined && pool.has(card)) relate(card, bead.id);
   }
 
   const structure = [...reached];

@@ -34,9 +34,9 @@
  *     top pick: 0 seconds of the hour, under both fences. That is the guard, and it is the number
  *     that had to stay at zero.
  *
- * THE HOLES THE SWEEP FOUND, and why {@link reachableSet} has three parts rather than two. The epic
+ * THE HOLES THE SWEEP FOUND, and why {@link reachableSet} has four parts rather than two. The epic
  * specifies the reachable set as "the candidate pool plus the blocks-closure over it". That is not
- * sound on its own, and it fails in both directions along the parent graph:
+ * sound on its own, and it fails in both directions along the parent graph — and again below it:
  *
  *   • DOWNWARD — `beads.isContainer` counts a feature child of ANY status, so re-parenting a CLOSED
  *     feature under an epic pick turns that pick into a container and drops it from the plan, with
@@ -49,12 +49,20 @@
  *     ancestor" and "a closed feature filed under a closed epic". Ancestors cost 0 further beads on
  *     THIS board, which is a fact about anton's own grooming rather than about the clause — nothing
  *     live on it stands under closed history ("has no live bead standing under closed history").
+ *   • BELOW THE POOL — `contractGatedBeads` judges a candidate through `beads.groupsChildren`, which
+ *     counts a ticket child of ANY status, so a feature whose tickets are all CLOSED is gated on
+ *     nothing and grooming the last finished one onto another card gates it on its own spec. Pinned
+ *     below as "a closed ticket groomed off a thin feature". The run tickets of the pool cost 1
+ *     further bead on this board — 288 to 289 — which is what a fence over a well-groomed board
+ *     costs; the write it catches is an ordinary move on a finished ticket.
  *
- * SWEPT EXHAUSTIVELY AT CAPTURE, and sampled in the gate: every one of the 569 beads this fence
+ * SWEPT EXHAUSTIVELY AT CAPTURE, and sampled in the gate: every one of the 568 beads this fence
  * drops, mutated every way the decision reads (reopened, re-parented under the top pick and under
  * closed history, re-typed to each tier, removed from the board, contract cleared, `approved`
  * dropped, raised to P0), of which 21 moved the ranking and 0 escaped the fence. The suite keeps a
- * fixed sample of that sweep so the unit gate stays fast; re-run it in full when the fence changes.
+ * fixed sample of that sweep so the unit gate stays fast; re-run it in full when the fence changes —
+ * it was, when the run-tickets clause landed: the one bead that clause admits (`anton-04pu`, a
+ * closed ticket) moved the ranking under none of those mutations, so the 21 is unchanged.
  *
  * THE CONTROL IS THE OLD FENCE. The narrowing has since landed in `stampBoard` (anton-t01f), so the
  * AFTER side of every measurement below is production and it is the BEFORE side that is restated
@@ -422,9 +430,9 @@ describe("the hour", () => {
 
   // The narrowing is only interesting if it is actually narrow: the reach is a minority of the
   // board, and it is what the 85.8% above is bought with.
-  it("reaches 288 of the board's 842 beads", () => {
+  it("reaches 289 of the board's 842 beads", () => {
     expect({ reached: reachableSet(BOARD).size, board: BOARD.length }).toEqual({
-      reached: 288,
+      reached: 289,
       board: 842,
     });
   });
@@ -499,13 +507,13 @@ describe("the beads the narrowed fence drops", () => {
   ];
 
   it("samples the sweep across the whole dropped set", () => {
-    expect({ dropped: DROPPED.length, sampled: SAMPLE.length }).toEqual({ dropped: 569, sampled: 41 });
+    expect({ dropped: DROPPED.length, sampled: SAMPLE.length }).toEqual({ dropped: 568, sampled: 41 });
   });
 
   /**
    * Why the two ancestor cases below are fixtures rather than corpus probes, stated as a fact about
    * the board instead of an excuse: anton's own board has no live bead standing under closed
-   * history, so no corpus mutation can exercise the parent closure and the reach is the same 288
+   * history, so no corpus mutation can exercise the parent closure and the reach is the same 289
    * with it or without it. The clause is not free of consequence on a board that HAS that shape —
    * which is what the two reproductions construct.
    */
@@ -606,6 +614,28 @@ describe("the beads the narrowed fence drops", () => {
 
     expect(admitAll(before).entries.map((e) => e.beadId)).toEqual(["anton-top"]);
     expect(admitAll(after).entries).toEqual([]);
+    expect(reachableStamp(before).digest).not.toBe(reachableStamp(after).digest);
+  });
+
+  /**
+   * THE HOLE BELOW THE POOL. `beads.groupsChildren` counts a ticket child of ANY status, so a
+   * feature whose only ticket is CLOSED is gated on nothing — `contractGatedBeads` returns the empty
+   * set, which is what keeps Force-run recovery reachable — and the thin feature is admitted. Groom
+   * that finished ticket onto the card that shipped it and the feature becomes its own single
+   * ticket, gated on the spec it does not have. No bead enters the pool, no `blocks` edge moves and
+   * nothing above the feature changes: only the run-tickets clause of {@link reachableSet} sees it.
+   */
+  it("catches a closed ticket groomed off a thin feature", () => {
+    const before = [
+      shaped({ id: "anton-thin", issue_type: "feature", description: "", acceptance_criteria: "" }),
+      shaped({ id: "anton-done", issue_type: "task", status: "closed", parent: "anton-thin" }),
+      shaped({ id: "anton-other", issue_type: "task" }),
+    ];
+    // The write: the finished ticket is re-filed under the card that actually shipped it.
+    const after = patch(before, "anton-done", { parent: "anton-other" });
+
+    expect(admitAll(before).entries.map((e) => e.beadId)).toContain("anton-thin");
+    expect(admitAll(after).entries.map((e) => e.beadId)).not.toContain("anton-thin");
     expect(reachableStamp(before).digest).not.toBe(reachableStamp(after).digest);
   });
 });
