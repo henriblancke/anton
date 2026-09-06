@@ -24,6 +24,8 @@ import {
   inactiveAgentTickets,
   orderTickets,
   reopenAbsorbedTimeouts,
+  reorderForPrereq,
+  reorderNote,
   reopenableAfterStop,
   runReadiness,
   runTargetDrift,
@@ -43,6 +45,7 @@ import {
   humanGateReason,
   HUMAN_GATE_ARMED_LABEL,
 } from "./execute-epic-human-gate";
+import { landableTicketIds } from "./execute-epic-dispatch";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage } from "./execute-epic-review";
 import { assertDelivered } from "./execute-epic-ticket";
@@ -1014,6 +1017,226 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
     const transitive = skipNote({ waitingOn: "b", stopped: "a" });
     expect(transitive).toContain("depends on b, which was itself skipped behind a");
     expect(transitive).toMatch(/Re-scope a/);
+  });
+});
+
+describe("reorderForPrereq — a prerequisite the run holds itself (anton-0gm2)", () => {
+  const dep = (from: string, to: string): BeadDep => ({
+    issue_id: from,
+    depends_on_id: to,
+    type: "blocks",
+  });
+  const ids = (beads: Bead[]) => beads.map((b) => b.id);
+
+  it("dispatches the prerequisite NEXT and puts the blocked ticket back behind it", () => {
+    // `wiring` blocked naming `schema`, which the run has not reached yet. `other` is independent
+    // and equally ready — the prerequisite still goes first, because that is the whole correction.
+    const board = [ticket("wiring"), ticket("other"), ticket("schema")];
+    const reorder = reorderForPrereq({
+      ticket: ticket("wiring"),
+      remaining: [ticket("other"), ticket("schema")],
+      blockerId: "schema",
+      drawn: [],
+      all: board,
+    });
+    expect(reorder.ok).toBe(true);
+    if (!reorder.ok) return;
+    expect(ids(reorder.order)).toEqual(["schema", "other", "wiring"]);
+    expect(reorder.prereqPending).toBe(true);
+  });
+
+  it("still obeys the edges already on the board — the prerequisite is a preference, not an override", () => {
+    // `schema` waits on `migration`, so it cannot go first however much the re-order wants it to.
+    const board = [
+      ticket("wiring"),
+      { ...ticket("schema"), dependencies: [dep("schema", "migration")] } as Bead,
+      ticket("migration"),
+    ];
+    const reorder = reorderForPrereq({
+      ticket: ticket("wiring"),
+      remaining: [ticket("schema"), ticket("migration")],
+      blockerId: "schema",
+      drawn: [],
+      all: board,
+    });
+    expect(reorder.ok).toBe(true);
+    if (!reorder.ok) return;
+    expect(ids(reorder.order)).toEqual(["migration", "schema", "wiring"]);
+  });
+
+  it("takes the blocked ticket LAST when the run already dispatched the prerequisite", () => {
+    // Nothing is left to schedule ahead of it, so the retry the repair earned costs the tickets
+    // that have not failed yet nothing — they go first.
+    const board = [ticket("wiring"), ticket("other"), ticket("schema")];
+    const reorder = reorderForPrereq({
+      ticket: ticket("wiring"),
+      remaining: [ticket("other")],
+      blockerId: "schema",
+      drawn: [],
+      all: board,
+    });
+    expect(reorder.ok).toBe(true);
+    if (!reorder.ok) return;
+    expect(ids(reorder.order)).toEqual(["other", "wiring"]);
+    expect(reorder.prereqPending).toBe(false);
+  });
+
+  it("keeps a ticket that depends on the blocked one behind it, wherever it lands", () => {
+    const board = [
+      ticket("wiring"),
+      { ...ticket("after"), dependencies: [dep("after", "wiring")] } as Bead,
+      ticket("schema"),
+    ];
+    const reorder = reorderForPrereq({
+      ticket: ticket("wiring"),
+      remaining: [ticket("after"), ticket("schema")],
+      blockerId: "schema",
+      drawn: [],
+      all: board,
+    });
+    expect(reorder.ok).toBe(true);
+    if (!reorder.ok) return;
+    expect(ids(reorder.order)).toEqual(["schema", "wiring", "after"]);
+  });
+
+  it("honours the orderings EARLIER re-orders in the same run drew", () => {
+    // Three tickets, no edges on the board. `page` blocks naming `api`, so the run records that and
+    // re-orders. `api` then blocks naming `schema` — and THAT sort has to honour the first ordering
+    // too: forgetting it puts `page` back ahead of `api`, where it blocks on the same missing
+    // prerequisite again and the repair's one-per-bead guard parks the run on the very incident
+    // this correction exists to prevent.
+    const board = [ticket("page"), ticket("api"), ticket("schema")];
+    const first = reorderForPrereq({
+      ticket: ticket("page"),
+      remaining: [ticket("api"), ticket("schema")],
+      blockerId: "api",
+      drawn: [],
+      all: board,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(ids(first.order)).toEqual(["api", "schema", "page"]);
+
+    const second = reorderForPrereq({
+      ticket: ticket("api"),
+      remaining: [ticket("schema"), ticket("page")],
+      blockerId: "schema",
+      drawn: [{ blockerId: "api", ticketId: "page" }],
+      all: board,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(ids(second.order)).toEqual(["schema", "api", "page"]);
+  });
+
+  it("counts a carried ordering once, and ignores one nothing left can obey", () => {
+    // An edge stated twice would count twice in the in-degree and read as a cycle no edge closes,
+    // and an ordering whose prerequisite the loop has already passed constrains nothing left to sort.
+    const board = [
+      ticket("page"),
+      { ...ticket("api"), dependencies: [dep("api", "schema")] } as Bead,
+      ticket("schema"),
+    ];
+    const reorder = reorderForPrereq({
+      ticket: ticket("page"),
+      remaining: [ticket("api"), ticket("schema")],
+      blockerId: "api",
+      drawn: [
+        { blockerId: "schema", ticketId: "api" }, // already on the board
+        { blockerId: "api", ticketId: "page" }, // the very edge this re-order is drawing
+        { blockerId: "gone", ticketId: "page" }, // dispatched already — not in what is left
+      ],
+      all: board,
+    });
+    expect(reorder.ok).toBe(true);
+    if (!reorder.ok) return;
+    expect(ids(reorder.order)).toEqual(["schema", "api", "page"]);
+  });
+
+  it("REFUSES a cycle rather than falling through to input order", () => {
+    // `schema` already waits on `wiring`, so the new wiring→schema edge closes the loop. The
+    // fallback orderTickets takes here — hand the input back — would dispatch `wiring` first all
+    // over again, which is how a bad edge gets executed.
+    const board = [
+      ticket("wiring"),
+      { ...ticket("schema"), dependencies: [dep("schema", "wiring")] } as Bead,
+      ticket("other"),
+    ];
+    expect(ids(orderTickets([ticket("wiring"), ticket("schema")], board))).toEqual([
+      "wiring",
+      "schema",
+    ]);
+    const reorder = reorderForPrereq({
+      ticket: ticket("wiring"),
+      remaining: [ticket("schema"), ticket("other")],
+      blockerId: "schema",
+      drawn: [],
+      all: board,
+    });
+    expect(reorder.ok).toBe(false);
+    if (reorder.ok) return;
+    expect(reorder.cycle.sort()).toEqual(["schema", "wiring"]);
+  });
+
+  it("says on the bead what was re-ordered and why, in both shapes", () => {
+    const pending = reorderNote({
+      ticketId: "wiring",
+      blockerId: "schema",
+      reorder: {
+        ok: true,
+        order: [ticket("schema"), ticket("wiring")],
+        prereqPending: true,
+      },
+    });
+    expect(pending).toContain("re-ordered, not parked");
+    expect(pending).toContain("`schema`");
+    expect(pending).toContain("dispatches it next");
+    expect(pending).toContain("Remaining order: schema \u2192 wiring.");
+
+    const already = reorderNote({
+      ticketId: "wiring",
+      blockerId: "schema",
+      reorder: { ok: true, order: [ticket("wiring")], prereqPending: false },
+    });
+    expect(already).toContain("had already been dispatched by this run");
+    expect(already).toContain("one retry");
+  });
+});
+
+describe("landableTicketIds — which prerequisites this run can still land (anton-0gm2)", () => {
+  const ledger = (skipped: string[] = []) => ({
+    skipCause: new Map(skipped.map((id) => [id, { waitingOn: "x", stopped: "x" }])),
+    skipped: new Map(),
+    onBranch: new Set<string>(),
+  });
+  const board = () => [ticket("schema"), ticket("api"), ticket("wiring")];
+
+  it("holds every ticket the run can still dispatch", () => {
+    expect(landableTicketIds(board(), ledger(), [])).toEqual(["schema", "api", "wiring"]);
+  });
+
+  it("drops one skipped behind a rolled-back timeout — its wait is genuine, so it parks", () => {
+    expect(landableTicketIds(board(), ledger(["schema"]), [])).toEqual(["api", "wiring"]);
+  });
+
+  // The stopped ticket itself is never in `skipCause` (that map holds only its DEPENDENTS), so
+  // reading the skip map alone would call it a sibling and re-order the run around work that
+  // already ran and rolled back — one dispatch, the identical block, then generic no-delivery.
+  it("drops the timed-out ticket itself when its own work rolled back", () => {
+    const timedOut = [{ id: "schema", delivered: false }];
+    expect(landableTicketIds(board(), ledger(), timedOut)).toEqual(["api", "wiring"]);
+  });
+
+  // An explicitly incomplete commit is not the mechanism the blocked ticket waits for, so a
+  // preserved timeout parks the same way a rolled-back one does (anton-d967).
+  it("drops a timeout whose partial work was only PRESERVED — nobody finished it", () => {
+    const timedOut = [{ id: "schema", delivered: false, preserved: true }];
+    expect(landableTicketIds(board(), ledger(), timedOut)).toEqual(["api", "wiring"]);
+  });
+
+  it("keeps a timeout that delivered before the deadline — its work is on the branch", () => {
+    const timedOut = [{ id: "schema", delivered: true }];
+    expect(landableTicketIds(board(), ledger(), timedOut)).toContain("schema");
   });
 });
 

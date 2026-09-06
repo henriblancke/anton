@@ -9,8 +9,10 @@
  */
 import { join } from "node:path";
 import { appendSessionLog } from "../sessions";
+import { checkoutMoved, describeBuildDrift, serverBuildDrift } from "../build/drift";
 import { refreshCheckout } from "../git/refresh";
 import { describeCouplingFilter } from "../scan-coupling";
+import { describeDeadcodeFilter } from "../scan-deadcode";
 import { describeDuplicationFilter } from "../scan-duplication";
 import { describeSecretFilter } from "../scan-secrets";
 import { summarizeSignals, type ScanCounts } from "../scan-health";
@@ -131,17 +133,50 @@ async function reportScanDiagnostics(
   const couplingLine = describeCouplingFilter(result.coupling);
   if (couplingLine) await appendSessionLog(logPath, `[stringer] ${couplingLine}\n`);
 
+  // Dead-code findings whose symbol has callers the collector never followed (anton-23xe). A silent
+  // filter is indistinguishable from a collector that found nothing, and a tree anton could not
+  // search leaves the phantoms counted — both belong on the session rather than in the counts alone.
+  const deadcodeLine = describeDeadcodeFilter(result.deadcode);
+  if (deadcodeLine) {
+    const prefix = result.deadcode.unavailable ? "WARNING: " : "";
+    await appendSessionLog(logPath, `[stringer] ${prefix}${deadcodeLine}\n`);
+    if (result.deadcode.unavailable) {
+      console.warn(`[nightly-stringer] ${project.slug}: ${deadcodeLine}`);
+    }
+  }
+
   // Duplication signals over blocks that hold no statement (anton-vb2h). This filter can remove
   // most of a scan, so it says so out loud: silence here would be indistinguishable from a
   // duplication collector that found nothing.
   const duplicationLine = describeDuplicationFilter(result.duplication);
   if (duplicationLine) await appendSessionLog(logPath, `[stringer] ${duplicationLine}\n`);
 
-  // Committed-secret signals over test fixtures (anton-r016). The loudest of the four: this is the
+  // Committed-secret signals over test fixtures (anton-r016). The loudest of the five: this is the
   // one class that must never be filtered silently, so a dropped secret is logged with the line and
   // the value that cleared it.
   const secretsLine = describeSecretFilter(result.secrets);
   if (secretsLine) await appendSessionLog(logPath, `[stringer] ${secretsLine}\n`);
+}
+
+/**
+ * Name the stale process on the session, beside the line recording what this pass invoked
+ * (anton-pzfb). The pass runs the code THIS SERVER booted with, not the code in the checkout it just
+ * fast-forwarded, so a guard that shipped days ago may simply not be in it — three nightlies in a
+ * row filed a signal two landed filters already dropped, and the only tell was a log line the
+ * running build was too old to write. The claim belongs on the log because that is where the run is
+ * reconstructed afterwards; the scan proceeds either way.
+ *
+ * The verdict has to stand on the tree the fast-forward just left, not on a read taken before it
+ * (PR #217 review): drift caches the code on disk for 15s, and a schedule firing that soon after
+ * boot would compare this server against the commit it started on and call itself current.
+ */
+async function reportStaleServer(project: Project, logPath: string): Promise<void> {
+  checkoutMoved(project.repoPath);
+  const drift = serverBuildDrift();
+  if (!drift) return;
+  const detail = describeBuildDrift(drift);
+  await appendSessionLog(logPath, `[stringer] WARNING: ${detail}\n`);
+  console.warn(`[nightly-stringer] ${project.slug}: ${detail}`);
 }
 
 /**
@@ -165,6 +200,7 @@ export async function scanShippedTree(opts: {
 
   const scanFile = scanFilePath(opts.sessionId);
   await appendSessionLog(logPath, `[stringer] scan --delta ${project.repoPath} @ ${scannedSha}\n`);
+  await reportStaleServer(project, logPath);
   const result = await scan({ repoPath: project.repoPath, scanFile, signal: opts.signal });
 
   // Nothing that can throw may run between the scan and this return: the scan has already consumed

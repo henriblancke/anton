@@ -38,6 +38,12 @@ export async function runTicket(args: {
   /** The formula's ticket phase, in execution order — dispatched once per ticket (anton-lnkt). */
   steps: ResolvedStep[];
   ticket: Bead;
+  /**
+   * Every ticket this run holds, ids only — the set that tells a prerequisite this run will land
+   * itself from one outside it (anton-0gm2). Carried down to the `dep-missing` repair in the
+   * settlement; the run already has it, so nothing below re-derives it from the board.
+   */
+  runTicketIds: readonly string[];
   operator?: string;
   /** Close the bead in beads once its work is committed. False for a standalone (epic-of-one)
    * target, which is never closed by execute-epic: it stays open + stage:in-review + PR ref until
@@ -77,6 +83,7 @@ export async function runTicket(args: {
     await settleFailedTicket({
       run,
       ticket,
+      runTicketIds: args.runTicketIds,
       session,
       ranOutOfTime: budget.ranOutOfTime(),
       baseline,

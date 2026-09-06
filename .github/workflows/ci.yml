@@ -1,6 +1,7 @@
-# CI (anton-1j1). Runs the quality gates on every push to main and every PR: lint, typecheck,
-# tests, and a production build. The release workflow (release.yml) runs the same gates on a `v*`
-# tag before cutting a Release, so a tag can only point at a green commit.
+# CI (anton-1j1). Runs the quality gates on every push to main and every PR: control bytes, lint,
+# typecheck, tests, and a production build. The release workflow (release.yml) runs the same gates on a `v*`
+# tag (plus a CLI-launch smoke check) before cutting a Release, so a tag can only point at a green
+# commit. Keep the two lists in sync: a gate added here belongs in release.yml's `gates` job too.
 name: ci
 
 on:
@@ -25,6 +26,13 @@ jobs:
 
       - name: Install
         run: bun install --frozen-lockfile
+
+      - name: Control bytes
+        # Replaces the `Binary files differ` alarm that .gitattributes retires by forcing source
+        # globs diffable: a stray control byte makes a module invisible to every diff-based
+        # reviewer (anton-74f8/anton-flih). Ahead of the slower gates: it is instant, and a diff
+        # nobody can read is not worth linting.
+        run: bun run check:control-bytes
 
       - name: Lint
         run: bun run lint

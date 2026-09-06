@@ -13,6 +13,7 @@ import { disarmAutopilot } from "../autopilot-disarm";
 import { beads, LABELS } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
+import { proposalFingerprint, type GardenerDetectionKind } from "../gardener/detections";
 import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
 import type { Bead } from "../beads/types";
 import * as schema from "../db/schema";
@@ -703,6 +704,104 @@ describe("applyPickerPlan", () => {
     expect(notes).toEqual([]);
     // Fail closed: the claim comes off so the next pass re-decides against a free target.
     expect(read("t1").assignee).toBeUndefined();
+  });
+
+  describe("a proposal is a decision, not work (anton-x37c)", () => {
+    /** The reason a skip carries, without the cast at every call site. */
+    const why = (outcome: unknown) => (outcome as { skipped: { reason: string } }).skipped.reason;
+
+    /** The label that makes a bead a decision — identical to `bead()` in every other respect. */
+    const decision = (id: string, kind: GardenerDetectionKind = "stale") =>
+      bead(id, { labels: [proposalFingerprint(kind, "t9")] });
+
+    /** Put the fingerprint on a bead already on the board — the window's move, whenever it lands. */
+    const relabel = (id: string, kind: GardenerDetectionKind = "stale") => {
+      const b = board.current.get(id)!;
+      b.labels = [...((b.labels as string[]) ?? []), proposalFingerprint(kind, "t9")];
+    };
+
+    /** Nothing of this pass survives on the bead — the shape every branch below has to end in. */
+    const wroteNothing = (id: string) => {
+      expect(read(id).assignee).toBeUndefined();
+      expect(read(id).labels ?? []).not.toContain(LABELS.approved);
+    };
+
+    it("refuses one the plan carried, before it writes anything", async () => {
+      // The picker is the second WRITER of `approved`, and on a proposal that label is not a
+      // decision to run: approving one applies its board move. So the pick is refused where every
+      // other ineligibility is, ahead of the CAS.
+      put(decision("p1"));
+
+      const outcome = await apply("p1");
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "p1" } });
+      expect(why(outcome)).toContain("proposal");
+      expect(why(outcome)).toContain(proposalFingerprint("stale", "t9"));
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      wroteNothing("p1");
+    });
+
+    it("stands down when the target becomes one INSIDE the claim lock", async () => {
+      // The ranking read the board a refresh, a lock and a CAS ago. A patrol filing its proposal
+      // onto this bead in that window is invisible to the plan, and the re-check under the lock is
+      // the only thing between it and an `approved` label on a decision.
+      put(bead("t1"));
+      vi.spyOn(beads, "pull").mockImplementation(async () => {
+        relabel("t1");
+      });
+
+      const outcome = await apply("t1");
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("proposal");
+      expect(await jobs()).toHaveLength(0);
+      wroteNothing("t1");
+    });
+
+    it("takes its writes back when the target becomes one while the claim settles", async () => {
+      // Past the CAS the label IS written, so the stand-down has to undo it: an approved,
+      // anton-claimed proposal is both a run nobody decided on and a decision that reads as taken.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired({ pull: async () => relabel("t1") }));
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("stopped being startable");
+      expect(why(outcome)).toContain("proposal");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      wroteNothing("t1");
+    });
+
+    it("takes its writes back when the target becomes one while the review queue is checked", async () => {
+      // The last window before the enqueue, and the longest: a `gh pr view` per waiting PR. The
+      // board is re-read on its far side, so a fingerprint that lands inside it still refuses.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          relabel("t1", "low-value");
+          return CLEAR;
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("stopped being startable");
+      expect(why(outcome)).toContain("proposal");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      wroteNothing("t1");
+    });
+
+    it("leaves the ordinary target beside it startable — the fingerprint is the whole difference", async () => {
+      put(decision("p1"), bead("t1"));
+
+      expect(await apply("p1")).toMatchObject({ skipped: { beadId: "p1" } });
+      expect(await apply("t1")).toMatchObject({ started: { beadId: "t1" } });
+      expect(read("t1").labels).toContain(LABELS.approved);
+      wroteNothing("p1");
+    });
   });
 
   describe("the standing approval behind the start", () => {

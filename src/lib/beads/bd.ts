@@ -8,6 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { isProposalBead } from "../gardener/detections";
 import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
 import { buildBdEnv, passwordVarHint } from "./bd-env";
@@ -1667,6 +1668,12 @@ export function buildClaimableReadyArgs(): string[] {
  *     the claimable set can never disagree with what anton will actually execute. That is what
  *     keeps container epics (their features each run on their own) and child tickets (executed as
  *     part of their target's run, never distributed) out of the set.
+ *   - not {@link isProposalBead} — a proposal is a DECISION about the board, not work on it. It is
+ *     shaped as a parentless task carrying a full contract, so every other clause here admits it,
+ *     and a worker that claimed one would dispatch an agent to "implement" a board move anton
+ *     applies itself on approval. The picker refuses one for the same reason (picker-targets.ts);
+ *     this is the same rule for the workers that never see the picker — a human following
+ *     `.beads/PRIME.md` and a second anton read this set instead.
  *   - not {@link beads.isHumanWork} — `agent:human` names the one specialist anton does not have,
  *     so a claimed human target would dispatch to the DEFAULT agent and burn a run failing at work
  *     no agent can do. It is approved work waiting for a person, not backlog: leaving it in the set
@@ -1682,6 +1689,7 @@ function isClaimable(b: Bead, board: Bead[]): boolean {
     beads.isApproved(b) &&
     !ownerOf(b) &&
     beads.isRunTarget(b, board) &&
+    !isProposalBead(b) &&
     !beads.isHumanWork(b)
   );
 }

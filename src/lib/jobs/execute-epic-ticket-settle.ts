@@ -31,6 +31,7 @@ import {
   NeedsHumanError,
   NoDeliveryError,
   ParkedOnPrereqError,
+  ReorderedOnPrereqError,
   RepairedBlockError,
   TicketTimeoutError,
   WorktreeDirtyError,
@@ -86,6 +87,8 @@ interface TicketFailureKinds {
 export async function settleFailedTicket(args: {
   run: Omit<StepContext, "tickets">;
   ticket: Bead;
+  /** The run's own ticket set, ids only — passed through to the repair pass (see `prereqSite`). */
+  runTicketIds: readonly string[];
   session: JobSession;
   /** Whether this ticket's own DEADLINE fired, as opposed to the job's abort. */
   ranOutOfTime: boolean;
@@ -129,7 +132,14 @@ export async function settleFailedTicket(args: {
   // on. Before the release, because what the repair answers decides whether this bead is left
   // `blocked` for a person or `open` for the retry it just earned.
   const repair = repairableBlock(e, kinds)
-    ? await repairBlockedTicket({ run, ticket, logPath, selfReport: progress.selfReport, e })
+    ? await repairBlockedTicket({
+        run,
+        ticket,
+        runTicketIds: args.runTicketIds,
+        logPath,
+        selfReport: progress.selfReport,
+        e,
+      })
     : undefined;
   await releaseFailedTicket({ run, ticket, session, progress, e, kinds, repair });
   // The repaired bead goes back through the ordinary queue (R5.10): a non-poison error spends one of
@@ -138,8 +148,14 @@ export async function settleFailedTicket(args: {
   if (repair?.action === "repaired") throw new RepairedBlockError(ticket.id, repair.attempted, e);
   // An ordering recorded is a WAIT, not a correction: the ticket cannot start until the blocker
   // lands, so the run parks behind the edge anton just drew instead of spending an attempt on it.
+  //
+  // Unless the run holds the blocker ITSELF (anton-0gm2), which is the same edge and a different
+  // wait: what lands that ticket is this run, so a park would be the run waiting on its own
+  // dispatch. That case re-orders and continues — see {@link ReorderedOnPrereqError}.
   if (repair?.action === "parked") {
-    throw new ParkedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, e);
+    throw repair.site === "sibling"
+      ? new ReorderedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, logPath, e)
+      : new ParkedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, e);
   }
   throw e;
 }
