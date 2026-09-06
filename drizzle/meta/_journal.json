@@ -211,6 +211,13 @@
       "when": 1788584620478,
       "tag": "0029_run_attempt_started_at",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1788734620828,
+      "tag": "0030_burn_sample_project",
+      "breakpoints": true
     }
   ]
 }

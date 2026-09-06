@@ -1112,8 +1112,15 @@ export class JobRunner {
         // Stamp the throttle here, not at window open: only a window that actually takes its fresh
         // upstream read spends the interval budget — a contaminated window that bailed doesn't.
         this.lastBurnSampleAt = this.clock.now();
-        await sampleJobBurn(this.db, this.clock, job.type as JobType, burnBefore, () =>
-          this.readUsageFreshSafe(),
+        await sampleJobBurn(
+          this.db,
+          this.clock,
+          job.type as JobType,
+          // The project whose quota this window spent; null for anton's own plumbing jobs, which
+          // belong to no project's share.
+          job.projectId ?? null,
+          burnBefore,
+          () => this.readUsageFreshSafe(),
         );
       }
       this.inFlight.delete(job.id);

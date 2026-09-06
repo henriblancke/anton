@@ -157,7 +157,8 @@ export const schedules = sqliteTable("schedules", {
 
 /**
  * Per-job Claude burn samples (anton-w8ny). One row per completed job attempt: the session%/weekly%
- * that moved across the job, attributed to its TYPE. Attribution is clean only for solo windows:
+ * that moved across the job, attributed to its TYPE and to the PROJECT that spent it (anton-wj3d,
+ * nullable — see `project_id`). Attribution is clean only for solo windows:
  * the runner opens a burn window only when this job runs alone (nothing else in flight), and
  * discards the window if a sibling is dispatched before it closes — so every recorded delta is
  * unambiguously one job's cost. A rolling per-type
@@ -170,13 +171,28 @@ export const burnSamples = sqliteTable(
     id: text("id").primaryKey(),
     // execute-epic | review-fix | nightly-stringer | orphan-grooming
     jobType: text("job_type").notNull(),
+    // Whose quota the job spent (anton-wj3d). Nullable, and NOT backfilled: rows written before this
+    // column genuinely do not know their project, and inventing one would poison the very per-project
+    // averages the quota shares are enforced from. Null also covers anton's own plumbing jobs, which
+    // belong to no project's share. Per-project reads match on equality, so unattributed rows are
+    // excluded by construction rather than misattributed.
+    projectId: text("project_id").references(() => projects.id),
     // session/weekly utilization delta (0–100 percentage points) burned across the job.
     sessionDelta: real("session_delta").notNull(),
     weeklyDelta: real("weekly_delta").notNull(),
     createdAt: ts("created_at").notNull().default(now),
   },
-  // Serve the "most recent N samples for this type" query without a full scan.
-  (table) => [index("burn_samples_type_created_idx").on(table.jobType, table.createdAt)],
+  (table) => [
+    // Serve the "most recent N samples for this type" query without a full scan. Kept alongside the
+    // per-project index: the per-type average is still read globally for cost estimates.
+    index("burn_samples_type_created_idx").on(table.jobType, table.createdAt),
+    // Serve "most recent N samples for this project and type" — the per-project spend read.
+    index("burn_samples_project_type_created_idx").on(
+      table.projectId,
+      table.jobType,
+      table.createdAt,
+    ),
+  ],
 );
 
 /**

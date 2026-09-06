@@ -82,7 +82,7 @@ describe("GET /picker/budget", () => {
 
   it("reports the measured average once a type is fully sampled", async () => {
     for (let i = 0; i < 5; i++) {
-      await recordBurnSample(tdb.db, systemClock, "execute-epic", {
+      await recordBurnSample(tdb.db, systemClock, "execute-epic", null, {
         sessionDelta: 30,
         weeklyDelta: 4,
       });

@@ -1396,6 +1396,44 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect(avg.weeklyAvg).toBe(3);
   });
 
+  it("attributes the sample to the project whose job spent it (anton-wj3d)", async () => {
+    insertProject(tdb.db, { id: "P", slug: "p", name: "P", repoPath: "/tmp/P" });
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage(10, 5),
+      readUsageFresh: async () => usage(30, 8),
+    });
+    r.registerHandler("execute-epic", async () => {});
+    await r.enqueue({ type: "execute-epic", projectId: "P" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const rows = await tdb.db.select().from(schema.burnSamples);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.projectId).toBe("P");
+  });
+
+  it("leaves the project null for a job that belongs to none", async () => {
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: CONFIG,
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage(10, 5),
+      readUsageFresh: async () => usage(30, 8),
+    });
+    r.registerHandler("execute-epic", async () => {});
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const rows = await tdb.db.select().from(schema.burnSamples);
+    expect(rows[0]!.projectId).toBeNull();
+  });
+
   it("closes the window with the fresh read, never the cached one (anti zero-delta)", async () => {
     // A cached after-read inside the TTL returns the same snapshot as the before-read → a bogus
     // 0% delta. The sampler must go through the fresh reader for the closing measurement.
@@ -2008,7 +2046,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   /** Seed enough real burn samples that execute-epic's rolling average is `sessionDelta` (not the L-tier seed). */
   async function seedBurn(sessionDelta: number) {
     for (let i = 0; i < 5; i++) {
-      await recordBurnSample(tdb.db, clock, "execute-epic", { sessionDelta, weeklyDelta: 0.1 });
+      await recordBurnSample(tdb.db, clock, "execute-epic", null, { sessionDelta, weeklyDelta: 0.1 });
     }
   }
 
