@@ -1,6 +1,6 @@
 /**
  * THE FENCE'S REGRESSION CORPUS (anton-otos): anton's own board as it stood on 2026-09-05 — 842
- * beads, 1285 edges, 37 picks under an armed policy — and the proof that the narrowed stamp
+ * beads, 1285 edges, 29 picks under an armed policy — and the proof that the narrowed stamp
  * (anton-7zpv) still catches every move that could reorder them.
  *
  * A narrowing argued over fixtures is an argument about fixtures. What the classification claims
@@ -93,7 +93,7 @@ const OBSERVED = Date.parse("2026-09-05T13:00:00Z");
 const HEARTBEAT_MS = 5 * 60_000;
 
 /** The policy the corpus is decided under: this repo's own vocabulary, narrowing 67 structurally
- *  claimable targets to 37 picks. Armed rather than admit-all so the policy half of the stamp is
+ *  claimable targets to 29 picks. Armed rather than admit-all so the policy half of the stamp is
  *  under test beside the board half. */
 const POLICY: Policy = {
   types: ["feature", "task", "bug"],
@@ -169,14 +169,25 @@ describe("the corpus", () => {
       edges: BOARD.reduce((n, bead) => n + (bead.dependencies?.length ?? 0), 0),
       picks: DECISION.entries.length,
       excluded: DECISION.exclusions.length,
-    }).toEqual({ beads: 842, edges: 1285, picks: 37, excluded: 127 });
+    // Re-recorded for the `proposal` refusal (anton-x37c, PR #234), which took 8 of the picks this
+    // corpus was captured under out of the plan: a gardener/pm proposal is a decision the founder
+    // applies, not work an agent implements.
+    }).toEqual({ beads: 842, edges: 1285, picks: 29, excluded: 135 });
   });
 
-  // A board that reached one refusal would exercise one code path. This one reaches six, including
+  // A board that reached one refusal would exercise one code path. This one reaches seven, including
   // the two the ranking's `board` scope depends on: work held by a blocker, and work no policy admits.
-  it("reaches six of the pass's refusals", () => {
+  it("reaches seven of the pass's refusals", () => {
     expect(new Set(DECISION.exclusions.map((x) => x.reason))).toEqual(
-      new Set(["not-a-run-target", "not-open", "claimed", "blocked", "approval-gap", "policy"]),
+      new Set([
+        "not-a-run-target",
+        "not-open",
+        "claimed",
+        "blocked",
+        "approval-gap",
+        "policy",
+        "proposal",
+      ]),
     );
   });
 });
@@ -325,7 +336,7 @@ describe("the 2026-09-05 board, mutated the ways the classification calls releva
 
   /**
    * The property the epic asks for, over the real picks rather than a fixture pair: lift each one to
-   * the head of the queue and the fence must catch it — 37 reorders, none of them silent.
+   * the head of the queue and the fence must catch it — 29 reorders, none of them silent.
    */
   it.each(DECISION.entries.map((e) => e.beadId))("catches the reorder that lifts %s to rank 1", (beadId) => {
     const lifted = patch(BOARD, beadId, { priority: 0, created_at: "2020-01-01T00:00:00Z" });
