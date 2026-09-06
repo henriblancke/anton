@@ -42,6 +42,7 @@ import {
   recordPickerAccept,
 } from "./picker-veto";
 import { getProjectSettings, resolvePickerAutonomy, resolvePickerPolicy } from "./projects";
+import type { ReleaseRefusal } from "./types";
 import { scheduleEnabled } from "./schedules";
 
 /** The decision a release answers: the generation, and that generation's own rank and rule. Read
@@ -59,12 +60,14 @@ export interface ReleasePick {
  *   • `skip`   — the run is the operator's to have, the evidence is not. The approval and the run go
  *                ahead and nothing is written about the picker.
  *   • `refuse` — the start itself must not happen: the operator answered a generation that has been
- *                replaced, and the ranking as of now does not carry this target at all.
+ *                replaced, and the ranking as of now does not carry this target at all. `refusal`
+ *                says WHICH of those it is, for the card that must report it as a state
+ *                ({@link ReleaseRefusal}, {@link ALREADY_SETTLED_EXCLUSIONS}).
  */
 export type ReleaseResolution =
   | { accept: ReleasePick }
   | { skip: string }
-  | { refuse: string };
+  | { refuse: string; refusal: ReleaseRefusal };
 
 export interface ResolveReleaseInput {
   projectId: string;
@@ -206,12 +209,14 @@ async function rederiveRelease(
     : "it is no longer in the ranked set";
   if (excluded && ALREADY_SETTLED_EXCLUSIONS.has(excluded.reason)) {
     return {
+      refusal: "settled",
       refuse:
         `${beadId} is already taken (${because}) — it was settled while this view was open. ` +
         `Nothing new was approved or started; the board is catching up.`,
     };
   }
   return {
+    refusal: "retired",
     refuse:
       `${beadId} is no longer one of anton's picks: the plan you released from was replaced, and ` +
       `the current one leaves it out (${because}). Nothing was approved or started — approve it ` +

@@ -6,8 +6,8 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { reportApprovalOutcome } from "@/components/board/contract-advisory";
-import { usePickDecision } from "@/components/board/pick-decision";
-import type { ApprovalRunOutcome } from "@/lib/types";
+import { ReleaseRefused, usePickDecision } from "@/components/board/pick-decision";
+import type { ApprovalRunOutcome, ReleaseRefusal } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
@@ -66,6 +66,14 @@ export function ReleaseAction({
   const router = useRouter();
   const [pending, setPending] = useState(false);
   const [failure, setFailure] = useState<string | undefined>(undefined);
+  // The server refused the START, not the request: the generation on screen was superseded and the
+  // re-derived ranking leaves this target out (anton-k4qr). That is a fact about the plan, not a
+  // failure to retry, so it REPLACES the button rather than printing red text beside one the
+  // operator would only click again — and it is said in its own words, never the withheld-start
+  // chip's, which promises a start that is coming back (anton-84lx).
+  const [refused, setRefused] = useState<{ refusal: ReleaseRefusal; message: string } | undefined>(
+    undefined,
+  );
   // Accepting the pick and declining it are one decision, and on a ranked card the veto beside this
   // button is the other half of it. The lock keeps them exclusive: a release that cannot claim the
   // pick never starts a run the operator has already deferred (PR #212 review). It also names the
@@ -93,13 +101,28 @@ export function ReleaseAction({
         error?: string;
         jobId?: string;
         run?: ApprovalRunOutcome;
+        /** Set only when the pick itself was refused — see {@link ReleaseRefused}. */
+        pickRefused?: ReleaseRefusal;
       } | null;
       if (!res.ok) {
         // Nothing was approved, so the pick is answerable again — by this button or by the veto.
         decision.abandon();
         const message = body?.error ?? `Release failed (${res.status})`;
-        setFailure(message);
-        toast.error(message);
+        // The pick itself was refused: anton re-derived the ranking and this target is no longer in
+        // it (or somebody else already took it). Reported as a state, with the route's own sentence
+        // — it names which fact retired the pick and what to do instead.
+        if (body?.pickRefused) {
+          setRefused({ refusal: body.pickRefused, message });
+          toast.warning(
+            body.pickRefused === "settled"
+              ? `"${title}" was already taken`
+              : `"${title}" is no longer one of anton's picks`,
+            { description: message },
+          );
+        } else {
+          setFailure(message);
+          toast.error(message);
+        }
         // 409 is the claim race: someone else holds the target, or its run already started. That is
         // the one refusal that proves this surface is stale, so re-read rather than leave the lane
         // offering a pick it can no longer start.
@@ -155,6 +178,16 @@ export function ReleaseAction({
     } finally {
       setPending(false);
     }
+  }
+
+  if (refused) {
+    return (
+      <ReleaseRefused
+        refusal={refused.refusal}
+        message={refused.message}
+        {...(className ? { className } : {})}
+      />
+    );
   }
 
   return (

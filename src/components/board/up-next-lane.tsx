@@ -7,7 +7,7 @@ import { GripVerticalIcon } from "lucide-react";
 import Link from "next/link";
 
 import type { UpNextCard } from "@/components/board/board-utils";
-import { UP_NEXT_LABEL, isPickerPick, upNextMetaLabel } from "@/components/board/board-utils";
+import { UP_NEXT_LABEL, upNextMetaLabel } from "@/components/board/board-utils";
 import { BudgetDivider, BudgetWaiting, useBudgetSignal } from "@/components/board/budget-line";
 import { EpicCard } from "@/components/board/epic-card";
 import { PickDecisionProvider } from "@/components/board/pick-decision";
@@ -292,13 +292,6 @@ function UpNextRow({
   const { beadId } = card.entry;
   const title = card.kind === "epic" ? card.epic.title : card.item.title;
   const notNowUntil = card.kind === "epic" ? card.epic.notNowUntil : card.item.notNowUntil;
-  const provenance = card.kind === "epic" ? card.epic.provenance : card.item.provenance;
-  // Is there a RECORDED decision behind this pick? The lane is DERIVED (anton-r0ew), so it ranks
-  // targets the last pass never wrote down — and a verdict on one of those has no generation to
-  // name. Both halves are asked because both are what binds it: the `◈ policy` mark is the plan
-  // naming THIS target (isPickerPick, which a stale plan fails), and `planId` is the generation the
-  // accept is written against. Missing either, the card offers no start at all (anton-5axf).
-  const unconfirmed = planId === undefined || !isPickerPick(provenance);
 
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
     useSortable({
@@ -315,7 +308,11 @@ function UpNextRow({
   };
 
   return (
-    <PickDecisionProvider unconfirmed={unconfirmed} {...(planId === undefined ? {} : { planId })}>
+    // Every row IS one of anton's picks — the lane is the ranking — so the row says so and the card
+    // below asks the one question that decides its start: does a current generation name it
+    // (`useUnrecordedPick`)? Stated once there rather than recomputed here, so the lane and the epic
+    // swimlanes cannot answer it differently (anton-84lx).
+    <PickDecisionProvider pick {...(planId === undefined ? {} : { planId })}>
       <div
         ref={setNodeRef}
         style={style}
