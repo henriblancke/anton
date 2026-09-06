@@ -11,24 +11,12 @@ import { conflictBody, ownerOf, stealRefused } from "@/lib/beads/claim";
 import { approveAndClaim, unwindApproveClaim } from "@/lib/beads/approve-claim";
 import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
 import { isProposalBead } from "@/lib/gardener/detections";
-import { agedOutPicks, getBoardPickerPlan, isPlanStale, stampBoard } from "@/lib/board-picker-plan";
 import { getDb } from "@/lib/db";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { systemClock } from "@/lib/jobs/queue";
 import { resolveOperator } from "@/lib/operator";
-import {
-  activeDeferrals,
-  declinedPicks,
-  pickerTrackRecord,
-  recordPickerAccept,
-  withdrawPickerAccept,
-} from "@/lib/picker-veto";
-import {
-  getProjectSettings,
-  resolvePickerAutonomy,
-  resolvePickerPolicy,
-} from "@/lib/projects";
-import { isScheduleEnabled } from "@/lib/schedules";
+import { recordRelease, resolveRelease } from "@/lib/picker-release";
+import { withdrawPickerAccept } from "@/lib/picker-veto";
 import type { ApprovalRunOutcome, Project } from "@/lib/types";
 import { contractGatedBeads, deriveStage, runTickets } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
@@ -57,7 +45,8 @@ export const dynamic = "force-dynamic";
  * blocker check, auto-claim and enqueue — and only adds what release MEANS that approve does not: the
  * target was anton's pick and the operator agreed with it, so the choice is recorded as an accept.
  * The flag ASKS for that record; whether the target really was a live pick is re-derived server-side
- * (see {@link reserveRelease}), because a client cannot be the witness to its own evidence.
+ * (`picker-release.ts` → `resolveRelease`), because a client cannot be the witness to its own
+ * evidence.
  *
  * `planId` rides with it: the plan GENERATION the operator was looking at, exactly as the veto route
  * takes one (PR #212 review). The client is not trusted to say the target was a pick, but it IS the
@@ -89,128 +78,6 @@ async function readApprovalBody(request: Request): Promise<{
     };
   } catch {
     return { steal: false, immediate: true, immediateExplicit: false, release: false };
-  }
-}
-
-/**
- * Record the operator's ACCEPT of the picker's pick — the half of a release that an ordinary approve
- * has no reason to write (anton-d2h6).
- *
- * WHICH pick is answered comes from the client — the generation it had on screen — and is honoured
- * only while the recorded plan is still that generation, exactly as the veto route binds its own
- * verdict (PR #212 review). Its rank and rule are then read off that plan, never off the request: a
- * client-supplied rank could name any decision. A release that names a generation a later pass has
- * replaced records NOTHING — the pick it agreed with no longer exists, and crediting the picker with
- * an accept of the newer one would put an agreement to an unseen decision into the evidence base.
- * A release that names no generation at all falls back to the recorded plan, which is every caller
- * that predates the field.
- *
- * And the pick must still BE one (PR #212 review). The flag is a client's claim that this target was
- * anton's pick, so a stale lane, a retried request, or any direct caller can set it on a target the
- * picker never offered — and an accept counts as evidence in `pickerTrackRecord`, which earned
- * autonomy reads to decide whether the picker may ever be armed. Recording an unvalidated flag would
- * let the record claim the operator agreed with a decision they were never shown. So the server
- * re-derives the very predicate the `[Release]` button is drawn from (`board.ts` → `isPickerPick`):
- * the picker is armed AND at a level that offers its picks, the plan carries this target as an
- * entry, the board and policy have not moved past that plan — including the age bounds the plan's
- * digest cannot hold, which a pick crosses on a whole-day boundary with nothing else moving
- * (`agedOutPicks`) — and the operator has not since vetoed it. Anything else releases exactly as an
- * approve does and records nothing — the run is the operator's to have, the evidence is not.
- *
- * Judged against `board` — the pre-write snapshot this request already read — not a fresh one: the
- * approval's own label and claim would otherwise invalidate the very plan they are answering.
- *
- * RESERVED BEFORE THE RUN, not recorded after it (PR #212 review). The accept and the veto are the
- * two answers to one pick, and only the store can settle which lands — so the release must take its
- * answer before it enqueues, or a veto posted from another tab slips into the window the enqueue
- * holds open and declines a pick whose run is already starting. Answering first collapses that
- * window: the loser is told it lost by a decision that was already durable.
- *
- * The price of reserving early is a run that then fails to start, and an accept for a run that never
- * started is evidence of nothing — so this hands back the row id and the caller withdraws it in
- * exactly that case ({@link withdrawPickerAccept}).
- *
- * Best-effort, like the enqueue that follows it: the approval has already landed, so a write to
- * anton.db that falls over must not fail a release the operator already got. The accept is evidence
- * about the picker, never a gate on the run — which is also why every failure here fails CLOSED,
- * recording nothing rather than an accept it could not stand behind.
- *
- * The deferral read below is the cheap guard, not the decisive one: a veto still being written is
- * invisible to it. `recordPickerAccept` re-asks the question holding the write lock, so at most one
- * of the two verdicts ever lands on a pick (PR #212 review).
- *
- * @returns the id of the accept this request filed, or undefined when it recorded nothing.
- */
-async function reserveRelease(
-  projectId: string,
-  beadId: string,
-  board: Bead[],
-  displayedPlanId?: string,
-): Promise<string | undefined> {
-  try {
-    const db = getDb();
-    const [plan, armed, settings, record, deferrals] = await Promise.all([
-      getBoardPickerPlan(db, projectId),
-      isScheduleEnabled(projectId, "board-picker"),
-      getProjectSettings(db, projectId),
-      pickerTrackRecord(db, projectId),
-      activeDeferrals(db, projectId, new Date()),
-    ]);
-    const policy = resolvePickerPolicy(settings);
-    const skip = (why: string) => {
-      console.warn(`[approve] release of ${beadId} recorded no accept: ${why}`);
-      return undefined;
-    };
-    const entry = plan?.entries.find((e) => e.beadId === beadId);
-    if (!armed) return skip("the picker is disarmed");
-    // The level, beside the schedule, because the board gates the button on both (PR #218 review):
-    // `propose` ranks and offers nothing (R3.5), so a flag arriving from a tab opened before the
-    // level changed answers a pick this project never put in front of anyone.
-    if (resolvePickerAutonomy(settings, record) === "propose") {
-      return skip("the picker is at propose — it offers no picks to answer");
-    }
-    if (!plan || !entry) return skip("no recorded plan picks this target");
-    if (displayedPlanId !== undefined && plan.planId !== displayedPlanId) {
-      return skip("a later pass replaced the plan generation the operator answered");
-    }
-    if (deferrals.has(beadId)) return skip("the operator vetoed this pick");
-    // Keyed on the plan id the entry above came from, so this asks whether THIS generation has been
-    // vetoed — including the pick whose hold lapsed with no pass to rewrite the plan (isPlanStale).
-    const declined = await declinedPicks(db, projectId, plan.planId);
-    // One clock read for both halves of the fence, so the stamp and the age bounds it cannot carry
-    // (`agedOutPicks`) are judged at the same instant the board read judges them at.
-    const now = Date.now();
-    if (
-      isPlanStale(
-        plan,
-        stampBoard(board, now, policy),
-        deferrals,
-        declined,
-        agedOutPicks(plan, board, policy, now),
-      )
-    ) {
-      return skip("the plan that picked it is no longer the decision anton stands behind");
-    }
-    // The store settles a veto that landed while this request was in flight — the deferral read above
-    // cannot see one still being written — so ask it what happened rather than assume the accept did.
-    const outcome = await recordPickerAccept(db, systemClock, {
-      projectId,
-      beadId,
-      ...(entry.rule ? { rule: entry.rule } : {}),
-      rank: entry.rank,
-      ...(plan.planId ? { planId: plan.planId } : {}),
-    });
-    if (outcome.recorded) return outcome.id;
-    // A duplicate is the SAME accept restated (a double-click, a retry): the standing row is not this
-    // request's to withdraw, so it reports nothing reserved.
-    return skip(
-      outcome.reason === "vetoed"
-        ? "the operator vetoed this pick first"
-        : "this pick already carries the operator's accept",
-    );
-  } catch (err) {
-    console.error(`[approve] failed to record the picker accept for ${beadId}`, err);
-    return undefined;
   }
 }
 
@@ -566,6 +433,30 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       );
     }
   }
+
+  // WHICH pick a release answers, resolved BEFORE anything is written (anton-d2h6, anton-k4qr).
+  //
+  // Judged against `allBeads` — the forced-fresh, pre-write snapshot this request already read —
+  // because the approval's own label and claim would otherwise invalidate the very plan they are
+  // answering. Ahead of the write for the one verdict that has to be: a release naming a generation
+  // a later pass replaced is re-derived against that board, and a target the current ranking leaves
+  // out is REFUSED — anton would not start it now, so neither the approval nor the enqueue may land.
+  // Every other outcome is unchanged: the pick is carried to the reservation below, or the run goes
+  // ahead recording nothing (the run is the operator's to have, the evidence is not).
+  const pick = release
+    ? await resolveRelease(getDb(), {
+        projectId: project.id,
+        beadId: epicId,
+        board: allBeads,
+        ...(planId ? { displayedPlanId: planId } : {}),
+      })
+    : undefined;
+  if (pick && "refuse" in pick) {
+    // 409, the same status a lost claim race answers with, and for the same reason: this surface's
+    // copy of the board is provably behind, which is exactly what the release control re-reads on.
+    return NextResponse.json({ error: pick.refuse }, { status: 409 });
+  }
+
   // Re-check the board shape, auto-claim, then approve — all under the bead's claim-write lock.
   //
   // The shape re-check: every gate above judged a read taken before the lock existed, so the lock is
@@ -739,8 +630,12 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   //
   // The evidence rule is unchanged — no accept for a run that never started — and is now kept by
   // withdrawing the reservation below rather than by waiting for the enqueue's verdict.
-  // Whether the target was a PICK at all is re-derived server-side, off the pre-write snapshot.
-  const acceptId = release ? await reserveRelease(project.id, epicId, allBeads, planId) : undefined;
+  // WHICH pick is being answered was settled before the write (`resolveRelease` above); what is left
+  // here is filing it, which is the half that has to sit after the swap.
+  const acceptId =
+    pick && "accept" in pick
+      ? await recordRelease(getDb(), { projectId: project.id, beadId: epicId, pick: pick.accept })
+      : undefined;
 
   // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7). Two paths:
   //

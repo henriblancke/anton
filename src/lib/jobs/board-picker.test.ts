@@ -9,7 +9,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import type { TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { getBoardPickerPlan, isPlanStale, stampBoard } from "../board-picker-plan";
+import {
+  getBoardPickerPlan,
+  isPlanStale,
+  saveBoardPickerPlan,
+  stampBoard,
+} from "../board-picker-plan";
 import { PICKER_DEFER_WINDOW_MS, recordPickerVeto } from "../picker-veto";
 import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
 import { activeDisarm, disarmAutopilot, listDisarms, reArmAutopilot } from "../autopilot-disarm";
@@ -124,20 +129,30 @@ function prActivity(number: number, state: string): PrActivity {
 /**
  * A db that trips `controller` on the plan write — the one instant between the write's own signal
  * gate and the start, which is the window an abort has to be re-checked in.
+ *
+ * The transaction handle is proxied along with the connection: the plan write picks its generation
+ * by comparing against the row, so it reads and inserts inside ONE transaction (anton-f12y) and the
+ * insert never touches the outer db.
  */
 function abortOnPlanWrite(db: TestDb["db"], controller: AbortController): TestDb["db"] {
-  return new Proxy(db, {
-    get(target, prop) {
-      const value = Reflect.get(target, prop) as unknown;
-      if (typeof value !== "function") return value;
-      const fn = value as (...args: unknown[]) => unknown;
-      if (prop !== "insert") return fn.bind(target);
-      return (...args: unknown[]) => {
-        controller.abort();
-        return fn.apply(target, args);
-      };
-    },
-  }) as TestDb["db"];
+  const trip = <T extends object>(handle: T): T =>
+    new Proxy(handle, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop) as unknown;
+        if (typeof value !== "function") return value;
+        const fn = value as (...args: unknown[]) => unknown;
+        if (prop === "transaction") {
+          return (cb: (tx: object) => unknown, ...rest: unknown[]) =>
+            fn.call(target, (tx: object) => cb(trip(tx)), ...rest);
+        }
+        if (prop !== "insert") return fn.bind(target);
+        return (...args: unknown[]) => {
+          controller.abort();
+          return fn.apply(target, args);
+        };
+      },
+    });
+  return trip(db);
 }
 
 function fakeCtx(over: Partial<JobContext> = {}): JobContext {
@@ -297,6 +312,51 @@ describe("makeBoardPickerHandler", () => {
     expect(rows[0].entriesJson).toBe(
       JSON.stringify([{ beadId: "t1", rank: 1, rule: "any claimable run target" }]),
     );
+  });
+
+  /**
+   * The pass is the FALLBACK writer (anton-m4il). It stamps its observation before a board read that
+   * costs seconds, so the operator's own read — which records the same decision from the board it is
+   * holding (anton-f12y) — can be looking at a newer board than this tick is. Clobbering it would
+   * retire the generation the Release button on screen names, and the accept would be refused.
+   */
+  describe("beside the board read's own writes", () => {
+    /** A generation recorded from a board observed after this pass looked. */
+    async function fresherPlan(): Promise<string> {
+      const plan = await saveBoardPickerPlan(t.db, clock, {
+        projectId: "p1",
+        stamp: { observedAtMs: NOW + 1_000, digest: "feedfacefeedface", beadCount: 1 },
+        entries: [{ beadId: "t9", rank: 1, rule: "any claimable run target" }],
+        exclusions: [],
+      });
+      return plan.planId;
+    }
+
+    it("keeps a generation derived from a fresher board rather than recording over it", async () => {
+      board.current = [bead("t1")];
+      const standing = await fresherPlan();
+
+      // The pass still decides — the ranking is what it reports as work done — it just does not
+      // replace a plan decided from a later look at the board.
+      expect(await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx())).toEqual({
+        changed: true,
+        note: "ranked 1 target(s)",
+      });
+
+      const plan = await getBoardPickerPlan(t.db, "p1");
+      expect(plan?.planId).toBe(standing);
+      expect(plan?.entries.map((e) => e.beadId)).toEqual(["t9"]);
+    });
+
+    it("still starts its own top pick — the apply acts on this pass's decision, not on the row", async () => {
+      board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2 })];
+      arm(t, "apply");
+      await fresherPlan();
+
+      await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+      expect(applyPickerPlan.mock.calls[0]?.[0].entries.map((e) => e.beadId)).toEqual(["t1", "t2"]);
+    });
   });
 
   it("heartbeats after the board read, so a slow `bd` isn't killed as no progress", async () => {
