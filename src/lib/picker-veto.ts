@@ -42,11 +42,32 @@ export type PickerVerdictAction = "not-now" | "never" | "release";
 /** What the operator said about the pick. `release` accepts; both vetoes decline. */
 export type PickerVerdict = "accepted" | "declined";
 
+/**
+ * What a decline MEANT, which is not the same question as which button produced it (anton-gtcd).
+ *
+ *   • `pacing`       — `✕ not now`. "Not this hour." An answer about the operator's own schedule,
+ *                      which says nothing about whether the pick was well chosen.
+ *   • `disagreement` — `Never`. An answer about the RULE that admitted the pick, which is why it
+ *                      sends the operator at the criterion to tighten.
+ *
+ * Only the second is evidence about the ranking, so only the second belongs in the record the
+ * earned-autonomy floor weighs. Both still defer, identically — the split is about what the row
+ * MEANS, never about what the veto does.
+ */
+export type PickerVetoKind = "pacing" | "disagreement";
+
+/** Which meaning an affordance carries. `Never` is the only veto that disagrees. */
+function vetoKindOf(action: Exclude<PickerVerdictAction, "release">): PickerVetoKind {
+  return action === "never" ? "disagreement" : "pacing";
+}
+
 /** One recorded answer to one pick. */
 export interface PickerVerdictRow {
   beadId: string;
   verdict: PickerVerdict;
   action: PickerVerdictAction;
+  /** What the decline meant; absent on an accept, which vetoes nothing. */
+  vetoKind?: PickerVetoKind;
   rule?: string;
   criterion?: PolicyCriterionKey;
   rank?: number;
@@ -170,6 +191,7 @@ function standingDecline(
     tx
       .select({
         id: schema.pickerVerdicts.id,
+        vetoKind: schema.pickerVerdicts.vetoKind,
         rule: schema.pickerVerdicts.rule,
         criterion: schema.pickerVerdicts.criterion,
         rank: schema.pickerVerdicts.rank,
@@ -198,6 +220,13 @@ function standingDecline(
  * Shared by the veto itself and by the REPLAY a withdrawn reservation performs
  * ({@link withdrawPickerAccept}) — one place decides what a decline does, so a replayed veto lands
  * exactly as the original would have.
+ *
+ * The extension keeps the STRONGER meaning (anton-gtcd). `action` records the last affordance that
+ * touched the row, so a `not-now` restating a pick the operator already said `Never` to overwrites
+ * it — and a record that read the meaning off `action` would have that pacing click quietly retract
+ * the disagreement, turning it into evidence the operator never objected. What was said cannot be
+ * unsaid by saying less: once a decline is disagreement it stays disagreement, exactly as the
+ * criterion it was sent at survives the same overwrite.
  */
 function writeDecline(
   tx: Pick<AntonDb, "select" | "insert" | "update">,
@@ -213,6 +242,8 @@ function writeDecline(
     tx.update(schema.pickerVerdicts)
       .set({
         action: input.action,
+        vetoKind:
+          standing.vetoKind === "disagreement" ? "disagreement" : vetoKindOf(input.action),
         rule: input.rule ?? standing.rule,
         criterion: input.criterion ?? standing.criterion,
         rank: input.rank ?? standing.rank,
@@ -229,6 +260,7 @@ function writeDecline(
         beadId: input.beadId,
         verdict: "declined",
         action: input.action,
+        vetoKind: vetoKindOf(input.action),
         rule: input.rule ?? null,
         criterion: input.criterion ?? null,
         rank: input.rank ?? null,
@@ -364,6 +396,9 @@ export async function recordPickerAccept(
           beadId: input.beadId,
           verdict: "accepted",
           action: "release",
+          // A release vetoes nothing, so there is no veto to classify — stated, like the criterion
+          // and the expiry beside it, rather than left to whatever a future default might be.
+          vetoKind: null,
           rule: input.rule ?? null,
           criterion: null,
           rank: input.rank ?? null,
@@ -614,6 +649,7 @@ export async function listPickerVerdicts(
     beadId: row.beadId,
     verdict: row.verdict as PickerVerdict,
     action: row.action as PickerVerdictAction,
+    ...(row.vetoKind ? { vetoKind: row.vetoKind as PickerVetoKind } : {}),
     ...(row.rule ? { rule: row.rule } : {}),
     ...(row.criterion
       ? { criterion: row.criterion as PolicyCriterionKey }

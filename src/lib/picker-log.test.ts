@@ -29,6 +29,7 @@ function verdictRow(over: Partial<PickerVerdictRow> = {}): PickerVerdictRow {
     beadId: "anton-b",
     verdict: "declined",
     action: "not-now",
+    vetoKind: "pacing",
     rule: "the work policy armed on this machine",
     rank: 2,
     decidedAtMs: NOW,
@@ -63,7 +64,30 @@ describe("pickerLogEntries", () => {
   it("files `Never` as a veto, carrying the criterion it sent the operator to tighten", () => {
     const [entry] = pickerLogEntries({
       starts: [],
-      verdicts: [verdictRow({ action: "never", criterion: "labels:severity" })],
+      verdicts: [
+        verdictRow({
+          action: "never",
+          vetoKind: "disagreement",
+          criterion: "labels:severity",
+        }),
+      ],
+    });
+    expect(entry).toMatchObject({ kind: "veto", criterion: "labels:severity" });
+  });
+
+  it("keeps a `Never` a veto after a later `not now` restated it", () => {
+    // The repeat overwrites the affordance and keeps the meaning (`writeDecline`), so a log reading
+    // `action` would draw the operator's judgment about the rule as plain pacing — while still
+    // offering the link to the criterion they went to tighten.
+    const [entry] = pickerLogEntries({
+      starts: [],
+      verdicts: [
+        verdictRow({
+          action: "not-now",
+          vetoKind: "disagreement",
+          criterion: "labels:severity",
+        }),
+      ],
     });
     expect(entry).toMatchObject({ kind: "veto", criterion: "labels:severity" });
   });
@@ -72,7 +96,12 @@ describe("pickerLogEntries", () => {
     const entries = pickerLogEntries({
       starts: [],
       verdicts: [
-        verdictRow({ beadId: "anton-released", verdict: "accepted", action: "release" }),
+        verdictRow({
+          beadId: "anton-released",
+          verdict: "accepted",
+          action: "release",
+          vetoKind: undefined,
+        }),
         verdictRow({ beadId: "anton-vetoed" }),
       ],
     });

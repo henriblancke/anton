@@ -55,9 +55,16 @@ export interface PickerLogEntry {
  */
 export const PICKER_LOG_LIMIT = 12;
 
-/** `never` is the only veto that names a rule to tighten; `not-now` is pacing and names none. */
+/**
+ * `never` is the only veto that names a rule to tighten; `not-now` is pacing and names none.
+ *
+ * Read off the MEANING rather than the affordance (anton-gtcd): a repeat `not-now` overwrites the
+ * `action` of a decline that already carried a `Never`, but keeps its kind and its criterion — so a
+ * log keyed on the button would draw that entry as a plain deferral while still offering the link to
+ * the rule the operator went to tighten.
+ */
 function kindOf(verdict: PickerVerdictRow): PickerLogKind {
-  return verdict.action === "never" ? "veto" : "deferral";
+  return verdict.vetoKind === "disagreement" ? "veto" : "deferral";
 }
 
 /**

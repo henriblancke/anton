@@ -283,6 +283,93 @@ describe("the decline record", () => {
   });
 });
 
+/**
+ * PACING IS NOT DISAGREEMENT (anton-gtcd). Both vetoes decline and both defer — what the row now
+ * says as well is which of the two the operator MEANT, so the record can weigh the judgment about
+ * the ranking without counting the operator's own scheduling against it.
+ */
+describe("what a decline meant", () => {
+  it("files `✕ not now` as pacing and `Never` as disagreement", async () => {
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-paced",
+      action: "not-now",
+    });
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-refused",
+      action: "never",
+      criterion: "labels:domain",
+    });
+
+    const kinds = new Map(
+      (await listPickerVerdicts(test.db, PROJECT)).map((r) => [r.beadId, r.vetoKind]),
+    );
+    expect(kinds.get("anton-paced")).toBe("pacing");
+    expect(kinds.get("anton-refused")).toBe("disagreement");
+  });
+
+  it("classifies no veto on an accept — a release refuses nothing", async () => {
+    await recordPickerAccept(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-a",
+      planId: "d1",
+    });
+
+    expect((await listPickerVerdicts(test.db, PROJECT))[0]?.vetoKind).toBeUndefined();
+  });
+
+  it("upgrades a standing pacing decline when the operator goes on to say Never", async () => {
+    const pick = { projectId: PROJECT, beadId: "anton-a", planId: "d1" };
+    await recordPickerVeto(test.db, clock, { ...pick, action: "not-now" });
+    nowMs = NOW + 60_000;
+    await recordPickerVeto(test.db, clock, {
+      ...pick,
+      action: "never",
+      criterion: "labels:domain",
+    });
+
+    // Still ONE decline — the repeat extends the standing row — now reading as disagreement.
+    expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
+      { action: "never", vetoKind: "disagreement", criterion: "labels:domain" },
+    ]);
+  });
+
+  it("never lets a later `✕ not now` retract a Never", async () => {
+    // `action` follows the last click, so a record reading the meaning off it would have this pacing
+    // click quietly turn the operator's disagreement into evidence they had not objected.
+    const pick = { projectId: PROJECT, beadId: "anton-a", planId: "d1" };
+    await recordPickerVeto(test.db, clock, {
+      ...pick,
+      action: "never",
+      criterion: "labels:domain",
+    });
+    nowMs = NOW + 60_000;
+    await recordPickerVeto(test.db, clock, { ...pick, action: "not-now" });
+
+    expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
+      { action: "not-now", vetoKind: "disagreement" },
+    ]);
+  });
+
+  it("holds both kinds for the same window — the split is about meaning, not pacing", async () => {
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-paced",
+      action: "not-now",
+    });
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-refused",
+      action: "never",
+    });
+
+    const held = await activeDeferrals(test.db, PROJECT, at(NOW));
+    expect(held.get("anton-paced")).toBe(NOW + PICKER_DEFER_WINDOW_MS);
+    expect(held.get("anton-refused")).toBe(NOW + PICKER_DEFER_WINDOW_MS);
+  });
+});
+
 describe("the window the earned floor reads (anton-vkp9)", () => {
   it("is at least as wide as the bar apply has to clear", () => {
     // The counts and the bar are set in two modules, and a window NARROWER than `minSettled` would
@@ -657,7 +744,14 @@ describe("withdrawing an accept", () => {
     expect(replayed).toEqual({ beadId: "anton-a", untilMs: NOW + PICKER_DEFER_WINDOW_MS });
     // The decline stands with everything the veto carried, and the target is held out of the plan.
     expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
-      { beadId: "anton-a", verdict: "declined", action: "never", rank: 1, planId: "d1" },
+      {
+        beadId: "anton-a",
+        verdict: "declined",
+        action: "never",
+        vetoKind: "disagreement",
+        rank: 1,
+        planId: "d1",
+      },
     ]);
     expect([...(await activeDeferrals(test.db, PROJECT, at(NOW))).keys()]).toEqual(["anton-a"]);
   });
