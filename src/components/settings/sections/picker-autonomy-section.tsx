@@ -337,25 +337,35 @@ function PickerLadder({ earned }: { earned: EarnedPicker }) {
   const { accepted, settled, bar } = earned;
   const pct = releasedPct(earned);
   return (
-    <dl className="flex flex-col gap-1">
-      <LadderRung
-        label="answered"
-        value={`${settled}/${bar.minSettled}`}
-        note="picks you released or vetoed"
-        filled={settled / bar.minSettled}
-        cleared={settled >= bar.minSettled}
-      />
-      <LadderRung
-        label="released"
-        value={pct === undefined ? `—/${bar.minAppliedPct}%` : `${pct}%/${bar.minAppliedPct}%`}
-        note={pct === undefined ? "nothing answered yet" : `${accepted} of ${settled} answered`}
-        filled={(pct ?? 0) / 100}
-        // Compared by cross multiplication like the floor itself, never on the rounded percentage:
-        // 26/29 is 89.66% and reads as 90, and a rung that called that cleared would disagree with
-        // the pass about the one thing this panel exists to explain.
-        cleared={settled > 0 && accepted * 100 >= bar.minAppliedPct * settled}
-      />
-    </dl>
+    <div className="flex flex-col gap-1">
+      <dl className="flex flex-col gap-1">
+        <LadderRung
+          label="answered"
+          value={`${settled}/${bar.minSettled}`}
+          note="picks you released or refused with Never"
+          filled={settled / bar.minSettled}
+          cleared={settled >= bar.minSettled}
+        />
+        <LadderRung
+          label="released"
+          value={pct === undefined ? `—/${bar.minAppliedPct}%` : `${pct}%/${bar.minAppliedPct}%`}
+          note={pct === undefined ? "nothing answered yet" : `${accepted} of ${settled} answered`}
+          filled={(pct ?? 0) / 100}
+          // Compared by cross multiplication like the floor itself, never on the rounded percentage:
+          // 26/29 is 89.66% and reads as 90, and a rung that called that cleared would disagree with
+          // the pass about the one thing this panel exists to explain.
+          cleared={settled > 0 && accepted * 100 >= bar.minAppliedPct * settled}
+        />
+      </dl>
+      {/* Said where the counts are read, not only in the pass that computes them (PR #245 review):
+          an operator who paced through a dozen picks with `✕ not now` and sees 0 answered would
+          otherwise read the ladder as having lost their clicks, rather than as never having asked
+          for them. */}
+      <span className="text-[11px] text-subtle">
+        a <span className="font-mono">✕ not now</span> is pacing, not a verdict on the ranking — it
+        is not counted either way.
+      </span>
+    </div>
   );
 }
 

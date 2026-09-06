@@ -2246,6 +2246,19 @@ describe("SettingsView picker autonomy (anton-vkp9)", () => {
     expect((screen.getByLabelText("picker · shadow") as HTMLInputElement).disabled).toBe(false);
   });
 
+  it("names what the answered rung counts, so a paced week does not read as lost clicks", () => {
+    // `settled` counts releases and `Never` disagreements only (anton-31gm), so a label promising
+    // "released or vetoed" would contradict an operator who just deferred a dozen picks.
+    renderView({ ...ARMED }, [], [], NO_RECORD, [], {
+      accepted: 12,
+      settled: 15,
+      bar: PICKER_BAR,
+    });
+
+    expect(screen.getByText("picks you released or refused with Never")).toBeTruthy();
+    expect(screen.getByText(/is pacing, not a verdict on the ranking/)).toBeTruthy();
+  });
+
   it("names the record on the way up too, once it clears the bar", () => {
     renderView({ ...ARMED }, [], [], NO_RECORD, [], {
       accepted: 19,
