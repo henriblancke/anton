@@ -118,7 +118,7 @@ export interface GovernedShare {
 
 /** The share in force for one project, plus the board-level facts that produced it. */
 export interface ResolvedQuotaShare {
-  /** The share that scales this project's weekly ceiling, 0–100 (R6.1), after renormalization. */
+  /** The share of the weekly target this project may spend, 0–100 (R6.1), after renormalization. */
   sharePct: number;
   /** The declaration it came from — the equal split when this project never declared one. */
   declaredPct: number;

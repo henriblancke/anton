@@ -449,12 +449,16 @@ describe("budgetAwareProjectPolicies (anton-81x2)", () => {
     await updateProjectSettings(big.slug, { budgetAware: true, quotaSharePct: 75 });
     await updateProjectSettings(small.slug, { budgetAware: true, quotaSharePct: 25 });
 
-    const targets = (await budgetAwareProjectPolicies())
-      .map((p) => p.weeklyTargetPct)
-      .sort((a, b) => a - b);
+    const policies = await budgetAwareProjectPolicies();
     const full = DEFAULT_PROJECT_BUDGET_POLICY.weeklyTargetPct;
 
-    expect(targets).toEqual([full * 0.25, full * 0.75]);
+    // The share is a SECOND ceiling on the project's own attributed spend; the machine-wide target
+    // stays whole on every policy, so the two projects between them can still reach it.
+    expect(policies.map((p) => p.weeklyTargetPct)).toEqual([full, full]);
+    expect(policies.map((p) => p.projectWeeklyCapPct).sort((a, b) => a! - b!)).toEqual([
+      full * 0.25,
+      full * 0.75,
+    ]);
   });
 });
 

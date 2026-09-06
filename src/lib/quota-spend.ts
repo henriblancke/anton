@@ -15,7 +15,7 @@
  */
 import { and, eq, gte, sql } from "drizzle-orm";
 
-import { getBurnAverage, burnsClaudeQuota } from "./burn";
+import { getBurnAverage, burnsClaudeQuota, type BurnAverage } from "./burn";
 import { getClaudeUsageCached, type ClaudeUsage } from "./claude/usage";
 import { getDb, schema } from "./db";
 import type { AntonDb, JobType } from "./jobs/queue";
@@ -38,6 +38,7 @@ export function weeklyWindowStart(usage: ClaudeUsage | null, now: number): numbe
 async function completedJobsByProject(
   db: AntonDb,
   since: number,
+  projectId?: string,
 ): Promise<Map<string, Map<string, number>>> {
   const rows = await db
     .select({
@@ -46,7 +47,13 @@ async function completedJobsByProject(
       count: sql<number>`count(*)`,
     })
     .from(schema.jobs)
-    .where(and(eq(schema.jobs.status, "done"), gte(schema.jobs.updatedAt, new Date(since))))
+    .where(
+      and(
+        eq(schema.jobs.status, "done"),
+        gte(schema.jobs.updatedAt, new Date(since)),
+        ...(projectId ? [eq(schema.jobs.projectId, projectId)] : []),
+      ),
+    )
     .groupBy(schema.jobs.projectId, schema.jobs.type);
 
   const byProject = new Map<string, Map<string, number>>();
@@ -58,6 +65,53 @@ async function completedJobsByProject(
     byProject.set(row.projectId, types);
   }
   return byProject;
+}
+
+/** The per-type rate each project's completions are charged at — the reason the figure is an estimate. */
+async function burnAveragesFor(db: AntonDb, types: Iterable<string>) {
+  const charged = [...new Set(types)].filter((type): type is JobType =>
+    burnsClaudeQuota(type as JobType),
+  );
+  return new Map(
+    await Promise.all(charged.map(async (type) => [type, await getBurnAverage(db, type)] as const)),
+  );
+}
+
+/** Charge one project's completions at those rates. `null` stays `null`: unattributed is not zero. */
+function chargeSpend(
+  types: Map<string, number> | undefined,
+  averages: Map<JobType, BurnAverage>,
+): { spentWeeklyPct: number | null; seeded: boolean } {
+  let spentWeeklyPct: number | null = null;
+  let seeded = false;
+  for (const [type, count] of types ?? []) {
+    const average = averages.get(type as JobType);
+    if (!average) continue;
+    spentWeeklyPct = (spentWeeklyPct ?? 0) + average.weeklyAvg * count;
+    seeded ||= average.seeded;
+  }
+  return { spentWeeklyPct, seeded };
+}
+
+/**
+ * What ONE project has spent of this quota week — the meter the governor measures its share ceiling
+ * against (R6.1). The account-wide reading `budgetGate` takes cannot serve: every repo on this
+ * machine, plus the operator's own sessions, move that one number, so a share can only be enforced
+ * against the spend actually attributable to the project.
+ *
+ * Deliberately the same estimate {@link quotaShareProjects} renders in the Quota shares panel, off
+ * the same window and the same per-type averages, so the panel can never show a project room its
+ * governor is about to deny. `null` means nothing is attributable yet — never zero.
+ */
+export async function projectWeeklySpendPct(
+  db: AntonDb,
+  projectId: string,
+  usage: ClaudeUsage | null,
+  now: number = Date.now(),
+): Promise<number | null> {
+  const byProject = await completedJobsByProject(db, weeklyWindowStart(usage, now), projectId);
+  const types = byProject.get(projectId);
+  return chargeSpend(types, await burnAveragesFor(db, types?.keys() ?? [])).spentWeeklyPct;
 }
 
 /**
@@ -82,15 +136,9 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
     () => new Map<string, Map<string, number>>(),
   );
 
-  // One average per type, shared across projects — the rate every project's completions are charged
-  // at, and the reason the whole figure is an estimate.
-  const chargedTypes = [
-    ...new Set([...jobsByProject.values()].flatMap((types) => [...types.keys()])),
-  ].filter((type): type is JobType => burnsClaudeQuota(type as JobType));
-  const averages = new Map(
-    await Promise.all(
-      chargedTypes.map(async (type) => [type, await getBurnAverage(db, type)] as const),
-    ),
+  const averages = await burnAveragesFor(
+    db,
+    [...jobsByProject.values()].flatMap((types) => [...types.keys()]),
   );
 
   const governedCount = settings.filter((s) => s.budgetAware === true).length;
@@ -98,15 +146,7 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
 
   return projects.map((project, index) => {
     const stored = settings[index];
-    const types = jobsByProject.get(project.id);
-    let spentWeeklyPct: number | null = null;
-    let seeded = false;
-    for (const [type, count] of types ?? []) {
-      const average = averages.get(type as JobType);
-      if (!average) continue;
-      spentWeeklyPct = (spentWeeklyPct ?? 0) + average.weeklyAvg * count;
-      seeded ||= average.seeded;
-    }
+    const { spentWeeklyPct, seeded } = chargeSpend(jobsByProject.get(project.id), averages);
     return {
       id: project.id,
       slug: project.slug,

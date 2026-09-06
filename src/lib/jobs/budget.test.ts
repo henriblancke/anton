@@ -581,57 +581,137 @@ describe("budgetHeadroom (the budget line's placement input, anton-vlom)", () =>
 });
 
 /**
- * Quota-share scaling (anton-81x2 / R6.1). Several repos run against one subscription, so a
- * governed project is paced against its SHARE of the weekly target rather than the whole of it.
+ * Quota shares (anton-81x2 / R6.1). Several repos run against ONE subscription, so a governed
+ * project may spend its declared share of the weekly target. The share and the machine-wide target
+ * sit on different meters, and these tests exist to keep them there: `usage.weeklyPct` is the
+ * ACCOUNT's reading (every repo plus the operator's own sessions), so a share enforced on it would
+ * cap the whole machine at one project's cut.
  */
 describe("withQuotaShare", () => {
-  it("scales the weekly ceiling and nothing else", () => {
-    const scaled = withQuotaShare(POLICY, 40);
-    expect(scaled.weeklyTargetPct).toBe(POLICY.weeklyTargetPct * 0.4);
-    expect({ ...scaled, weeklyTargetPct: POLICY.weeklyTargetPct }).toEqual(POLICY);
+  /** A project's attributed weekly spend, as the governor reads it off `quota-spend`. */
+  const spent = (pct: number | null) => ({ projectWeeklyPct: pct });
+
+  it("carries the share as its own ceiling and leaves the machine-wide target whole", () => {
+    const shared = withQuotaShare(POLICY, 40);
+    expect(shared.weeklyTargetPct).toBe(POLICY.weeklyTargetPct);
+    expect(shared.projectWeeklyCapPct).toBe(POLICY.weeklyTargetPct * 0.4);
+    expect({ ...shared, projectWeeklyCapPct: POLICY.projectWeeklyCapPct }).toEqual(POLICY);
   });
 
-  it("defers where the unscaled target admitted", () => {
-    // 50% weekly, half the week gone: on pace against a 100% target, over the cap against a 40% one.
+  it("defers once THIS project has spent its share", () => {
     const usage = makeUsage({
       sessionPct: 10,
       weeklyPct: 50,
       weeklyResetAt: resetForElapsed(NIGHT, 0.5),
     });
-    expect(budgetGate(usage, POLICY, NIGHT).admit).toBe(true);
+    const shared = withQuotaShare(POLICY, 40);
+    // 39 of a 40-point share left over: still inside it.
+    expect(budgetGate(usage, shared, NIGHT, spent(39)).admit).toBe(true);
 
-    const d = budgetGate(usage, withQuotaShare(POLICY, 40), NIGHT);
+    const d = budgetGate(usage, shared, NIGHT, spent(40));
     if (d.admit) throw new Error("expected defer");
     expect(d.reason).toBe("weekly-cap");
     expect(d.retryAt.toISOString()).toBe(usage.weeklyResetAt);
   });
 
-  it("still admits below the scaled ceiling", () => {
+  it("does NOT defer on a neighbour's spend showing in the shared account meter", () => {
+    // The regression this whole split exists to prevent: 50 points on the ACCOUNT meter, none of it
+    // this project's. Gating the shared number against a 40% share would stop a project that has
+    // spent nothing — and, with every project stopped the same way, leave most of the operator's
+    // weekly target unspendable every week (idle-fill, anton-ld7j).
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 50,
+      weeklyResetAt: resetForElapsed(NIGHT, 0.5),
+    });
+    expect(budgetGate(usage, withQuotaShare(POLICY, 40), NIGHT, spent(0))).toEqual({ admit: true });
+  });
+
+  it("lets two governed projects between them still reach the whole weekly target", () => {
+    // One armed repo caps at the target; arming a second must not halve what the MACHINE can spend.
+    // Walk the account meter up to the target with an even split, charging each project its own half.
+    const shared = withQuotaShare(POLICY, 50);
+    const target = POLICY.weeklyTargetPct;
+    // Late in the week, so the pace-line sits above the burn and only the ceilings can defer.
+    for (let accountPct = 0; accountPct < target; accountPct += 10) {
+      const usage = makeUsage({
+        sessionPct: 10,
+        weeklyPct: accountPct,
+        weeklyResetAt: resetForElapsed(NIGHT, 0.9),
+      });
+      // Each project has burned half of what the account meter reads — inside its 50% share
+      // throughout, so neither may be deferred before the machine's own target is reached.
+      expect(budgetGate(usage, shared, NIGHT, spent(accountPct / 2))).toEqual({ admit: true });
+    }
+    // …and at the target the machine-wide cap stops them, share or no share.
+    const atCap = makeUsage({
+      sessionPct: 10,
+      weeklyPct: target,
+      weeklyResetAt: resetForElapsed(NIGHT, 0.9),
+    });
+    const d = budgetGate(atCap, shared, NIGHT, spent(target / 2));
+    if (d.admit) throw new Error("expected defer");
+    expect(d.reason).toBe("weekly-cap");
+  });
+
+  it("holds the loser of the race at its share instead of first-come-first-served", () => {
+    // A=70 / B=30. A runs first and burns the account meter to 27. B has spent nothing, so B keeps
+    // its whole 30-point cut — the guarantee the split is for — while A, at 27 of its own 70, runs.
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 27,
+      weeklyResetAt: resetForElapsed(NIGHT, 0),
+    });
+    expect(budgetGate(usage, withQuotaShare(POLICY, 30), NIGHT, spent(0)).admit).toBe(true);
+    expect(budgetGate(usage, withQuotaShare(POLICY, 70), NIGHT, spent(27)).admit).toBe(true);
+    // Once A HAS spent its 70, it stops even though the machine's own target is nowhere near.
+    const a = budgetGate(usage, withQuotaShare(POLICY, 70), NIGHT, spent(70));
+    if (a.admit) throw new Error("expected defer");
+    expect(a.reason).toBe("weekly-cap");
+  });
+
+  it("still admits below the share ceiling", () => {
     const usage = makeUsage({
       sessionPct: 10,
       weeklyPct: 10,
       weeklyResetAt: resetForElapsed(NIGHT, 0.5),
     });
-    // A 40% share of the 100% default target caps at 40, so idle-fill runs freely below 20.
-    expect(budgetGate(usage, withQuotaShare(POLICY, 40), NIGHT)).toEqual({ admit: true });
+    expect(budgetGate(usage, withQuotaShare(POLICY, 40), NIGHT, spent(10))).toEqual({ admit: true });
   });
 
   it("leaves a full share exactly as it found it", () => {
-    expect(withQuotaShare(POLICY, 100)).toEqual(POLICY);
+    expect(withQuotaShare(POLICY, 100).projectWeeklyCapPct).toBe(POLICY.weeklyTargetPct);
+    expect({ ...withQuotaShare(POLICY, 100), projectWeeklyCapPct: null }).toEqual(POLICY);
   });
 
-  it("parks a 0% share rather than reading it as no weekly signal", () => {
-    // The trap: a 0 target used to mean "no pace data", which would run the project UNPACED —
-    // the exact opposite of what declaring a 0% share asks for.
+  it("leaves the share unbound when nothing is attributable yet", () => {
+    // Unattributed spend is not zero spend, but it is the only honest floor to gate on — and gating
+    // it as "spent everything" would park a project the moment its samples went missing.
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 60,
+      weeklyResetAt: resetForElapsed(NIGHT, 0.5),
+    });
+    expect(budgetGate(usage, withQuotaShare(POLICY, 40), NIGHT, spent(null))).toEqual({
+      admit: true,
+    });
+    expect(budgetGate(usage, withQuotaShare(POLICY, 40), NIGHT)).toEqual({ admit: true });
+  });
+
+  it("parks a 0% share whether or not anything has been sampled", () => {
+    // The trap: a 0 ceiling read as "no data" would run the project UNPACED — the exact opposite of
+    // what declaring a 0% share asks for.
     const usage = makeUsage({
       sessionPct: 10,
       weeklyPct: 0,
       weeklyResetAt: resetForElapsed(NIGHT, 0.1),
     });
     const parked = withQuotaShare(POLICY, 0);
-    const d = budgetGate(usage, parked, NIGHT);
-    if (d.admit) throw new Error("expected defer");
-    expect(d.reason).toBe("weekly-cap");
+    for (const opts of [spent(null), spent(0), undefined]) {
+      const d = budgetGate(usage, parked, NIGHT, opts);
+      if (d.admit) throw new Error("expected defer");
+      expect(d.reason).toBe("weekly-cap");
+    }
     // …and the headroom read agrees with the gate: nothing left, capped, inclusive.
     expect(budgetHeadroom(usage, parked, NIGHT)).toMatchObject({
       weeklyPct: 0,
@@ -641,7 +721,26 @@ describe("withQuotaShare", () => {
   });
 
   it("clamps a share outside 0-100 instead of inventing budget", () => {
-    expect(withQuotaShare(POLICY, 140).weeklyTargetPct).toBe(POLICY.weeklyTargetPct);
-    expect(withQuotaShare(POLICY, -10).weeklyTargetPct).toBe(0);
+    expect(withQuotaShare(POLICY, 140).projectWeeklyCapPct).toBe(POLICY.weeklyTargetPct);
+    expect(withQuotaShare(POLICY, -10).projectWeeklyCapPct).toBe(0);
+  });
+
+  it("bounds the headroom read by whichever ceiling runs out first", () => {
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 10,
+      weeklyResetAt: resetForElapsed(NIGHT, 0),
+    });
+    // Machine-wide: the throttle floor (100 − 20) less 10 spent = 70 points left. The 40-point
+    // share, 25 of it spent, leaves 15 — and 15 is the tighter of the two.
+    expect(budgetHeadroom(usage, withQuotaShare(POLICY, 40), NIGHT, spent(25))).toMatchObject({
+      weeklyPct: 15,
+      weeklyReason: "weekly-cap",
+      weeklyInclusive: true,
+    });
+    // A share with more room left than the machine has does not widen the line.
+    expect(budgetHeadroom(usage, withQuotaShare(POLICY, 100), NIGHT, spent(0))).toMatchObject({
+      weeklyPct: 70,
+    });
   });
 });

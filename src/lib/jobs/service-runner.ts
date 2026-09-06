@@ -12,7 +12,13 @@ import { Scheduler } from "./scheduler";
 import { systemClock } from "./queue";
 import { bootPreflight } from "./service-boot";
 import { registerJobHandlers } from "./service-handlers";
-import { liveRunCheck, readBeadLabels, resolveBudgetPolicy, resolvePolicy } from "./service-policy";
+import {
+  liveRunCheck,
+  readBeadLabels,
+  resolveBudgetPolicy,
+  resolvePolicy,
+  resolveProjectSpend,
+} from "./service-policy";
 
 const log: RunnerLogger = {
   info: (msg, meta) => console.log(`[jobs] ${msg}`, meta ?? ""),
@@ -61,6 +67,7 @@ export function getRunner(): JobRunner {
     config: { maxConcurrent: GLOBAL_MAX_CONCURRENT },
     resolvePolicy,
     resolveBudgetPolicy,
+    resolveProjectSpend,
     liveRunCheck,
     readBeadLabels,
   });

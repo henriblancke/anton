@@ -16,7 +16,9 @@ import {
   resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
 } from "../projects";
 import { resolveGovernedShare, type ResolvedQuotaShare } from "../quota-share";
+import { projectWeeklySpendPct } from "../quota-spend";
 import { withQuotaShare } from "./budget";
+import type { ClaudeUsage } from "../claude/usage";
 import { beads } from "../beads/bd";
 import { allIssues } from "../beads/issues";
 
@@ -42,8 +44,8 @@ export async function resolvePolicy(projectId: string | undefined) {
  * project-less job is never budget-aware (empty settings → off).
  *
  * The quota share (R6.1) is applied HERE rather than as a second gate downstream: several repos run
- * against one subscription, so a governed project's weekly ceiling is its share of the target, and
- * the one place that already decides "governed or not" is the one place that should decide "how
+ * against one subscription, so a governed project's weekly ceiling carries its share of the target,
+ * and the one place that already decides "governed or not" is the one place that should decide "how
  * much". A share is a fact about the BOARD, not about this project's settings, so it is resolved
  * from every budget-aware project rather than inside the pure settings projection — which is also
  * why an ungoverned project is untouched: it returns null above, before any share is read.
@@ -54,6 +56,28 @@ export async function resolveBudgetPolicy(projectId: string | undefined) {
   const share = resolveGovernedShare(projectId, await budgetAwareQuotaShares());
   announceImbalance(share);
   return withQuotaShare(resolveBudgetPolicyFromSettings(settings), share.sharePct);
+}
+
+/**
+ * What the governor measures a project's share ceiling against (R6.1): this project's OWN attributed
+ * weekly spend. The share cannot be enforced on the account meter `budgetGate` reads — that number
+ * is moved by every repo on the machine, so gating it per-share would stop them all at one repo's
+ * cut and leave the rest of the operator's weekly target unspendable (idle-fill, anton-ld7j).
+ *
+ * `usage` comes from the governor's own read so the spend window is anchored to the same weekly
+ * reset the gate is deciding against. Fails soft to `null` — unattributed, never zero — so a db
+ * hiccup relaxes the share rather than parking the project.
+ */
+export async function resolveProjectSpend(
+  projectId: string | null,
+  usage: ClaudeUsage | null,
+): Promise<number | null> {
+  if (!projectId) return null;
+  try {
+    return await projectWeeklySpendPct(getDb(), projectId, usage);
+  } catch {
+    return null;
+  }
 }
 
 /** The last imbalance announced, so a per-tick resolve reports a change rather than a stream. */

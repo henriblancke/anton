@@ -21,7 +21,7 @@ import {
   toMs,
   type Clock,
 } from "./queue";
-import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./budget";
+import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./budget";
 import {
   classifyError,
   DEFAULT_CONFIG,
@@ -30,6 +30,7 @@ import {
   nextAction,
   type BeadLabelsReader,
   type BudgetPolicyResolver,
+  type ProjectSpendResolver,
   type JobHandler,
   type JobPolicy,
   type JobPolicyResolver,
@@ -1701,6 +1702,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       readUsage: () => Promise<ClaudeUsage | null>;
       policy?: BudgetPolicy;
       resolveBudgetPolicy?: BudgetPolicyResolver;
+      resolveProjectSpend?: ProjectSpendResolver;
       readBeadLabels?: BeadLabelsReader;
     },
   ) {
@@ -1712,6 +1714,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       // Keep the burn sampler off the real endpoint — these tests exercise the governor only.
       readUsageFresh: async () => null,
       resolveBudgetPolicy: opts.resolveBudgetPolicy ?? (() => opts.policy ?? DEFAULT_BUDGET_POLICY),
+      resolveProjectSpend: opts.resolveProjectSpend,
       readBeadLabels: opts.readBeadLabels,
     });
     for (const type of ["execute-epic", "review-fix", "nightly-stringer", "orphan-grooming"] as const) {
@@ -2001,6 +2004,86 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     await r.whenIdle();
     expect(ran).toBe(1);
     expect((await getJob(tdb.db, id))?.status).toBe("done");
+  });
+
+  it("holds a project at its quota share while its neighbour keeps spending (R6.1)", async () => {
+    // One account meter, two armed repos. A declares 30%, B 70%; the meter reads 60, half of it
+    // each. A has spent its whole 30-point cut and must stop — but B, 30 into a 70-point cut, must
+    // NOT: the meter it shares with A says nothing about whose quota was spent, and stopping both
+    // at 30 would leave most of the operator's weekly target unspendable every week.
+    seedProjects("A", "B");
+    const weeklyResetAt = new Date(clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const shares: Record<string, number> = { A: 30, B: 70 };
+    const spent: Record<string, number> = { A: 30, B: 30 };
+    const ran: string[] = [];
+    const r = budgetRunner(
+      async (ctx) => {
+        ran.push(ctx.projectId ?? "?");
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        resolveBudgetPolicy: (pid) =>
+          pid ? withQuotaShare(DEFAULT_BUDGET_POLICY, shares[pid]) : null,
+        resolveProjectSpend: async (pid) => (pid ? spent[pid] : null),
+      },
+    );
+    const a = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    const b = await r.enqueue({ type: "execute-epic", projectId: "B" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toEqual(["B"]);
+    expect((await getJob(tdb.db, b))?.status).toBe("done");
+
+    const held = await getJob(tdb.db, a);
+    expect(held?.status).toBe("queued");
+    expect(held?.lastError).toMatch(/budget: weekly-cap/);
+    expect(toMs(held?.runAt)).toBe(Date.parse(weeklyResetAt));
+  });
+
+  it("does not hold a project on a neighbour's spend when its own share is untouched", async () => {
+    // The same meter reading, but every point of it is B's. A has spent nothing, so its 30-point
+    // share is entirely intact and the governor has no business deferring it.
+    seedProjects("A", "B");
+    const weeklyResetAt = new Date(clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const ran: string[] = [];
+    const r = budgetRunner(
+      async (ctx) => {
+        ran.push(ctx.projectId ?? "?");
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 30),
+        resolveProjectSpend: async (pid) => (pid === "B" ? 60 : 0),
+      },
+    );
+    await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toEqual(["A"]);
+  });
+
+  it("leaves the share unbound when no spend resolver is wired", async () => {
+    // Fail-open, like every other governor input: without attribution the machine-wide target is
+    // the only weekly limit, rather than a share the runner cannot actually measure.
+    seedProjects("A");
+    let ran = 0;
+    const weeklyResetAt = new Date(clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 30),
+      },
+    );
+    await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toBe(1);
   });
 
   it("keeps the reactive UsageLimitError backstop working with the governor wired", async () => {

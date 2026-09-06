@@ -136,6 +136,18 @@ export type BudgetPolicyResolver = (
 ) => Promise<BudgetPolicy | null> | BudgetPolicy | null;
 
 /**
+ * This project's own attributed weekly spend, read at gate time so the quota share (R6.1) can be
+ * enforced against it. The account-wide meter the governor reads is shared by every repo on the
+ * machine, so it cannot say whose quota was spent — see `withQuotaShare` in ./budget. `usage` is
+ * the governor's own read, passed through so the spend window anchors to the same weekly reset.
+ * Returns `null` when nothing is attributable (or the read failed): the share then doesn't bind.
+ */
+export type ProjectSpendResolver = (
+  projectId: string | null,
+  usage: ClaudeUsage | null,
+) => Promise<number | null>;
+
+/**
  * Job types the budget governor may proactively defer (anton-szld). An allowlist by design: only
  * anton's *autonomous* background work is held when the governor says the budget is scarce, and the
  * governor only delays when the runner *leases* a job — a human-approved epic still *enqueues* the
@@ -384,6 +396,7 @@ export class JobRunner {
   private readonly log: RunnerLogger;
   private readonly resolvePolicy: JobPolicyResolver | null;
   private readonly resolveBudgetPolicy: BudgetPolicyResolver | null;
+  private readonly resolveProjectSpend: ProjectSpendResolver | null;
   private readonly liveRunCheck: LiveRunCheck | null;
   private readonly readBeadLabels: BeadLabelsReader | null;
   private readonly readUsage: () => Promise<ClaudeUsage | null>;
@@ -420,6 +433,12 @@ export class JobRunner {
      */
     resolveBudgetPolicy?: BudgetPolicyResolver;
     /**
+     * Per-project attributed weekly spend for the governor's quota-share ceiling (R6.1). Only
+     * consulted alongside `resolveBudgetPolicy`; omit it and a project's declared share simply
+     * doesn't bind — the machine-wide weekly target is still enforced on the account meter.
+     */
+    resolveProjectSpend?: ProjectSpendResolver;
+    /**
      * Cross-machine run-liveness source (anton-jz1). When set, a fresh execute-epic enqueue that
      * has no active job in THIS machine's store is gated on it: if a run is already live for the
      * epic on another machine (read from the shared beads board), no second run is started. Omit
@@ -453,6 +472,7 @@ export class JobRunner {
     this.log = deps.log ?? noopLog;
     this.resolvePolicy = deps.resolvePolicy ?? null;
     this.resolveBudgetPolicy = deps.resolveBudgetPolicy ?? null;
+    this.resolveProjectSpend = deps.resolveProjectSpend ?? null;
     this.liveRunCheck = deps.liveRunCheck ?? null;
     this.readBeadLabels = deps.readBeadLabels ?? null;
     this.readUsage = deps.readUsage ?? getClaudeUsageCached;
@@ -841,7 +861,13 @@ export class JobRunner {
 
     const now = this.clock.now();
     for (const { pid, policy } of governed) {
-      const decision = budgetGate(usage, policy, now);
+      // The quota share (R6.1) is enforced against THIS project's attributed spend, not the account
+      // meter above — that one is moved by every repo here. Unresolvable spend leaves the share
+      // unbound, the same fail-open posture as a null usage read.
+      const projectWeeklyPct = this.resolveProjectSpend
+        ? await this.resolveProjectSpend(pid, usage).catch(() => null)
+        : null;
+      const decision = budgetGate(usage, policy, now, { projectWeeklyPct });
       if (decision.admit) {
         // Budget healthy → nothing paced this tick. First pull back any rows a PRIOR governed tick
         // pushed to a future runAt: the gate can start admitting before that stale boundary (the

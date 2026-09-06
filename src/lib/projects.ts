@@ -1088,10 +1088,13 @@ async function governedQuotaBoard(
  * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
  * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) and the SAME quota
  * share (R6.1) the per-project governor applies — rather than a hard-coded default, so an operator
- * who tunes `weeklyTargetPct` or `daytimeReservePct`, or divides the quota between repos, sees the
- * nudge agree with what the runner actually admits. Without the share the nudge would read a lone
- * project's headroom as the whole plan's and prompt for work every governor would then defer. Empty
- * when no project has opted in (the nudge's hide gate).
+ * who tunes `weeklyTargetPct` or `daytimeReservePct` sees the nudge agree with what the runner
+ * actually admits. Empty when no project has opted in (the nudge's hide gate).
+ *
+ * The nudge passes no per-project spend, so the share ceiling each policy carries doesn't bind
+ * there — deliberately. The nudge asks whether the MACHINE has idle weekly quota worth shaping work
+ * for, and that question is answered by the whole weekly target on the account meter; which repo
+ * gets to spend it is the governor's decision at lease time, not the nudge's.
  */
 export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
   const governed = await governedProjects();

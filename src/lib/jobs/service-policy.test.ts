@@ -3,7 +3,11 @@
  *
  * The claim under test is that the one place deciding whether a project is governed is also the
  * place deciding how much of this machine's single weekly Claude quota it may spend — so an
- * ungoverned project cannot be scaled by a share, and a governed one cannot escape it.
+ * ungoverned project carries no share, and a governed one cannot escape its own.
+ *
+ * The share lands in `projectWeeklyCapPct`, a ceiling on the project's OWN attributed spend, and
+ * never touches `weeklyTargetPct`: that one is measured against the account-wide meter every repo
+ * here moves, so shrinking it per share would stop the whole machine at one repo's cut.
  */
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,7 +19,7 @@ import { DEFAULT_PROJECT_BUDGET_POLICY, type ProjectSettings } from "@/lib/proje
 let tdb: TestDb;
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
 
-const { resolveBudgetPolicy } = await import("./service-policy");
+const { resolveBudgetPolicy, resolveProjectSpend } = await import("./service-policy");
 
 /** The shipped weekly ceiling a share is a cut OF. */
 const TARGET = DEFAULT_PROJECT_BUDGET_POLICY.weeklyTargetPct;
@@ -64,8 +68,8 @@ describe("resolveBudgetPolicy (quota share)", () => {
     project("a", armed());
     project("b", armed());
 
-    expect((await resolveBudgetPolicy("a"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
-    expect((await resolveBudgetPolicy("b"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("b"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
   });
 
   it("keeps an ungoverned project out of the denominator", async () => {
@@ -73,23 +77,34 @@ describe("resolveBudgetPolicy (quota share)", () => {
     project("off", {});
 
     // Counting the unpaced project would shrink the paced one's cut to fund a repo no share binds.
-    expect((await resolveBudgetPolicy("a"))?.weeklyTargetPct).toBe(TARGET);
+    expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBe(TARGET);
   });
 
-  it("scales the weekly target by a declared share", async () => {
+  it("cuts the weekly target by a declared share", async () => {
     project("a", armed({ quotaSharePct: 70 }));
     project("b", armed({ quotaSharePct: 30 }));
 
-    expect((await resolveBudgetPolicy("a"))?.weeklyTargetPct).toBeCloseTo(TARGET * 0.7, 6);
-    expect((await resolveBudgetPolicy("b"))?.weeklyTargetPct).toBeCloseTo(TARGET * 0.3, 6);
+    expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBeCloseTo(TARGET * 0.7, 6);
+    expect((await resolveBudgetPolicy("b"))?.projectWeeklyCapPct).toBeCloseTo(TARGET * 0.3, 6);
   });
 
-  it("scales the operator's own weekly target, not the shipped default", async () => {
+  it("leaves the machine-wide target whole on every share", async () => {
+    project("a", armed({ quotaSharePct: 70 }));
+    project("b", armed({ quotaSharePct: 30 }));
+
+    // Shrinking this would gate the SHARED account meter at one project's cut, so both projects
+    // would defer at 30% global usage and 60 points of the operator's target would be unspendable
+    // every week — the opposite of idle-fill (anton-ld7j).
+    expect((await resolveBudgetPolicy("a"))?.weeklyTargetPct).toBe(TARGET);
+    expect((await resolveBudgetPolicy("b"))?.weeklyTargetPct).toBe(TARGET);
+  });
+
+  it("cuts the operator's own weekly target, not the shipped default", async () => {
     project("a", armed({ quotaSharePct: 50, budgetPolicy: { weeklyTargetPct: 50 } }));
     project("b", armed({ quotaSharePct: 50 }));
 
     // The share is a cut of what this project targets — the two knobs compose, they don't compete.
-    expect((await resolveBudgetPolicy("a"))?.weeklyTargetPct).toBe(25);
+    expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBe(25);
   });
 
   it("parks a project that declared a 0% share instead of unpacing it", async () => {
@@ -98,8 +113,8 @@ describe("resolveBudgetPolicy (quota share)", () => {
 
     // A zero ceiling defers at the weekly cap; a "no weekly signal" reading of 0 would do the
     // opposite and let the parked repo run entirely unpaced.
-    expect((await resolveBudgetPolicy("a"))?.weeklyTargetPct).toBe(0);
-    expect((await resolveBudgetPolicy("b"))?.weeklyTargetPct).toBe(TARGET);
+    expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBe(0);
+    expect((await resolveBudgetPolicy("b"))?.projectWeeklyCapPct).toBe(TARGET);
   });
 
   it("holds the declared split when no picker pass has observed anybody", async () => {
@@ -108,8 +123,8 @@ describe("resolveBudgetPolicy (quota share)", () => {
 
     // board-picker ships disabled, so this is the ordinary machine. Renormalizing on the silence
     // would hand every project the whole quota and take the split out of force entirely.
-    expect((await resolveBudgetPolicy("a"))?.weeklyTargetPct).toBeCloseTo(TARGET * 0.6, 6);
-    expect((await resolveBudgetPolicy("b"))?.weeklyTargetPct).toBeCloseTo(TARGET * 0.4, 6);
+    expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBeCloseTo(TARGET * 0.6, 6);
+    expect((await resolveBudgetPolicy("b"))?.projectWeeklyCapPct).toBeCloseTo(TARGET * 0.4, 6);
   });
 
   it("renormalizes an idle project's share onto the projects that have work (R6.4)", async () => {
@@ -119,9 +134,9 @@ describe("resolveBudgetPolicy (quota share)", () => {
     plan("idle", 0);
 
     // Quota that resets unused is wasted: the idle half is spendable by the repo that has work…
-    expect((await resolveBudgetPolicy("busy"))?.weeklyTargetPct).toBe(TARGET);
+    expect((await resolveBudgetPolicy("busy"))?.projectWeeklyCapPct).toBe(TARGET);
     // …and the idle project keeps its own ceiling, because resolving one means it is asking to spend.
-    expect((await resolveBudgetPolicy("idle"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("idle"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
   });
 
   it("holds a reserved project's share out of the reallocation (R6.5)", async () => {
@@ -131,7 +146,7 @@ describe("resolveBudgetPolicy (quota share)", () => {
     plan("quiet", 0);
 
     // The repo touched irregularly keeps its allocation, so the busy neighbour gains nothing.
-    expect((await resolveBudgetPolicy("busy"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("busy"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
   });
 
   it("gives the share back on the next pass, with no operator action", async () => {
@@ -139,13 +154,13 @@ describe("resolveBudgetPolicy (quota share)", () => {
     project("waking", armed({ quotaSharePct: 50 }));
     plan("busy", 2);
     plan("waking", 0);
-    expect((await resolveBudgetPolicy("busy"))?.weeklyTargetPct).toBe(TARGET);
+    expect((await resolveBudgetPolicy("busy"))?.projectWeeklyCapPct).toBe(TARGET);
 
     // A repo that wakes up on Friday must not wait a week: the next pass recomputes the divisor.
     plan("waking", 1);
 
-    expect((await resolveBudgetPolicy("busy"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
-    expect((await resolveBudgetPolicy("waking"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("busy"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("waking"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
   });
 
   it("reads queued work as eligible, so reclaim does not wait for a picker pass", async () => {
@@ -165,7 +180,7 @@ describe("resolveBudgetPolicy (quota share)", () => {
       })
       .run();
 
-    expect((await resolveBudgetPolicy("busy"))?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("busy"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
   });
 
   it("says out loud when the declared shares do not sum to 100", async () => {
@@ -176,7 +191,7 @@ describe("resolveBudgetPolicy (quota share)", () => {
     const policy = await resolveBudgetPolicy("a");
 
     // Proportioned, so 120% of declarations still spends exactly the weekly target between them…
-    expect(policy?.weeklyTargetPct).toBeCloseTo(TARGET / 2, 6);
+    expect(policy?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
     // …and the operator who declared 60 is told why their ceiling reads 50.
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("total 120%, not 100%"));
   });
@@ -194,5 +209,55 @@ describe("resolveBudgetPolicy (quota share)", () => {
     await resolveBudgetPolicy("b");
 
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The meter the share is enforced ON (R6.1/R6.3). `usage.weeklyPct` is the whole account's, so the
+ * governor needs a second, per-project reading — approximate by construction, and `null` rather
+ * than 0 when nothing is attributable.
+ */
+describe("resolveProjectSpend", () => {
+  beforeEach(() => {
+    tdb = makeTestDb();
+  });
+  afterEach(() => {
+    tdb.close();
+    vi.restoreAllMocks();
+  });
+
+  /** A completed Claude-burning job, charged to `projectId` at its type's burn average. */
+  function done(projectId: string | null): void {
+    tdb.db
+      .insert(schema.jobs)
+      .values({
+        id: randomUUID(),
+        projectId,
+        type: "execute-epic",
+        status: "done",
+        payloadJson: "{}",
+        updatedAt: new Date(),
+      })
+      .run();
+  }
+
+  it("charges only the jobs this project completed", async () => {
+    project("mine", armed());
+    project("theirs", armed());
+    done("mine");
+    done("mine");
+    done("theirs");
+
+    // execute-epic's L-tier seed is 3 weekly points until real samples accrue.
+    expect(await resolveProjectSpend("mine", null)).toBeCloseTo(6, 6);
+    expect(await resolveProjectSpend("theirs", null)).toBeCloseTo(3, 6);
+  });
+
+  it("answers null — unattributed, never zero — when nothing is charged to it", async () => {
+    project("quiet", armed());
+    done(null); // anton's own plumbing belongs to nobody's share
+
+    expect(await resolveProjectSpend("quiet", null)).toBeNull();
+    expect(await resolveProjectSpend(null, null)).toBeNull();
   });
 });

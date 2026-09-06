@@ -17,7 +17,9 @@
  *   • session-headroom — the 5-hour session is nearly exhausted; a hard floor that outranks the
  *     weekly plan (never burn the last sliver of a session). Defers to the session reset.
  *   • weekly-cap       — weekly usage has hit the cap (the operator's weekly budget). Stop until the
- *     weekly window resets, protecting the reserve (100 − cap) and Claude's own hard limit.
+ *     weekly window resets, protecting the reserve (100 − cap) and Claude's own hard limit. Also
+ *     covers a governed project that has spent its quota share (R6.1) — same stop, different meter:
+ *     the cap reads the shared account meter, the share reads this project's attributed spend.
  *   • weekly-on-track  — inside the throttle band just below the cap AND *ahead* of the even
  *     pace-line: ease off until the line catches up, so the last stretch of budget lasts to reset.
  *   • daytime-reserve  — inside the day window with the session running low: hold the remaining
@@ -55,6 +57,13 @@ export interface BudgetPolicy {
    * and Claude's own hard limit. Below the {@link throttleBandPct} band it's spent freely.
    */
   weeklyTargetPct: number;
+  /**
+   * This project's cut of {@link weeklyTargetPct} (R6.1), measured against the project's OWN
+   * attributed spend — never against `usage.weeklyPct`, which meters the whole account. `null`
+   * means no share binds: the machine-wide target is the only weekly limit. See
+   * {@link withQuotaShare} for why the two ceilings sit on different meters.
+   */
+  projectWeeklyCapPct: number | null;
   /**
    * Throttle band (percentage points below the cap) where pacing engages (anton-ld7j). In
    * `[cap − this, cap)` anton paces against the even line so the last stretch lasts to the reset;
@@ -106,6 +115,18 @@ export type BudgetDecision =
   | { admit: true }
   | { admit: false; retryAt: Date; reason: DeferReason };
 
+/** The per-call readings the gate and the headroom read take beside the account-wide meter. */
+export interface BudgetProjectSpend {
+  /**
+   * Weekly quota attributed to THIS project so far this quota week, in the same percentage points
+   * `usage.weeklyPct` reads — what {@link BudgetPolicy.projectWeeklyCapPct} is measured against,
+   * since the account meter cannot say whose spend it is. `null`/absent means nothing is
+   * attributable yet, which reads as 0 spent: a share that has burned nothing measurable does not
+   * bind, and a 0% share still parks.
+   */
+  projectWeeklyPct?: number | null;
+}
+
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
@@ -116,6 +137,7 @@ export const DEFAULT_BUDGET_POLICY: BudgetPolicy = {
   dayEndHour: 22,
   utcOffsetMinutes: 0,
   weeklyTargetPct: 100,
+  projectWeeklyCapPct: null,
   throttleBandPct: 20,
   paceSlackPct: 5,
   weekMs: 7 * DAY_MS,
@@ -132,20 +154,30 @@ export const DEFAULT_BUDGET_POLICY: BudgetPolicy = {
 };
 
 /**
- * Scale a policy's weekly ceiling by this project's share of the machine's one Claude quota (R6.1).
+ * Give a policy this project's share of the machine's one Claude quota (R6.1).
  *
- * Several repos run against a single subscription, so a governed project's cap is its share OF the
- * weekly target, not the whole of it: at a 40% share a 90% target admits up to 36% weekly
- * utilization and defers past it. Nothing else moves — the session floor, the daytime reserve and
- * the pacing band are the same limits measured against a smaller ceiling.
+ * Several repos run against a single subscription, so a governed project may spend its share OF the
+ * weekly target: at a 40% share a 90% target lets this project burn up to 36 weekly%-points before
+ * it defers. That ceiling lands in {@link BudgetPolicy.projectWeeklyCapPct} — a SECOND limit beside
+ * `weeklyTargetPct`, not a smaller version of it — because the two are measured on different meters.
  *
- * A 0% share PARKS the project (see {@link budgetGate}'s weekly ceiling): the cap is 0, so the
- * weekly gate defers on every check. That is the opposite of what reading 0 as "no weekly signal"
- * would do, and the reason the gate treats a zero cap as a limit rather than as missing data.
+ * That separation is the whole point. `usage.weeklyPct` is the ACCOUNT's meter: every repo, plus the
+ * operator's own interactive sessions, move the same number. Scaling `weeklyTargetPct` and gating
+ * that shared number on it would cap the whole machine at one project's cut — arm a second repo and
+ * an even split drops both ceilings to 45, so at 45% global usage BOTH projects defer and half the
+ * operator's declared weekly target is unspendable every week (the opposite of idle-fill,
+ * anton-ld7j). It would also fail to enforce anything: at 70/30, whoever leases first burns the
+ * shared meter past the other's ceiling, which is exactly the race shares exist to end. So the
+ * machine-wide target stays whole and stays on the account meter, and the share is enforced against
+ * the project's own attributed spend (`quota-spend.ts`), which is the only reading that knows WHOSE
+ * quota was spent.
+ *
+ * A 0% share PARKS the project: its cap is 0, and unattributed spend reads as 0, so the weekly gate
+ * defers on every check whether or not anything has been sampled yet.
  */
 export function withQuotaShare(policy: BudgetPolicy, sharePct: number): BudgetPolicy {
   const share = Math.min(100, Math.max(0, sharePct));
-  return { ...policy, weeklyTargetPct: (policy.weeklyTargetPct * share) / 100 };
+  return { ...policy, projectWeeklyCapPct: (policy.weeklyTargetPct * share) / 100 };
 }
 
 /** Local hour-of-day (fractional, [0,24)) under the policy's fixed offset. */
@@ -249,12 +281,16 @@ function isNight(now: number, policy: BudgetPolicy): boolean {
  * session-headroom floor — that hard limit still protects the tail of a 5-hour session, so an
  * immediate run can't blow past the cap it would only hit mid-run. With it set, the gate admits as
  * soon as the session floor clears.
+ *
+ * `opts.projectWeeklyPct` is this project's own attributed weekly spend, which the share ceiling
+ * (R6.1) is measured against — see {@link withQuotaShare}. Omit it and only the machine-wide plan
+ * binds, which is the fail-open answer for a caller with no attribution to offer.
  */
 export function budgetGate(
   usage: ClaudeUsage | null,
   policy: BudgetPolicy,
   now: number,
-  opts?: { skipPacing?: boolean },
+  opts?: BudgetProjectSpend & { skipPacing?: boolean },
 ): BudgetDecision {
   if (!usage) return { admit: true };
 
@@ -278,15 +314,23 @@ export function budgetGate(
 
   // 2. Weekly ceiling (idle-fill, anton-ld7j). Spare weekly budget is spent freely — only the top of
   //    the plan is paced. Skipped entirely without a weekly signal (unknown reset), which leaves
-  //    pure idle-fill up to the session/daytime gates. A cap of exactly 0 is NOT missing data: it is
-  //    a project parked by a 0% quota share, and 2a below stops it every time.
+  //    pure idle-fill up to the session/daytime gates.
   if (!Number.isNaN(weeklyResetMs) && cap >= 0) {
-    // 2a. At/above the cap: the weekly budget is spent — stop until the window resets so the reserve
-    //     (100 − cap) and Claude's own hard limit are protected.
+    // 2a. At/above the cap: the machine's weekly budget is spent — stop until the window resets so
+    //     the reserve (100 − cap) and Claude's own hard limit are protected. Measured on the ACCOUNT
+    //     meter, and deliberately unscaled by any share: the cap bounds what this machine spends in
+    //     total, so the governed projects between them can still reach the operator's whole target.
     if (usage.weeklyPct >= cap) {
       return { admit: false, retryAt: new Date(weeklyResetMs), reason: "weekly-cap" };
     }
-    // 2b. Inside the throttle band just below the cap: pace what's left so it lasts to the reset —
+    // 2b. This project's share of that cap (R6.1), measured against its OWN attributed spend — the
+    //     account meter above is every repo's. A 0% share parks here on every check: its ceiling is
+    //     0 and unattributed spend reads as 0 (see withQuotaShare).
+    const shareCap = policy.projectWeeklyCapPct;
+    if (shareCap !== null && (opts?.projectWeeklyPct ?? 0) >= shareCap) {
+      return { admit: false, retryAt: new Date(weeklyResetMs), reason: "weekly-cap" };
+    }
+    // 2c. Inside the throttle band just below the cap: pace what's left so it lasts to the reset —
     //     defer only when ahead of the even line, retrying when the line catches up. BELOW the band
     //     it's idle-fill: run freely, day or night, so a productive early-week burst isn't benched.
     const throttleFloor = cap - policy.throttleBandPct;
@@ -330,7 +374,8 @@ export function budgetGate(
  *
  * Fail-open, exactly like the gate: a null usage read returns `null` — "unknown", never zero. A
  * caller that cannot read the meter must omit its claim rather than guess a limit the gate would
- * not enforce.
+ * not enforce. `opts.projectWeeklyPct` feeds the share ceiling for the same reason the gate takes
+ * it: the account meter cannot say how much of the share is left.
  */
 export interface BudgetHeadroom {
   /** Session%-points still spendable before the tightest session-side hold trips. Never negative. */
@@ -366,6 +411,7 @@ export function budgetHeadroom(
   usage: ClaudeUsage | null,
   policy: BudgetPolicy,
   now: number,
+  opts?: BudgetProjectSpend,
 ): BudgetHeadroom | null {
   if (!usage) return null;
 
@@ -413,6 +459,19 @@ export function budgetHeadroom(
     // Already over (`remaining` clamped to 0) is inclusive too: there is nothing left to spend.
     weeklyInclusive = remaining <= 0 || weeklyLimit >= cap || paceCeiling < throttleFloor;
     weeklyPct = Math.max(0, remaining);
+
+    // The quota share (R6.1) bounds the same answer from a different meter — this project's own
+    // attributed spend rather than the account's — so what is left is whichever runs out first. It
+    // defers AT its ceiling, hence inclusive, and it is a cap rather than a pace-line.
+    const shareCap = policy.projectWeeklyCapPct;
+    if (shareCap !== null) {
+      const shareRemaining = Math.max(0, shareCap - (opts?.projectWeeklyPct ?? 0));
+      if (shareRemaining <= weeklyPct) {
+        weeklyPct = shareRemaining;
+        weeklyReason = "weekly-cap";
+        weeklyInclusive = true;
+      }
+    }
   }
 
   return {
