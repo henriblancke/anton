@@ -58,6 +58,12 @@ type RepairKind = "dep-missing" | "ref-stale";
 export async function repairBlockedTicket(args: {
   run: Omit<StepContext, "tickets">;
   ticket: Bead;
+  /**
+   * Every ticket THIS run holds, ids only. Handed down from the dispatch loop rather than re-derived
+   * here: `dep-missing` resolves a prerequisite that may be one of them, and only the run knows
+   * which beads it is actually carrying (see `prereqSite`).
+   */
+  runTicketIds: readonly string[];
   /** This ticket's session log — where the repair's own account lands. */
   logPath: string;
   /** The agent's parsed `ANTON-RESULT` line, when it emitted one: the class AND the reason. */
@@ -91,6 +97,7 @@ export async function repairBlockedTicket(args: {
             block,
             now,
             autonomy: autonomy["dep-missing"],
+            runTicketIds: args.runTicketIds,
           })
         : await repairRefStale({
             repoPath: repo,
