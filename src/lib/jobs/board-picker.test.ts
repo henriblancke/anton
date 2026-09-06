@@ -12,16 +12,18 @@ import * as schema from "../db/schema";
 import { getBoardPickerPlan, isPlanStale, stampBoard } from "../board-picker-plan";
 import { PICKER_DEFER_WINDOW_MS, recordPickerVeto } from "../picker-veto";
 import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
-import { activeDisarm, listDisarms, reArmAutopilot } from "../autopilot-disarm";
+import { activeDisarm, disarmAutopilot, listDisarms, reArmAutopilot } from "../autopilot-disarm";
 import { listOpenEscalations } from "../escalations";
 import { LABELS } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import type { Bead } from "../beads/types";
 import { loadAllIssues } from "../beads/issues";
+import { invalidateIssueSnapshot, resetIssueSnapshots } from "../beads/snapshot";
 import { PoisonError } from "./errors";
-import type { Clock } from "./queue";
+import { enqueue, queuedJobId, type Clock } from "./queue";
 import type { JobContext } from "./runner";
 import { makeBoardPickerHandler } from "./board-picker";
+import { BoardPickerNudge, PICKER_NUDGE_WINDOW_MS } from "./picker-nudge";
 import type {
   ConfirmStart,
   PickerApplyInput,
@@ -844,5 +846,129 @@ describe("makeBoardPickerHandler", () => {
   it("parks a payload naming a project that is gone rather than retrying it forever", async () => {
     const handler = makeBoardPickerHandler({ db: t.db, clock });
     await expect(handler(fakeCtx({ payload: { projectId: "ghost" } }))).rejects.toThrow(PoisonError);
+  });
+});
+
+
+/**
+ * The board-change nudge (anton-h32k): the picker re-decides when the board MOVES, not only when the
+ * clock says so. What is pinned here is the gap the cadence used to own — that a burst of writes
+ * costs one pass and not N, that a frozen project buys none, and that the signal enqueues a job
+ * rather than deciding anything itself.
+ */
+describe("BoardPickerNudge", () => {
+  let nudge: BoardPickerNudge;
+  let enqueued: string[];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    // The listener registry and the snapshot cache are process-global (Next compiles the app and
+    // instrumentation into separate registries), so a suite that fires invalidations must start from
+    // a clean one or it inherits the previous test's entries.
+    resetIssueSnapshots();
+    enqueued = [];
+    nudge = new BoardPickerNudge({
+      db: t.db,
+      enqueue: async (projectId) => {
+        enqueued.push(projectId);
+        await enqueue(t.db, clock, { type: "board-picker", projectId, payload: { projectId } });
+      },
+    });
+    nudge.start();
+  });
+  afterEach(() => {
+    nudge.stop();
+    vi.useRealTimers();
+  });
+
+  it("folds a burst of board writes into exactly one pass", async () => {
+    // One claim is a label, an assignee and a note — three writes the operator reads as one move.
+    for (let i = 0; i < 5; i++) invalidateIssueSnapshot("/tmp/p1", true);
+
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual(["p1"]);
+  });
+
+  it("enqueues nothing before its window is up", async () => {
+    invalidateIssueSnapshot("/tmp/p1", true);
+
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS - 1);
+
+    expect(enqueued).toEqual([]);
+  });
+
+  it("stays quiet while the project is frozen", async () => {
+    await disarmAutopilot(t.db, clock, {
+      projectId: "p1",
+      reason: "consecutive-failures",
+      detail: "three runs stopped without delivering",
+    });
+
+    invalidateIssueSnapshot("/tmp/p1", true);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual([]);
+  });
+
+  // The whole point of routing through the queue: the signal says "re-decide", the JOB decides. A
+  // board read that wrote a plan would give the lane a second producer to disagree with.
+  it("writes no plan of its own — it only enqueues the pass that writes one", async () => {
+    board.current = [bead("t1")];
+
+    invalidateIssueSnapshot("/tmp/p1", true);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(await getBoardPickerPlan(t.db, "p1")).toBeUndefined();
+    expect(queuedJobId(t.db, "board-picker", "p1")).toBeDefined();
+  });
+
+  it("folds onto the pass already queued rather than stacking a second", async () => {
+    invalidateIssueSnapshot("/tmp/p1", true);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    invalidateIssueSnapshot("/tmp/p1", true);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual(["p1"]);
+  });
+
+  // A pass in flight may have read the board BEFORE this change landed, so it does not cover it —
+  // the dedupe above is on the queued row only, which is what keeps the window one window wide.
+  it("schedules a follow-up for a change that lands while a pass is running", async () => {
+    invalidateIssueSnapshot("/tmp/p1", true);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    t.db.update(schema.jobs).set({ status: "running" }).run();
+
+    invalidateIssueSnapshot("/tmp/p1", true);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual(["p1", "p1"]);
+  });
+
+  it("ignores a board no project on this machine owns", async () => {
+    invalidateIssueSnapshot("/tmp/somebody-elses-repo", true);
+
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual([]);
+  });
+
+  // A pull moves the board as surely as a local write does, and it is the only way another machine's
+  // work ever reaches this one.
+  it("hears a remote pull, not just a local write", async () => {
+    invalidateIssueSnapshot("/tmp/p1");
+
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual(["p1"]);
+  });
+
+  it("hears nothing once stopped", async () => {
+    nudge.stop();
+
+    invalidateIssueSnapshot("/tmp/p1", true);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual([]);
   });
 });

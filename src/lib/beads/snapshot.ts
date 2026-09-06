@@ -33,6 +33,7 @@ export interface SnapshotRead {
 
 const SNAPSHOTS_KEY = Symbol.for("anton.beads.issueSnapshots");
 const DESCRIPTIONS_KEY = Symbol.for("anton.beads.beadDescriptions");
+const LISTENERS_KEY = Symbol.for("anton.beads.boardChangeListeners");
 
 function snapshots(): Map<string, SnapshotEntry> {
   const global = globalThis as unknown as Record<
@@ -40,6 +41,34 @@ function snapshots(): Map<string, SnapshotEntry> {
     Map<string, SnapshotEntry> | undefined
   >;
   return (global[SNAPSHOTS_KEY] ??= new Map());
+}
+
+/** Told, with the repo path, whenever that repo's board moved. Never awaited, never throws. */
+export type BoardChangeListener = (cwd: string) => void;
+
+function boardChangeListeners(): Set<BoardChangeListener> {
+  const global = globalThis as unknown as Record<symbol, Set<BoardChangeListener> | undefined>;
+  return (global[LISTENERS_KEY] ??= new Set());
+}
+
+/**
+ * Subscribe to "this repo's board moved", and get back the unsubscribe (anton-h32k).
+ *
+ * The signal is {@link invalidateIssueSnapshot} itself, which is the point: every local write
+ * (`bdWrite`, `bdGateWrite`) and every remote pull (the sync coalescer's `recordOutcome`) already
+ * funnels through it, so subscribing here is subscribing to the three places the app ALREADY knows
+ * the board moved — no new watcher, and no fourth write path can appear that skips it.
+ *
+ * Global-keyed for the same reason the snapshots themselves are: Next compiles instrumentation and
+ * the app layer into separate module registries, so a module-scoped set would leave a listener
+ * registered at boot deaf to every invalidation a route handler makes.
+ */
+export function onBoardChanged(listener: BoardChangeListener): () => void {
+  const registered = boardChangeListeners();
+  registered.add(listener);
+  return () => {
+    registered.delete(listener);
+  };
 }
 
 /** Per-repo memo of the one field `bd list` can drop — a bead's description — keyed by bead id. */
@@ -120,6 +149,16 @@ export function invalidateIssueSnapshot(cwd: string, localWrite = false): void {
     // A post-write read must start after the write, never share a loader that started before it.
     entry.refresh = null;
     entry.pendingWrite = true;
+  }
+  // Announce the move AFTER the cache has taken it, so a listener that reads back sees the
+  // invalidated entry. A listener is a side channel and must never break the invalidation the
+  // caller actually asked for — its throw is logged and swallowed.
+  for (const listener of boardChangeListeners()) {
+    try {
+      listener(cwd);
+    } catch (e) {
+      console.error(`[snapshot] board-change listener failed for ${cwd}`, e);
+    }
   }
 }
 
