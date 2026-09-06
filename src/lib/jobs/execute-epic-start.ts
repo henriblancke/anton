@@ -11,6 +11,7 @@ import { loadAllIssues } from "../beads/issues";
 import { isUnit } from "../epic-graph";
 import { runTickets } from "../ticket-view";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
+import { fingerprintLabelOf, isProposalBead } from "../gardener/detections";
 import { getProjectById, getProjectSettings, resolveTicketTimeoutMs } from "../projects";
 import { createRun, findOpenRunForEpic, updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
@@ -150,6 +151,13 @@ async function discoverUserAgents(repo: string): Promise<string[]> {
 function assertRunnableTarget(all: Bead[], targetId: string): Bead | undefined {
   const target = all.find((b) => b.id === targetId);
   if (!target) throw new PoisonEpic(`bead ${targetId} not found on the board`);
+  // A PROPOSAL is a decision, not work (anton-x37c). It is shaped as a parentless task carrying a
+  // full contract, so every gate below would pass it through and this run would warm a worktree and
+  // dispatch an agent to "implement" a board move anton applies itself the moment a person approves
+  // it. Ahead of the run-target and approval tests for the same reason the picker puts it first
+  // (picker-targets.ts): what the bead IS settles this before anything about its shape or state is
+  // consulted — and an unapproved proposal must not read as work merely waiting for a signature.
+  if (isProposalBead(target)) throw proposalTargetPoison(target);
   if (!beads.isRunTarget(target, all)) throw notARunTarget(target, all, targetId);
   if (!beads.isApproved(target)) {
     throw new PoisonEpic(`target ${targetId} is not approved — refusing to execute`);
@@ -166,6 +174,24 @@ function assertRunnableTarget(all: Bead[], targetId: string): Bead | undefined {
   // who has to do it.
   if (beads.isHumanWork(target)) throw humanTargetPoison(targetId);
   return target;
+}
+
+/**
+ * The refusal a PROPOSAL target settles with (anton-x37c) — the runner's half of the rule the
+ * approve route and the picker already hold.
+ *
+ * Poison, not retry: no number of attempts turns a decision into work, and parking puts it back in
+ * front of the person whose call it is. The message names the label (the one thing on the bead that
+ * says "decision") and the gesture that ends it — approving a proposal APPLIES its move and closes
+ * it, which is the whole reason no agent is dispatched at it.
+ */
+function proposalTargetPoison(target: Bead): PoisonEpic {
+  return new PoisonEpic(
+    `bead ${target.id} is a proposal, not work — it is labelled ${fingerprintLabelOf(target)}, ` +
+      `which anton files for a board move a person decides on. Approving one APPLIES the move and ` +
+      `closes the bead; no agent implements it and no run can deliver it. Approve or decline it ` +
+      `instead of running it, and file the work as its own bead if there is any`,
+  );
 }
 
 /** Why this bead cannot be run, in the words the operator needs to act on it. */
