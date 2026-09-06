@@ -76,6 +76,77 @@ export function defaultQuotaSharePct(governedCount: number): number {
 }
 
 /**
+ * A share as a proportion of some denominator. An empty denominator means nothing in it can spend,
+ * so no share is in force — never a divide-by-zero and never an accidental 100.
+ */
+function proportionOf(sharePct: number, totalPct: number): number {
+  return totalPct > 0 ? (sharePct / totalPct) * 100 : 0;
+}
+
+/**
+ * Whether the declared shares fail to sum to 100. Only meaningful once something is governed — a
+ * board of pure defaults sums to 100 by construction, and a board with no governed project has
+ * nothing to balance.
+ */
+function isImbalanced(governedCount: number, declaredTotalPct: number): boolean {
+  return governedCount > 0 && Math.round(declaredTotalPct) !== 100;
+}
+
+/** One budget-aware project's declaration, as the governor reads it off the store. */
+export interface GovernedShare {
+  projectId: string;
+  /** What the operator declared, or absent when this project has never declared a share. */
+  declaredPct?: number;
+}
+
+/** The share in force for one project, plus the board-level facts that produced it. */
+export interface ResolvedQuotaShare {
+  /** The share that scales this project's weekly ceiling, 0–100 (R6.1). */
+  sharePct: number;
+  /** The declaration it came from — the equal split when this project never declared one. */
+  declaredPct: number;
+  /** False = still on the equal-split default, so a caller can say the number was never chosen. */
+  declared: boolean;
+  /** Σ shares across every governed project. */
+  declaredTotalPct: number;
+  /** The declarations don't sum to 100. `sharePct` IS proportioned — say so, don't smooth it away. */
+  imbalanced: boolean;
+}
+
+/**
+ * The share `projectId` spends against right now, given every budget-aware project on this machine.
+ *
+ * Undeclared projects ride the equal split, so a machine that has declared nothing still divides its
+ * quota rather than racing for it. Declarations that don't sum to 100 are taken in proportion — the
+ * same arithmetic {@link resolveQuotaSplit} shows the operator, so the governor and the panel can
+ * never disagree about a project's cut — with {@link ResolvedQuotaShare.imbalanced} carrying the
+ * fact so a caller can surface it rather than quietly rescaling behind the operator's back.
+ *
+ * A project absent from `board` is ungoverned and resolves to the whole 100: no share binds it, and
+ * scaling its ceiling by someone else's split would pace a project the operator never armed.
+ */
+export function resolveGovernedShare(
+  projectId: string,
+  board: readonly GovernedShare[],
+): ResolvedQuotaShare {
+  const equalSplit = defaultQuotaSharePct(board.length);
+  const declared = board.map((p) => p.declaredPct ?? equalSplit);
+  const declaredTotalPct = declared.reduce((sum, pct) => sum + pct, 0);
+  const imbalanced = isImbalanced(board.length, declaredTotalPct);
+  const index = board.findIndex((p) => p.projectId === projectId);
+  if (index < 0) {
+    return { sharePct: 100, declaredPct: 100, declared: false, declaredTotalPct, imbalanced };
+  }
+  return {
+    sharePct: proportionOf(declared[index], declaredTotalPct),
+    declaredPct: declared[index],
+    declared: board[index].declaredPct !== undefined,
+    declaredTotalPct,
+    imbalanced,
+  };
+}
+
+/**
  * Resolve the split in force right now.
  *
  * The denominator is the projects that can actually spend: governed, and either holding eligible
@@ -94,10 +165,8 @@ export function resolveQuotaSplit(projects: readonly QuotaShareProject[]): Quota
 
   const rows = projects.map<QuotaShareRow>((project) => {
     const participating = project.governed && (project.eligible || project.reserved);
-    const normalizedPct =
-      project.governed && declaredTotalPct > 0 ? (project.sharePct / declaredTotalPct) * 100 : 0;
-    const effectivePct =
-      participating && participantTotal > 0 ? (project.sharePct / participantTotal) * 100 : 0;
+    const normalizedPct = project.governed ? proportionOf(project.sharePct, declaredTotalPct) : 0;
+    const effectivePct = participating ? proportionOf(project.sharePct, participantTotal) : 0;
     return {
       ...project,
       normalizedPct,
@@ -112,9 +181,7 @@ export function resolveQuotaSplit(projects: readonly QuotaShareProject[]): Quota
   return {
     rows,
     declaredTotalPct,
-    // Only meaningful once something is declared — a board of pure defaults sums to 100 by
-    // construction, and a board with no governed project has nothing to balance.
-    imbalanced: governed.length > 0 && Math.round(declaredTotalPct) !== 100,
+    imbalanced: isImbalanced(governed.length, declaredTotalPct),
     seeded: projects.some((p) => p.seeded),
     spentTotalPct:
       attributed.length > 0 ? attributed.reduce((sum, p) => sum + (p.spentWeeklyPct ?? 0), 0) : null,

@@ -7,6 +7,7 @@
  */
 import { getDb } from "../db";
 import {
+  budgetAwareQuotaShares,
   DEFAULT_CONCURRENCY,
   DEFAULT_JOB_TIMEOUT_MINUTES,
   DEFAULT_MAX_RETRIES,
@@ -14,6 +15,8 @@ import {
   getProjectSettings,
   resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
 } from "../projects";
+import { resolveGovernedShare, type ResolvedQuotaShare } from "../quota-share";
+import { withQuotaShare } from "./budget";
 import { beads } from "../beads/bd";
 import { allIssues } from "../beads/issues";
 
@@ -37,11 +40,40 @@ export async function resolvePolicy(projectId: string | undefined) {
  * never reads Claude usage on its behalf, so the nav usage pill isn't starved of the shared cache.
  * When on, it projects the operator's knobs onto the governor's full {@link BudgetPolicy}. A
  * project-less job is never budget-aware (empty settings → off).
+ *
+ * The quota share (R6.1) is applied HERE rather than as a second gate downstream: several repos run
+ * against one subscription, so a governed project's weekly ceiling is its share of the target, and
+ * the one place that already decides "governed or not" is the one place that should decide "how
+ * much". A share is a fact about the BOARD, not about this project's settings, so it is resolved
+ * from every budget-aware project rather than inside the pure settings projection — which is also
+ * why an ungoverned project is untouched: it returns null above, before any share is read.
  */
 export async function resolveBudgetPolicy(projectId: string | undefined) {
   const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
-  if (!settings.budgetAware) return null;
-  return resolveBudgetPolicyFromSettings(settings);
+  if (!projectId || !settings.budgetAware) return null;
+  const share = resolveGovernedShare(projectId, await budgetAwareQuotaShares());
+  announceImbalance(share);
+  return withQuotaShare(resolveBudgetPolicyFromSettings(settings), share.sharePct);
+}
+
+/** The last imbalance announced, so a per-tick resolve reports a change rather than a stream. */
+let lastImbalanceAnnounced = "";
+
+/**
+ * Say out loud when the declared shares don't sum to 100. The governor proportions them anyway — an
+ * under-declared board must not leave weekly quota unspendable (idle-fill, anton-ld7j) — but an
+ * operator who declared 30/30/30 is owed the reason their ceiling reads 33, not a number that
+ * silently changed under them. The settings panel carries the same fact; this is for the operator
+ * watching the runner rather than the panel.
+ */
+function announceImbalance(share: ResolvedQuotaShare): void {
+  const key = share.imbalanced ? String(Math.round(share.declaredTotalPct)) : "";
+  if (key === lastImbalanceAnnounced) return;
+  lastImbalanceAnnounced = key;
+  if (!key) return;
+  console.warn(
+    `[jobs] quota shares across budget-aware projects total ${key}%, not 100% — each project's weekly ceiling is its declared share in proportion (Settings → Quota shares)`,
+  );
 }
 
 /**

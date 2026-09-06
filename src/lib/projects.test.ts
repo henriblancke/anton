@@ -22,6 +22,7 @@ let DEFAULT_PROJECT_BUDGET_POLICY: typeof import("./projects").DEFAULT_PROJECT_B
 let updateProjectSettings: typeof import("./projects").updateProjectSettings;
 let getProjectSettingsBySlug: typeof import("./projects").getProjectSettingsBySlug;
 let isBudgetAwareEnabledAnywhere: typeof import("./projects").isBudgetAwareEnabledAnywhere;
+let budgetAwareProjectPolicies: typeof import("./projects").budgetAwareProjectPolicies;
 let resolveValueLabels: typeof import("./projects").resolveValueLabels;
 let valueLabelsSchema: typeof import("./projects").valueLabelsSchema;
 let resolvePickerAutonomy: typeof import("./projects").resolvePickerAutonomy;
@@ -55,6 +56,7 @@ beforeAll(async () => {
   updateProjectSettings = mod.updateProjectSettings;
   getProjectSettingsBySlug = mod.getProjectSettingsBySlug;
   isBudgetAwareEnabledAnywhere = mod.isBudgetAwareEnabledAnywhere;
+  budgetAwareProjectPolicies = mod.budgetAwareProjectPolicies;
   resolveValueLabels = mod.resolveValueLabels;
   valueLabelsSchema = mod.valueLabelsSchema;
   resolvePickerAutonomy = mod.resolvePickerAutonomy;
@@ -432,6 +434,27 @@ describe("isBudgetAwareEnabledAnywhere (anton-7mpv.1)", () => {
     const created = await addProject({ name: "Budget On", repoPath: makeRepoDir("budget-on") });
     await updateProjectSettings(created.slug, { budgetAware: true });
     expect(await isBudgetAwareEnabledAnywhere()).toBe(true);
+  });
+});
+
+describe("budgetAwareProjectPolicies (anton-81x2)", () => {
+  it("carries each project's quota share, so the nudge reads the ceiling the runner enforces", async () => {
+    // This suite shares one db, so disarm what earlier blocks armed: the split's denominator IS
+    // every budget-aware project, and a stray one would silently change every share below.
+    for (const p of await listProjects()) {
+      await updateProjectSettings(p.slug, { budgetAware: false });
+    }
+    const big = await addProject({ name: "Share Big", repoPath: makeRepoDir("share-big") });
+    const small = await addProject({ name: "Share Small", repoPath: makeRepoDir("share-small") });
+    await updateProjectSettings(big.slug, { budgetAware: true, quotaSharePct: 75 });
+    await updateProjectSettings(small.slug, { budgetAware: true, quotaSharePct: 25 });
+
+    const targets = (await budgetAwareProjectPolicies())
+      .map((p) => p.weeklyTargetPct)
+      .sort((a, b) => a - b);
+    const full = DEFAULT_PROJECT_BUDGET_POLICY.weeklyTargetPct;
+
+    expect(targets).toEqual([full * 0.25, full * 0.75]);
   });
 });
 

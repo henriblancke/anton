@@ -13,7 +13,8 @@ import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
-import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
+import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./jobs/budget";
+import { resolveGovernedShare, type GovernedShare } from "./quota-share";
 import { GARDENER_DETECTION_KINDS } from "./gardener/detections";
 import {
   earnedPickerAutonomy,
@@ -1029,25 +1030,60 @@ export async function isBudgetAwareEnabledAnywhere(): Promise<boolean> {
 }
 
 /**
- * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
- * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) the per-project
- * governor applies — rather than a hard-coded default, so an operator who tunes `weeklyTargetPct`
- * or `daytimeReservePct` sees the nudge agree with what the runner actually admits. Empty when no
- * project has opted in (the nudge's hide gate); a project with unparseable settingsJson is treated
- * as off, mirroring {@link isBudgetAwareEnabledAnywhere}.
+ * Every budget-aware project on this machine, with its settings — the board a quota share is
+ * proportioned against, and the denominator of the equal-split default. An unparseable settingsJson
+ * reads as off, mirroring {@link isBudgetAwareEnabledAnywhere}.
  */
-export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
-  const rows = await getDb().select({ settingsJson: schema.projects.settingsJson }).from(schema.projects);
-  const policies: BudgetPolicy[] = [];
+async function governedProjects(): Promise<{ projectId: string; settings: ProjectSettings }[]> {
+  const rows = await getDb()
+    .select({ id: schema.projects.id, settingsJson: schema.projects.settingsJson })
+    .from(schema.projects);
+  const governed: { projectId: string; settings: ProjectSettings }[] = [];
   for (const row of rows) {
     try {
       const settings = JSON.parse(row.settingsJson) as ProjectSettings;
-      if (settings.budgetAware === true) policies.push(resolveBudgetPolicy(settings));
+      if (settings.budgetAware === true) governed.push({ projectId: row.id, settings });
     } catch {
       // unparseable settings → not budget-aware; skip
     }
   }
-  return policies;
+  return governed;
+}
+
+/**
+ * The declared quota shares of every budget-aware project on this machine (R6.1) — the board one
+ * project's share is proportioned against by `resolveGovernedShare` (./quota-share).
+ *
+ * Ungoverned projects are absent by construction: they spend unpaced, so counting them in the
+ * denominator would shrink everyone else's cut to fund a project no share binds. An undeclared
+ * project carries no `declaredPct` (it rides the equal split), which is NOT the same as declaring 0
+ * — that parks a repo.
+ */
+export async function budgetAwareQuotaShares(): Promise<GovernedShare[]> {
+  return (await governedProjects()).map(({ projectId, settings }) => ({
+    projectId,
+    declaredPct: settings.quotaSharePct,
+  }));
+}
+
+/**
+ * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
+ * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) and the SAME quota
+ * share (R6.1) the per-project governor applies — rather than a hard-coded default, so an operator
+ * who tunes `weeklyTargetPct` or `daytimeReservePct`, or divides the quota between repos, sees the
+ * nudge agree with what the runner actually admits. Without the share the nudge would read a lone
+ * project's headroom as the whole plan's and prompt for work every governor would then defer. Empty
+ * when no project has opted in (the nudge's hide gate).
+ */
+export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
+  const governed = await governedProjects();
+  const board = governed.map(({ projectId, settings }) => ({
+    projectId,
+    declaredPct: settings.quotaSharePct,
+  }));
+  return governed.map(({ projectId, settings }) =>
+    withQuotaShare(resolveBudgetPolicy(settings), resolveGovernedShare(projectId, board).sharePct),
+  );
 }
 
 /** Apply a patch to a settings blob, key by key. Pure — the store's read/write is the caller's. */

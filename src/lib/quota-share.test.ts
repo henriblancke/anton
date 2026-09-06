@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import {
   defaultQuotaSharePct,
   formatApproxPct,
+  resolveGovernedShare,
   resolveQuotaSplit,
   type QuotaShareProject,
 } from "@/lib/quota-share";
@@ -117,6 +118,73 @@ describe("resolveQuotaSplit", () => {
       project({ id: "b" }),
     ]);
     expect(partial.spentTotalPct).toBe(4);
+  });
+});
+
+describe("resolveGovernedShare", () => {
+  it("defaults an undeclared project to an equal split across the armed projects", () => {
+    const board = [{ projectId: "a" }, { projectId: "b" }, { projectId: "c" }];
+
+    expect(resolveGovernedShare("b", board)).toMatchObject({
+      sharePct: 100 / 3,
+      declaredPct: 100 / 3,
+      declared: false,
+      imbalanced: false,
+    });
+  });
+
+  it("holds a declared share that already sums to 100", () => {
+    const board = [
+      { projectId: "a", declaredPct: 70 },
+      { projectId: "b", declaredPct: 30 },
+    ];
+
+    expect(resolveGovernedShare("a", board).sharePct).toBe(70);
+    expect(resolveGovernedShare("b", board).sharePct).toBe(30);
+    expect(resolveGovernedShare("a", board).imbalanced).toBe(false);
+  });
+
+  it("surfaces a non-100 sum rather than renormalizing it away silently", () => {
+    const board = [
+      { projectId: "a", declaredPct: 30 },
+      { projectId: "b", declaredPct: 30 },
+      { projectId: "c", declaredPct: 30 },
+    ];
+    const share = resolveGovernedShare("a", board);
+
+    // Proportioned — an under-declared board must not leave weekly quota unspendable…
+    expect(share.sharePct).toBeCloseTo(33.33, 1);
+    // …but the operator declared 30, and the gap between the two is reported, not smoothed over.
+    expect(share.declaredPct).toBe(30);
+    expect(share.declaredTotalPct).toBe(90);
+    expect(share.imbalanced).toBe(true);
+  });
+
+  it("mixes a declaration with the equal-split default, and says the total is off", () => {
+    // The default is measured against the armed count (2 → 50), so declaring 80 over-commits.
+    const board = [{ projectId: "a", declaredPct: 80 }, { projectId: "b" }];
+    const declared = resolveGovernedShare("a", board);
+
+    expect(declared.declaredTotalPct).toBe(130);
+    expect(declared.imbalanced).toBe(true);
+    expect(declared.sharePct).toBeCloseTo((80 / 130) * 100, 6);
+    expect(resolveGovernedShare("b", board).sharePct).toBeCloseTo((50 / 130) * 100, 6);
+  });
+
+  it("parks a project that declared 0 without dragging the others down", () => {
+    const board = [
+      { projectId: "a", declaredPct: 0 },
+      { projectId: "b", declaredPct: 100 },
+    ];
+
+    expect(resolveGovernedShare("a", board).sharePct).toBe(0);
+    expect(resolveGovernedShare("b", board).sharePct).toBe(100);
+  });
+
+  it("leaves a project that is not on the governed board holding the whole quota", () => {
+    // Budget-aware execution is off for it: no share binds it, so nothing may scale its ceiling.
+    expect(resolveGovernedShare("off", [{ projectId: "a", declaredPct: 100 }]).sharePct).toBe(100);
+    expect(resolveGovernedShare("alone", []).sharePct).toBe(100);
   });
 });
 

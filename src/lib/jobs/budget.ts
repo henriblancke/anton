@@ -131,6 +131,23 @@ export const DEFAULT_BUDGET_POLICY: BudgetPolicy = {
   nightHeavyCostPct: 15,
 };
 
+/**
+ * Scale a policy's weekly ceiling by this project's share of the machine's one Claude quota (R6.1).
+ *
+ * Several repos run against a single subscription, so a governed project's cap is its share OF the
+ * weekly target, not the whole of it: at a 40% share a 90% target admits up to 36% weekly
+ * utilization and defers past it. Nothing else moves — the session floor, the daytime reserve and
+ * the pacing band are the same limits measured against a smaller ceiling.
+ *
+ * A 0% share PARKS the project (see {@link budgetGate}'s weekly ceiling): the cap is 0, so the
+ * weekly gate defers on every check. That is the opposite of what reading 0 as "no weekly signal"
+ * would do, and the reason the gate treats a zero cap as a limit rather than as missing data.
+ */
+export function withQuotaShare(policy: BudgetPolicy, sharePct: number): BudgetPolicy {
+  const share = Math.min(100, Math.max(0, sharePct));
+  return { ...policy, weeklyTargetPct: (policy.weeklyTargetPct * share) / 100 };
+}
+
 /** Local hour-of-day (fractional, [0,24)) under the policy's fixed offset. */
 function localHour(nowMs: number, offsetMinutes: number): number {
   const localMs = nowMs + offsetMinutes * 60_000;
@@ -260,9 +277,10 @@ export function budgetGate(
   const cap = policy.weeklyTargetPct;
 
   // 2. Weekly ceiling (idle-fill, anton-ld7j). Spare weekly budget is spent freely — only the top of
-  //    the plan is paced. Skipped entirely without a weekly signal (unknown reset or cap ≤ 0), which
-  //    leaves pure idle-fill up to the session/daytime gates.
-  if (!Number.isNaN(weeklyResetMs) && cap > 0) {
+  //    the plan is paced. Skipped entirely without a weekly signal (unknown reset), which leaves
+  //    pure idle-fill up to the session/daytime gates. A cap of exactly 0 is NOT missing data: it is
+  //    a project parked by a 0% quota share, and 2a below stops it every time.
+  if (!Number.isNaN(weeklyResetMs) && cap >= 0) {
     // 2a. At/above the cap: the weekly budget is spent — stop until the window resets so the reserve
     //     (100 − cap) and Claude's own hard limit are protected.
     if (usage.weeklyPct >= cap) {
@@ -382,7 +400,7 @@ export function budgetHeadroom(
   let weeklyPct: number | null = null;
   let weeklyReason: BudgetHeadroom["weeklyReason"] = "weekly-cap";
   let weeklyInclusive = true;
-  if (!Number.isNaN(weeklyResetMs) && cap > 0) {
+  if (!Number.isNaN(weeklyResetMs) && cap >= 0) {
     // Below the throttle floor spending is free whatever the pace (idle-fill, anton-ld7j), so the
     // pace-line only binds where it sits above that floor — and never above the cap.
     const throttleFloor = cap - policy.throttleBandPct;
