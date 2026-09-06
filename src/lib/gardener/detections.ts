@@ -285,15 +285,28 @@ export interface GardenerDetection {
  */
 export const FINGERPRINT_HASH_LENGTH = 12;
 
-export interface DetectionInput {
-  kind: GardenerDetectionKind;
-  move: GardenerMove;
+/**
+ * An evidenced claim with its VERB not yet chosen — everything a proposal needs except which move
+ * would settle it.
+ *
+ * Split out for the detector whose outcome is a separate decision (rejudge.ts): "this parked work
+ * has aged past re-judgement" is a fact about the board, while whether it comes back or dies is a
+ * judgment nothing mechanical is entitled to make. Such a detector produces the claim, and the pass
+ * that owns the verb spreads it into {@link makeDetection}. Every other detector states both at once
+ * and reaches the same fields through {@link DetectionInput}.
+ */
+export interface DetectionClaim {
   subjects: string[];
   target?: string;
-  retireAs?: RetireVerb;
-  detail?: string;
   summary: string;
   evidence: string[];
+}
+
+export interface DetectionInput extends DetectionClaim {
+  kind: GardenerDetectionKind;
+  move: GardenerMove;
+  retireAs?: RetireVerb;
+  detail?: string;
 }
 
 /**

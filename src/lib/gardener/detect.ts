@@ -63,5 +63,13 @@ export {
   RETIRE_STALE_IN_PROGRESS_DAYS,
   RETIRE_STALE_OPEN_DAYS,
 } from "./retire";
+// Deliberately NOT part of {@link detectBoard}: this one produces a claim with no move attached
+// (see rejudge.ts), so the pass that chooses the verb composes it rather than the board sweep.
+export {
+  detectDeferredRejudgement,
+  REJUDGE_DEFERRED_DAYS,
+  type DeferredRejudgement,
+  type RejudgeOptions,
+} from "./rejudge";
 export { indexBoard, type BoardIndex } from "./board-index";
 export * from "./detections";
