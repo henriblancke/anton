@@ -384,7 +384,7 @@ describe("decision inputs", () => {
  *
  * Both directions, because a fence is only as good as both: an edit outside the reach must leave the
  * generation standing, and every edit inside it must retire the generation. The same property is
- * measured over anton's real board — 289 beads of 842, swept exhaustively for an escape — in
+ * measured over anton's real board — 274 beads of 842, swept exhaustively for an escape — in
  * `board-picker-plan.currency.test.ts`; what is pinned here is each clause of the set on its own.
  */
 describe("the decision's reachable set", () => {

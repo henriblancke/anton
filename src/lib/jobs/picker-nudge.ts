@@ -5,9 +5,12 @@
  * generation is absent. This closes that window to one debounce window, using the signal the app
  * already has.
  *
- * The signal is {@link onBoardChanged} — that is, `invalidateIssueSnapshot`, which every local bd
- * write and every remote pull already funnels through. Nothing new watches, polls, or is emitted:
- * the three places the app knows the board moved simply get a second subscriber.
+ * The signal is {@link onBoardChanged} — a completed board read whose content differs from the one
+ * the snapshot held. Nothing new watches, polls, or is emitted: the read every local bd write and
+ * every remote pull already forces simply gets a second subscriber. Content, not invalidation, is
+ * what it subscribes to, and deliberately: the sync coalescer invalidates on every pass that
+ * reaches `synced`, so a nudge bound to that would re-decide every 30s on any wired board — the
+ * cron backstop's cadence, at a `bd list` under the repo's exclusive Dolt lock apiece.
  *
  * DECIDING stays the job's. This module only enqueues a `board-picker` pass; the plan row is still
  * written by exactly one producer, so a board READ can never write a plan and two surfaces can never
@@ -29,10 +32,10 @@ import type { RunnerLogger } from "./runner";
  * How long a burst of board writes folds into one pass.
  *
  * The window IS the rate limit, and that is what it is sized for: a pass spawns `bd list` under the
- * repo's exclusive Dolt lock, and the sync heartbeat invalidates every 30s on a wired board — so a
- * shorter window would buy freshness the operator cannot see while contending with the very writes
- * it is reacting to. Matched to `ISSUE_SNAPSHOT_MAX_AGE_MS`, which is the app's existing
- * answer to "how fresh does a board read need to be", and still twenty times the cadence it backs.
+ * repo's exclusive Dolt lock, so a shorter window would buy freshness the operator cannot see while
+ * contending with the very reads it is reacting to. Matched to `ISSUE_SNAPSHOT_MAX_AGE_MS`, which is
+ * the app's existing answer to "how fresh does a board read need to be", and still twenty times the
+ * cadence it backs.
  */
 export const PICKER_NUDGE_WINDOW_MS = 30_000;
 
@@ -86,10 +89,11 @@ export class BoardPickerNudge {
   /**
    * Fold a board change into the pass this repo is already owed, or open a window and owe one.
    *
-   * The first change in a window schedules; every change riding that window is dropped, so N writes
-   * produce exactly one pass. Trailing rather than leading on purpose: a write burst (a claim, a
-   * label, a note) is one board move to a reader, and deciding on its first write would rank a board
-   * halfway through it.
+   * A fixed window, not a resetting one: the first change opens it and every change riding it is
+   * dropped, so N moves cost exactly one pass and a board that never stops moving still gets one
+   * pass per window rather than none. The pass fires at the END of that window on purpose — a burst
+   * (a claim, a label, a note) is one board move to a reader, and deciding on its first write would
+   * rank a board halfway through it.
    */
   nudge(repoPath: string): void {
     if (this.owed.has(repoPath)) return;

@@ -41,7 +41,7 @@
  *   • DOWNWARD — `beads.isContainer` counts a feature child of ANY status, so re-parenting a CLOSED
  *     feature under an epic pick turns that pick into a container and drops it from the plan, with
  *     no bead entering the pool and no `blocks` edge moving. Pinned below as "a closed feature
- *     child". Feature children of the set widen the fence from 199 beads to 288 of 842 — some of
+ *     child". Feature children of the set widen the fence from 185 beads to 273 of 842 — some of
  *     the 85.8% above is paid for that, and it is cheap at the price.
  *   • UPWARD — `structureGaps` reads a candidate's ANCESTORS, and an ancestor may be closed and so
  *     outside all three of the above. Re-typing that closed epic, or filing a closed feature under
@@ -53,8 +53,12 @@
  *     counts a ticket child of ANY status, so a feature whose tickets are all CLOSED is gated on
  *     nothing and grooming the last finished one onto another card gates it on its own spec. Pinned
  *     below as "a closed ticket groomed off a thin feature". The run tickets of the pool cost 1
- *     further bead on this board — 288 to 289 — which is what a fence over a well-groomed board
+ *     further bead on this board — 273 to 274 — which is what a fence over a well-groomed board
  *     costs; the write it catches is an ordinary move on a finished ticket.
+ *
+ * Every rung of that ladder counts beads ON THE BOARD, which is what the fence hashes; the
+ * reachable set also carries 15 ids no bead answers to — dangling `blocks` references the walk
+ * follows and `stampBoard` then filters out. See "fences 274 of the board's 842 beads".
  *
  * SWEPT EXHAUSTIVELY AT CAPTURE, and sampled in the gate: every one of the 568 beads this fence
  * drops, mutated every way the decision reads (reopened, re-parented under the top pick and under
@@ -428,13 +432,26 @@ describe("the hour", () => {
     });
   });
 
-  // The narrowing is only interesting if it is actually narrow: the reach is a minority of the
-  // board, and it is what the 85.8% above is bought with.
-  it("reaches 289 of the board's 842 beads", () => {
-    expect({ reached: reachableSet(BOARD).size, board: BOARD.length }).toEqual({
-      reached: 289,
-      board: 842,
-    });
+  /**
+   * The narrowing is only interesting if it is actually narrow: the fence covers a minority of the
+   * board, and that is what the 85.8% above is bought with.
+   *
+   * Counted as the INTERSECTION with the board — the beads `stampBoard` actually hashes — rather
+   * than as the raw set: the walk follows `blocks` edges into `depends_on_id` values, and 15 of
+   * those on this corpus name a bead the board no longer carries. The fence holds them as ids and
+   * drops them as beads, so the reachable set is 289 while the fenced board is 274, and it is 274
+   * that closes with the 568 dropped below.
+   */
+  it("fences 274 of the board's 842 beads", () => {
+    const reached = reachableSet(BOARD);
+    const onBoard = new Set(BOARD.map((bead) => bead.id));
+
+    expect({
+      fenced: BOARD.filter((bead) => reached.has(bead.id)).length,
+      hashed: reachableStamp(BOARD).beadCount,
+      dangling: [...reached].filter((id) => !onBoard.has(id)).length,
+      board: BOARD.length,
+    }).toEqual({ fenced: 274, hashed: 274, dangling: 15, board: 842 });
   });
 });
 
@@ -513,8 +530,8 @@ describe("the beads the narrowed fence drops", () => {
   /**
    * Why the two ancestor cases below are fixtures rather than corpus probes, stated as a fact about
    * the board instead of an excuse: anton's own board has no live bead standing under closed
-   * history, so no corpus mutation can exercise the parent closure and the reach is the same 289
-   * with it or without it. The clause is not free of consequence on a board that HAS that shape —
+   * history, so no corpus mutation can exercise the parent closure and the fence is the same 274
+   * beads with it or without it. The clause is not free of consequence on a board that HAS that shape —
    * which is what the two reproductions construct.
    */
   it("has no live bead standing under closed history", () => {

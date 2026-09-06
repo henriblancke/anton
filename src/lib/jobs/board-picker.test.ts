@@ -24,7 +24,11 @@ import { LABELS } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import type { Bead } from "../beads/types";
 import { loadAllIssues } from "../beads/issues";
-import { invalidateIssueSnapshot, resetIssueSnapshots } from "../beads/snapshot";
+import {
+  invalidateIssueSnapshot,
+  refreshIssueSnapshot,
+  resetIssueSnapshots,
+} from "../beads/snapshot";
 import { PoisonError } from "./errors";
 import { enqueue, queuedJobId, type Clock } from "./queue";
 import type { JobContext } from "./runner";
@@ -918,17 +922,23 @@ describe("makeBoardPickerHandler", () => {
  * The board-change nudge (anton-h32k): the picker re-decides when the board MOVES, not only when the
  * clock says so. What is pinned here is the gap the cadence used to own — that a burst of writes
  * costs one pass and not N, that a frozen project buys none, and that the signal enqueues a job
- * rather than deciding anything itself.
+ * rather than deciding anything itself. And what is pinned beside it is the other half of "moves":
+ * a read that finds the board unchanged buys nothing, so the sync heartbeat cannot turn this into a
+ * second cron (PR #241 review).
  */
 describe("BoardPickerNudge", () => {
   let nudge: BoardPickerNudge;
   let enqueued: string[];
 
+  /** One board read landing `now`. The nudge hears a read whose CONTENT moved, so a change is two
+   *  reads: a baseline, then a different one. */
+  const read = (cwd: string, now: Bead[]) => refreshIssueSnapshot(cwd, async () => now);
+
   beforeEach(() => {
     vi.useFakeTimers();
     // The listener registry and the snapshot cache are process-global (Next compiles the app and
-    // instrumentation into separate registries), so a suite that fires invalidations must start from
-    // a clean one or it inherits the previous test's entries.
+    // instrumentation into separate registries), so a suite that fires board reads must start from
+    // a clean one or it inherits the previous test's entries and subscribers.
     resetIssueSnapshots();
     enqueued = [];
     nudge = new BoardPickerNudge({
@@ -946,25 +956,57 @@ describe("BoardPickerNudge", () => {
   });
 
   it("folds a burst of board writes into exactly one pass", async () => {
-    // One claim is a label, an assignee and a note — three writes the operator reads as one move.
-    for (let i = 0; i < 5; i++) invalidateIssueSnapshot("/tmp/p1", true);
+    await read("/tmp/p1", []);
 
+    // One claim is a label, an assignee and a note — three writes the operator reads as one move.
+    for (let i = 0; i < 5; i++) await read("/tmp/p1", [bead(`t${i}`)]);
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
     expect(enqueued).toEqual(["p1"]);
   });
 
   it("enqueues nothing before its window is up", async () => {
-    invalidateIssueSnapshot("/tmp/p1", true);
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", [bead("t1")]);
 
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS - 1);
 
     expect(enqueued).toEqual([]);
   });
 
+  /**
+   * The signal is CONTENT, not invalidation — the reason it can be wired to the picker at all. The
+   * sync coalescer invalidates on every pass that reaches `synced`, landed commits or not, and the
+   * heartbeat behind it beats every 30s on any wired board; a nudge that fired on the invalidation
+   * would spend a `bd list` under the repo's exclusive Dolt lock every window, forever, on a board
+   * nobody touched.
+   */
+  it("stays quiet when a sync pass leaves the board exactly as it was", async () => {
+    const unchanged = [bead("t1")];
+    await read("/tmp/p1", unchanged);
+
+    for (let i = 0; i < 3; i++) {
+      invalidateIssueSnapshot("/tmp/p1");
+      await read("/tmp/p1", [bead("t1")]);
+      await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    }
+
+    expect(enqueued).toEqual([]);
+  });
+
+  // A cold snapshot has no board to differ from, so the read that fills it is a baseline rather than
+  // a move — otherwise every boot would buy a pass the cron was about to run anyway.
+  it("stays quiet on the first read of a board", async () => {
+    await read("/tmp/p1", [bead("t1")]);
+
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual([]);
+  });
+
   // Switching the schedule off is how an operator STOPS the picker. Before anton-h32k the scheduler
   // was its only enqueuer, so the switch was the whole answer; a listener that ignored it would
-  // re-decide 30s after any bd write — and at `apply` a pass writes `approved`, claims the target
+  // re-decide 30s after any board move — and at `apply` a pass writes `approved`, claims the target
   // and starts the run the switch exists to prevent.
   it("stays quiet while the board-picker schedule is switched off", async () => {
     await createSchedule(t.db, clock, {
@@ -974,7 +1016,8 @@ describe("BoardPickerNudge", () => {
       enabled: false,
     });
 
-    invalidateIssueSnapshot("/tmp/p1", true);
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", [bead("t1")]);
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
     expect(enqueued).toEqual([]);
@@ -987,7 +1030,8 @@ describe("BoardPickerNudge", () => {
       detail: "three runs stopped without delivering",
     });
 
-    invalidateIssueSnapshot("/tmp/p1", true);
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", [bead("t1")]);
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
     expect(enqueued).toEqual([]);
@@ -998,7 +1042,8 @@ describe("BoardPickerNudge", () => {
   it("writes no plan of its own — it only enqueues the pass that writes one", async () => {
     board.current = [bead("t1")];
 
-    invalidateIssueSnapshot("/tmp/p1", true);
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", board.current);
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
     expect(await getBoardPickerPlan(t.db, "p1")).toBeUndefined();
@@ -1006,9 +1051,10 @@ describe("BoardPickerNudge", () => {
   });
 
   it("folds onto the pass already queued rather than stacking a second", async () => {
-    invalidateIssueSnapshot("/tmp/p1", true);
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", [bead("t1")]);
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
-    invalidateIssueSnapshot("/tmp/p1", true);
+    await read("/tmp/p1", [bead("t2")]);
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
     expect(enqueued).toEqual(["p1"]);
@@ -1017,18 +1063,20 @@ describe("BoardPickerNudge", () => {
   // A pass in flight may have read the board BEFORE this change landed, so it does not cover it —
   // the dedupe above is on the queued row only, which is what keeps the window one window wide.
   it("schedules a follow-up for a change that lands while a pass is running", async () => {
-    invalidateIssueSnapshot("/tmp/p1", true);
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", [bead("t1")]);
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
     t.db.update(schema.jobs).set({ status: "running" }).run();
 
-    invalidateIssueSnapshot("/tmp/p1", true);
+    await read("/tmp/p1", [bead("t2")]);
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
     expect(enqueued).toEqual(["p1", "p1"]);
   });
 
   it("ignores a board no project on this machine owns", async () => {
-    invalidateIssueSnapshot("/tmp/somebody-elses-repo", true);
+    await read("/tmp/somebody-elses-repo", []);
+    await read("/tmp/somebody-elses-repo", [bead("t1")]);
 
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
@@ -1036,19 +1084,23 @@ describe("BoardPickerNudge", () => {
   });
 
   // A pull moves the board as surely as a local write does, and it is the only way another machine's
-  // work ever reaches this one.
-  it("hears a remote pull, not just a local write", async () => {
-    invalidateIssueSnapshot("/tmp/p1");
+  // work ever reaches this one. It reaches the nudge through the same door: the coalescer marks the
+  // snapshot stale, and the read behind it comes back holding work this machine had never seen.
+  it("hears a remote pull that landed work, not just a local write", async () => {
+    await read("/tmp/p1", []);
 
+    invalidateIssueSnapshot("/tmp/p1");
+    await read("/tmp/p1", [bead("t1", { assignee: "another-machine" })]);
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
     expect(enqueued).toEqual(["p1"]);
   });
 
   it("hears nothing once stopped", async () => {
+    await read("/tmp/p1", []);
     nudge.stop();
 
-    invalidateIssueSnapshot("/tmp/p1", true);
+    await read("/tmp/p1", [bead("t1")]);
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
     expect(enqueued).toEqual([]);

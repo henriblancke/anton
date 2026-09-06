@@ -376,7 +376,7 @@ function digestLine(bead: Bead): string {
  * {@link DIGEST_FIELDS} narrows the fence per FIELD; this narrows it per BEAD, and both are the same
  * argument at a different granularity: the digest may cover a read the decision actually makes, and
  * nothing else. A fence over the whole snapshot retires a generation on every unrelated write there
- * is — on anton's own board the decision reaches 289 of 842 beads, and an hour of ordinary grooming
+ * is — on anton's own board the decision fences 274 of 842 beads, and an hour of ordinary grooming
  * that left the whole-board fence naming the current top pick 50% of the time leaves this one
  * naming it 85.8% of the time, with the false-current share still at zero
  * (`board-picker-plan.currency.test.ts`, which measures both sides and the guard between them).

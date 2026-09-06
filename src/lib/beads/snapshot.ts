@@ -54,14 +54,17 @@ function boardChangeListeners(): Set<BoardChangeListener> {
 /**
  * Subscribe to "this repo's board moved", and get back the unsubscribe (anton-h32k).
  *
- * The signal is {@link invalidateIssueSnapshot} itself, which is the point: every local write
- * (`bdWrite`, `bdGateWrite`) and every remote pull (the sync coalescer's `recordOutcome`) already
- * funnels through it, so subscribing here is subscribing to the three places the app ALREADY knows
- * the board moved — no new watcher, and no fourth write path can appear that skips it.
+ * The signal is a completed board read whose CONTENT differs from the last one — announced from
+ * {@link refreshIssueSnapshot}, never from an invalidation. That distinction is the whole contract:
+ * an invalidation says a fresh read is needed, not that anything changed, and the sync coalescer
+ * invalidates on every pass that reaches `synced` whether or not the pull landed a single commit.
+ * A listener wired to that would fire every 30s on any wired board — a heartbeat wearing a change
+ * feed's name. Every mover still reaches subscribers, because every local write (`bdWrite`,
+ * `bdGateWrite`) and every remote pull forces the read that detects it.
  *
  * Global-keyed for the same reason the snapshots themselves are: Next compiles instrumentation and
  * the app layer into separate module registries, so a module-scoped set would leave a listener
- * registered at boot deaf to every invalidation a route handler makes.
+ * registered at boot deaf to every board read a route handler makes.
  */
 export function onBoardChanged(listener: BoardChangeListener): () => void {
   const registered = boardChangeListeners();
@@ -69,6 +72,20 @@ export function onBoardChanged(listener: BoardChangeListener): () => void {
   return () => {
     registered.delete(listener);
   };
+}
+
+/**
+ * Tell every subscriber this repo's board moved. A listener is a side channel and must never break
+ * the read the caller actually asked for — its throw is logged and swallowed.
+ */
+function announceBoardChange(cwd: string): void {
+  for (const listener of boardChangeListeners()) {
+    try {
+      listener(cwd);
+    } catch (e) {
+      console.error(`[snapshot] board-change listener failed for ${cwd}`, e);
+    }
+  }
 }
 
 /** Per-repo memo of the one field `bd list` can drop — a bead's description — keyed by bead id. */
@@ -150,21 +167,15 @@ export function invalidateIssueSnapshot(cwd: string, localWrite = false): void {
     entry.refresh = null;
     entry.pendingWrite = true;
   }
-  // Announce the move AFTER the cache has taken it, so a listener that reads back sees the
-  // invalidated entry. A listener is a side channel and must never break the invalidation the
-  // caller actually asked for — its throw is logged and swallowed.
-  for (const listener of boardChangeListeners()) {
-    try {
-      listener(cwd);
-    } catch (e) {
-      console.error(`[snapshot] board-change listener failed for ${cwd}`, e);
-    }
-  }
 }
 
 /**
  * Refresh a repository once. Concurrent callers share the same loader invocation. A failed
  * refresh never discards the last good snapshot.
+ *
+ * This is also where "the board moved" is ANNOUNCED ({@link onBoardChanged}), because a completed
+ * read is the only place the app can tell a move from a poll: it compares the board it just loaded
+ * against the one it held.
  */
 export function refreshIssueSnapshot(
   cwd: string,
@@ -181,6 +192,9 @@ export function refreshIssueSnapshot(
       // boundary and must never repopulate the current snapshot.
       if (entry.generation !== generation) return entry.beads ?? beads;
       const serialized = JSON.stringify(beads);
+      // A cold entry has no board to differ FROM, so the first read of a repo sets the baseline
+      // rather than announcing a move nobody made.
+      const moved = entry.serialized !== null && entry.serialized !== serialized;
       if (entry.serialized !== serialized) entry.version += 1;
       entry.beads = beads;
       entry.serialized = serialized;
@@ -188,6 +202,8 @@ export function refreshIssueSnapshot(
       // This read started after (and its generation matches) the write, so it reflects it — the
       // retained board is no longer the only post-write data and reads can serve warm again.
       entry.pendingWrite = false;
+      // Announced AFTER the entry has taken the new board, so a listener that reads back sees it.
+      if (moved) announceBoardChange(cwd);
       return beads;
     })
     .finally(() => {
@@ -280,8 +296,13 @@ export function probeIssueSnapshot(
   }
 }
 
-/** Test-only reset; repository runtime code should invalidate instead. */
+/**
+ * Test-only reset; repository runtime code should invalidate instead. Drops the board-change
+ * subscribers too: the registry is process-global, so a suite that forgot to unsubscribe would
+ * otherwise leak a listener into the next one and have it fire on a board it knows nothing about.
+ */
 export function resetIssueSnapshots(): void {
   snapshots().clear();
   descriptionCaches().clear();
+  boardChangeListeners().clear();
 }

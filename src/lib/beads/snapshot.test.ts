@@ -6,6 +6,7 @@ import {
   getIssueSnapshot,
   invalidateIssueSnapshot,
   issueSnapshotVersion,
+  onBoardChanged,
   readIssueSnapshot,
   refreshIssueSnapshot,
   resetIssueSnapshots,
@@ -234,5 +235,106 @@ describe("bead description cache", () => {
       "post-write",
     );
     expect(loader).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The board-change announcement (anton-h32k): what {@link onBoardChanged} promises a subscriber, and
+ * the promise the picker's nudge is wired to. A subscriber acts on it — the nudge spends a `bd list`
+ * under the repo's exclusive Dolt lock per announcement — so "the board moved" has to mean the
+ * content moved, not that someone marked the cache stale.
+ */
+describe("board-change announcements", () => {
+  const moves = (): { cwd: string[]; stop: () => void } => {
+    const cwd: string[] = [];
+    return { cwd, stop: onBoardChanged((repo) => cwd.push(repo)) };
+  };
+
+  it("announces a read whose board differs from the one it held", async () => {
+    await refreshIssueSnapshot("/repo", async () => [bead("one")]);
+    const heard = moves();
+
+    await refreshIssueSnapshot("/repo", async () => [bead("one"), bead("two")]);
+
+    expect(heard.cwd).toEqual(["/repo"]);
+    heard.stop();
+  });
+
+  // The invalidation the sync coalescer fires on EVERY pass that reaches `synced` — landed commits
+  // or not. A subscriber woken by it would beat with the 30s sync heartbeat rather than the board.
+  it("says nothing when an invalidated read comes back with the same board", async () => {
+    await refreshIssueSnapshot("/repo", async () => [bead("one")]);
+    const heard = moves();
+
+    invalidateIssueSnapshot("/repo");
+    await refreshIssueSnapshot("/repo", async () => [bead("one")]);
+
+    expect(heard.cwd).toEqual([]);
+    heard.stop();
+  });
+
+  it("says nothing for an invalidation on its own, before any read lands", async () => {
+    await refreshIssueSnapshot("/repo", async () => [bead("one")]);
+    const heard = moves();
+
+    invalidateIssueSnapshot("/repo", true);
+
+    expect(heard.cwd).toEqual([]);
+    heard.stop();
+  });
+
+  // A cold entry has no board to differ from: the read that fills it is a baseline, not a move.
+  it("says nothing for the first read of a repository", async () => {
+    const heard = moves();
+
+    await refreshIssueSnapshot("/cold", async () => [bead("one")]);
+
+    expect(heard.cwd).toEqual([]);
+    heard.stop();
+  });
+
+  // A read that a write invalidated mid-flight is discarded rather than cached, so announcing it
+  // would name a board the snapshot never took.
+  it("says nothing for a read the generation guard threw away", async () => {
+    await refreshIssueSnapshot("/repo", async () => [bead("one")]);
+    const heard = moves();
+
+    const stale = refreshIssueSnapshot("/repo", async () => {
+      invalidateIssueSnapshot("/repo", true);
+      return [bead("two")];
+    });
+    await stale;
+
+    expect(heard.cwd).toEqual([]);
+    heard.stop();
+  });
+
+  it("keeps announcing after one subscriber throws", async () => {
+    const console_ = vi.spyOn(console, "error").mockImplementation(() => {});
+    await refreshIssueSnapshot("/repo", async () => [bead("one")]);
+    const stopThrower = onBoardChanged(() => {
+      throw new Error("boom");
+    });
+    const heard = moves();
+
+    await expect(
+      refreshIssueSnapshot("/repo", async () => [bead("two")]),
+    ).resolves.toEqual([bead("two")]);
+
+    expect(heard.cwd).toEqual(["/repo"]);
+    stopThrower();
+    heard.stop();
+    console_.mockRestore();
+  });
+
+  it("drops every subscriber on reset, so a suite cannot leak one into the next", async () => {
+    await refreshIssueSnapshot("/repo", async () => [bead("one")]);
+    const heard = moves();
+
+    resetIssueSnapshots();
+    await refreshIssueSnapshot("/repo", async () => [bead("one")]);
+    await refreshIssueSnapshot("/repo", async () => [bead("two")]);
+
+    expect(heard.cwd).toEqual([]);
   });
 });
