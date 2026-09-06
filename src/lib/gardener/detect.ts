@@ -12,7 +12,7 @@
  */
 import type { Bead } from "../beads/bd";
 import type { HygieneFinding } from "../hygiene";
-import { indexBoard } from "./board-index";
+import { indexBoard, type BoardIndex } from "./board-index";
 import {
   dedupeDetections,
   isProposalBead,
@@ -34,15 +34,24 @@ export interface DetectInput {
 }
 
 /**
+ * The board every judgment tier reasons over: the snapshot MINUS the proposals about it.
+ *
+ * A producer's own proposals are beads ABOUT the board, and a parentless one would read as a cluster
+ * candidate — the patrol proposing to garden itself. They still reach emission, which needs them to
+ * recognise a claim it already made. Shared with the pass that composes a detector of its own
+ * (gardener-proposals.ts), so "which beads are the work" has one answer rather than two.
+ */
+export function indexWorkBoard(board: Bead[]): BoardIndex {
+  return indexBoard(board.filter((b) => !isProposalBead(b)));
+}
+
+/**
  * Every board-shape detection the input supports, deduplicated by fingerprint and in a deterministic
  * order — two passes over an unchanged board return byte-identical output, which is what lets a
  * caller answer "is this new?" without re-reading the board.
  */
 export function detectBoard(input: DetectInput): GardenerDetection[] {
-  // The gardener's own proposals are excluded from the shape it judges: they are beads ABOUT the
-  // board, and a parentless one would read as a cluster candidate — the patrol proposing to garden
-  // itself. They still reach emission, which needs them to recognise a claim it already made.
-  const index = indexBoard(input.board.filter((b) => !isProposalBead(b)));
+  const index = indexWorkBoard(input.board);
   const now = input.now ?? Date.now();
   const findings = input.hygiene?.findings ?? [];
 

@@ -229,6 +229,9 @@ export async function listSchedules(
  * job that WRITES to the board unprompted (it closes epics bd judges done and repairs the blocked
  * flag). An operator who never asked for a patrol should not find work closed on their board — so
  * arming it is a deliberate act, and the report it produces is what earns the trust to leave it on.
+ * Its judgment tier also carries the re-judgement of parked work (anton-dsnr): daily is a fine
+ * cadence for a 90-day silence, and it needs no switch of its own because it costs no session and
+ * files nothing a founder has not already left parked for a quarter.
  *
  * product-master (anton-d2sx) ships disabled for both of the gardener's reasons and a third: it is
  * the only schedule that spends a claude session on judgment rather than on mechanism, and every
