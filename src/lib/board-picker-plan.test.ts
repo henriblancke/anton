@@ -14,6 +14,7 @@ import {
   getBoardPickerPlan,
   isDecisionRelevantLabel,
   isPlanStale,
+  reachableSet,
   saveBoardPickerPlan,
   sortExclusions,
   stampBoard,
@@ -113,8 +114,13 @@ describe("board stamp", () => {
     expect(armed.digest).toBe(stampBoard(board, OBSERVED, { types: ["feature"] }).digest);
   });
 
-  it("carries the observation moment and the snapshot's size verbatim", () => {
-    const stamped = stampBoard([bead(), bead({ id: "anton-b" })], OBSERVED);
+  // `beadCount` is the size of the set the digest COVERS, not of the snapshot it was narrowed from
+  // (anton-t01f) — the closed chore below is on the board and outside the decision's reach.
+  it("carries the observation moment and the size of the set it covers", () => {
+    const stamped = stampBoard(
+      [bead(), bead({ id: "anton-b" }), bead({ id: "anton-done", status: "closed" })],
+      OBSERVED,
+    );
 
     expect(stamped).toMatchObject({ observedAtMs: OBSERVED, beadCount: 2 });
     expect(stamped.digest).toMatch(/^[0-9a-f]{16}$/);
@@ -369,6 +375,122 @@ describe("decision inputs", () => {
       expect(read(after)).not.toBe(read(before));
       expect(stampBoard([after], OBSERVED).digest).toBe(stampBoard([before], OBSERVED).digest);
     }
+  });
+});
+
+/**
+ * The fence's INPUT SET (anton-t01f): the beads one decision can reach, and the narrowing that keeps
+ * an edit which cannot change the ranking from retiring the plan.
+ *
+ * Both directions, because a fence is only as good as both: an edit outside the reach must leave the
+ * generation standing, and every edit inside it must retire the generation. The same property is
+ * measured over anton's real board — 288 beads of 842, swept exhaustively for an escape — in
+ * `board-picker-plan.currency.test.ts`; what is pinned here is each clause of the set on its own.
+ */
+describe("the decision's reachable set", () => {
+  const blocks = (id: string, by: string) => ({ issue_id: id, depends_on_id: by, type: "blocks" });
+
+  /** A closed chore in a corner of the board: no candidate, no `blocks` edge, no parent a candidate
+   *  reads. The bead the narrowing exists to drop. */
+  const chore = (o: Partial<Bead> = {}) =>
+    bead({ id: "anton-chore", status: "closed", issue_type: "task", ...o });
+
+  it("covers the candidate pool and what it reaches, and nothing else", () => {
+    const pick = shaped({ id: "anton-a", dependencies: [blocks("anton-a", "anton-blocker")] });
+    const board = [pick, bead({ id: "anton-blocker", status: "closed" }), chore()];
+
+    expect(reachableSet(board)).toEqual(new Set(["anton-a", "anton-blocker"]));
+  });
+
+  // The ranking's second term is computed off beads no policy would ever admit, so what HOLDS a
+  // candidate and what a candidate RELEASES are both decision inputs whatever their status.
+  it("reaches the closed blocker and the open gate that hold a candidate", () => {
+    const pick = shaped({
+      id: "anton-a",
+      dependencies: [blocks("anton-a", "anton-settled"), blocks("anton-a", "anton-gate")],
+    });
+    const board = [
+      pick,
+      bead({ id: "anton-settled", status: "closed" }),
+      bead({ id: "anton-gate", issue_type: "gate" }),
+      chore(),
+    ];
+
+    expect(reachableSet(board)).toEqual(new Set(["anton-a", "anton-settled", "anton-gate"]));
+  });
+
+  // OUTSIDE: the whole point. A board where the only write is one the decision cannot read must
+  // leave the recorded generation exactly where it was.
+  it.each<[string, (board: Bead[]) => Bead[]]>([
+    ["it is raised to P0", (b) => b.map((x) => (x.id === "anton-chore" ? { ...x, priority: 0 } : x))],
+    ["it is re-typed", (b) => b.map((x) => (x.id === "anton-chore" ? { ...x, issue_type: "bug" } : x))],
+    ["it leaves the board", (b) => b.filter((x) => x.id !== "anton-chore")],
+  ])("holds still when a bead outside the reach %s", (_edit, mutate) => {
+    const board = [shaped({ id: "anton-a" }), chore()];
+
+    expect(stampBoard(mutate(board), OBSERVED).digest).toBe(stampBoard(board, OBSERVED).digest);
+  });
+
+  // INSIDE: the same edits, on the CLOSED blocker one hop from the pick — a bead no candidate pool
+  // holds and no policy would ever admit, in the fence on the strength of its edge alone. A fence
+  // over "the beads the plan named" would hold still across every row of this.
+  it.each<[string, (board: Bead[]) => Bead[]]>([
+    ["it reopens", (b) => b.map((x) => (x.id === "anton-settled" ? { ...x, status: "open" } : x))],
+    ["it is re-typed", (b) => b.map((x) => (x.id === "anton-settled" ? { ...x, issue_type: "bug" } : x))],
+    ["it leaves the board", (b) => b.filter((x) => x.id !== "anton-settled")],
+  ])("retires the generation when a bead inside the reach %s", (_edit, mutate) => {
+    const board = [
+      shaped({ id: "anton-a", dependencies: [blocks("anton-a", "anton-settled")] }),
+      bead({ id: "anton-settled", status: "closed" }),
+      chore(),
+    ];
+
+    expect(stampBoard(mutate(board), OBSERVED).digest).not.toBe(stampBoard(board, OBSERVED).digest);
+  });
+
+  /**
+   * The clause the epic's own statement of the narrowing is missing (anton-icu6). `beads.isContainer`
+   * counts a feature child of ANY status, so filing a finished feature under an epic pick turns that
+   * pick into a container and drops it from the plan — with no bead entering the pool and no `blocks`
+   * edge moving. A fence of "pool plus blocks-closure" reads current straight through it.
+   */
+  it("reaches the closed feature children of the pool, so re-parenting one is never silent", () => {
+    const epic = shaped({ id: "anton-epic", issue_type: "epic" });
+    const shipped = shaped({
+      id: "anton-shipped",
+      issue_type: "feature",
+      status: "closed",
+      parent: "anton-elsewhere",
+    });
+    const before = [epic, shipped, shaped({ id: "anton-elsewhere", issue_type: "epic", status: "closed" })];
+    const after = before.map((b) => (b.id === "anton-shipped" ? { ...b, parent: "anton-epic" } : b));
+
+    expect(reachableSet(before).has("anton-shipped")).toBe(false);
+    expect(reachableSet(after).has("anton-shipped")).toBe(true);
+    expect(stampBoard(after, OBSERVED).digest).not.toBe(stampBoard(before, OBSERVED).digest);
+  });
+
+  // Computed over the board being STAMPED, never carried on the plan: that is what makes the two
+  // digests comparable, so a bead that has newly become a candidate is an honest mismatch rather
+  // than a bead neither stamp was looking at.
+  it("admits a newly eligible bead to the fence on the board it stamps", () => {
+    const before = [shaped({ id: "anton-a" }), chore()];
+    const after = before.map((b) => (b.id === "anton-chore" ? { ...b, status: "open" } : b));
+
+    expect(reachableSet(before).has("anton-chore")).toBe(false);
+    expect(reachableSet(after).has("anton-chore")).toBe(true);
+    expect(stampBoard(after, OBSERVED).digest).not.toBe(stampBoard(before, OBSERVED).digest);
+  });
+
+  // The policy fold is outside the narrowing and unchanged by it: admission is a function of the
+  // rules as well as the beads, so an operator's edit has to move the stamp even on a board whose
+  // decision reaches nothing at all.
+  it("carries the armed policy even when the decision reaches no bead", () => {
+    const board = [chore()];
+    const unarmed = stampBoard(board, OBSERVED);
+
+    expect(unarmed.beadCount).toBe(0);
+    expect(stampBoard(board, OBSERVED, { types: ["feature"] }).digest).not.toBe(unarmed.digest);
   });
 });
 

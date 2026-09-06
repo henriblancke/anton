@@ -12,8 +12,9 @@
  * claim protocol — not this record — is what stops two machines starting the same target.
  *
  * Reading the record costs no `bd` call by construction: every field a surface needs is on the row,
- * and the only runtime dependency here is anton.db and the contract reader the stamp judges through
- * (`beads/contract.ts`, itself pure and spawn-free). `Bead` is a type-only import.
+ * and everything the stamp reaches for is pure and spawn-free — anton.db, the contract reader it
+ * judges through (`beads/contract.ts`), and the eligibility pass whose candidate pool its fence is
+ * narrowed to (`jobs/picker-targets.ts`). `Bead` is a type-only import.
  *
  * db-injectable (like run-health) so the pass and its tests share one connection; the UI read path
  * goes through the shared anton.db.
@@ -21,8 +22,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { beads } from "./beads/bd";
 import { contractStatusOf } from "./beads/contract";
 import type { Bead } from "./beads/types";
+import { eligibleTargets } from "./jobs/picker-targets";
 import { ageBoundBreached, ageInDays } from "./policy/age";
 import { policyDigest } from "./policy/digest";
 import { namespaceOf, type Policy } from "./policy/types";
@@ -94,7 +97,8 @@ export interface BoardStamp {
   observedAtMs: number;
   /** {@link stampBoard}'s digest over those inputs. Two reads agree iff their digests do. */
   digest: string;
-  /** How many beads the digest covers. */
+  /** How many beads the digest covers: the decision's reachable set ({@link reachableSet}), not the
+   *  board it was narrowed from. */
   beadCount: number;
 }
 
@@ -355,9 +359,85 @@ function digestLine(bead: Bead): string {
 }
 
 /**
- * Stamp the inputs one decision was made from — the classified ones ({@link DIGEST_FIELDS}) and no
- * others, so a `run-lease:` heartbeat rewritten mid-run leaves the ranking's fence exactly where it
- * was.
+ * THE BEADS ONE DECISION CAN READ — the fence's input set (anton-t01f).
+ *
+ * {@link DIGEST_FIELDS} narrows the fence per FIELD; this narrows it per BEAD, and both are the same
+ * argument at a different granularity: the digest may cover a read the decision actually makes, and
+ * nothing else. A fence over the whole snapshot retires a generation on every unrelated write there
+ * is — on anton's own board the decision reaches 288 of 842 beads, and an hour of ordinary grooming
+ * that left the whole-board fence naming the current top pick 50% of the time leaves this one
+ * naming it 85.8% of the time, with the false-current share still at zero
+ * (`board-picker-plan.currency.test.ts`, which measures both sides and the guard between them).
+ *
+ * Three parts, each one a read the pass makes:
+ *
+ *   1. the CANDIDATE POOL — every bead {@link eligibleTargets} weighed, admitted or refused. On any
+ *      board that is every non-closed bead, because a refusal is recorded for each of them.
+ *   2. the BLOCKS CLOSURE over it — the transitive unblocking walk (`beads/rank.ts`) is the
+ *      comparator's second term and it traverses closed beads freely, so a blocker three hops
+ *      downstream is a decision input even though no policy would ever admit it. Walked both ways
+ *      along each edge: what a candidate releases decides its rank, and what grips it decides
+ *      whether it is a candidate at all.
+ *   3. the FEATURE CHILDREN of everything in 1 and 2 — `beads.isContainer` counts a feature child of
+ *      ANY status, so a closed one decides whether its parent epic is a run target. Without this
+ *      clause, re-parenting a finished feature under an epic pick drops that pick from the plan with
+ *      no bead entering the pool and no `blocks` edge moving, and the fence never fires (anton-icu6
+ *      found it by sweeping the corpus; it is pinned as "a closed feature child").
+ *
+ * Computed over the board being STAMPED rather than carried on the plan, which is what makes the two
+ * digests comparable: a bead that has newly become a candidate is in this board's set and was not in
+ * the plan's, so the lines differ and the mismatch is honest.
+ *
+ * Fail CLOSED, like the field table: what is dropped here is what has been SHOWN unread, swept
+ * exhaustively over a real board rather than argued from a fixture.
+ */
+export function reachableSet(board: Bead[]): ReadonlySet<string> {
+  const { eligible, exclusions } = eligibleTargets(board);
+  const reached = new Set<string>([
+    ...eligible.map((b) => b.id),
+    ...exclusions.map((x) => x.beadId),
+  ]);
+
+  const neighbours = new Map<string, string[]>();
+  const link = (from: string, to: string) => {
+    const known = neighbours.get(from);
+    if (known) known.push(to);
+    else neighbours.set(from, [to]);
+  };
+  for (const bead of board) {
+    for (const dep of bead.dependencies ?? []) {
+      if (dep?.type !== "blocks" || !dep.issue_id || !dep.depends_on_id) continue;
+      link(dep.issue_id, dep.depends_on_id);
+      link(dep.depends_on_id, dep.issue_id);
+    }
+  }
+
+  // Cursor rather than `shift()`: this walk runs on every stamp, and every board read takes one.
+  const queue = [...reached];
+  for (let i = 0; i < queue.length; i++) {
+    for (const next of neighbours.get(queue[i]) ?? []) {
+      if (reached.has(next)) continue;
+      reached.add(next);
+      queue.push(next);
+    }
+  }
+
+  // Direct children only, matching `beads.isContainer`: a feature is a run target whatever sits
+  // under it, so what hangs off a feature child decides nothing further.
+  for (const bead of board) {
+    const parent = beads.parentOf(bead);
+    if (bead.issue_type === "feature" && parent !== undefined && reached.has(parent)) {
+      reached.add(bead.id);
+    }
+  }
+  return reached;
+}
+
+/**
+ * Stamp the inputs one decision was made from — the classified fields ({@link DIGEST_FIELDS}) of the
+ * beads the decision can reach ({@link reachableSet}), and nothing else. So a `run-lease:` heartbeat
+ * rewritten mid-run leaves the ranking's fence exactly where it was, and so does a chore closed in a
+ * corner of the board no pick depends on.
  *
  * Order-independent — the lines are sorted before hashing — because two reads of an unchanged board
  * may return the beads in any order, and a stamp that disagreed with itself over that would report
@@ -367,16 +447,20 @@ function digestLine(bead: Bead): string {
  * both, so an operator who narrows `pickerPolicy` without touching a bead has invalidated the plan
  * just as surely as a claim would have. A fence over the beads alone would keep offering a start the
  * new policy refuses until the next pass ran. Absent means the project has armed none, which is its
- * own state and digests differently from any policy.
+ * own state and digests differently from any policy. Hashed unconditionally, outside the narrowing:
+ * the operator's rules decide which beads are candidates at all, so an edit to them has to move the
+ * stamp even on a board whose decision reaches no bead.
  */
 export function stampBoard(board: Bead[], observedAtMs: number, policy?: Policy): BoardStamp {
+  const reached = reachableSet(board);
+  const fenced = board.filter((bead) => reached.has(bead.id));
   const hash = createHash("sha256");
   hash.update(`policy\t${policyDigest(policy)}\n`);
-  for (const line of board.map(digestLine).sort()) hash.update(`${line}\n`);
+  for (const line of fenced.map(digestLine).sort()) hash.update(`${line}\n`);
   return {
     observedAtMs,
     digest: hash.digest("hex").slice(0, DIGEST_LENGTH),
-    beadCount: board.length,
+    beadCount: fenced.length,
   };
 }
 

@@ -49,11 +49,12 @@
  * probes, of which 21 moved the ranking and 0 escaped the fence. The suite keeps a fixed sample of
  * that sweep so the unit gate stays fast; re-run it in full when the fence changes.
  *
- * The control is a CONTROL. `stampBoard` still digests the whole board today, so {@link
- * reachableStamp} restates the narrowing here the way `board-picker-plan.corpus.test.ts` restates
- * the pre-narrowing fence beside it — the comparison IS the measurement. When anton-t01f lands the
- * narrowing in production, the whole-board number below is what has to move, and the reachable-set
- * number is what production has to reproduce.
+ * THE CONTROL IS THE OLD FENCE. The narrowing has since landed in `stampBoard` (anton-t01f), so the
+ * AFTER side of every measurement below is production and it is the BEFORE side that is restated
+ * here — the whole-board digest, over the same classified columns, the way
+ * `board-picker-plan.corpus.test.ts` restates the pre-narrowing label fence beside it. The
+ * comparison is the measurement; without the control, "the plan reads current more often" is a
+ * number with nothing behind it.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -61,7 +62,9 @@ import { join } from "node:path";
 
 import type { Bead } from "./beads/types";
 import {
+  DIGEST_FIELDS,
   isPlanStale,
+  reachableSet,
   stampBoard,
   type BoardPickerPlan,
   type BoardStamp,
@@ -71,7 +74,6 @@ import { makeTestDb, type TestDb } from "./db/testing";
 import { ADMIT_ALL_POLICY, decideBoardPickerPlan } from "./jobs/picker-decision";
 import { PICKER_NUDGE_WINDOW_MS } from "./jobs/picker-nudge";
 import { armedPickerPolicy } from "./jobs/picker-policy";
-import { eligibleTargets } from "./jobs/picker-targets";
 import type { Clock } from "./jobs/queue";
 import {
   PICKER_DEFER_WINDOW_MS,
@@ -80,6 +82,7 @@ import {
   recordPickerAccept,
   recordPickerVeto,
 } from "./picker-veto";
+import { policyDigest } from "./policy/digest";
 import type { Policy } from "./policy/types";
 
 /** The fixture's row shape and encoding — see the module note on `board-picker-plan.corpus.test.ts`,
@@ -145,78 +148,30 @@ const patch = (board: Bead[], id: string, change: Partial<Bead>): Bead[] =>
 
 // ── the two fences ──────────────────────────────────────────────────────────────────────────────
 
-/** BEFORE: the fence as `stampBoard` writes it today — every bead on the board. */
-const wholeBoardStamp = (board: Bead[]): BoardStamp => stampBoard(board, OBSERVED, POLICY);
+/**
+ * BEFORE: the fence as it stood before the narrowing — the same classified columns over EVERY bead
+ * on the board. Restated here as a control because production no longer writes it; derived from
+ * {@link DIGEST_FIELDS}, so a column added to the table joins both sides of the measurement at once.
+ *
+ * The digest is the projection itself rather than a hash of it. Nothing compares it to a stored
+ * row — `isPlanStale` asks only whether two stamps agree — and an unhashed control is one fewer
+ * step between the reader and what is being measured.
+ */
+const wholeBoardStamp = (board: Bead[]): BoardStamp => ({
+  observedAtMs: OBSERVED,
+  digest: JSON.stringify([
+    policyDigest(POLICY),
+    ...board.map((bead) => DIGEST_FIELDS.map((f) => f.read(bead)).join("\t")).sort(),
+  ]),
+  beadCount: board.length,
+});
 
 /**
- * AFTER: the beads one decision can actually read, computed over the board being stamped.
- *
- * Three parts, each one a read the pass makes:
- *
- *   1. the CANDIDATE POOL — every bead `eligibleTargets` weighed, admitted or refused. On any board
- *      that is every non-closed bead, because a refusal is recorded for each of them.
- *   2. the BLOCKS CLOSURE over it — the transitive unblocking walk (`beads/rank.ts`) is the
- *      ranking's second term and it traverses closed beads freely, so a blocker three hops
- *      downstream is a decision input even though no policy would ever admit it.
- *   3. the FEATURE CHILDREN of everything in 1 and 2 — `beads.isContainer` counts a feature child
- *      of ANY status, so a closed one decides whether its parent epic is a run target at all. This
- *      part is not in the epic's statement of the narrowing and is not optional; see the module
- *      note and "a closed feature child", below.
- *
- * Computed over the CURRENT board rather than carried on the plan, which is what makes it compose:
- * a bead that has newly become a candidate is in this board's set and was not in the plan's, so the
- * digests differ and the mismatch is honest.
+ * AFTER: the fence as `stampBoard` now writes it — narrowed to {@link reachableSet}, the beads one
+ * decision can actually read. Production, not a restatement: the numbers below are what the running
+ * system does.
  */
-function reachableSet(board: Bead[]): ReadonlySet<string> {
-  const { eligible, exclusions } = eligibleTargets(board);
-  const reached = new Set<string>([
-    ...eligible.map((b) => b.id),
-    ...exclusions.map((x) => x.beadId),
-  ]);
-
-  const neighbours = new Map<string, string[]>();
-  const link = (a: string, b: string) => {
-    for (const [from, to] of [
-      [a, b],
-      [b, a],
-    ] as const) {
-      const known = neighbours.get(from);
-      if (known) known.push(to);
-      else neighbours.set(from, [to]);
-    }
-  };
-  for (const bead of board) {
-    for (const dep of bead.dependencies ?? []) {
-      if (dep?.type !== "blocks" || !dep.issue_id || !dep.depends_on_id) continue;
-      link(dep.issue_id, dep.depends_on_id);
-    }
-  }
-
-  const queue = [...reached];
-  while (queue.length > 0) {
-    for (const next of neighbours.get(queue.shift() as string) ?? []) {
-      if (reached.has(next)) continue;
-      reached.add(next);
-      queue.push(next);
-    }
-  }
-
-  for (const bead of board) {
-    if (bead.issue_type === "feature" && bead.parent && reached.has(bead.parent)) reached.add(bead.id);
-  }
-  return reached;
-}
-
-/** The narrowed fence, written through the production stamp so the two differ in their INPUT SET
- *  and in nothing else — same columns, same policy fold, same order-independence. */
-function reachableStamp(board: Bead[]): BoardStamp {
-  const reached = reachableSet(board);
-  return stampBoard(
-    board.filter((bead) => reached.has(bead.id)),
-    OBSERVED,
-    POLICY,
-  );
-}
+const reachableStamp = (board: Bead[]): BoardStamp => stampBoard(board, OBSERVED, POLICY);
 
 // ── the hour ────────────────────────────────────────────────────────────────────────────────────
 

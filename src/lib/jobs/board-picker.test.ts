@@ -279,7 +279,10 @@ describe("makeBoardPickerHandler", () => {
 
     const plan = await getBoardPickerPlan(t.db, "p1");
     expect(plan?.entries).toEqual([]);
-    expect(plan?.stamp.beadCount).toBe(1);
+    // A finished bead nothing depends on is outside the decision's reach, and `beadCount` counts
+    // what the fence covers rather than the snapshot (anton-t01f) — so this board is decided, has
+    // nothing to start, and stamps no bead at all.
+    expect(plan?.stamp.beadCount).toBe(0);
   });
 
   it("leaves one plan behind when two passes overlap", async () => {
