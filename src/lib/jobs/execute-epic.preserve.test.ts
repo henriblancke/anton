@@ -624,9 +624,17 @@ suite("preserveTimedOutWork (real git)", () => {
     write("HALF_WRITTEN.md", "finished work the kill must not delete\n");
     const hooks = join(repo, ".git", "hooks");
     mkdirSync(hooks, { recursive: true });
-    writeFileSync(join(hooks, "pre-commit"), "#!/bin/sh\nsleep 1\n", { mode: 0o755 });
+    // The kill is fired BY the commit, not by a wall clock: on a loaded machine the gates take
+    // longer than any timer chosen here, and the abort would land in the gate window instead — a
+    // different path, whose pass says nothing about this one.
+    const committing = join(sandbox, "committing");
+    writeFileSync(join(hooks, "pre-commit"), `#!/bin/sh\ntouch "${committing}"\nsleep 1\n`, {
+      mode: 0o755,
+    });
     const abort = new AbortController();
-    setTimeout(() => abort.abort(), 250);
+    const watch = setInterval(() => {
+      if (existsSync(committing)) abort.abort();
+    }, 10);
 
     const kept = await preserveTimedOutWork({
       run: run(abort.signal, { testCommand: "true" }),
@@ -636,7 +644,7 @@ suite("preserveTimedOutWork (real git)", () => {
       committed: false,
       timeoutMs: 60_000,
       standalone: true,
-    });
+    }).finally(() => clearInterval(watch));
 
     expect(kept).toEqual({ jobAborted: true });
     // The commit landed before the kill was noticed — it stays, and the caller writes nothing.
