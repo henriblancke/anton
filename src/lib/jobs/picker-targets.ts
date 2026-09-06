@@ -35,6 +35,7 @@ import {
   type ApprovalRule,
 } from "../approval-gate";
 import type { PickerExclusion, PickerExclusionReason } from "../board-picker-plan";
+import { fingerprintLabelOf, isProposalBead } from "../gardener/detections";
 
 /**
  * Which exclusion an approve-gate gap reports as. `contract` and `structure` collapse into one
@@ -74,6 +75,16 @@ export function ineligibility(
   gate: ApprovalGate = makeApprovalGate(board),
 ): PickerExclusion | undefined {
   const beadId = target.id;
+
+  // A proposal is a DECISION, not work (anton-x37c). It is shaped as a parentless task carrying a
+  // full contract, so every clause below would pass it through — and applying that pick would write
+  // `approved`, claim it and dispatch an agent to "implement" a board move anton applies itself.
+  // The approve route already refuses one here; the picker is the second writer of the label (R1.5)
+  // and must agree. Ahead of run-target identity for the same reason it is ahead of it there: what
+  // the bead IS settles this before anything about its shape or state is consulted.
+  if (isProposalBead(target)) {
+    return { beadId, reason: "proposal", detail: `labelled ${fingerprintLabelOf(target)}` };
+  }
 
   const notRunnable = notRunnableWhy(target, board);
   if (notRunnable) return { beadId, reason: "not-a-run-target", detail: notRunnable };

@@ -102,7 +102,10 @@ describe("detectFailureStreak", () => {
 
 describe("the case the operator reads", () => {
   const timeout = (id: string, ticket: string) =>
-    run(id, { error: `ticket ${ticket} timed out after 45m\n  at step commit` });
+    run(id, {
+      ticketBeadId: ticket,
+      error: `ticket ${ticket} timed out after 45m\n  at step commit`,
+    });
 
   it("names the shared failure point when the runs differ only in their ids", () => {
     const runs = [timeout("c", "anton-c3"), timeout("b", "anton-b2"), timeout("a", "anton-a1")];
@@ -127,6 +130,55 @@ describe("the case the operator reads", () => {
     );
   });
 
+  /**
+   * The three real parks the digit heuristic split (anton-q2jw): one broken ordering described three
+   * times, differing ONLY in the bead ids each run was carrying — and two of those ids
+   * (`anton-gsny`, `anton-ptsy`) carry no digit at all, so nothing about their shape says they vary.
+   */
+  const depMissingPark = (ticket: string, blocker: string) =>
+    `${ticket} is blocked by ${blocker} — refusing to execute; resume the run once the blocker(s) ` +
+    `complete — anton drew that edge itself after the agent reported \`dep-missing\`: recorded ` +
+    `\`${blocker}\` as a blocker of ${ticket} (bd link ${ticket} ${blocker} --type blocks), ` +
+    `parking it until that lands`;
+
+  const blocked = (id: string, epic: string, ticket: string, blocker: string) =>
+    run(id, {
+      epicBeadId: epic,
+      ticketBeadId: ticket,
+      status: "parked",
+      error: depMissingPark(ticket, blocker),
+    });
+
+  it("collapses three parks that differ only in ids whose characters say nothing", () => {
+    const runs = [
+      blocked("c", "anton-stb2", "anton-0lom", "anton-k4qr"),
+      blocked("b", "anton-u189", "anton-7zpv", "anton-gsny"),
+      blocked("a", "anton-x37c", "anton-n8eb", "anton-ptsy"),
+    ];
+    expect(detectFailureStreak(runs, THREE)!.commonFailure).toBe(
+      "anton-n8eb is blocked by anton-ptsy — refusing to execute; resume the run once the " +
+        "blocker(s) complete — anton drew that edge itself after t",
+    );
+  });
+
+  it("masks the run target too, not only the ticket and its blockers", () => {
+    const target = (epic: string) =>
+      run(epic, { epicBeadId: epic, error: `worktree for ${epic} would not check out` });
+    const runs = [target("anton-gsny"), target("anton-ptsy"), target("anton-k4qr")];
+    expect(detectFailureStreak(runs, THREE)!.commonFailure).toBe(
+      "worktree for anton-k4qr would not check out",
+    );
+  });
+
+  it("still reports nothing when one of those parks is a different failure", () => {
+    const runs = [
+      run("c", { epicBeadId: "anton-stb2", error: "test gate failed: 3 tests red" }),
+      blocked("b", "anton-u189", "anton-7zpv", "anton-gsny"),
+      blocked("a", "anton-x37c", "anton-n8eb", "anton-ptsy"),
+    ];
+    expect(detectFailureStreak(runs, THREE)!.commonFailure).toBeUndefined();
+  });
+
   it("names no shared point when one run recorded no error at all", () => {
     const runs = [run("c"), timeout("b", "anton-b2"), timeout("a", "anton-a1")];
     expect(detectFailureStreak(runs, THREE)!.commonFailure).toBeUndefined();
@@ -143,5 +195,177 @@ describe("the case the operator reads", () => {
       "bbbbbbbb · anton-one · parked · usage-limit",
       "cccccccc · anton-two · failed · test gate failed",
     ]);
+  });
+});
+
+/**
+ * What a signature masks, and — as much the point — what it no longer does (anton-4mql). Every row
+ * is three runs differing in ONE fragment: a quantity collapses and the streak keeps its common
+ * point; anything else stands and the streak honestly reports none. The pairs of rows that differ
+ * only in whether the varying token carries a digit are the criterion itself — character shape alone
+ * must never decide the verdict, so both members of a pair must land the same way.
+ */
+describe("what a failure point is compared modulo", () => {
+  const EPIC = "anton-w0rk";
+
+  /** The table reads oldest first; the breaker is handed runs newest first, as its callers do. */
+  const commonPointOf = (points: readonly string[]) =>
+    detectFailureStreak(
+      points.map((error, i) => run(`r${i}`, { epicBeadId: EPIC, error })).reverse(),
+      THREE,
+    )!.commonFailure;
+
+  const cases: Array<{ what: string; points: [string, string, string]; shared: boolean }> = [
+    {
+      what: "durations — the same timeout, three lengths",
+      points: [
+        "worktree checkout timed out after 45m",
+        "worktree checkout timed out after 90m",
+        "worktree checkout timed out after 1h30m",
+      ],
+      shared: true,
+    },
+    {
+      what: "durations spelled every way an error spells them",
+      points: [
+        "test gate gave up after 2.5s",
+        "test gate gave up after 1500ms",
+        "test gate gave up after 3 minutes",
+      ],
+      shared: true,
+    },
+    {
+      what: "ports — one dev server that will not bind",
+      points: [
+        "dev server could not bind localhost:3000",
+        "dev server could not bind localhost:3001",
+        "dev server could not bind localhost:5432",
+      ],
+      shared: true,
+    },
+    {
+      what: "a port named in words",
+      points: [
+        "port 3000 is already in use",
+        "port 3001 is already in use",
+        "port 51234 is already in use",
+      ],
+      shared: true,
+    },
+    {
+      what: "an exit code is NOT a quantity — 137 is an OOM kill and 1 is a test failure",
+      points: [
+        "the build exited with code 1",
+        "the build exited with code 2",
+        "the build exited with code 137",
+      ],
+      shared: false,
+    },
+    {
+      what: "paths differing by a digit stand — the old rule masked these",
+      points: [
+        "/tmp/anton-run-1/worktree is missing",
+        "/tmp/anton-run-2/worktree is missing",
+        "/tmp/anton-run-3/worktree is missing",
+      ],
+      shared: false,
+    },
+    {
+      what: "paths differing by a letter stand too — and that is the same verdict as the digits",
+      points: [
+        "/tmp/anton-run-a/worktree is missing",
+        "/tmp/anton-run-b/worktree is missing",
+        "/tmp/anton-run-c/worktree is missing",
+      ],
+      shared: false,
+    },
+    {
+      what: "bead ids the row cannot name stand, digits or none — the old rule split on exactly this",
+      points: [
+        "waiting on anton-k4qr before this can run",
+        "waiting on anton-gsny before this can run",
+        "waiting on anton-ptsy before this can run",
+      ],
+      shared: false,
+    },
+    {
+      what: "an id whose base36 tail reads like a duration is still an id",
+      points: [
+        "anton-12ms would not check out",
+        "anton-34ms would not check out",
+        "anton-56ms would not check out",
+      ],
+      shared: false,
+    },
+    {
+      what: "…and the duration beside that id still masks",
+      points: [
+        "anton-12ms timed out after 45m",
+        "anton-12ms timed out after 90m",
+        "anton-12ms timed out after 1h30m",
+      ],
+      shared: true,
+    },
+    {
+      what: "identical points — the control",
+      points: [
+        "base branch would not check out",
+        "base branch would not check out",
+        "base branch would not check out",
+      ],
+      shared: true,
+    },
+  ];
+
+  for (const { what, points, shared } of cases) {
+    it(shared ? `collapses ${what}` : `keeps ${what} apart`, () => {
+      expect(commonPointOf(points)).toBe(shared ? points[0] : undefined);
+    });
+  }
+});
+
+/**
+ * Where the 140-character cut lands must not decide whether two failures are the same story
+ * (anton-tyk0). The signature is compared on the whole first line; the cut is a display budget, and
+ * the pair of tests either side of it is the whole claim.
+ */
+describe("the display cut", () => {
+  const EPIC = "anton-w0rk";
+
+  /** The module's display budget, restated because it is the boundary under test. */
+  const DISPLAY_CHARS = 140;
+
+  /** Exactly one display's worth of failure, so anything appended sits past the cut. */
+  const PREFIX = "test gate failed while checking ".padEnd(DISPLAY_CHARS, "migrations ");
+
+  const streakOf = (points: readonly string[]) =>
+    detectFailureStreak(
+      points.map((error, i) => run(`r${i}`, { epicBeadId: EPIC, error })).reverse(),
+      THREE,
+    )!;
+
+  it("reports no common point when the runs differ only past the cut", () => {
+    const streak = streakOf([
+      `${PREFIX}: relation "runs" is missing`,
+      `${PREFIX}: relation "beads" is missing`,
+      `${PREFIX}: relation "jobs" is missing`,
+    ]);
+    expect(streak.commonFailure).toBeUndefined();
+  });
+
+  it("reports one point when the runs agree past the cut", () => {
+    const point = `${PREFIX}: relation "runs" is missing`;
+    const streak = streakOf([point, point, point]);
+    expect(streak.commonFailure).toBe(PREFIX);
+  });
+
+  it("cuts what it prints, in the summary and in the evidence alike", () => {
+    const point = `${PREFIX}: relation "runs" is missing`;
+    const streak = streakOf([point, point, point]);
+    expect(streak.commonFailure).toHaveLength(DISPLAY_CHARS);
+    expect(describeFailureStreak(streak)).toBe(
+      `3 runs in a row ended without delivering, every one of them at the same point: ${PREFIX}`,
+    );
+    expect(failureStreakEvidence(streak)[0]).toBe(`r0 · ${EPIC} · failed · ${PREFIX}`);
   });
 });

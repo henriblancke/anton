@@ -85,6 +85,33 @@ function prereqUnusable(prereq: Bead): string | undefined {
   return undefined;
 }
 
+/**
+ * Where the resolved prerequisite sits relative to the run that hit the block: work this run is
+ * already carrying, or work outside it.
+ *
+ * The two are different orderings. An `outside` prerequisite is somebody else's to land, so the
+ * target genuinely has to wait for it. A `sibling` is work THIS run performs — the run is the thing
+ * that lands it — so the ordering is a scheduling fact about the run's own dispatch, and waiting for
+ * it is waiting on itself (anton-0gm2: three real runs parked that way in one incident).
+ *
+ * The repair only says which of the two it is; what the run does about it is the caller's.
+ */
+export type PrereqSite = "sibling" | "outside";
+
+/**
+ * Whether the prerequisite is one of the tickets the run holds.
+ *
+ * Decided against the run's OWN ticket set and nothing else. Re-deriving it from the board —
+ * "same parent, therefore a sibling" — would answer a different question: a run dispatches the
+ * target's whole working-layer subtree (`runTickets`), which is neither every bead under the
+ * parent nor only the direct children, and it is the set that decides what this run will actually
+ * land. A bead sharing a parent that this run is not carrying must not read as a sibling.
+ */
+export function prereqSite(blockerId: string, runTicketIds: Iterable<string>): PrereqSite {
+  for (const id of runTicketIds) if (id === blockerId) return "sibling";
+  return "outside";
+}
+
 /** What the board answers for the prerequisite the agent named. */
 export type PrereqVerdict =
   | { state: "resolved"; id: string }
@@ -202,13 +229,15 @@ export type DepMissingOutcome =
    * because nothing was stamped — and deliberately not `parked`, because nothing holds the target
    * back, so the caller settles the block exactly as it would have without a repair.
    */
-  | { action: "shadow"; blockerId: string; attempted: string }
+  | { action: "shadow"; blockerId: string; site: PrereqSite; attempted: string }
   | {
       action: "parked";
       /** The repair stamp written on the target. */
       label: string;
       /** The prerequisite the edge now points at. */
       blockerId: string;
+      /** Whether that prerequisite is work this run holds — see {@link PrereqSite}. */
+      site: PrereqSite;
       attempted: string;
     }
   | { action: "escalate"; why: string; evidence: string[]; prior?: RepairAttempt };
@@ -258,6 +287,12 @@ export async function repairDepMissing(args: {
   /** How far this project lets anton go with `dep-missing` (R5.3) — see repair-autonomy.ts. */
   autonomy: ProposalAutonomy;
   /**
+   * Every ticket THIS run holds, ids only — what {@link prereqSite} tests the resolved prerequisite
+   * against. Required rather than optional: with no set there is no membership answer, and the one
+   * an absent argument would default to is a guess about a run the repair cannot see.
+   */
+  runTicketIds: Iterable<string>;
+  /**
    * The board the prerequisite is resolved against. Read fresh when absent ({@link readBoard}): the
    * snapshot the run dispatched from predates the session, and a prerequisite that closed meanwhile
    * must not be parked behind.
@@ -281,12 +316,13 @@ export async function repairDepMissing(args: {
   }
 
   const blockerId = verdict.id;
+  const site = prereqSite(blockerId, args.runTicketIds);
   const attempted =
     `recorded \`${blockerId}\` as a blocker of ${bead.id} (bd link ${bead.id} ${blockerId} ` +
     `--type blocks), parking it until that lands — the agent reported: ` +
     `${block.reason?.trim() || "(no reason given)"}`;
   // Resolving the prerequisite is a board READ, so the shadow is the armed answer minus the writes.
-  if (decision.action === "shadow") return { action: "shadow", blockerId, attempted };
+  if (decision.action === "shadow") return { action: "shadow", blockerId, site, attempted };
 
   // Both beads' locks, and the prerequisite re-read inside them (PR #223 review). The board above is
   // a SNAPSHOT, and the one thing this edge cannot survive is the prerequisite settling between that
@@ -328,7 +364,7 @@ export async function repairDepMissing(args: {
         ],
       };
     }
-    return { action: "parked", label, blockerId, attempted };
+    return { action: "parked", label, blockerId, site, attempted };
   });
 }
 

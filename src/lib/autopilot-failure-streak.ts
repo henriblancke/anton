@@ -15,6 +15,7 @@
  * stay testable without a db, a repo or a job queue.
  */
 import type { RunStatus } from "@/components/runs/run-view-utils";
+import { poisonBlockerIds } from "./jobs/errors";
 
 /** What one run says about the environment it ran in. */
 export type RunVerdict = "delivered" | "failure" | "ignored";
@@ -156,25 +157,122 @@ export function detectFailureStreak(
   };
 }
 
-/** Enough of the error to recognise it, short enough that a header can print N of them. */
+/**
+ * Enough of the error to recognise it, short enough that a header can print N of them. A DISPLAY
+ * budget only (anton-tyk0): comparing on the cut would let where the 140th character happens to
+ * land decide whether two failures are the same story, so the signature reads the whole line.
+ */
 const FAILURE_POINT_CHARS = 140;
 
-/** The first non-empty line of the run's error — where it stopped, without the stack behind it. */
+/** The whole first non-empty line of the run's error — where it stopped, without the stack. */
 function failurePoint(run: RunOutcome): string {
   const line = run.error?.split("\n").find((l) => l.trim().length > 0) ?? "";
-  return line.trim().slice(0, FAILURE_POINT_CHARS);
+  return line.trim();
+}
+
+/** A failure point cut to what an operator's header can hold. */
+function forDisplay(point: string): string {
+  return point.slice(0, FAILURE_POINT_CHARS);
+}
+
+/** What a run-specific fragment collapses to: a bead id the row named, or a quantity it printed. */
+const MASK = "#";
+
+/**
+ * The bead ids THIS run is known to name: the target it ran, the ticket it stopped inside, and the
+ * blockers a blocked park spells out (jobs/errors.ts owns that clause and its parser). All three
+ * arrive on the row or in the message the row already carries, so the module stays pure — nothing
+ * here asks the board what a token is.
+ */
+function knownBeadIds(run: RunOutcome): string[] {
+  const blockers = (run.error && poisonBlockerIds(run.error)) || [];
+  return [run.epicBeadId, run.ticketBeadId, ...blockers].filter(
+    (id): id is string => typeof id === "string" && id.length > 0,
+  );
+}
+
+/**
+ * Take the run's own ids out of its failure point.
+ *
+ * LONGEST FIRST, because a child id contains its parent's (`anton-287p.1` / `anton-287p`): masking
+ * the parent first leaves `#.1` behind, and that leftover is exactly the difference that makes two
+ * runs of one break look like two breaks.
+ */
+function maskBeadIds(point: string, ids: readonly string[]): string {
+  return [...new Set(ids)]
+    .sort((a, b) => b.length - a.length)
+    .reduce((text, id) => text.replaceAll(id, MASK), point);
+}
+
+/** A number, whole or fractional — the varying half of every quantity below. */
+const AMOUNT = String.raw`\d+(?:\.\d+)?`;
+
+/**
+ * Time units as an error prints them, LONGEST FIRST inside each family: alternation is
+ * leftmost-first, so `m` ahead of `minutes` would match the "m" of "minutes" and leave "inutes"
+ * standing.
+ */
+const TIME_UNIT = "milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d";
+
+/**
+ * The run-varying QUANTITIES no row can name — and the only thing this module still masks by shape.
+ *
+ * Each pattern matches a whole quantity: a number bound to its unit, or the number in a host's port
+ * position. Never "a token that carries a digit" (anton-4mql). That is the distinction the old rule
+ * lacked, and the reason it was wrong: `45m` is a duration whichever run printed it, but
+ * `anton-k4qr` is an identifier whatever digits its base36 alphabet happened to deal it — the digit
+ * rule masked that id and kept `anton-gsny`, so three parks with one cause scored three signatures.
+ * The boundary guards are what hold the line: a quantity stands on its own, an id's digits sit
+ * inside a word, so `anton-12ms` is never read as 12 milliseconds. No token's SHAPE alone can decide
+ * that it varies any more — a quantity is matched for what it is, and everything else is either
+ * masked because the run row named it (see {@link knownBeadIds}) or left standing.
+ *
+ * What went with the digit rule, and why nothing replaced it. PATHS and PIDS are recognisable only
+ * BY carrying a digit — `/tmp/anton-3` varies, `/tmp/anton-b` does not — which is the unsound rule
+ * back again; and the run-specific part of a worktree path is the bead id in it, which the row
+ * already names. A bead id the row CANNOT name — a third bead the message mentions in passing — is
+ * now left standing, so a streak differing only there reports no common point. That is the honest
+ * answer rather than a worse one: nothing here knows whether that token is what varies or what
+ * broke, and a wrong common point sends an operator to diagnose a break that isn't stopping them.
+ *
+ * Applied to an already-lowercased point, which is why no pattern carries `i`.
+ */
+const QUANTITIES: ReadonlyArray<readonly [RegExp, string]> = [
+  // 45m · 1500ms · 2.5 seconds · 1h30m. The compound tail is not decoration: without it `1h30m`
+  // fails the trailing guard and no part of it masks at all.
+  [
+    new RegExp(
+      `(^|[^\\w.-])${AMOUNT}\\s*(?:${TIME_UNIT})(?:\\s*${AMOUNT}\\s*(?:${TIME_UNIT}))*(?![\\w-])`,
+      "g",
+    ),
+    `$1${MASK}`,
+  ],
+  // localhost:3000 · 127.0.0.1:5432 · [::1]:8080 — the host is part of the failure, only its port
+  // varies, so the character before the colon is kept.
+  [/([\w.\]]):\d{1,5}(?![\w-])/g, `$1:${MASK}`],
+  // port 3000 · port=3000
+  [/\b(port[\s=]+)\d{1,5}(?![\w-])/g, `$1${MASK}`],
+];
+
+/** Collapse every {@link QUANTITIES} match, leaving the sentence around them intact. */
+function maskQuantities(point: string): string {
+  return QUANTITIES.reduce((text, [pattern, mask]) => text.replace(pattern, mask), point);
 }
 
 /**
  * Two failures are the same point once the run-specific parts are taken out: "ticket anton-a1b2
  * timed out after 45m" and "ticket anton-c3d4 timed out after 45m" are one broken environment
- * described twice, not two hard tickets. Any token carrying a digit — bead id, path, duration,
- * port — is what varies between two runs of the same break, so that is what collapses.
+ * described twice, not two hard tickets.
+ *
+ * Two rules do that, and neither guesses from characters what kind of thing a token is. The BEAD IDS
+ * come off first, from what the run row already knows they are (anton-q2jw). Then the QUANTITIES
+ * above — the durations and ports no row can name — each matched as a complete quantity rather than
+ * as a token carrying a digit (anton-4mql); the argument for keeping exactly those two, and for
+ * dropping the rest of the old heuristic, is with them.
  */
-function signatureOf(point: string): string {
-  return point
-    .toLowerCase()
-    .replace(/[\w./:-]*\d[\w./:-]*/g, "#")
+function signatureOf(run: RunOutcome, point: string): string {
+  const ids = knownBeadIds(run).map((id) => id.toLowerCase());
+  return maskQuantities(maskBeadIds(point.toLowerCase(), ids))
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -189,9 +287,10 @@ function signatureOf(point: string): string {
 export function sharedFailurePoint(runs: readonly RunOutcome[]): string | undefined {
   const points = runs.map(failurePoint);
   if (points.length === 0 || points.some((p) => p.length === 0)) return undefined;
-  const signature = signatureOf(points[0]);
+  const signatures = runs.map((run, i) => signatureOf(run, points[i]!));
+  const signature = signatures[0]!;
   if (!signature) return undefined;
-  return points.every((p) => signatureOf(p) === signature) ? points[0] : undefined;
+  return signatures.every((s) => s === signature) ? forDisplay(points[0]!) : undefined;
 }
 
 /** Why the breaker fired, in one sentence — the disarm's `detail`. */
@@ -212,7 +311,7 @@ export function describeFailureStreak(streak: FailureStreak): string {
 export function failureStreakEvidence(streak: FailureStreak): string[] {
   return streak.runs.map((run) => {
     const how = run.abandoned ? "abandoned" : run.status;
-    const point = failurePoint(run);
+    const point = forDisplay(failurePoint(run));
     return [run.id.slice(0, 8), run.epicBeadId, how, point].filter(Boolean).join(" · ");
   });
 }

@@ -168,6 +168,8 @@ async function haltOf(selfReport: AntonResult | null): Promise<Error> {
     run: run(),
     steps: steps(selfReport, false),
     ticket: ticket(),
+    // The run carries this ticket alone — no sibling for a `dep-missing` repair to resolve against.
+    runTicketIds: [TICKET_ID],
     timeoutMs: Infinity,
   }).then(
     () => undefined,

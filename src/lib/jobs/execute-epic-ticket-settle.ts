@@ -26,6 +26,7 @@ import {
   NeedsHumanError,
   NoDeliveryError,
   ParkedOnPrereqError,
+  ReorderedOnPrereqError,
   RepairedBlockError,
   TicketRetiredError,
   TicketTimeoutError,
@@ -68,6 +69,8 @@ interface TicketFailureKinds {
 export async function settleFailedTicket(args: {
   run: Omit<StepContext, "tickets">;
   ticket: Bead;
+  /** The run's own ticket set, ids only — passed through to the repair pass (see `prereqSite`). */
+  runTicketIds: readonly string[];
   session: JobSession;
   /** Whether this ticket's own DEADLINE fired, as opposed to the job's abort. */
   ranOutOfTime: boolean;
@@ -103,6 +106,7 @@ export async function settleFailedTicket(args: {
     ? await repairBlockedTicket({
         run,
         ticket,
+        runTicketIds: args.runTicketIds,
         logPath,
         selfReport: progress.selfReport,
         e,
@@ -116,8 +120,14 @@ export async function settleFailedTicket(args: {
   if (repair?.action === "repaired") throw new RepairedBlockError(ticket.id, repair.attempted, e);
   // An ordering recorded is a WAIT, not a correction: the ticket cannot start until the blocker
   // lands, so the run parks behind the edge anton just drew instead of spending an attempt on it.
+  //
+  // Unless the run holds the blocker ITSELF (anton-0gm2), which is the same edge and a different
+  // wait: what lands that ticket is this run, so a park would be the run waiting on its own
+  // dispatch. That case re-orders and continues — see {@link ReorderedOnPrereqError}.
   if (repair?.action === "parked") {
-    throw new ParkedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, e);
+    throw repair.site === "sibling"
+      ? new ReorderedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, logPath, e)
+      : new ParkedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, e);
   }
   // A RETIRED ticket earns neither a retry nor a wait (anton-5bpd): its work has already landed, so
   // there is nothing left for any attempt to do. The bead is closed against its survivor with the

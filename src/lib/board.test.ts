@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
+import {
+  proposalFingerprint,
+  type GardenerDetectionKind,
+} from "./gardener/detections";
 import { STAGES } from "./types";
 import type { ScanHealth } from "./scan-health";
 import type { HygieneReport, Project } from "./types";
@@ -1716,6 +1720,103 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/**
+ * A proposal is a DECISION, not work (anton-x37c) — and the Up Next lane claims to show the work
+ * anton would START next.
+ *
+ * Nothing here filters the lane. Eligibility already refuses a proposal with a reason
+ * (`ineligibility`, anton-ptsy) and the lane is DERIVED from that same decision (anton-r0ew), so a
+ * second subtraction in the projection would be an answer that could disagree with the pass that
+ * writes the plan. These pin the FALLOUT: that it reaches the lane, that it costs the ranking of
+ * real work nothing, and that a proposal is exactly as visible and approvable as it was — its chip,
+ * its Approve affordance, unmoved.
+ */
+describe("proposals never reach the Up Next lane (anton-n8eb)", () => {
+  /** A parentless task a bd read genuinely produced, so only its labels can refuse it. */
+  const authored = (id: string, overrides: Partial<Bead> = {}): Bead =>
+    makeBead({
+      id,
+      title: id,
+      created_at: "2026-08-01T00:00:00Z",
+      description: "## Goal\n\nShip it.\n\n## Acceptance\n- [ ] it ships",
+      acceptance_criteria: "- [ ] it ships",
+      ...overrides,
+    });
+
+  /**
+   * A proposal as either producer files one: an ordinary parentless task carrying a full contract
+   * plus a fingerprint — and P0, so a lane that admitted it would not merely include it, it would
+   * put it FIRST, above the work anton would actually start.
+   */
+  const proposal = (id: string, kind: GardenerDetectionKind, subject: string): Bead =>
+    authored(id, { priority: 0, labels: [proposalFingerprint(kind, subject)] });
+
+  const realWork = () => [
+    authored("t-1", { priority: 1 }),
+    authored("f-1", { priority: 1, issue_type: "feature" }),
+  ];
+
+  it("ranks the work and leaves both producers' proposals out of it", async () => {
+    listMock.mockResolvedValue([
+      ...realWork(),
+      proposal("g-1", "stale", "t-9"),
+      proposal("p-1", "low-value", "t-9"),
+    ]);
+
+    const served = await getBoard(project);
+    expect(served.upNext?.map((e) => e.beadId)).toEqual(["f-1", "t-1"]);
+  });
+
+  it("says a board of nothing but proposals holds nothing to start", async () => {
+    // The honest answer, and the one the lane already has words for: there are open, shaped,
+    // unclaimed, unblocked beads here — and not one of them is work anton may take.
+    listMock.mockResolvedValue([proposal("g-1", "stale", "t-9"), proposal("p-1", "misfiled", "t-9")]);
+
+    const served = await getBoard(project);
+    expect(served.upNext).toBeUndefined();
+    expect(served.upNextAbsence).toBe("no-claimable-work");
+  });
+
+  it("ranks the same work identically however many proposals are open", async () => {
+    listMock.mockResolvedValue(realWork());
+    const alone = await getBoard(project);
+
+    // A gardener pass files up to ten in one tick. Every one of them is P0 and older than the work,
+    // so an admitted proposal would take the top of the lane and push each real target down a rank.
+    resetIssueSnapshots();
+    listMock.mockResolvedValue([
+      ...realWork(),
+      ...Array.from({ length: 10 }, (_, i) =>
+        proposal(`g-${i}`, "stale", `t-${i}`),
+      ),
+    ]);
+    const crowded = await getBoard(project);
+
+    expect(crowded.upNext).toEqual(alone.upNext);
+  });
+
+  it("leaves the proposal's own chip — and its Approve affordance — exactly where it was", async () => {
+    // Refused as WORK, untouched as a decision: the chip a founder applies it from is a parentless
+    // task in Backlog, unapproved and unblocked, which is what the Approve action is gated on
+    // (useStandaloneApproval). The approve route turns that click into `applyProposal`.
+    listMock.mockResolvedValue([...realWork(), proposal("g-1", "stale", "t-9")]);
+
+    const served = await getBoard(project);
+    const chip = served.standalone.backlog.find((i) => i.id === "g-1");
+    expect(chip).toMatchObject({ id: "g-1", approved: false, ready: true, deferred: false });
+    expect(chip?.blockedBy).toEqual([]);
+  });
+
+  it("admits the very same bead once the fingerprint is gone — the label is the whole refusal", async () => {
+    // The control: strip the one label and this bead tops the lane it was refused from, so nothing
+    // about its shape, age or priority is what kept it out.
+    listMock.mockResolvedValue([...realWork(), { ...proposal("g-1", "stale", "t-9"), labels: [] }]);
+
+    const served = await getBoard(project);
+    expect(served.upNext?.map((e) => e.beadId)).toEqual(["g-1", "f-1", "t-1"]);
   });
 });
 
