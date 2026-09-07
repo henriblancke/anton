@@ -34,6 +34,7 @@ function fakeCtx(over: Partial<JobContext> & { payload: unknown }): JobContext {
     heartbeat: async () => {},
     report: () => {},
     signal: new AbortController().signal,
+    enqueueReviewFixPr: () => undefined,
     ...over,
   };
 }

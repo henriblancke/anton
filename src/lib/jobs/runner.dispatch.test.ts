@@ -586,6 +586,42 @@ describe("JobRunner dispatch (live, in-memory db)", () => {
     expect((await getJob(h.db, parked))?.status).toBe("parked");
   });
 
+  it("refuses a per-PR dispatch from a handler whose project was quiesced mid-triage (PR #250)", async () => {
+    // The review-fix dispatcher yields on its `gh` read and only then inserts. A project delete that
+    // lands inside that read raises the barrier and sweeps the project's active rows; an insert
+    // through the bare queue helper would then create a fresh `queued` row AFTER the sweep, and
+    // teardown's leftover guard fails the delete over it. Through the runner the insert is refused.
+    h.seedProjects("A");
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    let dispatched: string | undefined | "unset" = "unset";
+    const r = h.makeRunner({
+      handlers: {
+        "review-fix": async (ctx) => {
+          await gate;
+          dispatched = ctx.enqueueReviewFixPr("A", "epic-1");
+        },
+      },
+    });
+    await r.enqueue({ type: "review-fix", projectId: "A", payload: { projectId: "A" } });
+    expect(await r.tickOnce()).toBe(1);
+
+    const quiesce = r.quiesceProject("A");
+    // Let teardown finish its sweep — the dispatcher's own row is gone — before the handler wakes
+    // and reaches its insert, so the row it would create is one no sweep could catch.
+    await waitUntil(async () => {
+      const rows = await h.db.select().from(schema.jobs);
+      return rows.every((j) => j.status !== "queued" && j.status !== "running");
+    });
+    release();
+
+    await expect(quiesce).resolves.toBeUndefined();
+    await r.whenIdle();
+    expect(dispatched).toBeUndefined();
+    const fixes = await h.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr"));
+    expect(fixes).toHaveLength(0);
+  });
+
   it("runningJobInfo returns what the handler reported while in flight, undefined after settle (anton-susu)", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
@@ -675,7 +711,7 @@ describe("JobRunner dispatch (live, in-memory db)", () => {
     function prFixRunner(cap: number, handler: JobHandler = async () => {}) {
       return h.makeRunner({
         handlers: { "review-fix-pr": handler, "execute-epic": async () => {} },
-        config: { maxConcurrent: 8 },
+        config: { maxConcurrent: 8, maxReviewFixConcurrent: 4 },
         resolvePolicy: () => policy({ concurrency: 2, reviewFixConcurrency: cap }),
       });
     }
@@ -715,6 +751,55 @@ describe("JobRunner dispatch (live, in-memory db)", () => {
       await r.whenIdle();
       const rows = await h.db.select().from(schema.jobs);
       expect(rows.filter((j) => j.status === "done")).toHaveLength(4);
+    });
+
+    // The per-project cap bounds one project's fan-out, not the sum (PR #250 review): several
+    // projects with actionable PRs could still fill the whole pool between them. The runner-wide
+    // ceiling holds the sum, so a job of another type queued behind them still finds a slot.
+    it("holds the sum across projects at the runner-wide ceiling, leaving slots for other types", async () => {
+      h.seedProjects("A", "B", "C");
+      let release!: () => void;
+      const gate = new Promise<void>((res) => (release = res));
+      let epicRan = false;
+      const r = h.makeRunner({
+        handlers: {
+          "review-fix-pr": async () => {
+            await gate;
+          },
+          "execute-epic": async () => {
+            epicRan = true;
+          },
+        },
+        config: { maxConcurrent: 8, maxReviewFixConcurrent: 3 },
+        resolvePolicy: () => policy({ concurrency: 2, reviewFixConcurrency: 2 }),
+      });
+      for (const projectId of ["A", "B", "C"]) {
+        for (let i = 0; i < 2; i++) {
+          await r.enqueue({
+            type: "review-fix-pr",
+            projectId,
+            payload: { projectId, epicBeadId: `epic-${i}` },
+          });
+        }
+      }
+
+      // Six fixes, every one within its project's cap of two — the ceiling admits three.
+      expect(await r.tickOnce()).toBe(3);
+      expect(await r.tickOnce()).toBe(0);
+
+      // The other types are what the ceiling reserves for: an execute-epic leases beside the held
+      // fixes instead of waiting out one of them.
+      await r.enqueue({ type: "execute-epic", projectId: "A" });
+      expect(await r.tickOnce()).toBe(1);
+      release();
+      await r.whenIdle();
+      expect(epicRan).toBe(true);
+
+      // The held fixes lease once the first three settled — nothing dropped.
+      expect(await r.tickOnce()).toBe(3);
+      await r.whenIdle();
+      const rows = await h.db.select().from(schema.jobs);
+      expect(rows.filter((j) => j.status === "done")).toHaveLength(7);
     });
 
     /**

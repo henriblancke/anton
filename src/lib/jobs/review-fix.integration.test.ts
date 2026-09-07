@@ -483,7 +483,7 @@ process.stdin.on('end',()=>{
         clock,
         type: "review-fix-pr",
         handler: makeReviewFixPrHandler,
-        config: { leaseMs: 30_000, maxConcurrent: 2, maxAttempts: 1 },
+        config: { leaseMs: 30_000, maxConcurrent: 2, maxReviewFixConcurrent: 2, maxAttempts: 1 },
       });
       expect(await runner.tickOnce()).toBe(2);
       await runner.whenIdle();

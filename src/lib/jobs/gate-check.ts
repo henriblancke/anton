@@ -54,7 +54,7 @@ import {
   type PlainGateResume,
   type ResumePlan,
 } from "./gate-targets";
-import { enqueueReviewFixPrIfAbsent, systemClock, type AntonDb, type Clock } from "./queue";
+import { systemClock, type AntonDb, type Clock } from "./queue";
 import type { JobContext, JobEffect, JobHandler } from "./runner";
 import { resumeEpic } from "./unstick";
 
@@ -171,6 +171,12 @@ export interface PassContext {
   clock: Clock;
   projectId: string;
   repo: string;
+  /**
+   * The runner's guarded per-PR dispatch for THIS project (`JobContext.enqueueReviewFixPr`, bound
+   * to `projectId`). The pass fans out through it rather than the queue helper so a project delete
+   * that lands mid-pass refuses the insert instead of failing over the fresh row (PR #250 review).
+   */
+  enqueueReviewFixPr: (epicBeadId: string) => string | undefined;
 }
 
 /** What phase 1 learned about the project's gates — the input every later phase is scoped by. */
@@ -330,7 +336,7 @@ export async function dispatchReleased(
 export async function dispatchMerged(pass: PassContext, merged: Bead[]): Promise<number> {
   let dispatched = 0;
   for (const target of merged) {
-    const jobId = enqueueReviewFixPrIfAbsent(pass.db, pass.clock, pass.projectId, target.id);
+    const jobId = pass.enqueueReviewFixPr(target.id);
     if (jobId) {
       dispatched += 1;
       console.log(`[gate-check] ${pass.projectId}: ${target.id} merged — dispatched review-fix-pr`);
@@ -410,7 +416,13 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     const { projectId } = ctx.payload as GateCheckPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
-    const pass: PassContext = { db, clock, projectId, repo: project.repoPath };
+    const pass: PassContext = {
+      db,
+      clock,
+      projectId,
+      repo: project.repoPath,
+      enqueueReviewFixPr: (epicBeadId) => ctx.enqueueReviewFixPr(projectId, epicBeadId),
+    };
 
     const evaluation = await evaluateGates(pass, ctx);
 

@@ -431,6 +431,24 @@ describe("enqueueReviewFixPrIfAbsent", () => {
 
   // The dispatcher only triages; treating its in-flight poll as coverage would strand this target
   // until the next slot (and it may have skipped the target on ownership in the first place).
+  // The runner's teardown barrier is crossed inside the insert's own transaction (PR #250 review):
+  // a dispatcher that read the barrier before its `gh` triage would still insert behind
+  // quiesceProject's sweep, and teardown's leftover guard then fails the delete over that row.
+  it("inserts nothing when refuseProject vetoes the project, and reports it as not dispatched", () => {
+    const refused = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+      refuseProject: (projectId) => projectId === "p1",
+    });
+    expect(refused).toBeUndefined();
+    expect(activeRows()).toHaveLength(0);
+
+    // The veto is per project: another project's dispatch goes through the same call unrefused.
+    expect(
+      enqueueReviewFixPrIfAbsent(t.db, systemClock, "p2", "epic-1", {
+        refuseProject: (projectId) => projectId === "p1",
+      }),
+    ).toBeDefined();
+  });
+
   it("does not treat the review-fix dispatcher as covering a target", () => {
     t.db
       .insert(schema.jobs)

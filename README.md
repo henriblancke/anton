@@ -272,6 +272,8 @@ Environment variables (all optional):
 |----------|---------|---------|
 | `ANTON_DB` | `./anton.db` | SQLite path for machine-local state |
 | `ANTON_RUNNER` | on | set `off` to boot the UI without the job runner + scheduler |
+| `ANTON_MAX_CONCURRENT` | `8` | global ceiling on jobs in flight across all projects |
+| `ANTON_MAX_REVIEW_FIX_CONCURRENT` | half of `ANTON_MAX_CONCURRENT` | ceiling on PR-fix jobs in flight across all projects, so review fan-out leaves slots for other work |
 | `ANTON_WORKTREES_ROOT` | sibling of the repo | where run worktrees are created |
 | `ANTON_SESSIONS_ROOT` | `./.anton/sessions` | claude session logs |
 | `ANTON_SCANS_ROOT` | `./.anton/scans` | stringer scan files |

@@ -432,7 +432,9 @@ export const DEFAULT_CONCURRENCY = 3;
 /**
  * Two, not three: the global ceiling is 8 (ANTON_MAX_CONCURRENT) and {@link DEFAULT_CONCURRENCY} is
  * already 3, so 2 still fixes PRs in parallel while leaving headroom for gate-check, sync-push and
- * the other polls to keep their slots.
+ * the other polls to keep their slots. This bounds ONE project; the sum across projects is bounded
+ * by the runner-wide ANTON_MAX_REVIEW_FIX_CONCURRENT (half the pool by default), which is what
+ * actually keeps those slots free when several projects have actionable PRs at once.
  */
 export const DEFAULT_REVIEW_FIX_CONCURRENCY = 2;
 export const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2 hours without progress

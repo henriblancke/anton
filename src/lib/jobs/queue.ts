@@ -458,16 +458,28 @@ export function enqueueExecuteEpicIfAbsent(
  * exactly one job — don't make this async. `jobs_active_epic_unique` keys on
  * (type, project_id, $.epicBeadId) WHERE queued/running, so it backstops this type unchanged; a
  * concurrent insert that wins the race raises UNIQUE, which we absorb as "already covered".
+ *
+ * `refuseProject` is the runner's project-teardown veto, asked INSIDE the transaction exactly as
+ * `resumeJob` asks it (PR #250 review): the barrier lives in memory, so a caller that checked it
+ * before this call would still race `quiesceProject` — it raises the flag and sweeps the project's
+ * active rows between that check and this insert, and the fresh `queued` row then trips teardown's
+ * leftover guard and fails the delete. Crossed in the same synchronous step as the write there is
+ * no window. A refusal reads as "not dispatched" (undefined) — the project is going away, and no
+ * row is the correct outcome. Handlers reach this through `JobContext.enqueueReviewFixPr`, never
+ * this function bare; the runner is the only caller that can supply the veto.
  */
 export function enqueueReviewFixPrIfAbsent(
   db: AntonDb,
   clock: Clock,
   projectId: string,
   epicBeadId: string,
+  opts?: { refuseProject?: (projectId: string) => boolean },
 ): string | undefined {
   const nowMs = clock.now();
   try {
     return db.transaction((tx) => {
+      if (opts?.refuseProject?.(projectId)) return undefined;
+
       const existing = firstJobId(
         tx,
         and(
@@ -669,6 +681,12 @@ export function enqueueSyncPushDeduped(
  * global `limit` applies). Jobs whose bucket is already at capacity are skipped in favor of the
  * next-due job for a different bucket. Currently the runner gates execute-epic per project.
  *
+ * `typeCapOf` is the second, coarser dimension: the max jobs of a candidate's TYPE in flight across
+ * every project at once. A per-project cap bounds one project's fan-out but not the sum over
+ * projects (PR #250 review) — four projects each at a per-project cap of two are eight `review-fix-pr`
+ * jobs, the whole default pool, and every other type waits behind them. A candidate must clear both
+ * caps to lease; `Infinity` means no per-type ceiling.
+ *
  * `exclude` drops job ids that are already dispatched in-process (rolling dispatch keeps them in the
  * runner's `inFlight` set while their handler runs). Without it, a still-running job whose lease
  * lapsed — a missed renewal from laptop sleep or a transient DB failure — would look reclaimable and
@@ -689,6 +707,7 @@ export async function leaseDue(
     leaseMs: number;
     limit: number;
     capOf?: (job: JobRow) => number;
+    typeCapOf?: (job: JobRow) => number;
     exclude?: Iterable<string>;
     excludeBucketKeys?: Iterable<string>;
   },
@@ -699,9 +718,10 @@ export async function leaseDue(
   const excludeIds = opts.exclude ? [...opts.exclude] : [];
   const excludeBuckets = opts.excludeBucketKeys ? [...opts.excludeBucketKeys] : [];
 
-  // Without per-bucket caps, the DB `limit` alone bounds the result. With caps we must scan more
-  // candidates than `limit` (some get skipped for being at capacity), so widen the fetch.
-  const scanLimit = opts.capOf ? Math.max(opts.limit * 8, 200) : opts.limit;
+  // Without caps, the DB `limit` alone bounds the result. With caps we must scan more candidates
+  // than `limit` (some get skipped for being at capacity), so widen the fetch.
+  const capped = opts.capOf !== undefined || opts.typeCapOf !== undefined;
+  const scanLimit = capped ? Math.max(opts.limit * 8, 200) : opts.limit;
   const runnable = or(
     and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, nowDate)),
     and(eq(schema.jobs.status, "running"), lte(schema.jobs.leaseExpiresAt, nowDate)),
@@ -737,8 +757,9 @@ export async function leaseDue(
   if (candidates.length === 0) return [];
 
   let due = candidates;
-  if (opts.capOf) {
-    const capOf = opts.capOf;
+  if (capped) {
+    const capOf = opts.capOf ?? (() => Infinity);
+    const typeCapOf = opts.typeCapOf ?? (() => Infinity);
     // Count the live load a new lease competes with, per bucket. A `running` job counts if its lease
     // hasn't expired OR it's still dispatched in-process (in `exclude`): an in-flight handler whose
     // DB lease lapsed (missed heartbeat) is filtered out of the lease candidates above but is still
@@ -758,7 +779,13 @@ export async function leaseDue(
       .from(schema.jobs)
       .where(and(eq(schema.jobs.status, "running"), liveLoad));
     const usedByBucket = new Map<string, number>();
+    // The per-type load is tallied separately from the buckets: it spans every project, so it
+    // cannot ride the (type, project) key.
+    const usedByType = new Map<string, number>();
     for (const row of active) {
+      if (typeCapOf(row as JobRow) !== Infinity) {
+        usedByType.set(row.type, (usedByType.get(row.type) ?? 0) + 1);
+      }
       if (capOf(row as JobRow) === Infinity) continue;
       const key = bucketKey(row.type, row.projectId);
       usedByBucket.set(key, (usedByBucket.get(key) ?? 0) + 1);
@@ -767,15 +794,15 @@ export async function leaseDue(
     const picked: JobRow[] = [];
     for (const job of candidates) {
       if (picked.length >= opts.limit) break;
+      const typeCap = typeCapOf(job);
+      const usedOfType = usedByType.get(job.type) ?? 0;
+      if (usedOfType >= typeCap) continue; // type at its runner-wide ceiling — leave queued
       const cap = capOf(job);
-      if (cap === Infinity) {
-        picked.push(job);
-        continue;
-      }
       const key = bucketKey(job.type, job.projectId);
       const used = usedByBucket.get(key) ?? 0;
       if (used >= cap) continue; // bucket at capacity — leave queued, try the next candidate
-      usedByBucket.set(key, used + 1);
+      if (typeCap !== Infinity) usedByType.set(job.type, usedOfType + 1);
+      if (cap !== Infinity) usedByBucket.set(key, used + 1);
       picked.push(job);
     }
     due = picked;

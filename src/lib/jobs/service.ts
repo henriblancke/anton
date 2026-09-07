@@ -80,6 +80,17 @@ function state(): ServiceState {
  */
 const GLOBAL_MAX_CONCURRENT = Number(process.env.ANTON_MAX_CONCURRENT) || 8;
 
+/**
+ * Global ceiling on in-flight `review-fix-pr` jobs across all projects (PR #250 review). The
+ * per-project `reviewFixConcurrency` bounds one project's fan-out, not the sum: four projects each
+ * at the default two would take the whole pool above, and every other job type — execute-epic,
+ * gate-check, sync-push — would wait out a long fix. Half the pool by default, so the other half
+ * is always there for them. Override with ANTON_MAX_REVIEW_FIX_CONCURRENT.
+ */
+const GLOBAL_MAX_REVIEW_FIX_CONCURRENT =
+  Number(process.env.ANTON_MAX_REVIEW_FIX_CONCURRENT) ||
+  Math.max(1, Math.floor(GLOBAL_MAX_CONCURRENT / 2));
+
 /** Read a project's job policy from its settings, filling in defaults for any unset field. */
 async function resolvePolicy(projectId: string | undefined) {
   const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
@@ -159,7 +170,10 @@ export function getRunner(): JobRunner {
     db,
     clock: systemClock,
     log,
-    config: { maxConcurrent: GLOBAL_MAX_CONCURRENT },
+    config: {
+      maxConcurrent: GLOBAL_MAX_CONCURRENT,
+      maxReviewFixConcurrent: GLOBAL_MAX_REVIEW_FIX_CONCURRENT,
+    },
     resolvePolicy,
     resolveBudgetPolicy,
     liveRunCheck,

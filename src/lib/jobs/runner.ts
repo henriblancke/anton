@@ -28,6 +28,7 @@ import {
   enqueue,
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
+  enqueueReviewFixPrIfAbsent,
   getJob,
   leaseDue,
   park,
@@ -74,6 +75,14 @@ export interface RunnerConfig {
   notWiredRetryMs: number;
   /** Max jobs in flight at once. */
   maxConcurrent: number;
+  /**
+   * Max `review-fix-pr` jobs in flight at once ACROSS projects (PR #250 review). The per-project
+   * `reviewFixConcurrency` bounds one project's fan-out, not the sum: four projects each at the
+   * default two are the whole default pool of eight, and an execute-epic, gate-check or sync-push
+   * queued behind them waits out a long fix. This is the reserve for those other types — keep it
+   * below `maxConcurrent`. The wiring (service.ts) defaults it to half the pool.
+   */
+  maxReviewFixConcurrent: number;
   /** Poll interval for the background loop. */
   tickMs: number;
   /**
@@ -94,6 +103,7 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   quotaCooloffMs: 30 * 60_000,
   notWiredRetryMs: 5 * 60_000,
   maxConcurrent: 1,
+  maxReviewFixConcurrent: 1,
   tickMs: 2_000,
   burnSampleMinIntervalMs: 60_000,
 };
@@ -210,6 +220,15 @@ export interface JobContext {
    * Cleared automatically when the job settles — a settled job reports nothing.
    */
   report: (info: LiveJobInfo) => void;
+  /**
+   * Enqueue a per-PR fix job for a run target, deduped against a live one — see
+   * `queue.enqueueReviewFixPrIfAbsent`. Handlers fan out THROUGH the runner rather than calling the
+   * queue helper bare because the runner holds the project-teardown barrier (PR #250 review): a
+   * dispatcher that inserts directly can land a fresh `queued` row after `quiesceProject` swept the
+   * project's active rows, and the delete then fails over it. Returns the new job id, or undefined
+   * when a live job already covers the target — or the project is being torn down.
+   */
+  enqueueReviewFixPr: (projectId: string, epicBeadId: string) => string | undefined;
 }
 
 /**
@@ -564,6 +583,18 @@ export class JobRunner {
   }
 
   /**
+   * Enqueue a `review-fix-pr` job for one run target, deduped against a live one. The teardown
+   * barrier is handed INTO the insert's transaction (like `resume`), not read here first: a
+   * dispatcher mid-triage can only reach the write after `quiesceProject` has raised the flag and
+   * swept, and a pre-read check would still let that write through. Refused → undefined, no row.
+   */
+  enqueueReviewFixPrIfAbsent(projectId: string, epicBeadId: string): string | undefined {
+    return enqueueReviewFixPrIfAbsent(this.db, this.clock, projectId, epicBeadId, {
+      refuseProject: (pid) => this.quiescedProjects.has(pid),
+    });
+  }
+
+  /**
    * Un-park a parked job, returning it to `queued` with a fresh attempt budget so it is picked up
    * on the next tick. The recovery path for a job that exhausted its retries (or hit a permanent
    * error a human has since resolved). Resolves true if a parked job was resumed, false otherwise.
@@ -743,7 +774,8 @@ export class JobRunner {
 
       // The per-PR fix fan-out gets the same treatment against its own setting (anton-kwi6): the
       // dispatcher enqueues one job per actionable PR, so without a cap a busy review day fills the
-      // global pool and starves execute-epic.
+      // global pool and starves execute-epic. This bounds ONE project; the sum over projects is
+      // bounded by `maxReviewFixConcurrent`, passed to leaseDue as `typeCapOf` below.
       const reviewFixByProject = new Map<string, number>();
       for (const pid of await projectIdsWithPendingJobs(this.db, "review-fix-pr")) {
         const policy = await policyOnce(pid);
@@ -800,6 +832,10 @@ export class JobRunner {
       leaseMs: this.config.leaseMs,
       limit: capacity,
       capOf,
+      // The runner-wide review-fix ceiling, on top of the per-project cap in capOf: the sum of every
+      // project's fan-out must leave slots for the other job types (see RunnerConfig).
+      typeCapOf: (job) =>
+        job.type === "review-fix-pr" ? this.config.maxReviewFixConcurrent : Infinity,
       excludeBucketKeys: heldBucketKeys,
       // Never re-lease a job already dispatched in this process. Rolling dispatch keeps a running
       // job in `inFlight` while its handler works; if its lease lapses (missed renewal from sleep or
@@ -1129,6 +1165,8 @@ export class JobRunner {
           },
           signal: controller.signal,
           report: (info) => Object.assign(entry.live, info),
+          enqueueReviewFixPr: (projectId, epicBeadId) =>
+            this.enqueueReviewFixPrIfAbsent(projectId, epicBeadId),
         };
         effect = (await handler(ctx)) ?? undefined;
         outcome = { kind: "success" };

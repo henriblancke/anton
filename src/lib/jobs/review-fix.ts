@@ -41,8 +41,8 @@
  * .product/decisions/2026-08-02-pr-merge-as-gh-pr-gate.md.
  *
  * The dispatcher is enqueued per-project by the scheduler (a polling job): each run examines every
- * in-review epic once. Idempotent throughout — a PR with nothing actionable is dispatched for
- * nothing, a target already covered by a queued/running `review-fix-pr` is not dispatched twice,
+ * in-review epic once. Idempotent throughout — a PR with nothing actionable is not dispatched,
+ * a target already covered by a queued/running `review-fix-pr` is not dispatched twice,
  * claude's fixes are plain commits on the existing branch (a re-run just pushes whatever is left),
  * and finalizing a merge clears `stage:in-review` so a later pass no longer treats the epic as
  * in-review (never finalized twice).
@@ -97,7 +97,7 @@ import { IN_REVIEW, safe } from "./review-fix-board";
 import { finalizeMergedEpic } from "./review-fix-finalize";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
-import { enqueueReviewFixPrIfAbsent, systemClock } from "./queue";
+import { systemClock } from "./queue";
 import type { JobContext, JobEffect, JobHandler, RunnerLogger } from "./runner";
 
 // The per-thread report parser is a review-fix protocol concern; re-export so existing importers
@@ -208,8 +208,7 @@ export function claimOwnerFor(jobId: string): string {
 /** Build the DISPATCHER handler bound to a db/clock. Register it as the "review-fix" handler. */
 export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
   const db = deps.db;
-  const clock = deps.clock ?? systemClock;
-  return (ctx: JobContext) => dispatchInReview({ db, clock, ctx });
+  return (ctx: JobContext) => dispatchInReview({ db, ctx });
 }
 
 /** Build the PER-PR handler bound to a db/clock. Register it as the "review-fix-pr" handler. */
@@ -225,12 +224,8 @@ export function makeReviewFixPrHandler(deps: ReviewFixDeps): JobHandler {
  * work to its own job. Reads the board once and each PR once — no worktree, no claude, no gates —
  * so the pass costs seconds and always fits inside its poll slot.
  */
-async function dispatchInReview(args: {
-  db: AntonDb;
-  clock: Clock;
-  ctx: JobContext;
-}): Promise<JobEffect> {
-  const { db, clock, ctx } = args;
+async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise<JobEffect> {
+  const { db, ctx } = args;
   const { projectId, epicBeadId } = ctx.payload as ReviewFixPayload;
   const project = await getProjectById(db, projectId);
   if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -253,7 +248,9 @@ async function dispatchInReview(args: {
     await ctx.heartbeat();
     try {
       if (!(await needsFix(repo, target, ctx.signal))) continue;
-      if (enqueueReviewFixPrIfAbsent(db, clock, projectId, target.id)) dispatched += 1;
+      // Through the runner, not the queue helper: the `gh` read above yields, and a project delete
+      // landing inside it must refuse this insert or teardown fails over the row (PR #250 review).
+      if (ctx.enqueueReviewFixPr(projectId, target.id)) dispatched += 1;
     } catch (e) {
       // One unreadable PR must not cost the others their dispatch; the failure is surfaced below.
       lastError = e;

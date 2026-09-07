@@ -10,7 +10,7 @@ import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
 import type { TestDb } from "../db/testing";
 import { LABELS, type Bead, type Gate, type GateCheckResult } from "../beads/bd";
-import type { Clock } from "./queue";
+import { enqueueReviewFixPrIfAbsent, type Clock } from "./queue";
 import type { JobContext } from "./runner";
 import { makeProjectDb } from "@/lib/testing/project";
 
@@ -61,7 +61,13 @@ let pass: PassContext;
 
 beforeEach(() => {
   t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: REPO });
-  pass = { db: t.db, clock, projectId: "p1", repo: REPO };
+  pass = {
+    db: t.db,
+    clock,
+    projectId: "p1",
+    repo: REPO,
+    enqueueReviewFixPr: (epicBeadId) => enqueueReviewFixPrIfAbsent(t.db, clock, "p1", epicBeadId),
+  };
   gateListMock.mockReset().mockResolvedValue([]);
   gateCheckMock
     .mockReset()
@@ -104,6 +110,7 @@ function jobCtx(heartbeat = vi.fn().mockResolvedValue(undefined)): JobContext {
     heartbeat,
     signal: new AbortController().signal,
     report: () => {},
+    enqueueReviewFixPr: () => undefined,
   };
 }
 
