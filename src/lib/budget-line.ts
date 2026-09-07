@@ -21,11 +21,17 @@
  */
 import type { BudgetHeadroom, DeferReason } from "./jobs/budget";
 
-/** One job type's rolling burn average, as the API reports it (see `getBurnAverage`). */
+/**
+ * One job type's rolling burn average, as the API reports it. Each side comes from the average that
+ * matches the meter it is charged against: the session meter is account-wide, so `sessionPct` is the
+ * global per-type average (`getBurnAverage`); the weekly ceiling is bounded by the project's quota
+ * share, so `weeklyPct` is that project's own average (`getProjectBurnAverage`) — the same rates the
+ * runner charges.
+ */
 export interface BurnCost {
-  /** Mean session%-points one run of this type burns. */
+  /** Mean session%-points one run of this type burns, across the account. */
   sessionPct: number;
-  /** Mean weekly%-points one run of this type burns. */
+  /** Mean weekly%-points one run of this type burns for the project the line is drawn for. */
   weeklyPct: number;
   /** The average still leans on the tier seed — fewer real samples than the window holds. */
   seeded: boolean;

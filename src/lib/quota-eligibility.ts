@@ -6,16 +6,16 @@
  * the governor still holds that share back is worse than either answer alone.
  *
  * The answer is THREE-VALUED, and that is the whole care of this module. `true` = the picker ranks
- * startable work here, or quota-burning work is already queued/running. `false` = the picker looked
- * and found nothing. ABSENT = nobody looked — the board-picker pass ships disabled, so a project
- * that never armed it has no observation at all, and reading that silence as "idle" would strip a
- * busy repo's share on the strength of a question this machine never asked.
+ * startable work here, or quota-burning work is already startable — running, or queued and due.
+ * `false` = the picker looked and found nothing. ABSENT = nobody looked — the board-picker pass
+ * ships disabled, so a project that never armed it has no observation at all, and reading that
+ * silence as "idle" would strip a busy repo's share on a question this machine never asked.
  *
  * Work in flight counts alongside the picker's ranking because that is what makes reclaim prompt: a
- * repo that wakes up on Friday is back in the denominator the moment work is enqueued, rather than
+ * repo that wakes up on Friday is back in the denominator the moment work is DUE, rather than
  * waiting for the next scheduled pass to re-rank its board.
  */
-import { inArray } from "drizzle-orm";
+import { and, eq, lte, or } from "drizzle-orm";
 
 import { burnsClaudeQuota } from "./burn";
 import { schema } from "./db";
@@ -24,11 +24,11 @@ import type { AntonDb, JobType } from "./jobs/queue";
 /** Per-project eligibility; a project absent from the map was never observed, which is not `false`. */
 export type WorkEligibility = ReadonlyMap<string, boolean>;
 
-/** Statuses that mean the work is here now — a parked or finished job says nothing about idleness. */
-const IN_FLIGHT = ["queued", "running"] as const;
-
 /** What this machine can observe about who holds eligible work, by project id. */
-export async function observedWorkEligibility(db: AntonDb): Promise<WorkEligibility> {
+export async function observedWorkEligibility(
+  db: AntonDb,
+  now: number = Date.now(),
+): Promise<WorkEligibility> {
   const [plans, inFlight] = await Promise.all([
     db
       .select({
@@ -39,7 +39,17 @@ export async function observedWorkEligibility(db: AntonDb): Promise<WorkEligibil
     db
       .select({ projectId: schema.jobs.projectId, type: schema.jobs.type })
       .from(schema.jobs)
-      .where(inArray(schema.jobs.status, [...IN_FLIGHT])),
+      // The same definition of "startable" the queue itself leases on (`leaseDue`): running, or
+      // queued AND DUE. A queued row pushed to a future `runAt` — a retry backoff, a usage-limit
+      // reschedule, a budget deferral — cannot start before then, so counting it holds the project
+      // in the denominator while none of its work can spend, blocking the very reallocation that
+      // window exists to allow, and telling the settings panel it has work ready when it has none.
+      .where(
+        or(
+          eq(schema.jobs.status, "running"),
+          and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, new Date(now))),
+        ),
+      ),
   ]);
 
   const eligibility = new Map(plans.map((p) => [p.projectId, p.targetCount > 0]));

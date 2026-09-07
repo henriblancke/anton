@@ -152,7 +152,7 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
     getClaudeUsageCached().catch(() => null),
     // A failed read leaves every project UNOBSERVED, not idle: nobody's share moves on a query that
     // did not answer.
-    observedWorkEligibility(db).catch(() => null),
+    observedWorkEligibility(db, now).catch(() => null),
   ]);
   const attempts = await attemptsByProject(db, weeklyWindowStart(usage, now)).catch(
     () => new Map<string, Map<string, number>>(),

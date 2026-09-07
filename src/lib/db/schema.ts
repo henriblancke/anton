@@ -142,6 +142,14 @@ export const jobs = sqliteTable(
     index("jobs_project_parked_idx")
       .on(table.projectId, table.updatedAt)
       .where(sql`${table.status} = 'parked'`),
+    // Serves the quota-share spend estimate (R6.3, ./quota-spend), which sums attempts over the
+    // current quota week: once per governor tick for one project, and once per settings render for
+    // every project. `updated_at` leads because the week window is the predicate BOTH readers share
+    // — the all-project read has no project to seek on, so a (project_id, updated_at) index would
+    // leave it scanning a jobs table that keeps every finished job for the life of the project.
+    // Seeking the week first bounds both to the same small slice, and the per-project read narrows
+    // inside it without a second index to maintain on every job write.
+    index("jobs_updated_project_idx").on(table.updatedAt, table.projectId),
   ],
 );
 

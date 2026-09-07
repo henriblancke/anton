@@ -16,7 +16,7 @@ import { eq } from "drizzle-orm";
 
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
-import { recordBurnSample } from "@/lib/burn";
+import { recordBurnSample, TIER_SEEDS } from "@/lib/burn";
 import { systemClock } from "@/lib/jobs/queue";
 import type { ClaudeUsage } from "@/lib/claude/usage";
 import type { BudgetSignal } from "@/lib/budget-line";
@@ -118,14 +118,38 @@ describe("GET /picker/budget", () => {
   });
 
   it("reports the measured average once a type is fully sampled", async () => {
+    // Attributed to this project: the weekly side is charged at the project's own rate, so an
+    // unattributed sample would leave that half on the tier seed.
     for (let i = 0; i < 5; i++) {
-      await recordBurnSample(tdb.db, systemClock, "execute-epic", null, {
+      await recordBurnSample(tdb.db, systemClock, "execute-epic", "p1", {
         sessionDelta: 30,
         weeklyDelta: 4,
       });
     }
     const body = (await (await GET(req(), ctx("tmp"))).json()) as BudgetSignal;
     expect(body.burn["execute-epic"]).toEqual({ sessionPct: 30, weeklyPct: 4, seeded: false });
+  });
+
+  // The weekly side of the line is bounded by this project's SHARE, which the governor charges at
+  // the project's own measured rate — so a lane charging the global rate would show an expensive
+  // project too many affordable cards and a cheap one too few (PR #248 review). The session side
+  // stays global: that meter is account-wide, and the runner's value gate charges it globally too.
+  it("charges the weekly side at this project's rate and the session side at the account's", async () => {
+    await neighbour("p2", {});
+    // Only the NEIGHBOUR has samples, so the two averages cannot be confused: the account-wide read
+    // is fully measured while this project has nothing of its own and falls back to the tier seed.
+    for (let i = 0; i < 5; i++) {
+      await recordBurnSample(tdb.db, systemClock, "execute-epic", "p2", {
+        sessionDelta: 30,
+        weeklyDelta: 4,
+      });
+    }
+
+    const body = (await (await GET(req(), ctx("tmp"))).json()) as BudgetSignal;
+    expect(body.burn["execute-epic"]?.sessionPct).toBe(30);
+    expect(body.burn["execute-epic"]?.weeklyPct).toBe(TIER_SEEDS.L.weeklyPct);
+    // Seeded on either side is seeded: the line leans on an estimate and must say so.
+    expect(body.burn["execute-epic"]?.seeded).toBe(true);
   });
 
   it("answers 204 when usage is unreadable — the governor fails open and so does the line", async () => {

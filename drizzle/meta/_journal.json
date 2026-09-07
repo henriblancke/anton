@@ -218,6 +218,13 @@
       "when": 1788734620828,
       "tag": "0030_burn_sample_project",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1788810018109,
+      "tag": "0031_jobs_updated_idx",
+      "breakpoints": true
     }
   ]
 }

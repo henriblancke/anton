@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { RUN_JOB_TYPE, type BudgetSignal } from "@/lib/budget-line";
-import { getBurnAverage } from "@/lib/burn";
+import { getBurnAverage, getProjectBurnAverage } from "@/lib/burn";
 import { getClaudeUsageCached } from "@/lib/claude/usage";
 import { getDb } from "@/lib/db";
 import { budgetHeadroom, withQuotaShare } from "@/lib/jobs/budget";
@@ -49,14 +49,23 @@ export const GET = withProject<{ slug: string }>(async (_request, { project }) =
   const headroom = budgetHeadroom(usage, policy, Date.now(), { projectWeeklyPct });
   if (!headroom) return new NextResponse(null, { status: 204 });
 
-  const average = await getBurnAverage(db, RUN_JOB_TYPE);
+  // Each side is charged at the meter it is spent against, the same split the runner applies: the
+  // 5-hour session is one account-wide meter every repo moves, so it takes the global per-type
+  // average (`valueGateHolds`); the weekly side is bounded by THIS project's share, so it takes the
+  // project's own average (`projectWeeklyBurn`). Charging the global weekly rate here would show an
+  // expensive project too many affordable cards and a cheap one too few, against a ceiling the
+  // governor enforces at a different rate.
+  const [account, projectAverage] = await Promise.all([
+    getBurnAverage(db, RUN_JOB_TYPE),
+    getProjectBurnAverage(db, project.id, RUN_JOB_TYPE),
+  ]);
   const signal: BudgetSignal = {
     headroom,
     burn: {
       [RUN_JOB_TYPE]: {
-        sessionPct: average.sessionAvg,
-        weeklyPct: average.weeklyAvg,
-        seeded: average.seeded,
+        sessionPct: account.sessionAvg,
+        weeklyPct: projectAverage.weeklyAvg,
+        seeded: account.seeded || projectAverage.seeded,
       },
     },
   };
