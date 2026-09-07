@@ -14,7 +14,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LABELS, type Bead } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
-import { parseGardenerPlan, proposalFingerprint } from "./detections";
+import { parseGardenerPlan, proposalFingerprint, REASK_AFTER_DAYS } from "./detections";
 import {
   apply,
   applyWith,
@@ -50,6 +50,7 @@ import {
   showBead,
   startable,
   SUPERSEDE,
+  UNDEFER,
   warm,
 } from "./apply.fixture";
 
@@ -74,6 +75,7 @@ vi.mock("../beads/bd", async () => {
       close: (_cwd: string, id: string, reason?: string) => record("close", id, reason ?? ""),
       supersede: (_cwd: string, id: string, w: string) => record("supersede", id, w),
       defer: (_cwd: string, id: string) => record("defer", id),
+      undefer: (_cwd: string, id: string) => record("undefer", id),
       update: (_cwd: string, id: string, patch: { priority?: number }) =>
         record("update", id, `P${patch.priority}`),
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
@@ -724,6 +726,18 @@ describe("declining — the board's own memory of a no", () => {
 
   it("has nothing to say about a bead that is not a proposal", () => {
     expect(declineNote(bead("anton-x"))).toBeUndefined();
+  });
+
+  // The one kind whose decline EXPIRES (anton-rozm). "Never again" is what every other decline buys;
+  // promising it here and then coming back in a quarter would teach a founder to read the others as
+  // suggestions — so the window is stated, and so is the answer that ends it for good.
+  it("states the window a re-judgement's decline holds for, and how to end it permanently", () => {
+    const note = declineNote(proposalFor(UNDEFER));
+
+    expect(note).toContain(UNDEFER.fingerprint);
+    expect(note).toContain(`${REASK_AFTER_DAYS} days`);
+    expect(note).toContain("stays parked");
+    expect(note).toContain(LABELS.abandoned);
   });
 });
 

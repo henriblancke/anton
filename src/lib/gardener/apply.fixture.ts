@@ -421,6 +421,20 @@ export const CLOSE = planFor({
   subjects: ["anton-a"],
 });
 
+/**
+ * The gardener's re-judgement (anton-rozm): parked work returned to the board. The mirror of
+ * {@link DEFER} — same subject, opposite verb — so the two are asserted against the same board.
+ */
+export const UNDEFER = planFor({
+  kind: "aged-defer",
+  move: "undefer",
+  subjects: ["anton-a"],
+});
+
+/** An {@link UNDEFER} subject: parked long before the filing and untouched since, which IS the ask. */
+export const parked = (extra: Partial<Bead> = {}): Bead =>
+  cold("anton-a", { status: "deferred", ...extra });
+
 export const SUPERSEDE = planFor({
   kind: "superseded",
   move: "retire",

@@ -16,9 +16,11 @@
  *      duplicates, retiring stale work and relinking orphans are judgment moves that need a human
  *      (anton-bci0 "Out of scope"), and the seam deliberately has no wrapper for `--auto-merge`.
  *   3. PROPOSALS (gardener-proposals.ts, anton-9qwq) — the judgment tier: what the report can only
- *      describe becomes an approvable proposal bead. A kind the operator has ARMED (anton-nbyy) is
- *      then applied by the pass itself, capped, through the approve route's own `applyProposal`
- *      (anton-4ab3); everything else waits for a human.
+ *      describe becomes an approvable proposal bead, alongside the RE-JUDGEMENT of work an earlier
+ *      patrol parked (anton-dsnr) — which rides this cadence rather than one of its own because the
+ *      claim is a duration, so measuring it costs no session. A kind the operator has ARMED
+ *      (anton-nbyy) is then applied by the pass itself, capped, through the approve route's own
+ *      `applyProposal` (anton-4ab3); everything else waits for a human.
  *
  * The board is PULLED first and NUDGED after — the patrol reads the shared board and writes to it,
  * so it must not act on a working set that is a sync heartbeat behind (an epic whose child another
@@ -171,7 +173,11 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
       //
       // After the report is published, so a failure filing proposals costs the pass its judgment tier
       // and not its findings.
-      await fileGardenerProposals(scope, { findings, observedAtMs, arbitration: deps.arbitration });
+      const filed = await fileGardenerProposals(scope, {
+        findings,
+        observedAtMs,
+        arbitration: deps.arbitration,
+      });
 
       // A patrol that closed nothing and found nothing is the healthy board's outcome, and the one
       // an operator most needs told apart from a patrol that never ran. Read from the MERGED
@@ -185,6 +191,13 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
         closed > 0 && `closed ${closed} epic(s)`,
         actions.rowsRecomputed > 0 && `recomputed ${actions.rowsRecomputed} blocked row(s)`,
         findings.length > 0 && `${findings.length} finding(s)`,
+        // The asks the judgment tier filed earn a clause of their own, because several kinds rest on
+        // no hygiene finding at all — a re-judgement (anton-30vo), a container orphan — so without
+        // this a patrol that filed three questions would settle as "board clean". It counts what was
+        // WRITTEN, so an armed kind the pass then applied itself still shows here rather than
+        // vanishing into a clean-looking night; which asks are still open is the armed walk's own
+        // record, by id, in this session's log.
+        filed > 0 && `filed ${filed} proposal(s)`,
       ].filter((clause): clause is string => clause !== false);
       effect =
         did.length > 0
