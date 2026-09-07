@@ -4,9 +4,10 @@
  * The claim under test is that "has eligible work" is answered from both signals a repo can wake up
  * on — the picker's latest ranking AND work that can start now — so reclaim is prompt rather than
  * gated on the next scheduled picker pass; that "can start now" means the queue's own definition
- * (running, or queued and DUE), so a backed-off row does not hold a share it cannot spend; that
- * plumbing costing no quota never counts as a claim on anyone's share; and that a project nothing
- * has observed is reported as UNKNOWN rather than idle.
+ * (running, or queued and DUE), so a backed-off row does not hold a share it cannot spend; that a
+ * queued row the runner's own claim gates hold — autonomy off, schedule disabled — is likewise no
+ * claim (PR #248 review); that plumbing costing no quota never counts as a claim on anyone's share;
+ * and that a project nothing has observed is reported as UNKNOWN rather than idle.
  */
 import { randomUUID } from "node:crypto";
 import { beforeEach, afterEach, describe, expect, it } from "vitest";
@@ -26,8 +27,21 @@ beforeEach(() => {
 });
 afterEach(() => tdb.close());
 
-function project(id: string): string {
-  return insertProject(tdb.db, { id, slug: id, name: id, repoPath: `/tmp/${id}` });
+function project(id: string, settings: Record<string, unknown> = {}): string {
+  return insertProject(tdb.db, {
+    id,
+    slug: id,
+    name: id,
+    repoPath: `/tmp/${id}`,
+    settingsJson: JSON.stringify(settings),
+  });
+}
+
+function schedule(projectId: string, type: JobType, enabled: boolean): void {
+  tdb.db
+    .insert(schema.schedules)
+    .values({ id: randomUUID(), projectId, type, cron: "0 * * * *", enabled })
+    .run();
 }
 
 function plan(projectId: string, targetCount: number): void {
@@ -107,6 +121,51 @@ describe("observedWorkEligibility", () => {
     job(busy, "execute-epic", "running", new Date(NOW + 60 * 60 * 1000));
 
     expect(eligibilityOf(await observedWorkEligibility(tdb.db, NOW), busy)).toBe(true);
+  });
+
+  it("does not count execute-epic work an autonomy-off project cannot claim", async () => {
+    // The runner caps an autonomy-off project's execute-epic bucket at 0 (`tickOnce`), so a due row
+    // there sits queued until an operator flips the switch. Holding the share on it blocks idle
+    // renormalization for as long as the switch stays off — and the picker's ranking is the same
+    // claim, since every start it makes is an execute-epic.
+    const paused = project("paused", { autonomy: false });
+    plan(paused, 3);
+    job(paused, "execute-epic", "queued");
+
+    expect(eligibilityOf(await observedWorkEligibility(tdb.db, NOW), paused)).toBe(false);
+  });
+
+  it("still counts an autonomy-off project's other quota-burning work, and its running runs", async () => {
+    // Autonomy gates the CLAIM of execute-epic only: a review-fix leases regardless, and a run
+    // already in flight keeps spending until it settles.
+    const fixing = project("fixing", { autonomy: false });
+    plan(fixing, 0);
+    job(fixing, "review-fix", "queued");
+    const finishing = project("finishing", { autonomy: false });
+    plan(finishing, 0);
+    job(finishing, "execute-epic", "running");
+
+    const eligibility = await observedWorkEligibility(tdb.db, NOW);
+    expect(eligibilityOf(eligibility, fixing)).toBe(true);
+    expect(eligibilityOf(eligibility, finishing)).toBe(true);
+  });
+
+  it("does not count a queued job whose schedule is disabled", async () => {
+    // A disabled schedule caps its (type, project) bucket at 0 at claim time, not just at enqueue,
+    // so an already-queued review-fix is held exactly like an autonomy-off execute-epic.
+    const off = project("off");
+    plan(off, 0);
+    schedule(off, "review-fix", false);
+    job(off, "review-fix", "queued");
+    // The gate is per (type, project): another project's disabled schedule says nothing here.
+    const on = project("on");
+    plan(on, 0);
+    schedule(on, "review-fix", true);
+    job(on, "review-fix", "queued");
+
+    const eligibility = await observedWorkEligibility(tdb.db, NOW);
+    expect(eligibilityOf(eligibility, off)).toBe(false);
+    expect(eligibilityOf(eligibility, on)).toBe(true);
   });
 
   it("attributes nothing to anton's own project-less plumbing", async () => {
