@@ -563,6 +563,29 @@ function queuedSyncPushId(
 }
 
 /**
+ * Id of the `queued` job of `type` for this project, if one exists — "a pass is already owed".
+ *
+ * The read the picker's board-change nudge folds onto (anton-h32k), so a board that keeps moving
+ * cannot pile queued passes behind a busy runner. `running` is excluded for
+ * {@link enqueueSyncPushDeduped}'s reason: a pass in flight may have read the board BEFORE the
+ * change that nudged this one, so a follow-up must still be schedulable.
+ */
+export function queuedJobId(
+  db: Pick<AntonDb, "select">,
+  type: JobType,
+  projectId: string,
+): string | undefined {
+  return firstJobId(
+    db,
+    and(
+      eq(schema.jobs.type, type),
+      eq(schema.jobs.projectId, projectId),
+      eq(schema.jobs.status, "queued"),
+    ),
+  );
+}
+
+/**
  * Enqueue a durable sync-push job for a project's repo, deduped per repo (anton-nowq, anton-x7la).
  * Every local write can call this; the dedupe collapses a burst of writes onto at most one QUEUED
  * push job (all of a repo's writes push the same Dolt remote), so the queue never fills with

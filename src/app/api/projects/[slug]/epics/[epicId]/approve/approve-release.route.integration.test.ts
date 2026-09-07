@@ -10,7 +10,9 @@
  * Nor can it prove the half the button is not trusted for: the `release` flag is a CLAIM that this
  * target was anton's pick, and a stale lane or a direct caller can set it on anything runnable. The
  * cases below hold the server's own verdict — no plan entry, a stale plan, a vetoed pick, a disarmed
- * picker — each of which releases exactly as an approve does and records no evidence.
+ * picker — each of which releases exactly as an approve does and records no evidence. The one
+ * verdict that does stop the run is a SUPERSEDED generation whose re-derivation drops the target
+ * (anton-k4qr): anton would not pick it now, so the start is refused before anything is written.
  */
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
@@ -21,9 +23,11 @@ import {
   getBoardPickerPlan,
   saveBoardPickerPlan,
   stampBoard,
+  type BoardPickerPlan,
   type BoardStamp,
 } from "@/lib/board-picker-plan";
 import { loadAllIssues } from "@/lib/beads/issues";
+import { ADMIT_ALL_POLICY, STRUCTURAL_RULE, decideBoardPickerPlan } from "@/lib/jobs/picker-decision";
 import { listPickerVerdicts, pickerTrackRecord, recordPickerVeto } from "@/lib/picker-veto";
 
 let fileDb: ApproveSuiteCtx["fileDb"];
@@ -54,9 +58,46 @@ async function liveStamp(): Promise<BoardStamp> {
   return stampBoard(board, Date.now());
 }
 
+/**
+ * The generation the ROUTE will still be standing on when it resolves the release.
+ *
+ * A hand-written plan is no longer a usable fixture for the unsuperseded path (anton-f12y): the
+ * board read the route makes derives the ranking and records it, so a synthetic one-entry plan is
+ * replaced before the release is ever resolved, and every `planId` the client named reads as
+ * superseded. So the fixture records what a board read records — the same pure decision over the
+ * same live board — which `saveBoardPickerPlan` then RESTATES rather than replaces.
+ *
+ * Answers with the whole plan, because what a release must record is that generation's own rank and
+ * rule, and neither is a literal a test may assume.
+ */
+async function livePlan(): Promise<BoardPickerPlan> {
+  const board = await loadAllIssues(repo);
+  const project = await projectId();
+  const now = Date.now();
+  await saveBoardPickerPlan(getDb(), { now: () => now }, {
+    projectId: project,
+    ...decideBoardPickerPlan({
+      board,
+      policy: ADMIT_ALL_POLICY,
+      runtime: { observedAtMs: now },
+    }),
+  });
+  return (await getBoardPickerPlan(getDb(), project))!;
+}
+
+/** The plan the live board holds for `beadId`, or undefined when the ranking leaves it out. */
+async function livePick(beadId: string) {
+  const plan = await livePlan();
+  return { plan, entry: plan.entries.find((e) => e.beadId === beadId) };
+}
+
 /** Record a plan that ranks `beadId` first, so a release has a pick to answer. Returns the plan's
  *  GENERATION id — what a recorded accept must name as the decision it answers, and deliberately not
- *  the reusable board digest. */
+ *  the reusable board digest.
+ *
+ *  A DECISION NO BOARD READ MAKES, which is exactly what the superseded cases need: the route's own
+ *  read replaces it, so the `planId` a client names against it is provably a generation that no
+ *  longer stands. Use {@link livePlan} for the cases that need the opposite. */
 async function planFor(
   beadId: string,
   stamp?: BoardStamp,
@@ -79,9 +120,16 @@ async function verdictsFor(beadId: string) {
   return rows.filter((r) => r.beadId === beadId);
 }
 
-/** A runnable feature-with-child pair, the shape every release case starts from. */
-async function runTarget(title: string): Promise<string> {
-  const epic = await beads.create(repo, { title, type: "epic", acceptance: "- [ ] it works" });
+/** A runnable feature-with-child pair, the shape every release case starts from. `labels` is how a
+ *  case makes the target runnable-but-never-PICKED: `agent:human` is approvable work anton refuses
+ *  to rank, which is exactly the gap between what approve admits and what the picker offers. */
+async function runTarget(title: string, labels?: string[]): Promise<string> {
+  const epic = await beads.create(repo, {
+    title,
+    type: "epic",
+    acceptance: "- [ ] it works",
+    ...(labels ? { labels } : {}),
+  });
   const child = await beads.create(repo, {
     title: `${title} child`,
     type: "task",
@@ -107,7 +155,8 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
   it("performs exactly the approval — approve, auto-claim, one run — and records the accept", async () => {
     actAs("anton-test");
     const epic = await runTarget("Released target");
-    const planId = await planFor(epic);
+    const { plan, entry } = await livePick(epic);
+    expect(entry).toBeDefined();
 
     const res = await approve(epic, { release: true });
     expect(res.status).toBe(200);
@@ -128,9 +177,9 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
         beadId: epic,
         verdict: "accepted",
         action: "release",
-        rank: 1,
-        planId,
-        rule: "the work policy armed on this machine",
+        rank: entry!.rank,
+        planId: plan.planId,
+        rule: STRUCTURAL_RULE,
       }),
     ]);
     // The accept has no window to bound — only a decline defers.
@@ -140,19 +189,26 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
   it("records the accept against the generation the operator named", async () => {
     actAs("anton-test");
     const epic = await runTarget("Named generation");
-    const planId = await planFor(epic);
+    const { plan, entry } = await livePick(epic);
 
-    expect((await approve(epic, { release: true, planId })).status).toBe(200);
+    expect((await approve(epic, { release: true, planId: plan.planId })).status).toBe(200);
 
     expect(await verdictsFor(epic)).toEqual([
-      expect.objectContaining({ beadId: epic, verdict: "accepted", planId, rank: 1 }),
+      expect.objectContaining({
+        beadId: epic,
+        verdict: "accepted",
+        planId: plan.planId,
+        rank: entry!.rank,
+      }),
     ]);
   });
 
-  it("records nothing when a later pass replaced the generation the operator answered", async () => {
-    // The tab still shows generation A; the pass has since written B over it, carrying the same
-    // bead. Resolving the pick from B would credit the picker with an agreement to a decision that
-    // was never on screen — and could answer a pick another tab has already vetoed (PR #212 review).
+  it("re-derives a superseded generation and records against the one that now stands", async () => {
+    // The tab still shows generation A; something has since written B over it. Resolving the pick
+    // from B would credit the picker with an agreement to a decision that was never on screen — but
+    // dropping the answer loses an accept the operator did make, while the approve and the run land
+    // anyway (anton-k4qr). So the plan is re-decided from the board this request read, and the
+    // accept names THAT generation, with its rank and its rule.
     actAs("anton-test");
     const epic = await runTarget("Superseded generation");
     const displayed = await planFor(epic);
@@ -160,8 +216,55 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
     expect(current).not.toBe(displayed);
 
     expect((await approve(epic, { release: true, planId: displayed })).status).toBe(200);
-    // The run is the operator's to have either way — only the evidence is withheld.
     expect(await executeEpicJobs(epic)).toHaveLength(1);
+
+    // The generation the re-derivation left standing — neither the one on screen nor the one that
+    // replaced it — and the accept quotes its own entry rather than the displayed plan's rank 1.
+    const fresh = (await getBoardPickerPlan(getDb(), await projectId()))!;
+    const entry = fresh.entries.find((e) => e.beadId === epic);
+    expect(entry).toBeDefined();
+    expect(await verdictsFor(epic)).toEqual([
+      expect.objectContaining({
+        beadId: epic,
+        verdict: "accepted",
+        planId: fresh.planId,
+        rank: entry!.rank,
+        rule: entry!.rule,
+      }),
+    ]);
+  });
+
+  it("refuses the start when the re-derived ranking no longer carries the target", async () => {
+    // The other half of anton-k4qr: the generation on screen was replaced AND the board has moved
+    // the target out of the ranking — here by `agent:human`, work no agent may start. A release is a
+    // request to START the pick, so anton refusing to pick it is a refusal of the start, taken
+    // before anything is written: no approval, no claim, no run.
+    actAs("anton-test");
+    const epic = await beads.create(repo, {
+      title: "Retired pick",
+      type: "epic",
+      acceptance: "- [ ] it works",
+      labels: ["agent:human"],
+    });
+    const child = await beads.create(repo, {
+      title: "Retired pick child",
+      type: "task",
+      acceptance: "- [ ] it works",
+    });
+    await beads.link(repo, child, epic, "parent-child");
+    const displayed = await planFor(epic);
+    expect(await planFor(epic, undefined, "a rule the next pass ranked it under")).not.toBe(displayed);
+
+    const res = await approve(epic, { release: true, planId: displayed });
+    expect(res.status).toBe(409);
+    // Named, so the operator learns which fact retired their pick rather than that "it failed".
+    expect((await res.json()).error).toContain("needs-human");
+
+    // Neither the approval nor the enqueue — and no evidence about a start that never happened.
+    const bead = await beads.show(repo, epic);
+    expect(beads.isApproved(bead)).toBe(false);
+    expect(bead.assignee ?? null).toBeNull();
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
     expect(await verdictsFor(epic)).toHaveLength(0);
   });
 
@@ -268,11 +371,12 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
   it("records nothing for a target the recorded plan never picked", async () => {
     // The flag is a CLAIM, not a fact: a direct caller can set `release` on any runnable target. An
     // accept for a pick anton never made would tell earned autonomy the operator agreed with a
-    // decision they were never shown, so the run stands and the evidence does not.
+    // decision they were never shown, so the run stands and the evidence does not. `agent:human` is
+    // the gap that makes this stageable — approvable work the picker will never rank, so no plan,
+    // recorded or re-derived, carries it.
     actAs("anton-test");
-    const picked = await runTarget("The actual pick");
-    const unpicked = await runTarget("Never picked");
-    await planFor(picked);
+    const unpicked = await runTarget("Never picked", ["agent:human"]);
+    await livePlan();
 
     const res = await approve(unpicked, { release: true });
     expect(res.status).toBe(200);
@@ -283,34 +387,47 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
   });
 
   it("records nothing for an unnamed pick even when the generation named is the current one", async () => {
-    // The lane is DERIVED (anton-r0ew): it ranks targets the recorded plan has not caught up with,
-    // so a release can arrive naming the very generation on screen for a bead that generation never
-    // picked. Naming the right plan is not agreeing with a decision it contains — the accept is
-    // refused on the entry, not on the id (anton-5axf). The board withholds the button on the same
-    // fact; this is the half a client cannot be trusted for.
+    // Naming the right plan is not agreeing with a decision it contains — the accept is refused on
+    // the ENTRY, not on the id (anton-5axf). And the generation being current is what makes this
+    // distinct from the superseded cases above: nothing is re-derived, because nothing was replaced.
+    // The board withholds the button on the same fact; this is the half a client cannot be trusted for.
     actAs("anton-test");
-    const picked = await runTarget("Named by the plan");
-    const derived = await runTarget("Ranked ahead of the plan");
-    const planId = await planFor(picked);
+    const unranked = await runTarget("Named the plan, not in it", ["agent:human"]);
+    const plan = await livePlan();
+    expect(plan.entries.some((e) => e.beadId === unranked)).toBe(false);
 
-    const res = await approve(derived, { release: true, planId });
+    const res = await approve(unranked, { release: true, planId: plan.planId });
     expect(res.status).toBe(200);
-    expect(await executeEpicJobs(derived)).toHaveLength(1);
+    expect(await executeEpicJobs(unranked)).toHaveLength(1);
 
-    expect(await verdictsFor(derived)).toHaveLength(0);
+    expect(await verdictsFor(unranked)).toHaveLength(0);
   });
 
-  it("records nothing when the board has moved past the plan that picked the target", async () => {
-    // The lane's own standard, held on the server: a stale plan withholds `[Release]`, so a release
-    // that arrives against one came from a client whose copy of the decision is provably behind.
+  it("re-derives a plan the board has moved past rather than answering it", async () => {
+    // A client whose copy of the decision is provably behind. The route's own board read re-decides
+    // the ranking from the board it just refreshed (anton-f12y), so what a release finds here is
+    // never the stale generation — and anton-k4qr is what makes the answer land against the one that
+    // replaced it instead of evaporating. The stale-generation SKIP itself is unreachable through
+    // this route and is pinned where it can be staged: `picker-release.test.ts`.
     actAs("anton-test");
     const epic = await runTarget("Stale pick");
-    await planFor(epic, { observedAtMs: Date.now(), digest: STALE_DIGEST, beadCount: 1 });
+    const stale = await planFor(epic, { observedAtMs: Date.now(), digest: STALE_DIGEST, beadCount: 1 });
 
-    expect((await approve(epic, { release: true })).status).toBe(200);
+    expect((await approve(epic, { release: true, planId: stale })).status).toBe(200);
     expect(await executeEpicJobs(epic)).toHaveLength(1);
 
-    expect(await verdictsFor(epic)).toHaveLength(0);
+    const fresh = (await getBoardPickerPlan(getDb(), await projectId()))!;
+    const entry = fresh.entries.find((e) => e.beadId === epic);
+    expect(fresh.planId).not.toBe(stale);
+    expect(await verdictsFor(epic)).toEqual([
+      expect.objectContaining({
+        beadId: epic,
+        verdict: "accepted",
+        planId: fresh.planId,
+        rank: entry!.rank,
+        rule: STRUCTURAL_RULE,
+      }),
+    ]);
   });
 
   it("records nothing for a pick the policy's age bounds have moved past", async () => {
