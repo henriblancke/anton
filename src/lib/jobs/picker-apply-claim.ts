@@ -17,6 +17,7 @@ import { isServerMode } from "../beads/board-mode";
 import { ownerOf } from "../beads/claim";
 import { loadAllIssues } from "../beads/issues";
 import type { Bead } from "../beads/types";
+import { errorText, sleepMs } from "../retry-helpers";
 import type { PickerDisarmCheck, PickerStanceCheck } from "./picker-apply-checks";
 import type { PickerApplyOutcome } from "./picker-apply-outcome";
 import { ineligibility } from "./picker-targets";
@@ -48,16 +49,6 @@ function refreshFor(repoPath: string): (() => Promise<StartRefusal | undefined>)
     }
   };
 }
-
-function errorText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
-const sleepMs = (ms: number): Promise<void> =>
-  new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    if (typeof t.unref === "function") t.unref();
-  });
 
 /**
  * The settle seam, declared structurally like `beads.claimVerified`'s own deps so a test can drive
