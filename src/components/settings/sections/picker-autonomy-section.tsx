@@ -95,9 +95,15 @@ export function lockedPickerReason(earned: EarnedPicker): string {
   return earned.reason ?? "no record could be read for this project — apply stays locked";
 }
 
-/** The released share of what was answered, or undefined when nothing has been answered at all. */
+/**
+ * The released share of what was answered, or undefined when nothing has been answered at all.
+ *
+ * Floored on integer math, never rounded, so the number the rung PRINTS agrees with the test that
+ * colours it (PR #245 review): 26/29 rounds up to 90 and would read `90%/90%` on a rung the floor
+ * leaves short, sending the operator back to the raw counts to find out why it is still red.
+ */
 function releasedPct(earned: EarnedPicker): number | undefined {
-  return earned.settled > 0 ? Math.round((earned.accepted / earned.settled) * 100) : undefined;
+  return earned.settled > 0 ? Math.floor((earned.accepted * 100) / earned.settled) : undefined;
 }
 
 /**

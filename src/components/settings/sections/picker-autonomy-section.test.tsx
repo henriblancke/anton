@@ -150,6 +150,24 @@ describe("PickerAutonomySection ladder (anton-z1lp)", () => {
     expect(radio("apply").disabled).toBe(true);
   });
 
+  it("floors the released label, so a rung short of the floor never prints as having cleared it", () => {
+    // 26 of 29 is 89.66%: rounded it reads `90%/90%` beside a meter the cross-multiplied floor
+    // leaves red, and the operator has to work back through the raw counts to find out why.
+    render(
+      <PickerAutonomySection
+        slug="p1"
+        armed
+        stored="shadow"
+        earned={{ accepted: 26, settled: 29, bar: PICKER_BAR }}
+      />,
+    );
+
+    const rung = screen.getByText("89%/90%");
+    expect(screen.getByText("26 of 29 answered")).toBeTruthy();
+    // The label agrees with the colour: both say short of the bar.
+    expect(rung.className).toContain("text-risk-med");
+  });
+
   it("locked: offers the deliberate arming, and only behind an acknowledged confirmation", async () => {
     const fetchMock = vi
       .fn()

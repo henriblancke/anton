@@ -105,13 +105,16 @@ export function ReleaseAction({
         pickRefused?: ReleaseRefusal;
       } | null;
       if (!res.ok) {
-        // Nothing was approved, so the pick is answerable again — by this button or by the veto.
-        decision.abandon();
         const message = body?.error ?? `Release failed (${res.status})`;
         // The pick itself was refused: anton re-derived the ranking and this target is no longer in
         // it (or somebody else already took it). Reported as a state, with the route's own sentence
         // — it names which fact retired the pick and what to do instead.
         if (body?.pickRefused) {
+          // SETTLED, not handed back (PR #245 review). This branch replaces the button for good, so
+          // abandoning would reopen only the veto beside it — leaving the operator a `Never` that
+          // files a decline and a hold against a target the server has just said is no longer a
+          // pick. The same answer the veto gives its own 409: the pick is over, not un-answered.
+          decision.settle();
           setRefused({ refusal: body.pickRefused, message });
           toast.warning(
             body.pickRefused === "settled"
@@ -120,6 +123,8 @@ export function ReleaseAction({
             { description: message },
           );
         } else {
+          // Nothing was approved, so the pick is answerable again — by this button or by the veto.
+          decision.abandon();
           setFailure(message);
           toast.error(message);
         }
