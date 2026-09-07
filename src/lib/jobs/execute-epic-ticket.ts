@@ -248,16 +248,21 @@ export function assertDelivered(ticket: Bead, facts: StepFacts, progress: Ticket
  * How much a self-report OUTRANKS the one a phase already carries. A phase of several dispatching
  * steps keeps the most severe report any of them made, and severity is how actionable it is: an ask
  * names the one move a person owes, a block names a defect to diagnose, and `delivered` is a claim
- * a later step cannot make on an earlier step's behalf. An absent report (null) ranks below all
- * three, so the first step to say anything sets the phase's report.
+ * a later step cannot make on an earlier step's behalf. `satisfied` (anton-6l0q) ranks below even
+ * that, deliberately: it says this step added nothing because an earlier commit already covers it,
+ * so a step in the same phase that DID deliver has the report that describes the tree — and a later
+ * step's `satisfied` must not talk an earlier `delivered` down to "nothing new here". An absent
+ * report (null) ranks below all four, so the first step to say anything sets the phase's report.
  */
-function selfReportRank(outcome: AntonOutcome | undefined): number {
+export function selfReportRank(outcome: AntonOutcome | undefined): number {
   switch (outcome) {
     case "needs-human":
-      return 2;
+      return 3;
     case "blocked":
-      return 1;
+      return 2;
     case "delivered":
+      return 1;
+    case "satisfied":
       return 0;
     default:
       return -1;

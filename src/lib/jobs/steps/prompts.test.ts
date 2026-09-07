@@ -60,6 +60,20 @@ describe("ticketPrompt", () => {
     expect(prompt).not.toContain("## Context");
   });
 
+  // A ticket is one step of a run whose earlier steps committed to the same branch (anton-6l0q):
+  // the prompt must teach `satisfied` as the honest answer for that spot — with its evidence — so
+  // an agent whose work is already on the branch no longer has to choose `blocked` and park.
+  it("teaches the satisfied outcome, its commit evidence, and when it is the honest answer", () => {
+    const prompt = ticketPrompt(ticket());
+
+    expect(prompt).toContain("ANTON-RESULT: satisfied — <commit sha> —");
+    expect(prompt).toContain("earlier steps of this run committed here");
+    expect(prompt).toContain("every acceptance criterion");
+    expect(prompt).toContain("naming the commit that did it");
+    expect(prompt).toContain("do not report `blocked`");
+    expect(prompt).toContain("do the remaining work and report `delivered`");
+  });
+
   // The operator's steer (anton-bfy4) is the freshest intent, so it reads as a refinement of the
   // contract above it rather than as prologue.
   it("appends human notes last, after the spec", () => {

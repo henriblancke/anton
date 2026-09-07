@@ -48,7 +48,7 @@ import {
 import { landableTicketIds } from "./execute-epic-dispatch";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage } from "./execute-epic-review";
-import { assertDelivered } from "./execute-epic-ticket";
+import { assertDelivered, selfReportRank } from "./execute-epic-ticket";
 import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
 import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
 import {
@@ -2184,5 +2184,31 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
       } as ReopenBoard),
     ).resolves.toBeUndefined();
     expect(bd.current.status).toBe("blocked");
+  });
+});
+
+/**
+ * The phase's sticky self-report keeps the most ACTIONABLE outcome any of its steps made. The
+ * fourth outcome (anton-6l0q) is placed at the bottom on purpose: a step that says "an earlier
+ * commit already covers me" must not talk down a sibling that delivered, blocked, or asked.
+ */
+describe("selfReportRank — where `satisfied` sits among the outcomes (anton-6l0q)", () => {
+  it("orders ask > block > delivered > satisfied > nothing", () => {
+    expect(selfReportRank("needs-human")).toBeGreaterThan(selfReportRank("blocked"));
+    expect(selfReportRank("blocked")).toBeGreaterThan(selfReportRank("delivered"));
+    expect(selfReportRank("delivered")).toBeGreaterThan(selfReportRank("satisfied"));
+    expect(selfReportRank("satisfied")).toBeGreaterThan(selfReportRank(undefined));
+  });
+
+  it("lets a satisfied report set the phase's report only when nothing else has", () => {
+    // Mirrors the `>=` the phase loop applies: a later report overwrites an equal-or-lower one.
+    const sticks = (later: Parameters<typeof selfReportRank>[0], earlier: Parameters<typeof selfReportRank>[0]) =>
+      selfReportRank(later) >= selfReportRank(earlier);
+    expect(sticks("satisfied", undefined)).toBe(true);
+    expect(sticks("satisfied", "satisfied")).toBe(true);
+    expect(sticks("satisfied", "delivered")).toBe(false);
+    expect(sticks("satisfied", "blocked")).toBe(false);
+    expect(sticks("satisfied", "needs-human")).toBe(false);
+    expect(sticks("delivered", "satisfied")).toBe(true);
   });
 });

@@ -119,14 +119,27 @@ function standaloneContext(ticket: Bead, description: string | undefined): strin
   return context && context !== description ? context : undefined;
 }
 
-/** Why the inlined spec is authoritative, and what to do when it is empty anyway. */
+/**
+ * Why the inlined spec is authoritative, what to do when it is empty anyway, and when the step's
+ * honest outcome is `satisfied` rather than `blocked` (anton-6l0q): a ticket is one step of a run
+ * whose earlier steps committed to this same branch, so its acceptance can already be met before the
+ * agent starts. The contract defines the line; this names the moment it applies to THIS ticket.
+ */
 function ticketPromptClosing(ticketId: string): string {
-  return (
+  return [
     `The full ticket spec is inlined above so you can implement it even if the worktree's beads ` +
-    `DB is unreadable. \`bd show ${ticketId}\` gives the same content when bd is healthy. If ` +
-    `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
-    `not guess or silently bail. Follow the operating contract in your system prompt.`
-  );
+      `DB is unreadable. \`bd show ${ticketId}\` gives the same content when bd is healthy. If ` +
+      `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
+      `not guess or silently bail. Follow the operating contract in your system prompt.`,
+    ``,
+    `Before you implement, check the branch: earlier steps of this run committed here, and one of ` +
+      `them may already meet every acceptance criterion above. If it does, do not redo or ` +
+      `restate that work and do not report \`blocked\` — end with ` +
+      `\`ANTON-RESULT: satisfied — <commit sha> — <how that commit covers ${ticketId}>\`, naming ` +
+      `the commit that did it. That is the honest answer only when every criterion is met by work ` +
+      `already committed on this branch; if any is still open, do the remaining work and report ` +
+      `\`delivered\`.`,
+  ].join("\n");
 }
 
 /**
