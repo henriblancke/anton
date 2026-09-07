@@ -5,10 +5,13 @@
  *
  * The claims, in the order they matter:
  *   • A claim naming work that landed VERIFIES: the commit is in the base's history, the bead is
- *     closed, the PR is merged.
+ *     closed AND something says that close landed — a commit in the base naming it, its own PR
+ *     merged, or the merged PR of the run target it rides — the PR is merged.
  *   • Every other reading is a STATED failure — a commit on an unmerged branch, a commit this repo
- *     has never seen, a base git cannot resolve, a bead the board does not hold, a bead still open
- *     with no PR or an unmerged one, a PR `gh` could not read, a claim naming nothing checkable.
+ *     has never seen, a base git cannot resolve, a bead the board does not hold, a bead closed with
+ *     nothing saying its work landed (PR #238 review: children close when their run commits, before
+ *     the feature's PR merges), a bead still open with no PR or an unmerged one, a PR `gh` could
+ *     not read, a claim naming nothing checkable.
  *   • NOTHING IS WRITTEN: not to bd, not to git. Asserted against the repository's refs and worktree
  *     and against every bd write seam, on the verifying path and the refusing one alike.
  */
@@ -81,66 +84,70 @@ function has(cmd: string): boolean {
 
 const TARGET = "anton-9a4m";
 const SHIPPER = "anton-9pkk";
+/** A bead only an UNMERGED branch's commit names — closed on the board, landed nowhere. */
+const UNLANDED = "anton-unld";
+/** The run target {@link SHIPPER} rides in the child-of-a-feature cases. */
+const OWNER = "anton-feat";
 
 const bead = (id: string, over: Partial<Bead> = {}): Bead =>
   ({ id, title: id, status: "open", issue_type: "task", ...over }) as Bead;
 
 const suite = has("git") ? describe : describe.skip;
 
-suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
-  let sandbox: string;
-  let repo: string;
-  /** A commit merged into `main` — the shape of work that has actually shipped. */
-  let landed: string;
+/**
+ * The two things the claim is checked against, seeded for real: a git repository whose `main`
+ * carries a commit that NAMES the shipper (the shape anton's own commits and squash bodies take)
+ * beside an unmerged branch, and a fake `gh` answering `pr view` from a file rewritten per case.
+ */
+interface Sandbox {
+  dir: string;
+  repo: string;
+  /** A commit merged into `main` whose message names {@link SHIPPER} — work that actually shipped. */
+  landed: string;
   /** A commit on a branch `main` does not contain. */
-  let unmerged: string;
-  let prevGh: string | undefined;
-  /** Where the fake `gh` reads its answers from — rewritten per `setPr`, re-read per call. */
-  let stateFile: string;
+  unmerged: string;
+  setPr: (number: number, state: "OPEN" | "MERGED" | "CLOSED") => void;
+  /** Everything a write would move: refs, HEAD, the index and the working tree. */
+  repoFingerprint: () => string;
+  cleanup: () => void;
+}
 
-  /** How the fake `gh` answers `pr view <n> --json state`: number → state, or absent to fail. */
-  const prStates: Record<string, string> = {};
-
+function openSandbox(): Sandbox {
+  const dir = mkdtempSync(join(tmpdir(), "anton-shipped-"));
+  const repo = join(dir, "repo");
+  const binDir = join(dir, "bin");
+  mkdirSync(repo);
+  mkdirSync(binDir);
   const g = (args: string[]) =>
     execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
 
-  /** Everything a write would move: refs, HEAD, the index and the working tree. */
-  const repoFingerprint = () =>
-    [g(["show-ref", "--head"]), g(["status", "--porcelain=v1"]), g(["stash", "list"])].join("\n");
+  execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+  g(["config", "user.email", "t@example.com"]);
+  g(["config", "user.name", "anton-test"]);
+  writeFileSync(join(repo, "README.md"), "# sandbox\n");
+  g(["add", "-A"]);
+  g(["commit", "-q", "-m", "init"]);
+  writeFileSync(join(repo, "shipped.ts"), "export const shipped = true;\n");
+  g(["add", "-A"]);
+  g(["commit", "-q", "-m", `${SHIPPER}: the work that shipped`]);
+  const landed = g(["rev-parse", "HEAD"]);
+  g(["checkout", "-q", "-b", "someone-elses-branch"]);
+  writeFileSync(join(repo, "elsewhere.ts"), "export const elsewhere = true;\n");
+  g(["add", "-A"]);
+  // Names a bead too — on a branch `main` does not contain, which must prove nothing for it.
+  g(["commit", "-q", "-m", `${UNLANDED}: never merged`]);
+  const unmerged = g(["rev-parse", "HEAD"]);
+  g(["checkout", "-q", "main"]);
 
-  beforeEach(() => {
-    sandbox = mkdtempSync(join(tmpdir(), "anton-shipped-"));
-    repo = join(sandbox, "repo");
-    const binDir = join(sandbox, "bin");
-    mkdirSync(repo);
-    mkdirSync(binDir);
-
-    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
-    g(["config", "user.email", "t@example.com"]);
-    g(["config", "user.name", "anton-test"]);
-    writeFileSync(join(repo, "README.md"), "# sandbox\n");
-    g(["add", "-A"]);
-    g(["commit", "-q", "-m", "init"]);
-    writeFileSync(join(repo, "shipped.ts"), "export const shipped = true;\n");
-    g(["add", "-A"]);
-    g(["commit", "-q", "-m", "the work that shipped"]);
-    landed = g(["rev-parse", "HEAD"]);
-    g(["checkout", "-q", "-b", "someone-elses-branch"]);
-    writeFileSync(join(repo, "elsewhere.ts"), "export const elsewhere = true;\n");
-    g(["add", "-A"]);
-    g(["commit", "-q", "-m", "never merged"]);
-    unmerged = g(["rev-parse", "HEAD"]);
-    g(["checkout", "-q", "main"]);
-
-    for (const key of Object.keys(prStates)) delete prStates[key];
-    stateFile = join(sandbox, "pr-states.json");
-    writeFileSync(stateFile, "{}");
-    const fakeGh = join(binDir, "gh");
-    // `pr view <selector> --json state` answers from the file, and EXITS NON-ZERO for a PR it does
-    // not know — the shape of a gh that cannot reach GitHub, which must never read as a state.
-    writeFileSync(
-      fakeGh,
-      `#!/usr/bin/env node
+  const prStates: Record<string, string> = {};
+  const stateFile = join(dir, "pr-states.json");
+  writeFileSync(stateFile, "{}");
+  const fakeGh = join(binDir, "gh");
+  // `pr view <selector> --json state` answers from the file, and EXITS NON-ZERO for a PR it does
+  // not know — the shape of a gh that cannot reach GitHub, which must never read as a state.
+  writeFileSync(
+    fakeGh,
+    `#!/usr/bin/env node
 const fs=require('fs');
 const a=process.argv.slice(2);
 if(a[0]!=='pr'||a[1]!=='view'){process.exit(9)}
@@ -149,27 +156,48 @@ const state=states[a[2]];
 if(!state){process.stderr.write('could not resolve to a PullRequest\\n');process.exit(1)}
 process.stdout.write(JSON.stringify({state}));
 `,
-      { mode: 0o755 },
-    );
-    chmodSync(fakeGh, 0o755);
-    prevGh = process.env[GH_BIN_ENV];
-    process.env[GH_BIN_ENV] = fakeGh;
+    { mode: 0o755 },
+  );
+  chmodSync(fakeGh, 0o755);
+  const prevGh = process.env[GH_BIN_ENV];
+  process.env[GH_BIN_ENV] = fakeGh;
 
+  return {
+    dir,
+    repo,
+    landed,
+    unmerged,
+    setPr: (number, state) => {
+      prStates[String(number)] = state;
+      writeFileSync(stateFile, JSON.stringify(prStates));
+    },
+    repoFingerprint: () =>
+      [g(["show-ref", "--head"]), g(["status", "--porcelain=v1"]), g(["stash", "list"])].join("\n"),
+    cleanup: () => {
+      if (prevGh === undefined) delete process.env[GH_BIN_ENV];
+      else process.env[GH_BIN_ENV] = prevGh;
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
+  let sb: Sandbox;
+  let repo: string;
+  let landed: string;
+  let unmerged: string;
+  let setPr: Sandbox["setPr"];
+  let repoFingerprint: Sandbox["repoFingerprint"];
+
+  beforeEach(() => {
+    sb = openSandbox();
+    ({ repo, landed, unmerged, setPr, repoFingerprint } = sb);
     for (const write of bdWrites) write.mockClear();
     loadAllIssuesMock.mockClear();
     loadAllIssuesMock.mockResolvedValue([]);
   });
 
-  afterEach(() => {
-    if (prevGh === undefined) delete process.env[GH_BIN_ENV];
-    else process.env[GH_BIN_ENV] = prevGh;
-    rmSync(sandbox, { recursive: true, force: true });
-  });
-
-  const setPr = (number: number, state: "OPEN" | "MERGED" | "CLOSED") => {
-    prStates[String(number)] = state;
-    writeFileSync(stateFile, JSON.stringify(prStates));
-  };
+  afterEach(() => sb.cleanup());
 
   const verify = (reason: string | undefined, board: Bead[], base = "main") =>
     verifyShippedClaim({ repoPath: repo, base, targetId: TARGET, reason, board });
@@ -184,9 +212,13 @@ process.stdout.write(JSON.stringify({state}));
     expect(verdict.state).toBe("verified");
     expect(verdict.proof).toEqual([
       `commit \`${landed.slice(0, 10)}\` is in the history of the run's base (main)`,
-      `\`${SHIPPER}\` is closed on the board`,
+      `\`${SHIPPER}\` is closed on the board, and commit \`${landed.slice(0, 10)}\` in the ` +
+        `history of the run's base (main) names it`,
       `PR gh-85 is merged`,
     ]);
+    expect((verdict as { landed: unknown }).landed).toEqual({
+      [SHIPPER]: { via: "commit", sha: landed },
+    });
     // The note a caller may write states what was checked AND what was not.
     expect(shippedEvidenceNote(verdict)).toContain("acceptance criteria");
   });
@@ -224,7 +256,82 @@ process.stdout.write(JSON.stringify({state}));
     expect(verdict).toEqual({
       state: "verified",
       proof: [`\`${SHIPPER}\` is in_progress, but its PR (gh-85) is merged`],
+      landed: { [SHIPPER]: { via: "pr", ref: "gh-85" } },
     });
+  });
+
+  // CLOSED IS NOT LANDED (PR #238 review). An epic's children close the moment their run commits
+  // them, before the feature's one pull request opens, let alone merges — so a closed bead is
+  // routinely work on an unmerged branch, and retiring a live ticket against it would settle that
+  // ticket on work the base does not contain.
+  it("refuses a bead that is closed with nothing saying its work landed", async () => {
+    const verdict = await verify(`already done by ${UNLANDED}`, [
+      bead(TARGET),
+      bead(UNLANDED, { status: "closed" }),
+    ]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({ why: expect.stringContaining("nothing says its work LANDED") });
+    expect(verdict).toMatchObject({ why: expect.stringContaining("no commit in main names it") });
+  });
+
+  it("refuses a closed child of a feature whose pull request has NOT merged", async () => {
+    setPr(85, "OPEN");
+    const feature = bead(OWNER, { issue_type: "feature", status: "in_progress", metadata: { pr: "gh-85" } });
+    const child = bead(UNLANDED, { status: "closed" });
+    (child as unknown as Record<string, unknown>).parent = OWNER;
+
+    const verdict = await verify(`already done by ${UNLANDED}`, [bead(TARGET), feature, child]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({
+      why: expect.stringContaining(`the PR of \`${OWNER}\`, the run target it rides, (gh-85) is open, not merged`),
+    });
+  });
+
+  it("verifies a closed child through the MERGED pull request of the feature it rides", async () => {
+    setPr(85, "MERGED");
+    const feature = bead(OWNER, { issue_type: "feature", status: "closed", metadata: { pr: "gh-85" } });
+    const child = bead(UNLANDED, { status: "closed" });
+    (child as unknown as Record<string, unknown>).parent = OWNER;
+
+    const verdict = await verify(`already done by ${UNLANDED}`, [bead(TARGET), feature, child]);
+
+    expect(verdict).toEqual({
+      state: "verified",
+      proof: [
+        `\`${UNLANDED}\` is closed on the board and the PR of \`${OWNER}\`, the run target it ` +
+          `rides, (gh-85) is merged`,
+      ],
+      landed: { [UNLANDED]: { via: "owner-pr", ownerId: OWNER, ref: "gh-85" } },
+    });
+  });
+
+  it("verifies a closed bead through its own merged pull request", async () => {
+    setPr(85, "MERGED");
+    const verdict = await verify(`already done by ${UNLANDED}`, [
+      bead(TARGET),
+      bead(UNLANDED, { status: "closed", metadata: { pr: "gh-85" } }),
+    ]);
+
+    expect(verdict).toEqual({
+      state: "verified",
+      proof: [`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged`],
+      landed: { [UNLANDED]: { via: "pr", ref: "gh-85" } },
+    });
+  });
+
+  it("refuses a closed bead whose own pull request is not merged, before asking its feature", async () => {
+    setPr(85, "CLOSED");
+    setPr(86, "MERGED");
+    const feature = bead(OWNER, { issue_type: "feature", status: "closed", metadata: { pr: "gh-86" } });
+    const child = bead(UNLANDED, { status: "closed", metadata: { pr: "gh-85" } });
+    (child as unknown as Record<string, unknown>).parent = OWNER;
+
+    const verdict = await verify(`already done by ${UNLANDED}`, [bead(TARGET), feature, child]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({ why: expect.stringContaining("its PR (gh-85) is closed, not merged") });
   });
 
   it("refuses a bead the board does not hold", async () => {
@@ -308,7 +415,7 @@ process.stdout.write(JSON.stringify({state}));
       bead(SHIPPER, { status: "closed" }),
     ]);
 
-    expect(verdict).toEqual({ state: "verified", proof: [`\`${SHIPPER}\` is closed on the board`] });
+    expect(verdict).toMatchObject({ state: "verified", landed: { [SHIPPER]: { via: "commit", sha: landed } } });
   });
 
   it("reads the board itself when the caller hands it none", async () => {
@@ -368,11 +475,14 @@ describe("what a claim NAMES", () => {
  * A bead-only claim throughout: it exercises every gate without a repository, because what these
  * assert is the DECISION, and the git half of the evidence has its own suite above.
  */
-describe("repairAlreadyShipped — the retirement", () => {
-  const REPO = "/tmp/anton-shipped-repo";
+suite("repairAlreadyShipped — the retirement (real git · seeded board · fake gh)", () => {
+  let sb: Sandbox;
+  let repo: string;
+  let setPr: Sandbox["setPr"];
   const NOW = 1_700_000_000_000;
   /** The claim the epic's own motivating example makes, minus the parts that need a repository. */
   const CLAIM = `Already implemented by ${SHIPPER}`;
+  /** The survivor closed, with `main` carrying the commit that names it (the sandbox's `landed`). */
   const board = (over: Partial<Bead> = {}) => [
     bead(TARGET, { status: "in_progress" }),
     bead(SHIPPER, { status: "closed", ...over }),
@@ -380,7 +490,7 @@ describe("repairAlreadyShipped — the retirement", () => {
 
   const retire = (args: Partial<Parameters<typeof repairAlreadyShipped>[0]> = {}) =>
     repairAlreadyShipped({
-      repoPath: REPO,
+      repoPath: repo,
       base: "main",
       bead: { id: TARGET },
       block: { reason: CLAIM },
@@ -392,6 +502,8 @@ describe("repairAlreadyShipped — the retirement", () => {
     });
 
   beforeEach(() => {
+    sb = openSandbox();
+    ({ repo, setPr } = sb);
     for (const write of bdWrites) write.mockClear();
     showMock.mockReset();
     // The under-lock re-read finds both ends exactly as the snapshot did.
@@ -402,6 +514,12 @@ describe("repairAlreadyShipped — the retirement", () => {
     loadAllIssuesMock.mockResolvedValue(board());
   });
 
+  afterEach(() => sb.cleanup());
+
+  const commitProof = () =>
+    `\`${SHIPPER}\` is closed on the board, and commit \`${sb.landed.slice(0, 10)}\` in the ` +
+    `history of the run's base (main) names it`;
+
   it("retires the ticket as superseded, with the evidence on the bead and the stamp beside it", async () => {
     const outcome = await retire();
 
@@ -409,9 +527,9 @@ describe("repairAlreadyShipped — the retirement", () => {
       action: "retired",
       replacementId: SHIPPER,
       label: repairLabel(TARGET, "already-shipped", NOW),
-      proof: [`\`${SHIPPER}\` is closed on the board`],
+      proof: [commitProof()],
     });
-    expect(supersedeMock).toHaveBeenCalledWith(REPO, TARGET, SHIPPER);
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
 
     // The EVIDENCE note (the acceptance's "with the evidence in a note"), and it is ONE line — the
     // notes blob is line-delimited, so a multi-line note would parse back unattributed.
@@ -421,7 +539,7 @@ describe("repairAlreadyShipped — the retirement", () => {
     expect(evidence.split("\n")).toHaveLength(1);
 
     // The STAMP, so a repeat escalates rather than repairing again (R5.6).
-    expect(tagMock).toHaveBeenCalledWith(REPO, TARGET, [repairLabel(TARGET, "already-shipped", NOW)]);
+    expect(tagMock).toHaveBeenCalledWith(repo, TARGET, [repairLabel(TARGET, "already-shipped", NOW)]);
 
     // Written in the order the module promises: the statement of what anton checked lands BEFORE
     // anything is settled on the strength of it.
@@ -436,7 +554,7 @@ describe("repairAlreadyShipped — the retirement", () => {
     expect(outcome).toMatchObject({
       action: "shadow",
       replacementId: SHIPPER,
-      proof: [`\`${SHIPPER}\` is closed on the board`],
+      proof: [commitProof()],
     });
     expect((outcome as { attempted: string }).attempted).toContain(`bd supersede ${TARGET} --with ${SHIPPER}`);
     for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
@@ -468,6 +586,17 @@ describe("repairAlreadyShipped — the retirement", () => {
     expect(outcome).toMatchObject({ action: "escalate" });
     expect((outcome as { why: string }).why).toContain("could NOT verify");
     expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("nothing there says its work landed");
+    for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("retires NOTHING against a bead that is merely closed — a child committed on an unmerged branch", async () => {
+    const outcome = await retire({
+      block: { reason: `Already implemented by ${UNLANDED}` },
+      board: [bead(TARGET, { status: "in_progress" }), bead(UNLANDED, { status: "closed" })],
+    });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("nothing says its work LANDED");
     for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
   });
 
@@ -505,6 +634,35 @@ describe("repairAlreadyShipped — the retirement", () => {
     for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
   });
 
+  // The snapshot check above cannot see a re-parent landing in the window (PR #238 review): the
+  // gardener's re-parent takes the new home's lock, so the ordering is decidable — but only if the
+  // subtree is re-asked INSIDE the lock, against a fresh board rather than the one the decision read.
+  it("refuses under the lock when open work was attached beneath the ticket since the check", async () => {
+    const child = bead("anton-kid", { status: "open" });
+    (child as unknown as Record<string, unknown>).parent = TARGET;
+    loadAllIssuesMock.mockResolvedValue([...board(), child]);
+
+    const outcome = await retire();
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("the board moved");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("attached beneath");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("anton-kid");
+    expect(loadAllIssuesMock).toHaveBeenCalledWith(repo, { strictGates: true });
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(tagMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses under the lock when the board could not be re-read at all", async () => {
+    loadAllIssuesMock.mockRejectedValue(new Error("dolt server went away"));
+
+    const outcome = await retire();
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("could not be re-read");
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
   it("writes nothing when either end moved between the check and the write", async () => {
     // Somebody else settled the ticket in the window — anton does not rewrite that outcome.
     showMock.mockImplementation(async (_cwd, id) =>
@@ -514,7 +672,8 @@ describe("repairAlreadyShipped — the retirement", () => {
     expect(settled).toMatchObject({ action: "escalate" });
     expect((settled as { evidence: string[] }).evidence.join(" ")).toContain("already settled");
 
-    // …and the survivor reopened with no PR: it has not landed, so nothing is superseded by it.
+    // …and the survivor reopened: the commit naming it spoke for a closed ticket, and by the
+    // human's own hand it is work in progress again.
     showMock.mockImplementation(async (_cwd, id) =>
       id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "open" }),
     );
@@ -537,6 +696,69 @@ describe("repairAlreadyShipped — the retirement", () => {
     expect(tagMock).not.toHaveBeenCalled();
   });
 
+  // A survivor verified through its PR is re-verified through THAT PR (PR #238 review). "Has some
+  // PR" is what the window can fake: the pointer swapped for an open PR, or the bead reopened with an
+  // unmerged one attached, and a status-and-pointer reread accepts both.
+  describe("a survivor verified through its merged pull request", () => {
+    const viaPr = () => [
+      bead(TARGET, { status: "in_progress" }),
+      bead(UNLANDED, { status: "in_progress", metadata: { pr: "gh-85" } }),
+    ];
+    const retireViaPr = () =>
+      retire({ block: { reason: `Already implemented by ${UNLANDED}` }, board: viaPr() });
+
+    beforeEach(() => {
+      setPr(85, "MERGED");
+      loadAllIssuesMock.mockResolvedValue(viaPr());
+    });
+
+    it("retires against it while it is still the same PR and still merged", async () => {
+      showMock.mockImplementation(async (_cwd, id) =>
+        id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!,
+      );
+
+      const outcome = await retireViaPr();
+
+      expect(outcome).toMatchObject({
+        action: "retired",
+        replacementId: UNLANDED,
+        proof: [`\`${UNLANDED}\` is in_progress, but its PR (gh-85) is merged`],
+      });
+      expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);
+    });
+
+    it("refuses when its PR pointer was swapped in the window, whatever the new PR says", async () => {
+      setPr(90, "MERGED");
+      showMock.mockImplementation(async (_cwd, id) =>
+        id === TARGET
+          ? bead(TARGET, { status: "in_progress" })
+          : bead(UNLANDED, { status: "in_progress", metadata: { pr: "gh-90" } }),
+      );
+
+      const outcome = await retireViaPr();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
+        "no longer points at the PR anton verified (gh-85)",
+      );
+      expect(supersedeMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses when the PR it verified is no longer merged at the write", async () => {
+      showMock.mockImplementation(async (_cwd, id) => {
+        // Reread INSIDE the lock, after the check read it as merged.
+        if (id === UNLANDED) setPr(85, "OPEN");
+        return id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!;
+      });
+
+      const outcome = await retireViaPr();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("reads as open now, not merged");
+      expect(supersedeMock).not.toHaveBeenCalled();
+    });
+  });
+
   it("keeps the retirement when only the STAMP failed, and says the guard is not armed for it", async () => {
     tagMock.mockRejectedValueOnce(new Error("beads db is locked"));
 
@@ -544,7 +766,7 @@ describe("repairAlreadyShipped — the retirement", () => {
 
     expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
     expect((outcome as { label?: string }).label).toBeUndefined();
-    expect(supersedeMock).toHaveBeenCalledWith(REPO, TARGET, SHIPPER);
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
     const notes = noteMock.mock.calls.map((c) => c[2]);
     expect(notes.some((t) => t.includes("could not stamp it"))).toBe(true);
   });

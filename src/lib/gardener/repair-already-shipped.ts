@@ -37,8 +37,13 @@
 import { beads, type Bead } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
-import { pullRequestState, readCommitReach, type PullRequestState } from "../git/ops";
-import { beadIdsNamedIn, indexBoard, isOpenWork, type BoardIndex } from "./board-index";
+import {
+  pullRequestState,
+  readCommitNaming,
+  readCommitReach,
+  type PullRequestState,
+} from "../git/ops";
+import { beadIdsNamedIn, indexBoard, isOpenWork, ticketOwnerOf, type BoardIndex } from "./board-index";
 import type { ProposalAutonomy } from "./autonomy";
 import {
   decideRepair,
@@ -91,8 +96,22 @@ export function claimedPullRequests(reason: string | undefined): string[] {
  * never a reason to retire on its own: only `verified` is.
  */
 export type ShippedVerdict =
-  | { state: "verified"; proof: string[] }
+  | { state: "verified"; proof: string[]; landed: Record<string, BeadLanding> }
   | { state: "unverified"; why: string; proof: string[] };
+
+/**
+ * What PROVED a named bead's work landed — kept in its checkable form beside the prose, because the
+ * retirement re-asks exactly this under the lock (PR #238 review): the survivor's PR pointer being
+ * swapped, or its PR un-merging, in the window between the check and the write takes the
+ * verification back, and a reread that only looked at status would never see it.
+ */
+export type BeadLanding =
+  /** A commit in the run's base names the bead. */
+  | { via: "commit"; sha: string }
+  /** The bead's own PR is merged. */
+  | { via: "pr"; ref: string }
+  /** The bead is closed and the PR of the run target it rides is merged. */
+  | { via: "owner-pr"; ownerId: string; ref: string };
 
 /**
  * The whole-board read the claim is checked against — through `loadAllIssues` rather than a bare
@@ -190,6 +209,7 @@ export async function verifyShippedClaim(args: {
     }
   }
 
+  const landed: Record<string, BeadLanding> = {};
   for (const id of namedBeads) {
     const bead = index.byId.get(id);
     if (!bead) {
@@ -204,7 +224,10 @@ export async function verifyShippedClaim(args: {
     // shipped, whatever the bead was later labelled.
     const abandoned = beads.isAbandoned(bead);
     if (bead.status === "closed" && !abandoned) {
-      proof.push(`\`${id}\` is closed on the board`);
+      const closed = await closedBeadLanding({ repoPath, base, index, bead, readPr });
+      if ("why" in closed) return { state: "unverified", proof, why: closed.why };
+      proof.push(closed.proof);
+      landed[id] = closed.landing;
       continue;
     }
     const pr = beads.getPrRef(bead);
@@ -221,6 +244,7 @@ export async function verifyShippedClaim(args: {
     const state = await readPr(pr);
     if (state === "merged") {
       proof.push(`\`${id}\` is ${standing}, but its PR (${pr}) is merged`);
+      landed[id] = { via: "pr", ref: pr };
       continue;
     }
     return {
@@ -251,7 +275,98 @@ export async function verifyShippedClaim(args: {
     };
   }
 
-  return { state: "verified", proof };
+  return { state: "verified", proof, landed };
+}
+
+/**
+ * What says a CLOSED bead's work has landed — or why nothing does.
+ *
+ * Closed alone is not it (PR #238 review). In anton's own lifecycle an epic's children close the
+ * moment their run commits them (execute-epic-ticket-bookends `closeOnDone`), while the feature's
+ * one pull request opens afterwards and merges later still — so "closed on the board" is routinely
+ * true of work sitting on an unmerged branch, and retiring a live ticket against it would settle
+ * that ticket on work the run's base does not contain. What proves the close is one of three things
+ * the base or GitHub can be asked for, tried cheapest first: a commit in the base's history naming
+ * the bead (local, and the shape anton's own commits and squash bodies take), the bead's own PR
+ * merged, or the merged PR of the run target it rides — which is where a child's work actually
+ * lands, since the child carries no PR ref of its own.
+ */
+async function closedBeadLanding(args: {
+  repoPath: string;
+  base: string;
+  index: BoardIndex;
+  bead: Bead;
+  readPr: (ref: string) => Promise<PullRequestState>;
+}): Promise<{ landing: BeadLanding; proof: string } | { why: string }> {
+  const { repoPath, base, index, bead, readPr } = args;
+  const id = bead.id;
+  const naming = await readCommitNaming(repoPath, id, base);
+  switch (naming.state) {
+    case "found":
+      return {
+        landing: { via: "commit", sha: naming.sha },
+        proof:
+          `\`${id}\` is closed on the board, and commit \`${naming.sha.slice(0, 10)}\` in the ` +
+          `history of the run's base (${base}) names it`,
+      };
+    case "unreadable":
+      return {
+        why:
+          `\`${id}\` is closed on the board, but whether a commit in ${base} names it could not ` +
+          `be read (${naming.detail})`,
+      };
+    case "none":
+      break;
+  }
+
+  const ownPr = beads.getPrRef(bead);
+  if (ownPr) {
+    const state = await readPr(ownPr);
+    if (state === "merged") {
+      return {
+        landing: { via: "pr", ref: ownPr },
+        proof: `\`${id}\` is closed on the board and its PR (${ownPr}) is merged`,
+      };
+    }
+    return {
+      why:
+        state === "unknown"
+          ? `\`${id}\` is closed on the board and anton could not read the state of its PR ` +
+            `(${ownPr}) — whether that work landed is exactly what the claim rests on`
+          : `\`${id}\` is closed on the board, but its PR (${ownPr}) is ${state}, not merged`,
+    };
+  }
+
+  const owner = ticketOwnerOf(index, bead);
+  const ownerPr = owner ? beads.getPrRef(owner) : undefined;
+  if (owner && ownerPr) {
+    const state = await readPr(ownerPr);
+    if (state === "merged") {
+      return {
+        landing: { via: "owner-pr", ownerId: owner.id, ref: ownerPr },
+        proof:
+          `\`${id}\` is closed on the board and the PR of \`${owner.id}\`, the run target it ` +
+          `rides, (${ownerPr}) is merged`,
+      };
+    }
+    return {
+      why:
+        state === "unknown"
+          ? `\`${id}\` is closed on the board and anton could not read the state of the PR of ` +
+            `\`${owner.id}\`, the run target it rides (${ownerPr}) — whether that work landed ` +
+            `is exactly what the claim rests on`
+          : `\`${id}\` is closed on the board, but the PR of \`${owner.id}\`, the run target it ` +
+            `rides, (${ownerPr}) is ${state}, not merged — its run committed it, and that work ` +
+            `has not landed in ${base}`,
+    };
+  }
+
+  return {
+    why:
+      `\`${id}\` is closed on the board, but nothing says its work LANDED — no commit in ${base} ` +
+      `names it, and neither it${owner ? ` nor \`${owner.id}\`, the run target it rides,` : ""} ` +
+      `points at a merged PR; a ticket closes when its run commits, before the pull request merges`,
+  };
 }
 
 /**
@@ -470,6 +585,21 @@ export async function repairAlreadyShipped(args: {
     };
   }
 
+  // The survivor is one of the beads the check just verified — the one whose evidence the write
+  // below re-asks for. A survivor the check has no landing for is a bug in the resolve/verify pair,
+  // and the safe reading of a bug here is a refusal, never a retirement.
+  const landing = verdict.landed[replacementId];
+  if (!landing) {
+    return {
+      action: "escalate",
+      why:
+        `${bead.id} blocked as \`${KLASS}\`, but anton verified the claim without recording what ` +
+        `landed ${replacementId}'s work — it retired nothing rather than settle a ticket on ` +
+        `evidence it cannot re-check.`,
+      evidence: [`what did hold: ${verdict.proof.join("; ")}`, `the agent reported: ${claim}`],
+    };
+  }
+
   const attempted =
     `retired ${bead.id} as superseded by ${replacementId} (bd supersede ${bead.id} --with ` +
     `${replacementId}) on verified evidence that the work already landed — the agent reported: ${claim}`;
@@ -482,9 +612,16 @@ export async function repairAlreadyShipped(args: {
   // Both beads' locks, and the ticket re-read inside them: the board this was decided against is a
   // snapshot, and the one thing a retirement cannot survive is somebody else having settled either
   // end of it in the window — an operator abandoning the ticket, another run closing it, the
-  // survivor being reopened because its work turned out not to have landed after all.
+  // survivor being reopened because its work turned out not to have landed after all. The whole
+  // board is re-read under the same locks for the subtree question (PR #238 review): a gardener
+  // re-parent hanging work under this ticket takes the ticket's lock too (apply-steps `applyStep`),
+  // so the two orders serialize here — either that read finds the newcomer, or the re-parent's own
+  // re-check finds a closed home. Against the snapshot alone both would pass, and the newly
+  // attached ticket would sit beneath a card nothing will run.
   return withBeadWriteLocks(repoPath, [bead.id, replacementId], async () => {
-    const moved = await retirementMoved(repoPath, bead.id, replacementId);
+    const moved =
+      (await retirementMoved(repoPath, bead.id, replacementId, landing)) ??
+      (await strandedUnderLock(repoPath, bead.id));
     if (moved) {
       return {
         action: "escalate",
@@ -518,11 +655,21 @@ export async function repairAlreadyShipped(args: {
  *
  * A read that FAILED is a refusal rather than an assumption either way: anton closes a ticket against
  * a board it could check, and a `bd show` that broke is not a check.
+ *
+ * The survivor is re-checked against the EVIDENCE that verified it, not against its status (PR #238
+ * review). A status reread accepts any bead with any PR on it, which is the window's whole problem:
+ * the PR pointer the check read as merged can have been swapped for an open one, or the bead
+ * reopened with an unmerged PR attached, and "closed or has a PR" still reads true. So the pointer
+ * has to be the one that verified and `gh` has to still call it merged; for a landing the board
+ * only spoke for INDIRECTLY — the run target's PR, a commit the base names — the survivor also has
+ * to still be the closed ticket that made that evidence its own, since reopening or abandoning it in
+ * the window is the human saying otherwise.
  */
 async function retirementMoved(
   repoPath: string,
   targetId: string,
   replacementId: string,
+  landing: BeadLanding,
 ): Promise<string | undefined> {
   const read = async (id: string): Promise<Bead | string> => {
     try {
@@ -542,24 +689,85 @@ async function retirementMoved(
   }
   const replacement = await read(replacementId);
   if (typeof replacement === "string") return replacement;
-  // Reopened and pointing at no PR is the one reading that TAKES BACK the verification: the survivor
-  // is work in progress again, so it has not landed and nothing is superseded by it. A closed one —
-  // or one reopened for rework with its merged PR still attached — is still where the work landed.
-  //
-  // ABANDONED is that same reading from the other side (PR #238 review), and the one a status check
-  // alone gets wrong: it IS closed, so `isOpenWork` reads it as settled, while the label says the
-  // work was explicitly not done. Retiring onto it would file the last live copy of the work under a
-  // recorded won't-do — the state `verifyShippedClaim` refuses, so the guard has to refuse it too
-  // when somebody abandons the survivor in the window between the check and this write.
-  const abandoned = beads.isAbandoned(replacement);
-  if ((abandoned || isOpenWork(replacement)) && !beads.getPrRef(replacement)) {
-    return abandoned
-      ? `\`${replacementId}\` has been abandoned and points at no PR — a recorded won't-do ` +
-          `delivered nothing, so ${targetId} is not superseded by it`
-      : `\`${replacementId}\` is open again (${replacement.status}) and points at no PR — it has ` +
-          `not landed, so ${targetId} is not superseded by it`;
+
+  // Still the PR that verified, and still merged. ABANDONED is not asked here, on purpose: the check
+  // itself reads a merged PR as redeeming an abandoned bead — what shipped is what shipped, whatever
+  // the bead was later labelled — and the guard holds the survivor to the check's bar, not a higher
+  // one.
+  const stillMergedPr = async (holder: Bead, ref: string, whose: string): Promise<string | undefined> => {
+    const now = beads.getPrRef(holder);
+    if (now !== ref) {
+      return (
+        `${whose} no longer points at the PR anton verified (${ref}) — it points at ` +
+        `${now ? now : "no PR"} now, so what landed is not what was checked, and ${targetId} is ` +
+        `not superseded on that evidence`
+      );
+    }
+    const state = await pullRequestState(repoPath, ref);
+    if (state === "merged") return undefined;
+    return (
+      `${whose} PR (${ref}) reads as ${state === "unknown" ? "unreadable" : state} now, not merged — ` +
+      `the evidence ${targetId}'s retirement rested on no longer holds`
+    );
+  };
+
+  switch (landing.via) {
+    case "pr":
+      return stillMergedPr(replacement, landing.ref, `\`${replacementId}\``);
+    case "owner-pr": {
+      const settled = stillClosedSurvivor(replacement, "the run target's merged PR");
+      if (settled) return settled;
+      const owner = await read(landing.ownerId);
+      if (typeof owner === "string") return owner;
+      return stillMergedPr(owner, landing.ref, `\`${landing.ownerId}\`, the run target \`${replacementId}\` rides,`);
+    }
+    case "commit":
+      return stillClosedSurvivor(replacement, "the commit naming it in the base");
+  }
+}
+
+/**
+ * A survivor whose evidence was spoken for by its CLOSED standing — the base naming it, its run
+ * target's PR — has to still be that closed ticket at the write. Reopened, it is work in progress
+ * again by the human's own hand; abandoned, it is a recorded won't-do that delivered nothing to be
+ * superseded by. Either takes the verification back.
+ */
+function stillClosedSurvivor(replacement: Bead, spokeFor: string): string | undefined {
+  if (beads.isAbandoned(replacement)) {
+    return (
+      `\`${replacement.id}\` has been abandoned — a recorded won't-do delivered nothing, so ` +
+      `${spokeFor} no longer speaks for it`
+    );
+  }
+  if (isOpenWork(replacement)) {
+    return (
+      `\`${replacement.id}\` is open again (${replacement.status}) — ${spokeFor} spoke for a ` +
+      `closed ticket, and it is not one now`
+    );
   }
   return undefined;
+}
+
+/**
+ * Open work beneath the ticket, judged from a board read INSIDE its write lock — or why that could
+ * not be judged. The same bar the snapshot was held to before the check ran, re-asked where a
+ * concurrent re-parent is ordered against it. A board that could not be re-read says nothing, so
+ * the retirement refuses and nothing is written.
+ */
+async function strandedUnderLock(repoPath: string, targetId: string): Promise<string | undefined> {
+  let board: Bead[];
+  try {
+    board = await readBoard(repoPath);
+  } catch (e) {
+    return `the board could not be re-read before the retirement (${e instanceof Error ? e.message : String(e)})`;
+  }
+  const open = indexBoard(board).openDescendants(targetId);
+  if (open.length === 0) return undefined;
+  return (
+    `open work was attached beneath ${targetId} since the check ` +
+    `(${open.map((b) => b.id).join(", ")}) — closing it as superseded now would strand that ` +
+    `work under a card no run can reach`
+  );
 }
 
 /**

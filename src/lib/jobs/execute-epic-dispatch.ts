@@ -167,6 +167,24 @@ const byProvenance = (rs: readonly RetiredTicketOutcome[]) => ({
   found: rs.filter((r) => r.source === "pre-existing"),
 });
 
+/**
+ * The retirement ledger as a park may say it: one clause per provenance, each naming its tickets,
+ * and only the `this-run` clause claiming a verification. Every park that mentions retirements
+ * speaks through this so none of them can word a found supersede as one anton checked.
+ */
+function retirementClauses(rs: readonly RetiredTicketOutcome[]): string[] {
+  const { verified, found } = byProvenance(rs);
+  return [
+    verified.length
+      ? `already shipped, verified and closed as superseded (${retirements(verified)})`
+      : null,
+    found.length
+      ? `already settled as superseded on the board, which this run did not verify ` +
+        `(${retirements(found)})`
+      : null,
+  ].filter((clause): clause is string => clause !== null);
+}
+
 /** The run's tickets, split into what it may dispatch now and what a blocker outside it holds. */
 function partitionTickets(
   run: EpicRun,
@@ -210,14 +228,7 @@ function partitionTickets(
     // Said by PROVENANCE, never as one thing (PR #238 review): every retirement here is one the run
     // FOUND on the board — the dispatch loop has not run yet — so this run verified no delivery, and
     // "already shipped" would hand the operator a premise anton never checked when settling the epic.
-    const { verified, found } = byProvenance(run.retired);
-    const settled = [
-      verified.length ? `already shipped, verified and closed as superseded (${retirements(verified)})` : null,
-      found.length
-        ? `already settled as superseded on the board, which this run did not verify ` +
-          `(${retirements(found)})`
-        : null,
-    ].filter(Boolean);
+    const settled = retirementClauses(run.retired);
     throw new PoisonEpic(
       (settled.length > 0
         ? `every ticket under ${epicBeadId} has been abandoned or ${settled.join(", or ")}`
@@ -681,20 +692,24 @@ async function deliveredOrPark(
   // of a run that retired one ticket and had a person finish another outside the branch, and this
   // message would then claim the whole feature had shipped while never naming the human ticket at
   // all. That mix belongs to the `agent:human` park below, which names both halves.
+  //
+  // And by PROVENANCE, like every other park that names the ledger (PR #238 review): the ledger
+  // holds what partitionTickets FOUND already superseded on the board beside what this attempt
+  // verified and retired itself, and "anton verified that" is only true of the second half.
   const notRetired = live.filter((t) => !retired.has(t.id));
   if (delivered.length === 0 && run.retired.length > 0 && notRetired.length === 0) {
-    const named = retirements(run.retired);
+    const { verified, found } = byProvenance(run.retired);
     throw new PoisonEpic(
-      run.standaloneRun
-        ? `${epicBeadId} had ALREADY SHIPPED (${named}) — anton verified that against the ` +
-          `repository and the board and closed it as superseded, with the evidence on the bead. ` +
-          `Nothing was committed here, so there is no pull request to open and nothing is left to ` +
-          `run; read the bead if you want to check what anton checked`
-        : `every ticket under ${epicBeadId} that this run could dispatch had ALREADY SHIPPED ` +
-          `(${named}) — each is closed as superseded on the board, pointing at what shipped ` +
-          `it, and nothing was committed here, so there is no pull request to open. Close ` +
-          `${epicBeadId} by hand to settle it, or give it work that has not landed yet and ` +
-          `resume the run`,
+      run.standaloneRun && found.length === 0
+        ? `${epicBeadId} had ALREADY SHIPPED (${retirements(verified)}) — anton verified that ` +
+          `against the repository and the board and closed it as superseded, with the evidence on ` +
+          `the bead. Nothing was committed here, so there is no pull request to open and nothing ` +
+          `is left to run; read the bead if you want to check what anton checked`
+        : `every ticket under ${epicBeadId} that this run could dispatch was retired rather than ` +
+          `run: ${retirementClauses(run.retired).join("; ")} — each is closed on the board, ` +
+          `pointing at what it is superseded by, and nothing was committed here, so there is no ` +
+          `pull request to open. Close ${epicBeadId} by hand to settle it, or give it work that ` +
+          `has not landed yet and resume the run`,
     );
   }
 
@@ -747,9 +762,14 @@ async function deliveredOrPark(
  * When the preserve could not READ the branch it rolled back onto, that answer is unknown (PR #228
  * review) — and an unknown fate is spoken as one here rather than folded into the rollback, which
  * would tell the operator to expect a fresh start on a branch that may still carry the work.
+ *
+ * A ticket the run RETIRED as already shipped (anton-5bpd) is named too, by provenance (PR #238
+ * review): with one ticket timing out and another retired, nothing is delivered and this is the
+ * park that fires — and "every ticket ran out of time … re-scope them" would tell the operator to
+ * re-scope work the board has already settled, while never saying it was.
  */
 export function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string {
-  const { targetId, timedOut, branch, standaloneRun, ticketTimeoutMs } = run;
+  const { targetId, timedOut, branch, standaloneRun, ticketTimeoutMs, retired } = run;
   const budget = Number.isFinite(ticketTimeoutMs)
     ? `${Math.round(ticketTimeoutMs / 60_000)}m`
     : "unbounded";
@@ -802,11 +822,16 @@ export function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string
       `${fate} Raise this project's ticketTimeoutMinutes${split}, then resume the run`
     );
   }
+  const retiredClause =
+    retired.length > 0
+      ? ` — the rest were retired rather than run: ${retirementClauses(retired).join("; ")}`
+      : "";
   return (
-    `every ticket under ${targetId} ran out of time ` +
+    `every ticket under ${targetId}${retired.length > 0 ? " left to run" : ""} ran out of time ` +
     `(${timedOut.map((t) => t.id).join(", ")})` +
     (skippedIds.length > 0 ? ` or was skipped behind one that did (${skippedIds.join(", ")})` : "") +
-    ` — nothing was delivered. ${fate} Re-scope them into smaller tickets, or raise this ` +
-    `project's ticketTimeoutMinutes, then resume the run`
+    `${retiredClause} — nothing was delivered. ${fate} Re-scope ` +
+    `${retired.length > 0 ? "the ones that ran out of time" : "them"} into smaller tickets, or ` +
+    `raise this project's ticketTimeoutMinutes, then resume the run`
   );
 }

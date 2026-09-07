@@ -41,6 +41,7 @@ import {
   createTicket,
   makeEpicRunner,
   enqueueEpicJob,
+  pushFreshBaseCommit,
   tickToIdle,
   type ExecuteEpicSandbox,
 } from "./execute-epic.fixture";
@@ -92,10 +93,16 @@ describeBd("execute-epic e2e — the already-shipped repair (real handler · rea
     await resetPerCaseState(tdb);
   });
 
-  /** A bead that already LANDED — the survivor a verified retirement points at. */
+  /**
+   * A bead that already LANDED — the survivor a verified retirement points at: closed on the board,
+   * AND named by a commit the run's base contains (PR #238 review). Closed alone is what an epic's
+   * child looks like the moment its run commits, before the feature's PR merges, and the check
+   * refuses that.
+   */
   async function seedShipper(title: string): Promise<string> {
     const id = createTicket(repo, { title });
     await beads.close(repo, id);
+    pushFreshBaseCommit(sandbox, ctx.bare, id);
     return id;
   }
 
@@ -188,6 +195,51 @@ process.exit(0);`),
       expect(notice).toContain(shipper);
       // THIS run checked it, so the notice may say so — the half of the split that earns the claim.
       expect(notice).toContain("anton verified that against the repository");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("parks by PROVENANCE when everything it could dispatch was retired — found beside verified", async () => {
+    // One ticket the board ALREADY held as superseded when the run read it (a human's rescope, a
+    // gardener dedup, an earlier attempt), one this run verifies and retires itself. Both end up
+    // on the ledger, and the park must not put anton's verification behind the first (PR #238
+    // review): this run checked nothing about it.
+    const shipper = await seedShipper("The bead that shipped both");
+    const { epic, shipped, work } = await seedEpic("All-retired epic");
+    await beads.supersede(repo, work, shipper);
+    const runner = makeEpicRunner(ctx);
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    process.env.ANTON_CLAUDE_BIN = shippedClaude(
+      "claude-shipped-all",
+      shipped,
+      `Already implemented by ${shipper}`,
+    );
+    try {
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epic });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      // Nothing is on the branch, so the run parks rather than open an empty pull request.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      const park = job?.lastError ?? "";
+      expect(park).toContain(`every ticket under ${epic} that this run could dispatch was retired`);
+      // THIS run verified the one it retired…
+      expect(park).toContain(
+        `already shipped, verified and closed as superseded (${shipped} → superseded by ${shipper})`,
+      );
+      // …and only FOUND the other, which it says in as many words.
+      expect(park).toContain(
+        `already settled as superseded on the board, which this run did not verify ` +
+          `(${work} → superseded by ${shipper})`,
+      );
+      expect(park).not.toMatch(/had ALREADY SHIPPED/);
+
+      // The retirement this run made is real: closed, pointing at the survivor, evidence on it.
+      const retired = await beads.show(repo, shipped);
+      expect(retired.status).toBe("closed");
+      const board = await beads.list(repo, ["--status", "all"]);
+      expect(indexBoard(board).recordsSupersedes(shipped, shipper)).toBe(true);
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
     }

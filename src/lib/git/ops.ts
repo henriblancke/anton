@@ -813,6 +813,58 @@ export async function readCommitReach(
   }
 }
 
+/** What `base`'s history says about a BEAD — see {@link readCommitNaming}. */
+export type CommitNaming =
+  /** A commit `base` contains names the bead in its message: the work filed under it has landed. */
+  | { state: "found"; sha: string }
+  /** No commit in `base`'s history names it. */
+  | { state: "none" }
+  /** The question itself failed — an unresolvable base, a broken object store, a killed process. */
+  | { state: "unreadable"; detail: string };
+
+/**
+ * Does any commit in `base`'s history name `beadId` in its message? The read behind the
+ * `already-shipped` check's answer for a bead the board has CLOSED (PR #238 review): closed alone
+ * is not "landed" — an epic's children close the moment their run commits, before the feature's
+ * pull request is merged — so what proves the close is a commit the base actually contains.
+ *
+ * The whole MESSAGE, not the subject, because anton squash-merges: the tickets' own `<id>: …`
+ * subjects survive only as lines in the squash commit's body. Matched as a standalone token, so
+ * `anton-fade` does not answer for `anton-fade1`. Read as an ancestor walk from `base` and nothing
+ * else — no fetch, for the reason {@link readCommitReach} gives.
+ */
+export async function readCommitNaming(
+  repoPath: string,
+  beadId: string,
+  base: string,
+): Promise<CommitNaming> {
+  if (!/^[A-Za-z0-9][\w.-]*$/.test(beadId)) {
+    return { state: "unreadable", detail: `"${beadId}" is not a bead id` };
+  }
+  let log: string;
+  try {
+    // `-F` keeps the id a literal; `%x1e` separates commits, since `%B` spans lines.
+    log = await git(repoPath, [
+      "log",
+      "-F",
+      `--grep=${beadId}`,
+      "-n",
+      "50",
+      "--format=%H%x1f%B%x1e",
+      base,
+      "--",
+    ]);
+  } catch (error) {
+    return { state: "unreadable", detail: `${base}: ${describeGitFailure(error)}` };
+  }
+  const named = new RegExp(`(?<![\\w-])${beadId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`);
+  for (const entry of log.split("\x1e")) {
+    const [sha, message] = entry.trim().split("\x1f");
+    if (sha && message !== undefined && named.test(message)) return { state: "found", sha };
+  }
+  return { state: "none" };
+}
+
 /** A failed git call in one line — its own stderr where it wrote any, else the thrown message. */
 function describeGitFailure(error: unknown): string {
   const stderr = (error as { stderr?: unknown } | null)?.stderr;
