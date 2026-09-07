@@ -58,7 +58,7 @@ import {
 } from "./execute-epic-ticket-settle";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
-import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
+import { BUILTIN_STEPS, ticketPrompt, type StepFacts } from "./step-registry";
 import type { ResolvedStep } from "./run-formula";
 
 /** A promise the test resolves by hand, to hold a lock open across a deliberate interleave. */
@@ -1470,48 +1470,45 @@ describe("assertDelivered — an adopted preserve needs this run's agent to say 
     delivered: false,
     selfReport,
   });
+  /** A branch read no case here needs — the gate must decide these without asking git. */
+  const neverAsked = async (): Promise<boolean> => {
+    throw new Error("assertDelivered asked the branch about a case that has no satisfied claim");
+  };
+  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked);
 
-  it("passes work THIS run committed, self-report or not", () => {
-    expect(() => assertDelivered(ticket, { committed: true }, progress(null))).not.toThrow();
+  it("passes work THIS run committed, self-report or not", async () => {
+    await expect(gate({ committed: true }, progress(null))).resolves.toBeUndefined();
   });
 
-  it("blocks an adopted preserve the agent never affirmed", () => {
-    const err = (() => {
-      try {
-        assertDelivered(ticket, { committed: true, preservedAdoption: true }, progress(null));
-      } catch (e) {
-        return e as Error;
-      }
-    })();
+  it("blocks an adopted preserve the agent never affirmed", async () => {
+    const err = await gate({ committed: true, preservedAdoption: true }, progress(null)).then(
+      () => null,
+      (e: Error) => e,
+    );
 
     expect(err?.name).toBe("PoisonError");
     expect(err?.message).toMatch(/produced no delivery/);
     expect(err?.message).toMatch(/PRESERVED/);
   });
 
-  it("passes an adopted preserve the agent reported delivered — the resume it exists for", () => {
-    expect(() =>
-      assertDelivered(
-        ticket,
-        { committed: true, preservedAdoption: true },
-        progress({ outcome: "delivered" }),
-      ),
-    ).not.toThrow();
+  it("passes an adopted preserve the agent reported delivered — the resume it exists for", async () => {
+    await expect(
+      gate({ committed: true, preservedAdoption: true }, progress({ outcome: "delivered" })),
+    ).resolves.toBeUndefined();
   });
 
-  it("still blocks on the agent's own word first when it reported blocked", () => {
-    expect(() =>
-      assertDelivered(
-        ticket,
+  it("still blocks on the agent's own word first when it reported blocked", async () => {
+    await expect(
+      gate(
         { committed: true, preservedAdoption: true },
         progress({ outcome: "blocked", reason: "the acceptance criteria contradict each other" }),
       ),
-    ).toThrow(/self-reported blocked/);
+    ).rejects.toThrow(/self-reported blocked/);
   });
 
-  it("records the commit verdict on the progress the ticket's exits read", () => {
+  it("records the commit verdict on the progress the ticket's exits read", async () => {
     const p = progress(null);
-    expect(() => assertDelivered(ticket, { committed: false }, p)).toThrow(/no delivery/);
+    await expect(gate({ committed: false }, p)).rejects.toThrow(/no delivery/);
     expect(p.committed).toBe(false);
     expect(p.delivered).toBe(false);
   });
@@ -1520,22 +1517,165 @@ describe("assertDelivered — an adopted preserve needs this run's agent to say 
   // `progress` alone (PR #228 review). It must find the tree fact and the delivery verdict apart:
   // `committed` keeps the refused commit from being reset off the branch, `delivered` is what keeps
   // it out of the `not-delivered` skip and out of the pull request's delivered list.
-  it("separates the commit on the branch from the delivery it was refused as", () => {
+  it("separates the commit on the branch from the delivery it was refused as", async () => {
     const accepted = progress(null);
-    assertDelivered(ticket, { committed: true }, accepted);
+    await gate({ committed: true }, accepted);
     expect(accepted).toMatchObject({ committed: true, delivered: true });
 
     const adopted = progress(null);
-    expect(() =>
-      assertDelivered(ticket, { committed: true, preservedAdoption: true }, adopted),
-    ).toThrow(/produced no delivery/);
+    await expect(gate({ committed: true, preservedAdoption: true }, adopted)).rejects.toThrow(
+      /produced no delivery/,
+    );
     expect(adopted).toMatchObject({ committed: true, delivered: false });
 
     const declared = progress({ outcome: "blocked", reason: "the API it needs does not exist" });
-    expect(() => assertDelivered(ticket, { committed: true }, declared)).toThrow(
-      /self-reported blocked/,
-    );
+    await expect(gate({ committed: true }, declared)).rejects.toThrow(/self-reported blocked/);
     expect(declared).toMatchObject({ committed: true, delivered: false });
+  });
+});
+
+/**
+ * anton-nuft: a `satisfied` self-report (anton-6l0q) says an earlier commit of this run already did
+ * the step's work. The gate settles it on the BRANCH — is the named commit one the run added over
+ * its base — never on the claim, because a claim on an empty tree is the false success from issue
+ * #46 whatever verb it uses. Every other row of the gate is pinned here unchanged.
+ */
+describe("assertDelivered — a satisfied step settles on evidence, never on the claim (anton-nuft)", () => {
+  const ticket: Bead = {
+    id: "anton-nuft",
+    title: "assertDelivered settles a satisfied step on evidence",
+    status: "in_progress",
+    issue_type: "task",
+  };
+  const progress = (selfReport: TicketProgress["selfReport"]): TicketProgress => ({
+    committed: false,
+    delivered: false,
+    selfReport,
+  });
+  const ON_BRANCH = "a1b2c3d4e5f";
+  /** The branch as git would answer for it: one commit added over the base, everything else absent. */
+  const branch = (added: string) => {
+    const asked: string[] = [];
+    const read = async (commit: string) => {
+      asked.push(commit);
+      return commit === added;
+    };
+    return { read, asked };
+  };
+  const neverAsked = async (): Promise<boolean> => {
+    throw new Error("assertDelivered asked the branch about a case that has no satisfied claim");
+  };
+  const satisfied = (commit?: string): TicketProgress["selfReport"] => ({
+    outcome: "satisfied",
+    ...(commit ? { commit } : {}),
+    reason: "anton-6l0q's change already covers this step",
+  });
+  const failure = (run: Promise<void>) => run.then(() => null, (e: Error) => e);
+
+  it("settles a satisfied claim naming a commit the branch added, and lets the run continue", async () => {
+    const evidence = branch(ON_BRANCH);
+    const p = progress(satisfied(ON_BRANCH));
+
+    await expect(assertDelivered(ticket, { committed: false }, p, evidence.read)).resolves.toBeUndefined();
+
+    // The tree fact stays true — this ticket committed nothing — and the verdict is delivery.
+    expect(p).toMatchObject({ committed: false, delivered: true });
+    expect(evidence.asked).toEqual([ON_BRANCH]);
+  });
+
+  it("parks a satisfied claim naming a commit the branch did not add, as no delivery", async () => {
+    const evidence = branch(ON_BRANCH);
+    const p = progress(satisfied("0123456"));
+
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read));
+
+    expect(err?.name).toBe("PoisonError");
+    expect(err?.message).toMatch(/anton-nuft produced no delivery: claude exited cleanly/);
+    expect(err?.message).toMatch(/ANTON-RESULT: satisfied — 0123456/);
+    expect(err?.message).toMatch(/names no commit this run's branch added over its base/);
+    expect(err?.message).toMatch(/unverified — a false success on an unchanged tree/);
+    expect(p).toMatchObject({ committed: false, delivered: false });
+    expect(evidence.asked).toEqual(["0123456"]);
+  });
+
+  it("parks a satisfied claim naming no commit without asking the branch anything", async () => {
+    const evidence = branch(ON_BRANCH);
+    const p = progress(satisfied());
+
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read));
+
+    expect(err?.name).toBe("PoisonError");
+    expect(err?.message).toMatch(/produced no delivery/);
+    expect(err?.message).toMatch(/satisfied — \(no commit named\)/);
+    expect(err?.message).toMatch(/names no commit this run's branch added over its base/);
+    expect(p).toMatchObject({ committed: false, delivered: false });
+    expect(evidence.asked).toEqual([]);
+  });
+
+  it("parks a zero diff with no satisfied claim exactly as today — the message is unchanged", async () => {
+    const plain = await failure(assertDelivered(ticket, { committed: false }, progress(null), neverAsked));
+    expect(plain?.name).toBe("PoisonError");
+    expect(plain?.message).toBe(
+      "anton-nuft produced no delivery: claude exited cleanly and passed the verify gates but " +
+        "left no changes to commit (zero diff). Blocking the ticket for operator review and " +
+        "halting the epic — nothing landed, so closing it would be a false success.",
+    );
+
+    const claimed = await failure(
+      assertDelivered(ticket, { committed: false }, progress({ outcome: "delivered" }), neverAsked),
+    );
+    expect(claimed?.message).toBe(
+      `${plain?.message} The agent self-reported ANTON-RESULT: delivered — a false success on an ` +
+        "unchanged tree.",
+    );
+
+    const blocked = await failure(
+      assertDelivered(
+        ticket,
+        { committed: false },
+        progress({ outcome: "blocked", klass: "other", reason: "the spec is empty" }),
+        neverAsked,
+      ),
+    );
+    expect(blocked?.message).toBe(
+      `${plain?.message} The agent self-reported blocked — the spec is empty, corroborating the block.`,
+    );
+  });
+
+  it("leaves a normal commit-backed delivery untouched, whatever the agent reported", async () => {
+    for (const report of [null, { outcome: "delivered" as const }, satisfied(ON_BRANCH), satisfied("0123456")]) {
+      const p = progress(report);
+      await expect(assertDelivered(ticket, { committed: true }, p, neverAsked)).resolves.toBeUndefined();
+      expect(p).toMatchObject({ committed: true, delivered: true });
+    }
+  });
+
+  it("keeps refusing the preserved-WIP case — preserved work is still not a delivery", async () => {
+    const expected =
+      "anton-nuft produced no delivery: claude left no changes to commit (zero diff) and no " +
+      "`ANTON-RESULT` from this run says the ticket is finished, so the only work on the branch " +
+      "is the explicitly incomplete commit a previous attempt PRESERVED when it ran out of time. " +
+      "Blocking the ticket for operator " +
+      "review and halting the epic — nothing this run did says that work is finished, so " +
+      "adopting it as the delivery would be a false success. Finish it by hand or resume the run " +
+      "with a raised ticketTimeoutMinutes.";
+
+    const unaffirmed = progress(null);
+    const plain = await failure(
+      assertDelivered(ticket, { committed: true, preservedAdoption: true }, unaffirmed, neverAsked),
+    );
+    expect(plain?.name).toBe("PoisonError");
+    expect(plain?.message).toBe(expected);
+    expect(unaffirmed).toMatchObject({ committed: true, delivered: false });
+
+    // A satisfied claim is not the affirmation the preserve needs, even for the commit it names:
+    // the evidence on the branch is explicitly incomplete, and the branch is never asked.
+    const claimed = progress(satisfied(ON_BRANCH));
+    const refused = await failure(
+      assertDelivered(ticket, { committed: true, preservedAdoption: true }, claimed, neverAsked),
+    );
+    expect(refused?.message).toBe(expected);
+    expect(claimed).toMatchObject({ committed: true, delivered: false });
   });
 });
 

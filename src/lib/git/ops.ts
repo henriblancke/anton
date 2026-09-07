@@ -756,6 +756,36 @@ export async function branchContainsCommit(
 }
 
 /**
+ * True when `commit` is among the commits `branch` ADDED over `base` — reachable from the branch
+ * and not from the base — asked of the repository exactly as {@link branchContainsCommit} is.
+ *
+ * This is the evidence behind a `satisfied` self-report (anton-nuft): the agent claims an EARLIER
+ * commit of this run already did its step's work, and the gate settles on the branch, never on the
+ * claim. "On the branch" alone is too weak a test, because every commit of the base is on the branch
+ * too — the fork point, or anything merged in from `main` — and none of them is work this run did.
+ * A claim naming one is the zero-diff false success the gate exists to catch, dressed as evidence.
+ *
+ * Fails closed to `false` on every git error: an unknown or ambiguous sha, a branch or base this
+ * machine never had, an unreadable repository. Only git's own "not an ancestor of the base" (exit 1)
+ * is the answer that settles the step; a broken read of the base is no evidence that the commit is
+ * the run's own.
+ */
+export async function branchAddedCommit(
+  repoPath: string,
+  branch: string,
+  base: string,
+  commit: string,
+): Promise<boolean> {
+  if (!(await branchContainsCommit(repoPath, branch, commit))) return false;
+  try {
+    await git(repoPath, ["merge-base", "--is-ancestor", commit, base]);
+    return false;
+  } catch (e) {
+    return exitedWith(e, 1);
+  }
+}
+
+/**
  * What git's history says became of `path` on this branch — the raw read behind the `ref-stale`
  * repair (anton-fzas / R5.4). It reports; it does not judge. Whether a single destination is a
  * rename anton may follow, or a pointer it must refuse to guess at, is

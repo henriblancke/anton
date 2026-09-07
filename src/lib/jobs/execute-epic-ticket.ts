@@ -12,6 +12,7 @@
  */
 import type { Bead } from "../beads/bd";
 import { formatAntonResult, type AntonOutcome } from "../claude/anton-result";
+import { branchAddedCommit } from "../git/ops";
 import { BlockedByAgentError, NeedsHumanError, NoDeliveryError } from "./execute-epic-errors";
 import {
   claimTicket,
@@ -175,9 +176,18 @@ async function walkTicketSteps(args: {
       }
       continue;
     }
-    assertDelivered(ticket, result.facts ?? {}, progress);
+    await assertDelivered(ticket, result.facts ?? {}, progress, (commit) =>
+      branchAddedCommit(run.repoPath, run.branch, run.baseRef, commit),
+    );
   }
 }
+
+/**
+ * Asks the branch whether `commit` is one this run added over its base (anton-nuft) — the one read
+ * that can settle a `satisfied` self-report. Injected so the gate is a unit: production hands it
+ * {@link branchAddedCommit} over the run's repository, branch and fork point.
+ */
+export type BranchAddedCommit = (commit: string) => Promise<boolean>;
 
 /**
  * The commit is the ticket's evidence of record — honor the step's verdict on whether there is one,
@@ -187,8 +197,24 @@ async function walkTicketSteps(args: {
  * (root cause #1). Do NOT close/advance the ticket on empty delivery. {@link NoDeliveryError} is
  * poison, so the runner parks the run for a human instead of retrying claude to the same empty
  * result forever, and the ticket's own catch BLOCKS the bead rather than re-queueing it open.
+ *
+ * ONE zero diff is a delivery (anton-nuft): the step whose work an EARLIER commit of this same run
+ * already did, which the agent reports as `satisfied — <commit>` (anton-6l0q). That is a claim, and
+ * the false-success property above is exactly why a claim cannot settle anything on its own — the
+ * `delivered` line on an empty tree is the same words with a different verb. So the gate settles on
+ * the branch, never on the agent's word: `branchAdded` asks git whether the named commit is among
+ * those this run's branch added over its base. A claim naming no commit, a commit git cannot find,
+ * or a commit of the base parks exactly as the plain zero diff does, with the unverified claim
+ * folded into the reason. The step then settles with `committed: false` — the tree fact is still
+ * true, this ticket added nothing — and `delivered: true`, which is what the board and the pull
+ * request read. Which commit it settled against is the next ticket's business (attribution).
  */
-export function assertDelivered(ticket: Bead, facts: StepFacts, progress: TicketProgress): void {
+export async function assertDelivered(
+  ticket: Bead,
+  facts: StepFacts,
+  progress: TicketProgress,
+  branchAdded: BranchAddedCommit,
+): Promise<void> {
   const committed = facts.committed === true;
   // The TREE fact is recorded first and unconditionally — the timeout path reads it to know there
   // is a commit it must not reset off the branch, and that is true of a refused commit too. The
@@ -199,10 +225,22 @@ export function assertDelivered(ticket: Bead, facts: StepFacts, progress: Ticket
   progress.delivered = false;
   const { selfReport } = progress;
   if (!committed) {
+    // A satisfied step settles on the branch's answer, never on the claim (anton-nuft). The read is
+    // skipped when the claim names nothing: parsing already rejects such a line, but the type does
+    // not, and asking git about an empty sha would be asking it about HEAD.
+    if (
+      selfReport?.outcome === "satisfied" &&
+      selfReport.commit &&
+      (await branchAdded(selfReport.commit))
+    ) {
+      progress.delivered = true;
+      return;
+    }
     // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
     // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
     // false success the gate exists to catch; a `blocked` self-report corroborates the block and
-    // carries the agent's own reason forward. A missing line just reads as the plain gate message.
+    // carries the agent's own reason forward; a `satisfied` claim that the branch did not bear out
+    // is named as unverified. A missing line just reads as the plain gate message.
     throw new NoDeliveryError(
       `${ticket.id} produced no delivery: claude exited cleanly and passed the verify gates but ` +
         `left no changes to commit (zero diff). Blocking the ticket for operator review and ` +

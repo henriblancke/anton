@@ -39,6 +39,7 @@ import {
   restoreWorktreeState,
   sameWorktreeState,
   worktreeHasCommitFor,
+  branchAddedCommit,
   branchContainsCommit,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
@@ -401,6 +402,73 @@ suite("branchContainsCommit (real git)", () => {
     // in this clone.
     expect(await branchContainsCommit(repo, "anton/anton-x7la", "0123456")).toBe(false);
     expect(await branchContainsCommit(repo, "main", "0123456")).toBe(false);
+  });
+});
+
+/**
+ * anton-nuft: a `satisfied` self-report names a commit as the evidence its step is already done, and
+ * the gate settles on the branch rather than the claim. The commit has to be one the run's branch
+ * ADDED — a commit of the base is on the branch too, and naming it is a zero-diff false success
+ * dressed as evidence.
+ */
+suite("branchAddedCommit (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const head = () =>
+    execFileSync("git", ["-C", repo, "rev-parse", "--short", "HEAD"], { encoding: "utf8" }).trim();
+  const commitFile = (name: string, subject: string) => {
+    writeFileSync(join(repo, name), `${name}\n`);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", subject]);
+    return head();
+  };
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-branchadded-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    commitFile("README.md", "init");
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("accepts a commit the run's branch added over its base, by short sha", async () => {
+    g(["checkout", "-q", "-b", "anton/anton-e0y2"]);
+    const earlier = commitFile("shared.ts", "anton-6l0q: the change that covers both steps");
+    g(["checkout", "-q", "main"]);
+
+    expect(await branchAddedCommit(repo, "anton/anton-e0y2", "main", earlier)).toBe(true);
+  });
+
+  it("refuses a commit of the base, even though the branch contains it", async () => {
+    const fork = head();
+    g(["checkout", "-q", "-b", "anton/anton-e0y2"]);
+    commitFile("work.ts", "anton-6l0q: implement the thing");
+    // Merged-in base work is on the branch too, and just as little this run's own.
+    g(["checkout", "-q", "main"]);
+    const landed = commitFile("main.ts", "someone else: landed on main");
+    g(["checkout", "-q", "anton/anton-e0y2"]);
+    g(["merge", "-q", "--no-edit", "main"]);
+
+    expect(await branchContainsCommit(repo, "anton/anton-e0y2", fork)).toBe(true);
+    expect(await branchAddedCommit(repo, "anton/anton-e0y2", "main", fork)).toBe(false);
+    expect(await branchAddedCommit(repo, "anton/anton-e0y2", "main", landed)).toBe(false);
+  });
+
+  it("fails closed for an unknown sha, a missing branch, and an unreadable base", async () => {
+    g(["checkout", "-q", "-b", "anton/anton-e0y2"]);
+    const own = commitFile("work.ts", "anton-6l0q: implement the thing");
+
+    expect(await branchAddedCommit(repo, "anton/anton-e0y2", "main", "0123456")).toBe(false);
+    expect(await branchAddedCommit(repo, "anton/anton-x7la", "main", own)).toBe(false);
+    expect(await branchAddedCommit(repo, "anton/anton-e0y2", "origin/main", own)).toBe(false);
   });
 });
 

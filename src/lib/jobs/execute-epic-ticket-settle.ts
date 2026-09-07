@@ -50,12 +50,14 @@ export interface TicketProgress {
    */
   committed: boolean;
   /**
-   * Whether that evidence is THIS ticket's delivery (PR #228 review) — `committed` AND every
-   * delivery gate in `assertDelivered` accepted it. The two part company exactly where the gate
-   * refuses a commit that exists: a previous attempt's adopted `WIP` this run never affirmed, or
-   * work the agent itself declared blocked. Settlement reads THIS one, because a refused commit
-   * owes the board the `not-delivered` marker and belongs in no pull request's delivered list —
-   * `committed` alone would let a deadline landing on the refusal ship it as finished.
+   * Whether the ticket's work is delivered (PR #228 review) — `committed` AND every delivery gate in
+   * `assertDelivered` accepted it. The two part company exactly where the gate refuses a commit
+   * that exists: a previous attempt's adopted `WIP` this run never affirmed, or work the agent
+   * itself declared blocked. Settlement reads THIS one, because a refused commit owes the board the
+   * `not-delivered` marker and belongs in no pull request's delivered list — `committed` alone
+   * would let a deadline landing on the refusal ship it as finished. They part the other way for a
+   * `satisfied` step the branch bore out (anton-nuft): this ticket committed nothing, and an earlier
+   * commit of the run is its delivery.
    */
   delivered: boolean;
   /**
@@ -637,9 +639,19 @@ async function blockFailedTicket(args: {
 /** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
 export function selfReportSuffix(selfReport: AntonResult | null): string {
   if (!selfReport) return "";
-  return selfReport.outcome === "delivered"
-    ? ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`
-    : ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
+  if (selfReport.outcome === "delivered") {
+    return ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`;
+  }
+  // A satisfied claim only reaches a no-delivery message when the branch did not bear it out
+  // (anton-nuft): the gate settles a verified one before any message is composed.
+  if (selfReport.outcome === "satisfied") {
+    return (
+      ` The agent self-reported ANTON-RESULT: ${formatAntonResult(selfReport)}, but that names no ` +
+      `commit this run's branch added over its base, so the claim is unverified — a false success ` +
+      `on an unchanged tree.`
+    );
+  }
+  return ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
 }
 
 /**
