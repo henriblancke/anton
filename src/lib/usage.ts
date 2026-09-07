@@ -1,13 +1,14 @@
 /**
  * Client-safe usage types + the semantic ok/warn/crit ramp shared by the global nav pill.
  *
- * Mirrors the shape returned by `GET /api/usage` (see src/lib/claude/usage.ts) WITHOUT importing
- * that module — the data layer pulls in Node-only APIs (`node:child_process`, keychain reads) and
- * must never be dragged into a client bundle. Keep this file dependency-free and pure so the
+ * The canonical declaration of the shape `GET /api/usage` returns: the server data layer
+ * (src/lib/claude/usage.ts) aliases `ClaudeUsage` to it, so the two cannot drift. The dependency
+ * only ever points that way — that module pulls in Node-only APIs (child_process, keychain reads)
+ * and must never be dragged into a client bundle. Keep this file dependency-free and pure so the
  * threshold logic behind the pill's colors is unit-testable on its own.
  */
 
-/** Normalized usage snapshot the pill consumes. Structurally matches `ClaudeUsage`. */
+/** Normalized usage snapshot the pill consumes. `null` when a limit is absent for the tier. */
 export interface UsageSnapshot {
   /** Current 5-hour session utilization, 0–100 percent. */
   sessionPct: number;

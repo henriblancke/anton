@@ -4,6 +4,7 @@
  */
 import { and, count, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { toEpoch } from "./db/epoch";
 import type { AntonDb, Clock } from "./jobs/queue";
 import {
   ACTIVE_RUN_STATUSES,
@@ -22,12 +23,6 @@ export type RunRow = typeof schema.runs.$inferSelect;
 
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
-}
-
-function toEpoch(value: unknown): number | undefined {
-  if (value == null) return undefined;
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value);
 }
 
 function toSummary(row: typeof schema.runs.$inferSelect): RunSummary {

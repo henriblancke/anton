@@ -31,7 +31,7 @@ export function isActiveJobStatus(status: JobStatus): boolean {
 
 /**
  * Compact "3m ago" / "2h ago" for the activity column. Epoch 0 reads as absent, not 1970:
- * jobs-view.toEpoch collapses a null timestamp to 0, so it is this app's missing-time sentinel.
+ * db/epoch.epochOrZero collapses a null timestamp to 0, so it is this app's missing-time sentinel.
  */
 export function relativeTime(epoch?: number): string {
   if (!epoch) return "";

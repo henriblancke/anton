@@ -9,6 +9,7 @@
  */
 import { and, count, desc, eq, inArray } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { epochOrZero } from "./db/epoch";
 import type { JobStatus, JobType } from "./jobs/queue";
 import { isJobType, resolveStatusFilter, type JobFilters } from "./jobs-filters";
 
@@ -31,12 +32,6 @@ export interface JobSummary {
   createdAt: number;
   /** Epoch seconds. Last transition; for terminal jobs (done/parked/failed) this is the end. */
   updatedAt: number;
-}
-
-function toEpoch(value: unknown): number {
-  if (value == null) return 0;
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value);
 }
 
 /** Pull a string field out of the JSON payload without throwing on malformed data. */
@@ -63,8 +58,8 @@ export function toJobSummary(row: typeof schema.jobs.$inferSelect): JobSummary {
     scheduleId: stringFromPayload(row.payloadJson, "scheduleId"),
     attempts: row.attempts,
     lastError: row.lastError ?? undefined,
-    createdAt: toEpoch(row.createdAt),
-    updatedAt: toEpoch(row.updatedAt),
+    createdAt: epochOrZero(row.createdAt),
+    updatedAt: epochOrZero(row.updatedAt),
   };
 }
 
