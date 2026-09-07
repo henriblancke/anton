@@ -95,6 +95,13 @@ export const jobs = sqliteTable(
     runAt: ts("run_at").notNull().default(now),
     leaseExpiresAt: ts("lease_expires_at"),
     attempts: integer("attempts").notNull().default(0),
+    // Attempts that ran Claude on this row, for the quota-share spend estimate (R6.3, ./quota-spend).
+    // `attempts` is the RETRY budget and is rewound on purpose — `resumeJob` zeroes it so an un-parked
+    // job gets a fresh run at `maxAttempts` — so a meter summing it lost every attempt the job had
+    // already burned the moment an operator or the picker resumed it, and the governor granted that
+    // quota again (PR #248 review). This counter moves with `attempts` on a lease and on a refund
+    // (an attempt that never reached Claude is not spend), and nothing else touches it.
+    spentAttempts: integer("spent_attempts").notNull().default(0),
     lastError: text("last_error"),
     // What the handler reported it actually DID, written when the job completes (anton-znoz).
     // `ok` = it changed something, `noop` = it ran and found nothing to do. A completed job with a
@@ -142,7 +149,7 @@ export const jobs = sqliteTable(
     index("jobs_project_parked_idx")
       .on(table.projectId, table.updatedAt)
       .where(sql`${table.status} = 'parked'`),
-    // Serves the quota-share spend estimate (R6.3, ./quota-spend), which sums attempts over the
+    // Serves the quota-share spend estimate (R6.3, ./quota-spend), which sums spent attempts over the
     // current quota week: once per governor tick for one project, and once per settings render for
     // every project. `updated_at` leads because the week window is the predicate BOTH readers share
     // — the all-project read has no project to seek on, so a (project_id, updated_at) index would

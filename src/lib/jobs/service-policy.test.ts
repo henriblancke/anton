@@ -266,6 +266,7 @@ describe("resolveProjectSpend", () => {
         status: opts.status ?? "done",
         payloadJson: "{}",
         attempts: opts.attempts ?? 1,
+        spentAttempts: opts.attempts ?? 1,
         updatedAt: new Date(),
       })
       .run();

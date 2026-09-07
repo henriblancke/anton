@@ -653,7 +653,7 @@ export function enqueueSyncPushDeduped(
  * Atomically lease up to `limit` runnable jobs and return them. Runnable =
  *   • `queued` and due (runAt ≤ now), OR
  *   • `running` but the lease expired (crashed worker → reclaim).
- * Leasing sets status=`running`, a fresh lease, and increments `attempts`.
+ * Leasing sets status=`running`, a fresh lease, and increments `attempts` and `spentAttempts`.
  *
  * The runner is single-process, so a read-then-write inside one better-sqlite3 transaction is
  * sufficient mutual exclusion.
@@ -784,6 +784,7 @@ export async function leaseDue(
       status: "running",
       leaseExpiresAt: leaseDate,
       attempts: sql`${schema.jobs.attempts} + 1`,
+      spentAttempts: sql`${schema.jobs.spentAttempts} + 1`,
       updatedAt: nowDate,
     })
     // Candidates can be cancelled after the SELECT above. Re-assert runnable state here so a
@@ -970,6 +971,10 @@ export async function reschedule(
         attempts: opts?.refundAttempt
           ? sql`MAX(${schema.jobs.attempts} - 1, 0)`
           : schema.jobs.attempts,
+        // A refunded attempt never reached Claude, so it is not spend either.
+        spentAttempts: opts?.refundAttempt
+          ? sql`MAX(${schema.jobs.spentAttempts} - 1, 0)`
+          : schema.jobs.spentAttempts,
         updatedAt: secDate(nowMs),
       })
       .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
@@ -1172,6 +1177,7 @@ export async function park(
  * ticket) triggers. Returns a `parked` job to `queued`, due now, with `attempts` reset to 0 so it
  * gets a fresh retry budget rather than parking again on the next failure. This is what stops a
  * transient error that exhausted maxAttempts from being a permanent dead end (anton-ner.2).
+ * `spentAttempts` is left alone: the retry budget is renewed, the quota those attempts burned is not.
  *
  * Un-parks a `parked` job or a `failed` (reserved terminal) one; a no-op for anything else (returns
  * false) — resuming a running/done/queued job would corrupt its lifecycle. The status guard is

@@ -225,6 +225,13 @@
       "when": 1788810018109,
       "tag": "0031_jobs_updated_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1788815301862,
+      "tag": "0032_jobs_spent_attempts",
+      "breakpoints": true
     }
   ]
 }

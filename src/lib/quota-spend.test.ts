@@ -5,10 +5,11 @@
  * it must not charge one project at another's measured rate.
  */
 import { beforeEach, afterEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { recordBurnSample } from "./burn";
 import * as schema from "./db/schema";
 import { makeTestDb, type TestDb } from "./db/testing";
-import type { Clock } from "./jobs/queue";
+import { leaseDue, reschedule, resumeJob, type Clock } from "./jobs/queue";
 import { projectWeeklySpendPct, weeklyWindowStart } from "./quota-spend";
 import { insertProject } from "@/lib/testing/project";
 import type { ClaudeUsage } from "./claude/usage";
@@ -35,17 +36,20 @@ afterEach(() => tdb.close());
 /** One job row inside the window, with `attempts` leases already spent on it. */
 async function seedJob(
   projectId: string,
-  opts: { status: string; attempts: number; type?: string },
-): Promise<void> {
+  opts: { status: string; attempts: number; type?: string; id?: string },
+): Promise<string> {
+  const id = opts.id ?? `${projectId}-${opts.status}-${opts.attempts}-${Math.random()}`;
   await tdb.db.insert(schema.jobs).values({
-    id: `${projectId}-${opts.status}-${opts.attempts}-${Math.random()}`,
+    id,
     type: opts.type ?? "execute-epic",
     projectId,
     status: opts.status,
     runAt: new Date(NOW - 60_000),
     updatedAt: new Date(NOW - 60_000),
     attempts: opts.attempts,
+    spentAttempts: opts.attempts,
   });
+  return id;
 }
 
 /** A full sample window for one project, so its rate is measured (`seeded: false`) rather than the tier seed. */
@@ -108,6 +112,43 @@ describe("projectWeeklySpendPct", () => {
     expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBeNull();
   });
 
+  it("keeps charging a job's attempts after a resume renews its retry budget (PR #248 review)", async () => {
+    // `resumeJob` zeroes `attempts` so the un-parked job gets a fresh run at maxAttempts. The three
+    // runs that parked it still burned quota; a meter that forgot them on resume would let each
+    // park/resume cycle spend the project's share again.
+    const p = insertProject(tdb.db, { id: "P", slug: "p", name: "P", repoPath: "/tmp/P" });
+    await seedSamples(p, 2);
+    const parked = await seedJob(p, { status: "parked", attempts: 3, id: "parked" });
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(6);
+
+    expect(await resumeJob(tdb.db, clock, parked)).toBe(true);
+    const resumed = tdb.db.select().from(schema.jobs).where(eq(schema.jobs.id, parked)).get();
+    expect(resumed?.attempts).toBe(0);
+
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(6);
+  });
+
+  it("charges the attempt a lease starts, and hands back one a refund withdraws", async () => {
+    // The lease is the moment quota starts burning, so the meter moves with it — a running job has
+    // spent most of what it will. A refunded reschedule (quota gate, lease held elsewhere, no remote)
+    // is an attempt that never reached Claude, so it comes back off the meter as it does off the
+    // retry budget.
+    const p = insertProject(tdb.db, { id: "L", slug: "l", name: "L", repoPath: "/tmp/L" });
+    await seedSamples(p, 2);
+    await seedJob(p, { status: "queued", attempts: 0, id: "due" });
+
+    const [leased] = await leaseDue(tdb.db, clock, { leaseMs: 30_000, limit: 1 });
+    expect(leased?.id).toBe("due");
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
+
+    await reschedule(tdb.db, clock, "due", NOW + 60_000);
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
+
+    await leaseDue(tdb.db, { now: () => NOW + 60_000 }, { leaseMs: 30_000, limit: 1 });
+    await reschedule(tdb.db, clock, "due", NOW + 120_000, { refundAttempt: true });
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
+  });
+
   it("counts only attempts inside the quota week", async () => {
     const p = insertProject(tdb.db, { id: "W", slug: "w", name: "W", repoPath: "/tmp/W" });
     await seedSamples(p, 2);
@@ -120,6 +161,7 @@ describe("projectWeeklySpendPct", () => {
       runAt: new Date(before),
       updatedAt: new Date(before),
       attempts: 9,
+      spentAttempts: 9,
     });
 
     expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBeNull();
