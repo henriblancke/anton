@@ -1,9 +1,9 @@
 /**
- * The seam dolt-exec exists to hold (anton-n1m0): bd.ts and sync-coalescer.ts used to import each
- * other — bd.ts for the coalescer, the coalescer for the pass — so neither could be loaded or
- * reasoned about without the other. The pass moved down here, and the only thing keeping it down is
- * this: a nightly stringer scan would refile the cycle a day late, and by then the import that
- * closed it is already something else's dependency.
+ * The seam dolt-exec and dolt-sync exist to hold (anton-n1m0): bd.ts and sync-coalescer.ts used to
+ * import each other — bd.ts for the coalescer, the coalescer for the pass — so neither could be
+ * loaded or reasoned about without the other. The pass moved down into dolt-sync (over dolt-exec's
+ * spawn), and the only thing keeping it down is this: a nightly stringer scan would refile the cycle
+ * a day late, and by then the import that closed it is already something else's dependency.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -18,10 +18,17 @@ const importsOf = (rel: string): string[] =>
   [...source(rel).matchAll(/^import\s[^;]*?from\s+"([^"]+)";/gm)].map((m) => m[1]);
 
 describe("the bd ↔ sync-coalescer cycle stays broken", () => {
-  it("has the coalescer reach the pass through ./dolt-exec, never back through ./bd", () => {
+  // The runtime edge is ./dolt-sync (it carries runDoltSync); ./dolt-exec is a type-only import, so
+  // asserting it alone would stay green while dolt-sync quietly re-closed the cycle.
+  it("has the coalescer reach the pass through ./dolt-sync, never back through ./bd", () => {
     const imports = importsOf("sync-coalescer.ts");
-    expect(imports).toContain("./dolt-exec");
+    expect(imports).toContain("./dolt-sync");
     expect(imports).not.toContain("./bd");
+  });
+
+  it("leaves dolt-sync dependent on neither side it serves", () => {
+    expect(importsOf("dolt-sync.ts")).not.toContain("./bd");
+    expect(importsOf("dolt-sync.ts")).not.toContain("./sync-coalescer");
   });
 
   it("leaves dolt-exec dependent on neither side it serves", () => {
