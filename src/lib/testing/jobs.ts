@@ -7,7 +7,7 @@
  *
  * This lives beside `integration.ts` rather than inside it on purpose: `integration.ts` probes
  * `bd`/`git` with `execFileSync` at import time (for `describeBd`), a cost unit suites like
- * `runner.test.ts` should not pay just to reach this helper.
+ * `runner.*.test.ts` should not pay just to reach this helper.
  */
 import { expect } from "vitest";
 import {
