@@ -142,7 +142,10 @@ describe("decideBoardPickerPlan", () => {
     const plan = decide([bead("t1", { status: "closed" })]);
 
     expect(plan.entries).toEqual([]);
-    expect(plan.stamp.beadCount).toBe(1);
+    // Stamped, and stamped over nothing: `beadCount` covers the decision's reachable set
+    // (anton-t01f), and finished work no candidate depends on is outside it.
+    expect(plan.stamp.beadCount).toBe(0);
+    expect(plan.stamp.observedAtMs).toBe(OBSERVED);
   });
 
   it("leaves a vetoed target out of the plan, and says the OPERATOR held it", () => {

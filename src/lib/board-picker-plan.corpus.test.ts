@@ -1,7 +1,9 @@
 /**
  * THE FENCE'S REGRESSION CORPUS (anton-otos): anton's own board as it stood on 2026-09-05 — 842
- * beads, 1285 edges, 29 picks under an armed policy — and the proof that the narrowed stamp
- * (anton-7zpv) still catches every move that could reorder them.
+ * beads, 1285 edges, 29 picks under an armed policy — and the proof that the narrowed stamp still
+ * catches every move that could reorder them. Narrowed twice since: per FIELD (anton-7zpv, the
+ * classification these cases were written for) and per BEAD (anton-t01f, the decision's reachable
+ * set), and every case below holds across both.
  *
  * A narrowing argued over fixtures is an argument about fixtures. What the classification claims
  * (anton-gsny) is a claim about a REAL board: that anton's own bookkeeping churns in namespaces no
@@ -92,9 +94,10 @@ const OBSERVED = Date.parse("2026-09-05T13:00:00Z");
 /** Refresh cadence of the run-lease heartbeat (`RUN_LEASE_REFRESH_MS`, execute-epic-lease.ts). */
 const HEARTBEAT_MS = 5 * 60_000;
 
-/** The policy the corpus is decided under: this repo's own vocabulary, narrowing 59 structurally
- *  claimable targets to 29 picks. Armed rather than admit-all so the policy half of the stamp is
- *  under test beside the board half. */
+/** The policy the corpus is decided under: this repo's own vocabulary, narrowing 67 structurally
+ *  claimable targets to 29 picks — 30 the policy refuses, 8 more the pass reads as proposals, which
+ *  are decisions a person applies rather than work (anton-x37c). Armed rather than admit-all so the
+ *  policy half of the stamp is under test beside the board half. */
 const POLICY: Policy = {
   types: ["feature", "task", "bug"],
   maxPriority: 2,
@@ -169,6 +172,9 @@ describe("the corpus", () => {
       edges: BOARD.reduce((n, bead) => n + (bead.dependencies?.length ?? 0), 0),
       picks: DECISION.entries.length,
       excluded: DECISION.exclusions.length,
+    // Re-recorded for the `proposal` refusal (anton-x37c, PR #234), which took 8 of the picks this
+    // corpus was captured under out of the plan: a gardener/pm proposal is a decision the founder
+    // applies, not work an agent implements.
     }).toEqual({ beads: 842, edges: 1285, picks: 29, excluded: 135 });
   });
 
@@ -346,11 +352,11 @@ describe("the 2026-09-05 board, mutated the ways the classification calls releva
 /**
  * WHAT THE NARROWING BOUGHT, measured on this board.
  *
- * The baseline is the fence as it stood before anton-7zpv — the same classified columns, with the
- * `labels` column hashing every label rather than the decision-relevant ones. Restated here as a
- * CONTROL (derived from {@link DIGEST_FIELDS}, so a column added to the table joins both sides at
- * once) because the comparison is the measurement: without it "the fence holds" is a claim about
- * one digest, not an improvement over the one it replaced.
+ * The baseline is the fence as it stood before either narrowing — every bead, with the `labels`
+ * column hashing every label rather than the decision-relevant ones. Restated here as a CONTROL
+ * (derived from {@link DIGEST_FIELDS}, so a column added to the table joins both sides at once)
+ * because the comparison is the measurement: without it "the fence holds" is a claim about one
+ * digest, not an improvement over the one it replaced.
  */
 describe("generation lifetime", () => {
   const allLabels = (bead: Bead) => [...(bead.labels ?? [])].sort().join(",");
