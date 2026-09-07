@@ -86,6 +86,12 @@ export const POST = withProject<{ slug: string }>(async (_request, { project }) 
  *
  * 409 when nothing is armed, like the re-arm route: the state is the server's answer, not the one
  * the operator was looking at.
+ *
+ * Revoking is NOT signed, and the asymmetry with POST is deliberate. The arming is standing state
+ * that has to name who is holding `apply` up; a revoke leaves nothing standing to attribute. Making
+ * it an authored write would also let an unresolvable operator (a 500 here) block taking a risky
+ * arming back — the one act that must never be gated on anton's environment. Revocation HISTORY, if
+ * it is ever wanted, is an append-only record like `autopilot_disarms`, not a settings field.
  */
 export const DELETE = withProject<{ slug: string }>(async (_request, { project }) => {
   const result = await updateProjectSettingsIf<string>(project.slug, (current) =>
