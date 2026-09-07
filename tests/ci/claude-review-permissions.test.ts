@@ -165,6 +165,18 @@ describe("the claude-code-review workflow", () => {
     expect(isPermitted(`${HELPER} sticky <<'MARKDOWN'`, rules)).toBe(true);
   });
 
+  // A denied helper call is silent and the helper is the only summary route, so every spelling
+  // that executes the same file must be allowed, not just the one the prompt happens to use.
+  it.each([`./${HELPER}`, `bash ${HELPER}`])("allows the helper invoked as %s", (invocation) => {
+    expect(isPermitted(`${invocation} sticky <<'MARKDOWN'`, rules)).toBe(true);
+    expect(isPermitted(`${invocation} reply 1 'Resolved by a later commit.'`, rules)).toBe(true);
+  });
+
+  it("does not let the interpreter form run anything but the helper", () => {
+    expect(isPermitted("bash -c 'gh pr comment 42 --body x'", rules)).toBe(false);
+    expect(isPermitted("bash .github/scripts/other.sh", rules)).toBe(false);
+  });
+
   it("leaves no second route to a PR comment, so a duplicate summary is unreachable", () => {
     expect(isPermitted("gh pr comment 42 --body-file -", rules)).toBe(false);
     expect(isPermitted("gh pr comment 42 --edit-last --body x", rules)).toBe(false);

@@ -75,6 +75,9 @@ jobs:
           # variable id in its path therefore goes through `.github/scripts/pr-comment.sh`, whose
           # first token is fixed and whose ids are arguments. `gh pr comment` is deliberately absent:
           # with no second way to post a summary, a duplicate is not reachable by improvisation.
+          # The helper is allowed under each spelling that runs the same file — bare, `./`-prefixed,
+          # and via `bash` — because a denied call is silent and the helper is the ONLY summary
+          # route: one unlisted spelling and the PR gets no summary while the job still goes green.
           # `tests/ci/claude-review-permissions.test.ts` pins every command in the prompt against
           # this list.
           # The helper lives in the reviewed checkout, and allowing it widens nothing: on
@@ -85,7 +88,7 @@ jobs:
           claude_args: >-
             --model "${{ vars.CLAUDE_MODEL_AUTO || 'claude-sonnet-4-6' }}"
             --allowedTools
-            "Read,Glob,Grep,LS,Bash(jq:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh label create:*),Bash(gh api graphql:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files:*),Bash(.github/scripts/pr-comment.sh:*),mcp__github_inline_comment__create_inline_comment"
+            "Read,Glob,Grep,LS,Bash(jq:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh label create:*),Bash(gh api graphql:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files:*),Bash(.github/scripts/pr-comment.sh:*),Bash(./.github/scripts/pr-comment.sh:*),Bash(bash .github/scripts/pr-comment.sh:*),mcp__github_inline_comment__create_inline_comment"
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
