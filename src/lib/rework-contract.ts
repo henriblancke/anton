@@ -5,7 +5,8 @@
  * Kept apart from the action itself ({@link reworkTicket}, lib/rework.ts) because this is the
  * vocabulary the layers ABOVE share: the route maps these five errors onto status codes and never
  * touches the board, while the action is the only thing that writes. Importing the errors from here
- * costs a caller nothing else — no bd, no `gh`, no board read.
+ * costs a caller nothing else — no bd, no `gh`, no board read — which is also what lets the rework
+ * dialog import it: what the dialog refuses and what the route refuses are one judgement.
  */
 import type { ReviewFinding } from "./jobs/review-context";
 import {
@@ -86,13 +87,55 @@ export function validateReworkInput(input: ReworkInput): ReworkRequest {
     missing: "Fix instructions are required",
     tooLong: "Instructions are too long",
   });
+  const findings = input.findings ?? [];
+  const gap = doneGap(instructions, findings);
+  if (gap) throw new ReworkInvalidError(gap);
   return {
     ticketId,
     mode: knownMode(input.mode),
     summary,
     instructions,
-    findings: input.findings ?? [],
+    findings,
   };
+}
+
+/**
+ * Why these inputs state no definition of done — or null when they do (anton-xwf1).
+ *
+ * A follow-up's acceptance is one box per instruction line and one per attached finding
+ * ({@link followUpAcceptance}, lib/rework-notes.ts), and a reopen's note is the same text handed to
+ * the implementer. Inputs that yield neither — instructions that are only list markers, with nothing
+ * ticked — would file a bead whose one criterion is the generic findings-addressed line: a rubric no
+ * review can score and no implementer can act on. Judged here, in the vocabulary both layers share,
+ * so the dialog refuses before a bead is written and the route refuses the same request the same way.
+ *
+ * Only the ABSENCE of a step is judged. Whether a step is a good one is the founder's call.
+ */
+export function doneGap(instructions: string, findings: readonly ReviewFinding[]): string | null {
+  if (instructionCriteria(instructions).length > 0 || findings.length > 0) return null;
+  return (
+    "Nothing here says what done looks like: the fix instructions hold only list markers and no " +
+    "finding is attached. Write at least one line an implementer can act on, or attach a finding."
+  );
+}
+
+/**
+ * A leading `-`, `*`, `•`, `1.` or `1)` bullet, a checkbox, or both — and the whitespace after them.
+ * The bullet must be followed by whitespace or end the line, so a bare `-` is scaffolding while
+ * `-1 is the sentinel` keeps its sign.
+ */
+const LIST_MARKER = /^(?:(?:[-*•]|\d+[.)])(?:\s+|$))?(?:\[[ xX]\]\s*)?/;
+
+/**
+ * One criterion per non-blank instruction line, shorn of whatever list marker it was typed with.
+ * Instruction lines arrive as the founder typed them — prose, `-`/`*` bullets, numbered steps, or
+ * boxes already — so list markers are stripped rather than nested inside a second box.
+ */
+export function instructionCriteria(instructions: string): string[] {
+  return instructions
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(LIST_MARKER, ""))
+    .filter((line) => line.length > 0);
 }
 
 /**

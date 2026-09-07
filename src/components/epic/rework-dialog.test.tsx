@@ -126,6 +126,53 @@ describe("ReworkDialog", () => {
     expect(fetchMock.mock.calls.filter(([, init]) => (init as RequestInit)?.method === "POST")).toHaveLength(0);
   });
 
+  it("refuses a send-back too thin to state a done, in the dialog, naming the gap (anton-xwf1)", async () => {
+    const fetchMock = stubFetch();
+    open();
+    await screen.findByText("no null guard");
+
+    fill("not actually done", "- \n- ");
+    const refusal = screen.getByRole("alert");
+    expect(refusal.textContent).toMatch(/hold only list markers/);
+    expect(refusal.textContent).toMatch(/no finding is attached/);
+    expect(screen.getByLabelText("Fix instructions").getAttribute("aria-invalid")).toBe("true");
+
+    const submit = screen.getByRole("button", { name: "Send back" });
+    expect(submit.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(submit);
+    // Nothing is filed: no bead is written because no request ever leaves the dialog.
+    expect(fetchMock.mock.calls.filter(([, init]) => (init as RequestInit)?.method === "POST")).toHaveLength(0);
+    // The typed text is kept — the founder completes it rather than starting over.
+    expect((screen.getByLabelText("Fix instructions") as HTMLTextAreaElement).value).toBe("- \n- ");
+  });
+
+  it("lets a thin instruction file once a finding is ticked — the finding is the criterion", async () => {
+    const fetchMock = stubFetch();
+    const onReworked = vi.fn();
+    open({ onReworked });
+    await screen.findByText("no null guard");
+
+    fill("not actually done", "- ");
+    expect(screen.getByRole("alert")).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: /no null guard/ }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Send back" }));
+
+    await waitFor(() => expect(onReworked).toHaveBeenCalled());
+    const post = fetchMock.mock.calls.find(([, init]) => (init as RequestInit)?.method === "POST")!;
+    expect(JSON.parse((post[1] as RequestInit).body as string).findings).toHaveLength(1);
+  });
+
+  it("shows no refusal on an adequate send-back — it files exactly as before", async () => {
+    stubFetch();
+    open();
+    await screen.findByText("no null guard");
+
+    fill("not actually done", "Add the missing test.");
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("button", { name: "Send back" }).hasAttribute("disabled")).toBe(false);
+  });
+
   it("double-click sends ONE request — the button locks while the first is in flight", async () => {
     let resolvePost: (r: Response) => void = () => {};
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) =>

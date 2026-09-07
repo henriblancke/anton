@@ -12,6 +12,7 @@ import { ACCEPTANCE_HEADING } from "./beads/contract";
 import { parseTicketNotes } from "./beads/notes";
 import type { PullRequestState } from "./git/ops";
 import type { ReviewFinding } from "./jobs/review-context";
+import { instructionCriteria } from "./rework-contract";
 import type { ReworkMode, ReworkPipeline } from "./types";
 
 /**
@@ -118,8 +119,8 @@ export function followUpDescription(args: {
  * or answered. The generic box stays even when the specifics are listed — it is the one that admits
  * "this finding does not apply" as a legitimate close, which no per-finding box says.
  *
- * Instruction lines arrive as the founder typed them — prose, `-`/`*` bullets, numbered steps, or
- * boxes already — so list markers are stripped rather than nested inside a second box.
+ * Instruction lines become boxes through {@link instructionCriteria} — the derivation the dialog's
+ * refusal is judged against, so what it says will file is exactly what files.
  */
 function followUpAcceptance(instructions: string, findings: ReviewFinding[]): string[] {
   return [
@@ -127,17 +128,6 @@ function followUpAcceptance(instructions: string, findings: ReviewFinding[]): st
     ...findings.map((f) => `- [ ] ${f.location} — ${f.note}`),
     `- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply`,
   ];
-}
-
-/** A leading `-`, `*`, `•`, `1.` or `1)` bullet, a checkbox, or both — and the whitespace after them. */
-const LIST_MARKER = /^(?:(?:[-*•]|\d+[.)])\s+)?(?:\[[ xX]\]\s*)?/;
-
-/** One criterion per non-blank instruction line, shorn of whatever list marker it was typed with. */
-function instructionCriteria(instructions: string): string[] {
-  return instructions
-    .split(/\r?\n/)
-    .map((line) => line.trim().replace(LIST_MARKER, ""))
-    .filter((line) => line.length > 0);
 }
 
 /** Why this bead exists — and, for a REDIRECTED send-back, why it exists here rather than on the original. */

@@ -8,6 +8,8 @@
 import { describe, expect, it } from "vitest";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
+  doneGap,
+  instructionCriteria,
   ReworkConflictError,
   ReworkInvalidError,
   ReworkNotAllowedError,
@@ -71,6 +73,22 @@ describe("validateReworkInput", () => {
     expect(() => validateReworkInput(input({ instructions: undefined as never }))).toThrow(
       /Fix instructions/,
     );
+  });
+
+  it("refuses instructions that state no step — marker-only text with nothing attached (anton-xwf1)", () => {
+    // Blank instructions are already refused; "- " passes that check and would file a bead whose
+    // only criterion is the generic one. The route refuses it the way the dialog does.
+    expect(() => validateReworkInput(input({ instructions: "- \n1.\n[ ]" }))).toThrow(
+      /hold only list markers/,
+    );
+    expect(() => validateReworkInput(input({ instructions: "-" }))).toThrow(ReworkInvalidError);
+  });
+
+  it("lets marker-only instructions through when a finding is attached — the finding is the criterion", () => {
+    const findings: ReviewFinding[] = [
+      { severity: "blocking", location: "src/lib/rework.ts:12", note: "no null guard" },
+    ];
+    expect(validateReworkInput(input({ instructions: "- ", findings })).instructions).toBe("-");
   });
 
   it("refuses oversized text rather than truncating it downstream, and reports both numbers", () => {
@@ -149,5 +167,40 @@ describe("the five refusals", () => {
         expect(error instanceof Caught).toBe(Thrown === Caught);
       }
     }
+  });
+});
+
+describe("instructionCriteria", () => {
+  it("makes one criterion per non-blank line, shorn of its list marker", () => {
+    expect(
+      instructionCriteria("Some prose.\n\n- a bullet\n* starred\n1. numbered\n2) also\n- [ ] boxed\n[x] ticked"),
+    ).toEqual(["Some prose.", "a bullet", "starred", "numbered", "also", "boxed", "ticked"]);
+  });
+
+  it("reads a bare marker as scaffolding, not as a criterion", () => {
+    // `-` alone and `- [ ]` are what the founder leaves behind when they start a list and stop.
+    expect(instructionCriteria("-\n- \n1.\n- [ ]\n[ ]\n  ")).toEqual([]);
+  });
+
+  it("keeps a sign or a version that merely LOOKS like a marker", () => {
+    expect(instructionCriteria("-1 is the sentinel\n1.2 ships this")).toEqual([
+      "-1 is the sentinel",
+      "1.2 ships this",
+    ]);
+  });
+});
+
+describe("doneGap", () => {
+  const finding: ReviewFinding = { severity: "advisory", location: "(general)", note: "naming" };
+
+  it("is silent when the instructions yield a criterion, or a finding does", () => {
+    expect(doneGap("Add the missing test.", [])).toBeNull();
+    expect(doneGap("- ", [finding])).toBeNull();
+  });
+
+  it("names both things that are missing when neither yields one", () => {
+    const gap = doneGap("- \n- ", []);
+    expect(gap).toMatch(/only list markers/);
+    expect(gap).toMatch(/no finding is attached/);
   });
 });

@@ -162,10 +162,13 @@ describe("followUpDescription", () => {
           "2) another numbering",
           "- [ ] a box already",
           "[x] a ticked box",
+          "-",
+          "- [ ]",
           "   ",
         ].join("\n"),
       }),
     );
+    // A bare `-` or `- [ ]` is a list the founder started and abandoned — a box over nothing.
     expect(acceptance.slice(0, -1)).toEqual([
       "- [ ] Some prose first.",
       "- [ ] a dashed bullet",

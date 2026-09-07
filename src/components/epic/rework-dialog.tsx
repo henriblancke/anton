@@ -128,6 +128,7 @@ function ReworkForm(options: ReworkFormOptions) {
       <InstructionsField
         id={`${ids}-instructions`}
         value={form.draft.instructions}
+        refusal={form.refusal}
         onChange={(instructions) => form.patch({ instructions })}
       />
 
@@ -146,6 +147,7 @@ function ReworkForm(options: ReworkFormOptions) {
       <FormActions
         canSubmit={form.canSubmit}
         submitting={form.submitting}
+        refusal={form.refusal}
         onCancel={options.onClose}
         onSubmit={form.submit}
       />
@@ -259,15 +261,22 @@ function SummaryField({
   );
 }
 
+/**
+ * The refusal is shown HERE, under the field it is about, rather than on the button: the founder
+ * typed into this box and the send-back stalled, so this is where they look for why.
+ */
 function InstructionsField({
   id,
   value,
+  refusal,
   onChange,
 }: {
   id: string;
   value: string;
+  refusal: string | null;
   onChange: (instructions: string) => void;
 }) {
+  const refusalId = `${id}-refusal`;
   return (
     <div className="flex flex-col gap-1.5">
       <label htmlFor={id} className="text-[11px] text-subtle">
@@ -280,11 +289,22 @@ function InstructionsField({
         maxLength={MAX_REWORK_INSTRUCTIONS_CHARS}
         rows={4}
         placeholder="What the implementer should do differently…"
-        className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2.5 text-[12.5px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+        aria-invalid={refusal ? true : undefined}
+        aria-describedby={refusal ? refusalId : undefined}
+        className={cn(
+          "w-full resize-y rounded-lg border bg-card px-3 py-2.5 text-[12.5px] leading-relaxed text-foreground outline-none placeholder:text-subtle focus:border-primary/60",
+          refusal ? "border-risk-high/60" : "border-border",
+        )}
       />
-      <span className="text-[10px] text-subtle">
-        Lands as a note on the bead — the implementer reads it when it picks the ticket up.
-      </span>
+      {refusal ? (
+        <p id={refusalId} role="alert" className="text-[11px] leading-snug text-risk-high">
+          {refusal}
+        </p>
+      ) : (
+        <span className="text-[10px] text-subtle">
+          Lands as a note on the bead — the implementer reads it when it picks the ticket up.
+        </span>
+      )}
     </div>
   );
 }
@@ -356,11 +376,13 @@ function FindingOption({
 function FormActions({
   canSubmit,
   submitting,
+  refusal,
   onCancel,
   onSubmit,
 }: {
   canSubmit: boolean;
   submitting: boolean;
+  refusal: string | null;
   onCancel: () => void;
   onSubmit: () => void;
 }) {
@@ -374,7 +396,7 @@ function FormActions({
         size="sm"
         onClick={onSubmit}
         disabled={!canSubmit}
-        title={canSubmit ? undefined : "A reason and fix instructions are required"}
+        title={canSubmit ? undefined : (refusal ?? "A reason and fix instructions are required")}
       >
         {submitting ? "Sending back…" : "Send back"}
       </Button>

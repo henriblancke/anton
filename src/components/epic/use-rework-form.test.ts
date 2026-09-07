@@ -175,6 +175,33 @@ describe("useReworkForm — sending it back", () => {
     expect(result.current.canSubmit).toBe(true);
   });
 
+  it("refuses a filled-in draft that states no done, before anything is POSTed (anton-xwf1)", () => {
+    const { fetchMock } = gatedFetch();
+    const { result } = render({ report: REPORT });
+
+    act(() => result.current.patch({ summary: "not done", instructions: "- \n- " }));
+    expect(result.current.refusal).toMatch(/only list markers/);
+    expect(result.current.canSubmit).toBe(false);
+    act(() => result.current.submit());
+    expect(fetchMock).not.toHaveBeenCalled();
+    // The draft survives the refusal — the founder fixes it in place.
+    expect(result.current.draft.instructions).toBe("- \n- ");
+
+    // Ticking a finding gives the send-back its criterion; the refusal lifts without a retype.
+    act(() => result.current.toggleFinding("blocking\0src/a.ts:12\0no null guard"));
+    expect(result.current.refusal).toBeNull();
+    expect(result.current.canSubmit).toBe(true);
+  });
+
+  it("says nothing about a blank draft — the empty field already does", () => {
+    gatedFetch();
+    const { result } = render({ report: REPORT });
+    expect(result.current.refusal).toBeNull();
+    act(() => result.current.patch({ summary: "not done", instructions: "  " }));
+    expect(result.current.refusal).toBeNull();
+    expect(result.current.canSubmit).toBe(false);
+  });
+
   it("sends only the ticked findings, trimmed, and refuses an incomplete draft", () => {
     const { fetchMock } = gatedFetch();
     const { result } = render({ report: REPORT });

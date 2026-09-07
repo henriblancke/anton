@@ -1,3 +1,4 @@
+import { doneGap } from "@/lib/rework-contract";
 import type { ReviewFinding, ReworkMode, ReworkResult, Ticket } from "@/lib/types";
 
 /**
@@ -51,6 +52,27 @@ export function toggleKey(keys: ReadonlySet<string>, key: string): Set<string> {
  */
 export function isDraftComplete(draft: ReworkDraft): boolean {
   return !!draft.ticketId && draft.summary.trim().length > 0 && draft.instructions.trim().length > 0;
+}
+
+/**
+ * Why a draft with both texts filled still cannot file — or null when it can (anton-xwf1). Filled is
+ * not enough: instructions that are only list markers, with no finding ticked, yield no criterion for
+ * the bead ({@link doneGap}), so the send-back would reach the board unrunnable. Judged over the same
+ * three inputs {@link reworkPayload} is built from, so what is refused is exactly what would be sent.
+ *
+ * Silent while the instructions are blank: that gap is {@link isDraftComplete}'s, and the empty field
+ * already says what to type.
+ */
+export function draftRefusal(
+  draft: ReworkDraft,
+  findings: ReviewFinding[],
+  selected: ReadonlySet<string>,
+): string | null {
+  if (draft.instructions.trim().length === 0) return null;
+  return doneGap(
+    draft.instructions,
+    findings.filter((f) => selected.has(findingKey(f))),
+  );
 }
 
 export function reworkPayload(
