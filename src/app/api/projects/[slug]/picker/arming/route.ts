@@ -6,6 +6,7 @@ import { resolveOperator } from "@/lib/operator";
 import { pickerTrackRecord } from "@/lib/picker-veto";
 import type { PickerAutonomy } from "@/lib/policy/types";
 import {
+  deliberateArmingSchema,
   resolvePickerApplyOverride,
   resolvePickerAutonomy,
   updateProjectSettingsIf,
@@ -43,6 +44,12 @@ export const dynamic = "force-dynamic";
  * which is what makes the second one true: two clicks landing together would otherwise both find an
  * unarmed project, and the loser would replace the winner's signature while both were told they had
  * armed it.
+ *
+ * The signature is checked against the SAME schema that reads it back before anything is written.
+ * The reader drops what it cannot parse, so an operator name it would refuse (over its length cap)
+ * must not be stored as a success: the response would claim `apply` while the floor resolved
+ * `shadow`, and every retry would overwrite the same unreadable value. Same 500 as an unresolvable
+ * identity — it is anton's environment that cannot sign, not the project's state.
  */
 export const POST = withProject<{ slug: string }>(async (_request, { project }) => {
   const by = await resolveOperator();
@@ -53,7 +60,21 @@ export const POST = withProject<{ slug: string }>(async (_request, { project }) 
     );
   }
 
-  const arming = { by, at: new Date(systemClock.now()).toISOString() };
+  const signature = deliberateArmingSchema.safeParse({
+    by,
+    at: new Date(systemClock.now()).toISOString(),
+  });
+  if (!signature.success) {
+    return NextResponse.json(
+      {
+        error:
+          "anton's operator name cannot be stored as a signature (1–200 characters) — set " +
+          "ANTON_OPERATOR to a shorter name",
+      },
+      { status: 500 },
+    );
+  }
+  const arming = signature.data;
   const result = await updateProjectSettingsIf<string>(project.slug, (current) => {
     if (!current.pickerPolicy) {
       return {

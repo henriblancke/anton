@@ -88,6 +88,18 @@ describe("POST /picker/arming", () => {
     expect((await stored()).pickerApplyOverride).toBeUndefined();
   });
 
+  it("refuses an operator name the stored-arming reader would drop, rather than storing it", async () => {
+    // A signature the reader cannot parse would report `apply` while the floor resolved `shadow`.
+    operator = () => "x".repeat(201);
+    const res = await POST(req("POST"), ctx("tmp"));
+    expect(res.status).toBe(500);
+    expect(await res.json()).toMatchObject({ error: expect.stringContaining("ANTON_OPERATOR") });
+
+    const next = await stored();
+    expect(next.pickerApplyOverride).toBeUndefined();
+    expect(next.pickerAutonomy).toBeUndefined();
+  });
+
   /**
    * The 409 has to be the state's answer, not a likely one: the guard used to run against a snapshot
    * read before the write, so two clicks landing together both found an unarmed project and the
