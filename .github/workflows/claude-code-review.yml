@@ -77,6 +77,11 @@ jobs:
           # with no second way to post a summary, a duplicate is not reachable by improvisation.
           # `tests/ci/claude-review-permissions.test.ts` pins every command in the prompt against
           # this list.
+          # The helper lives in the reviewed checkout, and allowing it widens nothing: on
+          # `pull_request` GitHub runs the PR's own copy of THIS workflow file, so whoever can push a
+          # branch here can already run arbitrary code with these credentials, helper or not. Forks
+          # get neither the secrets nor a writable token. Pinning the helper to the base revision
+          # would buy no privilege back — and would break the PR that adds or edits it.
           claude_args: >-
             --model "${{ vars.CLAUDE_MODEL_AUTO || 'claude-sonnet-4-6' }}"
             --allowedTools
