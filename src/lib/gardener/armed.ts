@@ -445,8 +445,8 @@ async function cancelled(
  * adds the answer an unattended pass cannot get from a fire-and-forget call.
  *
  * What that answer does NOT buy is that the premise still held. `beads.push` PULLS before it pushes
- * (beads/bd.ts `runDoltSync`), and Dolt merges a concurrent write to a DIFFERENT column of the same
- * bead rather than conflicting on it — only a same-cell divergence rejects. So a machine that
+ * (beads/dolt-exec.ts `runDoltSync`), and Dolt merges a concurrent write to a DIFFERENT column of
+ * the same bead rather than conflicting on it — only a same-cell divergence rejects. So a machine that
  * touched a subject after this apply's pre-apply pull can land beside the move and the push still
  * succeeds: the walk decided on evidence its own publication has just superseded.
  *
@@ -614,8 +614,8 @@ const unmadeOf = (base: ArmedAsk): ArmedRecord => ({
  *
  * `beads.pull` RESOLVES for a workspace with no Dolt remote — a board with nowhere to be stale
  * against is fresh by definition — and rejects on every failure that can leave this checkout behind
- * one: auth, an unreachable remote, a real divergence (beads/bd.ts `runDoltSync`). So a rejection
- * here means exactly "anton cannot establish that it is looking at the current board".
+ * one: auth, an unreachable remote, a real divergence (beads/dolt-exec.ts `runDoltSync`). So a
+ * rejection here means exactly "anton cannot establish that it is looking at the current board".
  */
 async function pullFailure(repo: string): Promise<string | undefined> {
   try {
