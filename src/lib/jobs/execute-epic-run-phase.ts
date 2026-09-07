@@ -38,6 +38,7 @@ export async function walkRunPhase(
       stepCtx: {
         ...prep.runStep,
         tickets: dispatched.delivered,
+        satisfied: dispatched.satisfied,
         step: cooked,
         advisories: carry.advisories,
       },

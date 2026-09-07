@@ -5,6 +5,7 @@
  * sibling steps: `steps/git.ts` and `steps/gates.ts` share this file and know nothing of each other.
  */
 import type { Bead, CookedStep } from "../../beads/bd";
+import type { SatisfiedBy } from "../../beads/satisfied-note";
 import type { ClaudeResult, RunClaudeOptions } from "../../claude/driver";
 import type { ProjectSettings } from "../../projects";
 import { startJobSession, type JobSession } from "../../sessions";
@@ -64,6 +65,13 @@ export interface StepContext {
   target: Bead;
   /** The ticket(s) this step covers, in execution order. */
   tickets: Bead[];
+  /**
+   * Which of {@link tickets} settled on an EARLIER commit of this run instead of committing their
+   * own (anton-8h4b), by ticket id. Run-phase only: `pr` attributes each to that commit rather than
+   * listing it as a delivery. Absent on a ticket-phase context and for a caller invoking a handler
+   * directly, which reads as "every ticket committed its own work".
+   */
+  satisfied?: ReadonlyMap<string, SatisfiedBy>;
   settings: ProjectSettings;
   /** The formula step being executed. Absent for a caller invoking a handler directly. */
   step?: CookedStep;

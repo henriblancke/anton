@@ -786,6 +786,29 @@ export async function branchAddedCommit(
 }
 
 /**
+ * The full sha and subject line of `ref`, as the repository resolves it — undefined when it names
+ * nothing, or names more than one thing.
+ *
+ * This is what a satisfied step is RECORDED against (anton-8h4b): the agent names a commit by
+ * whatever abbreviation it read off `git log`, and the gate accepts it on the strength of the branch
+ * ({@link branchAddedCommit}). An abbreviation is unambiguous today and may not be next year, so the
+ * bead and the pull request cite the full sha; the subject is the attribution a reader wants, since
+ * anton subjects its own commits `<ticket-id>: <title>`.
+ */
+export async function describeCommit(
+  repoPath: string,
+  ref: string,
+): Promise<{ sha: string; subject: string } | undefined> {
+  try {
+    const out = await git(repoPath, ["log", "-1", "--format=%H%n%s", `${ref}^{commit}`, "--"]);
+    const [sha, subject = ""] = out.trim().split("\n");
+    return sha && /^[0-9a-f]{40}$/.test(sha) ? { sha, subject: subject.trim() } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * What git's history says became of `path` on this branch — the raw read behind the `ref-stale`
  * repair (anton-fzas / R5.4). It reports; it does not judge. Whether a single destination is a
  * rename anton may follow, or a pointer it must refuse to guess at, is

@@ -7,11 +7,13 @@
  * ticket stops short is the settlement's (execute-epic-ticket-settle.ts).
  */
 import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
+import { formatSatisfiedNote } from "../beads/satisfied-note";
 import { readWorktreeState, type WorktreeState } from "../git/ops";
 import { updateRun } from "../runs";
 import { appendSessionLog, endSession, startJobSession, type JobSession } from "../sessions";
 import { PoisonEpic } from "./errors";
 import { mustPersist, safe } from "./execute-epic-persist";
+import type { TicketSettlement } from "./execute-epic-ticket-settle";
 import type { JobContext } from "./runner";
 import type { StepContext } from "./step-registry";
 
@@ -283,15 +285,33 @@ export function narrowToTicket(
   };
 }
 
-/** Persist this ticket's "code done" state the moment it commits. */
+/**
+ * Persist this ticket's "code done" state the moment it commits — or, for a SATISFIED step, the
+ * moment the gate accepted the earlier commit that did its work.
+ */
 export async function finishTicket(
   run: Omit<StepContext, "tickets">,
   ticket: Bead,
   sessionId: string,
   closeOnDone: boolean,
+  settlement: TicketSettlement = { how: "committed" },
 ): Promise<void> {
   const { db, clock } = run;
   const repo = run.repoPath;
+  // A satisfied step closes exactly as a committed one does, so the bead has to say which it was
+  // (anton-8h4b): without the record, a reader later sees a closed ticket with no commit under its
+  // name on the branch and cannot tell "an earlier commit covered it" from "the close was a lie".
+  // Written before the close so the closed bead already carries its account; best-effort like the
+  // close beside it — the pull request cites the same commit from the run's own ledger.
+  if (settlement.how === "satisfied") {
+    await safe(() =>
+      beads.note(
+        repo,
+        ticket.id,
+        formatSatisfiedNote({ by: settlement.by, sessionId, branch: run.branch }),
+      ),
+    );
+  }
   // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
   // → done). A standalone target isn't closed until its PR merges, so instead move it to
   // stage:in-review here (dropping implementing): that is both its board state and the persisted

@@ -27,12 +27,18 @@ import { resilientClaude } from "./execute-epic-ticket-claude";
 import {
   selfReportSuffix,
   settleFailedTicket,
+  ticketSettlement,
   type TicketProgress,
+  type TicketSettlement,
 } from "./execute-epic-ticket-settle";
 import type { ResolvedStep } from "./run-formula";
 import type { StepContext, StepFacts } from "./step-registry";
 
-/** One ticket: session → the formula's ticket phase (…→ commit) → close. */
+/**
+ * One ticket: session → the formula's ticket phase (…→ commit) → close. Answers HOW the ticket
+ * settled (anton-8h4b) — on its own commit, or on an earlier commit of the run — because the close
+ * looks the same either way and the pull request must not.
+ */
 export async function runTicket(args: {
   /** The run-level step context every ticket shares; this ticket's own is derived from it. */
   run: Omit<StepContext, "tickets">;
@@ -62,7 +68,7 @@ export async function runTicket(args: {
   standalone?: boolean;
   /** This ticket's wall-clock budget (anton-t1mo); `Infinity` leaves it unbounded. */
   timeoutMs: number;
-}): Promise<void> {
+}): Promise<TicketSettlement> {
   const { run, ticket, operator, timeoutMs } = args;
   const standalone = args.standalone ?? false;
   const { ctx, worktreePath } = run;
@@ -79,9 +85,12 @@ export async function runTicket(args: {
 
   try {
     await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress });
-    await finishTicket(run, ticket, session.sessionId, closeOnDone);
+    const settlement = await ticketSettlement(run, progress);
+    await finishTicket(run, ticket, session.sessionId, closeOnDone, settlement);
+    return settlement;
   } catch (e) {
-    await settleFailedTicket({
+    // Always throws; returned so the signature carries the `never` and the walk's answer is typed.
+    return settleFailedTicket({
       run,
       ticket,
       runTicketIds: args.runTicketIds,

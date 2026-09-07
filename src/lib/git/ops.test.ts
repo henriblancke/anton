@@ -40,6 +40,7 @@ import {
   sameWorktreeState,
   worktreeHasCommitFor,
   branchAddedCommit,
+  describeCommit,
   branchContainsCommit,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
@@ -469,6 +470,48 @@ suite("branchAddedCommit (real git)", () => {
     expect(await branchAddedCommit(repo, "anton/anton-e0y2", "main", "0123456")).toBe(false);
     expect(await branchAddedCommit(repo, "anton/anton-x7la", "main", own)).toBe(false);
     expect(await branchAddedCommit(repo, "anton/anton-e0y2", "origin/main", own)).toBe(false);
+  });
+});
+
+/**
+ * anton-8h4b: a satisfied step is recorded against the FULL sha and subject of the commit it named,
+ * so the record outlives the abbreviation the agent read off `git log`.
+ */
+suite("describeCommit (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const rev = (ref: string) =>
+    execFileSync("git", ["-C", repo, "rev-parse", ref], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-describe-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "init\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-t1: Ticket one\n\nA body the subject must not carry."]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("resolves an abbreviated sha to its full form and subject line", async () => {
+    const full = rev("HEAD");
+    expect(await describeCommit(repo, full.slice(0, 7))).toEqual({
+      sha: full,
+      subject: "anton-t1: Ticket one",
+    });
+  });
+
+  it("answers undefined for a sha the repository does not have", async () => {
+    expect(await describeCommit(repo, "0123456")).toBeUndefined();
+    expect(await describeCommit(join(sandbox, "nowhere"), rev("HEAD"))).toBeUndefined();
   });
 });
 

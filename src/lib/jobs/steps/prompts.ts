@@ -9,6 +9,7 @@
 import type { Bead } from "../../beads/bd";
 import { acceptanceBody } from "../../beads/contract";
 import { humanNotesPromptBlock } from "../../beads/notes";
+import { shortSha, type SatisfiedBy } from "../../beads/satisfied-note";
 import { ANTON_REPO_URL } from "../../repo";
 import { findingLines, type ReviewFinding } from "../review-context";
 import type { StepContext } from "./context";
@@ -146,14 +147,35 @@ function ticketPromptClosing(ticketId: string): string {
  * `advisory` — findings the self-review reported and did NOT fix (anton-omum). They never hold the PR
  * back, so the merge gate is the only place the founder would ever see them; putting them in the body
  * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
+ *
+ * `satisfied` — the tickets that settled on an EARLIER commit of this run (anton-8h4b). They are
+ * closed and their acceptance is in this diff, but no commit here carries their name, so the body
+ * attributes each to the commit that did the work rather than listing it among the deliveries: a
+ * reader matching tickets to commits would otherwise go looking for one that does not exist.
  */
-export function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] = []): string {
+export function prBody(
+  target: Bead,
+  tickets: Bead[],
+  advisory: ReviewFinding[] = [],
+  satisfied: ReadonlyMap<string, SatisfiedBy> = new Map(),
+): string {
   // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
   const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
+  const committed = tickets.filter((t) => !satisfied.has(t.id));
+  const settled = tickets.filter((t) => satisfied.has(t.id));
   const lines = [
     `Autonomous run for **${target.id}** — ${target.title}.`,
     ``,
-    ...(standalone ? [] : [`Tickets:`, ...tickets.map((t) => `- ${t.id} — ${t.title}`), ``]),
+    ...(standalone || committed.length === 0
+      ? []
+      : [`Tickets:`, ...committed.map((t) => `- ${t.id} — ${t.title}`), ``]),
+    ...(settled.length > 0
+      ? [
+          `Satisfied by earlier commits of this run (closed on that work; no commit of their own):`,
+          ...settled.map((t) => `- ${t.id} — ${t.title} — by ${satisfiedByLine(satisfied.get(t.id)!)}`),
+          ``,
+        ]
+      : []),
     ...(advisory.length > 0
       ? [
           `### Unresolved review findings (${advisory.length}, advisory)`,
@@ -167,4 +189,9 @@ export function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] 
     `🤖 Generated with [anton](${ANTON_REPO_URL}) autonomous execution`,
   ];
   return lines.join("\n");
+}
+
+/** `<short sha> "<subject>"` — the subject is the attribution, since anton's commits are named for their ticket. */
+function satisfiedByLine(by: SatisfiedBy): string {
+  return by.subject ? `${shortSha(by.commit)} "${by.subject}"` : shortSha(by.commit);
 }

@@ -52,6 +52,7 @@ import { assertDelivered, selfReportRank } from "./execute-epic-ticket";
 import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
 import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
 import {
+  satisfiedClaim,
   ticketBlockNote,
   timedOutTicketNote,
   type TicketProgress,
@@ -1208,6 +1209,7 @@ describe("landableTicketIds — which prerequisites this run can still land (ant
     skipCause: new Map(skipped.map((id) => [id, { waitingOn: "x", stopped: "x" }])),
     skipped: new Map(),
     onBranch: new Set<string>(),
+    satisfied: new Map(),
   });
   const board = () => [ticket("schema"), ticket("api"), ticket("wiring")];
 
@@ -1684,6 +1686,39 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
  * logged; these cases pin it to the bead, alongside the evidence an operator would otherwise dig
  * for — and pin the invariant that keeps the notes blob parseable: exactly one line per note.
  */
+/**
+ * anton-8h4b: the close is the same for a committed step and a satisfied one, so the settle path has
+ * to read which it was off the progress the gate wrote — and only the shape the gate produces for a
+ * verified satisfied claim (`delivered` without `committed`) may settle as satisfied.
+ */
+describe("satisfiedClaim — how a finished ticket settled", () => {
+  const satisfied = { outcome: "satisfied" as const, commit: "a1b2c3d", reason: "covered by t1" };
+
+  it("reads the commit and the agent's account off a verified satisfied step", () => {
+    expect(satisfiedClaim({ committed: false, delivered: true, selfReport: satisfied })).toEqual({
+      commit: "a1b2c3d",
+      note: "covered by t1",
+    });
+  });
+
+  it("answers null for a step that committed its own work, whatever it self-reported", () => {
+    for (const selfReport of [null, { outcome: "delivered" as const }, satisfied]) {
+      expect(satisfiedClaim({ committed: true, delivered: true, selfReport })).toBeNull();
+    }
+  });
+
+  it("answers null for a step the gate did not deliver, even with a satisfied claim on it", () => {
+    expect(satisfiedClaim({ committed: false, delivered: false, selfReport: satisfied })).toBeNull();
+  });
+
+  it("answers null for a zero-diff delivery with no satisfied claim — nothing to attribute", () => {
+    expect(satisfiedClaim({ committed: false, delivered: true, selfReport: null })).toBeNull();
+    expect(
+      satisfiedClaim({ committed: false, delivered: true, selfReport: { outcome: "delivered" } }),
+    ).toBeNull();
+  });
+});
+
 describe("ticketBlockNote (anton-vqql)", () => {
   const HEAD = "0123456789abcdef0123456789abcdef01234567";
   const note = (over: Partial<Parameters<typeof ticketBlockNote>[0]> = {}) =>

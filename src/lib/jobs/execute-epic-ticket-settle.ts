@@ -15,8 +15,10 @@
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { blockNoteEvidence } from "../beads/block-note";
+import type { SatisfiedBy } from "../beads/satisfied-note";
 import { formatAntonResult, type AntonResult } from "../claude/anton-result";
 import {
+  describeCommit,
   preservedCommitPrefix,
   readWorktreeState,
   restoreWorktreeState,
@@ -66,6 +68,51 @@ export interface TicketProgress {
    * delivery-evidence gate, never replaces it; a missing/unparseable line (null) falls through to it.
    */
   selfReport: AntonResult | null;
+}
+
+/**
+ * HOW a finished ticket settled (anton-8h4b): on a commit of its own, or on an earlier commit of the
+ * run that already did its work. The close is the same either way; what differs is what the board
+ * and the pull request may say about it — a satisfied step is closed but delivered nothing of its
+ * own, and presenting it as a delivery is the false success the gate refuses in every other shape.
+ */
+export type TicketSettlement =
+  | { how: "committed" }
+  | { how: "satisfied"; by: SatisfiedBy };
+
+/**
+ * The satisfied claim a finished ticket settled on, or null when it committed its own work. Read
+ * off the same progress the gate wrote: `delivered` without `committed` is exactly the shape
+ * `assertDelivered` produces for a verified `satisfied` self-report, and nothing else produces it.
+ */
+export function satisfiedClaim(progress: TicketProgress): { commit: string; note?: string } | null {
+  if (progress.committed || !progress.delivered) return null;
+  const report = progress.selfReport;
+  if (report?.outcome !== "satisfied" || !report.commit) return null;
+  return { commit: report.commit, note: report.reason };
+}
+
+/**
+ * Settle a finished ticket against the branch: a satisfied step is recorded against the FULL sha
+ * and subject of the commit it named, so the record outlives the abbreviation the agent read off
+ * `git log`. Best-effort resolution — the gate already accepted the commit, so a read that fails
+ * here costs the subject and the long form, never the settlement.
+ */
+export async function ticketSettlement(
+  run: Pick<StepContext, "repoPath">,
+  progress: TicketProgress,
+): Promise<TicketSettlement> {
+  const claim = satisfiedClaim(progress);
+  if (!claim) return { how: "committed" };
+  const resolved = await describeCommit(run.repoPath, claim.commit);
+  return {
+    how: "satisfied",
+    by: {
+      commit: resolved?.sha ?? claim.commit,
+      ...(resolved?.subject ? { subject: resolved.subject } : {}),
+      ...(claim.note ? { note: claim.note } : {}),
+    },
+  };
 }
 
 /**

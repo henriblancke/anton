@@ -8,6 +8,7 @@
  * reads its marker, not this module's memory).
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
+import type { SatisfiedBy } from "../beads/satisfied-note";
 import { claimGuard } from "../beads/claim";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { appendSessionLog } from "../sessions";
@@ -42,6 +43,14 @@ import { runTicket } from "./execute-epic-ticket";
 export interface DispatchOutcome {
   /** The tickets whose work is actually on the branch — the PR body and review contract's set. */
   delivered: Bead[];
+  /**
+   * The subset of {@link delivered} that settled on an EARLIER commit of this run rather than one of
+   * its own (anton-8h4b), and the commit each was settled against. The PR body attributes these to
+   * that commit instead of listing them as deliveries. A ledger of THIS attempt only, and that is
+   * enough: a satisfied ticket has no commit under its own name, so a resume never skips it as
+   * done-on-branch — it re-runs and settles again here.
+   */
+  satisfied: Map<string, SatisfiedBy>;
   /** Tickets this run never dispatched, and the timeout each is waiting behind. */
   skipped: Map<string, SkipCause>;
 }
@@ -63,6 +72,8 @@ interface DispatchLedger {
    * only the loop knows what actually landed here.
    */
   onBranch: Set<string>;
+  /** Tickets that settled on an earlier commit of the run — see {@link DispatchOutcome.satisfied}. */
+  satisfied: Map<string, SatisfiedBy>;
 }
 
 /** Dispatch every ticket this run may run, then answer what it delivered. */
@@ -75,6 +86,7 @@ export async function dispatchRunTickets(
     skipCause: new Map(),
     skipped: new Map(),
     onBranch: new Set(),
+    satisfied: new Map(),
   };
   const recordSkipped = makeSkipRecorder(run, ledger);
 
@@ -104,6 +116,7 @@ export async function dispatchRunTickets(
   await settleHeldTail(run, prep, { held, dispatchable, ledger, stoppedShort, recordSkipped });
   return {
     delivered: await deliveredOrPark(run, prep, live, ledger, stoppedShort),
+    satisfied: ledger.satisfied,
     skipped: ledger.skipped,
   };
 }
@@ -449,7 +462,7 @@ async function dispatchTicket(
     await safe(() => beads.reopen(repo, ticket.id));
   }
   try {
-    await runTicket({
+    const settlement = await runTicket({
       run: runStep,
       steps: ticketSteps,
       ticket,
@@ -459,7 +472,10 @@ async function dispatchTicket(
       standalone: standaloneRun,
       timeoutMs: ticketTimeoutMs,
     });
-    onBranch.add(ticket.id); // it committed, so nothing behind it is missing its mechanism
+    // Its mechanism is on the branch either way — its own commit, or the earlier one it settled on
+    // — so nothing behind it is missing anything. Which it was is what the PR body has to say.
+    onBranch.add(ticket.id);
+    if (settlement.how === "satisfied") ledger.satisfied.set(ticket.id, settlement.by);
   } catch (e) {
     // A ticket that ran out of time is the ONE failure this loop absorbs (anton-t1mo). It has
     // already blocked its own bead and settled its partial work — preserved in a commit of its
