@@ -14,7 +14,7 @@ import {
   deferQueuedJobs,
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
-  enqueueReviewFixIfAbsent,
+  enqueueReviewFixPrIfAbsent,
   getJob,
   resumeBudgetDeferredJobs,
   resumeJob,
@@ -396,16 +396,18 @@ describe("resumeJob vs the active-epic index (anton-ner)", () => {
 });
 
 /**
- * anton-k0kj: the gate-driven merge dispatch. Every gate-check pass re-derives its list from the
- * board, so overlapping passes must converge on one job — and a SETTLED job must not hold a target
- * back, or a finalize that failed once would never be retried.
+ * anton-f01t / anton-k0kj: the per-PR fix job. Both writers re-derive their list from the board on
+ * every pass — the scheduled dispatcher and gate-check's merge dispatch — so overlapping passes must
+ * converge on one job, and a SETTLED job must not hold a target back, or a finalize that failed once
+ * would never be retried.
  */
-describe("enqueueReviewFixIfAbsent", () => {
-  it("enqueues one targeted review-fix job and dedupes the next pass onto it", () => {
-    const a = enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1");
+describe("enqueueReviewFixPrIfAbsent", () => {
+  it("enqueues one review-fix-pr job for the target and dedupes the next pass onto it", () => {
+    const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1");
     expect(a).toBeDefined();
-    expect(enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeUndefined();
+    expect(enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeUndefined();
     expect(activeRows()).toHaveLength(1);
+    expect(activeRows()[0].type).toBe("review-fix-pr");
     expect(JSON.parse(activeRows()[0].payloadJson)).toEqual({
       projectId: "p1",
       epicBeadId: "epic-1",
@@ -413,25 +415,27 @@ describe("enqueueReviewFixIfAbsent", () => {
   });
 
   it("dedupes against a running job too", () => {
-    const a = enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1")!;
+    const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1")!;
     t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
-    expect(enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeUndefined();
+    expect(enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeUndefined();
     expect(activeRows()).toHaveLength(1);
   });
 
   it("re-dispatches after a settled attempt — a failed finalize must be retryable", () => {
     for (const status of ["done", "failed", "parked"] as const) {
-      const id = enqueueReviewFixIfAbsent(t.db, systemClock, "p1", `epic-${status}`)!;
+      const id = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", `epic-${status}`)!;
       t.db.update(schema.jobs).set({ status }).where(eq(schema.jobs.id, id)).run();
-      expect(enqueueReviewFixIfAbsent(t.db, systemClock, "p1", `epic-${status}`)).toBeDefined();
+      expect(enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", `epic-${status}`)).toBeDefined();
     }
   });
 
-  it("does not treat the project-wide sweep as covering a target", () => {
+  // The dispatcher only triages; treating its in-flight poll as coverage would strand this target
+  // until the next slot (and it may have skipped the target on ownership in the first place).
+  it("does not treat the review-fix dispatcher as covering a target", () => {
     t.db
       .insert(schema.jobs)
       .values({
-        id: "sweep",
+        id: "dispatcher",
         type: "review-fix",
         projectId: "p1",
         payloadJson: JSON.stringify({ projectId: "p1" }),
@@ -442,13 +446,13 @@ describe("enqueueReviewFixIfAbsent", () => {
         updatedAt: new Date(),
       })
       .run();
-    expect(enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeDefined();
+    expect(enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeDefined();
   });
 
-  it("keeps targets and projects independent", () => {
-    const a = enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-1");
-    const b = enqueueReviewFixIfAbsent(t.db, systemClock, "p1", "epic-2");
-    const c = enqueueReviewFixIfAbsent(t.db, systemClock, "p2", "epic-1");
+  it("keeps targets and projects independent — a fix on one PR never covers another", () => {
+    const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1");
+    const b = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-2");
+    const c = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p2", "epic-1");
     expect(new Set([a, b, c]).size).toBe(3);
   });
 });

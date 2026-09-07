@@ -124,6 +124,7 @@ describe("option lists", () => {
     expect(JOB_TYPES).toEqual([
       "execute-epic",
       "review-fix",
+      "review-fix-pr",
       "nightly-stringer",
       "orphan-grooming",
       "sync-push",

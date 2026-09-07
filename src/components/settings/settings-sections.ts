@@ -77,7 +77,7 @@ export const SECTIONS = [
     id: "review-fix",
     label: "Review-fix",
     group: "Before the PR opens",
-    dirtyKeys: ["reviewFixPrompt"],
+    dirtyKeys: ["reviewFixPrompt", "reviewFixConcurrency"],
   },
   {
     id: "automation",
