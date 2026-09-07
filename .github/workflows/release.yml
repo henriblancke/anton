@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.4.0" # match package.json `packageManager`
+          bun-version: "1.4.2" # match package.json `packageManager`
       - name: Install
         run: bun install --frozen-lockfile
       - name: Control bytes
@@ -71,7 +71,7 @@ jobs:
           node-version: "24.20.0"
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.4.0"
+          bun-version: "1.4.2"
       - name: Install (with native addon builds for this platform)
         run: bun install --frozen-lockfile
       - name: Build Next.js
