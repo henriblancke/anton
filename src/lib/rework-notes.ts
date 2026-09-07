@@ -74,25 +74,27 @@ function reworkNoteHead(args: {
  * unshaped bead is refused by the approve route and poison-parks the runner — a rework that produced
  * one would hand the founder a follow-up they cannot run.
  *
- * The instructions themselves are NOT repeated here: they are the human note on the same bead, which
- * the dispatch prompt inlines, and duplicating them would leave two copies to drift apart the first
- * time the founder edits one.
+ * The acceptance is the founder's request itemised ({@link followUpAcceptance}), not the summary
+ * echoed back: the summary is the bead's title and Goal already, and a rubric that restates the
+ * headline gives the self-review nothing to score against. The note on the same bead keeps the
+ * request in the founder's own words and order; this section is what "done" means, box by box.
  */
 export function followUpDescription(args: {
   summary: string;
+  instructions: string;
+  findings: ReviewFinding[];
   ticket: Bead;
   targetId: string;
   parentId?: string;
   pipeline?: ReworkPipeline;
 }): string {
-  const { summary, ticket, targetId, parentId, pipeline } = args;
+  const { summary, instructions, findings, ticket, targetId, parentId, pipeline } = args;
   return [
     `## Goal`,
     summary,
     ``,
     `## ${ACCEPTANCE_HEADING}`,
-    `- [ ] ${summary}`,
-    `- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply`,
+    ...followUpAcceptance(instructions, findings),
     ``,
     `## Context`,
     followUpProvenance(ticket, targetId, pipeline),
@@ -108,6 +110,34 @@ export function followUpDescription(args: {
     `The project's own checks stay green, and the run's self-review scores this bead against the ` +
       `acceptance above.`,
   ].join("\n");
+}
+
+/**
+ * The definition of done, derived from what the founder asked for: one box per instruction line, one
+ * per finding they selected, then the standing rule that every finding in the note is either fixed
+ * or answered. The generic box stays even when the specifics are listed — it is the one that admits
+ * "this finding does not apply" as a legitimate close, which no per-finding box says.
+ *
+ * Instruction lines arrive as the founder typed them — prose, `-`/`*` bullets, numbered steps, or
+ * boxes already — so list markers are stripped rather than nested inside a second box.
+ */
+function followUpAcceptance(instructions: string, findings: ReviewFinding[]): string[] {
+  return [
+    ...instructionCriteria(instructions).map((line) => `- [ ] ${line}`),
+    ...findings.map((f) => `- [ ] ${f.location} — ${f.note}`),
+    `- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply`,
+  ];
+}
+
+/** A leading `-`, `*`, `•`, `1.` or `1)` bullet, a checkbox, or both — and the whitespace after them. */
+const LIST_MARKER = /^(?:(?:[-*•]|\d+[.)])\s+)?(?:\[[ xX]\]\s*)?/;
+
+/** One criterion per non-blank instruction line, shorn of whatever list marker it was typed with. */
+function instructionCriteria(instructions: string): string[] {
+  return instructions
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(LIST_MARKER, ""))
+    .filter((line) => line.length > 0);
 }
 
 /** Why this bead exists — and, for a REDIRECTED send-back, why it exists here rather than on the original. */

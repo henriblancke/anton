@@ -250,6 +250,8 @@ async function createFollowUp(context: FollowUpContext, all: Bead[]): Promise<Ap
     type: "task",
     description: followUpDescription({
       summary: request.summary,
+      instructions: request.instructions,
+      findings: request.findings,
       ticket,
       targetId: target.id,
       parentId,

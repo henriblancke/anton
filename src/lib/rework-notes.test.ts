@@ -86,7 +86,19 @@ describe("reworkNoteBody", () => {
 });
 
 describe("followUpDescription", () => {
-  const args = { summary: "harden the retry", ticket: ticket(), targetId: "feat" };
+  const args = {
+    summary: "harden the retry",
+    instructions: INSTRUCTIONS,
+    findings: [] as ReviewFinding[],
+    ticket: ticket(),
+    targetId: "feat",
+  };
+  const findings: ReviewFinding[] = [
+    { severity: "blocking", location: "src/retry.ts:12", note: "retries on a 4xx, which never recovers" },
+    { severity: "advisory", location: "(general)", note: "no test covers the exhausted path" },
+  ];
+  const acceptanceOf = (description: string) =>
+    description.split("## Acceptance Criteria\n")[1].split("\n\n## Context")[0].split("\n");
 
   it("writes a bead the contract judges as complete — an unshaped one poison-parks the runner", () => {
     const description = followUpDescription({ ...args, parentId: "feat" });
@@ -106,8 +118,95 @@ describe("followUpDescription", () => {
     }
   });
 
-  it("never repeats the instructions — they are the human note, and two copies would drift", () => {
-    expect(followUpDescription({ ...args, parentId: "feat" })).not.toContain(INSTRUCTIONS);
+  it("builds the acceptance from the instructions and the selected findings, not the summary", () => {
+    const acceptance = acceptanceOf(
+      followUpDescription({
+        ...args,
+        instructions: "Guard the null branch before retrying.\nAdd a test that fails without the guard.",
+        findings,
+      }),
+    );
+    expect(acceptance).toEqual([
+      "- [ ] Guard the null branch before retrying.",
+      "- [ ] Add a test that fails without the guard.",
+      "- [ ] src/retry.ts:12 — retries on a 4xx, which never recovers",
+      "- [ ] (general) — no test covers the exhausted path",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(acceptance).not.toContain("- [ ] harden the retry");
+  });
+
+  it("keeps the summary as the Goal and the title, never as a box to tick", () => {
+    const description = followUpDescription(args);
+    expect(description).toContain("## Goal\nharden the retry\n");
+    expect(acceptanceOf(description)).not.toContain("- [ ] harden the retry");
+  });
+
+  it("keeps the generic findings-addressed box even when the founder selected none", () => {
+    expect(acceptanceOf(followUpDescription(args))).toEqual([
+      `- [ ] ${INSTRUCTIONS}`,
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+  });
+
+  it("makes one box per instruction line, whatever list marker the founder typed", () => {
+    const acceptance = acceptanceOf(
+      followUpDescription({
+        ...args,
+        instructions: [
+          "Some prose first.",
+          "",
+          "- a dashed bullet",
+          "* a starred bullet",
+          "1. a numbered step",
+          "2) another numbering",
+          "- [ ] a box already",
+          "[x] a ticked box",
+          "   ",
+        ].join("\n"),
+      }),
+    );
+    expect(acceptance.slice(0, -1)).toEqual([
+      "- [ ] Some prose first.",
+      "- [ ] a dashed bullet",
+      "- [ ] a starred bullet",
+      "- [ ] a numbered step",
+      "- [ ] another numbering",
+      "- [ ] a box already",
+      "- [ ] a ticked box",
+    ]);
+  });
+
+  it("still writes a contract-complete bead when the instructions are blank — the generic box carries it", () => {
+    const description = followUpDescription({ ...args, instructions: "  \n", parentId: "feat" });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+  });
+
+  it("keeps Goal, Acceptance, Context, Out of scope and Verify in that order, with their content", () => {
+    expect(
+      followUpDescription({ ...args, findings: findings.slice(0, 1), parentId: "feat" }),
+    ).toMatchInlineSnapshot(`
+      "## Goal
+      harden the retry
+
+      ## Acceptance Criteria
+      - [ ] Add a test that fails without the null guard.
+      - [ ] src/retry.ts:12 — retries on a 4xx, which never recovers
+      - [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply
+
+      ## Context
+      Discovered from t1 — Ticket one. That ticket's acceptance was met and it keeps its review score; this bead carries the next iteration feat's self-review prompted. The founder's instructions and the findings they selected are the human note on this bead.
+      It runs as a ticket of feat, in that target's next run.
+
+      ## Out of scope
+      Anything beyond the instructions in the note. t1 already shipped its own acceptance; re-litigating it belongs on that ticket, not here.
+
+      ## Verify
+      The project's own checks stay green, and the run's self-review scores this bead against the acceptance above."
+    `);
   });
 
   it("tells a parented bead it runs as a ticket, and a parentless one that it is its own target", () => {
