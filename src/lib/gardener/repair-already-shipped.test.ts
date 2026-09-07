@@ -264,6 +264,24 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
   // them, before the feature's one pull request opens, let alone merges — so a closed bead is
   // routinely work on an unmerged branch, and retiring a live ticket against it would settle that
   // ticket on work the base does not contain.
+  // The log format splits sha from body on `\x1f`; a body that itself carries that byte must not
+  // lose whatever names the bead behind it (PR #238 review).
+  it("reads a naming commit whose body itself carries the log format's separator byte", async () => {
+    const g = (args: string[]) =>
+      execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    writeFileSync(join(repo, "separated.ts"), "export const separated = true;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "odd\x1fbody", "-m", "anton-sepr: shipped behind the separator"]);
+    const sha = g(["rev-parse", "HEAD"]);
+
+    const verdict = await verify("already done by anton-sepr", [
+      bead(TARGET),
+      bead("anton-sepr", { status: "closed" }),
+    ]);
+
+    expect(verdict).toMatchObject({ state: "verified", landed: { "anton-sepr": { via: "commit", sha } } });
+  });
+
   it("refuses a bead that is closed with nothing saying its work landed", async () => {
     const verdict = await verify(`already done by ${UNLANDED}`, [
       bead(TARGET),
@@ -663,6 +681,39 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(supersedeMock).not.toHaveBeenCalled();
   });
 
+  // Open is not enough for the TARGET either (PR #238 review): a ticket whose acceptance was
+  // rewritten in the window is open exactly as before, and the supersede would close the ticket the
+  // human just redefined on a claim verified about the one they replaced.
+  it("refuses under the lock when the ticket's contract was rewritten since the check", async () => {
+    showMock.mockImplementation(async (_cwd, id) =>
+      id === TARGET
+        ? bead(TARGET, { status: "in_progress", description: "## Acceptance\n- [ ] one more thing" })
+        : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire();
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("the board moved");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("rewritten since the check");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("description");
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(tagMock).not.toHaveBeenCalled();
+  });
+
+  it("still retires when the window only stamped the ticket — a label or a timestamp is not a rewrite", async () => {
+    showMock.mockImplementation(async (_cwd, id) =>
+      id === TARGET
+        ? bead(TARGET, { status: "in_progress", labels: ["gardener:seen"], updated_at: "2026-09-07T00:00:00Z" })
+        : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire();
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+  });
+
   it("writes nothing when either end moved between the check and the write", async () => {
     // Somebody else settled the ticket in the window — anton does not rewrite that outcome.
     showMock.mockImplementation(async (_cwd, id) =>
@@ -755,6 +806,71 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
       expect(outcome).toMatchObject({ action: "escalate" });
       expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("reads as open now, not merged");
+      expect(supersedeMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // A survivor verified through the PR of the run target it RIDES is re-verified as still riding it
+  // (PR #238 review). A re-parent takes the survivor's lock, so it serializes against this write —
+  // but serialized is not refused: re-homed under another card, or detached, the survivor's work is
+  // no longer what the verified PR carried, and rereading that PR by id would re-verify evidence
+  // that stopped being about the survivor.
+  describe("a survivor verified through the merged pull request of the run target it rides", () => {
+    const OTHER = "anton-othr";
+    const feature = (id: string, pr: string) =>
+      bead(id, { issue_type: "feature", status: "closed", metadata: { pr } });
+    /** `null` detaches the survivor — an explicit `undefined` would only re-apply the default. */
+    const viaOwner = (parent: string | null = OWNER) => [
+      bead(TARGET, { status: "in_progress" }),
+      feature(OWNER, "gh-85"),
+      feature(OTHER, "gh-90"),
+      bead(UNLANDED, { status: "closed", ...(parent ? { parent } : {}) }),
+    ];
+    const retireViaOwner = () =>
+      retire({ block: { reason: `Already implemented by ${UNLANDED}` }, board: viaOwner() });
+
+    beforeEach(() => {
+      setPr(85, "MERGED");
+      setPr(90, "MERGED");
+      loadAllIssuesMock.mockResolvedValue(viaOwner());
+      showMock.mockImplementation(async (_cwd, id) => viaOwner().find((b) => b.id === id)!);
+    });
+
+    it("retires against it while it still rides that run target and the PR is still merged", async () => {
+      const outcome = await retireViaOwner();
+
+      expect(outcome).toMatchObject({
+        action: "retired",
+        replacementId: UNLANDED,
+        proof: [
+          `\`${UNLANDED}\` is closed on the board and the PR of \`${OWNER}\`, the run target it ` +
+            `rides, (gh-85) is merged`,
+        ],
+      });
+      expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);
+    });
+
+    it("refuses when it was re-homed under another run target in the window, whatever that one's PR says", async () => {
+      loadAllIssuesMock.mockResolvedValue(viaOwner(OTHER));
+
+      const outcome = await retireViaOwner();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { why: string }).why).toContain("the board moved");
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`no longer rides \`${OWNER}\``);
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`rides \`${OTHER}\` now`);
+      expect(supersedeMock).not.toHaveBeenCalled();
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses when it was detached from its run target in the window", async () => {
+      loadAllIssuesMock.mockResolvedValue(viaOwner(null));
+
+      const outcome = await retireViaOwner();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`no longer rides \`${OWNER}\``);
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("rides no run target now");
       expect(supersedeMock).not.toHaveBeenCalled();
     });
   });

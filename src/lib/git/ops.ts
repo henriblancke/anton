@@ -859,8 +859,12 @@ export async function readCommitNaming(
   }
   const named = new RegExp(`(?<![\\w-])${beadId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`);
   for (const entry of log.split("\x1e")) {
-    const [sha, message] = entry.trim().split("\x1f");
-    if (sha && message !== undefined && named.test(message)) return { state: "found", sha };
+    // Split on the FIRST separator only — a body that itself carries `\x1f` must stay whole.
+    const sepIdx = entry.indexOf("\x1f");
+    if (sepIdx < 0) continue;
+    const sha = entry.slice(0, sepIdx).trim();
+    const message = entry.slice(sepIdx + 1);
+    if (sha && named.test(message)) return { state: "found", sha };
   }
   return { state: "none" };
 }

@@ -619,9 +619,18 @@ export async function repairAlreadyShipped(args: {
   // re-check finds a closed home. Against the snapshot alone both would pass, and the newly
   // attached ticket would sit beneath a card nothing will run.
   return withBeadWriteLocks(repoPath, [bead.id, replacementId], async () => {
+    const locked = await readBoardUnderLock(repoPath);
     const moved =
-      (await retirementMoved(repoPath, bead.id, replacementId, landing)) ??
-      (await strandedUnderLock(repoPath, bead.id));
+      typeof locked === "string"
+        ? locked
+        : ((await retirementMoved({
+            repoPath,
+            targetId: bead.id,
+            checked: index.byId.get(bead.id),
+            replacementId,
+            landing,
+            locked,
+          })) ?? strandedUnderLock(locked, bead.id));
     if (moved) {
       return {
         action: "escalate",
@@ -664,13 +673,21 @@ export async function repairAlreadyShipped(args: {
  * only spoke for INDIRECTLY — the run target's PR, a commit the base names — the survivor also has
  * to still be the closed ticket that made that evidence its own, since reopening or abandoning it in
  * the window is the human saying otherwise.
+ *
+ * The TARGET is held to more than "still open" for the same reason (PR #238 review): the claim is
+ * about this ticket's contract, and a ticket rewritten in the window is open exactly as before.
  */
-async function retirementMoved(
-  repoPath: string,
-  targetId: string,
-  replacementId: string,
-  landing: BeadLanding,
-): Promise<string | undefined> {
+async function retirementMoved(args: {
+  repoPath: string;
+  targetId: string;
+  /** The target as the CHECK read it — the contract the claim was verified against. */
+  checked: Bead | undefined;
+  replacementId: string;
+  landing: BeadLanding;
+  /** The whole board, re-read inside the locks. */
+  locked: BoardIndex;
+}): Promise<string | undefined> {
+  const { repoPath, targetId, checked, replacementId, landing, locked } = args;
   const read = async (id: string): Promise<Bead | string> => {
     try {
       const bead = await beads.show(repoPath, id);
@@ -687,6 +704,8 @@ async function retirementMoved(
       `outcome, and anton does not rewrite that`
     );
   }
+  const rewritten = contractRewritten(checked, target);
+  if (rewritten) return rewritten;
   const replacement = await read(replacementId);
   if (typeof replacement === "string") return replacement;
 
@@ -717,6 +736,8 @@ async function retirementMoved(
     case "owner-pr": {
       const settled = stillClosedSurvivor(replacement, "the run target's merged PR");
       if (settled) return settled;
+      const rehomed = stillRidesOwner(locked, targetId, replacementId, landing.ownerId);
+      if (rehomed) return rehomed;
       const owner = await read(landing.ownerId);
       if (typeof owner === "string") return owner;
       return stillMergedPr(owner, landing.ref, `\`${landing.ownerId}\`, the run target \`${replacementId}\` rides,`);
@@ -749,19 +770,87 @@ function stillClosedSurvivor(replacement: Bead, spokeFor: string): string | unde
 }
 
 /**
- * Open work beneath the ticket, judged from a board read INSIDE its write lock — or why that could
- * not be judged. The same bar the snapshot was held to before the check ran, re-asked where a
- * concurrent re-parent is ordered against it. A board that could not be re-read says nothing, so
- * the retirement refuses and nothing is written.
+ * The fields a ticket's CONTRACT lives in — the ones a claim about "this ticket's work" is a claim
+ * about. Every home the contract can occupy (beads/contract.ts `acceptanceBodies`), plus the title.
  */
-async function strandedUnderLock(repoPath: string, targetId: string): Promise<string | undefined> {
-  let board: Bead[];
+const CONTRACT_FIELDS = ["title", "description", "acceptance_criteria", "acceptance", "context", "design"] as const;
+
+/**
+ * Why the ticket at the write is no longer the one the claim was checked against — or undefined
+ * when its contract still reads as it did (PR #238 review).
+ *
+ * The claim says THIS ticket's work has landed, and the check proved that about the ticket as it
+ * stood. A human rewriting it in the window — an acceptance line added, the goal widened — leaves it
+ * open exactly as before, so a status reread passes it through to a supersede that closes the
+ * ticket they just redefined on evidence about the one they replaced. `updated_at` is deliberately
+ * not the fence (board-picker-plan.ts gives the reason): every write bumps it, and a label stamped
+ * in the window is not a rewrite.
+ */
+function contractRewritten(checked: Bead | undefined, now: Bead): string | undefined {
+  if (!checked) {
+    return (
+      `\`${now.id}\` was not on the board the claim was checked against — anton cannot tell ` +
+      `whether the ticket it would close is the one the claim is about`
+    );
+  }
+  const text = (v: unknown): string => (typeof v === "string" ? v : "");
+  const changed = CONTRACT_FIELDS.filter((field) => text(checked[field]) !== text(now[field]));
+  if (changed.length === 0) return undefined;
+  return (
+    `\`${now.id}\` was rewritten since the check (${changed.join(", ")} changed) — the claim was ` +
+    `verified against a ticket that no longer reads the same, and anton will not close the one ` +
+    `that replaced it on that evidence`
+  );
+}
+
+/**
+ * Why the survivor no longer rides the run target whose merged PR spoke for it — or undefined
+ * while it still does (PR #238 review).
+ *
+ * A re-parent takes the survivor's lock, so it SERIALIZES against this write; serialized is not
+ * refused. Re-homed under another card, or detached to run on its own, the survivor's work is no
+ * longer what the verified PR carried, and rereading that PR by id would re-verify evidence that
+ * stopped being about the survivor. Ownership is read off the locked whole-board read rather than
+ * the survivor alone, because it is the ancestors that decide whose card a bead rides.
+ */
+function stillRidesOwner(
+  locked: BoardIndex,
+  targetId: string,
+  replacementId: string,
+  ownerId: string,
+): string | undefined {
+  const onBoard = locked.byId.get(replacementId);
+  if (!onBoard) return `\`${replacementId}\` is no longer on the board`;
+  const owner = ticketOwnerOf(locked, onBoard);
+  if (owner?.id === ownerId) return undefined;
+  return (
+    `\`${replacementId}\` no longer rides \`${ownerId}\`, the run target whose merged PR anton ` +
+    `verified — it ${owner ? `rides \`${owner.id}\`` : "rides no run target"} now, so that PR no ` +
+    `longer speaks for its work, and ${targetId} is not superseded on that evidence`
+  );
+}
+
+/**
+ * The whole board, re-read INSIDE the write locks — or why it could not be. One read serves every
+ * question the retirement asks of the graph rather than of a single bead: the subtree beneath the
+ * ticket, and whose card the survivor rides. A board that could not be re-read says nothing, so the
+ * retirement refuses and nothing is written.
+ */
+async function readBoardUnderLock(repoPath: string): Promise<BoardIndex | string> {
   try {
-    board = await readBoard(repoPath);
+    return indexBoard(await readBoard(repoPath));
   } catch (e) {
     return `the board could not be re-read before the retirement (${e instanceof Error ? e.message : String(e)})`;
   }
-  const open = indexBoard(board).openDescendants(targetId);
+}
+
+/**
+ * Open work beneath the ticket, judged from the board read inside its write lock. The same bar the
+ * snapshot was held to before the check ran, re-asked where a concurrent re-parent is ordered
+ * against it.
+ */
+function strandedUnderLock(locked: BoardIndex, targetId: string): string | undefined {
+  const open = locked.openDescendants(targetId);
   if (open.length === 0) return undefined;
   return (
     `open work was attached beneath ${targetId} since the check ` +
