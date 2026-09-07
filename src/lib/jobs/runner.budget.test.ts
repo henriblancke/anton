@@ -392,6 +392,64 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     expect(ran).toEqual(["A"]);
   });
 
+  it("reserves the share across the whole leased batch, not just the first job (R6.1)", async () => {
+    // The governor reads a project's attributed spend ONCE per tick, and none of the attempts the
+    // batch it admits is about to make is visible to that meter until the next one. So a 10-point
+    // cut with room for three seeded execute-epic runs (3 weekly-points each) would otherwise start
+    // all five queued runs at once and spend 15 against it before anything could observe them.
+    h.seedProjects("A");
+    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 10),
+        resolveProjectSpend: async () => 0,
+      },
+    );
+    for (let i = 0; i < 5; i++) await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(3);
+    await r.whenIdle();
+    expect(ran).toBe(3);
+  });
+
+  it("never withholds the FIRST run over a share too small to fit it", async () => {
+    // The coarse gate admits while spend is still BELOW the cap, so the run that crosses it is one
+    // the operator's ceiling allows. Reserving against the first job too would leave any share with
+    // less left than a single job's burn unspendable until the weekly reset (idle-fill, anton-ld7j).
+    h.seedProjects("A");
+    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+      resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 10),
+      resolveProjectSpend: async () => 9, // 1 point left; a seeded execute-epic costs 3
+    });
+    for (let i = 0; i < 3; i++) await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+  });
+
+  it("leaves the batch unreserved when the project carries no share", async () => {
+    // No share, no ceiling to reserve against: an ungoverned-by-share project keeps leasing to its
+    // concurrency, exactly as before the reservation existed.
+    h.seedProjects("A");
+    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const r = budgetRunner(async () => {}, {
+      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+      resolveBudgetPolicy: () => DEFAULT_BUDGET_POLICY, // projectWeeklyCapPct: null
+      resolveProjectSpend: async () => 0,
+    });
+    for (let i = 0; i < 5; i++) await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(5);
+    await r.whenIdle();
+  });
+
   it("leaves the share unbound when no spend resolver is wired", async () => {
     // Fail-open, like every other governor input: without attribution the machine-wide target is
     // the only weekly limit, rather than a share the runner cannot actually measure.

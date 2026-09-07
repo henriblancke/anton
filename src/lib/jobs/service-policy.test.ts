@@ -183,6 +183,29 @@ describe("resolveBudgetPolicy (quota share)", () => {
     expect((await resolveBudgetPolicy("busy"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
   });
 
+  it("reads the share board ONCE for a whole concurrent governor pass", async () => {
+    // A share is a fact about the board, so every governed project's policy needs the same three
+    // reads. The governor resolves one policy per governed project on each 2s tick — resolving them
+    // together must serve them all from a single board read rather than N identical ones (PR #248
+    // review). Counted off the picker-plan query, which fires exactly once per board read.
+    project("a", armed());
+    project("b", armed());
+    project("c", armed());
+    const selects = vi.spyOn(tdb.db, "select");
+    const boardReads = () =>
+      selects.mock.calls.filter(
+        ([columns]) => columns !== undefined && "targetCount" in columns,
+      ).length;
+
+    await Promise.all(["a", "b", "c"].map((id) => resolveBudgetPolicy(id)));
+    expect(boardReads()).toBe(1);
+
+    // Coalescing, not caching: a later pass reads fresh, so a waking repo reclaims its cut on it.
+    selects.mockClear();
+    for (const id of ["a", "b", "c"]) await resolveBudgetPolicy(id);
+    expect(boardReads()).toBe(3);
+  });
+
   it("says out loud when the declared shares do not sum to 100", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     project("a", armed({ quotaSharePct: 60 }));

@@ -55,7 +55,7 @@ import {
   isUsageLimitError,
 } from "./errors";
 import { PollingLoop } from "./polling-loop";
-import { burnsClaudeQuota, getBurnAverage, sampleJobBurn } from "../burn";
+import { burnsClaudeQuota, getBurnAverage, getProjectBurnAverage, sampleJobBurn } from "../burn";
 import { getClaudeUsageCached, getClaudeUsageFresh, type ClaudeUsage } from "../claude/usage";
 import { admitJob, budgetGate, jobValueScore, type BudgetPolicy } from "./budget";
 
@@ -811,7 +811,8 @@ export class JobRunner {
     valueHeldJobIds: Set<string>,
     valueHeldReclaimIds: Set<string>,
   ): Promise<void> {
-    if (!this.resolveBudgetPolicy) return;
+    const resolveBudgetPolicy = this.resolveBudgetPolicy;
+    if (!resolveBudgetPolicy) return;
 
     // The gate decides per project (day window / reserve are per-project knobs), so gather every
     // project — including the null-project bucket — that has a pending job of a governed type.
@@ -826,9 +827,19 @@ export class JobRunner {
     // finding a governed project is deliberate: when no project has opted in (the default state), the
     // governor never calls the usage endpoint, so it can't cache a transient null into the shared
     // cache the nav pill reads (which is what darkened the pill on this branch) or hammer the keychain.
+    //
+    // Resolved TOGETHER, not one after another (PR #248 review): a governed project's policy carries
+    // its cut of the machine's quota (R6.1), which is a fact about the whole board — so resolving N
+    // of them in sequence re-reads one unchanging board N times per 2s tick. Overlapping the reads
+    // lets the resolver serve them all from a single pass.
+    const resolved = await Promise.all(
+      [...projectIds].map(async (pid) => ({
+        pid,
+        policy: await resolveBudgetPolicy(pid ?? undefined),
+      })),
+    );
     const governed: Array<{ pid: string | null; policy: BudgetPolicy }> = [];
-    for (const pid of projectIds) {
-      const policy = await this.resolveBudgetPolicy(pid ?? undefined);
+    for (const { pid, policy } of resolved) {
       if (policy) {
         governed.push({ pid, policy });
         continue;
@@ -881,7 +892,15 @@ export class JobRunner {
         // But "work may run" is not "any work may run": the fine-grained gate (anton-k05r) still
         // decides which queued jobs are worth the budget that's left — e.g. scarce session headroom
         // at night admits high-value work only.
-        await this.applyValueGate(usage, policy, pid, now, valueHeldJobIds, valueHeldReclaimIds);
+        await this.applyValueGate(
+          usage,
+          policy,
+          pid,
+          now,
+          valueHeldJobIds,
+          valueHeldReclaimIds,
+          projectWeeklyPct,
+        );
         continue;
       }
       const retryAtMs = decision.retryAt.getTime();
@@ -960,6 +979,9 @@ export class JobRunner {
    * mirroring the governor: a missing reader, an unresolvable bead, or a malformed payload admits
    * the job rather than starving it on a guess. An operator's immediate "Approve" (`bypassBudget`)
    * skips the gate entirely — they asked for now, and only the session floor may hold that.
+   *
+   * The same walk RESERVES the project's remaining quota share across the batch (R6.1) — see the
+   * reservation comment in the loop.
    */
   private async applyValueGate(
     usage: ClaudeUsage,
@@ -968,6 +990,7 @@ export class JobRunner {
     nowMs: number,
     valueHeldJobIds: Set<string>,
     valueHeldReclaimIds: Set<string>,
+    projectWeeklyPct: number | null,
   ): Promise<void> {
     const candidates = await queuedDueJobs(this.db, this.clock, {
       types: GOVERNED_JOB_TYPES,
@@ -976,40 +999,100 @@ export class JobRunner {
     });
     // One burn-average read per type per tick — the cost side of every candidate of that type.
     const costByType = new Map<string, number>();
+    // The share side reads the same rates per type, but this PROJECT's own (the meter the cap is
+    // enforced against), so it keeps its own memo.
+    const shareCostByType = new Map<string, number>();
+    let projectedWeeklyPct = projectWeeklyPct ?? 0;
+    let admitted = 0;
+
     for (const job of candidates) {
       if (job.status === "running" && this.inFlight.has(job.id)) continue; // genuinely running here
       const payload = parsePayload(job.payloadJson) as
         | { bypassBudget?: unknown; epicBeadId?: unknown }
         | null;
       if (payload?.bypassBudget === true) continue;
-
-      let labels: readonly string[] = [];
-      if (job.type === "execute-epic") {
-        if (!this.readBeadLabels || !job.projectId || typeof payload?.epicBeadId !== "string") {
-          continue; // can't score it → fail open
-        }
-        try {
-          const read = await this.readBeadLabels(job.projectId, payload.epicBeadId);
-          if (!read) continue; // bead unresolved → fail open
-          labels = read;
-        } catch {
-          continue; // reader error → fail open
-        }
-      }
-
-      let sessionCost = costByType.get(job.type);
-      if (sessionCost === undefined) {
-        sessionCost = (await getBurnAverage(this.db, job.type as JobType)).sessionAvg;
-        costByType.set(job.type, sessionCost);
-      }
-      const value = jobValueScore(
-        { labels, ageMs: Math.max(0, nowMs - (toMs(job.createdAt) ?? nowMs)) },
-        policy,
-      );
-      if (!admitJob(usage, policy, nowMs, { value, sessionCost }).admit) {
+      const hold = () =>
         (job.status === "running" ? valueHeldReclaimIds : valueHeldJobIds).add(job.id);
+
+      if (await this.valueGateHolds(usage, policy, job, payload, nowMs, costByType)) {
+        hold();
+        continue;
+      }
+
+      // Share headroom is reserved ACROSS the batch (PR #248 review). `budgetGate` measured this
+      // project's spend ONCE for the whole tick, but leaseDue dispatches up to the project's
+      // concurrency in one go — and no attempt of that batch is visible to the meter until the next
+      // tick — so a project with room for one run could start five and blow through its cut.
+      //
+      // The coarse admission covers the FIRST job: the gate admits while spend is still BELOW the
+      // cap, so the run that crosses it is one the operator's ceiling allows, and withholding it
+      // would leave a share smaller than one job's burn unspendable until the reset (idle-fill,
+      // anton-ld7j). Every job BEHIND it must fit in what the share has left after the ones ahead,
+      // charged at this project's own measured rate.
+      const shareCap = policy.projectWeeklyCapPct;
+      if (pid !== null && shareCap !== null) {
+        const cost = await this.projectWeeklyBurn(pid, job.type as JobType, shareCostByType);
+        if (admitted > 0 && projectedWeeklyPct + cost > shareCap) {
+          hold();
+          continue;
+        }
+        projectedWeeklyPct += cost;
+      }
+      admitted += 1;
+    }
+  }
+
+  /**
+   * The value/cost half of {@link applyValueGate}: whether this candidate is worth the budget that's
+   * left. Fail-open at every step — a missing label reader, an unresolvable bead, or a malformed
+   * payload returns `false` (admit) rather than starving the job on a guess.
+   */
+  private async valueGateHolds(
+    usage: ClaudeUsage,
+    policy: BudgetPolicy,
+    job: JobRow,
+    payload: { epicBeadId?: unknown } | null,
+    nowMs: number,
+    costByType: Map<string, number>,
+  ): Promise<boolean> {
+    let labels: readonly string[] = [];
+    if (job.type === "execute-epic") {
+      if (!this.readBeadLabels || !job.projectId || typeof payload?.epicBeadId !== "string") {
+        return false; // can't score it → fail open
+      }
+      try {
+        const read = await this.readBeadLabels(job.projectId, payload.epicBeadId);
+        if (!read) return false; // bead unresolved → fail open
+        labels = read;
+      } catch {
+        return false; // reader error → fail open
       }
     }
+
+    let sessionCost = costByType.get(job.type);
+    if (sessionCost === undefined) {
+      sessionCost = (await getBurnAverage(this.db, job.type as JobType)).sessionAvg;
+      costByType.set(job.type, sessionCost);
+    }
+    const value = jobValueScore(
+      { labels, ageMs: Math.max(0, nowMs - (toMs(job.createdAt) ?? nowMs)) },
+      policy,
+    );
+    return !admitJob(usage, policy, nowMs, { value, sessionCost }).admit;
+  }
+
+  /** What one more attempt of `type` is expected to charge THIS project's share, memoized per tick. */
+  private async projectWeeklyBurn(
+    projectId: string,
+    type: JobType,
+    memo: Map<string, number>,
+  ): Promise<number> {
+    let cost = memo.get(type);
+    if (cost === undefined) {
+      cost = (await getProjectBurnAverage(this.db, projectId, type)).weeklyAvg;
+      memo.set(type, cost);
+    }
+    return cost;
   }
 
   private async processJob(job: JobRow): Promise<void> {

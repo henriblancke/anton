@@ -15,7 +15,11 @@ import {
   getProjectSettings,
   resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
 } from "../projects";
-import { resolveGovernedShare, type ResolvedQuotaShare } from "../quota-share";
+import {
+  resolveGovernedShare,
+  type GovernedShare,
+  type ResolvedQuotaShare,
+} from "../quota-share";
 import { projectWeeklySpendPct } from "../quota-spend";
 import { withQuotaShare } from "./budget";
 import type { ClaudeUsage } from "../claude/usage";
@@ -53,9 +57,32 @@ export async function resolvePolicy(projectId: string | undefined) {
 export async function resolveBudgetPolicy(projectId: string | undefined) {
   const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
   if (!projectId || !settings.budgetAware) return null;
-  const share = resolveGovernedShare(projectId, await budgetAwareQuotaShares());
+  const share = resolveGovernedShare(projectId, await quotaShareBoard());
   announceImbalance(share);
   return withQuotaShare(resolveBudgetPolicyFromSettings(settings), share.sharePct);
+}
+
+/** The board read currently in flight, so concurrent resolutions share it. Never held past settle. */
+let inFlightShareBoard: Promise<GovernedShare[]> | null = null;
+
+/**
+ * The quota-share board, coalesced across CONCURRENT resolutions (PR #248 review). A share is a fact
+ * about the whole board, so every governed project's policy needs the same three reads — all
+ * projects, every picker plan, every in-flight job. The governor resolves one policy per governed
+ * project on each 2s tick, which without this re-reads one unchanging DB state N times per tick.
+ *
+ * Coalescing, not caching: the promise is dropped the moment it settles, so the NEXT pass still
+ * reads fresh — which is what lets a waking repo reclaim its cut on that pass rather than after a
+ * cache expiry (R6.4). It only collapses reads that overlap, so callers must resolve their pass
+ * together (see the runner's governor) to get the benefit; a sequential caller simply reads again.
+ */
+function quotaShareBoard(): Promise<GovernedShare[]> {
+  if (inFlightShareBoard) return inFlightShareBoard;
+  const board = budgetAwareQuotaShares().finally(() => {
+    if (inFlightShareBoard === board) inFlightShareBoard = null;
+  });
+  inFlightShareBoard = board;
+  return board;
 }
 
 /**
