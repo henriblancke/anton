@@ -545,11 +545,19 @@ async function retirementMoved(
   // Reopened and pointing at no PR is the one reading that TAKES BACK the verification: the survivor
   // is work in progress again, so it has not landed and nothing is superseded by it. A closed one —
   // or one reopened for rework with its merged PR still attached — is still where the work landed.
-  if (isOpenWork(replacement) && !beads.getPrRef(replacement)) {
-    return (
-      `\`${replacementId}\` is open again (${replacement.status}) and points at no PR — it has not ` +
-      `landed, so ${targetId} is not superseded by it`
-    );
+  //
+  // ABANDONED is that same reading from the other side (PR #238 review), and the one a status check
+  // alone gets wrong: it IS closed, so `isOpenWork` reads it as settled, while the label says the
+  // work was explicitly not done. Retiring onto it would file the last live copy of the work under a
+  // recorded won't-do — the state `verifyShippedClaim` refuses, so the guard has to refuse it too
+  // when somebody abandons the survivor in the window between the check and this write.
+  const abandoned = beads.isAbandoned(replacement);
+  if ((abandoned || isOpenWork(replacement)) && !beads.getPrRef(replacement)) {
+    return abandoned
+      ? `\`${replacementId}\` has been abandoned and points at no PR — a recorded won't-do ` +
+          `delivered nothing, so ${targetId} is not superseded by it`
+      : `\`${replacementId}\` is open again (${replacement.status}) and points at no PR — it has ` +
+          `not landed, so ${targetId} is not superseded by it`;
   }
   return undefined;
 }

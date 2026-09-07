@@ -26,6 +26,7 @@ import {
   skipNote,
   skippedDependents,
   type PrereqEdge,
+  type RetiredTicketOutcome,
   type SkipCause,
   type TicketTimeoutOutcome,
 } from "./execute-epic-board";
@@ -149,6 +150,23 @@ async function reorderAroundPrereq(
   return reorder.order;
 }
 
+/** How retired tickets read in an operator-facing park: each id, and the bead the board points it at. */
+const retirements = (rs: readonly RetiredTicketOutcome[]) =>
+  rs.map((r) => `${r.id} → superseded by ${r.replacedBy}`).join(", ");
+
+/**
+ * A run's retirements split the only way an operator-facing sentence may speak of them
+ * (PR #238 review): `this-run` is a claim anton checked against git and the board itself,
+ * `pre-existing` is one it merely FOUND on the board — a human's rescope, a gardener dedup, an
+ * earlier attempt's retirement. Both read as "closed as superseded" on the bead, so only the
+ * recorded source tells them apart, and wording a found supersede as shipped would ask the operator
+ * to settle work on a verification nobody performed.
+ */
+const byProvenance = (rs: readonly RetiredTicketOutcome[]) => ({
+  verified: rs.filter((r) => r.source === "this-run"),
+  found: rs.filter((r) => r.source === "pre-existing"),
+});
+
 /** The run's tickets, split into what it may dispatch now and what a blocker outside it holds. */
 function partitionTickets(
   run: EpicRun,
@@ -189,11 +207,20 @@ function partitionTickets(
     // Every ticket settled but the epic left open — a contradiction only a human can settle
     // (settle the epic too, or add work to it). Park rather than open an empty PR or mark the
     // run done, either of which would read as a delivery that never happened.
-    const retirements = run.retired.map((r) => `${r.id} → superseded by ${r.replacedBy}`);
+    // Said by PROVENANCE, never as one thing (PR #238 review): every retirement here is one the run
+    // FOUND on the board — the dispatch loop has not run yet — so this run verified no delivery, and
+    // "already shipped" would hand the operator a premise anton never checked when settling the epic.
+    const { verified, found } = byProvenance(run.retired);
+    const settled = [
+      verified.length ? `already shipped, verified and closed as superseded (${retirements(verified)})` : null,
+      found.length
+        ? `already settled as superseded on the board, which this run did not verify ` +
+          `(${retirements(found)})`
+        : null,
+    ].filter(Boolean);
     throw new PoisonEpic(
-      (retirements.length > 0
-        ? `every ticket under ${epicBeadId} has been abandoned or already shipped ` +
-          `(${retirements.join(", ")})`
+      (settled.length > 0
+        ? `every ticket under ${epicBeadId} has been abandoned or ${settled.join(", or ")}`
         : `every ticket under ${epicBeadId} has been abandoned`) +
         ` — nothing left to run; settle the epic itself or give it work, then resume the run`,
     );
@@ -656,15 +683,15 @@ async function deliveredOrPark(
   // all. That mix belongs to the `agent:human` park below, which names both halves.
   const notRetired = live.filter((t) => !retired.has(t.id));
   if (delivered.length === 0 && run.retired.length > 0 && notRetired.length === 0) {
-    const retirements = run.retired.map((r) => `${r.id} → superseded by ${r.replacedBy}`).join(", ");
+    const named = retirements(run.retired);
     throw new PoisonEpic(
       run.standaloneRun
-        ? `${epicBeadId} had ALREADY SHIPPED (${retirements}) — anton verified that against the ` +
+        ? `${epicBeadId} had ALREADY SHIPPED (${named}) — anton verified that against the ` +
           `repository and the board and closed it as superseded, with the evidence on the bead. ` +
           `Nothing was committed here, so there is no pull request to open and nothing is left to ` +
           `run; read the bead if you want to check what anton checked`
         : `every ticket under ${epicBeadId} that this run could dispatch had ALREADY SHIPPED ` +
-          `(${retirements}) — each is closed as superseded on the board, pointing at what shipped ` +
+          `(${named}) — each is closed as superseded on the board, pointing at what shipped ` +
           `it, and nothing was committed here, so there is no pull request to open. Close ` +
           `${epicBeadId} by hand to settle it, or give it work that has not landed yet and ` +
           `resume the run`,
@@ -677,12 +704,24 @@ async function deliveredOrPark(
   // would review nothing and hand `gh pr create` a branch with no commits between it and the base.
   // Park instead, naming the one thing left to do: this target ships no code, so a person settles
   // it. Any retirements are named alongside rather than folded in, so the operator sees which
-  // tickets a person finished and which were already in the tree.
+  // tickets a person finished and which were already in the tree — and split by PROVENANCE for the
+  // reason the retirement notice is (PR #238 review): a supersede this run only FOUND on the board
+  // is somebody else's decision, so saying it "had already shipped" would put anton's verification
+  // behind a delivery it never checked.
   if (delivered.length === 0) {
-    const alsoRetired = run.retired.length
-      ? `, and ${run.retired.length} more had already shipped, closed as superseded ` +
-        `(${run.retired.map((r) => `${r.id} → superseded by ${r.replacedBy}`).join(", ")})`
-      : "";
+    const { verified, found } = byProvenance(run.retired);
+    const alsoRetired = [
+      verified.length
+        ? `, and ${verified.length} more had already shipped, closed as superseded ` +
+          `(${retirements(verified)})`
+        : null,
+      found.length
+        ? `, and ${found.length} more were already settled as superseded on the board ` +
+          `(${retirements(found)})`
+        : null,
+    ]
+      .filter(Boolean)
+      .join("");
     throw new PoisonEpic(
       `every ticket under ${epicBeadId} that is left to run is work a person does, not an agent ` +
         `(${notRetired.map((t) => t.id).join(", ")})${alsoRetired} — they are done and nothing ` +

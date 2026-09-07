@@ -522,6 +522,17 @@ describe("repairAlreadyShipped — the retirement", () => {
     expect(reopened).toMatchObject({ action: "escalate" });
     expect((reopened as { evidence: string[] }).evidence.join(" ")).toContain("open again");
 
+    // …and the survivor ABANDONED in the window: it is closed, so a status check alone reads it as
+    // landed, but a recorded won't-do delivered nothing to be superseded by.
+    showMock.mockImplementation(async (_cwd, id) =>
+      id === TARGET
+        ? bead(TARGET, { status: "in_progress" })
+        : bead(SHIPPER, { status: "closed", labels: ["abandoned"] }),
+    );
+    const killed = await retire();
+    expect(killed).toMatchObject({ action: "escalate" });
+    expect((killed as { evidence: string[] }).evidence.join(" ")).toContain("has been abandoned");
+
     expect(supersedeMock).not.toHaveBeenCalled();
     expect(tagMock).not.toHaveBeenCalled();
   });
