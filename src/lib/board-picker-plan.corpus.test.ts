@@ -94,9 +94,10 @@ const OBSERVED = Date.parse("2026-09-05T13:00:00Z");
 /** Refresh cadence of the run-lease heartbeat (`RUN_LEASE_REFRESH_MS`, execute-epic-lease.ts). */
 const HEARTBEAT_MS = 5 * 60_000;
 
-/** The policy the corpus is decided under: this repo's own vocabulary, narrowing 59 structurally
- *  claimable targets to 29 picks. Armed rather than admit-all so the policy half of the stamp is
- *  under test beside the board half. */
+/** The policy the corpus is decided under: this repo's own vocabulary, narrowing 67 structurally
+ *  claimable targets to 29 picks — 30 the policy refuses, 8 more the pass reads as proposals, which
+ *  are decisions a person applies rather than work (anton-x37c). Armed rather than admit-all so the
+ *  policy half of the stamp is under test beside the board half. */
 const POLICY: Policy = {
   types: ["feature", "task", "bug"],
   maxPriority: 2,

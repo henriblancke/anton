@@ -2,12 +2,29 @@
  * Headless claude driver (anton-dzh.3): stream-json parsing, event normalization, and
  * usage-limit detection against fake claude binaries (no network / no real claude needed).
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { isRecoverableClaudeError, isUsageLimitError, type RecoverableClaudeError } from "../jobs/errors";
-import { CLAUDE_BIN_ENV, runClaude, type ClaudeEvent, type RunClaudeOptions } from "./driver";
+import { ABORT_GRACE_ENV, CLAUDE_BIN_ENV, runClaude, type ClaudeEvent, type RunClaudeOptions } from "./driver";
+
+/**
+ * `groupAlive` is answered through a hook so a test can hold a group "alive" on demand. SIGKILL
+ * cannot be trapped, so no fake descendant can be made to reliably outlive the direct child on real
+ * timing — and without that hold there is nothing to prove the driver waits for the group at all.
+ * Unset, every call goes straight to the real implementation.
+ */
+const spawnHooks = vi.hoisted(() => ({ groupAlive: null as (() => boolean) | null }));
+
+vi.mock("./driver-spawn", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./driver-spawn")>();
+  return {
+    ...actual,
+    groupAlive: (...args: Parameters<typeof actual.groupAlive>) =>
+      spawnHooks.groupAlive?.() ?? actual.groupAlive(...args),
+  };
+});
 
 let dir: string;
 let prevBin: string | undefined;
@@ -64,6 +81,28 @@ function writeFakeHangingClaudeWithChild(name: string, childPidPath: string): st
   return path;
 }
 
+/** Whether a pid is still around — asked with no grace period at all. */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Wait for a fixture's own "I am up" signal. A fixed sleep is not one: under a loaded full-suite
+ * run node's spawn alone can outlast it, and the test then aborts a process that never started.
+ */
+async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error(`fake claude never wrote ${basename(path)}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -75,6 +114,98 @@ async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boole
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   return false;
+}
+
+/**
+ * A fake that traps SIGTERM and keeps working for `lingerMs` before exiting — the agent that is
+ * SIGNALLED but not yet stopped. It writes `markerPath` on its way out, so a driver that settled on
+ * the signal rather than on the exit is provable: the marker is absent when the promise rejects.
+ */
+function writeFakeLingeringClaude(name: string, markerPath: string, lingerMs: number): string {
+  const path = join(dir, name);
+  const body = [
+    "#!/usr/bin/env node",
+    "const { writeFileSync } = require('node:fs');",
+    "process.on('SIGTERM', () => {",
+    `  setTimeout(() => { writeFileSync(${JSON.stringify(markerPath)}, 'late'); process.exit(0); }, ${lingerMs});`,
+    "});",
+    "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-abort' }) + '\\n');",
+    "setInterval(() => {}, 1 << 30);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
+/** A fake that ignores SIGTERM outright and writes its pid — only SIGKILL ends it. */
+function writeFakeUnkillableClaude(name: string, pidPath: string): string {
+  const path = join(dir, name);
+  const body = [
+    "#!/usr/bin/env node",
+    "const { writeFileSync } = require('node:fs');",
+    "process.on('SIGTERM', () => {});",
+    `writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+    "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-kill' }) + '\\n');",
+    "setInterval(() => {}, 1 << 30);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
+/**
+ * A fake that exits promptly on SIGTERM but leaves behind a descendant that IGNORES it — the tool
+ * process (a test runner, a formatter) still writing the worktree after claude has gone. Its stdio
+ * is detached from claude's pipes, so nothing about it holds `close` back.
+ */
+function writeFakeClaudeWithStubbornChild(name: string, pidPath: string): string {
+  const path = join(dir, name);
+  const grandchild = [
+    "process.on('SIGTERM', () => {});",
+    `require('node:fs').writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+    "setInterval(() => {}, 1 << 30);",
+  ].join("");
+  const body = [
+    "#!/usr/bin/env node",
+    "const { spawn } = require('node:child_process');",
+    `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore' });`,
+    "process.on('SIGTERM', () => process.exit(0));",
+    "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-group' }) + '\\n');",
+    "setInterval(() => {}, 1 << 30);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
+/**
+ * A fake that finishes its turn and EXITS at once, leaving a descendant holding its stdout open —
+ * the window where the direct process is already gone but `close` has not fired yet. An abort that
+ * lands here is never delivered to anything (node kills only a live child), so it produces no
+ * `error` event and nothing but the signal itself says the session was cancelled.
+ */
+function writeFakeExitedClaudeHoldingPipe(name: string, holdMs: number): string {
+  const path = join(dir, name);
+  const events: FakeClaudeEvent[] = [
+    { type: "system", subtype: "init", session_id: "sess-exited" },
+    { type: "result", subtype: "success", result: "ANTON-RESULT: delivered", is_error: false },
+  ];
+  const body = [
+    "#!/usr/bin/env node",
+    "const { spawn } = require('node:child_process');",
+    `const lines = ${JSON.stringify(events.map((e) => JSON.stringify(e)))};`,
+    "for (const l of lines) { process.stdout.write(l + \"\\n\"); }",
+    // Inherits stdout, so the driver's pipe stays open after this process is gone.
+    `spawn(process.execPath, ['-e', 'setTimeout(() => {}, ${holdMs})'], { stdio: ['ignore', 1, 'ignore'] });`,
+    "process.exit(0);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
 }
 
 /** A fake that emits each event `gapMs` apart — slow but demonstrably alive. */
@@ -952,9 +1083,140 @@ describe("runClaude", () => {
     const caught = await runClaudeExpectingError(bin, { prompt: "wedge tree", stallTimeoutMs: 1_500 });
     expect(caught).toMatchObject({ signature: "stalled" });
 
-    const childPid = Number(readFileSync(childPidPath, "utf8"));
-    expect(await waitForProcessExit(childPid)).toBe(true);
+    // Asked with no grace at all (PR #228 review): a descendant merely on its way out is still a
+    // descendant writing the worktree, and the timeout path commits that tree as soon as this
+    // promise settles.
+    expect(alive(Number(readFileSync(childPidPath, "utf8")))).toBe(false);
   });
+
+  // The same property proven directly: the watchdog's group-wide SIGKILL is a delivery, not an
+  // exit, so the rejection must wait on the group emptying rather than on claude's `close`.
+  it("holds a stalled session's rejection until its process group is gone", async () => {
+    const bin = writeFakeHangingClaude("stalled-held-claude", [
+      { type: "system", subtype: "init", session_id: "sess-stall-held" },
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+    let groupGone = false;
+    spawnHooks.groupAlive = () => !groupGone;
+
+    try {
+      const run = runClaude({ cwd: dir, prompt: "wedge", stallTimeoutMs: 500 });
+      const outcome = await Promise.race([
+        run.then(() => "settled", () => "settled"),
+        new Promise((r) => setTimeout(() => r("waiting"), 1_200)),
+      ]);
+      // Well past the watchdog firing and claude's own close: only the live group holds this back.
+      expect(outcome).toBe("waiting");
+
+      groupGone = true;
+      await expect(run).rejects.toMatchObject({ signature: "stalled" });
+    } finally {
+      spawnHooks.groupAlive = null;
+    }
+  });
+
+  // PR #228 review: the ticket-timeout path re-runs the verify gates and COMMITS the worktree as
+  // soon as this promise settles, so settling on the SIGNAL rather than on the exit hands it a tree
+  // the agent is still writing — an inconsistent commit, and later writes discarded with the run.
+  it.runIf(process.platform !== "win32")(
+    "waits for a cancelled session to actually exit before it settles",
+    async () => {
+      const marker = join(dir, "lingering-claude.marker");
+      const bin = writeFakeLingeringClaude("lingering-claude", marker, 400);
+      process.env[CLAUDE_BIN_ENV] = bin;
+      const control = new AbortController();
+
+      let up = () => {};
+      const started = new Promise<void>((resolve) => { up = resolve; });
+      const run = runClaude({ cwd: dir, prompt: "cancel me", signal: control.signal, onEvent: up });
+      // Abort only once the fake is up and has trapped SIGTERM — before that it would die on the
+      // default disposition and prove nothing. It writes its first event after installing the trap,
+      // so that event is the proof; a fixed sleep only guesses at it.
+      await started;
+      control.abort();
+
+      await expect(run).rejects.toMatchObject({ name: "AbortError" });
+      // The write the agent made AFTER the signal is on disk by the time the caller is told, which
+      // is the whole property: nothing verifies or commits the tree until the writer has gone.
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "escalates to SIGKILL for a cancelled session that ignores SIGTERM",
+    async () => {
+      const pidPath = join(dir, "unkillable-claude.pid");
+      const bin = writeFakeUnkillableClaude("unkillable-claude", pidPath);
+      process.env[CLAUDE_BIN_ENV] = bin;
+      // Shrink the grace so the escalation lands inside the test rather than 10s later.
+      process.env[ABORT_GRACE_ENV] = "300";
+      const control = new AbortController();
+
+      try {
+        const run = runClaude({ cwd: dir, prompt: "trap sigterm", signal: control.signal });
+        await waitForFile(pidPath);
+        control.abort();
+
+        await expect(run).rejects.toMatchObject({ name: "AbortError" });
+        expect(await waitForProcessExit(Number(readFileSync(pidPath, "utf8")))).toBe(true);
+      } finally {
+        delete process.env[ABORT_GRACE_ENV];
+      }
+    },
+  );
+
+  // The same property one level down (PR #228 review): `close` on the direct child proves only that
+  // CLAUDE exited. A tool process it spawned that ignores SIGTERM and holds none of its pipes is
+  // still in the group, still writing the tree — so the rejection must wait for the group, not the
+  // handle, or the timeout path commits a snapshot under active edit.
+  it.runIf(process.platform !== "win32")(
+    "waits for claude's descendants, not just claude, before a cancellation settles",
+    async () => {
+      const pidPath = join(dir, "stubborn-descendant.pid");
+      const bin = writeFakeClaudeWithStubbornChild("group-claude", pidPath);
+      process.env[CLAUDE_BIN_ENV] = bin;
+      // Long enough that the grace timer cannot be what kills the descendant: only the escalation
+      // the close handler delivers itself can end this inside the window below.
+      process.env[ABORT_GRACE_ENV] = "5000";
+      const control = new AbortController();
+
+      try {
+        const run = runClaude({ cwd: dir, prompt: "cancel my tree", signal: control.signal });
+        // The descendant's pid file is written by the descendant itself: waiting for it is what
+        // makes "the group still holds a writer" true at the moment of the abort.
+        await waitForFile(pidPath);
+        control.abort();
+
+        await expect(run).rejects.toMatchObject({ name: "AbortError" });
+        // Asked the instant the caller is told, with no waiting: by then the writer must be gone.
+        expect(alive(Number(readFileSync(pidPath, "utf8")))).toBe(false);
+      } finally {
+        delete process.env[ABORT_GRACE_ENV];
+      }
+    },
+  );
+
+  // PR #228 review: node delivers an abort only to a LIVE child, so one arriving after claude has
+  // exited — while a descendant still holds its stdout and `close` is pending — emits no `error`
+  // at all. Read from the `error` alone, the cancellation would vanish and the session would settle
+  // as an ordinary success: on a formula with no verify step nothing downstream consumes the
+  // signal, and the commit step would commit a cancelled ticket and update its bead.
+  it.runIf(process.platform !== "win32")(
+    "rejects a session cancelled after the process exited, with no child error to read it from",
+    async () => {
+      const bin = writeFakeExitedClaudeHoldingPipe("exited-claude", 3_000);
+      process.env[CLAUDE_BIN_ENV] = bin;
+      const control = new AbortController();
+
+      const run = runClaude({ cwd: dir, prompt: "cancel after exit", signal: control.signal });
+      // Long enough for the fake to have finished and exited, short enough that its descendant is
+      // still holding the pipe: the window where only the signal knows the run was cancelled.
+      await new Promise((r) => setTimeout(r, 500));
+      control.abort();
+
+      await expect(run).rejects.toMatchObject({ name: "AbortError" });
+    },
+  );
 
   it("does not kill a slow session that keeps emitting output", async () => {
     // Liveness is any byte, not a completed turn. The budget must exceed node's spawn time plus one

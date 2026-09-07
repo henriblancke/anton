@@ -12,6 +12,21 @@ import { join } from "node:path";
 /** Override the claude binary (tests point this at a fake stream-json emitter). */
 export const CLAUDE_BIN_ENV = "ANTON_CLAUDE_BIN";
 
+/** Override the SIGTERM→SIGKILL grace a cancelled session gets (tests shrink it). */
+export const ABORT_GRACE_ENV = "ANTON_CLAUDE_ABORT_GRACE_MS";
+
+/**
+ * How long a cancelled session has to exit on SIGTERM before the group is killed outright. Long
+ * enough for claude to finish the file write it is in the middle of and drop its own tools, short
+ * enough that a trapped signal does not hold the run for a meaningful part of a ticket's budget.
+ */
+const DEFAULT_ABORT_GRACE_MS = 10_000;
+
+export function abortGraceMs(): number {
+  const raw = Number(process.env[ABORT_GRACE_ENV]);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_ABORT_GRACE_MS;
+}
+
 /** The options that only shape argv — the session's own configuration, not this run's plumbing. */
 export interface ClaudeCliOptions {
   /** --model; falls back to claude's default when omitted. */
@@ -158,6 +173,28 @@ export function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
     }
   }
   child.kill(signal);
+}
+
+/**
+ * Whether ANY process in the child's group is still alive (PR #228 review).
+ *
+ * `close` on the direct child does not answer this: a tool process claude spawned that ignores
+ * SIGTERM and holds none of claude's pipes leaves the group populated — and still writing the
+ * worktree — while the handle looks finished. Signal 0 tests for existence without delivering
+ * anything.
+ *
+ * `EPERM` counts as ALIVE: the group is there and merely out of reach, and reading it as gone is
+ * the false "it stopped" this exists to prevent. The caller must bound its own wait rather than
+ * treat this as eventually-false.
+ */
+export function groupAlive(child: ChildProcess): boolean {
+  if (process.platform === "win32" || !child.pid) return false;
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException | null)?.code === "EPERM";
+  }
 }
 
 /**
