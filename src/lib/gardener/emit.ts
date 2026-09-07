@@ -32,6 +32,7 @@
 import { beads, CLAIM_SETTLE_MS, LABELS, type Bead, type SyncOutcome } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
+import { errorText, sleepMs } from "../retry-helpers";
 import { ageInDays, isClaimed, isOpenWork } from "./board-index";
 import {
   canonicalFingerprintOf,
@@ -595,14 +596,6 @@ export interface ArbitrationResult extends ReconcileResult {
    */
   skipped?: string;
 }
-
-const sleepMs = (ms: number): Promise<void> =>
-  new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    if (typeof t.unref === "function") t.unref();
-  });
-
-const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /**
  * Converge the claims THIS pass filed down to one proposal each — the run-lease arbitration pattern

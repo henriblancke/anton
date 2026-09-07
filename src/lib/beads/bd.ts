@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isProposalBead } from "../gardener/detections";
 import { githubRepoSlug } from "../git/remote";
+import { errorText, sleepMs } from "../retry-helpers";
 import { bd, type BdExec, type BdOpts, type SyncOutcome } from "./dolt-exec";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
@@ -1276,16 +1277,6 @@ export function staleClaimReason(bead: Bead, board: Bead[]): string | undefined 
     return `the target was labelled ${LABELS.agentHuman} while the claim settled — a person executes it, no agent can`;
   }
   return undefined;
-}
-
-const sleepMs = (ms: number): Promise<void> =>
-  new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    if (typeof t.unref === "function") t.unref();
-  });
-
-function errorText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }
 
 /**
