@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { toast } from "sonner";
 
+import { PICKER_BAR } from "@/components/settings/sections/picker-autonomy-section";
 import { SettingsView } from "@/components/settings/settings-view";
 import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
 import { REPAIR_CLASSES } from "@/lib/gardener/repair";
@@ -74,8 +75,6 @@ type PickerEarned = Parameters<typeof SettingsView>[0]["pickerEarned"];
  * The picker's own accept/veto record (anton-vkp9). The default is the project every operator
  * starts on — no pick answered either way, so `apply` is locked and has to say what on.
  */
-const PICKER_BAR: PickerEarned["bar"] = { minSettled: 20, minAppliedPct: 90 };
-
 const NO_PICKER_RECORD: PickerEarned = {
   accepted: 0,
   settled: 0,
