@@ -1,6 +1,6 @@
 /**
- * The review workflow's tool allowlist, pinned against the commands its own prompt hands the agent
- * (anton-9zzu).
+ * This repo's own CI, not anything anton ships: the review workflow's tool allowlist, pinned
+ * against the commands its own prompt hands the agent (anton-9zzu).
  *
  * A `Bash(prefix:*)` rule matches on WHITESPACE-DELIMITED TOKENS: the command's leading tokens must
  * equal the rule's, and there are no globs. A rule that ends mid-token therefore matches nothing —

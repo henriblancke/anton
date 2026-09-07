@@ -75,7 +75,7 @@ jobs:
           # variable id in its path therefore goes through `.github/scripts/pr-comment.sh`, whose
           # first token is fixed and whose ids are arguments. `gh pr comment` is deliberately absent:
           # with no second way to post a summary, a duplicate is not reachable by improvisation.
-          # `src/lib/claude-review-permissions.test.ts` pins every command in the prompt against
+          # `tests/ci/claude-review-permissions.test.ts` pins every command in the prompt against
           # this list.
           claude_args: >-
             --model "${{ vars.CLAUDE_MODEL_AUTO || 'claude-sonnet-4-6' }}"
