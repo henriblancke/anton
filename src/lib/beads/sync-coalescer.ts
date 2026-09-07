@@ -5,12 +5,13 @@
  * flight, the single trailing pass a burst coalesces into, whether this process has reconciled the
  * repo against its remote, and the operator-visible status registry the board reads.
  *
- * The seam: dolt-exec.ts owns talking to bd (including {@link runDoltSync}, which executes one
- * pass); this module decides WHEN a pass runs and under which mode; sync-engine.ts schedules the
- * heartbeat that asks for one. The pass lives one module down from bd.ts so neither side of that
- * seam imports the other (anton-n1m0).
+ * The seam: dolt-exec.ts owns talking to bd and dolt-sync.ts owns {@link runDoltSync}, which
+ * executes one pass; this module decides WHEN a pass runs and under which mode; sync-engine.ts
+ * schedules the heartbeat that asks for one. The pass lives one module down from bd.ts so neither
+ * side of that seam imports the other (anton-n1m0).
  */
-import { runDoltSync, type BdExec, type SyncMode, type SyncOutcome } from "./dolt-exec";
+import type { BdExec } from "./dolt-exec";
+import { runDoltSync, type SyncMode, type SyncOutcome } from "./dolt-sync";
 import { invalidateIssueSnapshot, issueSnapshotRefreshInFlight } from "./snapshot";
 
 // ── Sync status registry (anton-live-sync) ──
@@ -157,7 +158,7 @@ function recordStatus(cwd: string, patch: Partial<SyncRecord>): void {
   statusRegistry().set(cwd, next);
 }
 
-/** The pass's own shape is dolt-exec's (see there); re-exported so a caller reaching for the mode
+/** The pass's own shape is dolt-sync's (see there); re-exported so a caller reaching for the mode
  * and the request together still has one import site. */
 export type { SyncMode, SyncOutcome };
 
