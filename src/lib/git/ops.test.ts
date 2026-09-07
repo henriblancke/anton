@@ -33,6 +33,7 @@ import {
   pullRequestState,
   readFileAtRev,
   readPathHistory,
+  readPreservedCommitFor,
   readWorktreeState,
   resolveFreshBase,
   resolveMergeBase,
@@ -349,6 +350,57 @@ suite("worktreeHasCommitFor (real git)", () => {
 
   it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
     expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
+  });
+
+  /**
+   * What the resumed ticket's CONTINUATION block is written from (anton-16pq). Nothing preserved
+   * means no block at all, so "absent" has to be the answer for a branch that carries only other
+   * tickets' commits — a fresh ticket's prompt must not gain a paragraph.
+   */
+  describe("readPreservedCommitFor", () => {
+    it("reads the preserved commit's sha, subject and files", async () => {
+      writeFileSync(join(repo, "half-written.md"), "partial\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: Ship the thing\n\nINCOMPLETE — stopped at its budget"]);
+
+      const preserved = await readPreservedCommitFor(repo, "anton-d9");
+
+      expect(preserved?.subject).toBe("WIP anton-d9: Ship the thing");
+      expect(preserved?.sha).toMatch(/^[0-9a-f]{40}$/);
+      expect(preserved?.files).toEqual(["half-written.md"]);
+    });
+
+    // The marker form: the agent committed the work itself, so the preserved commit is EMPTY and
+    // the prompt must not present its diff as what was kept.
+    it("reports no files for a marker commit", async () => {
+      g(["commit", "-q", "--allow-empty", "-m", "WIP anton-d9: Ship the thing"]);
+
+      expect((await readPreservedCommitFor(repo, "anton-d9"))?.files).toEqual([]);
+    });
+
+    // A ticket can time out more than once; the freshest preserve is the tree the agent is looking
+    // at, so the newest match wins.
+    it("returns the newest preserved commit when a ticket timed out twice", async () => {
+      writeFileSync(join(repo, "first.md"), "first\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: first attempt"]);
+      writeFileSync(join(repo, "second.md"), "second\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: second attempt"]);
+
+      expect((await readPreservedCommitFor(repo, "anton-d9"))?.subject).toBe(
+        "WIP anton-d9: second attempt",
+      );
+    });
+
+    it("is undefined for a ticket nothing was preserved for, and for the delivery subject", async () => {
+      writeFileSync(join(repo, "work.md"), "work\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "anton-d9: Ship the thing"]);
+
+      expect(await readPreservedCommitFor(repo, "anton-d9")).toBeUndefined();
+      expect(await readPreservedCommitFor(repo, "anton-other")).toBeUndefined();
+    });
   });
 });
 

@@ -712,21 +712,78 @@ export async function worktreeHasPreservedCommitFor(
   return (await branchSubjects(worktreePath, options)).some((s) => s.startsWith(prefix));
 }
 
-/** How far back a subject scan reads. A run's own commits are always at the branch tip. */
-const BRANCH_SUBJECTS_ARGS = ["log", "--format=%s", "-n", "1000"];
+/** A timed-out attempt's preserved commit, as the resume's dispatch prompt describes it. */
+export interface PreservedCommit {
+  /** Full sha — what the prompt sends the agent to `git show`. */
+  sha: string;
+  subject: string;
+  /**
+   * The paths it changed. EMPTY for the marker form: there the agent committed the work under its
+   * own subjects and this commit only records whose it is, so the diff lives in the commits beneath
+   * it (see {@link commitMarker}).
+   */
+  files: string[];
+}
 
 /**
- * The subjects at the tip of the branch checked out in `worktreePath`. Fails closed to none (git
- * error → treat as absent) rather than risk a skip — except under `strict`, where absence is the
- * permissive answer and the caller has asked to see the failure instead.
+ * The preserved commit itself, for the prompt that tells a RESUMED ticket its earlier attempt's
+ * work is already on the branch (anton-16pq).
+ *
+ * The newest match wins: a ticket can time out more than once, and the freshest preserve is the one
+ * whose tree the agent is looking at. Fails closed to `undefined` for the same reason
+ * {@link worktreeHasPreservedCommitFor} fails closed to `false` — a git read that failed is not
+ * proof of absence, but the only cost here is a prompt that says nothing extra, and a dispatch is
+ * never worth failing over a paragraph of prose.
  */
+export async function readPreservedCommitFor(
+  worktreePath: string,
+  ticketId: string,
+): Promise<PreservedCommit | undefined> {
+  const prefix = preservedCommitPrefix(ticketId);
+  const commit = (await branchCommits(worktreePath)).find((c) => c.subject.startsWith(prefix));
+  if (!commit) return undefined;
+  // `-z` for the same reason `diffPaths` uses it: under `core.quotePath` a non-ASCII path comes back
+  // C-quoted, and the prompt would name a file that is not on disk.
+  const names = await git(worktreePath, [
+    "show",
+    "--name-only",
+    "-z",
+    "--format=",
+    commit.sha,
+  ]).catch(() => "");
+  return { ...commit, files: names.split("\0").filter(Boolean) };
+}
+
+/** How far back a subject scan reads. A run's own commits are always at the branch tip. */
+const BRANCH_LOG_ARGS = ["log", "--format=%H%x00%s", "-n", "1000"];
+
+/**
+ * The commits at the tip of the branch checked out in `worktreePath`, newest first. Fails closed to
+ * none (git error → treat as absent) rather than risk a skip — except under `strict`, where absence
+ * is the permissive answer and the caller has asked to see the failure instead.
+ *
+ * NUL between sha and subject: a subject may contain anything a person can type, so any printable
+ * separator is one a commit message can forge.
+ */
+async function branchCommits(
+  worktreePath: string,
+  options: { strict?: boolean } = {},
+): Promise<{ sha: string; subject: string }[]> {
+  const log = options.strict
+    ? await git(worktreePath, BRANCH_LOG_ARGS)
+    : await git(worktreePath, BRANCH_LOG_ARGS).catch(() => "");
+  return log.split("\n").flatMap((line) => {
+    const [sha, ...rest] = line.split("\0");
+    return sha && rest.length > 0 ? [{ sha, subject: rest.join("\0") }] : [];
+  });
+}
+
+/** The branch's commit subjects — {@link branchCommits} for the readers that only match on text. */
 async function branchSubjects(
   worktreePath: string,
   options: { strict?: boolean } = {},
 ): Promise<string[]> {
-  if (options.strict) return (await git(worktreePath, BRANCH_SUBJECTS_ARGS)).split("\n");
-  const log = await git(worktreePath, BRANCH_SUBJECTS_ARGS).catch(() => "");
-  return log.split("\n");
+  return (await branchCommits(worktreePath, options)).map((c) => c.subject);
 }
 
 /**

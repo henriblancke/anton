@@ -9,6 +9,7 @@
 import type { Bead } from "../../beads/bd";
 import { acceptanceBody } from "../../beads/contract";
 import { humanNotesPromptBlock } from "../../beads/notes";
+import type { PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
 import { findingLines, type ReviewFinding } from "../review-context";
 import type { StepContext } from "./context";
@@ -64,17 +65,95 @@ export function truncateField(text: string): string {
  * unreadable (issue #46 root cause #3). `bd show` is offered as a convenience, never as the sole
  * source: a bead whose spec is genuinely empty AND whose `bd show` fails is a fail-loud/blocked
  * condition, not a cue to silently produce nothing.
+ *
+ * `preserved` is the state of the BRANCH rather than of the bead (anton-16pq): a timed-out
+ * attempt's work already committed here. It reads after the spec because it only means anything
+ * once the agent knows what the ticket asks for.
  */
-export function ticketPrompt(ticket: Bead): string {
+export function ticketPrompt(ticket: Bead, preserved?: PreservedCommit): string {
   return [
     `Implement this beads ticket in the current worktree:`,
     ``,
     `Ticket: ${ticket.id} — ${ticket.title}`,
     ...ticketSpecSections(ticket),
+    ...continuationSection(preserved),
     ``,
     ticketPromptClosing(ticket.id),
   ].join("\n");
 }
+
+/**
+ * What a RESUMED ticket is owed: the work its timed-out attempt left on this branch (anton-d967).
+ *
+ * Without it the resume is dispatched blind. The agent re-reads a ticket whose change is apparently
+ * already made, finds nothing to do, and exits having written nothing — which the delivery-evidence
+ * gate reads as a zero-diff stall and parks the run again, forever. So the block says three things:
+ * what was preserved, that it is INCOMPLETE (nobody verified this ticket finished), and that the
+ * move is to continue from it rather than restart or revert it.
+ *
+ * It also names the one case where `delivered` on an unchanged working tree is correct, because the
+ * base contract otherwise forbids exactly that. This does not soften the gate: `step:commit` adopts
+ * the preserved commit only when THIS run's agent affirms the ticket is finished, so an agent that
+ * stays silent (or reports blocked) still cannot close a ticket on a zero diff.
+ *
+ * Omitted entirely when nothing is preserved — a fresh ticket's prompt is unchanged.
+ */
+function continuationSection(preserved: PreservedCommit | undefined): string[] {
+  if (!preserved) return [];
+  return [``, continuationPromptBlock(preserved)];
+}
+
+function continuationPromptBlock(preserved: PreservedCommit): string {
+  return [
+    `## CONTINUATION — a previous attempt's work is already on this branch`,
+    ``,
+    `An earlier attempt at this ticket ran out of its time budget and was stopped. anton kept what ` +
+      `it had built rather than deleting it, and that work is already committed here:`,
+    ``,
+    `    ${preserved.sha} ${preserved.subject}`,
+    ...preservedFilesLines(preserved),
+    ``,
+    `That commit is INCOMPLETE by construction: the attempt was stopped mid-ticket, nobody has ` +
+      `confirmed the ticket is finished, and it is in no pull request's delivered list.`,
+    ``,
+    `Read it first (\`git show ${preserved.sha}\`) and CONTINUE from it — finish the acceptance ` +
+      `criteria it has not met yet. Do not restart the ticket from scratch, and do not revert or ` +
+      `re-do what is already there.`,
+    ``,
+    `If, after reading it, everything the ticket asks for is genuinely already done, do not ` +
+      `manufacture a change to prove it: say what you found and end with \`ANTON-RESULT: ` +
+      `delivered\`. The preserved commit is then this ticket's delivery — this is the one case ` +
+      `where reporting \`delivered\` on an unchanged working tree is correct, because the work is ` +
+      `on the branch. Without that line the run parks and the work never reaches a pull request.`,
+  ].join("\n");
+}
+
+/**
+ * The preserved diff, or the marker's explanation. An EMPTY preserved commit is the marker form:
+ * the agent committed the work under its own subjects and this commit only records whose it is, so
+ * pointing at its (empty) diff would tell the agent nothing was kept.
+ */
+function preservedFilesLines(preserved: PreservedCommit): string[] {
+  if (preserved.files.length === 0) {
+    return [
+      ``,
+      `That commit is empty — it is a marker. The previous attempt committed the work itself under ` +
+        `subjects that name neither this ticket nor its incompleteness, so the changes are in the ` +
+        `commits beneath it (\`git log -p\`).`,
+    ];
+  }
+  const shown = preserved.files.slice(0, MAX_PRESERVED_FILES);
+  const rest = preserved.files.length - shown.length;
+  return [
+    ``,
+    `Files it changed:`,
+    ...shown.map((f) => `- ${f}`),
+    ...(rest > 0 ? [`- … and ${rest} more (\`git show --stat ${preserved.sha}\`)`] : []),
+  ];
+}
+
+/** Enough to see the shape of the change; past that the agent is better served by `git show`. */
+const MAX_PRESERVED_FILES = 40;
 
 /**
  * The spec blocks, each omitted when the bead carries nothing for it.

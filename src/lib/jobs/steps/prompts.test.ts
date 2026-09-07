@@ -8,6 +8,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Bead } from "../../beads/bd";
+import type { PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
 import { prBody, stepTaskBlock, ticketPrompt, truncateField } from "./prompts";
 import { target } from "./step.fixture";
@@ -72,6 +73,57 @@ describe("ticketPrompt", () => {
 
     expect(prompt).toContain("Prefer the smaller change.");
     expect(prompt.indexOf("Prefer the smaller change.")).toBeGreaterThan(prompt.indexOf("Ship it."));
+  });
+});
+
+describe("ticketPrompt — the continuation block (anton-16pq)", () => {
+  const preserved: PreservedCommit = {
+    sha: "abc1234",
+    subject: "WIP anton-t1: Ship the thing",
+    files: ["src/a.ts", "src/b.ts"],
+  };
+
+  // Silence is what parked the run: the resume re-read the spec, found its change apparently made,
+  // and exited having written nothing.
+  it("tells a resumed ticket what was preserved, that it is incomplete, and to continue from it", () => {
+    const prompt = ticketPrompt(ticket({ description: "## Goal\n\nShip it." }), preserved);
+
+    expect(prompt).toContain("CONTINUATION");
+    expect(prompt).toContain("abc1234 WIP anton-t1: Ship the thing");
+    expect(prompt).toContain("- src/a.ts");
+    expect(prompt).toContain("- src/b.ts");
+    expect(prompt).toContain("INCOMPLETE");
+    expect(prompt).toContain("git show abc1234");
+    expect(prompt).toMatch(/do not restart the ticket from scratch/i);
+    // The one case where the base contract's "never report delivered on an unchanged tree" does not
+    // apply — without saying so, an honest agent parks the run it could have finished.
+    expect(prompt).toContain("ANTON-RESULT: delivered");
+  });
+
+  // The block is state of the BRANCH, so it only means anything once the agent knows what the
+  // ticket asks for.
+  it("places the block after the spec", () => {
+    const prompt = ticketPrompt(ticket({ description: "## Goal\n\nShip it." }), preserved);
+
+    expect(prompt.indexOf("CONTINUATION")).toBeGreaterThan(prompt.indexOf("Ship it."));
+  });
+
+  // An empty preserved commit is the marker form: the previous agent committed the work itself, so
+  // pointing at this commit's diff would say nothing was kept.
+  it("sends the agent to the commits beneath a marker rather than to its empty diff", () => {
+    const prompt = ticketPrompt(ticket(), { ...preserved, files: [] });
+
+    expect(prompt).not.toContain("Files it changed:");
+    expect(prompt).toContain("it is a marker");
+    expect(prompt).toContain("git log -p");
+  });
+
+  // The whole point of the gate this feeds: a fresh ticket must read exactly as it did before.
+  it("leaves a fresh ticket's prompt byte-identical", () => {
+    const fresh = ticket({ description: "## Goal\n\nShip it.", acceptance_criteria: "- [ ] ships" });
+
+    expect(ticketPrompt(fresh, undefined)).toBe(ticketPrompt(fresh));
+    expect(ticketPrompt(fresh)).not.toContain("CONTINUATION");
   });
 });
 

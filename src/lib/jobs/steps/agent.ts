@@ -6,6 +6,7 @@
 import { beads, labelValueOf, type Bead } from "../../beads/bd";
 import { loadAgentPrompt } from "../../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../../claude/system-prompt";
+import { readPreservedCommitFor } from "../../git/ops";
 import type { StepContext } from "./context";
 import { dispatchClaude } from "./dispatch";
 import { stepTaskBlock, ticketPrompt } from "./prompts";
@@ -18,7 +19,9 @@ import type { StepResult, StepResultWith } from "./result";
  * stdin, and the agent's `ANTON-RESULT` self-report parsed out of its final message.
  *
  * The bead's notes are re-read at dispatch, not taken from the run's opening snapshot: an operator's
- * steer (anton-bfy4) can land while an earlier ticket is still running.
+ * steer (anton-bfy4) can land while an earlier ticket is still running. The BRANCH is read here too
+ * (anton-16pq) — a resume whose earlier attempt timed out is dispatched onto that attempt's
+ * preserved work, and is told so rather than left to rediscover it.
  */
 export async function implementStep(ctx: StepContext): Promise<StepResultWith<"sessionIds">> {
   const sessionIds: string[] = [];
@@ -33,9 +36,12 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
       seedPrompt: ctx.settings.seedPrompt,
     });
     const dispatched = await withDispatchNotes(ctx.repoPath, ticket);
+    // Asked per ticket, not once per run: the answer is about THIS bead's own preserved commit, and
+    // a resume can carry one for some tickets and not others.
+    const preserved = await readPreservedCommitFor(ctx.worktreePath, ticket.id);
     last = await dispatchClaude(ctx, {
       beadId: ticket.id,
-      prompt: ticketPrompt(dispatched),
+      prompt: ticketPrompt(dispatched, preserved),
       appendSystemPrompt,
       failure: (text) => `claude reported an error for ${ticket.id}: ${text ?? "unknown"}`,
     });
