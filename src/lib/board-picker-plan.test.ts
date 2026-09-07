@@ -420,10 +420,19 @@ describe("the decision's reachable set", () => {
   });
 
   // OUTSIDE: the whole point. A board where the only write is one the decision cannot read must
-  // leave the recorded generation exactly where it was.
+  // leave the recorded generation exactly where it was. The label row is the one that separates the
+  // two narrowings: `area:` is unclassified, so the fence carries it on every bead it reaches — this
+  // edit is silent because of WHERE it landed, not because of what it says.
   it.each<[string, (board: Bead[]) => Bead[]]>([
     ["it is raised to P0", (b) => b.map((x) => (x.id === "anton-chore" ? { ...x, priority: 0 } : x))],
     ["it is re-typed", (b) => b.map((x) => (x.id === "anton-chore" ? { ...x, issue_type: "bug" } : x))],
+    [
+      "it gains a decision-relevant label",
+      (b) =>
+        b.map((x) =>
+          x.id === "anton-chore" ? { ...x, labels: [...(x.labels ?? []), "area:picker"] } : x,
+        ),
+    ],
     ["it leaves the board", (b) => b.filter((x) => x.id !== "anton-chore")],
   ])("holds still when a bead outside the reach %s", (_edit, mutate) => {
     const board = [shaped({ id: "anton-a" }), chore()];
