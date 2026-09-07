@@ -365,21 +365,13 @@ export async function ensureSchedule(
 }
 
 /**
- * Is one of a project's schedules armed? UI read path over the shared anton.db.
+ * Is one of a project's schedules armed? The db-injectable half, for the runtime paths that already
+ * hold a connection (the scheduler's own db, a test's).
  *
  * A type with no row reads as ENABLED: absence means the seed has never run for this project, which
  * is not the operator switching the automation off, and a surface that treated it as a disable would
  * hide itself on an installation that simply predates the type.
  */
-export function isScheduleEnabled(
-  projectId: string,
-  type: ScheduledJobType,
-): Promise<boolean> {
-  return scheduleEnabled(getDb(), projectId, type);
-}
-
-/** {@link isScheduleEnabled} over an injected connection, so a caller already holding one — or a
- *  test holding a temp db — asks the same question without reaching for the shared anton.db. */
 export async function scheduleEnabled(
   db: AntonDb,
   projectId: string,
@@ -391,4 +383,12 @@ export async function scheduleEnabled(
     .where(and(eq(schema.schedules.projectId, projectId), eq(schema.schedules.type, type)))
     .limit(1);
   return rows[0]?.enabled ?? true;
+}
+
+/** {@link scheduleEnabled} over the shared anton.db — the UI read path. */
+export async function isScheduleEnabled(
+  projectId: string,
+  type: ScheduledJobType,
+): Promise<boolean> {
+  return scheduleEnabled(getDb(), projectId, type);
 }

@@ -226,36 +226,53 @@ describe("resolveProjectSpend", () => {
     vi.restoreAllMocks();
   });
 
-  /** A completed Claude-burning job, charged to `projectId` at its type's burn average. */
-  function done(projectId: string | null): void {
+  /**
+   * A Claude-burning job charged to `projectId` at its type's burn average — one unit per ATTEMPT,
+   * whatever the attempt ended as (the runner samples burn for every outcome, not just success).
+   */
+  function burned(
+    projectId: string | null,
+    opts: { attempts?: number; status?: string } = {},
+  ): void {
     tdb.db
       .insert(schema.jobs)
       .values({
         id: randomUUID(),
         projectId,
         type: "execute-epic",
-        status: "done",
+        status: opts.status ?? "done",
         payloadJson: "{}",
+        attempts: opts.attempts ?? 1,
         updatedAt: new Date(),
       })
       .run();
   }
 
-  it("charges only the jobs this project completed", async () => {
+  it("charges only the attempts this project made", async () => {
     project("mine", armed());
     project("theirs", armed());
-    done("mine");
-    done("mine");
-    done("theirs");
+    burned("mine");
+    burned("mine");
+    burned("theirs");
 
     // execute-epic's L-tier seed is 3 weekly points until real samples accrue.
     expect(await resolveProjectSpend("mine", null)).toBeCloseTo(6, 6);
     expect(await resolveProjectSpend("theirs", null)).toBeCloseTo(3, 6);
   });
 
+  it("charges an attempt that failed exactly like one that succeeded", async () => {
+    // A project whose runs keep failing spends the account's quota all the same; a meter that
+    // counted completions would let it run past its share reading zero.
+    project("flaky", armed());
+    burned("flaky", { status: "parked", attempts: 3 });
+
+    expect(await resolveProjectSpend("flaky", null)).toBeCloseTo(9, 6);
+  });
+
   it("answers null — unattributed, never zero — when nothing is charged to it", async () => {
     project("quiet", armed());
-    done(null); // anton's own plumbing belongs to nobody's share
+    burned(null); // anton's own plumbing belongs to nobody's share
+    burned("quiet", { status: "queued", attempts: 0 }); // enqueued, never dispatched
 
     expect(await resolveProjectSpend("quiet", null)).toBeNull();
     expect(await resolveProjectSpend(null, null)).toBeNull();

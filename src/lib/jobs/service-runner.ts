@@ -9,6 +9,7 @@ import { getDb } from "../db";
 import { startSyncEngine } from "../beads/sync-engine";
 import { JobRunner, type RunnerLogger } from "./runner";
 import { Scheduler } from "./scheduler";
+import { BoardPickerNudge } from "./picker-nudge";
 import { systemClock } from "./queue";
 import { bootPreflight } from "./service-boot";
 import { registerJobHandlers } from "./service-handlers";
@@ -40,13 +41,19 @@ const STATE_KEY = Symbol.for("anton.jobs.serviceState");
 interface ServiceState {
   runner: JobRunner | null;
   scheduler: Scheduler | null;
+  pickerNudge: BoardPickerNudge | null;
   /** Reconcile-once guard — process-wide for the same reason (see startRunner). */
   reconciled: boolean;
 }
 
 function state(): ServiceState {
   const global = globalThis as unknown as Record<symbol, ServiceState | undefined>;
-  return (global[STATE_KEY] ??= { runner: null, scheduler: null, reconciled: false });
+  return (global[STATE_KEY] ??= {
+    runner: null,
+    scheduler: null,
+    pickerNudge: null,
+    reconciled: false,
+  });
 }
 
 /**
@@ -84,6 +91,27 @@ export function getScheduler(): Scheduler {
 }
 
 /**
+ * The board-change nudge (anton-h32k): a debounced `board-picker` pass whenever a repo's board
+ * moves, so the recorded plan trails the board by seconds rather than by the ten-minute cadence
+ * that stays behind it as the backstop.
+ *
+ * Enqueued through the RUNNER, not the queue directly, so a project mid-teardown is refused by the
+ * same quiesce barrier every other enqueue path crosses — a nudge racing `deleteProject` must not
+ * insert a job row the abort sweep has already been past.
+ */
+export function getPickerNudge(): BoardPickerNudge {
+  const s = state();
+  if (s.pickerNudge) return s.pickerNudge;
+  s.pickerNudge = new BoardPickerNudge({
+    db: getDb(),
+    enqueue: (projectId) =>
+      getRunner().enqueue({ type: "board-picker", projectId, payload: { projectId } }),
+    log,
+  });
+  return s.pickerNudge;
+}
+
+/**
  * Idempotent: reconcile crash-orphaned jobs/runs (anton-nbd), then start the background runner loop
  * + the cron scheduler + the beads sync engine. Meant to be called once at server boot, but tolerant
  * of re-entry (dev hot-reload, tests): reconciliation runs at most once — the first call only —
@@ -103,5 +131,6 @@ export async function startRunner(): Promise<void> {
   }
   getRunner().start();
   getScheduler().start();
+  getPickerNudge().start();
   startSyncEngine();
 }

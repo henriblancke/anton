@@ -9,9 +9,9 @@ import { getDb } from "../db";
 import { activeExecuteEpicId, getJob, systemClock } from "./queue";
 import { resumeEpic, type ResumeOutcome } from "./unstick";
 import type { RunningJobInfo } from "./runner";
-import { getRunner, getScheduler, startRunner } from "./service-runner";
+import { getPickerNudge, getRunner, getScheduler, startRunner } from "./service-runner";
 
-export { getRunner, getScheduler, startRunner };
+export { getPickerNudge, getRunner, getScheduler, startRunner };
 
 /**
  * Enqueue an execute-epic job for an approved epic. Returns the job id — the existing one when an

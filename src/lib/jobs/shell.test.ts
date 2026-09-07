@@ -135,7 +135,10 @@ describe("runShell cancellation (anton-jfjw.6)", () => {
     expect(await waitForDeath(shPid)).toBe(true);
   });
 
-  it("escalates SIGTERM to SIGKILL for a gate that traps the signal", async () => {
+  // The rejection is what the timeout-preservation path reads as "this gate is done", and it rolls
+  // the worktree back on it — so a gate still alive at that moment can write past the cleanliness
+  // check and have its leftovers swept into the next ticket's commit (PR #228 review).
+  it("escalates to SIGKILL and settles only once the trapping gate is gone", async () => {
     process.env[KILL_GRACE_ENV] = "1000";
     const shPidFile = join(dir, "trap-sh.pid");
     const cmd = `trap "" TERM; echo $$ > ${shPidFile}; while true; do sleep 0.1; done`;
@@ -146,11 +149,30 @@ describe("runShell cancellation (anton-jfjw.6)", () => {
     strays.push(shPid);
 
     ac.abort();
+    // The trap makes SIGTERM a no-op, so only the escalation can end it — and the promise waits
+    // for that rather than rejecting into a caller that would then roll back under a live gate.
     await expect(promise).rejects.toMatchObject({ name: "AbortError" });
-    // The trap makes SIGTERM a no-op, so the process is still up when the run unwinds...
-    expect(isAlive(shPid)).toBe(true);
-    // ...and only the escalation can end it.
-    expect(await waitForDeath(shPid)).toBe(true);
+    expect(isAlive(shPid)).toBe(false);
+  });
+
+  it("keeps escalating for a worker that outlived the shell, and settles only once it is gone", async () => {
+    process.env[KILL_GRACE_ENV] = "200";
+    const kidPidFile = join(dir, "outlive-kid.pid");
+    // `exec` replaces the shell with a short sleep, so the direct child exits while its worker is
+    // still running: the escalation used to be cancelled by that exit, leaving the worker alive.
+    const cmd =
+      `${process.execPath} -e 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1 << 30)' & ` +
+      `echo $! > ${kidPidFile}; exec sleep 0.2`;
+
+    const ac = new AbortController();
+    const promise = runShell(cmd, dir, ac.signal);
+    const kidPid = await readPid(kidPidFile);
+    strays.push(kidPid);
+
+    await new Promise((r) => setTimeout(r, 600)); // let the shell exit, leaving only the worker
+    ac.abort();
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+    expect(isAlive(kidPid)).toBe(false);
   });
 
   it("settles on exit even when a leaked descendant still holds stdio", async () => {
