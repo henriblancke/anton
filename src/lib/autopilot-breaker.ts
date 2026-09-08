@@ -191,8 +191,8 @@ function commits(n: number): string {
  * answered. So the band renders on `behind`/`drift` alone; a clean or unknowable checkout shows
  * nothing, which is the whole "nothing renders when the checkout is clean" property.
  *
- * The counterpart of the run-side `staleCheckoutRefusal` (execute-epic-prepare.ts): the same two
- * halves, phrased for a card (detail + per-half evidence with its command) rather than a park line.
+ * The counterpart of the run-side `staleCheckoutRefusal` (jobs/execute-epic-freshness.ts): the same
+ * two halves, phrased for a card (detail + per-half evidence with its command) rather than a park line.
  */
 export function staleBreaker(freshness: SelfFreshness): AutopilotStale | undefined {
   const behind: string[] = [];

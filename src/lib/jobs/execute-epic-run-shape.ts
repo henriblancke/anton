@@ -3,8 +3,10 @@
  * cooked pipeline — and taking the cross-machine lease that makes this machine the only one walking
  * it are the last shape work before any worktree exists, so {@link prepareEpicRun} threads two calls
  * through this module rather than fanning out across the formula/step family and the lease's own
- * dependencies. A checkout-staleness preflight (anton-vzhf) joins these behind this same seam rather
- * than adding another top-level import to the preparation module — which is why this seam is kept
+ * dependencies. The checkout-staleness preflight (anton-vzhf) joins them behind this same seam:
+ * `assertSelfCheckoutFresh` is FORWARDED from execute-epic-freshness.ts (which owns the self-freshness
+ * and breaker modules) so the preparation module reaches it here rather than importing those modules
+ * itself (anton-8x1k) — the seam takes on one re-export, not their whole subgraph. The seam is kept
  * deliberately lean: the board-gate half of the lease (the drift/retry decision) is INJECTED by the
  * caller rather than imported here, so it stays with prepare's other board gates.
  */
@@ -20,6 +22,11 @@ import type { EpicRun } from "./execute-epic-run";
 // it to the formula/step family — the whole point of the grouping (anton-8x1k).
 export type { ResolvedStep } from "./run-formula";
 export type { StepContext } from "./step-registry";
+// The checkout-staleness preflight (anton-vzhf) reaches prepare through this same seam: its two
+// volatile modules (self-freshness, the breaker) stay in execute-epic-freshness.ts, and this seam
+// forwards the gate so the preparation module imports it here rather than fanning those modules out
+// into its own top-level graph (anton-8x1k) — the same firewall the type re-exports above serve.
+export { assertSelfCheckoutFresh } from "./execute-epic-freshness";
 
 /** Step 0d. Cook, floor-check and pin the pipeline this run walks, then split it into its phases. */
 export async function resolveRunPipeline(

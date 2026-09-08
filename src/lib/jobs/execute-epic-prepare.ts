@@ -7,7 +7,6 @@
  * that follow from holding it (the human waits, the checkout, the claim and its cascade). Moving a
  * step across that line changes what a park leaves behind, so each one says where it sits and why.
  */
-import { BREAKER_EFFECT } from "../autopilot-breaker";
 import { beads, type Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { contractGaps, formatContractGaps } from "../beads/contract";
@@ -37,12 +36,13 @@ import {
 } from "./execute-epic-claim";
 import { adoptRefreshedTarget, preflightHumanTickets } from "./execute-epic-human-gate";
 import { refreshRunBoard, settleCompletedRun } from "./execute-epic-recover";
-import { checkSelfFreshness, selfRepoRoot, type SelfFreshness } from "./self-freshness";
 import type { EpicRun } from "./execute-epic-run";
-// The formula/step family and the run-lease sit behind ONE seam (anton-8x1k) — the run-shape
-// helpers this module merely threads through or re-exports, kept out of its top-level import graph
-// so the checkout-staleness preflight (anton-vzhf) can join them there rather than fan out here.
+// The formula/step family, the run-lease, AND the checkout-staleness preflight (anton-vzhf) sit
+// behind ONE seam (anton-8x1k) — the run-shape helpers this module merely threads through or
+// re-exports, kept out of its top-level import graph so the self-freshness and breaker modules do
+// not fan out here and push preparation's coupling over the floor.
 import {
+  assertSelfCheckoutFresh,
   resolveRunPipeline,
   takeRunLease,
   type ResolvedStep,
@@ -89,6 +89,11 @@ interface RunGates {
 export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   const { preCheckTrusted, leaseTarget } = await refreshRunBoard(run);
   if (await settleCompletedRun(run, leaseTarget)) return { done: true };
+  // Step 0-pre. Refuse to start a new run on a stale checkout (anton-mh3c). Placed AFTER the
+  // completion short-circuit so a target already carried to its pull request still settles
+  // idempotently rather than being grounded by a staleness with nothing left to run. The gate lives
+  // behind the run-shape seam (anton-8x1k) so its freshness/breaker modules stay out of this module's
+  // import graph; see {@link assertSelfCheckoutFresh} for the full contract.
   await assertSelfCheckoutFresh();
   const gates = regateRefreshedBoard(run, leaseTarget);
   assertAgentsEnabled(run, gates);
@@ -125,63 +130,6 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
     gated: gates.gated,
     isResumeSkipped: gates.isResumeSkipped,
   };
-}
-
-/**
- * Step 0-pre. Refuse to START a new run when anton is running behind its own latest code
- * (anton-mh3c). anton pulls before it starts, but a fix merged after that pull — or a lockfile bump
- * nobody reinstalled — leaves the process a step behind its own repairs; starting new work on it
- * ships that stale code into the trunk.
- *
- * Machine-level, not board-level: the self-freshness verdict (anton-vzhf) is about the PROCESS, so
- * it is read against anton's OWN install root — not the project checkout in {@link EpicRun.repo}.
- *
- * A read-only refusal like every gate around it, and it inherits their contract: the park costs no
- * lease, worktree or claim, and a run already in flight — a separate job long past this gate — is
- * untouched, only a new start is stopped ({@link BREAKER_EFFECT}). Placed AFTER the completion
- * short-circuit so a target already carried to its pull request still settles idempotently rather
- * than being grounded by a staleness with nothing left to run. The PoisonEpic parks the job for a
- * human — the fix is theirs (pull/reinstall, then restart anton) — and its message is the durable
- * record the run row keeps and the run-health sweep surfaces.
- */
-async function assertSelfCheckoutFresh(): Promise<void> {
-  const root = selfRepoRoot();
-  const refusal = staleCheckoutRefusal(await checkSelfFreshness(root), root);
-  if (refusal) throw new PoisonEpic(refusal);
-}
-
-/**
- * The refusal a stale checkout parks a new start on (anton-mh3c), or undefined when anton is running
- * its own latest code. Names WHAT is stale and the command that clears it, and closes with the
- * disarm's contract line ({@link BREAKER_EFFECT}) so the operator reads the same "running work is
- * unaffected" promise a disarm makes rather than fearing a full stop.
- *
- * Only a verdict anton can act on by rebuilding counts as stale: HEAD behind its own upstream, or
- * installed packages that no longer match the lockfile. Every INDETERMINATE verdict — a remote it
- * could not reach, a branch with no upstream, a lockfile it could not read — passes exactly as a
- * clean one does: refusing a start on a check that never answered would ground an offline runner on
- * no evidence, the line anton-vzhf drew and this honours.
- */
-export function staleCheckoutRefusal(
-  freshness: SelfFreshness,
-  repoPath: string,
-): string | undefined {
-  const stale: string[] = [];
-  if (freshness.checkout.state === "behind") {
-    const { behind, upstream } = freshness.checkout;
-    stale.push(`its checkout is ${behind} commit(s) behind ${upstream} — run \`git pull\``);
-  }
-  if (freshness.dependencies.state === "drift") {
-    stale.push(
-      `its installed packages no longer match bun.lock ` +
-        `(${freshness.dependencies.packages.join(", ")}) — run \`bun install\``,
-    );
-  }
-  if (stale.length === 0) return undefined;
-  return (
-    `anton is running behind its own latest code, so it will not start new work: ` +
-    `${stale.join("; ")} in ${repoPath}, then restart anton. ${BREAKER_EFFECT}`
-  );
 }
 
 /**

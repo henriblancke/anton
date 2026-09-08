@@ -100,7 +100,11 @@ vi.mock("./execute-epic-formula", () => ({
   splitFormulaPhases: () => ({ ticketSteps: [], runSteps: [] }),
 }));
 
-const { prepareEpicRun, staleCheckoutRefusal } = await import("./execute-epic-prepare");
+const { prepareEpicRun } = await import("./execute-epic-prepare");
+// The staleness preflight lives in execute-epic-freshness.ts (forwarded to prepare through the
+// run-shape seam), so its pure unit imports from there; the self-freshness mock above intercepts the
+// import regardless of which module reads it.
+const { staleCheckoutRefusal } = await import("./execute-epic-freshness");
 const { PoisonEpic } = await import("./errors");
 import type { EpicRun } from "./execute-epic-run";
 
