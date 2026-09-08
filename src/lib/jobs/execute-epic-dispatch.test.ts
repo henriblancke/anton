@@ -386,4 +386,19 @@ describe("the cross-machine reopen of a closed child", () => {
     expect(reopenMock).not.toHaveBeenCalled();
     expect(dispatchedIds()).toEqual(["anton-a"]);
   });
+
+  // Unreadable is not "still closed" (PR #238 review): the snapshot's status is stale by
+  // construction on a resume, and a reopen decided on it alone would undo an abandon or a supersede
+  // that landed since, then dispatch the ticket again. Stop, like every other guarded write.
+  it("stops the run when bd cannot read the closed child back", async () => {
+    const child = closedChild("anton-a");
+    showMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+    await expect(dispatchRunTickets(makeResume(child), prep())).rejects.toThrow(PoisonEpic);
+    await expect(dispatchRunTickets(makeResume(child), prep())).rejects.toThrow(
+      /anton-a is closed on the board this run read but its commit is on no branch here, and bd would not read the ticket back/,
+    );
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(runTicketMock).not.toHaveBeenCalled();
+  });
 });

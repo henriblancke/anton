@@ -40,6 +40,7 @@ import {
   readPathHistory,
   readWorktreeState,
   resolveFreshBase,
+  resolveForkPoint,
   resolveMergeBase,
   restoreWorktreeState,
   sameWorktreeState,
@@ -1324,6 +1325,58 @@ suite("resolveMergeBase (real git)", () => {
     rmSync(join(repo, ".git", "objects", head.slice(0, 2), head.slice(2)));
 
     await expect(resolveMergeBase(repo, "main")).rejects.toThrow();
+  });
+});
+
+suite("resolveForkPoint (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const out = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-forkpoint-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", "anton/epic-1"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("pins the fork point as a SHA, like the lenient resolver", async () => {
+    const fork = out(["rev-parse", "HEAD"]);
+    g(["checkout", "-q", "main"]);
+    writeFileSync(join(repo, "other.ts"), "export const other = 0;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "someone else"]);
+    g(["checkout", "-q", "anton/epic-1"]);
+
+    expect(await resolveForkPoint(repo, "main")).toBe(fork);
+  });
+
+  it("throws on a base rewritten to an unrelated history, rather than pinning its tip", async () => {
+    // The lenient resolver answers the base TIP here — a commit this checkout never forked from.
+    // A landing check given that tip would find work "in the base" that HEAD does not contain.
+    g(["checkout", "-q", "--orphan", "rewritten"]);
+    writeFileSync(join(repo, "b.ts"), "export const b = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "unrelated history"]);
+    expect(await resolveMergeBase(repo, "main")).toBe(out(["rev-parse", "main"]));
+
+    await expect(resolveForkPoint(repo, "main")).rejects.toThrow(/share no commit/);
+  });
+
+  it("throws on a base that does not resolve, rather than handing the name back", async () => {
+    await expect(resolveForkPoint(repo, "origin/nope")).rejects.toThrow();
   });
 });
 

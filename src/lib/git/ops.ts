@@ -460,6 +460,32 @@ export async function resolveMergeBase(worktreePath: string, base: string): Prom
 }
 
 /**
+ * The commit `HEAD` forked from `base`, and NOTHING else — the strict form of
+ * {@link resolveMergeBase} for a caller that is about to treat "in the base" as "in this checkout".
+ *
+ * The lenient helper's no-merge-base fallback pins the base TIP, which is the right baseline for a
+ * review to diff against but the wrong one for a landing check: after `origin/<base>` is
+ * force-rewritten to an unrelated history, that tip reaches commits this branch never forked from,
+ * so a ticket's work could be found "landed" in a history `HEAD` does not contain, retired on that
+ * evidence, and the tickets behind it dispatched against a mechanism the checkout lacks. So an
+ * unrelated history (`merge-base` exit 1) THROWS here like a base that names nothing or a read that
+ * broke: with no fork point there is no checkout-bound answer, and the caller must fail closed.
+ */
+export async function resolveForkPoint(worktreePath: string, base: string): Promise<string> {
+  try {
+    return await git(worktreePath, ["merge-base", base, "HEAD"]);
+  } catch (error) {
+    if (exitedWith(error, 1)) {
+      throw new Error(
+        `${base} and HEAD share no commit in ${worktreePath} — the base was rewritten to an ` +
+          `unrelated history, so this checkout has no fork point to check against`,
+      );
+    }
+    throw error;
+  }
+}
+
+/**
  * Whether a rejected git call is the command exiting with `code` — its own answer — rather than a
  * run that never got one. A process killed by a timeout carries `code: null` and a signal, and a
  * spawn failure carries a string errno, so neither is mistaken for an exit status.

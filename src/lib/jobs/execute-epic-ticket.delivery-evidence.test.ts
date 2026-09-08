@@ -63,7 +63,7 @@ const readCommitNamingMock = vi.fn<(repo: string, beadId: string, base: string) 
   async () => ({ state: "none" }),
 );
 /** The fork point the repair pins its base to (PR #238 review) — the worktree's, read at the write. */
-const resolveMergeBaseMock = vi.fn<(worktree: string, base: string) => Promise<string>>(async () => FORK);
+const resolveForkPointMock = vi.fn<(worktree: string, base: string) => Promise<string>>(async () => FORK);
 /** The under-lock recheck of a naming commit — it still reaches the base unless a case says otherwise. */
 const readCommitReachMock = vi.fn(
   async (_repo: string, sha: string): Promise<CommitReach> => ({ state: "reaches", sha }),
@@ -119,7 +119,7 @@ vi.mock("../git/ops", async () => {
     readWorktreeState: () => readWorktreeStateMock(),
     restoreWorktreeState: async () => {},
     readCommitNaming: (repo: string, beadId: string, base: string) => readCommitNamingMock(repo, beadId, base),
-    resolveMergeBase: (worktree: string, base: string) => resolveMergeBaseMock(worktree, base),
+    resolveForkPoint: (worktree: string, base: string) => resolveForkPointMock(worktree, base),
     readCommitReach: (repo: string, sha: string) => readCommitReachMock(repo, sha),
   };
 });
@@ -258,7 +258,7 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
       logPath: "/tmp/sess-1.log",
     }));
     readWorktreeStateMock.mockImplementation(async () => ({ head: "a".repeat(40), status: "" }));
-    resolveMergeBaseMock.mockImplementation(async () => FORK);
+    resolveForkPointMock.mockImplementation(async () => FORK);
   });
 
   it("halts and blocks an UNCLASSIFIED zero diff, closing nothing (issue #46 root cause #1)", async () => {
@@ -423,16 +423,18 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
     // Checked against the commit the WORKTREE forked from, never the moving `origin/main` the run
     // was cut at (PR #238 review): a sibling run's fetch advances that ref, and a resumed checkout
     // is reused as-is, so the ref can hold work this branch does not.
-    expect(resolveMergeBaseMock).toHaveBeenCalledWith(WORKTREE, "origin/main");
+    expect(resolveForkPointMock).toHaveBeenCalledWith(WORKTREE, "origin/main");
     expect(readCommitNamingMock).toHaveBeenCalledWith(REPO, SHIPPED_ID, FORK);
     expect(readCommitNamingMock).not.toHaveBeenCalledWith(REPO, SHIPPED_ID, "origin/main");
   });
 
   // The fork point IS the check's baseline, so a fork point git cannot compute is a check that
-  // cannot run — the repair fails and the block stands, rather than falling back to the ref.
+  // cannot run — the repair fails and the block stands, rather than falling back to the ref. The
+  // strict resolver also refuses a base rewritten to an unrelated history (PR #238 review), and that
+  // refusal takes the same path: no fork point, no retirement.
   it("retires nothing when the worktree's fork point cannot be computed", async () => {
     readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40), committedAt: "2026-01-01T00:00:00Z" });
-    resolveMergeBaseMock.mockRejectedValue(new Error("fatal: not a git repository"));
+    resolveForkPointMock.mockRejectedValue(new Error("origin/main and HEAD share no commit"));
 
     const halt = await haltOf({
       outcome: "blocked",

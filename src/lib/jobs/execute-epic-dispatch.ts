@@ -379,13 +379,24 @@ async function markRetired(run: EpicRun, ticketId: string): Promise<void> {
  * reopen follows a retirement that was checked against a closed bead.
  *
  * `ticket.status` came from the run's snapshot, so a bead somebody has reopened since is left
- * alone: a reopen on a bead that already reads open is a write for nothing. The write itself stays
+ * alone: a reopen on a bead that already reads open is a write for nothing. A bead bd will not read
+ * back STOPS the run instead (PR #238 review), like every other guarded write: the snapshot's
+ * `closed` says nothing about what the board holds now, and reopening on it would undo an abandon
+ * or a supersede that landed since and dispatch the ticket again. The write itself stays
  * best-effort, as before — runTicket's claim is what fails loudly on a bead still closed.
  */
 async function reopenForRegeneration(repo: string, ticket: Bead): Promise<void> {
   await withBeadWriteLock(repo, ticket.id, async () => {
     const live = await mustRead(repo, ticket.id);
-    if (live && live.status !== "closed") return;
+    if (!live) {
+      throw new PoisonEpic(
+        `${ticket.id} is closed on the board this run read but its commit is on no branch here, ` +
+          `and bd would not read the ticket back, so anton cannot tell whether it is still closed ` +
+          `— the run stopped rather than reopen a ticket the board may since have abandoned or ` +
+          `superseded. Check the beads DB, then resume the run`,
+      );
+    }
+    if (live.status !== "closed") return;
     await safe(() => beads.reopen(repo, ticket.id));
   });
 }

@@ -22,7 +22,7 @@ import {
   type DepMissingOutcome,
 } from "../gardener/repair-dep-missing";
 import { refusalNote, repairRefStale, type RefStaleOutcome } from "../gardener/repair-ref-stale";
-import { resolveMergeBase } from "../git/ops";
+import { resolveForkPoint } from "../git/ops";
 import { resolveRepairAutonomy } from "../projects";
 import { appendSessionLog } from "../sessions";
 import { safe } from "./execute-epic-persist";
@@ -130,9 +130,11 @@ export async function repairBlockedTicket(args: {
             // verify against work this branch does not contain, and the tickets behind the retired
             // one would then be dispatched against a mechanism the checkout lacks. Pinned per
             // repair rather than once per run, for the same reason: it is the fork point AT THE
-            // WRITE that the retirement has to hold against. A fork point git cannot compute fails
-            // the repair, and the block stands.
-            base: await resolveMergeBase(worktreePath, run.baseRef),
+            // WRITE that the retirement has to hold against. The STRICT resolver, not the review
+            // gate's: a base force-rewritten to an unrelated history has no fork point, and the
+            // lenient fallback to its tip would let the check accept work only that history holds.
+            // A fork point git cannot compute fails the repair, and the block stands.
+            base: await resolveForkPoint(worktreePath, run.baseRef),
             bead: fresh,
             // The contract the agent was PROMPTED with (PR #238 review): `fresh` is read after the
             // report, so an edit landing mid-session is already in it, and a fence starting there
