@@ -625,7 +625,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     const resetAt = Math.floor(h.clock.now() / 1000) + 3600; // seconds
     const r = budgetRunner(
       async (ctx) => {
-        ctx.claudeReached();
+        await ctx.claudeReached();
         throw new UsageLimitError("hit the wall", resetAt);
       },
       { readUsage: async () => usage({ sessionPct: 10 }) },
@@ -644,9 +644,9 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
 
   it("charges the project's spend meter only for attempts the handler says reached Claude (PR #248)", async () => {
     // `spentAttempts` prices the project's weekly share, so it must count spawns, not leases. The
-    // lease charges up front; settle hands the attempt back unless the handler flagged
-    // `claudeReached` — on EVERY exit, since a preflight can complete (abandoned target), park
-    // (target vanished) or reschedule (lease held elsewhere) without ever spawning Claude.
+    // charge lands when the handler awaits `claudeReached`, and nowhere else — a preflight can
+    // complete (abandoned target), park (target vanished) or reschedule (lease held elsewhere)
+    // without ever spawning Claude, and each of those must leave the meter where it was.
     h.seedProjects("A");
     const attempts: Array<{ handler: JobHandler; status: string; spent: number }> = [
       { handler: async () => {}, status: "done", spent: 0 },
@@ -666,7 +666,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       },
       {
         handler: async (ctx) => {
-          ctx.claudeReached();
+          await ctx.claudeReached();
           throw new Error("agent crashed after the spawn");
         },
         status: "queued",
@@ -674,7 +674,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       },
       {
         handler: async (ctx) => {
-          ctx.claudeReached();
+          await ctx.claudeReached();
         },
         status: "done",
         spent: 1,
@@ -691,11 +691,11 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     }
   });
 
-  it("refunds the spend of a cancelled attempt that never reached Claude (PR #248)", async () => {
+  it("leaves a cancelled attempt charged exactly as far as it reached Claude (PR #248)", async () => {
     // `cancel()` terminalizes the row BEFORE aborting the handler, so the aborted handler's settle is
-    // a no-op against it — and would leave the lease's up-front charge on a row that quota
-    // accounting still sums. An operator killing a job in preflight must not spend the project's
-    // share on nothing; one killed after the spawn keeps its charge.
+    // a no-op against it — and quota accounting sums cancelled rows. Since the charge is written at
+    // the spawn rather than the lease, that no-op is harmless: an operator killing a job in preflight
+    // spends nothing of the project's share, and one killed after the spawn keeps its charge.
     h.seedProjects("A");
     for (const [reached, spent] of [
       [false, 0],
@@ -703,7 +703,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     ] as const) {
       const r = budgetRunner(
         async (ctx) => {
-          if (reached) ctx.claudeReached();
+          if (reached) await ctx.claudeReached();
           await new Promise<void>((resolveWait) => {
             ctx.signal.addEventListener("abort", () => resolveWait());
           });
@@ -713,7 +713,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
       expect(await r.tickOnce()).toBe(1);
       await waitUntil(() => r.activeCount === 1);
-      expect((await getJob(h.db, id))?.spentAttempts).toBe(1); // the lease charges up front
+      expect((await getJob(h.db, id))?.spentAttempts).toBe(spent); // the lease itself charges nothing
 
       expect(await r.cancel(id)).toBe(true);
       await r.whenIdle();
@@ -721,6 +721,34 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       expect(job?.status).toBe("cancelled");
       expect(job?.spentAttempts).toBe(spent);
     }
+  });
+
+  it("never charges a lease the process lost before reaching Claude (PR #248)", async () => {
+    // The unrefundable window: a lease taken, the process dead in preflight, the lease lapsed and
+    // reclaimed on restart. A charge written at the lease survived that (no settle, no refund) and
+    // was charged AGAIN by the reclaim; written at the spawn, the row reads zero however many times
+    // it is reclaimed, and one when an attempt finally spawns.
+    h.seedProjects("A");
+    const r = budgetRunner(
+      async () => {
+        throw new Error("preflight crash");
+      },
+      { readUsage: async () => usage({ sessionPct: 10 }) },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect((await getJob(h.db, id))?.spentAttempts).toBe(0);
+
+    // A retry that reaches Claude before crashing is the first — and only — charge.
+    r.registerHandler("execute-epic", async (ctx) => {
+      await ctx.claudeReached();
+      throw new Error("crash after the spawn");
+    });
+    h.clock.advance(60 * 60 * 1000);
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect((await getJob(h.db, id))?.spentAttempts).toBe(1);
   });
 
   // ── Per-job value/cost gate (anton-k05r) ──

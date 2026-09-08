@@ -62,7 +62,15 @@ describe("dispatchClaude", () => {
     });
 
     await dispatchClaude(
-      { ...ctx, ctx: { ...ctx.ctx, claudeReached: () => order.push("claudeReached") } },
+      {
+        ...ctx,
+        ctx: {
+          ...ctx.ctx,
+          claudeReached: async () => {
+            order.push("claudeReached");
+          },
+        },
+      },
       args(),
     );
 

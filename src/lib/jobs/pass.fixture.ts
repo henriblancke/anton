@@ -45,7 +45,7 @@ export function fakeJobContext(overrides: Partial<JobContext> = {}): FakeJobCont
     report: (info) => {
       ctx.reported.push(info as Record<string, unknown>);
     },
-    claudeReached: () => {
+    claudeReached: async () => {
       ctx.claudeSpawns += 1;
     },
     ...overrides,

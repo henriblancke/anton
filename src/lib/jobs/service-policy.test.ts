@@ -206,6 +206,28 @@ describe("resolveBudgetPolicy (quota share)", () => {
     expect(boardReads()).toBe(3);
   });
 
+  it("fails open on an unreadable share board, like every other governor read", async () => {
+    // The board read is coalesced across a whole governor pass, so one rejection would be shared by
+    // every policy that pass resolves and error the whole tick. A DB hiccup must instead admit the
+    // governed project at its full weekly target for that tick — an empty board, on which it is
+    // ungoverned — and the next pass reads fresh.
+    project("a", armed({ quotaSharePct: 30 }));
+    project("b", armed({ quotaSharePct: 70 }));
+    // Only the board's own project scan fails; the subject's settings read is untouched.
+    const select = tdb.db.select.bind(tdb.db);
+    const selects = vi.spyOn(tdb.db, "select").mockImplementation(((
+      columns?: Record<string, unknown>,
+    ) => {
+      if (columns && "id" in columns && "settingsJson" in columns) throw new Error("db down");
+      return select(columns as never);
+    }) as typeof tdb.db.select);
+
+    expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBe(TARGET);
+
+    selects.mockRestore();
+    expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBeCloseTo(TARGET * 0.3, 6);
+  });
+
   it("says out loud when the declared shares do not sum to 100", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     project("a", armed({ quotaSharePct: 60 }));

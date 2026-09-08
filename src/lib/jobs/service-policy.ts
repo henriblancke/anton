@@ -57,7 +57,10 @@ export async function resolvePolicy(projectId: string | undefined) {
 export async function resolveBudgetPolicy(projectId: string | undefined) {
   const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
   if (!projectId || !settings.budgetAware) return null;
-  const share = resolveGovernedShare(projectId, await quotaShareBoard());
+  // Fail open, like every other governor read: an unreadable board is an EMPTY board, on which the
+  // subject is absent and so ungoverned — the full weekly target for one tick — rather than a
+  // rejection shared by every policy the coalesced read served, which would error the whole tick.
+  const share = resolveGovernedShare(projectId, await quotaShareBoard().catch(() => []));
   announceImbalance(share);
   return withQuotaShare(resolveBudgetPolicyFromSettings(settings), share.sharePct);
 }

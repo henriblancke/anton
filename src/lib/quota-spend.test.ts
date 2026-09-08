@@ -9,7 +9,7 @@ import { eq } from "drizzle-orm";
 import { recordBurnSample } from "./burn";
 import * as schema from "./db/schema";
 import { makeTestDb, type TestDb } from "./db/testing";
-import { leaseDue, reschedule, resumeJob, type Clock } from "./jobs/queue";
+import { chargeSpentAttempt, leaseDue, reschedule, resumeJob, type Clock } from "./jobs/queue";
 import { projectWeeklySpendPct, weeklyWindowStart } from "./quota-spend";
 import { insertProject } from "@/lib/testing/project";
 import type { ClaudeUsage } from "./claude/usage";
@@ -128,33 +128,36 @@ describe("projectWeeklySpendPct", () => {
     expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(6);
   });
 
-  it("charges the attempt a lease starts, and hands back only one a spend refund withdraws", async () => {
-    // The lease is the moment quota starts burning, so the meter moves with it — a running job has
-    // spent most of what it will. Refunding the RETRY budget alone (a quota hit) keeps the charge:
-    // Claude was reached, and a multi-call handler may have finished real work before the wall. Only
-    // a reschedule that vouches the attempt never reached Claude (lease held elsewhere, no remote)
-    // comes back off the meter.
+  it("charges an attempt when it reaches Claude, never at the lease (PR #248 review)", async () => {
+    // A lease is not evidence of spend: a preflight can exit — or the process can die — before Claude
+    // is ever invoked. A charge taken at the lease needed a refund on every such exit, and a crash
+    // in that window (no settle, so no refund) left it on the row for the reclaim to charge AGAIN.
+    // So the meter moves only when the handler reports the spawn, and a lease that never gets there
+    // costs nothing however many times it is reclaimed.
     const p = insertProject(tdb.db, { id: "L", slug: "l", name: "L", repoPath: "/tmp/L" });
     await seedSamples(p, 2);
     await seedJob(p, { status: "queued", attempts: 0, id: "due" });
 
     const [leased] = await leaseDue(tdb.db, clock, { leaseMs: 30_000, limit: 1 });
     expect(leased?.id).toBe("due");
-    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBeNull();
 
-    await reschedule(tdb.db, clock, "due", NOW + 60_000);
-    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
-
+    // The process dies in preflight: the lease lapses and the reclaim leases it again. No spend.
     await leaseDue(tdb.db, { now: () => NOW + 60_000 }, { leaseMs: 30_000, limit: 1 });
-    await reschedule(tdb.db, clock, "due", NOW + 120_000, { refundAttempt: true });
-    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(4);
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBeNull();
 
+    // This attempt reaches Claude: charged at the spawn, and a quota hit that refunds the RETRY
+    // budget keeps the charge — Claude was reached, and a multi-call handler may have finished real
+    // work before the wall.
+    await chargeSpentAttempt(tdb.db, "due");
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
+    await reschedule(tdb.db, clock, "due", NOW + 120_000, { refundAttempt: true });
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
+
+    // A later attempt that exits in preflight (lease held elsewhere) was never charged.
     await leaseDue(tdb.db, { now: () => NOW + 120_000 }, { leaseMs: 30_000, limit: 1 });
-    await reschedule(tdb.db, clock, "due", NOW + 180_000, {
-      refundAttempt: true,
-      refundSpend: true,
-    });
-    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(4);
+    await reschedule(tdb.db, clock, "due", NOW + 180_000, { refundAttempt: true });
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
   });
 
   it("counts only attempts inside the quota week", async () => {

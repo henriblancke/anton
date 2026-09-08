@@ -653,7 +653,9 @@ export function enqueueSyncPushDeduped(
  * Atomically lease up to `limit` runnable jobs and return them. Runnable =
  *   • `queued` and due (runAt ≤ now), OR
  *   • `running` but the lease expired (crashed worker → reclaim).
- * Leasing sets status=`running`, a fresh lease, and increments `attempts` and `spentAttempts`.
+ * Leasing sets status=`running`, a fresh lease, and increments `attempts`. It does NOT touch the
+ * spend meter (`spentAttempts`): that charge lands when the handler reaches Claude
+ * ({@link chargeSpentAttempt}), never at lease time — see there for why.
  *
  * The runner is single-process, so a read-then-write inside one better-sqlite3 transaction is
  * sufficient mutual exclusion.
@@ -780,7 +782,6 @@ export async function leaseDue(
       status: "running",
       leaseExpiresAt: leaseDate,
       attempts: sql`${schema.jobs.attempts} + 1`,
-      spentAttempts: sql`${schema.jobs.spentAttempts} + 1`,
       updatedAt: nowDate,
     })
     // Candidates can be cancelled after the SELECT above. Re-assert runnable state here so a
@@ -949,26 +950,41 @@ export function toJobOutcome(
 }
 
 /**
- * The spend meter after settling: one attempt back when the caller vouches Claude was never reached
- * (the runner's `claudeReached` signal stayed off), else unchanged. Floored at zero — a resume that
- * re-leases a refunded attempt must not push the meter negative.
+ * Charge one attempt to the project's spend meter (`spentAttempts`) — the runner writes it the
+ * moment the handler reports it is about to spawn Claude, once per attempt (PR #248 review).
+ *
+ * Charged at the spawn rather than at the lease because the lease is not evidence of spend: an
+ * attempt can exit in preflight without ever invoking Claude (an abandoned target, a lease held
+ * elsewhere, a run already carried to a PR), and a charge taken up front had to be handed back on
+ * every such exit. That refund needed the runner to settle — a process that dies after the lease
+ * and before the spawn left the charge on the row for good, and the reclaim leased (and charged) it
+ * again, so a preflight that crashed repeatedly could spend a project's whole share on nothing.
+ * Writing the charge only when Claude is reached leaves nothing to reconcile: a crash before the
+ * write spent nothing and is charged nothing; a crash after it burned quota and keeps the charge.
+ *
+ * Not guarded on status: the handler is about to spawn whatever the row says, and quota accounting
+ * sums every status. `updatedAt` is left alone — it is the lease's timestamp, and on a cancelled
+ * row the cancel's, which `resumeEpic` reads as evidence.
  */
-function spentAttemptsAfter(refundSpend: boolean | undefined) {
-  return refundSpend ? sql`MAX(${schema.jobs.spentAttempts} - 1, 0)` : schema.jobs.spentAttempts;
+export async function chargeSpentAttempt(db: AntonDb, jobId: string): Promise<void> {
+  await db
+    .update(schema.jobs)
+    .set({ spentAttempts: sql`${schema.jobs.spentAttempts} + 1` })
+    .where(eq(schema.jobs.id, jobId));
 }
 
 /**
- * Settle a running job as `done`. `refundSpend` hands the attempt back off the project's spend meter
- * (`spentAttempts`): a job can finish without ever invoking Claude — a run resumed onto a PR it had
- * already opened, an abandoned target — and charging that attempt at the type's burn rate would
- * spend the project's share on nothing.
+ * Settle a running job as `done`. The spend meter is untouched here: the charge, if any, landed when
+ * the handler reached Claude ({@link chargeSpentAttempt}), so a job that finished without ever
+ * invoking it — a run resumed onto a PR it had already opened, an abandoned target — was never
+ * charged and has nothing to hand back.
  */
 export async function complete(
   db: AntonDb,
   clock: Clock,
   jobId: string,
   effect?: JobEffect,
-  opts?: { retried?: boolean; refundSpend?: boolean },
+  opts?: { retried?: boolean },
 ): Promise<void> {
   const nowMs = clock.now();
   await db
@@ -978,7 +994,6 @@ export async function complete(
       leaseExpiresAt: null,
       lastError: null,
       ...toJobOutcome(effect, opts),
-      spentAttempts: spentAttemptsAfter(opts?.refundSpend),
       updatedAt: secDate(nowMs),
     })
     .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
@@ -987,11 +1002,10 @@ export async function complete(
 /**
  * Reschedule a job to run again at `runAtMs` (used for both quota backoff and retry). Returns it
  * to `queued` and clears the lease so it is picked up when due. Optionally rewinds `attempts`
- * (quota isn't the job's fault, so it shouldn't burn the poison budget) and, separately,
- * `spentAttempts`: only a `refundSpend` caller vouches that the attempt never reached Claude. The
- * two diverge on a quota hit — the retry budget is refunded, but the attempt DID burn quota (the
- * limit is Claude's own answer, and a multi-call handler may have finished real work before it),
- * so the project's spend meter keeps the charge (PR #248 review).
+ * (quota isn't the job's fault, so it shouldn't burn the poison budget). `spentAttempts` is never
+ * rewound: it counts spawns, not leases (see {@link chargeSpentAttempt}), so a quota hit keeps its
+ * charge — the limit is Claude's own answer, and a multi-call handler may have finished real work
+ * before it — while a preflight exit was never charged (PR #248 review).
  *
  * One collision is possible for sync-push (anton-x7la): its dedup index is queued-only, so while
  * this job was `running` a board write may have enqueued a fresh queued follow-up into the project's
@@ -1012,7 +1026,7 @@ export async function reschedule(
   clock: Clock,
   jobId: string,
   runAtMs: number,
-  opts?: { lastError?: string; refundAttempt?: boolean; refundSpend?: boolean },
+  opts?: { lastError?: string; refundAttempt?: boolean },
 ): Promise<void> {
   const nowMs = clock.now();
   try {
@@ -1026,7 +1040,6 @@ export async function reschedule(
         attempts: opts?.refundAttempt
           ? sql`MAX(${schema.jobs.attempts} - 1, 0)`
           : schema.jobs.attempts,
-        spentAttempts: spentAttemptsAfter(opts?.refundSpend),
         updatedAt: secDate(nowMs),
       })
       .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
@@ -1227,7 +1240,6 @@ export async function park(
   clock: Clock,
   jobId: string,
   lastError: string,
-  opts?: { refundSpend?: boolean },
 ): Promise<boolean> {
   const nowMs = clock.now();
   const rows = await db
@@ -1236,8 +1248,6 @@ export async function park(
       status: "parked",
       leaseExpiresAt: null,
       lastError,
-      // A poison caught in preflight parks without ever invoking Claude; its attempt comes back.
-      spentAttempts: spentAttemptsAfter(opts?.refundSpend),
       updatedAt: secDate(nowMs),
     })
     .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...ACTIVE_STATUSES])))
@@ -1370,21 +1380,6 @@ export async function cancelJob(
     .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, allowed)))
     .returning({ id: schema.jobs.id });
   return updated.length > 0;
-}
-
-/**
- * Hand a cancelled attempt back off the project's spend meter (PR #248 review). `cancelJob` wins the
- * row before the runner's settle runs, so every settle write (which compares from `running`) is a
- * no-op against it and the lease's up-front charge would stay on the row — and quota accounting sums
- * cancelled rows too. The runner calls this only when the handler never reported reaching Claude; the
- * cancelled-only WHERE makes it a no-op whenever the settle write won instead. Leaves `updatedAt`
- * alone: on a cancelled row it is the cancel's timestamp, which `resumeEpic` reads as evidence.
- */
-export async function refundCancelledSpend(db: AntonDb, jobId: string): Promise<void> {
-  await db
-    .update(schema.jobs)
-    .set({ spentAttempts: spentAttemptsAfter(true) })
-    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "cancelled")));
 }
 
 /**

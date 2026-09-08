@@ -471,7 +471,7 @@ async function runReviewSession(args: {
           `${args.baseRev.slice(0, 12)} as ${describeReviewer(reviewer)}\n`,
       );
 
-      ctx.claudeReached();
+      await ctx.claudeReached();
       const result = await claude({
         cwd: worktreePath,
         prompt,
@@ -766,7 +766,7 @@ async function runGateFixSession(args: {
     let verified = false;
 
     try {
-      ctx.claudeReached();
+      await ctx.claudeReached();
       const result = await claude({
         cwd: worktreePath,
         prompt,

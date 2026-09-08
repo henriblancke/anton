@@ -32,7 +32,7 @@ export async function dispatchClaude(
   ctx.ctx.report({ sessionId: session.sessionId, cwd: ctx.worktreePath });
 
   try {
-    ctx.ctx.claudeReached();
+    await ctx.ctx.claudeReached();
     const result = await claude({
       cwd: ctx.worktreePath,
       prompt: args.prompt,

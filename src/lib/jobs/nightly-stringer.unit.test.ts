@@ -68,7 +68,7 @@ const ctx = {
   heartbeat: async () => {},
   signal: new AbortController().signal,
   report: () => {},
-  claudeReached: () => {},
+  claudeReached: async () => {},
 } as unknown as JobContext;
 
 const run = () =>

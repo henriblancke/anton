@@ -122,7 +122,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
       handlers: {
         "execute-epic": async (ctx) => {
           meter = { sessionPct: 18, weeklyPct: 7 };
-          ctx.claudeReached();
+          await ctx.claudeReached();
           meter = { sessionPct: 20, weeklyPct: 8 };
         },
       },
@@ -140,6 +140,37 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect(avg.weeklyAvg).toBe(1);
   });
 
+  it("settles claudeReached only once the opening read has landed, so the spawn cannot run ahead of it", async () => {
+    // A fresh read can be slow (credential I/O, a request already in flight). If the signal returned
+    // before it resolved, the handler would spawn Claude and move the meter INTO the supposed
+    // pre-job snapshot, undercounting the sample that prices this project's attempts. The handler
+    // here moves the meter the moment the signal returns; the sample must still be measured from
+    // the reading taken before that.
+    let meter = { sessionPct: 10, weeklyPct: 5 };
+    const r = h.makeRunner({
+      handlers: {
+        "execute-epic": async (ctx) => {
+          await ctx.claudeReached();
+          meter = { sessionPct: 30, weeklyPct: 8 };
+        },
+      },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => null,
+      readUsageFresh: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return usage(meter);
+      },
+    });
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const avg = await getBurnAverage(h.db, "execute-epic", 1);
+    expect(avg.seeded).toBe(false);
+    expect(avg.sessionAvg).toBe(20);
+    expect(avg.weeklyAvg).toBe(3);
+  });
+
   it("keeps the window a multi-spawn handler opened at its first spawn", async () => {
     // review-gate and friends say claudeReached before EACH spawn; the window must span all of
     // them, not restart at the last one and drop the earlier spawns' burn.
@@ -151,8 +182,8 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     const r = h.makeRunner({
       handlers: {
         "execute-epic": async (ctx) => {
-          ctx.claudeReached();
-          ctx.claudeReached();
+          await ctx.claudeReached();
+          await ctx.claudeReached();
         },
       },
       resolveBudgetPolicy: budgetAware,
@@ -233,7 +264,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     // None of the skipped windows spent throttle budget either: the next attempt that does reach
     // Claude samples — even one that then fails, since a failed spawn still burned quota.
     r.registerHandler("execute-epic", async (ctx) => {
-      ctx.claudeReached();
+      await ctx.claudeReached();
       throw new Error("agent crashed after the spawn");
     });
     await r.enqueue({ type: "execute-epic", projectId: "P" });

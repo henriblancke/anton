@@ -64,7 +64,7 @@ export async function runTriage(opts: {
   logPath: string;
   signal: AbortSignal;
   /** The runner's spend signal — the triage session is the one place this job invokes Claude. */
-  claudeReached: () => void;
+  claudeReached: () => Promise<void>;
   onEvent: (e: ClaudeEvent) => void;
 }): Promise<TriageOutcome | undefined> {
   const { project, settings } = opts;
@@ -75,7 +75,7 @@ export async function runTriage(opts: {
     boardSection,
   });
 
-  opts.claudeReached();
+  await opts.claudeReached();
   const claudeResult = await runClaude({
     cwd: project.repoPath,
     prompt,

@@ -115,7 +115,7 @@ suite("worktree-reaper job (real git · real anton.db)", () => {
     heartbeat: async () => {},
     signal: new AbortController().signal,
     report: () => {},
-    claudeReached: () => {},
+    claudeReached: async () => {},
   });
 
   beforeAll(async () => {

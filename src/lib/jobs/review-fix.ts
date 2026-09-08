@@ -494,7 +494,7 @@ async function runFixSession(args: {
       projectDir: worktree.path,
     });
 
-    ctx.claudeReached();
+    await ctx.claudeReached();
     const result = await runClaude({
       cwd: worktree.path,
       prompt,
