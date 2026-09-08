@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "./beads/bd";
-import { validateBeadContract } from "./beads/contract";
+import { acceptanceBody, validateBeadContract } from "./beads/contract";
 import { formatHumanNote } from "./beads/notes";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
@@ -459,6 +459,47 @@ describe("reconcileFollowUpDescription", () => {
     const reconciled = reconcileFollowUpDescription(fenced, edited);
     expect(reconciled).toContain("- [ ] a sample box");
     expect(reconciled).not.toContain("the real old box");
+  });
+
+  it("reconciles every Acceptance section — the judge concatenates repeated headings, so a stale later copy would still govern", () => {
+    const repeated = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Acceptance Criteria",
+      "- [ ] the first old box",
+      "",
+      "## Context",
+      "Kept.",
+      "",
+      "## Acceptance",
+      "### Grouped",
+      "- [ ] the second old box",
+      "",
+      "## Verify",
+      "Kept too.",
+      "",
+      "## Acceptance Criteria",
+      "- [ ] the trailing old box",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(repeated, edited);
+
+    expect(reconciled.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    expect(reconciled).not.toContain("old box");
+    expect(reconciled).not.toContain("### Grouped");
+    expect(reconciled).toContain("## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled).toContain("\n\n## Context\nKept.\n\n## Verify\nKept too.");
+    expect(reconciled.endsWith("Kept too.")).toBe(true);
+    // What the contract judge reads as this bead's acceptance is exactly the request's boxes.
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toBe(
+      [
+        "- [ ] Guard the null branch.",
+        "- [ ] Cover the exhausted path.",
+        "- [ ] src/retry.ts:12 — retries on a 4xx",
+        "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+      ].join("\n"),
+    );
   });
 });
 

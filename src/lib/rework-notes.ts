@@ -9,7 +9,7 @@
  */
 import type { Bead } from "./beads/bd";
 import { ACCEPTANCE_HEADING, ACCEPTANCE_KEYS, isContractHeading } from "./beads/contract";
-import { scanMarkdown } from "./beads/markdown";
+import { type ScannedLine, scanMarkdown } from "./beads/markdown";
 import { parseTicketNotes } from "./beads/notes";
 import type { PullRequestState } from "./git/ops";
 import type { ReviewFinding } from "./jobs/review-context";
@@ -142,23 +142,56 @@ export function reconcileFollowUpDescription(
  * The Acceptance section's body swapped for `boxes`, bounded exactly as the contract judge bounds it
  * (`sectionOccurrences`, lib/beads/contract.ts): a sub-heading grouping criteria is part of the
  * section and goes with it, a contract heading or a peer ends it. Text either side is kept verbatim.
+ *
+ * Every occurrence is reconciled, not just the first. The judge concatenates repeated headings
+ * (`sectionsOf`), so a description carrying `## Acceptance Criteria` and a later `## Acceptance`
+ * is governed by both — swapping one body and leaving the other would file a follow-up whose "done"
+ * still includes the stale criteria. The first heading keeps its place and takes the new boxes; the
+ * later copies go entirely, heading included, since one section is what the formula writes.
  */
 function replaceAcceptance(description: string, boxes: string[]): string {
   const lines = scanMarkdown(description);
-  const start = lines.findIndex((l) => l.heading && ACCEPTANCE_KEYS.includes(l.heading.key));
-  if (start === -1) {
+  const sections = acceptanceSections(lines);
+  if (sections.length === 0) {
     return [description.trimEnd(), ``, `## ${ACCEPTANCE_HEADING}`, ...boxes].join("\n");
   }
-  const depth = lines[start]!.heading!.depth;
-  let end = start + 1;
-  while (end < lines.length) {
-    const heading = lines[end]!.heading;
-    if (heading && (heading.depth <= depth || isContractHeading(heading))) break;
-    end += 1;
+  const texts = (from: number, to: number) => lines.slice(from, to).map((l) => l.text);
+  const [first, ...duplicates] = sections;
+  const pieces = [[...texts(0, first!.start + 1), ...boxes]];
+  // Text between a dropped copy and the next: verbatim, minus the blank lines that led into the copy.
+  let cursor = first!.end;
+  for (const { start, end } of duplicates) {
+    pieces.push(withoutTrailingBlank(texts(cursor, start)));
+    cursor = end;
   }
-  const before = lines.slice(0, start + 1).map((l) => l.text);
-  const after = lines.slice(end).map((l) => l.text);
-  return [...before, ...boxes, ...(after.length > 0 ? [``, ...after] : [])].join("\n");
+  pieces.push(texts(cursor, lines.length));
+  return pieces
+    .filter((piece) => piece.length > 0)
+    .map((piece) => piece.join("\n"))
+    .join("\n\n");
+}
+
+/** Every Acceptance section as the judge sees it: `start` is its heading's line, `end` the line opening the next section. */
+function acceptanceSections(lines: ScannedLine[]): { start: number; end: number }[] {
+  const out: { start: number; end: number }[] = [];
+  lines.forEach((line, start) => {
+    if (!line.heading || !ACCEPTANCE_KEYS.includes(line.heading.key)) return;
+    const depth = line.heading.depth;
+    let end = start + 1;
+    while (end < lines.length) {
+      const heading = lines[end]!.heading;
+      if (heading && (heading.depth <= depth || isContractHeading(heading))) break;
+      end += 1;
+    }
+    out.push({ start, end });
+  });
+  return out;
+}
+
+function withoutTrailingBlank(texts: string[]): string[] {
+  let end = texts.length;
+  while (end > 0 && texts[end - 1]!.trim() === "") end -= 1;
+  return texts.slice(0, end);
 }
 
 /**
