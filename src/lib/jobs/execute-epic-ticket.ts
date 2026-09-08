@@ -11,7 +11,8 @@
  * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
 import type { Bead } from "../beads/bd";
-import { formatAntonResult, type AntonOutcome } from "../claude/anton-result";
+import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
+import { branchAddedCommit } from "../git/ops";
 import { BlockedByAgentError, NeedsHumanError, NoDeliveryError } from "./execute-epic-errors";
 import {
   claimTicket,
@@ -26,12 +27,25 @@ import { resilientClaude } from "./execute-epic-ticket-claude";
 import {
   selfReportSuffix,
   settleFailedTicket,
+  ticketSettlement,
   type TicketProgress,
+  type TicketSettlement,
 } from "./execute-epic-ticket-settle";
 import type { ResolvedStep } from "./run-formula";
 import type { StepContext, StepFacts } from "./step-registry";
 
-/** One ticket: session → the formula's ticket phase (…→ commit) → close. */
+/**
+ * How a finished ticket settled, plus whether its close actually landed (PR #253 review). The close
+ * is best-effort, so the run may not derive it from its own shape: a bd that refused the write left
+ * the bead open, and the pull request has to say so.
+ */
+export type TicketOutcome = TicketSettlement & { closed: boolean };
+
+/**
+ * One ticket: session → the formula's ticket phase (…→ commit) → close. Answers HOW the ticket
+ * settled (anton-8h4b) — on its own commit, or on an earlier commit of the run — because the close
+ * looks the same either way and the pull request must not.
+ */
 export async function runTicket(args: {
   /** The run-level step context every ticket shares; this ticket's own is derived from it. */
   run: Omit<StepContext, "tickets">;
@@ -61,7 +75,7 @@ export async function runTicket(args: {
   standalone?: boolean;
   /** This ticket's wall-clock budget (anton-t1mo); `Infinity` leaves it unbounded. */
   timeoutMs: number;
-}): Promise<void> {
+}): Promise<TicketOutcome> {
   const { run, ticket, operator, timeoutMs } = args;
   const standalone = args.standalone ?? false;
   const { ctx, worktreePath } = run;
@@ -78,9 +92,22 @@ export async function runTicket(args: {
 
   try {
     await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress });
-    await finishTicket(run, ticket, session.sessionId, closeOnDone);
+    const settlement = await ticketSettlement(run, progress);
+    // The deadline only stops what observes it (PR #253 review). The gate's branch reads and the
+    // settlement's commit lookup are plain git reads that take no signal, so a deadline landing
+    // during one aborts nothing: the walk returns as if in time, and nothing below would ask. Asked
+    // here, the last point before the board is written — a ticket the clock caught on its final
+    // read settles as the timeout it is, never as a close.
+    if (budget.ranOutOfTime()) {
+      throw new Error(
+        `${ticket.id} ran out of its ticket budget while the delivery gate was reading the branch`,
+      );
+    }
+    const { closed } = await finishTicket(run, ticket, session.sessionId, closeOnDone, settlement);
+    return { ...settlement, closed };
   } catch (e) {
-    await settleFailedTicket({
+    // Always throws; returned so the signature carries the `never` and the walk's answer is typed.
+    return settleFailedTicket({
       run,
       ticket,
       runTicketIds: args.runTicketIds,
@@ -144,7 +171,7 @@ async function walkTicketSteps(args: {
     // behind no gate at all (PR #205 review). A missing/unparseable line (null) keeps whatever the
     // phase reported before it, as it always has.
     const reported = result.facts?.selfReport;
-    if (reported && selfReportRank(reported.outcome) >= selfReportRank(progress.selfReport?.outcome)) {
+    if (reported && displacesSelfReport(reported, progress.selfReport)) {
       progress.selfReport = reported;
     }
 
@@ -175,9 +202,18 @@ async function walkTicketSteps(args: {
       }
       continue;
     }
-    assertDelivered(ticket, result.facts ?? {}, progress);
+    await assertDelivered(ticket, result.facts ?? {}, progress, (commit) =>
+      branchAddedCommit(run.repoPath, run.branch, run.baseRef, commit),
+    );
   }
 }
+
+/**
+ * Asks the branch whether `commit` is one this run added over its base (anton-nuft) — the one read
+ * that can settle a `satisfied` self-report. Injected so the gate is a unit: production hands it
+ * {@link branchAddedCommit} over the run's repository, branch and fork point.
+ */
+export type BranchAddedCommit = (commit: string) => Promise<boolean>;
 
 /**
  * The commit is the ticket's evidence of record — honor the step's verdict on whether there is one,
@@ -187,8 +223,24 @@ async function walkTicketSteps(args: {
  * (root cause #1). Do NOT close/advance the ticket on empty delivery. {@link NoDeliveryError} is
  * poison, so the runner parks the run for a human instead of retrying claude to the same empty
  * result forever, and the ticket's own catch BLOCKS the bead rather than re-queueing it open.
+ *
+ * ONE zero diff is a delivery (anton-nuft): the step whose work an EARLIER commit of this same run
+ * already did, which the agent reports as `satisfied — <commit>` (anton-6l0q). That is a claim, and
+ * the false-success property above is exactly why a claim cannot settle anything on its own — the
+ * `delivered` line on an empty tree is the same words with a different verb. So the gate settles on
+ * the branch, never on the agent's word: `branchAdded` asks git whether the named commit is among
+ * those this run's branch added over its base. A claim naming no commit, a commit git cannot find,
+ * or a commit of the base parks exactly as the plain zero diff does, with the unverified claim
+ * folded into the reason. The step then settles with `committed: false` — the tree fact is still
+ * true, this ticket added nothing — and `delivered: true`, which is what the board and the pull
+ * request read. Which commit it settled against is the next ticket's business (attribution).
  */
-export function assertDelivered(ticket: Bead, facts: StepFacts, progress: TicketProgress): void {
+export async function assertDelivered(
+  ticket: Bead,
+  facts: StepFacts,
+  progress: TicketProgress,
+  branchAdded: BranchAddedCommit,
+): Promise<void> {
   const committed = facts.committed === true;
   // The TREE fact is recorded first and unconditionally — the timeout path reads it to know there
   // is a commit it must not reset off the branch, and that is true of a refused commit too. The
@@ -199,10 +251,22 @@ export function assertDelivered(ticket: Bead, facts: StepFacts, progress: Ticket
   progress.delivered = false;
   const { selfReport } = progress;
   if (!committed) {
+    // A satisfied step settles on the branch's answer, never on the claim (anton-nuft). The read is
+    // skipped when the claim names nothing: parsing already rejects such a line, but the type does
+    // not, and asking git about an empty sha would be asking it about HEAD.
+    if (
+      selfReport?.outcome === "satisfied" &&
+      selfReport.commit &&
+      (await branchAdded(selfReport.commit))
+    ) {
+      progress.delivered = true;
+      return;
+    }
     // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
     // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
     // false success the gate exists to catch; a `blocked` self-report corroborates the block and
-    // carries the agent's own reason forward. A missing line just reads as the plain gate message.
+    // carries the agent's own reason forward; a `satisfied` claim that the branch did not bear out
+    // is named as unverified. A missing line just reads as the plain gate message.
     throw new NoDeliveryError(
       `${ticket.id} produced no delivery: claude exited cleanly and passed the verify gates but ` +
         `left no changes to commit (zero diff). Blocking the ticket for operator review and ` +
@@ -248,18 +312,44 @@ export function assertDelivered(ticket: Bead, facts: StepFacts, progress: Ticket
  * How much a self-report OUTRANKS the one a phase already carries. A phase of several dispatching
  * steps keeps the most severe report any of them made, and severity is how actionable it is: an ask
  * names the one move a person owes, a block names a defect to diagnose, and `delivered` is a claim
- * a later step cannot make on an earlier step's behalf. An absent report (null) ranks below all
- * three, so the first step to say anything sets the phase's report.
+ * a later step cannot make on an earlier step's behalf. `satisfied` (anton-6l0q) ranks below even
+ * that, deliberately: it says this step added nothing because an earlier commit already covers it,
+ * so a step in the same phase that DID deliver has the report that describes the tree — and a later
+ * step's `satisfied` must not talk an earlier `delivered` down to "nothing new here". An absent
+ * report (null) ranks below all four, so the first step to say anything sets the phase's report.
+ *
+ * Rank alone does not decide the merge — see {@link displacesSelfReport} for the one case where the
+ * higher rank loses.
  */
-function selfReportRank(outcome: AntonOutcome | undefined): number {
+export function selfReportRank(outcome: AntonOutcome | undefined): number {
   switch (outcome) {
     case "needs-human":
-      return 2;
+      return 3;
     case "blocked":
-      return 1;
+      return 2;
     case "delivered":
+      return 1;
+    case "satisfied":
       return 0;
     default:
       return -1;
   }
+}
+
+/**
+ * Whether a step's report replaces the one its phase already carries: by {@link selfReportRank},
+ * with one exception (PR #253 review). A `delivered` outranks a `satisfied`, but it never DISPLACES
+ * one that names a commit. The two agree that the step found nothing wrong; they differ in what a
+ * zero diff can then settle on. `satisfied` carries the commit the gate verifies against the branch,
+ * and `delivered` carries nothing — so a project's own `step:claude` reporting `delivered` on the
+ * unchanged tree the implementer honestly left would turn a verifiable claim into the plain
+ * zero-diff park this outcome exists to prevent. Keeping the claim costs a later step that DID
+ * commit nothing: the tree fact decides that settlement, and a `satisfied` report on a committed
+ * tree settles as the commit ({@link satisfiedClaim} reads `committed` first).
+ */
+export function displacesSelfReport(incoming: AntonResult, current: AntonResult | null): boolean {
+  if (current?.outcome === "satisfied" && current.commit && incoming.outcome === "delivered") {
+    return false;
+  }
+  return selfReportRank(incoming.outcome) >= selfReportRank(current?.outcome);
 }

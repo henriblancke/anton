@@ -607,6 +607,22 @@ export interface MoveRequest {
  */
 export type ApprovalRunOutcome = "started" | "elsewhere" | "covered" | "none" | "failed";
 
+/**
+ * WHY a release was refused before it wrote anything (anton-k4qr), in a word a card can act on
+ * (anton-84lx).
+ *
+ * The route's prose already says it, but a card cannot read prose, and it has two states that look
+ * alike from the operator's seat: the start is gone either way. So the refusal names itself. It is
+ * the opposite answer to the withheld-start chip beside it — that one waits for a record the next
+ * board read writes, this one is anton having re-decided that it would not start this at all.
+ *
+ * - `retired` — the generation on screen was superseded and the re-derived ranking leaves the target
+ *               out. The remedy is the operator's own approve, not a wait.
+ * - `settled` — somebody else got there first (a teammate's claim, a run already in flight), so
+ *               there is a start already and nothing to re-approve.
+ */
+export type ReleaseRefusal = "retired" | "settled";
+
 // ── Epic detail + dependency graph ──
 // One definition of the allowed edge types, owned by the seam that validates every write of them
 // (lib/beads/link-types). Type-only, so nothing of lib/beads reaches the browser bundle.

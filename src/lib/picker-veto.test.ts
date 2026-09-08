@@ -156,11 +156,11 @@ describe("the decline record", () => {
     });
   });
 
-  it("counts declines as the track record earned autonomy reads", async () => {
+  it("counts a disagreement as the track record earned autonomy reads", async () => {
     await recordPickerVeto(test.db, clock, {
       projectId: PROJECT,
       beadId: "anton-a",
-      action: "not-now",
+      action: "never",
     });
     await recordPickerVeto(test.db, clock, {
       projectId: PROJECT,
@@ -179,7 +179,7 @@ describe("the decline record", () => {
     await recordPickerVeto(test.db, clock, {
       projectId: PROJECT,
       beadId: "anton-a",
-      action: "not-now",
+      action: "never",
     });
 
     const after = at(NOW + PICKER_DEFER_WINDOW_MS * 2);
@@ -283,6 +283,254 @@ describe("the decline record", () => {
   });
 });
 
+/**
+ * PACING IS NOT DISAGREEMENT (anton-gtcd). Both vetoes decline and both defer — what the row now
+ * says as well is which of the two the operator MEANT, so the record can weigh the judgment about
+ * the ranking without counting the operator's own scheduling against it.
+ */
+describe("what a decline meant", () => {
+  it("files `✕ not now` as pacing and `Never` as disagreement", async () => {
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-paced",
+      action: "not-now",
+    });
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-refused",
+      action: "never",
+      criterion: "labels:domain",
+    });
+
+    const kinds = new Map(
+      (await listPickerVerdicts(test.db, PROJECT)).map((r) => [r.beadId, r.vetoKind]),
+    );
+    expect(kinds.get("anton-paced")).toBe("pacing");
+    expect(kinds.get("anton-refused")).toBe("disagreement");
+  });
+
+  it("classifies no veto on an accept — a release refuses nothing", async () => {
+    await recordPickerAccept(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-a",
+      planId: "d1",
+    });
+
+    expect((await listPickerVerdicts(test.db, PROJECT))[0]?.vetoKind).toBeUndefined();
+  });
+
+  it("upgrades a standing pacing decline when the operator goes on to say Never", async () => {
+    const pick = { projectId: PROJECT, beadId: "anton-a", planId: "d1" };
+    await recordPickerVeto(test.db, clock, { ...pick, action: "not-now" });
+    nowMs = NOW + 60_000;
+    await recordPickerVeto(test.db, clock, {
+      ...pick,
+      action: "never",
+      criterion: "labels:domain",
+    });
+
+    // Still ONE decline — the repeat extends the standing row — now reading as disagreement.
+    expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
+      { action: "never", vetoKind: "disagreement", criterion: "labels:domain" },
+    ]);
+  });
+
+  it("never lets a later `✕ not now` retract a Never", async () => {
+    // `action` follows the last click, so a record reading the meaning off it would have this pacing
+    // click quietly turn the operator's disagreement into evidence they had not objected.
+    const pick = { projectId: PROJECT, beadId: "anton-a", planId: "d1" };
+    await recordPickerVeto(test.db, clock, {
+      ...pick,
+      action: "never",
+      criterion: "labels:domain",
+    });
+    nowMs = NOW + 60_000;
+    await recordPickerVeto(test.db, clock, { ...pick, action: "not-now" });
+
+    expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
+      { action: "not-now", vetoKind: "disagreement" },
+    ]);
+  });
+
+  it("leaves a decline nobody classified unclassified when a `✕ not now` restates it", async () => {
+    // A row `0030_picker_veto_kind` could not read — a bare `not-now`, which is also what a
+    // criterion-less `Never` leaves behind once a repeat overwrote it — is counted precisely because
+    // it may be a disagreement. A fresh pacing click is not evidence that it was pacing all along.
+    const pick = { projectId: PROJECT, beadId: "anton-legacy", planId: "d1" };
+    await test.db.insert(schema.pickerVerdicts).values({
+      id: "v-legacy",
+      projectId: PROJECT,
+      beadId: pick.beadId,
+      planId: pick.planId,
+      verdict: "declined",
+      action: "not-now",
+      vetoKind: null,
+      deferredUntil: at(NOW + PICKER_DEFER_WINDOW_MS),
+      decidedAt: at(NOW),
+    });
+    nowMs = NOW + 60_000;
+
+    await recordPickerVeto(test.db, clock, { ...pick, action: "not-now" });
+    const restated = await listPickerVerdicts(test.db, PROJECT);
+    expect(restated).toMatchObject([{ beadId: "anton-legacy", action: "not-now" }]);
+    expect(restated[0]?.vetoKind).toBeUndefined();
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ declined: 1 });
+
+    // Only a Never moves it — to the meaning it may have carried all along.
+    await recordPickerVeto(test.db, clock, { ...pick, action: "never" });
+    expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
+      { beadId: "anton-legacy", action: "never", vetoKind: "disagreement" },
+    ]);
+  });
+
+  it("holds both kinds for the same window — the split is about meaning, not pacing", async () => {
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-paced",
+      action: "not-now",
+    });
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-refused",
+      action: "never",
+    });
+
+    const held = await activeDeferrals(test.db, PROJECT, at(NOW));
+    expect(held.get("anton-paced")).toBe(NOW + PICKER_DEFER_WINDOW_MS);
+    expect(held.get("anton-refused")).toBe(NOW + PICKER_DEFER_WINDOW_MS);
+  });
+});
+
+/**
+ * THE RECORD READS DISAGREEMENT ONLY (anton-31gm). The floor asks whether the operator trusts the
+ * RANKING; `✕ not now` answers about their hour instead, so it is not a vote either way — neither a
+ * decline that counts against the picker nor a settled decision that fills the window.
+ */
+describe("what the earned record counts", () => {
+  const verdict = (
+    i: number,
+    row: {
+      beadId: string;
+      verdict: string;
+      action: string;
+      vetoKind?: string;
+      atMs?: number;
+    },
+  ) => ({
+    id: `v-${String(i).padStart(2, "0")}`,
+    projectId: PROJECT,
+    beadId: row.beadId,
+    verdict: row.verdict,
+    action: row.action,
+    vetoKind: row.vetoKind ?? null,
+    decidedAt: at(row.atMs ?? NOW + i * 1000),
+  });
+
+  it("counts accepts and Nevers over a mixed ledger, and no `✕ not now` at all", async () => {
+    await recordPickerAccept(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-released",
+      planId: "d1",
+    });
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-paced",
+      action: "not-now",
+    });
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-paced-again",
+      action: "not-now",
+    });
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-refused",
+      action: "never",
+    });
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toEqual({
+      accepted: 1,
+      declined: 1,
+      settled: 2,
+    });
+    // The pacing rows are not lost — they still defer, and the decision log still shows them.
+    expect((await activeDeferrals(test.db, PROJECT, at(NOW))).size).toBe(3);
+    expect(
+      (await listPickerVerdicts(test.db, PROJECT, PICKER_RECORD_WINDOW, "declined")).length,
+    ).toBe(3);
+  });
+
+  it("counts a Never a later `✕ not now` painted over — the meaning outlives the click", async () => {
+    const pick = { projectId: PROJECT, beadId: "anton-a", planId: "d1" };
+    await recordPickerVeto(test.db, clock, {
+      ...pick,
+      action: "never",
+      criterion: "labels:domain",
+    });
+    nowMs = NOW + 60_000;
+    await recordPickerVeto(test.db, clock, { ...pick, action: "not-now" });
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toEqual({
+      accepted: 0,
+      declined: 1,
+      settled: 1,
+    });
+  });
+
+  it("counts a decline nobody classified — an unread row must not read as consent", async () => {
+    // What `0030_picker_veto_kind` backfills, and how it reads an ambiguous row: only an EXPLICIT
+    // pacing row is dropped, because the other reading would invent agreement the operator never gave.
+    await test.db
+      .insert(schema.pickerVerdicts)
+      .values(verdict(0, { beadId: "anton-legacy", verdict: "declined", action: "not-now" }));
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toEqual({
+      accepted: 0,
+      declined: 1,
+      settled: 1,
+    });
+  });
+
+  it("never lets pacing crowd evidence out of the rolling window", async () => {
+    // Filtered in the QUERY, before the limit: an operator who paced through a full window since
+    // their last real answer would otherwise fetch nothing but `not-now` rows and drop them all,
+    // reporting an EMPTY record over a board that has both an accept and a refusal to weigh.
+    await test.db.insert(schema.pickerVerdicts).values([
+      verdict(0, { beadId: "anton-released", verdict: "accepted", action: "release" }),
+      verdict(1, { beadId: "anton-refused", verdict: "declined", action: "never", vetoKind: "disagreement" }),
+      ...Array.from({ length: PICKER_RECORD_WINDOW }, (_, i) =>
+        verdict(i + 2, {
+          beadId: `anton-paced-${i}`,
+          verdict: "declined",
+          action: "not-now",
+          vetoKind: "pacing",
+        }),
+      ),
+    ]);
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toEqual({
+      accepted: 1,
+      declined: 1,
+      settled: 2,
+    });
+  });
+
+  it("still rolls — evidence older than the window drops out of the counts", async () => {
+    await test.db.insert(schema.pickerVerdicts).values([
+      verdict(0, { beadId: "anton-old-refusal", verdict: "declined", action: "never", vetoKind: "disagreement" }),
+      ...Array.from({ length: PICKER_RECORD_WINDOW }, (_, i) =>
+        verdict(i + 1, { beadId: `anton-${i}`, verdict: "accepted", action: "release" }),
+      ),
+    ]);
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toEqual({
+      accepted: PICKER_RECORD_WINDOW,
+      declined: 0,
+      settled: PICKER_RECORD_WINDOW,
+    });
+  });
+});
+
 describe("the window the earned floor reads (anton-vkp9)", () => {
   it("is at least as wide as the bar apply has to clear", () => {
     // The counts and the bar are set in two modules, and a window NARROWER than `minSettled` would
@@ -381,7 +629,7 @@ describe("recording an accept", () => {
     const veto = {
       projectId: PROJECT,
       beadId: "anton-a",
-      action: "not-now" as const,
+      action: "never" as const,
       planId: "d1",
     };
     await recordPickerVeto(test.db, clock, veto);
@@ -425,7 +673,7 @@ describe("recording an accept", () => {
     const veto = {
       projectId: PROJECT,
       beadId: "anton-a",
-      action: "not-now" as const,
+      action: "never" as const,
     };
     await recordPickerVeto(test.db, clock, { ...veto, planId: "d1" });
     nowMs = NOW + 60_000;
@@ -445,7 +693,7 @@ describe("recording an accept", () => {
     const veto = {
       projectId: PROJECT,
       beadId: "anton-a",
-      action: "not-now" as const,
+      action: "never" as const,
     };
     await recordPickerVeto(test.db, clock, veto);
     nowMs = NOW + 60_000;
@@ -467,7 +715,7 @@ describe("recording an accept", () => {
     const veto = {
       projectId: PROJECT,
       beadId: "anton-a",
-      action: "not-now" as const,
+      action: "never" as const,
     };
     await recordPickerVeto(test.db, clock, veto);
     nowMs = NOW + PICKER_DEFER_WINDOW_MS + 1000;
@@ -657,14 +905,61 @@ describe("withdrawing an accept", () => {
     expect(replayed).toEqual({ beadId: "anton-a", untilMs: NOW + PICKER_DEFER_WINDOW_MS });
     // The decline stands with everything the veto carried, and the target is held out of the plan.
     expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
-      { beadId: "anton-a", verdict: "declined", action: "never", rank: 1, planId: "d1" },
+      {
+        beadId: "anton-a",
+        verdict: "declined",
+        action: "never",
+        vetoKind: "disagreement",
+        rank: 1,
+        planId: "d1",
+      },
     ]);
     expect([...(await activeDeferrals(test.db, PROJECT, at(NOW))).keys()]).toEqual(["anton-a"]);
   });
 
+  it("replays every veto that lost, in order — a `✕ not now` after a Never does not erase it", async () => {
+    // Two stale tabs both refused the reservation: a Never sent at a criterion, then a not-now. Kept
+    // only the latest, the replay would file a fresh pacing decline with no criterion and the
+    // withdrawal would have erased the operator's disagreement. Replayed in sequence through the
+    // standing-decline merge, the row lands exactly as the two vetoes would have.
+    const reserved = await recordPickerAccept(test.db, clock, PICK);
+    await recordPickerVeto(test.db, clock, {
+      ...PICK,
+      action: "never",
+      criterion: "labels:domain",
+      rank: 2,
+    });
+    nowMs = NOW + 60_000;
+    await recordPickerVeto(test.db, clock, { ...PICK, action: "not-now" });
+
+    const replayed = await withdrawPickerAccept(
+      test.db,
+      reserved.recorded ? reserved.id : "",
+      clock,
+    );
+
+    expect(replayed).toEqual({ beadId: "anton-a", untilMs: nowMs + PICKER_DEFER_WINDOW_MS });
+    expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
+      {
+        beadId: "anton-a",
+        verdict: "declined",
+        action: "not-now",
+        vetoKind: "disagreement",
+        criterion: "labels:domain",
+        rank: 2,
+        planId: "d1",
+      },
+    ]);
+    expect(await pickerTrackRecord(test.db, PROJECT)).toEqual({
+      accepted: 0,
+      declined: 1,
+      settled: 1,
+    });
+  });
+
   it("replays it once — a withdrawal is not a decline the pick keeps re-earning", async () => {
     const reserved = await recordPickerAccept(test.db, clock, PICK);
-    await recordPickerVeto(test.db, clock, { ...PICK, action: "not-now" });
+    await recordPickerVeto(test.db, clock, { ...PICK, action: "never" });
     const id = reserved.recorded ? reserved.id : "";
 
     await withdrawPickerAccept(test.db, id, clock);
@@ -733,9 +1028,10 @@ describe("opposite verdicts on one pick", () => {
   it("settles a release and a veto that OVERLAP on exactly one verdict", async () => {
     // Neither request can see the other's write before it commits, which is the whole race the
     // client-side lock cannot cover: the store takes the write lock before it reads.
+    // Both answers count toward the record, so `settled: 1` holds whichever one wins the lock.
     await Promise.all([
       recordPickerAccept(test.db, clock, PICK),
-      recordPickerVeto(test.db, clock, { ...PICK, action: "not-now" }),
+      recordPickerVeto(test.db, clock, { ...PICK, action: "never" }),
     ]);
 
     expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({
@@ -749,7 +1045,7 @@ describe("opposite verdicts on one pick", () => {
     const outcome = await recordPickerVeto(test.db, clock, {
       projectId: PROJECT,
       beadId: "anton-a",
-      action: "not-now",
+      action: "never",
       planId: "d2",
     });
 

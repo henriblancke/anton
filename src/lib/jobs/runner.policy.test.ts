@@ -50,6 +50,8 @@ describe("nextAction (pure durability policy)", () => {
   });
 
   it("reschedules a quota hit to the reset time and refunds the attempt", () => {
+    // Only the RETRY budget is the policy's call. Whether the project's spend meter keeps the
+    // charge is the handler's `claudeReached` report, settled by the runner — never inferred here.
     const resetAt = Math.floor(now / 1000) + 3600; // seconds
     const a = nextAction(CONFIG, { attempts: 2 }, { kind: "quota", resetAt }, now);
     expect(a.action).toBe("reschedule");

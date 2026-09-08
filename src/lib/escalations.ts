@@ -17,6 +17,7 @@
 import { randomUUID } from "node:crypto";
 import { and, desc, eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { toEpoch } from "./db/epoch";
 import type { AntonDb, Clock } from "./jobs/queue";
 import type { RunHealthFindingKind } from "./run-health";
 
@@ -114,12 +115,6 @@ export interface EscalationView {
 
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
-}
-
-function toEpoch(value: unknown): number | undefined {
-  if (value == null) return undefined;
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value);
 }
 
 /** The finding an escalation was raised from, or an empty shell when the blob is unreadable. */

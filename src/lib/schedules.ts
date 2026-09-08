@@ -9,6 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { toEpoch } from "./db/epoch";
 import { systemClock, type AntonDb, type Clock } from "./jobs/queue";
 import type { JobType } from "./jobs/queue";
 import { isValidCron, nextRun } from "./jobs/cron";
@@ -59,12 +60,6 @@ export interface ScheduleSummary {
 
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
-}
-
-function toEpoch(value: unknown): number | undefined {
-  if (value == null) return undefined;
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value);
 }
 
 export function toScheduleSummary(row: ScheduleRow): ScheduleSummary {
@@ -229,6 +224,9 @@ export async function listSchedules(
  * job that WRITES to the board unprompted (it closes epics bd judges done and repairs the blocked
  * flag). An operator who never asked for a patrol should not find work closed on their board — so
  * arming it is a deliberate act, and the report it produces is what earns the trust to leave it on.
+ * Its judgment tier also carries the re-judgement of parked work (anton-dsnr): daily is a fine
+ * cadence for a 90-day silence, and it needs no switch of its own because it costs no session and
+ * files nothing a founder has not already left parked for a quarter.
  *
  * product-master (anton-d2sx) ships disabled for both of the gardener's reasons and a third: it is
  * the only schedule that spends a claude session on judgment rather than on mechanism, and every

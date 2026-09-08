@@ -150,7 +150,16 @@ export type ApplyStep =
   | (StepSubject & EvidenceFence & { verb: "approve" })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "close"; reason: string })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "supersede"; replacement: string })
-  | (StepSubject & TicketOwner & EvidenceFence & { verb: "defer" });
+  | (StepSubject & TicketOwner & EvidenceFence & { verb: "defer" })
+  /**
+   * The reverse of `defer`, and the only step that puts work BACK (anton-rozm): a re-judgement the
+   * founder answered "still wanted". It carries the ticket owner for the mirror of the reason a
+   * retirement does — a run that has already selected its ticket set does not want a bead ADDED to
+   * it either, and the run target is where the only liveness signal lives — and it is fenced,
+   * because the whole claim is "nothing has touched this since it was parked", which a write since
+   * the filing is precisely what falsifies.
+   */
+  | (StepSubject & TicketOwner & EvidenceFence & { verb: "undefer" });
 
 /** The one verb whose steps come in clusters — the shape both halves of the move are written in. */
 export type ReparentStep = Extract<ApplyStep, { verb: "reparent" }>;
@@ -366,6 +375,8 @@ export function planApply(
       };
     case "approve":
       return planApprove(plan, index, at);
+    case "undefer":
+      return planUndefer(plan, index, at);
   }
 }
 
@@ -1318,6 +1329,87 @@ export function startBarred(
   return `${subject.id} ${standing} work anton may start — ${excluded.detail} (${excluded.reason}) — so approving it would set a run loose on a target the board itself refuses`;
 }
 
+// ── undefer ──
+
+/**
+ * Returning parked work to the board (anton-rozm) — the reverse of a `defer`, and the answer to a
+ * re-judgement the founder said was still wanted.
+ *
+ * The other conclusion has no branch here on purpose. "It is genuinely dead" settles by DECLINING
+ * (emit.ts `REJUDGE_INSTRUCTIONS`), because the write it calls for is a permanent won't-do and that
+ * stays a human's act however far a pass is armed — which is the same rule that made every judgment
+ * tier retire with `defer` in the first place.
+ *
+ * Every SETTLED state is read before any bar, and each is the ask answered rather than refused: a
+ * bead somebody already un-parked is the outcome this proposal wanted, and one they closed or
+ * abandoned is the third answer recorded by the only party entitled to record it. Refusing either
+ * would leave the proposal open against a board that agrees with it.
+ */
+function planUndefer(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+  const [id] = plan.subjects;
+  if (plan.subjects.length !== 1 || !id) {
+    return { status: "refuse", reason: "a re-judgement proposal names exactly one bead" };
+  }
+  const subject = index.byId.get(id);
+  if (!subject) return { status: "refuse", reason: missing(id) };
+  const settled = undeferSettled(subject);
+  if (settled) return settled;
+  const barred = undeferBarred(plan, subject, index, at);
+  if (barred) return { status: "refuse", reason: barred };
+  return {
+    status: "apply",
+    steps: [
+      {
+        verb: "undefer",
+        id: subject.id,
+        claim: runClaimOf(subject),
+        owner: ownerRef(ticketOwnerOf(index, subject)),
+        kind: plan.kind,
+        observedAtMs: at.observedAtMs,
+      },
+    ],
+    summary: `returned ${subject.id} to the board`,
+  };
+}
+
+/** The re-judgement already answered on the board, whoever answered it — or undefined to write. */
+function undeferSettled(subject: Bead): ApplyDecision | undefined {
+  if (!isOpenWork(subject)) {
+    // The human's own third answer: `abandoned` is the permanent won't-do this proposal will not
+    // write, and a plain close records the work as landed. Either way the parking is over.
+    return {
+      status: "settled",
+      summary: `${subject.id} is ${settledWord(subject)} — the parking was answered by hand`,
+    };
+  }
+  if (!beads.isDeferred(subject)) {
+    return { status: "settled", summary: `${subject.id} is already back on the board` };
+  }
+  return undefined;
+}
+
+/**
+ * Why this bead may not be returned to the board, or undefined.
+ *
+ * The retirement's bars, read from the other direction. A run that owns the subject, or the ticket
+ * set it rides, has already selected the work it will do — so a bead ADDED to that set now rides
+ * along unrun exactly as a re-parented one does. Then the fence, which for this kind is the ask
+ * itself: a write since the filing means somebody has been back to the parked bead, which is the
+ * question the proposal was raised to ask.
+ */
+function undeferBarred(
+  plan: GardenerPlan,
+  subject: Bead,
+  index: BoardIndex,
+  at: ApplyMoment,
+): string | undefined {
+  return (
+    subjectBusy(subject, at, DOING.undefer) ??
+    ticketSetBusy(index, subject, at, returningTicket(subject.id)) ??
+    premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs)
+  );
+}
+
 // ── retire ──
 
 function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
@@ -1859,6 +1951,13 @@ export const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | u
     still: "the bead whose contract this start was judged from",
     harm: "approving it now would set a run loose on work somebody has since rewritten",
   },
+  // The one kind whose whole claim IS the absence of a write: "parked, and nothing has looked at it
+  // since". Any write since the filing answers the question the proposal is asking — somebody has
+  // been back to this bead — so the fence is not a guard on the evidence here, it is the evidence.
+  "aged-defer": {
+    still: "the parked bead nobody had been back to",
+    harm: "returning it to the board now would answer a question somebody has since looked at themselves",
+  },
 };
 
 /**
@@ -2042,6 +2141,7 @@ export const DOING: Record<ApplyStep["verb"], string> = {
   close: "retiring it",
   supersede: "retiring it",
   defer: "retiring it",
+  undefer: "returning it to the board",
 };
 
 /**
@@ -2077,9 +2177,14 @@ export const retiringTicket = (id: string): string => `retiring ${id} out of its
 /** The same, for the move that takes a ticket out of that set by handing it to another target. */
 export const movingTicket = (id: string): string => `moving ${id} out of its ticket set`;
 
-/** Which of the two a step's verb reads as — the one phrasing every ticket-set refusal shares. */
-export const takingTicket = (verb: ApplyStep["verb"], id: string): string =>
-  verb === "reparent" ? movingTicket(id) : retiringTicket(id);
+/** The same, for the one move that puts a ticket back INTO a set a run may already have selected. */
+export const returningTicket = (id: string): string => `returning ${id} to its ticket set`;
+
+/** Which of the three a step's verb reads as — the one phrasing every ticket-set refusal shares. */
+export const takingTicket = (verb: ApplyStep["verb"], id: string): string => {
+  if (verb === "reparent") return movingTicket(id);
+  return verb === "undefer" ? returningTicket(id) : retiringTicket(id);
+};
 
 /** The one phrasing both readings of the link premise refuse with — snapshot and under-lock alike. */
 export const orderingUnstated = (blockedId: string, blockerId: string): string =>

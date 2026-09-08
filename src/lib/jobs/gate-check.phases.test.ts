@@ -10,7 +10,7 @@ import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
 import type { TestDb } from "../db/testing";
 import { LABELS, type Bead, type Gate, type GateCheckResult } from "../beads/bd";
-import type { Clock } from "./queue";
+import { enqueueReviewFixPrIfAbsent, type Clock } from "./queue";
 import type { JobContext } from "./runner";
 import { makeProjectDb } from "@/lib/testing/project";
 
@@ -61,7 +61,13 @@ let pass: PassContext;
 
 beforeEach(() => {
   t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: REPO });
-  pass = { db: t.db, clock, projectId: "p1", repo: REPO };
+  pass = {
+    db: t.db,
+    clock,
+    projectId: "p1",
+    repo: REPO,
+    enqueueReviewFixPr: (epicBeadId) => enqueueReviewFixPrIfAbsent(t.db, clock, "p1", epicBeadId),
+  };
   gateListMock.mockReset().mockResolvedValue([]);
   gateCheckMock
     .mockReset()
@@ -104,6 +110,8 @@ function jobCtx(heartbeat = vi.fn().mockResolvedValue(undefined)): JobContext {
     heartbeat,
     signal: new AbortController().signal,
     report: () => {},
+    claudeReached: async () => {},
+    enqueueReviewFixPr: () => undefined,
   };
 }
 
@@ -111,6 +119,10 @@ const jobsOfType = async (type: string) =>
   (await t.db.select().from(schema.jobs).where(eq(schema.jobs.type, type))).map(
     (j) => JSON.parse(j.payloadJson).epicBeadId as string,
   );
+
+/** Settle every job in the store, so the next pass sees no covering row. */
+const settleJobs = async (status: "done" | "parked" | "failed") =>
+  t.db.update(schema.jobs).set({ status }).run();
 
 describe("evaluateGates (phase 1)", () => {
   it("spawns no check at all for a project with no gates — the idle-pass cost", async () => {
@@ -239,10 +251,26 @@ describe("dispatchReleased (phase 4b)", () => {
 });
 
 describe("dispatchMerged (phase 4c)", () => {
-  it("hands each merged target to review-fix, deduped against the live job", async () => {
+  it("hands each merged target to review-fix-pr, deduped against the live job", async () => {
     expect(await dispatchMerged(pass, [bead("e-1")])).toBe(1);
     expect(await dispatchMerged(pass, [bead("e-1")])).toBe(0);
-    expect(await jobsOfType("review-fix")).toEqual(["e-1"]);
+    expect(await jobsOfType("review-fix-pr")).toEqual(["e-1"]);
+  });
+
+  // A merged target must NOT land on the dispatcher's coalescing key (anton-5mjt): the scheduler
+  // skips a due slot whose (type, project) is already in flight, so a finalize riding the poll's own
+  // type would cost every other PR its review-event poll for as long as it ran.
+  it("puts no row on the dispatcher's type", async () => {
+    await dispatchMerged(pass, [bead("e-1")]);
+    expect(await jobsOfType("review-fix")).toEqual([]);
+  });
+
+  // Settled rows do not cover: gate-check re-dispatches every pass until the target actually closes
+  // and loses stage:in-review, which is what makes a failed finalize self-healing.
+  it("re-dispatches once the prior job has settled", async () => {
+    await dispatchMerged(pass, [bead("e-1")]);
+    await settleJobs("done");
+    expect(await dispatchMerged(pass, [bead("e-1")])).toBe(1);
   });
 });
 
@@ -314,7 +342,7 @@ describe("gatePassEffect", () => {
   it("counts work put back in flight even when the pass wrote nothing to the board", () => {
     expect(gatePassEffect(counts({ resumed: 1, dispatched: 2 }))).toEqual({
       changed: true,
-      note: "resumed 1 run(s), dispatched 2 merged run(s) to review-fix",
+      note: "resumed 1 run(s), dispatched 2 merged run(s) to review-fix-pr",
     });
   });
 });

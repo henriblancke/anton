@@ -40,6 +40,8 @@ import {
   restoreWorktreeState,
   sameWorktreeState,
   worktreeHasCommitFor,
+  branchAddedCommit,
+  describeCommit,
   branchContainsCommit,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
@@ -379,8 +381,9 @@ suite("worktreeHasCommitFor (real git)", () => {
     });
 
     // A ticket can time out more than once; the freshest preserve is the tree the agent is looking
-    // at, so the newest match wins.
-    it("returns the newest preserved commit when a ticket timed out twice", async () => {
+    // at, so the newest match is the tip — but every earlier attempt's delta is on the branch too and
+    // must come along in `files`/`earlier`, or the resume is pointed at only the newest delta.
+    it("collects every preserved attempt when a ticket timed out twice", async () => {
       writeFileSync(join(repo, "first.md"), "first\n");
       g(["add", "-A"]);
       g(["commit", "-q", "-m", "WIP anton-d9: first attempt"]);
@@ -388,9 +391,11 @@ suite("worktreeHasCommitFor (real git)", () => {
       g(["add", "-A"]);
       g(["commit", "-q", "-m", "WIP anton-d9: second attempt"]);
 
-      expect((await readPreservedCommitFor(repo, "anton-d9"))?.subject).toBe(
-        "WIP anton-d9: second attempt",
-      );
+      const preserved = await readPreservedCommitFor(repo, "anton-d9");
+
+      expect(preserved?.subject).toBe("WIP anton-d9: second attempt");
+      expect(preserved?.files?.sort()).toEqual(["first.md", "second.md"]);
+      expect(preserved?.earlier.map((c) => c.subject)).toEqual(["WIP anton-d9: first attempt"]);
     });
 
     it("is undefined for a ticket nothing was preserved for, and for the delivery subject", async () => {
@@ -453,6 +458,115 @@ suite("branchContainsCommit (real git)", () => {
     // in this clone.
     expect(await branchContainsCommit(repo, "anton/anton-x7la", "0123456")).toBe(false);
     expect(await branchContainsCommit(repo, "main", "0123456")).toBe(false);
+  });
+});
+
+/**
+ * anton-nuft: a `satisfied` self-report names a commit as the evidence its step is already done, and
+ * the gate settles on the branch rather than the claim. The commit has to be one the run's branch
+ * ADDED — a commit of the base is on the branch too, and naming it is a zero-diff false success
+ * dressed as evidence.
+ */
+suite("branchAddedCommit (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const head = () =>
+    execFileSync("git", ["-C", repo, "rev-parse", "--short", "HEAD"], { encoding: "utf8" }).trim();
+  const commitFile = (name: string, subject: string) => {
+    writeFileSync(join(repo, name), `${name}\n`);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", subject]);
+    return head();
+  };
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-branchadded-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    commitFile("README.md", "init");
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("accepts a commit the run's branch added over its base, by short sha", async () => {
+    g(["checkout", "-q", "-b", "anton/anton-e0y2"]);
+    const earlier = commitFile("shared.ts", "anton-6l0q: the change that covers both steps");
+    g(["checkout", "-q", "main"]);
+
+    expect(await branchAddedCommit(repo, "anton/anton-e0y2", "main", earlier)).toBe(true);
+  });
+
+  it("refuses a commit of the base, even though the branch contains it", async () => {
+    const fork = head();
+    g(["checkout", "-q", "-b", "anton/anton-e0y2"]);
+    commitFile("work.ts", "anton-6l0q: implement the thing");
+    // Merged-in base work is on the branch too, and just as little this run's own.
+    g(["checkout", "-q", "main"]);
+    const landed = commitFile("main.ts", "someone else: landed on main");
+    g(["checkout", "-q", "anton/anton-e0y2"]);
+    g(["merge", "-q", "--no-edit", "main"]);
+
+    expect(await branchContainsCommit(repo, "anton/anton-e0y2", fork)).toBe(true);
+    expect(await branchAddedCommit(repo, "anton/anton-e0y2", "main", fork)).toBe(false);
+    expect(await branchAddedCommit(repo, "anton/anton-e0y2", "main", landed)).toBe(false);
+  });
+
+  it("fails closed for an unknown sha, a missing branch, and an unreadable base", async () => {
+    g(["checkout", "-q", "-b", "anton/anton-e0y2"]);
+    const own = commitFile("work.ts", "anton-6l0q: implement the thing");
+
+    expect(await branchAddedCommit(repo, "anton/anton-e0y2", "main", "0123456")).toBe(false);
+    expect(await branchAddedCommit(repo, "anton/anton-x7la", "main", own)).toBe(false);
+    expect(await branchAddedCommit(repo, "anton/anton-e0y2", "origin/main", own)).toBe(false);
+  });
+});
+
+/**
+ * anton-8h4b: a satisfied step is recorded against the FULL sha and subject of the commit it named,
+ * so the record outlives the abbreviation the agent read off `git log`.
+ */
+suite("describeCommit (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const rev = (ref: string) =>
+    execFileSync("git", ["-C", repo, "rev-parse", ref], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-describe-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "init\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-t1: Ticket one\n\nA body the subject must not carry."]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("resolves an abbreviated sha to its full form and subject line", async () => {
+    const full = rev("HEAD");
+    expect(await describeCommit(repo, full.slice(0, 7))).toEqual({
+      sha: full,
+      subject: "anton-t1: Ticket one",
+    });
+  });
+
+  it("answers undefined for a sha the repository does not have", async () => {
+    expect(await describeCommit(repo, "0123456")).toBeUndefined();
+    expect(await describeCommit(join(sandbox, "nowhere"), rev("HEAD"))).toBeUndefined();
   });
 });
 

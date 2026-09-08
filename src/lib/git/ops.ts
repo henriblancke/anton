@@ -714,44 +714,71 @@ export async function worktreeHasPreservedCommitFor(
 
 /** A timed-out attempt's preserved commit, as the resume's dispatch prompt describes it. */
 export interface PreservedCommit {
-  /** Full sha — what the prompt sends the agent to `git show`. */
+  /** Full sha of the NEWEST preserved commit — the tip of this ticket's preserved work. */
   sha: string;
   subject: string;
   /**
-   * The paths it changed. EMPTY for the marker form: there the agent committed the work under its
-   * own subjects and this commit only records whose it is, so the diff lives in the commits beneath
-   * it (see {@link commitMarker}).
+   * The paths changed across EVERY preserved attempt (anton-16pq): a ticket can time out more than
+   * once, and each timeout adds only its own delta, so the newest commit alone omits what earlier
+   * ones kept. EMPTY is the marker form — the agent committed the work under its own subjects and
+   * these commits only record whose it is, so the diff lives beneath them (see {@link commitMarker}).
+   * `undefined` means the diff could NOT be read: a git failure is not an empty commit, and the
+   * prompt must not present a failed read as proof nothing was kept.
    */
-  files: string[];
+  files: string[] | undefined;
+  /**
+   * The OLDER preserved commits beneath {@link sha}, newest first — present only when the ticket
+   * timed out more than once. Their work is on the branch too, so the prompt sends the agent across
+   * all of them rather than only the newest.
+   */
+  earlier: { sha: string; subject: string }[];
 }
 
 /**
- * The preserved commit itself, for the prompt that tells a RESUMED ticket its earlier attempt's
+ * The preserved commits themselves, for the prompt that tells a RESUMED ticket its earlier attempts'
  * work is already on the branch (anton-16pq).
  *
- * The newest match wins: a ticket can time out more than once, and the freshest preserve is the one
- * whose tree the agent is looking at. Fails closed to `undefined` for the same reason
- * {@link worktreeHasPreservedCommitFor} fails closed to `false` — a git read that failed is not
- * proof of absence, but the only cost here is a prompt that says nothing extra, and a dispatch is
- * never worth failing over a paragraph of prose.
+ * ALL matching commits are collected, not just the newest: a ticket can time out more than once, and
+ * each preserve holds only the delta since the last, so the newest commit alone hides what the
+ * earlier ones kept — the agent must be pointed at the whole range. Fails closed to `undefined` for
+ * the same reason {@link worktreeHasPreservedCommitFor} fails closed to `false` — a git read that
+ * failed is not proof of absence, but the only cost here is a prompt that says nothing extra, and a
+ * dispatch is never worth failing over a paragraph of prose. A `git show` that fails AFTER the
+ * history lookup succeeds is carried as `files: undefined`, distinct from the marker's `[]`, so the
+ * prompt never reads a failed read as an empty commit.
  */
 export async function readPreservedCommitFor(
   worktreePath: string,
   ticketId: string,
 ): Promise<PreservedCommit | undefined> {
   const prefix = preservedCommitPrefix(ticketId);
-  const commit = (await branchCommits(worktreePath)).find((c) => c.subject.startsWith(prefix));
-  if (!commit) return undefined;
-  // `-z` for the same reason `diffPaths` uses it: under `core.quotePath` a non-ASCII path comes back
-  // C-quoted, and the prompt would name a file that is not on disk.
-  const names = await git(worktreePath, [
+  const matches = (await branchCommits(worktreePath)).filter((c) => c.subject.startsWith(prefix));
+  const [newest, ...earlier] = matches;
+  if (!newest) return undefined;
+  return { sha: newest.sha, subject: newest.subject, earlier, files: await preservedFiles(worktreePath, matches) };
+}
+
+/**
+ * The union of paths changed across every preserved commit — `undefined` on a git failure (an
+ * unknown/error state the prompt keeps distinct from a genuine empty marker), `[]` when the commits
+ * really touched nothing.
+ *
+ * `-z` for the same reason `diffPaths` uses it: under `core.quotePath` a non-ASCII path comes back
+ * C-quoted, and the prompt would name a file that is not on disk.
+ */
+async function preservedFiles(
+  worktreePath: string,
+  commits: { sha: string }[],
+): Promise<string[] | undefined> {
+  const out = await git(worktreePath, [
     "show",
     "--name-only",
     "-z",
     "--format=",
-    commit.sha,
-  ]).catch(() => "");
-  return { ...commit, files: names.split("\0").filter(Boolean) };
+    ...commits.map((c) => c.sha),
+  ]).catch(() => undefined);
+  if (out === undefined) return undefined;
+  return [...new Set(out.split("\0").filter(Boolean))];
 }
 
 /** How far back a subject scan reads. A run's own commits are always at the branch tip. */
@@ -810,6 +837,59 @@ export async function branchContainsCommit(
     () => true,
     () => false,
   );
+}
+
+/**
+ * True when `commit` is among the commits `branch` ADDED over `base` — reachable from the branch
+ * and not from the base — asked of the repository exactly as {@link branchContainsCommit} is.
+ *
+ * This is the evidence behind a `satisfied` self-report (anton-nuft): the agent claims an EARLIER
+ * commit of this run already did its step's work, and the gate settles on the branch, never on the
+ * claim. "On the branch" alone is too weak a test, because every commit of the base is on the branch
+ * too — the fork point, or anything merged in from `main` — and none of them is work this run did.
+ * A claim naming one is the zero-diff false success the gate exists to catch, dressed as evidence.
+ *
+ * Fails closed to `false` on every git error: an unknown or ambiguous sha, a branch or base this
+ * machine never had, an unreadable repository. Only git's own "not an ancestor of the base" (exit 1)
+ * is the answer that settles the step; a broken read of the base is no evidence that the commit is
+ * the run's own.
+ */
+export async function branchAddedCommit(
+  repoPath: string,
+  branch: string,
+  base: string,
+  commit: string,
+): Promise<boolean> {
+  if (!(await branchContainsCommit(repoPath, branch, commit))) return false;
+  try {
+    await git(repoPath, ["merge-base", "--is-ancestor", commit, base]);
+    return false;
+  } catch (e) {
+    return exitedWith(e, 1);
+  }
+}
+
+/**
+ * The full sha and subject line of `ref`, as the repository resolves it — undefined when it names
+ * nothing, or names more than one thing.
+ *
+ * This is what a satisfied step is RECORDED against (anton-8h4b): the agent names a commit by
+ * whatever abbreviation it read off `git log`, and the gate accepts it on the strength of the branch
+ * ({@link branchAddedCommit}). An abbreviation is unambiguous today and may not be next year, so the
+ * bead and the pull request cite the full sha; the subject is the attribution a reader wants, since
+ * anton subjects its own commits `<ticket-id>: <title>`.
+ */
+export async function describeCommit(
+  repoPath: string,
+  ref: string,
+): Promise<{ sha: string; subject: string } | undefined> {
+  try {
+    const out = await git(repoPath, ["log", "-1", "--format=%H%n%s", `${ref}^{commit}`, "--"]);
+    const [sha, subject = ""] = out.trim().split("\n");
+    return sha && /^[0-9a-f]{40}$/.test(sha) ? { sha, subject: subject.trim() } : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

@@ -47,18 +47,19 @@ import {
 } from "./execute-epic-human-gate";
 import { landableTicketIds } from "./execute-epic-dispatch";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
-import { reviewParkMessage } from "./execute-epic-review";
-import { assertDelivered } from "./execute-epic-ticket";
+import { reviewParkMessage, stalePrBodyNote } from "./execute-epic-review";
+import { assertDelivered, displacesSelfReport, selfReportRank } from "./execute-epic-ticket";
 import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
 import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
 import {
+  satisfiedClaim,
   ticketBlockNote,
   timedOutTicketNote,
   type TicketProgress,
 } from "./execute-epic-ticket-settle";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
-import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
+import { BUILTIN_STEPS, ticketPrompt, type StepFacts } from "./step-registry";
 import type { ResolvedStep } from "./run-formula";
 
 /** A promise the test resolves by hand, to hold a lock open across a deliberate interleave. */
@@ -1208,6 +1209,7 @@ describe("landableTicketIds — which prerequisites this run can still land (ant
     skipCause: new Map(skipped.map((id) => [id, { waitingOn: "x", stopped: "x" }])),
     skipped: new Map(),
     onBranch: new Set<string>(),
+    satisfied: new Map(),
   });
   const board = () => [ticket("schema"), ticket("api"), ticket("wiring")];
 
@@ -1451,6 +1453,51 @@ describe("reviewParkMessage (anton-3apm)", () => {
 });
 
 /**
+ * PR #253 review: a reused PR whose body could not be refreshed shows an earlier attempt's text, and
+ * the note that salvages this run's findings is the only other home for its satisfied attribution —
+ * no commit carries a satisfied ticket's name, so a note that dropped it would leave the founder
+ * matching tickets to commits that do not exist.
+ */
+describe("stalePrBodyNote — the satisfied attribution rides the salvage too (PR #253 review)", () => {
+  const pr = { url: "https://github.com/acme/repo/pull/42", ref: "gh-42", number: 42, bodyStale: true };
+  const base = { status: "open", issue_type: "task" } as const;
+  const first = { ...base, id: "anton-t1", title: "Add the schema" };
+  const second = { ...base, id: "anton-t2", title: "Expose the schema" };
+  const third = { ...base, id: "anton-t3", title: "Document the schema" };
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const finding = { severity: "advisory" as const, location: "src/a.ts:10", note: "extract the mapper" };
+
+  it("names each satisfied ticket against its commit, after the findings", () => {
+    const note = stalePrBodyNote(
+      pr,
+      [finding],
+      [first, second, third],
+      new Map([
+        [second.id, { commit: sha, subject: "anton-t1: Add the schema", closed: true }],
+        [third.id, { commit: sha, subject: "anton-t1: Add the schema", closed: false }],
+      ]),
+    );
+    expect(note).toContain("could NOT rewrite its title/body");
+    expect(note).toContain("- src/a.ts:10 — extract the mapper");
+    expect(note).toContain("Satisfied by earlier commits of this run (no commit of their own):");
+    expect(note).toContain(`- anton-t2 — Expose the schema — by 0123456 "anton-t1: Add the schema"\n`);
+    // The timed-out close is not reported as a close here either.
+    expect(note).toContain(`- anton-t3 — Document the schema — by 0123456 "anton-t1: Add the schema" — NOT closed:`);
+    expect(note).not.toContain("anton-t1 —");
+    expect(note.indexOf("extract the mapper")).toBeLessThan(note.indexOf("Satisfied by"));
+    // A note is line-delimited on the bead: no trailing blank line to leave a stray paragraph.
+    expect(note.endsWith("\n")).toBe(false);
+  });
+
+  it("stays exactly as it was when nothing settled that way", () => {
+    const withEmptyLedger = stalePrBodyNote(pr, [], [first, second], new Map());
+    expect(withEmptyLedger).toBe(stalePrBodyNote(pr, []));
+    expect(withEmptyLedger).toContain("reported no advisory findings.");
+    expect(withEmptyLedger).not.toContain("Satisfied by");
+  });
+});
+
+/**
  * The delivery-evidence gate's judgement on WHOSE work the commit is (anton-d967 / PR #228 review).
  *
  * A commit adopted from a previous attempt's preserved `WIP` is the one kind of evidence that says
@@ -1470,48 +1517,45 @@ describe("assertDelivered — an adopted preserve needs this run's agent to say 
     delivered: false,
     selfReport,
   });
+  /** A branch read no case here needs — the gate must decide these without asking git. */
+  const neverAsked = async (): Promise<boolean> => {
+    throw new Error("assertDelivered asked the branch about a case that has no satisfied claim");
+  };
+  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked);
 
-  it("passes work THIS run committed, self-report or not", () => {
-    expect(() => assertDelivered(ticket, { committed: true }, progress(null))).not.toThrow();
+  it("passes work THIS run committed, self-report or not", async () => {
+    await expect(gate({ committed: true }, progress(null))).resolves.toBeUndefined();
   });
 
-  it("blocks an adopted preserve the agent never affirmed", () => {
-    const err = (() => {
-      try {
-        assertDelivered(ticket, { committed: true, preservedAdoption: true }, progress(null));
-      } catch (e) {
-        return e as Error;
-      }
-    })();
+  it("blocks an adopted preserve the agent never affirmed", async () => {
+    const err = await gate({ committed: true, preservedAdoption: true }, progress(null)).then(
+      () => null,
+      (e: Error) => e,
+    );
 
     expect(err?.name).toBe("PoisonError");
     expect(err?.message).toMatch(/produced no delivery/);
     expect(err?.message).toMatch(/PRESERVED/);
   });
 
-  it("passes an adopted preserve the agent reported delivered — the resume it exists for", () => {
-    expect(() =>
-      assertDelivered(
-        ticket,
-        { committed: true, preservedAdoption: true },
-        progress({ outcome: "delivered" }),
-      ),
-    ).not.toThrow();
+  it("passes an adopted preserve the agent reported delivered — the resume it exists for", async () => {
+    await expect(
+      gate({ committed: true, preservedAdoption: true }, progress({ outcome: "delivered" })),
+    ).resolves.toBeUndefined();
   });
 
-  it("still blocks on the agent's own word first when it reported blocked", () => {
-    expect(() =>
-      assertDelivered(
-        ticket,
+  it("still blocks on the agent's own word first when it reported blocked", async () => {
+    await expect(
+      gate(
         { committed: true, preservedAdoption: true },
         progress({ outcome: "blocked", reason: "the acceptance criteria contradict each other" }),
       ),
-    ).toThrow(/self-reported blocked/);
+    ).rejects.toThrow(/self-reported blocked/);
   });
 
-  it("records the commit verdict on the progress the ticket's exits read", () => {
+  it("records the commit verdict on the progress the ticket's exits read", async () => {
     const p = progress(null);
-    expect(() => assertDelivered(ticket, { committed: false }, p)).toThrow(/no delivery/);
+    await expect(gate({ committed: false }, p)).rejects.toThrow(/no delivery/);
     expect(p.committed).toBe(false);
     expect(p.delivered).toBe(false);
   });
@@ -1520,22 +1564,165 @@ describe("assertDelivered — an adopted preserve needs this run's agent to say 
   // `progress` alone (PR #228 review). It must find the tree fact and the delivery verdict apart:
   // `committed` keeps the refused commit from being reset off the branch, `delivered` is what keeps
   // it out of the `not-delivered` skip and out of the pull request's delivered list.
-  it("separates the commit on the branch from the delivery it was refused as", () => {
+  it("separates the commit on the branch from the delivery it was refused as", async () => {
     const accepted = progress(null);
-    assertDelivered(ticket, { committed: true }, accepted);
+    await gate({ committed: true }, accepted);
     expect(accepted).toMatchObject({ committed: true, delivered: true });
 
     const adopted = progress(null);
-    expect(() =>
-      assertDelivered(ticket, { committed: true, preservedAdoption: true }, adopted),
-    ).toThrow(/produced no delivery/);
+    await expect(gate({ committed: true, preservedAdoption: true }, adopted)).rejects.toThrow(
+      /produced no delivery/,
+    );
     expect(adopted).toMatchObject({ committed: true, delivered: false });
 
     const declared = progress({ outcome: "blocked", reason: "the API it needs does not exist" });
-    expect(() => assertDelivered(ticket, { committed: true }, declared)).toThrow(
-      /self-reported blocked/,
-    );
+    await expect(gate({ committed: true }, declared)).rejects.toThrow(/self-reported blocked/);
     expect(declared).toMatchObject({ committed: true, delivered: false });
+  });
+});
+
+/**
+ * anton-nuft: a `satisfied` self-report (anton-6l0q) says an earlier commit of this run already did
+ * the step's work. The gate settles it on the BRANCH — is the named commit one the run added over
+ * its base — never on the claim, because a claim on an empty tree is the false success from issue
+ * #46 whatever verb it uses. Every other row of the gate is pinned here unchanged.
+ */
+describe("assertDelivered — a satisfied step settles on evidence, never on the claim (anton-nuft)", () => {
+  const ticket: Bead = {
+    id: "anton-nuft",
+    title: "assertDelivered settles a satisfied step on evidence",
+    status: "in_progress",
+    issue_type: "task",
+  };
+  const progress = (selfReport: TicketProgress["selfReport"]): TicketProgress => ({
+    committed: false,
+    delivered: false,
+    selfReport,
+  });
+  const ON_BRANCH = "a1b2c3d4e5f";
+  /** The branch as git would answer for it: one commit added over the base, everything else absent. */
+  const branch = (added: string) => {
+    const asked: string[] = [];
+    const read = async (commit: string) => {
+      asked.push(commit);
+      return commit === added;
+    };
+    return { read, asked };
+  };
+  const neverAsked = async (): Promise<boolean> => {
+    throw new Error("assertDelivered asked the branch about a case that has no satisfied claim");
+  };
+  const satisfied = (commit?: string): TicketProgress["selfReport"] => ({
+    outcome: "satisfied",
+    ...(commit ? { commit } : {}),
+    reason: "anton-6l0q's change already covers this step",
+  });
+  const failure = (run: Promise<void>) => run.then(() => null, (e: Error) => e);
+
+  it("settles a satisfied claim naming a commit the branch added, and lets the run continue", async () => {
+    const evidence = branch(ON_BRANCH);
+    const p = progress(satisfied(ON_BRANCH));
+
+    await expect(assertDelivered(ticket, { committed: false }, p, evidence.read)).resolves.toBeUndefined();
+
+    // The tree fact stays true — this ticket committed nothing — and the verdict is delivery.
+    expect(p).toMatchObject({ committed: false, delivered: true });
+    expect(evidence.asked).toEqual([ON_BRANCH]);
+  });
+
+  it("parks a satisfied claim naming a commit the branch did not add, as no delivery", async () => {
+    const evidence = branch(ON_BRANCH);
+    const p = progress(satisfied("0123456"));
+
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read));
+
+    expect(err?.name).toBe("PoisonError");
+    expect(err?.message).toMatch(/anton-nuft produced no delivery: claude exited cleanly/);
+    expect(err?.message).toMatch(/ANTON-RESULT: satisfied — 0123456/);
+    expect(err?.message).toMatch(/names no commit this run's branch added over its base/);
+    expect(err?.message).toMatch(/unverified — a false success on an unchanged tree/);
+    expect(p).toMatchObject({ committed: false, delivered: false });
+    expect(evidence.asked).toEqual(["0123456"]);
+  });
+
+  it("parks a satisfied claim naming no commit without asking the branch anything", async () => {
+    const evidence = branch(ON_BRANCH);
+    const p = progress(satisfied());
+
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read));
+
+    expect(err?.name).toBe("PoisonError");
+    expect(err?.message).toMatch(/produced no delivery/);
+    expect(err?.message).toMatch(/satisfied — \(no commit named\)/);
+    expect(err?.message).toMatch(/names no commit this run's branch added over its base/);
+    expect(p).toMatchObject({ committed: false, delivered: false });
+    expect(evidence.asked).toEqual([]);
+  });
+
+  it("parks a zero diff with no satisfied claim exactly as today — the message is unchanged", async () => {
+    const plain = await failure(assertDelivered(ticket, { committed: false }, progress(null), neverAsked));
+    expect(plain?.name).toBe("PoisonError");
+    expect(plain?.message).toBe(
+      "anton-nuft produced no delivery: claude exited cleanly and passed the verify gates but " +
+        "left no changes to commit (zero diff). Blocking the ticket for operator review and " +
+        "halting the epic — nothing landed, so closing it would be a false success.",
+    );
+
+    const claimed = await failure(
+      assertDelivered(ticket, { committed: false }, progress({ outcome: "delivered" }), neverAsked),
+    );
+    expect(claimed?.message).toBe(
+      `${plain?.message} The agent self-reported ANTON-RESULT: delivered — a false success on an ` +
+        "unchanged tree.",
+    );
+
+    const blocked = await failure(
+      assertDelivered(
+        ticket,
+        { committed: false },
+        progress({ outcome: "blocked", klass: "other", reason: "the spec is empty" }),
+        neverAsked,
+      ),
+    );
+    expect(blocked?.message).toBe(
+      `${plain?.message} The agent self-reported blocked — the spec is empty, corroborating the block.`,
+    );
+  });
+
+  it("leaves a normal commit-backed delivery untouched, whatever the agent reported", async () => {
+    for (const report of [null, { outcome: "delivered" as const }, satisfied(ON_BRANCH), satisfied("0123456")]) {
+      const p = progress(report);
+      await expect(assertDelivered(ticket, { committed: true }, p, neverAsked)).resolves.toBeUndefined();
+      expect(p).toMatchObject({ committed: true, delivered: true });
+    }
+  });
+
+  it("keeps refusing the preserved-WIP case — preserved work is still not a delivery", async () => {
+    const expected =
+      "anton-nuft produced no delivery: claude left no changes to commit (zero diff) and no " +
+      "`ANTON-RESULT` from this run says the ticket is finished, so the only work on the branch " +
+      "is the explicitly incomplete commit a previous attempt PRESERVED when it ran out of time. " +
+      "Blocking the ticket for operator " +
+      "review and halting the epic — nothing this run did says that work is finished, so " +
+      "adopting it as the delivery would be a false success. Finish it by hand or resume the run " +
+      "with a raised ticketTimeoutMinutes.";
+
+    const unaffirmed = progress(null);
+    const plain = await failure(
+      assertDelivered(ticket, { committed: true, preservedAdoption: true }, unaffirmed, neverAsked),
+    );
+    expect(plain?.name).toBe("PoisonError");
+    expect(plain?.message).toBe(expected);
+    expect(unaffirmed).toMatchObject({ committed: true, delivered: false });
+
+    // A satisfied claim is not the affirmation the preserve needs, even for the commit it names:
+    // the evidence on the branch is explicitly incomplete, and the branch is never asked.
+    const claimed = progress(satisfied(ON_BRANCH));
+    const refused = await failure(
+      assertDelivered(ticket, { committed: true, preservedAdoption: true }, claimed, neverAsked),
+    );
+    expect(refused?.message).toBe(expected);
+    expect(claimed).toMatchObject({ committed: true, delivered: false });
   });
 });
 
@@ -1544,6 +1731,39 @@ describe("assertDelivered — an adopted preserve needs this run's agent to say 
  * logged; these cases pin it to the bead, alongside the evidence an operator would otherwise dig
  * for — and pin the invariant that keeps the notes blob parseable: exactly one line per note.
  */
+/**
+ * anton-8h4b: the close is the same for a committed step and a satisfied one, so the settle path has
+ * to read which it was off the progress the gate wrote — and only the shape the gate produces for a
+ * verified satisfied claim (`delivered` without `committed`) may settle as satisfied.
+ */
+describe("satisfiedClaim — how a finished ticket settled", () => {
+  const satisfied = { outcome: "satisfied" as const, commit: "a1b2c3d", reason: "covered by t1" };
+
+  it("reads the commit and the agent's account off a verified satisfied step", () => {
+    expect(satisfiedClaim({ committed: false, delivered: true, selfReport: satisfied })).toEqual({
+      commit: "a1b2c3d",
+      note: "covered by t1",
+    });
+  });
+
+  it("answers null for a step that committed its own work, whatever it self-reported", () => {
+    for (const selfReport of [null, { outcome: "delivered" as const }, satisfied]) {
+      expect(satisfiedClaim({ committed: true, delivered: true, selfReport })).toBeNull();
+    }
+  });
+
+  it("answers null for a step the gate did not deliver, even with a satisfied claim on it", () => {
+    expect(satisfiedClaim({ committed: false, delivered: false, selfReport: satisfied })).toBeNull();
+  });
+
+  it("answers null for a zero-diff delivery with no satisfied claim — nothing to attribute", () => {
+    expect(satisfiedClaim({ committed: false, delivered: true, selfReport: null })).toBeNull();
+    expect(
+      satisfiedClaim({ committed: false, delivered: true, selfReport: { outcome: "delivered" } }),
+    ).toBeNull();
+  });
+});
+
 describe("ticketBlockNote (anton-vqql)", () => {
   const HEAD = "0123456789abcdef0123456789abcdef01234567";
   const note = (over: Partial<Parameters<typeof ticketBlockNote>[0]> = {}) =>
@@ -2184,5 +2404,43 @@ describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock
       } as ReopenBoard),
     ).resolves.toBeUndefined();
     expect(bd.current.status).toBe("blocked");
+  });
+});
+
+/**
+ * The phase's sticky self-report keeps the most ACTIONABLE outcome any of its steps made. The
+ * fourth outcome (anton-6l0q) is placed at the bottom on purpose: a step that says "an earlier
+ * commit already covers me" must not talk down a sibling that delivered, blocked, or asked.
+ */
+describe("selfReportRank — where `satisfied` sits among the outcomes (anton-6l0q)", () => {
+  it("orders ask > block > delivered > satisfied > nothing", () => {
+    expect(selfReportRank("needs-human")).toBeGreaterThan(selfReportRank("blocked"));
+    expect(selfReportRank("blocked")).toBeGreaterThan(selfReportRank("delivered"));
+    expect(selfReportRank("delivered")).toBeGreaterThan(selfReportRank("satisfied"));
+    expect(selfReportRank("satisfied")).toBeGreaterThan(selfReportRank(undefined));
+  });
+
+  it("lets a satisfied report set the phase's report only when nothing else has", () => {
+    const satisfied = { outcome: "satisfied", commit: "0a76266d" } as const;
+    expect(displacesSelfReport(satisfied, null)).toBe(true);
+    expect(displacesSelfReport({ ...satisfied, commit: "f6348077" }, satisfied)).toBe(true);
+    expect(displacesSelfReport(satisfied, { outcome: "delivered" })).toBe(false);
+    expect(displacesSelfReport(satisfied, { outcome: "blocked", klass: "other" })).toBe(false);
+    expect(displacesSelfReport(satisfied, { outcome: "needs-human" })).toBe(false);
+  });
+
+  // The phase may dispatch a project's own `step:claude` after `implement` (PR #253 review). It
+  // reports on its own work, and "delivered" on the tree the implementer left unchanged would
+  // replace the one report carrying the commit the gate can settle that zero diff against.
+  it("keeps a satisfied claim over a later `delivered`, though delivered outranks it", () => {
+    const satisfied = { outcome: "satisfied", commit: "0a76266d" } as const;
+    expect(selfReportRank("delivered")).toBeGreaterThan(selfReportRank("satisfied"));
+    expect(displacesSelfReport({ outcome: "delivered" }, satisfied)).toBe(false);
+    // Everything more actionable than a delivery still displaces it.
+    expect(displacesSelfReport({ outcome: "blocked", klass: "env" }, satisfied)).toBe(true);
+    expect(displacesSelfReport({ outcome: "needs-human", reason: "a key" }, satisfied)).toBe(true);
+    // And a delivery replaces a delivery, so the ordinary phase keeps its last word.
+    expect(displacesSelfReport({ outcome: "delivered" }, { outcome: "delivered" })).toBe(true);
+    expect(displacesSelfReport({ outcome: "delivered" }, null)).toBe(true);
   });
 });

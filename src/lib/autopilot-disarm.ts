@@ -16,6 +16,7 @@
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { toEpoch } from "./db/epoch";
 import { raiseEscalation, settleEscalation } from "./escalations";
 import type { AutopilotDisarm, DisarmReason } from "./autopilot-breaker";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -24,12 +25,6 @@ export type AutopilotDisarmRow = typeof schema.autopilotDisarms.$inferSelect;
 
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
-}
-
-function toEpoch(value: unknown): number | undefined {
-  if (value == null) return undefined;
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value);
 }
 
 /**

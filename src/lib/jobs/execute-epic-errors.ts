@@ -4,6 +4,7 @@
  * the row status off them, the ticket loop absorbs exactly one, the runner classifies the poison
  * ones — so they live together rather than beside the code that happens to throw them.
  */
+import type { SatisfiedBy } from "../beads/satisfied-note";
 import { blockedByPoison, parkedOnGateClause, PoisonEpic } from "./errors";
 
 /**
@@ -338,11 +339,23 @@ export class TicketTimeoutError extends Error {
      * rather than the claim that the work was removed.
      */
     readonly preservedUnknown: boolean = false,
+    /**
+     * The earlier commit a DELIVERED ticket settled on instead of one of its own (PR #253 review):
+     * the deadline landed after `assertDelivered` accepted its `satisfied` claim and before the close
+     * that would have recorded it. The dispatch loop writes this to the run's satisfied ledger, so
+     * the pull request attributes the ticket to that commit rather than listing a delivery the
+     * branch carries under no such name. Null for an ordinary delivery.
+     */
+    readonly satisfiedBy: SatisfiedBy | null = null,
   ) {
     super(
       `${ticketId} exceeded its ${Math.round(budgetMs / 60_000)}m ticket budget and was stopped. ` +
         (delivered
-          ? `Its work IS committed on the branch (only its bead was left unfinished)`
+          ? satisfiedBy
+            ? `Its work was already on the branch — an earlier commit of this run ` +
+              `(${satisfiedBy.commit.slice(0, 7)}) met it, and the delivery gate had settled it on ` +
+              `that commit (only its bead was left unfinished)`
+            : `Its work IS committed on the branch (only its bead was left unfinished)`
           : preservedOn
             ? `Its work passed this project's verify gates, so it was PRESERVED on ` +
               `\`${preservedOn}\` as an explicitly incomplete commit — a resume continues from it`

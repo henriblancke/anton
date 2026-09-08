@@ -3,6 +3,11 @@ import type { AutomationSpec } from "@/components/settings/automation-table";
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
 // stays server-import-free. Keep in sync.
 export const DEFAULT_CONCURRENCY = 3;
+// Per-PR review-fix cap (anton-kwi6). 2 leaves headroom under the global ceiling of 8 once run
+// concurrency (3) and the deterministic polls have taken theirs.
+export const DEFAULT_REVIEW_FIX_CONCURRENCY = 2;
+export const REVIEW_FIX_CONCURRENCY_MIN = 1;
+export const REVIEW_FIX_CONCURRENCY_MAX = 6;
 export const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2h without progress
 export const DEFAULT_TICKET_TIMEOUT_MINUTES = 45;
 export const DEFAULT_MAX_RETRIES = 3;
@@ -108,7 +113,7 @@ export const AUTOMATIONS: AutomationSpec[] = [
   {
     id: "review-fix",
     label: "review-fix watcher",
-    description: "poll open PRs for review events",
+    description: "poll open PRs for review events · fans each one out to its own fix job",
     group: "Delivery",
   },
 ];

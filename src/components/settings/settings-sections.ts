@@ -46,6 +46,14 @@ export const SECTIONS = [
       "budget",
     ],
   },
+  // Beside the limits rather than under a page of its own: a share is a budget knob, and it only
+  // means anything for a project whose budget-aware switch is on one panel up.
+  {
+    id: "quota",
+    label: "Quota shares",
+    group: "While a run works",
+    dirtyKeys: ["quotaShare"],
+  },
   {
     id: "autopilot",
     label: "Autopilot brakes",
@@ -77,7 +85,7 @@ export const SECTIONS = [
     id: "review-fix",
     label: "Review-fix",
     group: "Before the PR opens",
-    dirtyKeys: ["reviewFixPrompt"],
+    dirtyKeys: ["reviewFixPrompt", "reviewFixConcurrency"],
   },
   {
     id: "automation",

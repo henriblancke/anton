@@ -208,12 +208,12 @@ describe("ApproveRunAction — releasing a pick", () => {
     expect(html).not.toContain(">Approve<");
   });
 
-  it("offers no start at all on a pick no recorded plan names, and says what it waits for", () => {
+  it("offers no start at all on a pick no current generation names, and says what it waits for", () => {
     // The lane ranks live (anton-r0ew), so a chip can be anton's pick with nothing written down to
     // accept against (anton-5axf). The plain "Approve & run" is withheld with `[Release]`: it would
     // start the pick while recording no answer to it, which is the same missing evidence.
     const html = renderToStaticMarkup(
-      <PickDecisionProvider unconfirmed>
+      <PickDecisionProvider pick>
         <ApproveRunAction
           slug="anton"
           item={makeStandaloneItem()}
@@ -225,7 +225,7 @@ describe("ApproveRunAction — releasing a pick", () => {
     expect(html).not.toContain(">Release<");
     expect(html).not.toContain(">Queue<");
     expect(html).not.toContain("Approve &amp; run");
-    expect(html).toContain("anton confirms next pass");
+    expect(html).toContain("anton records this next read");
   });
 
   it("withholds it from a pick the operator set aside", () => {

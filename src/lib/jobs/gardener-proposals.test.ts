@@ -10,6 +10,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Bead, SyncOutcome } from "../beads/bd";
+import { REJUDGE_DEFERRED_DAYS } from "../gardener/detect";
+import { MAX_PROPOSALS_PER_PASS } from "../gardener/emit";
 import type { HygieneFinding } from "../hygiene";
 import { fakeScope } from "./pass.fixture";
 
@@ -57,6 +59,20 @@ const bead = (id: string, o: Partial<Bead> = {}): Bead => ({
   issue_type: "task",
   ...o,
 });
+
+/** A bead parked `days` before the pass's clock and untouched since — the re-judgement's subject. */
+const parked = (id: string, days: number): Bead =>
+  bead(id, {
+    status: "deferred",
+    title: `parked ${id}`,
+    updated_at: new Date(OBSERVED_AT - days * 86_400_000).toISOString(),
+  });
+
+/** Which kinds a pass filed, in the order it filed them. */
+const filedKinds = (): string[] =>
+  createMock.mock.calls.map(
+    ([, draft]) => draft.labels?.find((l) => l.startsWith("gardener:"))?.split(":")[1] ?? "",
+  );
 
 /** The arbitration seam: a settle that costs no wall-clock, and no remote to race by default. */
 const arbitration = { push: (...a: [string]) => pushMock(...a), sleep: async () => {} };
@@ -206,5 +222,62 @@ describe("fileGardenerProposals", () => {
       "[gardener] SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD APPLY: closed t-4 as shipped\n",
     );
     expect(closeMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The re-judgement of parked work (anton-30vo), riding the patrol's own cadence.
+ *
+ * Two properties carry it, and they are the same property from either side: a board whose parked
+ * work is still recent produces NOTHING and that is the pass succeeding, while a bead nobody has
+ * looked at for a quarter produces exactly one ask. The third is the budget — a tier that files at
+ * most ten does not get to file eleven because a new detector joined it.
+ */
+describe("fileGardenerProposals · re-judging parked work", () => {
+  it("asks about a bead parked past the window, and leaves it parked", async () => {
+    listMock.mockResolvedValue([parked("t-9", REJUDGE_DEFERRED_DAYS)]);
+    const scope = fakeScope(REPO);
+
+    expect(await file(scope, [])).toBe(1);
+    const [, draft] = createMock.mock.calls[0];
+    expect(draft.title).toContain("t-9");
+    expect(draft.labels?.some((l) => l.startsWith("gardener:aged-defer:"))).toBe(true);
+    // The ask is the whole write: undeferring t-9 is the approver's move, never the patrol's.
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(scope.nudged).toEqual([scope.project]);
+  });
+
+  it("files nothing while the parking is still recent — and that is the pass succeeding", async () => {
+    listMock.mockResolvedValue([parked("t-9", REJUDGE_DEFERRED_DAYS - 1)]);
+    const scope = fakeScope(REPO);
+
+    expect(await file(scope, [])).toBe(0);
+    expect(createMock).not.toHaveBeenCalled();
+    expect(scope.nudged).toEqual([]);
+  });
+
+  it("respects the pass's write budget, spending it on live work before parked work", async () => {
+    // Twelve re-judgements and one shipped orphan, for a cap of ten: the cap is what a founder reads
+    // in a morning, and a detector added to the tier shares it rather than extending it. Board SHAPE
+    // goes first — work that is still live outranks work parked a quarter ago — and the oldest
+    // silence takes the rest, so what the next patrol picks up is the least forgotten.
+    const parkedIds = Array.from({ length: MAX_PROPOSALS_PER_PASS + 2 }, (_, i) => `t-${100 + i}`);
+    listMock.mockResolvedValue([
+      bead("t-4", { title: "shipped" }),
+      // Oldest first, so `parkedIds` reads in the order the detector ranks them.
+      ...parkedIds.map((id, i) => parked(id, REJUDGE_DEFERRED_DAYS + parkedIds.length - i)),
+    ]);
+
+    expect(await file(fakeScope(REPO))).toBe(MAX_PROPOSALS_PER_PASS);
+    expect(filedKinds()).toEqual([
+      "shipped-orphan",
+      ...Array.from({ length: MAX_PROPOSALS_PER_PASS - 1 }, () => "aged-defer"),
+    ]);
+    const asked = createMock.mock.calls.map(([, draft]) => draft.title).join("\n");
+    const held = parkedIds.slice(MAX_PROPOSALS_PER_PASS - 1);
+    for (const id of parkedIds.slice(0, MAX_PROPOSALS_PER_PASS - 1)) expect(asked).toContain(id);
+    // The three youngest silences are held back, not lost: the next patrol files them.
+    expect(held).toHaveLength(3);
+    for (const id of held) expect(asked).not.toContain(id);
   });
 });

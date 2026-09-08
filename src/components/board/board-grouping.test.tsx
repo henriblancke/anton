@@ -269,7 +269,7 @@ describe("board grouping (anton-9pkk.4)", () => {
     ];
     render(<EpicBoard slug="tmp" initialBoard={board} />);
 
-    const withheld = () => screen.getAllByText(/anton confirms next pass/i).length;
+    const withheld = () => screen.getAllByText(/anton records this next read/i).length;
     expect(withheld()).toBe(2);
 
     toggleTo("Epic");

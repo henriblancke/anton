@@ -3,6 +3,7 @@
 import type { ReactNode } from "react";
 
 import type { Project } from "@/lib/types";
+import type { QuotaShareProject } from "@/lib/quota-share";
 import { PageHeader } from "@/components/atoms";
 import {
   PolicyDraftSection,
@@ -21,6 +22,7 @@ import {
   type EarnedPicker,
 } from "@/components/settings/sections/picker-autonomy-section";
 import { PromptSection } from "@/components/settings/sections/prompt-section";
+import { QuotaSection } from "@/components/settings/sections/quota-section";
 import { RepairsSection } from "@/components/settings/sections/repairs-section";
 import { ProposalsSection } from "@/components/settings/sections/proposals-section";
 import { ReviewFixSection } from "@/components/settings/sections/review-fix-section";
@@ -57,6 +59,7 @@ export function SettingsView({
   boardUnavailable,
   earned,
   pickerEarned,
+  quotaProjects,
 }: {
   project: Project;
   settings: EditableSettings;
@@ -104,11 +107,19 @@ export function SettingsView({
    */
   earned: Record<string, EarnedKind>;
   /**
-   * What this project's own releases and vetoes have earned the PICKER (anton-vkp9). Computed on the
-   * server off the verdict record the pass reads, so the control and the pass can never disagree
-   * about whether `apply` is available.
+   * What this project's own releases and vetoes have earned the PICKER (anton-vkp9), the bar they
+   * are read against, and the operator's signed bypass of it when there is one (anton-d1lk).
+   * Computed on the server off the verdict record and the stored signature the pass reads, so the
+   * control and the pass can never disagree about whether `apply` is available — or about which of
+   * the two is holding it up.
    */
   pickerEarned: EarnedPicker;
+  /**
+   * Every project on this machine, with its declared share, its live eligibility and what this week
+   * attributed to it (R6). Cross-project by necessity: a share only means something against the
+   * other shares, and the split has to redraw as this project's own share is edited.
+   */
+  quotaProjects: QuotaShareProject[];
 }) {
   // Which panel is displayed. The URL hash IS the state — not a copy of it — so /settings#automation
   // lands where it says it will, a reload returns to the same place, and a link points at a section
@@ -143,14 +154,15 @@ export function SettingsView({
     patchSettings: form.patchSettings,
   });
 
-  // Elements, not components: building all fourteen costs a `createElement` each and keeps the panel
-  // choice a lookup rather than a fourteen-arm chain — only the one this renders ever mounts.
+  // Elements, not components: building all fifteen costs a `createElement` each and keeps the panel
+  // choice a lookup rather than a fifteen-arm chain — only the one this renders ever mounts.
   const panels: Record<SectionId, ReactNode> = {
     general: <GeneralSection project={project} form={form} />,
     agents: <AgentsSection form={form} bundledAgents={bundledAgents} userAgents={userAgents} />,
     prompt: <PromptSection form={form} basePrompt={basePrompt} />,
     variants: <VariantsSection form={form} />,
     execution: <ExecutionSection form={form} />,
+    quota: <QuotaSection form={form} project={project} quotaProjects={quotaProjects} />,
     autopilot: <AutopilotSection form={form} />,
     value: <ValueSection form={form} labelVocabulary={labelVocabulary} />,
     repairs: <RepairsSection form={form} projectSlug={project.slug} />,

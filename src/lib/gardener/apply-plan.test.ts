@@ -35,6 +35,7 @@ import {
   MISFILED,
   NOW,
   ordered,
+  parked,
   planFor,
   provenanced,
   REPARENT,
@@ -44,6 +45,7 @@ import {
   SUPERSEDE,
   supersededBy,
   ticket,
+  UNDEFER,
   warm,
 } from "./apply.fixture";
 
@@ -1143,5 +1145,93 @@ describe("planApply — what an approval means against the board as it now is", 
         expect(decide(plan, board).status).toBe("apply");
       }
     });
+  });
+});
+
+/**
+ * Re-judgement of parked work (anton-rozm) — the one move that puts a bead BACK.
+ *
+ * Its bars are the retirement's read from the other direction, and the interesting half is what it
+ * REFUSES to do: the third answer a re-judgement can have — that the work is genuinely dead — is a
+ * permanent won't-do, and no plan here can reach it. Approving returns the bead; the retirement stays
+ * a human's own write.
+ */
+describe("planApply — returning parked work to the board", () => {
+  const refuse = (decision: ReturnType<typeof planApply>): string => {
+    expect(decision.status).toBe("refuse");
+    return decision.status === "refuse" ? decision.reason : "";
+  };
+
+  it("undefers the subject, carrying the fence and the ticket owner the write re-asks", () => {
+    expect(decide(UNDEFER, [parked()])).toEqual({
+      status: "apply",
+      summary: "returned anton-a to the board",
+      steps: [
+        {
+          verb: "undefer",
+          id: "anton-a",
+          claim: "",
+          owner: undefined,
+          kind: "aged-defer",
+          observedAtMs: Date.parse(FILED),
+        },
+      ],
+    });
+  });
+
+  it("names the run target whose ticket set the bead would rejoin", () => {
+    const decision = decide(UNDEFER, [runCard(), parked({ parent: "anton-run" })]);
+
+    expect(decision).toMatchObject({
+      status: "apply",
+      steps: [{ verb: "undefer", owner: { id: "anton-run", claim: "" } }],
+    });
+  });
+
+  it("settles when somebody un-parked it first — the outcome the ask wanted", () => {
+    expect(decide(UNDEFER, [cold("anton-a")])).toEqual({
+      status: "settled",
+      summary: "anton-a is already back on the board",
+    });
+  });
+
+  // The third answer, recorded by the only party entitled to record it. Settling rather than
+  // refusing is the point: the parking is over, so the ask is answered and the proposal closes.
+  it("settles on the permanent won't-do a human wrote by hand", () => {
+    expect(decide(UNDEFER, [cold("anton-a", { status: "closed", labels: [LABELS.abandoned] })])).toEqual({
+      status: "settled",
+      summary: "anton-a is abandoned — the parking was answered by hand",
+    });
+    expect(decide(UNDEFER, [cold("anton-a", { status: "closed" })])).toMatchObject({
+      status: "settled",
+    });
+  });
+
+  it("refuses over a run that owns the bead, or the ticket set it would rejoin", () => {
+    expect(refuse(decide(UNDEFER, [{ ...leased("anton-a", NOW), status: "deferred" }], NOW))).toMatch(
+      /anton-a is mid-run .* returning it to the board/,
+    );
+    const live = runCard({ labels: [LABELS.runLease(NOW + 60_000, "run-9")] });
+    expect(refuse(decide(UNDEFER, [live, parked({ parent: "anton-run" })], NOW))).toMatch(
+      /anton-run is mid-run .* returning anton-a to its ticket set/,
+    );
+  });
+
+  // The fence IS the evidence for this kind: the claim is "parked, and nothing has been back to it",
+  // so a write since the filing is the founder having answered the question themselves.
+  it("refuses a subject somebody has been back to since the filing", () => {
+    expect(refuse(decide(UNDEFER, [warm("anton-a", { status: "deferred" })]))).toMatch(
+      /anton-a has been written to since this proposal was filed — it is no longer the parked bead nobody had been back to/,
+    );
+    expect(refuse(decide(UNDEFER, [bead("anton-a", { status: "deferred" })]))).toMatch(
+      /no write stamp/,
+    );
+  });
+
+  it("refuses a plan that names more than one bead, or none the board still holds", () => {
+    expect(refuse(decide({ ...UNDEFER, subjects: ["anton-a", "anton-b"] }, [parked()]))).toMatch(
+      /names exactly one bead/,
+    );
+    expect(refuse(decide(UNDEFER, []))).toMatch(/anton-a/);
   });
 });

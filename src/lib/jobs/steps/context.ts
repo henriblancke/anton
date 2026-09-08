@@ -5,6 +5,7 @@
  * sibling steps: `steps/git.ts` and `steps/gates.ts` share this file and know nothing of each other.
  */
 import type { Bead, CookedStep } from "../../beads/bd";
+import type { SatisfiedBy } from "../../beads/satisfied-note";
 import type { ClaudeResult, RunClaudeOptions } from "../../claude/driver";
 import type { ProjectSettings } from "../../projects";
 import { startJobSession, type JobSession } from "../../sessions";
@@ -12,6 +13,18 @@ import type { ReviewFinding } from "../review-context";
 import type { ReviewRound } from "../review-gate";
 import type { AntonDb, Clock } from "../queue";
 import type { JobContext } from "../runner";
+
+/**
+ * A satisfied ticket as the run's ledger holds it: the commit it settled on, and whether the close
+ * that settlement calls for actually landed. The deadline can fire between the delivery gate's
+ * acceptance and the close, or bd can refuse the best-effort close outright (PR #253 review) — the
+ * ticket is then blocked or still open, not closed, and the pull request must say so rather than
+ * report a close that never happened.
+ */
+export interface SatisfiedSettlement extends SatisfiedBy {
+  /** False when the close never landed — a budget that ran out on it, or a bd write that failed — so a person closes it. */
+  closed: boolean;
+}
 
 /**
  * A step as the cooked formula carries it, re-exported from the bd seam (anton-brdg) so the registry
@@ -43,7 +56,7 @@ export interface StepContext {
   db: AntonDb;
   clock: Clock;
   /** The runner's job context: cancellation, heartbeats, and the live-session handle. */
-  ctx: Pick<JobContext, "signal" | "heartbeat" | "report">;
+  ctx: Pick<JobContext, "signal" | "heartbeat" | "report" | "claudeReached">;
   projectId: string;
   runId: string;
   /** The project repo — where bd and gh run. Never the worktree. */
@@ -64,6 +77,13 @@ export interface StepContext {
   target: Bead;
   /** The ticket(s) this step covers, in execution order. */
   tickets: Bead[];
+  /**
+   * Which of {@link tickets} settled on an EARLIER commit of this run instead of committing their
+   * own (anton-8h4b), by ticket id. Run-phase only: `pr` attributes each to that commit rather than
+   * listing it as a delivery. Absent on a ticket-phase context and for a caller invoking a handler
+   * directly, which reads as "every ticket committed its own work".
+   */
+  satisfied?: ReadonlyMap<string, SatisfiedSettlement>;
   settings: ProjectSettings;
   /** The formula step being executed. Absent for a caller invoking a handler directly. */
   step?: CookedStep;

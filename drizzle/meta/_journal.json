@@ -211,6 +211,34 @@
       "when": 1788584620478,
       "tag": "0029_run_attempt_started_at",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1788724007937,
+      "tag": "0030_picker_veto_kind",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1788734620828,
+      "tag": "0031_burn_sample_project",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1788810018109,
+      "tag": "0032_jobs_updated_idx",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1788815301862,
+      "tag": "0033_jobs_spent_attempts",
+      "breakpoints": true
     }
   ]
 }

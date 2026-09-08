@@ -95,6 +95,14 @@ export const jobs = sqliteTable(
     runAt: ts("run_at").notNull().default(now),
     leaseExpiresAt: ts("lease_expires_at"),
     attempts: integer("attempts").notNull().default(0),
+    // Attempts that ran Claude on this row, for the quota-share spend estimate (R6.3, ./quota-spend).
+    // `attempts` is the RETRY budget and is rewound on purpose — `resumeJob` zeroes it so an un-parked
+    // job gets a fresh run at `maxAttempts` — so a meter summing it lost every attempt the job had
+    // already burned the moment an operator or the picker resumed it, and the governor granted that
+    // quota again (PR #248 review). This counter is charged when the handler reaches Claude
+    // (`chargeSpentAttempt`), never at the lease — an attempt that exits in preflight is not spend —
+    // and is never rewound or refunded: nothing else touches it.
+    spentAttempts: integer("spent_attempts").notNull().default(0),
     lastError: text("last_error"),
     // What the handler reported it actually DID, written when the job completes (anton-znoz).
     // `ok` = it changed something, `noop` = it ran and found nothing to do. A completed job with a
@@ -142,6 +150,14 @@ export const jobs = sqliteTable(
     index("jobs_project_parked_idx")
       .on(table.projectId, table.updatedAt)
       .where(sql`${table.status} = 'parked'`),
+    // Serves the quota-share spend estimate (R6.3, ./quota-spend), which sums spent attempts over the
+    // current quota week: once per governor tick for one project, and once per settings render for
+    // every project. `updated_at` leads because the week window is the predicate BOTH readers share
+    // — the all-project read has no project to seek on, so a (project_id, updated_at) index would
+    // leave it scanning a jobs table that keeps every finished job for the life of the project.
+    // Seeking the week first bounds both to the same small slice, and the per-project read narrows
+    // inside it without a second index to maintain on every job write.
+    index("jobs_updated_project_idx").on(table.updatedAt, table.projectId),
   ],
 );
 
@@ -157,7 +173,8 @@ export const schedules = sqliteTable("schedules", {
 
 /**
  * Per-job Claude burn samples (anton-w8ny). One row per completed job attempt: the session%/weekly%
- * that moved across the job, attributed to its TYPE. Attribution is clean only for solo windows:
+ * that moved across the job, attributed to its TYPE and to the PROJECT that spent it (anton-wj3d,
+ * nullable — see `project_id`). Attribution is clean only for solo windows:
  * the runner opens a burn window only when this job runs alone (nothing else in flight), and
  * discards the window if a sibling is dispatched before it closes — so every recorded delta is
  * unambiguously one job's cost. A rolling per-type
@@ -170,13 +187,28 @@ export const burnSamples = sqliteTable(
     id: text("id").primaryKey(),
     // execute-epic | review-fix | nightly-stringer | orphan-grooming
     jobType: text("job_type").notNull(),
+    // Whose quota the job spent (anton-wj3d). Nullable, and NOT backfilled: rows written before this
+    // column genuinely do not know their project, and inventing one would poison the very per-project
+    // averages the quota shares are enforced from. Null also covers anton's own plumbing jobs, which
+    // belong to no project's share. Per-project reads match on equality, so unattributed rows are
+    // excluded by construction rather than misattributed.
+    projectId: text("project_id").references(() => projects.id),
     // session/weekly utilization delta (0–100 percentage points) burned across the job.
     sessionDelta: real("session_delta").notNull(),
     weeklyDelta: real("weekly_delta").notNull(),
     createdAt: ts("created_at").notNull().default(now),
   },
-  // Serve the "most recent N samples for this type" query without a full scan.
-  (table) => [index("burn_samples_type_created_idx").on(table.jobType, table.createdAt)],
+  (table) => [
+    // Serve the "most recent N samples for this type" query without a full scan. Kept alongside the
+    // per-project index: the per-type average is still read globally for cost estimates.
+    index("burn_samples_type_created_idx").on(table.jobType, table.createdAt),
+    // Serve "most recent N samples for this project and type" — the per-project spend read.
+    index("burn_samples_project_type_created_idx").on(
+      table.projectId,
+      table.jobType,
+      table.createdAt,
+    ),
+  ],
 );
 
 /**
@@ -260,6 +292,11 @@ export const boardPickerPlans = sqliteTable("board_picker_plans", {
  * track record — the same evidence base earned autonomy reads for the gardener's kinds
  * (`gardener/track-record.ts`), for a surface that has no board fingerprint to count off.
  *
+ * The two vetoes are one VERDICT and two MEANINGS (anton-gtcd): both defer the target and both are
+ * declines, but `✕ not now` is pacing — "not this hour" — while `Never` is judgment about the rule
+ * that admitted the pick. `veto_kind` is what tells them apart on the row, so the record can weigh
+ * genuine disagreement without counting the operator's scheduling against the ranking.
+ *
  * One row per (verdict, pick) — a repeat veto extends its standing decline rather than filing a
  * second one, so the counts stay a record of DECISIONS and not of clicks. A decline carries its own
  * expiry rather than a flag somebody has to clear: a veto defers the target for a bounded window
@@ -283,6 +320,17 @@ export const pickerVerdicts = sqliteTable(
     verdict: text("verdict").notNull(),
     /** `PickerVerdictAction`: which affordance produced it (`not-now`, `never`, `release`). */
     action: text("action").notNull(),
+    /**
+     * `PickerVetoKind`: what a decline MEANT — `pacing` (`not-now`) or `disagreement` (`never`).
+     * Null on an accept, which vetoes nothing.
+     *
+     * Kept beside `action` rather than derived from it because the two answer different questions
+     * and drift apart on purpose (anton-gtcd). `action` is the LAST affordance that touched the row,
+     * and a repeat veto overwrites it; this is the strongest thing the operator ever said about the
+     * pick, and a later `not-now` never erases a `never`. Only the meaning is evidence about the
+     * ranking, so only the meaning may be counted.
+     */
+    vetoKind: text("veto_kind"),
     /** The admitting rule the plan recorded, frozen at the moment of the verdict. */
     rule: text("rule"),
     /**

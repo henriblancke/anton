@@ -9,10 +9,11 @@
 import type { Bead } from "../../beads/bd";
 import { acceptanceBody } from "../../beads/contract";
 import { humanNotesPromptBlock } from "../../beads/notes";
+import { shortSha } from "../../beads/satisfied-note";
 import type { PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
 import { findingLines, type ReviewFinding } from "../review-context";
-import type { StepContext } from "./context";
+import type { SatisfiedSettlement, StepContext } from "./context";
 
 /**
  * What the `step:claude` agent is working ON: the run target, the tickets in scope, and the worktree
@@ -104,36 +105,67 @@ function continuationSection(preserved: PreservedCommit | undefined): string[] {
 }
 
 function continuationPromptBlock(preserved: PreservedCommit): string {
+  const multiple = preserved.earlier.length > 0;
+  // Newest first, so the agent reads the freshest attempt at the top; every one is on the branch.
+  const commitLines = [preserved, ...preserved.earlier].map((c) => `    ${c.sha} ${c.subject}`);
   return [
     `## CONTINUATION — a previous attempt's work is already on this branch`,
     ``,
-    `An earlier attempt at this ticket ran out of its time budget and was stopped. anton kept what ` +
-      `it had built rather than deleting it, and that work is already committed here:`,
+    multiple
+      ? `Earlier attempts at this ticket each ran out of their time budget and were stopped. anton ` +
+        `kept what they had built rather than deleting it, and that work is already committed here ` +
+        `(newest first):`
+      : `An earlier attempt at this ticket ran out of its time budget and was stopped. anton kept ` +
+        `what it had built rather than deleting it, and that work is already committed here:`,
     ``,
-    `    ${preserved.sha} ${preserved.subject}`,
+    ...commitLines,
     ...preservedFilesLines(preserved),
     ``,
-    `That commit is INCOMPLETE by construction: the attempt was stopped mid-ticket, nobody has ` +
-      `confirmed the ticket is finished, and it is in no pull request's delivered list.`,
+    multiple
+      ? `Those commits are INCOMPLETE by construction: the attempts were stopped mid-ticket, nobody ` +
+        `has confirmed the ticket is finished, and none is in any pull request's delivered list.`
+      : `That commit is INCOMPLETE by construction: the attempt was stopped mid-ticket, nobody has ` +
+        `confirmed the ticket is finished, and it is in no pull request's delivered list.`,
     ``,
-    `Read it first (\`git show ${preserved.sha}\`) and CONTINUE from it — finish the acceptance ` +
+    `Read ${preservedInspectClause(preserved)} first and CONTINUE from it — finish the acceptance ` +
       `criteria it has not met yet. Do not restart the ticket from scratch, and do not revert or ` +
       `re-do what is already there.`,
     ``,
     `If, after reading it, everything the ticket asks for is genuinely already done, do not ` +
       `manufacture a change to prove it: say what you found and end with \`ANTON-RESULT: ` +
-      `delivered\`. The preserved commit is then this ticket's delivery — this is the one case ` +
+      `delivered\`. The preserved work is then this ticket's delivery — this is the one case ` +
       `where reporting \`delivered\` on an unchanged working tree is correct, because the work is ` +
       `on the branch. Without that line the run parks and the work never reaches a pull request.`,
   ].join("\n");
 }
 
 /**
- * The preserved diff, or the marker's explanation. An EMPTY preserved commit is the marker form:
- * the agent committed the work under its own subjects and this commit only records whose it is, so
- * pointing at its (empty) diff would tell the agent nothing was kept.
+ * What to `git show`: a single commit, or the whole preserved range when the ticket timed out more
+ * than once (anton-16pq) — the newest commit alone omits the earlier attempts' deltas.
+ */
+function preservedInspectClause(preserved: PreservedCommit): string {
+  const oldest = preserved.earlier.at(-1);
+  return oldest
+    ? `all of it (\`git show ${oldest.sha}^..${preserved.sha}\`)`
+    : `it (\`git show ${preserved.sha}\`)`;
+}
+
+/**
+ * The preserved diff, the marker's explanation, or — when git could not be read — nothing but a
+ * pointer to inspect it directly. An EMPTY (`[]`) preserved commit is the marker form: the agent
+ * committed the work under its own subjects and this commit only records whose it is, so pointing at
+ * its (empty) diff would tell the agent nothing was kept. `undefined` is an unreadable diff (a git
+ * failure), NOT an empty one — presenting it as a marker would falsely claim the work lives beneath
+ * a commit anton never actually read (PR #255 review).
  */
 function preservedFilesLines(preserved: PreservedCommit): string[] {
+  if (preserved.files === undefined) {
+    return [
+      ``,
+      `anton could not read the preserved diff (a git error), so no file list is shown — inspect it ` +
+        `yourself with the command below before continuing.`,
+    ];
+  }
   if (preserved.files.length === 0) {
     return [
       ``,
@@ -146,7 +178,7 @@ function preservedFilesLines(preserved: PreservedCommit): string[] {
   const rest = preserved.files.length - shown.length;
   return [
     ``,
-    `Files it changed:`,
+    `Files changed across the preserved work:`,
     ...shown.map((f) => `- ${f}`),
     ...(rest > 0 ? [`- … and ${rest} more (\`git show --stat ${preserved.sha}\`)`] : []),
   ];
@@ -198,28 +230,55 @@ function standaloneContext(ticket: Bead, description: string | undefined): strin
   return context && context !== description ? context : undefined;
 }
 
-/** Why the inlined spec is authoritative, and what to do when it is empty anyway. */
+/**
+ * Why the inlined spec is authoritative, what to do when it is empty anyway, and when the step's
+ * honest outcome is `satisfied` rather than `blocked` (anton-6l0q): a ticket is one step of a run
+ * whose earlier steps committed to this same branch, so its acceptance can already be met before the
+ * agent starts. The contract defines the line; this names the moment it applies to THIS ticket.
+ */
 function ticketPromptClosing(ticketId: string): string {
-  return (
+  return [
     `The full ticket spec is inlined above so you can implement it even if the worktree's beads ` +
-    `DB is unreadable. \`bd show ${ticketId}\` gives the same content when bd is healthy. If ` +
-    `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
-    `not guess or silently bail. Follow the operating contract in your system prompt.`
-  );
+      `DB is unreadable. \`bd show ${ticketId}\` gives the same content when bd is healthy. If ` +
+      `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
+      `not guess or silently bail. Follow the operating contract in your system prompt.`,
+    ``,
+    `Before you implement, check the branch: earlier steps of this run committed here, and one of ` +
+      `them may already meet every acceptance criterion above. If it does, do not redo or ` +
+      `restate that work and do not report \`blocked\` — end with ` +
+      `\`ANTON-RESULT: satisfied — <commit sha> — <how that commit covers ${ticketId}>\`, naming ` +
+      `the commit that did it. That is the honest answer only when every criterion is met by work ` +
+      `already committed on this branch; if any is still open, do the remaining work and report ` +
+      `\`delivered\`.`,
+  ].join("\n");
 }
 
 /**
  * `advisory` — findings the self-review reported and did NOT fix (anton-omum). They never hold the PR
  * back, so the merge gate is the only place the founder would ever see them; putting them in the body
  * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
+ *
+ * `satisfied` — the tickets that settled on an EARLIER commit of this run (anton-8h4b). Their
+ * acceptance is in this diff, but no commit here carries their name, so the body attributes each to
+ * the commit that did the work rather than listing it among the deliveries: a reader matching
+ * tickets to commits would otherwise go looking for one that does not exist.
  */
-export function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] = []): string {
+export function prBody(
+  target: Bead,
+  tickets: Bead[],
+  advisory: ReviewFinding[] = [],
+  satisfied: ReadonlyMap<string, SatisfiedSettlement> = new Map(),
+): string {
   // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
   const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
+  const committed = tickets.filter((t) => !satisfied.has(t.id));
   const lines = [
     `Autonomous run for **${target.id}** — ${target.title}.`,
     ``,
-    ...(standalone ? [] : [`Tickets:`, ...tickets.map((t) => `- ${t.id} — ${t.title}`), ``]),
+    ...(standalone || committed.length === 0
+      ? []
+      : [`Tickets:`, ...committed.map((t) => `- ${t.id} — ${t.title}`), ``]),
+    ...satisfiedLines(standalone ? [] : tickets, satisfied),
     ...(advisory.length > 0
       ? [
           `### Unresolved review findings (${advisory.length}, advisory)`,
@@ -233,4 +292,36 @@ export function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] 
     `🤖 Generated with [anton](${ANTON_REPO_URL}) autonomous execution`,
   ];
   return lines.join("\n");
+}
+
+/**
+ * The satisfied attribution as the PR body and its stale-body fallback both render it (PR #253
+ * review): one line per ticket naming the commit that did its work. Empty when nothing settled that
+ * way. The header claims no close — a ticket whose close never landed (a budget that ran out on it,
+ * or a bd write that failed) is still open or blocked, and its line says so, since the body is where
+ * a reviewer learns it needs closing by hand.
+ */
+export function satisfiedLines(
+  tickets: Bead[],
+  satisfied: ReadonlyMap<string, SatisfiedSettlement>,
+): string[] {
+  const settled = tickets.filter((t) => satisfied.has(t.id));
+  if (settled.length === 0) return [];
+  return [
+    `Satisfied by earlier commits of this run (no commit of their own):`,
+    ...settled.map((t) => {
+      const by = satisfied.get(t.id)!;
+      const line = `- ${t.id} — ${t.title} — by ${satisfiedByLine(by)}`;
+      return by.closed
+        ? line
+        : `${line} — NOT closed: the close never landed (its budget ran out on it, or bd refused ` +
+            `the write), so it is not done on the board; review that commit and close it by hand`;
+    }),
+    ``,
+  ];
+}
+
+/** `<short sha> "<subject>"` — the subject is the attribution, since anton's commits are named for their ticket. */
+function satisfiedByLine(by: SatisfiedSettlement): string {
+  return by.subject ? `${shortSha(by.commit)} "${by.subject}"` : shortSha(by.commit);
 }

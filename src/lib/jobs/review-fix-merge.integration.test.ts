@@ -10,11 +10,13 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { and, eq } from "drizzle-orm";
 import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
-import { driveJob } from "@/lib/testing/jobs";
+import { driveJob, makeJobRunner } from "@/lib/testing/jobs";
 import { beads, LABELS } from "../beads/bd";
+import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
-import { makeReviewFixHandler } from "./review-fix";
+import { makeReviewFixHandler, makeReviewFixPrHandler } from "./review-fix";
 import { createRun, getRunById } from "../runs";
 import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
@@ -59,7 +61,7 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
   let runId: string;
   let restoreEnv: () => void;
 
-  const runSweep = () =>
+  const runDispatch = () =>
     driveJob({
       db: tdb.db,
       clock,
@@ -68,6 +70,39 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
       projectId,
       config: { leaseMs: 30_000 },
     });
+
+  /** Every review-fix-pr row queued right now, by the target it names. */
+  const queuedFixTargets = async () =>
+    (
+      await tdb.db
+        .select()
+        .from(schema.jobs)
+        .where(and(eq(schema.jobs.type, "review-fix-pr"), eq(schema.jobs.status, "queued")))
+    ).map((j) => JSON.parse(j.payloadJson).epicBeadId as string);
+
+  /**
+   * A whole cycle: the DISPATCHER, then every per-PR job it fanned out. Finalization moved behind
+   * that fan-out (anton-3jwh) — the poll only triages now — so a merge is finalized by the job it
+   * dispatched, not by the poll itself. Returns the fix jobs' ids.
+   */
+  async function runSweep(): Promise<string[]> {
+    await runDispatch();
+    const queued = await tdb.db
+      .select({ id: schema.jobs.id })
+      .from(schema.jobs)
+      .where(and(eq(schema.jobs.type, "review-fix-pr"), eq(schema.jobs.status, "queued")));
+    if (queued.length === 0) return [];
+
+    const runner = makeJobRunner({
+      db: tdb.db,
+      clock,
+      type: "review-fix-pr",
+      handler: makeReviewFixPrHandler,
+      config: { leaseMs: 30_000 },
+    });
+    while ((await runner.tickOnce()) > 0) await runner.whenIdle();
+    return queued.map((q) => q.id);
+  }
 
   const branchExists = (b: string) => {
     const out = execFileSync("git", ["-C", repo, "branch", "--list", b], { encoding: "utf8" });
@@ -127,8 +162,9 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
   it("finalizes a merged PR: epic + tickets → done, stage cleared, branch + run cleaned up", async () => {
     process.env.ANTON_GH_BIN = ghForState(binDir, "gh-merged", "MERGED");
 
-    const jobId = await runSweep();
-    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    const [fixJob, ...rest] = await runSweep();
+    expect(rest).toEqual([]); // exactly one per-PR job carried the finalization
+    expect((await getJob(tdb.db, fixJob))?.status).toBe("done");
 
     // Epic + both tickets are closed; stage:in-review is gone.
     expect((await beads.show(repo, epicId)).status).toBe("closed");
@@ -149,10 +185,9 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
     process.env.ANTON_GH_BIN = ghForState(binDir, "gh-merged2", "MERGED");
     await runSweep();
 
-    // Re-run: the epic is no longer in-review (stage cleared + closed), so the sweep is a no-op —
-    // it completes cleanly and leaves the finalized state exactly as it was.
-    const jobId = await runSweep();
-    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    // Re-run: the epic is no longer in-review (stage cleared + closed), so the dispatcher finds
+    // nothing to fan out and leaves the finalized state exactly as it was.
+    expect(await runSweep()).toEqual([]);
     expect((await beads.show(repo, epicId)).status).toBe("closed");
     expect((await beads.show(repo, ticketA)).status).toBe("closed");
     expect((await getRunById(tdb.db, runId))?.status).toBe("done");
@@ -161,8 +196,8 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
   it("does NOT finalize a PR closed without merging", async () => {
     process.env.ANTON_GH_BIN = ghForState(binDir, "gh-closed", "CLOSED");
 
-    const jobId = await runSweep();
-    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    // A closed-but-unmerged PR is not actionable either, so nothing is even dispatched.
+    expect(await runSweep()).toEqual([]);
 
     // Epic stays open and in-review; the run is untouched.
     const epic = await beads.show(repo, epicId);
@@ -170,5 +205,35 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
     expect(epic.labels ?? []).toContain(LABELS.stage("in-review"));
     expect(branchExists(branch)).toBe(true);
     expect((await getRunById(tdb.db, runId))?.status).toBe("running");
+  });
+
+  /**
+   * anton-5mjt: a merged target reaches finalization through a `review-fix-pr` job, and the
+   * dispatcher's coalescing key stays clear. Its dedupe is settled-rows-do-not-cover, so gate-check
+   * keeps re-dispatching until the finalize actually lands — a half-done one heals itself.
+   */
+  it("dispatches the merge onto review-fix-pr, once, and re-dispatches after a settled attempt", async () => {
+    process.env.ANTON_GH_BIN = ghForState(binDir, "gh-merged3", "MERGED");
+
+    await runDispatch();
+    expect(await queuedFixTargets()).toEqual([epicId]);
+    // A second pass over the same still-open target adds nothing — the live job covers it.
+    await runDispatch();
+    expect(await queuedFixTargets()).toEqual([epicId]);
+    // And nothing landed on the dispatcher's own type, which is what would have swallowed the poll.
+    const dispatcherRows = await tdb.db
+      .select()
+      .from(schema.jobs)
+      .where(eq(schema.jobs.type, "review-fix"));
+    expect(dispatcherRows.every((j) => JSON.parse(j.payloadJson).epicBeadId === undefined)).toBe(true);
+
+    // Settle the fix without it finalizing anything (a park is what a failed finalize leaves), and
+    // the next pass dispatches again rather than treating the target as covered.
+    await tdb.db
+      .update(schema.jobs)
+      .set({ status: "parked" })
+      .where(eq(schema.jobs.type, "review-fix-pr"));
+    await runDispatch();
+    expect(await queuedFixTargets()).toEqual([epicId]);
   });
 });

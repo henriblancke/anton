@@ -58,6 +58,8 @@ export interface EditableSettings {
   /** Per-label pipeline variants (anton-aa3m), in precedence order — first matching label wins. */
   formulaVariants?: FormulaVariant[];
   concurrency?: number;
+  /** Max concurrent per-PR review fixes (anton-kwi6); absent = DEFAULT_REVIEW_FIX_CONCURRENCY. */
+  reviewFixConcurrency?: number;
   jobTimeoutMinutes?: number;
   ticketTimeoutMinutes?: number;
   maxRetries?: number;
@@ -80,6 +82,13 @@ export interface EditableSettings {
   repairAutonomy?: Record<string, string>;
   /** Budget-aware execution master-switch (anton-7mpv.1); off by default. Gates the knobs below. */
   budgetAware?: boolean;
+  /**
+   * This project's declared cut of the shared weekly quota (R6.1). Absent = never declared, which
+   * the panel renders as the equal split across paced projects rather than as a number nobody chose.
+   */
+  quotaSharePct?: number;
+  /** `reserve my share` (R6.5): keep the allocation even while this project sits idle. */
+  reserveQuotaShare?: boolean;
   /** Operator budget policy (anton-egrg); only the two exposed knobs round-trip through this form. */
   budgetPolicy?: {
     daytimeReservePct?: number;

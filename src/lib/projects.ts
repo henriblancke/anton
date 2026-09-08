@@ -13,12 +13,15 @@ import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
-import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
+import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./jobs/budget";
+import { resolveGovernedShare, type GovernedShare } from "./quota-share";
+import { eligibilityOf, observedWorkEligibility } from "./quota-eligibility";
 import { GARDENER_DETECTION_KINDS } from "./gardener/detections";
 import {
-  earnedPickerAutonomy,
+  pickerApplyVerdict,
   PROPOSAL_AUTONOMY_LEVELS,
   resolveProposalAutonomyPolicy,
+  type DeliberateArming,
   type PickerRecordCounts,
   type ProposalAutonomyOverrides,
   type ProposalAutonomyPolicy,
@@ -228,6 +231,13 @@ export interface ProjectSettings {
    */
   concurrency?: number;
   /**
+   * Max concurrent per-PR review fixes for this project (anton-kwi6). The scheduled review-fix poll
+   * fans out one `review-fix-pr` job per actionable PR, and the runner gates that type per project
+   * against this — so a burst of review activity cannot fill the global slot pool and starve
+   * execute-epic. Absent → DEFAULT_REVIEW_FIX_CONCURRENCY.
+   */
+  reviewFixConcurrency?: number;
+  /**
    * How long a job attempt may go WITHOUT PROGRESS before the runner aborts it, in minutes
    * (anton-xbk; re-scoped from a total wall clock in anton-t1mo). Measured from the handler's last
    * `ctx.heartbeat()` — a wedge backstop, NOT the per-task budget. On expiry the run is aborted and
@@ -302,6 +312,19 @@ export interface ProjectSettings {
    * {@link budgetAware} is on.
    */
   budgetPolicy?: ProjectBudgetPolicy;
+  /**
+   * This project's declared cut of the shared weekly Claude quota, 0–100 (R6.1). Absent → an equal
+   * split across the projects with budget-aware execution on ({@link defaultQuotaSharePct}), so a
+   * machine that never declares anything still divides its quota rather than racing for it. Only
+   * consulted when {@link budgetAware} is on — an ungoverned project spends unpaced either way.
+   */
+  quotaSharePct?: number;
+  /**
+   * `reserve my share` (R6.5): hold this project's share out of renormalization even while it has no
+   * eligible work, for a repo touched irregularly. Absent → off, which is what lets an idle repo's
+   * share flow to the projects that can use it rather than resetting unspent.
+   */
+  reserveQuotaShare?: boolean;
   /**
    * Per-label pipeline variants (anton-aa3m): bead label → the run formula a target carrying it
    * walks, in PRECEDENCE ORDER (first match wins — see `selectRunFormula`). Lets risk and size drive
@@ -396,6 +419,20 @@ export interface ProjectSettings {
    * {@link pickerAutonomySchema} at the API boundary.
    */
   pickerAutonomy?: PickerAutonomy;
+  /**
+   * A DELIBERATE arming of `apply` (anton-d1lk): the operator's explicit, signed bypass of the
+   * earned floor, or absent — which is every project until somebody arms one, since nothing writes
+   * this but the arming route. Revoking is deleting it, and the very next pass re-floors the project
+   * on its record.
+   *
+   * Deliberately NOT in the settings PATCH table: the actor is resolved SERVER-side
+   * (`resolveOperator`), because a caller-supplied author on the one field that starts unattended
+   * work with no evidence behind it would make the audit trail worth nothing.
+   *
+   * It bypasses the earned floor and nothing else. The structural floor below still refuses an
+   * unarmed project, and the brakes and the budget governor sit downstream of the level entirely.
+   */
+  pickerApplyOverride?: DeliberateArming;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -422,6 +459,14 @@ export function resolveVerifyGates(settings: ProjectSettings): VerifyGate[] {
 
 /** Defaults for the per-project job policy when a setting is unset. */
 export const DEFAULT_CONCURRENCY = 3;
+/**
+ * Two, not three: the global ceiling is 8 (ANTON_MAX_CONCURRENT) and {@link DEFAULT_CONCURRENCY} is
+ * already 3, so 2 still fixes PRs in parallel while leaving headroom for gate-check, sync-push and
+ * the other polls to keep their slots. This bounds ONE project; the sum across projects is bounded
+ * by the runner-wide ANTON_MAX_REVIEW_FIX_CONCURRENT (half the pool by default), which is what
+ * actually keeps those slots free when several projects have actionable PRs at once.
+ */
+export const DEFAULT_REVIEW_FIX_CONCURRENCY = 2;
 export const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2 hours without progress
 export const DEFAULT_TICKET_TIMEOUT_MINUTES = 45;
 export const DEFAULT_MAX_RETRIES = 3;
@@ -467,6 +512,7 @@ export const DEFAULT_AUTOPILOT_WIP_LIMIT = 3;
 
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
+export const REVIEW_FIX_CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const JOB_TIMEOUT_MINUTES_RANGE = { min: 5, max: 720 } as const; // 5 min … 12 h
 export const TICKET_TIMEOUT_MINUTES_RANGE = { min: 5, max: 240 } as const; // 5 min … 4 h
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
@@ -841,6 +887,34 @@ export function resolvePickerPolicy(settings: ProjectSettings): Policy | undefin
 export const pickerAutonomySchema = z.enum(PICKER_AUTONOMY_LEVELS);
 
 /**
+ * A stored deliberate arming (anton-d1lk). Both halves required and the instant a real one: an
+ * arming that cannot say who or when is not an audit trail, and the whole justification for letting
+ * it stand in for the record is that it names somebody.
+ */
+export const deliberateArmingSchema = z
+  .object({
+    by: z.string().trim().min(1).max(200),
+    at: z.iso.datetime(),
+  })
+  .strict();
+
+/**
+ * The deliberate arming stored on this project, or undefined when there is none — or when what is
+ * stored cannot be read as one.
+ *
+ * Validated on the way OUT, not merely on the way in, and that is the point: settingsJson is
+ * hand-editable, and a half-written arming must fall back to the earned floor rather than arm
+ * `apply` off a fragment. Same fail-safe direction as {@link resolveProposalAutonomyPolicy}, which
+ * drops what it cannot read instead of failing a pass over it.
+ */
+export function resolvePickerApplyOverride(
+  settings: ProjectSettings,
+): DeliberateArming | undefined {
+  const parsed = deliberateArmingSchema.safeParse(settings.pickerApplyOverride);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
  * How far the picker may go on this project — the stored level with BOTH floors applied here, so no
  * caller has to remember either.
  *
@@ -851,8 +925,14 @@ export const pickerAutonomySchema = z.enum(PICKER_AUTONOMY_LEVELS);
  *
  * The EARNED floor (anton-vkp9): `apply` also has to be earned, by this project's own record of
  * releases and vetoes, against the same bars the gardener's kinds clear
- * ({@link earnedPickerAutonomy}). A policy is what anton MAY start; the record is whether its picks
+ * ({@link pickerApplyVerdict}). A policy is what anton MAY start; the record is whether its picks
  * have been worth starting, and only the operator's answers say so.
+ *
+ * That second floor — and ONLY that one — takes a stored deliberate arming as its answer
+ * (anton-d1lk): an operator who accepts the risk today signs for it, and the signature stands in for
+ * the evidence. The structural floor above it does not move for anybody, so a project with no work
+ * policy still cannot reach `apply` however deliberately it was armed — there is no boundary there
+ * to accept the risk OF.
  *
  * Both land on `shadow` rather than on `propose`, and that is deliberate: `shadow` is the lane where
  * picks are offered and answered, so it is where the record is MADE. Demoting to `propose` would
@@ -861,7 +941,8 @@ export const pickerAutonomySchema = z.enum(PICKER_AUTONOMY_LEVELS);
  * reason: its `shadow` writes records nobody asked for.)
  *
  * Re-asked on every pass, never latched, which is what makes the earned floor bite after arming too:
- * a record that degrades returns the picker to `shadow` on the next tick.
+ * a record that degrades returns the picker to `shadow` on the next tick — and a project standing on
+ * a deliberate arming returns there on the tick after it is revoked.
  */
 export function resolvePickerAutonomy(
   settings: ProjectSettings,
@@ -872,7 +953,9 @@ export function resolvePickerAutonomy(
   if (!stored) return armed ? "shadow" : "propose";
   if (stored !== "apply") return stored;
   if (!armed) return "shadow";
-  return earnedPickerAutonomy(record).eligible ? "apply" : "shadow";
+  return pickerApplyVerdict(record, resolvePickerApplyOverride(settings)).allowed
+    ? "apply"
+    : "shadow";
 }
 
 /**
@@ -1016,25 +1099,79 @@ export async function isBudgetAwareEnabledAnywhere(): Promise<boolean> {
 }
 
 /**
- * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
- * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) the per-project
- * governor applies — rather than a hard-coded default, so an operator who tunes `weeklyTargetPct`
- * or `daytimeReservePct` sees the nudge agree with what the runner actually admits. Empty when no
- * project has opted in (the nudge's hide gate); a project with unparseable settingsJson is treated
- * as off, mirroring {@link isBudgetAwareEnabledAnywhere}.
+ * Every budget-aware project on this machine, with its settings — the board a quota share is
+ * proportioned against, and the denominator of the equal-split default. An unparseable settingsJson
+ * reads as off, mirroring {@link isBudgetAwareEnabledAnywhere}.
  */
-export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
-  const rows = await getDb().select({ settingsJson: schema.projects.settingsJson }).from(schema.projects);
-  const policies: BudgetPolicy[] = [];
+async function governedProjects(): Promise<{ projectId: string; settings: ProjectSettings }[]> {
+  const rows = await getDb()
+    .select({ id: schema.projects.id, settingsJson: schema.projects.settingsJson })
+    .from(schema.projects);
+  const governed: { projectId: string; settings: ProjectSettings }[] = [];
   for (const row of rows) {
     try {
       const settings = JSON.parse(row.settingsJson) as ProjectSettings;
-      if (settings.budgetAware === true) policies.push(resolveBudgetPolicy(settings));
+      if (settings.budgetAware === true) governed.push({ projectId: row.id, settings });
     } catch {
       // unparseable settings → not budget-aware; skip
     }
   }
-  return policies;
+  return governed;
+}
+
+/**
+ * The quota-share board of every budget-aware project on this machine (R6.1 / R6.4 / R6.5) — what
+ * one project's share is proportioned against by `resolveGovernedShare` (./quota-share).
+ *
+ * Ungoverned projects are absent by construction: they spend unpaced, so counting them in the
+ * denominator would shrink everyone else's cut to fund a project no share binds. An undeclared
+ * project carries no `declaredPct` (it rides the equal split), which is NOT the same as declaring 0
+ * — that parks a repo.
+ *
+ * Live eligibility rides along so the denominator is recomputed per pass rather than fixed at the
+ * declarations: an idle repo drops out and its share is spent by the repos that have work, unless it
+ * reserved it. Read fresh on every call for the same reason — that is what makes a waking repo
+ * reclaim its cut on the next pass instead of after an operator action. An unobservable or failed
+ * read resolves to `null`, which reads as "can spend": nobody loses a share to a question this
+ * machine never managed to ask.
+ */
+export async function budgetAwareQuotaShares(): Promise<GovernedShare[]> {
+  return governedQuotaBoard(await governedProjects());
+}
+
+/** The board above, over an already-read governed set — so a caller needing both reads once. */
+async function governedQuotaBoard(
+  governed: readonly { projectId: string; settings: ProjectSettings }[],
+): Promise<GovernedShare[]> {
+  const eligible = await observedWorkEligibility(getDb()).catch(() => null);
+  return governed.map(({ projectId, settings }) => ({
+    projectId,
+    declaredPct: settings.quotaSharePct,
+    eligible: eligibilityOf(eligible, projectId),
+    reserved: settings.reserveQuotaShare === true,
+  }));
+}
+
+/**
+ * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
+ * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) and the SAME quota
+ * share (R6.1) the per-project governor applies — rather than a hard-coded default, so an operator
+ * who tunes `weeklyTargetPct` or `daytimeReservePct` sees the nudge agree with what the runner
+ * actually admits. Empty when no project has opted in (the nudge's hide gate).
+ *
+ * The nudge passes no per-project spend to `budgetGate`, so the share ceiling each policy carries is
+ * checked against a spend of 0 there: it binds only for a 0% share — a parked repo defers, as it
+ * should, since its governor would never burn the quota being nudged about — and for any positive
+ * share it is the whole weekly target on the account meter that answers. Deliberate: the nudge asks
+ * whether the MACHINE has idle weekly quota worth shaping work for; which repo gets to spend it, and
+ * how much of its share is already gone, is the governor's decision at lease time, not the nudge's.
+ */
+export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
+  const governed = await governedProjects();
+  const board = await governedQuotaBoard(governed);
+  return governed.map(({ projectId, settings }) =>
+    withQuotaShare(resolveBudgetPolicy(settings), resolveGovernedShare(projectId, board).sharePct),
+  );
 }
 
 /** Apply a patch to a settings blob, key by key. Pure — the store's read/write is the caller's. */
@@ -1069,19 +1206,32 @@ function mergeSettings(
   return next;
 }
 
+/** What a conditional writer decides once it can see the settings it is writing against. */
+export type SettingsWriteDecision<R> = { write: Partial<ProjectSettings> } | { refuse: R };
+
+/** The outcome of a conditional write. `settings` is the standing blob either way. */
+export type SettingsWriteResult<R> =
+  | { applied: true; settings: ProjectSettings }
+  | { applied: false; settings: ProjectSettings; refused: R };
+
 /**
- * Merge a settings patch into the project's settingsJson. Returns the merged settings.
+ * Merge a settings patch into the project's settingsJson, unless `decide` refuses once it has seen
+ * the settings as they stand AT WRITE TIME. Returns the merged blob, or the untouched one plus the
+ * refusal.
  *
- * The read, the merge and the write happen inside ONE immediate transaction, synchronously, because
- * every writer here rewrites the WHOLE blob and the settings page has several of them: the global
- * Save, the automation table (which saves on change) and the work-policy panel each PATCH on their
- * own. Two in flight at once would otherwise both read the pre-save row, and the later write would
- * silently erase the earlier one's keys while both requests reported success.
+ * The read, the decision, the merge and the write happen inside ONE immediate transaction,
+ * synchronously, for two reasons. Every writer here rewrites the WHOLE blob and the settings page
+ * has several of them — the global Save, the automation table (which saves on change) and the
+ * work-policy panel each PATCH on their own — so two in flight at once would both read the pre-save
+ * row and the later write would silently erase the earlier one's keys while both reported success.
+ * And a guard that ran BEFORE the transaction is only a hint: two callers can both read a state
+ * their guard admits and both write, which is how a conflict the caller reports as a 409 becomes a
+ * silent overwrite instead. Deciding under the write lock is what makes the refusal true.
  */
-export async function updateProjectSettings(
+export async function updateProjectSettingsIf<R>(
   slug: string,
-  patch: Partial<ProjectSettings>,
-): Promise<ProjectSettings> {
+  decide: (current: ProjectSettings) => SettingsWriteDecision<R>,
+): Promise<SettingsWriteResult<R>> {
   const db = getDb();
   const p = await getProjectBySlug(slug);
   if (!p) throw new Error(`Project not found: ${slug}`);
@@ -1093,19 +1243,32 @@ export async function updateProjectSettings(
         .where(eq(schema.projects.id, p.id))
         .limit(1)
         .get();
-      const next = mergeSettings(parseSettings(row?.settingsJson), patch);
+      const current = parseSettings(row?.settingsJson);
+      const decision = decide(current);
+      if ("refuse" in decision) {
+        return { applied: false as const, settings: current, refused: decision.refuse };
+      }
+      const next = mergeSettings(current, decision.write);
       tx
         .update(schema.projects)
         .set({ settingsJson: JSON.stringify(next) })
         .where(eq(schema.projects.id, p.id))
         .run();
-      return next;
+      return { applied: true as const, settings: next };
     },
     // The write lock is taken up front: a deferred transaction would read first and only then try to
     // upgrade, which is the shape that loses to SQLITE_BUSY under exactly the concurrency this
     // guards against.
     { behavior: "immediate" },
   );
+}
+
+/** Merge a settings patch into the project's settingsJson. Returns the merged settings. */
+export async function updateProjectSettings(
+  slug: string,
+  patch: Partial<ProjectSettings>,
+): Promise<ProjectSettings> {
+  return (await updateProjectSettingsIf(slug, () => ({ write: patch }))).settings;
 }
 
 /** What the shared beads config path reports back — the one seam the log helpers below read. */
@@ -1316,7 +1479,7 @@ async function deleteSessionLogs(db: AntonDb, projectId: string): Promise<void> 
  * Teardown step 4 — drop the project's anton.db rows atomically, children before parents (no ON
  * DELETE CASCADE in the schema): sessions → runs → jobs → schedules → run-health → picker plan →
  * picker verdicts → picker starts → hygiene → scan summaries → autopilot disarms → escalations →
- * projects.
+ * burn samples (detached, not deleted) → projects.
  */
 function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
   try {
@@ -1345,6 +1508,16 @@ function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
         .where(eq(schema.autopilotDisarms.projectId, projectId))
         .run();
       tx.delete(schema.escalations).where(eq(schema.escalations.projectId, projectId)).run();
+      // Burn samples are DETACHED rather than dropped: what each job type costs this machine is a
+      // property of the machine, not of the project that happened to spend it, and the per-type
+      // averages pacing reads would otherwise regress to the tier seeds on every deregistration.
+      // Nulling the attribution is exactly what the column's null already means (unattributed), and
+      // it clears the foreign key that would otherwise roll the whole teardown back.
+      tx
+        .update(schema.burnSamples)
+        .set({ projectId: null })
+        .where(eq(schema.burnSamples.projectId, projectId))
+        .run();
       tx.delete(schema.projects).where(eq(schema.projects.id, projectId)).run();
     });
   } catch (e) {

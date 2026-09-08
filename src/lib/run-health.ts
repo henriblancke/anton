@@ -12,6 +12,7 @@
  */
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { epochOrZero } from "./db/epoch";
 import type { AntonDb, Clock } from "./jobs/queue";
 
 /**
@@ -78,11 +79,6 @@ function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
 }
 
-function toEpoch(value: unknown): number {
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value ?? 0);
-}
-
 /**
  * Deterministic ordering for a report's findings: by kind, then by key. Two sweeps over unchanged
  * state must serialize byte-identically — that's what makes the persisted report idempotent rather
@@ -139,7 +135,7 @@ export async function getRunHealthReport(
   return {
     projectId: row.projectId,
     jobId: row.jobId ?? undefined,
-    generatedAt: toEpoch(row.generatedAt),
+    generatedAt: epochOrZero(row.generatedAt),
     findings,
   };
 }

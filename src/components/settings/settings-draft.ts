@@ -7,6 +7,7 @@ import {
   DEFAULT_DAYTIME_RESERVE_PCT,
   DEFAULT_JOB_TIMEOUT_MINUTES,
   DEFAULT_MAX_RETRIES,
+  DEFAULT_REVIEW_FIX_CONCURRENCY,
   DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
   DEFAULT_REVIEW_MAX_ROUNDS,
   DEFAULT_REVIEW_MIN_SCORE,
@@ -41,6 +42,7 @@ export interface SettingsDraft {
   model: string;
   seedPrompt: string;
   reviewFixPrompt: string;
+  reviewFixConcurrency: number;
   productMasterPrompt: string;
   reviewEnabled: boolean;
   reviewAgent: string;
@@ -64,6 +66,13 @@ export interface SettingsDraft {
   autopilotScoreFloor: number;
   autopilotScoreWindow: number;
   budgetAware: boolean;
+  /**
+   * The declared quota share (R6.1), or `null` while the project is still on the equal split. Held
+   * unresolved — unlike the brakes above — because the default is a fact about the OTHER projects on
+   * this machine, so resolving it here would bake one page load's project count into an edit.
+   */
+  quotaSharePct: number | null;
+  reserveQuotaShare: boolean;
   daytimeReservePct: number;
   weeklyTargetPct: number;
   /** The enabled BUNDLED allowlist. User agents always run and are never members. */
@@ -96,6 +105,7 @@ export function draftFromSettings(
     model: settings.model ?? "",
     seedPrompt: settings.seedPrompt ?? "",
     reviewFixPrompt: settings.reviewFixPrompt ?? "",
+    reviewFixConcurrency: settings.reviewFixConcurrency ?? DEFAULT_REVIEW_FIX_CONCURRENCY,
     productMasterPrompt: settings.productMasterPrompt ?? "",
     // Absent → ON: the self-review gate runs unless the operator turns it off (anton-3apm).
     reviewEnabled: settings.reviewEnabled ?? true,
@@ -119,6 +129,8 @@ export function draftFromSettings(
     autopilotScoreFloor: settings.autopilotScoreFloor ?? DEFAULT_AUTOPILOT_SCORE_FLOOR,
     autopilotScoreWindow: settings.autopilotScoreWindow ?? DEFAULT_AUTOPILOT_SCORE_WINDOW,
     budgetAware: settings.budgetAware ?? false,
+    quotaSharePct: settings.quotaSharePct ?? null,
+    reserveQuotaShare: settings.reserveQuotaShare ?? false,
     daytimeReservePct: settings.budgetPolicy?.daytimeReservePct ?? DEFAULT_DAYTIME_RESERVE_PCT,
     weeklyTargetPct: settings.budgetPolicy?.weeklyTargetPct ?? DEFAULT_WEEKLY_TARGET_PCT,
     activeAgents: new Set(settings.agents ?? bundledAgentIds),
@@ -143,6 +155,7 @@ const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
   model: ["model"],
   seedPrompt: ["seedPrompt"],
   reviewFixPrompt: ["reviewFixPrompt"],
+  reviewFixConcurrency: ["reviewFixConcurrency"],
   productMasterPrompt: ["productMasterPrompt"],
   concurrency: ["concurrency"],
   jobTimeoutMinutes: ["jobTimeoutMinutes"],
@@ -157,6 +170,7 @@ const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
     "autopilotScoreWindow",
   ],
   budget: ["budgetAware", "daytimeReservePct", "weeklyTargetPct"],
+  quotaShare: ["quotaSharePct", "reserveQuotaShare"],
   gates: ["testCommand", "lintCommand", "typecheckCommand", "buildCommand"],
   review: [
     "reviewEnabled",
@@ -236,6 +250,7 @@ export function settingsPatchBody(
     model: orNull(draft.model),
     seedPrompt: orNull(draft.seedPrompt),
     reviewFixPrompt: orNull(draft.reviewFixPrompt),
+    reviewFixConcurrency: draft.reviewFixConcurrency,
     productMasterPrompt: orNull(draft.productMasterPrompt),
     // Self-review gate (anton-3apm). The knobs are sent even while the gate is off, so turning it
     // back on restores the operator's reviewer instead of silently resetting it.
@@ -282,6 +297,11 @@ export function settingsPatchBody(
     autopilotScoreFloor: draft.autopilotScoreFloor,
     autopilotScoreWindow: draft.autopilotScoreWindow,
     budgetAware: draft.budgetAware,
+    // The declared share (R6.1). `null` is the real answer for a project still on the equal split —
+    // it clears the override, so the default tracks the machine's project count instead of freezing
+    // at whatever it happened to be when this form was opened.
+    quotaSharePct: draft.quotaSharePct,
+    reserveQuotaShare: draft.reserveQuotaShare,
     // Only the two exposed knobs; the server deep-merges into the stored policy, so knobs set via
     // the API (dayWindow, minSessionHeadroomPct, …) survive a save from this form.
     budgetPolicy: {
