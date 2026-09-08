@@ -50,6 +50,48 @@ export function oneOf(allowed: ReadonlySet<string>): FieldParser<string> {
   };
 }
 
+/** An http(s) URL — a gateway base URL, not a bare host, a file path, or a stray scheme. */
+export function httpUrl(max: number): FieldParser<string> {
+  return (raw, key) => {
+    if (isClear(raw)) return accept(undefined);
+    if (typeof raw !== "string") return reject(`${key} must be a string`);
+    if (raw.length > max) return reject(`${key} too long (max ${max} chars)`);
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      return reject(`${key} must be a valid http(s) URL`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return reject(`${key} must be an http(s) URL`);
+    }
+    return accept(raw);
+  };
+}
+
+/** A POSIX env-var NAME: an uppercase identifier, never a value that happens to look like one. */
+const ENV_VAR_NAME = /^[A-Z_][A-Z0-9_]*$/;
+
+/**
+ * The NAME of an environment variable, e.g. `ANTHROPIC_AUTH_TOKEN` — not its value. A pasted token
+ * (lowercase, dashes, an `sk-…` prefix) fails the pattern, so a secret can never be stored here by
+ * mistake: only the name of the var anton reads it from is kept.
+ */
+export function envVarName(max: number): FieldParser<string> {
+  return (raw, key) => {
+    if (isClear(raw)) return accept(undefined);
+    if (typeof raw !== "string") return reject(`${key} must be a string`);
+    if (raw.length > max) return reject(`${key} too long (max ${max} chars)`);
+    if (!ENV_VAR_NAME.test(raw)) {
+      return reject(
+        `${key} must be an environment variable NAME like ANTHROPIC_AUTH_TOKEN ` +
+          `([A-Z_][A-Z0-9_]*), not a token value`,
+      );
+    }
+    return accept(raw);
+  };
+}
+
 /** How a rejected schema parse is spelled out to the operator. */
 export type IssueDetail = (error: ZodError) => string;
 

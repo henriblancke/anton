@@ -43,7 +43,9 @@ import {
   applyFieldRules,
   booleanValue,
   boundedString,
+  envVarName,
   fieldRule,
+  httpUrl,
   integerInRange,
   isClear,
   messageDetail,
@@ -67,6 +69,10 @@ const ALLOWED_MODELS = new Set([
 const MAX_PROMPT = 8000;
 /** Upper bound on an operator verify-gate command (anton-3oh8) — generous for a chained gate. */
 const MAX_COMMAND = 1000;
+/** Upper bound on a gateway base URL (anton-n16m) — well past any real endpoint. */
+const MAX_URL = 2000;
+/** Upper bound on an env-var name (anton-n16m) — no shell allows one near this long. */
+const MAX_ENV_NAME = 256;
 
 const settingsField = <K extends keyof ProjectSettings & string>(
   key: K,
@@ -151,6 +157,13 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
 
     settingsField("model", oneOf(ALLOWED_MODELS)),
 
+    // Gateway routing (anton-n16m). The base URL is validated as http(s); the token env var as a
+    // NAME, never a value — the secret stays in anton's environment. The base-url-needs-a-token
+    // cross-check runs after this group in buildSettingsPatch.
+    settingsField("claudeBaseUrl", httpUrl(MAX_URL)),
+    settingsField("claudeAuthTokenEnv", envVarName(MAX_ENV_NAME)),
+    settingsField("claudeGatewayModelDiscovery", booleanValue),
+
     // Operator prompt overrides — cleared, each falls back to the shipped contract.
     settingsField("seedPrompt", boundedString(MAX_PROMPT)),
     settingsField("reviewFixPrompt", boundedString(MAX_PROMPT)),
@@ -234,9 +247,33 @@ async function checkReviewAlarmReachable(
 }
 
 /**
+ * A gateway base URL is inert without the env var name anton reads its token from at spawn time
+ * (anton-n16m): the driver would point at the gateway with no credential. Neither field is wrong on
+ * its own, so — like the alarm cross-check — the contradiction is only visible against the values a
+ * run will resolve: the patched one, else the stored one.
+ */
+async function checkGatewayCredentialed(
+  body: Record<string, unknown>,
+  patch: Partial<ProjectSettings>,
+  slug: string,
+): Promise<string | null> {
+  if (!("claudeBaseUrl" in body || "claudeAuthTokenEnv" in body)) return null;
+  const stored = await getProjectSettingsBySlug(slug);
+  const baseUrl = "claudeBaseUrl" in patch ? patch.claudeBaseUrl : stored.claudeBaseUrl;
+  const tokenEnv = "claudeAuthTokenEnv" in patch ? patch.claudeAuthTokenEnv : stored.claudeAuthTokenEnv;
+  if (baseUrl && !tokenEnv) {
+    return (
+      `claudeBaseUrl needs claudeAuthTokenEnv — the name of the env var anton reads the gateway ` +
+      `token from at spawn time. Set the token env var name, or clear the base URL.`
+    );
+  }
+  return null;
+}
+
+/**
  * Validates the PATCH body into `patch`, returning the first 400 message or null. The alarm
  * cross-check runs between the two groups because it reads the job-policy numbers this patch sets
- * against the ones already stored.
+ * against the ones already stored; the gateway cross-check runs last, once its two fields are parsed.
  */
 export async function buildSettingsPatch(
   body: Record<string, unknown>,
@@ -252,6 +289,9 @@ export async function buildSettingsPatch(
 
   const fieldError = await applyFieldRules(projectFields(createAgentResolver(slug)), body, patch);
   if (fieldError) return { error: fieldError };
+
+  const gatewayError = await checkGatewayCredentialed(body, patch, slug);
+  if (gatewayError) return { error: gatewayError };
 
   return { patch };
 }

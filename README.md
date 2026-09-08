@@ -282,6 +282,26 @@ Environment variables (all optional):
 | `ANTON_STRINGER_BIN` | `stringer` (on `PATH`) | override the `stringer` executable |
 | `ANTON_USAGE_PILL` | on | live Claude usage pill (`GET /api/usage`); set falsy (`0`/`false`/`off`) to disable |
 
+### Claude gateway — route a project through a gateway
+
+A project can drive a Claude-compatible **gateway** (9Router, an in-house proxy, …) instead of the Claude API, set from **Settings → Claude gateway** — no editing of the shell that launched anton, and **no secret handed to anton's database**. Three per-project fields:
+
+| Field | Purpose |
+|-------|---------|
+| **Base URL** | the http(s) endpoint the driver points at; empty = the Claude API |
+| **Auth token env var** | the **NAME** of an environment variable in anton's own environment; anton reads the token from it at spawn time |
+| **Discover models from the gateway** | ask the gateway which models it serves (off by default) |
+
+The token itself is **never stored** — only the name of the variable it lives in. Set that variable in the shell or service that runs anton, scoped to the token. A base URL without a token env var name is rejected, and a value shaped like a token rather than a variable name (lowercase, dashes, an `sk-…` prefix) is refused so a pasted secret can't be saved by mistake.
+
+For [9Router](https://jugaldb.substack.com/p/how-to-make-claude-code-virtually), the concrete values are:
+
+| Field | 9Router value |
+|-------|---------------|
+| Base URL | `http://localhost:20128` |
+| Auth token env var | `ANTHROPIC_AUTH_TOKEN` (export it to your 9Router API key in anton's environment) |
+| Discover models from the gateway | on (mirrors `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`, so combos and gateway models show in the picker) |
+
 ### Board modes — solo or team
 
 Each project's beads board runs one of two ways. **Embedded is the default and needs no configuration.**

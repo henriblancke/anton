@@ -40,6 +40,12 @@ export interface ValueLabelRow {
 /** Settings the UI can edit today. */
 export interface EditableSettings {
   model?: string;
+  /** Gateway routing (anton-n16m): the base URL to drive instead of the Claude API; absent = the API. */
+  claudeBaseUrl?: string;
+  /** The NAME of the env var anton reads the gateway token from at spawn time — never the token. */
+  claudeAuthTokenEnv?: string;
+  /** Whether anton asks the gateway which models it serves (anton-n16m); absent = off. */
+  claudeGatewayModelDiscovery?: boolean;
   seedPrompt?: string;
   reviewFixPrompt?: string;
   productMasterPrompt?: string;

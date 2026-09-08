@@ -67,6 +67,41 @@ export function GateField({
   );
 }
 
+/** A single-line text field with an optional hint line — the plain sibling of {@link GateField}. */
+export function TextField({
+  label,
+  value,
+  onChange,
+  placeholder,
+  hint,
+  maxLength,
+  className,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  hint?: string;
+  maxLength?: number;
+  className?: string;
+}) {
+  return (
+    <label className={cn("flex flex-col gap-1.5", className)}>
+      <span className="text-[11px] text-subtle">{label}</span>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        maxLength={maxLength}
+        aria-label={label}
+        className="rounded-lg border border-border bg-card px-3 py-2 font-mono text-[12.5px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+      />
+      {hint && <span className="text-[11px] text-subtle">{hint}</span>}
+    </label>
+  );
+}
+
 /** A min–100 integer percentage knob for the budget policy (anton-egrg). Clamps on change. */
 export function PctField({
   label,
