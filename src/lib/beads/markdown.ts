@@ -247,8 +247,26 @@ function scanLine(state: ScanState, text: string): ScannedLine {
  * same way the description renders.
  */
 export function scanMarkdown(source: string): ScannedLine[] {
+  return scan(source).lines;
+}
+
+/**
+ * The line that closes whatever construct `source` ends inside — the fence's own delimiter, or
+ * `-->` for an HTML comment — or undefined when it ends clean. For a caller that APPENDS to a body:
+ * an unclosed fence or comment runs to the end of the text, so anything appended lands inside it,
+ * shown as literal code or hidden outright, and never read as a heading.
+ */
+export function unterminatedCloser(source: string): string | undefined {
+  const { state } = scan(source);
+  if (state.fence) return state.fence.char.repeat(state.fence.len);
+  return state.inComment ? COMMENT_CLOSE : undefined;
+}
+
+/** One walk of the state machine: the lines, plus the state the last line left open. */
+function scan(source: string): { lines: ScannedLine[]; state: ScanState } {
   const state: ScanState = { inComment: false };
-  return source.split(/\r?\n/).map((text) => scanLine(state, text));
+  const lines = source.split(/\r?\n/).map((text) => scanLine(state, text));
+  return { lines, state };
 }
 
 /**

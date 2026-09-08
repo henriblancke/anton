@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isHeading, renderedLines, scanMarkdown, unquote } from "./markdown";
+import { isHeading, renderedLines, scanMarkdown, unquote, unterminatedCloser } from "./markdown";
 
 /** The lines a body renders, as the consumers read them: text only, fence flag dropped. */
 const rendered = (source: string) => renderedLines(source).map((line) => line.text);
@@ -204,6 +204,26 @@ describe("renderedLines", () => {
 
   it("keeps an empty fenced block as nothing but its dropped delimiters", () => {
     expect(renderedLines("```\n```")).toEqual([]);
+  });
+});
+
+describe("unterminatedCloser", () => {
+  it("is undefined for a body that ends outside any construct", () => {
+    expect(unterminatedCloser("## Goal\nText\n```\ncode\n```\n<!-- note -->\ntail")).toBeUndefined();
+  });
+
+  it("is the fence's own delimiter — same character, same length — for an unclosed fence", () => {
+    expect(unterminatedCloser("intro\n```ts\ncode")).toBe("```");
+    expect(unterminatedCloser("intro\n~~~~\ncode\n```")).toBe("~~~~");
+  });
+
+  it("is the comment closer for an unclosed HTML comment, even one spanning lines", () => {
+    expect(unterminatedCloser("intro <!-- open")).toBe("-->");
+    expect(unterminatedCloser("intro\n<!--\nstill hidden")).toBe("-->");
+  });
+
+  it("does not read a `<!--` inside a fence as a comment — the render treats it as content", () => {
+    expect(unterminatedCloser("```\n<!-- literal\n```")).toBeUndefined();
   });
 });
 

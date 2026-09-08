@@ -533,6 +533,26 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled.trimEnd().endsWith("or answered with why they don't apply")).toBe(true);
   });
 
+  it("closes a fence the hand-made description ends inside before appending — a heading in a fence is literal code to the judge", () => {
+    const unclosed = "## Goal\nharden the retry\n\n## Context\nMade by hand:\n```ts\nretry();";
+    const reconciled = reconcileFollowUpDescription(unclosed, edited);
+    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled).toContain("\nretry();\n```\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+  });
+
+  it("closes an HTML comment the hand-made description ends inside before appending — a heading in a comment renders nothing", () => {
+    const unclosed = "## Goal\nharden the retry\n\n## Context\nMade by hand. <!-- todo: finish";
+    const reconciled = reconcileFollowUpDescription(unclosed, edited);
+    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled).toContain("finish\n-->\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+  });
+
   it("writes the whole contract over a blank description — there is nothing to keep", () => {
     expect(reconcileFollowUpDescription(undefined, edited)).toBe(followUpDescription(edited));
     expect(reconcileFollowUpDescription("  \n", edited)).toBe(followUpDescription(edited));

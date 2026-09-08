@@ -14,7 +14,7 @@ import {
   CONTEXT_KEYS,
   isTicketContractHeading,
 } from "./beads/contract";
-import { type ScannedLine, scanMarkdown } from "./beads/markdown";
+import { type ScannedLine, scanMarkdown, unterminatedCloser } from "./beads/markdown";
 import { parseTicketNotes } from "./beads/notes";
 import type { PullRequestState } from "./git/ops";
 import type { ReviewFinding } from "./jobs/review-context";
@@ -156,12 +156,19 @@ export function reconcileFollowUpDescription(
  * is governed by both — swapping one body and leaving the other would file a follow-up whose "done"
  * still includes the stale criteria. The first heading keeps its place and takes the new boxes; the
  * later copies go entirely, heading included, since one section is what the formula writes.
+ *
+ * With no section to swap, one is appended — after closing a fence or HTML comment the description
+ * ends inside ({@link unterminatedCloser}). Appended verbatim, the heading would land in that
+ * construct, where the judge reads no section at all; the pass would then note the bead finished,
+ * and no retry reconciles a finished bead, leaving one that can never be approved.
  */
 function replaceAcceptance(description: string, boxes: string[]): string {
   const lines = scanMarkdown(description);
   const sections = sectionsNamed(lines, ACCEPTANCE_KEYS);
   if (sections.length === 0) {
-    return [description.trimEnd(), ``, `## ${ACCEPTANCE_HEADING}`, ...boxes].join("\n");
+    const kept = description.trimEnd();
+    const closer = unterminatedCloser(kept);
+    return [kept, ...(closer ? [closer] : []), ``, `## ${ACCEPTANCE_HEADING}`, ...boxes].join("\n");
   }
   const texts = (from: number, to: number) => lines.slice(from, to).map((l) => l.text);
   const [first, ...duplicates] = sections;
