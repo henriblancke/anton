@@ -198,6 +198,7 @@ beforeEach(() => {
   checkSelfFreshnessMock.mockResolvedValue({
     checkout: { state: "current" },
     dependencies: { state: "match" },
+    build: { state: "current" },
   });
   // No human work by default: nothing written, nothing adopted.
   preflightHumanTicketsMock.mockImplementation((args: { board: Bead[] }) =>
@@ -372,6 +373,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
     checkSelfFreshnessMock.mockResolvedValue({
       checkout: { state: "behind", behind: 3, upstream: "origin/main" },
       dependencies: { state: "match" },
+      build: { state: "current" },
     });
 
     const error = await refusalFrom(clean);
@@ -394,6 +396,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
     checkSelfFreshnessMock.mockResolvedValue({
       checkout: { state: "current" },
       dependencies: { state: "drift", packages: ["drizzle-orm", "next"] },
+      build: { state: "current" },
     });
 
     const error = await refusalFrom(clean);
@@ -402,6 +405,24 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
     expect(error).not.toBeInstanceOf(PoisonEpic);
     expect(error.message).toContain("bun install");
     expect(error.message).toContain("drizzle-orm, next");
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+  });
+
+  it("defers a new start when the running build lags the code on disk, filesystem clean", async () => {
+    // The pull/reinstall the other halves ask for lands on disk instantly but never reaches the
+    // modules a live process booted with — so the gate must still refuse until anton restarts.
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "current" },
+      dependencies: { state: "match" },
+      build: { state: "drifted", drift: "outdated" },
+    });
+
+    const error = await refusalFrom(clean);
+
+    expect(error).toBeInstanceOf(StaleCheckoutError);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("moved past the build it is running");
+    expect(error.message).toContain("restart anton");
     expect(warmRunWorktreeMock).not.toHaveBeenCalled();
   });
 
@@ -419,6 +440,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
     checkSelfFreshnessMock.mockResolvedValue({
       checkout: { state: "unreachable", reason: "connection refused" },
       dependencies: { state: "unknown", reason: "bun.lock could not be read" },
+      build: { state: "current" },
     });
 
     const prep = await prepareEpicRun(run(clean));
@@ -448,7 +470,11 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
 
   it("names the checkout distance and `git pull` when HEAD is behind", () => {
     const message = staleCheckoutRefusal(
-      { checkout: { state: "behind", behind: 2, upstream: "origin/main" }, dependencies: { state: "match" } },
+      {
+        checkout: { state: "behind", behind: 2, upstream: "origin/main" },
+        dependencies: { state: "match" },
+        build: { state: "current" },
+      },
       ROOT,
     );
 
@@ -461,7 +487,11 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
 
   it("names the drifted packages and `bun install` when dependencies have drifted", () => {
     const message = staleCheckoutRefusal(
-      { checkout: { state: "current" }, dependencies: { state: "drift", packages: ["left-pad"] } },
+      {
+        checkout: { state: "current" },
+        dependencies: { state: "drift", packages: ["left-pad"] },
+        build: { state: "current" },
+      },
       ROOT,
     );
 
@@ -469,11 +499,28 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
     expect(message).toContain("left-pad");
   });
 
+  it("names a running build the disk has moved past, even with the filesystem halves clean", () => {
+    // The pull/reinstall that clears the checkout and dependency halves does not reach a live
+    // process's boot-time modules, so the gate must still refuse a start until anton restarts.
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "current" },
+        dependencies: { state: "match" },
+        build: { state: "drifted", drift: "outdated" },
+      },
+      ROOT,
+    );
+
+    expect(message).toContain("the code on disk has already moved past the build it is running");
+    expect(message).toContain("restart anton");
+  });
+
   it("names BOTH when the checkout is behind AND dependencies drifted", () => {
     const message = staleCheckoutRefusal(
       {
         checkout: { state: "behind", behind: 1, upstream: "origin/main" },
         dependencies: { state: "drift", packages: ["next"] },
+        build: { state: "current" },
       },
       ROOT,
     );
@@ -485,7 +532,11 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
   it("returns undefined for a clean verdict", () => {
     expect(
       staleCheckoutRefusal(
-        { checkout: { state: "current" }, dependencies: { state: "match" } },
+        {
+          checkout: { state: "current" },
+          dependencies: { state: "match" },
+          build: { state: "current" },
+        },
         ROOT,
       ),
     ).toBeUndefined();
@@ -494,13 +545,21 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
   it("returns undefined for every INDETERMINATE verdict — a check that could not run is not staleness", () => {
     expect(
       staleCheckoutRefusal(
-        { checkout: { state: "no-upstream" }, dependencies: { state: "unknown", reason: "x" } },
+        {
+          checkout: { state: "no-upstream" },
+          dependencies: { state: "unknown", reason: "x" },
+          build: { state: "current" },
+        },
         ROOT,
       ),
     ).toBeUndefined();
     expect(
       staleCheckoutRefusal(
-        { checkout: { state: "unreachable", reason: "x" }, dependencies: { state: "match" } },
+        {
+          checkout: { state: "unreachable", reason: "x" },
+          dependencies: { state: "match" },
+          build: { state: "current" },
+        },
         ROOT,
       ),
     ).toBeUndefined();

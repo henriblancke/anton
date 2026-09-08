@@ -262,6 +262,7 @@ describe("AutopilotBreakerHeader", () => {
           breaker={staleBreaker({
             checkout: { state: "current" },
             dependencies: { state: "match" },
+            build: { state: "current" },
           })}
         />,
       );

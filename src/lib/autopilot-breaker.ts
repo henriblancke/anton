@@ -31,9 +31,9 @@ export type HoldReason = "wip-limit";
 export type DisarmReason = "score-regression" | "consecutive-failures";
 
 /**
- * Why anton is stale. One reason — the halves (checkout behind, dependencies drifted) can each or
- * both be true, but the remedy is the same shape (update and restart), so the specifics live in the
- * detail and evidence rather than fracturing the kind.
+ * Why anton is stale. One reason — the halves (checkout behind, dependencies drifted, or a running
+ * build the disk has moved past) can each or all be true, but the remedy is the same shape (update
+ * and restart), so the specifics live in the detail and evidence rather than fracturing the kind.
  */
 export type StaleReason = "behind-own-code";
 
@@ -211,6 +211,12 @@ export function staleBreaker(freshness: SelfFreshness): AutopilotStale | undefin
       `Installed package${many ? "s" : ""} no longer ${many ? "match" : "matches"} bun.lock ` +
         `(${packages.join(", ")}) — run \`bun install\``,
     );
+  }
+  if (freshness.build.state === "drifted") {
+    // Disk can read current while the process still runs its boot-time build (anton-vzhf) — the one
+    // half `git pull`/`bun install` does not fix, cleared only by the restart the card already asks for.
+    behind.push("its running build is out of date");
+    evidence.push("The code on disk has moved past the build anton is running — restart anton");
   }
 
   if (evidence.length === 0) return undefined;

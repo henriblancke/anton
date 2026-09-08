@@ -19,7 +19,11 @@ vi.mock("./jobs/self-freshness", () => ({
   selfRepoRoot: () => "/self",
 }));
 
-const FRESH: SelfFreshness = { checkout: { state: "current" }, dependencies: { state: "match" } };
+const FRESH: SelfFreshness = {
+  checkout: { state: "current" },
+  dependencies: { state: "match" },
+  build: { state: "current" },
+};
 
 const { currentBreaker } = await import("./autopilot-state");
 
@@ -50,6 +54,7 @@ describe("currentBreaker", () => {
     checkSelfFreshness.mockResolvedValue({
       checkout: { state: "behind", behind: 2, upstream: "origin/main" },
       dependencies: { state: "match" },
+      build: { state: "current" },
     } satisfies SelfFreshness);
     currentDisarm.mockResolvedValue(disarm);
     currentWipHold.mockResolvedValue(hold);

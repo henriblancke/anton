@@ -17,6 +17,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { serverBuildDrift, type BuildDriftState } from "../build/drift";
 import { distanceBehindUpstream } from "../git/ops";
 
 /** Where the checkout stands against its upstream — plus `unknown` for a check that could not run. */
@@ -33,9 +34,25 @@ export type DependencyFreshness =
   | { state: "drift"; packages: string[] }
   | { state: "unknown"; reason: string };
 
+/**
+ * Whether the RUNNING process still executes the build on disk. The checkout and dependency halves
+ * read the filesystem, which an operator's `git pull`/`bun install` makes current the instant it
+ * lands — but the live Next process and job runner keep the modules they compiled at boot until a
+ * restart. So on the very remedy this gate displays, both filesystem halves can clear while the
+ * process is still running its old code; this half stays `drifted` across that gap, so freshness
+ * cannot clear merely because the files underneath the process changed (PR #257 review).
+ *
+ * Sourced from the boot identity `build/drift` already records. `current` covers a process that
+ * stamped none — a unit test, a script — which keeps those silent, exactly as `build/drift` does.
+ */
+export type BuildFreshness =
+  | { state: "current" }
+  | { state: "drifted"; drift: BuildDriftState };
+
 export interface SelfFreshness {
   checkout: CheckoutFreshness;
   dependencies: DependencyFreshness;
+  build: BuildFreshness;
 }
 
 function reason(e: unknown): string {
@@ -54,13 +71,28 @@ export function selfRepoRoot(): string {
   return process.env[APP_ROOT_ENV] ?? process.cwd();
 }
 
-/** Both halves of the freshness answer for the checkout at `repoPath`, read in parallel. */
+/**
+ * All three halves of the freshness answer for anton's own checkout at `repoPath`, read in parallel.
+ * The build half is the running process's own drift, so it answers for this process regardless of
+ * `repoPath` — sound because every caller passes {@link selfRepoRoot}, the same root `build/drift`
+ * records against.
+ */
 export async function checkSelfFreshness(repoPath: string): Promise<SelfFreshness> {
   const [checkout, dependencies] = await Promise.all([
     checkoutFreshness(repoPath),
     dependencyFreshness(repoPath),
   ]);
-  return { checkout, dependencies };
+  return { checkout, dependencies, build: buildFreshness() };
+}
+
+/**
+ * The running process's own build drift, read from what `build/drift` recorded at boot. A `git
+ * pull`/`bun install` clears the checkout and dependency halves at once but never reaches the modules
+ * a live process already loaded; this keeps freshness stale until the restart that adopts them.
+ */
+function buildFreshness(): BuildFreshness {
+  const drift = serverBuildDrift();
+  return drift ? { state: "drifted", drift: drift.state } : { state: "current" };
 }
 
 async function checkoutFreshness(repoPath: string): Promise<CheckoutFreshness> {

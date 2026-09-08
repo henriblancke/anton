@@ -117,8 +117,11 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
   });
 
   it("reports a checkout that holds the upstream tip as current", async () => {
-    const { checkout } = await checkSelfFreshness(repo);
+    const { checkout, build } = await checkSelfFreshness(repo);
     expect(checkout).toEqual({ state: "current" });
+    // No server booted in this process, so the build half has no recorded identity to call stale —
+    // exactly what keeps a test or script silent (anton-vzhf).
+    expect(build).toEqual({ state: "current" });
   });
 
   it("reports a branch with no upstream rather than a distance", async () => {

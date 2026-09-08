@@ -4,6 +4,7 @@
  * (ANTON_GH_BIN) so tests can point it at a fake. See DESIGN.md §4/§5.
  */
 import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
@@ -584,18 +585,30 @@ export async function pushBranch(repoPath: string, branch: string): Promise<void
 }
 
 /**
- * Serialize `git fetch`es per repository. git takes a per-ref lock while updating a tracking ref, so
- * two fetches racing to write the SAME ref leave the loser dead with `cannot lock ref '…' is at … but
- * expected …`. The self-freshness read ({@link distanceBehindUpstream}) runs from BOTH the board's
- * 60s breaker poll and the execute-epic preflight — and from two starts landing together — all in the
- * one in-process job runner, each fetching the same upstream tracking ref. Left unserialized, the
- * loser's lock failure is caught as `unreachable`, an INDETERMINATE verdict `staleCheckoutRefusal`
- * lets a start through on — so a run could execute a checkout that is actually behind. Chaining per
- * repo makes the ref lock uncontended: only one fetch touches a given repo at a time.
+ * Serialize `git fetch`es that write a SHARED tracking ref, per repository. git takes a per-ref lock
+ * while updating a ref, so two fetches racing to write the SAME ref leave the loser dead with
+ * `cannot lock ref '…' is at … but expected …`. {@link resolveFreshBase} and {@link refreshCheckout}
+ * both write `refs/remotes/origin/<base>` so a later step can branch off it; chaining per repo keeps
+ * that ref uncontended.
+ *
+ * The chain lives on `globalThis`, not in module scope: Next compiles the instrumentation/job-runner
+ * bundle and the request graph into SEPARATE module registries (see lib/build/drift.ts), so a
+ * module-local map is duplicated — a fetch in one registry cannot see the chain the other holds, and
+ * the two race the ref lock anyway. A `Symbol.for`-keyed slot both registries read makes the
+ * serialization process-wide (PR #257 review). It does NOT cover separate anton processes on the same
+ * repo — those still contend at the git layer — but every caller here fails SAFE on a lost lock (a
+ * fallback to the local base, a transient drift retried next pass), never open into stale code. The
+ * freshness read that WAS fail-open ({@link distanceBehindUpstream}) no longer writes a shared ref at
+ * all, so it needs no serialization: it fetches into a private per-read ref instead.
  */
-const fetchChains = new Map<string, Promise<void>>();
+const FETCH_CHAINS_KEY = Symbol.for("anton.git.fetchChains");
+function fetchChains(): Map<string, Promise<void>> {
+  const store = globalThis as unknown as Record<symbol, Map<string, Promise<void>> | undefined>;
+  return (store[FETCH_CHAINS_KEY] ??= new Map());
+}
 function serializeFetch<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
-  const prior = fetchChains.get(repoPath) ?? Promise.resolve();
+  const chains = fetchChains();
+  const prior = chains.get(repoPath) ?? Promise.resolve();
   // Run after any prior fetch SETTLES — success or failure — so the ref lock is never contended.
   const result = prior.then(fn, fn);
   // The chain tail must never reject, or one failed fetch would poison every fetch queued behind it.
@@ -603,10 +616,10 @@ function serializeFetch<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
     () => {},
     () => {},
   );
-  fetchChains.set(repoPath, tail);
+  chains.set(repoPath, tail);
   // Drop the entry once this is the last fetch queued, so the map does not grow one slot per repo forever.
   void tail.then(() => {
-    if (fetchChains.get(repoPath) === tail) fetchChains.delete(repoPath);
+    if (chains.get(repoPath) === tail) chains.delete(repoPath);
   });
   return result;
 }
@@ -734,22 +747,32 @@ export async function distanceBehindUpstream(repoPath: string): Promise<Upstream
   if (!remote || !mergeRef.startsWith("refs/heads/")) return { state: "no-upstream" };
 
   const remoteBranch = mergeRef.slice("refs/heads/".length);
-  const trackingRef = `refs/remotes/${remote}/${remoteBranch}`;
   const upstream = `${remote}/${remoteBranch}`;
+  // Fetch the upstream into a PRIVATE, per-read ref instead of the shared tracking ref, so this
+  // freshness read never contends on a ref lock — not with a concurrent read in another Next module
+  // registry (ops.ts is duplicated across bundles), nor with another anton process on the same repo.
+  // Serializing per process could cover neither, and a lost lock here is caught as `unreachable` —
+  // the indeterminate verdict the fail-open preflight lets a stale start through on (PR #257 review).
+  // A unique destination ref means no two fetches ever write the same ref, so none can lose it.
+  const scratchRef = `refs/anton/freshness/${randomUUID()}`;
   try {
-    // Explicit destination refspec, for the reason resolveFreshBase documents: a bare fetch honours
-    // the remote's configured refspec and can update FETCH_HEAD alone, leaving the tracking ref this
-    // then counts against stale. `+` allows a non-fast-forward update of the ref. Serialized per repo
-    // ({@link serializeFetch}) so a concurrent freshness fetch cannot lose the ref lock and be
-    // misread as `unreachable`.
-    await serializeFetch(repoPath, () => git(repoPath, ["fetch", remote, `+${mergeRef}:${trackingRef}`]));
+    // `--refmap=` drops the remote's CONFIGURED refspec so this fetch writes ONLY the private ref
+    // named on the command line — without it, git ALSO honours `+refs/heads/*:refs/remotes/origin/*`
+    // and updates the shared tracking ref, reintroducing the very lock contention the unique ref
+    // exists to avoid. `+` allows a non-fast-forward update of the private ref.
+    await git(repoPath, ["fetch", "--refmap=", remote, `+${mergeRef}:${scratchRef}`]);
   } catch (e) {
     return { state: "unreachable", reason: e instanceof Error ? e.message : String(e) };
   }
-
-  const behind = Number(await git(repoPath, ["rev-list", "--count", `HEAD..${trackingRef}`]));
-  if (!Number.isFinite(behind)) throw new Error(`could not count commits behind ${upstream}`);
-  return behind > 0 ? { state: "behind", behind, upstream } : { state: "current" };
+  try {
+    const behind = Number(await git(repoPath, ["rev-list", "--count", `HEAD..${scratchRef}`]));
+    if (!Number.isFinite(behind)) throw new Error(`could not count commits behind ${upstream}`);
+    return behind > 0 ? { state: "behind", behind, upstream } : { state: "current" };
+  } finally {
+    // Best-effort cleanup — a unique ref a crash leaves behind is harmless (nothing else reads it),
+    // so a failed delete never changes the verdict.
+    await git(repoPath, ["update-ref", "-d", scratchRef]).catch(() => {});
+  }
 }
 
 /**

@@ -10,7 +10,12 @@ import { clearingCondition, staleBreaker } from "./autopilot-breaker";
 import type { SelfFreshness } from "./jobs/self-freshness";
 
 function freshness(o: Partial<SelfFreshness> = {}): SelfFreshness {
-  return { checkout: { state: "current" }, dependencies: { state: "match" }, ...o };
+  return {
+    checkout: { state: "current" },
+    dependencies: { state: "match" },
+    build: { state: "current" },
+    ...o,
+  };
 }
 
 describe("staleBreaker", () => {
@@ -49,6 +54,17 @@ describe("staleBreaker", () => {
       "Installed packages no longer match bun.lock (drizzle-orm, next) — run `bun install`",
     ]);
     expect(stale?.detail).toContain("2 installed packages out of date");
+  });
+
+  it("names a running build the disk has moved past — the half a pull cannot fix", () => {
+    // A `git pull`/`bun install` clears the checkout and dependency halves at once, but the live
+    // process keeps its boot-time build until a restart; the band must stay up across that gap.
+    const stale = staleBreaker(freshness({ build: { state: "drifted", drift: "outdated" } }));
+    expect(stale?.kind).toBe("stale");
+    expect(stale?.detail).toContain("its running build is out of date");
+    expect(stale?.evidence).toEqual([
+      "The code on disk has moved past the build anton is running — restart anton",
+    ]);
   });
 
   it("carries one evidence line per stale half when both are behind", () => {
