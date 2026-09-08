@@ -235,6 +235,13 @@ describe("instructionCriteria", () => {
     // A block start between the lines ends the paragraph, so the underline is not the label's: the
     // first line is an ordinary step and only the heading below it drops.
     expect(texts("Backend\n## Heading\n=======")).toEqual(["Backend", "======="]);
+    // A non-1 ordered marker does NOT interrupt the paragraph, so `Backend\n2. API\n===` is one
+    // multiline Setext heading — every line drops, and doneGap sees no step. A `1.` still interrupts.
+    expect(texts("Backend\n2. API\n===\n- Fix the retry")).toEqual(["Fix the retry"]);
+    expect(doneGap("Backend\n2. API\n===", [])).toMatch(/only list markers, headings or rules/);
+    expect(texts("Backend\n1. API\n===")).toEqual(["Backend", "API", "==="]);
+    // List STRUCTURE is untouched: `1. a` / `2. b` stay two separate items.
+    expect(texts("1. first\n2. second")).toEqual(["first", "second"]);
   });
 
   it("reads nested markers as scaffolding too — shearing one layer must not leave the next as a criterion", () => {

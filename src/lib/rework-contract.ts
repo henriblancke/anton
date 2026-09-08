@@ -222,6 +222,16 @@ const LIST_ITEM = /^( {0,3})([-*+•]|\d{1,9}[.)])(?:([ \t]+)|$)/;
 const BLOCK_START = /^ {0,3}(?:[-*+•]|\d{1,9}[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
 /**
+ * A line that INTERRUPTS an open paragraph, ending it — {@link BLOCK_START}'s set, but an ordered
+ * marker only when it starts at 1. CommonMark lets `1.`/`1)` break a paragraph and no other number:
+ * `Backend\n2. API\n===` is one multiline Setext heading, not a label above a list, since `2.` does
+ * not interrupt. Used only to find where a Setext paragraph ends ({@link setextHeadingRun}); list
+ * STRUCTURE still reads every ordered marker ({@link BLOCK_START}, {@link LIST_ITEM}), so `1. a` /
+ * `2. b` stay two items — restricting that would misnest the second.
+ */
+const PARA_INTERRUPT = /^ {0,3}(?:[-*+•]|1[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
+
+/**
  * One blockquote marker peeled as a container: up to 3 spaces, then one `>` of a run that whitespace
  * or the line's end follows — {@link QUOTE_MARKER}'s rule, one marker at a time so `>> ` nests two.
  */
@@ -647,8 +657,8 @@ function blankQuoteLine(line: string, prefix: Prefix): boolean {
  * label above a heading; skipping only the last line would still file `Backend` as a criterion a
  * review cannot score, and {@link doneGap} would accept a draft that states no step. The run is
  * judged inside the paragraph's own containers `prefix`, so `> Backend` / `> =======` pairs too, and
- * a blank line, a block start ({@link BLOCK_START}), a fence, a comment or a line that leaves the
- * container ends the paragraph before any underline — those are not headings.
+ * a blank line, a line that interrupts the paragraph ({@link PARA_INTERRUPT}), a fence, a comment or
+ * a line that leaves the container ends the paragraph before any underline — those are not headings.
  */
 function setextHeadingRun(
   raw: readonly string[],
@@ -662,8 +672,9 @@ function setextHeadingRun(
     const inner = peelPrefix(raw[next]!, prefix);
     if (inner === undefined || inner.trim() === "") return 0;
     if (SETEXT_UNDERLINE.test(inner)) return next - at + 1;
-    // A line that begins a block of its own ends the paragraph, so no underline can reach `at`.
-    if (BLOCK_START.test(inner.trimStart())) return 0;
+    // A line that interrupts the paragraph ends it, so no underline can reach `at` — but a non-1
+    // ordered marker does not interrupt, and stays part of the multiline heading.
+    if (PARA_INTERRUPT.test(inner.trimStart())) return 0;
   }
   return 0;
 }
