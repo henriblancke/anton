@@ -27,6 +27,7 @@ const setPrRefMock = vi.fn();
 const tagMock = vi.fn();
 const closeMock = vi.fn();
 const reparentMock = vi.fn();
+const updateMock = vi.fn();
 const runIsLiveMock = vi.fn<(projectId: string, targetId: string) => boolean>();
 const prStateMock = vi.fn<(repo: string, ref: string) => Promise<string>>();
 
@@ -48,6 +49,7 @@ vi.mock("./beads/bd", async () => {
       tag: (...args: unknown[]) => tagMock(...args),
       close: (...args: unknown[]) => closeMock(...args),
       reparent: (...args: unknown[]) => reparentMock(...args),
+      update: (...args: unknown[]) => updateMock(...args),
     },
   };
 });
@@ -529,6 +531,11 @@ describe("follow-up", () => {
       expect(noted.map(([id]) => id)).toEqual(["already", "t1"]);
       expect(noted[0][1]).toContain(INSTRUCTIONS);
       expect(noted[1][1]).toContain("already");
+      // The contract `bd create` froze is this request's now, and it is settled before the note.
+      expect(updateMock).toHaveBeenCalledWith("/repo", "already", {
+        description: expect.stringContaining(`- [ ] ${INSTRUCTIONS}`),
+      });
+      expect(updateMock.mock.invocationCallOrder[0]).toBeLessThan(orderOfCallOn(noteMock, "already"));
     });
 
     it("prefers the bead that carries THIS request's note over an unfinished one", async () => {

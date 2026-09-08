@@ -192,6 +192,14 @@ describe("instructionCriteria", () => {
     ]);
   });
 
+  it("keeps a checkbox that is not followed by a separator — bracket syntax, not a ticked box", () => {
+    // A bullet needs whitespace after it to be a marker; a box is held to the same rule, so a CSS
+    // attribute selector at the head of a line is a criterion, and the criterion matches the note.
+    expect(
+      instructionCriteria("[x].disabled must stay matched\n- [ ]{2} is two spaces\n[X] done"),
+    ).toEqual(["[x].disabled must stay matched", "[ ]{2} is two spaces", "done"]);
+  });
+
   it("keeps a number too long to be an ordered marker — CommonMark stops at nine digits", () => {
     expect(instructionCriteria("1234567890) must remain supported\n999999999. is a marker")).toEqual([
       "1234567890) must remain supported",

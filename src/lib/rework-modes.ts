@@ -186,7 +186,9 @@ async function resumeFollowUp(
   const existing = match.bead;
   const stranded = context.shippedPr !== undefined && beads.parentOf(existing) === target.id;
   if (stranded) await detachStrandedFollowUp(context, existing);
-  if (match.partial) await finishHalfCreatedFollowUp(context, existing);
+  if (match.partial) {
+    await finishHalfCreatedFollowUp(context, existing, stranded ? undefined : beads.parentOf(existing));
+  }
   return {
     result: {
       mode: "follow-up",
@@ -230,12 +232,33 @@ async function detachStrandedFollowUp(context: FollowUpContext, existing: Bead):
  * is this request's own work, half done — so finish it rather than opening a second follow-up beside
  * it. Both remaining writes are made, in the order the create path makes them: the attempt died on
  * the first, so neither can already be on the board.
+ *
+ * The description is reconciled first. `bd create` froze the FIRST attempt's instructions and
+ * findings into the acceptance, and the founder may have edited either before retrying under the
+ * same title — the note about to land carries the edited request, and a bead whose contract says
+ * one thing while its note says another is judged against two different asks. Rewritten before the
+ * note so a failure here leaves the bead still noteless — still partial, still this request's to
+ * finish — rather than noted against a stale rubric. `parentId` is the parentage the bead holds
+ * after reconciliation, so the Context section says where it actually runs.
  */
 async function finishHalfCreatedFollowUp(
   context: FollowUpContext,
   existing: Bead,
+  parentId: string | undefined,
 ): Promise<void> {
-  const { repo, author, body } = context;
+  const { repo, target, ticket, request, author, body, pipeline } = context;
+  const description = followUpDescription({
+    summary: request.summary,
+    instructions: request.instructions,
+    findings: request.findings,
+    ticket,
+    targetId: target.id,
+    parentId,
+    pipeline,
+  });
+  if (existing.description !== description) {
+    await beads.update(repo, existing.id, { description });
+  }
   await beads.note(repo, existing.id, formatHumanNote(body, author, new Date()), author || undefined);
   await noteOrigin(context, existing.id);
 }

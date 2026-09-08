@@ -170,13 +170,15 @@ describe("followUpDescription", () => {
           "2) another numbering",
           "- [ ] a box already",
           "[x] a ticked box",
+          "[x].disabled must stay matched",
           "-",
           "- [ ]",
           "   ",
         ].join("\n"),
       }),
     );
-    // A bare `-` or `- [ ]` is a list the founder started and abandoned — a box over nothing.
+    // A bare `-` or `- [ ]` is a list the founder started and abandoned — a box over nothing. A
+    // `[x]` with no separator after it is a selector the founder wrote, and stays in the box.
     expect(acceptance.slice(0, -1)).toEqual([
       "- [ ] Some prose first.",
       "- [ ] a dashed bullet",
@@ -185,6 +187,7 @@ describe("followUpDescription", () => {
       "- [ ] another numbering",
       "- [ ] a box already",
       "- [ ] a ticked box",
+      "- [ ] [x].disabled must stay matched",
     ]);
   });
 

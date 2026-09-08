@@ -33,6 +33,7 @@ type CreateOpts = {
 const createMock = vi.fn<(cwd: string, opts: CreateOpts) => Promise<string>>();
 const linkMock = vi.fn();
 const reparentMock = vi.fn();
+const updateMock = vi.fn();
 const refreshMock = vi.fn<() => Promise<Bead[]>>();
 const operatorMock = vi.fn<() => Promise<string | undefined>>();
 
@@ -49,6 +50,7 @@ vi.mock("./beads/bd", async () => {
       create: (...args: unknown[]) => createMock(...(args as [string, CreateOpts])),
       link: (...args: unknown[]) => linkMock(...args),
       reparent: (...args: unknown[]) => reparentMock(...args),
+      update: (...args: unknown[]) => updateMock(...args),
     },
   };
 });
@@ -60,7 +62,7 @@ vi.mock("./operator", () => ({ resolveOperator: () => operatorMock() }));
 const { applyFollowUp, applyReopen, existingFollowUp, inheritedLabels } = await import(
   "./rework-modes"
 );
-const { hasHumanNote, reworkNoteBody } = await import("./rework-notes");
+const { followUpDescription, hasHumanNote, reworkNoteBody } = await import("./rework-notes");
 const { RUN_STAGE_LABELS } = await import("./rework-pipeline");
 
 const project: Project = { id: "p1", slug: "p", name: "p", repoPath: "/repo" } as Project;
@@ -159,7 +161,7 @@ function candidate(id: string, over: Partial<Bead> = {}): Bead {
 }
 
 /** Every bd write these modes can make — asserted absent wherever a request must write nothing. */
-const allWrites = [noteMock, reopenMock, untagMock, createMock, linkMock, reparentMock];
+const allWrites = [noteMock, reopenMock, untagMock, createMock, linkMock, reparentMock, updateMock];
 
 /** The bead a bd call was made on, and when it happened — the seam for asserting write order. */
 function orderOn(mock: ReturnType<typeof vi.fn>, id: string, nth = 0): number {
@@ -395,6 +397,68 @@ describe("applyFollowUp", () => {
     expect(linkMock).not.toHaveBeenCalled();
     expect(hasHumanNote(makeBead({ id: "half", notes: noteOn("half") }), followUpBody())).toBe(true);
     expect(noteOn("t1")).toContain("Follow-up half was opened from this ticket's review");
+  });
+
+  it("reconciles a half-created follow-up's acceptance to the request that finishes it", async () => {
+    // `bd create` froze the first attempt's instructions; the founder edited them before retrying
+    // under the same title. The note carries the edit — the contract must judge against it too.
+    const stale = followUpDescription({
+      summary: SUMMARY,
+      instructions: "Guard the null branch.",
+      findings: [],
+      ticket: finishedTicket(),
+      targetId: "feat",
+      parentId: "feat",
+    });
+    board(feature(), finishedTicket(), candidate("half", { description: stale }));
+    const edited = followUp({ instructions: INSTRUCTIONS, findings: FINDINGS });
+
+    await applyFollowUp(project, feature(), finishedTicket(), edited);
+
+    expect(updateMock).toHaveBeenCalledTimes(1);
+    const [, id, patch] = updateMock.mock.calls[0]!;
+    expect(id).toBe("half");
+    expect(patch).toEqual({
+      description: followUpDescription({
+        summary: SUMMARY,
+        instructions: INSTRUCTIONS,
+        findings: FINDINGS,
+        ticket: finishedTicket(),
+        targetId: "feat",
+        parentId: "feat",
+      }),
+    });
+    expect((patch as { description: string }).description).not.toContain("Guard the null branch.");
+    // Rewritten BEFORE the note lands, so a failure leaves the bead still noteless — still partial.
+    expect(updateMock.mock.invocationCallOrder[0]!).toBeLessThan(orderOn(noteMock, "half"));
+  });
+
+  it("leaves a half-created follow-up's description alone when it already matches the request", async () => {
+    const current = followUpDescription({
+      summary: SUMMARY,
+      instructions: INSTRUCTIONS,
+      findings: [],
+      ticket: finishedTicket(),
+      targetId: "feat",
+      parentId: "feat",
+    });
+    board(feature(), finishedTicket(), candidate("half", { description: current }));
+
+    await applyFollowUp(project, feature(), finishedTicket(), followUp());
+
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("describes a half-created follow-up as its own run target once a merged PR detaches it", async () => {
+    board(feature(), finishedTicket(), candidate("half"));
+
+    await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
+
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "half", "");
+    const [, , patch] = updateMock.mock.calls[0]!;
+    expect((patch as { description: string }).description).toContain(
+      "It is its own run target — approve it to run.",
+    );
   });
 
   it("detaches a follow-up stranded under a target whose PR merged under it, and reports the write", async () => {
