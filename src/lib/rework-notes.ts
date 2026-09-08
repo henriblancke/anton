@@ -8,7 +8,8 @@
  * so the rendering and the comparison must not drift apart.
  */
 import type { Bead } from "./beads/bd";
-import { ACCEPTANCE_HEADING } from "./beads/contract";
+import { ACCEPTANCE_HEADING, ACCEPTANCE_KEYS, isContractHeading } from "./beads/contract";
+import { scanMarkdown } from "./beads/markdown";
 import { parseTicketNotes } from "./beads/notes";
 import type { PullRequestState } from "./git/ops";
 import type { ReviewFinding } from "./jobs/review-context";
@@ -70,6 +71,17 @@ function reworkNoteHead(args: {
         `prompted another pass: ${args.summary}`;
 }
 
+/** What a follow-up's contract is written from — the request, its origin, and where the bead runs. */
+export interface FollowUpContractArgs {
+  summary: string;
+  instructions: string;
+  findings: ReviewFinding[];
+  ticket: Bead;
+  targetId: string;
+  parentId?: string;
+  pipeline?: ReworkPipeline;
+}
+
 /**
  * The follow-up bead's contract. Every section the bead contract judges is written, because an
  * unshaped bead is refused by the approve route and poison-parks the runner — a rework that produced
@@ -80,15 +92,7 @@ function reworkNoteHead(args: {
  * headline gives the self-review nothing to score against. The note on the same bead keeps the
  * request in the founder's own words and order; this section is what "done" means, box by box.
  */
-export function followUpDescription(args: {
-  summary: string;
-  instructions: string;
-  findings: ReviewFinding[];
-  ticket: Bead;
-  targetId: string;
-  parentId?: string;
-  pipeline?: ReworkPipeline;
-}): string {
+export function followUpDescription(args: FollowUpContractArgs): string {
   const { summary, instructions, findings, ticket, targetId, parentId, pipeline } = args;
   return [
     `## Goal`,
@@ -109,6 +113,67 @@ export function followUpDescription(args: {
     `The project's own checks stay green, and the run's self-review scores this bead against the ` +
       `acceptance above.`,
   ].join("\n");
+}
+
+/**
+ * A half-created follow-up's description, brought in line with the request finishing it
+ * (lib/rework-modes.ts). Only what the request DECIDES is touched: the Acceptance section, derived
+ * from its instructions and findings, and the Context line saying where the bead runs. Everything
+ * else stays as written. The bead matched on title and edge alone, so it may be one a founder made
+ * by hand, or a remnant whose Context, Out of scope or Verify they have edited since — and
+ * regenerating the whole contract to refresh the boxes would silently discard that authorship.
+ *
+ * A description with no Acceptance section gets the request's appended, since a bead without one is
+ * refused at approval; a blank one gets the whole contract, there being nothing to keep.
+ */
+export function reconcileFollowUpDescription(
+  current: string | undefined,
+  args: FollowUpContractArgs,
+): string {
+  if (!current?.trim()) return followUpDescription(args);
+  const withAcceptance = replaceAcceptance(
+    current,
+    followUpAcceptance(args.instructions, args.findings),
+  );
+  return replaceRunsUnder(withAcceptance, args.targetId, args.parentId);
+}
+
+/**
+ * The Acceptance section's body swapped for `boxes`, bounded exactly as the contract judge bounds it
+ * (`sectionOccurrences`, lib/beads/contract.ts): a sub-heading grouping criteria is part of the
+ * section and goes with it, a contract heading or a peer ends it. Text either side is kept verbatim.
+ */
+function replaceAcceptance(description: string, boxes: string[]): string {
+  const lines = scanMarkdown(description);
+  const start = lines.findIndex((l) => l.heading && ACCEPTANCE_KEYS.includes(l.heading.key));
+  if (start === -1) {
+    return [description.trimEnd(), ``, `## ${ACCEPTANCE_HEADING}`, ...boxes].join("\n");
+  }
+  const depth = lines[start]!.heading!.depth;
+  let end = start + 1;
+  while (end < lines.length) {
+    const heading = lines[end]!.heading;
+    if (heading && (heading.depth <= depth || isContractHeading(heading))) break;
+    end += 1;
+  }
+  const before = lines.slice(0, start + 1).map((l) => l.text);
+  const after = lines.slice(end).map((l) => l.text);
+  return [...before, ...boxes, ...(after.length > 0 ? [``, ...after] : [])].join("\n");
+}
+
+/**
+ * The run-location line ({@link followUpRunsUnder}) re-said for the parentage the bead holds now.
+ * Only the two shapes a create can write are recognised — under the target, or standing alone; a
+ * founder who rewrote that line has taken the Context into their own hands ({@link createdUnder}),
+ * and it is left as they put it.
+ */
+function replaceRunsUnder(description: string, targetId: string, parentId?: string): string {
+  const generated = new Set([followUpRunsUnder(targetId), followUpRunsUnder()]);
+  const wanted = followUpRunsUnder(parentId);
+  return description
+    .split(/\r?\n/)
+    .map((line) => (generated.has(line) ? wanted : line))
+    .join("\n");
 }
 
 /**
@@ -217,8 +282,9 @@ export function originNoteBody(followUpId: string, pipeline?: ReworkPipeline): s
  * under it. Split into a head and a Context clause because the retry that recovers a detachment
  * matches on the HEAD alone ({@link hasDetachmentNote}) — what the clause says depends on which
  * pass wrote it. A finished bead keeps its Context, which a founder may have edited, so the note
- * flags that it still names the old parent. A half-created bead's Context is rewritten by the pass
- * finishing it ({@link followUpRunsUnder}), so the note claims nothing about it either way.
+ * flags that it still names the old parent. A half-created bead's run-location line is re-said by
+ * the pass finishing it ({@link reconcileFollowUpDescription}), so the note claims nothing about it
+ * either way.
  */
 export function detachmentNoteBody(args: {
   targetId: string;

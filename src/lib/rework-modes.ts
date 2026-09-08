@@ -21,6 +21,7 @@ import {
   hasDetachmentNote,
   hasHumanNote,
   originNoteBody,
+  reconcileFollowUpDescription,
   reworkNoteBody,
 } from "./rework-notes";
 import { RUN_STAGE_LABELS } from "./rework-pipeline";
@@ -183,11 +184,11 @@ interface FollowUpContext {
  *
  * The detachment is three writes at most, and every one is re-derivable from the board so a retry
  * finishes exactly what the attempt before it left: the `bd reparent` is owed while the bead is
- * still under the target; the note is owed until it is on the bead; the half-created Context is
- * rewritten by the reconcile, which always reads the parentage the bead holds NOW. The note lands
- * between the other two on purpose — after the reparent, so it never records a detachment that
- * did not happen, and before the rewrite, because the rewrite erases the Context line the retry
- * would need to tell an unrecorded detachment from a bead created standing alone.
+ * still under the target; the note is owed until it is on the bead; the half-created bead's
+ * run-location line is re-said by the reconcile, which always reads the parentage the bead holds
+ * NOW. The note lands between the other two on purpose — after the reparent, so it never records a
+ * detachment that did not happen, and before the rewrite, because the rewrite erases the Context
+ * line the retry would need to tell an unrecorded detachment from a bead created standing alone.
  */
 async function resumeFollowUp(
   context: FollowUpContext,
@@ -294,6 +295,11 @@ async function noteStrandedFollowUp(
  * stale rubric. `parentId` is the parentage the bead holds after reconciliation, so the Context
  * section says where it actually runs — which, for a detached bead, also erases the line the
  * detachment recovery reads ({@link createdUnder}); the note recording it has landed by then.
+ *
+ * Only the acceptance and that run-location line are touched ({@link reconcileFollowUpDescription}).
+ * The match is on title and edge, not on who wrote the bead: a founder may have made it by hand, or
+ * edited the remnant's Context, Out of scope or Verify before retrying, and refreshing the boxes must
+ * not cost them that.
  */
 async function reconcileHalfCreatedContract(
   context: FollowUpContext,
@@ -301,7 +307,7 @@ async function reconcileHalfCreatedContract(
   parentId: string | undefined,
 ): Promise<void> {
   const { repo, target, ticket, request, pipeline } = context;
-  const description = followUpDescription({
+  const description = reconcileFollowUpDescription(existing.description, {
     summary: request.summary,
     instructions: request.instructions,
     findings: request.findings,

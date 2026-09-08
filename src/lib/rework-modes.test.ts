@@ -450,6 +450,26 @@ describe("applyFollowUp", () => {
     expect(updateMock.mock.invocationCallOrder[0]!).toBeLessThan(orderOn(noteMock, "half"));
   });
 
+  it("keeps a founder's edits to the rest of a half-created contract while refreshing its acceptance", async () => {
+    // The match is on title and edge, not authorship: this remnant's Out of scope and Verify were
+    // rewritten by hand before the retry, and refreshing the boxes must not cost the founder that.
+    const authored = createdUnderFeat()
+      .replace(
+        /## Out of scope\n[^\n]+/,
+        "## Out of scope\nLeave the timeout alone — the founder decided that by hand.",
+      )
+      .replace(/## Verify\n[^\n]+/, "## Verify\nRun the retry suite twice.");
+    board(feature(), finishedTicket(), candidate("half", { description: authored }));
+
+    await applyFollowUp(project, feature(), finishedTicket(), followUp({ findings: FINDINGS }));
+
+    expect(updateMock).toHaveBeenCalledTimes(1);
+    const description = (updateMock.mock.calls[0]![2] as { description: string }).description;
+    expect(description).toContain("Leave the timeout alone — the founder decided that by hand.");
+    expect(description).toContain("## Verify\nRun the retry suite twice.");
+    expect(description).toContain(`- [ ] src/lib/retry.ts:12 — the null guard is untested`);
+  });
+
   it("leaves a half-created follow-up's description alone when it already matches the request", async () => {
     const current = followUpDescription({
       summary: SUMMARY,

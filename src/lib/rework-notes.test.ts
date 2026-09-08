@@ -19,6 +19,7 @@ import {
   hasDetachmentNote,
   hasHumanNote,
   originNoteBody,
+  reconcileFollowUpDescription,
   reworkNoteBody,
   settledPhrase,
 } from "./rework-notes";
@@ -318,6 +319,146 @@ describe("followUpDescription", () => {
         pipeline: { outcome: "retired", pr: "gh-42", redirected: false },
       }),
     ).toContain("That ticket's acceptance was met");
+  });
+});
+
+describe("reconcileFollowUpDescription", () => {
+  const args = {
+    summary: "harden the retry",
+    instructions: INSTRUCTIONS,
+    findings: [] as ReviewFinding[],
+    ticket: ticket(),
+    targetId: "feat",
+    parentId: "feat",
+  };
+  const edited = {
+    ...args,
+    instructions: "Guard the null branch.\nCover the exhausted path.",
+    findings: [
+      { severity: "blocking", location: "src/retry.ts:12", note: "retries on a 4xx" },
+    ] as ReviewFinding[],
+  };
+
+  it("round-trips a generated contract — a frozen first attempt reconciles to exactly the regenerated one", () => {
+    expect(reconcileFollowUpDescription(followUpDescription(args), edited)).toBe(
+      followUpDescription(edited),
+    );
+  });
+
+  it("swaps only the acceptance, keeping a founder's Context, Out of scope and Verify as written", () => {
+    const authored = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Acceptance Criteria",
+      "- [ ] the old box",
+      "",
+      "## Context",
+      "Discovered from t1. The founder's own account of why this matters.",
+      "It runs as a ticket of feat, in that target's next run.",
+      "",
+      "## Out of scope",
+      "The founder narrowed this by hand: leave the timeout alone.",
+      "",
+      "## Verify",
+      "Run the retry suite twice; the second run must not flake.",
+      "",
+      "## Notes",
+      "A section the formula never writes.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(authored, edited);
+
+    expect(reconciled).not.toContain("the old box");
+    expect(reconciled).toContain("- [ ] Guard the null branch.");
+    expect(reconciled).toContain("- [ ] Cover the exhausted path.");
+    expect(reconciled).toContain("- [ ] src/retry.ts:12 — retries on a 4xx");
+    for (const kept of [
+      "The founder's own account of why this matters.",
+      "The founder narrowed this by hand: leave the timeout alone.",
+      "Run the retry suite twice; the second run must not flake.",
+      "## Notes\nA section the formula never writes.",
+    ]) {
+      expect(reconciled).toContain(kept);
+    }
+    // The section boundary is the contract judge's: the rest of the description is byte-for-byte.
+    expect(reconciled.split("\n\n## Context")[1]).toBe(authored.split("\n\n## Context")[1]);
+  });
+
+  it("takes a sub-heading grouping criteria with the acceptance — it is that section's own content", () => {
+    const grouped = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Acceptance Criteria",
+      "### API",
+      "- [ ] the api box",
+      "### UI",
+      "- [ ] the ui box",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(grouped, edited);
+
+    expect(reconciled).not.toContain("### API");
+    expect(reconciled).not.toContain("the ui box");
+    expect(reconciled).toContain("## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled).toContain("\n\n## Context\nKept.");
+  });
+
+  it("re-says a generated run-location line for the parentage the bead holds now, and nothing else in Context", () => {
+    const reconciled = reconcileFollowUpDescription(followUpDescription(args), {
+      ...args,
+      parentId: undefined,
+    });
+    expect(reconciled).toBe(followUpDescription({ ...args, parentId: undefined }));
+    expect(createdUnder(makeBead({ id: "f", description: reconciled }), "feat")).toBe(false);
+  });
+
+  it("leaves a run-location line the founder rewrote alone — they own the Context then", () => {
+    const rewritten = followUpDescription(args).replace(
+      "It runs as a ticket of feat, in that target's next run.",
+      "Runs wherever the gardener puts it.",
+    );
+    const reconciled = reconcileFollowUpDescription(rewritten, { ...args, parentId: undefined });
+    expect(reconciled).toContain("Runs wherever the gardener puts it.");
+    expect(reconciled).not.toContain("It is its own run target");
+  });
+
+  it("appends an Acceptance section to a hand-made bead that has none, keeping what it says", () => {
+    const handMade = "## Goal\nharden the retry\n\n## Context\nMade by hand.\n";
+    const reconciled = reconcileFollowUpDescription(handMade, edited);
+    expect(reconciled.startsWith("## Goal\nharden the retry\n\n## Context\nMade by hand.")).toBe(true);
+    expect(reconciled).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled.trimEnd().endsWith("or answered with why they don't apply")).toBe(true);
+  });
+
+  it("writes the whole contract over a blank description — there is nothing to keep", () => {
+    expect(reconcileFollowUpDescription(undefined, edited)).toBe(followUpDescription(edited));
+    expect(reconcileFollowUpDescription("  \n", edited)).toBe(followUpDescription(edited));
+  });
+
+  it("ignores an Acceptance heading quoted inside a fence — the judge does too", () => {
+    const fenced = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "```md",
+      "## Acceptance Criteria",
+      "- [ ] a sample box",
+      "```",
+      "",
+      "## Acceptance Criteria",
+      "- [ ] the real old box",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(fenced, edited);
+    expect(reconciled).toContain("- [ ] a sample box");
+    expect(reconciled).not.toContain("the real old box");
   });
 });
 
