@@ -185,10 +185,18 @@ async function resumeFollowUp(
   const { target, ticket, body } = context;
   const existing = match.bead;
   const stranded = context.shippedPr !== undefined && beads.parentOf(existing) === target.id;
-  if (stranded) await detachStrandedFollowUp(context, existing, match.partial);
+  if (stranded) await beads.reparent(context.repo, existing.id, "");
+  // A half-created bead's contract is reconciled before EITHER note lands: the detachment note
+  // reports the Context as rewritten, which is only true once `bd update` has returned.
   if (match.partial) {
-    await finishHalfCreatedFollowUp(context, existing, stranded ? undefined : beads.parentOf(existing));
+    await reconcileHalfCreatedContract(
+      context,
+      existing,
+      stranded ? undefined : beads.parentOf(existing),
+    );
   }
+  if (stranded) await noteStrandedFollowUp(context, existing, match.partial);
+  if (match.partial) await finishHalfCreatedFollowUp(context, existing);
   return {
     result: {
       mode: "follow-up",
@@ -208,25 +216,25 @@ async function resumeFollowUp(
 }
 
 /**
- * A follow-up created UNDER the target before its PR merged is stranded there: the merged target has
- * no run left to dispatch it, and a child task is not a run target of its own, so nothing would ever
- * pick it up. That is exactly the shape the instructed retry lands in — the 409 says "send it back
- * again", and this pass reads the PR as merged. So the parentage is reconciled to what this request
- * would have created had it gone first (parentless, {@link resolvePipeline}), rather than the
- * founder being told a stranded child "carries the next pass as its own run target".
+ * Record that a follow-up created UNDER the target before its PR merged has been detached. It was
+ * stranded there: the merged target has no run left to dispatch it, and a child task is not a run
+ * target of its own, so nothing would ever pick it up. That is exactly the shape the instructed retry
+ * lands in — the 409 says "send it back again", and this pass reads the PR as merged. So
+ * {@link resumeFollowUp} reconciles the parentage to what this request would have created had it
+ * gone first (parentless, {@link resolvePipeline}), rather than the founder being told a stranded
+ * child "carries the next pass as its own run target".
  *
- * What the note says about the Context section must match what this pass leaves there. A finished
- * bead keeps its Context, which a founder may have edited, so the note flags that it still names
- * the old parent. A half-created one has its Context rewritten right after this
- * ({@link finishHalfCreatedFollowUp}, with the detached parentage), so the note says so instead of
- * describing a contract that is about to change.
+ * What the note says about the Context section must match what is on the bead WHEN THE NOTE LANDS.
+ * A finished bead keeps its Context, which a founder may have edited, so the note flags that it
+ * still names the old parent. A half-created one has already had its Context rewritten to the
+ * detached parentage ({@link reconcileHalfCreatedContract}) — the note is written only after that
+ * `bd update` returns, so a failed rewrite never leaves an audit note claiming it happened.
  */
-async function detachStrandedFollowUp(
+async function noteStrandedFollowUp(
   context: FollowUpContext,
   existing: Bead,
   contextRewritten: boolean,
 ): Promise<void> {
-  await beads.reparent(context.repo, existing.id, "");
   const contextNote = contextRewritten
     ? `Its Context section was rewritten to say so.`
     : `Its Context section still names the parent it was created under.`;
@@ -240,25 +248,21 @@ async function detachStrandedFollowUp(
 }
 
 /**
- * A bead an earlier attempt created and linked but never got a note onto ({@link existingFollowUp})
- * is this request's own work, half done — so finish it rather than opening a second follow-up beside
- * it. Both remaining writes are made, in the order the create path makes them: the attempt died on
- * the first, so neither can already be on the board.
- *
- * The description is reconciled first. `bd create` froze the FIRST attempt's instructions and
- * findings into the acceptance, and the founder may have edited either before retrying under the
- * same title — the note about to land carries the edited request, and a bead whose contract says
- * one thing while its note says another is judged against two different asks. Rewritten before the
- * note so a failure here leaves the bead still noteless — still partial, still this request's to
- * finish — rather than noted against a stale rubric. `parentId` is the parentage the bead holds
- * after reconciliation, so the Context section says where it actually runs.
+ * Reconcile a half-created follow-up's contract ({@link existingFollowUp}) to the request finishing
+ * it. `bd create` froze the FIRST attempt's instructions and findings into the acceptance, and the
+ * founder may have edited either before retrying under the same title — the note about to land
+ * carries the edited request, and a bead whose contract says one thing while its note says another
+ * is judged against two different asks. Rewritten before any note so a failure here leaves the bead
+ * still noteless — still partial, still this request's to finish — rather than noted against a
+ * stale rubric. `parentId` is the parentage the bead holds after reconciliation, so the Context
+ * section says where it actually runs.
  */
-async function finishHalfCreatedFollowUp(
+async function reconcileHalfCreatedContract(
   context: FollowUpContext,
   existing: Bead,
   parentId: string | undefined,
 ): Promise<void> {
-  const { repo, target, ticket, request, author, body, pipeline } = context;
+  const { repo, target, ticket, request, pipeline } = context;
   const description = followUpDescription({
     summary: request.summary,
     instructions: request.instructions,
@@ -271,6 +275,17 @@ async function finishHalfCreatedFollowUp(
   if (existing.description !== description) {
     await beads.update(repo, existing.id, { description });
   }
+}
+
+/**
+ * A bead an earlier attempt created and linked but never got a note onto ({@link existingFollowUp})
+ * is this request's own work, half done — so finish it rather than opening a second follow-up beside
+ * it. Both remaining writes are made, in the order the create path makes them: the attempt died on
+ * the first, so neither can already be on the board. The contract has been reconciled by then
+ * ({@link reconcileHalfCreatedContract}).
+ */
+async function finishHalfCreatedFollowUp(context: FollowUpContext, existing: Bead): Promise<void> {
+  const { repo, author, body } = context;
   await beads.note(repo, existing.id, formatHumanNote(body, author, new Date()), author || undefined);
   await noteOrigin(context, existing.id);
 }

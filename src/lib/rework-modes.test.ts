@@ -462,6 +462,22 @@ describe("applyFollowUp", () => {
     // The Context was just rewritten to the detached parentage; the note must not claim otherwise.
     expect(noteOn("half")).toContain("Its Context section was rewritten to say so.");
     expect(noteOn("half")).not.toContain("still names the parent");
+    // ...and "was rewritten" is only true once `bd update` has returned, so it lands after it.
+    expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(updateMock.mock.invocationCallOrder[0]!);
+    expect(updateMock.mock.invocationCallOrder[0]!).toBeLessThan(orderOn(noteMock, "half"));
+  });
+
+  it("leaves no detachment note claiming a rewrite when the half-created Context rewrite fails", async () => {
+    board(feature(), finishedTicket(), candidate("half"));
+    updateMock.mockRejectedValueOnce(new Error("bd update: connection reset"));
+
+    await expect(
+      applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
+    ).rejects.toThrow("bd update: connection reset");
+
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "half", "");
+    // Still noteless — still partial, still this request's to finish on the next retry.
+    expect(noteMock).not.toHaveBeenCalled();
   });
 
   it("detaches a follow-up stranded under a target whose PR merged under it, and reports the write", async () => {

@@ -190,6 +190,10 @@ describe("instructionCriteria", () => {
     expect(instructionCriteria("---\n***\n___\n- - -\n_ _ _\n* * *\n-----")).toEqual([]);
   });
 
+  it("reads a rule nested in a list item as scaffolding too — `- ---` is a rule once shorn", () => {
+    expect(instructionCriteria("- ---\n1. ***\n* ___\n- [ ] ---\n[x] - - -\n2) _ _ _")).toEqual([]);
+  });
+
   it("keeps a line that merely CONTAINS a rule, and a short dash run that is not one", () => {
     expect(instructionCriteria("--- keep the header\n--\n* -- not a rule")).toEqual([
       "--- keep the header",
@@ -239,6 +243,7 @@ describe("doneGap", () => {
   it("refuses instructions that are only a rule — `---` is a separator, not a definition of done", () => {
     expect(doneGap("---", [])).toMatch(/only list markers or rules/);
     expect(doneGap("- \n***\n_ _ _", [])).not.toBeNull();
+    expect(doneGap("- ---\n1. ***", [])).toMatch(/only list markers or rules/);
     expect(doneGap("---\nAdd the missing test.", [])).toBeNull();
     expect(doneGap("---", [finding])).toBeNull();
   });
