@@ -245,6 +245,10 @@ process.stdout.write(JSON.stringify(pr));
 /** The oid the fake gh gives the i-th commit a PR carries (`setPr`'s `carries`). */
 const carriedOid = (i: number) => (i + 1).toString(16).padStart(40, "0");
 
+/** How a refusal names the commit a bead's own PR is dated by — one committed under it or a ticket of its own. */
+const ownWorkIn = (ref: string, id: string) =>
+  `the newest commit in PR ${ref} committed under \`${id}\` or a ticket of its own`;
+
 /** How a proof line ends for a PR whose merge the base contains — the evidence, not the state. */
 const mergedTail = (sha: string) =>
   `, and its merge commit \`${sha.slice(0, 10)}\` is in the history of the run's base (main)`;
@@ -388,7 +392,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
   // that merge speaks for the work it was reopened from. Accepted as-is, another live ticket would
   // be retired against work the survivor is still redoing.
   it("refuses a bead still open whose merged PR's commits all predate its last reopen", async () => {
-    setPr(85, "MERGED");
+    setPr(85, "MERGED", { carries: [`${SHIPPER}: as first shipped`] });
     historyMock.mockResolvedValue(versions([REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]));
 
     const verdict = await verify(`superseded by ${SHIPPER}`, [
@@ -400,7 +404,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     expect(verdict).toMatchObject({
       why: expect.stringContaining(`\`${SHIPPER}\` is in_progress and its PR (gh-85) is merged — but`),
     });
-    expect(verdict).toMatchObject({ why: expect.stringContaining("the newest commit in PR gh-85 is dated") });
+    expect(verdict).toMatchObject({ why: expect.stringContaining(ownWorkIn("gh-85", SHIPPER) + " is dated") });
     expect(verdict).toMatchObject({ why: expect.stringContaining(`the board reopened \`${SHIPPER}\` at ${REOPENED_AT}`) });
     expect(verdict).toMatchObject({ why: expect.stringContaining("is later work still in_progress") });
   });
@@ -409,7 +413,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
   // its merge postdates the reopen, and every commit in it predates it. The merge's date says the
   // rework landed; the PR's own commits say nothing of the current cycle is in it.
   it("refuses an open bead's PR merged after its last reopen when every commit in it predates the reopen", async () => {
-    setPr(85, "MERGED", { commit: landedAfterReopen() });
+    setPr(85, "MERGED", { commit: landedAfterReopen(), carries: [`${SHIPPER}: as first shipped`] });
     historyMock.mockResolvedValue(versions([REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]));
 
     const verdict = await verify(`superseded by ${SHIPPER}`, [
@@ -418,8 +422,87 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     ]);
 
     expect(verdict.state).toBe("unverified");
-    expect(verdict).toMatchObject({ why: expect.stringContaining("the newest commit in PR gh-85 is dated") });
+    expect(verdict).toMatchObject({ why: expect.stringContaining(ownWorkIn("gh-85", SHIPPER) + " is dated") });
     expect(verdict).toMatchObject({ why: expect.stringContaining("is an earlier cycle's") });
+  });
+
+  // PR #238 review: the PR kept across the reopen is one anyone can still push to, and GitHub's
+  // "Update branch" adds a merge from the base dated whenever it was clicked — after the reopen,
+  // here — under a subject that names the bead through its branch. The rework is dated by a commit
+  // committed UNDER the bead, and a merge from the base is not one, however new it is.
+  it("refuses an open bead's PR whose only post-reopen commit is a merge from the base, not its own", async () => {
+    setPr(85, "MERGED", {
+      commit: landedAfterReopen(),
+      carries: [`${SHIPPER}: as first shipped`, reworkCarried(`Merge branch 'main' into anton/${SHIPPER}`)],
+    });
+    historyMock.mockResolvedValue(versions([REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]));
+
+    const verdict = await verify(`superseded by ${SHIPPER}`, [
+      bead(TARGET),
+      bead(SHIPPER, { status: "in_progress", metadata: { pr: "gh-85" } }),
+    ]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({ why: expect.stringContaining(ownWorkIn("gh-85", SHIPPER) + " is dated") });
+    expect(verdict).toMatchObject({ why: expect.stringContaining("is an earlier cycle's") });
+  });
+
+  it("refuses a reopened bead's PR carrying no commit of its own at all — nothing in it can date the rework", async () => {
+    setPr(85, "MERGED", {
+      commit: landedAfterReopen(),
+      carries: ["chore: as first shipped", reworkCarried(`Merge branch 'main' into anton/${SHIPPER}`)],
+    });
+    historyMock.mockResolvedValue(versions([REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]));
+
+    const verdict = await verify(`superseded by ${SHIPPER}`, [
+      bead(TARGET),
+      bead(SHIPPER, { status: "in_progress", metadata: { pr: "gh-85" } }),
+    ]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({
+      why: expect.stringContaining(
+        `the board reopened \`${SHIPPER}\` at ${REOPENED_AT}, and none of the 2 commits GitHub records in it ` +
+          `is committed under \`${SHIPPER}\` or a ticket of its own — its newest, \`${carriedOid(1).slice(0, 10)}\` ` +
+          `dated ${AFTER_REWORK}, is not that rework`,
+      ),
+    });
+    expect(verdict).toMatchObject({ why: expect.stringContaining("is later work still in_progress") });
+  });
+
+  // A run target's PR carries its tickets' `<child>: …` commits, and a review round's under its
+  // own id — the rework of a reopened feature is committed under a ticket beneath it.
+  it("verifies a reopened bead's merged PR when a post-reopen commit is committed under a ticket beneath it", async () => {
+    setPr(85, "MERGED", {
+      commit: landedAfterReopen(),
+      carries: [`${SHIPPER}: as first shipped`, reworkCarried("anton-kid1: the rework")],
+    });
+    historyMock.mockResolvedValue(versions([REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]));
+
+    const verdict = await verify(`superseded by ${SHIPPER}`, [
+      bead(TARGET),
+      bead(SHIPPER, { status: "in_progress", issue_type: "feature", metadata: { pr: "gh-85" } }),
+      bead("anton-kid1", { status: "closed", parent: SHIPPER }),
+    ]);
+
+    expect(verdict.state).toBe("verified");
+    expect((verdict as { landed: unknown }).landed).toEqual({
+      [SHIPPER]: { via: "pr", ref: "gh-85", workedAt: AFTER_REWORK },
+    });
+  });
+
+  // Everything in a bead's own PR is its work: a PR whose commits were never committed under the
+  // bead — a hand-made one — still speaks for a bead that was never reopened.
+  it("verifies a never-reopened bead's merged PR carrying no commit under its id", async () => {
+    setPr(85, "MERGED", { carries: ["feat: written by hand, under no bead"] });
+
+    const verdict = await verify(`superseded by ${SHIPPER}`, [
+      bead(TARGET),
+      bead(SHIPPER, { status: "in_progress", metadata: { pr: "gh-85" } }),
+    ]);
+
+    expect(verdict.state).toBe("verified");
+    expect(historyMock).toHaveBeenCalledWith(repo, SHIPPER);
   });
 
   it("verifies an open bead's merged PR when a commit in it postdates the reopen — the rework is in it", async () => {
@@ -674,8 +757,10 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       expect(verdict).toMatchObject({ why: expect.stringContaining("could not be read") });
     });
 
-    it("verifies a PR whose work is at or after the close the board holds without reading the history", async () => {
-      setPr(85, "MERGED");
+    // The shortcut is the bead's OWN commit at or after its close; a commit under no bead — a merge
+    // from the base, say — is dated after the close just as easily and settles nothing.
+    it("verifies a PR whose own work is at or after the close the board holds without reading the history", async () => {
+      setPr(85, "MERGED", { carries: [`${UNLANDED}: the work`] });
       historyMock.mockRejectedValue(new Error("must not be read"));
 
       const verdict = await verify(`already done by ${UNLANDED}`, [
@@ -757,7 +842,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     });
 
     it("refuses a bead's own merged PR whose commits all predate its last reopen", async () => {
-      setPr(85, "MERGED");
+      setPr(85, "MERGED", { carries: [`${UNLANDED}: as first shipped`] });
       historyMock.mockResolvedValue(REWORKED);
 
       const verdict = await verify(`already done by ${UNLANDED}`, [
@@ -775,7 +860,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     // PR #238 review: the merge postdates the reopen — and even the second close — while every
     // commit in the PR predates it. The PR was open when the bead was reopened and merged unchanged.
     it("refuses a bead's own PR merged after its reopen and re-close when every commit in it predates the reopen", async () => {
-      setPr(85, "MERGED", { commit: landedAfterReopen() });
+      setPr(85, "MERGED", { commit: landedAfterReopen(), carries: [`${UNLANDED}: as first shipped`] });
       historyMock.mockResolvedValue(REWORKED);
 
       const verdict = await verify(`already done by ${UNLANDED}`, [
@@ -787,7 +872,28 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       expect(verdict).toMatchObject({
         why: expect.stringContaining(`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged — but`),
       });
-      expect(verdict).toMatchObject({ why: expect.stringContaining("the newest commit in PR gh-85 is dated") });
+      expect(verdict).toMatchObject({ why: expect.stringContaining(ownWorkIn("gh-85", UNLANDED) + " is dated") });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("is an earlier cycle's") });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("is later work under that close") });
+    });
+
+    // PR #238 review: a merge from the base after the re-close is dated after the close too, so the
+    // `closed_at` shortcut would pass it on its date alone — it is not a commit under the bead, so
+    // it never reaches that shortcut.
+    it("refuses a re-closed bead's PR whose only commit after the close is a merge from the base", async () => {
+      setPr(85, "MERGED", {
+        commit: landedAfterReopen(),
+        carries: [`${UNLANDED}: as first shipped`, reworkCarried(`Merge branch 'main' into anton/${UNLANDED}`)],
+      });
+      historyMock.mockResolvedValue(REWORKED);
+
+      const verdict = await verify(`already done by ${UNLANDED}`, [
+        bead(TARGET),
+        bead(UNLANDED, { status: "closed", closed_at: RECLOSED_AT, metadata: { pr: "gh-85" } }),
+      ]);
+
+      expect(verdict.state).toBe("unverified");
+      expect(verdict).toMatchObject({ why: expect.stringContaining(ownWorkIn("gh-85", UNLANDED) + " is dated") });
       expect(verdict).toMatchObject({ why: expect.stringContaining("is an earlier cycle's") });
       expect(verdict).toMatchObject({ why: expect.stringContaining("is later work under that close") });
     });

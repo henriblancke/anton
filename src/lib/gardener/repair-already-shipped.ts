@@ -41,6 +41,7 @@ import { humanNotesPromptBlock } from "../beads/notes";
 import {
   newestPullRequestCommit,
   pullRequestCommitNaming,
+  pullRequestCommitUnder,
   readCommitNaming,
   readCommitReach,
   readPullRequestCommits,
@@ -375,7 +376,7 @@ export async function verifyShippedClaim(args: {
       // and reopened for rework keeps its merged PR pointer, and that merge speaks for the work it
       // was reopened FROM, not the work it holds now. A never-closed bead awaiting its merge's
       // finalization has no reopen in its history and stands.
-      const work = await ownPullRequestWork({ repoPath, bead, ref: pr, readCommits });
+      const work = await ownPullRequestWork({ repoPath, index, bead, ref: pr, readCommits });
       if ("why" in work) {
         return {
           state: "unverified",
@@ -509,7 +510,7 @@ async function closedBeadLanding(args: {
   if (ownPr) {
     const landing = await readPr(ownPr);
     if (landing.landed) {
-      const work = await ownPullRequestWork({ repoPath, bead, ref: ownPr, readCommits });
+      const work = await ownPullRequestWork({ repoPath, index, bead, ref: ownPr, readCommits });
       if ("why" in work) {
         return refuse(`\`${id}\` is closed on the board and its PR (${ownPr}) is merged — but ${work.why}`);
       }
@@ -585,23 +586,37 @@ async function closedBeadLanding(args: {
 }
 
 /** How a refusal names the commit a PR's work was dated by — the bead's own PR, and the one it rides. */
-const ownWork = (ref: string): string => `the newest commit in PR ${ref}`;
+const ownWork = (ref: string, id: string): string =>
+  `the newest commit in PR ${ref} committed under \`${id}\` or a ticket of its own`;
 const carriedWork = (ref: string): string => `the newest commit in PR ${ref} naming it`;
 
 /**
- * The newest commit a bead's OWN merged PR carries, held to the bead's current cycle
- * ({@link workOfCurrentCycle}). Everything in a bead's own PR is its work, so no commit has to name
- * it — the newest is when that work was last done. `why` completes "<the PR> is merged — but …" for
- * every reading that is not proof, an unreadable or empty commit list included: whether the PR
- * carries this cycle's work is exactly what the claim rests on, so neither reads as "it does".
+ * When the work a bead's OWN merged PR carries was last done, held to the bead's current cycle
+ * ({@link workOfCurrentCycle}). `why` completes "<the PR> is merged — but …" for every reading that
+ * is not proof, an unreadable or empty commit list included: whether the PR carries this cycle's
+ * work is exactly what the claim rests on, so neither reads as "it does".
+ *
+ * The work is dated by the newest commit COMMITTED UNDER the bead or a ticket beneath it — the
+ * `<id>: …` subjects anton writes for a run target's own commits and for each ticket's (PR #238
+ * review). Not the newest commit of any kind: a bead reopened for rework that keeps its PR pointer
+ * has a PR anyone can still push to, and GitHub's "Update branch" adds a merge from the base dated
+ * whenever it was clicked. Measured by that, a PR holding nothing of the rework merges as if it
+ * did, and another ticket retires against it. A commit under the bead's ids is a run's delivery
+ * for it — the one thing that can say the rework is in the PR.
+ *
+ * With no such commit the PR can still speak for a bead that was NEVER reopened — everything in a
+ * bead's own PR is its work, whatever subjects a hand-made one carries — so the history is read,
+ * and only a bead with a reopen behind it is refused: the PR has to carry a commit of its own from
+ * after that reopen, and this one carries none at all.
  */
 async function ownPullRequestWork(args: {
   repoPath: string;
+  index: BoardIndex;
   bead: Bead;
   ref: string;
   readCommits: (ref: string) => Promise<PullRequestCommits>;
 }): Promise<{ workedAt: string } | { why: string }> {
-  const { repoPath, bead, ref, readCommits } = args;
+  const { repoPath, index, bead, ref, readCommits } = args;
   const carried = await readCommits(ref);
   if (carried.state === "unreadable") {
     return {
@@ -610,10 +625,38 @@ async function ownPullRequestWork(args: {
         `carries this cycle's work is exactly what the claim rests on`,
     };
   }
+  const own = pullRequestCommitUnder(carried.commits, [
+    bead.id,
+    ...index.descendantsOf(bead.id).map((child) => child.id),
+  ]);
+  if (own) {
+    const cycle = await workOfCurrentCycle(repoPath, bead, own.workedAt, ownWork(ref, bead.id));
+    return cycle.stale ? { why: cycle.stale } : { workedAt: own.workedAt };
+  }
   const newest = newestPullRequestCommit(carried.commits);
   if (!newest) return { why: `GitHub records no commit in it — nothing dates the work it carried` };
-  const cycle = await workOfCurrentCycle(repoPath, bead, newest.workedAt, ownWork(ref));
-  return cycle.stale ? { why: cycle.stale } : { workedAt: newest.workedAt };
+  const reopen = await lastReopenOf(repoPath, bead);
+  switch (reopen.state) {
+    case "never":
+      return { workedAt: newest.workedAt };
+    case "unreadable":
+      return {
+        why:
+          `none of the ${carried.commits.length} commits GitHub records in it is committed under ` +
+          `\`${bead.id}\` or a ticket of its own, so nothing in it says which cycle's work it holds, ` +
+          `and ${reopen.why}`,
+      };
+    case "reopened":
+      return {
+        why:
+          `the board reopened \`${bead.id}\` at ${reopen.at}, and none of the ` +
+          `${carried.commits.length} commits GitHub records in it is committed under \`${bead.id}\` ` +
+          `or a ticket of its own — its newest, \`${newest.sha.slice(0, 10)}\` dated ` +
+          `${newest.workedAt}, is not that rework, so what the board holds now ` +
+          `${bead.status === "closed" ? "is later work under that close" : `is later work still ${bead.status}`}, ` +
+          `and nothing says THAT work landed`,
+      };
+  }
 }
 
 /**
@@ -641,9 +684,9 @@ async function ownPullRequestWork(args: {
  *
  * A branch updated from its base after the reopen carries a merge commit dated then and adds no
  * work; a rebase re-dates without adding any, but the older of a commit's two dates
- * ({@link PullRequestCommit}) does not move with it. The first is named, not defended against: a
- * hand on the pull request after the reopen is the operator's, and the refusal a human sees names
- * the date it measured.
+ * ({@link PullRequestCommit}) does not move with it. The first never reaches here as `workedAt`:
+ * the callers date a bead's own PR by a commit committed under it ({@link ownPullRequestWork}) and
+ * the PR it rides by one naming it, and a merge from the base is neither.
  */
 async function workOfCurrentCycle(
   repoPath: string,
@@ -1493,7 +1536,7 @@ async function stillCurrentCycle(
           repoPath,
           replacement,
           landing.workedAt,
-          landing.via === "pr" ? ownWork(landing.ref) : carriedWork(landing.ref),
+          landing.via === "pr" ? ownWork(landing.ref, replacement.id) : carriedWork(landing.ref),
         );
   if (!cycle.stale) return undefined;
   return (

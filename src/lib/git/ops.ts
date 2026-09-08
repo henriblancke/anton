@@ -999,6 +999,31 @@ export function pullRequestCommitNaming(
   return newestPullRequestCommit(commits.filter((commit) => named.test(commit.message)));
 }
 
+/**
+ * The newest commit in a PR's list COMMITTED UNDER one of `beadIds` — a `<id>: …` subject, the
+ * delivery attribution anton writes ({@link worktreeHasCommitFor}) — undefined when none is.
+ *
+ * Stricter than {@link pullRequestCommitNaming} on purpose (PR #238 review): a commit that merely
+ * mentions the id is not the bead's work. GitHub's "Update branch" merges the base into the PR's
+ * branch under `Merge branch 'main' into anton/<id>`, which names the id as a token and carries no
+ * work of the bead's — dated after a reopen, it would pass for the rework. A subject the id heads
+ * is a commit a run made for that bead, and nothing else anton or GitHub writes takes that shape.
+ * Exact on the id: `anton-fade:` is not `anton-fade.1:`.
+ */
+export function pullRequestCommitUnder(
+  commits: readonly PullRequestCommit[],
+  beadIds: readonly string[],
+): PullRequestCommit | undefined {
+  const prefixes = beadIds.filter((id) => BEAD_ID.test(id)).map((id) => `${id}:`);
+  if (prefixes.length === 0) return undefined;
+  return newestPullRequestCommit(
+    commits.filter((commit) => {
+      const subject = commit.message.split("\n", 1)[0] ?? "";
+      return prefixes.some((prefix) => subject.startsWith(prefix));
+    }),
+  );
+}
+
 /** A failed git call in one line — its own stderr where it wrote any, else the thrown message. */
 function describeGitFailure(error: unknown): string {
   const stderr = (error as { stderr?: unknown } | null)?.stderr;

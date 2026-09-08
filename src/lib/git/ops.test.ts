@@ -36,6 +36,7 @@ import {
   readPullRequestCommits,
   newestPullRequestCommit,
   pullRequestCommitNaming,
+  pullRequestCommitUnder,
   readPathHistory,
   readWorktreeState,
   resolveFreshBase,
@@ -365,6 +366,26 @@ process.exit(0);
     expect(pullRequestCommitNaming(commits, "not an id")).toBeUndefined();
     expect(newestPullRequestCommit(commits)).toMatchObject({ sha: "b".repeat(40) });
     expect(newestPullRequestCommit([])).toBeUndefined();
+  });
+
+  // A commit COMMITTED UNDER a bead heads its subject with `<id>:` — a merge from the base names
+  // the id through the branch and is not one, nor is a commit whose body merely mentions it.
+  it("finds the NEWEST commit committed under one of the given ids, by its `<id>:` subject alone", async () => {
+    const commits = [
+      { sha: "a".repeat(40), message: "Merge branch 'main' into anton/anton-fade\n", workedAt: "2020-06-01T00:00:00Z" },
+      { sha: "b".repeat(40), message: "anton-fade1: a longer id\n", workedAt: "2020-05-01T00:00:00Z" },
+      { sha: "c".repeat(40), message: "anton-fade.1: the dotted child\n", workedAt: "2020-04-01T00:00:00Z" },
+      { sha: "d".repeat(40), message: "feat: the subject\nanton-fade: named in the body", workedAt: "2020-03-15T00:00:00Z" },
+      { sha: "e".repeat(40), message: "anton-fade: the rework\n", workedAt: "2020-03-01T00:00:00Z" },
+      { sha: "f".repeat(40), message: "anton-kid1: a ticket's commit\n", workedAt: "2020-02-01T00:00:00Z" },
+    ];
+    expect(pullRequestCommitUnder(commits, ["anton-fade"])).toMatchObject({ sha: "e".repeat(40) });
+    expect(pullRequestCommitUnder(commits, ["anton-fade", "anton-kid1"])).toMatchObject({ sha: "e".repeat(40) });
+    expect(pullRequestCommitUnder(commits, ["anton-kid1"])).toMatchObject({ sha: "f".repeat(40) });
+    expect(pullRequestCommitUnder(commits, ["anton-fade.1"])).toMatchObject({ sha: "c".repeat(40) });
+    expect(pullRequestCommitUnder(commits, ["anton-x1e5"])).toBeUndefined();
+    expect(pullRequestCommitUnder(commits, ["not an id"])).toBeUndefined();
+    expect(pullRequestCommitUnder(commits, [])).toBeUndefined();
   });
 
   it("fails closed when gh cannot read the PR, names no commit list, dates a commit with nothing, or the ref names nothing", async () => {
