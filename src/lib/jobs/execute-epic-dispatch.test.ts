@@ -34,12 +34,14 @@ vi.mock("./execute-epic-ticket", () => ({
 
 type HasCommitOptions = { base?: string; strict?: boolean };
 const hasCommitMock = vi.fn<(worktree: string, id: string, options?: HasCommitOptions) => Promise<boolean>>();
+const forkPointMock = vi.fn<(worktree: string, base: string) => Promise<string>>();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
     ...actual,
     worktreeHasCommitFor: (worktree: string, id: string, options?: HasCommitOptions) =>
       hasCommitMock(worktree, id, options),
+    resolveForkPoint: (worktree: string, base: string) => forkPointMock(worktree, base),
   };
 });
 
@@ -71,6 +73,8 @@ const EPIC = "anton-epic";
 const SHIPPER = "anton-ship";
 const WORKTREE = "/tmp/anton-worktree";
 const BASE_REF = "origin/main";
+/** The immutable commit `origin/main` forked from — what the delta scan is pinned to, not the ref. */
+const FORK_POINT = "f0f0f0fork";
 
 const bead = (id: string, over: Partial<Bead> = {}): Bead =>
   ({ id, title: id, status: "open", issue_type: "task", parent: EPIC, labels: [], ...over }) as Bead;
@@ -131,6 +135,7 @@ beforeEach(() => {
   board = [];
   runTicketMock.mockReset().mockResolvedValue(COMMITTED);
   hasCommitMock.mockReset().mockResolvedValue(false);
+  forkPointMock.mockReset().mockResolvedValue(FORK_POINT);
   reopenMock.mockReset().mockResolvedValue("");
   // Faithful default: a tag/untag the subsequent `show` reads back on the board bead, so the
   // post-write reread in retireFound sees the marker it just wrote (PR #238 review).
@@ -340,17 +345,37 @@ describe("a ticket the board already holds as superseded", () => {
   // The commit that keeps a superseded ticket live has to be in THIS run's delta (PR #238 review):
   // a `<id>:` commit an earlier merge landed in the base is on the branch's ancestry too, and read
   // there it would keep a settled ticket out of the ledger and in the delivered set of a PR that
-  // carries none of it — an all-retired run would then try to open an empty PR.
+  // carries none of it — an all-retired run would then try to open an empty PR. And the delta is
+  // pinned to the fork COMMIT, never the mutable `origin/<base>` ref: a sibling run rewinding that
+  // ref behind the fork point would widen `<base>..HEAD` back into pre-fork history and let the same
+  // stale commit read as this run's delivery, so partition against the resolved fork point instead.
   it("is retired when its only commit sits in the base's history, not in the branch's delta", async () => {
     hasCommitMock.mockImplementation(async (_worktree, id, options) => id === "anton-a" && !options?.base);
     const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
 
     const outcome = await dispatchRunTickets(run, prep());
 
-    expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", { base: BASE_REF, strict: true });
+    expect(forkPointMock).toHaveBeenCalledWith(WORKTREE, BASE_REF);
+    expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", { base: FORK_POINT, strict: true });
     expect(dispatchedIds()).toEqual(["anton-b"]);
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-b"]);
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "pre-existing" }]);
+  });
+
+  // A fork point git cannot compute — the base rewritten to an unrelated history, or the read itself
+  // broken — is not "no commit here" (PR #238 review): partitioning against the moving ref instead
+  // could read work this checkout never forked from as its own delivery, so the run stops.
+  it("stops the run when the fork point cannot be resolved", async () => {
+    forkPointMock.mockRejectedValue(new Error("origin/main and HEAD share no commit"));
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(PoisonEpic);
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /could not resolve the commit `anton\/anton-epic` forked from origin\/main[\s\S]*share no commit/,
+    );
+    expect(hasCommitMock).not.toHaveBeenCalled();
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
   });
 
   // The delta scan failing is not "no commit here" (PR #238 review): the base ref gone or git broken

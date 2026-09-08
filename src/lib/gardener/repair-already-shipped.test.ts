@@ -34,8 +34,9 @@ const supersedeMock = vi.fn<(cwd: string, id: string, replacement: string) => Pr
 );
 const reopenMock = vi.fn<(cwd: string, id: string, reason?: string) => Promise<string>>(async () => "");
 const unlinkMock = vi.fn<(cwd: string, a: string, b: string) => Promise<string>>(async () => "");
+const untagMock = vi.fn<(cwd: string, id: string, labels: string[]) => Promise<string>>(async () => "");
 /** Every bd seam that WRITES. A check that touches one of these has stopped being a check. */
-const bdWrites = [noteMock, tagMock, linkMock, closeMock, updateMock, setPrRefMock, supersedeMock, reopenMock, unlinkMock];
+const bdWrites = [noteMock, tagMock, linkMock, closeMock, updateMock, setPrRefMock, supersedeMock, reopenMock, unlinkMock, untagMock];
 /** The under-lock re-reads the RETIREMENT makes — before its write and after it; the check never calls it. */
 const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
 /** `bd history` as the check sees it — never reopened unless a case says so. */
@@ -65,6 +66,7 @@ vi.mock("../beads/bd", async () => {
       supersede: supersedeMock,
       reopen: reopenMock,
       unlink: unlinkMock,
+      untag: untagMock,
       show: showMock,
       history: historyMock,
     },
@@ -2371,21 +2373,54 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     const written = () => supersedeMock.mock.calls.length > 0;
     const evidenceOf = (outcome: unknown) => (outcome as { evidence: string[] }).evidence.join(" ");
 
-    it("re-reads both ends and the board after the supersede, and stamps only once they held", async () => {
+    it("re-reads both ends and the board after the supersede, then the ticket once more after the marker, before stamping", async () => {
       const outcome = await retire();
 
       expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
       const wrote = supersedeMock.mock.invocationCallOrder[0]!;
-      const afterWrite = showMock.mock.invocationCallOrder.filter((o) => o > wrote);
-      expect(afterWrite.length).toBeGreaterThanOrEqual(2);
-      // Neither the marker nor the stamp lands until the re-read has held.
-      expect(Math.max(...afterWrite)).toBeLessThan(markerOrder());
-      expect(Math.max(...afterWrite)).toBeLessThan(stampOrder());
-      expect(showMock.mock.calls.slice(-afterWrite.length).map((c) => c[1])).toEqual(
-        expect.arrayContaining([TARGET, SHIPPER]),
-      );
+      const readsIn = (lo: number, hi: number) =>
+        showMock.mock.calls
+          .filter((_c, i) => showMock.mock.invocationCallOrder[i]! > lo && showMock.mock.invocationCallOrder[i]! < hi)
+          .map((c) => c[1]);
+      // The post-write fence reads both ends and the board, and holds the marker until it has.
+      const beforeMarker = readsIn(wrote, markerOrder());
+      expect(beforeMarker.length).toBeGreaterThanOrEqual(2);
+      expect(beforeMarker).toEqual(expect.arrayContaining([TARGET, SHIPPER]));
       expect(loadAllIssuesMock).toHaveBeenCalledTimes(2);
-      for (const write of [reopenMock, unlinkMock]) expect(write).not.toHaveBeenCalled();
+      // The marker-and-ownership reread the marker's own window needs (PR #238 review): the ticket is
+      // read once more with the marker on the board, before the stamp, to catch a reopen that raced it.
+      const afterMarker = readsIn(markerOrder(), stampOrder());
+      expect(afterMarker).toContain(TARGET);
+      for (const write of [reopenMock, unlinkMock, untagMock]) expect(write).not.toHaveBeenCalled();
+    });
+
+    // The window the marker opens on its own (PR #238 review): the pre-write fence held, the supersede
+    // and the marker both landed, and only THEN did another process reopen and reclaim the ticket. The
+    // marker now sits on live work a later merge would carry as undelivered, so the ticket is read once
+    // more with the marker on the board — reopened, the marker is cleared and the retirement taken back.
+    it("clears the marker and takes the retirement back when the ticket was reopened after the marker landed", async () => {
+      const markerLanded = () => tagMock.mock.calls.some(([, , labels]) => labels.includes(LABELS.notDelivered));
+      showMock.mockImplementation(async (cwd, id) => {
+        // Open and reclaimed the instant the marker lands — the pre-write reread saw it superseded.
+        if (id === TARGET && markerLanded()) return bead(TARGET, { status: "in_progress", assignee: "other-box" });
+        const read = await boardShow(cwd, id);
+        const wrote = supersedeMock.mock.calls.find(([, target]) => target === id);
+        return wrote ? superseded(read, wrote[2]) : read;
+      });
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { why: string }).why).toContain("between the retirement and its `not-delivered` marker");
+      expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+      expect(tagMock).toHaveBeenCalledWith(repo, TARGET, [LABELS.notDelivered]);
+      // The marker is cleared off the live ticket, and the retirement is left to whoever reopened it —
+      // anton does not reopen it (that is somebody else's decision) and does not stamp it.
+      expect(untagMock).toHaveBeenCalledWith(repo, TARGET, [LABELS.notDelivered]);
+      expect(evidenceOf(outcome)).toContain("reopened or reclaimed");
+      expect(evidenceOf(outcome)).toContain(`cleared the \`${LABELS.notDelivered}\` marker`);
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(tagMock.mock.calls.some(([, , labels]) => labels.some((l) => l.startsWith("repair:")))).toBe(false);
     });
 
     it("withdraws a retirement that closed a ticket rewritten in the window, and does not stamp it", async () => {

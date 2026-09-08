@@ -1332,6 +1332,28 @@ export async function repairAlreadyShipped(args: {
     // like the skip path's, and reported rather than thrown — the retirement is not taken back over
     // it (see the header), so the caller has to know it stands unmarked.
     const marked = await mustPersist(() => beads.tag(repoPath, bead.id, [LABELS.notDelivered]));
+    // The marker lands in the same cross-process window the supersede did (PR #238 review): the locks
+    // order this process only, so between retirementHeld's reread and this tag another machine can
+    // reopen and claim the ticket, and the marker would then sit on live work a later merge carries as
+    // undelivered. So the ticket is read once more with the marker on the board — the marker-and-
+    // ownership reread {@link retireFound} makes for the same reason. Reopened or reclaimed, the marker
+    // is cleared and the retirement taken back before it is accepted; the marker stripped while the
+    // close still stands, the retirement holds and anton reports it could not keep the marker; unread,
+    // nothing is assumed either way. Only when the tag actually landed: a marker that never wrote
+    // leaves nothing on live work to clean up.
+    if (marked) {
+      const overtaken = await markerOvertaken({ repoPath, targetId: bead.id, replacementId });
+      if (overtaken) {
+        return {
+          action: "escalate",
+          why:
+            `${bead.id} blocked as \`${KLASS}\`, and the board moved between the retirement and its ` +
+            `\`${LABELS.notDelivered}\` marker — anton found out only on re-reading after the marker ` +
+            `landed, so a human decides the ticket.`,
+          evidence: [overtaken, `the retirement anton wrote: ${attempted}`],
+        };
+      }
+    }
     let label: string | undefined;
     try {
       label = await recordRepair(repoPath, bead, KLASS, attempted, now);
@@ -1542,6 +1564,47 @@ async function withdrawRetirement(args: {
     );
   }
   return `anton withdrew the retirement: ${targetId} is open again and its \`supersedes\` edge to ${replacementId} is gone`;
+}
+
+/**
+ * Whether the `not-delivered` marker anton just wrote sits on a ticket the retirement no longer owns
+ * — the marker-and-ownership reread {@link retireFound} makes after its own marker, for the reason the
+ * post-write fence exists (PR #238 review; see the header). The locks order this process only, so
+ * between {@link retirementHeld}'s reread and the tag another process can reopen and claim the ticket,
+ * and the marker would then read to a later merge as work no run reserved sitting on live work.
+ *
+ * Still closed by anton's OWN supersede, the marker rests on a settled ticket and nothing is done —
+ * undefined. Reopened or reclaimed — no longer that close — the marker is on work this retirement
+ * does not own: cleared, and the retirement taken back where it is still anton's to take
+ * ({@link withdrawRetirement} acts only on an `overtaken`/`unread` read the way it does on the
+ * pre-write fence's). Unread, nothing is assumed either way. Returns the one evidence line the
+ * escalation carries.
+ */
+async function markerOvertaken(args: {
+  repoPath: string;
+  targetId: string;
+  replacementId: string;
+}): Promise<string | undefined> {
+  const { repoPath, targetId, replacementId } = args;
+  const target = await readBead(repoPath, targetId, "after");
+  if (typeof target !== "string" && beads.supersededBy(target) === replacementId) return undefined;
+  const held: Exclude<RetirementVerdict, { state: "held" }> =
+    typeof target === "string"
+      ? { state: "unread", why: target }
+      : {
+          state: "overtaken",
+          why:
+            `${targetId} is ${target.status}` +
+            `${isOpenWork(target) ? "" : `, superseded by ${beads.supersededBy(target) ?? "nothing"}`}` +
+            ` now — reopened or reclaimed since the retirement's fence, and the ` +
+            `\`${LABELS.notDelivered}\` marker anton wrote would sit on live work`,
+        };
+  const cleared = (await mustPersist(() => beads.untag(repoPath, targetId, [LABELS.notDelivered])))
+    ? `anton cleared the \`${LABELS.notDelivered}\` marker it had written on ${targetId}`
+    : `anton could NOT clear the \`${LABELS.notDelivered}\` marker on ${targetId} — it sits on live ` +
+      `work, and \`bd update ${targetId} --remove-label ${LABELS.notDelivered}\` takes it off`;
+  const withdrawn = await withdrawRetirement({ repoPath, targetId, replacementId, held });
+  return `${held.why}; ${cleared}; ${withdrawn}`;
 }
 
 const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
