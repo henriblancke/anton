@@ -1,6 +1,10 @@
 import { notFound } from "next/navigation";
 
-import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
+import {
+  getProjectBySlug,
+  getProjectSettingsBySlug,
+  resolvePickerApplyOverride,
+} from "@/lib/projects";
 import { allIssues } from "@/lib/beads/issues";
 import { boardLabelVocabulary } from "@/lib/beads/labels";
 import { discoverVocabulary } from "@/lib/policy/vocabulary";
@@ -8,8 +12,8 @@ import { boardIssueTypes, calibratePolicy } from "@/lib/policy/calibrate";
 import { policyCandidates } from "@/lib/policy/candidates";
 import {
   earnedAutonomyOfKind,
-  earnedPickerAutonomy,
   emptyTrackRecord,
+  pickerApplyVerdict,
 } from "@/lib/gardener/autonomy";
 import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
 import { proposalTrackRecord } from "@/lib/gardener/track-record";
@@ -18,6 +22,7 @@ import { bundledAgentIds, discoverAgents } from "@/lib/agents-discovery";
 import { DEFAULT_SCHEDULES, listSchedules } from "@/lib/schedules";
 import { loadBaseSystemPrompt } from "@/lib/claude/system-prompt";
 import { SettingsView } from "@/components/settings/settings-view";
+import type { EarnedPicker } from "@/components/settings/sections/picker-autonomy-section";
 
 export const dynamic = "force-dynamic";
 
@@ -112,12 +117,18 @@ export default async function ProjectSettingsPage({
     declined: 0,
     settled: 0,
   }));
-  const picker = earnedPickerAutonomy(pickerRecord);
-  const pickerEarned = {
-    accepted: picker.accepted,
-    settled: picker.settled,
-    eligible: picker.eligible,
-    ...(picker.reason ? { reason: picker.reason } : {}),
+  // The earned floor and the operator's own override of it, weighed ONCE (anton-d1lk) so the control
+  // and the pass can never disagree about which of the two is holding `apply` up. The record's own
+  // reason travels even while a signature stands in for it — an operator has to be able to see what
+  // they are standing in for.
+  const picker = pickerApplyVerdict(pickerRecord, resolvePickerApplyOverride(settings));
+  const pickerEarned: EarnedPicker = {
+    accepted: picker.earned.accepted,
+    settled: picker.earned.settled,
+    bar: picker.earned.bar,
+    ...(picker.arming ? { arming: picker.arming } : {}),
+    ...(picker.deliberate ? { deliberate: picker.deliberate } : {}),
+    ...(picker.earned.reason ? { reason: picker.earned.reason } : {}),
   };
 
   return (

@@ -16,9 +16,10 @@ import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs"
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
 import { GARDENER_DETECTION_KINDS } from "./gardener/detections";
 import {
-  earnedPickerAutonomy,
+  pickerApplyVerdict,
   PROPOSAL_AUTONOMY_LEVELS,
   resolveProposalAutonomyPolicy,
+  type DeliberateArming,
   type PickerRecordCounts,
   type ProposalAutonomyOverrides,
   type ProposalAutonomyPolicy,
@@ -403,6 +404,20 @@ export interface ProjectSettings {
    * {@link pickerAutonomySchema} at the API boundary.
    */
   pickerAutonomy?: PickerAutonomy;
+  /**
+   * A DELIBERATE arming of `apply` (anton-d1lk): the operator's explicit, signed bypass of the
+   * earned floor, or absent — which is every project until somebody arms one, since nothing writes
+   * this but the arming route. Revoking is deleting it, and the very next pass re-floors the project
+   * on its record.
+   *
+   * Deliberately NOT in the settings PATCH table: the actor is resolved SERVER-side
+   * (`resolveOperator`), because a caller-supplied author on the one field that starts unattended
+   * work with no evidence behind it would make the audit trail worth nothing.
+   *
+   * It bypasses the earned floor and nothing else. The structural floor below still refuses an
+   * unarmed project, and the brakes and the budget governor sit downstream of the level entirely.
+   */
+  pickerApplyOverride?: DeliberateArming;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -857,6 +872,34 @@ export function resolvePickerPolicy(settings: ProjectSettings): Policy | undefin
 export const pickerAutonomySchema = z.enum(PICKER_AUTONOMY_LEVELS);
 
 /**
+ * A stored deliberate arming (anton-d1lk). Both halves required and the instant a real one: an
+ * arming that cannot say who or when is not an audit trail, and the whole justification for letting
+ * it stand in for the record is that it names somebody.
+ */
+export const deliberateArmingSchema = z
+  .object({
+    by: z.string().trim().min(1).max(200),
+    at: z.iso.datetime(),
+  })
+  .strict();
+
+/**
+ * The deliberate arming stored on this project, or undefined when there is none — or when what is
+ * stored cannot be read as one.
+ *
+ * Validated on the way OUT, not merely on the way in, and that is the point: settingsJson is
+ * hand-editable, and a half-written arming must fall back to the earned floor rather than arm
+ * `apply` off a fragment. Same fail-safe direction as {@link resolveProposalAutonomyPolicy}, which
+ * drops what it cannot read instead of failing a pass over it.
+ */
+export function resolvePickerApplyOverride(
+  settings: ProjectSettings,
+): DeliberateArming | undefined {
+  const parsed = deliberateArmingSchema.safeParse(settings.pickerApplyOverride);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
  * How far the picker may go on this project — the stored level with BOTH floors applied here, so no
  * caller has to remember either.
  *
@@ -867,8 +910,14 @@ export const pickerAutonomySchema = z.enum(PICKER_AUTONOMY_LEVELS);
  *
  * The EARNED floor (anton-vkp9): `apply` also has to be earned, by this project's own record of
  * releases and vetoes, against the same bars the gardener's kinds clear
- * ({@link earnedPickerAutonomy}). A policy is what anton MAY start; the record is whether its picks
+ * ({@link pickerApplyVerdict}). A policy is what anton MAY start; the record is whether its picks
  * have been worth starting, and only the operator's answers say so.
+ *
+ * That second floor — and ONLY that one — takes a stored deliberate arming as its answer
+ * (anton-d1lk): an operator who accepts the risk today signs for it, and the signature stands in for
+ * the evidence. The structural floor above it does not move for anybody, so a project with no work
+ * policy still cannot reach `apply` however deliberately it was armed — there is no boundary there
+ * to accept the risk OF.
  *
  * Both land on `shadow` rather than on `propose`, and that is deliberate: `shadow` is the lane where
  * picks are offered and answered, so it is where the record is MADE. Demoting to `propose` would
@@ -877,7 +926,8 @@ export const pickerAutonomySchema = z.enum(PICKER_AUTONOMY_LEVELS);
  * reason: its `shadow` writes records nobody asked for.)
  *
  * Re-asked on every pass, never latched, which is what makes the earned floor bite after arming too:
- * a record that degrades returns the picker to `shadow` on the next tick.
+ * a record that degrades returns the picker to `shadow` on the next tick — and a project standing on
+ * a deliberate arming returns there on the tick after it is revoked.
  */
 export function resolvePickerAutonomy(
   settings: ProjectSettings,
@@ -888,7 +938,9 @@ export function resolvePickerAutonomy(
   if (!stored) return armed ? "shadow" : "propose";
   if (stored !== "apply") return stored;
   if (!armed) return "shadow";
-  return earnedPickerAutonomy(record).eligible ? "apply" : "shadow";
+  return pickerApplyVerdict(record, resolvePickerApplyOverride(settings)).allowed
+    ? "apply"
+    : "shadow";
 }
 
 /**
@@ -1085,19 +1137,32 @@ function mergeSettings(
   return next;
 }
 
+/** What a conditional writer decides once it can see the settings it is writing against. */
+export type SettingsWriteDecision<R> = { write: Partial<ProjectSettings> } | { refuse: R };
+
+/** The outcome of a conditional write. `settings` is the standing blob either way. */
+export type SettingsWriteResult<R> =
+  | { applied: true; settings: ProjectSettings }
+  | { applied: false; settings: ProjectSettings; refused: R };
+
 /**
- * Merge a settings patch into the project's settingsJson. Returns the merged settings.
+ * Merge a settings patch into the project's settingsJson, unless `decide` refuses once it has seen
+ * the settings as they stand AT WRITE TIME. Returns the merged blob, or the untouched one plus the
+ * refusal.
  *
- * The read, the merge and the write happen inside ONE immediate transaction, synchronously, because
- * every writer here rewrites the WHOLE blob and the settings page has several of them: the global
- * Save, the automation table (which saves on change) and the work-policy panel each PATCH on their
- * own. Two in flight at once would otherwise both read the pre-save row, and the later write would
- * silently erase the earlier one's keys while both requests reported success.
+ * The read, the decision, the merge and the write happen inside ONE immediate transaction,
+ * synchronously, for two reasons. Every writer here rewrites the WHOLE blob and the settings page
+ * has several of them — the global Save, the automation table (which saves on change) and the
+ * work-policy panel each PATCH on their own — so two in flight at once would both read the pre-save
+ * row and the later write would silently erase the earlier one's keys while both reported success.
+ * And a guard that ran BEFORE the transaction is only a hint: two callers can both read a state
+ * their guard admits and both write, which is how a conflict the caller reports as a 409 becomes a
+ * silent overwrite instead. Deciding under the write lock is what makes the refusal true.
  */
-export async function updateProjectSettings(
+export async function updateProjectSettingsIf<R>(
   slug: string,
-  patch: Partial<ProjectSettings>,
-): Promise<ProjectSettings> {
+  decide: (current: ProjectSettings) => SettingsWriteDecision<R>,
+): Promise<SettingsWriteResult<R>> {
   const db = getDb();
   const p = await getProjectBySlug(slug);
   if (!p) throw new Error(`Project not found: ${slug}`);
@@ -1109,19 +1174,32 @@ export async function updateProjectSettings(
         .where(eq(schema.projects.id, p.id))
         .limit(1)
         .get();
-      const next = mergeSettings(parseSettings(row?.settingsJson), patch);
+      const current = parseSettings(row?.settingsJson);
+      const decision = decide(current);
+      if ("refuse" in decision) {
+        return { applied: false as const, settings: current, refused: decision.refuse };
+      }
+      const next = mergeSettings(current, decision.write);
       tx
         .update(schema.projects)
         .set({ settingsJson: JSON.stringify(next) })
         .where(eq(schema.projects.id, p.id))
         .run();
-      return next;
+      return { applied: true as const, settings: next };
     },
     // The write lock is taken up front: a deferred transaction would read first and only then try to
     // upgrade, which is the shape that loses to SQLITE_BUSY under exactly the concurrency this
     // guards against.
     { behavior: "immediate" },
   );
+}
+
+/** Merge a settings patch into the project's settingsJson. Returns the merged settings. */
+export async function updateProjectSettings(
+  slug: string,
+  patch: Partial<ProjectSettings>,
+): Promise<ProjectSettings> {
+  return (await updateProjectSettingsIf(slug, () => ({ write: patch }))).settings;
 }
 
 /** What the shared beads config path reports back — the one seam the log helpers below read. */

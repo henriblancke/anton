@@ -260,6 +260,11 @@ export const boardPickerPlans = sqliteTable("board_picker_plans", {
  * track record — the same evidence base earned autonomy reads for the gardener's kinds
  * (`gardener/track-record.ts`), for a surface that has no board fingerprint to count off.
  *
+ * The two vetoes are one VERDICT and two MEANINGS (anton-gtcd): both defer the target and both are
+ * declines, but `✕ not now` is pacing — "not this hour" — while `Never` is judgment about the rule
+ * that admitted the pick. `veto_kind` is what tells them apart on the row, so the record can weigh
+ * genuine disagreement without counting the operator's scheduling against the ranking.
+ *
  * One row per (verdict, pick) — a repeat veto extends its standing decline rather than filing a
  * second one, so the counts stay a record of DECISIONS and not of clicks. A decline carries its own
  * expiry rather than a flag somebody has to clear: a veto defers the target for a bounded window
@@ -283,6 +288,17 @@ export const pickerVerdicts = sqliteTable(
     verdict: text("verdict").notNull(),
     /** `PickerVerdictAction`: which affordance produced it (`not-now`, `never`, `release`). */
     action: text("action").notNull(),
+    /**
+     * `PickerVetoKind`: what a decline MEANT — `pacing` (`not-now`) or `disagreement` (`never`).
+     * Null on an accept, which vetoes nothing.
+     *
+     * Kept beside `action` rather than derived from it because the two answer different questions
+     * and drift apart on purpose (anton-gtcd). `action` is the LAST affordance that touched the row,
+     * and a repeat veto overwrites it; this is the strongest thing the operator ever said about the
+     * pick, and a later `not-now` never erases a `never`. Only the meaning is evidence about the
+     * ranking, so only the meaning may be counted.
+     */
+    vetoKind: text("veto_kind"),
     /** The admitting rule the plan recorded, frozen at the moment of the verdict. */
     rule: text("rule"),
     /**

@@ -104,9 +104,11 @@ export function SettingsView({
    */
   earned: Record<string, EarnedKind>;
   /**
-   * What this project's own releases and vetoes have earned the PICKER (anton-vkp9). Computed on the
-   * server off the verdict record the pass reads, so the control and the pass can never disagree
-   * about whether `apply` is available.
+   * What this project's own releases and vetoes have earned the PICKER (anton-vkp9), the bar they
+   * are read against, and the operator's signed bypass of it when there is one (anton-d1lk).
+   * Computed on the server off the verdict record and the stored signature the pass reads, so the
+   * control and the pass can never disagree about whether `apply` is available — or about which of
+   * the two is holding it up.
    */
   pickerEarned: EarnedPicker;
 }) {

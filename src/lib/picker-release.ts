@@ -28,7 +28,7 @@ import {
   saveBoardPickerPlan,
   stampBoard,
   type BoardPickerPlan,
-  type PickerExclusionReason,
+  type PickerExclusion,
 } from "./board-picker-plan";
 import type { Bead } from "./beads/types";
 import { systemClock, type AntonDb } from "./jobs/queue";
@@ -42,6 +42,7 @@ import {
   recordPickerAccept,
 } from "./picker-veto";
 import { getProjectSettings, resolvePickerAutonomy, resolvePickerPolicy } from "./projects";
+import type { ReleaseRefusal } from "./types";
 import { scheduleEnabled } from "./schedules";
 
 /** The decision a release answers: the generation, and that generation's own rank and rule. Read
@@ -59,12 +60,14 @@ export interface ReleasePick {
  *   • `skip`   — the run is the operator's to have, the evidence is not. The approval and the run go
  *                ahead and nothing is written about the picker.
  *   • `refuse` — the start itself must not happen: the operator answered a generation that has been
- *                replaced, and the ranking as of now does not carry this target at all.
+ *                replaced, and the ranking as of now does not carry this target at all. `refusal`
+ *                says WHICH of those it is, for the card that must report it as a state
+ *                ({@link ReleaseRefusal}, {@link isAlreadySettled}).
  */
 export type ReleaseResolution =
   | { accept: ReleasePick }
   | { skip: string }
-  | { refuse: string };
+  | { refuse: string; refusal: ReleaseRefusal };
 
 export interface ResolveReleaseInput {
   projectId: string;
@@ -200,18 +203,27 @@ async function rederiveRelease(
   // Named, not merely refused: the operator clicked a pick, and "it stopped being one" is only
   // actionable if it says which fact retired it. The exclusion is the decision's own words — the
   // same ones the lane groups the rest of the board by.
-  const excluded = decision.exclusions.find((x) => x.beadId === beadId);
+  // The decision reports every refusal but a CLOSED target's (`eligibleTargets`): finished work is
+  // most of a mature board and nobody asks why it isn't next. A release can still name one — the
+  // run it started finished while this view was open — so that one reading is restored here.
+  const excluded =
+    decision.exclusions.find((x) => x.beadId === beadId) ??
+    (board.find((b) => b.id === beadId)?.status === "closed"
+      ? { beadId, reason: "not-open" as const, detail: "closed" }
+      : undefined);
   const because = excluded
     ? `${excluded.reason}${excluded.detail ? ` — ${excluded.detail}` : ""}`
     : "it is no longer in the ranked set";
-  if (excluded && ALREADY_SETTLED_EXCLUSIONS.has(excluded.reason)) {
+  if (excluded && isAlreadySettled(excluded)) {
     return {
+      refusal: "settled",
       refuse:
         `${beadId} is already taken (${because}) — it was settled while this view was open. ` +
         `Nothing new was approved or started; the board is catching up.`,
     };
   }
   return {
+    refusal: "retired",
     refuse:
       `${beadId} is no longer one of anton's picks: the plan you released from was replaced, and ` +
       `the current one leaves it out (${because}). Nothing was approved or started — approve it ` +
@@ -220,19 +232,27 @@ async function rederiveRelease(
 }
 
 /**
- * The exclusions that mean the target was ALREADY SETTLED rather than retired (PR #236 review).
+ * Whether an exclusion means the target was ALREADY SETTLED rather than retired (PR #236 review).
  *
- * A ranking drops `claimed` and `not-open` targets because somebody else got there — a parallel
- * release from another tab, a teammate's claim, a run already in flight. The remedy for a retired
- * pick, "approve it directly", is wrong for those: it invites a second approval on a start that
- * exists. So they get the stale-surface reading instead, which is what the client's 409 handler
- * already acts on (`release-action.tsx` → `router.refresh()`). Every genuinely-retired reason —
- * `needs-human`, `policy`, `approval-gap`, `blocked` — keeps the approve-directly remedy.
+ * A ranking drops a target because somebody else got there — a parallel release from another tab,
+ * a teammate's claim, a run already in flight or finished. The remedy for a retired pick, "approve
+ * it directly", is wrong for those: it invites a second approval on a start that exists. So they get
+ * the stale-surface reading instead, which is what the client's 409 handler already acts on
+ * (`release-action.tsx` → `router.refresh()`).
+ *
+ * `not-open` is read by its STATUS, not taken whole (PR #245 review): `ineligibility` reports every
+ * non-open status under it, and only some of those are a start. `in_progress` and `closed` are;
+ * `blocked` and `deferred` are targets nobody has, waiting on a blocker or a hold — and telling the
+ * operator "already taken" would hide the one thing they need to do. Every genuinely-retired reason
+ * — `needs-human`, `policy`, `approval-gap`, `blocked` — keeps the approve-directly remedy.
  */
-const ALREADY_SETTLED_EXCLUSIONS: ReadonlySet<PickerExclusionReason> = new Set([
-  "claimed",
-  "not-open",
-]);
+function isAlreadySettled(excluded: PickerExclusion): boolean {
+  if (excluded.reason === "claimed") return true;
+  return excluded.reason === "not-open" && SETTLED_STATUSES.has(excluded.detail ?? "");
+}
+
+/** The `not-open` statuses that mean a start exists: running, or already run to completion. */
+const SETTLED_STATUSES: ReadonlySet<string> = new Set(["in_progress", "closed"]);
 
 function pickOf(planId: string, rank: number, rule?: string): ReleasePick {
   return { planId, rank, ...(rule ? { rule } : {}) };

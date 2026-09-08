@@ -454,7 +454,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   if (pick && "refuse" in pick) {
     // 409, the same status a lost claim race answers with, and for the same reason: this surface's
     // copy of the board is provably behind, which is exactly what the release control re-reads on.
-    return NextResponse.json({ error: pick.refuse }, { status: 409 });
+    // `pickRefused` is what tells it apart FROM that claim race: the card reports a retired pick as
+    // its own state rather than as a failed request, and must never report it as one still waiting to
+    // be recorded (anton-84lx).
+    return NextResponse.json({ error: pick.refuse, pickRefused: pick.refusal }, { status: 409 });
   }
 
   // Re-check the board shape, auto-claim, then approve — all under the bead's claim-write lock.
