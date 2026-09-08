@@ -5,6 +5,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
+import { withBeadWriteLock } from "./beads/claim-lock";
 import { formatHumanNote } from "./beads/notes";
 import type { Project } from "./types";
 
@@ -536,6 +537,44 @@ describe("follow-up", () => {
         description: expect.stringContaining(`- [ ] ${INSTRUCTIONS}`),
       });
       expect(updateMock.mock.invocationCallOrder[0]).toBeLessThan(orderOfCallOn(noteMock, "already"));
+    });
+
+    it("rewrites its contract only under the follow-up's OWN lock — a founder's edit can't be overwritten mid-flight", async () => {
+      // The ticket's and the target's locks say nothing about the follow-up, and ticket-detail's
+      // `updateTicket` edits a description under the bead's own lock. Held here as that edit holds
+      // it: the reconcile waits for it rather than replacing the description off a read it predates.
+      halfCreated();
+      let release!: () => void;
+      const founderEdit = withBeadWriteLock(
+        "/repo",
+        "already",
+        () => new Promise<void>((resolve) => (release = resolve)),
+      );
+
+      const pending = reworkTicket(project, "feat", followUp());
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(noteMock).not.toHaveBeenCalled();
+
+      release();
+      await founderEdit;
+      await expect(pending).resolves.toMatchObject({ reworkedId: "already", applied: true });
+      expect(updateMock).toHaveBeenCalledWith("/repo", "already", {
+        description: expect.stringContaining(`- [ ] ${INSTRUCTIONS}`),
+      });
+    });
+
+    it("409s rather than resume a follow-up that appeared after the snapshot it locked from", async () => {
+      // The board the request locked from carried no candidate; the re-read under those locks does
+      // — a founder linked a same-titled bead by hand in between. Its lock is not held, so writing
+      // to it would be unserialized: refuse, and the retry locks what it finds.
+      halfCreated();
+      listMock.mockResolvedValueOnce([feature(), ticketA()]);
+
+      await expect(reworkTicket(project, "feat", followUp())).rejects.toThrow(ReworkConflictError);
+      expect(createMock).not.toHaveBeenCalled();
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(noteMock).not.toHaveBeenCalled();
     });
 
     it("prefers the bead that carries THIS request's note over an unfinished one", async () => {

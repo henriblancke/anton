@@ -12,7 +12,7 @@ import { beads, type Bead } from "./beads/bd";
 import { refreshAllIssues } from "./beads/issues";
 import { formatHumanNote } from "./beads/notes";
 import { resolveOperator } from "./operator";
-import type { ReworkRequest } from "./rework-contract";
+import { ReworkConflictError, type ReworkRequest } from "./rework-contract";
 import {
   createdUnder,
   detachmentNoteBody,
@@ -127,13 +127,19 @@ function reopenAlreadyApplied(fresh: Bead, body: string): boolean {
  *
  * A SHIPPED target (its PR merged, {@link resolvePipeline}) is parented nowhere for a second reason:
  * its next run has nothing left to execute, so a child of it would never be dispatched either.
+ *
+ * `lockedFollowUps` is every bead the caller took a write lock on besides the ticket and the target
+ * ({@link followUpCandidateIds}) — the only beads this may RESUME. A resume rewrites the match's
+ * contract off the read it makes here, and a founder editing that same bead (ticket-detail's
+ * `updateTicket`, serialized on the bead's own lock) must land before or after it, never under it.
  */
 export async function applyFollowUp(
   project: Project,
   target: Bead,
   ticket: Bead,
   request: ReworkRequest,
-  pipeline?: ReworkPipeline,
+  pipeline: ReworkPipeline | undefined,
+  lockedFollowUps: ReadonlySet<string>,
 ): Promise<AppliedRework> {
   const repo = project.repoPath;
   const context: FollowUpContext = {
@@ -160,7 +166,18 @@ export async function applyFollowUp(
   // and the whole point of the lock is that the loser sees the winner's work.
   const all = await refreshAllIssues(repo);
   const match = await existingFollowUp(repo, all, ticket.id, request.summary, context.body);
-  return match ? resumeFollowUp(context, match) : createFollowUp(context, all);
+  if (!match) return createFollowUp(context, all);
+  // A match the caller did not lock became a candidate between its snapshot and its locks — a
+  // founder linking a same-titled bead by hand in that window. Writing to it unserialized is the
+  // lost update the lock exists to prevent, and the answer is the one every other moved-board race
+  // gets (409): look again, and the retry snapshots — and locks — the bead it will resume.
+  if (!lockedFollowUps.has(match.bead.id)) {
+    throw new ReworkConflictError(
+      `${match.bead.id} became ${ticket.id}'s follow-up while this send-back was being decided — ` +
+        `look again and send it back`,
+    );
+  }
+  return resumeFollowUp(context, match);
 }
 
 /** Everything both follow-up paths need: who is writing, what the note says, and what the PR decided. */
@@ -425,14 +442,26 @@ export async function existingFollowUp(
   for (const candidate of followUpCandidates(all, ticketId, summary)) {
     const fresh = await beads.show(repo, candidate.id);
     // The snapshot's "unsettled" rule, re-applied to the read the decision is actually made on: the
-    // lock covers the ticket and the target, not the follow-up, so a candidate can close between the
-    // two. A closed bead is nobody's follow-up — nothing dispatches it and its parentage no longer
-    // says anything — so matching one would report this send-back as already done and drop it.
+    // locks are in-process only (anton-od4), so a `bd close` from a terminal or another host can land
+    // between the two. A closed bead is nobody's follow-up — nothing dispatches it and its parentage
+    // no longer says anything — so matching one would report this send-back as already done and drop it.
     if (fresh.status === "closed") continue;
     if (hasHumanNote(fresh, body)) return { bead: fresh, partial: false };
     partial ??= unfinishedCreation(fresh);
   }
   return partial ? { bead: partial, partial: true } : undefined;
+}
+
+/**
+ * The beads a follow-up of `ticketId` under this summary could resume ({@link existingFollowUp}),
+ * off the caller's board snapshot — what `reworkTicket` locks alongside the ticket and the target
+ * before it applies, so the resume's rewrite of a match is serialized against that bead's own
+ * writers. Nested acquisition would not do: the ticket and target locks are already held by then,
+ * and a gardener move of the same follow-up takes its set in sorted order (`withBeadWriteLocks`),
+ * which can hold the follow-up while waiting on the target.
+ */
+export function followUpCandidateIds(all: Bead[], ticketId: string, summary: string): string[] {
+  return followUpCandidates(all, ticketId, summary).map((b) => b.id);
 }
 
 /**

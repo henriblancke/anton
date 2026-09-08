@@ -16,7 +16,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
 import { formatHumanNote } from "./beads/notes";
 import type { ReviewFinding } from "./jobs/review-context";
-import type { ReworkRequest } from "./rework-contract";
+import { ReworkConflictError, type ReworkRequest } from "./rework-contract";
 import type { Project, ReworkMode, ReworkPipeline } from "./types";
 
 const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
@@ -59,9 +59,28 @@ vi.mock("./beads/issues", () => ({ refreshAllIssues: () => refreshMock() }));
 
 vi.mock("./operator", () => ({ resolveOperator: () => operatorMock() }));
 
-const { applyFollowUp, applyReopen, existingFollowUp, inheritedLabels } = await import(
-  "./rework-modes"
-);
+const {
+  applyFollowUp: applyFollowUpHolding,
+  applyReopen,
+  existingFollowUp,
+  followUpCandidateIds,
+  inheritedLabels,
+} = await import("./rework-modes");
+
+/**
+ * `applyFollowUp` as `reworkTicket` calls it — holding the lock of every bead on the board it could
+ * resume. What the guard on that set refuses when a match is NOT held is pinned in its own case.
+ */
+async function applyFollowUp(
+  project: Project,
+  target: Bead,
+  ticket: Bead,
+  request: ReworkRequest,
+  pipeline?: ReworkPipeline,
+): ReturnType<typeof applyFollowUpHolding> {
+  const held = new Set((await refreshMock()).map((b) => b.id));
+  return applyFollowUpHolding(project, target, ticket, request, pipeline, held);
+}
 const { detachmentNoteBody, followUpDescription, hasHumanNote, reworkNoteBody } = await import(
   "./rework-notes",
 );
@@ -399,6 +418,18 @@ describe("applyFollowUp", () => {
     for (const write of allWrites) expect(write).not.toHaveBeenCalled();
   });
 
+  it("refuses to resume a match whose lock this request does not hold, writing nothing", async () => {
+    // The candidate was not on the snapshot `reworkTicket` locked from — a founder linked it by hand
+    // in that window. Rewriting its contract unserialized is the lost update the lock prevents, so
+    // the answer is the moved-board 409: look again, and the retry locks what it finds.
+    board(feature(), finishedTicket(), candidate("half", { description: createdUnderFeat() }));
+
+    await expect(
+      applyFollowUpHolding(project, feature(), finishedTicket(), followUp(), undefined, new Set()),
+    ).rejects.toThrow(ReworkConflictError);
+    for (const write of allWrites) expect(write).not.toHaveBeenCalled();
+  });
+
   it("finishes a half-created follow-up rather than opening a second one beside it", async () => {
     // `bd create` and `bd link` landed, the note after them didn't — the bead speaks for no request.
     board(feature(), finishedTicket(), candidate("half"));
@@ -689,6 +720,20 @@ describe("applyFollowUp", () => {
       mode: "follow-up",
     });
     expect(followed.result.note).toBe(followUpBody({ findings: FINDINGS }));
+  });
+});
+
+describe("followUpCandidateIds", () => {
+  it("names the beads a resume could write to — what reworkTicket locks besides ticket and target", () => {
+    const all = [
+      feature(),
+      finishedTicket(),
+      candidate("half"),
+      candidate("closed", { status: "closed" }),
+      candidate("other-title", { title: "Something else" }),
+      makeBead({ id: "unlinked", title: SUMMARY }),
+    ];
+    expect(followUpCandidateIds(all, "t1", SUMMARY)).toEqual(["half"]);
   });
 });
 
