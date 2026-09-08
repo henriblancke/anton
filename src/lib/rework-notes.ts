@@ -8,7 +8,7 @@
  * so the rendering and the comparison must not drift apart.
  */
 import type { Bead } from "./beads/bd";
-import { ACCEPTANCE_HEADING, ACCEPTANCE_KEYS, isContractHeading } from "./beads/contract";
+import { ACCEPTANCE_HEADING, ACCEPTANCE_KEYS, isTicketContractHeading } from "./beads/contract";
 import { type ScannedLine, scanMarkdown } from "./beads/markdown";
 import { parseTicketNotes } from "./beads/notes";
 import type { PullRequestState } from "./git/ops";
@@ -140,8 +140,11 @@ export function reconcileFollowUpDescription(
 
 /**
  * The Acceptance section's body swapped for `boxes`, bounded exactly as the contract judge bounds it
- * (`sectionOccurrences`, lib/beads/contract.ts): a sub-heading grouping criteria is part of the
- * section and goes with it, a contract heading or a peer ends it. Text either side is kept verbatim.
+ * for a ticket (`sectionOccurrences` with the ticket-tier keys, lib/beads/contract.ts): a
+ * sub-heading grouping criteria is part of the section and goes with it, a ticket contract heading
+ * or a peer ends it. Text either side is kept verbatim. The tier matters: a follow-up is a ticket,
+ * so a `### Success` grouping criteria is Acceptance's own content to the judge — ending on every
+ * tier's headings left those grouped boxes in the bead's effective acceptance beside the new ones.
  *
  * Every occurrence is reconciled, not just the first. The judge concatenates repeated headings
  * (`sectionsOf`), so a description carrying `## Acceptance Criteria` and a later `## Acceptance`
@@ -180,7 +183,7 @@ function acceptanceSections(lines: ScannedLine[]): { start: number; end: number 
     let end = start + 1;
     while (end < lines.length) {
       const heading = lines[end]!.heading;
-      if (heading && (heading.depth <= depth || isContractHeading(heading))) break;
+      if (heading && (heading.depth <= depth || isTicketContractHeading(heading))) break;
       end += 1;
     }
     out.push({ start, end });

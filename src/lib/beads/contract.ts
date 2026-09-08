@@ -415,6 +415,16 @@ const CONTRACT_KEYS: ReadonlySet<string> = new Set([...TICKET_KEYS, ...EPIC_KEYS
  */
 export const isContractHeading = (heading: Heading): boolean => CONTRACT_KEYS.has(heading.key);
 
+/**
+ * Does this heading name a TICKET's contract section? For a reader outside the gate that rewrites
+ * one section of a bead it KNOWS is a ticket and must end it exactly where {@link sectionOccurrences}
+ * does for that tier: rework's follow-up reconciliation (lib/rework-notes.ts) swaps the Acceptance
+ * body, and a `### Success` grouping criteria inside it is Acceptance's own content to the gate.
+ * Bounding on the merged set stopped there and left the grouped criteria in the bead's effective
+ * acceptance beside the new boxes.
+ */
+export const isTicketContractHeading = (heading: Heading): boolean => TICKET_KEYS.has(heading.key);
+
 /** The heading set {@link sectionsOf} sections a bead of this tier by. Exempt reads as ticket — the
  * same non-epic default {@link acceptanceKeysOf} and {@link goalKeysOf} apply. */
 const contractKeysOf = (tier: ContractTier): ReadonlySet<string> =>

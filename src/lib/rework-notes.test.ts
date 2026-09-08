@@ -408,6 +408,37 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).toContain("\n\n## Context\nKept.");
   });
 
+  it("takes an epic-only heading grouping criteria with the acceptance — on a ticket it is content, not a boundary", () => {
+    const grouped = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Acceptance Criteria",
+      "### Success",
+      "- [ ] the grouped old box",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(grouped, edited);
+
+    expect(reconciled).not.toContain("### Success");
+    expect(reconciled).not.toContain("old box");
+    expect(reconciled).toContain("## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled).toContain("\n\n## Context\nKept.");
+    // The judge sections a ticket by its own tier's headings, so its effective acceptance is exactly
+    // the request's boxes — no stale grouped criteria beside them.
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toBe(
+      [
+        "- [ ] Guard the null branch.",
+        "- [ ] Cover the exhausted path.",
+        "- [ ] src/retry.ts:12 — retries on a 4xx",
+        "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+      ].join("\n"),
+    );
+  });
+
   it("re-says a generated run-location line for the parentage the bead holds now, and nothing else in Context", () => {
     const reconciled = reconcileFollowUpDescription(followUpDescription(args), {
       ...args,
