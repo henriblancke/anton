@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 
+import {
+  claudeRouting,
+  routingEnvDelta,
+  type RoutingEnvDelta,
+} from "@/lib/claude/driver-routing";
 import { getDb } from "@/lib/db";
 import { systemClock } from "@/lib/jobs/queue";
+import { getProjectSettings } from "@/lib/projects";
 import { createSession, endSession } from "@/lib/sessions";
 import type { Project } from "@/lib/types";
 
@@ -21,6 +27,21 @@ export interface StartInteractiveInput {
    * client input directly.
    */
   cwd?: string;
+}
+
+/**
+ * Fold a routing delta into a pty env: a string SETS the var, `undefined` DELETES it. The headless
+ * driver hands the delta straight to `child_process.spawn`, which drops undefined-valued keys — but
+ * node-pty's `_parseEnv` stringifies every own key, so a lingering `undefined` would reach the child
+ * as the literal `ANTHROPIC_BASE_URL=undefined`. Deleting the key is what actually keeps an unrouted
+ * project's terminal off anton's ambient gateway (anton-7poz).
+ */
+function applyRoutingDelta(env: NodeJS.ProcessEnv, delta: RoutingEnvDelta): NodeJS.ProcessEnv {
+  for (const [key, value] of Object.entries(delta)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+  return env;
 }
 
 /**
@@ -47,13 +68,20 @@ export async function startInteractiveSession(
   });
 
   const bin = process.env[CLAUDE_BIN_ENV] ?? "claude";
+  // Route the terminal exactly like this project's headless runs (anton-7poz): the SAME resolver,
+  // applied OVER anton's env. A session opened to debug a run must hit the run's endpoint — and an
+  // unrouted project's pty must not inherit a stray ambient ANTHROPIC_BASE_URL.
+  const routing = claudeRouting(await getProjectSettings(db, project.id));
   try {
     getPtyManager().spawn({
       sessionId,
       file: bin,
       args: input.args ?? [],
       cwd: input.cwd ?? project.repoPath,
-      env: { ...process.env, TERM: "xterm-256color" },
+      env: applyRoutingDelta(
+        { ...process.env, TERM: "xterm-256color" },
+        routingEnvDelta(routing),
+      ),
       cols: input.cols ?? 80,
       rows: input.rows ?? 24,
     });
