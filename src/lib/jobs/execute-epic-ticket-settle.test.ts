@@ -15,6 +15,7 @@ const unassignMock = vi.fn(async () => "");
 const untagMock = vi.fn(async () => "");
 const setStatusMock = vi.fn(async () => "");
 const noteMock = vi.fn(async () => "");
+const showMock = vi.fn();
 const repairMock = vi.fn();
 
 vi.mock("../beads/bd", async () => {
@@ -27,6 +28,7 @@ vi.mock("../beads/bd", async () => {
       untag: (...args: unknown[]) => untagMock(...(args as [])),
       setStatus: (...args: unknown[]) => setStatusMock(...(args as [])),
       note: (...args: unknown[]) => noteMock(...(args as [])),
+      show: (...args: unknown[]) => showMock(...(args as [])),
     },
   };
 });
@@ -62,7 +64,7 @@ function run(): Omit<StepContext, "tickets"> {
 }
 
 /** A zero-diff block the agent classified `already-shipped` — the one failure the retirement runs on. */
-const settle = () =>
+const settle = (operator?: string) =>
   settleFailedTicket({
     run: run(),
     ticket,
@@ -77,8 +79,18 @@ const settle = () =>
     },
     timeoutMs: 60_000,
     standalone: false,
+    operator,
     e: new NoDeliveryError("no diff"),
   });
+
+/** The board's `bd show` shape for anton's retirement: closed, superseded by the survivor. */
+const retiredRead = (assignee?: string): Bead =>
+  ({
+    id: ticket.id,
+    status: "closed",
+    ...(assignee ? { assignee } : {}),
+    dependencies: [{ dependency_type: "supersedes", id: SHIPPER }],
+  }) as unknown as Bead;
 
 const retired = (marked: boolean) => ({
   action: "retired" as const,
@@ -90,7 +102,9 @@ const retired = (marked: boolean) => ({
 
 describe("settling a ticket the repair RETIRED", () => {
   beforeEach(() => {
-    for (const m of [unassignMock, untagMock, setStatusMock, noteMock, repairMock]) m.mockClear();
+    for (const m of [unassignMock, untagMock, setStatusMock, noteMock, showMock, repairMock]) m.mockClear();
+    // The release CASes on a fresh read: by default the board still shows anton's own retirement.
+    showMock.mockResolvedValue(retiredRead());
   });
 
   it("releases only the claim on a marked retirement, and hands the loop the retirement", async () => {
@@ -117,6 +131,54 @@ describe("settling a ticket the repair RETIRED", () => {
     expect(unassignMock).not.toHaveBeenCalled();
     expect(untagMock).not.toHaveBeenCalled();
     expect(setStatusMock).not.toHaveBeenCalled();
+  });
+
+  // The release runs after the retirement's lock is dropped, so another run can reopen and reclaim
+  // the ticket in the window — reachable with the same operator (PR #238 review). An unconditional
+  // unassign would strip that newer holder and leave the ticket in_progress but unowned.
+  it("leaves a reopened-and-reclaimed ticket's claim alone", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    // A concurrent run reopened it: no longer closed, so it is no longer anton's retirement close.
+    showMock.mockResolvedValue({ id: ticket.id, status: "in_progress", assignee: "someone-else" } as unknown as Bead);
+
+    await expect(settle()).rejects.toBeInstanceOf(TicketRetiredError);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  // Reassigned without reopening — still closed and superseded, but a different assignee now holds
+  // it; the CAS's assignee half keeps the release from taking that claim off.
+  it("leaves a reassigned retirement's claim alone", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    showMock.mockResolvedValue(retiredRead("someone-else"));
+
+    await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("releases when the fresh read still shows this run's own retirement claim", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    showMock.mockResolvedValue(retiredRead("anton-op"));
+
+    await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
+
+    expect(unassignMock).toHaveBeenCalledWith("/tmp/anton", "anton-a");
+    expect(untagMock).toHaveBeenCalledWith("/tmp/anton", "anton-a", [LABELS.stage("implementing")]);
+  });
+
+  // An unreadable board is not proof the retirement still stands, so the CAS fails closed rather
+  // than release blind.
+  it("does not release on an unreadable board", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    showMock.mockRejectedValue(new Error("bd offline"));
+
+    await expect(settle()).rejects.toBeInstanceOf(TicketRetiredError);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
   });
 });
 
