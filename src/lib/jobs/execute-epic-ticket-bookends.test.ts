@@ -152,10 +152,22 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     expect(unlinkMock).not.toHaveBeenCalled();
   });
 
-  it("does nothing when the authoritative read fails — silence proves no stale edge", async () => {
+  it("parks — restoring the claim — when the authoritative read fails (PR #238 review)", async () => {
+    // A transient `bd show` failure tells us NOTHING about the edge; treating the unreadable bead
+    // as edge-free would run the ticket and let a surviving `supersedes` reach the close/resume
+    // that drops the rerun's work. So fail closed rather than proceed on an unverified read.
     showMock.mockRejectedValue(new Error("database is locked"));
-    await claimTicket(run(), reopened, "op");
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PoisonEpic);
+    expect((err as Error).message).toMatch(/could not be re-read after claiming/);
     expect(unlinkMock).not.toHaveBeenCalled();
+    // The claim the gate took is handed back so the resume's own claim gate can re-take it.
+    expect(setStatusMock).toHaveBeenCalledWith(REPO, reopened.id, "open");
+    expect(unassignMock).toHaveBeenCalledWith(REPO, reopened.id);
   });
 
   it("parks — restoring the claim — when bd refuses to remove the edge", async () => {

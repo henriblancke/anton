@@ -1392,6 +1392,14 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(two).toMatchObject({ action: "escalate" });
     expect((two as { evidence: string[] }).evidence.join(" ")).toContain("2 bead ids");
 
+    // A bead id in a URL's owner/repo segment is not a survivor the claim names (PR #238 review):
+    // it would otherwise retire the target against a bead the reason only mentions inside a link.
+    const inUrl = await retire({
+      block: { reason: `already done, see https://github.com/${SHIPPER}/widgets/pull/85` },
+    });
+    expect(inUrl).toMatchObject({ action: "escalate" });
+    expect((inUrl as { evidence: string[] }).evidence.join(" ")).toContain("names no bead id");
+
     for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
   });
 

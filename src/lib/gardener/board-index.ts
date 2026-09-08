@@ -353,14 +353,32 @@ export function ageInDays(bead: Bead, nowMs: number): number | undefined {
 const ID_PATTERN = /\b[a-z][a-z0-9]*-[a-z0-9]{2,12}(?:\.[a-z0-9]+)*\b/gi;
 
 /**
- * Every bead id `text` mentions, lower-cased and de-duplicated in the order written.
+ * A url taken whole, so no segment of it is read as a bead id (PR #238 review): the owner or
+ * repository in `https://github.com/anton-abcd/widgets/pull/85` stands alone between slashes and,
+ * shaped exactly like a bead id, would otherwise be read as one — retiring a target as superseded
+ * by a bead the reason only names accidentally inside a link. The same span the commit-citation
+ * parser strips (repair-already-shipped.ts's `URL_PATTERN`), ended at the punctuation that
+ * separates one citation from the next without whitespace.
+ */
+const URL_PATTERN = /\bhttps?:\/\/[^\s,;()[\]<>"'`|]+/g;
+
+/** A url or a bead id, whichever comes first — one pass, so url spans are consumed before the id
+ * pattern can read a segment of them, and real ids keep the order written. */
+const ID_OR_URL = new RegExp(`${URL_PATTERN.source}|${ID_PATTERN.source}`, "gi");
+
+/**
+ * Every bead id `text` mentions, lower-cased and de-duplicated in the order written. Ids inside a
+ * url are skipped, not extracted — a link's owner or repository is not a bead the reason names.
  *
  * Order is how a caller REPORTS what it found; which id means what is never decided by position.
  */
 export function namedBeadIds(text: string | undefined): string[] {
   if (!text) return [];
   const seen = new Set<string>();
-  for (const match of text.matchAll(ID_PATTERN)) seen.add(match[0].toLowerCase());
+  for (const [token] of text.matchAll(ID_OR_URL)) {
+    if (/^https?:/i.test(token)) continue; // a url span, matched only to swallow its segments
+    seen.add(token.toLowerCase());
+  }
   return [...seen];
 }
 

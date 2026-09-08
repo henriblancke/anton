@@ -103,7 +103,21 @@ export async function claimTicket(
   // omits the rerun's work. So the edge is cleared here, on the authoritative read the claim just
   // earned; and — like the marker above — a run that cannot clear it parks before it can open that PR.
   const claimed = await beads.show(repo, ticket.id).catch(() => undefined);
-  const staleSurvivor = claimed && beads.supersedesTarget(claimed);
+  // The read is authoritative or nothing: a transient failure here tells us NOTHING about the
+  // edge, and treating an unreadable bead as edge-free would run the ticket and let a surviving
+  // `supersedes` reach the same close/resume that omits the rerun's work. So fail closed — park
+  // and restore the claim exactly as the unlink-refusal path below does — rather than proceed on
+  // an unverified read.
+  if (!claimed) {
+    await unclaimAndPark(repo, ticket.id);
+    throw new PoisonEpic(
+      `${ticket.id} could not be re-read after claiming, so a stale \`supersedes\` edge from a ` +
+        `previous retirement cannot be ruled out — running this ticket and opening a pull request ` +
+        `would risk its own honest close reading as superseded again, and a cross-machine resume ` +
+        `dropping the rerun's work from the PR. Check the beads DB, then resume the run`,
+    );
+  }
+  const staleSurvivor = beads.supersedesTarget(claimed);
   if (staleSurvivor) {
     if (!(await mustPersist(() => beads.unlink(repo, ticket.id, staleSurvivor)))) {
       await unclaimAndPark(repo, ticket.id);
