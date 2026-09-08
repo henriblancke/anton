@@ -510,4 +510,34 @@ describe("the cross-machine reopen of a closed child", () => {
     expect(reopenMock).not.toHaveBeenCalled();
     expect(runTicketMock).not.toHaveBeenCalled();
   });
+
+  // The snapshot's plain `closed` reaches the reopen as work to regenerate, but a fresh read shows
+  // an abandon landed since (PR #238 review). It is still `closed`, so a status-only check would
+  // reopen it and re-run work a person killed. Stop instead — the resume re-snapshots it as a
+  // won't-do.
+  it("stops the run when a fresh read finds the closed child abandoned since the snapshot", async () => {
+    const child = closedChild("anton-a");
+    showMock.mockResolvedValue(abandoned("anton-a"));
+
+    await expect(dispatchRunTickets(makeResume(child), prep())).rejects.toThrow(PoisonEpic);
+    await expect(dispatchRunTickets(makeResume(child), prep())).rejects.toThrow(
+      /anton-a is closed on the board this run read.*shows it was abandoned since/,
+    );
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(runTicketMock).not.toHaveBeenCalled();
+  });
+
+  // Same race, the other retirement: a supersede landed since the snapshot, and reopening would
+  // re-run work that shipped elsewhere (PR #238 review). The message names the survivor.
+  it("stops the run when a fresh read finds the closed child superseded since the snapshot", async () => {
+    const child = closedChild("anton-a");
+    showMock.mockResolvedValue(superseded("anton-a", SHIPPER));
+
+    await expect(dispatchRunTickets(makeResume(child), prep())).rejects.toThrow(PoisonEpic);
+    await expect(dispatchRunTickets(makeResume(child), prep())).rejects.toThrow(
+      new RegExp(`anton-a is closed on the board this run read.*superseded by ${SHIPPER} since`),
+    );
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(runTicketMock).not.toHaveBeenCalled();
+  });
 });

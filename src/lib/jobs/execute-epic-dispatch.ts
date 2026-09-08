@@ -445,11 +445,14 @@ async function markRetired(run: EpicRun, ticketId: string): Promise<void> {
  * reopen follows a retirement that was checked against a closed bead.
  *
  * `ticket.status` came from the run's snapshot, so a bead somebody has reopened since is left
- * alone: a reopen on a bead that already reads open is a write for nothing. A bead bd will not read
- * back STOPS the run instead (PR #238 review), like every other guarded write: the snapshot's
- * `closed` says nothing about what the board holds now, and reopening on it would undo an abandon
- * or a supersede that landed since and dispatch the ticket again. The write itself stays
- * best-effort, as before — runTicket's claim is what fails loudly on a bead still closed.
+ * alone: a reopen on a bead that already reads open is a write for nothing. A read that comes back
+ * abandoned or superseded STOPS the run instead (PR #238 review): those are still `closed`, so a
+ * status-only check would treat the retirement as the old close and regenerate it, undoing an
+ * abandon or a supersede that landed since. A bead bd will not read back stops it too, for the
+ * same reason under uncertainty — the snapshot's `closed` says nothing about what the board holds
+ * now, and anton cannot tell a plain close from a retirement it can no longer see. The reopen
+ * itself stays best-effort, as before — runTicket's claim is what fails loudly on a bead still
+ * closed.
  */
 async function reopenForRegeneration(repo: string, ticket: Bead): Promise<void> {
   await withBeadWriteLock(repo, ticket.id, async () => {
@@ -463,6 +466,22 @@ async function reopenForRegeneration(repo: string, ticket: Bead): Promise<void> 
       );
     }
     if (live.status !== "closed") return;
+    // A read that comes back abandoned or superseded is the !live branch's danger made visible
+    // (PR #238 review): the snapshot's plain `closed` reached here as work to regenerate, but the
+    // board has retired it SINCE. It is still `closed`, so the status check above lets it fall
+    // through — and reopening it would undo the newer settlement and re-run work a person killed
+    // or that shipped elsewhere. Stop; the resume re-snapshots and routes it through retirement
+    // or the nothing-live park instead.
+    const supersededBy = beads.supersededBy(live);
+    if (beads.isAbandoned(live) || supersededBy) {
+      throw new PoisonEpic(
+        `${ticket.id} is closed on the board this run read and its commit is on no branch here, ` +
+          `but a fresh read under its lock shows it was ${
+            beads.isAbandoned(live) ? "abandoned" : `superseded by ${supersededBy}`
+          } since — the run stopped rather than reopen it and regenerate work the board has ` +
+          `retired. Check the beads DB, then resume the run`,
+      );
+    }
     await safe(() => beads.reopen(repo, ticket.id));
   });
 }
