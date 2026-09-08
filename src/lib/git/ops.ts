@@ -662,6 +662,66 @@ export async function branchAheadOfRemote(
   }
 }
 
+/** How the checked-out branch stands against its configured upstream — see {@link distanceBehindUpstream}. */
+export type UpstreamDistance =
+  | { state: "current" }
+  | { state: "behind"; behind: number; upstream: string }
+  | { state: "no-upstream" }
+  | { state: "unreachable"; reason: string };
+
+/**
+ * How far the checked-out branch trails its configured upstream — the git read behind the
+ * self-freshness preflight (anton-vzhf): "is this checkout running the latest code its own remote
+ * carries".
+ *
+ * Contacts the remote — a network READ that fetches the upstream branch into its tracking ref; it
+ * never pushes — so the answer reflects what the remote holds NOW rather than whatever the last fetch
+ * left cached. A fetch that fails is its OWN verdict (`unreachable`), never folded into "current": an
+ * offline runner must not be told it is up to date. A branch with no upstream — a detached HEAD, an
+ * unpushed branch, no `branch.<name>.remote` — is `no-upstream`, also distinct from current.
+ *
+ * Only the FETCH's failure is caught. Every other git failure propagates, so the caller reports the
+ * check itself as broken rather than infer a distance from a read that never answered.
+ */
+export async function distanceBehindUpstream(repoPath: string): Promise<UpstreamDistance> {
+  const branch = await git(repoPath, ["symbolic-ref", "--short", "--quiet", "HEAD"]).catch(
+    (e: unknown) => {
+      if (exitedWith(e, 1)) return ""; // detached HEAD — no branch to carry an upstream
+      throw e;
+    },
+  );
+  if (!branch) return { state: "no-upstream" };
+
+  // `branch.<name>.remote` + `.merge` are the upstream, read straight from config rather than parsed
+  // out of `@{upstream}`: a remote or branch name holding a `/` survives the split this way.
+  const config = (key: string) =>
+    git(repoPath, ["config", "--get", key]).catch((e: unknown) => {
+      if (exitedWith(e, 1)) return ""; // unset key — the branch simply has no upstream
+      throw e;
+    });
+  const [remote, mergeRef] = await Promise.all([
+    config(`branch.${branch}.remote`),
+    config(`branch.${branch}.merge`),
+  ]);
+  if (!remote || !mergeRef.startsWith("refs/heads/")) return { state: "no-upstream" };
+
+  const remoteBranch = mergeRef.slice("refs/heads/".length);
+  const trackingRef = `refs/remotes/${remote}/${remoteBranch}`;
+  const upstream = `${remote}/${remoteBranch}`;
+  try {
+    // Explicit destination refspec, for the reason resolveFreshBase documents: a bare fetch honours
+    // the remote's configured refspec and can update FETCH_HEAD alone, leaving the tracking ref this
+    // then counts against stale. `+` allows a non-fast-forward update of the ref.
+    await git(repoPath, ["fetch", remote, `+${mergeRef}:${trackingRef}`]);
+  } catch (e) {
+    return { state: "unreachable", reason: e instanceof Error ? e.message : String(e) };
+  }
+
+  const behind = Number(await git(repoPath, ["rev-list", "--count", `HEAD..${trackingRef}`]));
+  if (!Number.isFinite(behind)) throw new Error(`could not count commits behind ${upstream}`);
+  return behind > 0 ? { state: "behind", behind, upstream } : { state: "current" };
+}
+
 /**
  * True when the branch checked out in `worktreePath` already contains the commit for `ticketId` —
  * a commit whose subject starts with `<ticketId>:` (the shape execute-epic's `commitAll` writes).
