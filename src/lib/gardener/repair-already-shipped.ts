@@ -961,6 +961,18 @@ export type AlreadyShippedOutcome =
     }
   | { action: "escalate"; why: string; evidence: string[]; prior?: RepairAttempt }
   /**
+   * The retirement's marker window was overtaken (PR #238 review): the supersede and its
+   * `not-delivered` marker both landed, and only THEN did another process move the ticket. Either it
+   * reopened and RECLAIMED the ticket — so the repair cleared the marker off that live work and took
+   * the retirement back where it was still anton's to take, leaving the newer decision standing — or
+   * it STRIPPED the marker while anton's close stood, which leaves the retirement valid but invisible
+   * to merge finalization. Told apart from `escalate` because the caller must neither RELEASE the
+   * claim (it would block the ticket and unassign whoever now holds it) nor open a PR (whose merge
+   * could close a reopen of an unmarked retirement as shipped): it stops on the block, touching
+   * nothing on the board.
+   */
+  | { action: "overtaken"; why: string; evidence: string[] }
+  /**
    * The job was cancelled while the repair was reading — and it stopped INSIDE the locks, before its
    * first write. Nothing was written, and nothing must be on its account either (PR #238 review):
    * the settlement path promises an aborted ticket writes nothing to the board, so the caller
@@ -1344,8 +1356,12 @@ export async function repairAlreadyShipped(args: {
     if (marked) {
       const overtaken = await markerOvertaken({ repoPath, targetId: bead.id, replacementId });
       if (overtaken) {
+        // `overtaken`, not `escalate` (PR #238 review): the ticket is either back in another run's
+        // hands or a valid-but-unmarked close, and a `releaseFailedTicket` on either would stomp it —
+        // block-and-unassign the live claim, or open a PR that could close a reopen as shipped. The
+        // caller stops on the block and writes nothing.
         return {
-          action: "escalate",
+          action: "overtaken",
           why:
             `${bead.id} blocked as \`${KLASS}\`, and the board moved between the retirement and its ` +
             `\`${LABELS.notDelivered}\` marker — anton found out only on re-reading after the marker ` +
@@ -1573,8 +1589,13 @@ async function withdrawRetirement(args: {
  * between {@link retirementHeld}'s reread and the tag another process can reopen and claim the ticket,
  * and the marker would then read to a later merge as work no run reserved sitting on live work.
  *
- * Still closed by anton's OWN supersede, the marker rests on a settled ticket and nothing is done —
- * undefined. Reopened or reclaimed — no longer that close — the marker is on work this retirement
+ * Still closed by anton's OWN supersede AND still marked, the retirement stands whole and nothing is
+ * done — undefined. The marker is asserted alongside the supersede (PR #238 review): a writer that
+ * stripped `not-delivered` while leaving the ticket superseded would pass a supersede-only check, and
+ * the retirement would read as marked when the board no longer carries the marker merge finalization
+ * needs. Still that close but the marker STRIPPED — the retirement is valid, nothing is reopened and
+ * there is no live work to clear, but unmarked it must not reach a PR, so the line says so and the
+ * caller stops. Reopened or reclaimed — no longer that close — the marker is on work this retirement
  * does not own: cleared, and the retirement taken back where it is still anton's to take
  * ({@link withdrawRetirement} acts only on an `overtaken`/`unread` read the way it does on the
  * pre-write fence's). Unread, nothing is assumed either way. Returns the one evidence line the
@@ -1587,7 +1608,24 @@ async function markerOvertaken(args: {
 }): Promise<string | undefined> {
   const { repoPath, targetId, replacementId } = args;
   const target = await readBead(repoPath, targetId, "after");
-  if (typeof target !== "string" && beads.supersededBy(target) === replacementId) return undefined;
+  const stillOurClose = typeof target !== "string" && beads.supersededBy(target) === replacementId;
+  // Still anton's own close AND the marker still on it: the retirement stands whole, nothing to do.
+  // The marker is asserted, not just the supersede (PR #238 review): a writer that STRIPPED
+  // `not-delivered` while leaving the ticket superseded would pass a supersede-only check, and the
+  // caller would take `marked: true` for a marker the board no longer carries — a retirement merge
+  // finalization can no longer preserve if the ticket is reopened in review.
+  if (stillOurClose && beads.isNotDelivered(target)) return undefined;
+  // Still the close anton wrote, but the marker was stripped in the window (PR #238 review). The
+  // retirement is valid, so nothing is reopened and there is no live work to clear it off — but
+  // unmarked it is invisible to merge finalization, which could then close a reopen of it as shipped
+  // by this run's PR. Reported so the caller stops rather than open one.
+  if (stillOurClose) {
+    return (
+      `${targetId} is retired as superseded by ${replacementId}, but its \`${LABELS.notDelivered}\` ` +
+      `marker was stripped between the retirement and this reread — unmarked, a reopen of it in ` +
+      `review could be closed as shipped by this run's PR, so the run stops rather than open one`
+    );
+  }
   const held: Exclude<RetirementVerdict, { state: "held" }> =
     typeof target === "string"
       ? { state: "unread", why: target }

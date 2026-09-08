@@ -119,3 +119,29 @@ describe("settling a ticket the repair RETIRED", () => {
     expect(setStatusMock).not.toHaveBeenCalled();
   });
 });
+
+// The retirement's marker window was overtaken (PR #238 review): another process moved the ticket
+// after the supersede and marker landed, and the repair already cleared its marker and took back
+// what was still its own. Releasing now would block-and-unassign whoever holds it, or reset a
+// settled bead open — so the settlement writes nothing and the run stops on the block.
+describe("settling a ticket the repair reported OVERTAKEN", () => {
+  const overtaken = () => ({
+    action: "overtaken" as const,
+    why: "anton-a blocked as `already-shipped`, and the board moved between the retirement and its marker",
+    evidence: ["reopened or reclaimed since the retirement's fence"],
+  });
+
+  beforeEach(() => {
+    for (const m of [unassignMock, untagMock, setStatusMock, noteMock, repairMock]) m.mockClear();
+  });
+
+  it("stops the run without releasing the claim or touching the status", async () => {
+    repairMock.mockResolvedValue(overtaken());
+
+    await expect(settle()).rejects.toBeInstanceOf(NoDeliveryError);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+    expect(setStatusMock).not.toHaveBeenCalled();
+  });
+});

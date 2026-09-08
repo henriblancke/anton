@@ -227,6 +227,10 @@ async function recordRepairOutcome(args: {
   } else if (outcome.action === "shadow") {
     await safe(() => beads.note(repo, ticketId, shadowNote(kind, outcome.attempted)));
   }
+  // `overtaken` writes NO bead note on purpose (PR #238 review): the repair already cleared the
+  // marker and took back what was still its own, and the ticket is now either another run's live
+  // work or a settled close carrying its own evidence — a refusal note from here would land on
+  // whichever the other hand left. The account travels in the session log line below.
   await appendSessionLog(logPath, `[repair:${kind}] ${repairLogLine(outcome)}\n`).catch(() => {});
 }
 
@@ -245,6 +249,8 @@ function repairLogLine(outcome: TicketRepair): string {
       return `shadow (not armed to write) — would have: ${outcome.attempted}`;
     case "escalate":
       return `escalated — ${[outcome.why, ...outcome.evidence].join(" ")}`;
+    case "overtaken":
+      return `overtaken after the marker — ${[outcome.why, ...outcome.evidence].join(" ")}`;
     case "cancelled":
       return `cancelled before writing — ${outcome.why}`;
     // Named rather than left to `default`, so a future outcome shape without a `why` is a type error

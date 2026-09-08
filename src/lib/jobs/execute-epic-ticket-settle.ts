@@ -226,6 +226,17 @@ export async function settleFailedTicket(args: {
         `resume the run`,
     );
   }
+  // A retirement OVERTAKEN in its marker window (PR #238 review) is settled by nobody here. Between
+  // the fence's reread and the marker another process either reopened and reclaimed the ticket — so
+  // the repair cleared its marker and took back what was still anton's, leaving the newer decision
+  // standing — or stripped the marker while anton's close stood. Releasing now would block the ticket
+  // and unassign whoever holds it, or reset a settled bead open; opening a PR on the unmarked close
+  // could later close a reopen of it as shipped. So the run stops on the block, writing nothing: the
+  // ticket stays exactly as the other hand left it.
+  if (repair?.action === "overtaken") {
+    await appendSessionLog(logPath, `[overtaken] ${ticket.id}: ${repair.why}\n`).catch(() => {});
+    throw e;
+  }
   await releaseFailedTicket({ run, ticket, session, progress, e, kinds, repair });
   // The repaired bead goes back through the ordinary queue (R5.10): a non-poison error spends one of
   // the runner's own attempts, behind its own backoff and the picker's brakes. The block it replaces

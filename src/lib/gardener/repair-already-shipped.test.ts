@@ -1247,7 +1247,13 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     showMock.mockImplementation(async (cwd, id) => {
       const read = await boardShow(cwd, id);
       const written = supersedeMock.mock.calls.find(([, target]) => target === id);
-      return written ? superseded(read, written[2]) : read;
+      const base = written ? superseded(read, written[2]) : read;
+      // The `not-delivered` marker is a separate `bd label` write; the post-marker reread must find
+      // it on the board, or the marker fence (`markerOvertaken`) would read every retirement as
+      // stripped. Cleared again when a withdraw untags it.
+      const tagged = tagMock.mock.calls.some(([, id2, labels]) => id2 === id && labels.includes(LABELS.notDelivered));
+      const cleared = untagMock.mock.calls.some(([, id2, labels]) => id2 === id && labels.includes(LABELS.notDelivered));
+      return tagged && !cleared ? ({ ...base, labels: [...(base.labels ?? []), LABELS.notDelivered] } as Bead) : base;
     });
     loadAllIssuesMock.mockClear();
     loadAllIssuesMock.mockResolvedValue(board());
@@ -2410,7 +2416,9 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
       const outcome = await retire();
 
-      expect(outcome).toMatchObject({ action: "escalate" });
+      // `overtaken`, not `escalate` (PR #238 review): the caller must not release the claim the new
+      // hand holds — an `escalate` would flow into `releaseFailedTicket` and block-and-unassign it.
+      expect(outcome).toMatchObject({ action: "overtaken" });
       expect((outcome as { why: string }).why).toContain("between the retirement and its `not-delivered` marker");
       expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
       expect(tagMock).toHaveBeenCalledWith(repo, TARGET, [LABELS.notDelivered]);
@@ -2420,6 +2428,34 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       expect(evidenceOf(outcome)).toContain("reopened or reclaimed");
       expect(evidenceOf(outcome)).toContain(`cleared the \`${LABELS.notDelivered}\` marker`);
       expect(reopenMock).not.toHaveBeenCalled();
+      expect(tagMock.mock.calls.some(([, , labels]) => labels.some((l) => l.startsWith("repair:")))).toBe(false);
+    });
+
+    // The other way the marker window is overtaken (PR #238 review): the ticket stays closed as
+    // anton's own supersede, but a concurrent writer STRIPS the `not-delivered` marker after it
+    // landed. The retirement is valid, so nothing is reopened — but unmarked it is invisible to merge
+    // finalization, which could close a reopen of it as shipped by this run's PR, so the run must stop
+    // rather than open one. The supersede-only check would have read it as a whole, marked retirement.
+    it("stops without stamping when the marker is stripped after it landed but the close still stands", async () => {
+      const markerLanded = () => tagMock.mock.calls.some(([, , labels]) => labels.includes(LABELS.notDelivered));
+      showMock.mockImplementation(async (cwd, id) => {
+        const read = await boardShow(cwd, id);
+        const wrote = supersedeMock.mock.calls.find(([, target]) => target === id);
+        const base = wrote ? superseded(read, wrote[2]) : read;
+        // Superseded by anton the whole time; the marker never sticks — the concurrent strip.
+        return base;
+      });
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "overtaken" });
+      expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+      expect(tagMock).toHaveBeenCalledWith(repo, TARGET, [LABELS.notDelivered]);
+      expect(evidenceOf(outcome)).toContain("marker was stripped");
+      // Nothing is taken back or stamped: the close is valid, it is only unmarked.
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(untagMock).not.toHaveBeenCalled();
+      expect(markerLanded()).toBe(true);
       expect(tagMock.mock.calls.some(([, , labels]) => labels.some((l) => l.startsWith("repair:")))).toBe(false);
     });
 
