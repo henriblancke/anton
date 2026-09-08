@@ -1159,6 +1159,31 @@ describe("what a claim NAMES", () => {
     expect(claimedCommits("https://abcdefg.example/deadbeef/x")).toEqual([]);
   });
 
+  // A url swallowing the citation glued to it by punctuation (PR #238 review) hides that citation
+  // from the check, and the claim verifies on the half that was read.
+  it("reads every citation separated from a url by punctuation alone", () => {
+    expect(claimedCommits("https://github.com/o/r/commit/aaaaaaa,bbbbbbb")).toEqual([
+      "aaaaaaa",
+      "bbbbbbb",
+    ]);
+    expect(
+      claimedCommits(
+        "[a](https://github.com/o/r/commit/aaaaaaa)[b](https://github.com/o/r/commit/bbbbbbb)",
+      ),
+    ).toEqual(["aaaaaaa", "bbbbbbb"]);
+    expect(claimedCommits("https://github.com/o/r/commit/aaaaaaa;https://github.com/o/r/pull/9/commits/bbbbbbb.")).toEqual([
+      "aaaaaaa",
+      "bbbbbbb",
+    ]);
+    // The url's own segments stay unread once the token is cut short of its neighbour.
+    expect(claimedCommits("(https://github.com/abcdefg/r/pull/85),9c51510")).toEqual(["9c51510"]);
+    expect(
+      claimedPullRequests(
+        "[a](https://github.com/o/r/pull/85)[b](https://github.com/o/r/pull/86),#12",
+      ),
+    ).toEqual(["https://github.com/o/r/pull/85", "https://github.com/o/r/pull/86", "gh-12"]);
+  });
+
   // A url keeps its repository (PR #238 review): reduced to `gh-85`, another repository's PR would
   // be read as whatever this one holds under that number.
   it("reads a bare number as the `gh-<n>` ref and keeps a url whole, deduped", () => {

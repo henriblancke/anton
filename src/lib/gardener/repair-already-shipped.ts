@@ -89,11 +89,20 @@ const SHA_PATTERN = /(?<![\w-])[0-9a-fA-F]{7,40}(?![\w-])/g;
  * never had. The one url segment that IS a citation — the sha under `/commit/` — is read by
  * {@link COMMIT_URL_SHA} from the url itself, so citing a commit by its GitHub link is not the
  * dropped citation the sha pattern's boundaries are careful to avoid.
+ *
+ * The token ends at the punctuation that separates one citation from the next without whitespace
+ * (PR #238 review) — a comma or semicolon, a bracket or parenthesis, a quote or backtick, a pipe —
+ * because a url that swallows its neighbour hides that neighbour from the check: in
+ * `…/commit/aaaaaaa,bbbbbbb` the second sha, and in `[a](…/commit/aaaaaaa)[b](…/commit/bbbbbbb)`
+ * the second link, would never be verified, and a claim whose omitted commit is absent from the
+ * base would still retire the ticket on the half that held. None of these characters occurs in a
+ * GitHub commit or PR url. A trailing full stop is left on the token: it delimits nothing here, and
+ * the sha extractor's own boundary reads past it.
  */
-const URL_PATTERN = /\bhttps?:\/\/\S+/g;
+const URL_PATTERN = /\bhttps?:\/\/[^\s,;()[\]<>"'`|]+/g;
 
-/** The sha a `…/commit/<sha>` (or `…/pull/<n>/commits/<sha>`) url cites. */
-const COMMIT_URL_SHA = /\/commits?\/([0-9a-fA-F]{7,40})(?![\w-])/;
+/** Every sha a `…/commit/<sha>` (or `…/pull/<n>/commits/<sha>`) url cites. */
+const COMMIT_URL_SHA = /\/commits?\/([0-9a-fA-F]{7,40})(?![\w-])/g;
 
 /** A sha or a url, whichever comes first — one pass, so the citations keep the order written. */
 const CITATION_PATTERN = new RegExp(`${URL_PATTERN.source}|${SHA_PATTERN.source}`, "g");
@@ -103,8 +112,10 @@ export function claimedCommits(reason: string | undefined): string[] {
   if (!reason) return [];
   const cited: string[] = [];
   for (const [token] of reason.matchAll(CITATION_PATTERN)) {
-    const sha = /^https?:/.test(token) ? COMMIT_URL_SHA.exec(token)?.[1] : token;
-    if (sha) cited.push(sha.toLowerCase());
+    const shas = /^https?:/.test(token)
+      ? [...token.matchAll(COMMIT_URL_SHA)].map((m) => m[1])
+      : [token];
+    for (const sha of shas) cited.push(sha.toLowerCase());
   }
   return [...new Set(cited)];
 }
