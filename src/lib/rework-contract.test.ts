@@ -179,33 +179,36 @@ describe("the five refusals", () => {
 });
 
 describe("instructionCriteria", () => {
+  /** The criteria as text — every case here is unfenced, so the shape is one line per criterion. */
+  const texts = (instructions: string) => instructionCriteria(instructions).map((c) => c.text);
+
   it("makes one criterion per non-blank line, shorn of its list marker", () => {
     expect(
-      instructionCriteria("Some prose.\n\n- a bullet\n* starred\n1. numbered\n2) also\n- [ ] boxed\n[x] ticked"),
+      texts("Some prose.\n\n- a bullet\n* starred\n1. numbered\n2) also\n- [ ] boxed\n[x] ticked"),
     ).toEqual(["Some prose.", "a bullet", "starred", "numbered", "also", "boxed", "ticked"]);
   });
 
   it("reads a bare marker as scaffolding, not as a criterion", () => {
     // `-` alone and `- [ ]` are what the founder leaves behind when they start a list and stop.
-    expect(instructionCriteria("-\n- \n1.\n- [ ]\n[ ]\n  ")).toEqual([]);
+    expect(texts("-\n- \n1.\n- [ ]\n[ ]\n  ")).toEqual([]);
     // `+` is CommonMark's third bullet; alone it is the same abandoned list, not a criterion.
-    expect(instructionCriteria("+\n+ \n+ [ ]")).toEqual([]);
+    expect(texts("+\n+ \n+ [ ]")).toEqual([]);
     // The zero-character box lib/beads/contract.ts accepts is the same abandoned list here.
-    expect(instructionCriteria("[]\n- []\n* []\n1. []\n- [] []\n> []")).toEqual([]);
-    expect(instructionCriteria("- [] boxed empty\n[] bare")).toEqual(["boxed empty", "bare"]);
+    expect(texts("[]\n- []\n* []\n1. []\n- [] []\n> []")).toEqual([]);
+    expect(texts("- [] boxed empty\n[] bare")).toEqual(["boxed empty", "bare"]);
   });
 
   it("reads a heading as scaffolding — a section label is not a step, in the contract's own rule", () => {
     // `## Backend` over `- Fix the retry` labels the step; boxing it filed `- [ ] ## Backend`.
-    expect(instructionCriteria("## Backend\n- Fix the retry\n### UI\nRe-run the snapshot")).toEqual([
+    expect(texts("## Backend\n- Fix the retry\n### UI\nRe-run the snapshot")).toEqual([
       "Fix the retry",
       "Re-run the snapshot",
     ]);
-    expect(instructionCriteria("# Title\n## Backend ##\n######\n#")).toEqual([]);
+    expect(texts("# Title\n## Backend ##\n######\n#")).toEqual([]);
     // A heading exposed once the outer markers are gone is still a heading, as a rule is.
-    expect(instructionCriteria("- ## Backend\n> ## Quoted\n1. [ ] ### Boxed")).toEqual([]);
+    expect(texts("- ## Backend\n> ## Quoted\n1. [ ] ### Boxed")).toEqual([]);
     // The marker must be followed by whitespace or end the line: an issue number keeps its `#`.
-    expect(instructionCriteria("#123 fixed the retry\n- #a11y must pass")).toEqual([
+    expect(texts("#123 fixed the retry\n- #a11y must pass")).toEqual([
       "#123 fixed the retry",
       "#a11y must pass",
     ]);
@@ -214,11 +217,11 @@ describe("instructionCriteria", () => {
   it("reads nested markers as scaffolding too — shearing one layer must not leave the next as a criterion", () => {
     // `- -`, `1. -` and `- [ ] [ ]` are a list started twice and abandoned; one strip leaves a bare
     // `-` or `[ ]`, which would file `- [ ] -` as the follow-up's one criterion.
-    expect(instructionCriteria("- -\n1. -\n- [ ] [ ]\n* * [x]\n- - - -\n1) 2) 3)")).toEqual([]);
+    expect(texts("- -\n1. -\n- [ ] [ ]\n* * [x]\n- - - -\n1) 2) 3)")).toEqual([]);
     // A rule that only appears once the outer markers are gone is still a rule.
-    expect(instructionCriteria("- - ---\n1. - ***")).toEqual([]);
+    expect(texts("- - ---\n1. - ***")).toEqual([]);
     // Nested markers ahead of real text are shorn all the way down to the text.
-    expect(instructionCriteria("- - nested bullet\n1. [ ] [x] twice boxed")).toEqual([
+    expect(texts("- - nested bullet\n1. [ ] [x] twice boxed")).toEqual([
       "nested bullet",
       "twice boxed",
     ]);
@@ -227,15 +230,15 @@ describe("instructionCriteria", () => {
   it("reads a thematic break as scaffolding — it renders as a rule, not as text", () => {
     // The same set lib/beads/contract.ts refuses: three or more of one of `-`, `*`, `_`, spaces
     // between allowed. Boxing one would file `- [ ] ---` as the follow-up's only criterion.
-    expect(instructionCriteria("---\n***\n___\n- - -\n_ _ _\n* * *\n-----")).toEqual([]);
+    expect(texts("---\n***\n___\n- - -\n_ _ _\n* * *\n-----")).toEqual([]);
   });
 
   it("reads a rule nested in a list item as scaffolding too — `- ---` is a rule once shorn", () => {
-    expect(instructionCriteria("- ---\n1. ***\n* ___\n- [ ] ---\n[x] - - -\n2) _ _ _")).toEqual([]);
+    expect(texts("- ---\n1. ***\n* ___\n- [ ] ---\n[x] - - -\n2) _ _ _")).toEqual([]);
   });
 
   it("keeps a line that merely CONTAINS a rule, and a short dash run that is not one", () => {
-    expect(instructionCriteria("--- keep the header\n--\n* -- not a rule")).toEqual([
+    expect(texts("--- keep the header\n--\n* -- not a rule")).toEqual([
       "--- keep the header",
       "--",
       "-- not a rule",
@@ -243,7 +246,7 @@ describe("instructionCriteria", () => {
   });
 
   it("keeps a sign or a version that merely LOOKS like a marker", () => {
-    expect(instructionCriteria("-1 is the sentinel\n+1 on the rename\n1.2 ships this")).toEqual([
+    expect(texts("-1 is the sentinel\n+1 on the rename\n1.2 ships this")).toEqual([
       "-1 is the sentinel",
       "+1 on the rename",
       "1.2 ships this",
@@ -254,7 +257,7 @@ describe("instructionCriteria", () => {
     // A bullet needs whitespace after it to be a marker; a box is held to the same rule, so a CSS
     // attribute selector at the head of a line is a criterion, and the criterion matches the note.
     expect(
-      instructionCriteria("[x].disabled must stay matched\n- [ ]{2} is two spaces\n[X] done"),
+      texts("[x].disabled must stay matched\n- [ ]{2} is two spaces\n[X] done"),
     ).toEqual(["[x].disabled must stay matched", "[ ]{2} is two spaces", "done"]);
   });
 
@@ -263,7 +266,7 @@ describe("instructionCriteria", () => {
     // with. lib/beads/contract.ts refuses a section holding only that as unwritten; boxing it here
     // would file the very placeholder rubric that gate exists to refuse.
     expect(
-      instructionCriteria(
+      texts(
         [
           "- [ ] TODO — a concrete, checkable statement of done",
           "TODO — one sentence: what this delivers",
@@ -281,7 +284,7 @@ describe("instructionCriteria", () => {
     // gate unquotes before it classifies (lib/beads/contract.ts); judging the quoted line as
     // authored here filed a `> -` or `> TODO` box the gate would then refuse.
     expect(
-      instructionCriteria(
+      texts(
         [
           "> -",
           "> ---",
@@ -293,7 +296,7 @@ describe("instructionCriteria", () => {
         ].join("\n"),
       ),
     ).toEqual([]);
-    expect(instructionCriteria("> - keep the quoted step\n> quoted prose\n- > nested quote")).toEqual([
+    expect(texts("> - keep the quoted step\n> quoted prose\n- > nested quote")).toEqual([
       "keep the quoted step",
       "quoted prose",
       "nested quote",
@@ -305,10 +308,10 @@ describe("instructionCriteria", () => {
     // box, and shearing the operator files `95% coverage` against a note that demands MORE than that.
     // A founder styling a callout types `> `; the space is what tells the two apart.
     expect(
-      instructionCriteria(">95% coverage on the retry path\n- >= 3 retries before giving up\n>>fast"),
+      texts(">95% coverage on the retry path\n- >= 3 retries before giving up\n>>fast"),
     ).toEqual([">95% coverage on the retry path", ">= 3 retries before giving up", ">>fast"]);
     // A run of `>` followed by a space is still one nested callout, and a bare one is scaffolding.
-    expect(instructionCriteria(">> nested callout\n> > spaced\n>>\n> >")).toEqual([
+    expect(texts(">> nested callout\n> > spaced\n>>\n> >")).toEqual([
       "nested callout",
       "spaced",
     ]);
@@ -316,15 +319,51 @@ describe("instructionCriteria", () => {
 
   it("keeps an authored line that merely mentions a TODO — the prompt is anchored on its separator", () => {
     expect(
-      instructionCriteria("- [ ] the TODO banner clears on save\nTODOs are listed in the readme"),
+      texts("- [ ] the TODO banner clears on save\nTODOs are listed in the readme"),
     ).toEqual(["the TODO banner clears on save", "TODOs are listed in the readme"]);
   });
 
   it("keeps a number too long to be an ordered marker — CommonMark stops at nine digits", () => {
-    expect(instructionCriteria("1234567890) must remain supported\n999999999. is a marker")).toEqual([
+    expect(texts("1234567890) must remain supported\n999999999. is a marker")).toEqual([
       "1234567890) must remain supported",
       "is a marker",
     ]);
+  });
+
+  it("keeps a fenced block verbatim, as one criterion — its content is literal, not markup", () => {
+    // A pasted example carries lines that LOOK like a heading, a bullet, a rule and the TODO prompt.
+    // Judged line by line they were dropped or shorn, so the acceptance asked for less than the
+    // note the implementer reads. The contract judge reads fenced content as authored, and so does this.
+    const example = ["```md", "## Expected", "- item", "---", "TODO — keep me", "  indented", "```"];
+    expect(instructionCriteria(["Output must match:", ...example].join("\n"))).toEqual([
+      { text: "Output must match:", fenced: false },
+      { text: example.join("\n"), fenced: true },
+    ]);
+  });
+
+  it("reads a tilde fence and a longer closer the way CommonMark does, and keeps fenced blank lines", () => {
+    expect(texts("~~~\nfirst\n\nsecond\n~~~~\nafter")).toEqual(["~~~\nfirst\n\nsecond\n~~~~", "after"]);
+    // A shorter run does not close the fence; it is content, and the block runs on to the real closer.
+    expect(texts("````\n```\nstill inside\n````")).toEqual(["````\n```\nstill inside\n````"]);
+  });
+
+  it("reads an empty fence as scaffolding — an example that shows nothing states no step", () => {
+    expect(instructionCriteria("```\n```")).toEqual([]);
+    expect(instructionCriteria("```js\n\n   \n```\n- [ ]")).toEqual([]);
+    expect(texts("```\n```\nthen this")).toEqual(["then this"]);
+  });
+
+  it("closes an unclosed fence — verbatim, it would swallow every section filed after it", () => {
+    expect(texts("Expect:\n```sh\nnpm test")).toEqual(["Expect:", "```sh\nnpm test\n```"]);
+    expect(texts("~~~~\nx")).toEqual(["~~~~\nx\n~~~~"]);
+    // Unclosed and empty is still empty.
+    expect(instructionCriteria("```\n\n")).toEqual([]);
+  });
+
+  it("does not open a fence on a backtick run with a backtick in its info string, nor on an indented one", () => {
+    // CommonMark: `` ```a`b `` is a paragraph, and a delimiter indented four spaces is code, not a fence.
+    expect(texts("```a`b\ninside?")).toEqual(["```a`b", "inside?"]);
+    expect(texts("    ```\n## still a heading\n    ```")).toEqual(["```", "```"]);
   });
 });
 
@@ -349,6 +388,13 @@ describe("doneGap", () => {
     expect(doneGap("- -\n1. -\n- [ ] [ ]", [])).toMatch(/only list markers, headings or rules/);
     expect(doneGap("---\nAdd the missing test.", [])).toBeNull();
     expect(doneGap("---", [finding])).toBeNull();
+  });
+
+  it("refuses an empty code block, and accepts one with content — the judge reads it the same way", () => {
+    expect(doneGap("```\n```", [])).toMatch(/empty code blocks/);
+    expect(doneGap("```\n\n```\n---", [])).not.toBeNull();
+    expect(doneGap("```\n## Expected\n```", [])).toBeNull();
+    expect(doneGap("```\n```", [finding])).toBeNull();
   });
 
   it("refuses instructions that are only headings or empty boxes — labels and blanks, not steps", () => {

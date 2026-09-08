@@ -196,6 +196,41 @@ describe("followUpDescription", () => {
     ]);
   });
 
+  it("files a fenced example verbatim and unboxed, in its place among the boxes", () => {
+    const example = ["```md", "## Expected", "- item", "<!-- literal -->", "```"];
+    const description = followUpDescription({
+      ...args,
+      parentId: "feat",
+      instructions: ["The rendered note reads:", ...example, "- and the test proves it"].join("\n"),
+    });
+    // Boxing each line would file `- [ ] ## Expected`, and the comment escape would alter literal
+    // text; the judge reads fenced content as authored, so the block stands as the founder typed it.
+    expect(acceptanceOf(description).slice(0, -1)).toEqual([
+      "- [ ] The rendered note reads:",
+      ...example,
+      "- [ ] and the test proves it",
+    ]);
+    // The heading inside the fence opens no section: Context, Out of scope and Verify still stand.
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(acceptanceBody(makeBead({ id: "anton-new", description }))).toContain("## Expected");
+  });
+
+  it("closes an unclosed fence in the instructions — open, it would swallow the rest of the contract", () => {
+    const description = followUpDescription({
+      ...args,
+      parentId: "feat",
+      instructions: "Expect:\n```sh\nnpm test",
+    });
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] Expect:",
+      "```sh",
+      "npm test",
+      "```",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+  });
+
   it("collapses a multiline finding into one box — a line break inside it would close the section", () => {
     const description = followUpDescription({
       ...args,

@@ -158,6 +158,17 @@ const opensFence = (fence: Fence): boolean => fence.char !== "`" || !fence.info.
 const closesFence = (fence: Fence, open: Fence): boolean =>
   fence.char === open.char && fence.len >= open.len && fence.info.trim() === "";
 
+/**
+ * The delimiter that closes the fence `opener` opens — its own run of backticks or tildes, alone on
+ * a line. For a caller that copies a fenced block into another body: an UNCLOSED fence runs to the
+ * end of the text it lands in, so it must be closed there or it swallows whatever follows.
+ */
+export function fenceCloser(opener: string): string {
+  const fence = fenceOf(opener);
+  if (!fence) throw new Error(`Not a fence delimiter: ${JSON.stringify(opener)}`);
+  return fence.char.repeat(fence.len);
+}
+
 /** Does this line delimit a fence? Advances `state` across the block it opens or closes. */
 function fenceDelimiter(state: ScanState, text: string): boolean {
   const fence = fenceOf(text);

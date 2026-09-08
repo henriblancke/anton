@@ -8,7 +8,7 @@
  * costs a caller nothing else — no bd, no `gh`, no board read — which is also what lets the rework
  * dialog import it: what the dialog refuses and what the route refuses are one judgement.
  */
-import { isHeading } from "./beads/markdown";
+import { fenceCloser, isHeading, scanMarkdown } from "./beads/markdown";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
   MAX_REWORK_INSTRUCTIONS_CHARS,
@@ -103,13 +103,13 @@ export function validateReworkInput(input: ReworkInput): ReworkRequest {
 /**
  * Why these inputs state no definition of done — or null when they do (anton-xwf1).
  *
- * A follow-up's acceptance is one box per instruction line and one per attached finding
- * ({@link followUpAcceptance}, lib/rework-notes.ts), and a reopen's note is the same text handed to
- * the implementer. Inputs that yield neither — instructions that are only list markers, headings,
- * rules or the formula's TODO placeholder, with nothing ticked — would file a bead whose one
- * criterion is the generic findings-addressed line: a rubric no review can score and no implementer
- * can act on. Judged here, in the vocabulary both layers share, so the dialog refuses before a bead
- * is written and the route refuses the same request the same way.
+ * A follow-up's acceptance is one box per instruction line, each fenced block as written, and one
+ * box per attached finding ({@link followUpAcceptance}, lib/rework-notes.ts), and a reopen's note is
+ * the same text handed to the implementer. Inputs that yield neither — instructions that are only
+ * list markers, headings, rules, empty code blocks or the formula's TODO placeholder, with nothing
+ * ticked — would file a bead whose one criterion is the generic findings-addressed line: a rubric no
+ * review can score and no implementer can act on. Judged here, in the vocabulary both layers share,
+ * so the dialog refuses before a bead is written and the route refuses the same request the same way.
  *
  * Only the ABSENCE of a step is judged. Whether a step is a good one is the founder's call.
  */
@@ -117,8 +117,8 @@ export function doneGap(instructions: string, findings: readonly ReviewFinding[]
   if (instructionCriteria(instructions).length > 0 || findings.length > 0) return null;
   return (
     "Nothing here says what done looks like: the fix instructions hold only list markers, headings " +
-    "or rules, or the formula's TODO placeholder, and no finding is attached. Write at least one " +
-    "line an implementer can act on, or attach a finding."
+    "or rules, empty code blocks, or the formula's TODO placeholder, and no finding is attached. " +
+    "Write at least one line an implementer can act on, or attach a finding."
   );
 }
 
@@ -168,18 +168,53 @@ const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
  */
 const PROMPT_LINE = /^TODO\s*[—–:-]/;
 
+/** One thing the instructions say must be true, as the follow-up's acceptance will file it. */
+export interface InstructionCriterion {
+  /** A shorn instruction line — or, for a fenced block, the whole block, delimiters included. */
+  text: string;
+  /** A fenced code block: literal content, filed as it was typed rather than boxed line by line. */
+  fenced: boolean;
+}
+
 /**
- * One criterion per non-blank instruction line, shorn of whatever list marker it was typed with.
- * Instruction lines arrive as the founder typed them — prose, `-`/`*` bullets, numbered steps, or
- * boxes already — so list markers are stripped rather than nested inside a second box. A line that
- * is only a rule ({@link THEMATIC_BREAK}), a heading ({@link isHeading}) or the formula's prompt
- * ({@link PROMPT_LINE}) is scaffolding like a bare marker, and yields nothing.
+ * One criterion per non-blank instruction line, shorn of whatever list marker it was typed with,
+ * and one per fenced code block, kept verbatim. Instruction lines arrive as the founder typed them
+ * — prose, `-`/`*` bullets, numbered steps, or boxes already — so list markers are stripped rather
+ * than nested inside a second box. A line that is only a rule ({@link THEMATIC_BREAK}), a heading
+ * ({@link isHeading}) or the formula's prompt ({@link PROMPT_LINE}) is scaffolding like a bare
+ * marker, and yields nothing.
+ *
+ * Fences are read the way the contract judge reads them ({@link scanMarkdown}): everything inside
+ * is LITERAL. A founder who pastes an expected output or a Markdown example has authored the lines
+ * `## Expected` and `- item` exactly as they stand, and judging them as heading and bullet dropped
+ * one and altered the other — the note kept the example while the acceptance silently asked for
+ * less. The block travels as one criterion, delimiters included, so what files is what was typed;
+ * an unclosed one is closed ({@link fenceCloser}), since verbatim it would swallow every section
+ * written after it. A fence holding nothing but blank lines says nothing, as the judge reads it.
  */
-export function instructionCriteria(instructions: string): string[] {
-  return instructions
-    .split(/\r?\n/)
-    .map(shorn)
-    .filter((line) => line.length > 0);
+export function instructionCriteria(instructions: string): InstructionCriterion[] {
+  const out: InstructionCriterion[] = [];
+  let block: { opener: string; content: string[] } | undefined;
+  const flush = (closer: string) => {
+    if (block && block.content.some((line) => line.trim() !== "")) {
+      out.push({ text: [block.opener, ...block.content, closer].join("\n"), fenced: true });
+    }
+    block = undefined;
+  };
+  for (const line of scanMarkdown(instructions)) {
+    if (!line.fenced) {
+      const text = shorn(line.text);
+      if (text) out.push({ text, fenced: false });
+    } else if (!block) {
+      block = { opener: line.text, content: [] };
+    } else if (line.delimiter) {
+      flush(line.text);
+    } else {
+      block.content.push(line.text);
+    }
+  }
+  if (block) flush(fenceCloser(block.opener));
+  return out;
 }
 
 /**

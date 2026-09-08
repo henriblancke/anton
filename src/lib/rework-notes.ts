@@ -271,11 +271,14 @@ export function createdUnder(bead: Bead, parentId: string): boolean {
  * "this finding does not apply" as a legitimate close, which no per-finding box says.
  *
  * Instruction lines become boxes through {@link instructionCriteria} — the derivation the dialog's
- * refusal is judged against, so what it says will file is exactly what files.
+ * refusal is judged against, so what it says will file is exactly what files. A fenced block among
+ * them is filed as it was typed, in its place and unboxed: it is the example the box beside it
+ * refers to, the judge (lib/beads/contract.ts) reads fenced content as authored, and neither a
+ * `- [ ]` on each of its lines nor the comment escape belongs in literal text.
  */
 function followUpAcceptance(instructions: string, findings: ReviewFinding[]): string[] {
   return [
-    ...instructionCriteria(instructions).map((line) => `- [ ] ${markdownSafe(line)}`),
+    ...instructionCriteria(instructions).map((c) => (c.fenced ? c.text : `- [ ] ${markdownSafe(c.text)}`)),
     ...findings.map((f) => `- [ ] ${markdownSafe(findingLine(f))}`),
     `- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply`,
   ];
