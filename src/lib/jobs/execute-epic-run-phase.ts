@@ -38,6 +38,7 @@ export async function walkRunPhase(
       stepCtx: {
         ...prep.runStep,
         tickets: dispatched.delivered,
+        satisfied: dispatched.satisfied,
         step: cooked,
         advisories: carry.advisories,
       },
@@ -78,7 +79,9 @@ async function runPrStep(
     );
   }
   if (pr.bodyStale) {
-    const note = stalePrBodyNote(pr, advisoryFindings);
+    // The satisfied attribution rides the same salvage as the findings (PR #253 review): the stale
+    // body says nothing about which tickets an earlier commit covered, and no commit does either.
+    const note = stalePrBodyNote(pr, advisoryFindings, stepCtx.tickets, stepCtx.satisfied);
     // If that write ALSO fails (a locked or unavailable beads DB) the findings have no home
     // left, and the run would still finish `done` — the advisory detail silently dropped
     // between this review and the merge gate. Carry the whole note out on the run row

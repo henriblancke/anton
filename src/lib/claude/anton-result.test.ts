@@ -237,6 +237,153 @@ describe("parseAntonResult — legacy prose is never mistaken for a class", () =
   });
 });
 
+/**
+ * The fourth outcome (anton-6l0q): a step whose acceptance an EARLIER commit of this run already
+ * met. It is a claim about evidence, so it parses only WITH its commit; every other shape is
+ * rejected outright — never degraded, never coerced from a word that merely resembles it.
+ */
+describe("parseAntonResult — satisfied (anton-6l0q)", () => {
+  it("parses a satisfied line with its commit and a note", () => {
+    expect(
+      parseAntonResult("ANTON-RESULT: satisfied — 0a76266d — the parser landed with anton-6l0q"),
+    ).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+      reason: "the parser landed with anton-6l0q",
+    });
+  });
+
+  it("parses a satisfied line with only its commit", () => {
+    expect(parseAntonResult("ANTON-RESULT: satisfied — 0a76266d")).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+    });
+    expect(parseAntonResult("ANTON-RESULT: satisfied — 0a76266d —")).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+    });
+  });
+
+  it("accepts a full 40-char sha, and lowercases what the agent wrote", () => {
+    const full = "0A76266DABCDEF0123456789ABCDEF0123456789";
+    expect(parseAntonResult(`ANTON-RESULT: satisfied — ${full} — done earlier`)).toEqual({
+      outcome: "satisfied",
+      commit: full.toLowerCase(),
+      reason: "done earlier",
+    });
+  });
+
+  it("accepts every separator around the commit, and plain whitespace before the note", () => {
+    for (const line of [
+      "ANTON-RESULT: satisfied — 0a76266d — covered by step 1",
+      "ANTON-RESULT: satisfied – 0a76266d – covered by step 1",
+      "ANTON-RESULT: satisfied - 0a76266d - covered by step 1",
+      "ANTON-RESULT: satisfied: 0a76266d: covered by step 1",
+      "ANTON-RESULT: satisfied 0a76266d covered by step 1",
+    ]) {
+      expect(parseAntonResult(line)).toEqual({
+        outcome: "satisfied",
+        commit: "0a76266d",
+        reason: "covered by step 1",
+      });
+    }
+  });
+
+  it("is case-insensitive on the token", () => {
+    expect(parseAntonResult("anton-result: SATISFIED — 0a76266d")).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+    });
+  });
+
+  // Agents habitually set a sha in inline code (PR #253 review); a claim that fails to parse for
+  // its backticks falls to the plain zero-diff park this outcome exists to prevent.
+  it("unwraps a backticked sha, with or without a note", () => {
+    expect(parseAntonResult("ANTON-RESULT: satisfied — `0a76266d`")).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+    });
+    expect(parseAntonResult("ANTON-RESULT: satisfied — `0A76266D` — step 1 covered it")).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+      reason: "step 1 covered it",
+    });
+    expect(parseAntonResult("ANTON-RESULT: satisfied — `0a76266d`: covered by `implement`")).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+      reason: "covered by `implement`",
+    });
+  });
+
+  it("does not let backticks launder a non-sha, an unbalanced pair, or a hyphen-glued sha", () => {
+    for (const evidence of ["`anton-6l0q`", "`0a76266d", "0a76266d`", "`0a76266d`-ish — note", "``"]) {
+      expect(parseAntonResult(`ANTON-RESULT: satisfied — ${evidence}`)).toBeNull();
+    }
+  });
+
+  it("rejects a satisfied line that names no commit", () => {
+    expect(parseAntonResult("ANTON-RESULT: satisfied")).toBeNull();
+    expect(parseAntonResult("ANTON-RESULT: satisfied —")).toBeNull();
+    expect(parseAntonResult("ANTON-RESULT: satisfied — an earlier step did it")).toBeNull();
+  });
+
+  it("rejects evidence that is not a sha: a bead id, a branch, a short or over-long hex run", () => {
+    for (const evidence of [
+      "anton-6l0q",
+      "anton/anton-e0y2",
+      "0a7626",
+      "0".repeat(41),
+      "0a76266dxyz",
+      "0a76266d-ish — hyphen glued to the sha",
+      "commit 0a76266d",
+      "HEAD~1",
+    ]) {
+      expect(parseAntonResult(`ANTON-RESULT: satisfied — ${evidence}`)).toBeNull();
+    }
+  });
+
+  it("a malformed satisfied line neither wins as last line nor displaces an earlier parse", () => {
+    const text = ["ANTON-RESULT: blocked — env — red build", "ANTON-RESULT: satisfied — no sha"].join("\n");
+    expect(parseAntonResult(text)).toEqual({ outcome: "blocked", klass: "env", reason: "red build" });
+  });
+
+  it("takes the LAST result line when a run corrects itself to satisfied", () => {
+    const text = [
+      "ANTON-RESULT: blocked — other — nothing left to do here",
+      "on reflection, step 1's commit already meets every criterion:",
+      "ANTON-RESULT: satisfied — 0a76266d — step 1 covered it",
+    ].join("\n");
+    expect(parseAntonResult(text)).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+      reason: "step 1 covered it",
+    });
+  });
+
+  it("ignores a satisfied mention buried mid-sentence (must start the line)", () => {
+    expect(parseAntonResult("I could emit ANTON-RESULT: satisfied — 0a76266d here.")).toBeNull();
+  });
+
+  it("rejects an unrecognised outcome rather than coercing it to satisfied", () => {
+    for (const word of ["done", "already-done", "satisfied-ish", "satisfy", "unsatisfied", "complete"]) {
+      expect(parseAntonResult(`ANTON-RESULT: ${word} — 0a76266d`)).toBeNull();
+    }
+  });
+
+  it("never attaches a commit to the three existing outcomes", () => {
+    expect(parseAntonResult("ANTON-RESULT: delivered — 0a76266d")).toEqual({ outcome: "delivered" });
+    expect(parseAntonResult("ANTON-RESULT: blocked — 0a76266d")).toEqual({
+      outcome: "blocked",
+      klass: "other",
+      reason: "0a76266d",
+    });
+    expect(parseAntonResult("ANTON-RESULT: needs-human — 0a76266d")).toEqual({
+      outcome: "needs-human",
+      reason: "0a76266d",
+    });
+  });
+});
+
 describe("isBlockClass", () => {
   it("accepts exactly the enum, and nothing that merely resembles it", () => {
     for (const klass of BLOCK_CLASSES) expect(isBlockClass(klass)).toBe(true);
@@ -258,6 +405,13 @@ describe("formatAntonResult", () => {
     );
     expect(formatAntonResult({ outcome: "needs-human" })).toBe("needs-human — (no ask given)");
     expect(formatAntonResult(null)).toContain("no ANTON-RESULT line");
+  });
+
+  it("renders a satisfied report with its commit, and the note when there is one", () => {
+    expect(formatAntonResult({ outcome: "satisfied", commit: "0a76266d" })).toBe("satisfied — 0a76266d");
+    expect(
+      formatAntonResult({ outcome: "satisfied", commit: "0a76266d", reason: "step 1 covered it" }),
+    ).toBe("satisfied — 0a76266d — step 1 covered it");
   });
 
   it("names the class when there is one to name, and stays quiet on `other`", () => {

@@ -67,6 +67,13 @@ describe("loadBaseSystemPrompt (real file)", () => {
     expect(base.toLowerCase()).toMatch(/do not run `bd close`|bd close/i); // beads ownership
     // The self-verification mandate: the agent runs the project's checks before declaring done.
     expect(base).toContain("Verify before you finish");
+    // The outcome vocabulary the parser reads (anton-j5i8, anton-287p, anton-6l0q) — all four, and
+    // the unchanged-tree rule must offer `satisfied` so it no longer forces a false `blocked`.
+    expect(base).toContain("ANTON-RESULT: delivered");
+    expect(base).toContain("ANTON-RESULT: blocked — <class> — <one-line reason>");
+    expect(base).toContain("ANTON-RESULT: needs-human — <one-line ask>");
+    expect(base).toContain("ANTON-RESULT: satisfied — <commit sha> —");
+    expect(base).toMatch(/report `satisfied` with the commit that already did the work/);
   });
 });
 
