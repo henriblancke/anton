@@ -208,6 +208,13 @@ export interface InstructionCriterion {
  * an unclosed one is closed ({@link fenceCloser}), since verbatim it would swallow every section
  * written after it. A fence holding nothing but blank lines says nothing, as the judge reads it.
  *
+ * Outside a fence a line is judged as TYPED, not as the scanner's `visible` text with HTML comments
+ * stripped. The instructions come from a plain textarea and land raw in the bead's note, which no
+ * markdown renderer shows: a founder who types `<!--` sees it, and so does the implementer reading
+ * the note. Judging the render would hide every line after an unmatched `<!--` — the request about
+ * comment parsing that lib/rework-notes.ts escapes the opener to KEEP as a criterion — and the
+ * contract would then say less than the note beside it. What was typed is what files.
+ *
  * An INDENTED code block is literal for the same reason, and CommonMark opens one where the scanner
  * does not: a line indented four columns ({@link CODE_INDENT}) that follows a blank line, a heading,
  * a rule or a fence — anywhere but inside a paragraph or a list. The note renders `Expected
