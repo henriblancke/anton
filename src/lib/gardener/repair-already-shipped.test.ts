@@ -31,10 +31,19 @@ const setPrRefMock = vi.fn(async () => "");
 const supersedeMock = vi.fn<(cwd: string, id: string, replacement: string) => Promise<string>>(
   async () => "",
 );
+const reopenMock = vi.fn<(cwd: string, id: string, reason?: string) => Promise<string>>(async () => "");
+const unlinkMock = vi.fn<(cwd: string, a: string, b: string) => Promise<string>>(async () => "");
 /** Every bd seam that WRITES. A check that touches one of these has stopped being a check. */
-const bdWrites = [noteMock, tagMock, linkMock, closeMock, updateMock, setPrRefMock, supersedeMock];
-/** The under-lock re-read the RETIREMENT makes; the check never calls it. */
+const bdWrites = [noteMock, tagMock, linkMock, closeMock, updateMock, setPrRefMock, supersedeMock, reopenMock, unlinkMock];
+/** The under-lock re-reads the RETIREMENT makes — before its write and after it; the check never calls it. */
 const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
+/**
+ * What the board holds for a bead apart from THIS repair's own write. Cases script this one; the
+ * retirement suite's `showMock` layers the supersede over it, so a post-write read of the ticket
+ * comes back closed against the survivor the way a real `bd show` would — and a case that wants the
+ * window to have moved the bead scripts `boardShow` to change its answer once `supersedeMock` fired.
+ */
+const boardShow = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
 
 const loadAllIssuesMock = vi.fn<(cwd: string, opts?: unknown) => Promise<Bead[]>>(async () => []);
 
@@ -51,6 +60,8 @@ vi.mock("../beads/bd", async () => {
       update: updateMock,
       setPrRef: setPrRefMock,
       supersede: supersedeMock,
+      reopen: reopenMock,
+      unlink: unlinkMock,
       show: showMock,
     },
   };
@@ -92,6 +103,13 @@ const OWNER = "anton-feat";
 
 const bead = (id: string, over: Partial<Bead> = {}): Bead =>
   ({ id, title: id, status: "open", issue_type: "task", ...over }) as Bead;
+
+/** A bead as `bd supersede <id> --with <by>` leaves it: closed, carrying the `supersedes` edge to `by`. */
+const superseded = (b: Bead, by: string): Bead => ({
+  ...b,
+  status: "closed",
+  dependencies: [...(b.dependencies ?? []), { issue_id: b.id, depends_on_id: by, type: "supersedes" }],
+});
 
 const suite = has("git") ? describe : describe.skip;
 
@@ -684,11 +702,19 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     sb = openSandbox();
     ({ repo, setPr } = sb);
     for (const write of bdWrites) write.mockClear();
-    showMock.mockReset();
+    boardShow.mockReset();
     // The under-lock re-read finds both ends exactly as the snapshot did.
-    showMock.mockImplementation(async (_cwd, id) =>
+    boardShow.mockImplementation(async (_cwd, id) =>
       id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" }),
     );
+    // `bd show` as the module sees it: the board's answer, with this repair's own supersede layered
+    // over it once written — the post-write fence reads the ticket closed against its survivor.
+    showMock.mockReset();
+    showMock.mockImplementation(async (cwd, id) => {
+      const read = await boardShow(cwd, id);
+      const written = supersedeMock.mock.calls.find(([, target]) => target === id);
+      return written ? superseded(read, written[2]) : read;
+    });
     loadAllIssuesMock.mockClear();
     loadAllIssuesMock.mockResolvedValue(board());
   });
@@ -889,7 +915,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
   // rewritten in the window is open exactly as before, and the supersede would close the ticket the
   // human just redefined on a claim verified about the one they replaced.
   it("refuses under the lock when the ticket's contract was rewritten since the check", async () => {
-    showMock.mockImplementation(async (_cwd, id) =>
+    boardShow.mockImplementation(async (_cwd, id) =>
       id === TARGET
         ? bead(TARGET, { status: "in_progress", description: "## Acceptance\n- [ ] one more thing" })
         : bead(SHIPPER, { status: "closed" }),
@@ -910,7 +936,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
   // a description the listing never carried is not a rewrite (PR #238 review).
   it("fences the contract on the full read, not on a board row that dropped the description", async () => {
     const contract = "## Goal\nShip the thing.\n## Acceptance\n- [ ] it ships";
-    showMock.mockImplementation(async (_cwd, id) =>
+    boardShow.mockImplementation(async (_cwd, id) =>
       id === TARGET ? bead(TARGET, { status: "in_progress", description: contract }) : bead(SHIPPER, { status: "closed" }),
     );
 
@@ -921,7 +947,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
   });
 
   it("still retires when the window only stamped the ticket — a label or a timestamp is not a rewrite", async () => {
-    showMock.mockImplementation(async (_cwd, id) =>
+    boardShow.mockImplementation(async (_cwd, id) =>
       id === TARGET
         ? bead(TARGET, { status: "in_progress", labels: ["gardener:seen"], updated_at: "2026-09-07T00:00:00Z" })
         : bead(SHIPPER, { status: "closed" }),
@@ -950,7 +976,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       b.id === TARGET ? bead(TARGET, { status: "in_progress", parent: OTHER }) : b,
     );
     loadAllIssuesMock.mockResolvedValue(moved);
-    showMock.mockImplementation(async (_cwd, id) => moved.find((b) => b.id === id)!);
+    boardShow.mockImplementation(async (_cwd, id) => moved.find((b) => b.id === id)!);
 
     const outcome = await retire({ board: snapshot });
 
@@ -977,7 +1003,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       bead(SHIPPER, { status: "closed" }),
     ];
     loadAllIssuesMock.mockResolvedValue(viaCarrier(OTHER));
-    showMock.mockImplementation(async (_cwd, id) => viaCarrier(OTHER).find((b) => b.id === id)!);
+    boardShow.mockImplementation(async (_cwd, id) => viaCarrier(OTHER).find((b) => b.id === id)!);
 
     const outcome = await retire({ board: viaCarrier(OWNER) });
 
@@ -1004,7 +1030,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       readAt = Date.now();
       return viaCarrier;
     });
-    showMock.mockImplementation(async (_cwd, id) => viaCarrier.find((b) => b.id === id)!);
+    boardShow.mockImplementation(async (_cwd, id) => viaCarrier.find((b) => b.id === id)!);
     const releasedAt: Record<string, number> = {};
     const holding = Promise.all(
       [CARRIER, OWNER].map((id) =>
@@ -1031,7 +1057,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       bead(SHIPPER, { status: "closed" }),
     ];
     loadAllIssuesMock.mockResolvedValue(snapshot);
-    showMock.mockImplementation(async (_cwd, id) => snapshot.find((b) => b.id === id)!);
+    boardShow.mockImplementation(async (_cwd, id) => snapshot.find((b) => b.id === id)!);
 
     const outcome = await retire({ board: snapshot });
 
@@ -1041,7 +1067,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
   it("writes nothing when either end moved between the check and the write", async () => {
     // Somebody else settled the ticket in the window — anton does not rewrite that outcome.
-    showMock.mockImplementation(async (_cwd, id) =>
+    boardShow.mockImplementation(async (_cwd, id) =>
       id === TARGET ? bead(TARGET, { status: "closed" }) : bead(SHIPPER, { status: "closed" }),
     );
     const settled = await retire();
@@ -1050,7 +1076,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
     // …and the survivor reopened: the commit naming it spoke for a closed ticket, and by the
     // human's own hand it is work in progress again.
-    showMock.mockImplementation(async (_cwd, id) =>
+    boardShow.mockImplementation(async (_cwd, id) =>
       id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "open" }),
     );
     const reopened = await retire();
@@ -1059,7 +1085,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
     // …and the survivor ABANDONED in the window: it is closed, so a status check alone reads it as
     // landed, but a recorded won't-do delivered nothing to be superseded by.
-    showMock.mockImplementation(async (_cwd, id) =>
+    boardShow.mockImplementation(async (_cwd, id) =>
       id === TARGET
         ? bead(TARGET, { status: "in_progress" })
         : bead(SHIPPER, { status: "closed", labels: ["abandoned"] }),
@@ -1079,7 +1105,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
   describe("a survivor verified through a commit naming it in the base", () => {
     it("refuses when the base no longer contains the naming commit at the write", async () => {
       const before = execFileSync("git", ["-C", repo, "rev-parse", `${sb.landed}^`], { encoding: "utf8" }).trim();
-      showMock.mockImplementation(async (_cwd, id) => {
+      boardShow.mockImplementation(async (_cwd, id) => {
         // Lands during the under-lock re-read: `main` rewound past the commit the check found.
         if (id === SHIPPER) execFileSync("git", ["-C", repo, "update-ref", "refs/heads/main", before]);
         return id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" });
@@ -1097,7 +1123,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     });
 
     it("refuses when whether the naming commit still reaches the base cannot be read at the write", async () => {
-      showMock.mockImplementation(async (_cwd, id) => {
+      boardShow.mockImplementation(async (_cwd, id) => {
         // The base ref itself gone in the window — git cannot answer, and no answer is a refusal.
         if (id === SHIPPER) {
           execFileSync("git", ["-C", repo, "checkout", "-q", "--detach"]);
@@ -1138,7 +1164,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       retire({ block: { reason: `Already implemented by ${SHIPPER} (commit ${extra.slice(0, 7)}, PR #85)` } });
 
     it("retires while every cited commit and PR still lands in the base", async () => {
-      showMock.mockImplementation(survivorStillClosed);
+      boardShow.mockImplementation(survivorStillClosed);
 
       const outcome = await retireCiting();
 
@@ -1155,7 +1181,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     });
 
     it("refuses when the base no longer contains a cited commit at the write, though the survivor's still lands", async () => {
-      showMock.mockImplementation(async (cwd, id) => {
+      boardShow.mockImplementation(async (cwd, id) => {
         // `main` rewound to the naming commit: the survivor's evidence holds, the cited commit's does not.
         if (id === SHIPPER) g(["update-ref", "refs/heads/main", sb.landed]);
         return survivorStillClosed(cwd, id);
@@ -1173,7 +1199,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     });
 
     it("refuses when a cited PR's merge is no longer in the base at the write", async () => {
-      showMock.mockImplementation(async (cwd, id) => {
+      boardShow.mockImplementation(async (cwd, id) => {
         if (id === SHIPPER) setPr(85, "MERGED", { commit: sb.unmerged, base: "develop" });
         return survivorStillClosed(cwd, id);
       });
@@ -1205,7 +1231,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     });
 
     it("retires against it while it is still the same PR and still merged", async () => {
-      showMock.mockImplementation(async (_cwd, id) =>
+      boardShow.mockImplementation(async (_cwd, id) =>
         id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!,
       );
 
@@ -1221,7 +1247,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
     it("refuses when its PR pointer was swapped in the window, whatever the new PR says", async () => {
       setPr(90, "MERGED");
-      showMock.mockImplementation(async (_cwd, id) =>
+      boardShow.mockImplementation(async (_cwd, id) =>
         id === TARGET
           ? bead(TARGET, { status: "in_progress" })
           : bead(UNLANDED, { status: "in_progress", metadata: { pr: "gh-90" } }),
@@ -1237,7 +1263,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     });
 
     it("refuses when the PR it verified is no longer merged at the write", async () => {
-      showMock.mockImplementation(async (_cwd, id) => {
+      boardShow.mockImplementation(async (_cwd, id) => {
         // Reread INSIDE the lock, after the check read it as merged.
         if (id === UNLANDED) setPr(85, "OPEN");
         return id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!;
@@ -1251,7 +1277,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     });
 
     it("refuses when the base no longer contains the PR's merge at the write — still merged is not enough", async () => {
-      showMock.mockImplementation(async (_cwd, id) => {
+      boardShow.mockImplementation(async (_cwd, id) => {
         if (id === UNLANDED) setPr(85, "MERGED", { commit: sb.unmerged, base: "develop" });
         return id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!;
       });
@@ -1273,7 +1299,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
   describe("the job's live abort signal", () => {
     it("writes nothing when the job was cancelled while it was checking, and says so", async () => {
       const controller = new AbortController();
-      showMock.mockImplementation(async (_cwd, id) => {
+      boardShow.mockImplementation(async (_cwd, id) => {
         // Lands during the under-lock re-read — after every check has passed, before any write.
         controller.abort();
         return id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" });
@@ -1318,7 +1344,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       setPr(85, "MERGED", { carries: [`${UNLANDED}: the survivor's commit`] });
       setPr(90, "MERGED", { carries: [`${UNLANDED}: the survivor's commit`] });
       loadAllIssuesMock.mockResolvedValue(viaOwner());
-      showMock.mockImplementation(async (_cwd, id) => viaOwner().find((b) => b.id === id)!);
+      boardShow.mockImplementation(async (_cwd, id) => viaOwner().find((b) => b.id === id)!);
     });
 
     it("retires against it while it still rides that run target and the PR is still merged", async () => {
@@ -1380,6 +1406,213 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`no longer rides \`${OWNER}\``);
       expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("rides no run target now");
       expect(supersedeMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // The locks order only THIS process's writers (beads/claim-lock.ts). On a shared-server board
+  // another anton, or a teammate's `bd` from a shell, can move either end between the locked reread
+  // and the supersede, and nothing orders the two (PR #238 review). The write's own post-write read
+  // is the one read that can have seen them, so the retirement is held to the check's bar once more
+  // against it — and taken back when it fails, but only while the close is still anton's own.
+  describe("the fence after the write — a writer in another process", () => {
+    /** Has this repair's supersede been written yet? What a cross-process write in the window keys on. */
+    const written = () => supersedeMock.mock.calls.length > 0;
+    const evidenceOf = (outcome: unknown) => (outcome as { evidence: string[] }).evidence.join(" ");
+
+    it("re-reads both ends and the board after the supersede, and stamps only once they held", async () => {
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+      const wrote = supersedeMock.mock.invocationCallOrder[0]!;
+      const stamped = tagMock.mock.invocationCallOrder[0]!;
+      const afterWrite = showMock.mock.invocationCallOrder.filter((o) => o > wrote);
+      expect(afterWrite.length).toBeGreaterThanOrEqual(2);
+      expect(Math.max(...afterWrite)).toBeLessThan(stamped);
+      expect(showMock.mock.calls.slice(-afterWrite.length).map((c) => c[1])).toEqual(
+        expect.arrayContaining([TARGET, SHIPPER]),
+      );
+      expect(loadAllIssuesMock).toHaveBeenCalledTimes(2);
+      for (const write of [reopenMock, unlinkMock]) expect(write).not.toHaveBeenCalled();
+    });
+
+    it("withdraws a retirement that closed a ticket rewritten in the window, and does not stamp it", async () => {
+      boardShow.mockImplementation(async (_cwd, id) =>
+        id === TARGET
+          ? bead(TARGET, {
+              status: "in_progress",
+              ...(written() ? { description: "## Acceptance\n- [ ] one more thing" } : {}),
+            })
+          : bead(SHIPPER, { status: "closed" }),
+      );
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { why: string }).why).toContain("moved between the check and the write");
+      expect(evidenceOf(outcome)).toContain("was rewritten since the check");
+      expect(evidenceOf(outcome)).toContain(`withdrew the retirement: ${TARGET} is open again`);
+      expect(evidenceOf(outcome)).toContain(`bd supersede ${TARGET} --with ${SHIPPER}`);
+      expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+      expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.stringContaining("board moved"));
+      expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+      // Open FIRST — that is what puts the ticket back in front of a human — then the edge.
+      expect(reopenMock.mock.invocationCallOrder[0]!).toBeLessThan(unlinkMock.mock.invocationCallOrder[0]!);
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    it("withdraws when the ticket was re-homed in the window", async () => {
+      boardShow.mockImplementation(async (_cwd, id) =>
+        id === TARGET
+          ? bead(TARGET, { status: "in_progress", ...(written() ? { parent: "anton-othr" } : {}) })
+          : bead(SHIPPER, { status: "closed" }),
+      );
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect(evidenceOf(outcome)).toContain("was re-homed since the check");
+      expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+      expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    it("withdraws when open work was attached beneath the ticket in the window", async () => {
+      const newcomer = bead("anton-newk", { status: "open" });
+      (newcomer as unknown as Record<string, unknown>).parent = TARGET;
+      loadAllIssuesMock.mockImplementation(async () => (written() ? [...board(), newcomer] : board()));
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect(evidenceOf(outcome)).toContain(`open work was attached beneath ${TARGET} since the check (anton-newk)`);
+      expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    it("withdraws when the survivor was reopened in the window", async () => {
+      boardShow.mockImplementation(async (_cwd, id) =>
+        id === TARGET
+          ? bead(TARGET, { status: "in_progress" })
+          : bead(SHIPPER, { status: written() ? "open" : "closed" }),
+      );
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect(evidenceOf(outcome)).toContain("is open again");
+      expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+      expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    describe("a survivor verified through its merged pull request", () => {
+      const viaPr = (ref = "gh-85") => [
+        bead(TARGET, { status: "in_progress" }),
+        bead(UNLANDED, { status: "in_progress", metadata: { pr: ref } }),
+      ];
+      const retireViaPr = () =>
+        retire({ block: { reason: `Already implemented by ${UNLANDED}` }, board: viaPr() });
+
+      beforeEach(() => {
+        setPr(85, "MERGED");
+        loadAllIssuesMock.mockResolvedValue(viaPr());
+      });
+
+      it("withdraws when its PR pointer was swapped in the window, whatever the new PR says", async () => {
+        setPr(90, "MERGED");
+        boardShow.mockImplementation(async (_cwd, id) =>
+          id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr(written() ? "gh-90" : "gh-85")[1]!,
+        );
+
+        const outcome = await retireViaPr();
+
+        expect(outcome).toMatchObject({ action: "escalate" });
+        expect(evidenceOf(outcome)).toContain("no longer points at the PR anton verified (gh-85)");
+        expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+        expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);
+        expect(tagMock).not.toHaveBeenCalled();
+      });
+
+      // What another process's bd write can move is the POINTER. The pointer that verified under the
+      // locks a moment ago, unchanged, still names the merge the base was proven to hold — so the
+      // post-write fence asks the board, not gh again, and a gh that changes its story in between is
+      // not a board race.
+      it("holds the survivor to the board's pointer after the write, not to gh a second time", async () => {
+        boardShow.mockImplementation(async (_cwd, id) => {
+          if (written()) setPr(85, "OPEN");
+          return id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!;
+        });
+
+        const outcome = await retireViaPr();
+
+        expect(outcome).toMatchObject({ action: "retired", replacementId: UNLANDED });
+        for (const write of [reopenMock, unlinkMock]) expect(write).not.toHaveBeenCalled();
+      });
+    });
+
+    it("leaves a retirement somebody else has already decided over — the ticket reopened by another hand", async () => {
+      // Bypasses the supersede layer on purpose: the board says OPEN after the write, so the close
+      // anton wrote is not what the ticket reads as any more.
+      showMock.mockImplementation(async (_cwd, id) =>
+        id === TARGET
+          ? bead(TARGET, { status: written() ? "open" : "in_progress" })
+          : bead(SHIPPER, { status: "closed" }),
+      );
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect(evidenceOf(outcome)).toContain("no longer reads as the close anton wrote");
+      expect(evidenceOf(outcome)).toContain("that decision stands");
+      for (const write of [reopenMock, unlinkMock, tagMock]) expect(write).not.toHaveBeenCalled();
+    });
+
+    it("reports a retirement it could not re-read as unsettled, names the check, and takes nothing back", async () => {
+      showMock.mockImplementation(async (_cwd, id) => {
+        if (written() && id === TARGET) throw new Error("dolt server went away");
+        return id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" });
+      });
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect(evidenceOf(outcome)).toContain("could not be re-read after the retirement");
+      expect(evidenceOf(outcome)).toContain("took nothing back");
+      expect(evidenceOf(outcome)).toContain(`bd show ${TARGET}`);
+      for (const write of [reopenMock, unlinkMock, tagMock]) expect(write).not.toHaveBeenCalled();
+    });
+
+    it("says the ticket stands closed when the withdrawal itself fails, and names the command a human runs", async () => {
+      boardShow.mockImplementation(async (_cwd, id) =>
+        id === TARGET
+          ? bead(TARGET, { status: "in_progress", ...(written() ? { title: "renamed" } : {}) })
+          : bead(SHIPPER, { status: "closed" }),
+      );
+      reopenMock.mockRejectedValueOnce(new Error("beads db is locked"));
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect(evidenceOf(outcome)).toContain("could NOT withdraw the retirement (beads db is locked)");
+      expect(evidenceOf(outcome)).toContain(`bd reopen ${TARGET}`);
+      for (const write of [unlinkMock, tagMock]) expect(write).not.toHaveBeenCalled();
+    });
+
+    it("keeps the ticket open when only the edge could not be removed, and says the edge is inert", async () => {
+      boardShow.mockImplementation(async (_cwd, id) =>
+        id === TARGET
+          ? bead(TARGET, { status: "in_progress", ...(written() ? { title: "renamed" } : {}) })
+          : bead(SHIPPER, { status: "closed" }),
+      );
+      unlinkMock.mockRejectedValueOnce(new Error("no such dependency"));
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+      expect(evidenceOf(outcome)).toContain(`${TARGET} is open again`);
+      expect(evidenceOf(outcome)).toContain("could not be removed (no such dependency)");
+      expect(tagMock).not.toHaveBeenCalled();
     });
   });
 

@@ -24,7 +24,7 @@ import { doltSync, type SyncMode, type SyncOutcome } from "./sync-coalescer";
 // bd.ts back (breaking the bd ↔ snapshot cycle, anton-mur). Re-exported here so every existing
 // `from ".../beads/bd"` import keeps working.
 export type { Bead, BeadComment, BeadDep } from "./types";
-import type { Bead } from "./types";
+import type { Bead, BeadDep } from "./types";
 
 // The dependency types anton may write, validated at the link seam because bd validates nothing
 // there (anton-igkb). Re-exported so callers reach the set through the same module as `link`.
@@ -2577,12 +2577,22 @@ export const beads = {
    * The distinction this exists for (anton-5bpd): a superseded bead has the same shape as an
    * abandoned one — closed, with no commit under its own id on any branch — and anything that reads
    * "closed with nothing on this branch" as a cross-machine resume must tell all three apart.
+   *
+   * TWO SHAPES of `dependencies`, because bd's two reads disagree (measured on 1.1.2). `bd list
+   * --json` carries EDGE rows — `{ issue_id, depends_on_id, type }`, the {@link BeadDep} shape.
+   * `bd show --json` carries the depended-on ISSUES themselves, each stamped with `dependency_type`
+   * and no edge fields at all. A reader that knew only the list shape read every `show` of a
+   * superseded bead as "not superseded" (PR #238 review — the post-write fence in
+   * gardener/repair-already-shipped.ts is a `show` reader), so both are accepted here.
    */
-  supersededBy: (b: Bead): string | undefined =>
-    b.status === "closed"
-      ? (b.dependencies ?? []).find((d) => d.issue_id === b.id && d.type === "supersedes")
-          ?.depends_on_id
-      : undefined,
+  supersededBy: (b: Bead): string | undefined => {
+    if (b.status !== "closed") return undefined;
+    for (const d of (b.dependencies ?? []) as Array<Partial<BeadDep> & { id?: string; dependency_type?: string }>) {
+      if (d.type === "supersedes" && d.issue_id === b.id && d.depends_on_id) return d.depends_on_id;
+      if (d.dependency_type === "supersedes" && d.id) return d.id;
+    }
+    return undefined;
+  },
 
   /** A bead a run reserved but never delivered (see LABELS.notDelivered) — open, and in no PR. */
   isNotDelivered: (b: Bead) => b.labels?.includes(LABELS.notDelivered) ?? false,

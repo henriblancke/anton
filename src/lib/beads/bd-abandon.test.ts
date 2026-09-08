@@ -99,6 +99,20 @@ describe("beads.supersededBy", () => {
     expect(beads.supersededBy(bead("closed", superseded("bd-9")))).toBe("bd-9");
   });
 
+  // `bd show --json` does not carry edge rows: its `dependencies` are the depended-on ISSUES, each
+  // stamped with `dependency_type` (bd 1.1.2). A fresh `show` of a bead just superseded must read as
+  // superseded, or a post-write fence reading it (repair-already-shipped) sees its own close as
+  // somebody else's.
+  it("reads the survivor off a `bd show` read, whose dependencies are issues stamped with a type", () => {
+    const shown = [
+      { id: "bd-2", title: "where it came from", status: "closed", dependency_type: "discovered-from" },
+      { id: "bd-9", title: "the survivor", status: "closed", dependency_type: "supersedes" },
+    ];
+    expect(beads.supersededBy(bead("closed", shown))).toBe("bd-9");
+    expect(beads.supersededBy(bead("closed", shown.slice(0, 1)))).toBeUndefined();
+    expect(beads.supersededBy(bead("open", shown))).toBeUndefined();
+  });
+
   it("answers nothing for a bead the board records no retirement for", () => {
     expect(beads.supersededBy(bead("closed"))).toBeUndefined();
     expect(beads.supersededBy(bead("closed", []))).toBeUndefined();
