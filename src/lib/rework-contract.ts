@@ -597,6 +597,10 @@ function peelContainers(
     prefix.push(">", 0);
     column = 0;
     quoted = true;
+    // A blockquote begins a new block, never a paragraph's lazy continuation, so entering one
+    // resets paragraph state as opening an item does — without it `Step\n>     - literal` keeps
+    // `inParagraph` true and shears the quoted indented code that CommonMark renders verbatim.
+    fresh = true;
   }
 }
 

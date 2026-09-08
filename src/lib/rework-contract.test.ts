@@ -533,6 +533,10 @@ describe("instructionCriteria", () => {
     expect(texts(">     first\n>\n>     second\nafter")).toEqual(["```\nfirst\n\nsecond\n```", "after"]);
     // A truly blank line — no `>` — leaves the callout, so the block ends and the trailing blank drops.
     expect(texts(">     first\n\n>     second")).toEqual(["```\nfirst\n```", "```\nsecond\n```"]);
+    // A callout right after a paragraph begins a new block, not the paragraph's lazy continuation:
+    // `>` grants one space of padding, so four more open indented code, and shearing its bullet filed
+    // `literal` while the note renders `- literal` as code.
+    expect(texts("Step\n>     - literal")).toEqual(["Step", "```\n- literal\n```"]);
   });
 
   it("keeps code that begins on the marker's own line — five spaces after `-` are one of padding and four of code", () => {
