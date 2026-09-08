@@ -449,6 +449,23 @@ describe("reconcileFollowUpDescription", () => {
     expect(createdUnder(makeBead({ id: "f", description: reconciled }), "feat")).toBe(false);
   });
 
+  it("re-says the run-location line only in Context — the same sentence in Goal or a box is authored text", () => {
+    const sentence = "It runs as a ticket of feat, in that target's next run.";
+    const elsewhere = followUpDescription(args)
+      .replace("## Goal\n", `## Goal\n${sentence}\n`)
+      .replace("## Acceptance Criteria\n", `## Acceptance Criteria\n- [ ] ${sentence}\n`);
+    const reconciled = reconcileFollowUpDescription(elsewhere, {
+      ...args,
+      instructions: `${sentence}\n${INSTRUCTIONS}`,
+      parentId: undefined,
+    });
+    expect(reconciled.split("\n\n## Acceptance")[0]).toBe(elsewhere.split("\n\n## Acceptance")[0]);
+    expect(reconciled).toContain(`- [ ] ${sentence}`);
+    expect(reconciled.split("\n\n## Context")[1]).not.toContain(sentence);
+    expect(reconciled.split("\n\n## Context")[1]).toContain("It is its own run target");
+    expect(createdUnder(makeBead({ id: "f", description: reconciled }), "feat")).toBe(false);
+  });
+
   it("leaves a run-location line the founder rewrote alone — they own the Context then", () => {
     const rewritten = followUpDescription(args).replace(
       "It runs as a ticket of feat, in that target's next run.",

@@ -160,7 +160,7 @@ export function reconcileFollowUpDescription(
  */
 function replaceAcceptance(description: string, boxes: string[]): string {
   const lines = scanMarkdown(description);
-  const sections = acceptanceSections(lines);
+  const sections = sectionsNamed(lines, ACCEPTANCE_KEYS);
   if (sections.length === 0) {
     return [description.trimEnd(), ``, `## ${ACCEPTANCE_HEADING}`, ...boxes].join("\n");
   }
@@ -180,11 +180,11 @@ function replaceAcceptance(description: string, boxes: string[]): string {
     .join("\n\n");
 }
 
-/** Every Acceptance section as the judge sees it: `start` is its heading's line, `end` the line opening the next section. */
-function acceptanceSections(lines: ScannedLine[]): { start: number; end: number }[] {
+/** Every section under one of `keys` as the judge sees it: `start` is its heading's line, `end` the line opening the next section. */
+function sectionsNamed(lines: ScannedLine[], keys: string[]): { start: number; end: number }[] {
   const out: { start: number; end: number }[] = [];
   lines.forEach((line, start) => {
-    if (!line.heading || !ACCEPTANCE_KEYS.includes(line.heading.key)) return;
+    if (!line.heading || !keys.includes(line.heading.key)) return;
     const depth = line.heading.depth;
     let end = start + 1;
     while (end < lines.length) {
@@ -208,13 +208,22 @@ function withoutTrailingBlank(texts: string[]): string[] {
  * Only the two shapes a create can write are recognised — under the target, or standing alone; a
  * founder who rewrote that line has taken the Context into their own hands ({@link createdUnder}),
  * and it is left as they put it.
+ *
+ * Only the Context section is searched, the one place the formula writes the line and the one
+ * {@link createdUnder} reads it back from. The same sentence elsewhere — a Goal that happens to say
+ * it, a founder's instruction quoting it into an Acceptance box — is authored text a reconcile
+ * promises to keep, and rewriting it there changed a section it had no business in.
  */
 function replaceRunsUnder(description: string, targetId: string, parentId?: string): string {
   const generated = new Set([followUpRunsUnder(targetId), followUpRunsUnder()]);
   const wanted = followUpRunsUnder(parentId);
-  return description
-    .split(/\r?\n/)
-    .map((line) => (generated.has(line) ? wanted : line))
+  const lines = scanMarkdown(description);
+  const inContext = new Set<number>();
+  for (const { start, end } of sectionsNamed(lines, CONTEXT_KEYS)) {
+    for (let at = start + 1; at < end; at += 1) inContext.add(at);
+  }
+  return lines
+    .map((line, at) => (inContext.has(at) && generated.has(line.text) ? wanted : line.text))
     .join("\n");
 }
 

@@ -257,6 +257,30 @@ describe("instructionCriteria", () => {
     ).toEqual([]);
   });
 
+  it("strips a blockquote marker before judging — `> ` styles a line, it does not author one", () => {
+    // A ticket's placeholder acceptance is often pasted as the callout it renders in. The contract
+    // gate unquotes before it classifies (lib/beads/contract.ts); judging the quoted line as
+    // authored here filed a `> -` or `> TODO` box the gate would then refuse.
+    expect(
+      instructionCriteria(
+        [
+          "> -",
+          "> ---",
+          "> - [ ] TODO — a concrete, checkable statement of done",
+          ">> TODO: nested callout",
+          "- > [ ]",
+          "> > - - ***",
+          ">",
+        ].join("\n"),
+      ),
+    ).toEqual([]);
+    expect(instructionCriteria("> - keep the quoted step\n>quoted prose\n- > nested quote")).toEqual([
+      "keep the quoted step",
+      "quoted prose",
+      "nested quote",
+    ]);
+  });
+
   it("keeps an authored line that merely mentions a TODO — the prompt is anchored on its separator", () => {
     expect(
       instructionCriteria("- [ ] the TODO banner clears on save\nTODOs are listed in the readme"),

@@ -8,6 +8,7 @@
  * costs a caller nothing else — no bd, no `gh`, no board read — which is also what lets the rework
  * dialog import it: what the dialog refuses and what the route refuses are one judgement.
  */
+import { unquote } from "./beads/markdown";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
   MAX_REWORK_INSTRUCTIONS_CHARS,
@@ -168,17 +169,23 @@ export function instructionCriteria(instructions: string): string[] {
 }
 
 /**
- * The line with every leading list marker stripped, or empty when nothing but scaffolding remains.
- * Markers nest — `- - `, `1. - `, `- [ ] [ ] ` — and shearing one layer can expose another bare
- * marker or a rule (`- - ---`), so each layer is judged as the line in full was: a rule yields
- * nothing, a marker is shorn and the remainder judged again. What is left once no marker remains is
- * judged last against the formula's prompt, which is scaffolding in whichever list shape it arrived.
+ * The line with every leading list and blockquote marker stripped, or empty when nothing but
+ * scaffolding remains. Markers nest — `- - `, `1. - `, `- [ ] [ ] `, `> - ` — and shearing one layer
+ * can expose another bare marker or a rule (`- - ---`, `> ---`), so each layer is judged as the line
+ * in full was: a rule yields nothing, a marker is shorn and the remainder judged again. What is left
+ * once no marker remains is judged last against the formula's prompt, which is scaffolding in
+ * whichever list shape it arrived.
+ *
+ * The blockquote marker comes off with the list markers ({@link unquote}) for the reason
+ * lib/beads/contract.ts strips it: it styles its content, it is not content. A founder who pastes a
+ * ticket's `> - [ ] TODO — ...` callout has written nothing, and leaving the `>` on hid the
+ * placeholder from {@link PROMPT_LINE} and filed the same marker-only box the contract gate refuses.
  */
 function shorn(line: string): string {
   let text = line.trim();
   for (;;) {
     if (THEMATIC_BREAK.test(text)) return "";
-    const next = text.replace(LIST_MARKER, "");
+    const next = unquote(text).trim().replace(LIST_MARKER, "");
     if (next === text) return PROMPT_LINE.test(text) ? "" : text;
     text = next;
   }
