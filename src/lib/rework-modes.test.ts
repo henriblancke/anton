@@ -459,6 +459,9 @@ describe("applyFollowUp", () => {
     expect((patch as { description: string }).description).toContain(
       "It is its own run target — approve it to run.",
     );
+    // The Context was just rewritten to the detached parentage; the note must not claim otherwise.
+    expect(noteOn("half")).toContain("Its Context section was rewritten to say so.");
+    expect(noteOn("half")).not.toContain("still names the parent");
   });
 
   it("detaches a follow-up stranded under a target whose PR merged under it, and reports the write", async () => {
@@ -476,6 +479,9 @@ describe("applyFollowUp", () => {
     expect(reparentMock).toHaveBeenCalledWith("/repo", "dup", "");
     expect(noteOn("dup")).toContain("gh-42");
     expect(noteOn("dup")).toContain("its own run target now");
+    // A finished bead keeps its Context, so the note points at the stale parent it still names.
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(noteOn("dup")).toContain("Its Context section still names the parent it was created under.");
   });
 
   it("leaves an already-parentless match alone when the target has shipped — nothing to reconcile", async () => {

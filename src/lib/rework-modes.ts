@@ -185,7 +185,7 @@ async function resumeFollowUp(
   const { target, ticket, body } = context;
   const existing = match.bead;
   const stranded = context.shippedPr !== undefined && beads.parentOf(existing) === target.id;
-  if (stranded) await detachStrandedFollowUp(context, existing);
+  if (stranded) await detachStrandedFollowUp(context, existing, match.partial);
   if (match.partial) {
     await finishHalfCreatedFollowUp(context, existing, stranded ? undefined : beads.parentOf(existing));
   }
@@ -213,17 +213,29 @@ async function resumeFollowUp(
  * pick it up. That is exactly the shape the instructed retry lands in — the 409 says "send it back
  * again", and this pass reads the PR as merged. So the parentage is reconciled to what this request
  * would have created had it gone first (parentless, {@link resolvePipeline}), rather than the
- * founder being told a stranded child "carries the next pass as its own run target". The bead keeps
- * its Context section, which a founder may have edited; the note is the record of the move.
+ * founder being told a stranded child "carries the next pass as its own run target".
+ *
+ * What the note says about the Context section must match what this pass leaves there. A finished
+ * bead keeps its Context, which a founder may have edited, so the note flags that it still names
+ * the old parent. A half-created one has its Context rewritten right after this
+ * ({@link finishHalfCreatedFollowUp}, with the detached parentage), so the note says so instead of
+ * describing a contract that is about to change.
  */
-async function detachStrandedFollowUp(context: FollowUpContext, existing: Bead): Promise<void> {
+async function detachStrandedFollowUp(
+  context: FollowUpContext,
+  existing: Bead,
+  contextRewritten: boolean,
+): Promise<void> {
   await beads.reparent(context.repo, existing.id, "");
+  const contextNote = contextRewritten
+    ? `Its Context section was rewritten to say so.`
+    : `Its Context section still names the parent it was created under.`;
   await beads.note(
     context.repo,
     existing.id,
     `anton: rework — ${context.target.id}'s pull request (${context.shippedPr}) merged after this ` +
       `follow-up was created under it, so it was detached and is its own run target now — approve ` +
-      `it to run. Its Context section still names the parent it was created under.`,
+      `it to run. ${contextNote}`,
   );
 }
 
