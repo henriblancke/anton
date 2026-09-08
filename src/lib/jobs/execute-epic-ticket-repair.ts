@@ -76,6 +76,12 @@ export async function repairBlockedTicket(args: {
   logPath: string;
   /** The agent's parsed `ANTON-RESULT` line, when it emitted one: the class AND the reason. */
   selfReport: AntonResult | null;
+  /**
+   * The ticket as the agent was PROMPTED with it, when the dispatching step reported it — the
+   * snapshot plus the notes read at dispatch. Falls back to the snapshot alone, which carries the
+   * contract fields and can attest to nothing about the notes.
+   */
+  dispatched?: Bead;
   /** The error that halted the ticket — the reason's fallback when the agent stated none. */
   e: unknown;
   /**
@@ -121,8 +127,9 @@ export async function repairBlockedTicket(args: {
             bead: fresh,
             // The contract the agent was PROMPTED with (PR #238 review): `fresh` is read after the
             // report, so an edit landing mid-session is already in it, and a fence starting there
-            // would hold the retirement to the rewritten ticket and never see the drift.
-            dispatched: ticket,
+            // would hold the retirement to the rewritten ticket and never see the drift. The
+            // dispatch-time read carries the human notes the prompt did; the snapshot does not.
+            dispatched: args.dispatched ?? ticket,
             block,
             committed: args.committed,
             now,

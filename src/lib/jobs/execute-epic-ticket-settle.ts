@@ -65,6 +65,12 @@ export interface TicketProgress {
    * delivery-evidence gate, never replaces it; a missing/unparseable line (null) falls through to it.
    */
   selfReport: AntonResult | null;
+  /**
+   * The ticket as the implementing agent was PROMPTED with it — the snapshot plus the notes read at
+   * dispatch (steps/agent.ts `withDispatchNotes`). The `already-shipped` repair fences its
+   * retirement on this read (PR #238 review); absent when no dispatching step reported one.
+   */
+  dispatched?: Bead;
 }
 
 /**
@@ -139,6 +145,7 @@ export async function settleFailedTicket(args: {
         runTicketIds: args.runTicketIds,
         logPath,
         selfReport: progress.selfReport,
+        dispatched: progress.dispatched,
         e,
         committed: progress.committed,
       })

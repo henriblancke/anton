@@ -147,6 +147,8 @@ async function walkTicketSteps(args: {
     if (reported && selfReportRank(reported.outcome) >= selfReportRank(progress.selfReport?.outcome)) {
       progress.selfReport = reported;
     }
+    // The bead the implementer was prompted with — the read an `already-shipped` claim is about.
+    if (result.facts?.dispatched) progress.dispatched = result.facts.dispatched;
 
     // The agent asked for a HUMAN (anton-287p): the next step belongs to a person — a credential,
     // a dashboard click, a judgement call — not to another attempt. Judged HERE, at the step that

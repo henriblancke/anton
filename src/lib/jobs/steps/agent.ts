@@ -42,7 +42,8 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
     sessionIds.push(...(last.facts?.sessionIds ?? []));
     // The LAST dispatch's self-report is the one that speaks for the step: a caller running a step
     // per ticket (as execute-epic does) sees one either way, and a run-wide dispatch is judged on
-    // where it ended up.
+    // where it ended up. The bead it was prompted with travels beside it, for the same caller.
+    last = { ...last, facts: { ...last.facts, dispatched } };
     if (!last.ok) return { ...last, facts: { ...last.facts, sessionIds } };
   }
   return { ok: true, detail: last.detail, facts: { ...last.facts, sessionIds } };

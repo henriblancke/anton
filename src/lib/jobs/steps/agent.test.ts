@@ -38,6 +38,9 @@ describe("step:implement", () => {
     expect(claude.calls[1].prompt).toContain("anton-b");
     // Every dispatch is recorded, in dispatch order, so the caller can file them all.
     expect(result.facts.sessionIds).toHaveLength(2);
+    // And the bead the LAST agent was prompted with rides out with the report — the read an
+    // `already-shipped` claim is fenced on (PR #238 review). No board here, so it is the snapshot.
+    expect(result.facts.dispatched).toEqual(ticket("anton-b"));
   });
 
   // A failed ticket must not silently pull the rest of the run along behind it.

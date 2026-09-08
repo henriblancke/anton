@@ -37,6 +37,7 @@
 import { beads, type Bead } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
+import { humanNotesPromptBlock } from "../beads/notes";
 import {
   readCommitDate,
   readCommitNaming,
@@ -453,6 +454,14 @@ function citesSame(a: CitedEvidence, b: CitedEvidence): boolean {
  * and any of those would retire another ticket against work the survivor's latest close does not
  * describe. So a landing counts only when it postdates the bead's last reopen
  * ({@link landingOfCurrentCycle}): what the base holds must be what this close is about.
+ *
+ * A naming commit that fails that bar is an evidence route that gave nothing, not a refusal (PR
+ * #238 review). It was DISCOVERED — the newest commit in the base naming the bead — not cited by
+ * the claim, and it is the newest exactly when the current cycle's commit does not name the bead:
+ * a squash whose message was edited to drop the id lands the rework and leaves the old commit as
+ * the only match. The PR routes are still asked; a merged PR that postdates the reopen proves the
+ * current cycle landed. What the stale commit said rides into any refusal that follows, so a human
+ * reading it sees every route anton tried.
  */
 async function closedBeadLanding(args: {
   repoPath: string;
@@ -463,23 +472,25 @@ async function closedBeadLanding(args: {
 }): Promise<{ landing: BeadLanding; proof: string } | { why: string }> {
   const { repoPath, base, index, bead, readPr } = args;
   const id = bead.id;
+  // The naming commit the base holds but the current cycle cannot claim — see the note above.
+  let staleCommit: string | undefined;
+  const refuse = (why: string): { why: string } => ({ why: staleCommit ? `${why}; ${staleCommit}` : why });
   const naming = await readCommitNaming(repoPath, id, base);
   switch (naming.state) {
     case "found": {
       const cycle = await landingOfCurrentCycle(repoPath, bead, naming.committedAt);
-      if (cycle.stale) {
+      if (!cycle.stale) {
         return {
-          why:
+          landing: { via: "commit", sha: naming.sha, landedAt: naming.committedAt },
+          proof:
             `\`${id}\` is closed on the board, and commit \`${naming.sha.slice(0, 10)}\` in the ` +
-            `history of the run's base (${base}) names it — but ${cycle.stale}`,
+            `history of the run's base (${base}) names it`,
         };
       }
-      return {
-        landing: { via: "commit", sha: naming.sha, landedAt: naming.committedAt },
-        proof:
-          `\`${id}\` is closed on the board, and commit \`${naming.sha.slice(0, 10)}\` in the ` +
-          `history of the run's base (${base}) names it`,
-      };
+      staleCommit =
+        `commit \`${naming.sha.slice(0, 10)}\` in the history of the run's base (${base}) names ` +
+        `it, but ${cycle.stale}`;
+      break;
     }
     case "unreadable":
       return {
@@ -506,13 +517,12 @@ async function closedBeadLanding(args: {
         proof: `\`${id}\` is closed on the board and its PR (${ownPr}) is merged${landedTail(base, landing)}`,
       };
     }
-    return {
-      why:
-        landing.state === "unknown"
-          ? `\`${id}\` is closed on the board and anton could not read the state of its PR ` +
+    return refuse(
+      landing.state === "unknown"
+        ? `\`${id}\` is closed on the board and anton could not read the state of its PR ` +
             `(${ownPr}) — whether that work landed is exactly what the claim rests on`
-          : `\`${id}\` is closed on the board, but its PR (${ownPr}) ${landing.predicate}`,
-    };
+        : `\`${id}\` is closed on the board, but its PR (${ownPr}) ${landing.predicate}`,
+    );
   }
 
   const owner = ticketOwnerOf(index, bead);
@@ -540,39 +550,39 @@ async function closedBeadLanding(args: {
           };
         }
         case "none":
-          return {
-            why:
-              `${rides} is merged, but none of the commits GitHub records for that PR names ` +
+          return refuse(
+            `${rides} is merged, but none of the commits GitHub records for that PR names ` +
               `\`${id}\` — the board says it rides \`${owner.id}\` now, and nothing says it did ` +
               `when that PR merged, so the PR is not evidence its work landed`,
-          };
+          );
         case "unreadable":
-          return {
-            why:
-              `${rides} is merged, but whether a commit in that PR names \`${id}\` could not be ` +
+          return refuse(
+            `${rides} is merged, but whether a commit in that PR names \`${id}\` could not be ` +
               `read (${carried.detail}) — whether that PR carried its work is exactly what the ` +
               `claim rests on`,
-          };
+          );
       }
     }
-    return {
-      why:
-        landing.state === "unknown"
-          ? `\`${id}\` is closed on the board and anton could not read the state of the PR of ` +
+    return refuse(
+      landing.state === "unknown"
+        ? `\`${id}\` is closed on the board and anton could not read the state of the PR of ` +
             `\`${owner.id}\`, the run target it rides (${ownerPr}) — whether that work landed ` +
             `is exactly what the claim rests on`
-          : `\`${id}\` is closed on the board, but the PR of \`${owner.id}\`, the run target it ` +
+        : `\`${id}\` is closed on the board, but the PR of \`${owner.id}\`, the run target it ` +
             `rides, (${ownerPr}) ${landing.predicate} — its run committed it, and that work ` +
             `has not landed in ${base}`,
-    };
+    );
   }
 
-  return {
-    why:
-      `\`${id}\` is closed on the board, but nothing says its work LANDED — no commit in ${base} ` +
-      `names it, and neither it${owner ? ` nor \`${owner.id}\`, the run target it rides,` : ""} ` +
-      `points at a merged PR; a ticket closes when its run commits, before the pull request merges`,
-  };
+  const rides = owner ? ` nor \`${owner.id}\`, the run target it rides,` : "";
+  return refuse(
+    staleCommit
+      ? `\`${id}\` is closed on the board, but nothing says its CURRENT work LANDED — neither it${rides} ` +
+          `points at a merged PR, and the one commit in ${base} naming it is an earlier cycle's`
+      : `\`${id}\` is closed on the board, but nothing says its work LANDED — no commit in ${base} ` +
+          `names it, and neither it${rides} points at a merged PR; a ticket closes when its run ` +
+          `commits, before the pull request merges`,
+  );
 }
 
 /**
@@ -625,7 +635,14 @@ async function landingOfCurrentCycle(
   const reopenedAt = lastReopen(versions);
   if (reopenedAt === undefined) return {};
   const reopened = Date.parse(reopenedAt);
-  if (Number.isNaN(reopened) || reopened <= landed) return {};
+  if (Number.isNaN(reopened)) {
+    return {
+      stale:
+        `the board's history dates \`${bead.id}\`'s last reopen as "${reopenedAt}", which is not a ` +
+        `date — whether it was reopened before or after that landing (${landedAt}) could not be read`,
+    };
+  }
+  if (reopened <= landed) return {};
   return {
     stale:
       `that landing (${landedAt}) is an earlier cycle's — the board reopened \`${bead.id}\` at ` +
@@ -1470,6 +1487,17 @@ function stillClosedSurvivor(replacement: Bead, spokeFor: string): string | unde
 const CONTRACT_FIELDS = ["title", "description", "acceptance_criteria", "acceptance", "context", "design"] as const;
 
 /**
+ * The human notes on a bead as the dispatch prompt reads them (steps/prompts.ts `ticketSpecSections`
+ * hands them to the agent as binding refinements of the contract) — so they are contract too, and
+ * both fences below compare them (PR #238 review). Machine notes are left out on purpose: anton
+ * appends its own line to the blob on every settlement, and the evidence note this repair writes
+ * lands before the post-write fence reads it.
+ */
+function humanNotesOf(bead: Bead): string {
+  return humanNotesPromptBlock(bead.notes) ?? "";
+}
+
+/**
  * Why the ticket at the write is no longer the one the claim was checked against — or undefined
  * when its contract still reads as it did (PR #238 review).
  *
@@ -1485,7 +1513,8 @@ const CONTRACT_FIELDS = ["title", "description", "acceptance_criteria", "accepta
  */
 function contractRewritten(checked: Bead, now: Bead): string | undefined {
   const text = (v: unknown): string => (typeof v === "string" ? v : "");
-  const changed = CONTRACT_FIELDS.filter((field) => text(checked[field]) !== text(now[field]));
+  const changed: string[] = CONTRACT_FIELDS.filter((field) => text(checked[field]) !== text(now[field]));
+  if (humanNotesOf(checked) !== humanNotesOf(now)) changed.push("human notes");
   if (changed.length === 0) return undefined;
   return (
     `\`${now.id}\` was rewritten since the check (${changed.join(", ")} changed) — the claim was ` +
@@ -1503,12 +1532,22 @@ function contractRewritten(checked: Bead, now: Bead): string | undefined {
  * the snapshot never carried is one it cannot attest to either way, so it is not compared — holding
  * it to the full read would refuse every retirement on such a bd. A field it did carry is held
  * exactly.
+ *
+ * The notes are the bead's as `withDispatchNotes` (steps/agent.ts) built the prompt: read fresh at
+ * dispatch, so an operator's note in the window between the run's snapshot and the agent's start
+ * reached the agent and is not drift. One appended AFTER that read is an instruction the agent
+ * never saw, and a claim made without it does not settle the ticket it now describes. A snapshot
+ * with no notes field at all — `bd show` failing at dispatch, on a listing that carries none — is
+ * held like any other field it never carried.
  */
 function contractDriftedSinceDispatch(dispatched: Bead, now: Bead): string | undefined {
   const text = (v: unknown): string => (typeof v === "string" ? v : "");
-  const changed = CONTRACT_FIELDS.filter(
+  const changed: string[] = CONTRACT_FIELDS.filter(
     (field) => dispatched[field] !== undefined && text(dispatched[field]) !== text(now[field]),
   );
+  if (dispatched.notes !== undefined && humanNotesOf(dispatched) !== humanNotesOf(now)) {
+    changed.push("human notes");
+  }
   if (changed.length === 0) return undefined;
   return (
     `\`${now.id}\` no longer reads as it did when the agent was dispatched (${changed.join(", ")} ` +

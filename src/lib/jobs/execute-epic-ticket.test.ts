@@ -158,15 +158,18 @@ function shown(id: string): Bead {
   } as Bead;
 }
 
-/** One dispatching step carrying the agent's self-report, then the commit that reports the diff. */
-function steps(selfReport: AntonResult | null, committed: boolean): ResolvedStep[] {
+/**
+ * One dispatching step carrying the agent's self-report — and, when a case says so, the bead it
+ * was prompted with — then the commit that reports the diff.
+ */
+function steps(selfReport: AntonResult | null, committed: boolean, dispatched?: Bead): ResolvedStep[] {
   const define = (name: string, handler: () => Promise<unknown>): ResolvedStep =>
     ({
       step: { id: name },
       definition: { name, class: "required", summary: name, producesDiff: false, handler },
     }) as unknown as ResolvedStep;
   return [
-    define("implement", async () => ({ ok: true, facts: { selfReport } })),
+    define("implement", async () => ({ ok: true, facts: { selfReport, dispatched } })),
     define("commit", async () => ({ ok: true, facts: { committed } })),
   ];
 }
@@ -202,10 +205,11 @@ async function haltOf(
   selfReport: AntonResult | null,
   signal?: AbortSignal,
   autonomy?: "apply" | "shadow",
+  dispatched?: Bead,
 ): Promise<Error> {
   const caught = await runTicket({
     run: run(signal, autonomy),
-    steps: steps(selfReport, false),
+    steps: steps(selfReport, false, dispatched),
     ticket: ticket(),
     // The run carries this ticket alone — no sibling for a `dep-missing` repair to resolve against.
     runTicketIds: [TICKET_ID],
@@ -290,6 +294,32 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
     // The agent's own words ride onto the block note too, so the two records agree.
     const block = notesWritten().find((n) => n.includes("zero diff"));
     expect(block).toContain("already-shipped");
+  });
+
+  // The bead the implementer was prompted with travels from the dispatching step to the repair
+  // (PR #238 review): a human note the operator appends while the agent runs is an instruction it
+  // never saw, and the retirement is fenced on the notes the prompt actually carried.
+  it("refuses to retire a verified claim when a human note landed after the agent was prompted", async () => {
+    readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40), committedAt: "2026-01-01T00:00:00Z" });
+    const steered = {
+      ...ticket(),
+      notes: "[human-note Henri 2026-09-07T10:00:00.000Z]\n  also cover the other app",
+    };
+    showMock.mockImplementation(async (_repo: string, id: string) => (id === TICKET_ID ? steered : shown(id)));
+
+    const halt = await haltOf(
+      { outcome: "blocked", klass: "already-shipped", reason: `Already implemented by ${SHIPPED_ID}` },
+      undefined,
+      undefined,
+      { ...ticket(), notes: "" },
+    );
+
+    expect(halt.message).toMatch(/produced no delivery/);
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(setStatusMock).toHaveBeenCalledWith(REPO, TICKET_ID, "blocked");
+    const refusal = notesWritten().find((n) => n.includes("did not repair this as `already-shipped`"));
+    expect(refusal).toContain("rewritten while the agent was running");
+    expect(refusal).toContain("human notes changed while it ran");
   });
 
   // The settlement reads the job's abort ONCE before the repair, and the repair then reads git, asks

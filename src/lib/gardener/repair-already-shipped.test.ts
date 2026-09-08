@@ -21,6 +21,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Bead } from "../beads/bd";
+import { formatHumanNote } from "../beads/notes";
 
 const noteMock = vi.fn<(cwd: string, id: string, text: string) => Promise<string>>(async () => "");
 const tagMock = vi.fn<(cwd: string, id: string, labels: string[]) => Promise<string>>(async () => "");
@@ -526,12 +527,84 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       ]);
 
       expect(verdict.state).toBe("unverified");
+      expect(verdict).toMatchObject({ why: expect.stringContaining("nothing says its CURRENT work LANDED") });
+      // The stale commit rides into the refusal: a human reads every route anton tried.
       expect(verdict).toMatchObject({
-        why: expect.stringContaining(`commit \`${landed.slice(0, 10)}\` in the history of the run's base (main) names it — but`),
+        why: expect.stringContaining(`commit \`${landed.slice(0, 10)}\` in the history of the run's base (main) names it, but`),
       });
       expect(verdict).toMatchObject({ why: expect.stringContaining(`the board reopened \`${SHIPPER}\` at ${REOPENED_AT}`) });
       expect(verdict).toMatchObject({ why: expect.stringContaining("nothing says THAT work landed") });
       expect(historyMock).toHaveBeenCalledWith(repo, SHIPPER);
+    });
+
+    /**
+     * The rework landed through a squash whose message no longer names the bead, AFTER the reopen —
+     * so the old naming commit is still the newest match in the base. Dated by hand: the sandbox's
+     * own commits are all "now", before {@link REOPENED_AT}.
+     */
+    const reworkLanded = (): string => {
+      const at = new Date(Date.now() + 3 * 3_600_000).toISOString();
+      const env = { ...process.env, GIT_AUTHOR_DATE: at, GIT_COMMITTER_DATE: at };
+      const message = "squash: the rework, id dropped from the message";
+      execFileSync("git", ["-C", repo, "commit", "-q", "--allow-empty", "-m", message], { env, stdio: "ignore" });
+      return execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    };
+
+    // PR #238 review: the naming commit was DISCOVERED, not cited, so one that fails the cycle bar
+    // is a route that gave nothing — the bead's merged PR, which postdates the reopen, still speaks.
+    it("falls through a stale naming commit to the bead's own PR when that merge postdates the reopen", async () => {
+      const rework = reworkLanded();
+      setPr(85, "MERGED", { commit: rework });
+      historyMock.mockResolvedValue(REWORKED);
+
+      const verdict = await verify(`already done by ${SHIPPER}`, [
+        bead(TARGET),
+        bead(SHIPPER, { status: "closed", closed_at: RECLOSED_AT, metadata: { pr: "gh-85" } }),
+      ]);
+
+      expect(verdict.state).toBe("verified");
+      expect(verdict.proof).toEqual([
+        `\`${SHIPPER}\` is closed on the board and its PR (gh-85) is merged${mergedTail(rework)}`,
+      ]);
+      expect((verdict as { landed: unknown }).landed).toEqual({
+        [SHIPPER]: { via: "pr", ref: "gh-85", landedAt: expect.any(String) },
+      });
+    });
+
+    it("carries the stale naming commit into the refusal when the PR route fails too", async () => {
+      setPr(85, "CLOSED");
+      historyMock.mockResolvedValue(REWORKED);
+
+      const verdict = await verify(`already done by ${SHIPPER}`, [
+        bead(TARGET),
+        bead(SHIPPER, { status: "closed", closed_at: RECLOSED_AT, metadata: { pr: "gh-85" } }),
+      ]);
+
+      expect(verdict.state).toBe("unverified");
+      expect(verdict).toMatchObject({ why: expect.stringContaining("its PR (gh-85) is closed, not merged") });
+      expect(verdict).toMatchObject({
+        why: expect.stringContaining(`commit \`${landed.slice(0, 10)}\` in the history of the run's base (main) names it, but`),
+      });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("is an earlier cycle's") });
+    });
+
+    // Every other unreadable signal here fails closed; a reopen the history dates with something
+    // that is not a date is one more of them, not a "never reopened" (PR #238 review).
+    it("refuses when the history dates the last reopen with something that is not a date", async () => {
+      historyMock.mockResolvedValue(
+        versions([RECLOSED_AT, "closed"], ["yesterday-ish", "in_progress"], ["2020-01-01T00:00:00Z", "closed"]),
+      );
+
+      const verdict = await verify(`already done by ${SHIPPER}`, [
+        bead(TARGET),
+        bead(SHIPPER, { status: "closed", closed_at: RECLOSED_AT }),
+      ]);
+
+      expect(verdict.state).toBe("unverified");
+      expect(verdict).toMatchObject({
+        why: expect.stringContaining(`dates \`${SHIPPER}\`'s last reopen as "yesterday-ish", which is not a date`),
+      });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("could not be read") });
     });
 
     it("verifies a landing at or after the close the board holds without reading the history", async () => {
@@ -1139,6 +1212,64 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     // Refused on the two reads in hand — nothing was checked against git or the board.
     expect(showMock).not.toHaveBeenCalled();
     expect(loadAllIssuesMock).not.toHaveBeenCalled();
+  });
+
+  /** A note the operator left on the ticket, as the board stores it. */
+  const humanNote = (text: string) => formatHumanNote(text, "Henri", new Date("2026-09-07T10:00:00Z"));
+  const MACHINE_NOTE = "anton: run failed after 1 attempt";
+
+  // A human note is task intent the prompt hands the agent as a binding refinement (PR #238 review).
+  // One appended after the prompt was built is an instruction the agent never saw, and the claim
+  // was made without it — the dispatch-time read is what carries the notes the agent DID see.
+  it("refuses a claim when a human note was appended after the agent was prompted", async () => {
+    const steered = `${MACHINE_NOTE}\n${humanNote("also cover the other app")}`;
+    boardShow.mockImplementation(async (_cwd, id) =>
+      id === TARGET ? bead(TARGET, { status: "in_progress", notes: steered }) : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress", notes: MACHINE_NOTE }),
+      bead: bead(TARGET, { status: "in_progress", notes: steered }),
+    });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("rewritten while the agent was running");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("human notes changed while it ran");
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(noteMock).not.toHaveBeenCalled();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("still retires on a note the agent already read, and on anton's own lines added since", async () => {
+    const read = humanNote("keep it small");
+    boardShow.mockImplementation(async (_cwd, id) =>
+      id === TARGET
+        ? bead(TARGET, { status: "in_progress", notes: `${read}\n${MACHINE_NOTE}` })
+        : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress", notes: read }),
+      bead: bead(TARGET, { status: "in_progress", notes: `${read}\n${MACHINE_NOTE}` }),
+    });
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+  });
+
+  it("refuses under the lock when a human note was appended since the check", async () => {
+    boardShow.mockImplementation(async (_cwd, id) =>
+      id === TARGET
+        ? bead(TARGET, { status: "in_progress", notes: humanNote("wait — do the migration first") })
+        : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire();
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("rewritten since the check");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("human notes");
+    expect(supersedeMock).not.toHaveBeenCalled();
   });
 
   it("holds the dispatch snapshot to the fields it carried — a listing that dropped the description is not a rewrite", async () => {
