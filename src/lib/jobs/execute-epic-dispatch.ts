@@ -332,8 +332,11 @@ async function partitionTickets(
  * the reopened bead BEFORE the tag landed never sees the marker at its claim gate, so the marker
  * outlives that run's delivery and its merge reads the work as undelivered. Re-read once the tag is
  * on the board — the only read that can have seen such a writer — the bead is either still closed
- * as superseded, and the retirement stands, or it has moved, and the marker is WITHDRAWN before the
- * ticket is handed back as live. What the fence cannot close is a reopen that lands after this
+ * as superseded AND still carrying the marker, and the retirement stands, or it has moved, and the
+ * marker is WITHDRAWN before the ticket is handed back as live. A bead superseded on the reread but
+ * with the marker stripped out from under it is the same race the other way, and stops the run: the
+ * retirement is accepted only against a marker the reread proves is still on the board. What the
+ * fence cannot close is a reopen that lands after this
  * second read: that one is seen by every snapshot taken after it, and the claim gate clears the
  * marker (execute-epic-ticket-bookends `claimTicket`); the cross-process rest is anton-od4.
  */
@@ -362,7 +365,25 @@ async function retireFound(run: EpicRun, ticket: Bead): Promise<RetiredTicketOut
       );
     }
     const replacedBy = beads.supersededBy(marked);
-    if (replacedBy) return { id: ticket.id, replacedBy, source: "pre-existing" };
+    if (replacedBy) {
+      // The reread proves the bead is still superseded, but the retirement is only safe if THIS
+      // run's marker is still on it: another process can strip `not-delivered` between markRetired
+      // and this read, and a bead superseded-but-unmarked reads to merge finalization as work no
+      // run reserved — reopened during review, the merge that carries none of it closes it as
+      // shipped. So the marker is asserted, not just the supersede, and its absence stops the run
+      // rather than open a PR whose merge would silently reverse that reopen.
+      if (!beads.isNotDelivered(marked)) {
+        throw new PoisonEpic(
+          `${ticket.id} is superseded on the reread that fenced its retirement, but the ` +
+            `\`${LABELS.notDelivered}\` marker anton just wrote is gone — another process cleared it ` +
+            `between the tag and this read, so the merge that lands the rest of the run would read ` +
+            `the ticket as work no run reserved and close it as shipped if it were reopened ` +
+            `meanwhile. The run stopped rather than open a pull request on that race. Check the ` +
+            `beads DB, then resume the run`,
+        );
+      }
+      return { id: ticket.id, replacedBy, source: "pre-existing" };
+    }
     await withdrawRetiredMarker(run, ticket.id);
     return undefined;
   });

@@ -132,8 +132,20 @@ beforeEach(() => {
   runTicketMock.mockReset().mockResolvedValue(COMMITTED);
   hasCommitMock.mockReset().mockResolvedValue(false);
   reopenMock.mockReset().mockResolvedValue("");
-  tagMock.mockReset().mockResolvedValue("");
-  untagMock.mockReset().mockResolvedValue("");
+  // Faithful default: a tag/untag the subsequent `show` reads back on the board bead, so the
+  // post-write reread in retireFound sees the marker it just wrote (PR #238 review).
+  tagMock.mockReset().mockImplementation(async (_repo: string, id: string, labels: string[]) => {
+    board = board.map((b) =>
+      b.id === id ? ({ ...b, labels: [...new Set([...(b.labels ?? []), ...labels])] } as Bead) : b,
+    );
+    return "";
+  });
+  untagMock.mockReset().mockImplementation(async (_repo: string, id: string, labels: string[]) => {
+    board = board.map((b) =>
+      b.id === id ? ({ ...b, labels: (b.labels ?? []).filter((l) => !labels.includes(l)) } as Bead) : b,
+    );
+    return "";
+  });
   showMock.mockReset().mockImplementation(async (_repo: string, id: string) => board.find((b) => b.id === id)!);
 });
 
@@ -255,6 +267,29 @@ describe("a ticket the board already holds as superseded", () => {
     expect(untagMock).not.toHaveBeenCalled();
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "pre-existing" }]);
   });
+
+  // Still superseded on the reread but with the marker gone is the race the fence has to close the
+  // other way (PR #238 review): another process cleared `not-delivered` between the tag and the
+  // reread, and a run that accepted the supersede alone would open a PR whose merge reads the
+  // ticket as work no run reserved — reopened in review, closed as shipped. Stop on the missing
+  // marker rather than open that PR.
+  it("stops the run when the marker is stripped before the reread but the ticket stays superseded", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    tagMock.mockImplementation(async (_repo: string, id: string, labels: string[]) => {
+      if (id === "anton-a" && labels.includes(LABELS.notDelivered)) {
+        // Lands the tag, then a concurrent writer clears it while the supersede still stands.
+        board = board.map((b) => (b.id === "anton-a" ? ({ ...b, labels: [] } as Bead) : b));
+      }
+      return "";
+    });
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /anton-a is superseded on the reread that fenced its retirement, but the `not-delivered` marker anton just wrote is gone/,
+    );
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
+    expect(untagMock).not.toHaveBeenCalled();
+  }, 10_000);
 
   // A marker on the board and a bead that will not read back is neither "still superseded" nor
   // "reopened": stop rather than open a PR on either guess.
