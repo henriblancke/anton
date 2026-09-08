@@ -49,7 +49,7 @@
  */
 import { existsSync } from "node:fs";
 import { beads, type Bead } from "../beads/bd";
-import { runClaude } from "../claude/driver";
+import { claudeRouting, runClaude } from "../claude/driver";
 import {
   branchAheadOfRemote,
   commitAll,
@@ -581,6 +581,7 @@ async function runFixSession(args: {
       prompt,
       appendSystemPrompt,
       model: settings.model,
+      routing: claudeRouting(settings),
       permissionMode: settings.permissionMode ?? "bypassPermissions",
       signal: ctx.signal,
       onEvent,

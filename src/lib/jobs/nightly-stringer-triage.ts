@@ -4,7 +4,7 @@
  * the contract between anton's resolved context and the skill's rules — can be asserted without
  * driving a scan.
  */
-import { runClaude, type ClaudeEvent } from "../claude/driver";
+import { claudeRouting, runClaude, type ClaudeEvent } from "../claude/driver";
 import { loadSkill } from "../claude/prompt";
 import { resolveScanSeverity, type ProjectSettings } from "../projects";
 import { parseTriageOutcome, type TriageOutcome } from "../scan-health";
@@ -80,6 +80,7 @@ export async function runTriage(opts: {
     cwd: project.repoPath,
     prompt,
     model: settings.model,
+    routing: claudeRouting(settings),
     permissionMode: settings.permissionMode ?? "bypassPermissions",
     signal: opts.signal,
     onEvent: opts.onEvent,

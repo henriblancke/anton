@@ -6,7 +6,7 @@
  * would quietly drop one of the three.
  */
 import { formatAntonResult, parseAntonResult } from "../../claude/anton-result";
-import { runClaude } from "../../claude/driver";
+import { claudeRouting, runClaude } from "../../claude/driver";
 import { appendSessionLog, endSession, setSessionClaudeId } from "../../sessions";
 import { stepSession, type StepContext } from "./context";
 import type { StepResult } from "./result";
@@ -38,6 +38,7 @@ export async function dispatchClaude(
       prompt: args.prompt,
       appendSystemPrompt: args.appendSystemPrompt,
       model: ctx.settings.model,
+      routing: claudeRouting(ctx.settings),
       permissionMode: ctx.settings.permissionMode ?? "bypassPermissions",
       signal: ctx.ctx.signal,
       onEvent: session.onEvent,

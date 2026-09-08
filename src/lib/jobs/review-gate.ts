@@ -14,7 +14,7 @@
  * wiring is what makes it unit-testable against a fake driver.
  */
 import { type Bead } from "../beads/bd";
-import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
+import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import {
   commitAll,
   diffAgainstBase,
@@ -476,6 +476,7 @@ async function runReviewSession(args: {
         cwd: worktreePath,
         prompt,
         model: settings.model,
+        routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         disallowedTools: REVIEW_DENIED_TOOLS,
         settingSources: [...REVIEW_SETTING_SOURCES],
@@ -772,6 +773,7 @@ async function runGateFixSession(args: {
         prompt,
         appendSystemPrompt,
         model: settings.model,
+        routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         signal: ctx.signal,
         onEvent,
