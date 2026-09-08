@@ -184,6 +184,20 @@ describe("instructionCriteria", () => {
     expect(instructionCriteria("+\n+ \n+ [ ]")).toEqual([]);
   });
 
+  it("reads a thematic break as scaffolding — it renders as a rule, not as text", () => {
+    // The same set lib/beads/contract.ts refuses: three or more of one of `-`, `*`, `_`, spaces
+    // between allowed. Boxing one would file `- [ ] ---` as the follow-up's only criterion.
+    expect(instructionCriteria("---\n***\n___\n- - -\n_ _ _\n* * *\n-----")).toEqual([]);
+  });
+
+  it("keeps a line that merely CONTAINS a rule, and a short dash run that is not one", () => {
+    expect(instructionCriteria("--- keep the header\n--\n* -- not a rule")).toEqual([
+      "--- keep the header",
+      "--",
+      "-- not a rule",
+    ]);
+  });
+
   it("keeps a sign or a version that merely LOOKS like a marker", () => {
     expect(instructionCriteria("-1 is the sentinel\n+1 on the rename\n1.2 ships this")).toEqual([
       "-1 is the sentinel",
@@ -220,5 +234,12 @@ describe("doneGap", () => {
     const gap = doneGap("- \n- ", []);
     expect(gap).toMatch(/only list markers/);
     expect(gap).toMatch(/no finding is attached/);
+  });
+
+  it("refuses instructions that are only a rule — `---` is a separator, not a definition of done", () => {
+    expect(doneGap("---", [])).toMatch(/only list markers or rules/);
+    expect(doneGap("- \n***\n_ _ _", [])).not.toBeNull();
+    expect(doneGap("---\nAdd the missing test.", [])).toBeNull();
+    expect(doneGap("---", [finding])).toBeNull();
   });
 });

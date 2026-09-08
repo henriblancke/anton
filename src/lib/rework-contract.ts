@@ -114,8 +114,9 @@ export function validateReworkInput(input: ReworkInput): ReworkRequest {
 export function doneGap(instructions: string, findings: readonly ReviewFinding[]): string | null {
   if (instructionCriteria(instructions).length > 0 || findings.length > 0) return null;
   return (
-    "Nothing here says what done looks like: the fix instructions hold only list markers and no " +
-    "finding is attached. Write at least one line an implementer can act on, or attach a finding."
+    "Nothing here says what done looks like: the fix instructions hold only list markers or rules " +
+    "and no finding is attached. Write at least one line an implementer can act on, or attach a " +
+    "finding."
   );
 }
 
@@ -133,14 +134,26 @@ export function doneGap(instructions: string, findings: readonly ReviewFinding[]
 const LIST_MARKER = /^(?:(?:[-*+•]|\d{1,9}[.)])(?:\s+|$))?(?:\[[ xX]\](?:\s+|$))?/;
 
 /**
+ * A thematic break — 3+ `-`/`*`/`_` of one kind, spaces between allowed — as CommonMark and
+ * lib/beads/contract.ts both read it. It renders as a rule, not text: a founder who types `---` to
+ * separate two thoughts and writes neither has stated no step, and boxing it would file
+ * `- [ ] ---` as the follow-up's one criterion. Judged BEFORE the marker is stripped, since `- - -`
+ * is a rule in full but a bare bullet once shorn.
+ */
+const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
+
+/**
  * One criterion per non-blank instruction line, shorn of whatever list marker it was typed with.
  * Instruction lines arrive as the founder typed them — prose, `-`/`*` bullets, numbered steps, or
- * boxes already — so list markers are stripped rather than nested inside a second box.
+ * boxes already — so list markers are stripped rather than nested inside a second box. A line that
+ * is only a rule ({@link THEMATIC_BREAK}) is scaffolding like a bare marker, and yields nothing.
  */
 export function instructionCriteria(instructions: string): string[] {
   return instructions
     .split(/\r?\n/)
-    .map((line) => line.trim().replace(LIST_MARKER, ""))
+    .map((line) => line.trim())
+    .filter((line) => !THEMATIC_BREAK.test(line))
+    .map((line) => line.replace(LIST_MARKER, ""))
     .filter((line) => line.length > 0);
 }
 
