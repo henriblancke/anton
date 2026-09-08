@@ -221,11 +221,12 @@ export interface JobContext {
   report: (info: LiveJobInfo) => void;
   /**
    * Say that Claude is about to be invoked. Call it immediately before every spawn: this is the
-   * runner's only evidence that the attempt spent quota. An attempt that never says so is refunded
-   * from the project's spend meter at settle and its burn window is discarded, whatever it settled
-   * as — a preflight that completes or parks before Claude (an abandoned target, a target that
-   * disappeared, a lease held elsewhere) burned nothing, and inferring that from the settlement type
-   * misses every such exit that isn't a reschedule.
+   * runner's only evidence that the attempt spent quota, and the first call is where its burn window
+   * opens (a fresh usage read, so the delta starts at the spawn and not at a stale snapshot). An
+   * attempt that never says so is refunded from the project's spend meter at settle and records no
+   * burn, whatever it settled as — a preflight that completes or parks before Claude (an abandoned
+   * target, a target that disappeared, a lease held elsewhere) burned nothing, and inferring that
+   * from the settlement type misses every such exit that isn't a reschedule.
    */
   claudeReached: () => void;
 }
@@ -474,15 +475,15 @@ export class JobRunner {
      */
     readBeadLabels?: BeadLabelsReader;
     /**
-     * Cached Claude-usage reader for the budget governor and the burn sampler's *pre-job* snapshot
-     * (anton-w8ny). Defaults to the shared, cached read so per-tick bursts collapse to one upstream
-     * fetch. Injectable for deterministic tests.
+     * Cached Claude-usage reader for the budget governor. Defaults to the shared, cached read so
+     * per-tick bursts collapse to one upstream fetch. Injectable for deterministic tests.
      */
     readUsage?: () => Promise<ClaudeUsage | null>;
     /**
-     * TTL-bypassing usage reader for the burn sampler's *post-job* measurement. Must go upstream:
-     * a job that finishes inside the cache TTL would otherwise subtract a cache entry from itself
-     * and record a zero delta, biasing burn averages toward zero. Defaults to
+     * TTL-bypassing usage reader for both ends of the burn sampler's window (anton-w8ny). Must go
+     * upstream at both: a cached opening read can be a whole TTL stale and would charge someone
+     * else's burn to this project (PR #248 review), and a cached closing read inside the TTL would
+     * subtract a cache entry from itself and record a zero delta. Defaults to
      * {@link getClaudeUsageFresh} (which also refreshes the shared cache). Injectable for tests.
      */
     readUsageFresh?: () => Promise<ClaudeUsage | null>;
@@ -1195,39 +1196,40 @@ export class JobRunner {
     const entry: InFlightEntry = { controller, type: job.type as JobType, live: {} };
     this.inFlight.set(job.id, entry);
 
-    // Burn sampler (anton-w8ny): snapshot Claude usage before the job so we can attribute the
-    // session%/weekly% that moves across it to this job's TYPE. Attribution needs a solo window —
-    // with jobs overlapping (maxConcurrent > 1), each delta would include the siblings' burn and
-    // double-count across types — so only open a window when nothing else is in flight; a sibling
-    // dispatched mid-window is caught at close via `dispatchSeq`. Types that never invoke Claude
+    // Burn sampler (anton-w8ny): snapshot Claude usage around the job so we can attribute the
+    // session%/weekly% that moves across it to this job's TYPE and PROJECT. Attribution needs a solo
+    // window — with jobs overlapping (maxConcurrent > 1), each delta would include the siblings'
+    // burn and double-count across types — so only open a window when nothing else is in flight; a
+    // sibling dispatched mid-window is caught via `dispatchSeq`. Types that never invoke Claude
     // (`burnsClaudeQuota`) are skipped outright — sampling them would blame an operator's own
     // Claude usage on a `git push` and spend the throttle a real job needs. Fail-soft — a null read
     // just means no sample; it never gates dispatch.
     //
     // Gated behind the project's budget-aware opt-in (anton-7mpv.1), like the governor: burn data
     // only feeds budget pacing, so in the default feature-off state the sampler must not shell out
-    // to credentials / hit the usage endpoint before every solo job — nor cache a transient null
-    // into the shared cache the nav pill reads. A closed gate leaves `burnBefore` null, which also
-    // suppresses the post-job fresh read.
+    // to credentials / hit the usage endpoint around every solo job — nor cache a transient null
+    // into the shared cache the nav pill reads.
     const seqAtStart = ++this.dispatchSeq;
-    // Throttle the sampler: its post-job read bypasses the usage cache, so with maxConcurrent: 1
-    // every solo completion would hit the endpoint. Only open a window once per burnSampleMinIntervalMs
-    // — measured from the last window that actually took its closing read (stamped at close), so a
-    // contaminated window that bails doesn't spend the budget. Closing the gate leaves burnBefore
-    // null, which also suppresses the fresh post-job read below.
+    // Throttle the sampler: both of its reads bypass the usage cache, so with maxConcurrent: 1 every
+    // solo job would hit the endpoint twice. Only open a window once per burnSampleMinIntervalMs,
+    // measured from the last window that actually took its opening read — a window the handler
+    // never opened (a preflight exit) spent nothing and leaves the interval for the next real job.
     const burnDue = this.clock.now() - this.lastBurnSampleAt >= this.config.burnSampleMinIntervalMs;
-    const burnBefore =
+    const burnEligible =
       burnDue &&
       burnsClaudeQuota(job.type as JobType) &&
       this.inFlight.size === 1 &&
-      (await this.budgetAwareFor(job.projectId ?? undefined))
-        ? await this.readUsageSafe()
-        : null;
+      (await this.budgetAwareFor(job.projectId ?? undefined));
 
-    // Flipped by the handler's `ctx.claudeReached()` right before it spawns Claude. Off, the attempt
-    // spent nothing: settle refunds it from the project's spend meter and the burn window below is
-    // discarded (it measured nothing this job burned).
+    // The window opens when the handler says it is about to spawn Claude — the moment the attempt
+    // starts spending — not at dispatch, and with a FRESH read rather than the cached snapshot. The
+    // cached read can be a whole TTL old, so a delta measured from it would include whatever else
+    // moved the meter first (an interactive session, a sibling that could not close its own window)
+    // and charge it to this project's share, repricing every attempt it has and throttling the wrong
+    // project (PR #248 review). Off, the attempt spent nothing: settle refunds it from the project's
+    // spend meter and there is no window to close.
     let claudeReached = false;
+    let burnBefore: Promise<ClaudeUsage | null> | null = null;
     try {
       const policy = await this.policyFor(job.projectId ?? undefined);
 
@@ -1284,6 +1286,12 @@ export class JobRunner {
           report: (info) => Object.assign(entry.live, info),
           claudeReached: () => {
             claudeReached = true;
+            // First spawn only — a multi-spawn handler keeps the window it opened. Re-check the
+            // window is still solo: a sibling dispatched between lease and spawn would already
+            // contaminate it, so don't spend a read (or the throttle) on a sample that can't land.
+            if (!burnEligible || burnBefore !== null || this.dispatchSeq !== seqAtStart) return;
+            this.lastBurnSampleAt = this.clock.now();
+            burnBefore = this.readUsageFreshSafe();
           },
         };
         effect = (await handler(ctx)) ?? undefined;
@@ -1308,22 +1316,20 @@ export class JobRunner {
       // expires and the job is reclaimed on a later tick.
       this.log.error(`job ${job.id} (${job.type}) did not settle`, e);
     } finally {
-      // Close the burn window: a fresh (TTL-bypassing) read minus the pre-job snapshot is this
-      // type's cost — the cached read would subtract a cache entry from itself for any job that
-      // finishes inside the TTL and record a bogus zero. Runs for every outcome (even a failed
-      // attempt burned quota) but only when the window stayed solo (no sibling dispatched across
-      // it — `dispatchSeq` unchanged), and is fully fail-soft — sampleJobBurn records nothing on a
-      // null read or a mid-job meter reset and swallows its own errors.
+      // Close the burn window: a fresh (TTL-bypassing) read minus the opening one is this type's
+      // cost — a cached read would subtract a cache entry from itself for any job that finishes
+      // inside the TTL and record a bogus zero. Runs for every outcome (even a failed attempt
+      // burned quota) but only when the window stayed solo (no sibling dispatched across it —
+      // `dispatchSeq` unchanged), and is fully fail-soft — sampleJobBurn records nothing on a null
+      // read or a mid-job meter reset and swallows its own errors.
       //
-      // Never sampled unless the handler said it reached Claude: an attempt that exited in preflight
-      // (a lease held elsewhere, an abandoned or vanished target, a run already carried to a PR)
-      // moved the meter by whatever ELSE was using Claude — usually nothing. Recording it would let
-      // a few such exits drag the type's rolling average (and the project's attributed spend)
-      // toward zero, repricing every attempt as free and letting the project run past its share.
-      if (burnBefore && this.dispatchSeq === seqAtStart && claudeReached) {
-        // Stamp the throttle here, not at window open: only a window that actually takes its fresh
-        // upstream read spends the interval budget — a contaminated window that bailed doesn't.
-        this.lastBurnSampleAt = this.clock.now();
+      // A window only exists if the handler said it reached Claude: an attempt that exited in
+      // preflight (a lease held elsewhere, an abandoned or vanished target, a run already carried to
+      // a PR) moved the meter by whatever ELSE was using Claude — usually nothing. Recording it
+      // would let a few such exits drag the type's rolling average (and the project's attributed
+      // spend) toward zero, repricing every attempt as free and letting the project run past its
+      // share.
+      if (burnBefore && this.dispatchSeq === seqAtStart) {
         await sampleJobBurn(
           this.db,
           this.clock,
@@ -1331,7 +1337,7 @@ export class JobRunner {
           // The project whose quota this window spent; null for anton's own plumbing jobs, which
           // belong to no project's share.
           job.projectId ?? null,
-          burnBefore,
+          await burnBefore,
           () => this.readUsageFreshSafe(),
         );
       }
@@ -1353,7 +1359,7 @@ export class JobRunner {
     }
   }
 
-  /** Read cached Claude usage (governor / pre-job snapshot), fail-soft to `null` (never throws into dispatch). */
+  /** Read cached Claude usage for the governor, fail-soft to `null` (never throws into dispatch). */
   private async readUsageSafe(): Promise<ClaudeUsage | null> {
     try {
       return await this.readUsage();
@@ -1362,7 +1368,7 @@ export class JobRunner {
     }
   }
 
-  /** TTL-bypassing usage read for the post-job burn measurement, fail-soft to `null`. */
+  /** TTL-bypassing usage read for both ends of a burn window, fail-soft to `null`. */
   private async readUsageFreshSafe(): Promise<ClaudeUsage | null> {
     try {
       return await this.readUsageFresh();

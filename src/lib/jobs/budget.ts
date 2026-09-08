@@ -373,10 +373,10 @@ export function budgetGate(
  * {@link budgetGate} defers on, expressed as what's LEFT rather than as a yes/no (anton-vlom).
  *
  * It lives here, beside the gate, because the two must never disagree: a surface that computed its
- * own idea of "remaining" would draw a budget line the governor does not keep. Both sides are
- * reported (session and weekly) rather than the tighter one, because which binds depends on what
- * the caller intends to spend it on, and the reason the operator is shown has to name the hold that
- * actually stops the work.
+ * own idea of "remaining" would draw a budget line the governor does not keep. Every meter is
+ * reported (session, account-weekly, and the project's share) rather than the tightest one, because
+ * which binds depends on what the caller intends to spend it on, and the reason the operator is
+ * shown has to name the hold that actually stops the work.
  *
  * Fail-open, exactly like the gate: a null usage read returns `null` — "unknown", never zero. A
  * caller that cannot read the meter must omit its claim rather than guess a limit the gate would
@@ -388,10 +388,13 @@ export interface BudgetHeadroom {
   sessionPct: number;
   /** Which session-side hold bounds it: the hard floor, or the day window's reserve. */
   sessionReason: Extract<DeferReason, "session-headroom" | "daytime-reserve">;
-  /** Weekly%-points still spendable before the weekly hold trips; null with no weekly signal. */
+  /**
+   * Weekly%-points still spendable on the ACCOUNT meter before its hold trips; null with no weekly
+   * signal. This is every repo's spend — the share below reads a different meter.
+   */
   weeklyPct: number | null;
-  /** Which weekly hold bounds it: the cap, this project's share of it, or the pace-line inside the throttle band. */
-  weeklyReason: Extract<DeferReason, "weekly-cap" | "share-cap" | "weekly-on-track">;
+  /** Which account-side hold bounds it: the cap, or the pace-line inside the throttle band. */
+  weeklyReason: Extract<DeferReason, "weekly-cap" | "weekly-on-track">;
   /**
    * Whether spending exactly {@link weeklyPct} already trips the hold. The cap and the throttle
    * floor bite AT their threshold (`usage >= limit`); the pace-line bites only PAST it
@@ -399,6 +402,15 @@ export interface BudgetHeadroom {
    * gate admits.
    */
   weeklyInclusive: boolean;
+  /**
+   * Weekly%-points this project may still charge its quota share (R6.1) before the share hold
+   * trips; null when no share is declared or there is no weekly signal. Reported BESIDE the account
+   * headroom rather than folded into it (PR #248 review): the two meters are spent at different
+   * rates, so which runs out first depends on what the caller intends to spend — a project whose
+   * runs are cheap for the fleet but dear for its own share can have more raw points left here and
+   * still hit this hold first. Always inclusive: the share defers AT its ceiling.
+   */
+  sharePct: number | null;
   /**
    * The daytime reserve is waived only while weekly usage is BEHIND pace, and a projection spends
    * weekly budget — so the waiver expires partway down the queue (PR #212 review). Null whenever it
@@ -452,6 +464,7 @@ export function budgetHeadroom(
   let weeklyPct: number | null = null;
   let weeklyReason: BudgetHeadroom["weeklyReason"] = "weekly-cap";
   let weeklyInclusive = true;
+  let sharePct: number | null = null;
   if (!Number.isNaN(weeklyResetMs) && cap >= 0) {
     // Below the throttle floor spending is free whatever the pace (idle-fill, anton-ld7j), so the
     // pace-line only binds where it sits above that floor — and never above the cap.
@@ -466,18 +479,12 @@ export function budgetHeadroom(
     weeklyInclusive = remaining <= 0 || weeklyLimit >= cap || paceCeiling < throttleFloor;
     weeklyPct = Math.max(0, remaining);
 
-    // The quota share (R6.1) bounds the same answer from a different meter — this project's own
-    // attributed spend rather than the account's — so what is left is whichever runs out first. It
-    // defers AT its ceiling, hence inclusive, and it is a cap rather than a pace-line.
+    // The quota share (R6.1) reads a different meter — this project's own attributed spend rather
+    // than the account's — and is charged at a different rate, so it is reported on its own instead
+    // of being folded into the account headroom by raw points. Same skip as the gate: no weekly
+    // signal, no share hold.
     const shareCap = policy.projectWeeklyCapPct;
-    if (shareCap !== null) {
-      const shareRemaining = Math.max(0, shareCap - (opts?.projectWeeklyPct ?? 0));
-      if (shareRemaining <= weeklyPct) {
-        weeklyPct = shareRemaining;
-        weeklyReason = "share-cap";
-        weeklyInclusive = true;
-      }
-    }
+    if (shareCap !== null) sharePct = Math.max(0, shareCap - (opts?.projectWeeklyPct ?? 0));
   }
 
   return {
@@ -486,6 +493,7 @@ export function budgetHeadroom(
     weeklyPct,
     weeklyReason,
     weeklyInclusive,
+    sharePct,
     reserveWaiver,
   };
 }

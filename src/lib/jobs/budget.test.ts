@@ -712,12 +712,8 @@ describe("withQuotaShare", () => {
       if (d.admit) throw new Error("expected defer");
       expect(d.reason).toBe("share-cap");
     }
-    // …and the headroom read agrees with the gate: nothing left, capped, inclusive.
-    expect(budgetHeadroom(usage, parked, NIGHT)).toMatchObject({
-      weeklyPct: 0,
-      weeklyReason: "share-cap",
-      weeklyInclusive: true,
-    });
+    // …and the headroom read agrees with the gate: nothing left on the share.
+    expect(budgetHeadroom(usage, parked, NIGHT)).toMatchObject({ sharePct: 0 });
   });
 
   it("clamps a share outside 0-100 instead of inventing budget", () => {
@@ -725,22 +721,25 @@ describe("withQuotaShare", () => {
     expect(withQuotaShare(POLICY, -10).projectWeeklyCapPct).toBe(0);
   });
 
-  it("bounds the headroom read by whichever ceiling runs out first", () => {
+  it("reports the share beside the account headroom, each on its own meter", () => {
     const usage = makeUsage({
       sessionPct: 10,
       weeklyPct: 10,
       weeklyResetAt: resetForElapsed(NIGHT, 0),
     });
     // Machine-wide: the throttle floor (100 − 20) less 10 spent = 70 points left. The 40-point
-    // share, 25 of it spent, leaves 15 — and 15 is the tighter of the two.
+    // share, 25 of it spent, leaves 15. Neither replaces the other (PR #248 review): they are spent
+    // at different rates, so which runs out first is the caller's walk to decide, not this read's.
     expect(budgetHeadroom(usage, withQuotaShare(POLICY, 40), NIGHT, spent(25))).toMatchObject({
-      weeklyPct: 15,
-      weeklyReason: "share-cap",
-      weeklyInclusive: true,
-    });
-    // A share with more room left than the machine has does not widen the line.
-    expect(budgetHeadroom(usage, withQuotaShare(POLICY, 100), NIGHT, spent(0))).toMatchObject({
       weeklyPct: 70,
+      sharePct: 15,
     });
+    // Unattributed spend reads as nothing spent — the whole share is left.
+    expect(budgetHeadroom(usage, withQuotaShare(POLICY, 100), NIGHT, spent(null))).toMatchObject({
+      weeklyPct: 70,
+      sharePct: POLICY.weeklyTargetPct,
+    });
+    // No share declared: no share hold to report.
+    expect(budgetHeadroom(usage, POLICY, NIGHT)).toMatchObject({ sharePct: null });
   });
 });

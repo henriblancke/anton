@@ -53,7 +53,7 @@ export const GET = withProject<{ slug: string }>(async (_request, { project }) =
   // and weekly account meters move with every repo, so they take the global per-type average
   // (`valueGateHolds`, and the cap/pace-line the gate reads off `usage.weeklyPct`); the share is
   // spent from THIS project's attributed burn, so it takes the project's own average
-  // (`projectWeeklyBurn`). The line picks the weekly rate by which hold binds: charging a cheap
+  // (`projectWeeklyBurn`). The line charges both weekly meters as it walks: charging a cheap
   // project's rate against the account cap would show cards the fleet's burn exhausts sooner, and
   // the reverse for an expensive one.
   const [account, projectAverage] = await Promise.all([

@@ -86,9 +86,9 @@ async function pickerPlan(projectId: string, targetCount: number): Promise<void>
     .values({ projectId, boardDigest: "d", boardObservedAtMs: 1, targetCount });
 }
 
-/** The lane's weekly headroom, which is what a share narrows. */
-async function weeklyHeadroom(): Promise<number | null> {
-  return ((await (await GET(req(), ctx("tmp"))).json()) as BudgetSignal).headroom.weeklyPct;
+/** The lane's share headroom — the project's own meter, reported beside the account's. */
+async function shareHeadroom(): Promise<number | null> {
+  return ((await (await GET(req(), ctx("tmp"))).json()) as BudgetSignal).headroom.sharePct;
 }
 
 describe("GET /picker/budget", () => {
@@ -203,8 +203,11 @@ describe("GET /picker/budget", () => {
     await settings({ budgetAware: true, quotaSharePct: 20, budgetPolicy: { weeklyTargetPct: 90 } });
     await neighbour("p2", { budgetAware: true, quotaSharePct: 80 });
 
-    // The account-side pace line alone would leave 40 points open; the 20% cut of 90 is tighter.
-    expect(await weeklyHeadroom()).toBeCloseTo(18, 6);
+    // The account-side pace line leaves 40 points open on its own meter; the share is the 20% cut
+    // of 90 on the project's, reported beside it rather than in its place.
+    const body = (await (await GET(req(), ctx("tmp"))).json()) as BudgetSignal;
+    expect(body.headroom.weeklyPct).toBeCloseTo(40, 6);
+    expect(body.headroom.sharePct).toBeCloseTo(18, 6);
   });
 
   it("holds the lane at the share cap when the spend read fails", async () => {
@@ -216,7 +219,7 @@ describe("GET /picker/budget", () => {
 
     const res = await GET(req(), ctx("tmp"));
     expect(res.status).toBe(200);
-    expect(((await res.json()) as BudgetSignal).headroom.weeklyPct).toBeCloseTo(18, 6);
+    expect(((await res.json()) as BudgetSignal).headroom.sharePct).toBeCloseTo(18, 6);
   });
 
   it("widens the lane when an idle neighbour's share is renormalized away (R6.4)", async () => {
@@ -228,8 +231,7 @@ describe("GET /picker/budget", () => {
     await neighbour("p3", { budgetAware: true, quotaSharePct: 50 });
     await pickerPlan("p2", 0);
 
-    // Still the binding limit (the account side leaves 40), so this is the share and nothing else.
-    expect(await weeklyHeadroom()).toBeCloseTo((90 * 20) / 70, 6);
+    expect(await shareHeadroom()).toBeCloseTo((90 * 20) / 70, 6);
   });
 
   it("404s on an unknown slug", async () => {

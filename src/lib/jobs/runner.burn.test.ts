@@ -14,6 +14,15 @@ import { getJob } from "./queue";
 import type { BudgetPolicyResolver } from "./runner";
 import { usage, useRunnerHarness } from "./runner.fixture";
 
+/**
+ * A fresh reader that answers each call with the next snapshot, holding the last one — the window
+ * opens and closes on the SAME (TTL-bypassing) reader, so the two ends are consecutive calls.
+ */
+function freshSequence(...reads: Array<Partial<ClaudeUsage>>): () => Promise<ClaudeUsage | null> {
+  let i = 0;
+  return async () => usage(reads[Math.min(i++, reads.length - 1)]!);
+}
+
 describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
   const h = useRunnerHarness();
 
@@ -22,15 +31,14 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
   const budgetAware: BudgetPolicyResolver = () => DEFAULT_BUDGET_POLICY;
 
   it("persists the session%/weekly% delta across a job, attributed to its type", async () => {
-    // Pre-job snapshot via the cached read, post-job via the FRESH (TTL-bypassing) read:
-    // 10%→30% session, 5%→8% weekly.
+    // Both ends of the window via the FRESH (TTL-bypassing) read: 10%→30% session, 5%→8% weekly.
     const r = h.makeRunner({
       handlers: {
         "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
-      readUsageFresh: async () => usage({ sessionPct: 30, weeklyPct: 8 }),
+      readUsageFresh: freshSequence({ sessionPct: 10, weeklyPct: 5 }, { sessionPct: 30, weeklyPct: 8 }),
     });
     await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
@@ -50,7 +58,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
       },
       resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
-      readUsageFresh: async () => usage({ sessionPct: 30, weeklyPct: 8 }),
+      readUsageFresh: freshSequence({ sessionPct: 10, weeklyPct: 5 }, { sessionPct: 30, weeklyPct: 8 }),
     });
     await r.enqueue({ type: "execute-epic", projectId: "P" });
     await r.tickOnce();
@@ -68,7 +76,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
       },
       resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
-      readUsageFresh: async () => usage({ sessionPct: 30, weeklyPct: 8 }),
+      readUsageFresh: freshSequence({ sessionPct: 10, weeklyPct: 5 }, { sessionPct: 30, weeklyPct: 8 }),
     });
     await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
@@ -78,28 +86,88 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect(rows[0]!.projectId).toBeNull();
   });
 
-  it("closes the window with the fresh read, never the cached one (anti zero-delta)", async () => {
-    // A cached after-read inside the TTL returns the same snapshot as the before-read → a bogus
-    // 0% delta. The sampler must go through the fresh reader for the closing measurement.
+  it("takes both ends of the window through the fresh read, never the cached one", async () => {
+    // The cached entry (what the governor's tick reads) is a stale 10% that predates the job — and
+    // would also be the after-read for any job finishing inside the TTL (a bogus 0% delta). Neither
+    // end of the window may use it: the opening read is what the meter says AT the spawn (PR #248
+    // review), the closing read what it says after.
     let freshCalls = 0;
+    const fresh = freshSequence({ sessionPct: 20, weeklyPct: 6 }, { sessionPct: 25, weeklyPct: 7 });
     const r = h.makeRunner({
       handlers: {
         "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       resolveBudgetPolicy: budgetAware,
-      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }), // the stale cache entry, before AND after
+      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
       readUsageFresh: async () => {
         freshCalls += 1;
-        return usage({ sessionPct: 25, weeklyPct: 7 });
+        return fresh();
       },
     });
     await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
     await r.whenIdle();
 
-    expect(freshCalls).toBe(1);
+    expect(freshCalls).toBe(2);
     const avg = await getBurnAverage(h.db, "execute-epic", 1);
-    expect(avg.sessionAvg).toBe(15); // 25 − 10, not the cached self-subtraction's 0
+    expect(avg.sessionAvg).toBe(5); // 25 − 20: the burn since the spawn, not since the stale 10%
+  });
+
+  it("opens the window at the spawn, so preflight burn by others is not this project's", async () => {
+    // Someone else moves the meter 10%→18% while the handler is still in preflight (before it says
+    // it reached Claude). A window opened at dispatch would charge those 8 points to this project's
+    // share and reprice every attempt it has; opened at the spawn, the sample is the job's own 2.
+    let meter = { sessionPct: 10, weeklyPct: 5 };
+    const r = h.makeRunner({
+      handlers: {
+        "execute-epic": async (ctx) => {
+          meter = { sessionPct: 18, weeklyPct: 7 };
+          ctx.claudeReached();
+          meter = { sessionPct: 20, weeklyPct: 8 };
+        },
+      },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage(meter),
+      readUsageFresh: async () => usage(meter),
+    });
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const avg = await getBurnAverage(h.db, "execute-epic", 1);
+    expect(avg.seeded).toBe(false);
+    expect(avg.sessionAvg).toBe(2);
+    expect(avg.weeklyAvg).toBe(1);
+  });
+
+  it("keeps the window a multi-spawn handler opened at its first spawn", async () => {
+    // review-gate and friends say claudeReached before EACH spawn; the window must span all of
+    // them, not restart at the last one and drop the earlier spawns' burn.
+    const fresh = freshSequence(
+      { sessionPct: 10, weeklyPct: 5 },
+      { sessionPct: 30, weeklyPct: 8 },
+    );
+    let freshCalls = 0;
+    const r = h.makeRunner({
+      handlers: {
+        "execute-epic": async (ctx) => {
+          ctx.claudeReached();
+          ctx.claudeReached();
+        },
+      },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => null,
+      readUsageFresh: async () => {
+        freshCalls += 1;
+        return fresh();
+      },
+    });
+    await r.enqueue({ type: "execute-epic" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect(freshCalls).toBe(2);
+    expect((await getBurnAverage(h.db, "execute-epic", 1)).sessionAvg).toBe(20);
   });
 
   it("records NO sample on a null usage read and still completes the job", async () => {
@@ -171,7 +239,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     await r.enqueue({ type: "execute-epic", projectId: "P" });
     await r.tickOnce();
     await r.whenIdle();
-    expect(freshReads).toBe(1);
+    expect(freshReads).toBe(2);
     expect(await h.db.select().from(schema.burnSamples)).toHaveLength(1);
   });
 
@@ -218,7 +286,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect(await r.tickOnce()).toBe(2); // both leased into the same tick → overlapping windows
     await r.whenIdle();
 
-    expect(reads).toBe(0); // contaminated windows never even take the closing read
+    expect(reads).toBe(0); // contaminated windows never open, let alone take the closing read
     expect(await h.db.select().from(schema.burnSamples)).toHaveLength(0);
 
     // Solo follow-up job still samples.
@@ -260,9 +328,9 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
   });
 
   it("throttles the sampler: no fresh read for a second solo job inside the interval", async () => {
-    // The fresh read bypasses the usage cache; with maxConcurrent: 1 every solo completion would
-    // hit the endpoint. burnSampleMinIntervalMs caps that — a second job finishing inside the
-    // window records no sample and takes no fresh read; once the interval elapses, sampling resumes.
+    // Both reads bypass the usage cache; with maxConcurrent: 1 every solo job would hit the
+    // endpoint twice. burnSampleMinIntervalMs caps that — a second job inside the window records no
+    // sample and takes no fresh read; once the interval elapses, sampling resumes.
     let freshReads = 0;
     const r = h.makeRunner({
       handlers: {
@@ -277,11 +345,11 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
       },
     });
 
-    // First solo job samples.
+    // First solo job samples: one read to open, one to close.
     await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
     await r.whenIdle();
-    expect(freshReads).toBe(1);
+    expect(freshReads).toBe(2);
     expect(await h.db.select().from(schema.burnSamples)).toHaveLength(1);
 
     // Second job 30s later — inside the 60s window — must NOT hit the endpoint.
@@ -289,7 +357,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
     await r.whenIdle();
-    expect(freshReads).toBe(1); // unchanged — throttled
+    expect(freshReads).toBe(2); // unchanged — throttled
     expect(await h.db.select().from(schema.burnSamples)).toHaveLength(1);
 
     // Past the window — sampling resumes.
@@ -297,7 +365,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
     await r.whenIdle();
-    expect(freshReads).toBe(2);
+    expect(freshReads).toBe(4);
     expect(await h.db.select().from(schema.burnSamples)).toHaveLength(2);
   });
 
@@ -335,7 +403,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     await r.enqueue({ type: "execute-epic" });
     await r.tickOnce();
     await r.whenIdle();
-    expect(freshReads).toBe(1);
+    expect(freshReads).toBe(2);
     const rows = await h.db.select().from(schema.burnSamples);
     expect(rows).toHaveLength(1);
     expect(rows[0]?.jobType).toBe("execute-epic");

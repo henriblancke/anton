@@ -20,6 +20,7 @@ function headroom(over: Partial<BudgetHeadroom> = {}): BudgetHeadroom {
     weeklyPct: null,
     weeklyReason: "weekly-cap",
     weeklyInclusive: true,
+    sharePct: null,
     reserveWaiver: null,
     ...over,
   };
@@ -150,27 +151,66 @@ describe("budgetLine", () => {
 
   it("charges the share at this project's own rate", () => {
     // The reverse case: 10 share points at 2 a run is five cards, and the fleet's 5-a-run average
-    // says nothing about what THIS project's runs cost its own share.
+    // says nothing about what THIS project's runs cost its own share. The account meter has room
+    // for all of them.
     const line = budgetLine(
-      signal(
-        { sessionPct: 200, weeklyPct: 10, weeklyReason: "share-cap" },
-        { weeklyPct: 5, shareWeeklyPct: 2 },
-      ),
+      signal({ sessionPct: 200, weeklyPct: 100, sharePct: 10 }, { weeklyPct: 5, shareWeeklyPct: 2 }),
       queue(8),
     );
     expect(line).toEqual({ affordable: 5, reason: "share-cap", seeded: false });
   });
 
+  it("lets the share bind first even when the account meter has fewer raw points left", () => {
+    // Which weekly hold binds is headroom over rate, not raw headroom (PR #248 review): 5 account
+    // points at 0.3 a run afford sixteen cards, but 6 share points at 3 a run are gone after two.
+    // Picking the account meter up front for its smaller number would call all sixteen affordable.
+    const line = budgetLine(
+      signal({ sessionPct: 200, weeklyPct: 5, sharePct: 6 }, { weeklyPct: 0.3, shareWeeklyPct: 3 }),
+      queue(20),
+    );
+    expect(line).toEqual({ affordable: 2, reason: "share-cap", seeded: false });
+  });
+
+  it("lets the account cap bind first even when the share has fewer raw points left", () => {
+    // The mirror: 3 share points at 0.3 a run outlast 10 account points at 5 a run.
+    const line = budgetLine(
+      signal({ sessionPct: 200, weeklyPct: 10, sharePct: 3 }, { weeklyPct: 5, shareWeeklyPct: 0.3 }),
+      queue(20),
+    );
+    expect(line).toEqual({ affordable: 2, reason: "weekly-cap", seeded: false });
+  });
+
+  it("names the share when it and the pace-line run out on the same card", () => {
+    // The gate tests the share before the pace-line, so a card over both waits on the share.
+    const line = budgetLine(
+      signal(
+        { sessionPct: 200, weeklyPct: 10, weeklyReason: "weekly-on-track", sharePct: 6 },
+        { weeklyPct: 5, shareWeeklyPct: 3 },
+      ),
+      queue(4),
+    );
+    expect(line).toEqual({ affordable: 2, reason: "share-cap", seeded: false });
+  });
+
+  it("names the cap when it and the share run out on the same card", () => {
+    // …but the account cap comes before the share in the gate's order.
+    const line = budgetLine(
+      signal({ sessionPct: 200, weeklyPct: 10, sharePct: 6 }, { weeklyPct: 5, shareWeeklyPct: 3 }),
+      queue(4),
+    );
+    expect(line).toEqual({ affordable: 2, reason: "weekly-cap", seeded: false });
+  });
+
   it("projects the reserve waiver on the account meter even while the share binds", () => {
     // The waiver ends where ACCOUNT usage catches the pace-line up, so it is charged at the account
-    // rate (20 a run: two cards) even though the binding weekly hold is the share, charged at the
+    // rate (20 a run: two cards) even though the tighter weekly hold is the share, charged at the
     // project's own 2 a run — the share would afford all six.
     const line = budgetLine(
       signal(
         {
           sessionPct: 55,
-          weeklyPct: 12,
-          weeklyReason: "share-cap",
+          weeklyPct: 100,
+          sharePct: 12,
           reserveWaiver: { afterWeeklyPct: 35, sessionPct: 20 },
         },
         { sessionPct: 10, weeklyPct: 20, shareWeeklyPct: 2 },
@@ -178,6 +218,14 @@ describe("budgetLine", () => {
       queue(6),
     );
     expect(line).toEqual({ affordable: 2, reason: "daytime-reserve", seeded: false });
+  });
+
+  it("yields the daytime reserve to the share when both run out on the same card", () => {
+    const line = budgetLine(
+      signal({ sessionPct: 10, sessionReason: "daytime-reserve", weeklyPct: 100, sharePct: 1 }),
+      queue(2),
+    );
+    expect(line).toEqual({ affordable: 1, reason: "share-cap", seeded: false });
   });
 
   it("reports the session floor when both sides run out on the same card", () => {
