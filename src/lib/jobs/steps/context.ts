@@ -17,11 +17,12 @@ import type { JobContext } from "../runner";
 /**
  * A satisfied ticket as the run's ledger holds it: the commit it settled on, and whether the close
  * that settlement calls for actually landed. The deadline can fire between the delivery gate's
- * acceptance and the close (PR #253 review) — the ticket is then blocked with a timeout note, not
- * closed, and the pull request must say so rather than report a close that never happened.
+ * acceptance and the close, or bd can refuse the best-effort close outright (PR #253 review) — the
+ * ticket is then blocked or still open, not closed, and the pull request must say so rather than
+ * report a close that never happened.
  */
 export interface SatisfiedSettlement extends SatisfiedBy {
-  /** False when the ticket's budget ran out on the close: it is blocked, and a person closes it. */
+  /** False when the close never landed — a budget that ran out on it, or a bd write that failed — so a person closes it. */
   closed: boolean;
 }
 

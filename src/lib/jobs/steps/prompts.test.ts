@@ -198,7 +198,8 @@ describe("prBody", () => {
     expect(body).toContain(`- anton-t2 — Expose the schema — by 0123456 "anton-t1: Add the schema"\n`);
     expect(body).toContain(
       `- anton-t3 — Document the schema — by 0123456 "anton-t1: Add the schema" — NOT closed: ` +
-        `its ticket budget ran out on the close, so it is blocked; review that commit and close it by hand`,
+        `the close never landed (its budget ran out on it, or bd refused the write), so it is not done ` +
+        `on the board; review that commit and close it by hand`,
     );
     expect(body).not.toContain("- anton-t3 — Document the schema\n");
   });

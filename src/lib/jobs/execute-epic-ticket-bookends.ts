@@ -288,6 +288,10 @@ export function narrowToTicket(
 /**
  * Persist this ticket's "code done" state the moment it commits — or, for a SATISFIED step, the
  * moment the gate accepted the earlier commit that did its work.
+ *
+ * Answers whether the bead actually CLOSED (PR #253 review): the close is best-effort, so a bd that
+ * refuses the write leaves the ticket open, and the run's ledger has to carry that fact rather than
+ * infer a close from the run's shape. A standalone target is never closed here, so it answers false.
  */
 export async function finishTicket(
   run: Omit<StepContext, "tickets">,
@@ -295,7 +299,7 @@ export async function finishTicket(
   sessionId: string,
   closeOnDone: boolean,
   settlement: TicketSettlement = { how: "committed" },
-): Promise<void> {
+): Promise<{ closed: boolean }> {
   const { db, clock } = run;
   const repo = run.repoPath;
   // A satisfied step closes exactly as a committed one does, so the bead has to say which it was
@@ -317,11 +321,13 @@ export async function finishTicket(
   // stage:in-review here (dropping implementing): that is both its board state and the persisted
   // resume marker, so a retry after a failed PR step skips it rather than re-running claude on
   // committed work. endSession still records the work done either way.
+  let closed = false;
   if (closeOnDone) {
-    await safe(() => beads.close(repo, ticket.id));
+    closed = await safe(() => beads.close(repo, ticket.id));
   } else {
     await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("in-review")]));
     await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
   }
   await endSession(db, clock, sessionId, "done");
+  return { closed };
 }

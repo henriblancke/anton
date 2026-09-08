@@ -187,8 +187,9 @@ export function prBody(
 /**
  * The satisfied attribution as the PR body and its stale-body fallback both render it (PR #253
  * review): one line per ticket naming the commit that did its work. Empty when nothing settled that
- * way. The header claims no close — a ticket whose budget ran out on the close is still blocked, and
- * its line says so, since the body is where a reviewer learns it needs closing by hand.
+ * way. The header claims no close — a ticket whose close never landed (a budget that ran out on it,
+ * or a bd write that failed) is still open or blocked, and its line says so, since the body is where
+ * a reviewer learns it needs closing by hand.
  */
 export function satisfiedLines(
   tickets: Bead[],
@@ -203,8 +204,8 @@ export function satisfiedLines(
       const line = `- ${t.id} — ${t.title} — by ${satisfiedByLine(by)}`;
       return by.closed
         ? line
-        : `${line} — NOT closed: its ticket budget ran out on the close, so it is blocked; ` +
-            `review that commit and close it by hand`;
+        : `${line} — NOT closed: the close never landed (its budget ran out on it, or bd refused ` +
+            `the write), so it is not done on the board; review that commit and close it by hand`;
     }),
     ``,
   ];

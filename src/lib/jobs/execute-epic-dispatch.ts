@@ -475,9 +475,10 @@ async function dispatchTicket(
     // Its mechanism is on the branch either way — its own commit, or the earlier one it settled on
     // — so nothing behind it is missing anything. Which it was is what the PR body has to say.
     onBranch.add(ticket.id);
-    // A standalone target is never closed here — it stays open until its PR merges.
+    // `closed` is what the bookend reports, not what the run's shape implies (PR #253 review): a
+    // standalone target is never closed here, and a bd that refused the close left the bead open.
     if (settlement.how === "satisfied") {
-      ledger.satisfied.set(ticket.id, { ...settlement.by, closed: !standaloneRun });
+      ledger.satisfied.set(ticket.id, { ...settlement.by, closed: settlement.closed });
     }
   } catch (e) {
     // A ticket that ran out of time is the ONE failure this loop absorbs (anton-t1mo). It has

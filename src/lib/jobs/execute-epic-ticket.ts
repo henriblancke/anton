@@ -35,6 +35,13 @@ import type { ResolvedStep } from "./run-formula";
 import type { StepContext, StepFacts } from "./step-registry";
 
 /**
+ * How a finished ticket settled, plus whether its close actually landed (PR #253 review). The close
+ * is best-effort, so the run may not derive it from its own shape: a bd that refused the write left
+ * the bead open, and the pull request has to say so.
+ */
+export type TicketOutcome = TicketSettlement & { closed: boolean };
+
+/**
  * One ticket: session → the formula's ticket phase (…→ commit) → close. Answers HOW the ticket
  * settled (anton-8h4b) — on its own commit, or on an earlier commit of the run — because the close
  * looks the same either way and the pull request must not.
@@ -68,7 +75,7 @@ export async function runTicket(args: {
   standalone?: boolean;
   /** This ticket's wall-clock budget (anton-t1mo); `Infinity` leaves it unbounded. */
   timeoutMs: number;
-}): Promise<TicketSettlement> {
+}): Promise<TicketOutcome> {
   const { run, ticket, operator, timeoutMs } = args;
   const standalone = args.standalone ?? false;
   const { ctx, worktreePath } = run;
@@ -86,8 +93,8 @@ export async function runTicket(args: {
   try {
     await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress });
     const settlement = await ticketSettlement(run, progress);
-    await finishTicket(run, ticket, session.sessionId, closeOnDone, settlement);
-    return settlement;
+    const { closed } = await finishTicket(run, ticket, session.sessionId, closeOnDone, settlement);
+    return { ...settlement, closed };
   } catch (e) {
     // Always throws; returned so the signature carries the `never` and the walk's answer is typed.
     return settleFailedTicket({
