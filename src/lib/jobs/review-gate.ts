@@ -439,7 +439,9 @@ async function runReviewSession(args: {
     kind: "review",
     beadId: target.id,
   });
-  ctx.report({ sessionId, cwd: worktreePath });
+  // Pin the report to this run's routing (anton-7poz) so an investigate terminal hits the endpoint
+  // under review even on an all-tickets-skipped resume, where openTicketSession never seeded it.
+  ctx.report({ sessionId, cwd: worktreePath, routing: claudeRouting(settings) });
 
   try {
     const before = await settleBaseline({
@@ -754,7 +756,7 @@ async function runGateFixSession(args: {
     kind: "review-fix",
     beadId: target.id,
   });
-  ctx.report({ sessionId, cwd: worktreePath });
+  ctx.report({ sessionId, cwd: worktreePath, routing: claudeRouting(settings) });
 
   try {
     await appendSessionLog(
