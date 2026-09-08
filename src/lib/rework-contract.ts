@@ -8,7 +8,15 @@
  * costs a caller nothing else — no bd, no `gh`, no board read — which is also what lets the rework
  * dialog import it: what the dialog refuses and what the route refuses are one judgement.
  */
-import { fenceCloser, isHeading, scanMarkdown, type ScannedLine } from "./beads/markdown";
+import {
+  closingFence,
+  type Fence,
+  fenceCloser,
+  isHeading,
+  openingFence,
+  scanMarkdown,
+  type ScannedLine,
+} from "./beads/markdown";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
   MAX_REWORK_INSTRUCTIONS_CHARS,
@@ -189,6 +197,20 @@ const LIST_ITEM = /^( {0,3})([-*+•]|\d{1,9}[.)])(?:([ \t]+)|$)/;
  */
 const BLOCK_START = /^ {0,3}(?:[-*+•]|\d{1,9}[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
+/**
+ * One blockquote marker peeled as a container: up to 3 spaces, then one `>` of a run that whitespace
+ * or the line's end follows — {@link QUOTE_MARKER}'s rule, one marker at a time so `>> ` nests two.
+ */
+const QUOTE_STEP = /^ {0,3}>(?=>*(?:[ \t]|$))/;
+
+/**
+ * The containers a line's content sits in, outermost first: a column its text must reach, or a
+ * blockquote marker it must carry. A code block or fence opened after container markers keeps
+ * only the lines that carry the same prefix; the first that does not has left the container, and
+ * the block ends with it. A column after a `>` counts from the marker, not the line.
+ */
+type Prefix = (number | ">")[];
+
 /** One thing the instructions say must be true, as the follow-up's acceptance will file it. */
 export interface InstructionCriterion {
   /**
@@ -242,32 +264,83 @@ export interface InstructionCriterion {
  * retry:` means bullets, while eight columns there is four past the content and renders as code.
  * The block is filed inside a fence rather than as it was indented ({@link refenced}): it lands
  * among the acceptance's boxes, where four spaces after a `- [ ]` line render as nesting, not code.
+ *
+ * Both blocks can also open on a container's OWN line, where the scanner sees neither: `- ```md`
+ * opens a fence inside the list item, as `> ```` does inside a callout, and a marker followed by
+ * five or more spaces holds indented code after the one space that is the item's padding
+ * ({@link itemContentIndent}). Shearing such a line filed the fence's opener as a step and what
+ * followed as steps or nothing. So every marker is peeled first ({@link peelContainers}), and what
+ * opens after them keeps the lines that stay inside the same containers ({@link peelPrefix}) —
+ * filed dedented, as the note renders them. A fence the scanner did not see leaves its verdicts
+ * stale from that line on, so the rest is scanned afresh once the block ends.
  */
 export function instructionCriteria(instructions: string): InstructionCriterion[] {
   const out: InstructionCriterion[] = [];
+  let lines = scanMarkdown(instructions);
+  let literal = insideClosedComment(lines);
+  const raw = lines.map((line) => line.text);
   let fence: { opener: string; content: string[] } | undefined;
-  let code: { indent: number; content: string[] } | undefined;
-  // Blank lines inside an indented block belong to it only when more indented lines follow.
+  // A fence opened after container markers, which the scanner does not track.
+  let nested: { opener: string; fence: Fence; prefix: Prefix; content: string[] } | undefined;
+  let code: { prefix: Prefix; content: string[] } | undefined;
+  // Blank lines inside a block belong to it only when more of its lines follow.
   let pendingBlanks = 0;
   // Content column of every open list item, innermost last.
   const items: number[] = [];
   let inParagraph = false;
 
+  // The state after a nested fence is clean — a fence closes every comment — so a fresh scan of
+  // what follows is the scan the scanner would have made had it seen the fence.
+  const rescan = (from: number) => {
+    if (from >= raw.length) return;
+    lines = [...lines.slice(0, from), ...scanMarkdown(raw.slice(from).join("\n"))];
+    literal = insideClosedComment(lines);
+  };
   const flushFence = (closer: string) => {
     if (fence && fence.content.some((line) => line.trim() !== "")) {
       out.push({ text: [fence.opener, ...fence.content, closer].join("\n"), fenced: true });
     }
     fence = undefined;
   };
+  const flushNested = (closer: string) => {
+    if (nested && nested.content.some((line) => line.trim() !== "")) {
+      out.push({ text: [nested.opener, ...nested.content, closer].join("\n"), fenced: true });
+    }
+    nested = undefined;
+    pendingBlanks = 0;
+  };
   const flushCode = () => {
     if (code) out.push({ text: refenced(code.content), fenced: true });
     code = undefined;
     pendingBlanks = 0;
   };
+  const blanks = () => Array<string>(pendingBlanks).fill("");
 
-  const lines = scanMarkdown(instructions);
-  const literal = insideClosedComment(lines);
-  for (const [at, line] of lines.entries()) {
+  for (let at = 0; at < lines.length; at += 1) {
+    if (nested) {
+      const text = raw[at]!;
+      // A blank line stays inside a list item; it ends a callout, as any line without its `>` does.
+      if (text.trim() === "" && !quoted(nested.prefix)) {
+        pendingBlanks += 1;
+        continue;
+      }
+      const inner = peelPrefix(text, nested.prefix);
+      if (inner !== undefined && closingFence(inner, nested.fence)) {
+        nested.content.push(...blanks());
+        flushNested(inner);
+        rescan(at + 1);
+        continue;
+      }
+      if (inner !== undefined) {
+        nested.content.push(...blanks(), inner);
+        pendingBlanks = 0;
+        continue;
+      }
+      // Leaving the container closes the fence with it; the line itself is judged afresh.
+      flushNested(fenceCloser(nested.opener));
+      rescan(at);
+    }
+    const line = lines[at]!;
     if (line.fenced) {
       flushCode();
       items.length = 0;
@@ -278,17 +351,20 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       continue;
     }
     if (line.text.trim() === "") {
-      if (code) pendingBlanks += 1;
+      if (code && quoted(code.prefix)) flushCode();
+      else if (code) pendingBlanks += 1;
       inParagraph = false;
       continue;
     }
-    const indent = indentColumns(line.text);
-    if (code && indent >= code.indent) {
-      code.content.push(...Array<string>(pendingBlanks).fill(""), dedent(line.text, code.indent));
-      pendingBlanks = 0;
-      continue;
+    if (code) {
+      const inner = peelPrefix(line.text, code.prefix);
+      if (inner !== undefined) {
+        code.content.push(...blanks(), inner);
+        pendingBlanks = 0;
+        continue;
+      }
+      flushCode();
     }
-    flushCode();
     if (literal[at]) {
       inParagraph = false;
       out.push({ text: line.text.trim(), fenced: false });
@@ -296,27 +372,42 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     }
     // A line indented less than the innermost item's content leaves it — unless it is the lazy
     // continuation of the item's paragraph, which stays inside from any indentation.
+    const indent = indentColumns(line.text);
     const lazy = inParagraph && !BLOCK_START.test(line.text.trimStart());
     while (!lazy && items.length > 0 && indent < items[items.length - 1]!) items.pop();
     const base = items[items.length - 1] ?? 0;
-    if (!inParagraph && indent - base >= CODE_INDENT) {
-      code = { indent: base + CODE_INDENT, content: [dedent(line.text, base + CODE_INDENT)] };
-      continue;
-    }
     const rel = indent >= base ? dedent(line.text, base) : line.text;
-    const item = LIST_ITEM.exec(rel);
     if (THEMATIC_BREAK.test(rel.trim()) || isHeading(rel)) {
       inParagraph = false;
-    } else if (item) {
-      items.push(itemContentIndent(item, base));
-      inParagraph = rel.slice(item[0].length).trim() !== "";
-    } else {
-      inParagraph = true;
+      continue;
     }
+    const peeled = peelContainers(rel, base);
+    items.push(...peeled.opened);
+    if (peeled.fresh) inParagraph = false;
+    const { text: content, column } = peeled;
+    if (content.trim() === "") {
+      inParagraph = false;
+      continue;
+    }
+    if (!inParagraph && indentColumns(content, column) - column >= CODE_INDENT) {
+      code = {
+        prefix: deeper(peeled.prefix, CODE_INDENT),
+        content: [dedent(content, column + CODE_INDENT, column)],
+      };
+      continue;
+    }
+    const opener = openingFence(content);
+    if (opener) {
+      nested = { opener: content, fence: opener, prefix: peeled.prefix, content: [] };
+      inParagraph = false;
+      continue;
+    }
+    inParagraph = !THEMATIC_BREAK.test(content.trim()) && !isHeading(content);
     const text = shorn(line.text);
     if (text) out.push({ text, fenced: false });
   }
   flushCode();
+  if (nested) flushNested(fenceCloser(nested.opener));
   if (fence) flushFence(fenceCloser(fence.opener));
   return out;
 }
@@ -342,9 +433,12 @@ function insideClosedComment(lines: readonly ScannedLine[]): boolean[] {
   return out;
 }
 
-/** The column the text of `line` starts at, a tab reaching the next tab stop. */
-function indentColumns(line: string): number {
-  let column = 0;
+/**
+ * The column the text of `line` starts at, a tab reaching the next tab stop — counted from `from`,
+ * the column `line` itself begins at when it is the tail of a longer one.
+ */
+function indentColumns(line: string, from = 0): number {
+  let column = from;
   for (const char of line) {
     if (char === " ") column += 1;
     else if (char === "\t") column += TAB_STOP - (column % TAB_STOP);
@@ -354,20 +448,89 @@ function indentColumns(line: string): number {
 }
 
 /**
- * `line` past its first `columns` of indentation. A tab that reaches past the boundary is split as
- * CommonMark splits it: the columns beyond the boundary come back as spaces.
+ * `line` past column `to`, its indentation counted from `from` as {@link indentColumns} counts it.
+ * A tab that reaches past the boundary is split as CommonMark splits it: the columns beyond the
+ * boundary come back as spaces.
  */
-function dedent(line: string, columns: number): string {
-  let column = 0;
+function dedent(line: string, to: number, from = 0): string {
+  let column = from;
   let at = 0;
-  while (at < line.length && column < columns) {
+  while (at < line.length && column < to) {
     const char = line[at]!;
     if (char === " ") column += 1;
     else if (char === "\t") column += TAB_STOP - (column % TAB_STOP);
     else break;
     at += 1;
   }
-  return " ".repeat(Math.max(0, column - columns)) + line.slice(at);
+  return " ".repeat(Math.max(0, column - to)) + line.slice(at);
+}
+
+/**
+ * `rel` — a line dedented to `base`, the innermost open item's content column — with every list
+ * and blockquote marker at its head peeled, as CommonMark opens containers left to right: what is
+ * left is the line's own content, `column` where it starts, and `prefix` what a following line
+ * must carry to sit inside the same containers. Items opened before any `>` are reported for the
+ * caller's stack, whose columns count from the line's start; those after one are not, since the
+ * stack has no way to say "after the marker" — the prefix does.
+ */
+function peelContainers(
+  rel: string,
+  base: number,
+): { text: string; column: number; prefix: Prefix; opened: number[]; fresh: boolean } {
+  const prefix: Prefix = [base];
+  const opened: number[] = [];
+  let text = rel;
+  let column = base;
+  let quoted = false;
+  let fresh = false;
+  for (;;) {
+    const item = LIST_ITEM.exec(text);
+    if (item) {
+      const marker = item[1]!.length + item[2]!.length;
+      const content = itemContentIndent(item, column);
+      text = dedent(text.slice(marker), content, column + marker);
+      prefix[prefix.length - 1] = content;
+      if (!quoted) opened.push(content);
+      column = content;
+      fresh = true;
+      continue;
+    }
+    const quote = QUOTE_STEP.exec(text);
+    if (!quote) return { text, column, prefix, opened, fresh };
+    text = unquoteOne(text.slice(quote[0].length));
+    prefix.push(">", 0);
+    column = 0;
+    quoted = true;
+  }
+}
+
+/** The text after a `>` marker: CommonMark grants the marker one space, and no more. */
+const unquoteOne = (text: string): string =>
+  !text.startsWith(">") && /^[ \t]/.test(text) ? text.slice(1) : text;
+
+/** `line` inside the containers `prefix` names, or undefined when it has left them. */
+function peelPrefix(line: string, prefix: Prefix): string | undefined {
+  let rest = line;
+  for (const step of prefix) {
+    if (step === ">") {
+      const quote = QUOTE_STEP.exec(rest);
+      if (!quote) return undefined;
+      rest = unquoteOne(rest.slice(quote[0].length));
+    } else {
+      if (indentColumns(rest) < step) return undefined;
+      rest = dedent(rest, step);
+    }
+  }
+  return rest;
+}
+
+const quoted = (prefix: Prefix): boolean => prefix.includes(">");
+
+/** `prefix` with its innermost column `columns` further in — where an indented block's content starts. */
+function deeper(prefix: Prefix, columns: number): Prefix {
+  const out = [...prefix];
+  out[out.length - 1] = (out[out.length - 1] as number) + columns;
+  return out;
 }
 
 /**

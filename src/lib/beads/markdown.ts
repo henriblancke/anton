@@ -82,7 +82,8 @@ export interface RenderedLine {
   fenced: boolean;
 }
 
-interface Fence {
+/** A fence delimiter as scanned: the character, the run's length, and whatever follows it. */
+export interface Fence {
   char: string;
   len: number;
   /** Whatever follows the delimiter — an info string on an opener, whitespace on a closer. */
@@ -172,6 +173,22 @@ export function fenceCloser(opener: string): string {
   const fence = fenceOf(opener);
   if (!fence) throw new Error(`Not a fence delimiter: ${JSON.stringify(opener)}`);
   return fence.char.repeat(fence.len);
+}
+
+/**
+ * The fence `text` opens, by the rule the scanner applies at the start of a line — or undefined.
+ * For a caller that meets a fence where the scanner does not look: after a container marker, as
+ * `- ```` opens one inside the list item.
+ */
+export function openingFence(text: string): Fence | undefined {
+  const fence = fenceOf(text);
+  return fence && opensFence(fence) ? fence : undefined;
+}
+
+/** Does `text` close the fence `open`, by the scanner's rule? */
+export function closingFence(text: string, open: Fence): boolean {
+  const fence = fenceOf(text);
+  return fence !== undefined && closesFence(fence, open);
 }
 
 /** Does this line delimit a fence? Advances `state` across the block it opens or closes. */

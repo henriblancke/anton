@@ -443,6 +443,62 @@ describe("instructionCriteria", () => {
     expect(texts("-\tstep\n\n        code")).toEqual(["step", "```\ncode\n```"]);
   });
 
+  it("keeps a fence opened on a list item's own line — `- ```md` opens it inside the item", () => {
+    // The scanner looks for a fence at the start of a line, and `- ```md` starts with the marker;
+    // judged as a step, the opener filed as `- [ ] ```md`, the heading dropped, the bullet was
+    // shorn, and the closer opened a fence that swallowed every step after it.
+    expect(instructionCriteria("- ```md\n  ## Expected\n  - item\n  ```\n- next")).toEqual([
+      { text: "```md\n## Expected\n- item\n```", fenced: true },
+      { text: "next", fenced: false },
+    ]);
+    // A delimiter of the other kind inside the block is content, and so is a blank line.
+    expect(texts("- ```\n  ~~~\n  ```\nafter")).toEqual(["```\n~~~\n```", "after"]);
+    expect(texts("- ```\n  a\n\n  b\n  ```")).toEqual(["```\na\n\nb\n```"]);
+    // The content column is the item's: three under `1. `, four under `- - `, past the tab stop
+    // under `-\t`.
+    expect(texts("1. ```\n   code\n   ```")).toEqual(["```\ncode\n```"]);
+    expect(texts("- - ```\n    x\n    ```")).toEqual(["```\nx\n```"]);
+    expect(texts("-\t```\n\tx\n\t```")).toEqual(["```\nx\n```"]);
+    // A line that leaves the item closes the fence with it, and is judged on its own; blank lines
+    // left behind at the end are the item's, not the block's.
+    expect(texts("- ```\n  x\n- next")).toEqual(["```\nx\n```", "next"]);
+    expect(texts("- ```\n  a\n\n- next")).toEqual(["```\na\n```", "next"]);
+    // As CommonMark reads it: the item's fence is empty, `top` is prose, and the last line opens
+    // a fence of its own that holds nothing.
+    expect(texts("- ```\ntop\n```")).toEqual(["top"]);
+    // Empty and unclosed read as a top-level fence does.
+    expect(instructionCriteria("- ```\n  ```")).toEqual([]);
+    expect(texts("- ```sh\n  npm test")).toEqual(["```sh\nnpm test\n```"]);
+    // A backtick in the info string opens nothing here either.
+    expect(texts("- ```a`b\n  x")).toEqual(["```a`b", "x"]);
+    // The item stays open once its fence closes, so what follows nests in it as before.
+    expect(texts("* ```\n  ## h\n  ```\n\n    prose")).toEqual(["```\n## h\n```", "prose"]);
+  });
+
+  it("keeps a fence opened inside a callout — `> ```` — and ends it where the callout ends", () => {
+    expect(texts("> ```md\n> ## Expected\n> ```\nnext")).toEqual(["```md\n## Expected\n```", "next"]);
+    expect(texts("> - ```\n>   x\n>   ```")).toEqual(["```\nx\n```"]);
+    // A callout has no blank lines: one ends it, and the fence, as any line without the `>` does.
+    expect(texts("> ```\n> a\n\n> b")).toEqual(["```\na\n```", "b"]);
+    // Indented code inside a callout is read the same way.
+    expect(texts(">     code\n>     more\nafter")).toEqual(["```\ncode\nmore\n```", "after"]);
+  });
+
+  it("keeps code that begins on the marker's own line — five spaces after `-` are one of padding and four of code", () => {
+    // CommonMark grants the item one space and reads the other four as indented code, so the note
+    // renders `- literal` as code; shorn, it filed `literal`.
+    expect(texts("-     - literal")).toEqual(["```\n- literal\n```"]);
+    // The block continues on lines indented to it, and ends at the next item.
+    expect(texts("-     - literal\n      more\n  - next")).toEqual(["```\n- literal\nmore\n```", "next"]);
+    // An ordered marker's content starts one further in, so one of six spaces stays in the code.
+    expect(texts("1.      code")).toEqual(["```\n code\n```"]);
+    // Four spaces are all padding: a nested item, as before.
+    expect(texts("-    - nested")).toEqual(["nested"]);
+    // Every marker on the line is a container, so `- - a` starts its content four in and a line
+    // indented four is a nested item under it, not code.
+    expect(texts("- - a\n    - b")).toEqual(["a", "b"]);
+  });
+
   it("keeps the lines inside a closed HTML comment as typed — a commented Markdown sample is an example", () => {
     // The scanner hides them and the note shows them; judged as bullet and heading they filed less
     // than the note. The delimiter lines begin outside the comment, and are judged as typed.
@@ -508,6 +564,11 @@ describe("doneGap", () => {
     expect(doneGap("```\n```", [finding])).toBeNull();
     // An indented block is never empty — whitespace-only lines are blank — so it always states one.
     expect(doneGap("\n    - item", [])).toBeNull();
+  });
+
+  it("reads a fence opened on a list item's line the same way — empty is refused, content accepted", () => {
+    expect(doneGap("- ```\n  ```", [])).toMatch(/what done looks like/);
+    expect(doneGap("- ```\n  npm test\n  ```", [])).toBeNull();
   });
 
   it("refuses instructions that are only headings or empty boxes — labels and blanks, not steps", () => {
