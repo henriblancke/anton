@@ -180,11 +180,14 @@ describe("instructionCriteria", () => {
   it("reads a bare marker as scaffolding, not as a criterion", () => {
     // `-` alone and `- [ ]` are what the founder leaves behind when they start a list and stop.
     expect(instructionCriteria("-\n- \n1.\n- [ ]\n[ ]\n  ")).toEqual([]);
+    // `+` is CommonMark's third bullet; alone it is the same abandoned list, not a criterion.
+    expect(instructionCriteria("+\n+ \n+ [ ]")).toEqual([]);
   });
 
   it("keeps a sign or a version that merely LOOKS like a marker", () => {
-    expect(instructionCriteria("-1 is the sentinel\n1.2 ships this")).toEqual([
+    expect(instructionCriteria("-1 is the sentinel\n+1 on the rename\n1.2 ships this")).toEqual([
       "-1 is the sentinel",
+      "+1 on the rename",
       "1.2 ships this",
     ]);
   });
