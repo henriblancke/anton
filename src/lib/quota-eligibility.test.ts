@@ -16,7 +16,7 @@ import * as schema from "@/lib/db/schema";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import { insertProject } from "@/lib/testing/project";
 import { eligibilityOf, observedWorkEligibility } from "@/lib/quota-eligibility";
-import type { JobStatus, JobType } from "@/lib/jobs/queue";
+import { BUDGET_DEFER_PREFIX, type JobStatus, type JobType } from "@/lib/jobs/queue";
 
 const NOW = Date.parse("2026-03-04T12:00:00Z");
 
@@ -57,10 +57,20 @@ function job(
   status: JobStatus,
   runAt: Date = new Date(NOW),
   leaseExpiresAt: Date | null = null,
+  lastError: string | null = null,
 ): void {
   tdb.db
     .insert(schema.jobs)
-    .values({ id: randomUUID(), projectId, type, status, runAt, leaseExpiresAt, payloadJson: "{}" })
+    .values({
+      id: randomUUID(),
+      projectId,
+      type,
+      status,
+      runAt,
+      leaseExpiresAt,
+      lastError,
+      payloadJson: "{}",
+    })
     .run();
 }
 
@@ -104,15 +114,59 @@ describe("observedWorkEligibility", () => {
   });
 
   it("does not count queued work that cannot start yet", async () => {
-    // A retry backoff, a usage-limit reschedule, a budget deferral: the row is `queued`, but its
-    // `runAt` is hours out and nothing here can spend before then. Holding the project in the
-    // denominator on it blocks the reallocation the idle window exists to allow — and tells the
-    // settings panel it has work ready when it has none.
+    // A retry backoff or a usage-limit reschedule: the row is `queued`, but its `runAt` is hours
+    // out and nothing here can spend before then. Holding the project in the denominator on it
+    // blocks the reallocation the idle window exists to allow — and tells the settings panel it has
+    // work ready when it has none.
     const backing = project("backing");
     plan(backing, 0);
     job(backing, "execute-epic", "queued", new Date(NOW + 60 * 60 * 1000));
+    job(
+      backing,
+      "execute-epic",
+      "queued",
+      new Date(NOW + 2 * 60 * 60 * 1000),
+      null,
+      "usage-limit: resumes at 2026-03-04T14:00:00Z",
+    );
 
     expect(eligibilityOf(await observedWorkEligibility(tdb.db, NOW), backing)).toBe(false);
+  });
+
+  it("keeps work the governor deferred on its share in the denominator", async () => {
+    // A budget deferral is not a backoff: the project HAS work, and its own share turned it away.
+    // Read as idle, a capped project would leave the divisor the moment it hit its cap, its
+    // neighbours' shares — and its own, the subject being always in its divisor — would widen by
+    // its cut, and the next tick would resume the very rows the share just held (PR #248 review).
+    const capped = project("capped");
+    plan(capped, 0);
+    job(
+      capped,
+      "execute-epic",
+      "queued",
+      new Date(NOW + 6 * 24 * 60 * 60 * 1000),
+      null,
+      `${BUDGET_DEFER_PREFIX}weekly-cap — resumes at 2026-03-10T12:00:00Z`,
+    );
+
+    expect(eligibilityOf(await observedWorkEligibility(tdb.db, NOW), capped)).toBe(true);
+  });
+
+  it("still holds no share for a budget-deferred row the runner's own gates park", async () => {
+    // The marker says the share held it; the autonomy switch says the runner would not lease it
+    // anyway. The hard hold wins, exactly as it does for a due row.
+    const off = project("off", { autonomy: false });
+    plan(off, 0);
+    job(
+      off,
+      "execute-epic",
+      "queued",
+      new Date(NOW + 6 * 24 * 60 * 60 * 1000),
+      null,
+      `${BUDGET_DEFER_PREFIX}weekly-cap — resumes at 2026-03-10T12:00:00Z`,
+    );
+
+    expect(eligibilityOf(await observedWorkEligibility(tdb.db, NOW), off)).toBe(false);
   });
 
   it("counts a running job whatever its runAt says", async () => {

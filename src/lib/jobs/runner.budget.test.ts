@@ -438,6 +438,37 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     await r.whenIdle();
   });
 
+  it("charges a bypass run's burn against the share before admitting autonomous work behind it", async () => {
+    // An immediate "Approve" skips the pacing gates but not the meter: its attempt lands on this
+    // project's spend at the next tick like any other. So when it precedes autonomous rows in one
+    // batch, the share it will spend is gone for THEM — otherwise a bypass run at the cap would let
+    // a second, ungated crossing lease beside it (PR #248 review). Share 10, spent 9, a seeded
+    // execute-epic costs 3: the bypass run crosses the cap, and nothing autonomous fits behind it.
+    h.seedProjects("A");
+    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const ran: string[] = [];
+    const r = budgetRunner(
+      async (ctx) => {
+        ran.push(ctx.jobId);
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 10),
+        resolveProjectSpend: async () => 9,
+      },
+    );
+    const bypass = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+      payload: { projectId: "A", epicBeadId: "A-1", bypassBudget: true },
+    });
+    for (let i = 0; i < 2; i++) await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toEqual([bypass]);
+  });
+
   it("leaves the batch unreserved when the project carries no share", async () => {
     // No share, no ceiling to reserve against: an ungoverned-by-share project keeps leasing to its
     // concurrency, exactly as before the reservation existed.

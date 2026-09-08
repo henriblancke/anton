@@ -1071,8 +1071,21 @@ export class JobRunner {
       const payload = parsePayload(job.payloadJson) as
         | { bypassBudget?: unknown; epicBeadId?: unknown }
         | null;
+      const shareCap = policy.projectWeeklyCapPct;
       if (payload?.bypassBudget === true) {
-        takeSlot(job); // leases ahead of the rows behind it, gate or no gate
+        // Leases ahead of the rows behind it, gate or no gate — but its burn is charged to this
+        // project's share all the same (PR #248 review): the meter will count the attempt on the
+        // next tick, so the autonomous work behind it in THIS batch must fit in what the share has
+        // left after it, or a bypass run near the cap would let a second, ungated crossing through.
+        if (pid !== null && shareCap !== null) {
+          projectedWeeklyPct += await this.projectWeeklyBurn(
+            pid,
+            job.type as JobType,
+            shareCostByType,
+          );
+          admitted += 1;
+        }
+        takeSlot(job);
         continue;
       }
       const hold = () =>
@@ -1091,9 +1104,8 @@ export class JobRunner {
       // The coarse admission covers the FIRST job: the gate admits while spend is still BELOW the
       // cap, so the run that crosses it is one the operator's ceiling allows, and withholding it
       // would leave a share smaller than one job's burn unspendable until the reset (idle-fill,
-      // anton-ld7j). Every job BEHIND it must fit in what the share has left after the ones ahead,
-      // charged at this project's own measured rate.
-      const shareCap = policy.projectWeeklyCapPct;
+      // anton-ld7j). Every job BEHIND it — including behind a bypass run — must fit in what the
+      // share has left after the ones ahead, charged at this project's own measured rate.
       if (pid !== null && shareCap !== null) {
         const cost = await this.projectWeeklyBurn(pid, job.type as JobType, shareCostByType);
         if (admitted > 0 && projectedWeeklyPct + cost > shareCap) {

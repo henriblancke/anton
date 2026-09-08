@@ -9,7 +9,8 @@
  * schedule — is not startable, whatever its `runAt` says (PR #248 review).
  *
  * The answer is THREE-VALUED, and that is the whole care of this module. `true` = the picker ranks
- * startable work here, or quota-burning work is already startable — running, or queued and due.
+ * startable work here, or quota-burning work is already startable — running, or queued and due —
+ * or the governor is holding work back on this project's own share, which is demand, not idleness.
  * `false` = the picker looked and found nothing, or what it found nothing here can start — its own
  * schedule or the autonomy switch is off. ABSENT = nobody looked — the board-picker pass ships
  * disabled, so a project that never armed it has no observation at all, and reading that silence
@@ -19,11 +20,17 @@
  * repo that wakes up on Friday is back in the denominator the moment work is DUE, rather than
  * waiting for the next scheduled pass to re-rank its board.
  */
-import { and, eq, lte, or } from "drizzle-orm";
+import { and, eq, like, lte, or } from "drizzle-orm";
 
 import { burnsClaudeQuota } from "./burn";
 import { schema } from "./db";
-import { disabledScheduleKeys, scheduleGateKey, type AntonDb, type JobType } from "./jobs/queue";
+import {
+  BUDGET_DEFER_PREFIX,
+  disabledScheduleKeys,
+  scheduleGateKey,
+  type AntonDb,
+  type JobType,
+} from "./jobs/queue";
 
 /** Per-project eligibility; a project absent from the map was never observed, which is not `false`. */
 export type WorkEligibility = ReadonlyMap<string, boolean>;
@@ -49,14 +56,28 @@ export async function observedWorkEligibility(
       })
       .from(schema.jobs)
       // The same definition of "startable" the queue itself leases on (`leaseDue`): running, or
-      // queued AND DUE. A queued row pushed to a future `runAt` — a retry backoff, a usage-limit
-      // reschedule, a budget deferral — cannot start before then, so counting it holds the project
-      // in the denominator while none of its work can spend, blocking the very reallocation that
-      // window exists to allow, and telling the settings panel it has work ready when it has none.
+      // queued AND DUE. A queued row pushed to a future `runAt` by a retry backoff or a usage-limit
+      // reschedule cannot start before then, so counting it holds the project in the denominator
+      // while none of its work can spend, blocking the very reallocation that window exists to
+      // allow, and telling the settings panel it has work ready when it has none.
+      //
+      // A row the GOVERNOR deferred is the one exception (PR #248 review): it is demand the project's
+      // own share turned away, not work that cannot start. Reading it as idle would drop the project
+      // from the divisor the moment it hit its cap, widen every neighbour's share by its cut — and,
+      // since each project's share resolves with itself always in the divisor, widen its own too, so
+      // the next admitting tick resumes the very rows the share just held. Two capped projects would
+      // then take turns handing each other the capacity a third, reserved repo declared. The
+      // governor marks its deferrals (`deferQueuedJobs`), so they are told apart by that marker.
       .where(
         or(
           eq(schema.jobs.status, "running"),
-          and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, new Date(now))),
+          and(
+            eq(schema.jobs.status, "queued"),
+            or(
+              lte(schema.jobs.runAt, new Date(now)),
+              like(schema.jobs.lastError, `${BUDGET_DEFER_PREFIX}%`),
+            ),
+          ),
         ),
       ),
     autonomyOffProjects(db),
