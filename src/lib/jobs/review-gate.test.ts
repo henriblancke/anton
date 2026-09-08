@@ -222,6 +222,7 @@ function gate(
   worktree = fakeWorktree(),
   assertLeaseHeld?: () => void,
   carried?: ReviewFinding[],
+  hashTree?: (worktreePath: string) => Promise<string>,
 ): {
   result: Promise<ReviewGateResult>;
   calls: RunClaudeOptions[];
@@ -266,6 +267,7 @@ function gate(
       },
       readState: worktree.readState,
       restoreState: worktree.restoreState,
+      ...(hashTree ? { hashTree } : {}),
     },
   });
   return { result, calls, commitMessages, restores: worktree.restores, diffStates, rounds };
@@ -1233,5 +1235,68 @@ describe("verify-gate evidence", () => {
     };
     const { result } = gate([report(9, [])], { testCommand: `touch ${sentinel}` }, [], dirty);
     await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+  });
+});
+
+/**
+ * The fix session's evidence is only good for the tree it describes (PR #254 review). `commitAll`
+ * runs the project's hooks, and a lint-staged that rewrites files leaves HEAD holding content the
+ * gates never saw — this repo's own pre-commit hook does exactly that.
+ */
+describe("verify-gate evidence across a commit hook", () => {
+  it("drops the fix session's evidence when a hook rewrote the tree, so the next round re-runs", async () => {
+    const counter = join(dir, "hooked-gate-runs");
+    let hashes = 0;
+    const { result } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { testCommand: `echo ran >> ${counter}` },
+      [true],
+      fakeWorktree(),
+      undefined,
+      undefined,
+      // Every call differs: the tree the gates tested is never the tree that got committed.
+      async () => `tree${++hashes}`,
+    );
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    // Round 1's review, the fix session's own gates, and round 2 re-running them: three, not two.
+    expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(3);
+  });
+
+  it("never rolls back a committed fix because the tree hash could not be taken", async () => {
+    // The hash only decides whether the evidence is reusable. A git that cannot answer must not put
+    // a verified, committed fix behind the failure path's `discardSessionWrites`.
+    const counter = join(dir, "unhashable-gate-runs");
+    const worktree = fakeWorktree();
+    const { result, commitMessages } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { testCommand: `echo ran >> ${counter}` },
+      [true],
+      worktree,
+      undefined,
+      undefined,
+      async () => {
+        throw new Error("git write-tree failed");
+      },
+    );
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    expect(commitMessages).toHaveLength(1); // the fix committed, and was kept
+    expect(worktree.restores).toEqual([]); // nothing was discarded
+    // Unproven evidence is not reused, so round 2 runs the gates itself.
+    expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(3);
+  });
+
+  it("keeps the evidence when the commit left the tree the gates tested", async () => {
+    const counter = join(dir, "unhooked-gate-runs");
+    const { result } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { testCommand: `echo ran >> ${counter}` },
+      [true],
+      fakeWorktree(),
+      undefined,
+      undefined,
+      async () => "same-tree",
+    );
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(2);
   });
 });

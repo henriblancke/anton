@@ -95,6 +95,21 @@ describe("captureVerifyGates", () => {
     expect(() => readFileSync(marker)).toThrow();
   });
 
+  it("runs EVERY gate under stopOnFail:false, so a red one cannot hide the rest", async () => {
+    // Evidence, not enforcement: a caller that stops at a red `tests` learns nothing about lint.
+    const gates: VerifyGate[] = [
+      { label: "tests", command: "exit 3" },
+      { label: "lint", command: "echo lint-ran" },
+      { label: "typecheck", command: "exit 2" },
+    ];
+    const out = await captureVerifyGates(gates, dir, undefined, logPath, { stopOnFail: false });
+    expect(out.map((o) => [o.label, o.ok])).toEqual([
+      ["tests", false],
+      ["lint", true],
+      ["typecheck", false],
+    ]);
+  });
+
   it("returns nothing for a project that pins no gates, without taking the lock", async () => {
     await expect(captureVerifyGates([], dir, undefined, logPath)).resolves.toEqual([]);
   });

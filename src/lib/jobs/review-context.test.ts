@@ -93,6 +93,20 @@ describe("reviewContext verify-gate evidence", () => {
     expect(out).toContain("[earlier output omitted]");
   });
 
+  it("keeps the cap when the tail holds no line boundary, marking the mid-line cut", () => {
+    // One long line — no newline to cut on. The budget wins; the marker says the text was cut.
+    const output = "x".repeat(9000);
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff,
+      verified: [{ label: "tests", command: "vitest run", ok: false, code: 1, output }],
+    });
+    expect(out).toContain("[earlier output omitted]");
+    // The whole 9000-char line was NOT kept: the section stays inside the per-gate budget.
+    expect(out).not.toContain("x".repeat(4000));
+  });
+
   it("still asks the reviewer to run the checks when the project pins no gates", () => {
     const out = reviewContext({ target: epic, tickets: [ticket], diff });
     expect(out).not.toContain("The checks anton already ran");

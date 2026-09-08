@@ -228,8 +228,14 @@ export interface VerifyGateOutcome extends VerifyGate {
 }
 
 /**
- * Run the operator's verify gates in order (anton-3oh8) and REPORT what each did, stopping at the
- * first non-zero exit. The reporting half of {@link runVerifyGates}, which is the throwing half.
+ * Run the operator's verify gates in order (anton-3oh8) and REPORT what each did. The reporting
+ * half of {@link runVerifyGates}, which is the throwing half.
+ *
+ * `stopOnFail` (the default) stops at the first red, where the throwing half stops: for ENFORCEMENT
+ * the first failure is the whole answer and the gates after it would judge a tree already known to
+ * be broken. Pass `false` when the outcomes are EVIDENCE someone will reason from (PR #254 review):
+ * a caller that stops early knows only that one gate failed, while a reader told "the checks were
+ * run for you" would take the silence of lint, typecheck and build for their success.
  *
  * The whole sequence runs under a host-wide lock (anton-0oi): concurrent runs each starting a full
  * suite starve each other into timeout failures that belong to neither change. The lock is advisory
@@ -247,8 +253,10 @@ export async function captureVerifyGates(
   cwd: string,
   signal: AbortSignal | undefined,
   logPath: string,
+  options: { stopOnFail?: boolean } = {},
 ): Promise<VerifyGateOutcome[]> {
   if (gates.length === 0) return []; // no gates: never take the lock
+  const stopOnFail = options.stopOnFail ?? true;
 
   const outcomes: VerifyGateOutcome[] = [];
   await withHostLock(
@@ -258,9 +266,7 @@ export async function captureVerifyGates(
         const res = await runShell(gate.command, cwd, signal);
         await appendSessionLog(logPath, `\n[${gate.label}] ${gate.command}\n${res.output}\n`);
         outcomes.push({ ...gate, ok: res.ok, code: res.code, output: res.output });
-        // Stop at the first red, exactly where the throwing half stops: the gates after it would be
-        // judging a tree already known to be broken, on the machine's slowest resource.
-        if (!res.ok) return;
+        if (!res.ok && stopOnFail) return;
       }
     },
     {

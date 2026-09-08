@@ -1017,6 +1017,12 @@ function truncate(text: string, max: number): string {
  * A test runner prints its failures and its totals last and its progress dots first, so keeping the
  * head of a suite log keeps the part that says nothing. Cutting mid-line would leave a half-written
  * path that reads as a real one, so the cut moves forward to the next newline.
+ *
+ * Unless there ISN'T one (PR #254 review): a tail that holds no newline is a single long line — one
+ * JSON blob, one minified stack — and the only ways to end it on a boundary are to keep the whole
+ * line, which breaks the budget this function exists to enforce, or to drop it entirely, which
+ * throws away the only output there is. So the cap wins and the cut lands mid-line; the
+ * `… [earlier output omitted]` marker already tells the reader the text is truncated.
  */
 function tailLines(text: string, max: number): string {
   const trimmed = text.trim();

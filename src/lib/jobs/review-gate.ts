@@ -22,6 +22,7 @@ import {
   resolveMergeBase,
   restoreWorktreeState,
   sameWorktreeState,
+  stageAllAndHashTree,
   type BranchDiff,
   type WorktreeState,
 } from "../git/ops";
@@ -119,6 +120,8 @@ export interface ReviewGateDeps {
   readState?: (worktreePath: string) => Promise<WorktreeState>;
   /** Undo whatever a review wrote, back to the fingerprint taken before it ran. */
   restoreState?: (worktreePath: string, state: WorktreeState) => Promise<void>;
+  /** Hash the tree a commit would write — the fix session's proof across its own commit hooks. */
+  hashTree?: (worktreePath: string) => Promise<string>;
 }
 
 /** The slice of the runner's JobContext the gate needs — narrow, so tests can fake it in two lines. */
@@ -263,6 +266,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const commit = args.deps?.commit ?? commitAll;
   const readState = args.deps?.readState ?? readWorktreeState;
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
+  const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
 
   // Pin the fork point once, for every round: `baseBranch` is a MOVABLE ref (`origin/<base>`), and a
   // sibling run's fetch or a resumed worktree can advance it while this gate runs. Re-resolving it
@@ -373,6 +377,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       commit,
       readState,
       restoreState,
+      hashTree,
     });
     entry.fixSessionId = fix.sessionId;
     entry.fixCommitted = fix.committed;
@@ -477,8 +482,15 @@ async function runReviewSession(args: {
     // evidence. A reviewer left to run the suite itself takes no lock, so it competes with every
     // run anton is serializing — and the loser backgrounds the suite and ends its turn waiting for
     // a notification a headless session cannot receive, which parks a finished run.
+    // `stopOnFail: false` because these outcomes are EVIDENCE, not enforcement (PR #254 review):
+    // the section below tells the reviewer the project's checks were run for it, and stopping at a
+    // red `tests` would make that a lie about the lint, typecheck and build that never ran — with
+    // the reviewer explicitly permitted to judge a red gate pre-existing and pass.
     const verified =
-      args.verified ?? (await captureVerifyGates(resolveVerifyGates(settings), worktreePath, ctx.signal, logPath));
+      args.verified ??
+      (await captureVerifyGates(resolveVerifyGates(settings), worktreePath, ctx.signal, logPath, {
+        stopOnFail: false,
+      }));
     // Re-fingerprint AFTER them. A suite writes caches and coverage; that is anton's own residue,
     // and attributing it to the reviewer would revert the report as a worktree-modified violation.
     const before = args.verified ? settled : await args.readState(worktreePath);
@@ -731,6 +743,29 @@ async function discardSessionWrites(args: {
 }
 
 /**
+ * The tree a commit would write from this worktree, or `undefined` when git could not say.
+ *
+ * The hash decides ONLY whether the fix session's gate outcomes still describe the committed tree,
+ * so failing to take it must never fail a session that has already verified and committed its work.
+ * An unreadable hash degrades to "unproven", and the next review round runs the gates itself.
+ */
+async function hashTreeOrUnknown(
+  hashTree: (worktreePath: string) => Promise<string>,
+  worktreePath: string,
+): Promise<string | undefined> {
+  try {
+    return await hashTree(worktreePath);
+  } catch {
+    return undefined;
+  }
+}
+
+/** A tree hash for the log line, naming the unreadable case rather than printing `undefined`. */
+function describeTree(tree: string | undefined): string {
+  return tree ? tree.slice(0, 12) : "unreadable";
+}
+
+/**
  * One fix: a fresh claude session over the round's blocking findings, the operator's verify gates,
  * then a commit onto the run's branch. Advisory findings are deliberately NOT dispatched — they are
  * surfaced to the founder, and letting the fixer roam past the blocking list widens the diff with
@@ -767,7 +802,9 @@ async function runGateFixSession(args: {
   commit: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
-}): Promise<{ sessionId: string; committed: boolean; verified: VerifyGateOutcome[] }> {
+  /** Hash the tree a commit would write — how the gate proves the committed tree is the tested one. */
+  hashTree: (worktreePath: string) => Promise<string>;
+}): Promise<{ sessionId: string; committed: boolean; verified?: VerifyGateOutcome[] }> {
   const { db, clock, ctx, projectId, runId, target, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
 
@@ -839,8 +876,21 @@ async function runGateFixSession(args: {
         );
       }
 
+      // The gates ran on the tree as it stands; `commitAll` then runs the PROJECT'S HOOKS, and a
+      // lint-staged that rewrites files leaves HEAD holding content those gates never saw —
+      // git/ops.ts documents exactly this hazard, and this repo's own pre-commit hook does it.
+      // Hashing either side of the commit is how the evidence proves it describes the committed
+      // tree; when it does not, it is dropped and the next round runs the gates itself.
+      const testedTree = await hashTreeOrUnknown(args.hashTree, worktreePath);
       const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`);
+      // Set the instant the commit lands, BEFORE the second hash: past here the round's work is
+      // verified and committed, and the rollback below must not touch it however this session ends.
+      // Hashing after it would otherwise put a good, gate-passing fix behind `discardSessionWrites`.
       verified = true;
+      const committedTree = await hashTreeOrUnknown(args.hashTree, worktreePath);
+      // Proven only when both hashes were readable AND equal. An unreadable hash is evidence that
+      // cannot be trusted, which is the same answer as evidence that is stale.
+      const treeProven = testedTree !== undefined && testedTree === committedTree;
       // Nothing staged is only "no progress" if HEAD also stood still — otherwise the fixer committed
       // its own work and the branch already carries the repair the next review will read.
       const selfCommitted = !committed && afterFix.head !== before.head;
@@ -852,8 +902,21 @@ async function runGateFixSession(args: {
             ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
             : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
       );
+      if (!treeProven) {
+        await appendSessionLog(
+          logPath,
+          `[review-fix] round ${round}/${maxRounds}: the gates' evidence is not provably the committed ` +
+            `tree (${describeTree(testedTree)} → ${describeTree(committedTree)}) — a commit hook that ` +
+            `rewrites files does exactly this — so the next review runs them itself rather than ` +
+            `trusting evidence for a tree it is not reading\n`,
+        );
+      }
       await endSession(db, clock, sessionId, "done");
-      return { sessionId, committed: committed || selfCommitted, verified: gates };
+      return {
+        sessionId,
+        committed: committed || selfCommitted,
+        ...(treeProven ? { verified: gates } : {}),
+      };
     } catch (e) {
       // Gates run before the commit so a failure leaves the fix uncommitted — unless the fixer
       // committed its own work first, which project instructions routinely tell an agent to do. Then
