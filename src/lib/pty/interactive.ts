@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   claudeRouting,
   routingEnvDelta,
+  type ClaudeRouting,
   type RoutingEnvDelta,
 } from "@/lib/claude/driver-routing";
 import { getDb } from "@/lib/db";
@@ -27,6 +28,14 @@ export interface StartInteractiveInput {
    * client input directly.
    */
   cwd?: string;
+  /**
+   * Routing to pin the pty to, resolved from a LIVE run's captured settings snapshot (anton-7poz).
+   * A headless run pins its routing at run start, so current project settings can drift mid-run; the
+   * investigate flow passes the run's captured routing here so the terminal hits the SAME endpoint as
+   * the headless session it debugs. Server-resolved from the live job handle — never client input.
+   * Absent (generic / `/shape` spawns), the pty routes on the project's CURRENT settings.
+   */
+  routing?: ClaudeRouting;
 }
 
 /**
@@ -69,11 +78,13 @@ export async function startInteractiveSession(
 
   const bin = process.env[CLAUDE_BIN_ENV] ?? "claude";
   try {
-    // Route the terminal exactly like this project's headless runs (anton-7poz): the SAME resolver,
-    // applied OVER anton's env. A session opened to debug a run must hit the run's endpoint — and an
-    // unrouted project's pty must not inherit a stray ambient ANTHROPIC_BASE_URL. Kept inside the
-    // guard so a failed settings read marks the row failed rather than leaving it stuck `running`.
-    const routing = claudeRouting(await getProjectSettings(db, project.id));
+    // Route the terminal exactly like the run it belongs to (anton-7poz). An investigate terminal
+    // carries the live job's OWN captured routing, so it hits the run's endpoint even if project
+    // settings changed since the run began. Absent one (generic / `/shape` spawns), resolve the
+    // project's CURRENT settings through the SAME resolver, applied OVER anton's env — so an unrouted
+    // project's pty never inherits a stray ambient ANTHROPIC_BASE_URL. Kept inside the guard so a
+    // failed settings read marks the row failed rather than leaving it stuck `running`.
+    const routing = input.routing ?? claudeRouting(await getProjectSettings(db, project.id));
     getPtyManager().spawn({
       sessionId,
       file: bin,

@@ -7,6 +7,7 @@
  * ticket stops short is the settlement's (execute-epic-ticket-settle.ts).
  */
 import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
+import { claudeRouting } from "../claude/driver-routing";
 import { formatSatisfiedNote, shortSha } from "../beads/satisfied-note";
 import { readWorktreeState, type WorktreeState } from "../git/ops";
 import { updateRun } from "../runs";
@@ -149,7 +150,7 @@ export async function openTicketSession(
   run: Omit<StepContext, "tickets">,
   ticket: Bead,
 ): Promise<JobSession> {
-  const { db, clock, ctx, projectId, runId, worktreePath } = run;
+  const { db, clock, ctx, projectId, runId, worktreePath, settings } = run;
   const agentTag = labelValueOf(ticket.labels, "agent");
   const session = await startJobSession(db, clock, {
     projectId,
@@ -160,8 +161,10 @@ export async function openTicketSession(
   const { sessionId } = session;
   await updateRun(db, clock, runId, { ticketBeadId: ticket.id, agentTag: agentTag ?? null });
   // Live handle (anton-susu): expose this ticket's session + worktree while it runs; each ticket's
-  // dispatch overwrites the last, so the handle always names the job's CURRENT session.
-  ctx.report({ sessionId, cwd: worktreePath });
+  // dispatch overwrites the last, so the handle always names the job's CURRENT session. The run's
+  // captured routing rides along (anton-7poz) so an investigate terminal opened against this job hits
+  // the SAME endpoint the run drives — from its pinned snapshot, not settings that drifted since.
+  ctx.report({ sessionId, cwd: worktreePath, routing: claudeRouting(settings) });
   return session;
 }
 

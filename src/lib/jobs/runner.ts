@@ -66,6 +66,7 @@ import {
   getProjectBurnAverage,
   sampleJobBurn,
 } from "../burn";
+import type { ClaudeRouting } from "../claude/driver-routing";
 import { getClaudeUsageCached, getClaudeUsageFresh, type ClaudeUsage } from "../claude/usage";
 import { admitJob, budgetGate, jobValueScore, type BudgetPolicy } from "./budget";
 
@@ -222,6 +223,13 @@ export type LiveRunCheck = (
 export interface LiveJobInfo {
   sessionId?: string;
   cwd?: string;
+  /**
+   * The routing this job's headless spawn is pinned to — its settings snapshot at run start
+   * (anton-7poz). Reported so an investigate terminal can hit the SAME endpoint the live session
+   * does, even after project settings drift mid-run. Absent for jobs that don't report it; the
+   * terminal then falls back to routing on the project's current settings.
+   */
+  routing?: ClaudeRouting;
 }
 
 /** The synchronous live read for an in-flight job: what it reported, plus its type. */

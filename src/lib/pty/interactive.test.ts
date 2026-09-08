@@ -132,4 +132,45 @@ describe("startInteractiveSession routing", () => {
     expect(env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY).toBeUndefined();
     expect(env.TERM).toBe("xterm-256color");
   });
+
+  // An investigate terminal carries the live run's captured routing (anton-7poz): it must hit that
+  // endpoint even if project settings drifted since the run began, so the pinned routing is used
+  // verbatim and the current settings are never consulted.
+  it("honors a captured routing override without reading current settings", async () => {
+    process.env.RUN_GATEWAY_TOKEN = "run-token";
+    // Settings now point elsewhere — the drift the override exists to defeat.
+    getProjectSettings.mockResolvedValue({
+      claudeBaseUrl: "https://drifted.example/v1",
+      claudeAuthTokenEnv: "RUN_GATEWAY_TOKEN",
+    });
+
+    await startInteractiveSession(project, {
+      routing: {
+        routed: true,
+        baseUrl: "https://run.example/v1",
+        authTokenEnv: "RUN_GATEWAY_TOKEN",
+        gatewayModelDiscovery: false,
+      },
+    });
+
+    expect(getProjectSettings).not.toHaveBeenCalled();
+    const env = spawnedEnv();
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://run.example/v1");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("run-token");
+  });
+
+  // A run captured while UNROUTED must keep its terminal off any gateway — including anton's ambient
+  // one — rather than falling through to a routed current-settings read.
+  it("honors a captured unrouted routing, clearing ambient gateway env", async () => {
+    process.env.ANTHROPIC_BASE_URL = "https://ambient.example/v1";
+    getProjectSettings.mockResolvedValue({
+      claudeBaseUrl: "https://drifted.example/v1",
+      claudeAuthTokenEnv: "SOME_TOKEN",
+    });
+
+    await startInteractiveSession(project, { routing: { routed: false } });
+
+    expect(getProjectSettings).not.toHaveBeenCalled();
+    expect(spawnedEnv().ANTHROPIC_BASE_URL).toBeUndefined();
+  });
 });
