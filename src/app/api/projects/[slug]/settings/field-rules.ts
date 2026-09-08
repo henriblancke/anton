@@ -111,8 +111,9 @@ const ENV_VAR_NAME = /^[A-Z_][A-Z0-9_]*$/;
 
 /**
  * The NAME of an environment variable, e.g. `ANTHROPIC_AUTH_TOKEN` — not its value. A pasted token
- * (lowercase, dashes, an `sk-…` prefix) fails the pattern, so a secret can never be stored here by
- * mistake: only the name of the var anton reads it from is kept.
+ * (lowercase, dashes, an `sk-…` prefix) fails the pattern, and an all-uppercase credential that
+ * slips past it (`AKIA…`) is caught by the credential detector, so a secret can never be stored
+ * here by mistake: only the name of the var anton reads it from is kept.
  */
 export function envVarName(max: number): FieldParser<string> {
   return (raw, key) => {
@@ -123,6 +124,15 @@ export function envVarName(max: number): FieldParser<string> {
       return reject(
         `${key} must be an environment variable NAME like ANTHROPIC_AUTH_TOKEN ` +
           `([A-Z_][A-Z0-9_]*), not a token value`,
+      );
+    }
+    // An all-uppercase credential (`AKIA…`, `SK_LIVE…`) satisfies the identifier pattern, so the
+    // shape check alone would let a pasted secret land in settings_json — the one thing this field
+    // exists to prevent. Reject anything the credential detector recognises outright.
+    if (hasCredentialMarker(raw)) {
+      return reject(
+        `${key} looks like a credential value, not an environment variable name — ` +
+          `paste the NAME of the env var anton reads the token from, not the token itself`,
       );
     }
     return accept(raw);

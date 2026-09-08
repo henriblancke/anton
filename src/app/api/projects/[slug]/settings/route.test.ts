@@ -431,7 +431,16 @@ describe("settings route — Claude gateway routing (anton-n16m)", () => {
   });
 
   it("PATCH rejects a token VALUE in the env-var-name field — a secret must not be stored", async () => {
-    for (const bad of ["sk-ant-abc123", "anthropic-auth-token", "MY TOKEN", "1TOKEN", 42]) {
+    // "AKIAIOSFODNN7EXAMPLE" is all-uppercase, so it satisfies the identifier pattern; the
+    // credential detector still rejects it, keeping a pasted AWS key out of settings_json.
+    for (const bad of [
+      "sk-ant-abc123",
+      "anthropic-auth-token",
+      "MY TOKEN",
+      "1TOKEN",
+      "AKIAIOSFODNN7EXAMPLE",
+      42,
+    ]) {
       const res = await PATCH(patchReq({ claudeAuthTokenEnv: bad }), ctx("tmp"));
       expect(res.status).toBe(400);
       expect((await res.json()).error).toMatch(/claudeAuthTokenEnv/);
