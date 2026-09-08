@@ -9,7 +9,6 @@
  */
 import { beads, type Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
-import { withBeadWriteLock } from "../beads/claim-lock";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
 import {
@@ -18,7 +17,6 @@ import {
   worktreeHasPreservedCommitFor,
 } from "../git/ops";
 import type { Worktree } from "../git/worktree";
-import { findRunFormulaForBranch, updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
 import {
   blockedRunPoison,
@@ -39,10 +37,15 @@ import {
 import { adoptRefreshedTarget, preflightHumanTickets } from "./execute-epic-human-gate";
 import { refreshRunBoard, settleCompletedRun } from "./execute-epic-recover";
 import type { EpicRun } from "./execute-epic-run";
-import { assertRunFormulaFloor } from "./formula-floor";
-import { validateRunFormula, type ResolvedStep } from "./run-formula";
-import { splitFormulaPhases } from "./execute-epic-formula";
-import type { StepContext } from "./step-registry";
+// The formula/step family and the run-lease sit behind ONE seam (anton-8x1k) — the run-shape
+// helpers this module merely threads through or re-exports, kept out of its top-level import graph
+// so the checkout-staleness preflight (anton-vzhf) can join them there rather than fan out here.
+import {
+  resolveRunPipeline,
+  takeRunLease,
+  type ResolvedStep,
+  type StepContext,
+} from "./execute-epic-run-shape";
 
 
 /**
@@ -89,7 +92,7 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   assertBeadContract(run, gates);
   await assertTicketsClaimable(run, gates);
   const { ticketSteps, runSteps } = await resolveRunPipeline(run);
-  await takeRunLease(run, preCheckTrusted, gates);
+  gates.children = await takeRunLease(run, preCheckTrusted, gates.children, confirmSelectionUnderLease);
   // Re-asked after EVERY board this run adopts past the read-only gates (PR #227 review). Step 1c
   // swaps in the children the lease confirmed, and the arm below swaps in the ones ITS own refresh
   // brought back — so a person blocking or deferring a child inside either window arrives unjudged,
@@ -443,174 +446,80 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
   throw humanHeldPoison(epicBeadId, held, run.branch, await commitsHere(run, held));
 }
 
-/** Step 0d. Cook, floor-check and pin the pipeline this run walks, then split it into its phases. */
-async function resolveRunPipeline(
-  run: EpicRun,
-): Promise<{ ticketSteps: ResolvedStep[]; runSteps: ResolvedStep[] }> {
-  const { db, clock, projectId, repo, runId, branch, targetId: epicBeadId, settings, existing, target } = run;
-  // 0d. Validate the project's run pipeline (anton-hrql). The formula is what a run walks, so a
-  //     broken one must fail at the START of a run rather than halfway through: cook it and
-  //     resolve every step's handler here — before the lease is published and before any worktree
-  //     exists — so an unparseable file, a key bd would silently drop, or a `step:` label that
-  //     maps to no handler parks with the file path and the offending step instead of stranding a
-  //     half-executed run. PARK, like the gates above: the operator fixes the file (or deletes it
-  //     to fall back to anton's default) and resumes. Cheap and read-only — the project copy when
-  //     it has one, else anton's bundled default.
-  //     Then hold the cooked pipeline to anton's invariant floor (anton-6b99): the project owns
-  //     the steps, anton owns the guarantees, so a formula may ADD steps freely but may not omit
-  //     implement/commit/pr or order them so the run's work is thrown away (a PR opened before
-  //     the commit, an agent dispatched after it). Same park, same place — before the worktree.
-  //     WHICH pipeline is a per-label choice (anton-aa3m): the project may map a bead label to a
-  //     formula of its own, so this run walks the first mapped label the TARGET carries (one run
-  //     is one worktree and one PR, so it walks one pipeline), else the project's default. The
-  //     floor is applied to whatever came back — selection only changes which file is loaded —
-  //     so a variant cannot escape it. The choice is then recorded ON THE RUN below rather than
-  //     left to be inferred from settings and labels that may since have changed.
-  //     Selection happens ONCE PER BRANCH, not once per attempt: an attempt that already
-  //     recorded a pipeline pins it, and this one re-validates that source instead of selecting
-  //     again. Every attempt re-reads the board and the settings, so re-selecting would let a
-  //     label added since (`stage:implementing` — which this very job adds below — or an
-  //     operator's relabel) or an edited variant map switch pipelines after some tickets had
-  //     already committed, while the record below claimed the whole run used the new one. The
-  //     pin is not limited to the open run row: an ordinary handler error settles the row
-  //     `failed`, so the runner's retry lands here with `existing` undefined while still reusing
-  //     that attempt's worktree and its committed tickets — hence the branch-scoped lookup
-  //     (findRunFormulaForBranch), which is the same continuity the retry itself resumes by.
-  //     `{{var}}` values make this a RUNTIME cook: the pipeline is resolved with the run's own
-  //     target, and bd's "every declared variable needs a value" check fires here rather than a
-  //     formula anton cannot satisfy walking with literal placeholders in it.
-  const pinnedFormula = existing?.formula
-    ? { source: existing.formula, variant: existing.formulaVariant ?? undefined }
-    : await findRunFormulaForBranch(db, projectId, epicBeadId, branch);
-  const formula = await validateRunFormula(repo, {
-    labels: target.labels,
-    variants: settings.formulaVariants,
-    pinned: pinnedFormula,
-    vars: { target: epicBeadId },
-  });
-  assertRunFormulaFloor(formula);
-  // `recorded`, not `source`: anton's bundled default is stored as a sentinel rather than an
-  // install-absolute path, so a run in flight across an upgrade that moved the install root
-  // re-reads the pipeline it pinned instead of parking on a path that only changed.
-  await updateRun(db, clock, runId, {
-    formula: formula.recorded,
-    formulaVariant: formula.variant ?? null,
-  });
-  // The pipeline this run walks (anton-lnkt), split at the commit into its two phases. Steps run
-  // ONE AT A TIME — they share one worktree and one PR, so a formula whose steps could run
-  // concurrently is not a licence to fan out.
-  const { ticketSteps, runSteps } = splitFormulaPhases(formula);
-  return { ticketSteps, runSteps };
+/**
+ * 1c. The retry/steal decision {@link takeRunLease} runs UNDER the lease's write lock: re-read the
+ * board that can now SEE this run, and decide whether the selection stands, must retry, or must
+ * park (anton-e42l). A board gate like the ones above it — injected into the lease seam so the seam
+ * keeps only the lease mechanism (anton-8x1k) — and it re-derives the confirmed children the caller
+ * re-gates on.
+ *
+ * Steps 0a-ter/0b/0c chose and gated the tickets from a read taken BEFORE the lease was published,
+ * and until it landed the target carried neither a lease nor a claim — so for that whole window it
+ * reads as free work to anyone else. An approved gardener re-parent is the case that matters: its
+ * home check (gardener/apply.ts `homeUnusable`) asks exactly "is a run holding this card", sees
+ * nothing, and attaches a ticket this run has already finished selecting. That newcomer is never
+ * dispatched, and merge finalization closes it unrun along with the rest of the target's subtree.
+ * The lock (held by the caller) is what makes this read a serialization point rather than just a
+ * later read; cross-machine the lock buys nothing and the lease is the only guard there.
+ *
+ * Status-blind by construction: `runTickets` filters on shape, not state, so a ticket another
+ * machine closed mid-window is still in both sets and doesn't trip the drift check.
+ */
+async function confirmSelectionUnderLease(run: EpicRun, freshChildren: Bead[]): Promise<Bead[]> {
+  const { targetId: epicBeadId } = run;
+  const confirmedBoard = await reReadConfirmedBoard(run);
+  // The target's OWN run shape is re-confirmed here, not just its subtree: a parentless task/bug
+  // re-parented under another card in this same window keeps an EMPTY ticket set on both sides of
+  // the drift check below, so nothing would fire while the bead has become a ticket in someone
+  // else's run — executed here as well as there. PARK rather than retry, like 0a-ter: a target that
+  // stopped being one doesn't become one again by trying, and the message names what took it.
+  const targetDrift = runTargetDrift(epicBeadId, confirmedBoard);
+  if (targetDrift) {
+    throw new PoisonEpic(
+      `${epicBeadId} stopped being a run target while this run was starting (${targetDrift}) ` +
+        `— refusing to execute work another target now owns`,
+    );
+  }
+  const confirmedChildren = runTickets(confirmedBoard, epicBeadId);
+  const drift = ticketSetDrift(freshChildren, confirmedChildren);
+  if (drift) {
+    throw new Error(
+      `${epicBeadId}'s ticket set changed while this run was starting (${drift}) — retrying so ` +
+        `the run gates and executes the whole set rather than dropping work moved under it ` +
+        `before its run-lease was visible`,
+    );
+  }
+  // And the target's LABEL, on the freshest board this run ever reads (PR #213 review).
+  // `agent:human` is asked in exactly two places — the top-of-handler backstop and this adopt — so a
+  // relabel that lands in the lease window is refused here or nowhere. Adopted, not merely checked:
+  // the two drift gates just proved this board describes the same run, so its bead is the one every
+  // later label read should be answering. The CHILDREN are adopted for the same reason — a child
+  // RELABELLED `agent:human` inside the lease window passes the id-only drift gate untouched, and a
+  // grouped run carrying its pre-lease objects forward would hand human work to the default agent. A
+  // standalone run's ticket IS its target, so the two never diverge.
+  const confirmedTarget = confirmedBoard.find((b) => b.id === epicBeadId);
+  if (confirmedTarget) {
+    run.target = adoptRefreshedTarget(confirmedBoard, epicBeadId, confirmedTarget);
+    run.tickets = run.standaloneRun ? [run.target] : confirmedChildren;
+  }
+  return confirmedChildren;
 }
 
-/** Steps 1 → 1c. Take the lease, then re-confirm the selection against a board that can SEE it. */
-async function takeRunLease(
-  run: EpicRun,
-  preCheckTrusted: boolean,
-  gates: RunGates,
-): Promise<void> {
-  const { repo, targetId: epicBeadId, lease } = run;
-  let freshChildren = gates.children;
-  // 1. Publish the cross-machine run-liveness lease BEFORE any slow setup — worktree creation,
-  //    operator resolution, the epic claim — and keep it fresh while this run executes
-  //    (anton-jz1). Acquiring it up front closes the window where another machine's Force run
-  //    (whose local jobs table is empty) sees no lease during our setup and starts a second
-  //    concurrent run; the fresh foreign-lease gate above already ruled out an existing one. The
-  //    initial publish fails closed (`lease.claim` throws if the label can't be written OR
-  //    pushed to the shared remote) — a run whose lease no other machine can see must not
-  //    proceed. `claim` also settles the post-publish race (step 1b) before it returns, so
-  //    reaching the confirmation below means this run is the only one holding the target.
-  //    `preCheckTrusted` is what forbids arbitrating by owner order after a stale pre-check.
-  // Steps 1 → 1c run under the TARGET's own bead write lock (anton-e42l). The lease and the
-  // confirmation read below are what stop an approved gardener re-parent attaching a ticket to a
-  // set this run has already selected — but a read alone serializes nothing: the gardener writes
-  // under `withBeadWriteLock` (gardener/apply.ts `applyStep` locks the subject AND the home), and
-  // it yields between passing `homeUnusable` and running the write. Outside that lock, this
-  // confirmation could land in exactly that gap, see the old ticket set, and let the run proceed
-  // while the delayed re-parent hangs a ticket nothing will dispatch — later closed unrun with
-  // the target. Holding the home's lock across the publish and the confirmation makes the two
-  // orders real: either the re-parent completes first and this read sees the drift (retry), or it
-  // queues behind this block and its own locked re-read finds the live lease (refuse). Released
-  // before the claim in step 3, which takes this same lock (beads/claim.ts) — nothing inside here
-  // may take it, on pain of deadlock.
-  await withBeadWriteLock(repo, epicBeadId, async () => {
-    await lease.claim(preCheckTrusted);
-
-    // 1c. Re-confirm the ticket selection against a board that can SEE this run (anton-e42l).
-    //     Steps 0a-ter/0b/0c chose and gated the tickets from a read taken BEFORE the publish
-    //     above, and until that lease landed the target carried neither a lease nor a claim — so
-    //     for that whole window it reads as free work to anyone else. An approved gardener
-    //     re-parent is the case that matters: its home check (gardener/apply.ts `homeUnusable`)
-    //     asks exactly "is a run holding this card", sees nothing, and attaches a ticket this run
-    //     has already finished selecting. That newcomer is never dispatched, and merge
-    //     finalization closes it unrun along with the rest of the target's subtree.
-    //     The lease is now published, pushed and arbitrated, and this read runs under the
-    //     target's write lock (see the wrapper above) — which is what makes it a serialization
-    //     point rather than just a later read: a move that landed before it is IN this board, and
-    //     one that has not written yet cannot write until the lock is released, by which time its
-    //     own locked re-read sees the live lease and refuses. Cross-machine the lock buys
-    //     nothing, and the lease is still the only guard there. A set that differs means our
-    //     selection is the stale half of
-    //     that race — retry (a plain Error, not a park) so the next attempt re-gates and runs the
-    //     whole set rather than silently dropping the newcomer. Converges: the retry re-reads the
-    //     board from the top and selects the set this read just saw.
-    //     Fails closed on an unreadable board, like the arbitration reads above — we cannot prove
-    //     the set is stable — and costs nothing, since no worktree exists yet.
-    //     Status-blind by construction: `runTickets` filters on shape, not state, so a ticket
-    //     another machine closed mid-window is still in both sets and doesn't trip this.
-    let confirmedBoard: Bead[];
-    try {
-      confirmedBoard = await loadAllIssues(repo, { strictGates: true });
-    } catch (e) {
-      throw new Error(
-        `${epicBeadId} could not re-read the board after publishing its run-lease to confirm its ` +
-          `ticket set — retrying rather than executing a selection that may already be stale. ` +
-          `(${e instanceof Error ? e.message : String(e)})`,
-      );
-    }
-    //     The target's OWN run shape is re-confirmed here, not just its subtree: a parentless
-    //     task/bug re-parented under another card in this same window keeps an EMPTY ticket set
-    //     on both sides of the drift check below, so nothing would fire while the bead has
-    //     become a ticket in someone else's run — executed here as well as there. PARK rather
-    //     than retry, like 0a-ter: a target that stopped being one doesn't become one again by
-    //     trying, and the message names what took it.
-    const targetDrift = runTargetDrift(epicBeadId, confirmedBoard);
-    if (targetDrift) {
-      throw new PoisonEpic(
-        `${epicBeadId} stopped being a run target while this run was starting (${targetDrift}) ` +
-          `— refusing to execute work another target now owns`,
-      );
-    }
-    const confirmedChildren = runTickets(confirmedBoard, epicBeadId);
-    const drift = ticketSetDrift(freshChildren, confirmedChildren);
-    if (drift) {
-      throw new Error(
-        `${epicBeadId}'s ticket set changed while this run was starting (${drift}) — retrying so ` +
-          `the run gates and executes the whole set rather than dropping work moved under it ` +
-          `before its run-lease was visible`,
-      );
-    }
-    //     And the target's LABEL, on the freshest board this run ever reads (PR #213 review).
-    //     `agent:human` is asked in exactly two places — the top-of-handler backstop and this
-    //     adopt — so a relabel that lands in the lease window is refused here or nowhere.
-    //     Adopted, not merely checked: the two drift gates just proved this board describes the
-    //     same run, so its bead is the one every later label read should be answering.
-    //     Read out of the board rather than off `target`, which widens back to
-    //     `Bead | undefined` inside this closure; the drift gate above already proved it is here.
-    const confirmedTarget = confirmedBoard.find((b) => b.id === epicBeadId);
-    //     The CHILDREN are adopted for the same reason, not just compared (PR #213 review). The
-    //     drift gate above asks about IDs, so a child RELABELLED `agent:human` inside the lease
-    //     window passes it untouched — and a grouped run that carried its pre-lease objects
-    //     forward would classify human work off the superseded labels below and hand the ticket
-    //     to the default agent. The confirmed objects are the ones every later label read
-    //     answers. A standalone run's ticket IS its target, so the two never diverge.
-    freshChildren = confirmedChildren;
-    if (confirmedTarget) {
-      run.target = adoptRefreshedTarget(confirmedBoard, epicBeadId, confirmedTarget);
-      run.tickets = run.standaloneRun ? [run.target] : freshChildren;
-    }
-  });
-  gates.children = freshChildren;
+/**
+ * The confirmation's one read. Fails closed, like the arbitration reads it follows — a run that
+ * cannot prove its selection is stable must not proceed — and costs nothing, since no worktree
+ * exists yet.
+ */
+async function reReadConfirmedBoard(run: EpicRun): Promise<Bead[]> {
+  try {
+    return await loadAllIssues(run.repo, { strictGates: true });
+  } catch (e) {
+    throw new Error(
+      `${run.targetId} could not re-read the board after publishing its run-lease to confirm its ` +
+        `ticket set — retrying rather than executing a selection that may already be stale. ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
 }
 
 /** Step 0b-pre. Turn every ticket only a person can do into a gate at its own boundary. */
