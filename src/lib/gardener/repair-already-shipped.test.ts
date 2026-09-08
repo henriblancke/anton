@@ -1885,6 +1885,49 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(tagMock).not.toHaveBeenCalled();
   });
 
+  // isOpenWork passes every non-closed, non-abandoned status, and a reclaim/park touches no field
+  // the contract or home fences read — so the lifecycle and claim are compared to the check's own
+  // read (PR #238 review). The supersede would otherwise close work the board just took back.
+  it("refuses when an operator returned the ticket to open in the window", async () => {
+    boardShow.mockImplementation(async (_cwd, id) =>
+      id === TARGET ? bead(TARGET, { status: "open" }) : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire();
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("its lifecycle moved while anton ran");
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(tagMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses when an operator parked the ticket (blocked/deferred) in the window", async () => {
+    boardShow.mockImplementation(async (_cwd, id) =>
+      id === TARGET ? bead(TARGET, { status: "blocked" }) : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire();
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("reclaimed or parked this ticket");
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the ticket's assignee changed in the window", async () => {
+    boardShow.mockImplementation(async (_cwd, id) =>
+      id === TARGET
+        ? bead(TARGET, { status: "in_progress", assignee: "other-box" })
+        : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire({ bead: bead(TARGET, { status: "in_progress", assignee: "anton-box" }) });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("its claim changed while anton ran");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("claimed by `other-box`");
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
   // A survivor verified through a commit NAMING it is re-verified against the base's history at the
   // write (PR #238 review). The base is a movable ref: another run force-fetching `origin/main`
   // while this repair waits on its locks can drop the naming commit from it, and "still closed"

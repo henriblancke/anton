@@ -34,7 +34,7 @@
  * {@link AlreadyShippedOutcome} is the repair, and it re-enters the check rather than reimplementing
  * any part of it.
  */
-import { beads, LABELS, type Bead } from "../beads/bd";
+import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { humanNotesPromptBlock } from "../beads/notes";
@@ -1342,6 +1342,11 @@ export async function repairAlreadyShipped(args: {
  * about this ticket's contract, and a ticket rewritten in the window is open exactly as before. So
  * is a ticket RE-HOMED in the window ({@link targetRehomed}): moved under another feature, it is
  * open with its contract intact, and the supersede would close it inside a run this one does not own.
+ * And its LIFECYCLE and CLAIM are held to what they were ({@link lifecycleDrifted}): an operator
+ * returning it to `open`, blocking it, or reassigning it is open work with an untouched contract,
+ * so status and parentage both pass it — but the board has reclaimed or parked the ticket. Unlike
+ * the others this one has no post-write twin: the supersede overwrites `status`, so the fresh read
+ * after the write cannot tell a reclaim apart from anton's own close.
  *
  * This is the PRE-write fence, ordered against this process's writers by the locks; its post-write
  * twin, {@link retirementHeld}, asks the same questions after the supersede has landed, which is the
@@ -1351,7 +1356,7 @@ async function retirementMoved(args: RetirementFence & {
   /** The whole board, re-read inside the locks. */
   locked: BoardIndex;
 }): Promise<string | undefined> {
-  const { repoPath, targetId } = args;
+  const { repoPath, targetId, contract } = args;
   const target = await readBead(repoPath, targetId, "before");
   if (typeof target === "string") return target;
   if (!isOpenWork(target)) {
@@ -1360,6 +1365,8 @@ async function retirementMoved(args: RetirementFence & {
       `outcome, and anton does not rewrite that`
     );
   }
+  const reclaimed = lifecycleDrifted(contract, target);
+  if (reclaimed) return reclaimed;
   return retirementDrifted({ ...args, target, when: "before" });
 }
 
@@ -1762,6 +1769,38 @@ function humanNotesOf(bead: Bead): string {
  * Both sides are `bd show` reads, on purpose: the fence compares like with like, and a board row
  * that dropped `description` would otherwise read every real description as a rewrite.
  */
+/**
+ * Why the ticket's lifecycle or claim no longer reads as it did at the check — or undefined while
+ * both still do (PR #238 review).
+ *
+ * {@link isOpenWork} passes every non-closed, non-abandoned status, so a ticket an operator returns
+ * to `open`, blocks, or defers in the window reads as open work exactly as before, and reassigning
+ * it touches no field {@link contractRewritten} or {@link targetRehomed} compares. Either is a
+ * globally visible board action reclaiming or parking the ticket while this run held it, and the
+ * supersede would close work that was just taken back or set aside. Only the PRE-write reread can
+ * catch it: the supersede overwrites `status` to closed, so the post-write read cannot reconstruct
+ * what it was — this fence lives before the write, ordered against the operator's own by the locks.
+ */
+function lifecycleDrifted(checked: Bead, now: Bead): string | undefined {
+  if (checked.status !== now.status) {
+    return (
+      `\`${now.id}\` is ${now.status} now, not ${checked.status} as it was at the check — its ` +
+      `lifecycle moved while anton ran, so the board has reclaimed or parked this ticket, and ` +
+      `anton does not close work another board action just took back`
+    );
+  }
+  const was = ownerOf(checked);
+  const is = ownerOf(now);
+  if (was !== is) {
+    return (
+      `\`${now.id}\` is ${is ? `claimed by \`${is}\`` : "unclaimed"} now, not ` +
+      `${was ? `\`${was}\`` : "unclaimed"} as at the check — its claim changed while anton ran, so ` +
+      `the ticket the supersede would close is not the one this run holds`
+    );
+  }
+  return undefined;
+}
+
 function contractRewritten(checked: Bead, now: Bead): string | undefined {
   const text = (v: unknown): string => (typeof v === "string" ? v : "");
   const changed: string[] = CONTRACT_FIELDS.filter((field) => text(checked[field]) !== text(now[field]));
