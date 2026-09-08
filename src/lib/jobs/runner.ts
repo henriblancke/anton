@@ -1220,6 +1220,9 @@ export class JobRunner {
         ? await this.readUsageSafe()
         : null;
 
+    // Whether settling withdrew this attempt from the project's spend meter (`refundSpend`): Claude
+    // was never invoked, so the window measured nothing this job burned — see the burn close below.
+    let spendRefunded = false;
     try {
       const policy = await this.policyFor(job.projectId ?? undefined);
 
@@ -1291,7 +1294,8 @@ export class JobRunner {
         if (timeoutTimer) clearTimeout(timeoutTimer);
       }
 
-      await this.settle(job, outcome, policy, effect);
+      const action = await this.settle(job, outcome, policy, effect);
+      spendRefunded = action?.action === "reschedule" && action.refundSpend;
     } catch (e) {
       // Policy resolution or the settle write itself failed — log and release the slot; the lease
       // expires and the job is reclaimed on a later tick.
@@ -1303,7 +1307,13 @@ export class JobRunner {
       // attempt burned quota) but only when the window stayed solo (no sibling dispatched across
       // it — `dispatchSeq` unchanged), and is fully fail-soft — sampleJobBurn records nothing on a
       // null read or a mid-job meter reset and swallows its own errors.
-      if (burnBefore && this.dispatchSeq === seqAtStart) {
+      //
+      // Never sampled when the attempt's spend was refunded: those outcomes (a lease held elsewhere,
+      // no remote to push to) bail before Claude is invoked, so the delta is whatever ELSE moved the
+      // meter — usually nothing. Recording it would let a few lease-held retries drag the type's
+      // rolling average (and the project's attributed spend) toward zero, repricing every attempt
+      // as free and letting the project run past its quota share.
+      if (burnBefore && this.dispatchSeq === seqAtStart && !spendRefunded) {
         // Stamp the throttle here, not at window open: only a window that actually takes its fresh
         // upstream read spends the interval budget — a contaminated window that bailed doesn't.
         this.lastBurnSampleAt = this.clock.now();
@@ -1354,18 +1364,19 @@ export class JobRunner {
     }
   }
 
+  /** Apply the durability policy to an outcome. Returns the action taken; null when a cancel won. */
   private async settle(
     job: JobRow,
     outcome: Outcome,
     policy: JobPolicy,
     effect?: JobEffect,
-  ): Promise<void> {
+  ): Promise<Action | null> {
     // Re-read attempts (a heartbeat/lease may have advanced updatedAt, not attempts, but be safe).
     const fresh = (await getJob(this.db, job.id)) ?? job;
     // Fast-path a cancel already visible at this read. The queue transition below also compares from
     // `running`, which closes the remaining race where cancel lands after this check but before the
     // settle write.
-    if (fresh.status === "cancelled") return;
+    if (fresh.status === "cancelled") return null;
     // The project's retry budget governs when we park; backoff/quota stay from the runner config.
     const config = { ...this.config, maxAttempts: policy.maxAttempts };
     const action = nextAction(config, fresh, outcome, this.clock.now());
@@ -1384,6 +1395,7 @@ export class JobRunner {
         await park(this.db, this.clock, job.id, action.lastError);
         break;
     }
+    return action;
   }
 
   /** Start the background polling loop (idempotent). */

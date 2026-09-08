@@ -17,9 +17,10 @@
  *   • session-headroom — the 5-hour session is nearly exhausted; a hard floor that outranks the
  *     weekly plan (never burn the last sliver of a session). Defers to the session reset.
  *   • weekly-cap       — weekly usage has hit the cap (the operator's weekly budget). Stop until the
- *     weekly window resets, protecting the reserve (100 − cap) and Claude's own hard limit. Also
- *     covers a governed project that has spent its quota share (R6.1) — same stop, different meter:
- *     the cap reads the shared account meter, the share reads this project's attributed spend.
+ *     weekly window resets, protecting the reserve (100 − cap) and Claude's own hard limit.
+ *   • share-cap        — a governed project has spent its quota share (R6.1). The same stop, on a
+ *     different meter: the cap reads the shared account meter, the share reads this project's own
+ *     attributed spend — so "the fleet is exhausted" and "this project alone is" stay tellable apart.
  *   • weekly-on-track  — inside the throttle band just below the cap AND *ahead* of the even
  *     pace-line: ease off until the line catches up, so the last stretch of budget lasts to reset.
  *   • daytime-reserve  — inside the day window with the session running low: hold the remaining
@@ -32,7 +33,12 @@
 import type { ClaudeUsage } from "../claude/usage";
 
 /** Why work was deferred. The runner/admission-gate surfaces this to the operator. */
-export type DeferReason = "session-headroom" | "weekly-cap" | "weekly-on-track" | "daytime-reserve";
+export type DeferReason =
+  | "session-headroom"
+  | "weekly-cap"
+  | "share-cap"
+  | "weekly-on-track"
+  | "daytime-reserve";
 
 /**
  * Operator-tunable pace policy. Percentages are 0–100 (same scale as {@link ClaudeUsage}). The
@@ -328,7 +334,7 @@ export function budgetGate(
     //     0 and unattributed spend reads as 0 (see withQuotaShare).
     const shareCap = policy.projectWeeklyCapPct;
     if (shareCap !== null && (opts?.projectWeeklyPct ?? 0) >= shareCap) {
-      return { admit: false, retryAt: new Date(weeklyResetMs), reason: "weekly-cap" };
+      return { admit: false, retryAt: new Date(weeklyResetMs), reason: "share-cap" };
     }
     // 2c. Inside the throttle band just below the cap: pace what's left so it lasts to the reset —
     //     defer only when ahead of the even line, retrying when the line catches up. BELOW the band
@@ -384,8 +390,8 @@ export interface BudgetHeadroom {
   sessionReason: Extract<DeferReason, "session-headroom" | "daytime-reserve">;
   /** Weekly%-points still spendable before the weekly hold trips; null with no weekly signal. */
   weeklyPct: number | null;
-  /** Which weekly hold bounds it: the cap, or the pace-line inside the throttle band. */
-  weeklyReason: Extract<DeferReason, "weekly-cap" | "weekly-on-track">;
+  /** Which weekly hold bounds it: the cap, this project's share of it, or the pace-line inside the throttle band. */
+  weeklyReason: Extract<DeferReason, "weekly-cap" | "share-cap" | "weekly-on-track">;
   /**
    * Whether spending exactly {@link weeklyPct} already trips the hold. The cap and the throttle
    * floor bite AT their threshold (`usage >= limit`); the pace-line bites only PAST it
@@ -468,7 +474,7 @@ export function budgetHeadroom(
       const shareRemaining = Math.max(0, shareCap - (opts?.projectWeeklyPct ?? 0));
       if (shareRemaining <= weeklyPct) {
         weeklyPct = shareRemaining;
-        weeklyReason = "weekly-cap";
+        weeklyReason = "share-cap";
         weeklyInclusive = true;
       }
     }

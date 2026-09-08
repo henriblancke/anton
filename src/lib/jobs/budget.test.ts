@@ -610,7 +610,7 @@ describe("withQuotaShare", () => {
 
     const d = budgetGate(usage, shared, NIGHT, spent(40));
     if (d.admit) throw new Error("expected defer");
-    expect(d.reason).toBe("weekly-cap");
+    expect(d.reason).toBe("share-cap");
     expect(d.retryAt.toISOString()).toBe(usage.weeklyResetAt);
   });
 
@@ -667,7 +667,7 @@ describe("withQuotaShare", () => {
     // Once A HAS spent its 70, it stops even though the machine's own target is nowhere near.
     const a = budgetGate(usage, withQuotaShare(POLICY, 70), NIGHT, spent(70));
     if (a.admit) throw new Error("expected defer");
-    expect(a.reason).toBe("weekly-cap");
+    expect(a.reason).toBe("share-cap");
   });
 
   it("still admits below the share ceiling", () => {
@@ -710,12 +710,12 @@ describe("withQuotaShare", () => {
     for (const opts of [spent(null), spent(0), undefined]) {
       const d = budgetGate(usage, parked, NIGHT, opts);
       if (d.admit) throw new Error("expected defer");
-      expect(d.reason).toBe("weekly-cap");
+      expect(d.reason).toBe("share-cap");
     }
     // …and the headroom read agrees with the gate: nothing left, capped, inclusive.
     expect(budgetHeadroom(usage, parked, NIGHT)).toMatchObject({
       weeklyPct: 0,
-      weeklyReason: "weekly-cap",
+      weeklyReason: "share-cap",
       weeklyInclusive: true,
     });
   });
@@ -735,7 +735,7 @@ describe("withQuotaShare", () => {
     // share, 25 of it spent, leaves 15 — and 15 is the tighter of the two.
     expect(budgetHeadroom(usage, withQuotaShare(POLICY, 40), NIGHT, spent(25))).toMatchObject({
       weeklyPct: 15,
-      weeklyReason: "weekly-cap",
+      weeklyReason: "share-cap",
       weeklyInclusive: true,
     });
     // A share with more room left than the machine has does not widen the line.

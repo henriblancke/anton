@@ -9,6 +9,7 @@ import * as schema from "../db/schema";
 import { getBurnAverage } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
 import { DEFAULT_BUDGET_POLICY } from "./budget";
+import { RunAlreadyLiveError } from "./errors";
 import { getJob } from "./queue";
 import type { BudgetPolicyResolver } from "./runner";
 import { usage, useRunnerHarness } from "./runner.fixture";
@@ -117,6 +118,40 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect((await getJob(h.db, id))?.status).toBe("done");
     const rows = await h.db.select().from(schema.burnSamples);
     expect(rows).toHaveLength(0);
+  });
+
+  it("records NO sample for an attempt whose spend was refunded (Claude never invoked)", async () => {
+    // A lease held on another machine bails before Claude runs, and settling refunds the attempt's
+    // spend. Sampling the window anyway would record whatever ELSE moved the meter (here: nothing)
+    // and, over a few retries, reprice the type at zero for the project's quota share.
+    h.seedProjects("P");
+    let freshReads = 0;
+    const r = h.makeRunner({
+      handlers: {
+        "execute-epic": async () => {
+          throw new RunAlreadyLiveError("run live on another machine", "foreign");
+        },
+      },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
+      readUsageFresh: async () => {
+        freshReads++;
+        return usage({ sessionPct: 10, weeklyPct: 5 });
+      },
+    });
+    const id = await r.enqueue({ type: "execute-epic", projectId: "P" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect((await getJob(h.db, id))?.status).toBe("queued");
+    expect(freshReads).toBe(0);
+    expect(await h.db.select().from(schema.burnSamples)).toHaveLength(0);
+    // The skipped window spent no throttle budget either: the next solo job still samples.
+    r.registerHandler("execute-epic", async () => {});
+    await r.enqueue({ type: "execute-epic", projectId: "P" });
+    await r.tickOnce();
+    await r.whenIdle();
+    expect(freshReads).toBe(1);
   });
 
   it("never fails a job when the usage read throws", async () => {

@@ -122,7 +122,7 @@ export function budgetLine(
       headroom.weeklyPct !== null &&
       (headroom.weeklyInclusive ? weekly >= headroom.weeklyPct : weekly > headroom.weeklyPct);
     if (overSession || overWeekly) {
-      // budgetGate's order is session-headroom → weekly-cap → weekly-on-track → daytime-reserve, so
+      // budgetGate's order is session-headroom → weekly-cap → share-cap → weekly-on-track → daytime-reserve, so
       // only the hard floor beats a weekly hold when both are exhausted.
       const sessionFirst = overSession && (!overWeekly || sessionReason === "session-headroom");
       return {

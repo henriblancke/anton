@@ -44,6 +44,10 @@ const REASON_COPY: Record<DeferReason, ReasonCopy> = {
     label: "weekly cap",
     blurb: "this week's budget is spent — these start after the weekly window resets",
   },
+  "share-cap": {
+    label: "quota share",
+    blurb: "this project's share of the weekly budget is spent — these start after the weekly window resets",
+  },
   "weekly-on-track": {
     label: "weekly pacing",
     blurb: "ahead of the weekly pace-line — these start as the line catches up",

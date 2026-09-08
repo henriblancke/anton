@@ -380,7 +380,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
 
     const held = await getJob(h.db, a);
     expect(held?.status).toBe("queued");
-    expect(held?.lastError).toMatch(/budget: weekly-cap/);
+    expect(held?.lastError).toMatch(/budget: share-cap/);
     expect(toMs(held?.runAt)).toBe(Date.parse(weeklyResetAt));
   });
 
