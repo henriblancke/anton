@@ -21,6 +21,7 @@
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, notInArray, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { epochOrZero } from "./db/epoch";
 import type { AntonDb, Clock } from "./jobs/queue";
 import type { DeltaState } from "./stringer";
 import {
@@ -139,11 +140,6 @@ export const SCAN_HEALTH_WINDOW = 14;
 
 /** Insertion order, newest first — the tiebreak for two scans landing inside the same second. */
 const NEWEST_FIRST = sql`rowid desc`;
-
-function toEpoch(value: unknown): number {
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value ?? 0);
-}
 
 export function emptySeverityCounts(): SeverityCounts {
   return Object.fromEntries(SCAN_SEVERITIES.map((s) => [s, 0])) as SeverityCounts;
@@ -804,7 +800,7 @@ function toSummary(row: typeof schema.scanSummaries.$inferSelect): ScanSummary {
     projectId: row.projectId,
     ...(row.jobId ? { jobId: row.jobId } : {}),
     ...(row.sessionId ? { sessionId: row.sessionId } : {}),
-    generatedAt: toEpoch(row.generatedAt),
+    generatedAt: epochOrZero(row.generatedAt),
     counts: {
       total: row.totalSignals,
       bySeverity: parseCounts(row.bySeverityJson, emptySeverityCounts()),
