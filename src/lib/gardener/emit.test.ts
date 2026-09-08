@@ -14,6 +14,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
 import { contractGaps } from "../beads/contract";
 import { parseAcceptance, parseGoal, toStandaloneItem } from "../ticket-view";
+import { indexBoard } from "./board-index";
 import { detectBoard } from "./detect";
 import {
   concernedBeads,
@@ -22,9 +23,11 @@ import {
   makeDetection,
   proposalFingerprint,
   proposalPlanOf,
+  REASK_AFTER_DAYS,
   type DetectionInput,
   type GardenerDetection,
 } from "./detections";
+import { detectDeferredRejudgements } from "./rejudge";
 import type { HygieneFinding } from "../hygiene";
 
 /** Every proposal this pass filed, as the bead bd would hand back on the next board read. */
@@ -903,5 +906,135 @@ describe("a patrol pass", () => {
     const result = await emitProposals(REPO, { board: quiet, detections: detect(quiet) });
     expect(result).toEqual({ created: [], suppressed: 0, deferred: 0 });
     expect(createMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The re-judgement of parked work, as an ORDINARY proposal (anton-rozm).
+ *
+ * The whole point of the ticket is that it is ordinary: same draft, same fingerprint, same
+ * provenance, same dedup. What is NOT ordinary is what a decline buys — every other one holds
+ * forever, and this one states a window and expires with it, because "still parked" is an answer
+ * about today. Both halves are asserted here, because a window that only existed in the prose would
+ * be a promise the emitter does not keep.
+ */
+describe("the re-judgement proposal", () => {
+  /** A bead parked well past the window, on a board with nothing else to say. */
+  const PARKED: Bead[] = [
+    bead("anton-old", { status: "deferred", updated_at: daysAgo(200), title: "Escalation digest" }),
+  ];
+
+  const rejudgement = (board: Bead[] = PARKED): GardenerDetection => {
+    const [found] = detectDeferredRejudgements(indexBoard(board), NOW);
+    expect(found).toBeDefined();
+    return found;
+  };
+
+  it("carries the verb the detector deliberately left off", () => {
+    const detection = rejudgement();
+
+    expect(detection.kind).toBe("aged-defer");
+    expect(detection.move).toBe("undefer");
+    expect(detection.subjects).toEqual(["anton-old"]);
+    expect(detection.fingerprint).toBe(
+      proposalFingerprint("aged-defer", "aged-defer:anton-old"),
+    );
+  });
+
+  it("files evidence, fingerprint and provenance like every other proposal", () => {
+    const detection = rejudgement();
+    const draft = proposalDraft(detection);
+
+    expect(draft.labels).toContain(detection.fingerprint);
+    expect(draft.labels).toContain("source:gardener");
+    expect(draft.labels).toEqual(expect.arrayContaining([...PROPOSAL_LABELS]));
+    for (const line of detection.evidence) expect(draft.description).toContain(line);
+    // Provenance: the proposal hangs off the bead it is about, so it is reachable from it.
+    expect(draft.deps).toEqual(["discovered-from:anton-old"]);
+    expect(proposalPlanOf({ labels: draft.labels, metadata: draft.metadata })).toMatchObject({
+      kind: "aged-defer",
+      move: "undefer",
+      subjects: ["anton-old"],
+    });
+
+    // …and it renders as a bead, judged by the contract validator the board itself reads through.
+    const asBoardSees: Bead = {
+      id: "anton-prop",
+      title: draft.title,
+      status: "open",
+      issue_type: draft.type,
+      labels: draft.labels,
+      description: draft.description,
+      acceptance_criteria: draft.acceptance,
+    };
+    expect(contractGaps([asBoardSees], "blocking")).toEqual([]);
+    expect(contractGaps([asBoardSees], "advisory")).toEqual([]);
+  });
+
+  it("states the decline window, and that the permanent retirement is the founder's own write", () => {
+    const draft = proposalDraft(rejudgement());
+
+    expect(draft.description).toContain(`${REASK_AFTER_DAYS} days`);
+    expect(draft.description).toContain("bd close --reason abandoned");
+    expect(draft.description).toContain("never applies one");
+    // Approving is a real move here, unlike a manual proposal's.
+    expect(draft.description).not.toContain("Approve is refused");
+    expect(draft.acceptance).toContain("open again rather than deferred");
+  });
+
+  describe("declining holds for the stated window, and no longer", () => {
+    const declined = (over: Partial<Bead>): Bead[] => [
+      ...PARKED,
+      proposal(rejudgement().fingerprint, {
+        status: "closed",
+        labels: [rejudgement().fingerprint, ...PROPOSAL_LABELS, LABELS.abandoned],
+        ...over,
+      }),
+    ];
+
+    const emitted = (board: Bead[]) =>
+      planEmission({ detections: [rejudgement()], board, observedAtMs: NOW });
+
+    it("suppresses a decline still inside the window", () => {
+      const plan = emitted(declined({ updated_at: daysAgo(REASK_AFTER_DAYS - 1) }));
+      expect(plan.emit).toEqual([]);
+      expect(plan.suppressed).toHaveLength(1);
+    });
+
+    it("asks once more when the window has run out", () => {
+      const plan = emitted(declined({ updated_at: daysAgo(REASK_AFTER_DAYS) }));
+      expect(plan.emit).toHaveLength(1);
+      expect(plan.suppressed).toEqual([]);
+    });
+
+    // Fails closed: a proposal nothing can date is one we cannot prove has aged out, and asking a
+    // founder the same question every night is the worse of the two mistakes.
+    it("keeps suppressing a decline it cannot date", () => {
+      const undated = declined({ updated_at: undefined, created_at: undefined });
+      expect(emitted(undated).emit).toEqual([]);
+    });
+
+    // An OPEN re-judgement is suppressed on the label alone, like every other ask: the window is
+    // about how long a NO holds, not about how long the question stands.
+    it("suppresses a re-judgement still standing on the board, however old", () => {
+      const standing = [...PARKED, proposal(rejudgement().fingerprint, { updated_at: daysAgo(400) })];
+      expect(emitted(standing).emit).toEqual([]);
+    });
+
+    // The rule everywhere else, unchanged — the window is one kind's exception, not a new default.
+    it("still holds another kind's decline forever", () => {
+      const detection = reparent();
+      const forever = proposal(detection.fingerprint, {
+        status: "closed",
+        updated_at: daysAgo(4000),
+        labels: [detection.fingerprint, ...PROPOSAL_LABELS, LABELS.abandoned],
+      });
+      const plan = planEmission({
+        detections: [detection],
+        board: [...MISPARENTED, forever],
+        observedAtMs: NOW,
+      });
+      expect(plan.emit).toEqual([]);
+    });
   });
 });

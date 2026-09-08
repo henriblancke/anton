@@ -371,4 +371,31 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
     expect(setStatusMock).not.toHaveBeenCalled();
     expect(unassignMock).toHaveBeenCalledWith(REPO, TICKET_ID);
   });
+
+  // The repair reads the bead fresh after the report, and an edit landing while the agent ran is
+  // already in that read (PR #238 review). The claim was made about the ticket the agent was
+  // PROMPTED with — the run's snapshot — so the repair is handed that too, and a contract that moved
+  // between the two blocks the ticket for a human instead of retiring the widened one.
+  it("refuses a verified claim when the ticket was rewritten while the agent was running", async () => {
+    readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40), committedAt: "2026-01-01T00:00:00Z" });
+    showMock.mockImplementation(async (_repo: string, id: string) =>
+      id === TICKET_ID ? { ...shown(id), description: "## Goal\nShip it.\n## Acceptance\n- [ ] and the other half too" } : shown(id),
+    );
+
+    const halt = await haltOf({
+      outcome: "blocked",
+      klass: "already-shipped",
+      reason: `Already implemented by ${SHIPPED_ID}`,
+    });
+
+    expect(halt.message).toMatch(/produced no delivery/);
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(setStatusMock).toHaveBeenCalledWith(REPO, TICKET_ID, "blocked");
+    expect(labelsWritten().some((l) => l.startsWith("repair:"))).toBe(false);
+    const refusal = notesWritten().find((n) => n.includes("did not repair this as `already-shipped`"));
+    expect(refusal).toBeDefined();
+    expect(refusal).toContain("rewritten while the agent was running");
+    expect(refusal).toContain("description changed while it ran");
+  });
 });

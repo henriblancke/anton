@@ -5,11 +5,13 @@
  * flight, the single trailing pass a burst coalesces into, whether this process has reconciled the
  * repo against its remote, and the operator-visible status registry the board reads.
  *
- * The seam: bd.ts owns talking to bd (including {@link runDoltSync}, which executes one pass);
- * this module decides WHEN a pass runs and under which mode; sync-engine.ts schedules the
- * heartbeat that asks for one.
+ * The seam: dolt-exec.ts owns talking to bd and dolt-sync.ts owns {@link runDoltSync}, which
+ * executes one pass; this module decides WHEN a pass runs and under which mode; sync-engine.ts
+ * schedules the heartbeat that asks for one. The pass lives one module down from bd.ts so neither
+ * side of that seam imports the other (anton-n1m0).
  */
-import { runDoltSync, type BdExec } from "./bd";
+import type { BdExec } from "./dolt-exec";
+import { runDoltSync, type SyncMode, type SyncOutcome } from "./dolt-sync";
 import { invalidateIssueSnapshot, issueSnapshotRefreshInFlight } from "./snapshot";
 
 // ── Sync status registry (anton-live-sync) ──
@@ -156,13 +158,9 @@ function recordStatus(cwd: string, patch: Partial<SyncRecord>): void {
   statusRegistry().set(cwd, next);
 }
 
-/**
- * Concrete sync passes runDoltSync executes. "full" (write-nudged): pull → commit → push.
- * "pull": pull only — the heartbeat's default, which must NOT push when there are no local
- * changes; every anton instance pushing a shared remote every ~10s is the concurrent-push
- * manifest-corruption pattern (beads GH#2466).
- */
-export type SyncMode = "full" | "pull";
+/** The pass's own shape is dolt-sync's (see there); re-exported so a caller reaching for the mode
+ * and the request together still has one import site. */
+export type { SyncMode, SyncOutcome };
 
 /**
  * What the coalescer accepts. "backstop" is the heartbeat's push safety net (anton-sr8f): the
@@ -180,9 +178,6 @@ export type SyncMode = "full" | "pull";
  * it. "push" forces the retry unconditionally without the count-inflation "full" would cause.
  */
 export type SyncRequest = SyncMode | "backstop" | "push";
-
-export type SyncOutcome = "synced" | "not-wired" | "shared-server";
-
 
 // ── The coalescer ──
 

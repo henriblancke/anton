@@ -172,6 +172,10 @@ describe("the earned floor — a kind is armable only once its proposals have a 
     // An approve releases a run that spends what it spends — withdrawing the label afterwards does
     // not un-run it, which is the dearest tier's whole property (anton-1ivg).
     expect(autonomyTierOf({ move: "approve" })).toBe("history");
+    // An undefer is one `bd defer` from undone — but a parked bead keeps its labels, so returning an
+    // APPROVED one puts it straight back in the claimable pool and what follows is the same run
+    // `approve` is priced for. Priced on that worst case, like every row here (anton-rozm).
+    expect(autonomyTierOf({ move: "undefer" })).toBe("history");
 
     const { reversible, dequeued, history } = EARNED_AUTONOMY_BARS;
     expect(reversible.minSettled).toBeLessThan(dequeued.minSettled);

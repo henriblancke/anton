@@ -73,6 +73,7 @@ export const DEFAULT_PROPOSAL_AUTONOMY_POLICY: ProposalAutonomyPolicy = {
   "low-value": "propose",
   "degraded-approval": "propose",
   "withheld-approval": "propose",
+  "aged-defer": "propose",
 };
 
 function isAutonomy(value: unknown): value is ProposalAutonomy {
@@ -177,6 +178,13 @@ export function autonomyTierOf(plan: { move: GardenerMove; retireAs?: RetireVerb
       // No mechanical move at all, so this is never reached through {@link autonomyFor} — the manual
       // floor answers first. Priced at the dearest tier regardless: a move that fell through to the
       // cheapest bar by accident is the one failure this table must not have.
+      return "history";
+    case "undefer":
+      // Priced on its WORST case, like every row here. Returning parked work is one `bd defer` away
+      // from undone — but a deferred bead keeps its labels, so one still carrying `approved` re-enters
+      // the claimable pool the moment it leaves `deferred` (rejudge.ts states this in the evidence),
+      // and what follows is the run `approve` is priced for. A tier read off the common case would
+      // arm the uncommon one at the cheapest bar.
       return "history";
   }
 }

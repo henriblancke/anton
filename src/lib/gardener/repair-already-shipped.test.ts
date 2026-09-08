@@ -294,7 +294,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       { kind: "pr", ref: "gh-85" },
     ]);
     expect((verdict as { landed: unknown }).landed).toEqual({
-      [SHIPPER]: { via: "commit", sha: landed },
+      [SHIPPER]: { via: "commit", sha: landed, landedAt: expect.any(String) },
     });
     // The note a caller may write states what was checked AND what was not.
     expect(shippedEvidenceNote(verdict)).toContain("acceptance criteria");
@@ -355,7 +355,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     expect(verdict).toEqual({
       state: "verified",
       proof: [`\`${SHIPPER}\` is in_progress, but its PR (gh-85) is merged${mergedTail(landed)}`],
-      landed: { [SHIPPER]: { via: "pr", ref: "gh-85" } },
+      landed: { [SHIPPER]: { via: "pr", ref: "gh-85", landedAt: expect.any(String) } },
       cited: [{ kind: "pr", ref: "gh-85" }],
     });
   });
@@ -422,7 +422,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
           `rides, (gh-85) is merged${mergedTail(landed)}, and GitHub records commit ` +
           `\`${carriedOid(1).slice(0, 10)}\` in that PR naming it`,
       ],
-      landed: { [UNLANDED]: { via: "owner-pr", ownerId: OWNER, ref: "gh-85" } },
+      landed: { [UNLANDED]: { via: "owner-pr", ownerId: OWNER, ref: "gh-85", landedAt: expect.any(String) } },
       cited: [{ kind: "pr", ref: "gh-85" }],
     });
   });
@@ -470,7 +470,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     expect(verdict).toEqual({
       state: "verified",
       proof: [`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged${mergedTail(landed)}`],
-      landed: { [UNLANDED]: { via: "pr", ref: "gh-85" } },
+      landed: { [UNLANDED]: { via: "pr", ref: "gh-85", landedAt: expect.any(String) } },
       cited: [{ kind: "pr", ref: "gh-85" }],
     });
   });
@@ -838,9 +838,20 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     });
     loadAllIssuesMock.mockClear();
     loadAllIssuesMock.mockResolvedValue(board());
+    historyMock.mockReset().mockResolvedValue([]);
   });
 
   afterEach(() => sb.cleanup());
+
+  /** A reopen an hour from now — after every commit the sandbox makes — and the close that followed it. */
+  const REOPENED_AT = new Date(Date.now() + 3_600_000).toISOString();
+  const RECLOSED_AT = new Date(Date.now() + 7_200_000).toISOString();
+  /** `bd history` of a survivor shipped once, reopened for rework, and closed again. */
+  const REWORKED = [
+    { at: RECLOSED_AT, status: "closed" },
+    { at: REOPENED_AT, status: "in_progress" },
+    { at: "2020-01-01T00:00:00Z", status: "closed" },
+  ];
 
   const commitProof = () =>
     `\`${SHIPPER}\` is closed on the board, and commit \`${sb.landed.slice(0, 10)}\` in the ` +
@@ -1067,6 +1078,46 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
   });
 
+  // The claim is about the ticket the AGENT read (PR #238 review). The caller's `bead` is read after
+  // the report, so an edit landing while the agent ran is already in it — and a fence that starts
+  // there compares the rewritten ticket with itself. The dispatch snapshot is the earlier read.
+  it("refuses a claim made about a ticket that was rewritten while the agent was running", async () => {
+    const rewritten = "## Acceptance\n- [ ] it ships\n- [ ] AND it ships in the other app too";
+    boardShow.mockImplementation(async (_cwd, id) =>
+      id === TARGET ? bead(TARGET, { status: "in_progress", description: rewritten }) : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress", description: "## Acceptance\n- [ ] it ships" }),
+      bead: bead(TARGET, { status: "in_progress", description: rewritten }),
+    });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("rewritten while the agent was running");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("description changed while it ran");
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(noteMock).not.toHaveBeenCalled();
+    expect(tagMock).not.toHaveBeenCalled();
+    // Refused on the two reads in hand — nothing was checked against git or the board.
+    expect(showMock).not.toHaveBeenCalled();
+    expect(loadAllIssuesMock).not.toHaveBeenCalled();
+  });
+
+  it("holds the dispatch snapshot to the fields it carried — a listing that dropped the description is not a rewrite", async () => {
+    const contract = "## Goal\nShip the thing.\n## Acceptance\n- [ ] it ships";
+    boardShow.mockImplementation(async (_cwd, id) =>
+      id === TARGET ? bead(TARGET, { status: "in_progress", description: contract }) : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress" }),
+      bead: bead(TARGET, { status: "in_progress", description: contract }),
+    });
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+  });
+
   it("still retires when the window only stamped the ticket — a label or a timestamp is not a rewrite", async () => {
     boardShow.mockImplementation(async (_cwd, id) =>
       id === TARGET
@@ -1239,6 +1290,31 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
         `commit \`${sb.landed.slice(0, 10)}\` is no longer in the history of the run's base (main)`,
       );
+      expect(supersedeMock).not.toHaveBeenCalled();
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    // Reopened AND closed again before the locks were taken: closed on the reread, its naming commit
+    // still in the base, and a status reread would call that held (PR #238 review). The close the
+    // board holds now is a later cycle's, and the check's own cycle question is re-asked of it.
+    it("refuses when the survivor was reopened and closed again since the check", async () => {
+      boardShow.mockImplementation(async (_cwd, id) =>
+        id === TARGET
+          ? bead(TARGET, { status: "in_progress" })
+          : bead(SHIPPER, { status: "closed", closed_at: RECLOSED_AT }),
+      );
+      // The check read the board's row (no reopen yet); the fence's reread finds the rework.
+      historyMock.mockImplementation(async () => (boardShow.mock.calls.length > 0 ? REWORKED : []));
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { why: string }).why).toContain("the board moved");
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
+        `\`${SHIPPER}\` is not closed on the evidence anton verified`,
+      );
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`the board reopened \`${SHIPPER}\` at ${REOPENED_AT}`);
+      expect(historyMock).toHaveBeenCalledWith(repo, SHIPPER);
       expect(supersedeMock).not.toHaveBeenCalled();
       expect(tagMock).not.toHaveBeenCalled();
     });
@@ -1621,6 +1697,30 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
       expect(outcome).toMatchObject({ action: "escalate" });
       expect(evidenceOf(outcome)).toContain("is open again");
+      expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+      expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    // A reopen the window also CLOSED again reads `closed` after the write, its naming commit still
+    // in the base — only the closure moved (PR #238 review). The post-write fence re-asks the
+    // check's cycle question, exactly as the pre-write one does.
+    it("withdraws when the survivor was reopened and closed again in the window", async () => {
+      boardShow.mockImplementation(async (_cwd, id) =>
+        id === TARGET
+          ? bead(TARGET, { status: "in_progress" })
+          : bead(SHIPPER, { status: "closed", ...(written() ? { closed_at: RECLOSED_AT } : {}) }),
+      );
+      historyMock.mockImplementation(async () => (written() ? REWORKED : []));
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { why: string }).why).toContain("moved between the check and the write");
+      expect(evidenceOf(outcome)).toContain(`\`${SHIPPER}\` is not closed on the evidence anton verified`);
+      expect(evidenceOf(outcome)).toContain("is an earlier cycle's");
+      expect(evidenceOf(outcome)).toContain(`withdrew the retirement: ${TARGET} is open again`);
+      expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
       expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
       expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
       expect(tagMock).not.toHaveBeenCalled();

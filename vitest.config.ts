@@ -15,7 +15,10 @@ export default defineConfig({
   plugins: [tsconfigPaths()],
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts", "src/**/*.test.tsx", "bin/**/*.test.ts"],
+    // `tests/ci/**` gates THIS REPO's own automation (`.github/`), not anything anton ships —
+    // product tests stay colocated under `src/`. Kept out of `src/` so the source tree stays the
+    // product, and run in the same blocking gate because a broken workflow fails just as silently.
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx", "bin/**/*.test.ts", "tests/ci/**/*.test.ts"],
     exclude: [...configDefaults.exclude, "**/*.integration.test.ts", "**/*.integration.test.tsx"],
     // Points ANTON_DB at a throwaway temp db so no suite can reach the real one by omission — see
     // the file for why that is worth a global. Shared with the integration config.

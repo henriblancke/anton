@@ -128,17 +128,22 @@ export type CitedEvidence = { kind: "commit"; sha: string } | { kind: "pr"; ref:
  * retirement re-asks exactly this under the lock (PR #238 review): the survivor's PR pointer being
  * swapped, or its PR un-merging, in the window between the check and the write takes the
  * verification back, and a reread that only looked at status would never see it.
+ *
+ * `landedAt` is WHEN the landing entered the base — the naming commit's committer date, or the
+ * merge commit's — carried so the fences can measure it against the survivor's closure again
+ * ({@link stillCurrentCycle}): a survivor reopened and closed once more in the window keeps this
+ * landing in the base, and it is the closure that moved, not the evidence.
  */
 export type BeadLanding =
   /** A commit in the run's base names the bead. */
-  | { via: "commit"; sha: string }
+  | { via: "commit"; sha: string; landedAt: string }
   /** The bead's own PR is merged. */
-  | { via: "pr"; ref: string }
+  | { via: "pr"; ref: string; landedAt: string }
   /**
    * The bead is closed, the PR of the run target it rides is merged, and a commit GitHub records
    * in that PR names the bead — the PR carried it, whatever the board says of its parentage now.
    */
-  | { via: "owner-pr"; ownerId: string; ref: string };
+  | { via: "owner-pr"; ownerId: string; ref: string; landedAt: string };
 
 /**
  * The whole-board read the claim is checked against — through `loadAllIssues` rather than a bare
@@ -365,7 +370,7 @@ export async function verifyShippedClaim(args: {
     const landing = await readPr(pr);
     if (landing.landed) {
       proof.push(`\`${id}\` is ${standing}, but its PR (${pr}) is merged${landedTail(base, landing)}`);
-      landed[id] = { via: "pr", ref: pr };
+      landed[id] = { via: "pr", ref: pr, landedAt: landing.landedAt };
       cite({ kind: "pr", ref: pr });
       continue;
     }
@@ -457,7 +462,7 @@ async function closedBeadLanding(args: {
         };
       }
       return {
-        landing: { via: "commit", sha: naming.sha },
+        landing: { via: "commit", sha: naming.sha, landedAt: naming.committedAt },
         proof:
           `\`${id}\` is closed on the board, and commit \`${naming.sha.slice(0, 10)}\` in the ` +
           `history of the run's base (${base}) names it`,
@@ -484,7 +489,7 @@ async function closedBeadLanding(args: {
         };
       }
       return {
-        landing: { via: "pr", ref: ownPr },
+        landing: { via: "pr", ref: ownPr, landedAt: landing.landedAt },
         proof: `\`${id}\` is closed on the board and its PR (${ownPr}) is merged${landedTail(base, landing)}`,
       };
     }
@@ -515,7 +520,7 @@ async function closedBeadLanding(args: {
             };
           }
           return {
-            landing: { via: "owner-pr", ownerId: owner.id, ref: ownerPr },
+            landing: { via: "owner-pr", ownerId: owner.id, ref: ownerPr, landedAt: landing.landedAt },
             proof:
               `${rides} is merged${landedTail(base, landing)}, and GitHub records commit ` +
               `\`${carried.sha.slice(0, 10)}\` in that PR naming it`,
@@ -743,7 +748,9 @@ export type AlreadyShippedOutcome =
  *      anything else because it costs no read and no autonomy level makes it acceptable. The agent
  *      says nothing needed to change and the branch says something did; retiring would close a
  *      ticket whose diff is in the run's own pull request, attributed to work that shipped
- *      elsewhere.
+ *      elsewhere. A ticket REWRITTEN since the agent was prompted is refused on the same terms
+ *      (PR #238 review): the claim describes the contract the agent read, and the fences below
+ *      start from the post-report read, which already holds the edit.
  *   2. The loop guard and the trust dial ({@link decideRepair}), asked next for `dep-missing`'s
  *      reason: the CLASS here is the agent's own report and nothing about the bead asserts it, so a
  *      second `already-shipped` block on a ticket anton already retired is a diagnosis that has been
@@ -785,6 +792,14 @@ export async function repairAlreadyShipped(args: {
    * retirement in such an environment would refuse.
    */
   bead: Bead;
+  /**
+   * The ticket as the AGENT was prompted with it — the run's dispatch snapshot, whose contract the
+   * claim is a claim about (PR #238 review). `bead` is read after the report, so an edit landing
+   * while the agent ran is already in it, and a fence that starts from `bead` would hold the write
+   * to the rewritten ticket and never see the drift. Absent, the caller has no earlier read than
+   * `bead` and the gate has nothing to compare — see {@link contractDriftedSinceDispatch}.
+   */
+  dispatched?: Bead;
   /** The block being repaired — its reason carries the claim, and rides into the record. */
   block: { reason?: string };
   /** Whether this ticket's work reached a commit on the run's branch — see gate 1 above. */
@@ -803,7 +818,7 @@ export async function repairAlreadyShipped(args: {
    */
   signal?: AbortSignal;
 }): Promise<AlreadyShippedOutcome> {
-  const { repoPath, base, bead, block, committed, now, autonomy, signal } = args;
+  const { repoPath, base, bead, dispatched, block, committed, now, autonomy, signal } = args;
   const claim = block.reason?.trim() || "(no reason given)";
 
   if (committed) {
@@ -817,6 +832,21 @@ export async function repairAlreadyShipped(args: {
         `its work is in this run's diff, so closing the ticket as superseded would file that diff ` +
           `under work that shipped somewhere else`,
       ],
+    };
+  }
+
+  // The claim was made about the ticket the agent READ, and a rewrite in the meantime makes it a
+  // claim about a ticket that no longer exists. Decided before any read, like gate 1: both beads are
+  // already in hand, and no autonomy level makes it acceptable.
+  const drifted = dispatched ? contractDriftedSinceDispatch(dispatched, bead) : undefined;
+  if (drifted) {
+    return {
+      action: "escalate",
+      why:
+        `${bead.id} blocked as \`${KLASS}\`, but the ticket was rewritten while the agent was ` +
+        `running — the claim is about the ticket as it was dispatched, not the one on the board ` +
+        `now, so anton retired nothing.`,
+      evidence: [drifted, `the agent reported: ${claim}`],
     };
   }
 
@@ -1265,9 +1295,14 @@ async function retirementDrifted(
 
   switch (landing.via) {
     case "pr":
-      return stillMergedPr(replacement, landing.ref, `\`${replacementId}\``);
+      return (
+        (await stillCurrentCycle(repoPath, replacement, landing, targetId)) ??
+        stillMergedPr(replacement, landing.ref, `\`${replacementId}\``)
+      );
     case "owner-pr": {
-      const settled = stillClosedSurvivor(replacement, "the run target's merged PR");
+      const settled =
+        stillClosedSurvivor(replacement, "the run target's merged PR") ??
+        (await stillCurrentCycle(repoPath, replacement, landing, targetId));
       if (settled) return settled;
       const rehomed = stillRidesOwner(locked, targetId, replacementId, landing.ownerId);
       if (rehomed) return rehomed;
@@ -1276,11 +1311,38 @@ async function retirementDrifted(
       return stillMergedPr(owner, landing.ref, `\`${landing.ownerId}\`, the run target \`${replacementId}\` rides,`);
     }
     case "commit": {
-      const settled = stillClosedSurvivor(replacement, "the commit naming it in the base");
+      const settled =
+        stillClosedSurvivor(replacement, "the commit naming it in the base") ??
+        (await stillCurrentCycle(repoPath, replacement, landing, targetId));
       if (settled) return settled;
       return stillReachingCommit(repoPath, base, landing.sha, targetId);
     }
   }
+}
+
+/**
+ * A closed survivor's landing has to still be its CURRENT closure's at the write (PR #238 review).
+ * {@link stillClosedSurvivor} catches a reopen the window left open; a survivor reopened AND closed
+ * again before the fence reads it is closed once more, its naming commit or merged PR still in the
+ * base, and status alone would call that held — while the rework its latest close describes may be
+ * sitting on an unmerged branch. So the check's own question ({@link landingOfCurrentCycle}) is
+ * re-asked of the fresh read: its `closed_at` is the new close, and the history holds the reopen.
+ * Asked only of a closed survivor — an open one either failed {@link stillClosedSurvivor} already or
+ * verified through its own PR, which the check accepts whatever its status.
+ */
+async function stillCurrentCycle(
+  repoPath: string,
+  replacement: Bead,
+  landing: BeadLanding,
+  targetId: string,
+): Promise<string | undefined> {
+  if (replacement.status !== "closed") return undefined;
+  const cycle = await landingOfCurrentCycle(repoPath, replacement, landing.landedAt);
+  if (!cycle.stale) return undefined;
+  return (
+    `\`${replacement.id}\` is not closed on the evidence anton verified — ${cycle.stale}; ` +
+    `${targetId} is not superseded on that evidence`
+  );
 }
 
 /**
@@ -1409,6 +1471,29 @@ function contractRewritten(checked: Bead, now: Bead): string | undefined {
     `\`${now.id}\` was rewritten since the check (${changed.join(", ")} changed) — the claim was ` +
     `verified against a ticket that no longer reads the same, and anton will not close the one ` +
     `that replaced it on that evidence`
+  );
+}
+
+/**
+ * Why the ticket the agent was prompted with is not the one the report came back to — or undefined
+ * while its contract still reads as dispatched (PR #238 review).
+ *
+ * Same fields as {@link contractRewritten}, one difference: the dispatch snapshot is a board ROW,
+ * and on some bd versions the listing drops `description` (issues.ts `ensureDescription`). A field
+ * the snapshot never carried is one it cannot attest to either way, so it is not compared — holding
+ * it to the full read would refuse every retirement on such a bd. A field it did carry is held
+ * exactly.
+ */
+function contractDriftedSinceDispatch(dispatched: Bead, now: Bead): string | undefined {
+  const text = (v: unknown): string => (typeof v === "string" ? v : "");
+  const changed = CONTRACT_FIELDS.filter(
+    (field) => dispatched[field] !== undefined && text(dispatched[field]) !== text(now[field]),
+  );
+  if (changed.length === 0) return undefined;
+  return (
+    `\`${now.id}\` no longer reads as it did when the agent was dispatched (${changed.join(", ")} ` +
+    `changed while it ran) — the claim was made about the ticket the agent read, and anton will ` +
+    `not close the one that replaced it on that evidence`
   );
 }
 

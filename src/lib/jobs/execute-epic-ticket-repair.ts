@@ -119,6 +119,10 @@ export async function repairBlockedTicket(args: {
             repoPath: repo,
             base: run.baseRef,
             bead: fresh,
+            // The contract the agent was PROMPTED with (PR #238 review): `fresh` is read after the
+            // report, so an edit landing mid-session is already in it, and a fence starting there
+            // would hold the retirement to the rewritten ticket and never see the drift.
+            dispatched: ticket,
             block,
             committed: args.committed,
             now,
