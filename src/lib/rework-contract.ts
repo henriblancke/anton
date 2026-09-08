@@ -673,8 +673,11 @@ function setextHeadingRun(
     if (inner === undefined || inner.trim() === "") return 0;
     if (SETEXT_UNDERLINE.test(inner)) return next - at + 1;
     // A line that interrupts the paragraph ends it, so no underline can reach `at` — but a non-1
-    // ordered marker does not interrupt, and stays part of the multiline heading.
-    if (PARA_INTERRUPT.test(inner.trimStart())) return 0;
+    // ordered marker does not interrupt, and stays part of the multiline heading. Judged on `inner`
+    // with its indentation intact: a marker indented four columns past the container cannot interrupt
+    // an open paragraph, so `Backend\n    ## API\n===` is one Setext heading — trimming it first
+    // filed `Backend` as a step and let a heading-only draft pass doneGap.
+    if (PARA_INTERRUPT.test(inner)) return 0;
   }
   return 0;
 }

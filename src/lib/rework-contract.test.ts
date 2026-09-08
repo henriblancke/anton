@@ -240,6 +240,14 @@ describe("instructionCriteria", () => {
     expect(texts("Backend\n2. API\n===\n- Fix the retry")).toEqual(["Fix the retry"]);
     expect(doneGap("Backend\n2. API\n===", [])).toMatch(/only list markers, headings or rules/);
     expect(texts("Backend\n1. API\n===")).toEqual(["Backend", "API", "==="]);
+    // An indented marker cannot interrupt an open paragraph, so a four-space `## API` or `* API`
+    // between the label and its underline stays part of one multiline Setext heading — every line
+    // drops, and a heading-only draft is caught by doneGap rather than filing `Backend` as a step.
+    expect(texts("Backend\n    ## API\n===\n- Fix the retry")).toEqual(["Fix the retry"]);
+    expect(texts("Backend\n    * API\n===\n- Fix the retry")).toEqual(["Fix the retry"]);
+    expect(doneGap("Backend\n    ## API\n===", [])).toMatch(/only list markers, headings or rules/);
+    // A marker indented three columns or fewer still interrupts, as CommonMark allows.
+    expect(texts("Backend\n  ## API\n===")).toEqual(["Backend", "==="]);
     // List STRUCTURE is untouched: `1. a` / `2. b` stay two separate items.
     expect(texts("1. first\n2. second")).toEqual(["first", "second"]);
   });
