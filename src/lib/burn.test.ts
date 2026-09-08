@@ -64,10 +64,14 @@ describe("burnsClaudeQuota", () => {
     // sync-push is a deterministic `git push` of dolt refs — no Claude, so nothing to sample.
     expect(burnsClaudeQuota("sync-push")).toBe(false);
     expect(JOB_TYPE_TIER["sync-push"]).toBe("none");
+    // orphan-grooming is bd link verbs over the board — governed for pacing, but it never spawns
+    // Claude, so a paced row of it must not read as quota demand (PR #248 review).
+    expect(burnsClaudeQuota("orphan-grooming")).toBe(false);
+    expect(JOB_TYPE_TIER["orphan-grooming"]).toBe("none");
   });
 
   it("includes every Claude-driven type", () => {
-    for (const t of ["execute-epic", "review-fix", "nightly-stringer", "orphan-grooming"] as const) {
+    for (const t of ["execute-epic", "review-fix", "nightly-stringer", "product-master"] as const) {
       expect(burnsClaudeQuota(t)).toBe(true);
     }
   });
@@ -188,7 +192,7 @@ describe("sampleJobBurn", () => {
   });
 
   it("leaves the project null for anton's own plumbing, which belongs to no share", async () => {
-    await sampleJobBurn(t.db, clock, "orphan-grooming", null, usage(10, 5), async () =>
+    await sampleJobBurn(t.db, clock, "product-master", null, usage(10, 5), async () =>
       usage(12, 6),
     );
     const rows = await t.db.select().from(dbSchema.burnSamples);

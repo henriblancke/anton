@@ -152,6 +152,25 @@ describe("observedWorkEligibility", () => {
     expect(eligibilityOf(await observedWorkEligibility(tdb.db, NOW), capped)).toBe(true);
   });
 
+  it("holds no share for a budget-deferred row that could never spend Claude quota", async () => {
+    // The governor paces orphan-grooming alongside execute-epic, so a capped project can carry a
+    // deferred grooming row until reset — but the sweep is bd link verbs and never spawns Claude,
+    // so it is not demand on the quota. Counting it would keep an otherwise idle project in the
+    // divisor for the whole window (PR #248 review).
+    const groomed = project("groomed");
+    plan(groomed, 0);
+    job(
+      groomed,
+      "orphan-grooming",
+      "queued",
+      new Date(NOW + 6 * 24 * 60 * 60 * 1000),
+      null,
+      `${BUDGET_DEFER_PREFIX}weekly-cap — resumes at 2026-03-10T12:00:00Z`,
+    );
+
+    expect(eligibilityOf(await observedWorkEligibility(tdb.db, NOW), groomed)).toBe(false);
+  });
+
   it("still holds no share for a budget-deferred row the runner's own gates park", async () => {
     // The marker says the share held it; the autonomy switch says the runner would not lease it
     // anyway. The hard hold wins, exactly as it does for a due row.

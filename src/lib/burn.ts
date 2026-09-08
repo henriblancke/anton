@@ -50,17 +50,19 @@ export const TIER_SEEDS: Record<BurnTier, { sessionPct: number; weeklyPct: numbe
 };
 
 /**
- * Static tier per job type (ticket: stringer=S, review-fix=M, execute-epic=L; grooming is cheap).
+ * Static tier per job type (ticket: stringer=S, review-fix=M, execute-epic=L).
  * sync-push is a deterministic `git push` of dolt refs — it invokes no Claude at all, so it's `none`:
  * zero cost to the pacer and never worth sampling (see {@link burnsClaudeQuota}). run-health is the
  * same shape: deterministic queries over anton.db, the board, and `gh`; so is the gardener patrol,
- * which is bd hygiene verbs and nothing else.
+ * which is bd hygiene verbs and nothing else — and so is orphan-grooming, which buckets loose
+ * tickets with bd link verbs and never spawns Claude (the runner refunds every attempt of it). It
+ * stays a GOVERNED type for pacing, but a paced row of it is no claim on the quota (PR #248 review).
  */
 export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "nightly-stringer": "S",
   "review-fix": "M",
   "execute-epic": "L",
-  "orphan-grooming": "S",
+  "orphan-grooming": "none",
   "sync-push": "none",
   "run-health": "none",
   unstick: "none",
