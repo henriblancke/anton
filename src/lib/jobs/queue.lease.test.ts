@@ -237,6 +237,31 @@ describe("leaseDue paginates past saturated caps", () => {
     expect(leased.map((j) => j.id)).toEqual(["leasable"]);
   });
 
+  it("does not re-pick a job leased from an earlier page when the next page is read", async () => {
+    seedLive("busy", "execute-epic", "A"); // A's per-project cap of 1 is full
+    // Page one: A's capped backlog fills all but the last slot, and B's first job takes it. It gets
+    // picked, the page is full, and a skip widened the exclusion — so the scan reads a second page.
+    seedBacklog("execute-epic", "A", WINDOW - 1);
+    const firstAt = new Date(systemClock.now() - 5_000);
+    const secondAt = new Date(systemClock.now() - 1_000);
+    t.db
+      .insert(schema.jobs)
+      .values([
+        { id: "b-first", type: "execute-epic", projectId: "B", status: "queued", runAt: firstAt },
+        { id: "b-second", type: "execute-epic", projectId: "B", status: "queued", runAt: secondAt },
+      ])
+      .run();
+
+    const leased = await leaseDue(t.db, systemClock, {
+      leaseMs: 30_000,
+      limit: 2,
+      capOf: (job) => (job.projectId === "A" ? 1 : Infinity),
+    });
+    // Page two must not return "b-first" again: a duplicate would meet the limit on its own and
+    // leave "b-second" queued with a free slot.
+    expect(leased.map((j) => j.id).sort()).toEqual(["b-first", "b-second"]);
+  });
+
   it("stops paging once the limit is met, without touching the rest of the backlog", async () => {
     seedBacklog("review-fix-pr", "A", WINDOW + 50); // nothing running: the type is under its cap
     seedLeasable("execute-epic", "B");

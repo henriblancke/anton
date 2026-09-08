@@ -745,17 +745,24 @@ export async function leaseDue(
     });
     return clauses.length > 0 ? not(or(...clauses)!) : undefined;
   };
-  // One page of the earliest-due candidates, minus the hard-held buckets and whatever the scan has
-  // already found saturated.
-  const fetchCandidates = (skipTypes: Iterable<string>, skipBuckets: Iterable<string>) => {
+  // One page of the earliest-due candidates, minus the hard-held buckets, whatever the scan has
+  // already found saturated, and the rows it already picked. A picked row's bucket is usually still
+  // under its cap, so nothing else drops it from the next page: without `skipIds` it is fetched and
+  // appended again, and its duplicates can meet `limit` while distinct leasable jobs sit behind it.
+  const fetchCandidates = (
+    skipTypes: Iterable<string>,
+    skipBuckets: Iterable<string>,
+    skipIds: Iterable<string> = [],
+  ) => {
     const types = [...skipTypes];
+    const ids = [...excludeIds, ...skipIds];
     return db
       .select()
       .from(schema.jobs)
       .where(
         and(
           runnable,
-          excludeIds.length > 0 ? notInArray(schema.jobs.id, excludeIds) : undefined,
+          ids.length > 0 ? notInArray(schema.jobs.id, ids) : undefined,
           outsideBuckets(excludeBuckets),
           types.length > 0 ? notInArray(schema.jobs.type, types) : undefined,
           outsideBuckets(skipBuckets),
@@ -808,7 +815,11 @@ export async function leaseDue(
     const saturatedBuckets = new Set<string>();
     const picked: JobRow[] = [];
     for (;;) {
-      const candidates = await fetchCandidates(saturatedTypes, saturatedBuckets);
+      const candidates = await fetchCandidates(
+        saturatedTypes,
+        saturatedBuckets,
+        picked.map((job) => job.id),
+      );
       let skipped = false;
       for (const job of candidates) {
         if (picked.length >= opts.limit) break;
