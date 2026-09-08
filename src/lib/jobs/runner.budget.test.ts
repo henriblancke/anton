@@ -600,6 +600,43 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     await r.whenIdle();
   });
 
+  it("does not reserve share for a fix the runner-wide review-fix ceiling keeps off the lease", async () => {
+    // B's long-running fix fills `maxReviewFixConcurrent` (1), so A's older queued fix cannot lease
+    // this tick whatever A's bucket cap says — leaseDue's `typeCapOf` skips it. Charging its 1.2
+    // points to A's 6-point share anyway (3 already spent) would hold the runnable epic behind it
+    // (4.2 + 3 > 6), leaving the pool's reserved non-fix capacity idle until B's fix completes.
+    h.seedProjects("A", "B");
+    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const ran: string[] = [];
+    const r = budgetRunner(
+      async (ctx) => {
+        ran.push(`${ctx.type}:${ctx.projectId}`);
+        if (ctx.projectId === "B") await gate;
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 6),
+        resolveProjectSpend: async () => 3,
+        resolvePolicy: () => ({ concurrency: 1, timeoutMs: Infinity, maxAttempts: 3 }),
+      },
+    );
+    await r.enqueue({ type: "review-fix-pr", projectId: "B" });
+    expect(await r.tickOnce()).toBe(1); // B's fix takes the runner's only review-fix slot
+    const heldFix = await r.enqueue({ type: "review-fix-pr", projectId: "A" });
+    h.clock.advance(1_000);
+    const epic = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await waitUntil(async () => (await getJob(h.db, epic))?.status === "done");
+    expect(ran).toEqual(["review-fix-pr:B", "execute-epic:A"]);
+    expect((await getJob(h.db, heldFix))?.status).toBe("queued");
+
+    release();
+    await r.whenIdle();
+  });
+
   it("fails OPEN when the bucket's live-load read fails: the tick admits instead of aborting", async () => {
     // Every other governor read — usage, spend, policy, bead labels — fails open. A slot count that
     // throws must do the same: the candidate is left to leaseDue's own cap rather than the whole
@@ -738,9 +775,11 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       [false, 0],
       [true, 1],
     ] as const) {
+      let atSpawn = false;
       const r = budgetRunner(
         async (ctx) => {
           if (reached) await ctx.claudeReached();
+          atSpawn = true;
           await new Promise<void>((resolveWait) => {
             ctx.signal.addEventListener("abort", () => resolveWait());
           });
@@ -749,7 +788,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       );
       const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
       expect(await r.tickOnce()).toBe(1);
-      await waitUntil(() => r.activeCount === 1);
+      await waitUntil(() => atSpawn);
       expect((await getJob(h.db, id))?.spentAttempts).toBe(spent); // the lease itself charges nothing
 
       expect(await r.cancel(id)).toBe(true);
@@ -758,6 +797,46 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       expect(job?.status).toBe("cancelled");
       expect(job?.spentAttempts).toBe(spent);
     }
+  });
+
+  it("charges nothing for an attempt cancelled while its opening usage read was in flight (PR #248)", async () => {
+    // `claudeReached` awaits a fresh opening snapshot before the handler may spawn. A cancel that
+    // lands during that read aborts the signal the handler is about to hand the driver, so the
+    // child dies on spawn and no quota burns: the cancelled row must not keep a spent attempt, and
+    // no burn window may close over a meter nothing moved.
+    h.seedProjects("A");
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => (releaseRead = resolve));
+    let freshReads = 0;
+    const r = h.makeRunner({
+      handlers: {
+        "execute-epic": async (ctx) => {
+          await ctx.claudeReached();
+          if (ctx.signal.aborted) return; // the driver would be spawned into a dead signal
+          await new Promise<void>((resolveWait) => {
+            ctx.signal.addEventListener("abort", () => resolveWait());
+          });
+        },
+      },
+      resolveBudgetPolicy: () => DEFAULT_BUDGET_POLICY,
+      readUsage: async () => usage({ sessionPct: 10 }),
+      readUsageFresh: async () => {
+        freshReads += 1;
+        await readGate;
+        return usage({ sessionPct: 10, weeklyPct: 5 });
+      },
+    });
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    expect(await r.tickOnce()).toBe(1);
+    await waitUntil(() => freshReads === 1);
+
+    expect(await r.cancel(id)).toBe(true);
+    releaseRead();
+    await r.whenIdle();
+    const job = await getJob(h.db, id);
+    expect(job?.status).toBe("cancelled");
+    expect(job?.spentAttempts).toBe(0);
+    expect(await h.db.select().from(schema.burnSamples)).toHaveLength(0);
   });
 
   it("never charges a lease the process lost before reaching Claude (PR #248)", async () => {

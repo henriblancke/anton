@@ -45,6 +45,7 @@ import {
   scheduleGateKey,
   systemClock,
   toMs,
+  typeLiveLoad,
   type AntonDb,
   type Clock,
   type JobEffect,
@@ -842,12 +843,18 @@ export class JobRunner {
     const pacedExecuteEpicHolds = new Set<string>();
     const valueHeldJobIds = new Set<string>();
     const valueHeldReclaimIds = new Set<string>();
+    // The runner-wide review-fix ceiling, on top of the per-project cap in capOf: the sum of every
+    // project's fan-out must leave slots for the other job types (see RunnerConfig). Defined once
+    // so the governor's admission walk skips exactly the rows leaseDue will skip under it.
+    const typeCapOf = (job: JobRow) =>
+      job.type === "review-fix-pr" ? this.config.maxReviewFixConcurrent : Infinity;
     await this.applyBudgetGovernor(
       heldBucketKeys,
       pacedExecuteEpicHolds,
       valueHeldJobIds,
       valueHeldReclaimIds,
       policyCapOf ?? (() => Infinity),
+      typeCapOf,
     );
     const holdLogKey = [...valueHeldJobIds, ...valueHeldReclaimIds].sort().join(",");
     if (holdLogKey !== this.valueHoldLogKey) {
@@ -901,10 +908,7 @@ export class JobRunner {
       leaseMs: this.config.leaseMs,
       limit: capacity,
       capOf,
-      // The runner-wide review-fix ceiling, on top of the per-project cap in capOf: the sum of every
-      // project's fan-out must leave slots for the other job types (see RunnerConfig).
-      typeCapOf: (job) =>
-        job.type === "review-fix-pr" ? this.config.maxReviewFixConcurrent : Infinity,
+      typeCapOf,
       excludeBucketKeys: heldBucketKeys,
       // Never re-lease a job already dispatched in this process. Rolling dispatch keeps a running
       // job in `inFlight` while its handler works; if its lease lapses (missed renewal from sleep or
@@ -946,9 +950,14 @@ export class JobRunner {
     valueHeldJobIds: Set<string>,
     valueHeldReclaimIds: Set<string>,
     bucketCapOf: (job: JobRow) => number,
+    typeCapOf: (job: JobRow) => number,
   ): Promise<void> {
     const resolveBudgetPolicy = this.resolveBudgetPolicy;
     if (!resolveBudgetPolicy) return;
+    // Lease slots each type-capped TYPE has left this tick. A type cap spans every project, so the
+    // memo outlives the per-project value-gate walks below: a fix one project's walk admits takes a
+    // slot the next project's walk can no longer count on.
+    const typeSlotsLeft = new Map<string, number>();
 
     // The gate decides per project (day window / reserve are per-project knobs), so gather every
     // project — including the null-project bucket — that has a pending job of a governed type.
@@ -1038,6 +1047,8 @@ export class JobRunner {
           valueHeldReclaimIds,
           projectWeeklyPct,
           bucketCapOf,
+          typeCapOf,
+          typeSlotsLeft,
         );
         continue;
       }
@@ -1131,7 +1142,11 @@ export class JobRunner {
    * BUCKET is already at its concurrency (`bucketCapOf`, the same cap leaseDue enforces) is skipped
    * for the same reason: an older queued execute-epic behind a long-running one cannot lease either,
    * and letting it reserve the last of the share would hold an ungated grooming sweep behind a job
-   * capOf then skips — nothing dispatched, with global capacity to spare (PR #248 review).
+   * capOf then skips — nothing dispatched, with global capacity to spare (PR #248 review). The
+   * runner-wide TYPE cap (`typeCapOf`, leaseDue's second dimension) skips a row the same way: a fix
+   * due here while other projects' fixes fill `maxReviewFixConcurrent` cannot lease either, and
+   * charging it would hold a runnable epic behind it while the pool's reserved non-fix capacity
+   * sat idle until another fix completed (PR #248 review).
    */
   private async applyValueGate(
     usage: ClaudeUsage,
@@ -1143,6 +1158,8 @@ export class JobRunner {
     valueHeldReclaimIds: Set<string>,
     projectWeeklyPct: number | null,
     bucketCapOf: (job: JobRow) => number,
+    typeCapOf: (job: JobRow) => number,
+    typeSlotsLeft: Map<string, number>,
   ): Promise<void> {
     const candidates = await queuedDueJobs(this.db, this.clock, {
       types: VALUE_GATE_JOB_TYPES,
@@ -1153,7 +1170,7 @@ export class JobRunner {
     // same cap), decremented as this walk admits — so the reservation below tracks what leaseDue
     // will actually pick, in the same runAt order.
     const slotsByBucket = new Map<string, number>();
-    const slotsLeft = async (job: JobRow): Promise<number> => {
+    const bucketSlotsLeft = async (job: JobRow): Promise<number> => {
       const cap = bucketCapOf(job);
       if (cap === Infinity) return Infinity;
       const key = scheduleGateKey(job.type, job.projectId);
@@ -1172,10 +1189,30 @@ export class JobRunner {
       }
       return slots;
     };
+    // The type dimension, memoised across projects in `typeSlotsLeft` (see applyBudgetGovernor).
+    const typeSlots = async (job: JobRow): Promise<number> => {
+      const cap = typeCapOf(job);
+      if (cap === Infinity) return Infinity;
+      let slots = typeSlotsLeft.get(job.type);
+      if (slots === undefined) {
+        const live = await typeLiveLoad(this.db, this.clock, {
+          type: job.type as JobType,
+          inFlightIds: this.inFlight.keys(),
+        }).catch(() => null);
+        slots = live === null ? 0 : cap - live;
+        typeSlotsLeft.set(job.type, slots);
+      }
+      return slots;
+    };
+    // A candidate must clear BOTH caps to lease, exactly as in leaseDue.
+    const slotsLeft = async (job: JobRow): Promise<number> =>
+      Math.min(await bucketSlotsLeft(job), await typeSlots(job));
     const takeSlot = (job: JobRow) => {
       const key = scheduleGateKey(job.type, job.projectId);
       const slots = slotsByBucket.get(key);
       if (slots !== undefined) slotsByBucket.set(key, slots - 1);
+      const ofType = typeSlotsLeft.get(job.type);
+      if (ofType !== undefined) typeSlotsLeft.set(job.type, ofType - 1);
     };
     // One burn-average read per type per tick — the cost side of every candidate of that type.
     const costByType = new Map<string, number>();
@@ -1189,7 +1226,7 @@ export class JobRunner {
       if (job.status === "running" && this.inFlight.has(job.id)) continue; // genuinely running here
       if (heldBucketKeys.has(scheduleGateKey(job.type, job.projectId))) continue; // hard-held
       if (job.projectId && this.quiescedProjects.has(job.projectId)) continue; // being deleted
-      if ((await slotsLeft(job)) <= 0) continue; // bucket at concurrency — capOf skips it anyway
+      if ((await slotsLeft(job)) <= 0) continue; // bucket or type at its cap — leaseDue skips it anyway
       const payload = parsePayload(job.payloadJson) as
         | { bypassBudget?: unknown; epicBeadId?: unknown }
         | null;
@@ -1408,20 +1445,28 @@ export class JobRunner {
             // window it opened.
             if (claudeReached) return;
             claudeReached = true;
+            // Re-check the window is still solo: a sibling dispatched between lease and spawn would
+            // already contaminate it, so don't spend a read (or the throttle) on a sample that can't
+            // land. The opening read is AWAITED so the spawn cannot start moving the meter before
+            // the snapshot it is measured against has been taken.
+            let opening: Promise<ClaudeUsage | null> | null = null;
+            if (burnEligible && this.dispatchSeq === seqAtStart) {
+              this.lastBurnSampleAt = this.clock.now();
+              opening = this.readUsageFreshSafe();
+              await opening;
+            }
+            // A cancel that landed while that read was in flight reaches the handler as an
+            // already-aborted signal: the driver kills the child on spawn and nothing burns. Charge
+            // nothing and open no window — a charge here would be a spent attempt on a cancelled
+            // row that spent nothing, and the window would measure an idle meter (PR #248 review).
+            if (controller.signal.aborted) return;
+            burnBefore = opening;
             // The charge is the durable record that this attempt burned quota — written now, not at
             // the lease, so a crash in preflight leaves nothing to refund. Fail-soft: the meter is a
             // pacing estimate, and a write that fails must not stand between the job and Claude.
             await chargeSpentAttempt(this.db, job.id).catch((e) => {
               this.log.error(`job ${job.id} (${job.type}): could not charge the spend meter`, e);
             });
-            // Re-check the window is still solo: a sibling dispatched between lease and spawn would
-            // already contaminate it, so don't spend a read (or the throttle) on a sample that can't
-            // land. The opening read is AWAITED so the spawn cannot start moving the meter before
-            // the snapshot it is measured against has been taken.
-            if (!burnEligible || this.dispatchSeq !== seqAtStart) return;
-            this.lastBurnSampleAt = this.clock.now();
-            burnBefore = this.readUsageFreshSafe();
-            await burnBefore;
           },
           enqueueReviewFixPr: (projectId, epicBeadId) =>
             this.enqueueReviewFixPrIfAbsent(projectId, epicBeadId),

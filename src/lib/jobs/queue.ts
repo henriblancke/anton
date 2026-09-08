@@ -907,6 +907,26 @@ export async function bucketLiveLoad(
 }
 
 /**
+ * How many jobs of one TYPE are live across every project — what a new lease of that type competes
+ * with under `leaseDue`'s `typeCapOf` (the runner-wide review-fix ceiling). Same live definition as
+ * {@link bucketLiveLoad}; the value gate reads both, since a candidate must clear both caps to lease
+ * (PR #248 review).
+ */
+export async function typeLiveLoad(
+  db: AntonDb,
+  clock: Clock,
+  opts: { type: JobType; inFlightIds: Iterable<string> },
+): Promise<number> {
+  const rows = await db
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(liveRunning(secDate(clock.now()), [...opts.inFlightIds]), eq(schema.jobs.type, opts.type)),
+    );
+  return rows.length;
+}
+
+/**
  * Distinct project ids that currently have a `queued` or `running` job of the given type. Used by
  * the runner to know which projects' concurrency caps it must resolve before leasing. A job with
  * no project surfaces as `null`.
