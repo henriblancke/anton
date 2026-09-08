@@ -274,10 +274,24 @@ describe("instructionCriteria", () => {
         ].join("\n"),
       ),
     ).toEqual([]);
-    expect(instructionCriteria("> - keep the quoted step\n>quoted prose\n- > nested quote")).toEqual([
+    expect(instructionCriteria("> - keep the quoted step\n> quoted prose\n- > nested quote")).toEqual([
       "keep the quoted step",
       "quoted prose",
       "nested quote",
+    ]);
+  });
+
+  it("keeps a `>` glued to its text — a comparison, not a callout, and the note still says it", () => {
+    // CommonMark would render `>95% coverage` as a quote, but what is filed here is the acceptance
+    // box, and shearing the operator files `95% coverage` against a note that demands MORE than that.
+    // A founder styling a callout types `> `; the space is what tells the two apart.
+    expect(
+      instructionCriteria(">95% coverage on the retry path\n- >= 3 retries before giving up\n>>fast"),
+    ).toEqual([">95% coverage on the retry path", ">= 3 retries before giving up", ">>fast"]);
+    // A run of `>` followed by a space is still one nested callout, and a bare one is scaffolding.
+    expect(instructionCriteria(">> nested callout\n> > spaced\n>>\n> >")).toEqual([
+      "nested callout",
+      "spaced",
     ]);
   });
 

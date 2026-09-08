@@ -430,6 +430,33 @@ describe("applyFollowUp", () => {
     for (const write of allWrites) expect(write).not.toHaveBeenCalled();
   });
 
+  it("reports an unlocked match that is already complete as sent back — the loser of two identical requests", async () => {
+    // Both requests snapshotted an empty candidate set; the winner created the follow-up under the
+    // ticket lock, and this one's re-read finds it. Nothing is owed on it, so nothing is written and
+    // no lock is needed: this is the documented no-op, not a conflict to retry.
+    board(feature(), finishedTicket(), candidate("dup"));
+    showsWithNote("dup", followUpBody());
+
+    await expect(
+      applyFollowUpHolding(project, feature(), finishedTicket(), followUp(), undefined, new Set()),
+    ).resolves.toMatchObject({
+      result: { reworkedId: "dup", applied: false },
+      runsUnderTarget: true,
+      reconciled: false,
+    });
+    for (const write of allWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unlocked match that is complete but owes a detachment — that resume writes", async () => {
+    board(feature(), finishedTicket(), candidate("dup", { description: createdUnderFeat() }));
+    showsWithNote("dup", followUpBody());
+
+    await expect(
+      applyFollowUpHolding(project, feature(), finishedTicket(), followUp(), SHIPPED, new Set()),
+    ).rejects.toThrow(ReworkConflictError);
+    for (const write of allWrites) expect(write).not.toHaveBeenCalled();
+  });
+
   it("finishes a half-created follow-up rather than opening a second one beside it", async () => {
     // `bd create` and `bd link` landed, the note after them didn't — the bead speaks for no request.
     board(feature(), finishedTicket(), candidate("half"));

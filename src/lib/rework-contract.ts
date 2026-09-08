@@ -8,7 +8,6 @@
  * costs a caller nothing else — no bd, no `gh`, no board read — which is also what lets the rework
  * dialog import it: what the dialog refuses and what the route refuses are one judgement.
  */
-import { unquote } from "./beads/markdown";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
   MAX_REWORK_INSTRUCTIONS_CHARS,
@@ -135,6 +134,17 @@ export function doneGap(instructions: string, findings: readonly ReviewFinding[]
 const LIST_MARKER = /^(?:(?:[-*+•]|\d{1,9}[.)])(?:\s+|$))?(?:\[[ xX]\](?:\s+|$))?/;
 
 /**
+ * A blockquote marker — a run of `>` and the whitespace after it — held to the same rule as a
+ * bullet: it must be followed by whitespace or end the line. CommonMark reads `>95% coverage` as a
+ * callout too, and lib/beads/contract.ts strips it that way because there it judges what a
+ * description RENDERS. Here the shorn line is what gets FILED, as an acceptance box, so a `>` glued
+ * to its text is kept as the comparison it is: shearing it would file `95% coverage` as the contract
+ * while the note the implementer reads still demands more than that. A founder styling a callout
+ * types `> `, so the space is what tells the two apart. Nested `>>`/`> >` shear as one marker each.
+ */
+const QUOTE_MARKER = /^>+(?:[ \t]+|$)/;
+
+/**
  * A thematic break — 3+ `-`/`*`/`_` of one kind, spaces between allowed — as CommonMark and
  * lib/beads/contract.ts both read it. It renders as a rule, not text: a founder who types `---` to
  * separate two thoughts and writes neither has stated no step, and boxing it would file
@@ -176,7 +186,7 @@ export function instructionCriteria(instructions: string): string[] {
  * once no marker remains is judged last against the formula's prompt, which is scaffolding in
  * whichever list shape it arrived.
  *
- * The blockquote marker comes off with the list markers ({@link unquote}) for the reason
+ * The blockquote marker comes off with the list markers ({@link QUOTE_MARKER}) for the reason
  * lib/beads/contract.ts strips it: it styles its content, it is not content. A founder who pastes a
  * ticket's `> - [ ] TODO — ...` callout has written nothing, and leaving the `>` on hid the
  * placeholder from {@link PROMPT_LINE} and filed the same marker-only box the contract gate refuses.
@@ -185,7 +195,7 @@ function shorn(line: string): string {
   let text = line.trim();
   for (;;) {
     if (THEMATIC_BREAK.test(text)) return "";
-    const next = unquote(text).trim().replace(LIST_MARKER, "");
+    const next = text.replace(QUOTE_MARKER, "").trim().replace(LIST_MARKER, "");
     if (next === text) return PROMPT_LINE.test(text) ? "" : text;
     text = next;
   }

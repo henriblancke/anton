@@ -129,9 +129,11 @@ function reopenAlreadyApplied(fresh: Bead, body: string): boolean {
  * its next run has nothing left to execute, so a child of it would never be dispatched either.
  *
  * `lockedFollowUps` is every bead the caller took a write lock on besides the ticket and the target
- * ({@link followUpCandidateIds}) — the only beads this may RESUME. A resume rewrites the match's
- * contract off the read it makes here, and a founder editing that same bead (ticket-detail's
- * `updateTicket`, serialized on the bead's own lock) must land before or after it, never under it.
+ * ({@link followUpCandidateIds}) — the only beads this may WRITE to when it resumes one. A resume
+ * rewrites the match's contract off the read it makes here, and a founder editing that same bead
+ * (ticket-detail's `updateTicket`, serialized on the bead's own lock) must land before or after it,
+ * never under it. A match that is already complete is only read, and is reported as done whether or
+ * not it was locked.
  */
 export async function applyFollowUp(
   project: Project,
@@ -167,17 +169,22 @@ export async function applyFollowUp(
   const all = await refreshAllIssues(repo);
   const match = await existingFollowUp(repo, all, ticket.id, request.summary, context.body);
   if (!match) return createFollowUp(context, all);
-  // A match the caller did not lock became a candidate between its snapshot and its locks — a
-  // founder linking a same-titled bead by hand in that window. Writing to it unserialized is the
-  // lost update the lock exists to prevent, and the answer is the one every other moved-board race
-  // gets (409): look again, and the retry snapshots — and locks — the bead it will resume.
-  if (!lockedFollowUps.has(match.bead.id)) {
+  const detachment = owedDetachment(context, match.bead);
+  // A match the caller did not lock became a candidate between its snapshot and its locks. The lock
+  // guards WRITES to that bead — finishing a half-made one, or detaching a stranded one — so only a
+  // resume that owes one is refused: writing unserialized is the lost update the lock exists to
+  // prevent, and the answer is the one every other moved-board race gets (409): look again, and the
+  // retry snapshots — and locks — the bead it will resume. A match that is DONE, and owes nothing, is
+  // read and reported without a write, so it needs no lock. That is exactly what the loser of two
+  // identical requests sees: both snapshot an empty candidate set, the winner creates the follow-up
+  // under the ticket lock, and the loser's re-read finds it — the documented no-op, not a conflict.
+  if ((match.partial || detachment) && !lockedFollowUps.has(match.bead.id)) {
     throw new ReworkConflictError(
       `${match.bead.id} became ${ticket.id}'s follow-up while this send-back was being decided — ` +
         `look again and send it back`,
     );
   }
-  return resumeFollowUp(context, match);
+  return resumeFollowUp(context, match, detachment);
 }
 
 /** Everything both follow-up paths need: who is writing, what the note says, and what the PR decided. */
@@ -210,10 +217,10 @@ interface FollowUpContext {
 async function resumeFollowUp(
   context: FollowUpContext,
   match: FollowUpMatch,
+  detachment: Detachment | undefined,
 ): Promise<AppliedRework> {
   const { target, ticket, body } = context;
   const existing = match.bead;
-  const detachment = owedDetachment(context, existing);
   if (detachment?.stage === "attached") await beads.reparent(context.repo, existing.id, "");
   if (detachment) await noteStrandedFollowUp(context, existing, detachment.pr, !match.partial);
   if (match.partial) {
