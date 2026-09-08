@@ -209,6 +209,27 @@ describe("followUpDescription", () => {
     expect(description.match(/^## Context$/gm)).toHaveLength(1);
   });
 
+  it("escapes an HTML comment opener in the founder's text — unmatched, it would hide the rest of the bead", () => {
+    const description = followUpDescription({
+      ...args,
+      summary: "handle <!-- in titles",
+      instructions: "Handle an unmatched <!-- in the parser.\nKeep a matched <!-- x --> as text.",
+      findings: [{ severity: "blocking", location: "src/md.ts:3", note: "chokes on <!--" }],
+      ticket: makeBead({ id: "t1", title: "Parse <!-- safely" }),
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain("## Goal\nhandle <\\!-- in titles\n");
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] Handle an unmatched <\\!-- in the parser.",
+      "- [ ] Keep a matched <\\!-- x --> as text.",
+      "- [ ] src/md.ts:3 — chokes on <\\!--",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(description).toContain("Discovered from t1 — Parse <\\!-- safely.");
+    expect(description).not.toContain("<!--");
+  });
+
   it("still writes a contract-complete bead when the instructions are blank — the generic box carries it", () => {
     const description = followUpDescription({ ...args, instructions: "  \n", parentId: "feat" });
     expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);

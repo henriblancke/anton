@@ -92,7 +92,7 @@ export function followUpDescription(args: {
   const { summary, instructions, findings, ticket, targetId, parentId, pipeline } = args;
   return [
     `## Goal`,
-    summary,
+    markdownSafe(summary),
     ``,
     `## ${ACCEPTANCE_HEADING}`,
     ...followUpAcceptance(instructions, findings),
@@ -124,8 +124,8 @@ export function followUpDescription(args: {
  */
 function followUpAcceptance(instructions: string, findings: ReviewFinding[]): string[] {
   return [
-    ...instructionCriteria(instructions).map((line) => `- [ ] ${line}`),
-    ...findings.map((f) => `- [ ] ${findingLine(f)}`),
+    ...instructionCriteria(instructions).map((line) => `- [ ] ${markdownSafe(line)}`),
+    ...findings.map((f) => `- [ ] ${markdownSafe(findingLine(f))}`),
     `- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply`,
   ];
 }
@@ -145,20 +145,33 @@ function oneLine(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Founder- and reviewer-typed text, made safe to sit in the description's markdown. An unmatched
+ * `<!--` opens an HTML comment that runs to the end of the bead: the contract scanner
+ * (lib/beads/markdown.ts) and every markdown renderer hide all that follows it, so a criterion
+ * about comment parsing would file a bead with no Context, Out of scope or Verify — which the
+ * approve route refuses. The `!` is backslash-escaped: CommonMark renders the same four characters,
+ * and no scanner reads them as an opener. The note keeps the raw text; it is prose, not a contract.
+ */
+function markdownSafe(text: string): string {
+  return text.replace(/<!--/g, "<\\!--");
+}
+
 /** Why this bead exists — and, for a REDIRECTED send-back, why it exists here rather than on the original. */
 function followUpProvenance(ticket: Bead, targetId: string, pipeline?: ReworkPipeline): string {
   if (pipeline?.redirected) {
     return (
-      `Discovered from ${ticket.id} — ${ticket.title}. The founder judged its acceptance unmet, but ` +
-      `${targetId}'s pull request (${pipeline.pr}) had already merged, so this bead carries the fix ` +
-      `instead of reopening work that has shipped. The founder's instructions and the findings they ` +
-      `selected are the human note on this bead.`
+      `Discovered from ${ticket.id} — ${markdownSafe(ticket.title)}. The founder judged its ` +
+      `acceptance unmet, but ${targetId}'s pull request (${pipeline.pr}) had already merged, so ` +
+      `this bead carries the fix instead of reopening work that has shipped. The founder's ` +
+      `instructions and the findings they selected are the human note on this bead.`
     );
   }
   return (
-    `Discovered from ${ticket.id} — ${ticket.title}. That ticket's acceptance was met and it keeps ` +
-    `its review score; this bead carries the next iteration ${targetId}'s self-review prompted. ` +
-    `The founder's instructions and the findings they selected are the human note on this bead.`
+    `Discovered from ${ticket.id} — ${markdownSafe(ticket.title)}. That ticket's acceptance was ` +
+    `met and it keeps its review score; this bead carries the next iteration ${targetId}'s ` +
+    `self-review prompted. The founder's instructions and the findings they selected are the ` +
+    `human note on this bead.`
   );
 }
 
