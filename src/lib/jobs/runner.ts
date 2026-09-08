@@ -1040,12 +1040,15 @@ export class JobRunner {
       const key = scheduleGateKey(job.type, job.projectId);
       let slots = slotsByBucket.get(key);
       if (slots === undefined) {
+        // Fail open like every other governor read: a load count that cannot be read admits the
+        // bucket's candidates to leaseDue's own cap — neither held nor charged this tick — rather
+        // than failing the whole tick on one query.
         const live = await bucketLiveLoad(this.db, this.clock, {
           type: job.type as JobType,
           projectId: job.projectId,
           inFlightIds: this.inFlight.keys(),
-        });
-        slots = cap - live;
+        }).catch(() => null);
+        slots = live === null ? 0 : cap - live;
         slotsByBucket.set(key, slots);
       }
       return slots;

@@ -7,7 +7,7 @@
  * (anton-d8i4), and it fails OPEN — an unreadable usage or label read must never stall the queue.
  * The reactive `UsageLimitError` backstop is unaffected either way and is asserted here too.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as schema from "../db/schema";
 import { recordBurnSample } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
@@ -22,6 +22,17 @@ import type {
   ProjectSpendResolver,
 } from "./runner";
 import { usage, useRunnerHarness, waitUntil } from "./runner.fixture";
+
+/** Swap in a failing bucket load for one case; null routes to the real query. */
+let bucketLiveLoadOverride: (() => Promise<number>) | null = null;
+vi.mock("./queue", async () => {
+  const actual = await vi.importActual<typeof import("./queue")>("./queue");
+  return {
+    ...actual,
+    bucketLiveLoad: (...args: Parameters<typeof actual.bucketLiveLoad>) =>
+      bucketLiveLoadOverride ? bucketLiveLoadOverride() : actual.bucketLiveLoad(...args),
+  };
+});
 
 /** Every bucket the governor is wired to hold — registered together so a case can enqueue any. */
 const GOVERNED_TYPES = ["execute-epic", "review-fix", "nightly-stringer", "orphan-grooming"] as const;
@@ -550,6 +561,39 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
 
     release();
     await r.whenIdle();
+  });
+
+  it("fails OPEN when the bucket's live-load read fails: the tick admits instead of aborting", async () => {
+    // Every other governor read — usage, spend, policy, bead labels — fails open. A slot count that
+    // throws must do the same: the candidate is left to leaseDue's own cap rather than the whole
+    // tick failing on one query (PR #248 review).
+    h.seedProjects("A");
+    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    let ran = 0;
+    const r = budgetRunner(
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 9),
+        resolveProjectSpend: async () => 0,
+        resolvePolicy: () => ({ concurrency: 1, timeoutMs: Infinity, maxAttempts: 3 }),
+      },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    bucketLiveLoadOverride = async () => {
+      throw new Error("db hiccup");
+    };
+    try {
+      await expect(r.tickOnce()).resolves.toBe(1);
+    } finally {
+      bucketLiveLoadOverride = null;
+    }
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(h.db, id))?.status).toBe("done");
   });
 
   it("leaves the share unbound when no spend resolver is wired", async () => {

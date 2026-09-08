@@ -67,7 +67,9 @@ export async function observedWorkEligibility(
       // since each project's share resolves with itself always in the divisor, widen its own too, so
       // the next admitting tick resumes the very rows the share just held. Two capped projects would
       // then take turns handing each other the capacity a third, reserved repo declared. The
-      // governor marks its deferrals (`deferQueuedJobs`), so they are told apart by that marker.
+      // governor marks its deferrals (`deferQueuedJobs`), so they are told apart by that marker —
+      // and it stamps only rows that were DUE, so a row still inside a retry or usage-limit backoff
+      // never carries it and stays out of the divisor until its backoff elapses.
       .where(
         or(
           eq(schema.jobs.status, "running"),

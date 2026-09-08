@@ -1093,6 +1093,15 @@ function priorErrorSql(): SQL {
  * its own), never burns an attempt, and only ever moves a job *later* — a job already scheduled past
  * `retryAtMs` (e.g. a longer quota backoff) is left where it is. Returns how many rows it deferred.
  *
+ * Only DUE rows — and rows the governor itself already holds — are deferred (PR #248 review). A row
+ * still inside a retry or usage-limit backoff cannot start before that backoff elapses whatever the
+ * governor decides, and the governor's marker is read as demand by the quota split
+ * (`observedWorkEligibility`): stamping it on a backed-off row would keep a project that cannot
+ * spend in the divisor for the length of a backoff it was already idle through. Leaving the row
+ * alone loses nothing — the governor holds the bucket every tick it pays, and defers the row the
+ * tick it comes due if the budget still says so. A row already carrying the marker was due when it
+ * was first held, so a later, longer boundary may move it again and keep its note current.
+ *
  * `bypass` filters execute-epic rows by the `bypassBudget` payload flag (anton-d8i4), so the governor
  * can hold the paced ("Queue") jobs and the immediate-approved ("Approve"/run-directly) ones on
  * different boundaries: `"exclude"` matches only the paced rows (flag unset), `"only"` matches only
@@ -1139,6 +1148,10 @@ export async function deferQueuedJobs(
         opts.projectId == null
           ? isNull(schema.jobs.projectId)
           : eq(schema.jobs.projectId, opts.projectId),
+        or(
+          lte(schema.jobs.runAt, secDate(nowMs)),
+          like(schema.jobs.lastError, `${BUDGET_DEFER_PREFIX}%`),
+        ),
         lt(schema.jobs.runAt, retryDate),
         bypassFilter,
       ),
