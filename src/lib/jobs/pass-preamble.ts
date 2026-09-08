@@ -12,6 +12,7 @@
  * board must leave no empty row behind.
  */
 import { beads } from "../beads/bd";
+import type { ClaudeRouting } from "../claude/driver-routing";
 import type { NudgeTarget } from "../beads/sync-nudge";
 import type { ProposalAutonomyPolicy } from "../gardener/autonomy";
 import { getProjectById } from "../projects";
@@ -26,7 +27,7 @@ import {
 import type { Project } from "../types";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
-import type { JobContext } from "./runner";
+import type { JobContext, LiveJobInfo } from "./runner";
 
 /**
  * One-line error text for a pass's log — collapsed, never merely quoted.
@@ -111,6 +112,12 @@ export interface PassSessionInput {
   runId?: string;
   /** Reported alongside the live handle for a pass that runs claude somewhere (anton-susu). */
   cwd?: string;
+  /**
+   * The routing the pass's headless spawn is pinned to (anton-7poz). Reported on the live handle so
+   * an investigate terminal opened mid-pass hits the SAME gateway the session does, even after
+   * project settings drift. Absent for a pass that runs no claude session (the gardener).
+   */
+  routing?: ClaudeRouting;
 }
 
 /** A pass's session log, whether or not the row behind it exists yet. */
@@ -148,9 +155,10 @@ async function openRow(db: AntonDb, clock: Clock, input: PassSessionInput): Prom
   await createSessionLog(session.logPath).catch((e) =>
     console.warn(`[${input.kind}] could not open the session log at ${session.logPath}`, e),
   );
-  input.ctx.report(
-    input.cwd ? { sessionId: session.sessionId, cwd: input.cwd } : { sessionId: session.sessionId },
-  );
+  const info: LiveJobInfo = { sessionId: session.sessionId };
+  if (input.cwd) info.cwd = input.cwd;
+  if (input.routing) info.routing = input.routing;
+  input.ctx.report(info);
   return session;
 }
 
