@@ -4,9 +4,9 @@
  * One definition, shared by the settings panel and the governor, because the two must never
  * disagree about whether a repo is idle: a panel that says "your share is in use elsewhere" while
  * the governor still holds that share back is worse than either answer alone. For the same reason
- * it answers with the runner's OWN claim gates: queued work the runner would refuse to lease — an
- * execute-epic under an autonomy-off project, a scheduled job whose schedule is disabled — is not
- * startable, whatever its `runAt` says (PR #248 review).
+ * it answers with the runner's OWN claim gates: work the runner would refuse to lease — a queued row
+ * or an expired running lease under an autonomy-off project's execute-epic bucket or a disabled
+ * schedule — is not startable, whatever its `runAt` says (PR #248 review).
  *
  * The answer is THREE-VALUED, and that is the whole care of this module. `true` = the picker ranks
  * startable work here, or quota-burning work is already startable — running, or queued and due.
@@ -44,6 +44,7 @@ export async function observedWorkEligibility(
         projectId: schema.jobs.projectId,
         type: schema.jobs.type,
         status: schema.jobs.status,
+        leaseExpiresAt: schema.jobs.leaseExpiresAt,
       })
       .from(schema.jobs)
       // The same definition of "startable" the queue itself leases on (`leaseDue`): running, or
@@ -71,12 +72,16 @@ export async function observedWorkEligibility(
     if (!job.projectId) continue;
     // Plumbing costs no quota, so a queued sync-push is not a claim on anyone's share.
     if (!burnsClaudeQuota(job.type as JobType)) continue;
-    // A running row is spending whatever the switches say — both gate the CLAIM, not the run. A
-    // queued one the runner holds at cap 0 (`tickOnce`) cannot spend until an operator flips the
-    // switch back, which is an operator action, not the idle window's business.
-    if (job.status === "queued" && isHeld(job.type, job.projectId, autonomyOff, disabledSchedules)) {
-      continue;
-    }
+    // A live running row is spending whatever the switches say — both gate the CLAIM, not the run.
+    // A queued one the runner holds at cap 0 (`tickOnce`) cannot spend until an operator flips the
+    // switch back, which is an operator action, not the idle window's business. A running row whose
+    // lease has EXPIRED is a reclaim — the runner leases it through the same held-bucket filter as a
+    // queued row — so it holds no share either: a restart expires every surviving lease, and the
+    // held project would otherwise sit in the denominator until the operator's next visit.
+    const reclaimable =
+      job.status === "queued" ||
+      (job.leaseExpiresAt !== null && job.leaseExpiresAt.getTime() <= now);
+    if (reclaimable && isHeld(job.type, job.projectId, autonomyOff, disabledSchedules)) continue;
     eligibility.set(job.projectId, true);
   }
   return eligibility;

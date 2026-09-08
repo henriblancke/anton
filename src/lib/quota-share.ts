@@ -64,8 +64,10 @@ export interface QuotaSplit {
   /** Σ declared shares across governed projects. */
   declaredTotalPct: number;
   /**
-   * Σ declared shares of the governed projects that dropped out of this pass's denominator — how
-   * much of the split is currently being spent by somebody else. 0 when nothing was reallocated.
+   * Σ NORMALIZED shares of the governed projects that dropped out of this pass's denominator — how
+   * much of the split is currently being spent by somebody else. Normalized, not raw: the split the
+   * panel shows and the governor enforces is already in proportion, so an imbalanced 30/30/30 board
+   * with one idle project has 33.3 points in use elsewhere, not 30. 0 when nothing was reallocated.
    */
   reallocatedPct: number;
   /**
@@ -237,7 +239,7 @@ export function resolveQuotaSplit(projects: readonly QuotaShareProject[]): Quota
   return {
     rows,
     declaredTotalPct,
-    reallocatedPct: rows.reduce((sum, r) => (r.reallocated ? sum + r.sharePct : sum), 0),
+    reallocatedPct: rows.reduce((sum, r) => (r.reallocated ? sum + r.normalizedPct : sum), 0),
     imbalanced: isImbalanced(governed.length, declaredTotalPct),
     seeded: projects.some((p) => p.seeded),
     spentTotalPct:

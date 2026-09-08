@@ -131,6 +131,19 @@ describe("resolveQuotaSplit", () => {
     expect(split.reallocatedPct).toBe(35);
     expect(resolveQuotaSplit([project({ id: "a" })]).reallocatedPct).toBe(0);
   });
+
+  it("reports the reallocated share in the same normalized terms as the split it came out of", () => {
+    // 30/30/30 with one idle: the split in force is 50/50, and the idle project's cut of the
+    // normalized split was 33.3 — the panel must not say 30 while the rows say otherwise.
+    const split = resolveQuotaSplit([
+      project({ id: "a", sharePct: 30 }),
+      project({ id: "b", sharePct: 30 }),
+      project({ id: "idle", sharePct: 30, eligible: false }),
+    ]);
+
+    expect(split.reallocatedPct).toBeCloseTo(33.33, 1);
+    expect(split.reallocatedPct).toBeCloseTo(row(split, "idle").normalizedPct, 5);
+  });
 });
 
 describe("resolveGovernedShare", () => {

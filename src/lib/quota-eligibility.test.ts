@@ -56,10 +56,11 @@ function job(
   type: JobType,
   status: JobStatus,
   runAt: Date = new Date(NOW),
+  leaseExpiresAt: Date | null = null,
 ): void {
   tdb.db
     .insert(schema.jobs)
-    .values({ id: randomUUID(), projectId, type, status, runAt, payloadJson: "{}" })
+    .values({ id: randomUUID(), projectId, type, status, runAt, leaseExpiresAt, payloadJson: "{}" })
     .run();
 }
 
@@ -148,6 +149,34 @@ describe("observedWorkEligibility", () => {
     const eligibility = await observedWorkEligibility(tdb.db, NOW);
     expect(eligibilityOf(eligibility, fixing)).toBe(true);
     expect(eligibilityOf(eligibility, finishing)).toBe(true);
+  });
+
+  it("treats a held project's expired running lease as a reclaim, not a live run", async () => {
+    // A restart expires every surviving lease (`reclaimRunningJobs`); the runner then re-leases
+    // through the same held-bucket filter as a queued row, so an autonomy-off project's expired
+    // execute-epic is never picked back up. Counting it would hold the share indefinitely.
+    const stale = project("stale", { autonomy: false });
+    plan(stale, 0);
+    job(stale, "execute-epic", "running", new Date(NOW), new Date(NOW - 1000));
+    // The same expiry on a disabled schedule's type is held the same way.
+    const off = project("off");
+    plan(off, 0);
+    schedule(off, "review-fix", false);
+    job(off, "review-fix", "running", new Date(NOW), new Date(NOW));
+    // A lease still in force is a run in flight, switches or not; and a held project's expired
+    // lease on an UNHELD type is reclaimable, so it still counts.
+    const live = project("live", { autonomy: false });
+    plan(live, 0);
+    job(live, "execute-epic", "running", new Date(NOW), new Date(NOW + 60_000));
+    const fixing = project("fixing", { autonomy: false });
+    plan(fixing, 0);
+    job(fixing, "review-fix", "running", new Date(NOW), new Date(NOW - 1000));
+
+    const eligibility = await observedWorkEligibility(tdb.db, NOW);
+    expect(eligibilityOf(eligibility, stale)).toBe(false);
+    expect(eligibilityOf(eligibility, off)).toBe(false);
+    expect(eligibilityOf(eligibility, live)).toBe(true);
+    expect(eligibilityOf(eligibility, fixing)).toBe(true);
   });
 
   it("does not count a queued job whose schedule is disabled", async () => {
