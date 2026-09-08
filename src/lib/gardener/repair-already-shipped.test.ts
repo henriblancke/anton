@@ -358,6 +358,44 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       landed: { [SHIPPER]: { via: "pr", ref: "gh-85", landedAt: expect.any(String) } },
       cited: [{ kind: "pr", ref: "gh-85" }],
     });
+    // An open bead has no `closed_at` to settle the cycle question by, so its history is always
+    // asked — and a never-reopened one stands.
+    expect(historyMock).toHaveBeenCalledWith(repo, SHIPPER);
+  });
+
+  // PR #238 review: a bead shipped once and REOPENED for rework keeps its merged PR pointer, and
+  // that merge speaks for the work it was reopened from. Accepted as-is, another live ticket would
+  // be retired against work the survivor is still redoing.
+  it("refuses a bead still open whose merged PR predates its last reopen", async () => {
+    setPr(85, "MERGED");
+    historyMock.mockResolvedValue(versions([REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]));
+
+    const verdict = await verify(`superseded by ${SHIPPER}`, [
+      bead(TARGET),
+      bead(SHIPPER, { status: "in_progress", metadata: { pr: "gh-85" } }),
+    ]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({
+      why: expect.stringContaining(`\`${SHIPPER}\` is in_progress and its PR (gh-85) is merged — but`),
+    });
+    expect(verdict).toMatchObject({ why: expect.stringContaining(`the board reopened \`${SHIPPER}\` at ${REOPENED_AT}`) });
+    expect(verdict).toMatchObject({ why: expect.stringContaining("is later work still in_progress") });
+  });
+
+  it("refuses an open bead's merged PR when its history cannot be read — no `closed_at` answers for it", async () => {
+    setPr(85, "MERGED");
+    historyMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+    const verdict = await verify(`superseded by ${SHIPPER}`, [
+      bead(TARGET),
+      bead(SHIPPER, { status: "in_progress", metadata: { pr: "gh-85" } }),
+    ]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({
+      why: expect.stringContaining(`whether \`${SHIPPER}\` was reopened since could not be read (dolt: connection refused)`),
+    });
   });
 
   // CLOSED IS NOT LANDED (PR #238 review). An epic's children close the moment their run commits
@@ -1442,6 +1480,34 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);
     });
 
+    // The pointer kept and the PR still merged is what a reopen for rework looks like (PR #238
+    // review): the same bead holding the same merged PR, and nothing but its history saying the
+    // work it holds now is not what that merge shipped. The fence never asks an open survivor's
+    // status, so the cycle question has to be asked of it whatever it reads as.
+    it("refuses when it was reopened after its merge in the window — same PR, still merged", async () => {
+      boardShow.mockImplementation(async (_cwd, id) =>
+        id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!,
+      );
+      historyMock.mockImplementation(async () =>
+        boardShow.mock.calls.length > 0
+          ? [
+              { at: REOPENED_AT, status: "in_progress" },
+              { at: "2020-01-01T00:00:00Z", status: "closed" },
+            ]
+          : [],
+      );
+
+      const outcome = await retireViaPr();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
+        `\`${UNLANDED}\` is not in_progress on the evidence anton verified`,
+      );
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("is an earlier cycle's");
+      expect(historyMock).toHaveBeenCalledWith(repo, UNLANDED);
+      expect(supersedeMock).not.toHaveBeenCalled();
+    });
+
     it("refuses when its PR pointer was swapped in the window, whatever the new PR says", async () => {
       setPr(90, "MERGED");
       boardShow.mockImplementation(async (_cwd, id) =>
@@ -1737,6 +1803,30 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       beforeEach(() => {
         setPr(85, "MERGED");
         loadAllIssuesMock.mockResolvedValue(viaPr());
+      });
+
+      it("withdraws when it was reopened after its merge in the window — same PR, still merged", async () => {
+        boardShow.mockImplementation(async (_cwd, id) =>
+          id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!,
+        );
+        historyMock.mockImplementation(async () =>
+          written()
+            ? [
+                { at: REOPENED_AT, status: "in_progress" },
+                { at: "2020-01-01T00:00:00Z", status: "closed" },
+              ]
+            : [],
+        );
+
+        const outcome = await retireViaPr();
+
+        expect(outcome).toMatchObject({ action: "escalate" });
+        expect(evidenceOf(outcome)).toContain(`\`${UNLANDED}\` is not in_progress on the evidence anton verified`);
+        expect(evidenceOf(outcome)).toContain("is an earlier cycle's");
+        expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);
+        expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+        expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);
+        expect(tagMock).not.toHaveBeenCalled();
       });
 
       it("withdraws when its PR pointer was swapped in the window, whatever the new PR says", async () => {

@@ -130,9 +130,10 @@ export type CitedEvidence = { kind: "commit"; sha: string } | { kind: "pr"; ref:
  * verification back, and a reread that only looked at status would never see it.
  *
  * `landedAt` is WHEN the landing entered the base — the naming commit's committer date, or the
- * merge commit's — carried so the fences can measure it against the survivor's closure again
- * ({@link stillCurrentCycle}): a survivor reopened and closed once more in the window keeps this
- * landing in the base, and it is the closure that moved, not the evidence.
+ * merge commit's — carried so the fences can measure it against the survivor's history again
+ * ({@link stillCurrentCycle}): a survivor reopened in the window — closed once more, or still open
+ * and keeping its merged PR pointer — keeps this landing in the base, and it is the cycle that
+ * moved, not the evidence.
  */
 export type BeadLanding =
   /** A commit in the run's base names the bead. */
@@ -369,6 +370,18 @@ export async function verifyShippedClaim(args: {
     }
     const landing = await readPr(pr);
     if (landing.landed) {
+      // Held to the bead's CURRENT cycle like a closed one is (PR #238 review): a bead shipped once
+      // and reopened for rework keeps its merged PR pointer, and that merge speaks for the work it
+      // was reopened FROM, not the work it holds now. A never-closed bead awaiting its merge's
+      // finalization has no reopen in its history and stands.
+      const cycle = await landingOfCurrentCycle(repoPath, bead, landing.landedAt);
+      if (cycle.stale) {
+        return {
+          state: "unverified",
+          proof,
+          why: `\`${id}\` is ${standing} and its PR (${pr}) is merged — but ${cycle.stale}`,
+        };
+      }
       proof.push(`\`${id}\` is ${standing}, but its PR (${pr}) is merged${landedTail(base, landing)}`);
       landed[id] = { via: "pr", ref: pr, landedAt: landing.landedAt };
       cite({ kind: "pr", ref: pr });
@@ -563,20 +576,23 @@ async function closedBeadLanding(args: {
 }
 
 /**
- * Is a landing dated `landedAt` the CURRENT closure's, or a previous cycle's (PR #238 review)?
+ * Is a landing dated `landedAt` the bead's CURRENT cycle's, or a previous one's (PR #238 review)?
  *
- * The bead's row settles the common case without a history read: a landing at or after its
+ * A CLOSED bead's row settles the common case without a history read: a landing at or after its
  * `closed_at` cannot be an earlier cycle's, since that cycle's landing preceded its own close, which
  * preceded the reopen, which preceded this close. In anton's own lifecycle that is every child of a
- * run — closed on commit, landed at the merge after — so the fast path is the usual path.
+ * run — closed on commit, landed at the merge after — so the fast path is the usual path. An OPEN
+ * bead has no such row to ask: bd clears `closed_at` on reopen, and a `closed_at` that survived one
+ * would be the very close the reopen undid, so its history is always read.
  *
  * A landing that PREDATES the close is ambiguous: a standalone target closes seconds after its
  * merge, a person closes a bead by hand a week after the work landed, and a reopened bead's first
  * landing sits before its second close — the last is the one that must not count, and only the
  * board's history tells it from the others. So the history is read, and the landing is stale when
- * the bead was reopened after it: the close the board holds now is a later cycle's, and this landing
- * says nothing about that cycle's work. Never reopened, or reopened before the landing, and it
- * stands. An unreadable history fails closed, for the reason every other read here does.
+ * the bead was reopened after it: what the board holds now is a later cycle's work — closed again,
+ * or still open for rework — and this landing says nothing about it. Never reopened, or reopened
+ * before the landing, and it stands. An unreadable history fails closed, for the reason every other
+ * read here does.
  *
  * `bd flatten` erases the record this reads — a board squashed to one version reads as never
  * reopened. Named, not defended against: the operator who flattens has chosen to lose history.
@@ -590,17 +606,20 @@ async function landingOfCurrentCycle(
   if (Number.isNaN(landed)) {
     return { stale: `when that landing happened could not be read ("${landedAt}" is not a date)` };
   }
-  const closedAt = typeof bead.closed_at === "string" ? Date.parse(bead.closed_at) : NaN;
+  const closedAt =
+    bead.status === "closed" && typeof bead.closed_at === "string" ? Date.parse(bead.closed_at) : NaN;
   if (!Number.isNaN(closedAt) && landed >= closedAt) return {};
 
   let versions;
   try {
     versions = await beads.history(repoPath, bead.id);
   } catch (error) {
+    const closed = bead.status === "closed";
     return {
       stale:
-        `that landing (${landedAt}) predates the close the board holds, and whether \`${bead.id}\` ` +
-        `was reopened since could not be read (${error instanceof Error ? error.message : String(error)})`,
+        `that landing (${landedAt}) ${closed ? "predates the close the board holds" : `may not be the ${bead.status} work the board holds`}, ` +
+        `and whether \`${bead.id}\` was reopened since could not be read ` +
+        `(${error instanceof Error ? error.message : String(error)})`,
     };
   }
   const reopenedAt = lastReopen(versions);
@@ -610,8 +629,9 @@ async function landingOfCurrentCycle(
   return {
     stale:
       `that landing (${landedAt}) is an earlier cycle's — the board reopened \`${bead.id}\` at ` +
-      `${reopenedAt}, after it, so the close it holds now is later work, and nothing says THAT ` +
-      `work landed`,
+      `${reopenedAt}, after it, so what it holds now ` +
+      `${bead.status === "closed" ? "is later work under that close" : `is later work still ${bead.status}`}, ` +
+      `and nothing says THAT work landed`,
   };
 }
 
@@ -1321,14 +1341,15 @@ async function retirementDrifted(
 }
 
 /**
- * A closed survivor's landing has to still be its CURRENT closure's at the write (PR #238 review).
- * {@link stillClosedSurvivor} catches a reopen the window left open; a survivor reopened AND closed
- * again before the fence reads it is closed once more, its naming commit or merged PR still in the
- * base, and status alone would call that held — while the rework its latest close describes may be
- * sitting on an unmerged branch. So the check's own question ({@link landingOfCurrentCycle}) is
- * re-asked of the fresh read: its `closed_at` is the new close, and the history holds the reopen.
- * Asked only of a closed survivor — an open one either failed {@link stillClosedSurvivor} already or
- * verified through its own PR, which the check accepts whatever its status.
+ * The survivor's landing has to still be its CURRENT cycle's at the write (PR #238 review).
+ * {@link stillClosedSurvivor} catches a reopen the window left open on a survivor the check read as
+ * closed; a survivor reopened AND closed again before the fence reads it is closed once more, its
+ * naming commit or merged PR still in the base, and status alone would call that held — while the
+ * rework its latest close describes may be sitting on an unmerged branch. And a survivor verified
+ * through its own PR whatever its status (the `pr` landing) passes no status fence at all: reopened
+ * in the window with the pointer kept, it is the same bead holding the same merged PR, and only the
+ * reopen in its history says the work it holds now is not what that merge shipped. So the check's
+ * own question ({@link landingOfCurrentCycle}) is re-asked of the fresh read, whatever it reads as.
  */
 async function stillCurrentCycle(
   repoPath: string,
@@ -1336,11 +1357,10 @@ async function stillCurrentCycle(
   landing: BeadLanding,
   targetId: string,
 ): Promise<string | undefined> {
-  if (replacement.status !== "closed") return undefined;
   const cycle = await landingOfCurrentCycle(repoPath, replacement, landing.landedAt);
   if (!cycle.stale) return undefined;
   return (
-    `\`${replacement.id}\` is not closed on the evidence anton verified — ${cycle.stale}; ` +
+    `\`${replacement.id}\` is not ${replacement.status} on the evidence anton verified — ${cycle.stale}; ` +
     `${targetId} is not superseded on that evidence`
   );
 }

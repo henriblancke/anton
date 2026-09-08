@@ -84,9 +84,25 @@ export async function dispatchRunTickets(
   // into the base finds a commit an earlier merge landed under the same id, keeping a ticket the
   // board has since settled out of the retirement ledger and in the delivered set of a PR that
   // carries nothing of it.
-  const { live, held, dispatchable } = await partitionTickets(run, prep.gated, (id) =>
-    worktreeHasCommitFor(prep.worktree.path, id, { base: prep.runStep.baseRef }),
-  );
+  //
+  // And read STRICTLY (PR #238 review): "no commit here" is what drops a superseded ticket from the
+  // run, so a scan that failed — the base ref gone, git itself broken — must stop the run rather
+  // than read as absence. Taken for absence, a ticket whose commit IS in this delta leaves the
+  // delivered set and the PR body while its diff ships, or an all-retired run parks without opening
+  // the pull request that carries it.
+  const { live, held, dispatchable } = await partitionTickets(run, prep.gated, async (id) => {
+    try {
+      return await worktreeHasCommitFor(prep.worktree.path, id, { base: prep.runStep.baseRef, strict: true });
+    } catch (e) {
+      throw new PoisonEpic(
+        `${id} is superseded on the board, and anton could not read the commits ` +
+          `\`${prep.worktree.branch}\` carries beyond ${prep.runStep.baseRef} in ${prep.worktree.path} ` +
+          `to tell whether this branch holds its work (${e instanceof Error ? e.message : String(e)}). ` +
+          `Refusing to retire it on an unreadable branch — if its commit IS here, the pull request ` +
+          `would ship it unlisted. Repair the worktree, then resume the run`,
+      );
+    }
+  });
   const ledger: DispatchLedger = {
     skipCause: new Map(),
     skipped: new Map(),

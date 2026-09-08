@@ -672,7 +672,11 @@ export async function branchAheadOfRemote(
  * machine closed then crashed on (before opening the PR) has its commit solely in that machine's
  * local, never-pushed worktree. Skipping such a ticket on board state alone would open the epic's PR
  * missing that work. A run's own ticket commits are always at the branch tip, so bounding the scan
- * is safe. Fails closed to `false` (git error → treat as absent → re-run) rather than risk a skip.
+ * is safe. Fails closed to `false` (git error → treat as absent → re-run) rather than risk a skip —
+ * except under `strict`, for the caller whose safe answer is the other one (PR #238 review): the
+ * retirement ledger drops a superseded ticket on "no commit here", and a `git log` that failed is
+ * not that answer. Read as absent, the ticket leaves the delivered set and the pull request's body
+ * while its commit ships in the diff, or an all-retired run parks without opening the PR at all.
  *
  * `base` narrows the read to the commits the branch carries BEYOND it — `<base>..HEAD` — for the
  * caller whose question is "did THIS run commit it", not "has it ever been committed" (PR #238
@@ -684,7 +688,7 @@ export async function branchAheadOfRemote(
 export async function worktreeHasCommitFor(
   worktreePath: string,
   ticketId: string,
-  options: { base?: string } = {},
+  options: { base?: string; strict?: boolean } = {},
 ): Promise<boolean> {
   return (await branchSubjects(worktreePath, options)).some((s) => s.startsWith(`${ticketId}:`));
 }

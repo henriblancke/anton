@@ -27,12 +27,13 @@ vi.mock("./execute-epic-ticket", () => ({
   runTicket: (args: { ticket: Bead }) => runTicketMock(args),
 }));
 
-const hasCommitMock = vi.fn<(worktree: string, id: string, options?: { base?: string }) => Promise<boolean>>();
+type HasCommitOptions = { base?: string; strict?: boolean };
+const hasCommitMock = vi.fn<(worktree: string, id: string, options?: HasCommitOptions) => Promise<boolean>>();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
     ...actual,
-    worktreeHasCommitFor: (worktree: string, id: string, options?: { base?: string }) =>
+    worktreeHasCommitFor: (worktree: string, id: string, options?: HasCommitOptions) =>
       hasCommitMock(worktree, id, options),
   };
 });
@@ -54,6 +55,7 @@ vi.mock("../beads/bd", async () => {
 
 const { dispatchRunTickets } = await import("./execute-epic-dispatch");
 const { TicketRetiredError } = await import("./execute-epic-errors");
+const { PoisonEpic } = await import("./errors");
 const { beads } = await import("../beads/bd");
 const reopenMock = vi.mocked(beads.reopen);
 const showMock = vi.mocked(beads.show);
@@ -100,7 +102,7 @@ const prep = (): Extract<RunPreparation, { done: false }> =>
     ticketSteps: [],
     runSteps: [],
     runStep: { baseRef: BASE_REF },
-    worktree: { path: WORKTREE },
+    worktree: { path: WORKTREE, branch: "anton/anton-epic" },
     readiness: { blockers: [] },
     gated: new Set<string>(),
     isResumeSkipped: (t: Bead) => resumeSkipped(t, false),
@@ -156,10 +158,27 @@ describe("a ticket the board already holds as superseded", () => {
 
     const outcome = await dispatchRunTickets(run, prep());
 
-    expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", { base: BASE_REF });
+    expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", { base: BASE_REF, strict: true });
     expect(dispatchedIds()).toEqual(["anton-b"]);
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-b"]);
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "pre-existing" }]);
+  });
+
+  // The delta scan failing is not "no commit here" (PR #238 review): the base ref gone or git broken
+  // must stop the run, not retire a ticket whose commit may be in the very diff the PR would carry.
+  it("stops the run when the branch's delta cannot be read, rather than reading the failure as absence", async () => {
+    hasCommitMock.mockImplementation(async (_worktree, id) => {
+      if (id === "anton-a") throw new Error("fatal: bad revision 'origin/main..HEAD'");
+      return false;
+    });
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(PoisonEpic);
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /anton-a is superseded on the board, and anton could not read the commits `anton\/anton-epic` carries beyond origin\/main[\s\S]*bad revision/,
+    );
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
   });
 });
 

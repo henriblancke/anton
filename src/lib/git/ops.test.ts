@@ -430,8 +430,10 @@ suite("worktreeHasCommitFor (real git)", () => {
     expect(await worktreeHasCommitFor(repo, "anton-old1")).toBe(true);
     expect(await worktreeHasCommitFor(repo, "anton-old1", { base: "main" })).toBe(false);
     expect(await worktreeHasCommitFor(repo, "anton-new1", { base: "main" })).toBe(true);
-    // A base that resolves to nothing fails closed to absent, as the unscoped read does.
+    // A base that resolves to nothing fails closed to absent, as the unscoped read does — unless the
+    // caller asked to see the failure, because absence is the answer that drops a ticket for it.
     expect(await worktreeHasCommitFor(repo, "anton-new1", { base: "origin/nope" })).toBe(false);
+    await expect(worktreeHasCommitFor(repo, "anton-new1", { base: "origin/nope", strict: true })).rejects.toThrow();
   });
 });
 
