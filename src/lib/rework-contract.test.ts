@@ -488,6 +488,14 @@ describe("instructionCriteria", () => {
     // left behind at the end are the item's, not the block's.
     expect(texts("- ```\n  x\n- next")).toEqual(["```\nx\n```", "next"]);
     expect(texts("- ```\n  a\n\n- next")).toEqual(["```\na\n```", "next"]);
+    // A bare closer at column 0 leaves the item too, and CommonMark judges it afresh as a NEW
+    // top-level fence — not the just-left one's closer — so the line after it is that fence's
+    // literal content, exactly as the note renders it. Filing it as an actionable step instead
+    // would make the acceptance say what no renderer shows.
+    expect(instructionCriteria("- ```\n  some code\n```\n- Fix the retry")).toEqual([
+      { text: "```\nsome code\n```", fenced: true },
+      { text: "```\n- Fix the retry\n```", fenced: true },
+    ]);
     // As CommonMark reads it: the item's fence is empty, `top` is prose, and the last line opens
     // a fence of its own that holds nothing.
     expect(texts("- ```\ntop\n```")).toEqual(["top"]);
