@@ -361,9 +361,55 @@ describe("instructionCriteria", () => {
   });
 
   it("does not open a fence on a backtick run with a backtick in its info string, nor on an indented one", () => {
-    // CommonMark: `` ```a`b `` is a paragraph, and a delimiter indented four spaces is code, not a fence.
+    // CommonMark: `` ```a`b `` is a paragraph, and a delimiter indented four spaces is code, not a
+    // fence — so it is filed as code, inside a fence long enough that its own backticks cannot close.
     expect(texts("```a`b\ninside?")).toEqual(["```a`b", "inside?"]);
-    expect(texts("    ```\n## still a heading\n    ```")).toEqual(["```", "```"]);
+    expect(texts("    ```\n## still a heading\n    ```")).toEqual([
+      "````\n```\n````",
+      "````\n```\n````",
+    ]);
+  });
+
+  it("keeps an indented code block literal — its bullet is content the note renders as code", () => {
+    // `Expected output:`, a blank line, then a four-space-indented line is an indented code block.
+    // Shearing its marker filed `item` while the note still showed `- item`.
+    expect(instructionCriteria("Expected output:\n\n    - item\n    ## not a heading")).toEqual([
+      { text: "Expected output:", fenced: false },
+      { text: "```\n- item\n## not a heading\n```", fenced: true },
+    ]);
+    // A tab indents the same way, and a heading or a rule opens the block as a blank line does.
+    expect(texts("## Expected\n\t- item")).toEqual(["```\n- item\n```"]);
+    expect(texts("---\n    1. step")).toEqual(["```\n1. step\n```"]);
+    expect(texts("```\nx\n```\n    - after a fence")).toEqual(["```\nx\n```", "```\n- after a fence\n```"]);
+  });
+
+  it("keeps blank lines inside an indented block and drops the ones that trail it", () => {
+    expect(texts("\n    first\n\n    second\n\n\nthen this")).toEqual([
+      "```\nfirst\n\nsecond\n```",
+      "then this",
+    ]);
+    expect(instructionCriteria("    only\n    \n")).toEqual([{ text: "```\nonly\n```", fenced: true }]);
+  });
+
+  it("still shears indented lines under a list item or a paragraph — nested steps, not code", () => {
+    // Four-space nesting is how founders (and rich-text pastes) indent sub-bullets; CommonMark reads
+    // both shapes as list content, and a founder who indents steps under `Add a retry:` means steps.
+    expect(texts("- Add a retry:\n    - up to 3 times\n\n    - with backoff")).toEqual([
+      "Add a retry:",
+      "up to 3 times",
+      "with backoff",
+    ]);
+    expect(texts("1. step\n    - sub\n  - two-space sub")).toEqual(["step", "sub", "two-space sub"]);
+    expect(texts("Add a retry:\n    - up to 3 times")).toEqual(["Add a retry:", "up to 3 times"]);
+    // A paragraph line after a blank ends the list, so the next indented block is code again.
+    expect(texts("- item\n\nprose\n\n    - code")).toEqual(["item", "prose", "```\n- code\n```"]);
+    // A heading or a rule ends the list too, and cannot be continued.
+    expect(texts("- item\n## Section\n    - code")).toEqual(["item", "```\n- code\n```"]);
+  });
+
+  it("fences an indented block with one backtick more than any run its content opens with", () => {
+    expect(texts("    ````\n    inner\n    ````")).toEqual(["`````\n````\ninner\n````\n`````"]);
+    expect(texts("    a `tick` inline")).toEqual(["```\na `tick` inline\n```"]);
   });
 });
 
@@ -395,6 +441,8 @@ describe("doneGap", () => {
     expect(doneGap("```\n\n```\n---", [])).not.toBeNull();
     expect(doneGap("```\n## Expected\n```", [])).toBeNull();
     expect(doneGap("```\n```", [finding])).toBeNull();
+    // An indented block is never empty — whitespace-only lines are blank — so it always states one.
+    expect(doneGap("\n    - item", [])).toBeNull();
   });
 
   it("refuses instructions that are only headings or empty boxes — labels and blanks, not steps", () => {

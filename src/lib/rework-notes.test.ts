@@ -12,10 +12,8 @@ import { acceptanceBody, validateBeadContract } from "./beads/contract";
 import { formatHumanNote } from "./beads/notes";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
-  createdUnder,
   detachmentNoteBody,
   followUpDescription,
-  followUpRunsUnder,
   hasAnyHumanNote,
   hasDetachmentNote,
   hasHumanNote,
@@ -481,7 +479,6 @@ describe("reconcileFollowUpDescription", () => {
       parentId: undefined,
     });
     expect(reconciled).toBe(followUpDescription({ ...args, parentId: undefined }));
-    expect(createdUnder(makeBead({ id: "f", description: reconciled }), "feat")).toBe(false);
   });
 
   it("re-says the run-location line only in Context — the same sentence in Goal or a box is authored text", () => {
@@ -498,7 +495,6 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).toContain(`- [ ] ${sentence}`);
     expect(reconciled.split("\n\n## Context")[1]).not.toContain(sentence);
     expect(reconciled.split("\n\n## Context")[1]).toContain("It is its own run target");
-    expect(createdUnder(makeBead({ id: "f", description: reconciled }), "feat")).toBe(false);
   });
 
   it("leaves a run-location line the founder rewrote alone — they own the Context then", () => {
@@ -680,86 +676,17 @@ describe("hasAnyHumanNote", () => {
   });
 });
 
-describe("createdUnder", () => {
-  const args = {
-    summary: "harden the retry",
-    instructions: INSTRUCTIONS,
-    findings: [],
-    ticket: ticket(),
-    targetId: "feat",
-  };
-
-  it("reads the parent off the Context line the bead was created with, not its parentage", () => {
-    const detached = makeBead({
-      id: "f",
-      parent: undefined,
-      description: followUpDescription({ ...args, parentId: "feat" }),
-    });
-    expect(createdUnder(detached, "feat")).toBe(true);
-    expect(createdUnder(detached, "other")).toBe(false);
-  });
-
-  it("is false for a bead created standing alone, and for one with no contract at all", () => {
-    expect(createdUnder(makeBead({ id: "f", description: followUpDescription(args) }), "feat")).toBe(
-      false,
-    );
-    expect(createdUnder(makeBead({ id: "f" }), "feat")).toBe(false);
-  });
-
-  it("ignores the generated line when it sits outside Context — an instruction quoting it lands in Acceptance", () => {
-    const quoted = `Keep saying: ${followUpRunsUnder("feat")}`;
-    const standalone = followUpDescription({ ...args, instructions: quoted });
-    expect(acceptanceBody(makeBead({ id: "f", description: standalone }))).toContain(
-      followUpRunsUnder("feat"),
-    );
-    expect(createdUnder(makeBead({ id: "f", parent: undefined, description: standalone }), "feat")).toBe(
-      false,
-    );
-
-    const inGoal = followUpDescription({ ...args, summary: followUpRunsUnder("feat") });
-    expect(createdUnder(makeBead({ id: "f", description: inGoal }), "feat")).toBe(false);
-  });
-
-  it("reads a Context line a founder padded but did not rewrite", () => {
-    const padded = followUpDescription({ ...args, parentId: "feat" }).replace(
-      followUpRunsUnder("feat"),
-      `  ${followUpRunsUnder("feat")}  `,
-    );
-    expect(createdUnder(makeBead({ id: "f", description: padded }), "feat")).toBe(true);
-  });
-
-  it("bounds Context by the ticket's own headings — an epic-only `### Success` nested in it is Context's content", () => {
-    // The same bounds the reconcile uses: a `### Success` grouping notes inside Context does not end
-    // the section on a ticket, so the run-location line below it is still read. Ending on the merged
-    // set lost it, and a detachment whose audit note failed to land was never recorded on retry.
-    const grouped = followUpDescription({ ...args, parentId: "feat" }).replace(
-      followUpRunsUnder("feat"),
-      `### Success\nWhat the founder wants to see.\n${followUpRunsUnder("feat")}`,
-    );
-    expect(createdUnder(makeBead({ id: "f", parent: undefined, description: grouped }), "feat")).toBe(
-      true,
-    );
-    expect(createdUnder(makeBead({ id: "f", parent: undefined, description: grouped }), "other")).toBe(
-      false,
-    );
-  });
-
-  it("reads every Context occurrence, as the judge concatenates repeated headings", () => {
-    const repeated = `${followUpDescription({ ...args, parentId: "feat" })}\n\n## Context\nA later copy.`;
-    expect(createdUnder(makeBead({ id: "f", parent: undefined, description: repeated }), "feat")).toBe(
-      true,
-    );
-  });
-});
-
 describe("detachmentNoteBody / hasDetachmentNote", () => {
   const kept = detachmentNoteBody({ targetId: "feat", pr: "gh-42", contextKept: true });
   const rewritten = detachmentNoteBody({ targetId: "feat", pr: "gh-42", contextKept: false });
 
-  it("names the target and the PR that merged, and says the bead is its own run target now", () => {
+  it("names the target and the PR that merged, and says the detachment is being carried out", () => {
+    // Written before the reparent, so it must hold whether or not that write lands: a decision in
+    // progress, never a move already made.
     for (const body of [kept, rewritten]) {
       expect(body).toContain("feat's pull request (gh-42) merged after this follow-up was created under it");
-      expect(body).toContain("its own run target now — approve it to run.");
+      expect(body).toContain("anton is detaching it to stand as its own run target — approve it to run.");
+      expect(body).not.toContain("was detached");
     }
   });
 

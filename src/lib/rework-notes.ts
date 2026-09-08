@@ -205,13 +205,13 @@ function withoutTrailingBlank(texts: string[]): string[] {
 /**
  * The run-location line ({@link followUpRunsUnder}) re-said for the parentage the bead holds now.
  * Only the two shapes a create can write are recognised — under the target, or standing alone; a
- * founder who rewrote that line has taken the Context into their own hands ({@link createdUnder}),
- * and it is left as they put it.
+ * founder who rewrote that line has taken the Context into their own hands, and it is left as they
+ * put it.
  *
- * Only the Context section is searched, the one place the formula writes the line and the one
- * {@link createdUnder} reads it back from. The same sentence elsewhere — a Goal that happens to say
- * it, a founder's instruction quoting it into an Acceptance box — is authored text a reconcile
- * promises to keep, and rewriting it there changed a section it had no business in.
+ * Only the Context section is searched, the one place the formula writes the line. The same
+ * sentence elsewhere — a Goal that happens to say it, a founder's instruction quoting it into an
+ * Acceptance box — is authored text a reconcile promises to keep, and rewriting it there changed a
+ * section it had no business in.
  */
 function replaceRunsUnder(description: string, targetId: string, parentId?: string): string {
   const generated = new Set([followUpRunsUnder(targetId), followUpRunsUnder()]);
@@ -227,41 +227,16 @@ function replaceRunsUnder(description: string, targetId: string, parentId?: stri
 }
 
 /**
- * The Context line that says WHERE the follow-up runs. Rendered on its own because the detachment
- * recovery reads it back ({@link createdUnder}): it is frozen at `bd create`, so it still names the
- * parent after a `bd reparent` has moved the bead — which is how a retry tells a follow-up whose
- * detachment went unrecorded from one that was created standing alone.
+ * The Context line that says WHERE the follow-up runs. Rendered on its own because the reconcile
+ * re-says it ({@link replaceRunsUnder}): it is frozen at `bd create`, so it still names the parent
+ * after a `bd reparent` has moved the bead. It is a description line, not a record — a founder may
+ * rewrite it — so nothing reads it back to decide what the bead is owed; the detachment that moves
+ * a bead leaves its own note ({@link detachmentNoteBody}).
  */
 export function followUpRunsUnder(parentId?: string): string {
   return parentId
     ? `It runs as a ticket of ${parentId}, in that target's next run.`
     : `It is its own run target — approve it to run.`;
-}
-
-/**
- * Was this follow-up created as a ticket of `parentId`? Read off the Context line
- * ({@link followUpRunsUnder}) rather than the parentage, which is exactly what a detachment
- * changes. A founder who has rewritten that line has taken the Context into their own hands, and
- * with it the record of where the bead came from.
- *
- * Only a whole line of the Context section counts. The same sentence can sit elsewhere in the
- * description without saying anything about parentage — a founder's instruction quoting it lands
- * verbatim in an Acceptance box ({@link followUpAcceptance}) — and a bead created standing alone
- * that carried it there would otherwise be read as detached, and given a note about a detachment
- * that never happened.
- *
- * Context is bounded the way {@link replaceRunsUnder} bounds it — by the ticket's own headings
- * (`sectionsNamed`), not every tier's merged. A `### Success` grouping notes inside Context is the
- * section's own content on a ticket; ending there hid the line below it, so a detachment whose
- * audit note failed to land read as a bead created standing alone on the retry, and went unrecorded.
- */
-export function createdUnder(bead: Bead, parentId: string): boolean {
-  if (!bead.description) return false;
-  const generated = followUpRunsUnder(parentId);
-  const lines = scanMarkdown(bead.description);
-  return sectionsNamed(lines, CONTEXT_KEYS).some(({ start, end }) =>
-    lines.slice(start + 1, end).some((line) => line.text.trim() === generated),
-  );
 }
 
 /**
@@ -347,13 +322,17 @@ export function originNoteBody(followUpId: string, pipeline?: ReworkPipeline): s
 }
 
 /**
- * The record that a follow-up created UNDER a target was detached because the target's PR merged
- * under it. Split into a head and a Context clause because the retry that recovers a detachment
- * matches on the HEAD alone ({@link hasDetachmentNote}) — what the clause says depends on which
- * pass wrote it. A finished bead keeps its Context, which a founder may have edited, so the note
- * flags that it still names the old parent. A half-created bead's run-location line is re-said by
- * the pass finishing it ({@link reconcileFollowUpDescription}), so the note claims nothing about it
- * either way.
+ * The record that a follow-up created UNDER a target is being detached because the target's PR
+ * merged under it. Written BEFORE the `bd reparent` that detaches it (lib/rework-modes.ts) — it is
+ * the record a retry finds the owed detachment by, and neither the reparent nor a founder editing
+ * the Context can erase it — so it states the decision being carried out, not a move already made:
+ * true on the bead whether the reparent that follows lands or is left for the retry.
+ *
+ * Split into a head and a Context clause because the retry matches on the HEAD alone
+ * ({@link hasDetachmentNote}) — what the clause says depends on which pass wrote it. A finished
+ * bead keeps its Context, which a founder may have edited, so the note flags that it still names
+ * the old parent. A half-created bead's run-location line is re-said by the pass finishing it
+ * ({@link reconcileFollowUpDescription}), so the note claims nothing about it either way.
  */
 export function detachmentNoteBody(args: {
   targetId: string;
@@ -370,7 +349,7 @@ export function detachmentNoteBody(args: {
 function detachmentNoteHead(targetId: string, pr: string): string {
   return (
     `anton: rework — ${targetId}'s pull request (${pr}) merged after this follow-up was created ` +
-    `under it, so it was detached and is its own run target now — approve it to run.`
+    `under it, so anton is detaching it to stand as its own run target — approve it to run.`
   );
 }
 

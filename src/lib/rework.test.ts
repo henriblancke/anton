@@ -868,7 +868,7 @@ describe("pipeline: the target's own pull request (anton-leit)", () => {
       // ...which is what makes the founder's "carries the next pass as its own run target" true.
       expect(result.pipeline).toEqual({ outcome: "shipped", pr: "gh-42", redirected: false });
       const noted = noteMock.mock.calls.map((c) => [c[1], c[2] as string] as const);
-      expect(noted.find(([id]) => id === "already")?.[1]).toContain("detached");
+      expect(noted.find(([id]) => id === "already")?.[1]).toContain("detaching it");
     });
 
     it("detaches on a REDIRECTED reopen too — the same stranded child, reached the other way", async () => {

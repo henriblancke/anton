@@ -168,17 +168,33 @@ const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
  */
 const PROMPT_LINE = /^TODO\s*[—–:-]/;
 
+/**
+ * Four or more columns of indentation — CommonMark's indented code, a tab reaching the next tab
+ * stop as it does there — and the text past them, which is what the block renders.
+ */
+const CODE_INDENT = /^(?: {4}| {0,3}\t)(.*)$/;
+
+/**
+ * A line that opens a list item as CommonMark reads one: up to 3 leading spaces, a bullet or an
+ * ordered marker, then whitespace. The marker set is {@link LIST_MARKER}'s; only where the line
+ * STARTS differs, since here it decides whether the indented lines after it are nested in a list.
+ */
+const LIST_ITEM = /^ {0,3}(?:[-*+•]|\d{1,9}[.)])(?:\s|$)/;
+
 /** One thing the instructions say must be true, as the follow-up's acceptance will file it. */
 export interface InstructionCriterion {
-  /** A shorn instruction line — or, for a fenced block, the whole block, delimiters included. */
+  /**
+   * A shorn instruction line — or, for a code block, the whole block inside its fence: a fenced
+   * block as typed, delimiters included, and an indented one re-fenced ({@link refenced}).
+   */
   text: string;
-  /** A fenced code block: literal content, filed as it was typed rather than boxed line by line. */
+  /** A code block: literal content, filed as it was typed rather than boxed line by line. */
   fenced: boolean;
 }
 
 /**
  * One criterion per non-blank instruction line, shorn of whatever list marker it was typed with,
- * and one per fenced code block, kept verbatim. Instruction lines arrive as the founder typed them
+ * and one per code block, kept verbatim. Instruction lines arrive as the founder typed them
  * — prose, `-`/`*` bullets, numbered steps, or boxes already — so list markers are stripped rather
  * than nested inside a second box. A line that is only a rule ({@link THEMATIC_BREAK}), a heading
  * ({@link isHeading}) or the formula's prompt ({@link PROMPT_LINE}) is scaffolding like a bare
@@ -191,30 +207,84 @@ export interface InstructionCriterion {
  * less. The block travels as one criterion, delimiters included, so what files is what was typed;
  * an unclosed one is closed ({@link fenceCloser}), since verbatim it would swallow every section
  * written after it. A fence holding nothing but blank lines says nothing, as the judge reads it.
+ *
+ * An INDENTED code block is literal for the same reason, and CommonMark opens one where the scanner
+ * does not: a line indented four columns ({@link CODE_INDENT}) that follows a blank line, a heading,
+ * a rule or a fence — anywhere but inside a paragraph or a list. The note renders `Expected
+ * output:`, a blank, `    - item` as a code block, and shearing its bullet filed `item` as the
+ * contract while the note still showed the marker. The same indentation under a list item is a
+ * nested item, and under a paragraph line a continuation of it; a founder who indents sub-steps
+ * beneath `Add a retry:` means bullets, so those keep being shorn. The block is filed inside a
+ * fence rather than as it was indented ({@link refenced}): it lands among the acceptance's boxes,
+ * where four spaces after a `- [ ]` line render as nesting, not code.
  */
 export function instructionCriteria(instructions: string): InstructionCriterion[] {
   const out: InstructionCriterion[] = [];
-  let block: { opener: string; content: string[] } | undefined;
-  const flush = (closer: string) => {
-    if (block && block.content.some((line) => line.trim() !== "")) {
-      out.push({ text: [block.opener, ...block.content, closer].join("\n"), fenced: true });
+  let fence: { opener: string; content: string[] } | undefined;
+  let code: string[] | undefined;
+  // Blank lines inside an indented block belong to it only when more indented lines follow.
+  let pendingBlanks = 0;
+  let inList = false;
+  let inParagraph = false;
+
+  const flushFence = (closer: string) => {
+    if (fence && fence.content.some((line) => line.trim() !== "")) {
+      out.push({ text: [fence.opener, ...fence.content, closer].join("\n"), fenced: true });
     }
-    block = undefined;
+    fence = undefined;
   };
+  const flushCode = () => {
+    if (code) out.push({ text: refenced(code), fenced: true });
+    code = undefined;
+    pendingBlanks = 0;
+  };
+
   for (const line of scanMarkdown(instructions)) {
-    if (!line.fenced) {
-      const text = shorn(line.text);
-      if (text) out.push({ text, fenced: false });
-    } else if (!block) {
-      block = { opener: line.text, content: [] };
-    } else if (line.delimiter) {
-      flush(line.text);
-    } else {
-      block.content.push(line.text);
+    if (line.fenced) {
+      flushCode();
+      inList = false;
+      inParagraph = false;
+      if (!fence) fence = { opener: line.text, content: [] };
+      else if (line.delimiter) flushFence(line.text);
+      else fence.content.push(line.text);
+      continue;
     }
+    if (line.text.trim() === "") {
+      if (code) pendingBlanks += 1;
+      inParagraph = false;
+      continue;
+    }
+    const indented = CODE_INDENT.exec(line.text);
+    if (indented && (code || !(inList || inParagraph))) {
+      code = [...(code ?? []), ...Array<string>(pendingBlanks).fill(""), indented[1]!];
+      pendingBlanks = 0;
+      continue;
+    }
+    flushCode();
+    if (!indented) {
+      const rule = THEMATIC_BREAK.test(line.text.trim()) || isHeading(line.text);
+      inList = !rule && LIST_ITEM.test(line.text);
+      inParagraph = !rule;
+    } else {
+      inParagraph = true;
+    }
+    const text = shorn(line.text);
+    if (text) out.push({ text, fenced: false });
   }
-  if (block) flush(fenceCloser(block.opener));
+  flushCode();
+  if (fence) flushFence(fenceCloser(fence.opener));
   return out;
+}
+
+/**
+ * An indented code block's content, de-indented, inside a backtick fence it cannot close: one
+ * backtick longer than any run opening a content line, as CommonMark bounds a closer. The block
+ * renders exactly as the indented original did, and the judge reads it as literal either way.
+ */
+function refenced(content: string[]): string {
+  const longest = Math.max(0, ...content.map((line) => /^ {0,3}(`*)/.exec(line)![1]!.length));
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return [fence, ...content, fence].join("\n");
 }
 
 /**

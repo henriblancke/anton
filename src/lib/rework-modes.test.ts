@@ -557,10 +557,10 @@ describe("applyFollowUp", () => {
     // The Context is rewritten by this very pass, so the note claims nothing about it either way.
     expect(noteOn("half")).toBe(detachedNote(false));
     expect(noteOn("half")).not.toContain("Context section");
-    // Recorded after the reparent — never a detachment that failed — and BEFORE the rewrite erases
-    // the Context line a retry would need to tell an unrecorded detachment from a bead created alone.
-    expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(orderOn(noteMock, "half"));
-    expect(orderOn(noteMock, "half")).toBeLessThan(updateMock.mock.invocationCallOrder[0]!);
+    // Recorded BEFORE the reparent — the note is the record a retry finds the detachment by once
+    // the parent edge is gone — and before the rewrite, which needs the parentage settled.
+    expect(orderOn(noteMock, "half")).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
+    expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(updateMock.mock.invocationCallOrder[0]!);
   });
 
   it("keeps the detachment recorded when the half-created Context rewrite fails after it", async () => {
@@ -578,13 +578,13 @@ describe("applyFollowUp", () => {
     expect(noteMock).not.toHaveBeenCalledWith("/repo", "half", expect.stringContaining("[human-note"), expect.anything());
   });
 
-  it("records a detachment an earlier attempt applied but never noted, then finishes the follow-up", async () => {
-    // The earlier pass got `bd reparent` through and died before its note: the re-read is already
-    // parentless, but the Context it was created with still names the target.
+  it("applies a detachment an earlier attempt recorded but never got through, then finishes the follow-up", async () => {
+    // The earlier pass wrote its note and died on `bd reparent`: the re-read is still under the
+    // target, carrying the record. The retry owes the reparent and the rest, not a second note.
     board(
       feature(),
       finishedTicket(),
-      candidate("half", { parent: undefined, description: createdUnderFeat() }),
+      candidate("half", { description: createdUnderFeat(), notes: detachedNote(false) }),
     );
 
     const applied = await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
@@ -594,13 +594,13 @@ describe("applyFollowUp", () => {
       runsUnderTarget: false,
       reconciled: true,
     });
-    expect(reparentMock).not.toHaveBeenCalled();
-    expect(noteOn("half")).toBe(detachedNote(false));
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "half", "");
+    expect(noteMock.mock.calls.filter((c) => c[1] === "half")).toHaveLength(1);
     const [, , patch] = updateMock.mock.calls[0]!;
     expect((patch as { description: string }).description).toContain(
       "It is its own run target — approve it to run.",
     );
-    expect(hasHumanNote(makeBead({ id: "half", notes: noteOn("half", 1) }), followUpBody())).toBe(true);
+    expect(hasHumanNote(makeBead({ id: "half", notes: noteOn("half") }), followUpBody())).toBe(true);
   });
 
   it("finishes a half-created follow-up whose detachment is recorded but whose rewrite failed", async () => {
@@ -628,28 +628,38 @@ describe("applyFollowUp", () => {
     expect(hasHumanNote(makeBead({ id: "half", notes: noteOn("half") }), followUpBody())).toBe(true);
   });
 
-  it("records a detachment of a FINISHED follow-up that an earlier attempt applied but never noted", async () => {
-    board(
-      feature(),
-      finishedTicket(),
-      candidate("dup", { parent: undefined, description: createdUnderFeat() }),
+  it("recovers a FINISHED follow-up's detachment when the reparent fails after its note — Context edited or not", async () => {
+    // The founder rewrote the generated run-location line before the target shipped. The record of
+    // the detachment must not depend on that line: the note lands first, and a retry finds the
+    // detachment by the note and the parent edge alone.
+    const edited = createdUnderFeat().replace(
+      "It runs as a ticket of feat, in that target's next run.",
+      "Runs wherever the founder says.",
     );
+    board(feature(), finishedTicket(), candidate("dup", { description: edited }));
     showsWithNote("dup", followUpBody());
+    reparentMock.mockRejectedValueOnce(new Error("bd reparent: connection reset"));
 
     await expect(
       applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
-    ).resolves.toMatchObject({ result: { applied: false }, runsUnderTarget: false, reconciled: true });
-    expect(reparentMock).not.toHaveBeenCalled();
-    expect(updateMock).not.toHaveBeenCalled();
+    ).rejects.toThrow("bd reparent: connection reset");
     expect(noteOn("dup")).toBe(detachedNote(true));
+    expect(orderOn(noteMock, "dup")).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
+
+    // The retry: still under the target, the record already on the bead.
+    showsWithNote("dup", followUpBody(), {
+      notes: [detachedNote(true), formatHumanNote(followUpBody(), "founder", new Date())].join("\n"),
+    });
+    await expect(
+      applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
+    ).resolves.toMatchObject({ result: { applied: false }, runsUnderTarget: false, reconciled: true });
+    expect(reparentMock).toHaveBeenCalledTimes(2);
+    expect(noteMock.mock.calls.filter((c) => c[1] === "dup")).toHaveLength(1);
+    expect(updateMock).not.toHaveBeenCalled();
   });
 
-  it("leaves a detachment alone once it is recorded — the third retry writes nothing", async () => {
-    board(
-      feature(),
-      finishedTicket(),
-      candidate("dup", { parent: undefined, description: createdUnderFeat() }),
-    );
+  it("leaves a detachment alone once it has gone through — the third retry writes nothing", async () => {
+    board(feature(), finishedTicket(), candidate("dup", { parent: undefined }));
     showsWithNote("dup", followUpBody(), {
       notes: [detachedNote(true), formatHumanNote(followUpBody(), "founder", new Date())].join("\n"),
     });
@@ -692,13 +702,14 @@ describe("applyFollowUp", () => {
     });
     expect(reparentMock).toHaveBeenCalledWith("/repo", "dup", "");
     expect(noteOn("dup")).toContain("gh-42");
-    expect(noteOn("dup")).toContain("its own run target now");
+    expect(noteOn("dup")).toContain("its own run target");
     // A finished bead keeps its Context, so the note points at the stale parent it still names.
     expect(updateMock).not.toHaveBeenCalled();
     expect(noteOn("dup")).toBe(detachedNote(true));
     expect(noteOn("dup")).toContain("Its Context section still names the parent it was created under.");
-    // Recorded only once the reparent has returned — never a detachment that did not happen.
-    expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(orderOn(noteMock, "dup"));
+    // Recorded before the reparent — the record a retry finds the detachment by once the parent
+    // edge is gone, and worded so it holds whether or not the reparent lands.
+    expect(orderOn(noteMock, "dup")).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
   });
 
   it("leaves an already-parentless match alone when the target has shipped — nothing to reconcile", async () => {

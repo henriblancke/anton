@@ -325,8 +325,8 @@ export const GOAL_KEYS = ["goal"];
  * gate accepts but the reader misses would hand the reviewer a bead with no bounds and no proof. */
 export const OUT_OF_SCOPE_KEYS = ["outofscope"];
 export const VERIFY_KEYS = ["verify", "verification"];
-/** Named for the same reason: the rework recovery reads a follow-up's Context back
- * (rework-notes.ts `createdUnder`), and must section by the heading the gate judges. */
+/** Named for the same reason: the rework reconcile rewrites a follow-up's Context line
+ * (rework-notes.ts `replaceRunsUnder`), and must section by the heading the gate judges. */
 export const CONTEXT_KEYS = ["context"];
 
 /** The four advisory sections every task/bug/chore/feature carries, in the order they read best. */
