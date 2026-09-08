@@ -12,8 +12,11 @@ import { validateBeadContract } from "./beads/contract";
 import { formatHumanNote } from "./beads/notes";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
+  createdUnder,
+  detachmentNoteBody,
   followUpDescription,
   hasAnyHumanNote,
+  hasDetachmentNote,
   hasHumanNote,
   originNoteBody,
   reworkNoteBody,
@@ -408,5 +411,68 @@ describe("hasAnyHumanNote", () => {
     expect(
       hasAnyHumanNote(makeBead({ id: "t1", notes: formatHumanNote("hi", "founder", new Date()) })),
     ).toBe(true);
+  });
+});
+
+describe("createdUnder", () => {
+  const args = {
+    summary: "harden the retry",
+    instructions: INSTRUCTIONS,
+    findings: [],
+    ticket: ticket(),
+    targetId: "feat",
+  };
+
+  it("reads the parent off the Context line the bead was created with, not its parentage", () => {
+    const detached = makeBead({
+      id: "f",
+      parent: undefined,
+      description: followUpDescription({ ...args, parentId: "feat" }),
+    });
+    expect(createdUnder(detached, "feat")).toBe(true);
+    expect(createdUnder(detached, "other")).toBe(false);
+  });
+
+  it("is false for a bead created standing alone, and for one with no contract at all", () => {
+    expect(createdUnder(makeBead({ id: "f", description: followUpDescription(args) }), "feat")).toBe(
+      false,
+    );
+    expect(createdUnder(makeBead({ id: "f" }), "feat")).toBe(false);
+  });
+});
+
+describe("detachmentNoteBody / hasDetachmentNote", () => {
+  const kept = detachmentNoteBody({ targetId: "feat", pr: "gh-42", contextKept: true });
+  const rewritten = detachmentNoteBody({ targetId: "feat", pr: "gh-42", contextKept: false });
+
+  it("names the target and the PR that merged, and says the bead is its own run target now", () => {
+    for (const body of [kept, rewritten]) {
+      expect(body).toContain("feat's pull request (gh-42) merged after this follow-up was created under it");
+      expect(body).toContain("its own run target now — approve it to run.");
+    }
+  });
+
+  it("warns about a stale Context only where the pass leaves the Context alone", () => {
+    expect(kept).toContain("Its Context section still names the parent it was created under.");
+    expect(rewritten).not.toContain("Context section");
+  });
+
+  it("is one line — a system note is parsed per line", () => {
+    expect(kept).not.toContain("\n");
+  });
+
+  it("is found back whichever variant a pass wrote, and only for that target and PR", () => {
+    for (const body of [kept, rewritten]) {
+      const bead = makeBead({ id: "f", notes: ["anton: run failed after 2 tickets", body].join("\n") });
+      expect(hasDetachmentNote(bead, "feat", "gh-42")).toBe(true);
+      expect(hasDetachmentNote(bead, "feat", "gh-43")).toBe(false);
+      expect(hasDetachmentNote(bead, "other", "gh-42")).toBe(false);
+    }
+  });
+
+  it("ignores the same words in a HUMAN note — only anton records a detachment", () => {
+    const bead = makeBead({ id: "f", notes: formatHumanNote(kept, "founder", new Date()) });
+    expect(hasDetachmentNote(bead, "feat", "gh-42")).toBe(false);
+    expect(hasDetachmentNote(makeBead({ id: "f" }), "feat", "gh-42")).toBe(false);
   });
 });

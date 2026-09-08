@@ -99,9 +99,7 @@ export function followUpDescription(args: {
     ``,
     `## Context`,
     followUpProvenance(ticket, targetId, pipeline),
-    parentId
-      ? `It runs as a ticket of ${parentId}, in that target's next run.`
-      : `It is its own run target — approve it to run.`,
+    followUpRunsUnder(parentId),
     ``,
     `## Out of scope`,
     `Anything beyond the instructions in the note. ${ticket.id} already shipped its own acceptance; ` +
@@ -111,6 +109,28 @@ export function followUpDescription(args: {
     `The project's own checks stay green, and the run's self-review scores this bead against the ` +
       `acceptance above.`,
   ].join("\n");
+}
+
+/**
+ * The Context line that says WHERE the follow-up runs. Rendered on its own because the detachment
+ * recovery reads it back ({@link createdUnder}): it is frozen at `bd create`, so it still names the
+ * parent after a `bd reparent` has moved the bead — which is how a retry tells a follow-up whose
+ * detachment went unrecorded from one that was created standing alone.
+ */
+export function followUpRunsUnder(parentId?: string): string {
+  return parentId
+    ? `It runs as a ticket of ${parentId}, in that target's next run.`
+    : `It is its own run target — approve it to run.`;
+}
+
+/**
+ * Was this follow-up created as a ticket of `parentId`? Read off the Context line
+ * ({@link followUpRunsUnder}) rather than the parentage, which is exactly what a detachment
+ * changes. A founder who has rewritten that line has taken the Context into their own hands, and
+ * with it the record of where the bead came from.
+ */
+export function createdUnder(bead: Bead, parentId: string): boolean {
+  return (bead.description ?? "").includes(followUpRunsUnder(parentId));
 }
 
 /**
@@ -190,6 +210,41 @@ export function originNoteBody(followUpId: string, pipeline?: ReworkPipeline): s
         `own target rather than reopening work that has shipped.`
     : `Follow-up ${followUpId} was opened from this ticket's review — its acceptance stands; the ` +
         `next iteration is tracked there.`;
+}
+
+/**
+ * The record that a follow-up created UNDER a target was detached because the target's PR merged
+ * under it. Split into a head and a Context clause because the retry that recovers a detachment
+ * matches on the HEAD alone ({@link hasDetachmentNote}) — what the clause says depends on which
+ * pass wrote it. A finished bead keeps its Context, which a founder may have edited, so the note
+ * flags that it still names the old parent. A half-created bead's Context is rewritten by the pass
+ * finishing it ({@link followUpRunsUnder}), so the note claims nothing about it either way.
+ */
+export function detachmentNoteBody(args: {
+  targetId: string;
+  pr: string;
+  /** The bead keeps the Context it was created with — the note warns that it is stale. */
+  contextKept: boolean;
+}): string {
+  const head = detachmentNoteHead(args.targetId, args.pr);
+  return args.contextKept
+    ? `${head} Its Context section still names the parent it was created under.`
+    : head;
+}
+
+function detachmentNoteHead(targetId: string, pr: string): string {
+  return (
+    `anton: rework — ${targetId}'s pull request (${pr}) merged after this follow-up was created ` +
+    `under it, so it was detached and is its own run target now — approve it to run.`
+  );
+}
+
+/** Has the detachment of this follow-up from `targetId` already been recorded, by any pass? */
+export function hasDetachmentNote(bead: Bead, targetId: string, pr: string): boolean {
+  const head = normalize(detachmentNoteHead(targetId, pr));
+  return parseTicketNotes(bead.notes).some(
+    (n) => n.source === "system" && normalize(n.text).startsWith(head),
+  );
 }
 
 /**

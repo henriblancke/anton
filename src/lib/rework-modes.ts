@@ -14,8 +14,11 @@ import { formatHumanNote } from "./beads/notes";
 import { resolveOperator } from "./operator";
 import type { ReworkRequest } from "./rework-contract";
 import {
+  createdUnder,
+  detachmentNoteBody,
   followUpDescription,
   hasAnyHumanNote,
+  hasDetachmentNote,
   hasHumanNote,
   originNoteBody,
   reworkNoteBody,
@@ -175,8 +178,16 @@ interface FollowUpContext {
 
 /**
  * A follow-up this request must not duplicate is already on the board. Two things can still be owed
- * on it — a parentage the target's merge has invalidated, and an unfinished creation — and both are
- * settled here rather than reported as "already sent back".
+ * on it — a detachment the target's merge demands ({@link owedDetachment}), and an unfinished
+ * creation — and both are settled here rather than reported as "already sent back".
+ *
+ * The detachment is three writes at most, and every one is re-derivable from the board so a retry
+ * finishes exactly what the attempt before it left: the `bd reparent` is owed while the bead is
+ * still under the target; the note is owed until it is on the bead; the half-created Context is
+ * rewritten by the reconcile, which always reads the parentage the bead holds NOW. The note lands
+ * between the other two on purpose — after the reparent, so it never records a detachment that
+ * did not happen, and before the rewrite, because the rewrite erases the Context line the retry
+ * would need to tell an unrecorded detachment from a bead created standing alone.
  */
 async function resumeFollowUp(
   context: FollowUpContext,
@@ -184,19 +195,17 @@ async function resumeFollowUp(
 ): Promise<AppliedRework> {
   const { target, ticket, body } = context;
   const existing = match.bead;
-  const stranded = context.shippedPr !== undefined && beads.parentOf(existing) === target.id;
-  if (stranded) await beads.reparent(context.repo, existing.id, "");
-  // A half-created bead's contract is reconciled before EITHER note lands: the detachment note
-  // reports the Context as rewritten, which is only true once `bd update` has returned.
+  const detachment = owedDetachment(context, existing);
+  if (detachment?.stage === "attached") await beads.reparent(context.repo, existing.id, "");
+  if (detachment) await noteStrandedFollowUp(context, existing, detachment.pr, !match.partial);
   if (match.partial) {
     await reconcileHalfCreatedContract(
       context,
       existing,
-      stranded ? undefined : beads.parentOf(existing),
+      detachment ? undefined : beads.parentOf(existing),
     );
+    await finishHalfCreatedFollowUp(context, existing);
   }
-  if (stranded) await noteStrandedFollowUp(context, existing, match.partial);
-  if (match.partial) await finishHalfCreatedFollowUp(context, existing);
   return {
     result: {
       mode: "follow-up",
@@ -211,39 +220,67 @@ async function resumeFollowUp(
     // Read off the bead the winner actually created — as reconciled above — so the repeat that
     // finishes a half-applied send-back retires on exactly the condition that holds now.
     runsUnderTarget: context.shippedPr === undefined && beads.parentOf(existing) === target.id,
-    reconciled: stranded,
+    reconciled: detachment !== undefined,
   };
 }
 
 /**
- * Record that a follow-up created UNDER the target before its PR merged has been detached. It was
- * stranded there: the merged target has no run left to dispatch it, and a child task is not a run
- * target of its own, so nothing would ever pick it up. That is exactly the shape the instructed retry
- * lands in — the 409 says "send it back again", and this pass reads the PR as merged. So
- * {@link resumeFollowUp} reconciles the parentage to what this request would have created had it
- * gone first (parentless, {@link resolvePipeline}), rather than the founder being told a stranded
- * child "carries the next pass as its own run target".
+ * How far a detachment the target's merge demands has got on this bead, or `undefined` where none
+ * is owed. A follow-up created UNDER the target before its PR merged is stranded there: the merged
+ * target has no run left to dispatch it, and a child task is not a run target of its own, so
+ * nothing would ever pick it up. That is exactly the shape the instructed retry lands in — the 409
+ * says "send it back again", and this pass reads the PR as merged. So the parentage is reconciled
+ * to what this request would have created had it gone first (parentless,
+ * {@link resolvePipeline}), rather than the founder being told a stranded child "carries the next
+ * pass as its own run target".
  *
- * What the note says about the Context section must match what is on the bead WHEN THE NOTE LANDS.
- * A finished bead keeps its Context, which a founder may have edited, so the note flags that it
- * still names the old parent. A half-created one has already had its Context rewritten to the
- * detached parentage ({@link reconcileHalfCreatedContract}) — the note is written only after that
- * `bd update` returns, so a failed rewrite never leaves an audit note claiming it happened.
+ *   • `attached` — still under the target: the reparent itself is owed, and everything after it.
+ *   • `unrecorded` — parentless, created under the target ({@link createdUnder}), and carrying no
+ *     detachment note: an earlier pass got the reparent through and died before recording why.
+ *     Without this reading, the retry would see a parentless bead, take the detachment as never
+ *     owed, and finish the follow-up with its reason for standing alone recorded nowhere — and an
+ *     ORDINARY follow-up's Context does not mention the merge either.
+ *
+ * A bead the gardener moved somewhere else entirely is under neither reading: its parentage is
+ * someone's decision, not a stranding.
+ */
+interface Detachment {
+  stage: "attached" | "unrecorded";
+  /** The merged PR that demands it — what the note names. */
+  pr: string;
+}
+
+function owedDetachment(context: FollowUpContext, existing: Bead): Detachment | undefined {
+  const { shippedPr: pr, target } = context;
+  if (pr === undefined) return undefined;
+  const parent = beads.parentOf(existing);
+  if (parent === target.id) return { stage: "attached", pr };
+  if (
+    parent === undefined &&
+    createdUnder(existing, target.id) &&
+    !hasDetachmentNote(existing, target.id, pr)
+  ) {
+    return { stage: "unrecorded", pr };
+  }
+  return undefined;
+}
+
+/**
+ * Record that the follow-up has been detached ({@link owedDetachment}) — written once the
+ * `bd reparent` has returned, so the note never claims a detachment that failed. What it says about
+ * the Context section is decided by whether this pass leaves that section alone
+ * ({@link detachmentNoteBody}).
  */
 async function noteStrandedFollowUp(
   context: FollowUpContext,
   existing: Bead,
-  contextRewritten: boolean,
+  pr: string,
+  contextKept: boolean,
 ): Promise<void> {
-  const contextNote = contextRewritten
-    ? `Its Context section was rewritten to say so.`
-    : `Its Context section still names the parent it was created under.`;
   await beads.note(
     context.repo,
     existing.id,
-    `anton: rework — ${context.target.id}'s pull request (${context.shippedPr}) merged after this ` +
-      `follow-up was created under it, so it was detached and is its own run target now — approve ` +
-      `it to run. ${contextNote}`,
+    detachmentNoteBody({ targetId: context.target.id, pr, contextKept }),
   );
 }
 
@@ -255,7 +292,8 @@ async function noteStrandedFollowUp(
  * is judged against two different asks. Rewritten before any note so a failure here leaves the bead
  * still noteless — still partial, still this request's to finish — rather than noted against a
  * stale rubric. `parentId` is the parentage the bead holds after reconciliation, so the Context
- * section says where it actually runs.
+ * section says where it actually runs — which, for a detached bead, also erases the line the
+ * detachment recovery reads ({@link createdUnder}); the note recording it has landed by then.
  */
 async function reconcileHalfCreatedContract(
   context: FollowUpContext,
