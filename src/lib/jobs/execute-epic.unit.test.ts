@@ -47,7 +47,7 @@ import {
 } from "./execute-epic-human-gate";
 import { landableTicketIds } from "./execute-epic-dispatch";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
-import { reviewParkMessage } from "./execute-epic-review";
+import { reviewParkMessage, stalePrBodyNote } from "./execute-epic-review";
 import { assertDelivered, displacesSelfReport, selfReportRank } from "./execute-epic-ticket";
 import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
 import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
@@ -1449,6 +1449,51 @@ describe("reviewParkMessage (anton-3apm)", () => {
     expect(out).not.toContain("the findings are on the bead;");
     expect(out).toContain("AC-2 is not implemented");
     expect(out).toContain("Resolve them (or correct the ticket), then resume the run.");
+  });
+});
+
+/**
+ * PR #253 review: a reused PR whose body could not be refreshed shows an earlier attempt's text, and
+ * the note that salvages this run's findings is the only other home for its satisfied attribution —
+ * no commit carries a satisfied ticket's name, so a note that dropped it would leave the founder
+ * matching tickets to commits that do not exist.
+ */
+describe("stalePrBodyNote — the satisfied attribution rides the salvage too (PR #253 review)", () => {
+  const pr = { url: "https://github.com/acme/repo/pull/42", ref: "gh-42", number: 42, bodyStale: true };
+  const base = { status: "open", issue_type: "task" } as const;
+  const first = { ...base, id: "anton-t1", title: "Add the schema" };
+  const second = { ...base, id: "anton-t2", title: "Expose the schema" };
+  const third = { ...base, id: "anton-t3", title: "Document the schema" };
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const finding = { severity: "advisory" as const, location: "src/a.ts:10", note: "extract the mapper" };
+
+  it("names each satisfied ticket against its commit, after the findings", () => {
+    const note = stalePrBodyNote(
+      pr,
+      [finding],
+      [first, second, third],
+      new Map([
+        [second.id, { commit: sha, subject: "anton-t1: Add the schema", closed: true }],
+        [third.id, { commit: sha, subject: "anton-t1: Add the schema", closed: false }],
+      ]),
+    );
+    expect(note).toContain("could NOT rewrite its title/body");
+    expect(note).toContain("- src/a.ts:10 — extract the mapper");
+    expect(note).toContain("Satisfied by earlier commits of this run (no commit of their own):");
+    expect(note).toContain(`- anton-t2 — Expose the schema — by 0123456 "anton-t1: Add the schema"\n`);
+    // The timed-out close is not reported as a close here either.
+    expect(note).toContain(`- anton-t3 — Document the schema — by 0123456 "anton-t1: Add the schema" — NOT closed:`);
+    expect(note).not.toContain("anton-t1 —");
+    expect(note.indexOf("extract the mapper")).toBeLessThan(note.indexOf("Satisfied by"));
+    // A note is line-delimited on the bead: no trailing blank line to leave a stray paragraph.
+    expect(note.endsWith("\n")).toBe(false);
+  });
+
+  it("stays exactly as it was when nothing settled that way", () => {
+    const withEmptyLedger = stalePrBodyNote(pr, [], [first, second], new Map());
+    expect(withEmptyLedger).toBe(stalePrBodyNote(pr, []));
+    expect(withEmptyLedger).toContain("reported no advisory findings.");
+    expect(withEmptyLedger).not.toContain("Satisfied by");
   });
 });
 

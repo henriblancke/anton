@@ -15,6 +15,17 @@ import type { AntonDb, Clock } from "../queue";
 import type { JobContext } from "../runner";
 
 /**
+ * A satisfied ticket as the run's ledger holds it: the commit it settled on, and whether the close
+ * that settlement calls for actually landed. The deadline can fire between the delivery gate's
+ * acceptance and the close (PR #253 review) — the ticket is then blocked with a timeout note, not
+ * closed, and the pull request must say so rather than report a close that never happened.
+ */
+export interface SatisfiedSettlement extends SatisfiedBy {
+  /** False when the ticket's budget ran out on the close: it is blocked, and a person closes it. */
+  closed: boolean;
+}
+
+/**
  * A step as the cooked formula carries it, re-exported from the bd seam (anton-brdg) so the registry
  * and the loader (anton-hrql) read ONE definition of a step rather than two that can drift. `labels`
  * is where the step names its handler (`step:<name>`) and, for `step:claude`, its prompt
@@ -71,7 +82,7 @@ export interface StepContext {
    * listing it as a delivery. Absent on a ticket-phase context and for a caller invoking a handler
    * directly, which reads as "every ticket committed its own work".
    */
-  satisfied?: ReadonlyMap<string, SatisfiedBy>;
+  satisfied?: ReadonlyMap<string, SatisfiedSettlement>;
   settings: ProjectSettings;
   /** The formula step being executed. Absent for a caller invoking a handler directly. */
   step?: CookedStep;

@@ -8,7 +8,6 @@
  * reads its marker, not this module's memory).
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
-import type { SatisfiedBy } from "../beads/satisfied-note";
 import { claimGuard } from "../beads/claim";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { appendSessionLog } from "../sessions";
@@ -38,6 +37,7 @@ import { mustPersist, mustRead, safe } from "./execute-epic-persist";
 import type { RunPreparation } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
 import { runTicket } from "./execute-epic-ticket";
+import type { SatisfiedSettlement } from "./step-registry";
 
 /** What the ticket phase leaves for the run phase to speak for. */
 export interface DispatchOutcome {
@@ -50,7 +50,7 @@ export interface DispatchOutcome {
    * enough: a satisfied ticket has no commit under its own name, so a resume never skips it as
    * done-on-branch — it re-runs and settles again here.
    */
-  satisfied: Map<string, SatisfiedBy>;
+  satisfied: Map<string, SatisfiedSettlement>;
   /** Tickets this run never dispatched, and the timeout each is waiting behind. */
   skipped: Map<string, SkipCause>;
 }
@@ -73,7 +73,7 @@ interface DispatchLedger {
    */
   onBranch: Set<string>;
   /** Tickets that settled on an earlier commit of the run — see {@link DispatchOutcome.satisfied}. */
-  satisfied: Map<string, SatisfiedBy>;
+  satisfied: Map<string, SatisfiedSettlement>;
 }
 
 /** Dispatch every ticket this run may run, then answer what it delivered. */
@@ -475,7 +475,10 @@ async function dispatchTicket(
     // Its mechanism is on the branch either way — its own commit, or the earlier one it settled on
     // — so nothing behind it is missing anything. Which it was is what the PR body has to say.
     onBranch.add(ticket.id);
-    if (settlement.how === "satisfied") ledger.satisfied.set(ticket.id, settlement.by);
+    // A standalone target is never closed here — it stays open until its PR merges.
+    if (settlement.how === "satisfied") {
+      ledger.satisfied.set(ticket.id, { ...settlement.by, closed: !standaloneRun });
+    }
   } catch (e) {
     // A ticket that ran out of time is the ONE failure this loop absorbs (anton-t1mo). It has
     // already blocked its own bead and settled its partial work — preserved in a commit of its
@@ -491,8 +494,9 @@ async function dispatchTicket(
     });
     if (e.delivered) onBranch.add(e.ticketId); // the deadline hit the bookkeeping, not the code
     // …and for a satisfied step, the bookkeeping it hit was the very record the ledger needs
-    // (PR #253 review): the PR body would otherwise list it as a delivery of its own.
-    if (e.satisfiedBy) ledger.satisfied.set(e.ticketId, e.satisfiedBy);
+    // (PR #253 review): the PR body would otherwise list it as a delivery of its own. The close
+    // is what the deadline stopped — the bead is blocked, and the body must not say otherwise.
+    if (e.satisfiedBy) ledger.satisfied.set(e.ticketId, { ...e.satisfiedBy, closed: false });
     console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
     // Recomputed over the whole ledger, which decides for itself what cascades: a timeout
     // that landed AFTER its commit takes nothing down with it (anton-67xj). Walked over

@@ -8,8 +8,8 @@
 import { describe, expect, it } from "vitest";
 
 import type { Bead } from "../../beads/bd";
-import type { SatisfiedBy } from "../../beads/satisfied-note";
 import { ANTON_REPO_URL } from "../../repo";
+import type { SatisfiedSettlement } from "./context";
 import { prBody, stepTaskBlock, ticketPrompt, truncateField } from "./prompts";
 import { target } from "./step.fixture";
 
@@ -138,7 +138,9 @@ describe("prBody", () => {
     const second: Bead = { ...target, id: "anton-t2", title: "Expose the schema" };
     const third: Bead = { ...target, id: "anton-t3", title: "Wire the endpoint" };
     const sha = "0123456789abcdef0123456789abcdef01234567";
-    const satisfied = new Map([[second.id, { commit: sha, subject: "anton-t1: Add the schema" }]]);
+    const satisfied = new Map<string, SatisfiedSettlement>([
+      [second.id, { commit: sha, subject: "anton-t1: Add the schema", closed: true }],
+    ]);
 
     const body = prBody(target, [first, second, third], [], satisfied);
     const [deliveries, attributions] = body.split("Satisfied by earlier commits of this run");
@@ -147,9 +149,10 @@ describe("prBody", () => {
     expect(deliveries).toContain("Tickets:\n- anton-t1 — Add the schema\n- anton-t3 — Wire the endpoint\n");
     expect(deliveries).not.toContain("anton-t2");
     // The satisfied step is named once, against the commit and the ticket whose work it was.
-    expect(attributions).toContain("(closed on that work; no commit of their own):");
-    expect(attributions).toContain(`- anton-t2 — Expose the schema — by 0123456 "anton-t1: Add the schema"`);
+    expect(attributions).toContain("(no commit of their own):");
+    expect(attributions).toContain(`- anton-t2 — Expose the schema — by 0123456 "anton-t1: Add the schema"\n`);
     expect(body.match(/anton-t2/g)).toHaveLength(1);
+    expect(body).not.toContain("NOT closed");
     // Order is preserved on both sides: the body reads as the run ran.
     expect(body.indexOf("anton-t1")).toBeLessThan(body.indexOf("anton-t3"));
   });
@@ -159,9 +162,9 @@ describe("prBody", () => {
     const second: Bead = { ...target, id: "anton-t2", title: "Second step" };
     const third: Bead = { ...target, id: "anton-t3", title: "Third step" };
     const sha = "fedcba9876543210fedcba9876543210fedcba98";
-    const satisfied = new Map<string, SatisfiedBy>([
-      [second.id, { commit: sha, subject: "anton-t1: One change covers all three" }],
-      [third.id, { commit: sha }],
+    const satisfied = new Map<string, SatisfiedSettlement>([
+      [second.id, { commit: sha, subject: "anton-t1: One change covers all three", closed: true }],
+      [third.id, { commit: sha, closed: true }],
     ]);
 
     const body = prBody(target, [first, second, third], [], satisfied);
@@ -171,6 +174,41 @@ describe("prBody", () => {
     expect(body).toContain("- anton-t3 — Third step — by fedcba9\n");
     expect(body).not.toContain("- anton-t2 — Second step\n");
     expect(body).not.toContain("- anton-t3 — Third step\n");
+  });
+
+  /**
+   * PR #253 review: the deadline can land after the delivery gate accepted the satisfied claim and
+   * before the close. The ticket is then BLOCKED with a timeout note, not closed, so the body must not
+   * report a close that never happened — it is where the reviewer learns the ticket needs closing.
+   */
+  it("says a satisfied step whose budget ran out on the close is still blocked, not closed", () => {
+    const first: Bead = { ...target, id: "anton-t1", title: "Add the schema" };
+    const second: Bead = { ...target, id: "anton-t2", title: "Expose the schema" };
+    const third: Bead = { ...target, id: "anton-t3", title: "Document the schema" };
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const satisfied = new Map<string, SatisfiedSettlement>([
+      [second.id, { commit: sha, subject: "anton-t1: Add the schema", closed: true }],
+      [third.id, { commit: sha, subject: "anton-t1: Add the schema", closed: false }],
+    ]);
+
+    const body = prBody(target, [first, second, third], [], satisfied);
+
+    // The header asserts no close on anyone's behalf; each line says what the board holds.
+    expect(body).not.toContain("closed on that work");
+    expect(body).toContain(`- anton-t2 — Expose the schema — by 0123456 "anton-t1: Add the schema"\n`);
+    expect(body).toContain(
+      `- anton-t3 — Document the schema — by 0123456 "anton-t1: Add the schema" — NOT closed: ` +
+        `its ticket budget ran out on the close, so it is blocked; review that commit and close it by hand`,
+    );
+    expect(body).not.toContain("- anton-t3 — Document the schema\n");
+  });
+
+  it("says nothing of a standalone target's own settlement — it is never closed before its PR merges", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const satisfied = new Map<string, SatisfiedSettlement>([[target.id, { commit: sha, closed: false }]]);
+    const body = prBody(target, [target], [], satisfied);
+    expect(body).not.toContain("Satisfied by");
+    expect(body).not.toContain("NOT closed");
   });
 
   it("leaves a run with no satisfied step exactly as it was", () => {

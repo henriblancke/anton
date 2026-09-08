@@ -9,10 +9,10 @@
 import type { Bead } from "../../beads/bd";
 import { acceptanceBody } from "../../beads/contract";
 import { humanNotesPromptBlock } from "../../beads/notes";
-import { shortSha, type SatisfiedBy } from "../../beads/satisfied-note";
+import { shortSha } from "../../beads/satisfied-note";
 import { ANTON_REPO_URL } from "../../repo";
 import { findingLines, type ReviewFinding } from "../review-context";
-import type { StepContext } from "./context";
+import type { SatisfiedSettlement, StepContext } from "./context";
 
 /**
  * What the `step:claude` agent is working ON: the run target, the tickets in scope, and the worktree
@@ -148,34 +148,27 @@ function ticketPromptClosing(ticketId: string): string {
  * back, so the merge gate is the only place the founder would ever see them; putting them in the body
  * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
  *
- * `satisfied` — the tickets that settled on an EARLIER commit of this run (anton-8h4b). They are
- * closed and their acceptance is in this diff, but no commit here carries their name, so the body
- * attributes each to the commit that did the work rather than listing it among the deliveries: a
- * reader matching tickets to commits would otherwise go looking for one that does not exist.
+ * `satisfied` — the tickets that settled on an EARLIER commit of this run (anton-8h4b). Their
+ * acceptance is in this diff, but no commit here carries their name, so the body attributes each to
+ * the commit that did the work rather than listing it among the deliveries: a reader matching
+ * tickets to commits would otherwise go looking for one that does not exist.
  */
 export function prBody(
   target: Bead,
   tickets: Bead[],
   advisory: ReviewFinding[] = [],
-  satisfied: ReadonlyMap<string, SatisfiedBy> = new Map(),
+  satisfied: ReadonlyMap<string, SatisfiedSettlement> = new Map(),
 ): string {
   // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
   const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
   const committed = tickets.filter((t) => !satisfied.has(t.id));
-  const settled = tickets.filter((t) => satisfied.has(t.id));
   const lines = [
     `Autonomous run for **${target.id}** — ${target.title}.`,
     ``,
     ...(standalone || committed.length === 0
       ? []
       : [`Tickets:`, ...committed.map((t) => `- ${t.id} — ${t.title}`), ``]),
-    ...(settled.length > 0
-      ? [
-          `Satisfied by earlier commits of this run (closed on that work; no commit of their own):`,
-          ...settled.map((t) => `- ${t.id} — ${t.title} — by ${satisfiedByLine(satisfied.get(t.id)!)}`),
-          ``,
-        ]
-      : []),
+    ...satisfiedLines(standalone ? [] : tickets, satisfied),
     ...(advisory.length > 0
       ? [
           `### Unresolved review findings (${advisory.length}, advisory)`,
@@ -191,7 +184,33 @@ export function prBody(
   return lines.join("\n");
 }
 
+/**
+ * The satisfied attribution as the PR body and its stale-body fallback both render it (PR #253
+ * review): one line per ticket naming the commit that did its work. Empty when nothing settled that
+ * way. The header claims no close — a ticket whose budget ran out on the close is still blocked, and
+ * its line says so, since the body is where a reviewer learns it needs closing by hand.
+ */
+export function satisfiedLines(
+  tickets: Bead[],
+  satisfied: ReadonlyMap<string, SatisfiedSettlement>,
+): string[] {
+  const settled = tickets.filter((t) => satisfied.has(t.id));
+  if (settled.length === 0) return [];
+  return [
+    `Satisfied by earlier commits of this run (no commit of their own):`,
+    ...settled.map((t) => {
+      const by = satisfied.get(t.id)!;
+      const line = `- ${t.id} — ${t.title} — by ${satisfiedByLine(by)}`;
+      return by.closed
+        ? line
+        : `${line} — NOT closed: its ticket budget ran out on the close, so it is blocked; ` +
+            `review that commit and close it by hand`;
+    }),
+    ``,
+  ];
+}
+
 /** `<short sha> "<subject>"` — the subject is the attribution, since anton's commits are named for their ticket. */
-function satisfiedByLine(by: SatisfiedBy): string {
+function satisfiedByLine(by: SatisfiedSettlement): string {
   return by.subject ? `${shortSha(by.commit)} "${by.subject}"` : shortSha(by.commit);
 }
