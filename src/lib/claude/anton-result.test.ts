@@ -296,6 +296,31 @@ describe("parseAntonResult — satisfied (anton-6l0q)", () => {
     });
   });
 
+  // Agents habitually set a sha in inline code (PR #253 review); a claim that fails to parse for
+  // its backticks falls to the plain zero-diff park this outcome exists to prevent.
+  it("unwraps a backticked sha, with or without a note", () => {
+    expect(parseAntonResult("ANTON-RESULT: satisfied — `0a76266d`")).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+    });
+    expect(parseAntonResult("ANTON-RESULT: satisfied — `0A76266D` — step 1 covered it")).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+      reason: "step 1 covered it",
+    });
+    expect(parseAntonResult("ANTON-RESULT: satisfied — `0a76266d`: covered by `implement`")).toEqual({
+      outcome: "satisfied",
+      commit: "0a76266d",
+      reason: "covered by `implement`",
+    });
+  });
+
+  it("does not let backticks launder a non-sha, an unbalanced pair, or a hyphen-glued sha", () => {
+    for (const evidence of ["`anton-6l0q`", "`0a76266d", "0a76266d`", "`0a76266d`-ish — note", "``"]) {
+      expect(parseAntonResult(`ANTON-RESULT: satisfied — ${evidence}`)).toBeNull();
+    }
+  });
+
   it("rejects a satisfied line that names no commit", () => {
     expect(parseAntonResult("ANTON-RESULT: satisfied")).toBeNull();
     expect(parseAntonResult("ANTON-RESULT: satisfied —")).toBeNull();

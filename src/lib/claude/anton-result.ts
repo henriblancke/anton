@@ -109,12 +109,21 @@ function classifyBlock(reason: string | undefined): { klass: BlockClass; reason?
 const SATISFIED_EVIDENCE_RE = /^([0-9a-f]{7,40})(?:(?:[ \t]*[—–:]|[ \t]+-?)[ \t]*(.*))?$/i;
 
 /**
+ * A SHA the agent set in inline code — `` `0a76266d` `` — which is how a sha usually lands in
+ * markdown-habituated output (PR #253 review). Only a SHA-shaped token between the backticks is
+ * unwrapped, and only at the head of the evidence, so a backticked note further along is untouched
+ * and a backticked non-sha still fails the evidence read below.
+ */
+const BACKTICKED_SHA_RE = /^`([0-9a-f]{7,40})`/i;
+
+/**
  * Read a satisfied line's evidence, or `null` when it names no commit: unlike a classless block,
  * which still says something true (`other`), a satisfied claim without its commit says nothing the
  * gate can act on, so it is rejected rather than degraded.
  */
 function readSatisfied(evidence: string | undefined): { commit: string; reason?: string } | null {
-  const m = evidence ? SATISFIED_EVIDENCE_RE.exec(evidence) : null;
+  const bare = evidence?.replace(BACKTICKED_SHA_RE, "$1");
+  const m = bare ? SATISFIED_EVIDENCE_RE.exec(bare) : null;
   if (!m) return null;
   return { commit: m[1].toLowerCase(), reason: m[2]?.trim() || undefined };
 }

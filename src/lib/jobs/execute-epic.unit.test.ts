@@ -48,7 +48,7 @@ import {
 import { landableTicketIds } from "./execute-epic-dispatch";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage } from "./execute-epic-review";
-import { assertDelivered, selfReportRank } from "./execute-epic-ticket";
+import { assertDelivered, displacesSelfReport, selfReportRank } from "./execute-epic-ticket";
 import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
 import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
 import {
@@ -2376,14 +2376,26 @@ describe("selfReportRank — where `satisfied` sits among the outcomes (anton-6l
   });
 
   it("lets a satisfied report set the phase's report only when nothing else has", () => {
-    // Mirrors the `>=` the phase loop applies: a later report overwrites an equal-or-lower one.
-    const sticks = (later: Parameters<typeof selfReportRank>[0], earlier: Parameters<typeof selfReportRank>[0]) =>
-      selfReportRank(later) >= selfReportRank(earlier);
-    expect(sticks("satisfied", undefined)).toBe(true);
-    expect(sticks("satisfied", "satisfied")).toBe(true);
-    expect(sticks("satisfied", "delivered")).toBe(false);
-    expect(sticks("satisfied", "blocked")).toBe(false);
-    expect(sticks("satisfied", "needs-human")).toBe(false);
-    expect(sticks("delivered", "satisfied")).toBe(true);
+    const satisfied = { outcome: "satisfied", commit: "0a76266d" } as const;
+    expect(displacesSelfReport(satisfied, null)).toBe(true);
+    expect(displacesSelfReport({ ...satisfied, commit: "f6348077" }, satisfied)).toBe(true);
+    expect(displacesSelfReport(satisfied, { outcome: "delivered" })).toBe(false);
+    expect(displacesSelfReport(satisfied, { outcome: "blocked", klass: "other" })).toBe(false);
+    expect(displacesSelfReport(satisfied, { outcome: "needs-human" })).toBe(false);
+  });
+
+  // The phase may dispatch a project's own `step:claude` after `implement` (PR #253 review). It
+  // reports on its own work, and "delivered" on the tree the implementer left unchanged would
+  // replace the one report carrying the commit the gate can settle that zero diff against.
+  it("keeps a satisfied claim over a later `delivered`, though delivered outranks it", () => {
+    const satisfied = { outcome: "satisfied", commit: "0a76266d" } as const;
+    expect(selfReportRank("delivered")).toBeGreaterThan(selfReportRank("satisfied"));
+    expect(displacesSelfReport({ outcome: "delivered" }, satisfied)).toBe(false);
+    // Everything more actionable than a delivery still displaces it.
+    expect(displacesSelfReport({ outcome: "blocked", klass: "env" }, satisfied)).toBe(true);
+    expect(displacesSelfReport({ outcome: "needs-human", reason: "a key" }, satisfied)).toBe(true);
+    // And a delivery replaces a delivery, so the ordinary phase keeps its last word.
+    expect(displacesSelfReport({ outcome: "delivered" }, { outcome: "delivered" })).toBe(true);
+    expect(displacesSelfReport({ outcome: "delivered" }, null)).toBe(true);
   });
 });

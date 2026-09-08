@@ -490,6 +490,9 @@ async function dispatchTicket(
       ...(e.preservedUnknown ? { preservedUnknown: true } : {}),
     });
     if (e.delivered) onBranch.add(e.ticketId); // the deadline hit the bookkeeping, not the code
+    // …and for a satisfied step, the bookkeeping it hit was the very record the ledger needs
+    // (PR #253 review): the PR body would otherwise list it as a delivery of its own.
+    if (e.satisfiedBy) ledger.satisfied.set(e.ticketId, e.satisfiedBy);
     console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
     // Recomputed over the whole ledger, which decides for itself what cascades: a timeout
     // that landed AFTER its commit takes nothing down with it (anton-67xj). Walked over

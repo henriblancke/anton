@@ -11,7 +11,7 @@
  * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
 import type { Bead } from "../beads/bd";
-import { formatAntonResult, type AntonOutcome } from "../claude/anton-result";
+import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { branchAddedCommit } from "../git/ops";
 import { BlockedByAgentError, NeedsHumanError, NoDeliveryError } from "./execute-epic-errors";
 import {
@@ -154,7 +154,7 @@ async function walkTicketSteps(args: {
     // behind no gate at all (PR #205 review). A missing/unparseable line (null) keeps whatever the
     // phase reported before it, as it always has.
     const reported = result.facts?.selfReport;
-    if (reported && selfReportRank(reported.outcome) >= selfReportRank(progress.selfReport?.outcome)) {
+    if (reported && displacesSelfReport(reported, progress.selfReport)) {
       progress.selfReport = reported;
     }
 
@@ -300,6 +300,9 @@ export async function assertDelivered(
  * so a step in the same phase that DID deliver has the report that describes the tree — and a later
  * step's `satisfied` must not talk an earlier `delivered` down to "nothing new here". An absent
  * report (null) ranks below all four, so the first step to say anything sets the phase's report.
+ *
+ * Rank alone does not decide the merge — see {@link displacesSelfReport} for the one case where the
+ * higher rank loses.
  */
 export function selfReportRank(outcome: AntonOutcome | undefined): number {
   switch (outcome) {
@@ -314,4 +317,22 @@ export function selfReportRank(outcome: AntonOutcome | undefined): number {
     default:
       return -1;
   }
+}
+
+/**
+ * Whether a step's report replaces the one its phase already carries: by {@link selfReportRank},
+ * with one exception (PR #253 review). A `delivered` outranks a `satisfied`, but it never DISPLACES
+ * one that names a commit. The two agree that the step found nothing wrong; they differ in what a
+ * zero diff can then settle on. `satisfied` carries the commit the gate verifies against the branch,
+ * and `delivered` carries nothing — so a project's own `step:claude` reporting `delivered` on the
+ * unchanged tree the implementer honestly left would turn a verifiable claim into the plain
+ * zero-diff park this outcome exists to prevent. Keeping the claim costs a later step that DID
+ * commit nothing: the tree fact decides that settlement, and a `satisfied` report on a committed
+ * tree settles as the commit ({@link satisfiedClaim} reads `committed` first).
+ */
+export function displacesSelfReport(incoming: AntonResult, current: AntonResult | null): boolean {
+  if (current?.outcome === "satisfied" && current.commit && incoming.outcome === "delivered") {
+    return false;
+  }
+  return selfReportRank(incoming.outcome) >= selfReportRank(current?.outcome);
 }
