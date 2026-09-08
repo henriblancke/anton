@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
 import { enqueue, getJob } from "./queue";
-import type { JobHandler, JobPolicy, JobPolicyResolver, RunnerConfig } from "./runner";
+import type { JobHandler, JobPolicy, JobPolicyResolver, JobRunner, RunnerConfig } from "./runner";
 import { CONFIG, useRunnerHarness, waitUntil } from "./runner.fixture";
 
 describe("JobRunner dispatch (live, in-memory db)", () => {
@@ -586,6 +586,42 @@ describe("JobRunner dispatch (live, in-memory db)", () => {
     expect((await getJob(h.db, parked))?.status).toBe("parked");
   });
 
+  it("refuses a per-PR dispatch from a handler whose project was quiesced mid-triage (PR #250)", async () => {
+    // The review-fix dispatcher yields on its `gh` read and only then inserts. A project delete that
+    // lands inside that read raises the barrier and sweeps the project's active rows; an insert
+    // through the bare queue helper would then create a fresh `queued` row AFTER the sweep, and
+    // teardown's leftover guard fails the delete over it. Through the runner the insert is refused.
+    h.seedProjects("A");
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    let dispatched: string | undefined | "unset" = "unset";
+    const r = h.makeRunner({
+      handlers: {
+        "review-fix": async (ctx) => {
+          await gate;
+          dispatched = ctx.enqueueReviewFixPr("A", "epic-1");
+        },
+      },
+    });
+    await r.enqueue({ type: "review-fix", projectId: "A", payload: { projectId: "A" } });
+    expect(await r.tickOnce()).toBe(1);
+
+    const quiesce = r.quiesceProject("A");
+    // Let teardown finish its sweep — the dispatcher's own row is gone — before the handler wakes
+    // and reaches its insert, so the row it would create is one no sweep could catch.
+    await waitUntil(async () => {
+      const rows = await h.db.select().from(schema.jobs);
+      return rows.every((j) => j.status !== "queued" && j.status !== "running");
+    });
+    release();
+
+    await expect(quiesce).resolves.toBeUndefined();
+    await r.whenIdle();
+    expect(dispatched).toBeUndefined();
+    const fixes = await h.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr"));
+    expect(fixes).toHaveLength(0);
+  });
+
   it("runningJobInfo returns what the handler reported while in flight, undefined after settle (anton-susu)", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
@@ -659,5 +695,148 @@ describe("JobRunner dispatch (live, in-memory db)", () => {
     await r.whenIdle();
     expect(r.runningJobInfo(id)).toBeUndefined();
     expect((await getJob(h.db, id))?.status).toBe("queued"); // rescheduled for retry
+  });
+
+  // ── the per-PR fix cap (anton-g5eu / anton-kwi6) ──
+  //
+  // The review-fix poll fans out one job per actionable PR, so the fan-out is bounded by how many
+  // PRs are in review — nothing else. Without a cap a busy review day fills the global slot pool and
+  // starves execute-epic; with one, the extras stay queued and lease on later ticks.
+  //
+  // Ported here from the pre-split runner.test.ts (anton-tart) — it is a dispatch/concurrency
+  // concern, so it belongs beside the other cap cases and reuses this suite's `policy` and
+  // `seedSchedule` helpers.
+  describe("review-fix-pr concurrency", () => {
+    /** A runner that gates review-fix-pr at `cap`, with a roomy global ceiling. */
+    function prFixRunner(cap: number, handler: JobHandler = async () => {}) {
+      return h.makeRunner({
+        handlers: { "review-fix-pr": handler, "execute-epic": async () => {} },
+        config: { maxConcurrent: 8, maxReviewFixConcurrent: 4 },
+        resolvePolicy: () => policy({ concurrency: 2, reviewFixConcurrency: cap }),
+      });
+    }
+
+    const enqueuePrFixes = async (r: JobRunner, count: number) => {
+      for (let i = 0; i < count; i++) {
+        await r.enqueue({
+          type: "review-fix-pr",
+          projectId: "A",
+          payload: { projectId: "A", epicBeadId: `epic-${i}` },
+        });
+      }
+    };
+
+    it("leases only up to the project's cap and leaves the rest queued", async () => {
+      h.seedProjects("A");
+      let concurrent = 0;
+      let peak = 0;
+      let release!: () => void;
+      const gate = new Promise<void>((res) => (release = res));
+      const r = prFixRunner(2, async () => {
+        concurrent += 1;
+        peak = Math.max(peak, concurrent);
+        await gate;
+        concurrent -= 1;
+      });
+      await enqueuePrFixes(r, 4);
+
+      expect(await r.tickOnce()).toBe(2);
+      expect(await r.tickOnce()).toBe(0); // still at capacity — nothing dropped, nothing doubled
+      release();
+      await r.whenIdle();
+      expect(peak).toBe(2);
+
+      // The two held jobs lease on a later tick, once the first pair settled.
+      expect(await r.tickOnce()).toBe(2);
+      await r.whenIdle();
+      const rows = await h.db.select().from(schema.jobs);
+      expect(rows.filter((j) => j.status === "done")).toHaveLength(4);
+    });
+
+    // The per-project cap bounds one project's fan-out, not the sum (PR #250 review): several
+    // projects with actionable PRs could still fill the whole pool between them. The runner-wide
+    // ceiling holds the sum, so a job of another type queued behind them still finds a slot.
+    it("holds the sum across projects at the runner-wide ceiling, leaving slots for other types", async () => {
+      h.seedProjects("A", "B", "C");
+      let release!: () => void;
+      const gate = new Promise<void>((res) => (release = res));
+      let epicRan = false;
+      const r = h.makeRunner({
+        handlers: {
+          "review-fix-pr": async () => {
+            await gate;
+          },
+          "execute-epic": async () => {
+            epicRan = true;
+          },
+        },
+        config: { maxConcurrent: 8, maxReviewFixConcurrent: 3 },
+        resolvePolicy: () => policy({ concurrency: 2, reviewFixConcurrency: 2 }),
+      });
+      for (const projectId of ["A", "B", "C"]) {
+        for (let i = 0; i < 2; i++) {
+          await r.enqueue({
+            type: "review-fix-pr",
+            projectId,
+            payload: { projectId, epicBeadId: `epic-${i}` },
+          });
+        }
+      }
+
+      // Six fixes, every one within its project's cap of two — the ceiling admits three.
+      expect(await r.tickOnce()).toBe(3);
+      expect(await r.tickOnce()).toBe(0);
+
+      // The other types are what the ceiling reserves for: an execute-epic leases beside the held
+      // fixes instead of waiting out one of them.
+      await r.enqueue({ type: "execute-epic", projectId: "A" });
+      expect(await r.tickOnce()).toBe(1);
+      release();
+      await r.whenIdle();
+      expect(epicRan).toBe(true);
+
+      // The held fixes lease once the first three settled — nothing dropped.
+      expect(await r.tickOnce()).toBe(3);
+      await r.whenIdle();
+      const rows = await h.db.select().from(schema.jobs);
+      expect(rows.filter((j) => j.status === "done")).toHaveLength(7);
+    });
+
+    /**
+     * The child type has no schedule row of its own — it is dispatched by the `review-fix` poll — so
+     * its hold is DERIVED from that switch. Otherwise turning the poll off would stop dispatching
+     * while queued fixes kept leasing: the master switch has to stop fixing, not just polling.
+     */
+    it("is held by the review-fix schedule's master switch, and resumes when it is re-enabled", async () => {
+      h.seedProjects("A");
+      await seedSchedule("A", "review-fix", { enabled: false });
+      let ran = 0;
+      const r = prFixRunner(2, async () => {
+        ran += 1;
+      });
+      await enqueuePrFixes(r, 2);
+
+      expect(await r.tickOnce()).toBe(0);
+      await r.whenIdle();
+      expect(ran).toBe(0);
+      const held = await h.db.select().from(schema.jobs);
+      expect(held.every((j) => j.status === "queued" && j.attempts === 0)).toBe(true);
+
+      await h.db
+        .update(schema.schedules)
+        .set({ enabled: true })
+        .where(eq(schema.schedules.id, "sched-review-fix-A"));
+      expect(await r.tickOnce()).toBe(2);
+      await r.whenIdle();
+      expect(ran).toBe(2);
+    });
+
+    it("leases none for a quiesced project, like every other type", async () => {
+      h.seedProjects("A");
+      const r = prFixRunner(2);
+      await enqueuePrFixes(r, 2);
+      await r.quiesceProject("A");
+      expect(await r.tickOnce()).toBe(0);
+    });
   });
 });

@@ -2,7 +2,8 @@
  * Read-only view over the durable `jobs` table for the runs UI (anton-ner.3). The jobs table is
  * the single source of truth the runner mutates (queue.ts), so reading it directly keeps the UI
  * status consistent with the runner — including job types that never write a `runs` row
- * (review-fix, nightly-stringer, orphan-grooming) and parked/failed jobs kept for audit.
+ * (review-fix, review-fix-pr, nightly-stringer, orphan-grooming) and parked/failed jobs kept for
+ * audit.
  *
  * Mirrors runs.ts: uses the shared `getDb()` connection and exposes a pure row→summary mapper so
  * the field extraction (JSON payload parse, timestamp normalization) is unit-testable.
@@ -21,7 +22,7 @@ export interface JobSummary {
   type: JobType;
   status: JobStatus;
   projectId?: string;
-  /** Epic the job targets, when the payload names one (execute-epic, scoped review-fix). */
+  /** Epic the job targets, when the payload names one (execute-epic, review-fix-pr). */
   epicBeadId?: string;
   /** Schedule that fired this job, when cron-enqueued (nightly-stringer, orphan-grooming, review-fix). */
   scheduleId?: string;

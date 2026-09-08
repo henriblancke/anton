@@ -58,6 +58,8 @@ export interface EditableSettings {
   /** Per-label pipeline variants (anton-aa3m), in precedence order — first matching label wins. */
   formulaVariants?: FormulaVariant[];
   concurrency?: number;
+  /** Max concurrent per-PR review fixes (anton-kwi6); absent = DEFAULT_REVIEW_FIX_CONCURRENCY. */
+  reviewFixConcurrency?: number;
   jobTimeoutMinutes?: number;
   ticketTimeoutMinutes?: number;
   maxRetries?: number;

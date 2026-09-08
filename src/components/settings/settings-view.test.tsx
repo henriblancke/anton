@@ -2282,3 +2282,39 @@ describe("SettingsView picker autonomy (anton-vkp9)", () => {
     expect(JSON.parse(String(init?.body))).toEqual({ pickerAutonomy: "apply" });
   });
 });
+
+/**
+ * The per-PR fix cap (anton-kwi6). It lives in the Review-fix section rather than beside the run
+ * concurrency slider so an operator reads it as "how many PRs are fixed at once", not "how many
+ * runs execute at once" — two different pools under one global ceiling.
+ */
+describe("SettingsView review-fix concurrency (anton-kwi6)", () => {
+  showing("review-fix");
+
+  it("renders the cap at its shipped default when nothing is persisted", () => {
+    renderView({});
+    const slider = screen.getByLabelText("Max concurrent PR fixes") as HTMLInputElement;
+    expect(slider.value).toBe("2");
+    expect(slider.min).toBe("1");
+    expect(slider.max).toBe("6");
+  });
+
+  it("seeds from a persisted value (round-trip in)", () => {
+    renderView({ reviewFixConcurrency: 5 });
+    expect((screen.getByLabelText("Max concurrent PR fixes") as HTMLInputElement).value).toBe("5");
+  });
+
+  it("dirties the form only once the cap is edited, and PATCHes it (round-trip out)", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+    const save = () => screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement;
+    expect(save().disabled).toBe(true); // untouched form stages nothing
+
+    fireEvent.change(screen.getByLabelText("Max concurrent PR fixes"), { target: { value: "4" } });
+    expect(save().disabled).toBe(false);
+    fireEvent.click(save());
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.reviewFixConcurrency).toBe(4);
+  });
+});

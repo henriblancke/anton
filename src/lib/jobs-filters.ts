@@ -39,6 +39,7 @@ const JOB_STATUS_LABELS: Record<JobStatus, string> = {
 const JOB_TYPE_LABELS: Record<JobType, string> = {
   "execute-epic": "Execute epic",
   "review-fix": "Review fix",
+  "review-fix-pr": "Review fix (PR)",
   "nightly-stringer": "Nightly stringer",
   "orphan-grooming": "Orphan grooming",
   "sync-push": "Sync push",

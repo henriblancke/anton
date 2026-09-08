@@ -9,6 +9,7 @@ import {
   DEFAULT_CONCURRENCY,
   DEFAULT_JOB_TIMEOUT_MINUTES,
   DEFAULT_MAX_RETRIES,
+  DEFAULT_REVIEW_FIX_CONCURRENCY,
   getProjectById,
   getProjectSettings,
   listProjects,
@@ -20,7 +21,7 @@ import { allIssues } from "../beads/issues";
 import { assertRepoSchemaCurrent, preflightBd } from "../beads/bd-bin";
 import { hasLocalDoltDb } from "../beads/config.mjs";
 import { makeExecuteEpicHandler } from "./execute-epic";
-import { makeReviewFixHandler } from "./review-fix";
+import { makeReviewFixHandler, makeReviewFixPrHandler } from "./review-fix";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
 import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { makeSyncPushHandler } from "./sync-push";
@@ -79,11 +80,25 @@ function state(): ServiceState {
  */
 const GLOBAL_MAX_CONCURRENT = Number(process.env.ANTON_MAX_CONCURRENT) || 8;
 
+/**
+ * Global ceiling on in-flight `review-fix-pr` jobs across all projects (PR #250 review). The
+ * per-project `reviewFixConcurrency` bounds one project's fan-out, not the sum: four projects each
+ * at the default two would take the whole pool above, and every other job type — execute-epic,
+ * gate-check, sync-push — would wait out a long fix. Half the pool by default, so the other half
+ * is always there for them. Override with ANTON_MAX_REVIEW_FIX_CONCURRENT.
+ */
+const GLOBAL_MAX_REVIEW_FIX_CONCURRENT =
+  Number(process.env.ANTON_MAX_REVIEW_FIX_CONCURRENT) ||
+  Math.max(1, Math.floor(GLOBAL_MAX_CONCURRENT / 2));
+
 /** Read a project's job policy from its settings, filling in defaults for any unset field. */
 async function resolvePolicy(projectId: string | undefined) {
   const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
   return {
     concurrency: settings.concurrency ?? DEFAULT_CONCURRENCY,
+    // Per-PR review fixes get their own ceiling (anton-kwi6): the fan-out is unbounded by the
+    // number of PRs in review, so without it a busy review day fills the global slot pool.
+    reviewFixConcurrency: settings.reviewFixConcurrency ?? DEFAULT_REVIEW_FIX_CONCURRENCY,
     timeoutMs: (settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES) * 60_000,
     maxAttempts: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
     // Autonomy master-switch (anton-y3l): off pauses claiming of this project's execute-epic
@@ -155,7 +170,10 @@ export function getRunner(): JobRunner {
     db,
     clock: systemClock,
     log,
-    config: { maxConcurrent: GLOBAL_MAX_CONCURRENT },
+    config: {
+      maxConcurrent: GLOBAL_MAX_CONCURRENT,
+      maxReviewFixConcurrent: GLOBAL_MAX_REVIEW_FIX_CONCURRENT,
+    },
     resolvePolicy,
     resolveBudgetPolicy,
     liveRunCheck,
@@ -163,6 +181,7 @@ export function getRunner(): JobRunner {
   });
   runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db }));
   runner.registerHandler("review-fix", makeReviewFixHandler({ db }));
+  runner.registerHandler("review-fix-pr", makeReviewFixPrHandler({ db }));
   runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db }));
   runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db }));
   runner.registerHandler("sync-push", makeSyncPushHandler({ db }));

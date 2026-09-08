@@ -9,12 +9,13 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { and } from "drizzle-orm";
 import { describeBd, makeBdRepo, saveEnv, withOperator, type BdRepo } from "@/lib/testing/integration";
-import { driveJob } from "@/lib/testing/jobs";
+import { driveJob, makeJobRunner } from "@/lib/testing/jobs";
 import { beads, LABELS } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
-import { makeReviewFixHandler } from "./review-fix";
+import { makeReviewFixHandler, makeReviewFixPrHandler } from "./review-fix";
 import { createWorktree } from "../git/worktree";
 import { resetOperatorCache } from "../operator";
 import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
@@ -45,8 +46,8 @@ describeBd("review-fix e2e (real handler · real bd/git · fake claude/gh)", () 
   let branch: string;
   let restoreEnv: () => void;
 
-  /** One review-fix sweep, driven to settlement. `epicBeadId` narrows it to a single epic. */
-  const runSweep = (epicBeadId?: string) =>
+  /** One dispatcher pass, driven to settlement. `epicBeadId` narrows it to a single target. */
+  const runDispatch = (epicBeadId?: string) =>
     driveJob({
       db: tdb.db,
       clock,
@@ -56,6 +57,36 @@ describeBd("review-fix e2e (real handler · real bd/git · fake claude/gh)", () 
       ...(epicBeadId === undefined ? {} : { payload: { projectId, epicBeadId } }),
       config: { leaseMs: 30_000 },
     });
+
+  /**
+   * A whole review-fix cycle: the scheduled DISPATCHER, then every per-PR job it fanned out, each
+   * driven to settlement. Returns the fix jobs' ids — one per PR the dispatcher found work on — so
+   * a test can assert both how many were dispatched and how each settled.
+   */
+  async function runSweep(epicBeadId?: string): Promise<string[]> {
+    await runDispatch(epicBeadId);
+    const queued = await tdb.db
+      .select({ id: schema.jobs.id })
+      .from(schema.jobs)
+      .where(and(eq(schema.jobs.type, "review-fix-pr"), eq(schema.jobs.status, "queued")));
+    if (queued.length === 0) return [];
+
+    const runner = makeJobRunner({
+      db: tdb.db,
+      clock,
+      type: "review-fix-pr",
+      handler: makeReviewFixPrHandler,
+      config: { leaseMs: 30_000 },
+    });
+    while ((await runner.tickOnce()) > 0) await runner.whenIdle();
+    return queued.map((q) => q.id);
+  }
+
+  /** The single fix job a sweep dispatched, asserted to have settled `done`. */
+  async function expectOneFix(fixes: string[]): Promise<void> {
+    expect(fixes).toHaveLength(1);
+    expect((await getJob(tdb.db, fixes[0]))?.status).toBe("done");
+  }
 
   beforeAll(async () => {
     bdRepo = makeBdRepo({ bare: true, initialCommit: true });
@@ -164,10 +195,8 @@ process.exit(0);`,
   });
 
   it("resolves an actionable PR: claude fix → commit → push → thread reply/resolve + comment + re-request", async () => {
-    const jobId = await runSweep();
-
-    // Job succeeded.
-    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    // The poll dispatched exactly one per-PR job, and that job carried the whole fix.
+    await expectOneFix(await runSweep());
 
     // claude was dispatched with a review-fix prompt naming the feedback + failing check.
     const invocations = readFileSync(join(sandbox, "claude-argv.jsonl"), "utf8")
@@ -250,8 +279,7 @@ process.exit(0);`,
     const prev = process.env.ANTON_CLAUDE_BIN;
     process.env.ANTON_CLAUDE_BIN = noopClaude;
     try {
-      const jobId = await runSweep();
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      await expectOneFix(await runSweep());
 
       // The previously-unpushed commit is now on origin.
       const remoteLog = execFileSync("git", ["-C", repo, "log", "--oneline", `origin/${branch}`], {
@@ -277,9 +305,9 @@ process.exit(0);`,
     process.env.ANTON_GH_BIN = greenGh;
     const before = (await tdb.db.select().from(schema.sessions)).length;
     try {
-      const jobId = await runSweep();
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
-      // Nothing actionable → no worktree/claude/session work happened.
+      // Nothing actionable → the dispatcher fans out nothing at all, so no worktree, claude session
+      // or verify gate is ever reached. The poll costs one board read and one `gh pr view`.
+      expect(await runSweep()).toEqual([]);
       const after = await tdb.db.select().from(schema.sessions);
       expect(after.length).toBe(before);
     } finally {
@@ -331,8 +359,7 @@ process.exit(0);`,
 
     await actAs("alice", async () => {
       process.env.ANTON_GH_BIN = mergedGhFor(8);
-      const jobId = await runSweep();
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      expect(await runSweep()).toEqual([]); // bob's target was never even dispatched
     });
 
     // Bob's epic was skipped entirely — finalizeMergedEpic (close + drop stage:in-review) never ran.
@@ -355,8 +382,7 @@ process.exit(0);`,
     await actAs("alice", async () => {
       process.env.ANTON_GH_BIN = mergedGhFor(9);
       // Explicit single-epic target bypasses the ownership filter — alice runs bob's epic.
-      const jobId = await runSweep(bobEpic);
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      await expectOneFix(await runSweep(bobEpic));
     });
 
     // The override reached finalizeMergedEpic: bob's epic is closed and out of review.
@@ -364,5 +390,123 @@ process.exit(0);`,
     const bob = now.find((b) => b.id === bobEpic);
     expect(bob?.status).toBe("closed");
     expect(bob?.labels?.includes(LABELS.stage("in-review")) ?? false).toBe(false);
+  });
+
+  /**
+   * anton-3jwh's whole point: two PRs in review are two jobs, so they fix CONCURRENTLY in their own
+   * worktrees, and one that fails takes only itself down. Before the split a single sequential sweep
+   * carried both — a failure on the first was caught and logged, but its time was still spent before
+   * the second was touched, and one long fix held the slot for every PR behind it.
+   */
+  it("fixes two PRs concurrently in distinct worktrees, and one failure leaves the other alone", async () => {
+    const otherEpic = await beads.create(repo, {
+      title: "Second feature in review",
+      type: "epic",
+      description: "## Goal\nAlso in review.",
+    });
+    const otherBranch = `anton/${otherEpic}`;
+    const g = (args: string[], cwd = repo) => execFileSync("git", args, { cwd, stdio: "ignore" });
+    g(["checkout", "-q", "-b", otherBranch]);
+    writeFileSync(join(repo, "other.txt"), "v1\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "other work"]);
+    g(["push", "-q", "-u", "origin", otherBranch]);
+    g(["checkout", "-q", "main"]);
+    await beads.tag(repo, otherEpic, [LABELS.stage("in-review")]);
+    await beads.setPrRef(repo, otherEpic, "gh-10");
+
+    // Both PRs want changes; every other number (bob's leftover epic) is approved + green.
+    const twoPrGh = writeBin(
+      binDir,
+      "gh-two-prs",
+      `const a=process.argv.slice(2);
+const branches={7:process.env.FAKE_BRANCH,10:process.env.FAKE_OTHER_BRANCH};
+if(a[0]==='pr'&&a[1]==='view'){
+  const n=Number(a[2]);
+  if(branches[n]){console.log(JSON.stringify({number:n,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:branches[n],url:'u',reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'fix it'}],statusCheckRollup:[]}));process.exit(0);}
+  console.log(JSON.stringify({number:n,state:'OPEN',reviewDecision:'APPROVED',headRefName:'x',url:'u',reviews:[],statusCheckRollup:[]}));process.exit(0);
+}
+if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
+process.exit(0);`,
+    );
+
+    // claude succeeds in the first PR's worktree and fails in the second's, logging the cwd each ran
+    // in so the test can prove the two never shared a checkout.
+    const splitClaude = writeBin(
+      binDir,
+      "claude-split",
+      `const fs=require('fs');const path=require('path');
+fs.appendFileSync(process.env.FAKE_CWD_LOG,process.cwd()+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+let stdin='';process.stdin.setEncoding('utf8');
+process.stdin.on('data',c=>{stdin+=c;});
+process.stdin.on('end',()=>{
+  if(process.cwd().includes(process.env.FAKE_FAILING_EPIC)){
+    e({type:'result',subtype:'error',result:'could not resolve the feedback',is_error:true});
+    process.exit(0);
+  }
+  fs.writeFileSync(path.join(process.cwd(),'CONCURRENT_FIX.md'),'fixed');
+  e({type:'result',subtype:'success',result:'done',is_error:false});
+  process.exit(0);
+});`,
+    );
+
+    const restore = saveEnv([
+      "ANTON_GH_BIN",
+      "ANTON_CLAUDE_BIN",
+      "FAKE_OTHER_BRANCH",
+      "FAKE_FAILING_EPIC",
+      "FAKE_CWD_LOG",
+    ]);
+    const cwdLog = join(sandbox, `cwds-${otherEpic}.log`);
+    process.env.ANTON_GH_BIN = twoPrGh;
+    process.env.ANTON_CLAUDE_BIN = splitClaude;
+    process.env.FAKE_OTHER_BRANCH = otherBranch;
+    process.env.FAKE_FAILING_EPIC = otherEpic;
+    process.env.FAKE_CWD_LOG = cwdLog;
+    writeFileSync(cwdLog, "");
+
+    try {
+      // One poll, two jobs — one per actionable PR.
+      await runDispatch();
+      const queued = await tdb.db
+        .select()
+        .from(schema.jobs)
+        .where(and(eq(schema.jobs.type, "review-fix-pr"), eq(schema.jobs.status, "queued")));
+      expect(queued.map((j) => JSON.parse(j.payloadJson).epicBeadId).sort()).toEqual(
+        [epicId, otherEpic].sort(),
+      );
+
+      // Both lease on ONE tick and run at the same time — that is the parallelism.
+      const runner = makeJobRunner({
+        db: tdb.db,
+        clock,
+        type: "review-fix-pr",
+        handler: makeReviewFixPrHandler,
+        config: { leaseMs: 30_000, maxConcurrent: 2, maxReviewFixConcurrent: 2, maxAttempts: 1 },
+      });
+      expect(await runner.tickOnce()).toBe(2);
+      await runner.whenIdle();
+
+      const byTarget = new Map(
+        (await tdb.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr"))).map(
+          (j) => [JSON.parse(j.payloadJson).epicBeadId as string, j],
+        ),
+      );
+      // The failure is scoped to its own job; the other PR's fix landed and was pushed.
+      expect(byTarget.get(otherEpic)?.status).toBe("parked");
+      expect(byTarget.get(epicId)?.status).toBe("done");
+      const remoteLog = execFileSync("git", ["-C", repo, "log", "--oneline", `origin/${branch}`], {
+        encoding: "utf8",
+      });
+      expect(remoteLog).toContain("address review feedback");
+
+      // Distinct worktree claims: each fix drove claude in its own checkout, never a shared one.
+      const cwds = readFileSync(cwdLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(cwds).toHaveLength(2);
+      expect(new Set(cwds).size).toBe(2);
+    } finally {
+      restore();
+    }
   });
 });

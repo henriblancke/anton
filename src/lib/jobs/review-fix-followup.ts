@@ -112,11 +112,11 @@ export async function resolveFollowUp(
 
 /**
  * The board the stamped candidates are read off. A snapshot that names NO candidate is not evidence
- * that none exists (PR #199): two jobs may finalize the same merged target —
- * `enqueueReviewFixIfAbsent` counts the project-wide sweep and a gate-check's targeted fix as
- * different work — and whichever runs second holds a board read taken before the first created its
- * follow-up. Creating on that silence splits the preserved tickets across two run targets, so the
- * board itself is asked once more before anything is created.
+ * that none exists (PR #199): two jobs may finalize the same merged target — a crash-reclaimed row,
+ * or two anton instances sharing a board, whose `jobs` tables dedupe independently — and whichever
+ * runs second holds a board read taken before the first created its follow-up. Creating on that
+ * silence splits the preserved tickets across two run targets, so the board itself is asked once
+ * more before anything is created.
  */
 async function stampedBoard(ctx: FollowUpContext): Promise<Bead[] | undefined> {
   if (ctx.all.some((b) => stampedFor(b, ctx.epic.id))) return ctx.all;
