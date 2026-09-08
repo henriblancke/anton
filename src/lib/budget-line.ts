@@ -21,12 +21,22 @@
  */
 import type { BudgetHeadroom, DeferReason } from "./jobs/budget";
 
-/** One job type's rolling burn average, as the API reports it (see `getBurnAverage`). */
+/**
+ * One job type's rolling burn average, as the API reports it. Each rate matches the meter it is
+ * charged against, the same split the runner applies: the session and weekly account meters move
+ * with every repo, so `sessionPct` and `weeklyPct` are the global per-type averages
+ * (`getBurnAverage`); the quota share is spent from this project's own attributed burn, so
+ * `shareWeeklyPct` is its own average (`getProjectBurnAverage`). The line charges BOTH weekly
+ * meters as it walks — which one runs out first is headroom divided by rate, not raw headroom, so
+ * it cannot be settled up front (PR #248 review).
+ */
 export interface BurnCost {
-  /** Mean session%-points one run of this type burns. */
+  /** Mean session%-points one run of this type burns, across the account. */
   sessionPct: number;
-  /** Mean weekly%-points one run of this type burns. */
+  /** Mean weekly%-points one run of this type burns on the account meter, across the account. */
   weeklyPct: number;
+  /** Mean weekly%-points one run of this type charges the project's own share. */
+  shareWeeklyPct: number;
   /** The average still leans on the tier seed — fewer real samples than the window holds. */
   seeded: boolean;
 }
@@ -86,8 +96,14 @@ export function budgetLine(
   if (!signal) return null;
 
   const { headroom, burn } = signal;
+  // The share hold reads a different meter from the cap and pace-line — this project's attributed
+  // spend, charged at its own rate — so the weekly side keeps one running total per meter and tests
+  // EACH hold against the total on its meter. Picking one meter up front from raw headroom would
+  // miss the other running out first at its own rate (PR #248 review). The reserve waiver is a
+  // pace-line question, so it always reads the account total.
   let session = 0;
   let weekly = 0;
+  let share = 0;
   let seeded = false;
 
   for (const [index, entry] of entries.entries()) {
@@ -115,19 +131,27 @@ export function budgetLine(
     const overWeekly =
       headroom.weeklyPct !== null &&
       (headroom.weeklyInclusive ? weekly >= headroom.weeklyPct : weekly > headroom.weeklyPct);
-    if (overSession || overWeekly) {
-      // budgetGate's order is session-headroom → weekly-cap → weekly-on-track → daytime-reserve, so
-      // only the hard floor beats a weekly hold when both are exhausted.
-      const sessionFirst = overSession && (!overWeekly || sessionReason === "session-headroom");
-      return {
-        affordable: index,
-        reason: sessionFirst ? sessionReason : headroom.weeklyReason,
-        seeded,
-      };
+    const overShare = headroom.sharePct !== null && share >= headroom.sharePct;
+    if (overSession || overWeekly || overShare) {
+      // budgetGate's order is session-headroom → weekly-cap → share-cap → weekly-on-track →
+      // daytime-reserve, so a card over several holds reports the one the gate reaches first: only
+      // the hard floor beats the weekly holds, and the reserve yields to all of them.
+      const reason: DeferReason =
+        overSession && sessionReason === "session-headroom"
+          ? sessionReason
+          : overWeekly && headroom.weeklyReason === "weekly-cap"
+            ? "weekly-cap"
+            : overShare
+              ? "share-cap"
+              : overWeekly
+                ? headroom.weeklyReason
+                : sessionReason;
+      return { affordable: index, reason, seeded };
     }
 
     session += cost.sessionPct;
     weekly += cost.weeklyPct;
+    share += cost.shareWeeklyPct;
     seeded ||= cost.seeded;
   }
 

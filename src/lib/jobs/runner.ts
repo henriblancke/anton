@@ -4,7 +4,8 @@
  *
  *   • Leases + crash reclaim — a leased job whose lease expires is re-leased next tick.
  *   • API-limit backoff      — `UsageLimitError` → reschedule past the reset window; the attempt is
- *                              refunded (you can't retry an exhausted quota).
+ *                              refunded (you can't retry an exhausted quota) but its quota spend
+ *                              is not — Claude was reached, and may have done real work first.
  *   • Poison-pill            — a job that errors `maxAttempts` times (or throws `PoisonError`) is
  *                              parked for a human. Parking is recoverable, not terminal: `resume()`
  *                              (queue.resumeJob) un-parks a job back to `queued` with a fresh budget.
@@ -20,7 +21,9 @@ import {
   activeExecuteEpicId,
   activeExecuteEpicKeys,
   activeJobIdsForProject,
+  bucketLiveLoad,
   cancelJob,
+  chargeSpentAttempt,
   complete,
   deferQueuedJobs,
   deleteActiveJobsForProject,
@@ -56,7 +59,13 @@ import {
   isUsageLimitError,
 } from "./errors";
 import { PollingLoop } from "./polling-loop";
-import { burnsClaudeQuota, getBurnAverage, sampleJobBurn } from "../burn";
+import {
+  JOB_TYPE_TIER,
+  burnsClaudeQuota,
+  getBurnAverage,
+  getProjectBurnAverage,
+  sampleJobBurn,
+} from "../burn";
 import { getClaudeUsageCached, getClaudeUsageFresh, type ClaudeUsage } from "../claude/usage";
 import { admitJob, budgetGate, jobValueScore, type BudgetPolicy } from "./budget";
 
@@ -152,6 +161,18 @@ export type BudgetPolicyResolver = (
 ) => Promise<BudgetPolicy | null> | BudgetPolicy | null;
 
 /**
+ * This project's own attributed weekly spend, read at gate time so the quota share (R6.1) can be
+ * enforced against it. The account-wide meter the governor reads is shared by every repo on the
+ * machine, so it cannot say whose quota was spent — see `withQuotaShare` in ./budget. `usage` is
+ * the governor's own read, passed through so the spend window anchors to the same weekly reset.
+ * Returns `null` when nothing is attributable (or the read failed): the share then doesn't bind.
+ */
+export type ProjectSpendResolver = (
+  projectId: string | null,
+  usage: ClaudeUsage | null,
+) => Promise<number | null>;
+
+/**
  * Job types the budget governor may proactively defer (anton-szld). An allowlist by design: only
  * anton's *autonomous* background work is held when the governor says the budget is scarce, and the
  * governor only delays when the runner *leases* a job — a human-approved epic still *enqueues* the
@@ -165,6 +186,21 @@ export type BudgetPolicyResolver = (
  * the pacing holds, keeping only the session-headroom floor (see `applyBudgetGovernor`).
  */
 export const GOVERNED_JOB_TYPES: readonly JobType[] = ["execute-epic", "orphan-grooming"];
+
+/**
+ * What the value gate walks: the governed types, plus every EXEMPT type whose attempt is still
+ * charged to its project's quota share (`burnsClaudeQuota` — `review-fix-pr`, the nightly scan, the
+ * product master) and that leaseDue dispatches beside them. An exempt job is never gated, but its
+ * burn lands on the same meter, so the share reservation has to count it before the autonomous work
+ * behind it is admitted (PR #248 review). Governed types stay in whatever they burn: the grooming
+ * sweep costs nothing and is still paced.
+ */
+const VALUE_GATE_JOB_TYPES: readonly JobType[] = [
+  ...new Set([
+    ...GOVERNED_JOB_TYPES,
+    ...(Object.keys(JOB_TYPE_TIER) as JobType[]).filter(burnsClaudeQuota),
+  ]),
+];
 
 /**
  * Is an execute-epic run already live for this project + epic on ANOTHER machine? (anton-jz1)
@@ -220,6 +256,18 @@ export interface JobContext {
    * Cleared automatically when the job settles — a settled job reports nothing.
    */
   report: (info: LiveJobInfo) => void;
+  /**
+   * Say that Claude is about to be invoked. AWAIT it immediately before every spawn: this is the
+   * runner's only evidence that the attempt spent quota, and the first call is where the attempt is
+   * charged to the project's spend meter and where its burn window opens. It settles only once the
+   * window's opening usage read has landed — a spawn that raced ahead of a slow read would move the
+   * meter into the supposed pre-job snapshot and price this project's attempts at less than they
+   * cost (PR #248 review). An attempt that never says so is never charged and records no burn,
+   * whatever it settled as — a preflight that completes or parks before Claude (an abandoned
+   * target, a target that disappeared, a lease held elsewhere) burned nothing, and inferring that
+   * from the settlement type misses every such exit that isn't a reschedule.
+   */
+  claudeReached: () => Promise<void>;
   /**
    * Enqueue a per-PR fix job for a run target, deduped against a live one — see
    * `queue.enqueueReviewFixPrIfAbsent`. Handlers fan out THROUGH the runner rather than calling the
@@ -280,7 +328,13 @@ export function exhaustedParkAttempts(lastError: string): number | undefined {
 
 export type Action =
   | { action: "complete" }
-  | { action: "reschedule"; runAtMs: number; refundAttempt: boolean; lastError?: string }
+  | {
+      action: "reschedule";
+      runAtMs: number;
+      /** Rewind the retry budget: the failure was not the job's own. */
+      refundAttempt: boolean;
+      lastError?: string;
+    }
   | { action: "park"; lastError: string };
 
 export function classifyError(e: unknown): Outcome {
@@ -303,6 +357,9 @@ export function nextAction(
       return { action: "complete" };
     case "quota": {
       const runAtMs = outcome.resetAt ? outcome.resetAt * 1000 : nowMs + config.quotaCooloffMs;
+      // The limit is Claude's own answer, so this attempt reached it — and a multi-call handler may
+      // have finished real work (a whole PR) before the wall. The retry budget comes back; the
+      // project's spend does not (the charge landed when the handler said it reached Claude).
       return {
         action: "reschedule",
         runAtMs,
@@ -409,6 +466,7 @@ export class JobRunner {
   private readonly log: RunnerLogger;
   private readonly resolvePolicy: JobPolicyResolver | null;
   private readonly resolveBudgetPolicy: BudgetPolicyResolver | null;
+  private readonly resolveProjectSpend: ProjectSpendResolver | null;
   private readonly liveRunCheck: LiveRunCheck | null;
   private readonly readBeadLabels: BeadLabelsReader | null;
   private readonly readUsage: () => Promise<ClaudeUsage | null>;
@@ -445,6 +503,12 @@ export class JobRunner {
      */
     resolveBudgetPolicy?: BudgetPolicyResolver;
     /**
+     * Per-project attributed weekly spend for the governor's quota-share ceiling (R6.1). Only
+     * consulted alongside `resolveBudgetPolicy`; omit it and a project's declared share simply
+     * doesn't bind — the machine-wide weekly target is still enforced on the account meter.
+     */
+    resolveProjectSpend?: ProjectSpendResolver;
+    /**
      * Cross-machine run-liveness source (anton-jz1). When set, a fresh execute-epic enqueue that
      * has no active job in THIS machine's store is gated on it: if a run is already live for the
      * epic on another machine (read from the shared beads board), no second run is started. Omit
@@ -459,15 +523,15 @@ export class JobRunner {
      */
     readBeadLabels?: BeadLabelsReader;
     /**
-     * Cached Claude-usage reader for the budget governor and the burn sampler's *pre-job* snapshot
-     * (anton-w8ny). Defaults to the shared, cached read so per-tick bursts collapse to one upstream
-     * fetch. Injectable for deterministic tests.
+     * Cached Claude-usage reader for the budget governor. Defaults to the shared, cached read so
+     * per-tick bursts collapse to one upstream fetch. Injectable for deterministic tests.
      */
     readUsage?: () => Promise<ClaudeUsage | null>;
     /**
-     * TTL-bypassing usage reader for the burn sampler's *post-job* measurement. Must go upstream:
-     * a job that finishes inside the cache TTL would otherwise subtract a cache entry from itself
-     * and record a zero delta, biasing burn averages toward zero. Defaults to
+     * TTL-bypassing usage reader for both ends of the burn sampler's window (anton-w8ny). Must go
+     * upstream at both: a cached opening read can be a whole TTL stale and would charge someone
+     * else's burn to this project (PR #248 review), and a cached closing read inside the TTL would
+     * subtract a cache entry from itself and record a zero delta. Defaults to
      * {@link getClaudeUsageFresh} (which also refreshes the shared cache). Injectable for tests.
      */
     readUsageFresh?: () => Promise<ClaudeUsage | null>;
@@ -478,6 +542,7 @@ export class JobRunner {
     this.log = deps.log ?? noopLog;
     this.resolvePolicy = deps.resolvePolicy ?? null;
     this.resolveBudgetPolicy = deps.resolveBudgetPolicy ?? null;
+    this.resolveProjectSpend = deps.resolveProjectSpend ?? null;
     this.liveRunCheck = deps.liveRunCheck ?? null;
     this.readBeadLabels = deps.readBeadLabels ?? null;
     this.readUsage = deps.readUsage ?? getClaudeUsageCached;
@@ -694,7 +759,9 @@ export class JobRunner {
     // SQL level, not just skipped by capOf — otherwise a large backlog of disabled/autonomy-off jobs
     // (the earliest by runAt) fills the finite scan window every tick and starves leasable work for
     // other schedules and projects (anton-7l7). Seed with disabled schedules; autonomy-off projects
-    // are added below. capOf still enforces cap 0 as a backstop for anything not excluded (quiesce).
+    // are added next. capOf still enforces cap 0 as a backstop for anything not excluded (quiesce).
+    // Both hard holds are gathered BEFORE the governor runs so its value gate can skip held rows
+    // instead of reserving quota share for work that cannot lease (PR #248 review).
     const heldBucketKeys = new Set<string>(disabledSchedules);
 
     // `review-fix-pr` has no schedule row of its own — it is dispatched by the `review-fix` poll —
@@ -703,44 +770,6 @@ export class JobRunner {
     for (const key of disabledSchedules) {
       const [type, projectId] = key.split("\0");
       if (type === "review-fix") heldBucketKeys.add(scheduleGateKey("review-fix-pr", projectId));
-    }
-
-    // Budget governor (anton-szld): before leasing, ask the pace-line whether autonomous work may
-    // run *now*. A DEFER verdict adds the project's governed buckets here (same hold as the
-    // master-switch) and pushes their queued runAt out to retryAt. Proactive back-off past the
-    // reset/night boundary — the reactive UsageLimitError path below still backstops a wall we hit
-    // anyway. Fails OPEN on a null usage read, so a broken meter never halts anton.
-    // `pacedExecuteEpicHolds` collects projects where only pacing defers (immediate work admits):
-    // their non-bypass execute-epic rows are capped at 0 in capOf below, so a crashed/lease-expired
-    // paced row isn't reclaimed ahead of the pace boundary while bypass rows still lease.
-    // `valueHeldJobIds` collects individual queued jobs the per-job value/cost gate (anton-k05r)
-    // holds this tick when the coarse gate ADMITS a budget-aware project: scarce budget admits only
-    // high-value work. Fed into leaseDue's `exclude` below so the held rows aren't leased.
-    // `valueHeldReclaimIds` collects the gate's holds on RECLAIMABLE rows — `running` with an
-    // expired lease after a crash/missed heartbeat, which leaseDue treats as runnable. They can't
-    // ride `exclude`: an excluded running row counts toward capOf's live load, so a dead held row
-    // would occupy its project's concurrency slot and block admitted high-value work. capOf caps
-    // them at 0 instead (same trick as pacedExecuteEpicHolds), which skips the lease without the
-    // live-load side effect.
-    const pacedExecuteEpicHolds = new Set<string>();
-    const valueHeldJobIds = new Set<string>();
-    const valueHeldReclaimIds = new Set<string>();
-    await this.applyBudgetGovernor(
-      heldBucketKeys,
-      pacedExecuteEpicHolds,
-      valueHeldJobIds,
-      valueHeldReclaimIds,
-    );
-    const holdLogKey = [...valueHeldJobIds, ...valueHeldReclaimIds].sort().join(",");
-    if (holdLogKey !== this.valueHoldLogKey) {
-      this.valueHoldLogKey = holdLogKey;
-      const heldCount = valueHeldJobIds.size + valueHeldReclaimIds.size;
-      if (heldCount > 0) {
-        this.log.info(`budget value gate holding ${heldCount} job(s)`, [
-          ...valueHeldJobIds,
-          ...valueHeldReclaimIds,
-        ]);
-      }
     }
 
     // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
@@ -792,6 +821,46 @@ export class JobRunner {
         return Infinity;
       };
     }
+
+    // Budget governor (anton-szld): before leasing, ask the pace-line whether autonomous work may
+    // run *now*. A DEFER verdict adds the project's governed buckets here (same hold as the
+    // master-switch) and pushes their queued runAt out to retryAt. Proactive back-off past the
+    // reset/night boundary — the reactive UsageLimitError path below still backstops a wall we hit
+    // anyway. Fails OPEN on a null usage read, so a broken meter never halts anton.
+    // `pacedExecuteEpicHolds` collects projects where only pacing defers (immediate work admits):
+    // their non-bypass execute-epic rows are capped at 0 in capOf below, so a crashed/lease-expired
+    // paced row isn't reclaimed ahead of the pace boundary while bypass rows still lease.
+    // `valueHeldJobIds` collects individual queued jobs the per-job value/cost gate (anton-k05r)
+    // holds this tick when the coarse gate ADMITS a budget-aware project: scarce budget admits only
+    // high-value work. Fed into leaseDue's `exclude` below so the held rows aren't leased.
+    // `valueHeldReclaimIds` collects the gate's holds on RECLAIMABLE rows — `running` with an
+    // expired lease after a crash/missed heartbeat, which leaseDue treats as runnable. They can't
+    // ride `exclude`: an excluded running row counts toward capOf's live load, so a dead held row
+    // would occupy its project's concurrency slot and block admitted high-value work. capOf caps
+    // them at 0 instead (same trick as pacedExecuteEpicHolds), which skips the lease without the
+    // live-load side effect.
+    const pacedExecuteEpicHolds = new Set<string>();
+    const valueHeldJobIds = new Set<string>();
+    const valueHeldReclaimIds = new Set<string>();
+    await this.applyBudgetGovernor(
+      heldBucketKeys,
+      pacedExecuteEpicHolds,
+      valueHeldJobIds,
+      valueHeldReclaimIds,
+      policyCapOf ?? (() => Infinity),
+    );
+    const holdLogKey = [...valueHeldJobIds, ...valueHeldReclaimIds].sort().join(",");
+    if (holdLogKey !== this.valueHoldLogKey) {
+      this.valueHoldLogKey = holdLogKey;
+      const heldCount = valueHeldJobIds.size + valueHeldReclaimIds.size;
+      if (heldCount > 0) {
+        this.log.info(`budget value gate holding ${heldCount} job(s)`, [
+          ...valueHeldJobIds,
+          ...valueHeldReclaimIds,
+        ]);
+      }
+    }
+
     const capOf = (job: JobRow) => {
       if (job.projectId && this.quiescedProjects.has(job.projectId)) return 0;
       if (disabledSchedules.has(scheduleGateKey(job.type, job.projectId))) return 0;
@@ -876,8 +945,10 @@ export class JobRunner {
     pacedExecuteEpicHolds: Set<string>,
     valueHeldJobIds: Set<string>,
     valueHeldReclaimIds: Set<string>,
+    bucketCapOf: (job: JobRow) => number,
   ): Promise<void> {
-    if (!this.resolveBudgetPolicy) return;
+    const resolveBudgetPolicy = this.resolveBudgetPolicy;
+    if (!resolveBudgetPolicy) return;
 
     // The gate decides per project (day window / reserve are per-project knobs), so gather every
     // project — including the null-project bucket — that has a pending job of a governed type.
@@ -892,9 +963,19 @@ export class JobRunner {
     // finding a governed project is deliberate: when no project has opted in (the default state), the
     // governor never calls the usage endpoint, so it can't cache a transient null into the shared
     // cache the nav pill reads (which is what darkened the pill on this branch) or hammer the keychain.
+    //
+    // Resolved TOGETHER, not one after another (PR #248 review): a governed project's policy carries
+    // its cut of the machine's quota (R6.1), which is a fact about the whole board — so resolving N
+    // of them in sequence re-reads one unchanging board N times per 2s tick. Overlapping the reads
+    // lets the resolver serve them all from a single pass.
+    const resolved = await Promise.all(
+      [...projectIds].map(async (pid) => ({
+        pid,
+        policy: await resolveBudgetPolicy(pid ?? undefined),
+      })),
+    );
     const governed: Array<{ pid: string | null; policy: BudgetPolicy }> = [];
-    for (const pid of projectIds) {
-      const policy = await this.resolveBudgetPolicy(pid ?? undefined);
+    for (const { pid, policy } of resolved) {
       if (policy) {
         governed.push({ pid, policy });
         continue;
@@ -927,7 +1008,13 @@ export class JobRunner {
 
     const now = this.clock.now();
     for (const { pid, policy } of governed) {
-      const decision = budgetGate(usage, policy, now);
+      // The quota share (R6.1) is enforced against THIS project's attributed spend, not the account
+      // meter above — that one is moved by every repo here. Unresolvable spend leaves the share
+      // unbound, the same fail-open posture as a null usage read.
+      const projectWeeklyPct = this.resolveProjectSpend
+        ? await this.resolveProjectSpend(pid, usage).catch(() => null)
+        : null;
+      const decision = budgetGate(usage, policy, now, { projectWeeklyPct });
       if (decision.admit) {
         // Budget healthy → nothing paced this tick. First pull back any rows a PRIOR governed tick
         // pushed to a future runAt: the gate can start admitting before that stale boundary (the
@@ -941,7 +1028,17 @@ export class JobRunner {
         // But "work may run" is not "any work may run": the fine-grained gate (anton-k05r) still
         // decides which queued jobs are worth the budget that's left — e.g. scarce session headroom
         // at night admits high-value work only.
-        await this.applyValueGate(usage, policy, pid, now, valueHeldJobIds, valueHeldReclaimIds);
+        await this.applyValueGate(
+          usage,
+          policy,
+          pid,
+          now,
+          heldBucketKeys,
+          valueHeldJobIds,
+          valueHeldReclaimIds,
+          projectWeeklyPct,
+          bucketCapOf,
+        );
         continue;
       }
       const retryAtMs = decision.retryAt.getTime();
@@ -1020,56 +1117,191 @@ export class JobRunner {
    * mirroring the governor: a missing reader, an unresolvable bead, or a malformed payload admits
    * the job rather than starving it on a guess. An operator's immediate "Approve" (`bypassBudget`)
    * skips the gate entirely — they asked for now, and only the session floor may hold that.
+   *
+   * The same walk RESERVES the project's remaining quota share across the batch (R6.1) — see the
+   * reservation comment in the loop. That is why the candidates include every QUOTA-BURNING type,
+   * not only the governed ones: leaseDue leases an exempt `review-fix-pr` (or a nightly scan) from the
+   * same runAt order, and its attempt is charged to the same share — so an older fix due beside an
+   * epic would otherwise spend the crossing allowance the epic was granted (PR #248 review). Exempt
+   * rows are never gated or held here — they must land promptly — only charged, like a bypass run.
+   * Rows a HARD hold already keeps off the lease (a disabled
+   * schedule, autonomy off, a quiescing project — `heldBucketKeys` / `quiescedProjects`) are skipped
+   * before either check: they cannot run this tick, so reserving share for them would hold a runnable
+   * job behind them and, with leaseDue then excluding both, lease nothing tick after tick. A row whose
+   * BUCKET is already at its concurrency (`bucketCapOf`, the same cap leaseDue enforces) is skipped
+   * for the same reason: an older queued execute-epic behind a long-running one cannot lease either,
+   * and letting it reserve the last of the share would hold an ungated grooming sweep behind a job
+   * capOf then skips — nothing dispatched, with global capacity to spare (PR #248 review).
    */
   private async applyValueGate(
     usage: ClaudeUsage,
     policy: BudgetPolicy,
     pid: string | null,
     nowMs: number,
+    heldBucketKeys: ReadonlySet<string>,
     valueHeldJobIds: Set<string>,
     valueHeldReclaimIds: Set<string>,
+    projectWeeklyPct: number | null,
+    bucketCapOf: (job: JobRow) => number,
   ): Promise<void> {
     const candidates = await queuedDueJobs(this.db, this.clock, {
-      types: GOVERNED_JOB_TYPES,
+      types: VALUE_GATE_JOB_TYPES,
       projectId: pid,
       includeReclaimable: true,
     });
+    // Lease slots each gated bucket has left this tick, by leaseDue's own count (live load under the
+    // same cap), decremented as this walk admits — so the reservation below tracks what leaseDue
+    // will actually pick, in the same runAt order.
+    const slotsByBucket = new Map<string, number>();
+    const slotsLeft = async (job: JobRow): Promise<number> => {
+      const cap = bucketCapOf(job);
+      if (cap === Infinity) return Infinity;
+      const key = scheduleGateKey(job.type, job.projectId);
+      let slots = slotsByBucket.get(key);
+      if (slots === undefined) {
+        // Fail open like every other governor read: a load count that cannot be read admits the
+        // bucket's candidates to leaseDue's own cap — neither held nor charged this tick — rather
+        // than failing the whole tick on one query.
+        const live = await bucketLiveLoad(this.db, this.clock, {
+          type: job.type as JobType,
+          projectId: job.projectId,
+          inFlightIds: this.inFlight.keys(),
+        }).catch(() => null);
+        slots = live === null ? 0 : cap - live;
+        slotsByBucket.set(key, slots);
+      }
+      return slots;
+    };
+    const takeSlot = (job: JobRow) => {
+      const key = scheduleGateKey(job.type, job.projectId);
+      const slots = slotsByBucket.get(key);
+      if (slots !== undefined) slotsByBucket.set(key, slots - 1);
+    };
     // One burn-average read per type per tick — the cost side of every candidate of that type.
     const costByType = new Map<string, number>();
+    // The share side reads the same rates per type, but this PROJECT's own (the meter the cap is
+    // enforced against), so it keeps its own memo.
+    const shareCostByType = new Map<string, number>();
+    let projectedWeeklyPct = projectWeeklyPct ?? 0;
+    let admitted = 0;
+
     for (const job of candidates) {
       if (job.status === "running" && this.inFlight.has(job.id)) continue; // genuinely running here
+      if (heldBucketKeys.has(scheduleGateKey(job.type, job.projectId))) continue; // hard-held
+      if (job.projectId && this.quiescedProjects.has(job.projectId)) continue; // being deleted
+      if ((await slotsLeft(job)) <= 0) continue; // bucket at concurrency — capOf skips it anyway
       const payload = parsePayload(job.payloadJson) as
         | { bypassBudget?: unknown; epicBeadId?: unknown }
         | null;
-      if (payload?.bypassBudget === true) continue;
-
-      let labels: readonly string[] = [];
-      if (job.type === "execute-epic") {
-        if (!this.readBeadLabels || !job.projectId || typeof payload?.epicBeadId !== "string") {
-          continue; // can't score it → fail open
+      const shareCap = policy.projectWeeklyCapPct;
+      // An exempt type (a per-PR fix, the nightly scan) is not the governor's to hold: it leases
+      // whatever the pace says, exactly like an operator's immediate "Approve".
+      const ungated =
+        payload?.bypassBudget === true || !GOVERNED_JOB_TYPES.includes(job.type as JobType);
+      if (ungated) {
+        // Leases ahead of the rows behind it, gate or no gate — but its burn is charged to this
+        // project's share all the same (PR #248 review): the meter will count the attempt on the
+        // next tick, so the autonomous work behind it in THIS batch must fit in what the share has
+        // left after it, or a bypass run near the cap would let a second, ungated crossing through.
+        if (pid !== null && shareCap !== null) {
+          projectedWeeklyPct += await this.projectWeeklyBurn(
+            pid,
+            job.type as JobType,
+            shareCostByType,
+          );
+          admitted += 1;
         }
-        try {
-          const read = await this.readBeadLabels(job.projectId, payload.epicBeadId);
-          if (!read) continue; // bead unresolved → fail open
-          labels = read;
-        } catch {
-          continue; // reader error → fail open
-        }
+        takeSlot(job);
+        continue;
       }
-
-      let sessionCost = costByType.get(job.type);
-      if (sessionCost === undefined) {
-        sessionCost = (await getBurnAverage(this.db, job.type as JobType)).sessionAvg;
-        costByType.set(job.type, sessionCost);
-      }
-      const value = jobValueScore(
-        { labels, ageMs: Math.max(0, nowMs - (toMs(job.createdAt) ?? nowMs)) },
-        policy,
-      );
-      if (!admitJob(usage, policy, nowMs, { value, sessionCost }).admit) {
+      const hold = () =>
         (job.status === "running" ? valueHeldReclaimIds : valueHeldJobIds).add(job.id);
+
+      if (await this.valueGateHolds(usage, policy, job, payload, nowMs, costByType)) {
+        hold();
+        continue;
+      }
+
+      // Share headroom is reserved ACROSS the batch (PR #248 review). `budgetGate` measured this
+      // project's spend ONCE for the whole tick, but leaseDue dispatches up to the project's
+      // concurrency in one go — and no attempt of that batch is visible to the meter until the next
+      // tick — so a project with room for one run could start five and blow through its cut.
+      //
+      // The coarse admission covers the FIRST job: the gate admits while spend is still BELOW the
+      // cap, so the run that crosses it is one the operator's ceiling allows, and withholding it
+      // would leave a share smaller than one job's burn unspendable until the reset (idle-fill,
+      // anton-ld7j). Every job BEHIND it — including behind a bypass run — must fit in what the
+      // share has left after the ones ahead, charged at this project's own measured rate.
+      if (pid !== null && shareCap !== null) {
+        const cost = await this.projectWeeklyBurn(pid, job.type as JobType, shareCostByType);
+        if (admitted > 0 && projectedWeeklyPct + cost > shareCap) {
+          hold();
+          continue;
+        }
+        projectedWeeklyPct += cost;
+      }
+      takeSlot(job);
+      admitted += 1;
+    }
+  }
+
+  /**
+   * The value/cost half of {@link applyValueGate}: whether this candidate is worth the budget that's
+   * left. Fail-open at every step — a missing label reader, an unresolvable bead, or a malformed
+   * payload returns `false` (admit) rather than starving the job on a guess.
+   */
+  private async valueGateHolds(
+    usage: ClaudeUsage,
+    policy: BudgetPolicy,
+    job: JobRow,
+    payload: { epicBeadId?: unknown } | null,
+    nowMs: number,
+    costByType: Map<string, number>,
+  ): Promise<boolean> {
+    let labels: readonly string[] = [];
+    if (job.type === "execute-epic") {
+      if (!this.readBeadLabels || !job.projectId || typeof payload?.epicBeadId !== "string") {
+        return false; // can't score it → fail open
+      }
+      try {
+        const read = await this.readBeadLabels(job.projectId, payload.epicBeadId);
+        if (!read) return false; // bead unresolved → fail open
+        labels = read;
+      } catch {
+        return false; // reader error → fail open
       }
     }
+
+    let sessionCost = costByType.get(job.type);
+    if (sessionCost === undefined) {
+      sessionCost = (await getBurnAverage(this.db, job.type as JobType)).sessionAvg;
+      costByType.set(job.type, sessionCost);
+    }
+    const value = jobValueScore(
+      { labels, ageMs: Math.max(0, nowMs - (toMs(job.createdAt) ?? nowMs)) },
+      policy,
+    );
+    return !admitJob(usage, policy, nowMs, { value, sessionCost }).admit;
+  }
+
+  /**
+   * What one more attempt of `type` is expected to charge THIS project's share, memoized per tick.
+   * Fail-open like the governor's other reads: an unreadable average charges nothing, admitting the
+   * job rather than failing the whole tick on a transient DB error.
+   */
+  private async projectWeeklyBurn(
+    projectId: string,
+    type: JobType,
+    memo: Map<string, number>,
+  ): Promise<number> {
+    let cost = memo.get(type);
+    if (cost === undefined) {
+      cost = await getProjectBurnAverage(this.db, projectId, type)
+        .then((average) => average.weeklyAvg)
+        .catch(() => 0);
+      memo.set(type, cost);
+    }
+    return cost;
   }
 
   private async processJob(job: JobRow): Promise<void> {
@@ -1082,35 +1314,41 @@ export class JobRunner {
     const entry: InFlightEntry = { controller, type: job.type as JobType, live: {} };
     this.inFlight.set(job.id, entry);
 
-    // Burn sampler (anton-w8ny): snapshot Claude usage before the job so we can attribute the
-    // session%/weekly% that moves across it to this job's TYPE. Attribution needs a solo window —
-    // with jobs overlapping (maxConcurrent > 1), each delta would include the siblings' burn and
-    // double-count across types — so only open a window when nothing else is in flight; a sibling
-    // dispatched mid-window is caught at close via `dispatchSeq`. Types that never invoke Claude
+    // Burn sampler (anton-w8ny): snapshot Claude usage around the job so we can attribute the
+    // session%/weekly% that moves across it to this job's TYPE and PROJECT. Attribution needs a solo
+    // window — with jobs overlapping (maxConcurrent > 1), each delta would include the siblings'
+    // burn and double-count across types — so only open a window when nothing else is in flight; a
+    // sibling dispatched mid-window is caught via `dispatchSeq`. Types that never invoke Claude
     // (`burnsClaudeQuota`) are skipped outright — sampling them would blame an operator's own
     // Claude usage on a `git push` and spend the throttle a real job needs. Fail-soft — a null read
     // just means no sample; it never gates dispatch.
     //
     // Gated behind the project's budget-aware opt-in (anton-7mpv.1), like the governor: burn data
     // only feeds budget pacing, so in the default feature-off state the sampler must not shell out
-    // to credentials / hit the usage endpoint before every solo job — nor cache a transient null
-    // into the shared cache the nav pill reads. A closed gate leaves `burnBefore` null, which also
-    // suppresses the post-job fresh read.
+    // to credentials / hit the usage endpoint around every solo job — nor cache a transient null
+    // into the shared cache the nav pill reads.
     const seqAtStart = ++this.dispatchSeq;
-    // Throttle the sampler: its post-job read bypasses the usage cache, so with maxConcurrent: 1
-    // every solo completion would hit the endpoint. Only open a window once per burnSampleMinIntervalMs
-    // — measured from the last window that actually took its closing read (stamped at close), so a
-    // contaminated window that bails doesn't spend the budget. Closing the gate leaves burnBefore
-    // null, which also suppresses the fresh post-job read below.
+    // Throttle the sampler: both of its reads bypass the usage cache, so with maxConcurrent: 1 every
+    // solo job would hit the endpoint twice. Only open a window once per burnSampleMinIntervalMs,
+    // measured from the last window that actually took its opening read — a window the handler
+    // never opened (a preflight exit) spent nothing and leaves the interval for the next real job.
     const burnDue = this.clock.now() - this.lastBurnSampleAt >= this.config.burnSampleMinIntervalMs;
-    const burnBefore =
+    const burnEligible =
       burnDue &&
       burnsClaudeQuota(job.type as JobType) &&
       this.inFlight.size === 1 &&
-      (await this.budgetAwareFor(job.projectId ?? undefined))
-        ? await this.readUsageSafe()
-        : null;
+      (await this.budgetAwareFor(job.projectId ?? undefined));
 
+    // The window opens when the handler says it is about to spawn Claude — the moment the attempt
+    // starts spending — not at dispatch, and with a FRESH read rather than the cached snapshot. The
+    // cached read can be a whole TTL old, so a delta measured from it would include whatever else
+    // moved the meter first (an interactive session, a sibling that could not close its own window)
+    // and charge it to this project's share, repricing every attempt it has and throttling the wrong
+    // project (PR #248 review). The same moment is when the attempt is charged to the project's
+    // spend meter; an attempt that never gets there spent nothing, is charged nothing, and has no
+    // window to close.
+    let claudeReached = false;
+    let burnBefore: Promise<ClaudeUsage | null> | null = null;
     try {
       const policy = await this.policyFor(job.projectId ?? undefined);
 
@@ -1165,6 +1403,26 @@ export class JobRunner {
           },
           signal: controller.signal,
           report: (info) => Object.assign(entry.live, info),
+          claudeReached: async () => {
+            // First spawn only: the charge is per attempt, and a multi-spawn handler keeps the
+            // window it opened.
+            if (claudeReached) return;
+            claudeReached = true;
+            // The charge is the durable record that this attempt burned quota — written now, not at
+            // the lease, so a crash in preflight leaves nothing to refund. Fail-soft: the meter is a
+            // pacing estimate, and a write that fails must not stand between the job and Claude.
+            await chargeSpentAttempt(this.db, job.id).catch((e) => {
+              this.log.error(`job ${job.id} (${job.type}): could not charge the spend meter`, e);
+            });
+            // Re-check the window is still solo: a sibling dispatched between lease and spawn would
+            // already contaminate it, so don't spend a read (or the throttle) on a sample that can't
+            // land. The opening read is AWAITED so the spawn cannot start moving the meter before
+            // the snapshot it is measured against has been taken.
+            if (!burnEligible || this.dispatchSeq !== seqAtStart) return;
+            this.lastBurnSampleAt = this.clock.now();
+            burnBefore = this.readUsageFreshSafe();
+            await burnBefore;
+          },
           enqueueReviewFixPr: (projectId, epicBeadId) =>
             this.enqueueReviewFixPrIfAbsent(projectId, epicBeadId),
         };
@@ -1190,18 +1448,29 @@ export class JobRunner {
       // expires and the job is reclaimed on a later tick.
       this.log.error(`job ${job.id} (${job.type}) did not settle`, e);
     } finally {
-      // Close the burn window: a fresh (TTL-bypassing) read minus the pre-job snapshot is this
-      // type's cost — the cached read would subtract a cache entry from itself for any job that
-      // finishes inside the TTL and record a bogus zero. Runs for every outcome (even a failed
-      // attempt burned quota) but only when the window stayed solo (no sibling dispatched across
-      // it — `dispatchSeq` unchanged), and is fully fail-soft — sampleJobBurn records nothing on a
-      // null read or a mid-job meter reset and swallows its own errors.
+      // Close the burn window: a fresh (TTL-bypassing) read minus the opening one is this type's
+      // cost — a cached read would subtract a cache entry from itself for any job that finishes
+      // inside the TTL and record a bogus zero. Runs for every outcome (even a failed attempt
+      // burned quota) but only when the window stayed solo (no sibling dispatched across it —
+      // `dispatchSeq` unchanged), and is fully fail-soft — sampleJobBurn records nothing on a null
+      // read or a mid-job meter reset and swallows its own errors.
+      //
+      // A window only exists if the handler said it reached Claude: an attempt that exited in
+      // preflight (a lease held elsewhere, an abandoned or vanished target, a run already carried to
+      // a PR) moved the meter by whatever ELSE was using Claude — usually nothing. Recording it
+      // would let a few such exits drag the type's rolling average (and the project's attributed
+      // spend) toward zero, repricing every attempt as free and letting the project run past its
+      // share.
       if (burnBefore && this.dispatchSeq === seqAtStart) {
-        // Stamp the throttle here, not at window open: only a window that actually takes its fresh
-        // upstream read spends the interval budget — a contaminated window that bailed doesn't.
-        this.lastBurnSampleAt = this.clock.now();
-        await sampleJobBurn(this.db, this.clock, job.type as JobType, burnBefore, () =>
-          this.readUsageFreshSafe(),
+        await sampleJobBurn(
+          this.db,
+          this.clock,
+          job.type as JobType,
+          // The project whose quota this window spent; null for anton's own plumbing jobs, which
+          // belong to no project's share.
+          job.projectId ?? null,
+          await burnBefore,
+          () => this.readUsageFreshSafe(),
         );
       }
       this.inFlight.delete(job.id);
@@ -1222,7 +1491,7 @@ export class JobRunner {
     }
   }
 
-  /** Read cached Claude usage (governor / pre-job snapshot), fail-soft to `null` (never throws into dispatch). */
+  /** Read cached Claude usage for the governor, fail-soft to `null` (never throws into dispatch). */
   private async readUsageSafe(): Promise<ClaudeUsage | null> {
     try {
       return await this.readUsage();
@@ -1231,7 +1500,7 @@ export class JobRunner {
     }
   }
 
-  /** TTL-bypassing usage read for the post-job burn measurement, fail-soft to `null`. */
+  /** TTL-bypassing usage read for both ends of a burn window, fail-soft to `null`. */
   private async readUsageFreshSafe(): Promise<ClaudeUsage | null> {
     try {
       return await this.readUsageFresh();
@@ -1240,18 +1509,37 @@ export class JobRunner {
     }
   }
 
+  /**
+   * Apply the durability policy to an outcome. Returns the action taken; null when a cancel won.
+   *
+   * The project's spend meter is not settled here: the attempt was charged when the handler reported
+   * reaching Claude (`ctx.claudeReached`) and never otherwise, so every exit — complete, reschedule,
+   * park, or a cancel that won — leaves exactly the charge the attempt earned. Whether Claude was
+   * invoked is the handler's report, not a property of how the attempt ended.
+   */
   private async settle(
     job: JobRow,
     outcome: Outcome,
     policy: JobPolicy,
-    effect?: JobEffect,
-  ): Promise<void> {
+    effect: JobEffect | undefined,
+  ): Promise<Action | null> {
     // Re-read attempts (a heartbeat/lease may have advanced updatedAt, not attempts, but be safe).
     const fresh = (await getJob(this.db, job.id)) ?? job;
-    // Fast-path a cancel already visible at this read. The queue transition below also compares from
-    // `running`, which closes the remaining race where cancel lands after this check but before the
-    // settle write.
-    if (fresh.status === "cancelled") return;
+    // Fast-path a cancel already visible at this read. Each transition in `applyAction` also compares
+    // from `running`, which closes the remaining race where cancel lands after this check but before
+    // the settle write.
+    if (fresh.status === "cancelled") return null;
+    return this.applyAction(job, fresh, outcome, policy, effect);
+  }
+
+  /** The durability transition for a still-`running` job: complete, reschedule or park. */
+  private async applyAction(
+    job: JobRow,
+    fresh: JobRow,
+    outcome: Outcome,
+    policy: JobPolicy,
+    effect: JobEffect | undefined,
+  ): Promise<Action> {
     // The project's retry budget governs when we park; backoff/quota stay from the runner config.
     const config = { ...this.config, maxAttempts: policy.maxAttempts };
     const action = nextAction(config, fresh, outcome, this.clock.now());
@@ -1269,6 +1557,7 @@ export class JobRunner {
         await park(this.db, this.clock, job.id, action.lastError);
         break;
     }
+    return action;
   }
 
   /** Start the background polling loop (idempotent). */

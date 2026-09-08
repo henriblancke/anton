@@ -72,6 +72,25 @@ const FALLBACK_DRAFT: Parameters<typeof SettingsView>[0]["policyDraft"] = {
 type PickerEarned = Parameters<typeof SettingsView>[0]["pickerEarned"];
 
 /**
+ * The quota split as the server resolves it (R6). One project, nothing attributed yet — what a
+ * single-repo machine that has never declared a share looks like; the panel is its own suite.
+ */
+const QUOTA_PROJECTS: Parameters<typeof SettingsView>[0]["quotaProjects"] = [
+  {
+    id: project.id,
+    slug: project.slug,
+    name: project.name,
+    sharePct: 100,
+    declared: false,
+    governed: false,
+    reserved: false,
+    eligible: true,
+    spentWeeklyPct: null,
+    seeded: false,
+  },
+];
+
+/**
  * The picker's own accept/veto record (anton-vkp9). The default is the project every operator
  * starts on — no pick answered either way, so `apply` is locked and has to say what on.
  */
@@ -108,6 +127,7 @@ function renderView(
       boardUnavailable={false}
       earned={earned}
       pickerEarned={pickerEarned}
+      quotaProjects={QUOTA_PROJECTS}
     />,
   );
 }

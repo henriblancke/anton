@@ -23,9 +23,10 @@ function signal(sessionPct: number, sessionReason: DeferReason = "session-headro
       weeklyPct: null,
       weeklyReason: "weekly-cap",
       weeklyInclusive: true,
+      sharePct: null,
       reserveWaiver: null,
     },
-    burn: { [RUN_JOB_TYPE]: { sessionPct: 20, weeklyPct: 3, seeded: false } },
+    burn: { [RUN_JOB_TYPE]: { sessionPct: 20, weeklyPct: 3, shareWeeklyPct: 3, seeded: false } },
   };
 }
 
@@ -91,6 +92,7 @@ describe("BudgetDivider", () => {
   const REASONS: Record<DeferReason, string> = {
     "session-headroom": "session headroom",
     "weekly-cap": "weekly cap",
+    "share-cap": "quota share",
     "weekly-on-track": "weekly pacing",
     "daytime-reserve": "daytime reserve",
   };

@@ -177,6 +177,7 @@ function fakeCtx(over: Partial<JobContext> = {}): JobContext {
     attempt: 1,
     heartbeat: async () => {},
     report: () => {},
+    claudeReached: async () => {},
     signal: new AbortController().signal,
     enqueueReviewFixPr: () => undefined,
     ...over,

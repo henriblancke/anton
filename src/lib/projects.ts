@@ -13,7 +13,9 @@ import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
-import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
+import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./jobs/budget";
+import { resolveGovernedShare, type GovernedShare } from "./quota-share";
+import { eligibilityOf, observedWorkEligibility } from "./quota-eligibility";
 import { GARDENER_DETECTION_KINDS } from "./gardener/detections";
 import {
   pickerApplyVerdict,
@@ -310,6 +312,19 @@ export interface ProjectSettings {
    * {@link budgetAware} is on.
    */
   budgetPolicy?: ProjectBudgetPolicy;
+  /**
+   * This project's declared cut of the shared weekly Claude quota, 0–100 (R6.1). Absent → an equal
+   * split across the projects with budget-aware execution on ({@link defaultQuotaSharePct}), so a
+   * machine that never declares anything still divides its quota rather than racing for it. Only
+   * consulted when {@link budgetAware} is on — an ungoverned project spends unpaced either way.
+   */
+  quotaSharePct?: number;
+  /**
+   * `reserve my share` (R6.5): hold this project's share out of renormalization even while it has no
+   * eligible work, for a repo touched irregularly. Absent → off, which is what lets an idle repo's
+   * share flow to the projects that can use it rather than resetting unspent.
+   */
+  reserveQuotaShare?: boolean;
   /**
    * Per-label pipeline variants (anton-aa3m): bead label → the run formula a target carrying it
    * walks, in PRECEDENCE ORDER (first match wins — see `selectRunFormula`). Lets risk and size drive
@@ -1084,25 +1099,79 @@ export async function isBudgetAwareEnabledAnywhere(): Promise<boolean> {
 }
 
 /**
- * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
- * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) the per-project
- * governor applies — rather than a hard-coded default, so an operator who tunes `weeklyTargetPct`
- * or `daytimeReservePct` sees the nudge agree with what the runner actually admits. Empty when no
- * project has opted in (the nudge's hide gate); a project with unparseable settingsJson is treated
- * as off, mirroring {@link isBudgetAwareEnabledAnywhere}.
+ * Every budget-aware project on this machine, with its settings — the board a quota share is
+ * proportioned against, and the denominator of the equal-split default. An unparseable settingsJson
+ * reads as off, mirroring {@link isBudgetAwareEnabledAnywhere}.
  */
-export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
-  const rows = await getDb().select({ settingsJson: schema.projects.settingsJson }).from(schema.projects);
-  const policies: BudgetPolicy[] = [];
+async function governedProjects(): Promise<{ projectId: string; settings: ProjectSettings }[]> {
+  const rows = await getDb()
+    .select({ id: schema.projects.id, settingsJson: schema.projects.settingsJson })
+    .from(schema.projects);
+  const governed: { projectId: string; settings: ProjectSettings }[] = [];
   for (const row of rows) {
     try {
       const settings = JSON.parse(row.settingsJson) as ProjectSettings;
-      if (settings.budgetAware === true) policies.push(resolveBudgetPolicy(settings));
+      if (settings.budgetAware === true) governed.push({ projectId: row.id, settings });
     } catch {
       // unparseable settings → not budget-aware; skip
     }
   }
-  return policies;
+  return governed;
+}
+
+/**
+ * The quota-share board of every budget-aware project on this machine (R6.1 / R6.4 / R6.5) — what
+ * one project's share is proportioned against by `resolveGovernedShare` (./quota-share).
+ *
+ * Ungoverned projects are absent by construction: they spend unpaced, so counting them in the
+ * denominator would shrink everyone else's cut to fund a project no share binds. An undeclared
+ * project carries no `declaredPct` (it rides the equal split), which is NOT the same as declaring 0
+ * — that parks a repo.
+ *
+ * Live eligibility rides along so the denominator is recomputed per pass rather than fixed at the
+ * declarations: an idle repo drops out and its share is spent by the repos that have work, unless it
+ * reserved it. Read fresh on every call for the same reason — that is what makes a waking repo
+ * reclaim its cut on the next pass instead of after an operator action. An unobservable or failed
+ * read resolves to `null`, which reads as "can spend": nobody loses a share to a question this
+ * machine never managed to ask.
+ */
+export async function budgetAwareQuotaShares(): Promise<GovernedShare[]> {
+  return governedQuotaBoard(await governedProjects());
+}
+
+/** The board above, over an already-read governed set — so a caller needing both reads once. */
+async function governedQuotaBoard(
+  governed: readonly { projectId: string; settings: ProjectSettings }[],
+): Promise<GovernedShare[]> {
+  const eligible = await observedWorkEligibility(getDb()).catch(() => null);
+  return governed.map(({ projectId, settings }) => ({
+    projectId,
+    declaredPct: settings.quotaSharePct,
+    eligible: eligibilityOf(eligible, projectId),
+    reserved: settings.reserveQuotaShare === true,
+  }));
+}
+
+/**
+ * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
+ * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) and the SAME quota
+ * share (R6.1) the per-project governor applies — rather than a hard-coded default, so an operator
+ * who tunes `weeklyTargetPct` or `daytimeReservePct` sees the nudge agree with what the runner
+ * actually admits. Empty when no project has opted in (the nudge's hide gate).
+ *
+ * The nudge passes no per-project spend to `budgetGate`, so the share ceiling each policy carries is
+ * checked against a spend of 0 there: it binds only for a 0% share — a parked repo defers, as it
+ * should, since its governor would never burn the quota being nudged about — and for any positive
+ * share it is the whole weekly target on the account meter that answers. Deliberate: the nudge asks
+ * whether the MACHINE has idle weekly quota worth shaping work for; which repo gets to spend it, and
+ * how much of its share is already gone, is the governor's decision at lease time, not the nudge's.
+ */
+export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
+  const governed = await governedProjects();
+  const board = await governedQuotaBoard(governed);
+  return governed.map(({ projectId, settings }) =>
+    withQuotaShare(resolveBudgetPolicy(settings), resolveGovernedShare(projectId, board).sharePct),
+  );
 }
 
 /** Apply a patch to a settings blob, key by key. Pure — the store's read/write is the caller's. */
@@ -1410,7 +1479,7 @@ async function deleteSessionLogs(db: AntonDb, projectId: string): Promise<void> 
  * Teardown step 4 — drop the project's anton.db rows atomically, children before parents (no ON
  * DELETE CASCADE in the schema): sessions → runs → jobs → schedules → run-health → picker plan →
  * picker verdicts → picker starts → hygiene → scan summaries → autopilot disarms → escalations →
- * projects.
+ * burn samples (detached, not deleted) → projects.
  */
 function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
   try {
@@ -1439,6 +1508,16 @@ function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
         .where(eq(schema.autopilotDisarms.projectId, projectId))
         .run();
       tx.delete(schema.escalations).where(eq(schema.escalations.projectId, projectId)).run();
+      // Burn samples are DETACHED rather than dropped: what each job type costs this machine is a
+      // property of the machine, not of the project that happened to spend it, and the per-type
+      // averages pacing reads would otherwise regress to the tier seeds on every deregistration.
+      // Nulling the attribution is exactly what the column's null already means (unattributed), and
+      // it clears the foreign key that would otherwise roll the whole teardown back.
+      tx
+        .update(schema.burnSamples)
+        .set({ projectId: null })
+        .where(eq(schema.burnSamples.projectId, projectId))
+        .run();
       tx.delete(schema.projects).where(eq(schema.projects.id, projectId)).run();
     });
   } catch (e) {

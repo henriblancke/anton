@@ -23,6 +23,8 @@ export interface FakeJobContext extends JobContext {
   abort: () => void;
   /** What the step reported as its live handle (anton-susu). */
   reported: Array<Record<string, unknown>>;
+  /** How many times the pass told the runner it was about to invoke Claude. */
+  claudeSpawns: number;
 }
 
 export function fakeJobContext(overrides: Partial<JobContext> = {}): FakeJobContext {
@@ -34,6 +36,7 @@ export function fakeJobContext(overrides: Partial<JobContext> = {}): FakeJobCont
     attempt: 1,
     beats: 0,
     reported: [],
+    claudeSpawns: 0,
     heartbeat: async () => {
       ctx.beats += 1;
     },
@@ -41,6 +44,9 @@ export function fakeJobContext(overrides: Partial<JobContext> = {}): FakeJobCont
     abort: () => controller.abort(),
     report: (info) => {
       ctx.reported.push(info as Record<string, unknown>);
+    },
+    claudeReached: async () => {
+      ctx.claudeSpawns += 1;
     },
     enqueueReviewFixPr: () => undefined,
     ...overrides,

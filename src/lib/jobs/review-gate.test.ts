@@ -118,6 +118,7 @@ const ctx: ReviewGateContext = {
   signal: new AbortController().signal,
   heartbeat: async () => {},
   report: () => {},
+  claudeReached: async () => {},
 };
 
 beforeEach(async () => {

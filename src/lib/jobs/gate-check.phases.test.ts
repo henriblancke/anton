@@ -110,6 +110,7 @@ function jobCtx(heartbeat = vi.fn().mockResolvedValue(undefined)): JobContext {
     heartbeat,
     signal: new AbortController().signal,
     report: () => {},
+    claudeReached: async () => {},
     enqueueReviewFixPr: () => undefined,
   };
 }
