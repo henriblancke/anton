@@ -402,6 +402,34 @@ describe("settings route — Claude gateway routing (anton-n16m)", () => {
     expect("claudeBaseUrl" in persisted()).toBe(false);
   });
 
+  it("PATCH rejects a base URL embedding a credential in its path — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://gateway.example/api/sk-secret/v1",
+      "https://gateway.example/sk-ant-abc123",
+      "https://gateway.example/ghp_0123456789abcdef/v1",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH accepts a versioned base-URL path — a token-free path is not a credential", async () => {
+    const res = await PATCH(
+      patchReq({
+        claudeBaseUrl: "https://gateway.example/v1/openai",
+        claudeAuthTokenEnv: "GATEWAY_TOKEN",
+      }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    expect(persisted().claudeBaseUrl).toBe("https://gateway.example/v1/openai");
+  });
+
   it("PATCH rejects a token VALUE in the env-var-name field — a secret must not be stored", async () => {
     for (const bad of ["sk-ant-abc123", "anthropic-auth-token", "MY TOKEN", "1TOKEN", 42]) {
       const res = await PATCH(patchReq({ claudeAuthTokenEnv: bad }), ctx("tmp"));

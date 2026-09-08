@@ -5,6 +5,7 @@
  * Knows nothing about project settings — the concrete table lives in ./settings-patch.
  */
 import type { ZodError, ZodType } from "zod";
+import { hasCredentialMarker } from "@/lib/scan-secrets";
 
 export type FieldResult<V> = { ok: true; value: V | undefined } | { ok: false; error: string };
 
@@ -50,6 +51,15 @@ export function oneOf(allowed: ReadonlySet<string>): FieldParser<string> {
   };
 }
 
+/** Percent-decode a path segment for credential matching; a malformed escape falls back to raw. */
+function safeDecode(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 /** An http(s) URL — a gateway base URL, not a bare host, a file path, or a stray scheme. */
 export function httpUrl(max: number): FieldParser<string> {
   return (raw, key) => {
@@ -80,6 +90,16 @@ export function httpUrl(max: number): FieldParser<string> {
       return reject(
         `${key} must not include a query or fragment — paste the base URL only, ` +
           `and keep any token in the auth-token env var`,
+      );
+    }
+    // The path is the last place a token hides (`…/sk-secret/v1`). It can't be forbidden outright —
+    // a base URL is legitimately versioned (`/v1`, `/openai`) — so reject only segments carrying a
+    // shape anton recognises as a credential, the same detector it uses elsewhere. Word/entropy
+    // heuristics stay out: they would reject `/v1` and public ids like a Cloudflare account tag.
+    if (parsed.pathname.split("/").some((segment) => hasCredentialMarker(safeDecode(segment)))) {
+      return reject(
+        `${key} must not embed a credential in its path — paste the base URL without the token, ` +
+          `and keep it in the auth-token env var`,
       );
     }
     return accept(raw);
