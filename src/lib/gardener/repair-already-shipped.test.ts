@@ -896,6 +896,43 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(supersedeMock).not.toHaveBeenCalled();
   });
 
+  // The reread above only ORDERS against a move that holds a lock this retirement also holds. A
+  // re-parent takes the moved bead's lock and its new home's, and moving an ancestor carries the
+  // ticket with nothing written to it — so the ticket's own lock orders nothing against it. Every
+  // ancestor through the run target is held too (PR #238 review), and this is that hold in action.
+  it("holds the ancestors' locks through the run target, so its locked read queues behind a move of one", async () => {
+    const CARRIER = "anton-carr";
+    const viaCarrier = [
+      bead(TARGET, { status: "in_progress", parent: CARRIER }),
+      bead(CARRIER, { status: "in_progress", parent: OWNER }),
+      bead(OWNER, { issue_type: "feature", status: "in_progress" }),
+      bead(SHIPPER, { status: "closed" }),
+    ];
+    let readAt = 0;
+    loadAllIssuesMock.mockImplementation(async () => {
+      readAt = Date.now();
+      return viaCarrier;
+    });
+    showMock.mockImplementation(async (_cwd, id) => viaCarrier.find((b) => b.id === id)!);
+    const releasedAt: Record<string, number> = {};
+    const holding = Promise.all(
+      [CARRIER, OWNER].map((id) =>
+        withBeadWriteLock(repo, id, async () => {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          releasedAt[id] = Date.now();
+        }),
+      ),
+    );
+
+    const outcome = await retire({ board: viaCarrier });
+    await holding;
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(readAt).toBeGreaterThanOrEqual(releasedAt[CARRIER]!);
+    expect(readAt).toBeGreaterThanOrEqual(releasedAt[OWNER]!);
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+  });
+
   it("still retires a ticket that hangs where the check found it, parent and run target alike", async () => {
     const snapshot = [
       bead(TARGET, { status: "in_progress", parent: OWNER }),

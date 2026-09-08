@@ -1507,6 +1507,40 @@ describe("finalizeMergedEpic", () => {
     expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-2");
   });
 
+  // Both re-parents hold the moved bead's lock and its new home's, like every other re-parent
+  // writer (PR #238 review): the already-shipped retirement re-reads the board under the ticket's
+  // lock and its ancestors' to see that it still hangs where it was checked, and an unlocked move
+  // could land between that read and the supersede — closing the ticket inside a run it just
+  // joined. The HOME's lock is the one nothing else in finalization takes, so it is the one held.
+  it("re-parents only under the moved bead's lock and its new home's (PR #238)", async () => {
+    const movedAt: Record<string, number> = {};
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      movedAt[id] = Date.now();
+    });
+    const releasedAt: Record<string, number> = {};
+    const holding = Promise.all(
+      ["epic-1", "epic-2"].map((id) =>
+        withBeadWriteLock("/repo", id, async () => {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          releasedAt[id] = Date.now();
+        }),
+      ),
+    );
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3")),
+    ]);
+    await holding;
+
+    expect(reparentMock.mock.calls).toEqual([
+      ["/repo", "t3", "epic-1"],
+      ["/repo", "t2", "epic-2"],
+    ]);
+    expect(movedAt.t3).toBeGreaterThanOrEqual(releasedAt["epic-1"]!); // the detach, onto the merged target
+    expect(movedAt.t2).toBeGreaterThanOrEqual(releasedAt["epic-2"]!); // the move, onto the follow-up
+  });
+
   it("pins the ancestor when a delivered descendant was reopened since the sweep (PR #199)", async () => {
     // The closing batch is built from the same snapshot that called t3 delivered, so a t3 reopened
     // while the PR was being finalized is left out of it. Detaching it onto the merged target would

@@ -43,7 +43,14 @@ import {
   readPullRequestMerge,
   type PullRequestState,
 } from "../git/ops";
-import { beadIdsNamedIn, indexBoard, isOpenWork, ticketOwnerOf, type BoardIndex } from "./board-index";
+import {
+  beadIdsNamedIn,
+  indexBoard,
+  isOpenWork,
+  ticketOwnerOf,
+  ticketPathOf,
+  type BoardIndex,
+} from "./board-index";
 import type { ProposalAutonomy } from "./autonomy";
 import {
   decideRepair,
@@ -722,9 +729,18 @@ export async function repairAlreadyShipped(args: {
   // merged PR swapped for an open one between `retirementMoved`'s reread and the supersede, with
   // nothing to order the two. Held here, the swap either lands first and the reread refuses it, or
   // queues behind a retirement that verified what was actually there.
+  //
+  // And the ticket's ANCESTORS, up to and including the run target it rides (PR #238 review). A
+  // re-parent holds the moved bead's lock and its new home's, and a move carries everything beneath
+  // it: the ticket changes owners when an ancestor is re-homed, with nothing written to the ticket
+  // itself. Holding the ticket alone orders nothing against that move, so `targetRehomed`'s reread
+  // could accept the old owner and the supersede then close the ticket inside the run it rode into.
+  // With the chain held, the move either lands first and the reread refuses it, or queues behind a
+  // retirement that closed the ticket where it was checked.
   const subtree = index.descendantsOf(bead.id).map((b) => b.id);
   const evidenceHolders = landing.via === "owner-pr" ? [landing.ownerId] : [];
-  return withBeadWriteLocks(repoPath, [bead.id, replacementId, ...subtree, ...evidenceHolders], async () => {
+  const ancestors = ancestorChainOf(index, bead.id);
+  return withBeadWriteLocks(repoPath, [bead.id, replacementId, ...subtree, ...evidenceHolders, ...ancestors], async () => {
     const locked = await readBoardUnderLock(repoPath);
     const moved =
       typeof locked === "string"
@@ -1039,6 +1055,19 @@ function stillRidesOwner(
     `verified — it ${owner ? `rides \`${owner.id}\`` : "rides no run target"} now, so that PR no ` +
     `longer speaks for its work, and ${targetId} is not superseded on that evidence`
   );
+}
+
+/**
+ * The beads a re-parent of which would carry `id` to another home: every ancestor it reaches its
+ * run target through, and that run target itself — the two things {@link targetRehomed} compares.
+ * Read off the board the CHECK read, since that is the chain the retirement is written against.
+ */
+function ancestorChainOf(index: BoardIndex, id: string): string[] {
+  const checked = index.byId.get(id);
+  if (!checked) return [];
+  const through = ticketPathOf(index, checked).map((b) => b.id);
+  const owner = ticketOwnerOf(index, checked)?.id;
+  return owner ? [...through, owner] : through;
 }
 
 /**

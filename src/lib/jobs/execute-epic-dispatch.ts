@@ -78,7 +78,9 @@ export async function dispatchRunTickets(
   run: EpicRun,
   prep: Extract<RunPreparation, { done: false }>,
 ): Promise<DispatchOutcome> {
-  const { live, held, dispatchable } = partitionTickets(run, prep.gated);
+  const { live, held, dispatchable } = await partitionTickets(run, prep.gated, (id) =>
+    worktreeHasCommitFor(prep.worktree.path, id),
+  );
   const ledger: DispatchLedger = {
     skipCause: new Map(),
     skipped: new Map(),
@@ -190,10 +192,12 @@ function retirementClauses(rs: readonly RetiredTicketOutcome[]): string[] {
 }
 
 /** The run's tickets, split into what it may dispatch now and what a blocker outside it holds. */
-function partitionTickets(
+async function partitionTickets(
   run: EpicRun,
   gated: Set<string>,
-): { live: Bead[]; held: Bead[]; dispatchable: Bead[] } {
+  /** Whether THIS branch carries a commit under the ticket's id — the branch's own evidence. */
+  hasCommitFor: (ticketId: string) => Promise<boolean>,
+): Promise<{ live: Bead[]; held: Bead[]; dispatchable: Bead[] }> {
   const { targetId: epicBeadId, tickets, all } = run;
   // 4. Per ticket: the formula's ticket phase (its steps up to and including the commit) →
   //    (close | in-review). Skip work that already
@@ -217,11 +221,20 @@ function partitionTickets(
   // `bd supersede` writes beside the close), so a retirement an EARLIER attempt made reads the same
   // as one this attempt is about to. Recorded on the run's retired ledger rather than dropped
   // silently, so the pull request this attempt opens still says what it does not contain.
+  //
+  // UNLESS this branch carries a commit under the ticket's own id (PR #238 review). A child that
+  // committed and closed on an earlier attempt, and was superseded by hand between that attempt's
+  // failure and this resume, is closed with its work IN THIS DIFF: the branch is the evidence, and
+  // "no commit under its own id" — the premise of dropping it — is false. Dropped here, it never
+  // reaches the loop, so the delivered set and the pull request's body omit a commit the reviewer
+  // will read, and the retirement notice claims the PR does not carry it. Kept live instead: the
+  // loop's done-on-board check finds the commit, skips the ticket exactly as any closed child whose
+  // work is already here, and counts it delivered.
   const live: Bead[] = [];
   for (const ticket of orderTickets(tickets, all)) {
     if (beads.isAbandoned(ticket)) continue;
     const survivor = beads.supersededBy(ticket);
-    if (survivor)
+    if (survivor && !(await hasCommitFor(ticket.id)))
       run.retired.push({ id: ticket.id, replacedBy: survivor, source: "pre-existing" });
     else live.push(ticket);
   }
@@ -537,10 +550,19 @@ async function dispatchTicket(
     // do. Halting here would park the whole feature on a ticket that is finished, which is exactly
     // the false stall the class exists to end. Nothing cascades: the work it was waiting for is in
     // the run's BASE, so every ticket written against it still has its mechanism.
+    //
+    // Recorded, then the cancellation is asked (PR #238 review). The settlement lets a retirement
+    // that landed before the job's kill stand — the abort cannot take a supersede back — and so it
+    // does not rethrow on the kill the way every other stop does, which leaves THIS catch as the
+    // one place the kill can be heard. `ctx.heartbeat()` does not read the signal (runner.ts only
+    // renews the lease), so returning normally here would have the queue claim and tag the next
+    // ticket under a job that is already cancelled. The retirement stays on the ledger — it is
+    // done, and a resume finds it on the board either way — and the loop stops here.
     if (e instanceof TicketRetiredError) {
       run.retired.push({ id: e.ticketId, replacedBy: e.replacementId, source: "this-run" });
       onBranch.add(e.ticketId);
       console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
+      ctx.signal.throwIfAborted();
       await ctx.heartbeat();
       return;
     }
@@ -668,8 +690,10 @@ async function deliveredOrPark(
   //     no-delivery park below claim an empty branch that has commits on it.
   //     A ticket RETIRED as already shipped (anton-5bpd) is out on the same rule: its work is in
   //     this run's BASE, under the survivor's id, so no commit here carries it. One retired on an
-  //     EARLIER attempt never reached `live` at all (partitionTickets drops it); this covers the
-  //     one this attempt retired mid-loop, whose board snapshot still predates the supersede.
+  //     EARLIER attempt never reached `live` at all (partitionTickets drops it — unless this branch
+  //     carries its commit, in which case it is delivered like any other closed child whose work
+  //     is here); this covers the one this attempt retired mid-loop, whose board snapshot still
+  //     predates the supersede.
   const retired = new Set(run.retired.map((r) => r.id));
   const delivered = await deliveredTickets(
     live.filter((t) => !skipped.has(t.id) && !retired.has(t.id)),
