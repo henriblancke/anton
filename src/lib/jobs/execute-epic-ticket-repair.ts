@@ -136,7 +136,7 @@ export async function repairBlockedTicket(args: {
             now,
             autonomy: autonomy["ref-stale"],
           });
-    await recordRepairOutcome({ repo, ticketId: ticket.id, logPath, kind, outcome });
+    await recordRepairOutcome({ repo, ticketId: ticket.id, logPath, kind, outcome, signal: run.ctx.signal });
     return outcome;
   } catch (failure) {
     // The MODULE that ran and the block CLASS it ran on are two different facts (PR #223 review).
@@ -152,9 +152,14 @@ export async function repairBlockedTicket(args: {
 
 /**
  * What a repair leaves behind whichever way it went: the refusal or shadow note on the bead, then
- * its own line in the session log. Both best-effort — the block stands either way. A repair the
- * job's abort stopped leaves only the log line: the cancellation's author is deciding the ticket,
- * and a note is a board write like any other.
+ * its own line in the session log. Both best-effort — the block stands either way.
+ *
+ * A job the abort has reached leaves only the log line, whatever the repair answered (PR #238
+ * review). The repair reads the live signal before ITS first write, but a shadowed or escalated
+ * outcome reaches here without one — a kill landing during a long GitHub read, or after the
+ * under-lock reread found the board moved, would otherwise turn into a note on a bead the
+ * settlement promised to leave untouched. The cancellation's author is deciding the ticket, and a
+ * note is a board write like any other.
  */
 async function recordRepairOutcome(args: {
   repo: string;
@@ -162,8 +167,17 @@ async function recordRepairOutcome(args: {
   logPath: string;
   kind: RepairKind;
   outcome: TicketRepair;
+  /** The job's LIVE abort signal — re-read here, at the moment of the write, not the settlement's read. */
+  signal: AbortSignal;
 }): Promise<void> {
-  const { repo, ticketId, logPath, kind, outcome } = args;
+  const { repo, ticketId, logPath, kind, outcome, signal } = args;
+  if (signal.aborted) {
+    await appendSessionLog(
+      logPath,
+      `[repair:${kind}] not recorded on the bead — the job was cancelled; ${repairLogLine(outcome)}\n`,
+    ).catch(() => {});
+    return;
+  }
   if (outcome.action === "escalate") {
     await safe(() =>
       beads.note(

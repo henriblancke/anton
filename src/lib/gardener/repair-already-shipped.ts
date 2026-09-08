@@ -51,7 +51,6 @@ import {
   refusalNote as refusal,
   unstampedNote,
   type RepairAttempt,
-  type RepairedBead,
 } from "./repair";
 
 /** The class this module repairs. Named once so the guard, the stamp and the prose cannot drift. */
@@ -582,7 +581,14 @@ export async function repairAlreadyShipped(args: {
   repoPath: string;
   /** The ref the run forked from — what "has landed" is measured against (`baseRef`). */
   base: string;
-  bead: RepairedBead;
+  /**
+   * The ticket as `bd show` reads it — the FULL bead, not a `bd list` row (PR #238 review). Its
+   * contract is the fence the write is held to ({@link contractRewritten}), and the list-shaped
+   * board can omit `description` on some bd versions (issues.ts `ensureDescription`): fenced on
+   * that, the under-lock reread's real description would read as a rewrite and every valid
+   * retirement in such an environment would refuse.
+   */
+  bead: Bead;
   /** The block being repaired — its reason carries the claim, and rides into the record. */
   block: { reason?: string };
   /** Whether this ticket's work reached a commit on the run's branch — see gate 1 above. */
@@ -709,8 +715,16 @@ export async function repairAlreadyShipped(args: {
   // newcomer and refuses, or queues behind the supersede and meets a closed home. Against the
   // snapshot alone both would pass, and the newly attached ticket would sit beneath a card nothing
   // will run.
+  //
+  // The EVIDENCE holder's lock too (PR #238 review): a survivor verified through the PR of the run
+  // target it rides has its evidence on THAT bead's pointer, and the PR-ref writers (pr-link.ts,
+  // the run's own `pr` step) take the holder's lock — so an owner outside this set could have its
+  // merged PR swapped for an open one between `retirementMoved`'s reread and the supersede, with
+  // nothing to order the two. Held here, the swap either lands first and the reread refuses it, or
+  // queues behind a retirement that verified what was actually there.
   const subtree = index.descendantsOf(bead.id).map((b) => b.id);
-  return withBeadWriteLocks(repoPath, [bead.id, replacementId, ...subtree], async () => {
+  const evidenceHolders = landing.via === "owner-pr" ? [landing.ownerId] : [];
+  return withBeadWriteLocks(repoPath, [bead.id, replacementId, ...subtree, ...evidenceHolders], async () => {
     const locked = await readBoardUnderLock(repoPath);
     const moved =
       typeof locked === "string"
@@ -719,6 +733,7 @@ export async function repairAlreadyShipped(args: {
             repoPath,
             base,
             targetId: bead.id,
+            contract: bead,
             checked: index.byId.get(bead.id),
             snapshot: index,
             replacementId,
@@ -792,7 +807,13 @@ async function retirementMoved(args: {
   /** The ref the merge has to be in the history of — the same `base` the check placed it in. */
   base: string;
   targetId: string;
-  /** The target as the CHECK read it — the contract the claim was verified against. */
+  /**
+   * The target's FULL read ahead of the check — the contract the claim was verified against. Held
+   * apart from `checked` because the two answer different questions off different reads: the
+   * contract lives on a `bd show`, and the ticket's home on the board listing.
+   */
+  contract: Bead;
+  /** The target as it sat on the board the CHECK read — where it hung when the claim was verified. */
   checked: Bead | undefined;
   /** The board the CHECK read — where the target hung when the claim was verified. */
   snapshot: BoardIndex;
@@ -801,7 +822,7 @@ async function retirementMoved(args: {
   /** The whole board, re-read inside the locks. */
   locked: BoardIndex;
 }): Promise<string | undefined> {
-  const { repoPath, base, targetId, checked, snapshot, replacementId, landing, locked } = args;
+  const { repoPath, base, targetId, contract, checked, snapshot, replacementId, landing, locked } = args;
   const read = async (id: string): Promise<Bead | string> => {
     try {
       const bead = await beads.show(repoPath, id);
@@ -818,9 +839,15 @@ async function retirementMoved(args: {
       `outcome, and anton does not rewrite that`
     );
   }
-  const rewritten = contractRewritten(checked, target);
+  const rewritten = contractRewritten(contract, target);
   if (rewritten) return rewritten;
-  const rehomed = checked && targetRehomed(snapshot, checked, locked, target);
+  if (!checked) {
+    return (
+      `\`${targetId}\` was not on the board the claim was checked against — anton cannot tell ` +
+      `whether the ticket it would close is the one the claim is about`
+    );
+  }
+  const rehomed = targetRehomed(snapshot, checked, locked, target);
   if (rehomed) return rehomed;
   const replacement = await read(replacementId);
   if (typeof replacement === "string") return replacement;
@@ -933,14 +960,11 @@ const CONTRACT_FIELDS = ["title", "description", "acceptance_criteria", "accepta
  * ticket they just redefined on evidence about the one they replaced. `updated_at` is deliberately
  * not the fence (board-picker-plan.ts gives the reason): every write bumps it, and a label stamped
  * in the window is not a rewrite.
+ *
+ * Both sides are `bd show` reads, on purpose: the fence compares like with like, and a board row
+ * that dropped `description` would otherwise read every real description as a rewrite.
  */
-function contractRewritten(checked: Bead | undefined, now: Bead): string | undefined {
-  if (!checked) {
-    return (
-      `\`${now.id}\` was not on the board the claim was checked against — anton cannot tell ` +
-      `whether the ticket it would close is the one the claim is about`
-    );
-  }
+function contractRewritten(checked: Bead, now: Bead): string | undefined {
   const text = (v: unknown): string => (typeof v === "string" ? v : "");
   const changed = CONTRACT_FIELDS.filter((field) => text(checked[field]) !== text(now[field]));
   if (changed.length === 0) return undefined;

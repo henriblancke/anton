@@ -580,7 +580,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     repairAlreadyShipped({
       repoPath: repo,
       base: "main",
-      bead: { id: TARGET },
+      bead: bead(TARGET, { status: "in_progress" }),
       block: { reason: CLAIM },
       committed: false,
       now: NOW,
@@ -658,7 +658,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
   it("escalates the SECOND block on a ticket it already retired (R5.6)", async () => {
     const outcome = await retire({
-      bead: { id: TARGET, labels: [repairLabel(TARGET, "already-shipped", NOW - 60_000)] },
+      bead: bead(TARGET, { status: "in_progress", labels: [repairLabel(TARGET, "already-shipped", NOW - 60_000)] }),
     });
 
     expect(outcome).toMatchObject({ action: "escalate" });
@@ -812,6 +812,21 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("description");
     expect(supersedeMock).not.toHaveBeenCalled();
     expect(tagMock).not.toHaveBeenCalled();
+  });
+
+  // The board row the check ran against can omit `description` on some bd versions (issues.ts
+  // `ensureDescription`); the fence compares the caller's `bd show` read with the under-lock one, so
+  // a description the listing never carried is not a rewrite (PR #238 review).
+  it("fences the contract on the full read, not on a board row that dropped the description", async () => {
+    const contract = "## Goal\nShip the thing.\n## Acceptance\n- [ ] it ships";
+    showMock.mockImplementation(async (_cwd, id) =>
+      id === TARGET ? bead(TARGET, { status: "in_progress", description: contract }) : bead(SHIPPER, { status: "closed" }),
+    );
+
+    const outcome = await retire({ bead: bead(TARGET, { status: "in_progress", description: contract }) });
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
   });
 
   it("still retires when the window only stamped the ticket — a label or a timestamp is not a rewrite", async () => {
@@ -1118,6 +1133,28 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
         ],
       });
       expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);
+    });
+
+    // The PR-ref writers (pr-link.ts, the run's `pr` step) take the holder's lock, so the owner's
+    // pointer is what this lock set has to cover: outside it, a swap could land between the reread
+    // and the supersede with nothing to order the two (PR #238 review).
+    it("holds the run target's lock too, so its locked read queues behind a PR-ref write on it", async () => {
+      let readAt = 0;
+      loadAllIssuesMock.mockImplementation(async () => {
+        readAt = Date.now();
+        return viaOwner();
+      });
+      let releasedAt = 0;
+      const holding = withBeadWriteLock(repo, OWNER, async () => {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        releasedAt = Date.now();
+      });
+
+      const outcome = await retireViaOwner();
+      await holding;
+
+      expect(outcome).toMatchObject({ action: "retired", replacementId: UNLANDED });
+      expect(readAt).toBeGreaterThanOrEqual(releasedAt);
     });
 
     it("refuses when it was re-homed under another run target in the window, whatever that one's PR says", async () => {

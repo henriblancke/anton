@@ -158,7 +158,10 @@ function steps(selfReport: AntonResult | null, committed: boolean): ResolvedStep
  * a project can give it, so a claim that still does not settle the ticket is refused by the CHECK
  * and not merely by an unarmed dial.
  */
-function run(signal: AbortSignal = new AbortController().signal): Omit<StepContext, "tickets"> {
+function run(
+  signal: AbortSignal = new AbortController().signal,
+  autonomy: "apply" | "shadow" = "apply",
+): Omit<StepContext, "tickets"> {
   const clock: Clock = { now: () => NOW };
   return {
     db: {} as AntonDb,
@@ -172,14 +175,18 @@ function run(signal: AbortSignal = new AbortController().signal): Omit<StepConte
     baseBranch: "main",
     baseRef: "origin/main",
     target: { id: "anton-epic", title: "The epic", status: "in_progress" } as Bead,
-    settings: { repairAutonomy: { "already-shipped": "apply" } },
+    settings: { repairAutonomy: { "already-shipped": autonomy } },
   } as unknown as Omit<StepContext, "tickets">;
 }
 
 /** Walk the ticket and hand back the error it halted on (failing if it did not halt). */
-async function haltOf(selfReport: AntonResult | null, signal?: AbortSignal): Promise<Error> {
+async function haltOf(
+  selfReport: AntonResult | null,
+  signal?: AbortSignal,
+  autonomy?: "apply" | "shadow",
+): Promise<Error> {
   const caught = await runTicket({
-    run: run(signal),
+    run: run(signal, autonomy),
     steps: steps(selfReport, false),
     ticket: ticket(),
     // The run carries this ticket alone — no sibling for a `dep-missing` repair to resolve against.
@@ -299,6 +306,36 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
     // The session log is where the cancellation is accounted for.
     const logged = appendSessionLogMock.mock.calls.map((c) => (c as unknown as string[])[1]).join("");
     expect(logged).toContain("cancelled before writing");
+    expect(logged).toContain(`[aborted] ${TICKET_ID} was aborted mid-run`);
+  });
+
+  // At `shadow` the repair never reaches its own under-lock abort check — it returns before the
+  // locks — so a kill landing during the GitHub read would otherwise arrive at the shadow note with
+  // nothing having asked the signal (PR #238 review). The recording asks it, and keeps the session
+  // log as the only account.
+  it("writes no shadow note when the job is cancelled while the claim is being verified", async () => {
+    const controller = new AbortController();
+    readCommitNamingMock.mockImplementationOnce(async () => {
+      // Lands inside the check — before the repair has decided anything, long after the settlement
+      // read the signal.
+      controller.abort();
+      return { state: "found", sha: "b".repeat(40) };
+    });
+
+    const halt = await haltOf(
+      { outcome: "blocked", klass: "already-shipped", reason: `Already implemented by ${SHIPPED_ID}` },
+      controller.signal,
+      "shadow",
+    );
+
+    expect(halt.message).toMatch(/produced no delivery/);
+    expect(noteMock).not.toHaveBeenCalled();
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(unassignMock).not.toHaveBeenCalled();
+    const logged = appendSessionLogMock.mock.calls.map((c) => (c as unknown as string[])[1]).join("");
+    expect(logged).toContain("not recorded on the bead — the job was cancelled");
+    expect(logged).toContain("shadow (not armed to write)");
     expect(logged).toContain(`[aborted] ${TICKET_ID} was aborted mid-run`);
   });
 

@@ -8,6 +8,7 @@
  * overlap is still not a licence to fan out.
  */
 import { beads, LABELS } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { updateRun } from "../runs";
 import { releaseRunResources } from "./worktree-reaper";
 import type { RetiredTicketOutcome, SkipCause } from "./execute-epic-board";
@@ -87,7 +88,9 @@ async function runPrStep(
       carry.staleBodyFallback = stalePrBodyRunError(epicBeadId, note);
     }
   }
-  await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
+  // Under the bead's write lock, like every other live PR-ref write (pr-link.ts gives the reason):
+  // an `already-shipped` retirement elsewhere may be re-reading this pointer as its evidence.
+  await safe(() => withBeadWriteLock(repo, epicBeadId, () => beads.setPrRef(repo, epicBeadId, pr.ref)));
   // The merge wait becomes board state, not a polling job (anton-k0kj): past this step the
   // only thing left to learn is whether this PR merges, which `bd gate check` answers for the
   // whole project in one call per slot. Best-effort like the writes around it — the
