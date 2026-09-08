@@ -799,6 +799,11 @@ export async function repairAlreadyShipped(args: {
   // could accept the old owner and the supersede then close the ticket inside the run it rode into.
   // With the chain held, the move either lands first and the reread refuses it, or queues behind a
   // retirement that closed the ticket where it was checked.
+  //
+  // The survivor's lock also orders the run's own cross-machine reopen (PR #238 review): a resumed
+  // run whose branch lacks the survivor's landed commit reopens it to regenerate, and does so under
+  // the same lock (execute-epic-dispatch `reopenForRegeneration`), so it cannot slip between the
+  // reread below and the supersede.
   const subtree = index.descendantsOf(bead.id).map((b) => b.id);
   const evidenceHolders = landing.via === "owner-pr" ? [landing.ownerId] : [];
   const ancestors = ancestorChainOf(index, bead.id);

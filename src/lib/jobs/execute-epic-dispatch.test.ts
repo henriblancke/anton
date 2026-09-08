@@ -6,13 +6,18 @@
  *     carries its commit, in which case its work is in the diff and the loop must count it
  *     delivered rather than tell the reviewer the PR does not contain it;
  *   • a retirement that lands under a job that has since been cancelled stays retired, but the
- *     loop stops there — `ctx.heartbeat()` never reads the signal, so nothing else would.
+ *     loop stops there — `ctx.heartbeat()` never reads the signal, so nothing else would;
+ *   • a run left with nothing live parks on a message that names only what actually settled its
+ *     tickets — "abandoned" is a different decision from "superseded";
+ *   • the cross-machine reopen of a closed child is decided under that bead's write lock, so it
+ *     cannot land between the already-shipped repair's reread of a survivor and its supersede.
  *
  * Mocked at the IO seams only — the ticket walk, git's branch read, bd's writes. The partition, the
  * loop and the delivery verdict all RUN.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bead } from "../beads/bd";
+import { LABELS, type Bead } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { resumeSkipped } from "../ticket-view";
 import type { EpicRun } from "./execute-epic-run";
 import type { RunPreparation } from "./execute-epic-prepare";
@@ -41,12 +46,16 @@ vi.mock("../beads/bd", async () => {
       tag: vi.fn(async () => ""),
       untag: vi.fn(async () => ""),
       reopen: vi.fn(async () => ""),
+      show: vi.fn(async () => undefined),
     },
   };
 });
 
 const { dispatchRunTickets } = await import("./execute-epic-dispatch");
 const { TicketRetiredError } = await import("./execute-epic-errors");
+const { beads } = await import("../beads/bd");
+const reopenMock = vi.mocked(beads.reopen);
+const showMock = vi.mocked(beads.show);
 
 const EPIC = "anton-epic";
 const SHIPPER = "anton-ship";
@@ -97,9 +106,17 @@ const prep = (): Extract<RunPreparation, { done: false }> =>
 
 const dispatchedIds = () => runTicketMock.mock.calls.map((c) => c[0].ticket.id);
 
+/** A contract the run's re-gate accepts, for a child the loop is about to regenerate. */
+const CONTRACT = "## Goal\nShip X.\n\n## Acceptance\nWorks.";
+
+const abandoned = (id: string): Bead =>
+  bead(id, { status: "closed", labels: [LABELS.abandoned] });
+
 beforeEach(() => {
   runTicketMock.mockReset().mockResolvedValue(undefined);
   hasCommitMock.mockReset().mockResolvedValue(false);
+  reopenMock.mockReset().mockResolvedValue("");
+  showMock.mockReset().mockResolvedValue(undefined as unknown as Bead);
 });
 
 describe("a ticket the board already holds as superseded", () => {
@@ -157,5 +174,92 @@ describe("a retirement landing under a cancelled job", () => {
     expect(dispatchedIds()).toEqual(["anton-a", "anton-b"]);
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "this-run" }]);
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-b"]);
+  });
+});
+
+describe("a run left with nothing live", () => {
+  const park = (tickets: Bead[]) =>
+    dispatchRunTickets(makeRun(tickets, new AbortController().signal), prep()).then(
+      () => {
+        throw new Error("expected the run to park");
+      },
+      (e: Error) => e.message,
+    );
+
+  // Every ticket was superseded on the board, none abandoned (PR #238 review): the message must not
+  // tell the operator a won't-do was recorded when the board says the work shipped elsewhere.
+  it("names only the supersedes when no ticket was abandoned", async () => {
+    const message = await park([superseded("anton-a", SHIPPER), superseded("anton-b", SHIPPER)]);
+
+    expect(message).toContain("already settled as superseded on the board");
+    expect(message).not.toContain("abandoned");
+  });
+
+  it("names only the abandon when no ticket was superseded", async () => {
+    const message = await park([abandoned("anton-a")]);
+
+    expect(message).toContain("has been abandoned");
+    expect(message).not.toContain("superseded");
+  });
+
+  it("names both when the board holds one of each", async () => {
+    const message = await park([abandoned("anton-a"), superseded("anton-b", SHIPPER)]);
+
+    expect(message).toContain("been abandoned");
+    expect(message).toContain("already settled as superseded on the board");
+  });
+});
+
+describe("the cross-machine reopen of a closed child", () => {
+  const closedChild = (id: string) => bead(id, { status: "closed", description: CONTRACT });
+  const makeResume = (child: Bead) => {
+    const run = makeRun([child], new AbortController().signal);
+    (run.target as Bead).description = CONTRACT;
+    return run;
+  };
+
+  // The already-shipped repair rereads a survivor under its write lock and supersedes the target
+  // against it; the reopen has to queue on that same lock, or it lands in between (PR #238 review).
+  it("waits on the bead's write lock before it writes", async () => {
+    const child = closedChild("anton-a");
+    showMock.mockResolvedValue(child);
+    let release!: () => void;
+    const held = withBeadWriteLock(
+      "/tmp/anton-repo",
+      "anton-a",
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+
+    const dispatch = dispatchRunTickets(makeResume(child), prep());
+    await new Promise((r) => setTimeout(r, 20));
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(runTicketMock).not.toHaveBeenCalled();
+
+    release();
+    await held;
+    await dispatch;
+
+    expect(reopenMock).toHaveBeenCalledWith("/tmp/anton-repo", "anton-a");
+    expect(dispatchedIds()).toEqual(["anton-a"]);
+  });
+
+  it("reopens a bead the fresh read still finds closed", async () => {
+    const child = closedChild("anton-a");
+    showMock.mockResolvedValue(child);
+
+    await dispatchRunTickets(makeResume(child), prep());
+
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+    expect(dispatchedIds()).toEqual(["anton-a"]);
+  });
+
+  it("leaves alone a bead somebody reopened since the run's snapshot", async () => {
+    const child = closedChild("anton-a");
+    showMock.mockResolvedValue({ ...child, status: "open" });
+
+    await dispatchRunTickets(makeResume(child), prep());
+
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(dispatchedIds()).toEqual(["anton-a"]);
   });
 });

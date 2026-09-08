@@ -11,6 +11,7 @@
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { claimGuard } from "../beads/claim";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { appendSessionLog } from "../sessions";
 import { resumeSkipped } from "../ticket-view";
@@ -231,8 +232,12 @@ async function partitionTickets(
   // loop's done-on-board check finds the commit, skips the ticket exactly as any closed child whose
   // work is already here, and counts it delivered.
   const live: Bead[] = [];
+  let abandoned = 0;
   for (const ticket of orderTickets(tickets, all)) {
-    if (beads.isAbandoned(ticket)) continue;
+    if (beads.isAbandoned(ticket)) {
+      abandoned += 1;
+      continue;
+    }
     const survivor = beads.supersededBy(ticket);
     if (survivor && !(await hasCommitFor(ticket.id)))
       run.retired.push({ id: ticket.id, replacedBy: survivor, source: "pre-existing" });
@@ -245,11 +250,13 @@ async function partitionTickets(
     // Said by PROVENANCE, never as one thing (PR #238 review): every retirement here is one the run
     // FOUND on the board — the dispatch loop has not run yet — so this run verified no delivery, and
     // "already shipped" would hand the operator a premise anton never checked when settling the epic.
-    const settled = retirementClauses(run.retired);
+    // And "abandoned" only when a ticket WAS (PR #238 review): an abandon is a recorded won't-do, a
+    // different decision from a supersede, and naming one that never happened misreads the board.
+    const outcomes = [...(abandoned > 0 ? ["been abandoned"] : []), ...retirementClauses(run.retired)];
     throw new PoisonEpic(
-      (settled.length > 0
-        ? `every ticket under ${epicBeadId} has been abandoned or ${settled.join(", or ")}`
-        : `every ticket under ${epicBeadId} has been abandoned`) +
+      (outcomes.length > 0
+        ? `every ticket under ${epicBeadId} has ${outcomes.join(", or ")}`
+        : `${epicBeadId} has no tickets`) +
         ` — nothing left to run; settle the epic itself or give it work, then resume the run`,
     );
   }
@@ -261,6 +268,28 @@ async function partitionTickets(
   const held = live.filter((t) => gated.has(t.id));
   const dispatchable = live.filter((t) => !gated.has(t.id));
   return { live, held, dispatchable };
+}
+
+/**
+ * Reopen a closed child whose commit this branch lacks, decided on a read taken under the bead's
+ * write lock (PR #238 review). The already-shipped repair retires a ticket against a SURVIVOR it
+ * re-reads as closed under that survivor's lock, then supersedes; a resumed run whose old branch
+ * lacks the survivor's now-landed commit reaches this reopen for that very bead. Unlocked, the
+ * reopen could land between the repair's reread and its supersede, and the target would be retired
+ * against a survivor that is live work again. Queued on the survivor's lock, the two can only order:
+ * the reopen lands first and the repair's reread refuses it, or the supersede lands first and this
+ * reopen follows a retirement that was checked against a closed bead.
+ *
+ * `ticket.status` came from the run's snapshot, so a bead somebody has reopened since is left
+ * alone: a reopen on a bead that already reads open is a write for nothing. The write itself stays
+ * best-effort, as before — runTicket's claim is what fails loudly on a bead still closed.
+ */
+async function reopenForRegeneration(repo: string, ticket: Bead): Promise<void> {
+  await withBeadWriteLock(repo, ticket.id, async () => {
+    const live = await mustRead(repo, ticket.id);
+    if (live && live.status !== "closed") return;
+    await safe(() => beads.reopen(repo, ticket.id));
+  });
 }
 
 /**
@@ -529,7 +558,7 @@ async function dispatchTicket(
   // work must be regenerated here. Reopen a closed child first so runTicket's claim + close
   // operate on a live bead (a standalone target is never closed, so it needs no reopen).
   if (doneOnBoard && ticket.status === "closed") {
-    await safe(() => beads.reopen(repo, ticket.id));
+    await reopenForRegeneration(repo, ticket);
   }
   try {
     await runTicket({
