@@ -83,6 +83,11 @@ export async function repairBlockedTicket(args: {
    * contract fields and can attest to nothing about the notes.
    */
   dispatched?: Bead;
+  /**
+   * The operator this run holds the ticket's claim for (`run.operator`). Only `already-shipped`
+   * reads it, to tell an operator's reassignment mid-run from anton's own claim.
+   */
+  operator?: string;
   /** The error that halted the ticket — the reason's fallback when the agent stated none. */
   e: unknown;
   /**
@@ -144,6 +149,10 @@ export async function repairBlockedTicket(args: {
             // And the run the claim was made FOR: a re-parent of the ticket or an ancestor while
             // the agent ran hands it to another run, and `fresh` already reads as that run's.
             runTargetId: run.target.id,
+            // The operator anton holds the claim for (PR #238 review): a reassignment landing while
+            // the agent ran leaves `fresh` in_progress under another name, and no lifecycle field
+            // on the bead tells that from anton's own claim.
+            operator: args.operator,
             block,
             committed: args.committed,
             now,

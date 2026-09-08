@@ -153,6 +153,8 @@ export async function settleFailedTicket(args: {
   timeoutMs: number;
   /** Whether this ticket IS the whole run target — the timeout's licence to KEEP its work. */
   standalone: boolean;
+  /** The operator this run holds the ticket's claim for — the `already-shipped` repair reads it. */
+  operator?: string;
   e: unknown;
 }): Promise<never> {
   const { run, ticket, session, ranOutOfTime, baseline, progress, timeoutMs, standalone, e } = args;
@@ -195,6 +197,7 @@ export async function settleFailedTicket(args: {
         logPath,
         selfReport: progress.selfReport,
         dispatched: progress.dispatched,
+        operator: args.operator,
         e,
         committed: progress.committed,
       })

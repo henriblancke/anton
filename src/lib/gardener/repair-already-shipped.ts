@@ -982,7 +982,13 @@ export type AlreadyShippedOutcome =
  *      same terms (PR #238 review): the claim describes the contract the agent read, for the run
  *      that dispatched it, and the fences below start from the post-report reads, which already
  *      hold the edit or the move. The run-target half of the home needs the board, so it is asked
- *      right after the board is read and before anything is resolved against it.
+ *      right after the board is read and before anything is resolved against it. A ticket an
+ *      operator RECLAIMED — returned to `open`, blocked, deferred, or reassigned — while the agent
+ *      ran is refused on the same terms ({@link claimReclaimedSinceDispatch}, PR #238 review): the
+ *      change is in the post-report read the under-lock lifecycle fence starts from, so only the
+ *      CLAIM anton dispatched under — `in_progress`, held for the run's operator — predates it.
+ *      `isOpenWork` passes `open`/`blocked`/`deferred`, so without this gate the supersede would
+ *      overwrite a globally visible board decision a person just made.
  *   2. The loop guard and the trust dial ({@link decideRepair}), asked next for `dep-missing`'s
  *      reason: the CLASS here is the agent's own report and nothing about the bead asserts it, so a
  *      second `already-shipped` block on a ticket anton already retired is a diagnosis that has been
@@ -1056,6 +1062,15 @@ export async function repairAlreadyShipped(args: {
    * the claim was made for, and the gate has nothing to compare.
    */
   runTargetId?: string;
+  /**
+   * The operator this run holds the ticket's claim FOR (PR #238 review) — `run.operator`. anton
+   * claimed the ticket `in_progress` and assigned to this operator before the run, and it stays
+   * there until this settlement releases it: a reassignment landing while the agent ran leaves the
+   * ticket in_progress under another name, which no lifecycle field on `bead` can tell from anton's
+   * own claim ({@link claimReclaimedSinceDispatch}). Absent, the run resolved no operator identity
+   * and the reassignment half is not asked — the status half still is.
+   */
+  operator?: string;
   /** The block being repaired — its reason carries the claim, and rides into the record. */
   block: { reason?: string };
   /** Whether this ticket's work reached a commit on the run's branch — see gate 1 above. */
@@ -1074,7 +1089,7 @@ export async function repairAlreadyShipped(args: {
    */
   signal?: AbortSignal;
 }): Promise<AlreadyShippedOutcome> {
-  const { repoPath, base, bead, dispatched, runTargetId, block, committed, now, autonomy, signal } = args;
+  const { repoPath, base, bead, dispatched, runTargetId, operator, block, committed, now, autonomy, signal } = args;
   const claim = block.reason?.trim() || "(no reason given)";
 
   if (committed) {
@@ -1111,6 +1126,22 @@ export async function repairAlreadyShipped(args: {
   // start from the post-report board, which already holds the move (PR #238 review).
   const rehomed = dispatched ? homeMovedSinceDispatch(dispatched, bead) : undefined;
   if (rehomed) return rehomedWhileRunning(bead.id, rehomed, claim);
+  // The ticket's LIFECYCLE and CLAIM at dispatch, held against the same post-report read. anton
+  // claimed it `in_progress` for the run's operator, and an operator reopening, blocking, deferring
+  // or reassigning it while the agent ran is a globally visible board decision the supersede would
+  // stomp — `bead` already holds the change, so the under-lock lifecycle fence starts from it and
+  // sees nothing, and `isOpenWork` passes every non-closed status (PR #238 review).
+  const reclaimed = claimReclaimedSinceDispatch(bead, operator);
+  if (reclaimed) {
+    return {
+      action: "escalate",
+      why:
+        `${bead.id} blocked as \`${KLASS}\`, but its lifecycle or claim changed while the agent ` +
+        `was running — an operator has reclaimed or parked the ticket, so anton does not close ` +
+        `work another board action just took back.`,
+      evidence: [reclaimed, `the agent reported: ${claim}`],
+    };
+  }
 
   const decision = decideRepair(bead, KLASS, block, autonomy);
   if (decision.action === "escalate") return { ...decision };
@@ -1890,6 +1921,42 @@ function ownerMovedSinceDispatch(index: BoardIndex, now: Bead, runTargetId: stri
     `${rides ? `rides \`${rides}\`` : "rides no run target"} now, so closing it as superseded would ` +
     `settle it inside a run this one does not own`
   );
+}
+
+/**
+ * Why the ticket no longer reads as the claim anton dispatched it under — or undefined while it
+ * still does (PR #238 review).
+ *
+ * The lifecycle-and-ownership counterpart to {@link contractDriftedSinceDispatch} and
+ * {@link homeMovedSinceDispatch}, and the dispatch-time half of the under-lock {@link lifecycleDrifted}
+ * fence. That fence compares the check-time read with the write's, but `bead` is read AFTER the
+ * report — so an operator's reclaim landing while the agent ran is already the baseline it starts
+ * from, and it passes. {@link isOpenWork} compounds it: `open`, `blocked` and `deferred` all read as
+ * open work, so a ticket a person just reopened or parked is retired anyway.
+ *
+ * The baseline is the CLAIM, not the dispatch snapshot: anton claimed the ticket `in_progress` and
+ * assigned to the run's operator, and it holds that until this settlement releases it. The snapshot
+ * `dispatched` carries is the pre-claim board row (`open`, unassigned — {@link readForDispatch}
+ * overlays only notes and description), so it cannot serve as the baseline the other two gates'
+ * snapshots do; the claim anton wrote is what the fresh read is held to. Status alone is asked when
+ * the run resolved no operator — bd's assignee for an empty operator is not the run's own name to
+ * compare against.
+ */
+function claimReclaimedSinceDispatch(now: Bead, operator: string | undefined): string | undefined {
+  if (now.status !== "in_progress") {
+    return (
+      `\`${now.id}\` is ${now.status} now, not in_progress as anton claimed it at dispatch — its ` +
+      `lifecycle moved while the agent ran, so the board has reclaimed or parked this ticket`
+    );
+  }
+  if (operator && ownerOf(now) !== operator) {
+    const held = ownerOf(now);
+    return (
+      `\`${now.id}\` is ${held ? `claimed by \`${held}\`` : "unclaimed"} now, not held for ` +
+      `\`${operator}\` as anton claimed it at dispatch — its claim changed while the agent ran`
+    );
+  }
+  return undefined;
 }
 
 /** The refusal both dispatch-time home fences hand back — one wording, whichever half saw the move. */

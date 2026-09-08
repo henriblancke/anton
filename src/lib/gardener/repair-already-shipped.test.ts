@@ -1733,6 +1733,75 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
   });
 
+  // anton claimed the ticket in_progress before the run; an operator returning it to open, blocking,
+  // or deferring it while the agent ran is a globally visible decision the supersede would stomp. The
+  // change is already in `bead`, so the under-lock lifecycle fence starts from it and sees nothing,
+  // and `isOpenWork` passes open/blocked/deferred alike — only the dispatch-time claim predates it.
+  it("refuses a claim when an operator moved the ticket's lifecycle off in_progress while the agent was running", async () => {
+    for (const status of ["open", "blocked", "deferred"]) {
+      supersedeMock.mockClear();
+      const outcome = await retire({ bead: bead(TARGET, { status }) });
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { why: string }).why).toContain("lifecycle or claim changed while the agent");
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
+        `is ${status} now, not in_progress as anton claimed it`,
+      );
+      expect(supersedeMock).not.toHaveBeenCalled();
+      // Refused on the read in hand — nothing was resolved against git or the board.
+      expect(showMock).not.toHaveBeenCalled();
+      expect(loadAllIssuesMock).not.toHaveBeenCalled();
+    }
+  });
+
+  // A reassignment leaves the ticket in_progress under another name, which no lifecycle field on the
+  // bead can tell from anton's own claim — only the run's operator can. Its status half stands; the
+  // claim half is asked against `operator`.
+  it("refuses a claim when the ticket was reassigned away from the run's operator while the agent was running", async () => {
+    const outcome = await retire({
+      bead: bead(TARGET, { status: "in_progress", assignee: "someone-else" }),
+      operator: "anton@runner",
+    });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("lifecycle or claim changed while the agent");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
+      "claimed by `someone-else` now, not held for `anton@runner`",
+    );
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("still retires a ticket the run's operator still holds in_progress", async () => {
+    // The under-lock reread carries the same claim, so the lifecycle fence there passes too.
+    boardShow.mockImplementation(async (_cwd, id) =>
+      id === TARGET
+        ? bead(TARGET, { status: "in_progress", assignee: "anton@runner" })
+        : bead(SHIPPER, { status: "closed" }),
+    );
+    const outcome = await retire({
+      bead: bead(TARGET, { status: "in_progress", assignee: "anton@runner" }),
+      operator: "anton@runner",
+    });
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+  });
+
+  it("still retires when the run resolved no operator — the status half stands, the claim half is not asked", async () => {
+    boardShow.mockImplementation(async (_cwd, id) =>
+      id === TARGET
+        ? bead(TARGET, { status: "in_progress", assignee: "someone-else" })
+        : bead(SHIPPER, { status: "closed" }),
+    );
+    const outcome = await retire({
+      bead: bead(TARGET, { status: "in_progress", assignee: "someone-else" }),
+    });
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+  });
+
   it("still retires when the window only stamped the ticket — a label or a timestamp is not a rewrite", async () => {
     boardShow.mockImplementation(async (_cwd, id) =>
       id === TARGET

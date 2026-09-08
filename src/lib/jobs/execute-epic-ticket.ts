@@ -117,6 +117,7 @@ export async function runTicket(args: {
       progress,
       timeoutMs,
       standalone,
+      operator,
       e,
     });
   } finally {
