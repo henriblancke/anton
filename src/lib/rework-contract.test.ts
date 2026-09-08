@@ -475,6 +475,22 @@ describe("instructionCriteria", () => {
     expect(texts("* ```\n  ## h\n  ```\n\n    prose")).toEqual(["```\n## h\n```", "prose"]);
   });
 
+  it("opens a fence under a task marker as under the bullet — `- [ ] ```md` is a checklist example", () => {
+    // The peel strips the bullet but leaves the checkbox on the content, so the fence check missed
+    // it: the opener filed as `- [ ] ```md`, the heading dropped, the bullet shorn, and the closer
+    // opened a fence that swallowed `- next`. The checkbox comes off before the fence check now.
+    expect(instructionCriteria("- [ ] ```md\n  ## Expected\n  - item\n  ```\n- [ ] next")).toEqual([
+      { text: "```md\n## Expected\n- item\n```", fenced: true },
+      { text: "next", fenced: false },
+    ]);
+    // A ticked box and the zero-character box are peeled the same way.
+    expect(texts("- [x] ```\n  code\n  ```")).toEqual(["```\ncode\n```"]);
+    expect(texts("1. [] ```\n   code\n   ```")).toEqual(["```\ncode\n```"]);
+    // The checkbox rule holds: `]` must be followed by whitespace, so a CSS selector is not a box
+    // and opens no fence — it stays an ordinary shorn step.
+    expect(texts("- [x].disabled ```")).toEqual(["[x].disabled ```"]);
+  });
+
   it("keeps a fence opened inside a callout — `> ```` — and ends it where the callout ends", () => {
     expect(texts("> ```md\n> ## Expected\n> ```\nnext")).toEqual(["```md\n## Expected\n```", "next"]);
     expect(texts("> - ```\n>   x\n>   ```")).toEqual(["```\nx\n```"]);

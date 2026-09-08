@@ -146,6 +146,18 @@ export function doneGap(instructions: string, findings: readonly ReviewFinding[]
 const LIST_MARKER = /^(?:(?:[-*+•]|\d{1,9}[.)])(?:\s+|$))?(?:\[[ xX]?\](?:\s+|$))?/;
 
 /**
+ * A GFM task-list checkbox at a step's head — `[ ]`, `[x]`, `[X]` or the zero-character `[]`, and the
+ * whitespace after it — held to {@link LIST_MARKER}'s rule that `]` is followed by whitespace or the
+ * line's end, so a CSS selector like `[x].disabled` keeps its brackets. It is the checkbox half of
+ * {@link LIST_MARKER} on its own: a container peel ({@link peelContainers}) strips the bullet but
+ * leaves the checkbox, since CommonMark makes it the item paragraph's text, not a container. A fence
+ * still opens beneath it as it does beneath the bullet, so it comes off before fence detection just as
+ * {@link shorn} takes it off an ordinary step — without it `- [ ] ```md` files the opener as a plain
+ * criterion, drops the literal heading, shears the bullet, and lets the closer swallow later steps.
+ */
+const TASK_MARKER = /^\[[ xX]?\](?:\s+|$)/;
+
+/**
  * A blockquote marker — a run of `>` and the whitespace after it — held to the same rule as a
  * bullet: it must be followed by whitespace or end the line. CommonMark reads `>95% coverage` as a
  * callout too, and lib/beads/contract.ts strips it that way because there it judges what a
@@ -272,8 +284,11 @@ export interface InstructionCriterion {
  * ({@link itemContentIndent}). Shearing such a line filed the fence's opener as a step and what
  * followed as steps or nothing. So every marker is peeled first ({@link peelContainers}), and what
  * opens after them keeps the lines that stay inside the same containers ({@link peelPrefix}) —
- * filed dedented, as the note renders them. A fence the scanner did not see leaves its verdicts
- * stale from that line on, so the rest is scanned afresh once the block ends.
+ * filed dedented, as the note renders them. A task marker rides on the item's paragraph, not its
+ * container, so the peel leaves it on the content; it comes off before the fence check
+ * ({@link TASK_MARKER}) so `- [ ] ```md` opens its fence as the bare `- ```md` does. A fence the
+ * scanner did not see leaves its verdicts stale from that line on, so the rest is scanned afresh
+ * once the block ends.
  */
 export function instructionCriteria(instructions: string): InstructionCriterion[] {
   const out: InstructionCriterion[] = [];
@@ -397,9 +412,12 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       };
       continue;
     }
-    const opener = openingFence(content);
+    // A fence opens beneath a task marker as it does beneath the bullet, but the peel leaves the
+    // checkbox on the content; take it off first, as shorn does, so the opener is the fence itself.
+    const fenceLine = content.replace(TASK_MARKER, "");
+    const opener = openingFence(fenceLine);
     if (opener) {
-      nested = { opener: content, fence: opener, prefix: peeled.prefix, content: [] };
+      nested = { opener: fenceLine, fence: opener, prefix: peeled.prefix, content: [] };
       inParagraph = false;
       continue;
     }
