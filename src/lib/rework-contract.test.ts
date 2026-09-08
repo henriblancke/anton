@@ -515,6 +515,17 @@ describe("instructionCriteria", () => {
       "- [ ] TODO — kept",
       "--> tail",
     ]);
+    // Indentation-sensitive content keeps its relative nesting: the sample is dedented as one unit,
+    // not trimmed line by line, or a Python/YAML example would flatten into criteria that ask for
+    // different behaviour than the note shows.
+    expect(texts("<!--\nif ok:\n    retry()\n-->")).toEqual([
+      "<!--",
+      "if ok:",
+      "    retry()",
+      "-->",
+    ]);
+    // A wholly indented sample loses only its common indentation, keeping the relative structure.
+    expect(texts("<!--\n    a:\n      b: 1\n-->")).toEqual(["<!--", "a:", "  b: 1", "-->"]);
     // Once the comment closes the lines are ordinary steps again, and the closer ends no paragraph
     // an indented block could not follow.
     expect(texts("<!--\n- x\n-->\n- y")).toEqual(["<!--", "- x", "-->", "y"]);

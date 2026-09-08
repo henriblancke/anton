@@ -248,7 +248,8 @@ export interface InstructionCriterion {
  * The lines INSIDE a comment that closes are literal for the same reason a fence's are: a founder
  * who types `<!--`, a Markdown sample, `-->` has authored the sample as an example, and shearing
  * `- item` to `item` and dropping `## heading` filed less than the note shows while keeping the two
- * delimiters that framed it. Each such line files as it was typed, trimmed and unshorn; the
+ * delimiters that framed it. Each such line files as it was typed, unshorn, the sample dedented as
+ * one unit so an indentation-sensitive example keeps its nesting ({@link flushCommentedSample}); the
  * delimiter lines are judged as typed like any other, since each begins outside the comment. Only
  * a comment that CLOSES is read so ({@link insideClosedComment}): after a stray `<!--` the rest of
  * the instructions are ordinary steps, and filing their labels and markers verbatim would be the
@@ -367,7 +368,7 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     }
     if (literal[at]) {
       inParagraph = false;
-      out.push({ text: line.text.trim(), fenced: false });
+      at = flushCommentedSample(raw, literal, at, out) - 1;
       continue;
     }
     // A line indented less than the innermost item's content leaves it — unless it is the lazy
@@ -431,6 +432,39 @@ function insideClosedComment(lines: readonly ScannedLine[]): boolean[] {
     out[at] = closes;
   }
   return out;
+}
+
+/**
+ * File the closed HTML comment beginning at `at` as criteria, and return the index past its run.
+ *
+ * A commented Markdown or code sample is literal like a fence's content, so its lines file as typed
+ * rather than shorn ({@link instructionCriteria}). The sample — the lines before the one carrying the
+ * closing `-->` — is dedented as ONE unit by its common indentation, so an indentation-sensitive
+ * example (Python, YAML) keeps its relative nesting; trimming each line on its own flattened a sample
+ * like `if ok:` / `    retry()` into two unindented criteria that describe different behaviour. The
+ * delimiter lines are judged as typed, each on its own, since each begins outside the comment. Blank
+ * lines file nothing, as they did line by line.
+ */
+function flushCommentedSample(
+  raw: readonly string[],
+  literal: readonly boolean[],
+  at: number,
+  out: InstructionCriterion[],
+): number {
+  let end = at;
+  while (end < raw.length && literal[end]) end += 1;
+  const run = raw.slice(at, end);
+  const closeAt = run.findIndex((line) => line.includes("-->"));
+  const sample = closeAt === -1 ? run : run.slice(0, closeAt);
+  const closers = closeAt === -1 ? [] : run.slice(closeAt);
+  const indents = sample.filter((line) => line.trim() !== "").map((line) => indentColumns(line));
+  const common = indents.length > 0 ? Math.min(...indents) : 0;
+  for (const line of sample) {
+    if (line.trim() === "") continue;
+    out.push({ text: dedent(line, common).replace(/\s+$/, ""), fenced: false });
+  }
+  for (const line of closers) out.push({ text: line.trim(), fenced: false });
+  return end;
 }
 
 /**
