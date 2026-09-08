@@ -92,6 +92,15 @@ describe("pickerLogEntries", () => {
     expect(entry).toMatchObject({ kind: "veto", criterion: "labels:severity" });
   });
 
+  it("reads a decline `0030_picker_veto_kind` left unclassified as the deferral it always was", () => {
+    const [entry] = pickerLogEntries({
+      starts: [],
+      verdicts: [verdictRow({ action: "not-now", vetoKind: undefined, criterion: undefined })],
+    });
+    expect(entry).toMatchObject({ kind: "deferral", heldUntilMs: NOW + 86_400_000 });
+    expect(entry.criterion).toBeUndefined();
+  });
+
   it("leaves accepts out — a release is the operator's own start, not an unattended one", () => {
     const entries = pickerLogEntries({
       starts: [],

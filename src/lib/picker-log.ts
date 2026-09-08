@@ -62,6 +62,12 @@ export const PICKER_LOG_LIMIT = 12;
  * `action` of a decline that already carried a `Never`, but keeps its kind and its criterion — so a
  * log keyed on the button would draw that entry as a plain deferral while still offering the link to
  * the rule the operator went to tighten.
+ *
+ * A decline `0030_picker_veto_kind` left NULL falls through to deferral on purpose. That migration
+ * files every `never` and every criterion-bearing row as disagreement, so an unclassified decline is
+ * always a criterion-less `not-now` — which this log drew as a deferral before the column existed
+ * too. A `Never` this hides is unrecoverable (no criterion survived it), so it is left reading as
+ * pacing here rather than dressed as a veto with no rule to link; the track record still COUNTS it.
  */
 function kindOf(verdict: PickerVerdictRow): PickerLogKind {
   return verdict.vetoKind === "disagreement" ? "veto" : "deferral";
