@@ -1326,17 +1326,33 @@ export async function repairAlreadyShipped(args: {
     // retirement is withdrawn if the close is still anton's own, and reported either way.
     const held = await retirementHeld({ ...fence, subtree });
     if (held.state !== "held") {
+      const withdrawn = await withdrawRetirement({ repoPath, targetId: bead.id, replacementId, held });
+      const evidence = [held.why, withdrawn, `the retirement anton wrote: ${attempted}`];
+      // Only a `moved` verdict is anton's own supersede over a board that changed, so only it is
+      // withdrawn above and escalated for a human. `overtaken`/`unread` are not anton's to take back
+      // (PR #238 review): another process reopened and reclaimed the ticket after the supersede but
+      // before this reread, or the board could not be read at all. An `escalate` here flows into
+      // `releaseFailedTicket`, which would block the ticket and unassign whoever now holds it —
+      // overwriting the very decision this fence detected. So those return `overtaken`, the same
+      // non-releasing outcome the marker fence gives, and the caller stops on the block touching
+      // nothing.
+      if (held.state === "moved") {
+        return {
+          action: "escalate",
+          why:
+            `${bead.id} blocked as \`${KLASS}\`, and the board moved between the check and the ` +
+            `write — anton found out only on re-reading the ticket after its retirement landed, so the ` +
+            `retirement is not one it stands behind, and a human decides the ticket.`,
+          evidence,
+        };
+      }
       return {
-        action: "escalate",
+        action: "overtaken",
         why:
-          `${bead.id} blocked as \`${KLASS}\`, and the board moved between the check and the ` +
-          `write — anton found out only on re-reading the ticket after its retirement landed, so the ` +
-          `retirement is not one it stands behind, and a human decides the ticket.`,
-        evidence: [
-          held.why,
-          await withdrawRetirement({ repoPath, targetId: bead.id, replacementId, held }),
-          `the retirement anton wrote: ${attempted}`,
-        ],
+          `${bead.id} blocked as \`${KLASS}\`, and the board moved between the retirement and the ` +
+          `reread that followed it — anton found out only after the supersede landed, and the ticket's ` +
+          `close is no longer anton's to take back, so a human decides the ticket.`,
+        evidence,
       };
     }
     // The marker first, the stamp second: the stamp guards the NEXT block, the marker guards the

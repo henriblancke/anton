@@ -2697,6 +2697,9 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       });
     });
 
+    // `overtaken`, not `escalate` (PR #238 review): the reopen overwrote anton's close, so another
+    // hand holds the ticket now — an `escalate` would flow into `releaseFailedTicket` and block-and-
+    // unassign the very claim this fence detected. The non-releasing outcome leaves it as they left it.
     it("leaves a retirement somebody else has already decided over — the ticket reopened by another hand", async () => {
       // Bypasses the supersede layer on purpose: the board says OPEN after the write, so the close
       // anton wrote is not what the ticket reads as any more.
@@ -2708,12 +2711,14 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
       const outcome = await retire();
 
-      expect(outcome).toMatchObject({ action: "escalate" });
+      expect(outcome).toMatchObject({ action: "overtaken" });
       expect(evidenceOf(outcome)).toContain("no longer reads as the close anton wrote");
       expect(evidenceOf(outcome)).toContain("that decision stands");
       for (const write of [reopenMock, unlinkMock, tagMock]) expect(write).not.toHaveBeenCalled();
     });
 
+    // Unread is non-releasing for the same reason (PR #238 review): the retirement MAY stand and the
+    // ticket MAY be held by another hand — anton cannot tell, so it must not release it either way.
     it("reports a retirement it could not re-read as unsettled, names the check, and takes nothing back", async () => {
       showMock.mockImplementation(async (_cwd, id) => {
         if (written() && id === TARGET) throw new Error("dolt server went away");
@@ -2722,7 +2727,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
       const outcome = await retire();
 
-      expect(outcome).toMatchObject({ action: "escalate" });
+      expect(outcome).toMatchObject({ action: "overtaken" });
       expect(evidenceOf(outcome)).toContain("could not be re-read after the retirement");
       expect(evidenceOf(outcome)).toContain("took nothing back");
       expect(evidenceOf(outcome)).toContain(`bd show ${TARGET}`);
