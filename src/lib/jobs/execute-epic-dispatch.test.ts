@@ -188,6 +188,24 @@ describe("a ticket the board already holds as superseded", () => {
     expect(markedNotDelivered()).toEqual([]);
   });
 
+  // A reopen on a shared-server board can also REHOME the ticket onto another run's target
+  // (PR #238 review). Returning it as live would feed the loop the stale snapshot — reopenForRegeneration
+  // no-ops on the already-open bead and runTicket claims it by id, running work that now belongs to
+  // that other target. Stop instead of dispatching a ticket a different run target now owns.
+  it("stops the run when the fresh read finds it reopened AND reparented onto another target", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    board = board.map((b) =>
+      b.id === "anton-a" ? ({ ...b, status: "open", parent: "anton-other-epic" } as Bead) : b,
+    );
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /anton-a was superseded on the board this run read but has since been reopened and reparented onto anton-other-epic/,
+    );
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
+    expect(markedNotDelivered()).toEqual([]);
+  });
+
   it("decides the retirement under the ticket's write lock, not on the snapshot", async () => {
     const run = makeRun([superseded("anton-a", SHIPPER)], new AbortController().signal);
     let release!: () => void;

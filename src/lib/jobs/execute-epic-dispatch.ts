@@ -373,7 +373,25 @@ async function retireFound(run: EpicRun, ticket: Bead): Promise<RetiredTicketOut
           `beads DB, then resume the run`,
       );
     }
-    if (!beads.supersededBy(live)) return undefined;
+    if (!beads.supersededBy(live)) {
+      // No longer superseded — reopened since the snapshot, so it is live work again. Normally that
+      // hands it back to the loop to dispatch or regenerate against THIS run's target. But a reopen
+      // on a shared-server board can also REHOME it onto another run's target between the snapshot
+      // and this read, and returning undefined feeds the loop the stale snapshot `ticket`:
+      // reopenForRegeneration sees an already-open bead and no-ops, and runTicket claims it by id and
+      // runs work that now belongs to that other target. So the retirement stands down only when the
+      // bead is still parented where this run left it; a bead rehomed since stops the run rather than
+      // execute another target's ticket.
+      if (beads.parentOf(live) !== beads.parentOf(ticket)) {
+        throw new PoisonEpic(
+          `${ticket.id} was superseded on the board this run read but has since been reopened and ` +
+            `reparented onto ${beads.parentOf(live) ?? "another target"} — the run stopped rather ` +
+            `than dispatch a ticket that now belongs to a different run target. Check the beads DB, ` +
+            `then resume the run`,
+        );
+      }
+      return undefined;
+    }
     await markRetired(run, ticket.id);
     const marked = await mustRead(repo, ticket.id);
     if (!marked) {
