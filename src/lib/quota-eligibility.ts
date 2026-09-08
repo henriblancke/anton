@@ -114,7 +114,16 @@ export async function observedWorkEligibility(
     const reclaimable =
       job.status === "queued" ||
       (job.leaseExpiresAt !== null && job.leaseExpiresAt.getTime() <= now);
-    if (reclaimable && isHeld(job.type, job.projectId, autonomyOff, disabledSchedules)) continue;
+    if (reclaimable && isHeld(job.type, job.projectId, autonomyOff, disabledSchedules)) {
+      // A held row IS an observation — "this project has work, and its own switch keeps it from
+      // starting" — so it records `false` where nothing else has spoken (PR #248 review). The map is
+      // seeded from picker plans alone, and the picker ships disabled, so a plan-less project whose
+      // only due row is held would otherwise stay ABSENT, read as unobserved, and keep its share for
+      // as long as the switch stays off. Never demotes: a plan or a startable row already found here
+      // is the stronger claim.
+      if (!eligibility.has(job.projectId)) eligibility.set(job.projectId, false);
+      continue;
+    }
     eligibility.set(job.projectId, true);
   }
   return eligibility;

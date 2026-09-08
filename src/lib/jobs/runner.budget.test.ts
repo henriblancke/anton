@@ -35,7 +35,13 @@ vi.mock("./queue", async () => {
 });
 
 /** Every bucket the governor is wired to hold — registered together so a case can enqueue any. */
-const GOVERNED_TYPES = ["execute-epic", "review-fix", "nightly-stringer", "orphan-grooming"] as const;
+const GOVERNED_TYPES = [
+  "execute-epic",
+  "review-fix",
+  "review-fix-pr",
+  "nightly-stringer",
+  "orphan-grooming",
+] as const;
 
 describe("JobRunner budget governor admission gate (anton-szld)", () => {
   const h = useRunnerHarness();
@@ -478,6 +484,37 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     expect(await r.tickOnce()).toBe(1);
     await r.whenIdle();
     expect(ran).toEqual([bypass]);
+  });
+
+  it("charges an exempt fix's burn against the share before admitting autonomous work behind it", async () => {
+    // A per-PR fix is not the governor's to hold — it must land promptly — but its attempt is
+    // charged to the same project share as the epic leased beside it (PR #248 review). When an
+    // older fix and an epic are due in one tick, the fix's expected burn has to be counted before
+    // the epic is granted the batch's crossing allowance, or the two together overshoot the cut.
+    // Share 10, spent 8, a seeded fix costs 1.2 and a seeded execute-epic 3: the fix crosses the
+    // cap, and the epic behind it must wait — leasing alone, it would have been admitted.
+    h.seedProjects("A");
+    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const ran: string[] = [];
+    const r = budgetRunner(
+      async (ctx) => {
+        ran.push(ctx.type);
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 10),
+        resolveProjectSpend: async () => 8,
+      },
+    );
+    const fix = await r.enqueue({ type: "review-fix-pr", projectId: "A" });
+    h.clock.advance(1000);
+    const epic = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toEqual(["review-fix-pr"]);
+    expect((await getJob(h.db, fix))?.status).toBe("done");
+    expect((await getJob(h.db, epic))?.status).toBe("queued");
   });
 
   it("leaves the batch unreserved when the project carries no share", async () => {

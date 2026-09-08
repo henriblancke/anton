@@ -99,8 +99,9 @@ export const jobs = sqliteTable(
     // `attempts` is the RETRY budget and is rewound on purpose — `resumeJob` zeroes it so an un-parked
     // job gets a fresh run at `maxAttempts` — so a meter summing it lost every attempt the job had
     // already burned the moment an operator or the picker resumed it, and the governor granted that
-    // quota again (PR #248 review). This counter moves with `attempts` on a lease and on a refund
-    // (an attempt that never reached Claude is not spend), and nothing else touches it.
+    // quota again (PR #248 review). This counter is charged when the handler reaches Claude
+    // (`chargeSpentAttempt`), never at the lease — an attempt that exits in preflight is not spend —
+    // and is never rewound or refunded: nothing else touches it.
     spentAttempts: integer("spent_attempts").notNull().default(0),
     lastError: text("last_error"),
     // What the handler reported it actually DID, written when the job completes (anton-znoz).

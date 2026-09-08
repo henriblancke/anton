@@ -42,6 +42,18 @@ vi.mock("@/lib/claude/usage", () => ({
     return usage;
   },
 }));
+/** Whether the share board read blows up — the lane must fail open, like the governor's own read. */
+let boardFails = false;
+vi.mock("@/lib/projects", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/projects")>("@/lib/projects");
+  return {
+    ...actual,
+    budgetAwareQuotaShares: async () => {
+      if (boardFails) throw new Error("db hiccup");
+      return actual.budgetAwareQuotaShares();
+    },
+  };
+});
 vi.mock("@/lib/quota-spend", () => ({
   projectWeeklySpendPct: async () => {
     if (spendFails) throw new Error("db hiccup");
@@ -98,6 +110,7 @@ describe("GET /picker/budget", () => {
     usageReads = 0;
     spendPct = null;
     spendFails = false;
+    boardFails = false;
     displayReads.mockClear();
     await tdb.db
       .insert(schema.projects)
@@ -220,6 +233,19 @@ describe("GET /picker/budget", () => {
     const res = await GET(req(), ctx("tmp"));
     expect(res.status).toBe(200);
     expect(((await res.json()) as BudgetSignal).headroom.sharePct).toBeCloseTo(18, 6);
+  });
+
+  it("draws the unshared headroom when the share board is unreadable, rather than failing", async () => {
+    // The governor reads an unreadable board as EMPTY and runs the tick unshared (`service-policy`);
+    // a 500 here would blank the lane until the next successful read while the governor kept
+    // admitting, so the line takes the same answer: this project absent from the board, 100%.
+    await settings({ budgetAware: true, quotaSharePct: 20, budgetPolicy: { weeklyTargetPct: 90 } });
+    await neighbour("p2", { budgetAware: true, quotaSharePct: 80 });
+    boardFails = true;
+
+    const res = await GET(req(), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as BudgetSignal).headroom.sharePct).toBeCloseTo(90, 6);
   });
 
   it("widens the lane when an idle neighbour's share is renormalized away (R6.4)", async () => {

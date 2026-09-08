@@ -59,7 +59,13 @@ import {
   isUsageLimitError,
 } from "./errors";
 import { PollingLoop } from "./polling-loop";
-import { burnsClaudeQuota, getBurnAverage, getProjectBurnAverage, sampleJobBurn } from "../burn";
+import {
+  JOB_TYPE_TIER,
+  burnsClaudeQuota,
+  getBurnAverage,
+  getProjectBurnAverage,
+  sampleJobBurn,
+} from "../burn";
 import { getClaudeUsageCached, getClaudeUsageFresh, type ClaudeUsage } from "../claude/usage";
 import { admitJob, budgetGate, jobValueScore, type BudgetPolicy } from "./budget";
 
@@ -180,6 +186,21 @@ export type ProjectSpendResolver = (
  * the pacing holds, keeping only the session-headroom floor (see `applyBudgetGovernor`).
  */
 export const GOVERNED_JOB_TYPES: readonly JobType[] = ["execute-epic", "orphan-grooming"];
+
+/**
+ * What the value gate walks: the governed types, plus every EXEMPT type whose attempt is still
+ * charged to its project's quota share (`burnsClaudeQuota` — `review-fix-pr`, the nightly scan, the
+ * product master) and that leaseDue dispatches beside them. An exempt job is never gated, but its
+ * burn lands on the same meter, so the share reservation has to count it before the autonomous work
+ * behind it is admitted (PR #248 review). Governed types stay in whatever they burn: the grooming
+ * sweep costs nothing and is still paced.
+ */
+const VALUE_GATE_JOB_TYPES: readonly JobType[] = [
+  ...new Set([
+    ...GOVERNED_JOB_TYPES,
+    ...(Object.keys(JOB_TYPE_TIER) as JobType[]).filter(burnsClaudeQuota),
+  ]),
+];
 
 /**
  * Is an execute-epic run already live for this project + epic on ANOTHER machine? (anton-jz1)
@@ -1098,7 +1119,12 @@ export class JobRunner {
    * skips the gate entirely — they asked for now, and only the session floor may hold that.
    *
    * The same walk RESERVES the project's remaining quota share across the batch (R6.1) — see the
-   * reservation comment in the loop. Rows a HARD hold already keeps off the lease (a disabled
+   * reservation comment in the loop. That is why the candidates include every QUOTA-BURNING type,
+   * not only the governed ones: leaseDue leases an exempt `review-fix-pr` (or a nightly scan) from the
+   * same runAt order, and its attempt is charged to the same share — so an older fix due beside an
+   * epic would otherwise spend the crossing allowance the epic was granted (PR #248 review). Exempt
+   * rows are never gated or held here — they must land promptly — only charged, like a bypass run.
+   * Rows a HARD hold already keeps off the lease (a disabled
    * schedule, autonomy off, a quiescing project — `heldBucketKeys` / `quiescedProjects`) are skipped
    * before either check: they cannot run this tick, so reserving share for them would hold a runnable
    * job behind them and, with leaseDue then excluding both, lease nothing tick after tick. A row whose
@@ -1119,7 +1145,7 @@ export class JobRunner {
     bucketCapOf: (job: JobRow) => number,
   ): Promise<void> {
     const candidates = await queuedDueJobs(this.db, this.clock, {
-      types: GOVERNED_JOB_TYPES,
+      types: VALUE_GATE_JOB_TYPES,
       projectId: pid,
       includeReclaimable: true,
     });
@@ -1168,7 +1194,11 @@ export class JobRunner {
         | { bypassBudget?: unknown; epicBeadId?: unknown }
         | null;
       const shareCap = policy.projectWeeklyCapPct;
-      if (payload?.bypassBudget === true) {
+      // An exempt type (a per-PR fix, the nightly scan) is not the governor's to hold: it leases
+      // whatever the pace says, exactly like an operator's immediate "Approve".
+      const ungated =
+        payload?.bypassBudget === true || !GOVERNED_JOB_TYPES.includes(job.type as JobType);
+      if (ungated) {
         // Leases ahead of the rows behind it, gate or no gate — but its burn is charged to this
         // project's share all the same (PR #248 review): the meter will count the attempt on the
         // next tick, so the autonomous work behind it in THIS batch must fit in what the share has

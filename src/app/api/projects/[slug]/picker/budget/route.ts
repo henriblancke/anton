@@ -39,7 +39,10 @@ export const GET = withProject<{ slug: string }>(async (_request, { project }) =
   // Carrying the share in force RIGHT NOW (R6.1/R6.4), the same resolution the governor applies at
   // lease time: a lane drawn against the unshared ceiling would show headroom for work the governor
   // is about to defer — and would hide the extra room an idle neighbour's renormalized share buys.
-  const share = resolveGovernedShare(project.id, await budgetAwareQuotaShares());
+  // An unreadable board is an EMPTY board, the governor's own fail-open (`service-policy`): this
+  // project is absent from it and so unshared, which draws the full headroom rather than dropping
+  // the line with a 500 until the next successful read.
+  const share = resolveGovernedShare(project.id, await budgetAwareQuotaShares().catch(() => []));
   const policy = withQuotaShare(resolveBudgetPolicy(settings), share.sharePct);
 
   const usage = await getClaudeUsageCached();

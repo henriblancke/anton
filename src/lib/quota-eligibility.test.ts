@@ -209,6 +209,23 @@ describe("observedWorkEligibility", () => {
     expect(eligibilityOf(await observedWorkEligibility(tdb.db, NOW), paused)).toBe(false);
   });
 
+  it("records a plan-less project whose only due work is held as observed idle, not unobserved", async () => {
+    // The map is seeded from picker plans alone, and the picker ships disabled — so a project that
+    // never ran it has no row to carry `false`. Skipping its held execute-epic would leave it ABSENT,
+    // which the split reads as "nobody looked" and keeps its share for as long as autonomy stays off
+    // (PR #248 review). The held row is the observation: work exists, and its own switch parks it.
+    const paused = project("paused", { autonomy: false });
+    job(paused, "execute-epic", "queued");
+    // A held row never demotes a claim already found: the fix beside it is startable.
+    const mixed = project("mixed", { autonomy: false });
+    job(mixed, "execute-epic", "queued");
+    job(mixed, "review-fix-pr", "queued");
+
+    const eligibility = await observedWorkEligibility(tdb.db, NOW);
+    expect(eligibilityOf(eligibility, paused)).toBe(false);
+    expect(eligibilityOf(eligibility, mixed)).toBe(true);
+  });
+
   it("still counts an autonomy-off project's other quota-burning work, and its running runs", async () => {
     // Autonomy gates the CLAIM of execute-epic only: a per-PR review fix leases regardless, and a
     // run already in flight keeps spending until it settles.
