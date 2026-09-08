@@ -78,6 +78,14 @@ describe("reworkNoteBody", () => {
     expect(body).toContain("- [advisory] (general) — naming drifts");
   });
 
+  it("keeps a multiline finding on one bullet, so the list a founder reads is one item per finding", () => {
+    const body = reworkNoteBody({
+      ...noteArgs,
+      findings: [{ severity: "blocking", location: "src/a.ts:1", note: "first line\nsecond line" }],
+    });
+    expect(body).toContain("- [blocking] src/a.ts:1 — first line second line");
+  });
+
   it("writes no findings section at all when none were selected", () => {
     const body = reworkNoteBody(noteArgs);
     expect(body).not.toContain("Findings to fix");
@@ -178,6 +186,27 @@ describe("followUpDescription", () => {
       "- [ ] a box already",
       "- [ ] a ticked box",
     ]);
+  });
+
+  it("collapses a multiline finding into one box — a line break inside it would close the section", () => {
+    const description = followUpDescription({
+      ...args,
+      parentId: "feat",
+      findings: [
+        {
+          severity: "blocking",
+          location: "src/retry.ts:12\nsrc/retry.ts:40",
+          note: "retries on a 4xx\n\n## Context\nwhich never recovers",
+        },
+      ],
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(acceptanceOf(description)).toEqual([
+      `- [ ] ${INSTRUCTIONS}`,
+      "- [ ] src/retry.ts:12 src/retry.ts:40 — retries on a 4xx ## Context which never recovers",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(description.match(/^## Context$/gm)).toHaveLength(1);
   });
 
   it("still writes a contract-complete bead when the instructions are blank — the generic box carries it", () => {

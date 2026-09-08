@@ -191,6 +191,13 @@ describe("instructionCriteria", () => {
       "1.2 ships this",
     ]);
   });
+
+  it("keeps a number too long to be an ordered marker — CommonMark stops at nine digits", () => {
+    expect(instructionCriteria("1234567890) must remain supported\n999999999. is a marker")).toEqual([
+      "1234567890) must remain supported",
+      "is a marker",
+    ]);
+  });
 });
 
 describe("doneGap", () => {

@@ -39,7 +39,7 @@ export function reworkNoteBody(args: {
       ? [
           ``,
           `Findings to fix (from the self-review):`,
-          ...args.findings.map((f) => `- [${f.severity}] ${f.location} — ${f.note}`),
+          ...args.findings.map((f) => `- [${f.severity}] ${findingLine(f)}`),
         ]
       : []),
   ].join("\n");
@@ -125,9 +125,24 @@ export function followUpDescription(args: {
 function followUpAcceptance(instructions: string, findings: ReviewFinding[]): string[] {
   return [
     ...instructionCriteria(instructions).map((line) => `- [ ] ${line}`),
-    ...findings.map((f) => `- [ ] ${f.location} — ${f.note}`),
+    ...findings.map((f) => `- [ ] ${findingLine(f)}`),
     `- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply`,
   ];
+}
+
+/**
+ * A finding as one list item. The review model's location and note are accepted with internal
+ * newlines ({@link toFinding}, lib/jobs/review-context.ts), and a line break inside a box is not
+ * part of that box: a note that continues `\n## Context` would close the Acceptance section early
+ * and carry the rest of itself — and the generic findings box — out of it. Collapsed to a single
+ * line, so what the founder selected is exactly one criterion.
+ */
+function findingLine(f: ReviewFinding): string {
+  return `${oneLine(f.location)} — ${oneLine(f.note)}`;
+}
+
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 /** Why this bead exists — and, for a REDIRECTED send-back, why it exists here rather than on the original. */

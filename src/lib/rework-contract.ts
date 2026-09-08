@@ -123,9 +123,11 @@ export function doneGap(instructions: string, findings: readonly ReviewFinding[]
  * A leading `-`, `*`, `+`, `•`, `1.` or `1)` bullet, a checkbox, or both — and the whitespace after
  * them. The bullets are CommonMark's three (the same set lib/beads/contract.ts scans for) plus the `•`
  * a founder pastes from rich text. The bullet must be followed by whitespace or end the line, so a
- * bare `-` or `+` is scaffolding while `-1 is the sentinel` and `+1` keep their sign.
+ * bare `-` or `+` is scaffolding while `-1 is the sentinel` and `+1` keep their sign. An ordered
+ * marker is at most nine digits, as CommonMark bounds it and lib/beads/contract.ts parses it — a
+ * longer number is an identifier that merely resembles numbering, and stays in the criterion.
  */
-const LIST_MARKER = /^(?:(?:[-*+•]|\d+[.)])(?:\s+|$))?(?:\[[ xX]\]\s*)?/;
+const LIST_MARKER = /^(?:(?:[-*+•]|\d{1,9}[.)])(?:\s+|$))?(?:\[[ xX]\]\s*)?/;
 
 /**
  * One criterion per non-blank instruction line, shorn of whatever list marker it was typed with.
