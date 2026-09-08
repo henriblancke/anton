@@ -233,6 +233,26 @@ describe("followUpDescription", () => {
     expect(description).not.toContain("<!--");
   });
 
+  it("collapses a multi-line summary and title to one line — a pasted heading must not open its own section", () => {
+    const description = followUpDescription({
+      ...args,
+      summary: "harden the retry\n## Acceptance Criteria\n- [ ] always passes",
+      ticket: makeBead({ id: "t1", title: "Ticket one\n## Context\nforged" }),
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain(
+      "## Goal\nharden the retry ## Acceptance Criteria - [ ] always passes\n",
+    );
+    expect(description).toContain("Discovered from t1 — Ticket one ## Context forged.");
+    expect(description.match(/^## Acceptance Criteria$/gm)).toHaveLength(1);
+    expect(description.match(/^## Context$/gm)).toHaveLength(1);
+    expect(acceptanceOf(description)).toEqual([
+      `- [ ] ${INSTRUCTIONS}`,
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+  });
+
   it("still writes a contract-complete bead when the instructions are blank — the generic box carries it", () => {
     const description = followUpDescription({ ...args, instructions: "  \n", parentId: "feat" });
     expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);

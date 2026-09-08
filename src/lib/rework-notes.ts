@@ -92,7 +92,7 @@ export function followUpDescription(args: {
   const { summary, instructions, findings, ticket, targetId, parentId, pipeline } = args;
   return [
     `## Goal`,
-    markdownSafe(summary),
+    markdownSafe(oneLine(summary)),
     ``,
     `## ${ACCEPTANCE_HEADING}`,
     ...followUpAcceptance(instructions, findings),
@@ -151,7 +151,9 @@ function oneLine(text: string): string {
  * (lib/beads/markdown.ts) and every markdown renderer hide all that follows it, so a criterion
  * about comment parsing would file a bead with no Context, Out of scope or Verify — which the
  * approve route refuses. The `!` is backslash-escaped: CommonMark renders the same four characters,
- * and no scanner reads them as an opener. The note keeps the raw text; it is prose, not a contract.
+ * and no scanner reads them as an opener. Text that must sit on ONE line — the Goal, the title in
+ * Context — is collapsed with {@link oneLine} first, since a pasted `\n## Acceptance Criteria` would
+ * otherwise open a section of its own. The note keeps the raw text; it is prose, not a contract.
  */
 function markdownSafe(text: string): string {
   return text.replace(/<!--/g, "<\\!--");
@@ -161,14 +163,14 @@ function markdownSafe(text: string): string {
 function followUpProvenance(ticket: Bead, targetId: string, pipeline?: ReworkPipeline): string {
   if (pipeline?.redirected) {
     return (
-      `Discovered from ${ticket.id} — ${markdownSafe(ticket.title)}. The founder judged its ` +
+      `Discovered from ${ticket.id} — ${markdownSafe(oneLine(ticket.title))}. The founder judged its ` +
       `acceptance unmet, but ${targetId}'s pull request (${pipeline.pr}) had already merged, so ` +
       `this bead carries the fix instead of reopening work that has shipped. The founder's ` +
       `instructions and the findings they selected are the human note on this bead.`
     );
   }
   return (
-    `Discovered from ${ticket.id} — ${markdownSafe(ticket.title)}. That ticket's acceptance was ` +
+    `Discovered from ${ticket.id} — ${markdownSafe(oneLine(ticket.title))}. That ticket's acceptance was ` +
     `met and it keeps its review score; this bead carries the next iteration ${targetId}'s ` +
     `self-review prompted. The founder's instructions and the findings they selected are the ` +
     `human note on this bead.`

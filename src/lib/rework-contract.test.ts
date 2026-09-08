@@ -184,6 +184,19 @@ describe("instructionCriteria", () => {
     expect(instructionCriteria("+\n+ \n+ [ ]")).toEqual([]);
   });
 
+  it("reads nested markers as scaffolding too — shearing one layer must not leave the next as a criterion", () => {
+    // `- -`, `1. -` and `- [ ] [ ]` are a list started twice and abandoned; one strip leaves a bare
+    // `-` or `[ ]`, which would file `- [ ] -` as the follow-up's one criterion.
+    expect(instructionCriteria("- -\n1. -\n- [ ] [ ]\n* * [x]\n- - - -\n1) 2) 3)")).toEqual([]);
+    // A rule that only appears once the outer markers are gone is still a rule.
+    expect(instructionCriteria("- - ---\n1. - ***")).toEqual([]);
+    // Nested markers ahead of real text are shorn all the way down to the text.
+    expect(instructionCriteria("- - nested bullet\n1. [ ] [x] twice boxed")).toEqual([
+      "nested bullet",
+      "twice boxed",
+    ]);
+  });
+
   it("reads a thematic break as scaffolding — it renders as a rule, not as text", () => {
     // The same set lib/beads/contract.ts refuses: three or more of one of `-`, `*`, `_`, spaces
     // between allowed. Boxing one would file `- [ ] ---` as the follow-up's only criterion.
@@ -244,6 +257,7 @@ describe("doneGap", () => {
     expect(doneGap("---", [])).toMatch(/only list markers or rules/);
     expect(doneGap("- \n***\n_ _ _", [])).not.toBeNull();
     expect(doneGap("- ---\n1. ***", [])).toMatch(/only list markers or rules/);
+    expect(doneGap("- -\n1. -\n- [ ] [ ]", [])).toMatch(/only list markers or rules/);
     expect(doneGap("---\nAdd the missing test.", [])).toBeNull();
     expect(doneGap("---", [finding])).toBeNull();
   });

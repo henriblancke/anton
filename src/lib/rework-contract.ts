@@ -137,9 +137,8 @@ const LIST_MARKER = /^(?:(?:[-*+•]|\d{1,9}[.)])(?:\s+|$))?(?:\[[ xX]\](?:\s+|$
  * A thematic break — 3+ `-`/`*`/`_` of one kind, spaces between allowed — as CommonMark and
  * lib/beads/contract.ts both read it. It renders as a rule, not text: a founder who types `---` to
  * separate two thoughts and writes neither has stated no step, and boxing it would file
- * `- [ ] ---` as the follow-up's one criterion. Judged both BEFORE the marker is stripped, since
- * `- - -` is a rule in full but a bare bullet once shorn, and AFTER, since `- ---` is a bullet in
- * full but a rule once shorn.
+ * `- [ ] ---` as the follow-up's one criterion. Judged at EVERY level of marker stripping: `- - -` is
+ * a rule in full but a bare bullet once shorn, and `- ---` is a bullet in full but a rule once shorn.
  */
 const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
@@ -152,10 +151,24 @@ const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 export function instructionCriteria(instructions: string): string[] {
   return instructions
     .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => !THEMATIC_BREAK.test(line))
-    .map((line) => line.replace(LIST_MARKER, ""))
-    .filter((line) => line.length > 0 && !THEMATIC_BREAK.test(line));
+    .map(shorn)
+    .filter((line) => line.length > 0);
+}
+
+/**
+ * The line with every leading list marker stripped, or empty when nothing but scaffolding remains.
+ * Markers nest — `- - `, `1. - `, `- [ ] [ ] ` — and shearing one layer can expose another bare
+ * marker or a rule (`- - ---`), so each layer is judged as the line in full was: a rule yields
+ * nothing, a marker is shorn and the remainder judged again.
+ */
+function shorn(line: string): string {
+  let text = line.trim();
+  for (;;) {
+    if (THEMATIC_BREAK.test(text)) return "";
+    const next = text.replace(LIST_MARKER, "");
+    if (next === text) return text;
+    text = next;
+  }
 }
 
 /**
