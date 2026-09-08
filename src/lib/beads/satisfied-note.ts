@@ -2,11 +2,16 @@
  * The record a SATISFIED step leaves on its bead (anton-8h4b), and the reader that takes it back
  * apart.
  *
- * A satisfied step closed without a commit of its own: an earlier commit of the same run already met
- * its acceptance (anton-6l0q), and the branch bore that out (anton-nuft). On the board that close
- * looks exactly like any other, so the bead itself has to say how it was settled — otherwise a
- * reader later cannot tell it from a step that produced its own commit, and the `bd close` alone
+ * A satisfied step settled without a commit of its own: an earlier commit of the same run already met
+ * its acceptance (anton-6l0q), and the branch bore that out (anton-nuft). On the board a close that
+ * follows looks exactly like any other, so the bead itself has to say how it was settled — otherwise
+ * a reader later cannot tell it from a step that produced its own commit, and the `bd close` alone
  * would read as a delivery the branch never carries under this ticket's name.
+ *
+ * The note speaks only of the settlement, never of a close (PR #253 review): it is written BEFORE
+ * `bd close` runs, that close is best-effort and can fail, and a standalone target is never closed
+ * here at all — it stays open in review until its PR merges. Whether the bead is closed is the
+ * board's to say; this note says what the work was settled against.
  *
  * It rides the existing machine-note channel (see beads/notes.ts): one unindented `anton:` line, so
  * `parseTicketNotes` reads it back as a system note and a human note appended after it stays
@@ -54,7 +59,7 @@ export function shortSha(sha: string): string {
   return sha.slice(0, 7);
 }
 
-/** The one-line machine note a satisfied close writes on its bead. */
+/** The one-line machine note a satisfied settlement writes on its bead. */
 export function formatSatisfiedNote(args: {
   by: SatisfiedBy;
   sessionId: string;
@@ -65,7 +70,7 @@ export function formatSatisfiedNote(args: {
   const account = by.note ? ` Agent's account: ${oneLine(by.note, NOTE_DETAIL_CHARS)}` : "";
   return oneLine(
     `anton: satisfied by ${shortSha(by.commit)}${subject} — an earlier commit of this run already ` +
-      `met this ticket's acceptance, so it was closed on that work and produced no commit of its ` +
+      `met this ticket's acceptance, so it was settled on that work and produced no commit of its ` +
       `own.${account} [session ${sessionId}, satisfied on ${branch} by ${by.commit}]`,
   );
 }

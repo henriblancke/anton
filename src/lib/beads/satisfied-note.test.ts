@@ -26,6 +26,9 @@ describe("formatSatisfiedNote / parseSatisfiedNote round-trip", () => {
     const text = note();
     expect(text).toMatch(/^anton: satisfied by 0123456 "anton-t1: Ticket one" — /);
     expect(text).toContain("no commit of its own");
+    // Written before `bd close`, which is best-effort and skipped for a standalone target, so the
+    // durable record must not assert a close the board may never hold.
+    expect(text).not.toMatch(/\bclosed?\b/);
     expect(parseSatisfiedNote(text)).toEqual({
       sessionId: "sess-1",
       branch: "anton/anton-e0y2",
