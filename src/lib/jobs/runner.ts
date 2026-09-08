@@ -21,6 +21,7 @@ import {
   activeExecuteEpicId,
   activeExecuteEpicKeys,
   activeJobIdsForProject,
+  bucketLiveLoad,
   cancelJob,
   complete,
   deferQueuedJobs,
@@ -745,6 +746,7 @@ export class JobRunner {
       pacedExecuteEpicHolds,
       valueHeldJobIds,
       valueHeldReclaimIds,
+      policyCapOf ?? (() => Infinity),
     );
     const holdLogKey = [...valueHeldJobIds, ...valueHeldReclaimIds].sort().join(",");
     if (holdLogKey !== this.valueHoldLogKey) {
@@ -829,6 +831,7 @@ export class JobRunner {
     pacedExecuteEpicHolds: Set<string>,
     valueHeldJobIds: Set<string>,
     valueHeldReclaimIds: Set<string>,
+    bucketCapOf: (job: JobRow) => number,
   ): Promise<void> {
     const resolveBudgetPolicy = this.resolveBudgetPolicy;
     if (!resolveBudgetPolicy) return;
@@ -920,6 +923,7 @@ export class JobRunner {
           valueHeldJobIds,
           valueHeldReclaimIds,
           projectWeeklyPct,
+          bucketCapOf,
         );
         continue;
       }
@@ -1004,7 +1008,11 @@ export class JobRunner {
    * reservation comment in the loop. Rows a HARD hold already keeps off the lease (a disabled
    * schedule, autonomy off, a quiescing project — `heldBucketKeys` / `quiescedProjects`) are skipped
    * before either check: they cannot run this tick, so reserving share for them would hold a runnable
-   * job behind them and, with leaseDue then excluding both, lease nothing tick after tick.
+   * job behind them and, with leaseDue then excluding both, lease nothing tick after tick. A row whose
+   * BUCKET is already at its concurrency (`bucketCapOf`, the same cap leaseDue enforces) is skipped
+   * for the same reason: an older queued execute-epic behind a long-running one cannot lease either,
+   * and letting it reserve the last of the share would hold an ungated grooming sweep behind a job
+   * capOf then skips — nothing dispatched, with global capacity to spare (PR #248 review).
    */
   private async applyValueGate(
     usage: ClaudeUsage,
@@ -1015,12 +1023,38 @@ export class JobRunner {
     valueHeldJobIds: Set<string>,
     valueHeldReclaimIds: Set<string>,
     projectWeeklyPct: number | null,
+    bucketCapOf: (job: JobRow) => number,
   ): Promise<void> {
     const candidates = await queuedDueJobs(this.db, this.clock, {
       types: GOVERNED_JOB_TYPES,
       projectId: pid,
       includeReclaimable: true,
     });
+    // Lease slots each gated bucket has left this tick, by leaseDue's own count (live load under the
+    // same cap), decremented as this walk admits — so the reservation below tracks what leaseDue
+    // will actually pick, in the same runAt order.
+    const slotsByBucket = new Map<string, number>();
+    const slotsLeft = async (job: JobRow): Promise<number> => {
+      const cap = bucketCapOf(job);
+      if (cap === Infinity) return Infinity;
+      const key = scheduleGateKey(job.type, job.projectId);
+      let slots = slotsByBucket.get(key);
+      if (slots === undefined) {
+        const live = await bucketLiveLoad(this.db, this.clock, {
+          type: job.type as JobType,
+          projectId: job.projectId,
+          inFlightIds: this.inFlight.keys(),
+        });
+        slots = cap - live;
+        slotsByBucket.set(key, slots);
+      }
+      return slots;
+    };
+    const takeSlot = (job: JobRow) => {
+      const key = scheduleGateKey(job.type, job.projectId);
+      const slots = slotsByBucket.get(key);
+      if (slots !== undefined) slotsByBucket.set(key, slots - 1);
+    };
     // One burn-average read per type per tick — the cost side of every candidate of that type.
     const costByType = new Map<string, number>();
     // The share side reads the same rates per type, but this PROJECT's own (the meter the cap is
@@ -1033,10 +1067,14 @@ export class JobRunner {
       if (job.status === "running" && this.inFlight.has(job.id)) continue; // genuinely running here
       if (heldBucketKeys.has(scheduleGateKey(job.type, job.projectId))) continue; // hard-held
       if (job.projectId && this.quiescedProjects.has(job.projectId)) continue; // being deleted
+      if ((await slotsLeft(job)) <= 0) continue; // bucket at concurrency — capOf skips it anyway
       const payload = parsePayload(job.payloadJson) as
         | { bypassBudget?: unknown; epicBeadId?: unknown }
         | null;
-      if (payload?.bypassBudget === true) continue;
+      if (payload?.bypassBudget === true) {
+        takeSlot(job); // leases ahead of the rows behind it, gate or no gate
+        continue;
+      }
       const hold = () =>
         (job.status === "running" ? valueHeldReclaimIds : valueHeldJobIds).add(job.id);
 
@@ -1064,6 +1102,7 @@ export class JobRunner {
         }
         projectedWeeklyPct += cost;
       }
+      takeSlot(job);
       admitted += 1;
     }
   }

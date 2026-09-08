@@ -10,9 +10,10 @@
  *
  * The answer is THREE-VALUED, and that is the whole care of this module. `true` = the picker ranks
  * startable work here, or quota-burning work is already startable — running, or queued and due.
- * `false` = the picker looked and found nothing. ABSENT = nobody looked — the board-picker pass
- * ships disabled, so a project that never armed it has no observation at all, and reading that
- * silence as "idle" would strip a busy repo's share on a question this machine never asked.
+ * `false` = the picker looked and found nothing, or what it found nothing here can start — its own
+ * schedule or the autonomy switch is off. ABSENT = nobody looked — the board-picker pass ships
+ * disabled, so a project that never armed it has no observation at all, and reading that silence
+ * as "idle" would strip a busy repo's share on a question this machine never asked.
  *
  * Work in flight counts alongside the picker's ranking because that is what makes reclaim prompt: a
  * repo that wakes up on Friday is back in the denominator the moment work is DUE, rather than
@@ -63,9 +64,18 @@ export async function observedWorkEligibility(
   ]);
 
   // The picker only ever starts execute-epic work, so its ranking is no claim on the quota where
-  // the autonomy switch would leave every start it makes queued.
+  // the autonomy switch would leave every start it makes queued. Nor where the picker itself is
+  // switched OFF: disabling its schedule leaves the last plan row in place (only teardown deletes
+  // it) and stops every refresh — the cron and the board-change nudge both refuse — so a nonempty
+  // plan there is a stale ranking nothing will act on, and reading it as a claim would hold the
+  // project in the denominator for as long as the switch stays off.
   const eligibility = new Map(
-    plans.map((p) => [p.projectId, p.targetCount > 0 && !autonomyOff.has(p.projectId)]),
+    plans.map((p) => [
+      p.projectId,
+      p.targetCount > 0 &&
+        !autonomyOff.has(p.projectId) &&
+        !disabledSchedules.has(scheduleGateKey("board-picker", p.projectId)),
+    ]),
   );
   for (const job of inFlight) {
     // A job with no project is anton's own plumbing and belongs to nobody's share.

@@ -197,6 +197,29 @@ describe("observedWorkEligibility", () => {
     expect(eligibilityOf(eligibility, on)).toBe(true);
   });
 
+  it("reads a nonempty plan as no claim once the picker's own schedule is switched off", async () => {
+    // Disabling the board-picker schedule stops every refresh but leaves the last plan row behind,
+    // so without this the ranking it recorded would hold an idle project in the denominator until
+    // the operator turns the picker back on.
+    const parked = project("parked");
+    plan(parked, 3);
+    schedule(parked, "board-picker", false);
+    // The switch is per project: a neighbour's live picker still ranks.
+    const ranking = project("ranking");
+    plan(ranking, 3);
+    schedule(ranking, "board-picker", true);
+    // Work an operator started by hand is due and counts whatever the picker's switch says.
+    const approved = project("approved");
+    plan(approved, 3);
+    schedule(approved, "board-picker", false);
+    job(approved, "execute-epic", "queued");
+
+    const eligibility = await observedWorkEligibility(tdb.db, NOW);
+    expect(eligibilityOf(eligibility, parked)).toBe(false);
+    expect(eligibilityOf(eligibility, ranking)).toBe(true);
+    expect(eligibilityOf(eligibility, approved)).toBe(true);
+  });
+
   it("attributes nothing to anton's own project-less plumbing", async () => {
     tdb.db
       .insert(schema.jobs)

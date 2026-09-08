@@ -743,14 +743,10 @@ export async function leaseDue(
     // so a cap on one job type — execute-epic concurrency, or a disabled schedule's cap-0 — never
     // counts against a different type sharing the same project (anton-7l7).
     const bucketKey = (type: string, projectId: string | null) => `${type}\0${projectId ?? ""}`;
-    const liveLoad =
-      excludeIds.length > 0
-        ? or(gt(schema.jobs.leaseExpiresAt, nowDate), inArray(schema.jobs.id, excludeIds))
-        : gt(schema.jobs.leaseExpiresAt, nowDate);
     const active = await db
       .select({ projectId: schema.jobs.projectId, type: schema.jobs.type })
       .from(schema.jobs)
-      .where(and(eq(schema.jobs.status, "running"), liveLoad));
+      .where(liveRunning(nowDate, excludeIds));
     const usedByBucket = new Map<string, number>();
     for (const row of active) {
       if (capOf(row as JobRow) === Infinity) continue;
@@ -793,6 +789,45 @@ export async function leaseDue(
     .returning();
 
   return leased;
+}
+
+/**
+ * The rows occupying a concurrency slot right now: `running` with a lease still in force, or still
+ * dispatched in-process (`inFlightIds`) whatever its DB lease says. One definition, shared by
+ * `leaseDue`'s per-bucket cap and {@link bucketLiveLoad}, so the governor's slot count can never
+ * disagree with the lease that follows it.
+ */
+function liveRunning(nowDate: Date, inFlightIds: readonly string[]): SQL | undefined {
+  const live =
+    inFlightIds.length > 0
+      ? or(gt(schema.jobs.leaseExpiresAt, nowDate), inArray(schema.jobs.id, inFlightIds))
+      : gt(schema.jobs.leaseExpiresAt, nowDate);
+  return and(eq(schema.jobs.status, "running"), live);
+}
+
+/**
+ * How many jobs one `(type, projectId)` bucket has live, by `leaseDue`'s own definition — what a
+ * new lease in that bucket competes with under `capOf`. The runner's value gate reads it so a
+ * candidate the bucket cannot admit this tick reserves no quota share (PR #248 review).
+ */
+export async function bucketLiveLoad(
+  db: AntonDb,
+  clock: Clock,
+  opts: { type: JobType; projectId: string | null; inFlightIds: Iterable<string> },
+): Promise<number> {
+  const rows = await db
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        liveRunning(secDate(clock.now()), [...opts.inFlightIds]),
+        eq(schema.jobs.type, opts.type),
+        opts.projectId === null
+          ? isNull(schema.jobs.projectId)
+          : eq(schema.jobs.projectId, opts.projectId),
+      ),
+    );
+  return rows.length;
 }
 
 /**

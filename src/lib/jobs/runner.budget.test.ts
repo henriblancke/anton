@@ -21,7 +21,7 @@ import type {
   JobPolicyResolver,
   ProjectSpendResolver,
 } from "./runner";
-import { usage, useRunnerHarness } from "./runner.fixture";
+import { usage, useRunnerHarness, waitUntil } from "./runner.fixture";
 
 /** Every bucket the governor is wired to hold — registered together so a case can enqueue any. */
 const GOVERNED_TYPES = ["execute-epic", "review-fix", "nightly-stringer", "orphan-grooming"] as const;
@@ -482,6 +482,43 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     await r.whenIdle();
     expect(ran).toEqual(["orphan-grooming"]);
     expect((await getJob(h.db, sweep))?.status).toBe("done");
+  });
+
+  it("does not reserve share for a row its bucket's concurrency keeps off the lease", async () => {
+    // A's one execute-epic slot is occupied by a long-running epic, so the older queued epic cannot
+    // lease this tick whatever the share says (capOf skips it). Reserving the last of the 6-point
+    // share for it anyway would hold the ungated grooming sweep behind a job that never starts —
+    // nothing dispatched, with global capacity to spare.
+    h.seedProjects("A");
+    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const ran: string[] = [];
+    const r = budgetRunner(
+      async (ctx) => {
+        ran.push(ctx.type);
+        if (ctx.type === "execute-epic") await gate;
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 6),
+        // The running epic's own attempt is already on the meter; one more seeded run (3) fills it.
+        resolveProjectSpend: async () => 3,
+        resolvePolicy: () => ({ concurrency: 1, timeoutMs: Infinity, maxAttempts: 3 }),
+      },
+    );
+    await r.enqueue({ type: "execute-epic", projectId: "A" });
+    expect(await r.tickOnce()).toBe(1); // the long-running epic takes A's only slot
+    const queuedEpic = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    const sweep = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await waitUntil(async () => (await getJob(h.db, sweep))?.status === "done");
+    expect(ran).toEqual(["execute-epic", "orphan-grooming"]);
+    expect((await getJob(h.db, queuedEpic))?.status).toBe("queued");
+
+    release();
+    await r.whenIdle();
   });
 
   it("leaves the share unbound when no spend resolver is wired", async () => {
