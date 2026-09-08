@@ -190,6 +190,25 @@ describe("instructionCriteria", () => {
     expect(instructionCriteria("-\n- \n1.\n- [ ]\n[ ]\n  ")).toEqual([]);
     // `+` is CommonMark's third bullet; alone it is the same abandoned list, not a criterion.
     expect(instructionCriteria("+\n+ \n+ [ ]")).toEqual([]);
+    // The zero-character box lib/beads/contract.ts accepts is the same abandoned list here.
+    expect(instructionCriteria("[]\n- []\n* []\n1. []\n- [] []\n> []")).toEqual([]);
+    expect(instructionCriteria("- [] boxed empty\n[] bare")).toEqual(["boxed empty", "bare"]);
+  });
+
+  it("reads a heading as scaffolding — a section label is not a step, in the contract's own rule", () => {
+    // `## Backend` over `- Fix the retry` labels the step; boxing it filed `- [ ] ## Backend`.
+    expect(instructionCriteria("## Backend\n- Fix the retry\n### UI\nRe-run the snapshot")).toEqual([
+      "Fix the retry",
+      "Re-run the snapshot",
+    ]);
+    expect(instructionCriteria("# Title\n## Backend ##\n######\n#")).toEqual([]);
+    // A heading exposed once the outer markers are gone is still a heading, as a rule is.
+    expect(instructionCriteria("- ## Backend\n> ## Quoted\n1. [ ] ### Boxed")).toEqual([]);
+    // The marker must be followed by whitespace or end the line: an issue number keeps its `#`.
+    expect(instructionCriteria("#123 fixed the retry\n- #a11y must pass")).toEqual([
+      "#123 fixed the retry",
+      "#a11y must pass",
+    ]);
   });
 
   it("reads nested markers as scaffolding too — shearing one layer must not leave the next as a criterion", () => {
@@ -324,12 +343,22 @@ describe("doneGap", () => {
   });
 
   it("refuses instructions that are only a rule — `---` is a separator, not a definition of done", () => {
-    expect(doneGap("---", [])).toMatch(/only list markers or rules/);
+    expect(doneGap("---", [])).toMatch(/only list markers, headings or rules/);
     expect(doneGap("- \n***\n_ _ _", [])).not.toBeNull();
-    expect(doneGap("- ---\n1. ***", [])).toMatch(/only list markers or rules/);
-    expect(doneGap("- -\n1. -\n- [ ] [ ]", [])).toMatch(/only list markers or rules/);
+    expect(doneGap("- ---\n1. ***", [])).toMatch(/only list markers, headings or rules/);
+    expect(doneGap("- -\n1. -\n- [ ] [ ]", [])).toMatch(/only list markers, headings or rules/);
     expect(doneGap("---\nAdd the missing test.", [])).toBeNull();
     expect(doneGap("---", [finding])).toBeNull();
+  });
+
+  it("refuses instructions that are only headings or empty boxes — labels and blanks, not steps", () => {
+    expect(doneGap("## Backend\n### UI", [])).toMatch(/only list markers, headings or rules/);
+    expect(doneGap("[]\n- []", [])).toMatch(/only list markers, headings or rules/);
+    expect(doneGap("- [] TODO — a concrete, checkable statement of done", [])).toMatch(
+      /formula's TODO placeholder/,
+    );
+    expect(doneGap("## Backend\n- Fix the retry", [])).toBeNull();
+    expect(doneGap("## Backend", [finding])).toBeNull();
   });
 
   it("refuses instructions that are only the formula's TODO placeholder — a prompt, not a step", () => {

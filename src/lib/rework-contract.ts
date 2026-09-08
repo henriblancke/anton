@@ -8,6 +8,7 @@
  * costs a caller nothing else — no bd, no `gh`, no board read — which is also what lets the rework
  * dialog import it: what the dialog refuses and what the route refuses are one judgement.
  */
+import { isHeading } from "./beads/markdown";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
   MAX_REWORK_INSTRUCTIONS_CHARS,
@@ -104,19 +105,20 @@ export function validateReworkInput(input: ReworkInput): ReworkRequest {
  *
  * A follow-up's acceptance is one box per instruction line and one per attached finding
  * ({@link followUpAcceptance}, lib/rework-notes.ts), and a reopen's note is the same text handed to
- * the implementer. Inputs that yield neither — instructions that are only list markers or the
- * formula's TODO placeholder, with nothing ticked — would file a bead whose one criterion is the
- * generic findings-addressed line: a rubric no review can score and no implementer can act on. Judged here, in the vocabulary both layers share,
- * so the dialog refuses before a bead is written and the route refuses the same request the same way.
+ * the implementer. Inputs that yield neither — instructions that are only list markers, headings,
+ * rules or the formula's TODO placeholder, with nothing ticked — would file a bead whose one
+ * criterion is the generic findings-addressed line: a rubric no review can score and no implementer
+ * can act on. Judged here, in the vocabulary both layers share, so the dialog refuses before a bead
+ * is written and the route refuses the same request the same way.
  *
  * Only the ABSENCE of a step is judged. Whether a step is a good one is the founder's call.
  */
 export function doneGap(instructions: string, findings: readonly ReviewFinding[]): string | null {
   if (instructionCriteria(instructions).length > 0 || findings.length > 0) return null;
   return (
-    "Nothing here says what done looks like: the fix instructions hold only list markers or rules, " +
-    "or the formula's TODO placeholder, and no finding is attached. Write at least one line an " +
-    "implementer can act on, or attach a finding."
+    "Nothing here says what done looks like: the fix instructions hold only list markers, headings " +
+    "or rules, or the formula's TODO placeholder, and no finding is attached. Write at least one " +
+    "line an implementer can act on, or attach a finding."
   );
 }
 
@@ -129,9 +131,11 @@ export function doneGap(instructions: string, findings: readonly ReviewFinding[]
  * longer number is an identifier that merely resembles numbering, and stays in the criterion. A
  * checkbox is held to the same rule as a bullet: `]` must be followed by whitespace or end the line,
  * so `[x].disabled must stay matched` — a CSS selector, not a ticked box — keeps its brackets and
- * lands in the criterion exactly as the note carries it.
+ * lands in the criterion exactly as the note carries it. The box may be the zero-character `[]`, as
+ * lib/beads/contract.ts reads it: a founder who types `- []` has started a box and stopped, and
+ * reading it as text filed `[]` as the follow-up's one criterion.
  */
-const LIST_MARKER = /^(?:(?:[-*+•]|\d{1,9}[.)])(?:\s+|$))?(?:\[[ xX]\](?:\s+|$))?/;
+const LIST_MARKER = /^(?:(?:[-*+•]|\d{1,9}[.)])(?:\s+|$))?(?:\[[ xX]?\](?:\s+|$))?/;
 
 /**
  * A blockquote marker — a run of `>` and the whitespace after it — held to the same rule as a
@@ -168,8 +172,8 @@ const PROMPT_LINE = /^TODO\s*[—–:-]/;
  * One criterion per non-blank instruction line, shorn of whatever list marker it was typed with.
  * Instruction lines arrive as the founder typed them — prose, `-`/`*` bullets, numbered steps, or
  * boxes already — so list markers are stripped rather than nested inside a second box. A line that
- * is only a rule ({@link THEMATIC_BREAK}) or the formula's prompt ({@link PROMPT_LINE}) is
- * scaffolding like a bare marker, and yields nothing.
+ * is only a rule ({@link THEMATIC_BREAK}), a heading ({@link isHeading}) or the formula's prompt
+ * ({@link PROMPT_LINE}) is scaffolding like a bare marker, and yields nothing.
  */
 export function instructionCriteria(instructions: string): string[] {
   return instructions
@@ -181,10 +185,16 @@ export function instructionCriteria(instructions: string): string[] {
 /**
  * The line with every leading list and blockquote marker stripped, or empty when nothing but
  * scaffolding remains. Markers nest — `- - `, `1. - `, `- [ ] [ ] `, `> - ` — and shearing one layer
- * can expose another bare marker or a rule (`- - ---`, `> ---`), so each layer is judged as the line
- * in full was: a rule yields nothing, a marker is shorn and the remainder judged again. What is left
- * once no marker remains is judged last against the formula's prompt, which is scaffolding in
- * whichever list shape it arrived.
+ * can expose another bare marker, a rule or a heading (`- - ---`, `> ---`, `- ## Backend`), so each
+ * layer is judged as the line in full was: a rule or heading yields nothing, a marker is shorn and
+ * the remainder judged again. What is left once no marker remains is judged last against the
+ * formula's prompt, which is scaffolding in whichever list shape it arrived.
+ *
+ * A heading is scaffolding for the reason lib/beads/contract.ts reads it so: `## Backend` labels the
+ * steps under it, it is not one. A founder who structures the note that way has stated the steps
+ * beneath the label, and boxing the label filed `- [ ] ## Backend` as a criterion no implementer
+ * can act on — while a note that is ONLY labels passed the gate having stated nothing. The heading
+ * rule is the scanner's own ({@link isHeading}), so `#123 fixed the retry` keeps its issue number.
  *
  * The blockquote marker comes off with the list markers ({@link QUOTE_MARKER}) for the reason
  * lib/beads/contract.ts strips it: it styles its content, it is not content. A founder who pastes a
@@ -194,7 +204,7 @@ export function instructionCriteria(instructions: string): string[] {
 function shorn(line: string): string {
   let text = line.trim();
   for (;;) {
-    if (THEMATIC_BREAK.test(text)) return "";
+    if (THEMATIC_BREAK.test(text) || isHeading(text)) return "";
     const next = text.replace(QUOTE_MARKER, "").trim().replace(LIST_MARKER, "");
     if (next === text) return PROMPT_LINE.test(text) ? "" : text;
     text = next;
