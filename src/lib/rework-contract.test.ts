@@ -214,6 +214,23 @@ describe("instructionCriteria", () => {
     ]);
   });
 
+  it("reads a Setext heading as scaffolding — an underlined label is a heading, both lines drop", () => {
+    // `Backend\n=======` renders as an h1, so neither the label nor the `=` underline is a step;
+    // without this the label AND the underline filed as criteria a review cannot score.
+    expect(texts("Backend\n=======\n- Fix the retry")).toEqual(["Fix the retry"]);
+    // The `-` underline renders an h2, but only at a rule's length — a short dash run stays content.
+    expect(texts("Backend\n---\nRe-run the snapshot")).toEqual(["Re-run the snapshot"]);
+    expect(texts("Backend\n--\nRe-run the snapshot")).toEqual([
+      "Backend",
+      "--",
+      "Re-run the snapshot",
+    ]);
+    // Judged inside the line's own containers, so a callout-wrapped label underlines too.
+    expect(texts("> Backend\n> =======")).toEqual([]);
+    // A blank line between them ends the paragraph, so the underline is not one: both stand.
+    expect(texts("Backend\n\n=======")).toEqual(["Backend", "======="]);
+  });
+
   it("reads nested markers as scaffolding too — shearing one layer must not leave the next as a criterion", () => {
     // `- -`, `1. -` and `- [ ] [ ]` are a list started twice and abandoned; one strip leaves a bare
     // `-` or `[ ]`, which would file `- [ ] -` as the follow-up's one criterion.
@@ -611,6 +628,8 @@ describe("doneGap", () => {
 
   it("refuses instructions that are only headings or empty boxes — labels and blanks, not steps", () => {
     expect(doneGap("## Backend\n### UI", [])).toMatch(/only list markers, headings or rules/);
+    // A Setext heading is a heading too: an underlined label states no step.
+    expect(doneGap("Backend\n=======", [])).toMatch(/only list markers, headings or rules/);
     expect(doneGap("[]\n- []", [])).toMatch(/only list markers, headings or rules/);
     expect(doneGap("- [] TODO — a concrete, checkable statement of done", [])).toMatch(
       /formula's TODO placeholder/,

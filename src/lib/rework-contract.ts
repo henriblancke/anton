@@ -188,6 +188,18 @@ const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
  */
 const PROMPT_LINE = /^TODO\s*[—–:-]/;
 
+/**
+ * A Setext heading underline as CommonMark reads one — a line of only `=` (any length, an h1) or a
+ * rule-length run of `-` (an h2), up to 3 columns in. The underline turns the paragraph line above
+ * it into a heading, so both are scaffolding like an ATX `## Backend` and neither files as a
+ * criterion. The `=` form is unambiguous — a line of only `=` is never content. The `-` form is
+ * held to {@link THEMATIC_BREAK}'s three-mark threshold on purpose: a short dash run like `--` is
+ * content the note carries ("a short dash run that is not one"), and only a rule-length one reads as
+ * a heading underline here. Recognised only from the line it underlines, since a paragraph must
+ * precede it — which is also why it outranks a bare thematic break.
+ */
+const SETEXT_UNDERLINE = /^ {0,3}(?:=+|-[ \t]*(?:-[ \t]*){2,})[ \t]*$/;
+
 /** Columns of indentation past a container's content that open indented code (CommonMark). */
 const CODE_INDENT = 4;
 
@@ -240,7 +252,9 @@ export interface InstructionCriterion {
  * — prose, `-`/`*` bullets, numbered steps, or boxes already — so list markers are stripped rather
  * than nested inside a second box. A line that is only a rule ({@link THEMATIC_BREAK}), a heading
  * ({@link isHeading}) or the formula's prompt ({@link PROMPT_LINE}) is scaffolding like a bare
- * marker, and yields nothing.
+ * marker, and yields nothing. A paragraph line the next line underlines with `=` or a rule-length
+ * run of `-` is a Setext heading ({@link setextUnderlineFollows}), so both it and the underline
+ * yield nothing too.
  *
  * Fences are read the way the contract judge reads them ({@link scanMarkdown}): everything inside
  * is LITERAL. A founder who pastes an expected output or a Markdown example has authored the lines
@@ -429,7 +443,14 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       inParagraph = false;
       continue;
     }
-    inParagraph = !THEMATIC_BREAK.test(content.trim()) && !isHeading(content);
+    const paragraph = !THEMATIC_BREAK.test(content.trim()) && !isHeading(content);
+    // A Setext underline on the next line makes this paragraph a heading, so both are scaffolding.
+    if (paragraph && setextUnderlineFollows(raw, lines, literal, at, peeled.prefix)) {
+      inParagraph = false;
+      at += 1;
+      continue;
+    }
+    inParagraph = paragraph;
     const text = shorn(line.text);
     if (text) out.push({ text, fenced: false });
   }
@@ -598,6 +619,26 @@ function blankQuoteLine(line: string, prefix: Prefix): boolean {
   if (last === -1) return false;
   const peeled = peelPrefix(line, prefix.slice(0, last + 1));
   return peeled !== undefined && peeled.trim() === "";
+}
+
+/**
+ * Whether the line after `at` is a Setext underline ({@link SETEXT_UNDERLINE}) for the paragraph
+ * line at `at`, judged inside that paragraph's own containers `prefix` so `> Backend` / `> =======`
+ * pairs too. When it is, both lines are a heading (CommonMark) and neither files; without it the
+ * underline — and, for the `=` form, the label above it — file as criteria a review cannot score,
+ * and {@link doneGap} accepts a draft that states no step.
+ */
+function setextUnderlineFollows(
+  raw: readonly string[],
+  lines: readonly ScannedLine[],
+  literal: readonly boolean[],
+  at: number,
+  prefix: Prefix,
+): boolean {
+  const next = lines[at + 1];
+  if (!next || next.fenced || literal[at + 1]) return false;
+  const inner = peelPrefix(raw[at + 1]!, prefix);
+  return inner !== undefined && SETEXT_UNDERLINE.test(inner);
 }
 
 /** `prefix` with its innermost column `columns` further in — where an indented block's content starts. */
