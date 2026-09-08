@@ -42,9 +42,14 @@ const setStatusMock = vi.fn(async () => {});
 const unassignMock = vi.fn(async () => {});
 const noteMock = vi.fn(async () => {});
 const closeMock = vi.fn(async () => {});
-const supersedeMock = vi.fn(async () => {});
+const supersedeMock = vi.fn<(repo: string, id: string, replacementId: string) => Promise<void>>(async () => {});
 const syncMock = vi.fn(async () => {});
-const showMock = vi.fn(async (_repo: string, id: string) => beadById(id));
+/**
+ * `bd show` as the repair sees it: the board's answer, with this run's own supersede layered over it
+ * once written — the post-write fence re-reads the ticket closed against its survivor, the way a
+ * real bd would answer after the write.
+ */
+const showMock = vi.fn(async (_repo: string, id: string) => shown(id));
 const loadAllIssuesMock = vi.fn(async () => board());
 const startJobSessionMock = vi.fn(async () => ({ sessionId: "sess-1", logPath: "/tmp/sess-1.log" }));
 const endSessionMock = vi.fn(async () => {});
@@ -71,7 +76,7 @@ vi.mock("../beads/bd", async () => {
       unassign: (...args: unknown[]) => unassignMock(...(args as [])),
       note: (...args: unknown[]) => noteMock(...(args as [])),
       close: (...args: unknown[]) => closeMock(...(args as [])),
-      supersede: (...args: unknown[]) => supersedeMock(...(args as [])),
+      supersede: (...args: unknown[]) => supersedeMock(...(args as [string, string, string])),
       sync: (...args: unknown[]) => syncMock(...(args as [])),
       show: (repo: string, id: string) => showMock(repo, id),
     },
@@ -138,6 +143,18 @@ function beadById(id: string): Bead {
   const found = board().find((b) => b.id === id);
   if (!found) throw new Error(`no such bead: ${id}`);
   return found;
+}
+
+/** A bead as `bd supersede <id> --with <by>` leaves it: closed, carrying the `supersedes` edge to `by`. */
+function shown(id: string): Bead {
+  const read = beadById(id);
+  const written = supersedeMock.mock.calls.find(([, target]) => target === id);
+  if (!written) return read;
+  return {
+    ...read,
+    status: "closed",
+    dependencies: [{ issue_id: id, depends_on_id: written[2], type: "supersedes" }],
+  } as Bead;
 }
 
 /** One dispatching step carrying the agent's self-report, then the commit that reports the diff. */
@@ -210,7 +227,7 @@ const labelsWritten = (): string[] =>
 describe("the delivery-evidence gate — zero diff still blocks and halts (anton-3on8)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    showMock.mockImplementation(async (_repo: string, id: string) => beadById(id));
+    showMock.mockImplementation(async (_repo: string, id: string) => shown(id));
     loadAllIssuesMock.mockImplementation(async () => board());
     startJobSessionMock.mockImplementation(async () => ({
       sessionId: "sess-1",

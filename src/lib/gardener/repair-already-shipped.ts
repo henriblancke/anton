@@ -650,7 +650,9 @@ export type AlreadyShippedOutcome =
  * swap its PR between the locked reread and the supersede, and nothing orders the two. bd has no
  * conditional write to close that window (anton-od4), so the fence is the same one apply-steps'
  * `assertReservationHeld` uses: the write's own post-write read is the newest read there is, and the
- * retirement is held to the check's bar once more against it — {@link retirementHeld}.
+ * retirement is held to the check's bar once more against it — {@link retirementHeld}. The base is
+ * part of that read: no bead lock holds a git ref, so the commit or merge that authorized the
+ * retirement is asked of the base again beside the board, not taken from the pre-write answer.
  *
  * Nothing is taken back on JUDGEMENT: un-superseding a bead whose retirement verified is not an undo,
  * it is a second decision about work that has already landed, and a stamp that failed after one
@@ -820,23 +822,26 @@ export async function repairAlreadyShipped(args: {
   const subtree = index.descendantsOf(bead.id).map((b) => b.id);
   const evidenceHolders = landing.via === "owner-pr" ? [landing.ownerId] : [];
   const ancestors = ancestorChainOf(index, bead.id);
+  // What BOTH fences hold the fresh reads to — the check's reads, fixed once so neither fence can be
+  // handed a different bar from the other.
+  const fence: RetirementFence = {
+    repoPath,
+    base,
+    targetId: bead.id,
+    contract: bead,
+    checked: index.byId.get(bead.id),
+    snapshot: index,
+    replacementId,
+    landing,
+    cited: verdict.cited,
+  };
   return withBeadWriteLocks(repoPath, [bead.id, replacementId, ...subtree, ...evidenceHolders, ...ancestors], async () => {
     const locked = await readBoardUnderLock(repoPath, "before");
     const moved =
       typeof locked === "string"
         ? locked
-        : ((await retirementMoved({
-            repoPath,
-            base,
-            targetId: bead.id,
-            contract: bead,
-            checked: index.byId.get(bead.id),
-            snapshot: index,
-            replacementId,
-            landing,
-            locked,
-          })) ??
-          (await citedEvidenceMoved({ repoPath, base, targetId: bead.id, cited: verdict.cited, landing })) ??
+        : ((await retirementMoved({ ...fence, locked })) ??
+          (await citedEvidenceMoved(fence)) ??
           strandedUnderLock(locked, bead.id) ??
           subtreeMoved(locked, bead.id, subtree));
     if (moved) {
@@ -864,20 +869,11 @@ export async function repairAlreadyShipped(args: {
     // is honest whether or not the retirement below lands.
     await beads.note(repoPath, bead.id, shippedEvidenceNote(verdict));
     await beads.supersede(repoPath, bead.id, replacementId);
-    // The write has landed; now the fence the locks cannot hold (see the header). Re-read both ends
-    // and re-ask the check's questions of what is on the board NOW — the only read that can have
-    // seen a writer from another process. Held, the stamp follows; moved, the retirement is
-    // withdrawn if the close is still anton's own, and reported either way.
-    const held = await retirementHeld({
-      repoPath,
-      targetId: bead.id,
-      contract: bead,
-      checked: index.byId.get(bead.id),
-      snapshot: index,
-      replacementId,
-      landing,
-      subtree,
-    });
+    // The write has landed; now the fence the locks cannot hold (see the header). Re-read both ends,
+    // the board and the base, and re-ask the check's questions of what they hold NOW — the only read
+    // that can have seen a writer from another process. Held, the stamp follows; moved, the
+    // retirement is withdrawn if the close is still anton's own, and reported either way.
+    const held = await retirementHeld({ ...fence, subtree });
     if (held.state !== "held") {
       return {
         action: "escalate",
@@ -928,12 +924,10 @@ export async function repairAlreadyShipped(args: {
  * open with its contract intact, and the supersede would close it inside a run this one does not own.
  *
  * This is the PRE-write fence, ordered against this process's writers by the locks; its post-write
- * twin, {@link retirementHeld}, asks the same questions of the board after the supersede has landed,
- * which is the only read that can have seen a writer from another process.
+ * twin, {@link retirementHeld}, asks the same questions after the supersede has landed, which is the
+ * only read that can have seen a writer from another process.
  */
 async function retirementMoved(args: RetirementFence & {
-  /** The ref the merge has to be in the history of — the same `base` the check placed it in. */
-  base: string;
   /** The whole board, re-read inside the locks. */
   locked: BoardIndex;
 }): Promise<string | undefined> {
@@ -946,15 +940,18 @@ async function retirementMoved(args: RetirementFence & {
       `outcome, and anton does not rewrite that`
     );
   }
-  return retirementDrifted({ ...args, target, when: "before", evidence: { base: args.base } });
+  return retirementDrifted({ ...args, target, when: "before" });
 }
 
 /**
- * What both fences compare the board against: the reads the CHECK was made on. Neither fence reads
- * these; they are the fixed point, and the fresh read is what is held to them.
+ * What both fences compare the fresh reads against: the reads the CHECK was made on, and the ref it
+ * measured "landed" against. Neither fence reads these; they are the fixed point, and the fresh read
+ * is what is held to them.
  */
 interface RetirementFence {
   repoPath: string;
+  /** The ref every landing has to be in the history of — the same `base` the check placed it in. */
+  base: string;
   targetId: string;
   /**
    * The target's FULL read ahead of the check — the contract the claim was verified against. Held
@@ -968,6 +965,8 @@ interface RetirementFence {
   snapshot: BoardIndex;
   replacementId: string;
   landing: BeadLanding;
+  /** Every commit and PR the claim cited — re-asked of the base beside the survivor's own landing. */
+  cited: CitedEvidence[];
 }
 
 /**
@@ -986,14 +985,17 @@ type RetirementVerdict =
  * Whether the retirement that just landed closed the ticket the check verified, against the survivor
  * it verified — the cross-process fence (PR #238 review; see the header).
  *
- * The same questions {@link retirementMoved} asked before the write, asked once more of the board
- * after it: the two fences share {@link retirementDrifted}, so neither can hold the ticket to a bar
- * the other does not. Two things differ. The target is held to "closed by THIS supersede" rather
- * than "still open", because the write is the thing being verified — a ticket that reads open, or
- * closed some other way, is one somebody else has decided since. And the survivor's evidence is
- * re-asked of the BOARD alone — the PR pointer, the standing, the card it rides — not of `gh` or
- * git again: what another process's bd write can move is the pointer, and the pointer that verified
- * a moment ago under these locks, unchanged, still names the merge the base was proven to hold.
+ * The same questions {@link retirementMoved} asked before the write, asked once more after it: the
+ * two fences share {@link retirementDrifted} and {@link citedEvidenceMoved}, so neither can hold the
+ * ticket to a bar the other does not. One thing differs. The target is held to "closed by THIS
+ * supersede" rather than "still open", because the write is the thing being verified — a ticket
+ * that reads open, or closed some other way, is one somebody else has decided since.
+ *
+ * The landing is re-asked of git and `gh` in FULL, not of the board's pointer alone (PR #238
+ * review). The bead locks order nothing in the repository: the base is a movable ref, and another
+ * run fetching or resetting `origin/<base>` between the pre-write reread and the supersede drops
+ * the commit or merge that authorized the retirement with the pointer unchanged — a board-only
+ * reread would call that held. So the base is asked again, for every landing and every citation.
  *
  * The board is read whole again for the same reason the pre-write fence read it: whose card the
  * ticket and the survivor ride is decided by their ancestors, and open work attached beneath the
@@ -1021,7 +1023,8 @@ async function retirementHeld(
   const locked = await readBoardUnderLock(repoPath, "after");
   if (typeof locked === "string") return { state: "unread", why: locked };
   const drifted =
-    (await retirementDrifted({ ...args, target, locked, when: "after", evidence: "board" })) ??
+    (await retirementDrifted({ ...args, target, locked, when: "after" })) ??
+    (await citedEvidenceMoved(args)) ??
     strandedUnderLock(locked, targetId) ??
     subtreeMoved(locked, targetId, subtree);
   return drifted ? { state: "moved", why: drifted } : { state: "held" };
@@ -1102,12 +1105,12 @@ async function readBead(repoPath: string, id: string, when: "before" | "after"):
 /**
  * The questions BOTH fences ask once the target's standing has been judged — its contract and its
  * home, then the survivor's evidence — against a fresh read of each. Shared so the post-write fence
- * cannot drift from the pre-write one; what differs between them is `evidence`.
+ * cannot drift from the pre-write one; only `when` differs, and it only words a refusal.
  *
- * `evidence: { base }` re-asks the landing in full — the PR's merge still in the base's history, the
- * naming commit still reaching it — which is the pre-write fence's bar, and costs `gh`. `"board"`
- * holds the survivor to the board alone: the same pointer, the same standing, the same card ridden.
- * That is the post-write fence's bar, for the reason {@link retirementHeld} gives.
+ * The landing is re-asked in full each time — the PR's merge still in the base's history, the
+ * naming commit still reaching it — at the cost of `gh`. The board's pointer alone would not do: the
+ * base is a ref no bead lock holds, so the pointer can be unchanged while what it names has left
+ * the base ({@link retirementHeld}).
  */
 async function retirementDrifted(
   args: RetirementFence & {
@@ -1116,11 +1119,9 @@ async function retirementDrifted(
     /** The whole board, read alongside the target. */
     locked: BoardIndex;
     when: "before" | "after";
-    evidence: { base: string } | "board";
   },
 ): Promise<string | undefined> {
-  const { repoPath, targetId, contract, checked, snapshot, replacementId, landing, locked, target, when, evidence } =
-    args;
+  const { repoPath, base, targetId, contract, checked, snapshot, replacementId, landing, locked, target, when } = args;
   const rewritten = contractRewritten(contract, target);
   if (rewritten) return rewritten;
   if (!checked) {
@@ -1134,10 +1135,10 @@ async function retirementDrifted(
   const replacement = await readBead(repoPath, replacementId, when);
   if (typeof replacement === "string") return replacement;
 
-  // Still the PR that verified, and — pre-write — its merge still in the base
-  // ({@link stillLandedPullRequest}). ABANDONED is not asked here, on purpose: the check itself
-  // reads a merged PR as redeeming an abandoned bead — what shipped is what shipped, whatever the
-  // bead was later labelled — and the guard holds the survivor to the check's bar, not a higher one.
+  // Still the PR that verified, and its merge still in the base ({@link stillLandedPullRequest}).
+  // ABANDONED is not asked here, on purpose: the check itself reads a merged PR as redeeming an
+  // abandoned bead — what shipped is what shipped, whatever the bead was later labelled — and the
+  // guard holds the survivor to the check's bar, not a higher one.
   const stillMergedPr = async (holder: Bead, ref: string, whose: string): Promise<string | undefined> => {
     const now = beads.getPrRef(holder);
     if (now !== ref) {
@@ -1147,8 +1148,7 @@ async function retirementDrifted(
         `not superseded on that evidence`
       );
     }
-    if (evidence === "board") return undefined;
-    return stillLandedPullRequest(repoPath, evidence.base, ref, `${whose} PR (${ref})`, targetId);
+    return stillLandedPullRequest(repoPath, base, ref, `${whose} PR (${ref})`, targetId);
   };
 
   switch (landing.via) {
@@ -1166,8 +1166,7 @@ async function retirementDrifted(
     case "commit": {
       const settled = stillClosedSurvivor(replacement, "the commit naming it in the base");
       if (settled) return settled;
-      if (evidence === "board") return undefined;
-      return stillReachingCommit(repoPath, evidence.base, landing.sha, targetId);
+      return stillReachingCommit(repoPath, base, landing.sha, targetId);
     }
   }
 }

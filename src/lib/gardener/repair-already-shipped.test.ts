@@ -1533,11 +1533,10 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
         expect(tagMock).not.toHaveBeenCalled();
       });
 
-      // What another process's bd write can move is the POINTER. The pointer that verified under the
-      // locks a moment ago, unchanged, still names the merge the base was proven to hold — so the
-      // post-write fence asks the board, not gh again, and a gh that changes its story in between is
-      // not a board race.
-      it("holds the survivor to the board's pointer after the write, not to gh a second time", async () => {
+      // The pointer is not the evidence — the merge in the base is, and no bead lock holds the base
+      // (PR #238 review). A pointer unchanged after the write can still name a PR that gh no longer
+      // calls merged, or a merge the base no longer contains, so both are asked again.
+      it("withdraws when the PR it verified is no longer merged after the write, pointer unchanged", async () => {
         boardShow.mockImplementation(async (_cwd, id) => {
           if (written()) setPr(85, "OPEN");
           return id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!;
@@ -1545,8 +1544,76 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
         const outcome = await retireViaPr();
 
-        expect(outcome).toMatchObject({ action: "retired", replacementId: UNLANDED });
-        for (const write of [reopenMock, unlinkMock]) expect(write).not.toHaveBeenCalled();
+        expect(outcome).toMatchObject({ action: "escalate" });
+        expect(evidenceOf(outcome)).toContain("reads as open now, not merged");
+        expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+        expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);
+        expect(tagMock).not.toHaveBeenCalled();
+      });
+
+      it("withdraws when the base no longer contains the PR's merge after the write — still merged is not enough", async () => {
+        boardShow.mockImplementation(async (_cwd, id) => {
+          if (written()) setPr(85, "MERGED", { commit: sb.unmerged, base: "develop" });
+          return id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!;
+        });
+
+        const outcome = await retireViaPr();
+
+        expect(outcome).toMatchObject({ action: "escalate" });
+        expect(evidenceOf(outcome)).toContain("is merged elsewhere than the run's base (main) — into `develop`");
+        expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+        expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);
+        expect(tagMock).not.toHaveBeenCalled();
+      });
+    });
+
+    // The base is a movable ref that another run's fetch or reset can rewind at any moment, with
+    // nothing on the board changing (PR #238 review). The post-write fence asks git again for the
+    // survivor's naming commit and for every commit and PR the claim cited beside it.
+    describe("a survivor verified through a commit naming it in the base", () => {
+      const g = (args: string[]) =>
+        execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+
+      it("withdraws when the base no longer contains the naming commit after the write", async () => {
+        const before = g(["rev-parse", `${sb.landed}^`]);
+        boardShow.mockImplementation(async (_cwd, id) => {
+          // `main` rewound past the commit the check found, after the supersede landed.
+          if (written()) g(["update-ref", "refs/heads/main", before]);
+          return id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" });
+        });
+
+        const outcome = await retire();
+
+        expect(outcome).toMatchObject({ action: "escalate" });
+        expect(evidenceOf(outcome)).toContain(
+          `commit \`${sb.landed.slice(0, 10)}\` is no longer in the history of the run's base (main)`,
+        );
+        expect(evidenceOf(outcome)).toContain(`withdrew the retirement: ${TARGET} is open again`);
+        expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+        expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+        expect(tagMock).not.toHaveBeenCalled();
+      });
+
+      it("withdraws when the base no longer contains a cited commit after the write, though the survivor's still lands", async () => {
+        g(["commit", "-q", "--allow-empty", "-m", "unrelated follow-up"]);
+        const extra = g(["rev-parse", "HEAD"]);
+        boardShow.mockImplementation(async (_cwd, id) => {
+          // `main` rewound to the naming commit: the survivor's evidence holds, the cited commit's does not.
+          if (written()) g(["update-ref", "refs/heads/main", sb.landed]);
+          return id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" });
+        });
+
+        const outcome = await retire({
+          block: { reason: `Already implemented by ${SHIPPER} (commit ${extra.slice(0, 7)})` },
+        });
+
+        expect(outcome).toMatchObject({ action: "escalate" });
+        expect(evidenceOf(outcome)).toContain(
+          `commit \`${extra.slice(0, 10)}\` is no longer in the history of the run's base (main)`,
+        );
+        expect(reopenMock).toHaveBeenCalledWith(repo, TARGET, expect.any(String));
+        expect(unlinkMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+        expect(tagMock).not.toHaveBeenCalled();
       });
     });
 
