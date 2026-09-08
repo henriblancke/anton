@@ -236,6 +236,12 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
         `history of the run's base (main) names it`,
       `PR gh-85 is merged${mergedTail(landed)}`,
     ]);
+    // Every commit and PR the verdict rests on, in checkable form, deduped — the survivor's naming
+    // commit is the one the prose cited too, and the write re-asks all of it under the lock.
+    expect((verdict as { cited: unknown }).cited).toEqual([
+      { kind: "commit", sha: landed },
+      { kind: "pr", ref: "gh-85" },
+    ]);
     expect((verdict as { landed: unknown }).landed).toEqual({
       [SHIPPER]: { via: "commit", sha: landed },
     });
@@ -277,6 +283,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       state: "verified",
       proof: [`\`${SHIPPER}\` is in_progress, but its PR (gh-85) is merged${mergedTail(landed)}`],
       landed: { [SHIPPER]: { via: "pr", ref: "gh-85" } },
+      cited: [{ kind: "pr", ref: "gh-85" }],
     });
   });
 
@@ -342,6 +349,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
           `rides, (gh-85) is merged${mergedTail(landed)}`,
       ],
       landed: { [UNLANDED]: { via: "owner-pr", ownerId: OWNER, ref: "gh-85" } },
+      cited: [{ kind: "pr", ref: "gh-85" }],
     });
   });
 
@@ -356,6 +364,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       state: "verified",
       proof: [`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged${mergedTail(landed)}`],
       landed: { [UNLANDED]: { via: "pr", ref: "gh-85" } },
+      cited: [{ kind: "pr", ref: "gh-85" }],
     });
   });
 
@@ -1020,6 +1029,78 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       expect(outcome).toMatchObject({ action: "escalate" });
       expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
         `whether commit \`${sb.landed.slice(0, 10)}\` still reaches the run's base (main) could not be read`,
+      );
+      expect(supersedeMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // The claim verified as a WHOLE, and it is re-asked as a whole (PR #238 review): a commit or PR
+  // cited BESIDE the survivor is evidence the check would fail without, so a base that dropped it
+  // in the window takes the verification back exactly as it would the survivor's own landing.
+  describe("commits and PRs cited beside the survivor", () => {
+    let extra: string;
+    const g = (args: string[]) =>
+      execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const survivorStillClosed = async (_cwd: string, id: string) =>
+      id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" });
+
+    beforeEach(() => {
+      // A second commit on `main`, after the one naming the survivor: cited by the claim, and the
+      // one a rewind can drop while the survivor's naming commit stays in the base.
+      g(["commit", "-q", "--allow-empty", "-m", "unrelated follow-up"]);
+      extra = g(["rev-parse", "HEAD"]);
+      setPr(85, "MERGED");
+    });
+
+    const retireCiting = () =>
+      retire({ block: { reason: `Already implemented by ${SHIPPER} (commit ${extra.slice(0, 7)}, PR #85)` } });
+
+    it("retires while every cited commit and PR still lands in the base", async () => {
+      showMock.mockImplementation(survivorStillClosed);
+
+      const outcome = await retireCiting();
+
+      expect(outcome).toMatchObject({
+        action: "retired",
+        replacementId: SHIPPER,
+        proof: [
+          `commit \`${extra.slice(0, 10)}\` is in the history of the run's base (main)`,
+          commitProof(),
+          `PR gh-85 is merged${mergedTail(sb.landed)}`,
+        ],
+      });
+      expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+    });
+
+    it("refuses when the base no longer contains a cited commit at the write, though the survivor's still lands", async () => {
+      showMock.mockImplementation(async (cwd, id) => {
+        // `main` rewound to the naming commit: the survivor's evidence holds, the cited commit's does not.
+        if (id === SHIPPER) g(["update-ref", "refs/heads/main", sb.landed]);
+        return survivorStillClosed(cwd, id);
+      });
+
+      const outcome = await retireCiting();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { why: string }).why).toContain("the board moved");
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
+        `commit \`${extra.slice(0, 10)}\` is no longer in the history of the run's base (main)`,
+      );
+      expect(supersedeMock).not.toHaveBeenCalled();
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses when a cited PR's merge is no longer in the base at the write", async () => {
+      showMock.mockImplementation(async (cwd, id) => {
+        if (id === SHIPPER) setPr(85, "MERGED", { commit: sb.unmerged, base: "develop" });
+        return survivorStillClosed(cwd, id);
+      });
+
+      const outcome = await retireCiting();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
+        "the cited PR gh-85 is merged elsewhere than the run's base (main) — into `develop`",
       );
       expect(supersedeMock).not.toHaveBeenCalled();
     });

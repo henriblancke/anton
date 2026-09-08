@@ -102,8 +102,17 @@ export function claimedPullRequests(reason: string | undefined): string[] {
  * never a reason to retire on its own: only `verified` is.
  */
 export type ShippedVerdict =
-  | { state: "verified"; proof: string[]; landed: Record<string, BeadLanding> }
+  | { state: "verified"; proof: string[]; landed: Record<string, BeadLanding>; cited: CitedEvidence[] }
   | { state: "unverified"; why: string; proof: string[] };
+
+/**
+ * One piece of git or GitHub evidence the verdict rests on, in its checkable form — every commit
+ * and PR the claim cited, beside the ones the named beads' landings read (PR #238 review). The
+ * survivor's landing is what a retirement points at, but the claim verified as a WHOLE: a commit or
+ * PR cited alongside the survivor that the base no longer contains at the write would fail a rerun
+ * of the check, so the same set is re-asked under the lock rather than surviving as prose in `proof`.
+ */
+export type CitedEvidence = { kind: "commit"; sha: string } | { kind: "pr"; ref: string };
 
 /**
  * What PROVED a named bead's work landed — kept in its checkable form beside the prose, because the
@@ -247,6 +256,10 @@ export async function verifyShippedClaim(args: {
   }
 
   const proof: string[] = [];
+  const cited: CitedEvidence[] = [];
+  const cite = (evidence: CitedEvidence) => {
+    if (!cited.some((c) => citesSame(c, evidence))) cited.push(evidence);
+  };
   // One reading per PR however many times it is named — a bead's own ref and the number written in
   // the prose are routinely the same PR, and `gh` is a network call.
   const landings = new Map<string, PullRequestLanding>();
@@ -263,6 +276,7 @@ export async function verifyShippedClaim(args: {
     switch (reach.state) {
       case "reaches":
         proof.push(`commit \`${reach.sha.slice(0, 10)}\` is in the history of the run's base (${base})`);
+        cite({ kind: "commit", sha: reach.sha });
         break;
       case "outside":
         return {
@@ -308,6 +322,7 @@ export async function verifyShippedClaim(args: {
       if ("why" in closed) return { state: "unverified", proof, why: closed.why };
       proof.push(closed.proof);
       landed[id] = closed.landing;
+      cite(citedByLanding(closed.landing));
       continue;
     }
     const pr = beads.getPrRef(bead);
@@ -325,6 +340,7 @@ export async function verifyShippedClaim(args: {
     if (landing.landed) {
       proof.push(`\`${id}\` is ${standing}, but its PR (${pr}) is merged${landedTail(base, landing)}`);
       landed[id] = { via: "pr", ref: pr };
+      cite({ kind: "pr", ref: pr });
       continue;
     }
     return {
@@ -342,6 +358,7 @@ export async function verifyShippedClaim(args: {
     const landing = await readPr(pr);
     if (landing.landed) {
       proof.push(`PR ${pr} is merged${landedTail(base, landing)}`);
+      cite({ kind: "pr", ref: pr });
       continue;
     }
     return {
@@ -355,7 +372,16 @@ export async function verifyShippedClaim(args: {
     };
   }
 
-  return { state: "verified", proof, landed };
+  return { state: "verified", proof, landed, cited };
+}
+
+/** The git or GitHub fact a bead's landing read — the half of it the base can take back. */
+function citedByLanding(landing: BeadLanding): CitedEvidence {
+  return landing.via === "commit" ? { kind: "commit", sha: landing.sha } : { kind: "pr", ref: landing.ref };
+}
+
+function citesSame(a: CitedEvidence, b: CitedEvidence): boolean {
+  return a.kind === "commit" ? b.kind === "commit" && a.sha === b.sha : b.kind === "pr" && a.ref === b.ref;
 }
 
 /**
@@ -756,6 +782,7 @@ export async function repairAlreadyShipped(args: {
             landing,
             locked,
           })) ??
+          (await citedEvidenceMoved({ repoPath, base, targetId: bead.id, cited: verdict.cited, landing })) ??
           strandedUnderLock(locked, bead.id) ??
           subtreeMoved(locked, bead.id, subtree));
     if (moved) {
@@ -868,9 +895,7 @@ async function retirementMoved(args: {
   const replacement = await read(replacementId);
   if (typeof replacement === "string") return replacement;
 
-  // Still the PR that verified, and its merge still in the base — the same bar the check held it
-  // to, re-asked in full rather than as "still merged" (a PR can no more un-merge than the base can
-  // lose a commit, but a force-pushed base can, and the check's answer is the base's history).
+  // Still the PR that verified, and its merge still in the base ({@link stillLandedPullRequest}).
   // ABANDONED is not asked here, on purpose: the check itself reads a merged PR as redeeming an
   // abandoned bead — what shipped is what shipped, whatever the bead was later labelled — and the
   // guard holds the survivor to the check's bar, not a higher one.
@@ -883,14 +908,7 @@ async function retirementMoved(args: {
         `not superseded on that evidence`
       );
     }
-    const landing = await readPullRequestLanding(repoPath, base, ref);
-    if (landing.landed) return undefined;
-    return (
-      (landing.state === "merged"
-        ? `${whose} PR (${ref}) ${landing.predicate}`
-        : `${whose} PR (${ref}) reads as ${landing.state === "unknown" ? "unreadable" : landing.state} ` +
-          `now, not merged`) + ` — the evidence ${targetId}'s retirement rested on no longer holds`
-    );
+    return stillLandedPullRequest(repoPath, base, ref, `${whose} PR (${ref})`, targetId);
   };
 
   switch (landing.via) {
@@ -911,6 +929,57 @@ async function retirementMoved(args: {
       return stillReachingCommit(repoPath, base, landing.sha, targetId);
     }
   }
+}
+
+/**
+ * The PR's merge has to still be in the base's history at the write — the same bar the check held
+ * it to, re-asked in full rather than as "still merged" (a PR can no more un-merge than the base can
+ * lose a commit, but a force-pushed base can, and the check's answer is the base's history).
+ * `subject` names the PR as the refusal should read it: "`anton-x`'s PR (gh-85)", "the cited PR gh-85".
+ */
+async function stillLandedPullRequest(
+  repoPath: string,
+  base: string,
+  ref: string,
+  subject: string,
+  targetId: string,
+): Promise<string | undefined> {
+  const landing = await readPullRequestLanding(repoPath, base, ref);
+  if (landing.landed) return undefined;
+  return (
+    (landing.state === "merged"
+      ? `${subject} ${landing.predicate}`
+      : `${subject} reads as ${landing.state === "unknown" ? "unreadable" : landing.state} now, not merged`) +
+    ` — the evidence ${targetId}'s retirement rested on no longer holds`
+  );
+}
+
+/**
+ * Every commit and PR the claim cited has to still land in the base at the write, not only the one
+ * the survivor's landing read (PR #238 review). The check verified the claim as a WHOLE — one cited
+ * commit outside the base fails it — and the base is a movable ref, so a citation that held at the
+ * check can be gone by the time the locks are taken. Anything already re-asked through the
+ * survivor's own landing is skipped: {@link retirementMoved} holds that one to a stricter bar
+ * (pointer and standing too), and `gh` is a network call.
+ */
+async function citedEvidenceMoved(args: {
+  repoPath: string;
+  base: string;
+  targetId: string;
+  cited: CitedEvidence[];
+  landing: BeadLanding;
+}): Promise<string | undefined> {
+  const { repoPath, base, targetId, cited, landing } = args;
+  const survivor = citedByLanding(landing);
+  for (const evidence of cited) {
+    if (citesSame(evidence, survivor)) continue;
+    const moved =
+      evidence.kind === "commit"
+        ? await stillReachingCommit(repoPath, base, evidence.sha, targetId)
+        : await stillLandedPullRequest(repoPath, base, evidence.ref, `the cited PR ${evidence.ref}`, targetId);
+    if (moved) return moved;
+  }
+  return undefined;
 }
 
 /**
