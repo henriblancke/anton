@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { KILL_GRACE_ENV, MAX_OUTPUT_ENV, runShell, runVerifyGates } from "./shell";
+import { captureVerifyGates, KILL_GRACE_ENV, MAX_OUTPUT_ENV, runShell, runVerifyGates } from "./shell";
 import type { VerifyGate } from "../projects";
 
 // runVerifyGates is the shared backstop (anton-3oh8) that both execute-epic and review-fix run
@@ -51,6 +51,52 @@ describe("runVerifyGates (anton-3oh8)", () => {
 
   it("is a no-op when there are no gates (unchanged behavior)", async () => {
     await expect(runVerifyGates([], dir, undefined, logPath, fail)).resolves.toBeUndefined();
+  });
+});
+
+// The reporting half the review gate hands to the reviewer instead of letting it run the suite
+// itself — the one suite run on this host that used to take no verify lock.
+describe("captureVerifyGates", () => {
+  let dir: string;
+  let logPath: string;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "anton-capture-gates-test-"));
+    logPath = join(dir, "session.log");
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reports every gate's command, exit and output when they all pass", async () => {
+    const gates: VerifyGate[] = [
+      { label: "tests", command: "echo tests-ran" },
+      { label: "lint", command: "echo lint-ran" },
+    ];
+    const out = await captureVerifyGates(gates, dir, undefined, logPath);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toMatchObject({ label: "tests", command: "echo tests-ran", ok: true, code: 0 });
+    expect(out[0].output).toContain("tests-ran");
+    expect(out[1]).toMatchObject({ label: "lint", ok: true });
+  });
+
+  it("RETURNS a red gate rather than throwing — a red tree at review time is a finding, not a crash", async () => {
+    const marker = join(dir, "capture-should-not-exist");
+    const gates: VerifyGate[] = [
+      { label: "tests", command: "true" },
+      { label: "lint", command: "echo boom >&2; exit 3" },
+      { label: "build", command: `touch ${marker}` },
+    ];
+    const out = await captureVerifyGates(gates, dir, undefined, logPath);
+    expect(out).toHaveLength(2); // stops at the red one, exactly where the throwing half stops
+    expect(out[1]).toMatchObject({ label: "lint", ok: false, code: 3 });
+    expect(out[1].output).toContain("boom");
+    expect(() => readFileSync(marker)).toThrow();
+  });
+
+  it("returns nothing for a project that pins no gates, without taking the lock", async () => {
+    await expect(captureVerifyGates([], dir, undefined, logPath)).resolves.toEqual([]);
   });
 });
 

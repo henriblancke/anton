@@ -17,6 +17,7 @@ import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { listDirBlobsAtRev, readFileAtRev, resolveRepoPath, type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
 import { labelValue } from "./review-fix-context";
+import type { VerifyGateOutcome } from "./shell";
 
 /** The project's own enforced rules, read at the base revision and inlined into the review context. */
 export const PRINCIPLES_PATH = ".product/principles.md";
@@ -36,6 +37,12 @@ export const INSTRUCTION_FILENAMES = ["CLAUDE.md", "AGENTS.md"];
 /** Bounds on inlined text, so one huge bead or rules file can't crowd out the diff. */
 const MAX_BEAD_FIELD_CHARS = 4000;
 const MAX_PRINCIPLES_CHARS = 8000;
+/**
+ * Per verify gate. Enough for a runner's failure list and its summary, which is all the reviewer
+ * needs from a check it did not have to run — and small enough that four green gates cannot crowd
+ * out the diff they are evidence about.
+ */
+const MAX_GATE_OUTPUT_CHARS = 3000;
 /**
  * Per instruction file, and across all of them — a deep tree can carry many.
  *
@@ -129,6 +136,12 @@ export interface ReviewRun {
    * round can settle them: restated ⇒ still true, omitted ⇒ the fix removed it.
    */
   carriedAdvisories?: ReviewFinding[];
+  /**
+   * The project's verify gates as anton ran them on THIS tree, immediately before the review.
+   * Absent (or empty) when the project pins no gates — the one case where the reviewer is still
+   * asked to find and run the checks itself.
+   */
+  verified?: VerifyGateOutcome[];
 }
 
 /** One instruction file inlined into the review context, with the path it came from. */
@@ -173,6 +186,8 @@ export async function buildReviewPrompt(args: {
   baseRev: string;
   /** Advisories still open from earlier rounds, for this review to restate or settle. */
   carriedAdvisories?: ReviewFinding[];
+  /** The gates anton already ran on this tree, so the reviewer never runs the suite itself. */
+  verified?: VerifyGateOutcome[];
 }): Promise<{ prompt: string; reviewer: ReviewerSource }> {
   const { target, tickets, diff, settings, projectDir, baseRev } = args;
   const config = resolveReviewConfig(settings);
@@ -204,7 +219,15 @@ export async function buildReviewPrompt(args: {
     "",
     "---",
     "",
-    reviewContext({ target, tickets, diff, principles, instructions, carriedAdvisories: args.carriedAdvisories }),
+    reviewContext({
+      target,
+      tickets,
+      diff,
+      principles,
+      instructions,
+      carriedAdvisories: args.carriedAdvisories,
+      verified: args.verified,
+    }),
   ].join("\n");
   return { prompt, reviewer };
 }
@@ -444,7 +467,8 @@ export function reviewContext(run: ReviewRun): string {
     ...diffSection(run.diff),
     ...principlesSection(run),
     ...carriedAdvisorySection(run.carriedAdvisories ?? []),
-    ...readOnlySection(),
+    ...verifiedGatesSection(run.verified ?? []),
+    ...readOnlySection(run.verified ?? []),
     ...reportingFormatSection(),
   ]
     .join("\n")
@@ -780,7 +804,7 @@ function carriedAdvisorySection(advisories: ReviewFinding[]): string[] {
  * repairs what it finds and then reports clean would ship its verdict and lose its fix — the branch
  * anton pushes is the one it just judged, and the gate discards any edit made under a review.
  */
-function readOnlySection(): string[] {
+function readOnlySection(verified: VerifyGateOutcome[]): string[] {
   return [
     `## This review is READ-ONLY`,
     ``,
@@ -792,10 +816,76 @@ function readOnlySection(): string[] {
     `the review is discarded as a protocol violation, which parks the run for a human. The editing`,
     `tools and \`git\` are blocked outright for this session — a ref you write leaves the worktree`,
     `byte-identical, so it is denied rather than detected. Everything you would reach for git is`,
-    `already above: the diff, the changed-file list, and the beads. Reading, searching, and running`,
-    `the project's own read-only checks (tests, type-check, lint) is expected — just leave the tree`,
-    `exactly as you found it.`,
+    `already above: the diff, the changed-file list, and the beads. Reading and searching are`,
+    `expected — just leave the tree exactly as you found it.`,
     ``,
+    ...(verified.length > 0
+      ? [
+          `Running the project's checks is NOT: they were run for you, above. Re-run at most one`,
+          `targeted test to settle one question, in the FOREGROUND. See that section for why.`,
+        ]
+      : [
+          `This project pins no verify gates, so running its own read-only checks (tests, type-check,`,
+          `lint) is expected too. Run them in the FOREGROUND — see the reporting rules below, and do`,
+          `not background anything.`,
+        ]),
+    ``,
+  ];
+}
+
+/**
+ * The checks anton ALREADY ran, and the instruction not to run them again (anton-3jwh's fallout).
+ *
+ * The reviewer used to be told that running the project's checks "is expected", with nothing said
+ * about how. It is the last agent in the pipeline, so it reaches the machine at its busiest — and
+ * the suite it reached for was the one run on this host that took no verify-gate lock. What that
+ * produced, repeatedly, was a reviewer that backgrounded the integration suite, waited, and ended
+ * its turn to wait for a completion notification a headless session can never receive: no report,
+ * a `no-report` protocol violation, and a finished run parked for a human.
+ *
+ * So the gates come to it as evidence instead. Each gate's output is TAILED, not headed: a runner
+ * prints its failures and its summary last, and the head of a suite log is the part that says
+ * nothing.
+ */
+function verifiedGatesSection(verified: VerifyGateOutcome[]): string[] {
+  if (verified.length === 0) return [];
+  const red = verified.filter((g) => !g.ok);
+  return [
+    `## The checks anton already ran`,
+    ``,
+    `anton ran this project's verify gates on exactly the tree you are reviewing, immediately before`,
+    `this review, under a host-wide lock that serializes suite runs across every job on this machine.`,
+    `You do not need to run them, and should not: the suite is the slowest thing here, a second copy`,
+    `competes with whichever run holds that lock, and your own run of it would hold no lock at all.`,
+    ``,
+    ...verified.map(
+      (g) => `- **${g.label}** — \`${g.command}\` — ${g.ok ? `passed` : `FAILED (exit ${g.code ?? "?"})`}`,
+    ),
+    ``,
+    ...(red.length > 0
+      ? [
+          `A gate above FAILED. That is a blocking finding — the work is not fit for a PR while a`,
+          `pinned gate is red — unless the diff shows the failure is pre-existing and untouched by`,
+          `this run. Say which in your rationale either way.`,
+          ``,
+        ]
+      : [
+          `Every gate passed. That is evidence the work RUNS, not evidence it is correct or that it`,
+          `meets its Acceptance criteria — a green suite that never tested the new behavior is`,
+          `exactly the case your contract asks you to catch. Judge the tests in the diff, not the`,
+          `exit code.`,
+          ``,
+        ]),
+    `The tail of each gate's output follows. The full output is in this session's log.`,
+    ``,
+    ...verified.flatMap((g) => [
+      `### ${g.label} — \`${g.command}\``,
+      ``,
+      "```",
+      tailLines(g.output, MAX_GATE_OUTPUT_CHARS),
+      "```",
+      ``,
+    ]),
   ];
 }
 
@@ -835,6 +925,15 @@ function reportingFormatSection(): string[] {
     `trailing text — a closing remark, a correction, a retraction — is a protocol violation and parks`,
     `the run, because anton cannot tell a courtesy sign-off from a verdict you just took back. If you`,
     `change your mind, emit a new report block last; do not amend one in prose.`,
+    ``,
+    `Report BEFORE you wait. This session is headless and single-shot: ending your turn ends it.`,
+    `A backgrounded command's completion notification will never reach you — there is no turn left`,
+    `for it to arrive in — so a final message saying you will report once the suite lands IS your`,
+    `report, and anton reads it as a review that never reported and parks the run for a human. Never`,
+    `end a turn waiting on a background task. Run what you need in the foreground, and if something`,
+    `is genuinely unfinished when you must answer, score what you did read and say so in the`,
+    `rationale: a scored review naming what it could not check is worth everything to the founder,`,
+    `and a promise to report later is worth nothing.`,
     ``,
     `Use "blocking" only for work that fails a stated Acceptance criterion, is wrong or unsafe, or`,
     `reaches green by weakening a check — anton fixes every blocking finding before the PR opens.`,
@@ -910,6 +1009,22 @@ function truncate(text: string, max: number): string {
   const trimmed = text.trim();
   if (trimmed.length <= max) return trimmed;
   return `${trimmed.slice(0, max)}${TRUNCATION_MARKER}`;
+}
+
+/**
+ * The LAST `max` characters, cut on a line boundary — the opposite end from {@link truncate}.
+ *
+ * A test runner prints its failures and its totals last and its progress dots first, so keeping the
+ * head of a suite log keeps the part that says nothing. Cutting mid-line would leave a half-written
+ * path that reads as a real one, so the cut moves forward to the next newline.
+ */
+function tailLines(text: string, max: number): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "(no output)";
+  if (trimmed.length <= max) return trimmed;
+  const cut = trimmed.length - max;
+  const nl = trimmed.indexOf("\n", cut);
+  return `… [earlier output omitted]\n${trimmed.slice(nl === -1 ? cut : nl + 1)}`;
 }
 
 /** True iff `f` is a usable finding: a known severity and a note a fixer can act on. */

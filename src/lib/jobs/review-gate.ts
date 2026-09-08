@@ -40,7 +40,7 @@ import {
   type ReviewerSource,
 } from "./review-context";
 import type { JobContext } from "./runner";
-import { runVerifyGates } from "./shell";
+import { captureVerifyGates, type VerifyGateOutcome } from "./shell";
 
 /** One review (and the fix it dispatched, if any) — the record the call-site persists per round. */
 export interface ReviewRound {
@@ -278,6 +278,12 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
    * here is handed what that gate left rather than starting blind (see {@link ReviewGateArgs.carried}).
    */
   let carried: ReviewFinding[] = args.carried ?? [];
+  /**
+   * Gate evidence still valid for the tree the next round will read. Undefined on round 1 (the
+   * review session runs them), then carried from each fix session, which already runs the gates on
+   * exactly the content it commits — so a converging review never runs the suite twice per round.
+   */
+  let verified: VerifyGateOutcome[] | undefined;
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();
@@ -301,6 +307,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       claude,
       readState,
       restoreState,
+      verified,
     });
     reviewer = review.reviewer;
 
@@ -369,6 +376,9 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     });
     entry.fixSessionId = fix.sessionId;
     entry.fixCommitted = fix.committed;
+    // The fix ran the gates on what it committed, so the next round is handed that evidence rather
+    // than re-running the suite to learn the same thing.
+    verified = fix.verified;
 
     // Nothing changed: the next review would read the identical diff and report the identical
     // findings. Stop and let the call-site decide, rather than burning the remaining rounds.
@@ -430,7 +440,18 @@ async function runReviewSession(args: {
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
-}): Promise<{ sessionId: string; reviewer: ReviewerSource; report: ReviewReportResult }> {
+  /**
+   * Gate evidence already fresh for this tree — the previous round's fix session ran them after its
+   * repair. Absent on round 1, and after any round whose evidence a commit has since invalidated:
+   * this session then runs them itself.
+   */
+  verified?: VerifyGateOutcome[];
+}): Promise<{
+  sessionId: string;
+  reviewer: ReviewerSource;
+  report: ReviewReportResult;
+  verified: VerifyGateOutcome[];
+}> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, round, maxRounds, claude } = args;
 
   const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
@@ -442,7 +463,7 @@ async function runReviewSession(args: {
   ctx.report({ sessionId, cwd: worktreePath });
 
   try {
-    const before = await settleBaseline({
+    const settled = await settleBaseline({
       worktreePath,
       logPath,
       round,
@@ -450,6 +471,17 @@ async function runReviewSession(args: {
       readState: args.readState,
       restoreState: args.restoreState,
     });
+
+    // The project's gates, run HERE rather than by the reviewer (anton-3jwh's fallout): under the
+    // host-wide verify lock, on the settled tree, with their output handed to the reviewer as
+    // evidence. A reviewer left to run the suite itself takes no lock, so it competes with every
+    // run anton is serializing — and the loser backgrounds the suite and ends its turn waiting for
+    // a notification a headless session cannot receive, which parks a finished run.
+    const verified =
+      args.verified ?? (await captureVerifyGates(resolveVerifyGates(settings), worktreePath, ctx.signal, logPath));
+    // Re-fingerprint AFTER them. A suite writes caches and coverage; that is anton's own residue,
+    // and attributing it to the reviewer would revert the report as a worktree-modified violation.
+    const before = args.verified ? settled : await args.readState(worktreePath);
 
     try {
       const diff = await args.readDiff(worktreePath, args.baseRev);
@@ -464,6 +496,7 @@ async function runReviewSession(args: {
         // own diff could not have written, and that no commit landing on the base mid-review moves.
         baseRev: args.baseRev,
         carriedAdvisories: args.carried,
+        verified,
       });
       await appendSessionLog(
         logPath,
@@ -498,7 +531,7 @@ async function runReviewSession(args: {
       });
       await appendSessionLog(logPath, `[review] round ${round}/${maxRounds}: ${describeReport(report)}\n`);
       await endSession(db, clock, sessionId, "done");
-      return { sessionId, reviewer, report };
+      return { sessionId, reviewer, report, verified };
     } catch (e) {
       // Throws PoisonError of its own when the reviewer's COMMIT could not be reverted — the one case
       // where retrying this worktree is more dangerous than losing the original error's backoff.
@@ -734,7 +767,7 @@ async function runGateFixSession(args: {
   commit: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
-}): Promise<{ sessionId: string; committed: boolean }> {
+}): Promise<{ sessionId: string; committed: boolean; verified: VerifyGateOutcome[] }> {
   const { db, clock, ctx, projectId, runId, target, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
 
@@ -795,13 +828,16 @@ async function runGateFixSession(args: {
         );
       }
 
-      await runVerifyGates(
-        resolveVerifyGates(settings),
-        worktreePath,
-        ctx.signal,
-        logPath,
-        (gate, code) => `${gate.label} gate failed after review round ${round} for ${target.id} (exit ${code})`,
-      );
+      // Captured, not merely enforced: these gates run on exactly the content committed below, so
+      // they are also the evidence the NEXT round's reviewer is handed — which is what spares that
+      // reviewer from running the suite again to learn what this session just learned.
+      const gates = await captureVerifyGates(resolveVerifyGates(settings), worktreePath, ctx.signal, logPath);
+      const red = gates.find((g) => !g.ok);
+      if (red) {
+        throw new Error(
+          `${red.label} gate failed after review round ${round} for ${target.id} (exit ${red.code})`,
+        );
+      }
 
       const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`);
       verified = true;
@@ -817,7 +853,7 @@ async function runGateFixSession(args: {
             : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
       );
       await endSession(db, clock, sessionId, "done");
-      return { sessionId, committed: committed || selfCommitted };
+      return { sessionId, committed: committed || selfCommitted, verified: gates };
     } catch (e) {
       // Gates run before the commit so a failure leaves the fix uncommitted — unless the fixer
       // committed its own work first, which project instructions routinely tell an agent to do. Then

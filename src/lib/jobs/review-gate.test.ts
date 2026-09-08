@@ -4,13 +4,14 @@
  * in-memory anton.db) so "each review and each fix is its own recorded session" is asserted on the
  * rows the UI reads, not on a spy.
  *
- * The verify gates are deliberately left unconfigured here: `runVerifyGates` takes the host-wide
- * verify-gate lock and shells out, which belongs to the execute-epic integration suite (anton-omum),
- * not to a loop test.
+ * The verify gates are left unconfigured in most cases here: running a real suite belongs to the
+ * execute-epic integration suite (anton-omum), not to a loop test. The exception is the block at the
+ * bottom, which pins a trivial `echo` gate — the gate evidence the reviewer is handed is loop
+ * behavior (which session runs the gates, and how often), so it is asserted where the loop is.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { asc } from "drizzle-orm";
@@ -1178,5 +1179,59 @@ describe("runReviewGate — the base is pinned to the fork point", () => {
 
     // And no reviewer was dispatched on the half-read rulebook.
     expect(calls).toEqual([]);
+  });
+});
+
+/**
+ * The gates the REVIEWER is handed instead of running (anton-3jwh's fallout). A trivial `echo` gate
+ * stands in for the project's suite: what is under test is which session runs the gates and how
+ * often, not what they do.
+ */
+describe("verify-gate evidence", () => {
+  it("runs the project's gates in the review session and hands the reviewer their output", async () => {
+    const { result, calls } = gate([report(9, [])], { testCommand: "echo unit-suite-green" });
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    expect(calls[0].prompt).toContain("The checks anton already ran");
+    expect(calls[0].prompt).toContain("`echo unit-suite-green`");
+    // The reviewer reads the result rather than re-deriving it — the whole point of running it here.
+    expect(calls[0].prompt).toContain("unit-suite-green");
+  });
+
+  it("runs the gates ONCE per tree, reusing the fix session's run for the next round", async () => {
+    const counter = join(dir, "gate-runs");
+    const { result } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { testCommand: `echo ran >> ${counter}` },
+      [true],
+    );
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    // Round 1's review ran them, then the fix session ran them on what it committed. Round 2 is
+    // handed that evidence: a third run would be the suite twice on one tree, which is the
+    // contention this whole change exists to remove.
+    expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  it("tells a reviewer with no gates to run the checks itself, in the foreground", async () => {
+    const { result, calls } = gate([report(9, [])]);
+    await expect(result).resolves.toMatchObject({ outcome: "clean" });
+    expect(calls[0].prompt).not.toContain("The checks anton already ran");
+    expect(calls[0].prompt).toContain("This project pins no verify gates");
+  });
+
+  it("does not blame the reviewer for the cache a gate wrote — the baseline is taken after them", async () => {
+    // The tree is clean until the gate runs and then carries what the gate left behind. That
+    // residue is anton's, not the reviewer's: fingerprinting before the gates would read it as a
+    // reviewer that edited the code it was judging and reject a perfectly good report.
+    const sentinel = join(dir, "cache-the-gate-wrote");
+    const worktree = fakeWorktree();
+    const dirty = {
+      ...worktree,
+      readState: async () => {
+        const state = await worktree.readState();
+        return existsSync(sentinel) ? { ...state, status: "?? .cache/vitest/results.json" } : state;
+      },
+    };
+    const { result } = gate([report(9, [])], { testCommand: `touch ${sentinel}` }, [], dirty);
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
   });
 });

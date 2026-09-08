@@ -45,6 +45,72 @@ const diff: BranchDiff = {
   truncated: false,
 };
 
+// anton-3jwh's fallout: the reviewer is the last agent in the pipeline and the only one that ran
+// the suite outside the host verify lock. It is handed the gate results now, and told the two
+// things nobody had told it: don't re-run the suite, and never end a turn waiting on one.
+describe("reviewContext verify-gate evidence", () => {
+  const green = [
+    { label: "tests", command: "vitest run", ok: true, code: 0, output: "Tests  412 passed (412)" },
+    { label: "lint", command: "eslint", ok: true, code: 0, output: "" },
+  ];
+
+  it("hands over the gates anton ran, with their commands and output, and forbids re-running them", () => {
+    const out = reviewContext({ target: epic, tickets: [ticket], diff, verified: green });
+    expect(out).toContain("The checks anton already ran");
+    expect(out).toContain("`vitest run`");
+    expect(out).toContain("Tests  412 passed (412)");
+    expect(out).toContain("host-wide lock");
+    expect(out).toMatch(/do not need to run them, and should not/);
+    // And the read-only section no longer asks for the suite it was just handed.
+    expect(out).toMatch(/Running the project's checks is NOT/);
+  });
+
+  it("does not let a green suite stand in for meeting the contract", () => {
+    const out = reviewContext({ target: epic, tickets: [ticket], diff, verified: green });
+    expect(out).toMatch(/evidence the work RUNS, not evidence it is correct/);
+  });
+
+  it("names a red gate as blocking rather than leaving the reviewer to discover it", () => {
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff,
+      verified: [{ label: "tests", command: "vitest run", ok: false, code: 1, output: "1 failed" }],
+    });
+    expect(out).toContain("FAILED (exit 1)");
+    expect(out).toMatch(/That is a blocking finding/);
+  });
+
+  it("keeps the TAIL of a long gate log — where a runner puts its failures and totals", () => {
+    const output = `${"progress dot line\n".repeat(500)}FAILED: the last line that matters`;
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff,
+      verified: [{ label: "tests", command: "vitest run", ok: true, code: 0, output }],
+    });
+    expect(out).toContain("FAILED: the last line that matters");
+    expect(out).toContain("[earlier output omitted]");
+  });
+
+  it("still asks the reviewer to run the checks when the project pins no gates", () => {
+    const out = reviewContext({ target: epic, tickets: [ticket], diff });
+    expect(out).not.toContain("The checks anton already ran");
+    expect(out).toMatch(/This project pins no verify gates/);
+    expect(out).toMatch(/Run them in the FOREGROUND/);
+  });
+
+  it("tells every reviewer that ending the turn ends the session — the no-report failure", () => {
+    // Stated with the report protocol, not the gates, so it holds for a project with no gates too.
+    for (const verified of [green, undefined]) {
+      const out = reviewContext({ target: epic, tickets: [ticket], diff, verified });
+      expect(out).toContain("Report BEFORE you wait");
+      expect(out).toMatch(/headless and single-shot/);
+      expect(out).toMatch(/Never\s+end a turn waiting on a background task/);
+    }
+  });
+});
+
 describe("reviewContext", () => {
   it("states the run, its beads' Goal/Acceptance, the diff and the report format", () => {
     const out = reviewContext({ target: epic, tickets: [ticket], diff });
