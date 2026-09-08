@@ -41,6 +41,7 @@ import {
   readCommitNaming,
   readCommitReach,
   readPullRequestMerge,
+  readPullRequestNaming,
   type PullRequestState,
 } from "../git/ops";
 import {
@@ -75,8 +76,13 @@ const KLASS = "already-shipped" as const;
  */
 const SHA_PATTERN = /(?<![\w-])[0-9a-fA-F]{7,40}(?![\w-])/g;
 
-/** A pull request as it appears in prose — `#85`, `PR #85`, or any github `…/pull/85` url. */
-const PR_PATTERN = /(?:#|\/pull\/)(\d+)/g;
+/**
+ * A pull request as it appears in prose — `#85`, `PR #85`, or a `https://…/<owner>/<repo>/pull/85`
+ * url. The url's repository is captured whole with the number (PR #238 review): `gh pr view` reads
+ * a bare number in the CURRENT repository, so a url pointing at another one reduced to its number
+ * would be checked against whatever PR this repository happens to hold under it.
+ */
+const PR_PATTERN = /\bhttps?:\/\/[^\s/]+\/[^\s/]+\/[^\s/]+\/pull\/(\d+)\b|#(\d+)\b/g;
 
 /** Every commit the reason cites, lower-cased and de-duplicated in the order written. */
 export function claimedCommits(reason: string | undefined): string[] {
@@ -85,13 +91,15 @@ export function claimedCommits(reason: string | undefined): string[] {
 }
 
 /**
- * Every PR the reason cites, as the `gh-<n>` ref beads uses — the same form
- * {@link readPullRequestLanding} takes, so a PR named in prose and one read off a bead are checked
- * by one code path.
+ * Every PR the reason cites, in the form {@link readPullRequestLanding} takes — so a PR named in
+ * prose and one read off a bead are checked by one code path. A bare number becomes the `gh-<n>`
+ * ref beads uses; a url stays a url, which `gh` resolves in the repository it names. That is what
+ * fails a citation of another repository's PR closed: its merge commit is one this repository has
+ * never seen, so it never reaches the run's base.
  */
 export function claimedPullRequests(reason: string | undefined): string[] {
   if (!reason) return [];
-  return [...new Set([...reason.matchAll(PR_PATTERN)].map((m) => `gh-${m[1]}`))];
+  return [...new Set([...reason.matchAll(PR_PATTERN)].map((m) => (m[2] ? `gh-${m[2]}` : m[0])))];
 }
 
 /**
@@ -125,7 +133,10 @@ export type BeadLanding =
   | { via: "commit"; sha: string }
   /** The bead's own PR is merged. */
   | { via: "pr"; ref: string }
-  /** The bead is closed and the PR of the run target it rides is merged. */
+  /**
+   * The bead is closed, the PR of the run target it rides is merged, and a commit GitHub records
+   * in that PR names the bead — the PR carried it, whatever the board says of its parentage now.
+   */
   | { via: "owner-pr"; ownerId: string; ref: string };
 
 /**
@@ -396,6 +407,12 @@ function citesSame(a: CitedEvidence, b: CitedEvidence): boolean {
  * the bead (local, and the shape anton's own commits and squash bodies take), the bead's own PR
  * merged, or the merged PR of the run target it rides — which is where a child's work actually
  * lands, since the child carries no PR ref of its own.
+ *
+ * The last of those is held to more than the parentage the board shows NOW (PR #238 review). A bead
+ * re-homed under a feature after that feature's PR merged rides it today and was carried by nothing
+ * of it: the PR could not have held work that was filed elsewhere when it merged. So the PR has to
+ * say so itself — one of the commits GitHub records for it names the bead — and a merged owner PR
+ * whose commit list never mentions the bead proves nothing for it.
  */
 async function closedBeadLanding(args: {
   repoPath: string;
@@ -448,12 +465,31 @@ async function closedBeadLanding(args: {
   if (owner && ownerPr) {
     const landing = await readPr(ownerPr);
     if (landing.landed) {
-      return {
-        landing: { via: "owner-pr", ownerId: owner.id, ref: ownerPr },
-        proof:
-          `\`${id}\` is closed on the board and the PR of \`${owner.id}\`, the run target it ` +
-          `rides, (${ownerPr}) is merged${landedTail(base, landing)}`,
-      };
+      const rides = `\`${id}\` is closed on the board and the PR of \`${owner.id}\`, the run target it rides, (${ownerPr})`;
+      const carried = await readPullRequestNaming(repoPath, ownerPr, id);
+      switch (carried.state) {
+        case "found":
+          return {
+            landing: { via: "owner-pr", ownerId: owner.id, ref: ownerPr },
+            proof:
+              `${rides} is merged${landedTail(base, landing)}, and GitHub records commit ` +
+              `\`${carried.sha.slice(0, 10)}\` in that PR naming it`,
+          };
+        case "none":
+          return {
+            why:
+              `${rides} is merged, but none of the commits GitHub records for that PR names ` +
+              `\`${id}\` — the board says it rides \`${owner.id}\` now, and nothing says it did ` +
+              `when that PR merged, so the PR is not evidence its work landed`,
+          };
+        case "unreadable":
+          return {
+            why:
+              `${rides} is merged, but whether a commit in that PR names \`${id}\` could not be ` +
+              `read (${carried.detail}) — whether that PR carried its work is exactly what the ` +
+              `claim rests on`,
+          };
+      }
     }
     return {
       why:

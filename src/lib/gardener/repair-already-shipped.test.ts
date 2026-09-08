@@ -108,15 +108,17 @@ interface Sandbox {
   /** A commit on a branch `main` does not contain. */
   unmerged: string;
   /**
-   * What gh answers for a PR. A MERGED one names the commit that merged it and the branch it merged
-   * into — `landed` into `main` unless the case says otherwise, since the check places the merge in
-   * the base's history rather than taking the state's word for it (PR #238 review). `commit: null`
-   * is a gh that names no merge commit at all.
+   * What gh answers for a PR — keyed by the selector `gh pr view` is handed, a number or a url. A
+   * MERGED one names the commit that merged it and the branch it merged into — `landed` into `main`
+   * unless the case says otherwise, since the check places the merge in the base's history rather
+   * than taking the state's word for it (PR #238 review). `commit: null` is a gh that names no merge
+   * commit at all. `carries` is the PR's own commit list as GitHub records it — the messages, given
+   * oids by {@link carriedOid} — which is what vouches for a closed child the base names nowhere.
    */
   setPr: (
-    number: number,
+    selector: number | string,
     state: "OPEN" | "MERGED" | "CLOSED",
-    merge?: { commit?: string | null; base?: string },
+    merge?: { commit?: string | null; base?: string; carries?: string[] },
   ) => void;
   /** Everything a write would move: refs, HEAD, the index and the working tree. */
   repoFingerprint: () => string;
@@ -150,7 +152,15 @@ function openSandbox(): Sandbox {
   const unmerged = g(["rev-parse", "HEAD"]);
   g(["checkout", "-q", "main"]);
 
-  const prStates: Record<string, { state: string; mergeCommit: { oid: string } | null; baseRefName: string }> = {};
+  const prStates: Record<
+    string,
+    {
+      state: string;
+      mergeCommit: { oid: string } | null;
+      baseRefName: string;
+      commits: { oid: string; messageHeadline: string; messageBody: string }[];
+    }
+  > = {};
   const stateFile = join(dir, "pr-states.json");
   writeFileSync(stateFile, "{}");
   const fakeGh = join(binDir, "gh");
@@ -178,12 +188,20 @@ process.stdout.write(JSON.stringify(pr));
     repo,
     landed,
     unmerged,
-    setPr: (number, state, merge = {}) => {
+    setPr: (selector, state, merge = {}) => {
       const commit = state === "MERGED" ? (merge.commit === undefined ? landed : merge.commit) : null;
-      prStates[String(number)] = {
+      prStates[String(selector)] = {
         state,
         mergeCommit: commit ? { oid: commit } : null,
         baseRefName: merge.base ?? "main",
+        commits: (merge.carries ?? []).map((message, i) => {
+          const nl = message.indexOf("\n");
+          return {
+            oid: carriedOid(i),
+            messageHeadline: nl < 0 ? message : message.slice(0, nl),
+            messageBody: nl < 0 ? "" : message.slice(nl + 1),
+          };
+        }),
       };
       writeFileSync(stateFile, JSON.stringify(prStates));
     },
@@ -196,6 +214,9 @@ process.stdout.write(JSON.stringify(pr));
     },
   };
 }
+
+/** The oid the fake gh gives the i-th commit a PR carries (`setPr`'s `carries`). */
+const carriedOid = (i: number) => (i + 1).toString(16).padStart(40, "0");
 
 /** How a proof line ends for a PR whose merge the base contains — the evidence, not the state. */
 const mergedTail = (sha: string) =>
@@ -254,6 +275,28 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
 
     expect(verdict.state).toBe("unverified");
     expect(verdict).toMatchObject({ why: expect.stringContaining("does not contain it") });
+  });
+
+  // A PR url is handed to gh WHOLE (PR #238 review), so the repository it names is the one read —
+  // never this repository's PR of the same number, whatever state that one is in.
+  it("checks a PR url in the repository it names, not this repository's PR of that number", async () => {
+    setPr(85, "MERGED");
+    const url = "https://github.com/someone-else/theirs/pull/85";
+    setPr(url, "MERGED", { commit: "f".repeat(40) });
+
+    const verdict = await verify(`shipped in ${url}`, [bead(TARGET)]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({
+      why: expect.stringContaining(`the claim names PR ${url}, which is merged, and its merge commit`),
+    });
+    expect(verdict).toMatchObject({ why: expect.stringContaining("this repository has never seen") });
+
+    const unread = await verify("shipped in https://github.com/someone-else/theirs/pull/86", [bead(TARGET)]);
+    expect(unread).toMatchObject({
+      state: "unverified",
+      why: expect.stringContaining("could not read its state"),
+    });
   });
 
   it("refuses a commit this repository has never seen, without fetching", async () => {
@@ -334,8 +377,8 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     });
   });
 
-  it("verifies a closed child through the MERGED pull request of the feature it rides", async () => {
-    setPr(85, "MERGED");
+  it("verifies a closed child through the MERGED pull request of the feature it rides, when that PR's commits name it", async () => {
+    setPr(85, "MERGED", { carries: ["feat: unrelated", `${UNLANDED}: the child's own commit`] });
     const feature = bead(OWNER, { issue_type: "feature", status: "closed", metadata: { pr: "gh-85" } });
     const child = bead(UNLANDED, { status: "closed" });
     (child as unknown as Record<string, unknown>).parent = OWNER;
@@ -346,11 +389,45 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       state: "verified",
       proof: [
         `\`${UNLANDED}\` is closed on the board and the PR of \`${OWNER}\`, the run target it ` +
-          `rides, (gh-85) is merged${mergedTail(landed)}`,
+          `rides, (gh-85) is merged${mergedTail(landed)}, and GitHub records commit ` +
+          `\`${carriedOid(1).slice(0, 10)}\` in that PR naming it`,
       ],
       landed: { [UNLANDED]: { via: "owner-pr", ownerId: OWNER, ref: "gh-85" } },
       cited: [{ kind: "pr", ref: "gh-85" }],
     });
+  });
+
+  // Parentage is read off the board NOW (PR #238 review): a bead re-homed under a feature after
+  // that feature's PR merged rides it today and was carried by nothing of it. The PR's own commit
+  // list is GitHub's record of what it held, and a merged owner PR that never named the bead is no
+  // evidence for it — whatever another closed child of the same feature would prove.
+  it("refuses a closed child whose feature's merged PR never carried a commit naming it", async () => {
+    setPr(85, "MERGED", { carries: ["anton-sibl: a sibling that did ride this PR"] });
+    const feature = bead(OWNER, { issue_type: "feature", status: "closed", metadata: { pr: "gh-85" } });
+    const child = bead(UNLANDED, { status: "closed" });
+    (child as unknown as Record<string, unknown>).parent = OWNER;
+
+    const verdict = await verify(`already done by ${UNLANDED}`, [bead(TARGET), feature, child]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({
+      why: expect.stringContaining(
+        `(gh-85) is merged, but none of the commits GitHub records for that PR names \`${UNLANDED}\``,
+      ),
+    });
+    expect(verdict).toMatchObject({ why: expect.stringContaining("nothing says it did when that PR merged") });
+  });
+
+  it("refuses a closed child through a merged owner PR whose commit list a dotted child of it names, not it", async () => {
+    setPr(85, "MERGED", { carries: [`${UNLANDED}.1: the child's child`] });
+    const feature = bead(OWNER, { issue_type: "feature", status: "closed", metadata: { pr: "gh-85" } });
+    const child = bead(UNLANDED, { status: "closed" });
+    (child as unknown as Record<string, unknown>).parent = OWNER;
+
+    const verdict = await verify(`already done by ${UNLANDED}`, [bead(TARGET), feature, child]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({ why: expect.stringContaining("none of the commits GitHub records") });
   });
 
   it("verifies a closed bead through its own merged pull request", async () => {
@@ -557,10 +634,15 @@ describe("what a claim NAMES", () => {
     expect(claimedCommits("anton-deadbee shipped abc-1234567 in 9c515")).toEqual([]);
   });
 
-  it("reads PRs as the `gh-<n>` ref, from a number or a url, deduped", () => {
+  // A url keeps its repository (PR #238 review): reduced to `gh-85`, another repository's PR would
+  // be read as whatever this one holds under that number.
+  it("reads a bare number as the `gh-<n>` ref and keeps a url whole, deduped", () => {
     expect(
-      claimedPullRequests("PR #85, also https://github.com/o/r/pull/85 and #12"),
-    ).toEqual(["gh-85", "gh-12"]);
+      claimedPullRequests("PR #85, also https://github.com/o/r/pull/85 (#85 again) and #12"),
+    ).toEqual(["gh-85", "https://github.com/o/r/pull/85", "gh-12"]);
+    expect(claimedPullRequests("see https://github.com/o/r/pull/85/files and https://github.com/o/r/pull/85#issuecomment-1")).toEqual([
+      "https://github.com/o/r/pull/85",
+    ]);
     expect(claimedPullRequests(undefined)).toEqual([]);
   });
 });
@@ -1233,8 +1315,8 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       retire({ block: { reason: `Already implemented by ${UNLANDED}` }, board: viaOwner() });
 
     beforeEach(() => {
-      setPr(85, "MERGED");
-      setPr(90, "MERGED");
+      setPr(85, "MERGED", { carries: [`${UNLANDED}: the survivor's commit`] });
+      setPr(90, "MERGED", { carries: [`${UNLANDED}: the survivor's commit`] });
       loadAllIssuesMock.mockResolvedValue(viaOwner());
       showMock.mockImplementation(async (_cwd, id) => viaOwner().find((b) => b.id === id)!);
     });
@@ -1247,7 +1329,8 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
         replacementId: UNLANDED,
         proof: [
           `\`${UNLANDED}\` is closed on the board and the PR of \`${OWNER}\`, the run target it ` +
-            `rides, (gh-85) is merged${mergedTail(sb.landed)}`,
+            `rides, (gh-85) is merged${mergedTail(sb.landed)}, and GitHub records commit ` +
+            `\`${carriedOid(0).slice(0, 10)}\` in that PR naming it`,
         ],
       });
       expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);

@@ -33,6 +33,7 @@ import {
   pullRequestState,
   readFileAtRev,
   readPullRequestMerge,
+  readPullRequestNaming,
   readPathHistory,
   readWorktreeState,
   resolveFreshBase,
@@ -275,6 +276,7 @@ if(a[0]==='pr'&&a[1]==='view'){
   const oid=process.env.ANTON_TEST_PR_MERGE_OID;
   const out={state:st,mergeCommit:oid?{oid}:null};
   if(process.env.ANTON_TEST_PR_BASE)out.baseRefName=process.env.ANTON_TEST_PR_BASE;
+  if(process.env.ANTON_TEST_PR_COMMITS)out.commits=JSON.parse(process.env.ANTON_TEST_PR_COMMITS);
   process.stdout.write(JSON.stringify(out)+'\\n');process.exit(0);
 }
 process.exit(0);
@@ -298,6 +300,7 @@ process.exit(0);
     delete process.env.ANTON_TEST_PR_STATE;
     delete process.env.ANTON_TEST_PR_MERGE_OID;
     delete process.env.ANTON_TEST_PR_BASE;
+    delete process.env.ANTON_TEST_PR_COMMITS;
     rmSync(sandbox, { recursive: true, force: true });
   });
 
@@ -319,6 +322,38 @@ process.exit(0);
     expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({ state: "merged" });
     process.env.ANTON_TEST_PR_STATE = "__error__";
     expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({ state: "unknown" });
+  });
+
+  // The PR's own commit list is GitHub's record of what it carried — read for a closed bead the
+  // base names nowhere, so that the board's parentage today is not what vouches for it.
+  it("finds a bead named in one of the PR's recorded commits, as a whole token", async () => {
+    process.env.ANTON_TEST_PR_STATE = "MERGED";
+    process.env.ANTON_TEST_PR_COMMITS = JSON.stringify([
+      { oid: "b".repeat(40), messageHeadline: "anton-fade1: a longer id", messageBody: "" },
+      { oid: "c".repeat(40), messageHeadline: "anton-fade.1: the dotted child", messageBody: "" },
+      { oid: "d".repeat(40), messageHeadline: "feat: the subject", messageBody: "closes anton-fade." },
+    ]);
+    expect(await readPullRequestNaming(sandbox, "gh-42", "anton-fade")).toEqual({
+      state: "found",
+      sha: "d".repeat(40),
+    });
+    expect(await readPullRequestNaming(sandbox, "gh-42", "anton-fade.1")).toEqual({
+      state: "found",
+      sha: "c".repeat(40),
+    });
+    expect(await readPullRequestNaming(sandbox, "gh-42", "anton-x1e5")).toEqual({ state: "none" });
+  });
+
+  it("fails closed when gh cannot read the PR, names no commit list, or the ref names nothing", async () => {
+    process.env.ANTON_TEST_PR_STATE = "__error__";
+    expect(await readPullRequestNaming(sandbox, "gh-42", "anton-fade")).toMatchObject({ state: "unreadable" });
+    process.env.ANTON_TEST_PR_STATE = "MERGED";
+    expect(await readPullRequestNaming(sandbox, "gh-42", "anton-fade")).toMatchObject({
+      state: "unreadable",
+      detail: expect.stringContaining("no commit list"),
+    });
+    expect(await readPullRequestNaming(sandbox, "", "anton-fade")).toMatchObject({ state: "unreadable" });
+    expect(await readPullRequestNaming(sandbox, "gh-42", "not an id")).toMatchObject({ state: "unreadable" });
   });
 
   it("maps gh states to open / merged / closed, strips the gh- ref prefix", async () => {
@@ -544,6 +579,19 @@ suite("readCommitNaming (real git)", () => {
 
     expect(await readCommitNaming(repo, "anton-fade", "main")).toEqual({ state: "none" });
     expect(await readCommitNaming(repo, "anton-fade1", "main")).toMatchObject({ state: "found" });
+  });
+
+  // bd mints child ids as `<parent>.<n>`, so a commit naming the child has not said the parent
+  // landed (PR #238 review) — while a parent named ahead of a full stop has been.
+  it("does not let a dotted child's commit answer for its parent, but reads a sentence-final id", async () => {
+    g(["commit", "-q", "--allow-empty", "-m", "anton-fade.1: the child"]);
+
+    expect(await readCommitNaming(repo, "anton-fade", "main")).toEqual({ state: "none" });
+    expect(await readCommitNaming(repo, "anton-fade.1", "main")).toMatchObject({ state: "found" });
+
+    g(["commit", "-q", "--allow-empty", "-m", "feat: subject\n\nthis closes anton-fade."]);
+    const sha = g(["rev-parse", "HEAD"]);
+    expect(await readCommitNaming(repo, "anton-fade", "main")).toEqual({ state: "found", sha });
   });
 
   it("fails closed on a base git cannot resolve", async () => {

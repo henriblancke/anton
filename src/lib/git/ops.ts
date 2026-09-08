@@ -813,6 +813,9 @@ export async function readCommitReach(
   }
 }
 
+/** The shape a bead id takes — the gate both naming reads hold their input to before it reaches a regex. */
+const BEAD_ID = /^[A-Za-z0-9][\w.-]*$/;
+
 /** What `base`'s history says about a BEAD — see {@link readCommitNaming}. */
 export type CommitNaming =
   /** A commit `base` contains names the bead in its message: the work filed under it has landed. */
@@ -829,18 +832,17 @@ export type CommitNaming =
  * pull request is merged — so what proves the close is a commit the base actually contains.
  *
  * The whole MESSAGE, not the subject, because anton squash-merges: the tickets' own `<id>: …`
- * subjects survive only as lines in the squash commit's body. Matched as a standalone token, so
- * `anton-fade` does not answer for `anton-fade1`. Read as an ancestor walk from `base` and nothing
- * else — no fetch, for the reason {@link readCommitReach} gives.
+ * subjects survive only as lines in the squash commit's body. Matched as a standalone token
+ * ({@link beadNamedIn}), so `anton-fade` does not answer for `anton-fade1`, nor for its dotted child
+ * `anton-fade.1`. Read as an ancestor walk from `base` and nothing else — no fetch, for the reason
+ * {@link readCommitReach} gives.
  */
 export async function readCommitNaming(
   repoPath: string,
   beadId: string,
   base: string,
 ): Promise<CommitNaming> {
-  if (!/^[A-Za-z0-9][\w.-]*$/.test(beadId)) {
-    return { state: "unreadable", detail: `"${beadId}" is not a bead id` };
-  }
+  if (!BEAD_ID.test(beadId)) return { state: "unreadable", detail: `"${beadId}" is not a bead id` };
   let log: string;
   try {
     // `-F` keeps the id a literal. Commits are separated by NUL, since `%B` spans lines and a
@@ -859,7 +861,7 @@ export async function readCommitNaming(
   } catch (error) {
     return { state: "unreadable", detail: `${base}: ${describeGitFailure(error)}` };
   }
-  const named = new RegExp(`(?<![\\w-])${beadId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`);
+  const named = beadNamedIn(beadId);
   for (const entry of log.split("\0")) {
     // Split on the FIRST separator only — a body that itself carries `\x1f` must stay whole.
     const sepIdx = entry.indexOf("\x1f");
@@ -867,6 +869,62 @@ export async function readCommitNaming(
     const sha = entry.slice(0, sepIdx).trim();
     const message = entry.slice(sepIdx + 1);
     if (sha && named.test(message)) return { state: "found", sha };
+  }
+  return { state: "none" };
+}
+
+/**
+ * `beadId` as a standalone token in prose. The boundaries reject a longer id it is the head of
+ * (`anton-fade1`) and — because bd mints child ids by appending `.<n>` — a dotted child of it
+ * (`anton-fade.1`) (PR #238 review): a commit naming the child has not said the parent landed. A
+ * dot followed by nothing id-like is sentence punctuation, and the id still matches ahead of it.
+ */
+function beadNamedIn(beadId: string): RegExp {
+  return new RegExp(`(?<![\\w-])${beadId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-]|\\.\\w)`);
+}
+
+/**
+ * Does one of the commits GitHub records for a pull request name `beadId` in its message?
+ *
+ * The record behind the `already-shipped` check's answer for a closed bead that carries no PR of
+ * its own and that no commit in the base names (PR #238 review): the bead rides a run target whose
+ * PR merged, but the board's parentage is read NOW, and a bead re-homed under that target after the
+ * merge would pass on it. GitHub keeps the PR's own commit list — the `<id>: …` subjects anton
+ * committed for each ticket — whatever the squash's body was rewritten to and whatever the board
+ * says today, so that list is what proves the PR carried the bead.
+ *
+ * `unreadable` for anything short of an answer — no gh, an unreachable GitHub, a PR the ref does
+ * not name — so a caller fails closed rather than reading a network failure as "not carried".
+ */
+export async function readPullRequestNaming(
+  repoPath: string,
+  ref: string,
+  beadId: string,
+): Promise<CommitNaming> {
+  if (!BEAD_ID.test(beadId)) return { state: "unreadable", detail: `"${beadId}" is not a bead id` };
+  const selector = ref.startsWith("gh-") ? ref.slice(3) : ref;
+  if (!selector) return { state: "unreadable", detail: `"${ref}" names no pull request` };
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  let commits: unknown;
+  try {
+    const { stdout } = await execFileAsync(gh, ["pr", "view", selector, "--json", "commits"], {
+      cwd: repoPath,
+      timeout: 120_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    commits = (JSON.parse(stdout) as { commits?: unknown }).commits;
+  } catch (error) {
+    return { state: "unreadable", detail: `${ref}: ${describeGitFailure(error)}` };
+  }
+  if (!Array.isArray(commits)) {
+    return { state: "unreadable", detail: `${ref}: gh reported no commit list for the pull request` };
+  }
+  const named = beadNamedIn(beadId);
+  for (const entry of commits as { oid?: unknown; messageHeadline?: unknown; messageBody?: unknown }[]) {
+    const text = (v: unknown): string => (typeof v === "string" ? v : "");
+    const message = `${text(entry.messageHeadline)}\n${text(entry.messageBody)}`;
+    const oid = text(entry.oid);
+    if (/^[0-9a-f]{7,40}$/i.test(oid) && named.test(message)) return { state: "found", sha: oid };
   }
   return { state: "none" };
 }
