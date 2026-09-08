@@ -84,6 +84,14 @@ describe("validateReworkInput", () => {
     expect(() => validateReworkInput(input({ instructions: "-" }))).toThrow(ReworkInvalidError);
   });
 
+  it("refuses instructions that are only the formula's TODO placeholder with nothing attached", () => {
+    expect(() =>
+      validateReworkInput(
+        input({ instructions: "- [ ] TODO — a concrete, checkable statement of done" }),
+      ),
+    ).toThrow(ReworkInvalidError);
+  });
+
   it("lets marker-only instructions through when a finding is attached — the finding is the criterion", () => {
     const findings: ReviewFinding[] = [
       { severity: "blocking", location: "src/lib/rework.ts:12", note: "no null guard" },
@@ -231,6 +239,30 @@ describe("instructionCriteria", () => {
     ).toEqual(["[x].disabled must stay matched", "[ ]{2} is two spaces", "done"]);
   });
 
+  it("reads the formula's TODO placeholder as scaffolding, in every list shape it can be pasted in", () => {
+    // `- [ ] TODO — a concrete, checkable statement of done` is the acceptance box a bead is cooked
+    // with. lib/beads/contract.ts refuses a section holding only that as unwritten; boxing it here
+    // would file the very placeholder rubric that gate exists to refuse.
+    expect(
+      instructionCriteria(
+        [
+          "- [ ] TODO — a concrete, checkable statement of done",
+          "TODO — one sentence: what this delivers",
+          "1. TODO: fill in",
+          "* TODO - later",
+          "- - [ ] TODO – nested",
+          "[x] TODO—no space",
+        ].join("\n"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps an authored line that merely mentions a TODO — the prompt is anchored on its separator", () => {
+    expect(
+      instructionCriteria("- [ ] the TODO banner clears on save\nTODOs are listed in the readme"),
+    ).toEqual(["the TODO banner clears on save", "TODOs are listed in the readme"]);
+  });
+
   it("keeps a number too long to be an ordered marker — CommonMark stops at nine digits", () => {
     expect(instructionCriteria("1234567890) must remain supported\n999999999. is a marker")).toEqual([
       "1234567890) must remain supported",
@@ -260,5 +292,14 @@ describe("doneGap", () => {
     expect(doneGap("- -\n1. -\n- [ ] [ ]", [])).toMatch(/only list markers or rules/);
     expect(doneGap("---\nAdd the missing test.", [])).toBeNull();
     expect(doneGap("---", [finding])).toBeNull();
+  });
+
+  it("refuses instructions that are only the formula's TODO placeholder — a prompt, not a step", () => {
+    const placeholder = "- [ ] TODO — a concrete, checkable statement of done";
+    expect(doneGap(placeholder, [])).toMatch(/formula's TODO placeholder/);
+    expect(doneGap(`- \n${placeholder}\n---`, [])).not.toBeNull();
+    // A placeholder left beside a written step is the founder's call, as in the contract gate.
+    expect(doneGap(`${placeholder}\nAdd the missing test.`, [])).toBeNull();
+    expect(doneGap(placeholder, [finding])).toBeNull();
   });
 });

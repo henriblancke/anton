@@ -104,9 +104,9 @@ export function validateReworkInput(input: ReworkInput): ReworkRequest {
  *
  * A follow-up's acceptance is one box per instruction line and one per attached finding
  * ({@link followUpAcceptance}, lib/rework-notes.ts), and a reopen's note is the same text handed to
- * the implementer. Inputs that yield neither — instructions that are only list markers, with nothing
- * ticked — would file a bead whose one criterion is the generic findings-addressed line: a rubric no
- * review can score and no implementer can act on. Judged here, in the vocabulary both layers share,
+ * the implementer. Inputs that yield neither — instructions that are only list markers or the
+ * formula's TODO placeholder, with nothing ticked — would file a bead whose one criterion is the
+ * generic findings-addressed line: a rubric no review can score and no implementer can act on. Judged here, in the vocabulary both layers share,
  * so the dialog refuses before a bead is written and the route refuses the same request the same way.
  *
  * Only the ABSENCE of a step is judged. Whether a step is a good one is the founder's call.
@@ -114,9 +114,9 @@ export function validateReworkInput(input: ReworkInput): ReworkRequest {
 export function doneGap(instructions: string, findings: readonly ReviewFinding[]): string | null {
   if (instructionCriteria(instructions).length > 0 || findings.length > 0) return null;
   return (
-    "Nothing here says what done looks like: the fix instructions hold only list markers or rules " +
-    "and no finding is attached. Write at least one line an implementer can act on, or attach a " +
-    "finding."
+    "Nothing here says what done looks like: the fix instructions hold only list markers or rules, " +
+    "or the formula's TODO placeholder, and no finding is attached. Write at least one line an " +
+    "implementer can act on, or attach a finding."
   );
 }
 
@@ -143,10 +143,22 @@ const LIST_MARKER = /^(?:(?:[-*+•]|\d{1,9}[.)])(?:\s+|$))?(?:\[[ xX]\](?:\s+|$
 const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
 /**
+ * The bead formula's own prompt — `TODO — a concrete, checkable statement of done` — as
+ * lib/beads/contract.ts classifies it: an UNWRITTEN line, not an authored one. A founder who pastes a
+ * ticket's placeholder acceptance box and writes nothing over it has stated no step, and boxing it
+ * would file the same placeholder rubric the contract gate refuses to run. Judged on the text once
+ * every marker is shorn, so `- [ ] TODO —`, `1. TODO:` and bare `TODO -` read the same; anchored on
+ * the separator after `TODO`, so an authored line that merely mentions one ("the TODO banner clears")
+ * keeps its place.
+ */
+const PROMPT_LINE = /^TODO\s*[—–:-]/;
+
+/**
  * One criterion per non-blank instruction line, shorn of whatever list marker it was typed with.
  * Instruction lines arrive as the founder typed them — prose, `-`/`*` bullets, numbered steps, or
  * boxes already — so list markers are stripped rather than nested inside a second box. A line that
- * is only a rule ({@link THEMATIC_BREAK}) is scaffolding like a bare marker, and yields nothing.
+ * is only a rule ({@link THEMATIC_BREAK}) or the formula's prompt ({@link PROMPT_LINE}) is
+ * scaffolding like a bare marker, and yields nothing.
  */
 export function instructionCriteria(instructions: string): string[] {
   return instructions
@@ -159,14 +171,15 @@ export function instructionCriteria(instructions: string): string[] {
  * The line with every leading list marker stripped, or empty when nothing but scaffolding remains.
  * Markers nest — `- - `, `1. - `, `- [ ] [ ] ` — and shearing one layer can expose another bare
  * marker or a rule (`- - ---`), so each layer is judged as the line in full was: a rule yields
- * nothing, a marker is shorn and the remainder judged again.
+ * nothing, a marker is shorn and the remainder judged again. What is left once no marker remains is
+ * judged last against the formula's prompt, which is scaffolding in whichever list shape it arrived.
  */
 function shorn(line: string): string {
   let text = line.trim();
   for (;;) {
     if (THEMATIC_BREAK.test(text)) return "";
     const next = text.replace(LIST_MARKER, "");
-    if (next === text) return text;
+    if (next === text) return PROMPT_LINE.test(text) ? "" : text;
     text = next;
   }
 }
