@@ -74,6 +74,11 @@ describe("loadBaseSystemPrompt (real file)", () => {
     expect(base).toContain("ANTON-RESULT: needs-human — <one-line ask>");
     expect(base).toContain("ANTON-RESULT: satisfied — <commit sha> —");
     expect(base).toMatch(/report `satisfied` with the commit that already did the work/);
+    // The unchanged-tree rule must carve out the CONTINUATION exception (PR #255 review): a resume
+    // whose previous attempt's work is already on the branch reports `delivered`, so the locked
+    // contract can no longer forbid the one outcome the resume prompt and the delivery gate require.
+    expect(base).toContain("CONTINUATION of this");
+    expect(base).toMatch(/previous attempt at THIS ticket/);
   });
 });
 

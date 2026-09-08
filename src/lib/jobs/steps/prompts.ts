@@ -15,14 +15,26 @@ import { ANTON_REPO_URL } from "../../repo";
 import { findingLines, type ReviewFinding } from "../review-context";
 import type { SatisfiedSettlement, StepContext } from "./context";
 
+/** A ticket in scope whose previous attempt left preserved work on the branch (anton-16pq). */
+export interface TicketPreserved {
+  ticketId: string;
+  commit: PreservedCommit;
+}
+
 /**
  * What the `step:claude` agent is working ON: the run target, the tickets in scope, and the worktree
  * it is already in. The operating contract (git/beads ownership, scope, fail-loud, the
  * `ANTON-RESULT` line) lives in the system prompt, so it isn't repeated here.
+ *
+ * `preserved` is any preserved-work continuation for the tickets in scope. A formula may run a
+ * generic step BEFORE `step:implement` (PR #255 review), so on resume this step — not the
+ * implementer — is dispatched first onto a timed-out attempt's commits; it must be told they exist
+ * or it can revert or re-do them before the implementer ever sees them.
  */
 export function stepTaskBlock(
   ctx: Pick<StepContext, "target" | "tickets" | "branch" | "baseBranch">,
   stepId: string,
+  preserved: TicketPreserved[] = [],
 ): string {
   const lines = [
     `You are running the \`${stepId}\` step of anton's run pipeline for **${ctx.target.id}** — ` +
@@ -38,7 +50,37 @@ export function stepTaskBlock(
       ...ctx.tickets.map((t) => `- ${t.id} — ${t.title}`),
     );
   }
+  lines.push(...stepContinuationSection(preserved));
   return lines.join("\n");
+}
+
+/**
+ * Continuation awareness for a GENERIC step (`step:claude`), which a formula can place before
+ * `step:implement` (PR #255 review). Unlike {@link continuationSection} it prescribes no outcome:
+ * settling the ticket is the implementer's job and the delivery gate's, not this step's. It only
+ * tells the agent that a previous attempt's incomplete-but-real work is already on the branch so it
+ * builds on it rather than reverting, re-doing, or discarding it. Omitted when nothing is preserved.
+ */
+function stepContinuationSection(preserved: TicketPreserved[]): string[] {
+  if (preserved.length === 0) return [];
+  const multiple = preserved.length > 1;
+  const commitLines = preserved.flatMap(({ commit }) =>
+    [commit, ...commit.earlier].map((c) => `    ${c.sha} ${c.subject}`),
+  );
+  return [
+    ``,
+    `## CONTINUATION — a previous attempt's work is already on this branch`,
+    ``,
+    `A previous attempt at ${multiple ? "these tickets" : "this ticket"} ran out of its time budget ` +
+      `and was stopped. anton kept what it had built rather than deleting it, and that work is ` +
+      `already committed here:`,
+    ``,
+    ...commitLines,
+    ``,
+    `That work is INCOMPLETE — the attempts were stopped mid-ticket — but it is real and belongs on ` +
+      `this branch. Build on it: do not revert, re-do, or discard it, and do not restart from ` +
+      `scratch. Inspect it with \`git show <sha>\` before you change anything.`,
+  ];
 }
 
 /**

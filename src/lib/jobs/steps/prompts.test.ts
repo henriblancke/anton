@@ -230,6 +230,45 @@ describe("stepTaskBlock", () => {
     expect(block).toContain("forked from main");
     expect(block).toContain(`- ${target.id} — ${target.title}`);
   });
+
+  // A formula may run a generic step before `step:implement` (PR #255 review), so on resume this
+  // step is dispatched first onto a timed-out attempt's preserved commits and must be told they
+  // exist — but not told to settle the ticket, which is the implementer's job and the gate's.
+  it("injects continuation awareness for a resumed step but prescribes no outcome", () => {
+    const block = stepTaskBlock(
+      { target, tickets: [target], branch: "anton/anton-8d0f", baseBranch: "main" },
+      "claude",
+      [
+        {
+          ticketId: target.id,
+          commit: {
+            sha: "abc1234",
+            subject: `WIP ${target.id}: work so far`,
+            files: ["src/a.ts"],
+            earlier: [{ sha: "def5678", subject: `WIP ${target.id}: first pass` }],
+          },
+        },
+      ],
+    );
+
+    expect(block).toContain("CONTINUATION");
+    expect(block).toContain("abc1234 WIP");
+    expect(block).toContain("def5678 WIP");
+    expect(block).toContain("INCOMPLETE");
+    expect(block).toMatch(/do not revert, re-do, or discard it/i);
+    // Settling is the implementer's job and the delivery gate's, so a generic step is never told to
+    // report `delivered`/`satisfied` off the preserved work.
+    expect(block).not.toContain("ANTON-RESULT");
+  });
+
+  it("omits the continuation block when no ticket in scope has preserved work", () => {
+    const block = stepTaskBlock(
+      { target, tickets: [target], branch: "anton/anton-8d0f", baseBranch: "main" },
+      "claude",
+    );
+
+    expect(block).not.toContain("CONTINUATION");
+  });
 });
 
 describe("prBody", () => {

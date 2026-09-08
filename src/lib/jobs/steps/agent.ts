@@ -9,7 +9,7 @@ import { buildExecutionSystemPrompt } from "../../claude/system-prompt";
 import { readPreservedCommitFor } from "../../git/ops";
 import type { StepContext } from "./context";
 import { dispatchClaude } from "./dispatch";
-import { stepTaskBlock, ticketPrompt } from "./prompts";
+import { stepTaskBlock, ticketPrompt, type TicketPreserved } from "./prompts";
 import { loadStepReasoning } from "./resolve";
 import type { StepResult, StepResultWith } from "./result";
 
@@ -70,12 +70,26 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
   const stepId = ctx.step?.id ?? "claude";
   ctx.assertLeaseHeld?.();
   const reasoning = await loadStepReasoning(ctx, stepId);
+  // A formula can run this generic step before `step:implement`, so a resume is dispatched here
+  // first onto a timed-out attempt's preserved commits (PR #255 review). Read them per ticket — as
+  // implementStep does — so the step is told the work exists rather than reverting or re-doing it.
+  const preserved = await readTicketsPreserved(ctx);
   return dispatchClaude(ctx, {
     beadId: ctx.target.id,
-    prompt: [reasoning, "", "---", "", stepTaskBlock(ctx, stepId)].join("\n"),
+    prompt: [reasoning, "", "---", "", stepTaskBlock(ctx, stepId, preserved)].join("\n"),
     appendSystemPrompt: await buildExecutionSystemPrompt({ seedPrompt: ctx.settings.seedPrompt }),
     failure: (text) => `claude reported an error for step ${stepId}: ${text ?? "unknown"}`,
   });
+}
+
+/** Preserved work on the branch for each ticket in scope, in ticket order; empty when none has any. */
+async function readTicketsPreserved(ctx: StepContext): Promise<TicketPreserved[]> {
+  const preserved: TicketPreserved[] = [];
+  for (const ticket of ctx.tickets) {
+    const commit = await readPreservedCommitFor(ctx.worktreePath, ticket.id, ctx.baseRef);
+    if (commit) preserved.push({ ticketId: ticket.id, commit });
+  }
+  return preserved;
 }
 
 /**
