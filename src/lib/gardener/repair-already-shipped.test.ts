@@ -758,6 +758,75 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
   });
 
+  // A re-parent of the TICKET itself finishes before these locks are held, and leaves it open with
+  // its contract intact — so status and contract rereads both pass it (PR #238 review). The
+  // supersede would then close it inside the feature it now rides, while this run records it as
+  // retired from its own ticket set. Its home is compared with the snapshot's before the write.
+  it("refuses under the lock when the ticket itself was re-homed since the check", async () => {
+    const OTHER = "anton-othr";
+    const feature = (id: string) => bead(id, { issue_type: "feature", status: "in_progress" });
+    const snapshot = [
+      bead(TARGET, { status: "in_progress", parent: OWNER }),
+      feature(OWNER),
+      feature(OTHER),
+      bead(SHIPPER, { status: "closed" }),
+    ];
+    const moved = snapshot.map((b) =>
+      b.id === TARGET ? bead(TARGET, { status: "in_progress", parent: OTHER }) : b,
+    );
+    loadAllIssuesMock.mockResolvedValue(moved);
+    showMock.mockImplementation(async (_cwd, id) => moved.find((b) => b.id === id)!);
+
+    const outcome = await retire({ board: snapshot });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("the board moved");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("was re-homed since the check");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`hung under \`${OWNER}\``);
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`hangs under \`${OTHER}\` now`);
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(tagMock).not.toHaveBeenCalled();
+  });
+
+  // The parent field alone cannot see this one: a `feature → task → subtask` subtask changes run
+  // targets when the TASK is re-homed, and nothing writes the subtask (board-index `ticketPathOf`).
+  it("refuses under the lock when an ancestor's move handed the ticket to another run target", async () => {
+    const OTHER = "anton-othr";
+    const CARRIER = "anton-carr";
+    const feature = (id: string) => bead(id, { issue_type: "feature", status: "in_progress" });
+    const viaCarrier = (home: string) => [
+      bead(TARGET, { status: "in_progress", parent: CARRIER }),
+      bead(CARRIER, { status: "in_progress", parent: home }),
+      feature(OWNER),
+      feature(OTHER),
+      bead(SHIPPER, { status: "closed" }),
+    ];
+    loadAllIssuesMock.mockResolvedValue(viaCarrier(OTHER));
+    showMock.mockImplementation(async (_cwd, id) => viaCarrier(OTHER).find((b) => b.id === id)!);
+
+    const outcome = await retire({ board: viaCarrier(OWNER) });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`no longer rides \`${OWNER}\``);
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`rides \`${OTHER}\` now`);
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
+  it("still retires a ticket that hangs where the check found it, parent and run target alike", async () => {
+    const snapshot = [
+      bead(TARGET, { status: "in_progress", parent: OWNER }),
+      bead(OWNER, { issue_type: "feature", status: "in_progress" }),
+      bead(SHIPPER, { status: "closed" }),
+    ];
+    loadAllIssuesMock.mockResolvedValue(snapshot);
+    showMock.mockImplementation(async (_cwd, id) => snapshot.find((b) => b.id === id)!);
+
+    const outcome = await retire({ board: snapshot });
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+  });
+
   it("writes nothing when either end moved between the check and the write", async () => {
     // Somebody else settled the ticket in the window — anton does not rewrite that outcome.
     showMock.mockImplementation(async (_cwd, id) =>

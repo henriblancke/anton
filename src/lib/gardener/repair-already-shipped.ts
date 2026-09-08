@@ -631,6 +631,7 @@ export async function repairAlreadyShipped(args: {
             repoPath,
             targetId: bead.id,
             checked: index.byId.get(bead.id),
+            snapshot: index,
             replacementId,
             landing,
             locked,
@@ -681,19 +682,23 @@ export async function repairAlreadyShipped(args: {
  * the window is the human saying otherwise.
  *
  * The TARGET is held to more than "still open" for the same reason (PR #238 review): the claim is
- * about this ticket's contract, and a ticket rewritten in the window is open exactly as before.
+ * about this ticket's contract, and a ticket rewritten in the window is open exactly as before. So
+ * is a ticket RE-HOMED in the window ({@link targetRehomed}): moved under another feature, it is
+ * open with its contract intact, and the supersede would close it inside a run this one does not own.
  */
 async function retirementMoved(args: {
   repoPath: string;
   targetId: string;
   /** The target as the CHECK read it — the contract the claim was verified against. */
   checked: Bead | undefined;
+  /** The board the CHECK read — where the target hung when the claim was verified. */
+  snapshot: BoardIndex;
   replacementId: string;
   landing: BeadLanding;
   /** The whole board, re-read inside the locks. */
   locked: BoardIndex;
 }): Promise<string | undefined> {
-  const { repoPath, targetId, checked, replacementId, landing, locked } = args;
+  const { repoPath, targetId, checked, snapshot, replacementId, landing, locked } = args;
   const read = async (id: string): Promise<Bead | string> => {
     try {
       const bead = await beads.show(repoPath, id);
@@ -712,6 +717,8 @@ async function retirementMoved(args: {
   }
   const rewritten = contractRewritten(checked, target);
   if (rewritten) return rewritten;
+  const rehomed = checked && targetRehomed(snapshot, checked, locked, target);
+  if (rehomed) return rehomed;
   const replacement = await read(replacementId);
   if (typeof replacement === "string") return replacement;
 
@@ -806,6 +813,45 @@ function contractRewritten(checked: Bead | undefined, now: Bead): string | undef
     `\`${now.id}\` was rewritten since the check (${changed.join(", ")} changed) — the claim was ` +
     `verified against a ticket that no longer reads the same, and anton will not close the one ` +
     `that replaced it on that evidence`
+  );
+}
+
+/**
+ * Why the ticket at the write no longer hangs where the claim was checked — or undefined while it
+ * still does (PR #238 review).
+ *
+ * A re-parent takes the moved bead's lock and its new home's (apply-steps `lockedBeads`), so one
+ * that moved THIS ticket has already finished by the time these locks are held — and it leaves the
+ * ticket open with its contract untouched, which every other target guard here accepts. But the
+ * retirement is written on behalf of the run whose ticket set the check read: `supersede` closes
+ * the ticket wherever it now hangs, so the old run would record as retired a ticket that closed
+ * inside a feature another run owns. Both the direct parent and the run target are compared,
+ * because the two move independently: a `feature → task → subtask` subtask changes owners when the
+ * TASK is re-homed, its own parent field never written (board-index.ts `ticketPathOf`).
+ */
+function targetRehomed(
+  snapshot: BoardIndex,
+  checked: Bead,
+  locked: BoardIndex,
+  now: Bead,
+): string | undefined {
+  const home = (bead: Bead): string => beads.parentOf(bead) ?? "";
+  const was = home(checked);
+  const is = home(now);
+  if (was !== is) {
+    return (
+      `\`${now.id}\` was re-homed since the check — it hung under ${was ? `\`${was}\`` : "no parent"} ` +
+      `and hangs under ${is ? `\`${is}\`` : "no parent"} now, so closing it as superseded would ` +
+      `settle it inside a run this one does not own`
+    );
+  }
+  const owner = ticketOwnerOf(snapshot, checked)?.id ?? "";
+  const rides = ticketOwnerOf(locked, locked.byId.get(now.id) ?? now)?.id ?? "";
+  if (owner === rides) return undefined;
+  return (
+    `\`${now.id}\` no longer rides ${owner ? `\`${owner}\`` : "the run target"} it was checked ` +
+    `under — it ${rides ? `rides \`${rides}\`` : "rides no run target"} now, so closing it as ` +
+    `superseded would settle it inside a run this one does not own`
   );
 }
 
