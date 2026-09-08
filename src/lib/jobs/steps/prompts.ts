@@ -140,14 +140,22 @@ function continuationPromptBlock(preserved: PreservedCommit): string {
 }
 
 /**
- * What to `git show`: a single commit, or the whole preserved range when the ticket timed out more
- * than once (anton-16pq) — the newest commit alone omits the earlier attempts' deltas.
+ * The revision to `git show`: the fork point range when the ticket's baseline is known (anton-16pq),
+ * which spans a first attempt's self-committed work beneath an empty marker as well as the markers
+ * themselves; otherwise the whole marker range when the ticket timed out more than once, or the
+ * single commit when it timed out once. The newest commit alone omits the earlier attempts' deltas.
  */
-function preservedInspectClause(preserved: PreservedCommit): string {
+function preservedShowRange(preserved: PreservedCommit): string {
+  if (preserved.baseline) return `${preserved.baseline}..${preserved.sha}`;
   const oldest = preserved.earlier.at(-1);
-  return oldest
-    ? `all of it (\`git show ${oldest.sha}^..${preserved.sha}\`)`
-    : `it (\`git show ${preserved.sha}\`)`;
+  return oldest ? `${oldest.sha}^..${preserved.sha}` : preserved.sha;
+}
+
+function preservedInspectClause(preserved: PreservedCommit): string {
+  const range = preservedShowRange(preserved);
+  return range.includes("..")
+    ? `all of it (\`git show ${range}\`)`
+    : `it (\`git show ${range}\`)`;
 }
 
 /**
@@ -180,7 +188,7 @@ function preservedFilesLines(preserved: PreservedCommit): string[] {
     ``,
     `Files changed across the preserved work:`,
     ...shown.map((f) => `- ${f}`),
-    ...(rest > 0 ? [`- … and ${rest} more (\`git show --stat ${preserved.sha}\`)`] : []),
+    ...(rest > 0 ? [`- … and ${rest} more (\`git show --stat ${preservedShowRange(preserved)}\`)`] : []),
   ];
 }
 

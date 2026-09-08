@@ -37,8 +37,9 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
     });
     const dispatched = await withDispatchNotes(ctx.repoPath, ticket);
     // Asked per ticket, not once per run: the answer is about THIS bead's own preserved commit, and
-    // a resume can carry one for some tickets and not others.
-    const preserved = await readPreservedCommitFor(ctx.worktreePath, ticket.id);
+    // a resume can carry one for some tickets and not others. The fork point lets the continuation
+    // range span the whole preserved delta, self-committed work beneath an empty marker included.
+    const preserved = await readPreservedCommitFor(ctx.worktreePath, ticket.id, ctx.baseRef);
     last = await dispatchClaude(ctx, {
       beadId: ticket.id,
       prompt: ticketPrompt(dispatched, preserved),

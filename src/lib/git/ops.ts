@@ -41,6 +41,23 @@ async function diffPaths(cwd: string, args: string[]): Promise<string[]> {
 }
 
 /**
+ * Paths a SINGLE commit changed against its first parent, read exactly as on disk — the `git show`
+ * analogue of {@link diffPaths}, untrimmed for the same reason: leading and trailing whitespace are
+ * legal in a filename, so `git()`'s `stdout.trim()` would corrupt a path that begins or ends with
+ * it (PR #255 review). ONE commit per call by design — a multi-commit `git show` interleaves a bare
+ * `\n` between sections that `-z` does not suppress on every git, folding it onto the first path of
+ * each later commit (PR #255 review).
+ */
+async function showPaths(cwd: string, sha: string): Promise<string[]> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", cwd, "show", "--name-only", "-z", "--format=", sha],
+    { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+  );
+  return stdout.split("\0").filter(Boolean);
+}
+
+/**
  * Run git and keep at most `maxChars` of its stdout, killing it the moment output overflows.
  *
  * For commands whose output has no useful upper bound. `git()` collects stdout through execFile's
@@ -718,12 +735,15 @@ export interface PreservedCommit {
   sha: string;
   subject: string;
   /**
-   * The paths changed across EVERY preserved attempt (anton-16pq): a ticket can time out more than
+   * The paths changed across the WHOLE preserved delta (anton-16pq): a ticket can time out more than
    * once, and each timeout adds only its own delta, so the newest commit alone omits what earlier
-   * ones kept. EMPTY is the marker form — the agent committed the work under its own subjects and
-   * these commits only record whose it is, so the diff lives beneath them (see {@link commitMarker}).
-   * `undefined` means the diff could NOT be read: a git failure is not an empty commit, and the
-   * prompt must not present a failed read as proof nothing was kept.
+   * ones kept. With {@link baseline} known this is the single diff `baseline..sha`, which also
+   * captures a first attempt's SELF-committed work living beneath an empty marker — a per-commit
+   * union would see the (empty) marker and miss it (PR #255 review). `[]` is the marker form only on
+   * the fork-pointless fallback: the agent committed the work under its own subjects and the empty
+   * marker records whose it is, so the diff lives beneath it (see {@link commitMarker}). `undefined`
+   * means the diff could NOT be read: a git failure is not an empty commit, and the prompt must not
+   * present a failed read as proof nothing was kept.
    */
   files: string[] | undefined;
   /**
@@ -732,6 +752,13 @@ export interface PreservedCommit {
    * all of them rather than only the newest.
    */
   earlier: { sha: string; subject: string }[];
+  /**
+   * The ticket's fork point, when it resolved to a commit — the START of the range holding ALL of
+   * this run's preserved work, self-committed commits included (anton-16pq). The prompt points
+   * `git show baseline..sha` at it. Absent when the base could not be resolved; the prompt then
+   * falls back to a marker-relative range.
+   */
+  baseline?: string;
 }
 
 /**
@@ -743,42 +770,70 @@ export interface PreservedCommit {
  * earlier ones kept — the agent must be pointed at the whole range. Fails closed to `undefined` for
  * the same reason {@link worktreeHasPreservedCommitFor} fails closed to `false` — a git read that
  * failed is not proof of absence, but the only cost here is a prompt that says nothing extra, and a
- * dispatch is never worth failing over a paragraph of prose. A `git show` that fails AFTER the
- * history lookup succeeds is carried as `files: undefined`, distinct from the marker's `[]`, so the
- * prompt never reads a failed read as an empty commit.
+ * dispatch is never worth failing over a paragraph of prose. A diff that fails AFTER the history
+ * lookup succeeds is carried as `files: undefined`, distinct from the marker's `[]`, so the prompt
+ * never reads a failed read as an empty commit.
+ *
+ * `baseRef` is the fork point to measure the preserved delta against. Resolving it lets the prompt
+ * point at `baseline..sha`, which — unlike a per-commit union — includes a first attempt's
+ * self-committed work beneath an empty marker (PR #255 review). It is OPTIONAL and best-effort: a
+ * base that will not resolve to a commit drops the range to the marker-relative fallback rather than
+ * failing the read.
  */
 export async function readPreservedCommitFor(
   worktreePath: string,
   ticketId: string,
+  baseRef?: string,
 ): Promise<PreservedCommit | undefined> {
   const prefix = preservedCommitPrefix(ticketId);
   const matches = (await branchCommits(worktreePath)).filter((c) => c.subject.startsWith(prefix));
   const [newest, ...earlier] = matches;
   if (!newest) return undefined;
-  return { sha: newest.sha, subject: newest.subject, earlier, files: await preservedFiles(worktreePath, matches) };
+  // Only a fork point that resolved to a real commit is usable as a `git show` range endpoint —
+  // resolveMergeBase hands back the base NAME verbatim when it names nothing, and that is no
+  // revision to diff or show.
+  const resolved = baseRef
+    ? await resolveMergeBase(worktreePath, baseRef).catch(() => undefined)
+    : undefined;
+  const baseline = resolved && /^[0-9a-f]{40}$/.test(resolved) ? resolved : undefined;
+  return {
+    sha: newest.sha,
+    subject: newest.subject,
+    earlier,
+    baseline,
+    files: await preservedFiles(worktreePath, matches, baseline),
+  };
 }
 
 /**
- * The union of paths changed across every preserved commit — `undefined` on a git failure (an
- * unknown/error state the prompt keeps distinct from a genuine empty marker), `[]` when the commits
- * really touched nothing.
+ * The union of paths changed across the whole preserved delta — `undefined` on a git failure (an
+ * unknown/error state the prompt keeps distinct from a genuine empty marker), `[]` when nothing
+ * changed.
  *
- * `-z` for the same reason `diffPaths` uses it: under `core.quotePath` a non-ASCII path comes back
- * C-quoted, and the prompt would name a file that is not on disk.
+ * With `baseline` known, the answer is the single diff `baseline..newest`: it spans self-committed
+ * work beneath an empty marker as well as the markers, which a per-commit union of the markers alone
+ * would miss (PR #255 review). Without a fork point it falls back to a per-commit union — one
+ * {@link showPaths} per marker, so a multi-commit `git show`'s inter-section `\n` never folds onto a
+ * path. Both read paths are `-z` (under `core.quotePath` a non-ASCII path comes back C-quoted, and
+ * the prompt would name a file not on disk) and untrimmed (leading/trailing whitespace is a legal
+ * filename), and both fail closed to `undefined`.
  */
 async function preservedFiles(
   worktreePath: string,
   commits: { sha: string }[],
+  baseline: string | undefined,
 ): Promise<string[] | undefined> {
-  const out = await git(worktreePath, [
-    "show",
-    "--name-only",
-    "-z",
-    "--format=",
-    ...commits.map((c) => c.sha),
-  ]).catch(() => undefined);
-  if (out === undefined) return undefined;
-  return [...new Set(out.split("\0").filter(Boolean))];
+  const newest = commits[0]?.sha;
+  if (!newest) return [];
+  if (baseline) {
+    return diffPaths(worktreePath, ["--name-only", "--no-renames", baseline, newest]).catch(
+      () => undefined,
+    );
+  }
+  const perCommit = await Promise.all(commits.map((c) => showPaths(worktreePath, c.sha))).catch(
+    () => undefined,
+  );
+  return perCommit === undefined ? undefined : [...new Set(perCommit.flat())];
 }
 
 /** How far back a subject scan reads. A run's own commits are always at the branch tip. */

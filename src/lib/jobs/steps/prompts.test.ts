@@ -150,6 +150,19 @@ describe("ticketPrompt — the continuation block (anton-16pq)", () => {
     expect(prompt).toContain("Those commits are INCOMPLETE");
   });
 
+  // With the fork point known the range starts at the ticket BASELINE, so the agent inspects a first
+  // attempt's self-committed work beneath an empty marker too, not just the marker commits (anton-16pq).
+  it("inspects from the ticket baseline when the fork point is known", () => {
+    const prompt = ticketPrompt(ticket(), {
+      ...preserved,
+      earlier: [{ sha: "old5678", subject: "WIP anton-t1: first attempt" }],
+      baseline: "base0000",
+    });
+
+    expect(prompt).toContain("git show base0000..abc1234");
+    expect(prompt).not.toContain("old5678^..abc1234");
+  });
+
   // A git failure is not an empty commit: presenting `undefined` files as a marker would falsely tell
   // the agent the work lives beneath a commit anton never actually read (PR #255 review).
   it("does not claim an empty marker when the preserved diff could not be read", () => {

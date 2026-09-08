@@ -398,6 +398,41 @@ suite("worktreeHasCommitFor (real git)", () => {
       expect(preserved?.earlier.map((c) => c.subject)).toEqual(["WIP anton-d9: first attempt"]);
     });
 
+    // A first timeout can leave the agent's OWN commits with an EMPTY marker recording them, and a
+    // second a non-empty WIP commit. The self-committed work lives BENEATH the marker, so a
+    // per-marker union misses it — the fork point makes `files` the whole delta (PR #255 review).
+    it("spans self-committed work beneath an empty marker when the fork point is known", async () => {
+      g(["checkout", "-q", "-b", "feature"]);
+      writeFileSync(join(repo, "self.md"), "self\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "the agent's own subject"]);
+      g(["commit", "-q", "--allow-empty", "-m", "WIP anton-d9: first attempt (marker)"]);
+      writeFileSync(join(repo, "wip.md"), "wip\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: second attempt"]);
+
+      const preserved = await readPreservedCommitFor(repo, "anton-d9", "main");
+
+      expect(preserved?.baseline).toMatch(/^[0-9a-f]{40}$/);
+      // The self-committed file AND the second attempt's — not just the WIP commits' own deltas.
+      expect(preserved?.files?.sort()).toEqual(["self.md", "wip.md"]);
+      expect(preserved?.earlier.map((c) => c.subject)).toEqual([
+        "WIP anton-d9: first attempt (marker)",
+      ]);
+    });
+
+    // `git()`'s `stdout.trim()` would strip a leading-space filename emitted at the start of the
+    // diff; the untrimmed reads keep it, on both the fork-point and the fallback path (PR #255).
+    it("preserves leading whitespace in a changed path", async () => {
+      g(["checkout", "-q", "-b", "feature"]);
+      writeFileSync(join(repo, " lead.md"), "x\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: whitespace path"]);
+
+      expect((await readPreservedCommitFor(repo, "anton-d9", "main"))?.files).toEqual([" lead.md"]);
+      expect((await readPreservedCommitFor(repo, "anton-d9"))?.files).toEqual([" lead.md"]);
+    });
+
     it("is undefined for a ticket nothing was preserved for, and for the delivery subject", async () => {
       writeFileSync(join(repo, "work.md"), "work\n");
       g(["add", "-A"]);
