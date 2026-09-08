@@ -128,11 +128,12 @@ describe("projectWeeklySpendPct", () => {
     expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(6);
   });
 
-  it("charges the attempt a lease starts, and hands back one a refund withdraws", async () => {
+  it("charges the attempt a lease starts, and hands back only one a spend refund withdraws", async () => {
     // The lease is the moment quota starts burning, so the meter moves with it — a running job has
-    // spent most of what it will. A refunded reschedule (quota gate, lease held elsewhere, no remote)
-    // is an attempt that never reached Claude, so it comes back off the meter as it does off the
-    // retry budget.
+    // spent most of what it will. Refunding the RETRY budget alone (a quota hit) keeps the charge:
+    // Claude was reached, and a multi-call handler may have finished real work before the wall. Only
+    // a reschedule that vouches the attempt never reached Claude (lease held elsewhere, no remote)
+    // comes back off the meter.
     const p = insertProject(tdb.db, { id: "L", slug: "l", name: "L", repoPath: "/tmp/L" });
     await seedSamples(p, 2);
     await seedJob(p, { status: "queued", attempts: 0, id: "due" });
@@ -146,7 +147,14 @@ describe("projectWeeklySpendPct", () => {
 
     await leaseDue(tdb.db, { now: () => NOW + 60_000 }, { leaseMs: 30_000, limit: 1 });
     await reschedule(tdb.db, clock, "due", NOW + 120_000, { refundAttempt: true });
-    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(4);
+
+    await leaseDue(tdb.db, { now: () => NOW + 120_000 }, { leaseMs: 30_000, limit: 1 });
+    await reschedule(tdb.db, clock, "due", NOW + 180_000, {
+      refundAttempt: true,
+      refundSpend: true,
+    });
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(4);
   });
 
   it("counts only attempts inside the quota week", async () => {

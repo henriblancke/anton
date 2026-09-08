@@ -4,7 +4,8 @@
  *
  *   • Leases + crash reclaim — a leased job whose lease expires is re-leased next tick.
  *   • API-limit backoff      — `UsageLimitError` → reschedule past the reset window; the attempt is
- *                              refunded (you can't retry an exhausted quota).
+ *                              refunded (you can't retry an exhausted quota) but its quota spend
+ *                              is not — Claude was reached, and may have done real work first.
  *   • Poison-pill            — a job that errors `maxAttempts` times (or throws `PoisonError`) is
  *                              parked for a human. Parking is recoverable, not terminal: `resume()`
  *                              (queue.resumeJob) un-parks a job back to `queued` with a fresh budget.
@@ -267,7 +268,15 @@ export function exhaustedParkAttempts(lastError: string): number | undefined {
 
 export type Action =
   | { action: "complete" }
-  | { action: "reschedule"; runAtMs: number; refundAttempt: boolean; lastError?: string }
+  | {
+      action: "reschedule";
+      runAtMs: number;
+      /** Rewind the retry budget: the failure was not the job's own. */
+      refundAttempt: boolean;
+      /** Also withdraw the attempt from the project's spend meter: it never reached Claude. */
+      refundSpend: boolean;
+      lastError?: string;
+    }
   | { action: "park"; lastError: string };
 
 export function classifyError(e: unknown): Outcome {
@@ -290,10 +299,14 @@ export function nextAction(
       return { action: "complete" };
     case "quota": {
       const runAtMs = outcome.resetAt ? outcome.resetAt * 1000 : nowMs + config.quotaCooloffMs;
+      // The limit is Claude's own answer, so this attempt reached it — and a multi-call handler may
+      // have finished real work (a whole PR) before the wall. The retry budget comes back; the
+      // project's spend does not.
       return {
         action: "reschedule",
         runAtMs,
         refundAttempt: true,
+        refundSpend: false,
         lastError: `usage-limit: resumes at ${new Date(runAtMs).toISOString()}`,
       };
     }
@@ -312,6 +325,7 @@ export function nextAction(
         action: "reschedule",
         runAtMs,
         refundAttempt: true,
+        refundSpend: true, // liveness is checked before Claude is ever invoked
         lastError: `run live elsewhere: ${outcome.error} — retries at ${new Date(runAtMs).toISOString()}`,
       };
     }
@@ -326,6 +340,7 @@ export function nextAction(
         action: "reschedule",
         runAtMs,
         refundAttempt: true,
+        refundSpend: true, // a push that found no remote invoked nothing
         lastError: `not wired to a remote: rechecks at ${new Date(runAtMs).toISOString()}`,
       };
     }
@@ -343,6 +358,7 @@ export function nextAction(
         action: "reschedule",
         runAtMs: nowMs + backoff,
         refundAttempt: false,
+        refundSpend: false,
         lastError: outcome.error,
       };
     }
@@ -677,8 +693,32 @@ export class JobRunner {
     // SQL level, not just skipped by capOf — otherwise a large backlog of disabled/autonomy-off jobs
     // (the earliest by runAt) fills the finite scan window every tick and starves leasable work for
     // other schedules and projects (anton-7l7). Seed with disabled schedules; autonomy-off projects
-    // are added below. capOf still enforces cap 0 as a backstop for anything not excluded (quiesce).
+    // are added next. capOf still enforces cap 0 as a backstop for anything not excluded (quiesce).
+    // Both hard holds are gathered BEFORE the governor runs so its value gate can skip held rows
+    // instead of reserving quota share for work that cannot lease (PR #248 review).
     const heldBucketKeys = new Set<string>(disabledSchedules);
+
+    // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
+    // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
+    let policyCapOf: ((job: JobRow) => number) | undefined;
+    if (this.resolvePolicy) {
+      const projectIds = await projectIdsWithPendingJobs(this.db, "execute-epic");
+      const concByProject = new Map<string, number>();
+      for (const pid of projectIds) {
+        const policy = await this.policyFor(pid ?? undefined);
+        // Autonomy master-switch: off → cap 0, so no execute-epic job for this project is leased
+        // (they stay queued and resume when the switch turns back on). See JobPolicy.autonomy.
+        const cap = policy.autonomy === false ? 0 : policy.concurrency;
+        concByProject.set(pid ?? "", cap);
+        // Cap 0 is a hard hold — exclude the whole bucket from the scan window so its backlog can't
+        // starve other work (same rationale as disabled schedules above).
+        if (cap === 0) heldBucketKeys.add(scheduleGateKey("execute-epic", pid));
+      }
+      policyCapOf = (job) =>
+        job.type === "execute-epic"
+          ? (concByProject.get(job.projectId ?? "") ?? DEFAULT_CONFIG.maxConcurrent)
+          : Infinity;
+    }
 
     // Budget governor (anton-szld): before leasing, ask the pace-line whether autonomous work may
     // run *now*. A DEFER verdict adds the project's governed buckets here (same hold as the
@@ -718,27 +758,6 @@ export class JobRunner {
       }
     }
 
-    // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
-    // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
-    let policyCapOf: ((job: JobRow) => number) | undefined;
-    if (this.resolvePolicy) {
-      const projectIds = await projectIdsWithPendingJobs(this.db, "execute-epic");
-      const concByProject = new Map<string, number>();
-      for (const pid of projectIds) {
-        const policy = await this.policyFor(pid ?? undefined);
-        // Autonomy master-switch: off → cap 0, so no execute-epic job for this project is leased
-        // (they stay queued and resume when the switch turns back on). See JobPolicy.autonomy.
-        const cap = policy.autonomy === false ? 0 : policy.concurrency;
-        concByProject.set(pid ?? "", cap);
-        // Cap 0 is a hard hold — exclude the whole bucket from the scan window so its backlog can't
-        // starve other work (same rationale as disabled schedules above).
-        if (cap === 0) heldBucketKeys.add(scheduleGateKey("execute-epic", pid));
-      }
-      policyCapOf = (job) =>
-        job.type === "execute-epic"
-          ? (concByProject.get(job.projectId ?? "") ?? DEFAULT_CONFIG.maxConcurrent)
-          : Infinity;
-    }
     const capOf = (job: JobRow) => {
       if (job.projectId && this.quiescedProjects.has(job.projectId)) return 0;
       if (disabledSchedules.has(scheduleGateKey(job.type, job.projectId))) return 0;
@@ -897,6 +916,7 @@ export class JobRunner {
           policy,
           pid,
           now,
+          heldBucketKeys,
           valueHeldJobIds,
           valueHeldReclaimIds,
           projectWeeklyPct,
@@ -981,13 +1001,17 @@ export class JobRunner {
    * skips the gate entirely — they asked for now, and only the session floor may hold that.
    *
    * The same walk RESERVES the project's remaining quota share across the batch (R6.1) — see the
-   * reservation comment in the loop.
+   * reservation comment in the loop. Rows a HARD hold already keeps off the lease (a disabled
+   * schedule, autonomy off, a quiescing project — `heldBucketKeys` / `quiescedProjects`) are skipped
+   * before either check: they cannot run this tick, so reserving share for them would hold a runnable
+   * job behind them and, with leaseDue then excluding both, lease nothing tick after tick.
    */
   private async applyValueGate(
     usage: ClaudeUsage,
     policy: BudgetPolicy,
     pid: string | null,
     nowMs: number,
+    heldBucketKeys: ReadonlySet<string>,
     valueHeldJobIds: Set<string>,
     valueHeldReclaimIds: Set<string>,
     projectWeeklyPct: number | null,
@@ -1007,6 +1031,8 @@ export class JobRunner {
 
     for (const job of candidates) {
       if (job.status === "running" && this.inFlight.has(job.id)) continue; // genuinely running here
+      if (heldBucketKeys.has(scheduleGateKey(job.type, job.projectId))) continue; // hard-held
+      if (job.projectId && this.quiescedProjects.has(job.projectId)) continue; // being deleted
       const payload = parsePayload(job.payloadJson) as
         | { bypassBudget?: unknown; epicBeadId?: unknown }
         | null;
@@ -1081,7 +1107,11 @@ export class JobRunner {
     return !admitJob(usage, policy, nowMs, { value, sessionCost }).admit;
   }
 
-  /** What one more attempt of `type` is expected to charge THIS project's share, memoized per tick. */
+  /**
+   * What one more attempt of `type` is expected to charge THIS project's share, memoized per tick.
+   * Fail-open like the governor's other reads: an unreadable average charges nothing, admitting the
+   * job rather than failing the whole tick on a transient DB error.
+   */
   private async projectWeeklyBurn(
     projectId: string,
     type: JobType,
@@ -1089,7 +1119,9 @@ export class JobRunner {
   ): Promise<number> {
     let cost = memo.get(type);
     if (cost === undefined) {
-      cost = (await getProjectBurnAverage(this.db, projectId, type)).weeklyAvg;
+      cost = await getProjectBurnAverage(this.db, projectId, type)
+        .then((average) => average.weeklyAvg)
+        .catch(() => 0);
       memo.set(type, cost);
     }
     return cost;
@@ -1291,6 +1323,7 @@ export class JobRunner {
         await reschedule(this.db, this.clock, job.id, action.runAtMs, {
           lastError: action.lastError,
           refundAttempt: action.refundAttempt,
+          refundSpend: action.refundSpend,
         });
         break;
       case "park":

@@ -18,6 +18,7 @@ import type {
   BeadLabelsReader,
   BudgetPolicyResolver,
   JobHandler,
+  JobPolicyResolver,
   ProjectSpendResolver,
 } from "./runner";
 import { usage, useRunnerHarness } from "./runner.fixture";
@@ -37,6 +38,8 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       resolveBudgetPolicy?: BudgetPolicyResolver;
       resolveProjectSpend?: ProjectSpendResolver;
       readBeadLabels?: BeadLabelsReader;
+      /** The concurrency/autonomy policy — only the hard-hold cases need one. */
+      resolvePolicy?: JobPolicyResolver;
     },
   ) {
     return h.makeRunner({
@@ -48,6 +51,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       resolveBudgetPolicy: opts.resolveBudgetPolicy ?? (() => opts.policy ?? DEFAULT_BUDGET_POLICY),
       resolveProjectSpend: opts.resolveProjectSpend,
       readBeadLabels: opts.readBeadLabels,
+      resolvePolicy: opts.resolvePolicy,
     });
   }
 
@@ -450,6 +454,36 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     await r.whenIdle();
   });
 
+  it("does not reserve share for rows a hard hold already keeps off the lease", async () => {
+    // Autonomy is off for A, so its execute-epic backlog cannot lease this tick whatever the budget
+    // says. Reserving share for those rows anyway would spend A's whole 9-point cut on work that
+    // never starts and hold the one runnable governed job (the grooming sweep) behind them — and
+    // with leaseDue then excluding the held bucket AND the held job, nothing would launch, tick
+    // after tick. The same starvation applies to a disabled schedule's bucket.
+    h.seedProjects("A");
+    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const ran: string[] = [];
+    const r = budgetRunner(
+      async (ctx) => {
+        ran.push(ctx.type);
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 9),
+        resolveProjectSpend: async () => 0,
+        resolvePolicy: () => ({ concurrency: 5, timeoutMs: Infinity, maxAttempts: 3, autonomy: false }),
+      },
+    );
+    // Three seeded execute-epic runs (3 weekly-points each) would exactly fill the 9-point share.
+    for (let i = 0; i < 3; i++) await r.enqueue({ type: "execute-epic", projectId: "A" });
+    const sweep = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toEqual(["orphan-grooming"]);
+    expect((await getJob(h.db, sweep))?.status).toBe("done");
+  });
+
   it("leaves the share unbound when no spend resolver is wired", async () => {
     // Fail-open, like every other governor input: without attribution the machine-wide target is
     // the only weekly limit, rather than a share the runner cannot actually measure.
@@ -491,6 +525,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     expect(job?.status).toBe("queued"); // rescheduled, not parked
     expect(toMs(job?.runAt)).toBe(resetAt * 1000);
     expect(job?.attempts).toBe(0); // attempt refunded — quota isn't the job's fault
+    expect(job?.spentAttempts).toBe(1); // but it reached Claude, so the project's spend keeps it
     expect(job?.lastError).toMatch(/usage-limit/);
   });
 

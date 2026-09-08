@@ -936,7 +936,11 @@ export async function complete(
 /**
  * Reschedule a job to run again at `runAtMs` (used for both quota backoff and retry). Returns it
  * to `queued` and clears the lease so it is picked up when due. Optionally rewinds `attempts`
- * (quota isn't the job's fault, so it shouldn't burn the poison budget).
+ * (quota isn't the job's fault, so it shouldn't burn the poison budget) and, separately,
+ * `spentAttempts`: only a `refundSpend` caller vouches that the attempt never reached Claude. The
+ * two diverge on a quota hit — the retry budget is refunded, but the attempt DID burn quota (the
+ * limit is Claude's own answer, and a multi-call handler may have finished real work before it),
+ * so the project's spend meter keeps the charge (PR #248 review).
  *
  * One collision is possible for sync-push (anton-x7la): its dedup index is queued-only, so while
  * this job was `running` a board write may have enqueued a fresh queued follow-up into the project's
@@ -957,7 +961,7 @@ export async function reschedule(
   clock: Clock,
   jobId: string,
   runAtMs: number,
-  opts?: { lastError?: string; refundAttempt?: boolean },
+  opts?: { lastError?: string; refundAttempt?: boolean; refundSpend?: boolean },
 ): Promise<void> {
   const nowMs = clock.now();
   try {
@@ -971,8 +975,7 @@ export async function reschedule(
         attempts: opts?.refundAttempt
           ? sql`MAX(${schema.jobs.attempts} - 1, 0)`
           : schema.jobs.attempts,
-        // A refunded attempt never reached Claude, so it is not spend either.
-        spentAttempts: opts?.refundAttempt
+        spentAttempts: opts?.refundSpend
           ? sql`MAX(${schema.jobs.spentAttempts} - 1, 0)`
           : schema.jobs.spentAttempts,
         updatedAt: secDate(nowMs),
