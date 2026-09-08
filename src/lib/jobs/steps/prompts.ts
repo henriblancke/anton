@@ -79,7 +79,7 @@ export function ticketPrompt(ticket: Bead, preserved?: PreservedCommit): string 
     ...ticketSpecSections(ticket),
     ...continuationSection(preserved),
     ``,
-    ticketPromptClosing(ticket.id),
+    ticketPromptClosing(ticket.id, preserved !== undefined),
   ].join("\n");
 }
 
@@ -243,21 +243,31 @@ function standaloneContext(ticket: Bead, description: string | undefined): strin
  * honest outcome is `satisfied` rather than `blocked` (anton-6l0q): a ticket is one step of a run
  * whose earlier steps committed to this same branch, so its acceptance can already be met before the
  * agent starts. The contract defines the line; this names the moment it applies to THIS ticket.
+ *
+ * The `satisfied` guidance is omitted for a RESUMED ticket (`preserved`): its CONTINUATION block
+ * already names the one correct unchanged-tree outcome — `delivered` — and a preserved-adoption
+ * settle can only be `delivered` (PR #255 review). `assertDelivered` refuses every other outcome
+ * once `preservedAdoption` is set, so leaving the generic `satisfied` line here after it would tell
+ * the agent to report the one thing that re-parks the resume this prompt exists to unblock.
  */
-function ticketPromptClosing(ticketId: string): string {
+function ticketPromptClosing(ticketId: string, preserved: boolean): string {
   return [
     `The full ticket spec is inlined above so you can implement it even if the worktree's beads ` +
       `DB is unreadable. \`bd show ${ticketId}\` gives the same content when bd is healthy. If ` +
       `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
       `not guess or silently bail. Follow the operating contract in your system prompt.`,
-    ``,
-    `Before you implement, check the branch: earlier steps of this run committed here, and one of ` +
-      `them may already meet every acceptance criterion above. If it does, do not redo or ` +
-      `restate that work and do not report \`blocked\` — end with ` +
-      `\`ANTON-RESULT: satisfied — <commit sha> — <how that commit covers ${ticketId}>\`, naming ` +
-      `the commit that did it. That is the honest answer only when every criterion is met by work ` +
-      `already committed on this branch; if any is still open, do the remaining work and report ` +
-      `\`delivered\`.`,
+    ...(preserved
+      ? []
+      : [
+          ``,
+          `Before you implement, check the branch: earlier steps of this run committed here, and one ` +
+            `of them may already meet every acceptance criterion above. If it does, do not redo or ` +
+            `restate that work and do not report \`blocked\` — end with ` +
+            `\`ANTON-RESULT: satisfied — <commit sha> — <how that commit covers ${ticketId}>\`, naming ` +
+            `the commit that did it. That is the honest answer only when every criterion is met by work ` +
+            `already committed on this branch; if any is still open, do the remaining work and report ` +
+            `\`delivered\`.`,
+        ]),
   ].join("\n");
 }
 

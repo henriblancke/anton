@@ -747,7 +747,7 @@ export interface PreservedCommit {
    */
   files: string[] | undefined;
   /**
-   * The OLDER preserved commits beneath {@link sha}, newest first — present only when the ticket
+   * The OLDER preserved commits beneath {@link sha}, newest first — non-empty only when the ticket
    * timed out more than once. Their work is on the branch too, so the prompt sends the agent across
    * all of them rather than only the newest.
    */

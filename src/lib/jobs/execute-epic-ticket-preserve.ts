@@ -302,11 +302,14 @@ export async function preserveTimedOutWork(args: {
           "error" in kept
             ? `git rejected this ticket's preserved commit after it had already landed`
             : `the agent committed this ticket's work itself`,
-        // A landed-but-rejected commit is anton's OWN, so it already carries the `WIP <id>:` subject
-        // a resume reads and needs no marker. An unmarked forward HEAD is the agent's work and does.
+        // A landed-but-rejected commit is anton's OWN `WIP <id>:` commit at the tip, so it already
+        // carries the subject a resume reads and needs no marker. An unmarked forward HEAD is the
+        // agent's work and DOES need one — even when a previous attempt's marker sits BELOW it (PR
+        // #255 review): that older marker predates these self-commits, so the resume's newest `WIP`
+        // would no longer be the preserved tip and its `baseline..marker` range would omit them. A
+        // fresh marker at the tip keeps the newest `WIP` where the range reader expects it.
         alreadyMarked:
-          retainedOn !== null ||
-          ("error" in kept && (await worktreeHasPreservedCommitFor(worktreePath, ticket.id))),
+          "error" in kept && (await worktreeHasPreservedCommitFor(worktreePath, ticket.id)),
       });
     }
     if ("error" in kept) {

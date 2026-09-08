@@ -116,6 +116,16 @@ describe("ticketPrompt — the continuation block (anton-16pq)", () => {
     expect(prompt).toContain("ANTON-RESULT: delivered");
   });
 
+  // The generic closing's `satisfied` guidance would follow the continuation block and contradict
+  // it: a preserved-adoption settle can only be `delivered`, so telling the agent to report
+  // `satisfied` re-parks the resume this block exists to unblock (PR #255 review).
+  it("omits the satisfied closing for a resumed ticket, leaving delivered as the only outcome", () => {
+    const prompt = ticketPrompt(ticket({ description: "## Goal\n\nShip it." }), preserved);
+
+    expect(prompt).not.toContain("ANTON-RESULT: satisfied");
+    expect(prompt).toContain("ANTON-RESULT: delivered");
+  });
+
   // The block is state of the BRANCH, so it only means anything once the agent knows what the
   // ticket asks for.
   it("places the block after the spec", () => {

@@ -29,7 +29,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import type { Worktree } from "../git/worktree";
 import type { ProjectSettings } from "../projects";
-import { COMMIT_TIMEOUT_ENV, readWorktreeState } from "../git/ops";
+import { COMMIT_TIMEOUT_ENV, readPreservedCommitFor, readWorktreeState } from "../git/ops";
 import { isPoisonError } from "./errors";
 import { TicketTimeoutError } from "./execute-epic-errors";
 import { outOfTimeParkMessage } from "./execute-epic-dispatch";
@@ -357,12 +357,14 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(subjects().some((s) => s.startsWith(`WIP ${ticket.id}:`))).toBe(false);
   });
 
-  // …and the marker is written once. A resume that starts from a previous attempt's preserved
-  // commit, self-commits more work and times out again already has the prefix on the branch.
-  it("does not re-mark a branch that already carries this ticket's preserved commit", async () => {
+  // A resume that starts from a previous attempt's preserved commit, self-commits more work and
+  // times out again gets a FRESH marker at the tip (PR #255 review). The older marker predates the
+  // new self-commits, so reusing it would leave the newest `WIP` below them and the resume's
+  // `baseline..marker` range would omit them — the range reader wants the newest `WIP` at the tip.
+  it("re-marks the tip when self-committed work sits above a previous attempt's marker", async () => {
     write("HALF_WRITTEN.md", "work preserved by the attempt before this one\n");
     g(["add", "-A"]);
-    g(["commit", "-q", "-m", `WIP ${ticket.id}: ${ticket.title}`]);
+    g(["commit", "-q", "-m", `WIP ${ticket.id}: earlier attempt`]);
     const baseline = await readWorktreeState(repo);
     write("MORE.md", "what this attempt added, and committed itself\n");
     g(["add", "-A"]);
@@ -380,8 +382,12 @@ suite("preserveTimedOutWork (real git)", () => {
     });
 
     expect(kept).toEqual({ branch: BRANCH, retained: false });
-    expect(head()).toBe(selfCommitted);
-    expect(subjects().filter((s) => s.startsWith(`WIP ${ticket.id}:`))).toHaveLength(1);
+    // A new empty marker sits at the tip, on top of the agent's own commit; the older marker stays
+    // beneath it, so the read side collects both and spans the whole preserved delta.
+    expect(out(["rev-parse", "HEAD~1"])).toBe(selfCommitted);
+    expect(subjects().filter((s) => s.startsWith(`WIP ${ticket.id}:`))).toHaveLength(2);
+    const preserved = await readPreservedCommitFor(repo, ticket.id, "main");
+    expect(preserved?.files?.sort()).toEqual(["HALF_WRITTEN.md", "MORE.md"]);
   });
 
   // The genuinely empty case the branch above must not swallow: nothing staged AND HEAD never moved
