@@ -285,8 +285,9 @@ export interface InstructionCriterion {
  * followed as steps or nothing. So every marker is peeled first ({@link peelContainers}), and what
  * opens after them keeps the lines that stay inside the same containers ({@link peelPrefix}) —
  * filed dedented, as the note renders them. A task marker rides on the item's paragraph, not its
- * container, so the peel leaves it on the content; it comes off before the fence check
- * ({@link TASK_MARKER}) so `- [ ] ```md` opens its fence as the bare `- ```md` does. A fence the
+ * container, so the peel leaves it on the content; every one comes off before the fence check
+ * ({@link peelTasks}) so `- [ ] ```md` — and nested `- [ ] [ ] ```md` — opens its fence as the bare
+ * `- ```md` does. A fence the
  * scanner did not see leaves its verdicts stale from that line on, so the rest is scanned afresh
  * once the block ends.
  */
@@ -413,8 +414,9 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       continue;
     }
     // A fence opens beneath a task marker as it does beneath the bullet, but the peel leaves the
-    // checkbox on the content; take it off first, as shorn does, so the opener is the fence itself.
-    const fenceLine = content.replace(TASK_MARKER, "");
+    // checkbox on the content; take every one off first, as shorn does with nested boxes, so the
+    // opener is the fence itself.
+    const fenceLine = peelTasks(content);
     const opener = openingFence(fenceLine);
     if (opener) {
       nested = { opener: fenceLine, fence: opener, prefix: peeled.prefix, content: [] };
@@ -630,6 +632,20 @@ function refenced(content: string[]): string {
  * ticket's `> - [ ] TODO — ...` callout has written nothing, and leaving the `>` on hid the
  * placeholder from {@link PROMPT_LINE} and filed the same marker-only box the contract gate refuses.
  */
+/**
+ * `text` with every leading GFM task marker peeled ({@link TASK_MARKER}). Boxes nest — a founder
+ * pastes `- [ ] [ ] ```md` as `shorn` reads `- [ ] [x] twice boxed` — so one `.replace` leaves a
+ * `[ ] ` glued to the fence and the opener goes undetected; peeling to a fixed point matches shorn's
+ * nested-marker behaviour, so a fence opens beneath any depth of scaffolding.
+ */
+function peelTasks(text: string): string {
+  let out = text;
+  for (let next = out.replace(TASK_MARKER, ""); next !== out; next = out.replace(TASK_MARKER, "")) {
+    out = next;
+  }
+  return out;
+}
+
 function shorn(line: string): string {
   let text = line.trim();
   for (;;) {

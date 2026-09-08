@@ -489,6 +489,12 @@ describe("instructionCriteria", () => {
     // The checkbox rule holds: `]` must be followed by whitespace, so a CSS selector is not a box
     // and opens no fence — it stays an ordinary shorn step.
     expect(texts("- [x].disabled ```")).toEqual(["[x].disabled ```"]);
+    // Boxes nest as shorn reads them, so every one comes off before the fence check: a single peel
+    // left `[ ] ```md`, filed the opener as a step, and let the closer swallow `- next`.
+    expect(instructionCriteria("- [ ] [ ] ```md\n  ## Expected\n  - item\n  ```\n- next")).toEqual([
+      { text: "```md\n## Expected\n- item\n```", fenced: true },
+      { text: "next", fenced: false },
+    ]);
   });
 
   it("keeps a fence opened inside a callout — `> ```` — and ends it where the callout ends", () => {
