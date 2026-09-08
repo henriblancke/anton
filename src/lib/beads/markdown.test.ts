@@ -62,19 +62,21 @@ describe("scanMarkdown", () => {
   describe("fences", () => {
     it("flags the delimiters as punctuation and the content as literal, opening no section", () => {
       expect(scanMarkdown("```js\n## Acceptance\n```\nafter")).toEqual([
-        { text: "```js", fenced: true, delimiter: true, visible: "", masked: "```js" },
+        { text: "```js", fenced: true, delimiter: true, commented: false, visible: "", masked: "```js" },
         {
           text: "## Acceptance",
           fenced: true,
           delimiter: false,
+          commented: false,
           visible: "## Acceptance",
           masked: "## Acceptance",
         },
-        { text: "```", fenced: true, delimiter: true, visible: "", masked: "```" },
+        { text: "```", fenced: true, delimiter: true, commented: false, visible: "", masked: "```" },
         {
           text: "after",
           fenced: false,
           delimiter: false,
+          commented: false,
           visible: "after",
           masked: "after",
           heading: undefined,
@@ -148,6 +150,16 @@ describe("scanMarkdown", () => {
     it("lets an unclosed comment swallow the rest of the body", () => {
       expect(visible("text <!-- x\n## Hidden")).toEqual(["text ", ""]);
       expect(headings("text <!-- x\n## Hidden")).toEqual([undefined, undefined]);
+    });
+
+    it("flags the lines that BEGIN inside a comment — the opener's own line is not one of them", () => {
+      const commented = (source: string) => scanMarkdown(source).map((l) => l.commented);
+      expect(commented("a <!-- x\n## hidden\n--> tail\nafter")).toEqual([false, true, true, false]);
+      // Closed and reopened on one line: the next line begins inside the second comment.
+      expect(commented("<!--\n--> <!--\nstill")).toEqual([false, true, true]);
+      // A `<!--` inside a fence opens nothing, so nothing after it is flagged.
+      expect(commented("```\n<!--\n```\nafter")).toEqual([false, false, false, false]);
+      expect(commented("<!-- x -->\nafter")).toEqual([false, false]);
     });
 
     // What a caller that REWRITES a line reads: the comment is gone as content, but every byte of

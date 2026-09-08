@@ -411,6 +411,71 @@ describe("instructionCriteria", () => {
     expect(texts("    ````\n    inner\n    ````")).toEqual(["`````\n````\ninner\n````\n`````"]);
     expect(texts("    a `tick` inline")).toEqual(["```\na `tick` inline\n```"]);
   });
+
+  it("keeps an indented block nested in a list item — four columns past the item's content is code there", () => {
+    // `- Expected output:` starts its content two columns in, so six spaces after a blank line is
+    // four past that: the note renders it as code, while four spaces is a nested item, as before.
+    expect(texts("- Expected output:\n\n      - literal\n      ## kept")).toEqual([
+      "Expected output:",
+      "```\n- literal\n## kept\n```",
+    ]);
+    // Deeper indentation is the block's own, kept as the render keeps it.
+    expect(texts("- Expected output:\n\n        - literal")).toEqual([
+      "Expected output:",
+      "```\n  - literal\n```",
+    ]);
+    // Under a nested item the content starts deeper, so eight columns is a third level, not code.
+    expect(texts("- a\n    - b\n\n        - c")).toEqual(["a", "b", "c"]);
+    // An ordered marker is wider: `1. ` starts content at three, so seven columns is its code and
+    // six a nested item.
+    expect(texts("1. step\n\n       code")).toEqual(["step", "```\ncode\n```"]);
+    expect(texts("1. step\n\n      - nested")).toEqual(["step", "nested"]);
+    // The block cannot interrupt the item's paragraph, and ends at the next lesser-indented line.
+    expect(texts("- a\n      - continuation\n\n      code\n- next")).toEqual([
+      "a",
+      "continuation",
+      "```\ncode\n```",
+      "next",
+    ]);
+    // A lazy continuation keeps the item open, so a block after it still nests in the item.
+    expect(texts("- a\nlazy\n\n      code")).toEqual(["a", "lazy", "```\ncode\n```"]);
+    // A tab after the marker reaches the next tab stop, as CommonMark counts it.
+    expect(texts("-\tstep\n\n        code")).toEqual(["step", "```\ncode\n```"]);
+  });
+
+  it("keeps the lines inside a closed HTML comment as typed — a commented Markdown sample is an example", () => {
+    // The scanner hides them and the note shows them; judged as bullet and heading they filed less
+    // than the note. The delimiter lines begin outside the comment, and are judged as typed.
+    expect(texts("Render this:\n<!--\n## heading\n- item\n-->")).toEqual([
+      "Render this:",
+      "<!--",
+      "## heading",
+      "- item",
+      "-->",
+    ]);
+    // A comment opened mid-line, and text after the closer, read the same way.
+    expect(texts("see <!-- start\n  - [ ] TODO — kept\n--> tail")).toEqual([
+      "see <!-- start",
+      "- [ ] TODO — kept",
+      "--> tail",
+    ]);
+    // Once the comment closes the lines are ordinary steps again, and the closer ends no paragraph
+    // an indented block could not follow.
+    expect(texts("<!--\n- x\n-->\n- y")).toEqual(["<!--", "- x", "-->", "y"]);
+    expect(texts("<!--\n- x\n-->\n    code")).toEqual(["<!--", "- x", "-->", "```\ncode\n```"]);
+  });
+
+  it("still shears the lines after an unclosed `<!--` — a stray opener leaves ordinary steps behind it", () => {
+    expect(texts("Handle an unmatched <!-- in the parser.\n- then this\n## Backend\n- and that")).toEqual([
+      "Handle an unmatched <!-- in the parser.",
+      "then this",
+      "and that",
+    ]);
+    // An indented block keeps its lines together even when a comment opens inside it.
+    expect(texts("    <!--\n    - x\n    -->")).toEqual(["```\n<!--\n- x\n-->\n```"]);
+    // Inside a fence a `<!--` is content, so nothing after the fence is commented.
+    expect(texts("```\n<!--\n```\n- step")).toEqual(["```\n<!--\n```", "step"]);
+  });
 });
 
 describe("doneGap", () => {

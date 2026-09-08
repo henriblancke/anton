@@ -8,7 +8,7 @@
  * costs a caller nothing else — no bd, no `gh`, no board read — which is also what lets the rework
  * dialog import it: what the dialog refuses and what the route refuses are one judgement.
  */
-import { fenceCloser, isHeading, scanMarkdown } from "./beads/markdown";
+import { fenceCloser, isHeading, scanMarkdown, type ScannedLine } from "./beads/markdown";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
   MAX_REWORK_INSTRUCTIONS_CHARS,
@@ -168,18 +168,26 @@ const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
  */
 const PROMPT_LINE = /^TODO\s*[—–:-]/;
 
-/**
- * Four or more columns of indentation — CommonMark's indented code, a tab reaching the next tab
- * stop as it does there — and the text past them, which is what the block renders.
- */
-const CODE_INDENT = /^(?: {4}| {0,3}\t)(.*)$/;
+/** Columns of indentation past a container's content that open indented code (CommonMark). */
+const CODE_INDENT = 4;
+
+/** A tab reaches the next multiple of this, as CommonMark counts indentation. */
+const TAB_STOP = 4;
 
 /**
  * A line that opens a list item as CommonMark reads one: up to 3 leading spaces, a bullet or an
  * ordered marker, then whitespace. The marker set is {@link LIST_MARKER}'s; only where the line
- * STARTS differs, since here it decides whether the indented lines after it are nested in a list.
+ * STARTS differs, since here it decides where the item's content begins and so how far the lines
+ * after it must be indented to nest in it.
  */
-const LIST_ITEM = /^ {0,3}(?:[-*+•]|\d{1,9}[.)])(?:\s|$)/;
+const LIST_ITEM = /^( {0,3})([-*+•]|\d{1,9}[.)])(?:([ \t]+)|$)/;
+
+/**
+ * A line that starts a block of its own rather than continuing a paragraph — a list item, a heading,
+ * a rule, a callout. Only these end a list item's paragraph from a lesser indentation; any other
+ * text there is the paragraph's lazy continuation, and the item stays open around it.
+ */
+const BLOCK_START = /^ {0,3}(?:[-*+•]|\d{1,9}[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
 /** One thing the instructions say must be true, as the follow-up's acceptance will file it. */
 export interface InstructionCriterion {
@@ -215,23 +223,34 @@ export interface InstructionCriterion {
  * comment parsing that lib/rework-notes.ts escapes the opener to KEEP as a criterion — and the
  * contract would then say less than the note beside it. What was typed is what files.
  *
+ * The lines INSIDE a comment that closes are literal for the same reason a fence's are: a founder
+ * who types `<!--`, a Markdown sample, `-->` has authored the sample as an example, and shearing
+ * `- item` to `item` and dropping `## heading` filed less than the note shows while keeping the two
+ * delimiters that framed it. Each such line files as it was typed, trimmed and unshorn; the
+ * delimiter lines are judged as typed like any other, since each begins outside the comment. Only
+ * a comment that CLOSES is read so ({@link insideClosedComment}): after a stray `<!--` the rest of
+ * the instructions are ordinary steps, and filing their labels and markers verbatim would be the
+ * render's mistake in the other direction.
+ *
  * An INDENTED code block is literal for the same reason, and CommonMark opens one where the scanner
- * does not: a line indented four columns ({@link CODE_INDENT}) that follows a blank line, a heading,
- * a rule or a fence — anywhere but inside a paragraph or a list. The note renders `Expected
- * output:`, a blank, `    - item` as a code block, and shearing its bullet filed `item` as the
- * contract while the note still showed the marker. The same indentation under a list item is a
- * nested item, and under a paragraph line a continuation of it; a founder who indents sub-steps
- * beneath `Add a retry:` means bullets, so those keep being shorn. The block is filed inside a
- * fence rather than as it was indented ({@link refenced}): it lands among the acceptance's boxes,
- * where four spaces after a `- [ ]` line render as nesting, not code.
+ * does not: a line indented {@link CODE_INDENT} columns past its container's content, after a
+ * blank line, a heading, a rule or a fence — anywhere but inside a paragraph. The note renders
+ * `Expected output:`, a blank, `    - item` as a code block, and shearing its bullet filed `item` as
+ * the contract while the note still showed the marker. The container is the innermost open list
+ * item ({@link itemContentIndent}): four columns under `- Expected output:` is a nested item, since
+ * the item's content starts two columns in and a founder who indents sub-steps beneath `Add a
+ * retry:` means bullets, while eight columns there is four past the content and renders as code.
+ * The block is filed inside a fence rather than as it was indented ({@link refenced}): it lands
+ * among the acceptance's boxes, where four spaces after a `- [ ]` line render as nesting, not code.
  */
 export function instructionCriteria(instructions: string): InstructionCriterion[] {
   const out: InstructionCriterion[] = [];
   let fence: { opener: string; content: string[] } | undefined;
-  let code: string[] | undefined;
+  let code: { indent: number; content: string[] } | undefined;
   // Blank lines inside an indented block belong to it only when more indented lines follow.
   let pendingBlanks = 0;
-  let inList = false;
+  // Content column of every open list item, innermost last.
+  const items: number[] = [];
   let inParagraph = false;
 
   const flushFence = (closer: string) => {
@@ -241,15 +260,17 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     fence = undefined;
   };
   const flushCode = () => {
-    if (code) out.push({ text: refenced(code), fenced: true });
+    if (code) out.push({ text: refenced(code.content), fenced: true });
     code = undefined;
     pendingBlanks = 0;
   };
 
-  for (const line of scanMarkdown(instructions)) {
+  const lines = scanMarkdown(instructions);
+  const literal = insideClosedComment(lines);
+  for (const [at, line] of lines.entries()) {
     if (line.fenced) {
       flushCode();
-      inList = false;
+      items.length = 0;
       inParagraph = false;
       if (!fence) fence = { opener: line.text, content: [] };
       else if (line.delimiter) flushFence(line.text);
@@ -261,17 +282,34 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       inParagraph = false;
       continue;
     }
-    const indented = CODE_INDENT.exec(line.text);
-    if (indented && (code || !(inList || inParagraph))) {
-      code = [...(code ?? []), ...Array<string>(pendingBlanks).fill(""), indented[1]!];
+    const indent = indentColumns(line.text);
+    if (code && indent >= code.indent) {
+      code.content.push(...Array<string>(pendingBlanks).fill(""), dedent(line.text, code.indent));
       pendingBlanks = 0;
       continue;
     }
     flushCode();
-    if (!indented) {
-      const rule = THEMATIC_BREAK.test(line.text.trim()) || isHeading(line.text);
-      inList = !rule && LIST_ITEM.test(line.text);
-      inParagraph = !rule;
+    if (literal[at]) {
+      inParagraph = false;
+      out.push({ text: line.text.trim(), fenced: false });
+      continue;
+    }
+    // A line indented less than the innermost item's content leaves it — unless it is the lazy
+    // continuation of the item's paragraph, which stays inside from any indentation.
+    const lazy = inParagraph && !BLOCK_START.test(line.text.trimStart());
+    while (!lazy && items.length > 0 && indent < items[items.length - 1]!) items.pop();
+    const base = items[items.length - 1] ?? 0;
+    if (!inParagraph && indent - base >= CODE_INDENT) {
+      code = { indent: base + CODE_INDENT, content: [dedent(line.text, base + CODE_INDENT)] };
+      continue;
+    }
+    const rel = indent >= base ? dedent(line.text, base) : line.text;
+    const item = LIST_ITEM.exec(rel);
+    if (THEMATIC_BREAK.test(rel.trim()) || isHeading(rel)) {
+      inParagraph = false;
+    } else if (item) {
+      items.push(itemContentIndent(item, base));
+      inParagraph = rel.slice(item[0].length).trim() !== "";
     } else {
       inParagraph = true;
     }
@@ -281,6 +319,70 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
   flushCode();
   if (fence) flushFence(fenceCloser(fence.opener));
   return out;
+}
+
+/**
+ * For each line, whether it begins inside an HTML comment that goes on to close. A line beginning
+ * inside a comment closes it iff it holds a `-->`, so a run of commented lines is closed by its last
+ * one; walked backwards, that verdict reaches every line of the run and stops at the first line
+ * outside it — which is also where a comment reopened on the closing line starts its own run.
+ */
+function insideClosedComment(lines: readonly ScannedLine[]): boolean[] {
+  const out = Array<boolean>(lines.length).fill(false);
+  let closes = false;
+  for (let at = lines.length - 1; at >= 0; at -= 1) {
+    const line = lines[at]!;
+    if (!line.commented) {
+      closes = false;
+      continue;
+    }
+    if (line.text.includes("-->")) closes = true;
+    out[at] = closes;
+  }
+  return out;
+}
+
+/** The column the text of `line` starts at, a tab reaching the next tab stop. */
+function indentColumns(line: string): number {
+  let column = 0;
+  for (const char of line) {
+    if (char === " ") column += 1;
+    else if (char === "\t") column += TAB_STOP - (column % TAB_STOP);
+    else break;
+  }
+  return column;
+}
+
+/**
+ * `line` past its first `columns` of indentation. A tab that reaches past the boundary is split as
+ * CommonMark splits it: the columns beyond the boundary come back as spaces.
+ */
+function dedent(line: string, columns: number): string {
+  let column = 0;
+  let at = 0;
+  while (at < line.length && column < columns) {
+    const char = line[at]!;
+    if (char === " ") column += 1;
+    else if (char === "\t") column += TAB_STOP - (column % TAB_STOP);
+    else break;
+    at += 1;
+  }
+  return " ".repeat(Math.max(0, column - columns)) + line.slice(at);
+}
+
+/**
+ * The column a list item's content starts at: the marker's own column and width, then the
+ * whitespace after it — one to four columns, or one when the marker ends the line or five or more
+ * follow, as CommonMark reads both (the rest of such a line is indented code).
+ */
+function itemContentIndent(item: RegExpExecArray, base: number): number {
+  const markerEnd = base + item[1]!.length + item[2]!.length;
+  let column = markerEnd;
+  for (const char of item[3] ?? "") {
+    column += char === "\t" ? TAB_STOP - (column % TAB_STOP) : 1;
+  }
+  const after = column - markerEnd;
+  return markerEnd + (after >= 1 && after <= 4 ? after : 1);
 }
 
 /**

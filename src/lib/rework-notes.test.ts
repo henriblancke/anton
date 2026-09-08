@@ -271,6 +271,24 @@ describe("followUpDescription", () => {
     expect(description).not.toContain("<!--");
   });
 
+  it("files the lines of a closed HTML comment as boxes, escaped — a commented sample is an example, not markup", () => {
+    const description = followUpDescription({
+      ...args,
+      instructions: "Render this:\n<!--\n## heading\n- item\n-->",
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] Render this:",
+      "- [ ] <\\!--",
+      "- [ ] ## heading",
+      "- [ ] - item",
+      "- [ ] -->",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(description.match(/^## Context$/gm)).toHaveLength(1);
+  });
+
   it("collapses a multi-line summary and title to one line — a pasted heading must not open its own section", () => {
     const description = followUpDescription({
       ...args,

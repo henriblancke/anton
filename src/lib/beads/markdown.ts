@@ -55,6 +55,11 @@ export interface ScannedLine {
   fenced: boolean;
   /** A fence delimiter: punctuation rather than content, so the render shows no line for it. */
   delimiter: boolean;
+  /**
+   * Begins inside an HTML comment opened on an earlier line. The render hides it and it opens
+   * neither a section nor a fence; whether the comment ever closes is the line's own `-->`.
+   */
+  commented: boolean;
   /** What the line RENDERS — HTML comments stripped outside fences, fenced content kept as written. */
   visible: string;
   /**
@@ -197,20 +202,30 @@ function scanLine(state: ScanState, text: string): ScannedLine {
   if (state.inComment) {
     const comment = stripComments(text, true);
     state.inComment = comment.inComment;
-    return { text, fenced: false, delimiter: false, visible: comment.visible, masked: comment.masked };
+    return {
+      text,
+      fenced: false,
+      delimiter: false,
+      commented: true,
+      visible: comment.visible,
+      masked: comment.masked,
+    };
   }
   if (fenceDelimiter(state, text)) {
-    return { text, fenced: true, delimiter: true, visible: "", masked: text };
+    return { text, fenced: true, delimiter: true, commented: false, visible: "", masked: text };
   }
   // Inside a fence everything is literal: comment state is not tracked there, matching the render's
   // own rule that a `<!--` in fenced code is content rather than markup.
-  if (state.fence) return { text, fenced: true, delimiter: false, visible: text, masked: text };
+  if (state.fence) {
+    return { text, fenced: true, delimiter: false, commented: false, visible: text, masked: text };
+  }
   const comment = stripComments(text, false);
   state.inComment = comment.inComment;
   return {
     text,
     fenced: false,
     delimiter: false,
+    commented: false,
     visible: comment.visible,
     masked: comment.masked,
     heading: headingOf(text),
