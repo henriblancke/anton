@@ -223,13 +223,16 @@ const BLOCK_START = /^ {0,3}(?:[-*+•]|\d{1,9}[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1
 
 /**
  * A line that INTERRUPTS an open paragraph, ending it — {@link BLOCK_START}'s set, but an ordered
- * marker only when it starts at 1. CommonMark lets `1.`/`1)` break a paragraph and no other number:
- * `Backend\n2. API\n===` is one multiline Setext heading, not a label above a list, since `2.` does
- * not interrupt. Used only to find where a Setext paragraph ends ({@link setextHeadingRun}); list
- * STRUCTURE still reads every ordered marker ({@link BLOCK_START}, {@link LIST_ITEM}), so `1. a` /
- * `2. b` stay two items — restricting that would misnest the second.
+ * marker only when its start number is 1. CommonMark lets an ordered list break a paragraph only
+ * when it starts at 1 and no other number: `Backend\n2. API\n===` is one multiline Setext heading,
+ * not a label above a list, since `2.` does not interrupt. The start number is a VALUE, not a
+ * spelling — leading zeros are stripped, so `01.` and `001.` start at 1 and interrupt just as `1.`
+ * does; `0{0,8}1` matches those (and nothing longer than {@link LIST_ITEM}'s nine-digit bound).
+ * Used only to find where a Setext paragraph ends ({@link setextHeadingRun}); list STRUCTURE still
+ * reads every ordered marker ({@link BLOCK_START}, {@link LIST_ITEM}), so `1. a` / `2. b` stay two
+ * items — restricting that would misnest the second.
  */
-const PARA_INTERRUPT = /^ {0,3}(?:[-*+•]|1[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
+const PARA_INTERRUPT = /^ {0,3}(?:[-*+•]|0{0,8}1[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
 /**
  * One blockquote marker peeled as a container: up to 3 spaces, then one `>` of a run that whitespace

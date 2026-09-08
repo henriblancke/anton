@@ -240,6 +240,14 @@ describe("instructionCriteria", () => {
     expect(texts("Backend\n2. API\n===\n- Fix the retry")).toEqual(["Fix the retry"]);
     expect(doneGap("Backend\n2. API\n===", [])).toMatch(/only list markers, headings or rules/);
     expect(texts("Backend\n1. API\n===")).toEqual(["Backend", "API", "==="]);
+    // A zero-padded marker starts at 1 by VALUE, so `01.` interrupts just as `1.` does — the run is
+    // not a Setext heading, and doneGap accepts the actionable step rather than rejecting the whole
+    // draft. Filing only literal `1.` treated `Backend\n01. Add retry\n===` as a heading and dropped
+    // a real instruction the dialog then could not submit.
+    expect(texts("Backend\n01. Add retry\n===")).toEqual(["Backend", "Add retry", "==="]);
+    expect(doneGap("Backend\n01. Add retry\n===", [])).toBeNull();
+    // A non-1 value still does not interrupt, however it is spelled: `00.` is zero, `02.` is two.
+    expect(doneGap("Backend\n02. API\n===", [])).toMatch(/only list markers, headings or rules/);
     // An indented marker cannot interrupt an open paragraph, so a four-space `## API` or `* API`
     // between the label and its underline stays part of one multiline Setext heading — every line
     // drops, and a heading-only draft is caught by doneGap rather than filing `Backend` as a step.
