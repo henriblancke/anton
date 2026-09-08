@@ -186,6 +186,19 @@ describe("an idle project", () => {
     expect(screen.queryByText("share in use elsewhere")).toBeNull();
   });
 
+  it("does not call a reserved project idle when its eligibility was never observed", () => {
+    // Reserved says the share stays put; "idle" is a claim about a picker pass this repo never ran.
+    render(
+      <Harness
+        projects={[project({ id: "mine", name: "mine", eligible: null, reserved: true }), TWO[1]]}
+        reserved
+      />,
+    );
+
+    expect(within(rowFor("mine")).getByText("eligibility not observed here")).toBeTruthy();
+    expect(within(rowFor("mine")).queryByText("reserved while idle")).toBeNull();
+  });
+
   it("does not claim a share moved when no project can spend it", () => {
     render(
       <Harness

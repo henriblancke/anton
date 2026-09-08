@@ -49,12 +49,13 @@ export const GET = withProject<{ slug: string }>(async (_request, { project }) =
   const headroom = budgetHeadroom(usage, policy, Date.now(), { projectWeeklyPct });
   if (!headroom) return new NextResponse(null, { status: 204 });
 
-  // Each side is charged at the meter it is spent against, the same split the runner applies: the
-  // 5-hour session is one account-wide meter every repo moves, so it takes the global per-type
-  // average (`valueGateHolds`); the weekly side is bounded by THIS project's share, so it takes the
-  // project's own average (`projectWeeklyBurn`). Charging the global weekly rate here would show an
-  // expensive project too many affordable cards and a cheap one too few, against a ceiling the
-  // governor enforces at a different rate.
+  // Each meter is charged at the rate it is spent at, the same split the runner applies: the session
+  // and weekly account meters move with every repo, so they take the global per-type average
+  // (`valueGateHolds`, and the cap/pace-line the gate reads off `usage.weeklyPct`); the share is
+  // spent from THIS project's attributed burn, so it takes the project's own average
+  // (`projectWeeklyBurn`). The line picks the weekly rate by which hold binds: charging a cheap
+  // project's rate against the account cap would show cards the fleet's burn exhausts sooner, and
+  // the reverse for an expensive one.
   const [account, projectAverage] = await Promise.all([
     getBurnAverage(db, RUN_JOB_TYPE),
     getProjectBurnAverage(db, project.id, RUN_JOB_TYPE),
@@ -64,7 +65,8 @@ export const GET = withProject<{ slug: string }>(async (_request, { project }) =
     burn: {
       [RUN_JOB_TYPE]: {
         sessionPct: account.sessionAvg,
-        weeklyPct: projectAverage.weeklyAvg,
+        weeklyPct: account.weeklyAvg,
+        shareWeeklyPct: projectAverage.weeklyAvg,
         seeded: account.seeded || projectAverage.seeded,
       },
     },

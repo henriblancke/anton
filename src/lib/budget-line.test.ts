@@ -28,7 +28,7 @@ function headroom(over: Partial<BudgetHeadroom> = {}): BudgetHeadroom {
 function signal(over: Partial<BudgetHeadroom> = {}, cost: Partial<BurnCost> = {}): BudgetSignal {
   return {
     headroom: headroom(over),
-    burn: { [RUN_JOB_TYPE]: { sessionPct: 20, weeklyPct: 3, seeded: false, ...cost } },
+    burn: { [RUN_JOB_TYPE]: { sessionPct: 20, weeklyPct: 3, shareWeeklyPct: 3, seeded: false, ...cost } },
   };
 }
 
@@ -125,6 +125,61 @@ describe("budgetLine", () => {
     expect(line).toEqual({ affordable: 2, reason: "weekly-cap", seeded: false });
   });
 
+  // Each weekly hold is charged at the rate of the meter it reads (PR #248 review): the cap and the
+  // pace-line at the account's, the share at this project's own.
+  it("charges the cap at the account rate, whatever this project's own rate is", () => {
+    // 10 account points at 5 a run across the fleet: two cards. The project's own 2-a-run rate would
+    // promise five, against a cap the fleet's burn crosses long before.
+    const line = budgetLine(
+      signal({ sessionPct: 100, weeklyPct: 10 }, { weeklyPct: 5, shareWeeklyPct: 2 }),
+      queue(6),
+    );
+    expect(line).toEqual({ affordable: 2, reason: "weekly-cap", seeded: false });
+  });
+
+  it("charges the pace-line at the account rate", () => {
+    const line = budgetLine(
+      signal(
+        { sessionPct: 100, weeklyPct: 10, weeklyReason: "weekly-on-track", weeklyInclusive: false },
+        { weeklyPct: 5, shareWeeklyPct: 2 },
+      ),
+      queue(6),
+    );
+    expect(line).toEqual({ affordable: 3, reason: "weekly-on-track", seeded: false });
+  });
+
+  it("charges the share at this project's own rate", () => {
+    // The reverse case: 10 share points at 2 a run is five cards, and the fleet's 5-a-run average
+    // says nothing about what THIS project's runs cost its own share.
+    const line = budgetLine(
+      signal(
+        { sessionPct: 200, weeklyPct: 10, weeklyReason: "share-cap" },
+        { weeklyPct: 5, shareWeeklyPct: 2 },
+      ),
+      queue(8),
+    );
+    expect(line).toEqual({ affordable: 5, reason: "share-cap", seeded: false });
+  });
+
+  it("projects the reserve waiver on the account meter even while the share binds", () => {
+    // The waiver ends where ACCOUNT usage catches the pace-line up, so it is charged at the account
+    // rate (20 a run: two cards) even though the binding weekly hold is the share, charged at the
+    // project's own 2 a run — the share would afford all six.
+    const line = budgetLine(
+      signal(
+        {
+          sessionPct: 55,
+          weeklyPct: 12,
+          weeklyReason: "share-cap",
+          reserveWaiver: { afterWeeklyPct: 35, sessionPct: 20 },
+        },
+        { sessionPct: 10, weeklyPct: 20, shareWeeklyPct: 2 },
+      ),
+      queue(6),
+    );
+    expect(line).toEqual({ affordable: 2, reason: "daytime-reserve", seeded: false });
+  });
+
   it("reports the session floor when both sides run out on the same card", () => {
     // The gate's own precedence: the hard session floor is checked before the weekly holds.
     const line = budgetLine(signal({ sessionPct: 10, weeklyPct: 1 }), queue(2));
@@ -190,8 +245,8 @@ describe("budgetLine", () => {
     const mixed: BudgetSignal = {
       headroom: headroom({ sessionPct: 25 }),
       burn: {
-        [RUN_JOB_TYPE]: { sessionPct: 20, weeklyPct: 1, seeded: false },
-        "nightly-stringer": { sessionPct: 2, weeklyPct: 0.3, seeded: true },
+        [RUN_JOB_TYPE]: { sessionPct: 20, weeklyPct: 1, shareWeeklyPct: 1, seeded: false },
+        "nightly-stringer": { sessionPct: 2, weeklyPct: 0.3, shareWeeklyPct: 0.3, seeded: true },
       },
     };
     // 2 + 2 + 20 = 24 still fits under 25, so the second run target is the one that crosses — and

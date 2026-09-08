@@ -22,17 +22,21 @@
 import type { BudgetHeadroom, DeferReason } from "./jobs/budget";
 
 /**
- * One job type's rolling burn average, as the API reports it. Each side comes from the average that
- * matches the meter it is charged against: the session meter is account-wide, so `sessionPct` is the
- * global per-type average (`getBurnAverage`); the weekly ceiling is bounded by the project's quota
- * share, so `weeklyPct` is that project's own average (`getProjectBurnAverage`) — the same rates the
- * runner charges.
+ * One job type's rolling burn average, as the API reports it. Each rate matches the meter it is
+ * charged against, the same split the runner applies: the session and weekly account meters move
+ * with every repo, so `sessionPct` and `weeklyPct` are the global per-type averages
+ * (`getBurnAverage`); the quota share is spent from this project's own attributed burn, so
+ * `shareWeeklyPct` is its own average (`getProjectBurnAverage`). Which weekly rate the line charges
+ * depends on which weekly hold binds — a cheap project runs into the account cap no later than the
+ * fleet does, whatever its own rate says.
  */
 export interface BurnCost {
   /** Mean session%-points one run of this type burns, across the account. */
   sessionPct: number;
-  /** Mean weekly%-points one run of this type burns for the project the line is drawn for. */
+  /** Mean weekly%-points one run of this type burns on the account meter, across the account. */
   weeklyPct: number;
+  /** Mean weekly%-points one run of this type charges the project's own share. */
+  shareWeeklyPct: number;
   /** The average still leans on the tier seed — fewer real samples than the window holds. */
   seeded: boolean;
 }
@@ -92,8 +96,14 @@ export function budgetLine(
   if (!signal) return null;
 
   const { headroom, burn } = signal;
+  // The share hold reads a different meter from the cap and pace-line — this project's attributed
+  // spend, charged at its own rate — so the weekly side keeps one running total per meter and tests
+  // the binding hold against the total on ITS meter. The reserve waiver is a pace-line question,
+  // so it always reads the account total.
+  const shareBinds = headroom.weeklyReason === "share-cap";
   let session = 0;
   let weekly = 0;
+  let share = 0;
   let seeded = false;
 
   for (const [index, entry] of entries.entries()) {
@@ -118,9 +128,10 @@ export function budgetLine(
     const sessionReason = reserveBack ? "daytime-reserve" : headroom.sessionReason;
 
     const overSession = session >= sessionLimit;
+    const spent = shareBinds ? share : weekly;
     const overWeekly =
       headroom.weeklyPct !== null &&
-      (headroom.weeklyInclusive ? weekly >= headroom.weeklyPct : weekly > headroom.weeklyPct);
+      (headroom.weeklyInclusive ? spent >= headroom.weeklyPct : spent > headroom.weeklyPct);
     if (overSession || overWeekly) {
       // budgetGate's order is session-headroom → weekly-cap → share-cap → weekly-on-track → daytime-reserve, so
       // only the hard floor beats a weekly hold when both are exhausted.
@@ -134,6 +145,7 @@ export function budgetLine(
 
     session += cost.sessionPct;
     weekly += cost.weeklyPct;
+    share += cost.shareWeeklyPct;
     seeded ||= cost.seeded;
   }
 

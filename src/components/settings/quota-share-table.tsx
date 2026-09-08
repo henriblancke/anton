@@ -285,7 +285,7 @@ function InForceCell({ row }: { row: QuotaShareRow }) {
           +{Math.round(row.gainedPct)} pts from idle projects
         </span>
       )}
-      {row.reserved && !row.eligible && (
+      {row.reserved && row.eligible === false && (
         <span className="text-[10.5px] text-subtle">reserved while idle</span>
       )}
     </span>

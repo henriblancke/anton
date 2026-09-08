@@ -25,7 +25,7 @@ function signal(sessionPct: number, sessionReason: DeferReason = "session-headro
       weeklyInclusive: true,
       reserveWaiver: null,
     },
-    burn: { [RUN_JOB_TYPE]: { sessionPct: 20, weeklyPct: 3, seeded: false } },
+    burn: { [RUN_JOB_TYPE]: { sessionPct: 20, weeklyPct: 3, shareWeeklyPct: 3, seeded: false } },
   };
 }
 
