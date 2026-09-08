@@ -312,6 +312,9 @@ async function openRunRow(args: {
     error: null,
     reviewScore: null,
     attemptStartedAt: clock.now(),
+    // The resumed attempt drives the freshly resolved endpoint (anton-oom5). Rewrite the provenance
+    // so a resume after the project's gateway setting changed isn't attributed to the old route.
+    endpointHost,
   });
   return { runId, existing };
 }

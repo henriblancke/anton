@@ -71,6 +71,18 @@ describe("startInteractiveSession cwd", () => {
       "failed",
     );
   });
+
+  it("marks the session failed and rethrows when the routing lookup rejects", async () => {
+    getProjectSettings.mockRejectedValueOnce(new Error("db read failed"));
+    await expect(startInteractiveSession(project, {})).rejects.toThrow("db read failed");
+    expect(spawn).not.toHaveBeenCalled();
+    expect(endSession).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.any(String),
+      "failed",
+    );
+  });
 });
 
 // The pty must talk to the SAME endpoint this project's headless runs do (anton-7poz): resolve the

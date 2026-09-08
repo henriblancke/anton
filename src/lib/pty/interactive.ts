@@ -68,11 +68,12 @@ export async function startInteractiveSession(
   });
 
   const bin = process.env[CLAUDE_BIN_ENV] ?? "claude";
-  // Route the terminal exactly like this project's headless runs (anton-7poz): the SAME resolver,
-  // applied OVER anton's env. A session opened to debug a run must hit the run's endpoint — and an
-  // unrouted project's pty must not inherit a stray ambient ANTHROPIC_BASE_URL.
-  const routing = claudeRouting(await getProjectSettings(db, project.id));
   try {
+    // Route the terminal exactly like this project's headless runs (anton-7poz): the SAME resolver,
+    // applied OVER anton's env. A session opened to debug a run must hit the run's endpoint — and an
+    // unrouted project's pty must not inherit a stray ambient ANTHROPIC_BASE_URL. Kept inside the
+    // guard so a failed settings read marks the row failed rather than leaving it stuck `running`.
+    const routing = claudeRouting(await getProjectSettings(db, project.id));
     getPtyManager().spawn({
       sessionId,
       file: bin,

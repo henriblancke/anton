@@ -23,6 +23,7 @@ import { PoisonEpic } from "./errors";
 
 const loadAllIssuesMock = vi.fn();
 const createRunMock = vi.fn();
+const updateRunMock = vi.fn();
 const findOpenRunForEpicMock = vi.fn();
 
 // The settings a start reads — mutable so a case can route the project before starting it.
@@ -48,6 +49,7 @@ vi.mock("../runs", async () => {
     ...actual,
     findOpenRunForEpic: (...args: unknown[]) => findOpenRunForEpicMock(...args),
     createRun: (...args: unknown[]) => createRunMock(...args),
+    updateRun: (...args: unknown[]) => updateRunMock(...args),
   };
 });
 
@@ -93,6 +95,7 @@ async function start(board: Bead[], targetId: string): Promise<unknown> {
 beforeEach(() => {
   loadAllIssuesMock.mockReset();
   createRunMock.mockReset();
+  updateRunMock.mockReset();
   findOpenRunForEpicMock.mockReset().mockResolvedValue(undefined);
   projectSettings = {};
 });
@@ -182,5 +185,21 @@ describe("beginEpicRun — the created run records its endpoint host (anton-oom5
     await start([bead("t1")], "t1");
 
     expect(endpointHostOf()).toBe("api.anthropic.com");
+  });
+
+  it("refreshes the provenance on resume — the reopened attempt drives the current gateway", async () => {
+    // A parked run resumed after its project's gateway setting changed drives the newly resolved
+    // endpoint, so the reused row must move with it rather than keep the old route it was opened on.
+    findOpenRunForEpicMock.mockResolvedValue({ id: "existing-run" });
+    projectSettings = {
+      claudeBaseUrl: "https://token@router.local:20128/v1",
+      claudeAuthTokenEnv: "GATEWAY_TOKEN",
+    };
+
+    await start([bead("t1")], "t1");
+
+    expect(createRunMock).not.toHaveBeenCalled();
+    expect(updateRunMock).toHaveBeenCalledTimes(1);
+    expect(updateRunMock.mock.calls[0][3]).toMatchObject({ endpointHost: "router.local:20128" });
   });
 });

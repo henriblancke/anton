@@ -65,6 +65,14 @@ export function httpUrl(max: number): FieldParser<string> {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return reject(`${key} must be an http(s) URL`);
     }
+    // Userinfo is a secret in a URL's clothing — storing it verbatim would land a credential in
+    // settings_json, exactly the "no secret in anton.db" guarantee this feature rests on.
+    if (parsed.username || parsed.password) {
+      return reject(
+        `${key} must not include credentials — paste the URL without userinfo, ` +
+          `and keep the token in the auth-token env var`,
+      );
+    }
     return accept(raw);
   };
 }

@@ -191,6 +191,12 @@ export type RunPatch = Partial<{
   branch: string | null;
   model: string | null;
   agentTag: string | null;
+  /**
+   * The endpoint host this run drove (anton-oom5). Rewritten on resume: a parked run reopened after
+   * its project's gateway setting changed drives the newly resolved endpoint, so the recorded
+   * provenance must move with it rather than attribute resumed traffic to the old route.
+   */
+  endpointHost: string;
   /** The pipeline this run walked (anton-aa3m) — written once the formula is selected + validated. */
   formula: string | null;
   formulaVariant: string | null;
