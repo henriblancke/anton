@@ -4,6 +4,7 @@
  * is allowed to land. Assembled once by the handler and threaded through its steps, so a step's own
  * signature carries only what makes it that step.
  */
+import { claudeRouting } from "../claude/driver-routing";
 import { getProjectById, getProjectSettings, type ProjectSettings } from "../projects";
 import { appendSessionLog, endSession, startJobSession, type JobSession } from "../sessions";
 import type { Project } from "../types";
@@ -55,8 +56,9 @@ export async function openPass(
     kind: "nightly-stringer",
   });
   // Live handle (anton-susu): nightly-stringer writes no run row, so this is how observe finds
-  // the in-flight session. It runs claude directly in the project repo — no worktree.
-  ctx.report({ sessionId, cwd: project.repoPath });
+  // the in-flight session. It runs claude directly in the project repo — no worktree. The captured
+  // routing rides along (anton-7poz) so an investigate terminal hits the SAME gateway triage does.
+  ctx.report({ sessionId, cwd: project.repoPath, routing: claudeRouting(settings) });
 
   // Closure-held so the window rule cannot be defeated by a caller assigning the field directly.
   let triaged = false;

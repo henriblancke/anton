@@ -386,6 +386,22 @@ describe("settings route — Claude gateway routing (anton-n16m)", () => {
     expect("claudeBaseUrl" in persisted()).toBe(false);
   });
 
+  it("PATCH rejects a base URL with a query or fragment — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://gateway.example/v1?api_key=sk-secret",
+      "https://gateway.example/v1#token=sk-secret",
+      "https://gateway.example/v1?foo=bar",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
   it("PATCH rejects a token VALUE in the env-var-name field — a secret must not be stored", async () => {
     for (const bad of ["sk-ant-abc123", "anthropic-auth-token", "MY TOKEN", "1TOKEN", 42]) {
       const res = await PATCH(patchReq({ claudeAuthTokenEnv: bad }), ctx("tmp"));

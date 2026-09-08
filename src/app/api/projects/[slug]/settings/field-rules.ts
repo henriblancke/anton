@@ -73,6 +73,15 @@ export function httpUrl(max: number): FieldParser<string> {
           `and keep the token in the auth-token env var`,
       );
     }
+    // A query or fragment is the other place a secret hides in a URL (`?api_key=…`, `#token=…`);
+    // a gateway BASE URL has no use for either, so forbid both outright rather than sniff for
+    // credential-shaped params — same guarantee, no persisted secret.
+    if (parsed.search || parsed.hash) {
+      return reject(
+        `${key} must not include a query or fragment — paste the base URL only, ` +
+          `and keep any token in the auth-token env var`,
+      );
+    }
     return accept(raw);
   };
 }
