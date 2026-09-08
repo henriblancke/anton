@@ -2,6 +2,8 @@
  * PR #253 review — {@link finishTicket} answers whether the bead actually CLOSED. The close is
  * best-effort (`safe`), so a bd that refuses the write leaves the ticket open; the run's ledger and
  * the pull request body it feeds must carry that fact, not a close inferred from the run's shape.
+ * A satisfied step's attribution note is NOT best-effort: it is what makes the close honest, so a
+ * note bd refuses stops the close and halts the run rather than closing a bead that cannot say why.
  *
  * Mocked at the bd seam: a close that FAILS is a state a real board can't be asked for on demand.
  */
@@ -34,6 +36,7 @@ vi.mock("../sessions", async () => {
 });
 
 const { finishTicket } = await import("./execute-epic-ticket-bookends");
+import { PoisonEpic } from "./errors";
 import type { StepContext } from "./step-registry";
 
 const REPO = "/tmp/anton";
@@ -65,6 +68,24 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
     await expect(finishTicket(run(), ticket, "s1", true, satisfied)).resolves.toEqual({ closed: true });
     expect(closeMock).toHaveBeenCalledWith(REPO, ticket.id);
     expect(endSessionMock).toHaveBeenCalledWith({}, expect.anything(), "s1", "done");
+  });
+
+  it("does NOT close a satisfied step whose attribution bd refused to record (PR #253 review)", async () => {
+    // The satisfied record is the closed bead's only account of itself: the run's ledger is lost
+    // by a later park, and the pull request that would cite it may never open. So a note bd refuses
+    // — after every retry — refuses the close too, and the run halts on a park a person can act on.
+    noteMock.mockRejectedValue(new Error("Command failed: bd note anton-t2\ndatabase is locked"));
+
+    const err = await finishTicket(run(), ticket, "s1", true, satisfied).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PoisonEpic);
+    expect((err as Error).message).toMatch(/bd would not record/);
+    expect((err as Error).message).toContain("0123456");
+    expect(noteMock).toHaveBeenCalledTimes(3);
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(endSessionMock).not.toHaveBeenCalled();
   });
 
   it("answers NOT closed when bd refused the close, and still ends the session", async () => {

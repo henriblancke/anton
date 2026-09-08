@@ -7,7 +7,7 @@
  * ticket stops short is the settlement's (execute-epic-ticket-settle.ts).
  */
 import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
-import { formatSatisfiedNote } from "../beads/satisfied-note";
+import { formatSatisfiedNote, shortSha } from "../beads/satisfied-note";
 import { readWorktreeState, type WorktreeState } from "../git/ops";
 import { updateRun } from "../runs";
 import { appendSessionLog, endSession, startJobSession, type JobSession } from "../sessions";
@@ -305,16 +305,26 @@ export async function finishTicket(
   // A satisfied step closes exactly as a committed one does, so the bead has to say which it was
   // (anton-8h4b): without the record, a reader later sees a closed ticket with no commit under its
   // name on the branch and cannot tell "an earlier commit covered it" from "the close was a lie".
-  // Written before the close so the closed bead already carries its account; best-effort like the
-  // close beside it — the pull request cites the same commit from the run's own ledger.
+  // Written before the close, and the close WAITS on it (PR #253 review): the run's ledger is the
+  // only other copy, and a later park loses it before any pull request cites it. A note bd refuses
+  // therefore refuses the close too — the bead is left open for the resume to settle again, and the
+  // run halts on the same "check the beads DB" park every unrecordable board fact takes.
   if (settlement.how === "satisfied") {
-    await safe(() =>
+    const recorded = await mustPersist(() =>
       beads.note(
         repo,
         ticket.id,
         formatSatisfiedNote({ by: settlement.by, sessionId, branch: run.branch }),
       ),
     );
+    if (!recorded) {
+      throw new PoisonEpic(
+        `${ticket.id} is satisfied by an earlier commit of this run ` +
+          `(${shortSha(settlement.by.commit)}), but bd would not record that on the bead — closing ` +
+          `it anyway would leave a closed ticket with no commit under its name and no account of ` +
+          `why, so it was left open instead. Check the beads DB, then resume the run`,
+      );
+    }
   }
   // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
   // → done). A standalone target isn't closed until its PR merges, so instead move it to

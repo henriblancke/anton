@@ -93,6 +93,16 @@ export async function runTicket(args: {
   try {
     await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress });
     const settlement = await ticketSettlement(run, progress);
+    // The deadline only stops what observes it (PR #253 review). The gate's branch reads and the
+    // settlement's commit lookup are plain git reads that take no signal, so a deadline landing
+    // during one aborts nothing: the walk returns as if in time, and nothing below would ask. Asked
+    // here, the last point before the board is written — a ticket the clock caught on its final
+    // read settles as the timeout it is, never as a close.
+    if (budget.ranOutOfTime()) {
+      throw new Error(
+        `${ticket.id} ran out of its ticket budget while the delivery gate was reading the branch`,
+      );
+    }
     const { closed } = await finishTicket(run, ticket, session.sessionId, closeOnDone, settlement);
     return { ...settlement, closed };
   } catch (e) {
