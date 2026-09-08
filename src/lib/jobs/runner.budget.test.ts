@@ -691,6 +691,38 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     }
   });
 
+  it("refunds the spend of a cancelled attempt that never reached Claude (PR #248)", async () => {
+    // `cancel()` terminalizes the row BEFORE aborting the handler, so the aborted handler's settle is
+    // a no-op against it — and would leave the lease's up-front charge on a row that quota
+    // accounting still sums. An operator killing a job in preflight must not spend the project's
+    // share on nothing; one killed after the spawn keeps its charge.
+    h.seedProjects("A");
+    for (const [reached, spent] of [
+      [false, 0],
+      [true, 1],
+    ] as const) {
+      const r = budgetRunner(
+        async (ctx) => {
+          if (reached) ctx.claudeReached();
+          await new Promise<void>((resolveWait) => {
+            ctx.signal.addEventListener("abort", () => resolveWait());
+          });
+        },
+        { readUsage: async () => usage({ sessionPct: 10 }) },
+      );
+      const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+      expect(await r.tickOnce()).toBe(1);
+      await waitUntil(() => r.activeCount === 1);
+      expect((await getJob(h.db, id))?.spentAttempts).toBe(1); // the lease charges up front
+
+      expect(await r.cancel(id)).toBe(true);
+      await r.whenIdle();
+      const job = await getJob(h.db, id);
+      expect(job?.status).toBe("cancelled");
+      expect(job?.spentAttempts).toBe(spent);
+    }
+  });
+
   // ── Per-job value/cost gate (anton-k05r) ──
   // The h.clock (1_700_000_000_000 ≈ 22:13 UTC) is NIGHT under the default policy (day 8–22), so the
   // daytime reserve never holds these ticks: the coarse gate admits and the fine gate decides.

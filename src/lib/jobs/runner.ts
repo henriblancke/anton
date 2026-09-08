@@ -36,6 +36,7 @@ import {
   projectIdsWithPendingJobs,
   queuedDueJobs,
   reclaimRunningJobs,
+  refundCancelledSpend,
   renewLease,
   reschedule,
   resumeBudgetDeferredJobs,
@@ -1374,9 +1375,10 @@ export class JobRunner {
    * Apply the durability policy to an outcome. Returns the action taken; null when a cancel won.
    *
    * `refundSpend` withdraws the attempt from the project's spend meter (`spentAttempts`) on EVERY
-   * action — complete, reschedule or park: whether Claude was invoked is the handler's report, not
-   * a property of how the attempt ended. A quota hit keeps its charge because the handler reached
-   * Claude before the wall; a poison that parked in preflight hands its attempt back.
+   * exit — complete, reschedule, park, or a cancel that won: whether Claude was invoked is the
+   * handler's report, not a property of how the attempt ended. A quota hit keeps its charge because
+   * the handler reached Claude before the wall; a poison that parked in preflight hands its attempt
+   * back, and so does a job an operator killed during preflight.
    */
   private async settle(
     job: JobRow,
@@ -1387,10 +1389,30 @@ export class JobRunner {
   ): Promise<Action | null> {
     // Re-read attempts (a heartbeat/lease may have advanced updatedAt, not attempts, but be safe).
     const fresh = (await getJob(this.db, job.id)) ?? job;
-    // Fast-path a cancel already visible at this read. The queue transition below also compares from
-    // `running`, which closes the remaining race where cancel lands after this check but before the
-    // settle write.
-    if (fresh.status === "cancelled") return null;
+    // Fast-path a cancel already visible at this read. Each transition in `applyAction` also compares
+    // from `running`, which closes the remaining race where cancel lands after this check but before
+    // the settle write.
+    const action =
+      fresh.status === "cancelled"
+        ? null
+        : await this.applyAction(job, fresh, outcome, policy, effect, opts);
+    // A cancel that won — at the read above, or in the race between it and the settle write (every
+    // settle write compares from `running`, so the loser touched nothing) — leaves the lease's
+    // up-front charge on the row, and quota accounting sums cancelled rows too. Hand it back when
+    // Claude was never reached; the cancelled-only WHERE makes this a no-op when settle won.
+    if (opts.refundSpend) await refundCancelledSpend(this.db, job.id);
+    return action;
+  }
+
+  /** The durability transition for a still-`running` job: complete, reschedule or park. */
+  private async applyAction(
+    job: JobRow,
+    fresh: JobRow,
+    outcome: Outcome,
+    policy: JobPolicy,
+    effect: JobEffect | undefined,
+    opts: { refundSpend: boolean },
+  ): Promise<Action> {
     // The project's retry budget governs when we park; backoff/quota stay from the runner config.
     const config = { ...this.config, maxAttempts: policy.maxAttempts };
     const action = nextAction(config, fresh, outcome, this.clock.now());

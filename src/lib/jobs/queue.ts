@@ -1373,6 +1373,21 @@ export async function cancelJob(
 }
 
 /**
+ * Hand a cancelled attempt back off the project's spend meter (PR #248 review). `cancelJob` wins the
+ * row before the runner's settle runs, so every settle write (which compares from `running`) is a
+ * no-op against it and the lease's up-front charge would stay on the row — and quota accounting sums
+ * cancelled rows too. The runner calls this only when the handler never reported reaching Claude; the
+ * cancelled-only WHERE makes it a no-op whenever the settle write won instead. Leaves `updatedAt`
+ * alone: on a cancelled row it is the cancel's timestamp, which `resumeEpic` reads as evidence.
+ */
+export async function refundCancelledSpend(db: AntonDb, jobId: string): Promise<void> {
+  await db
+    .update(schema.jobs)
+    .set({ spentAttempts: spentAttemptsAfter(true) })
+    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "cancelled")));
+}
+
+/**
  * Ids of a project's active (`queued`|`running`) jobs. Project teardown (anton-adt) uses this to
  * find what must be aborted/removed before the project's rows and worktrees are deleted.
  */
