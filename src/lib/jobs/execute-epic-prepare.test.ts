@@ -91,6 +91,7 @@ vi.mock("../git/ops", async () => {
 // tests that ask for a stale one exercise the refusal.
 vi.mock("./self-freshness", () => ({
   checkSelfFreshness: (...args: unknown[]) => checkSelfFreshnessMock(...args),
+  selfRepoRoot: () => "/anton",
 }));
 
 vi.mock("./formula-floor", () => ({ assertRunFormulaFloor: () => {} }));

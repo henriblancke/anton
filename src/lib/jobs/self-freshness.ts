@@ -42,6 +42,18 @@ function reason(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** Where build/drift.ts publishes anton's OWN install root, so a moved runtime dir is still found. */
+const APP_ROOT_ENV = "ANTON_APP_ROOT";
+
+/**
+ * anton's own install root — the checkout the self-freshness verdict is read against, NOT the project
+ * checkout a run operates on. Both the start-time preflight and the board's stale-breaker read resolve
+ * it here, so "which tree is anton itself" is answered in exactly one place.
+ */
+export function selfRepoRoot(): string {
+  return process.env[APP_ROOT_ENV] ?? process.cwd();
+}
+
 /** Both halves of the freshness answer for the checkout at `repoPath`, read in parallel. */
 export async function checkSelfFreshness(repoPath: string): Promise<SelfFreshness> {
   const [checkout, dependencies] = await Promise.all([

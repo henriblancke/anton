@@ -17,7 +17,8 @@ import {
   AutopilotBreakerBand,
   AutopilotBreakerHeader,
 } from "@/components/board/autopilot-breaker-header";
-import type { AutopilotDisarm, AutopilotHold } from "@/lib/autopilot-breaker";
+import { staleBreaker } from "@/lib/autopilot-breaker";
+import type { AutopilotDisarm, AutopilotHold, AutopilotStale } from "@/lib/autopilot-breaker";
 
 const refresh = vi.fn();
 const success = vi.fn();
@@ -59,9 +60,21 @@ function disarm(o: Partial<AutopilotDisarm> = {}): AutopilotDisarm {
   };
 }
 
+function stale(o: Partial<AutopilotStale> = {}): AutopilotStale {
+  return {
+    kind: "stale",
+    reason: "behind-own-code",
+    detail: "The running anton is behind its own latest code: 3 commits behind origin/main.",
+    evidence: ["Checkout is 3 commits behind origin/main — run `git pull`"],
+    ...o,
+  };
+}
+
 /** The band itself, so "does the hold offer buttons" is asked of the band and not of the document. */
 function band(): HTMLElement {
-  return screen.getByRole("region", { name: /Autopilot is (holding|disarmed)/ });
+  return screen.getByRole("region", {
+    name: /Autopilot is (holding|disarmed)|Anton is running old code/,
+  });
 }
 
 describe("AutopilotBreakerHeader", () => {
@@ -188,6 +201,71 @@ describe("AutopilotBreakerHeader", () => {
       );
       // Someone else lifted it: re-read rather than leave a band that errors on every click.
       expect(refresh).toHaveBeenCalled();
+    });
+  });
+
+  describe("stale", () => {
+    it("says why anton stopped, in the failure register", () => {
+      render(<AutopilotBreakerHeader slug="anton" breaker={stale()} />);
+      expect(screen.getByText("Anton is running old code")).toBeTruthy();
+      expect(screen.getByText("Behind its own latest code")).toBeTruthy();
+      expect(
+        screen.getByText(/The running anton is behind its own latest code/),
+      ).toBeTruthy();
+      // Red like a disarm — it needs a human — and told apart by the word beside the colour.
+      expect(within(band()).getByText("stale")).toBeTruthy();
+      expect(band().className).toMatch(/destructive/);
+    });
+
+    it("states the remedy on the surface — the command to run and the restart it needs", () => {
+      // R4.5's whole point: the fix is on the board, not buried in a run's park message.
+      render(<AutopilotBreakerHeader slug="anton" breaker={stale()} />);
+      expect(
+        within(band()).getByText("Checkout is 3 commits behind origin/main — run `git pull`"),
+      ).toBeTruthy();
+      expect(
+        screen.getByText("Update anton and restart it. Nothing starts new work until you do."),
+      ).toBeTruthy();
+      expect(screen.getByText(/only starting new work is stopped/)).toBeTruthy();
+    });
+
+    it("carries a line for each stale half", () => {
+      render(
+        <AutopilotBreakerHeader
+          slug="anton"
+          breaker={stale({
+            evidence: [
+              "Checkout is 3 commits behind origin/main — run `git pull`",
+              "Installed packages no longer match bun.lock (drizzle-orm, next) — run `bun install`",
+            ],
+          })}
+        />,
+      );
+      expect(
+        within(band()).getByText(/Installed packages no longer match bun.lock/),
+      ).toBeTruthy();
+    });
+
+    it("offers no buttons — there is nothing to re-arm and no page to investigate", () => {
+      render(<AutopilotBreakerHeader slug="anton" breaker={stale()} />);
+      expect(within(band()).queryByRole("button")).toBeNull();
+      expect(within(band()).queryByRole("link")).toBeNull();
+      expect(screen.queryByText(/re-arm/i)).toBeNull();
+    });
+
+    it("renders nothing for a clean self-freshness verdict", () => {
+      // The verdict → band step is what the board actually runs; a current checkout with matched
+      // packages must produce no band at all.
+      const { container } = render(
+        <AutopilotBreakerHeader
+          slug="anton"
+          breaker={staleBreaker({
+            checkout: { state: "current" },
+            dependencies: { state: "match" },
+          })}
+        />,
+      );
+      expect(container.innerHTML).toBe("");
     });
   });
 });

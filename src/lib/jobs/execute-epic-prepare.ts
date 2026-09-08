@@ -37,7 +37,7 @@ import {
 } from "./execute-epic-claim";
 import { adoptRefreshedTarget, preflightHumanTickets } from "./execute-epic-human-gate";
 import { refreshRunBoard, settleCompletedRun } from "./execute-epic-recover";
-import { checkSelfFreshness, type SelfFreshness } from "./self-freshness";
+import { checkSelfFreshness, selfRepoRoot, type SelfFreshness } from "./self-freshness";
 import type { EpicRun } from "./execute-epic-run";
 // The formula/step family and the run-lease sit behind ONE seam (anton-8x1k) — the run-shape
 // helpers this module merely threads through or re-exports, kept out of its top-level import graph
@@ -127,9 +127,6 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   };
 }
 
-/** Where build/drift.ts publishes anton's OWN install root, so a moved runtime dir is still found. */
-const APP_ROOT_ENV = "ANTON_APP_ROOT";
-
 /**
  * Step 0-pre. Refuse to START a new run when anton is running behind its own latest code
  * (anton-mh3c). anton pulls before it starts, but a fix merged after that pull — or a lockfile bump
@@ -148,7 +145,7 @@ const APP_ROOT_ENV = "ANTON_APP_ROOT";
  * record the run row keeps and the run-health sweep surfaces.
  */
 async function assertSelfCheckoutFresh(): Promise<void> {
-  const root = process.env[APP_ROOT_ENV] ?? process.cwd();
+  const root = selfRepoRoot();
   const refusal = staleCheckoutRefusal(await checkSelfFreshness(root), root);
   if (refusal) throw new PoisonEpic(refusal);
 }
