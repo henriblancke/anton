@@ -583,9 +583,37 @@ export async function pushBranch(repoPath: string, branch: string): Promise<void
   await git(repoPath, ["push", "-u", "origin", branch]);
 }
 
-/** Fetch refs from origin (all refs when none given). */
+/**
+ * Serialize `git fetch`es per repository. git takes a per-ref lock while updating a tracking ref, so
+ * two fetches racing to write the SAME ref leave the loser dead with `cannot lock ref '…' is at … but
+ * expected …`. The self-freshness read ({@link distanceBehindUpstream}) runs from BOTH the board's
+ * 60s breaker poll and the execute-epic preflight — and from two starts landing together — all in the
+ * one in-process job runner, each fetching the same upstream tracking ref. Left unserialized, the
+ * loser's lock failure is caught as `unreachable`, an INDETERMINATE verdict `staleCheckoutRefusal`
+ * lets a start through on — so a run could execute a checkout that is actually behind. Chaining per
+ * repo makes the ref lock uncontended: only one fetch touches a given repo at a time.
+ */
+const fetchChains = new Map<string, Promise<void>>();
+function serializeFetch<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+  const prior = fetchChains.get(repoPath) ?? Promise.resolve();
+  // Run after any prior fetch SETTLES — success or failure — so the ref lock is never contended.
+  const result = prior.then(fn, fn);
+  // The chain tail must never reject, or one failed fetch would poison every fetch queued behind it.
+  const tail = result.then(
+    () => {},
+    () => {},
+  );
+  fetchChains.set(repoPath, tail);
+  // Drop the entry once this is the last fetch queued, so the map does not grow one slot per repo forever.
+  void tail.then(() => {
+    if (fetchChains.get(repoPath) === tail) fetchChains.delete(repoPath);
+  });
+  return result;
+}
+
+/** Fetch refs from origin (all refs when none given). Serialized per repo — see {@link serializeFetch}. */
 export async function fetchOrigin(repoPath: string, refs: string[] = []): Promise<void> {
-  await git(repoPath, ["fetch", "origin", ...refs]);
+  await serializeFetch(repoPath, () => git(repoPath, ["fetch", "origin", ...refs]));
 }
 
 /**
@@ -711,8 +739,10 @@ export async function distanceBehindUpstream(repoPath: string): Promise<Upstream
   try {
     // Explicit destination refspec, for the reason resolveFreshBase documents: a bare fetch honours
     // the remote's configured refspec and can update FETCH_HEAD alone, leaving the tracking ref this
-    // then counts against stale. `+` allows a non-fast-forward update of the ref.
-    await git(repoPath, ["fetch", remote, `+${mergeRef}:${trackingRef}`]);
+    // then counts against stale. `+` allows a non-fast-forward update of the ref. Serialized per repo
+    // ({@link serializeFetch}) so a concurrent freshness fetch cannot lose the ref lock and be
+    // misread as `unreachable`.
+    await serializeFetch(repoPath, () => git(repoPath, ["fetch", remote, `+${mergeRef}:${trackingRef}`]));
   } catch (e) {
     return { state: "unreachable", reason: e instanceof Error ? e.message : String(e) };
   }
