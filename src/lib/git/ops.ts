@@ -729,6 +729,27 @@ export async function worktreeHasPreservedCommitFor(
   return (await branchSubjects(worktreePath, options)).some((s) => s.startsWith(prefix));
 }
 
+/**
+ * True when the branch TIP is this ticket's preserved (`WIP <id>:`) commit — the question the
+ * self-committed-work adoption asks before deciding a fresh marker is unnecessary (PR #255 review).
+ *
+ * History-wide presence ({@link worktreeHasPreservedCommitFor}) is NOT the same question, and using
+ * it here loses work: an older marker sitting BENEATH newer self-commits does not cover them, so the
+ * resume's newest `WIP` would no longer be the preserved tip and its `baseline..tip` range would omit
+ * the latest commits. Only a marker AT the tip covers everything down to the baseline. Fails closed
+ * to `false` — the answer that makes a marker, never the one that skips it — like
+ * {@link worktreeHasPreservedCommitFor}.
+ */
+export async function worktreeTipIsPreservedCommitFor(
+  worktreePath: string,
+  ticketId: string,
+  options: { strict?: boolean } = {},
+): Promise<boolean> {
+  const prefix = preservedCommitPrefix(ticketId);
+  const [tip] = await branchCommits(worktreePath, options);
+  return tip !== undefined && tip.subject.startsWith(prefix);
+}
+
 /** A timed-out attempt's preserved commit, as the resume's dispatch prompt describes it. */
 export interface PreservedCommit {
   /** Full sha of the NEWEST preserved commit — the tip of this ticket's preserved work. */
@@ -739,11 +760,11 @@ export interface PreservedCommit {
    * once, and each timeout adds only its own delta, so the newest commit alone omits what earlier
    * ones kept. With {@link baseline} known this is the single diff `baseline..sha`, which also
    * captures a first attempt's SELF-committed work living beneath an empty marker — a per-commit
-   * union would see the (empty) marker and miss it (PR #255 review). `[]` is the marker form only on
-   * the fork-pointless fallback: the agent committed the work under its own subjects and the empty
-   * marker records whose it is, so the diff lives beneath it (see {@link commitMarker}). `undefined`
-   * means the diff could NOT be read: a git failure is not an empty commit, and the prompt must not
-   * present a failed read as proof nothing was kept.
+   * union would see the (empty) marker and miss it (PR #255 review). `[]` is ambiguous — the marker
+   * form (empty newest commit, work beneath) OR a range that nets to nothing though the newest
+   * commit is non-empty (earlier edits undone by later ones) — so {@link newestEmpty} disambiguates
+   * it for the prompt. `undefined` means the diff could NOT be read: a git failure is not an empty
+   * commit, and the prompt must not present a failed read as proof nothing was kept.
    */
   files: string[] | undefined;
   /**
@@ -759,6 +780,15 @@ export interface PreservedCommit {
    * falls back to a marker-relative range.
    */
   baseline?: string;
+  /**
+   * Whether the NEWEST preserved commit is itself empty — the signal that disambiguates a `[]`
+   * {@link files} (PR #255 review). An empty newest commit is the marker form: the work is in the
+   * commits beneath it. A non-empty newest commit whose `baseline..sha` range still nets to `[]` is
+   * NOT a marker — earlier attempts' edits were undone by later ones — and the prompt must not point
+   * the agent beneath it. `undefined` when git could not be read (the newest commit's own diff), in
+   * which case the prompt keeps the pre-existing marker wording rather than guess.
+   */
+  newestEmpty?: boolean;
 }
 
 /**
@@ -796,12 +826,16 @@ export async function readPreservedCommitFor(
     ? await resolveMergeBase(worktreePath, baseRef).catch(() => undefined)
     : undefined;
   const baseline = resolved && /^[0-9a-f]{40}$/.test(resolved) ? resolved : undefined;
+  // The newest commit's OWN diff, kept apart from the aggregate `files`: only it tells a genuine
+  // empty marker from a range that nets to nothing (PR #255 review).
+  const newestOwnFiles = await showPaths(worktreePath, newest.sha).catch(() => undefined);
   return {
     sha: newest.sha,
     subject: newest.subject,
     earlier,
     baseline,
     files: await preservedFiles(worktreePath, matches, baseline),
+    newestEmpty: newestOwnFiles === undefined ? undefined : newestOwnFiles.length === 0,
   };
 }
 

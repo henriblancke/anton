@@ -40,6 +40,8 @@ import {
   restoreWorktreeState,
   sameWorktreeState,
   worktreeHasCommitFor,
+  worktreeHasPreservedCommitFor,
+  worktreeTipIsPreservedCommitFor,
   branchAddedCommit,
   describeCommit,
   branchContainsCommit,
@@ -373,11 +375,32 @@ suite("worktreeHasCommitFor (real git)", () => {
     });
 
     // The marker form: the agent committed the work itself, so the preserved commit is EMPTY and
-    // the prompt must not present its diff as what was kept.
-    it("reports no files for a marker commit", async () => {
+    // the prompt must not present its diff as what was kept. `newestEmpty` is what says so.
+    it("reports no files and an empty newest commit for a marker commit", async () => {
       g(["commit", "-q", "--allow-empty", "-m", "WIP anton-d9: Ship the thing"]);
 
-      expect((await readPreservedCommitFor(repo, "anton-d9"))?.files).toEqual([]);
+      const preserved = await readPreservedCommitFor(repo, "anton-d9");
+      expect(preserved?.files).toEqual([]);
+      expect(preserved?.newestEmpty).toBe(true);
+    });
+
+    // A net-zero range is NOT a marker: attempt one's added file is removed by attempt two, so the
+    // aggregate `baseline..newest` diff is `[]` even though the newest commit itself is non-empty.
+    // `newestEmpty: false` is what lets the prompt tell the two apart (PR #255 review).
+    it("distinguishes a non-empty newest commit whose range nets to nothing from a marker", async () => {
+      g(["checkout", "-q", "-b", "feature"]);
+      writeFileSync(join(repo, "toggle.md"), "added\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: first attempt (adds the file)"]);
+      rmSync(join(repo, "toggle.md"));
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: second attempt (removes it)"]);
+
+      const preserved = await readPreservedCommitFor(repo, "anton-d9", "main");
+      // The added-then-removed file leaves no net change across the range…
+      expect(preserved?.files).toEqual([]);
+      // …but the newest commit is a real removal, not an empty marker.
+      expect(preserved?.newestEmpty).toBe(false);
     });
 
     // A ticket can time out more than once; the freshest preserve is the tree the agent is looking
@@ -440,6 +463,30 @@ suite("worktreeHasCommitFor (real git)", () => {
 
       expect(await readPreservedCommitFor(repo, "anton-d9")).toBeUndefined();
       expect(await readPreservedCommitFor(repo, "anton-other")).toBeUndefined();
+    });
+  });
+
+  // Adoption of self-committed work asks whether the TIP is the marker — a marker deeper in history
+  // does not cover the self-commits above it, so history-wide presence is the wrong question (PR #255).
+  describe("worktreeTipIsPreservedCommitFor", () => {
+    it("is true only when the branch tip is this ticket's marker", async () => {
+      g(["commit", "-q", "--allow-empty", "-m", "WIP anton-d9: Ship the thing"]);
+
+      expect(await worktreeTipIsPreservedCommitFor(repo, "anton-d9")).toBe(true);
+      // A prefix collision must not false-positive.
+      expect(await worktreeTipIsPreservedCommitFor(repo, "anton-d")).toBe(false);
+    });
+
+    it("is false when the marker sits BELOW newer self-commits, though history still carries it", async () => {
+      g(["commit", "-q", "--allow-empty", "-m", "WIP anton-d9: first attempt (marker)"]);
+      writeFileSync(join(repo, "more.md"), "more\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "the agent's own subject"]);
+
+      // History-wide would say yes; the tip check — the one adoption must use — says no, because the
+      // marker no longer covers the self-commit above it.
+      expect(await worktreeHasPreservedCommitFor(repo, "anton-d9")).toBe(true);
+      expect(await worktreeTipIsPreservedCommitFor(repo, "anton-d9")).toBe(false);
     });
   });
 });

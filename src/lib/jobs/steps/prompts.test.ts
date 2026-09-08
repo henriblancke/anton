@@ -144,6 +144,17 @@ describe("ticketPrompt — the continuation block (anton-16pq)", () => {
     expect(prompt).toContain("git log -p");
   });
 
+  // A net-zero range is NOT a marker: the newest commit is non-empty (an earlier attempt's edits
+  // were undone by a later one), so telling the agent the work is self-committed beneath it lies.
+  it("does not claim a marker when the range nets to nothing but the newest commit is non-empty", () => {
+    const prompt = ticketPrompt(ticket(), { ...preserved, files: [], newestEmpty: false });
+
+    expect(prompt).not.toContain("it is a marker");
+    expect(prompt).not.toContain("Files changed across the preserved work:");
+    expect(prompt).toContain("cancel out to no net change");
+    expect(prompt).toContain("git log -p");
+  });
+
   // A ticket can time out more than once; every preserved commit's work is on the branch, so the
   // agent must be pointed at the whole range, not just the newest delta (anton-16pq, PR #255 review).
   it("lists every preserved attempt and inspects the whole range when a ticket timed out twice", () => {

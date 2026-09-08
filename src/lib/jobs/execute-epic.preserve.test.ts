@@ -390,6 +390,49 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(preserved?.files?.sort()).toEqual(["HALF_WRITTEN.md", "MORE.md"]);
   });
 
+  // The SAME staleness bug on the `"error" in kept` path (PR #255 review): the preserve's OWN commit
+  // is attempted and fails WITHOUT landing, so the tip is still the agent's self-commit — not anton's
+  // `WIP`. A history-wide marker check finds the previous attempt's marker BELOW these self-commits
+  // and skips making a fresh one, leaving the newest `WIP` beneath the work it must sit above and the
+  // resume's `baseline..marker` range omitting it. The tip check makes a fresh marker instead.
+  it("re-marks the tip when the preserve commit errors above a previous attempt's marker", async () => {
+    write("HALF_WRITTEN.md", "work preserved by the attempt before this one\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", `WIP ${ticket.id}: earlier attempt`]);
+    const baseline = await readWorktreeState(repo);
+    write("MORE.md", "what this attempt added, and committed itself\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: more of the agent's own work"]);
+    const selfCommitted = head();
+    // Uncommitted work remains, so the preserve tries to commit it — a pre-commit hook rewrites the
+    // tree and rejects, which the preserve refuses to retry (the tree is no longer the gated one), so
+    // `commitPreservedTree` returns an error without HEAD moving. The empty marker is made under
+    // `--no-verify`, so it still lands.
+    write("STILL_UNCOMMITTED.md", "work the deadline cut off before the agent committed it\n");
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(
+      join(hooks, "pre-commit"),
+      "#!/bin/sh\necho rewritten > REWRITTEN.md\ngit add REWRITTEN.md\nexit 1\n",
+      { mode: 0o755 },
+    );
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ branch: BRANCH, retained: false });
+    // A fresh marker sits at the tip on top of the agent's own commit; the older marker stays beneath.
+    expect(out(["rev-parse", "HEAD~1"])).toBe(selfCommitted);
+    expect(subjects().filter((s) => s.startsWith(`WIP ${ticket.id}:`))).toHaveLength(2);
+  });
+
   // The genuinely empty case the branch above must not swallow: nothing staged AND HEAD never moved
   // is still the rollback it always was.
   it("still rolls back when the index is empty and HEAD never moved", async () => {

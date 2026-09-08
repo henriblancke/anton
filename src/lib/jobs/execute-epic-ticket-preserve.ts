@@ -16,6 +16,7 @@ import {
   stageAllAndHashTree,
   sameWorktreeState,
   worktreeHasPreservedCommitFor,
+  worktreeTipIsPreservedCommitFor,
   type WorktreeState,
 } from "../git/ops";
 import { resolveVerifyGates } from "../projects";
@@ -303,13 +304,15 @@ export async function preserveTimedOutWork(args: {
             ? `git rejected this ticket's preserved commit after it had already landed`
             : `the agent committed this ticket's work itself`,
         // A landed-but-rejected commit is anton's OWN `WIP <id>:` commit at the tip, so it already
-        // carries the subject a resume reads and needs no marker. An unmarked forward HEAD is the
-        // agent's work and DOES need one — even when a previous attempt's marker sits BELOW it (PR
-        // #255 review): that older marker predates these self-commits, so the resume's newest `WIP`
-        // would no longer be the preserved tip and its `baseline..marker` range would omit them. A
-        // fresh marker at the tip keeps the newest `WIP` where the range reader expects it.
+        // carries the subject a resume reads and needs no marker. But `"error" in kept` does not
+        // PROVE it landed — a failed signing or index write leaves the tip as the agent's own
+        // self-commits with anton's `WIP` never made — so this asks whether the TIP is the marker,
+        // not whether history holds one ANYWHERE (PR #255 review). An older marker sitting BELOW
+        // these self-commits does not cover them: the resume's newest `WIP` would no longer be the
+        // preserved tip and its `baseline..marker` range would omit them. Only a marker at the tip
+        // earns `alreadyMarked`; anything else makes a fresh one.
         alreadyMarked:
-          "error" in kept && (await worktreeHasPreservedCommitFor(worktreePath, ticket.id)),
+          "error" in kept && (await worktreeTipIsPreservedCommitFor(worktreePath, ticket.id)),
       });
     }
     if ("error" in kept) {
@@ -346,9 +349,9 @@ export async function preserveTimedOutWork(args: {
  * A `commit-msg` hook enforcing its own subject convention is what would otherwise reject that
  * marker, so {@link commitMarker} makes it with this project's hooks bypassed — legitimate for that
  * commit and no other, since it is EMPTY and no hook is being asked about content. A rejected marker
- * call is then checked against the HISTORY rather than believed, and only work the branch genuinely
- * does not carry a marker for is truly unmarked — never rolled back, since the commits outrank their
- * bookkeeping, but handed to a person instead of reported as preserved.
+ * call is then checked against the branch TIP rather than believed, and only work whose tip is
+ * genuinely not this ticket's marker is truly unmarked — never rolled back, since the commits
+ * outrank their bookkeeping, but handed to a person instead of reported as preserved.
  */
 async function adoptSelfCommittedWork(args: {
   worktreePath: string;
@@ -358,21 +361,27 @@ async function adoptSelfCommittedWork(args: {
   logPath: string;
   /** How the commits on this branch came to be there, for the operator reading the log. */
   why: string;
-  /** A previous attempt's marker is already on the branch; one is all a resume needs. */
+  /**
+   * The branch TIP is already this ticket's `WIP` marker (anton's own commit landed there), so no
+   * fresh one is needed. A marker merely present deeper in history does NOT qualify — it would not
+   * cover the self-commits above it (PR #255 review).
+   */
   alreadyMarked: boolean;
 }): Promise<PreservedWork> {
   const { worktreePath, branch, ticket, timeoutMs, logPath, why, alreadyMarked } = args;
   const message = preservedCommitMessage(ticket, timeoutMs, { marker: true });
   // A REJECTED marker call is not proof the marker is absent (PR #228 review). `--no-verify` bypasses
   // only `pre-commit` and `commit-msg` (git-commit(1)); `post-commit` runs AFTER the commit is made,
-  // so a hook outliving the commit budget fails a call whose marker is already on the branch — and
-  // the halt below would then tell the operator to create a marker that exists. History decides, not
-  // the call's exit status. A read that fails stays "unmarked": that answer stops for a person, where
-  // a wrong "marked" reports work no resume can see as preserved.
+  // so a hook outliving the commit budget fails a call whose marker is already at the tip — and the
+  // halt below would then tell the operator to create a marker that exists. So the TIP decides, not
+  // the call's exit status — and the TIP specifically, not history anywhere (PR #255 review): an
+  // older marker beneath these self-commits does not cover them, so it must not pass for the fresh
+  // tip marker this call meant to make. A read that fails stays "unmarked": that answer stops for a
+  // person, where a wrong "marked" reports work no resume can see as preserved.
   const marked =
     alreadyMarked ||
     (await safe(() => commitMarker(worktreePath, message))) ||
-    (await worktreeHasPreservedCommitFor(worktreePath, ticket.id));
+    (await worktreeTipIsPreservedCommitFor(worktreePath, ticket.id));
   if (!marked) {
     await logPreserve(
       logPath,

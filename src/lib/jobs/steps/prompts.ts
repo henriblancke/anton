@@ -160,11 +160,14 @@ function preservedInspectClause(preserved: PreservedCommit): string {
 
 /**
  * The preserved diff, the marker's explanation, or — when git could not be read — nothing but a
- * pointer to inspect it directly. An EMPTY (`[]`) preserved commit is the marker form: the agent
+ * pointer to inspect it directly. A `[]` file list is ambiguous, so {@link PreservedCommit.newestEmpty}
+ * decides which it is (PR #255 review): an EMPTY newest commit is the marker form — the agent
  * committed the work under its own subjects and this commit only records whose it is, so pointing at
- * its (empty) diff would tell the agent nothing was kept. `undefined` is an unreadable diff (a git
- * failure), NOT an empty one — presenting it as a marker would falsely claim the work lives beneath
- * a commit anton never actually read (PR #255 review).
+ * its (empty) diff would tell the agent nothing was kept. A NON-EMPTY newest commit whose range
+ * still nets to `[]` is not a marker but a range that cancels out (earlier edits undone by later
+ * ones); claiming the work is self-committed beneath it would be a lie. `undefined` files is an
+ * unreadable diff (a git failure), NOT an empty one — presenting it as a marker would falsely claim
+ * the work lives beneath a commit anton never actually read (PR #255 review).
  */
 function preservedFilesLines(preserved: PreservedCommit): string[] {
   if (preserved.files === undefined) {
@@ -175,6 +178,17 @@ function preservedFilesLines(preserved: PreservedCommit): string[] {
     ];
   }
   if (preserved.files.length === 0) {
+    // A non-empty newest commit whose range nets to nothing is NOT a marker (PR #255 review); only a
+    // genuinely empty newest commit sends the agent to the work beneath it. `undefined` (git could
+    // not read the newest commit's own diff) keeps the marker wording as the safe default.
+    if (preserved.newestEmpty === false) {
+      return [
+        ``,
+        `The preserved attempts cancel out to no net change against the ticket baseline — an earlier ` +
+          `attempt's edits were undone by a later one — so no file list is shown. Inspect the full ` +
+          `history (\`git log -p\`) to see what each attempt did before continuing.`,
+      ];
+    }
     return [
       ``,
       `That commit is empty — it is a marker. The previous attempt committed the work itself under ` +
