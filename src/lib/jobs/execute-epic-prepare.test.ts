@@ -28,6 +28,7 @@ const pullMock = vi.fn();
 const updateRunMock = vi.fn();
 const validateRunFormulaMock = vi.fn();
 const hasPreservedCommitMock = vi.fn();
+const checkSelfFreshnessMock = vi.fn();
 
 vi.mock("./execute-epic-recover", () => ({
   refreshRunBoard: (...args: unknown[]) => refreshRunBoardMock(...args),
@@ -85,13 +86,20 @@ vi.mock("../git/ops", async () => {
   };
 });
 
+// The self-freshness gate (anton-mh3c) would otherwise fetch anton's OWN checkout on every start —
+// a real network read against process.cwd(). Stubbed to a clean verdict by default, so only the
+// tests that ask for a stale one exercise the refusal.
+vi.mock("./self-freshness", () => ({
+  checkSelfFreshness: (...args: unknown[]) => checkSelfFreshnessMock(...args),
+}));
+
 vi.mock("./formula-floor", () => ({ assertRunFormulaFloor: () => {} }));
 
 vi.mock("./execute-epic-formula", () => ({
   splitFormulaPhases: () => ({ ticketSteps: [], runSteps: [] }),
 }));
 
-const { prepareEpicRun } = await import("./execute-epic-prepare");
+const { prepareEpicRun, staleCheckoutRefusal } = await import("./execute-epic-prepare");
 const { PoisonEpic } = await import("./errors");
 import type { EpicRun } from "./execute-epic-run";
 
@@ -180,6 +188,12 @@ beforeEach(() => {
   pullMock.mockResolvedValue(undefined);
   publishRunClaimMock.mockResolvedValue(undefined);
   hasPreservedCommitMock.mockResolvedValue(false);
+  // anton is running its own latest code by default, so the self-freshness gate lets every start
+  // through — only the tests that hand it a stale verdict exercise the refusal.
+  checkSelfFreshnessMock.mockResolvedValue({
+    checkout: { state: "current" },
+    dependencies: { state: "match" },
+  });
   // No human work by default: nothing written, nothing adopted.
   preflightHumanTicketsMock.mockImplementation((args: { board: Bead[] }) =>
     Promise.resolve({ ...preflight(args.board), armed: false }),
@@ -338,5 +352,147 @@ describe("prepareEpicRun — a held child is caught on every board the run adopt
     expect(warmRunWorktreeMock).toHaveBeenCalled();
     expect(claimRunTargetMock).toHaveBeenCalled();
     expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+});
+
+describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)", () => {
+  const clean = board(ticket("t-1"));
+
+  beforeEach(() => {
+    loadAllIssuesMock.mockResolvedValue(clean);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(clean));
+  });
+
+  it("parks a new start when anton's checkout is behind its upstream", async () => {
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "behind", behind: 3, upstream: "origin/main" },
+      dependencies: { state: "match" },
+    });
+
+    const error = await refusalFrom(clean);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("3 commit(s) behind origin/main");
+    expect(error.message).toContain("git pull");
+    // Read-only refusal: nothing was leased, warmed or claimed, so a run already in flight — and the
+    // board itself — is untouched.
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+    expect(claimRunTargetMock).not.toHaveBeenCalled();
+    expect(publishRunClaimMock).not.toHaveBeenCalled();
+  });
+
+  it("parks a new start when installed dependencies have drifted", async () => {
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "current" },
+      dependencies: { state: "drift", packages: ["drizzle-orm", "next"] },
+    });
+
+    const error = await refusalFrom(clean);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("bun install");
+    expect(error.message).toContain("drizzle-orm, next");
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+  });
+
+  it("dispatches normally when anton is running its own latest code", async () => {
+    const prep = await prepareEpicRun(run(clean));
+
+    expect(prep.done).toBe(false);
+    expect(warmRunWorktreeMock).toHaveBeenCalled();
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
+  it("dispatches normally on an INDETERMINATE verdict — the check that could not run grounds nothing", async () => {
+    // An offline runner: the remote was unreachable and the lockfile unreadable. Neither is evidence
+    // of staleness, so the start proceeds exactly as a clean verdict would.
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "unreachable", reason: "connection refused" },
+      dependencies: { state: "unknown", reason: "bun.lock could not be read" },
+    });
+
+    const prep = await prepareEpicRun(run(clean));
+
+    expect(prep.done).toBe(false);
+    expect(warmRunWorktreeMock).toHaveBeenCalled();
+  });
+
+  it("still settles a target already carried to its PR, stale checkout or not", async () => {
+    // The completion short-circuit runs BEFORE this gate, so a finished target is not grounded by a
+    // staleness it has no work left to run against.
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "behind", behind: 1, upstream: "origin/main" },
+      dependencies: { state: "match" },
+    });
+    settleCompletedRunMock.mockResolvedValue(true);
+
+    const prep = await prepareEpicRun(run(clean));
+
+    expect(prep.done).toBe(true);
+    expect(checkSelfFreshnessMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("staleCheckoutRefusal — the message names the staleness and its fix (anton-mh3c)", () => {
+  const ROOT = "/opt/anton";
+
+  it("names the checkout distance and `git pull` when HEAD is behind", () => {
+    const message = staleCheckoutRefusal(
+      { checkout: { state: "behind", behind: 2, upstream: "origin/main" }, dependencies: { state: "match" } },
+      ROOT,
+    );
+
+    expect(message).toContain("2 commit(s) behind origin/main");
+    expect(message).toContain("git pull");
+    expect(message).toContain(ROOT);
+    // The disarm's contract, so the operator reads "only new starts stop", not "everything stopped".
+    expect(message).toContain("Work already running is unaffected");
+  });
+
+  it("names the drifted packages and `bun install` when dependencies have drifted", () => {
+    const message = staleCheckoutRefusal(
+      { checkout: { state: "current" }, dependencies: { state: "drift", packages: ["left-pad"] } },
+      ROOT,
+    );
+
+    expect(message).toContain("bun install");
+    expect(message).toContain("left-pad");
+  });
+
+  it("names BOTH when the checkout is behind AND dependencies drifted", () => {
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "behind", behind: 1, upstream: "origin/main" },
+        dependencies: { state: "drift", packages: ["next"] },
+      },
+      ROOT,
+    );
+
+    expect(message).toContain("git pull");
+    expect(message).toContain("bun install");
+  });
+
+  it("returns undefined for a clean verdict", () => {
+    expect(
+      staleCheckoutRefusal(
+        { checkout: { state: "current" }, dependencies: { state: "match" } },
+        ROOT,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined for every INDETERMINATE verdict — a check that could not run is not staleness", () => {
+    expect(
+      staleCheckoutRefusal(
+        { checkout: { state: "no-upstream" }, dependencies: { state: "unknown", reason: "x" } },
+        ROOT,
+      ),
+    ).toBeUndefined();
+    expect(
+      staleCheckoutRefusal(
+        { checkout: { state: "unreachable", reason: "x" }, dependencies: { state: "match" } },
+        ROOT,
+      ),
+    ).toBeUndefined();
   });
 });
