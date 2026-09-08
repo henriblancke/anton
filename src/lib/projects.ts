@@ -1091,10 +1091,12 @@ async function governedQuotaBoard(
  * who tunes `weeklyTargetPct` or `daytimeReservePct` sees the nudge agree with what the runner
  * actually admits. Empty when no project has opted in (the nudge's hide gate).
  *
- * The nudge passes no per-project spend, so the share ceiling each policy carries doesn't bind
- * there — deliberately. The nudge asks whether the MACHINE has idle weekly quota worth shaping work
- * for, and that question is answered by the whole weekly target on the account meter; which repo
- * gets to spend it is the governor's decision at lease time, not the nudge's.
+ * The nudge passes no per-project spend to `budgetGate`, so the share ceiling each policy carries is
+ * checked against a spend of 0 there: it binds only for a 0% share — a parked repo defers, as it
+ * should, since its governor would never burn the quota being nudged about — and for any positive
+ * share it is the whole weekly target on the account meter that answers. Deliberate: the nudge asks
+ * whether the MACHINE has idle weekly quota worth shaping work for; which repo gets to spend it, and
+ * how much of its share is already gone, is the governor's decision at lease time, not the nudge's.
  */
 export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
   const governed = await governedProjects();
