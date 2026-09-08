@@ -699,6 +699,12 @@ export function enqueueSyncPushDeduped(
  * fill the earliest-by-`runAt` scan window and be skipped, so every tick keeps re-scanning the same
  * gated prefix and never reaches leasable work for other schedules/projects (anton-7l7). Excluding
  * them in the query paginates past them instead. `capOf` still enforces the cap as a backstop.
+ *
+ * A cap that fills up DURING the scan gets the same treatment (PR #250 review): once a type or a
+ * bucket is found saturated, its rows are excluded from the next page and the scan continues, so a
+ * backlog of due PR fixes wider than one window — every one skipped by a full `typeCapOf` — cannot
+ * hide an execute-epic, gate-check or sync-push queued behind it. The reserve those caps exist for
+ * is only real if the scan can reach past the capped rows to the work it was reserved for.
  */
 export async function leaseDue(
   db: AntonDb,
@@ -719,45 +725,50 @@ export async function leaseDue(
   const excludeBuckets = opts.excludeBucketKeys ? [...opts.excludeBucketKeys] : [];
 
   // Without caps, the DB `limit` alone bounds the result. With caps we must scan more candidates
-  // than `limit` (some get skipped for being at capacity), so widen the fetch.
+  // than `limit` (some get skipped for being at capacity), so widen the fetch — and page past a
+  // window that a saturated cap filled entirely (see below).
   const capped = opts.capOf !== undefined || opts.typeCapOf !== undefined;
   const scanLimit = capped ? Math.max(opts.limit * 8, 200) : opts.limit;
   const runnable = or(
     and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, nowDate)),
     and(eq(schema.jobs.status, "running"), lte(schema.jobs.leaseExpiresAt, nowDate)),
   );
-  // Drop hard-held buckets before the scan window so they can't crowd out leasable work. Each key is
+  // Rows in any of these `(type, projectId)` buckets are dropped from the scan window. Each key is
   // `scheduleGateKey(type, projectId)`; an empty projectId segment means the null-project bucket.
-  const heldBucketFilter =
-    excludeBuckets.length > 0
-      ? not(
-          or(
-            ...excludeBuckets.map((key) => {
-              const [type, projectId] = key.split("\0");
-              return and(
-                eq(schema.jobs.type, type),
-                projectId === "" ? isNull(schema.jobs.projectId) : eq(schema.jobs.projectId, projectId),
-              );
-            }),
-          )!,
-        )
-      : undefined;
-  const where = and(
-    runnable,
-    excludeIds.length > 0 ? notInArray(schema.jobs.id, excludeIds) : undefined,
-    heldBucketFilter,
-  );
-  const candidates = await db
-    .select()
-    .from(schema.jobs)
-    .where(where)
-    .orderBy(schema.jobs.runAt)
-    .limit(scanLimit);
+  const outsideBuckets = (keys: Iterable<string>): SQL | undefined => {
+    const clauses = [...keys].map((key) => {
+      const [type, projectId] = key.split("\0");
+      return and(
+        eq(schema.jobs.type, type),
+        projectId === "" ? isNull(schema.jobs.projectId) : eq(schema.jobs.projectId, projectId),
+      );
+    });
+    return clauses.length > 0 ? not(or(...clauses)!) : undefined;
+  };
+  // One page of the earliest-due candidates, minus the hard-held buckets and whatever the scan has
+  // already found saturated.
+  const fetchCandidates = (skipTypes: Iterable<string>, skipBuckets: Iterable<string>) => {
+    const types = [...skipTypes];
+    return db
+      .select()
+      .from(schema.jobs)
+      .where(
+        and(
+          runnable,
+          excludeIds.length > 0 ? notInArray(schema.jobs.id, excludeIds) : undefined,
+          outsideBuckets(excludeBuckets),
+          types.length > 0 ? notInArray(schema.jobs.type, types) : undefined,
+          outsideBuckets(skipBuckets),
+        ),
+      )
+      .orderBy(schema.jobs.runAt)
+      .limit(scanLimit);
+  };
 
-  if (candidates.length === 0) return [];
-
-  let due = candidates;
-  if (capped) {
+  let due: JobRow[];
+  if (!capped) {
+    due = await fetchCandidates([], []);
+  } else {
     const capOf = opts.capOf ?? (() => Infinity);
     const typeCapOf = opts.typeCapOf ?? (() => Infinity);
     // Count the live load a new lease competes with, per bucket. A `running` job counts if its lease
@@ -791,19 +802,39 @@ export async function leaseDue(
       usedByBucket.set(key, (usedByBucket.get(key) ?? 0) + 1);
     }
 
+    // A type or bucket found at capacity is excluded from every later page: a skipped candidate
+    // would only be skipped again, and a full window of them is how leasable work got hidden.
+    const saturatedTypes = new Set<string>();
+    const saturatedBuckets = new Set<string>();
     const picked: JobRow[] = [];
-    for (const job of candidates) {
-      if (picked.length >= opts.limit) break;
-      const typeCap = typeCapOf(job);
-      const usedOfType = usedByType.get(job.type) ?? 0;
-      if (usedOfType >= typeCap) continue; // type at its runner-wide ceiling — leave queued
-      const cap = capOf(job);
-      const key = bucketKey(job.type, job.projectId);
-      const used = usedByBucket.get(key) ?? 0;
-      if (used >= cap) continue; // bucket at capacity — leave queued, try the next candidate
-      if (typeCap !== Infinity) usedByType.set(job.type, usedOfType + 1);
-      if (cap !== Infinity) usedByBucket.set(key, used + 1);
-      picked.push(job);
+    for (;;) {
+      const candidates = await fetchCandidates(saturatedTypes, saturatedBuckets);
+      let skipped = false;
+      for (const job of candidates) {
+        if (picked.length >= opts.limit) break;
+        const typeCap = typeCapOf(job);
+        const usedOfType = usedByType.get(job.type) ?? 0;
+        if (usedOfType >= typeCap) {
+          saturatedTypes.add(job.type); // type at its runner-wide ceiling — leave queued
+          skipped = true;
+          continue;
+        }
+        const cap = capOf(job);
+        const key = bucketKey(job.type, job.projectId);
+        const used = usedByBucket.get(key) ?? 0;
+        if (used >= cap) {
+          saturatedBuckets.add(key); // bucket at capacity — leave queued, try the next candidate
+          skipped = true;
+          continue;
+        }
+        if (typeCap !== Infinity) usedByType.set(job.type, usedOfType + 1);
+        if (cap !== Infinity) usedByBucket.set(key, used + 1);
+        picked.push(job);
+      }
+      // Another page is worth reading only when this one was full (more rows may follow) and a
+      // skip just widened the exclusion, so the next query reaches rows this one could not. Each
+      // extra page excludes at least one new key, which is what bounds the loop.
+      if (picked.length >= opts.limit || candidates.length < scanLimit || !skipped) break;
     }
     due = picked;
   }

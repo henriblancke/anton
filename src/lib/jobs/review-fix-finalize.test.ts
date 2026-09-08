@@ -615,10 +615,10 @@ describe("finalizeMergedEpic", () => {
   });
 
   it("reuses a follow-up the sweep's snapshot could not have seen (PR #199)", async () => {
-    // `enqueueReviewFixIfAbsent` lets the project-wide sweep and a gate-check's targeted fix both
-    // reach one merged target, and whichever finalizes second read the board before the first
-    // created its follow-up. Nominating off that snapshot alone would create a SECOND target and
-    // split the preserved tickets across the two.
+    // Two jobs can finalize one merged target — a crash-reclaimed row, or two anton instances
+    // sharing a board, since `enqueueReviewFixPrIfAbsent`'s dedupe is machine-local — and whichever
+    // finalizes second read the board before the first created its follow-up. Nominating off that
+    // snapshot alone would create a SECOND target and split the preserved tickets across the two.
     const concurrent = {
       ...bead("epic-7"),
       issue_type: "epic",

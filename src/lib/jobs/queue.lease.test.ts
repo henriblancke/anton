@@ -144,3 +144,112 @@ describe("leaseDue exclude", () => {
     expect(leased).toHaveLength(0);
   });
 });
+
+/**
+ * Cap-saturation pagination (PR #250 review): the scan window is finite (max(limit*8, 200)), and a
+ * cap only skips a candidate — it does not remove it from the window. A backlog of capped rows wider
+ * than the window therefore used to leave every later job unreachable, however many free slots the
+ * runner had for it. The scan now excludes a saturated type/bucket from the next page and reads on.
+ */
+describe("leaseDue paginates past saturated caps", () => {
+  const WINDOW = 200;
+
+  function seedBacklog(type: "review-fix-pr" | "execute-epic", projectId: string, count: number) {
+    const backlogAt = new Date(systemClock.now() - 10_000);
+    t.db
+      .insert(schema.jobs)
+      .values(
+        Array.from({ length: count }, (_, i) => ({
+          id: `${type}-${projectId}-${i}`,
+          type,
+          projectId,
+          status: "queued" as const,
+          runAt: backlogAt,
+          attempts: 0,
+        })),
+      )
+      .run();
+  }
+
+  /** A `running` job with a live lease — real load against the caps. */
+  function seedLive(id: string, type: "review-fix-pr" | "execute-epic", projectId: string) {
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id,
+        type,
+        projectId,
+        status: "running",
+        runAt: new Date(systemClock.now() - 100_000),
+        leaseExpiresAt: new Date(systemClock.now() + 100_000),
+        attempts: 1,
+      })
+      .run();
+  }
+
+  /** The one job of another type/project, due AFTER the whole backlog. */
+  function seedLeasable(type: "review-fix-pr" | "execute-epic", projectId: string) {
+    t.db
+      .insert(schema.jobs)
+      .values({
+        id: "leasable",
+        type,
+        projectId,
+        status: "queued",
+        runAt: new Date(systemClock.now() - 1_000),
+        attempts: 0,
+      })
+      .run();
+  }
+
+  beforeEach(() => {
+    for (const id of ["A", "B"]) {
+      insertProject(t.db, { id, slug: id, name: id, repoPath: `/tmp/${id}` });
+    }
+  });
+
+  it("reaches an execute-epic queued behind a window of type-capped review-fix-pr jobs", async () => {
+    seedLive("busy", "review-fix-pr", "A"); // the runner-wide review-fix ceiling of 1 is full
+    seedBacklog("review-fix-pr", "A", WINDOW + 50);
+    seedLeasable("execute-epic", "B");
+
+    const leased = await leaseDue(t.db, systemClock, {
+      leaseMs: 30_000,
+      limit: 2,
+      typeCapOf: (job) => (job.type === "review-fix-pr" ? 1 : Infinity),
+    });
+    expect(leased.map((j) => j.id)).toEqual(["leasable"]);
+    // The capped backlog is untouched — skipped, not consumed.
+    const backlog = t.db.select().from(schema.jobs).all().filter((j) => j.id.startsWith("review-fix-pr-"));
+    expect(backlog.every((j) => j.status === "queued")).toBe(true);
+  });
+
+  it("reaches another project's job queued behind a window of bucket-capped jobs", async () => {
+    seedLive("busy", "execute-epic", "A"); // A's per-project cap of 1 is full
+    seedBacklog("execute-epic", "A", WINDOW + 50);
+    seedLeasable("execute-epic", "B");
+
+    const leased = await leaseDue(t.db, systemClock, {
+      leaseMs: 30_000,
+      limit: 2,
+      capOf: (job) => (job.type === "execute-epic" ? 1 : Infinity),
+    });
+    expect(leased.map((j) => j.id)).toEqual(["leasable"]);
+  });
+
+  it("stops paging once the limit is met, without touching the rest of the backlog", async () => {
+    seedBacklog("review-fix-pr", "A", WINDOW + 50); // nothing running: the type is under its cap
+    seedLeasable("execute-epic", "B");
+
+    const leased = await leaseDue(t.db, systemClock, {
+      leaseMs: 30_000,
+      limit: 2,
+      typeCapOf: (job) => (job.type === "review-fix-pr" ? 2 : Infinity),
+    });
+    // Two fixes fill the type cap inside the first page; the limit is met there, so "leasable"
+    // (due later) correctly waits for the next tick.
+    expect(leased).toHaveLength(2);
+    expect(leased.every((j) => j.type === "review-fix-pr")).toBe(true);
+  });
+});
+
