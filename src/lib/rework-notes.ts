@@ -13,7 +13,6 @@ import {
   ACCEPTANCE_KEYS,
   CONTEXT_KEYS,
   isTicketContractHeading,
-  sectionBody,
 } from "./beads/contract";
 import { type ScannedLine, scanMarkdown } from "./beads/markdown";
 import { parseTicketNotes } from "./beads/notes";
@@ -250,12 +249,19 @@ export function followUpRunsUnder(parentId?: string): string {
  * verbatim in an Acceptance box ({@link followUpAcceptance}) — and a bead created standing alone
  * that carried it there would otherwise be read as detached, and given a note about a detachment
  * that never happened.
+ *
+ * Context is bounded the way {@link replaceRunsUnder} bounds it — by the ticket's own headings
+ * (`sectionsNamed`), not every tier's merged. A `### Success` grouping notes inside Context is the
+ * section's own content on a ticket; ending there hid the line below it, so a detachment whose
+ * audit note failed to land read as a bead created standing alone on the retry, and went unrecorded.
  */
 export function createdUnder(bead: Bead, parentId: string): boolean {
-  const context = sectionBody(bead.description, CONTEXT_KEYS);
-  if (!context) return false;
+  if (!bead.description) return false;
   const generated = followUpRunsUnder(parentId);
-  return context.split(/\r?\n/).some((line) => line.trim() === generated);
+  const lines = scanMarkdown(bead.description);
+  return sectionsNamed(lines, CONTEXT_KEYS).some(({ start, end }) =>
+    lines.slice(start + 1, end).some((line) => line.text.trim() === generated),
+  );
 }
 
 /**

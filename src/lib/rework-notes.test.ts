@@ -692,6 +692,29 @@ describe("createdUnder", () => {
     );
     expect(createdUnder(makeBead({ id: "f", description: padded }), "feat")).toBe(true);
   });
+
+  it("bounds Context by the ticket's own headings — an epic-only `### Success` nested in it is Context's content", () => {
+    // The same bounds the reconcile uses: a `### Success` grouping notes inside Context does not end
+    // the section on a ticket, so the run-location line below it is still read. Ending on the merged
+    // set lost it, and a detachment whose audit note failed to land was never recorded on retry.
+    const grouped = followUpDescription({ ...args, parentId: "feat" }).replace(
+      followUpRunsUnder("feat"),
+      `### Success\nWhat the founder wants to see.\n${followUpRunsUnder("feat")}`,
+    );
+    expect(createdUnder(makeBead({ id: "f", parent: undefined, description: grouped }), "feat")).toBe(
+      true,
+    );
+    expect(createdUnder(makeBead({ id: "f", parent: undefined, description: grouped }), "other")).toBe(
+      false,
+    );
+  });
+
+  it("reads every Context occurrence, as the judge concatenates repeated headings", () => {
+    const repeated = `${followUpDescription({ ...args, parentId: "feat" })}\n\n## Context\nA later copy.`;
+    expect(createdUnder(makeBead({ id: "f", parent: undefined, description: repeated }), "feat")).toBe(
+      true,
+    );
+  });
 });
 
 describe("detachmentNoteBody / hasDetachmentNote", () => {
