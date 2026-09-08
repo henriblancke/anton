@@ -218,13 +218,12 @@ describe("instructionCriteria", () => {
     // `Backend\n=======` renders as an h1, so neither the label nor the `=` underline is a step;
     // without this the label AND the underline filed as criteria a review cannot score.
     expect(texts("Backend\n=======\n- Fix the retry")).toEqual(["Fix the retry"]);
-    // The `-` underline renders an h2, but only at a rule's length — a short dash run stays content.
+    // A `-` underline renders an h2 at ANY length — one hyphen or more, unlike a thematic break's
+    // three-mark minimum — so `Backend\n-` and `Backend\n--` are h2s just as `Backend\n---` is.
     expect(texts("Backend\n---\nRe-run the snapshot")).toEqual(["Re-run the snapshot"]);
-    expect(texts("Backend\n--\nRe-run the snapshot")).toEqual([
-      "Backend",
-      "--",
-      "Re-run the snapshot",
-    ]);
+    expect(texts("Backend\n--\nRe-run the snapshot")).toEqual(["Re-run the snapshot"]);
+    expect(texts("Backend\n-\nRe-run the snapshot")).toEqual(["Re-run the snapshot"]);
+    expect(doneGap("Backend\n-", [])).toMatch(/only list markers, headings or rules/);
     // Judged inside the line's own containers, so a callout-wrapped label underlines too.
     expect(texts("> Backend\n> =======")).toEqual([]);
     // A blank line between them ends the paragraph, so the underline is not one: both stand.
@@ -261,10 +260,12 @@ describe("instructionCriteria", () => {
     expect(texts("- ---\n1. ***\n* ___\n- [ ] ---\n[x] - - -\n2) _ _ _")).toEqual([]);
   });
 
-  it("keeps a line that merely CONTAINS a rule, and a short dash run that is not one", () => {
-    expect(texts("--- keep the header\n--\n* -- not a rule")).toEqual([
+  it("keeps a line that merely CONTAINS a rule", () => {
+    // `--- keep the header` has text after the dashes, so it is a paragraph, not a thematic break;
+    // `-- not a rule` is a list item's content. The blank line keeps the header off the Setext
+    // underline `--` would otherwise be — without it CommonMark reads the pair as an h2 heading.
+    expect(texts("--- keep the header\n\n* -- not a rule")).toEqual([
       "--- keep the header",
-      "--",
       "-- not a rule",
     ]);
   });

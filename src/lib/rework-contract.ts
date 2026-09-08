@@ -189,16 +189,16 @@ const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 const PROMPT_LINE = /^TODO\s*[—–:-]/;
 
 /**
- * A Setext heading underline as CommonMark reads one — a line of only `=` (any length, an h1) or a
- * rule-length run of `-` (an h2), up to 3 columns in. The underline turns the paragraph line above
- * it into a heading, so both are scaffolding like an ATX `## Backend` and neither files as a
- * criterion. The `=` form is unambiguous — a line of only `=` is never content. The `-` form is
- * held to {@link THEMATIC_BREAK}'s three-mark threshold on purpose: a short dash run like `--` is
- * content the note carries ("a short dash run that is not one"), and only a rule-length one reads as
- * a heading underline here. Recognised only from the line it underlines, since a paragraph must
- * precede it — which is also why it outranks a bare thematic break.
+ * A Setext heading underline as CommonMark reads one — a line of only `=` (an h1) or only `-` (an
+ * h2), any length, up to 3 columns in. The underline turns the paragraph line above it into a
+ * heading, so both are scaffolding like an ATX `## Backend` and neither files as a criterion. Unlike
+ * a thematic break ({@link THEMATIC_BREAK}), which needs three marks, a `-` underline is ANY nonempty
+ * run — `Backend\n-` and `Backend\n--` render as h2s just as `Backend\n---` does, so filing the label
+ * as a step would let a heading-only draft pass {@link doneGap}. The marks are contiguous: `- -` is a
+ * list and `- - -` a thematic break, neither a heading underline. Recognised only from the line it
+ * underlines, since a paragraph must precede it — which is also why it outranks a bare thematic break.
  */
-const SETEXT_UNDERLINE = /^ {0,3}(?:=+|-[ \t]*(?:-[ \t]*){2,})[ \t]*$/;
+const SETEXT_UNDERLINE = /^ {0,3}(?:=+|-+)[ \t]*$/;
 
 /** Columns of indentation past a container's content that open indented code (CommonMark). */
 const CODE_INDENT = 4;
@@ -252,8 +252,8 @@ export interface InstructionCriterion {
  * — prose, `-`/`*` bullets, numbered steps, or boxes already — so list markers are stripped rather
  * than nested inside a second box. A line that is only a rule ({@link THEMATIC_BREAK}), a heading
  * ({@link isHeading}) or the formula's prompt ({@link PROMPT_LINE}) is scaffolding like a bare
- * marker, and yields nothing. A paragraph line the next line underlines with `=` or a rule-length
- * run of `-` is a Setext heading ({@link setextUnderlineFollows}), so both it and the underline
+ * marker, and yields nothing. A paragraph line the next line underlines with `=` or any run of `-`
+ * is a Setext heading ({@link setextHeadingRun}), so both it and the underline
  * yield nothing too.
  *
  * Fences are read the way the contract judge reads them ({@link scanMarkdown}): everything inside
