@@ -1146,15 +1146,31 @@ export const beads = {
   /**
    * The bead that SUPERSEDED this one — the survivor `bd supersede <id> --with <survivor>` points
    * its `supersedes` edge at — or undefined when the board records no such retirement. Read off the
-   * bead's own inline `dependencies` (bd carries the edge on the superseded side, `issue_id` ===
-   * this bead), so it costs nothing beyond the board read every caller already has.
+   * bead's own inline `dependencies` ({@link beads.supersedesTarget}), so it costs nothing beyond the
+   * board read every caller already has.
    *
    * Closed is part of the question, not a separate check: the edge is written alongside the close,
-   * and a bead someone REOPENED is live work again whatever pointer it still carries.
+   * and a bead someone REOPENED is live work again whatever pointer it still carries — so this gates
+   * `supersedesTarget` to `closed`, and a run re-executing a reopened retirement clears the now-stale
+   * edge through the ungated reader instead.
    *
    * The distinction this exists for (anton-5bpd): a superseded bead has the same shape as an
    * abandoned one — closed, with no commit under its own id on any branch — and anything that reads
    * "closed with nothing on this branch" as a cross-machine resume must tell all three apart.
+   */
+  supersededBy: (b: Bead): string | undefined =>
+    b.status === "closed" ? beads.supersedesTarget(b) : undefined,
+
+  /**
+   * The survivor a `supersedes` edge on this bead names, whatever the bead's STATUS — the
+   * status-agnostic half of {@link beads.supersededBy}, which is that answer gated to `closed`.
+   *
+   * The edge outlives the close it was written beside: `bd reopen` returns the bead to `open` but
+   * leaves its `supersedes` pointer in place, so a retirement an operator reopened to re-run still
+   * carries it (PR #238 review). To every reader that gates on `closed`, that reopened edge is inert
+   * — but the run about to re-execute the ticket must CLEAR it, or the ticket's honest close reads as
+   * superseded all over again (execute-epic-ticket-bookends `claimTicket`). That reader needs the id
+   * on an OPEN bead, which {@link beads.supersededBy} withholds by design; this is what it reads.
    *
    * TWO SHAPES of `dependencies`, because bd's two reads disagree (measured on 1.1.2). `bd list
    * --json` carries EDGE rows — `{ issue_id, depends_on_id, type }`, the {@link BeadDep} shape.
@@ -1163,8 +1179,7 @@ export const beads = {
    * superseded bead as "not superseded" (PR #238 review — the post-write fence in
    * gardener/repair-already-shipped.ts is a `show` reader), so both are accepted here.
    */
-  supersededBy: (b: Bead): string | undefined => {
-    if (b.status !== "closed") return undefined;
+  supersedesTarget: (b: Bead): string | undefined => {
     for (const d of (b.dependencies ?? []) as Array<Partial<BeadDep> & { id?: string; dependency_type?: string }>) {
       if (d.type === "supersedes" && d.issue_id === b.id && d.depends_on_id) return d.depends_on_id;
       if (d.dependency_type === "supersedes" && d.id) return d.id;

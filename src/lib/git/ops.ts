@@ -966,6 +966,18 @@ function beadNamedIn(beadId: string): RegExp {
  * `unreadable` for anything short of an answer — no gh, an unreachable GitHub, a PR the ref does
  * not name, a commit gh dates with nothing — so a caller fails closed rather than reading a network
  * failure as "not carried" or an undated commit as an old one.
+ *
+ * `gh pr view --json commits` reads GitHub's GraphQL API, which returns at most 250 commits per PR
+ * without explicit pagination (PR #238 review). A PR past that cap has its list silently truncated,
+ * and a bead-naming commit in position 251+ goes unseen — {@link pullRequestCommitNaming} and
+ * {@link pullRequestCommitUnder} then answer `undefined` and the caller fails CLOSED (escalates to a
+ * human rather than accepting an unverifiable retirement), so no wrong retirement results, but a
+ * valid claim on such a PR fails spuriously. This is acceptable because anton opens ONE PR per epic
+ * and commits one per ticket, so a PR's commit count tracks its epic's ticket count — orders of
+ * magnitude below 250. Should that ever change, swap this for the paginated REST endpoint
+ * (`gh api repos/{owner}/{repo}/pulls/{number}/commits --paginate`, 100 per page, guaranteed
+ * complete) — its per-commit shape (`sha`, `commit.message`, `commit.author.date`,
+ * `commit.committer.date`) differs from the fields read below and would need remapping.
  */
 export async function readPullRequestCommits(repoPath: string, ref: string): Promise<PullRequestCommits> {
   const selector = ref.startsWith("gh-") ? ref.slice(3) : ref;

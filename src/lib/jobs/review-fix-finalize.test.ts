@@ -220,6 +220,39 @@ describe("finalizeMergedEpic", () => {
     expect(noteMock.mock.calls[0][2]).toContain("merged WITHOUT this ticket");
   });
 
+  it("holds the close open when a snapshot-closed child was reopened in the window (PR #238 review)", async () => {
+    // The run delivered t1 and retired t2 (closed as superseded). Between the sweep's snapshot and
+    // this close, an operator reopens t2 to re-run it. The snapshot still says closed, so t2 is
+    // neither preserved nor in the close batch — closing the target now would strand it open beneath
+    // a merged, undiscoverable epic. The fresh read immediately before the close catches the reopen
+    // and holds finalization open (leaving `stage:in-review`) for the next sweep to redo from a
+    // fresh snapshot that preserves and rehomes it.
+    const reopenedRetirement = { id: "t2", title: "t2", status: "closed", labels: [] } as Bead;
+    statuses.set("t2", "open"); // the LIVE board — reopened since the snapshot
+    boardLabels.set("t2", []);
+
+    await finalize(bead("epic-1"), [bead("t1"), reopenedRetirement]);
+
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("holds the close open when a snapshot-closed child cannot be re-read (PR #238 review)", async () => {
+    // An unreadable bead proves nothing either way — this seam never closes a merged target over
+    // work that may still be somebody's, so a read it cannot make holds finalization open too.
+    const t2 = { id: "t2", title: "t2", status: "closed", labels: [] } as Bead;
+    statuses.set("t2", "closed");
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t2") throw new Error("database is locked");
+      return { id, title: id, status: statuses.get(id) ?? "open", labels: boardLabels.get(id) ?? [] } as Bead;
+    });
+
+    await finalize(bead("epic-1"), [bead("t1"), t2]);
+
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
   it("rehomes the preserved tickets under a new run target", async () => {
     // A ticket parented to the merged (now closed) target is not a run target, and the target
     // itself short-circuits on its merged PR ref — so without a new home the note telling the

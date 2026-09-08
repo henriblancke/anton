@@ -32,6 +32,20 @@ export interface TicketBudget {
 }
 
 /**
+ * Undo the claim before a gate parks the run: hand the status back to `open` and drop the assignee
+ * and the stage label the claim wrote. The claim moved the ticket to `in_progress`, and the
+ * epic-level cleanup hands the assignee back but NOT the status — leaving `in_progress` with no
+ * owner, which `bd update --claim` refuses outright, so the resume the park tells the operator to
+ * run would never get past its own claim gate. Best-effort throughout: this runs on the way to a
+ * throw, and a write that also fails changes nothing the operator cannot fix by hand.
+ */
+async function unclaimAndPark(repo: string, ticketId: string): Promise<void> {
+  await safe(() => beads.setStatus(repo, ticketId, "open"));
+  await safe(() => beads.unassign(repo, ticketId));
+  await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
+}
+
+/**
  * Claim the ticket for the operator as a HARD GATE before doing any work, and clear any verdict a
  * previous run left on it.
  */
@@ -72,13 +86,32 @@ export async function claimTicket(
       // status — leaving `in_progress` with no owner, which `bd update --claim` refuses outright.
       // The resume this park tells the operator to run would then never get past its claim gate.
       // Same restore the retryable-failure path performs, for the same reason.
-      await safe(() => beads.setStatus(repo, ticket.id, "open"));
-      await safe(() => beads.unassign(repo, ticket.id));
-      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+      await unclaimAndPark(repo, ticket.id);
       throw new PoisonEpic(
         `${ticket.id} carries \`${LABELS.notDelivered}\` from a previous run but bd would not ` +
           `clear it — running this ticket and opening a pull request would make merge ` +
           `finalization treat delivered work as undelivered. Check the beads DB, then resume the run`,
+      );
+    }
+  }
+  // A ticket an earlier attempt RETIRED (`bd supersede`) and an operator then reopened to re-run
+  // still carries the stale `supersedes` edge that close wrote — reopen leaves it (anton-5bpd,
+  // PR #238 review). We are about to run the ticket, so that edge is a lie: left in place, this
+  // run's honest close reads as superseded again ({@link beads.supersededBy}), and a cross-machine
+  // resume between that close and its push drops the ticket as a pre-existing retirement
+  // (execute-epic-dispatch `partitionTickets`) instead of regenerating its commit — the PR then
+  // omits the rerun's work. So the edge is cleared here, on the authoritative read the claim just
+  // earned; and — like the marker above — a run that cannot clear it parks before it can open that PR.
+  const claimed = await beads.show(repo, ticket.id).catch(() => undefined);
+  const staleSurvivor = claimed && beads.supersedesTarget(claimed);
+  if (staleSurvivor) {
+    if (!(await mustPersist(() => beads.unlink(repo, ticket.id, staleSurvivor)))) {
+      await unclaimAndPark(repo, ticket.id);
+      throw new PoisonEpic(
+        `${ticket.id} carries a stale \`supersedes\` edge to ${staleSurvivor} from a previous ` +
+          `retirement but bd would not remove it — running this ticket and opening a pull request ` +
+          `would make its own honest close read as superseded again, and a cross-machine resume ` +
+          `drop the rerun's work from the PR. Check the beads DB, then resume the run`,
       );
     }
   }

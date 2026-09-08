@@ -14,6 +14,12 @@ const closeMock = vi.fn();
 const noteMock = vi.fn();
 const tagMock = vi.fn();
 const untagMock = vi.fn();
+const claimMock = vi.fn();
+const showMock = vi.fn();
+const unlinkMock = vi.fn();
+const setStatusMock = vi.fn();
+const unassignMock = vi.fn();
+const syncMock = vi.fn();
 const endSessionMock = vi.fn();
 
 vi.mock("../beads/bd", async () => {
@@ -26,6 +32,12 @@ vi.mock("../beads/bd", async () => {
       note: (...args: unknown[]) => noteMock(...args),
       tag: (...args: unknown[]) => tagMock(...args),
       untag: (...args: unknown[]) => untagMock(...args),
+      claim: (...args: unknown[]) => claimMock(...args),
+      show: (...args: unknown[]) => showMock(...args),
+      unlink: (...args: unknown[]) => unlinkMock(...args),
+      setStatus: (...args: unknown[]) => setStatusMock(...args),
+      unassign: (...args: unknown[]) => unassignMock(...args),
+      sync: (...args: unknown[]) => syncMock(...args),
     },
   };
 });
@@ -35,7 +47,7 @@ vi.mock("../sessions", async () => {
   return { ...actual, endSession: (...args: unknown[]) => endSessionMock(...args) };
 });
 
-const { finishTicket } = await import("./execute-epic-ticket-bookends");
+const { finishTicket, claimTicket } = await import("./execute-epic-ticket-bookends");
 import { PoisonEpic } from "./errors";
 import type { StepContext } from "./step-registry";
 
@@ -103,4 +115,61 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
     expect(tagMock).toHaveBeenCalledWith(REPO, ticket.id, ["stage:in-review"]);
     expect(untagMock).toHaveBeenCalledWith(REPO, ticket.id, ["stage:implementing"]);
   });
+});
+
+describe("claimTicket — clears a stale supersedes edge before running (PR #238 review)", () => {
+  const SURVIVOR = "anton-t9";
+  // A reopened retirement: `bd reopen` returns it to `open` but leaves the `supersedes` edge behind.
+  const reopened = {
+    id: "anton-t2",
+    title: "Expose the schema",
+    status: "open",
+    labels: [],
+    dependencies: [{ issue_id: "anton-t2", depends_on_id: SURVIVOR, type: "supersedes" }],
+  } as unknown as Bead;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    claimMock.mockResolvedValue(undefined);
+    tagMock.mockResolvedValue(undefined);
+    untagMock.mockResolvedValue(undefined);
+    setStatusMock.mockResolvedValue(undefined);
+    unassignMock.mockResolvedValue(undefined);
+    syncMock.mockResolvedValue(undefined);
+    unlinkMock.mockResolvedValue(undefined);
+    showMock.mockResolvedValue(reopened);
+  });
+
+  it("removes the stale edge on the authoritative read the claim just earned", async () => {
+    await claimTicket(run(), reopened, "op");
+    expect(showMock).toHaveBeenCalledWith(REPO, reopened.id);
+    expect(unlinkMock).toHaveBeenCalledWith(REPO, reopened.id, SURVIVOR);
+  });
+
+  it("leaves a ticket with no stale edge untouched", async () => {
+    showMock.mockResolvedValue({ ...reopened, dependencies: [] });
+    await claimTicket(run(), reopened, "op");
+    expect(unlinkMock).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when the authoritative read fails — silence proves no stale edge", async () => {
+    showMock.mockRejectedValue(new Error("database is locked"));
+    await claimTicket(run(), reopened, "op");
+    expect(unlinkMock).not.toHaveBeenCalled();
+  });
+
+  it("parks — restoring the claim — when bd refuses to remove the edge", async () => {
+    unlinkMock.mockRejectedValue(new Error("Command failed: bd dep remove\ndatabase is locked"));
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PoisonEpic);
+    expect((err as Error).message).toMatch(/stale `supersedes` edge/);
+    expect(unlinkMock).toHaveBeenCalledTimes(3); // mustPersist retries before it gives up
+    // The claim the gate took is handed back so the resume's own claim gate can re-take it.
+    expect(setStatusMock).toHaveBeenCalledWith(REPO, reopened.id, "open");
+    expect(unassignMock).toHaveBeenCalledWith(REPO, reopened.id);
+  }, 10_000);
 });

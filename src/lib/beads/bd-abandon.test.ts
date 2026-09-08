@@ -133,3 +133,33 @@ describe("beads.supersededBy", () => {
     expect(beads.supersededBy(bead("in_progress", superseded("bd-9")))).toBeUndefined();
   });
 });
+
+describe("beads.supersedesTarget", () => {
+  const bead = (status: string, deps?: Array<Record<string, string>>) =>
+    ({ id: "x", title: "x", status, ...(deps ? { dependencies: deps } : {}) }) as never;
+  const superseded = (survivor: string) => [
+    { issue_id: "x", depends_on_id: survivor, type: "supersedes" },
+  ];
+
+  // The status-agnostic reader supersededBy gates on `closed`: a run re-executing a reopened
+  // retirement must see the stale edge to clear it (PR #238 review), and supersededBy withholds it.
+  it("names the survivor whatever the bead's status — including a reopened retirement", () => {
+    expect(beads.supersedesTarget(bead("closed", superseded("bd-9")))).toBe("bd-9");
+    expect(beads.supersedesTarget(bead("open", superseded("bd-9")))).toBe("bd-9");
+    expect(beads.supersedesTarget(bead("in_progress", superseded("bd-9")))).toBe("bd-9");
+  });
+
+  it("reads the survivor off a `bd show` read too, whose deps are issues stamped with a type", () => {
+    const shown = [{ id: "bd-9", title: "the survivor", status: "closed", dependency_type: "supersedes" }];
+    expect(beads.supersedesTarget(bead("open", shown))).toBe("bd-9");
+  });
+
+  it("answers nothing when no `supersedes` edge points off this bead", () => {
+    expect(beads.supersedesTarget(bead("open"))).toBeUndefined();
+    expect(beads.supersedesTarget(bead("open", [{ issue_id: "x", depends_on_id: "bd-9", type: "blocks" }]))).toBeUndefined();
+    // This bead is the SURVIVOR of someone else's retirement, not the retired one.
+    expect(
+      beads.supersedesTarget(bead("open", [{ issue_id: "bd-9", depends_on_id: "x", type: "supersedes" }])),
+    ).toBeUndefined();
+  });
+});
