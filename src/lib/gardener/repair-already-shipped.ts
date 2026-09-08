@@ -938,9 +938,11 @@ export type AlreadyShippedOutcome =
  *      anything else because it costs no read and no autonomy level makes it acceptable. The agent
  *      says nothing needed to change and the branch says something did; retiring would close a
  *      ticket whose diff is in the run's own pull request, attributed to work that shipped
- *      elsewhere. A ticket REWRITTEN since the agent was prompted is refused on the same terms
- *      (PR #238 review): the claim describes the contract the agent read, and the fences below
- *      start from the post-report read, which already holds the edit.
+ *      elsewhere. A ticket REWRITTEN or RE-HOMED since the agent was prompted is refused on the
+ *      same terms (PR #238 review): the claim describes the contract the agent read, for the run
+ *      that dispatched it, and the fences below start from the post-report reads, which already
+ *      hold the edit or the move. The run-target half of the home needs the board, so it is asked
+ *      right after the board is read and before anything is resolved against it.
  *   2. The loop guard and the trust dial ({@link decideRepair}), asked next for `dep-missing`'s
  *      reason: the CLASS here is the agent's own report and nothing about the bead asserts it, so a
  *      second `already-shipped` block on a ticket anton already retired is a diagnosis that has been
@@ -988,8 +990,22 @@ export async function repairAlreadyShipped(args: {
    * while the agent ran is already in it, and a fence that starts from `bead` would hold the write
    * to the rewritten ticket and never see the drift. Absent, the caller has no earlier read than
    * `bead` and the gate has nothing to compare — see {@link contractDriftedSinceDispatch}.
+   *
+   * Its parentage is the dispatch-time HOME, held the same way ({@link homeMovedSinceDispatch}):
+   * `bead` and the board are both read after the report, so a re-parent landing while the agent ran
+   * is already the baseline every later fence starts from, and this snapshot is the only read that
+   * still says where the ticket hung when the claim was made about it.
    */
   dispatched?: Bead;
+  /**
+   * The run target this ticket was DISPATCHED under — `ctx.target.id`, the card whose run the
+   * retirement is written on behalf of (PR #238 review). Compared with whose card the ticket rides
+   * on the post-report board ({@link ownerMovedSinceDispatch}): a move of an ANCESTOR while the
+   * agent ran hands the ticket to another run with nothing written to the ticket itself, so neither
+   * `dispatched`'s parent nor its contract can see it. Absent, the caller has not said which run
+   * the claim was made for, and the gate has nothing to compare.
+   */
+  runTargetId?: string;
   /** The block being repaired — its reason carries the claim, and rides into the record. */
   block: { reason?: string };
   /** Whether this ticket's work reached a commit on the run's branch — see gate 1 above. */
@@ -1008,7 +1024,7 @@ export async function repairAlreadyShipped(args: {
    */
   signal?: AbortSignal;
 }): Promise<AlreadyShippedOutcome> {
-  const { repoPath, base, bead, dispatched, block, committed, now, autonomy, signal } = args;
+  const { repoPath, base, bead, dispatched, runTargetId, block, committed, now, autonomy, signal } = args;
   const claim = block.reason?.trim() || "(no reason given)";
 
   if (committed) {
@@ -1039,12 +1055,22 @@ export async function repairAlreadyShipped(args: {
       evidence: [drifted, `the agent reported: ${claim}`],
     };
   }
+  // The ticket's HOME at dispatch, on the same two reads: the retirement is written on behalf of
+  // the run that dispatched the agent, and a re-parent landing while it ran leaves the ticket open
+  // with its contract intact — inside a run this one does not own. The fences under the lock
+  // start from the post-report board, which already holds the move (PR #238 review).
+  const rehomed = dispatched ? homeMovedSinceDispatch(dispatched, bead) : undefined;
+  if (rehomed) return rehomedWhileRunning(bead.id, rehomed, claim);
 
   const decision = decideRepair(bead, KLASS, block, autonomy);
   if (decision.action === "escalate") return { ...decision };
 
   const board = args.board ?? (await readBoard(repoPath));
   const index = indexBoard(board);
+  // The other half of the dispatch-time home, which needs the board: a move of an ANCESTOR hands
+  // the ticket to another run target with nothing written to the ticket or its parent field.
+  const disowned = runTargetId ? ownerMovedSinceDispatch(index, bead, runTargetId) : undefined;
+  if (disowned) return rehomedWhileRunning(bead.id, disowned, claim);
   const shipper = resolveShipper(index, bead.id, block.reason);
   if (shipper.state === "unresolved") {
     return {
@@ -1690,33 +1716,91 @@ function contractRewritten(checked: Bead, now: Bead): string | undefined {
  * Why the ticket the agent was prompted with is not the one the report came back to — or undefined
  * while its contract still reads as dispatched (PR #238 review).
  *
- * Same fields as {@link contractRewritten}, one difference: the dispatch snapshot is a board ROW,
- * and on some bd versions the listing drops `description` (issues.ts `ensureDescription`). A field
- * the snapshot never carried is one it cannot attest to either way, so it is not compared — holding
- * it to the full read would refuse every retirement on such a bd. A field it did carry is held
- * exactly.
+ * Same fields as {@link contractRewritten}, held the same way — a field neither read carries is
+ * empty on both, and one the ticket gained while the agent ran (an acceptance list written onto a
+ * bare ticket) is drift like any edit. One field is different: the dispatch snapshot began as a
+ * board ROW, and on some bd versions the listing drops `description` (issues.ts
+ * `ensureDescription`). `readForDispatch` (steps/agent.ts) carries it over from the full read, so a
+ * snapshot still without it is one whose dispatch-time `bd show` FAILED — the agent was prompted
+ * without the contract's main body, and nothing attests to what it read. That is refused outright
+ * rather than compared: a field the snapshot cannot speak for is not a licence to skip it, since
+ * the claim would then settle a ticket on a contract the agent never saw.
  *
- * The notes are the bead's as `withDispatchNotes` (steps/agent.ts) built the prompt: read fresh at
- * dispatch, so an operator's note in the window between the run's snapshot and the agent's start
- * reached the agent and is not drift. One appended AFTER that read is an instruction the agent
- * never saw, and a claim made without it does not settle the ticket it now describes. A snapshot
- * with no notes field at all — `bd show` failing at dispatch, on a listing that carries none — is
- * held like any other field it never carried.
+ * The notes are the bead's as `readForDispatch` built the prompt: read fresh at dispatch, so an
+ * operator's note in the window between the run's snapshot and the agent's start reached the agent
+ * and is not drift. One appended AFTER that read is an instruction the agent never saw, and a claim
+ * made without it does not settle the ticket it now describes. A snapshot with no notes field at
+ * all — `bd show` failing at dispatch, on a listing that carries none — is held to "no human notes":
+ * the agent was prompted with none, so any on the ticket now are ones it never read.
  */
 function contractDriftedSinceDispatch(dispatched: Bead, now: Bead): string | undefined {
-  const text = (v: unknown): string => (typeof v === "string" ? v : "");
-  const changed: string[] = CONTRACT_FIELDS.filter(
-    (field) => dispatched[field] !== undefined && text(dispatched[field]) !== text(now[field]),
-  );
-  if (dispatched.notes !== undefined && humanNotesOf(dispatched) !== humanNotesOf(now)) {
-    changed.push("human notes");
+  if (dispatched.description === undefined) {
+    return (
+      `the dispatch-time read of \`${now.id}\` never carried its description — the agent was ` +
+      `prompted without the contract's main body, so anton cannot tell whether the claim is about ` +
+      `the ticket the board holds, and will not close it on that evidence`
+    );
   }
+  const text = (v: unknown): string => (typeof v === "string" ? v : "");
+  const changed: string[] = CONTRACT_FIELDS.filter((field) => text(dispatched[field]) !== text(now[field]));
+  if (humanNotesOf(dispatched) !== humanNotesOf(now)) changed.push("human notes");
   if (changed.length === 0) return undefined;
   return (
     `\`${now.id}\` no longer reads as it did when the agent was dispatched (${changed.join(", ")} ` +
     `changed while it ran) — the claim was made about the ticket the agent read, and anton will ` +
     `not close the one that replaced it on that evidence`
   );
+}
+
+/**
+ * Why the ticket's direct home is not the one the agent was dispatched under — or undefined while
+ * it still is (PR #238 review).
+ *
+ * The under-lock fence ({@link targetRehomed}) compares the write's read with the CHECK's, and the
+ * check's board is read after the report — so a re-parent that landed while the agent ran is the
+ * baseline it starts from, and it passes. The dispatch snapshot is the one read from before the
+ * move: the board row the run dispatched from, which carries the parent field the listing writes.
+ */
+function homeMovedSinceDispatch(dispatched: Bead, now: Bead): string | undefined {
+  const was = beads.parentOf(dispatched) ?? "";
+  const is = beads.parentOf(now) ?? "";
+  if (was === is) return undefined;
+  return (
+    `\`${now.id}\` was re-homed while the agent was running — it hung under ` +
+    `${was ? `\`${was}\`` : "no parent"} when the agent was dispatched and hangs under ` +
+    `${is ? `\`${is}\`` : "no parent"} now, so closing it as superseded would settle it inside a ` +
+    `run this one does not own`
+  );
+}
+
+/**
+ * Why the ticket no longer rides the run target it was dispatched under — or undefined while it
+ * still does (PR #238 review). The ancestor half of {@link homeMovedSinceDispatch}: a
+ * `feature → task → subtask` subtask changes run targets when the TASK is re-homed, its own parent
+ * field never written (board-index.ts `ticketPathOf`), so only the run's own knowledge of which
+ * card it dispatched for can see the move. A ticket that IS its run target rides itself.
+ */
+function ownerMovedSinceDispatch(index: BoardIndex, now: Bead, runTargetId: string): string | undefined {
+  const onBoard = index.byId.get(now.id) ?? now;
+  const rides = ticketOwnerOf(index, onBoard)?.id ?? (beads.isRunTarget(onBoard, index.all) ? onBoard.id : "");
+  if (rides === runTargetId) return undefined;
+  return (
+    `\`${now.id}\` no longer rides \`${runTargetId}\`, the run target it was dispatched under — it ` +
+    `${rides ? `rides \`${rides}\`` : "rides no run target"} now, so closing it as superseded would ` +
+    `settle it inside a run this one does not own`
+  );
+}
+
+/** The refusal both dispatch-time home fences hand back — one wording, whichever half saw the move. */
+function rehomedWhileRunning(id: string, moved: string, claim: string): AlreadyShippedOutcome {
+  return {
+    action: "escalate",
+    why:
+      `${id} blocked as \`${KLASS}\`, but the ticket was re-homed while the agent was running — ` +
+      `the claim was made for the run that dispatched it, and the ticket now belongs to another, ` +
+      `so anton retired nothing.`,
+    evidence: [moved, `the agent reported: ${claim}`],
+  };
 }
 
 /**

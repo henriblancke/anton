@@ -120,7 +120,13 @@ vi.mock("../git/ops", async () => {
 const { runTicket } = await import("./execute-epic-ticket");
 const { isPoisonError } = await import("./errors");
 
-/** The ticket under test: claimed, and citing no paths, so `ref-stale` has nothing to say about it. */
+/** The run target the ticket rides — the epic `run()` dispatches for. */
+const EPIC_ID = "anton-epic";
+
+/**
+ * The ticket under test: claimed, hanging under the run's epic, and citing no paths, so `ref-stale`
+ * has nothing to say about it.
+ */
 function ticket(): Bead {
   return {
     id: TICKET_ID,
@@ -128,13 +134,19 @@ function ticket(): Bead {
     status: "in_progress",
     description: "## Goal\nShip it.",
     labels: ["stage:implementing"],
+    parent: EPIC_ID,
   } as Bead;
 }
 
-/** The board the repair checks a claim against — the ticket, and one bead that has NOT landed. */
+/**
+ * The board the repair checks a claim against — the ticket under its epic, and one bead that has
+ * NOT landed. The epic is on it because the `already-shipped` fence asks whose card the ticket
+ * rides on the post-report board, and holds it to the run target it was dispatched under.
+ */
 function board(): Bead[] {
   return [
     ticket(),
+    { id: EPIC_ID, title: "The epic", status: "in_progress", issue_type: "epic", labels: [] } as Bead,
     { id: NOT_SHIPPED_ID, title: "Work that has not landed", status: "open", labels: [] } as Bead,
     { id: SHIPPED_ID, title: "Work that landed", status: "closed", labels: [] } as Bead,
   ];
@@ -195,7 +207,7 @@ function run(
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
-    target: { id: "anton-epic", title: "The epic", status: "in_progress" } as Bead,
+    target: { id: EPIC_ID, title: "The epic", status: "in_progress", issue_type: "epic" } as Bead,
     settings: { repairAutonomy: { "already-shipped": autonomy } },
   } as unknown as Omit<StepContext, "tickets">;
 }
@@ -427,5 +439,34 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
     expect(refusal).toBeDefined();
     expect(refusal).toContain("rewritten while the agent was running");
     expect(refusal).toContain("description changed while it ran");
+  });
+
+  // The same window, for the ticket's HOME (PR #238 review): a re-parent landing while the agent
+  // ran is already in the post-report reads, so the run's own target is what the repair is handed
+  // to hold the ticket to — and a ticket that now rides another run is blocked for a human.
+  it("refuses a verified claim when the ticket was re-homed to another run while the agent was running", async () => {
+    const OTHER_EPIC = "anton-othr";
+    readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40), committedAt: "2026-01-01T00:00:00Z" });
+    const moved = (): Bead[] => [
+      ...board().map((b) => (b.id === TICKET_ID ? ({ ...b, parent: OTHER_EPIC } as Bead) : b)),
+      { id: OTHER_EPIC, title: "Another epic", status: "in_progress", issue_type: "epic", labels: [] } as Bead,
+    ];
+    loadAllIssuesMock.mockImplementation(async () => moved());
+    showMock.mockImplementation(async (_repo: string, id: string) => moved().find((b) => b.id === id) ?? shown(id));
+
+    const halt = await haltOf({
+      outcome: "blocked",
+      klass: "already-shipped",
+      reason: `Already implemented by ${SHIPPED_ID}`,
+    });
+
+    expect(halt.message).toMatch(/produced no delivery/);
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(setStatusMock).toHaveBeenCalledWith(REPO, TICKET_ID, "blocked");
+    const refusal = notesWritten().find((n) => n.includes("did not repair this as `already-shipped`"));
+    expect(refusal).toBeDefined();
+    expect(refusal).toContain("re-homed while the agent was running");
+    expect(refusal).toContain(`hung under \`${EPIC_ID}\` when the agent was dispatched`);
+    expect(refusal).toContain(`hangs under \`${OTHER_EPIC}\` now`);
   });
 });

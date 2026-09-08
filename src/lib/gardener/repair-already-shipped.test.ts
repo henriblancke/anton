@@ -1488,7 +1488,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     );
 
     const outcome = await retire({
-      dispatched: bead(TARGET, { status: "in_progress", notes: MACHINE_NOTE }),
+      dispatched: bead(TARGET, { status: "in_progress", description: "", notes: MACHINE_NOTE }),
       bead: bead(TARGET, { status: "in_progress", notes: steered }),
     });
 
@@ -1509,7 +1509,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     );
 
     const outcome = await retire({
-      dispatched: bead(TARGET, { status: "in_progress", notes: read }),
+      dispatched: bead(TARGET, { status: "in_progress", description: "", notes: read }),
       bead: bead(TARGET, { status: "in_progress", notes: `${read}\n${MACHINE_NOTE}` }),
     });
 
@@ -1532,7 +1532,11 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(supersedeMock).not.toHaveBeenCalled();
   });
 
-  it("holds the dispatch snapshot to the fields it carried — a listing that dropped the description is not a rewrite", async () => {
+  // The dispatch read carries the description over from `bd show` when the listing dropped it
+  // (steps/agent.ts `readForDispatch`), so a snapshot still without one is a dispatch whose full
+  // read FAILED — the agent was prompted without the contract's body (PR #238 review). Skipping
+  // the field would let a claim made blind close the ticket against the contract it never saw.
+  it("refuses a claim when the dispatch snapshot never carried the description", async () => {
     const contract = "## Goal\nShip the thing.\n## Acceptance\n- [ ] it ships";
     boardShow.mockImplementation(async (_cwd, id) =>
       id === TARGET ? bead(TARGET, { status: "in_progress", description: contract }) : bead(SHIPPER, { status: "closed" }),
@@ -1541,6 +1545,133 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     const outcome = await retire({
       dispatched: bead(TARGET, { status: "in_progress" }),
       bead: bead(TARGET, { status: "in_progress", description: contract }),
+    });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("never carried its description");
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(noteMock).not.toHaveBeenCalled();
+    expect(showMock).not.toHaveBeenCalled();
+    expect(loadAllIssuesMock).not.toHaveBeenCalled();
+  });
+
+  it("still retires when the dispatch read carried an empty description and the ticket has none", async () => {
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress", description: "" }),
+      bead: bead(TARGET, { status: "in_progress" }),
+    });
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+  });
+
+  // A field the snapshot carried as ABSENT is held exactly like one it carried as text: an
+  // acceptance list written onto a bare ticket while the agent ran is a contract it never read.
+  it("refuses a claim when a contract field was added to the ticket while the agent was running", async () => {
+    const added = bead(TARGET, { status: "in_progress", description: "", acceptance_criteria: "- [ ] it ships" });
+    boardShow.mockImplementation(async (_cwd, id) => (id === TARGET ? added : bead(SHIPPER, { status: "closed" })));
+
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress", description: "" }),
+      bead: added,
+    });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("acceptance_criteria changed while it ran");
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
+  // The fences under the lock compare the write's read with the CHECK's, and both are read after
+  // the report — so a re-parent landing while the agent ran is the baseline they start from, and
+  // the supersede would close the ticket inside the run it rode into (PR #238 review). The dispatch
+  // snapshot is the one read from before the move.
+  it("refuses a claim when the ticket was re-homed while the agent was running", async () => {
+    const OTHER = "anton-othr";
+    const feature = (id: string) => bead(id, { issue_type: "feature", status: "in_progress" });
+    const moved = [
+      bead(TARGET, { status: "in_progress", parent: OTHER }),
+      feature(OWNER),
+      feature(OTHER),
+      bead(SHIPPER, { status: "closed" }),
+    ];
+    boardShow.mockImplementation(async (_cwd, id) => moved.find((b) => b.id === id)!);
+
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress", parent: OWNER, description: "" }),
+      bead: bead(TARGET, { status: "in_progress", parent: OTHER }),
+      board: moved,
+      runTargetId: OWNER,
+    });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("re-homed while the agent was running");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`hung under \`${OWNER}\` when the agent was dispatched`);
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`hangs under \`${OTHER}\` now`);
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(noteMock).not.toHaveBeenCalled();
+    // Refused on the two reads in hand — nothing was checked against git or the board.
+    expect(showMock).not.toHaveBeenCalled();
+    expect(loadAllIssuesMock).not.toHaveBeenCalled();
+  });
+
+  // The parent field cannot see this one: an ANCESTOR's move hands the ticket to another run target
+  // with nothing written to the ticket. Only the run's own knowledge of which card it dispatched
+  // for — `runTargetId` — can, against whose card the post-report board says the ticket rides.
+  it("refuses a claim when an ancestor's move handed the ticket to another run target while the agent was running", async () => {
+    const OTHER = "anton-othr";
+    const CARRIER = "anton-carr";
+    const feature = (id: string) => bead(id, { issue_type: "feature", status: "in_progress" });
+    const viaCarrier = (home: string) => [
+      bead(TARGET, { status: "in_progress", parent: CARRIER }),
+      bead(CARRIER, { status: "in_progress", parent: home }),
+      feature(OWNER),
+      feature(OTHER),
+      bead(SHIPPER, { status: "closed" }),
+    ];
+    boardShow.mockImplementation(async (_cwd, id) => viaCarrier(OTHER).find((b) => b.id === id)!);
+
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress", parent: CARRIER, description: "" }),
+      bead: bead(TARGET, { status: "in_progress", parent: CARRIER }),
+      board: viaCarrier(OTHER),
+      runTargetId: OWNER,
+    });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("re-homed while the agent was running");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`no longer rides \`${OWNER}\`, the run target it was dispatched under`);
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(`rides \`${OTHER}\` now`);
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(noteMock).not.toHaveBeenCalled();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("still retires a ticket that hangs where it was dispatched, parent and run target alike", async () => {
+    const CARRIER = "anton-carr";
+    const viaCarrier = [
+      bead(TARGET, { status: "in_progress", parent: CARRIER }),
+      bead(CARRIER, { status: "in_progress", parent: OWNER }),
+      bead(OWNER, { issue_type: "feature", status: "in_progress" }),
+      bead(SHIPPER, { status: "closed" }),
+    ];
+    loadAllIssuesMock.mockResolvedValue(viaCarrier);
+    boardShow.mockImplementation(async (_cwd, id) => viaCarrier.find((b) => b.id === id)!);
+
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress", parent: CARRIER, description: "" }),
+      bead: bead(TARGET, { status: "in_progress", parent: CARRIER }),
+      board: viaCarrier,
+      runTargetId: OWNER,
+    });
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+  });
+
+  it("still retires a standalone ticket that is its own run target", async () => {
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress", description: "" }),
+      runTargetId: TARGET,
     });
 
     expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });

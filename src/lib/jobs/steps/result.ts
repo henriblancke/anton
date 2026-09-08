@@ -30,7 +30,8 @@ export interface StepFacts {
   selfReport?: AntonResult | null;
   /**
    * `implement` — the ticket as the agent was PROMPTED with it: the run's snapshot plus the notes
-   * read at dispatch (`withDispatchNotes`). Retained because a claim about "this ticket" is a claim
+   * and, when the listing dropped it, the description read at dispatch (`readForDispatch`).
+   * Retained because a claim about "this ticket" is a claim
    * about that read, and the `already-shipped` repair fences the retirement on it (PR #238 review):
    * a human note appended after the prompt was built is an instruction the agent never saw.
    */

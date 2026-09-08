@@ -2,13 +2,13 @@
  * Direct tests for the agent-dispatching steps: what `step:implement` hands each ticket's agent, and
  * where `step:claude` gets its reasoning from.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import type { Bead } from "../../beads/bd";
+import { beads, type Bead } from "../../beads/bd";
 import { RunAlreadyLiveError } from "../errors";
-import { claudeStep, implementStep, withDispatchNotes } from "./agent";
+import { claudeStep, implementStep, readForDispatch } from "./agent";
 import { closeSandbox, fakeClaude, openSandbox, target } from "./step.fixture";
 
 let sandbox: Awaited<ReturnType<typeof openSandbox>>;
@@ -77,12 +77,40 @@ describe("step:implement", () => {
   });
 });
 
-describe("withDispatchNotes", () => {
+describe("readForDispatch", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  /** A board row as a listing that drops the description hands it over. */
+  const row: Bead = { id: "anton-a", title: "ticket anton-a", status: "in_progress", issue_type: "task" };
+
   // `bd show` failing (a locked DB, a frozen in-worktree Dolt) must never block the run.
   it("falls back to the board snapshot when bd cannot be read", async () => {
     const snapshot = ticket("anton-a");
 
-    expect(await withDispatchNotes(join(sandbox.dir, "not-a-repo"), snapshot)).toEqual(snapshot);
+    expect(await readForDispatch(join(sandbox.dir, "not-a-repo"), snapshot)).toEqual(snapshot);
+  });
+
+  // A listing that dropped the description (the one field `bd list` omits on some bd versions)
+  // would otherwise prompt the agent without the contract — and leave the `already-shipped` fence
+  // with no dispatch-time contract to hold the claim to (PR #238 review).
+  it("carries the full read's description when the snapshot row dropped it", async () => {
+    const contract = "## Goal\nShip it.\n## Acceptance\n- [ ] it ships";
+    vi.spyOn(beads, "show").mockResolvedValue({ ...row, description: contract, notes: "anton: steer" });
+
+    expect(await readForDispatch(sandbox.dir, row)).toEqual({ ...row, description: contract, notes: "anton: steer" });
+  });
+
+  it("dispatches an empty description, not an unknown one, when the full read carries none", async () => {
+    vi.spyOn(beads, "show").mockResolvedValue({ ...row });
+
+    expect(await readForDispatch(sandbox.dir, row)).toEqual({ ...row, description: "" });
+  });
+
+  it("keeps the snapshot's own description over the full read's", async () => {
+    const snapshot = { ...ticket("anton-a"), description: "as listed" };
+    vi.spyOn(beads, "show").mockResolvedValue({ ...snapshot, description: "as shown" });
+
+    expect(await readForDispatch(sandbox.dir, snapshot)).toEqual(snapshot);
   });
 });
 

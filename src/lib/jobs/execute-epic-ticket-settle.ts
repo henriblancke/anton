@@ -67,7 +67,7 @@ export interface TicketProgress {
   selfReport: AntonResult | null;
   /**
    * The ticket as the implementing agent was PROMPTED with it — the snapshot plus the notes read at
-   * dispatch (steps/agent.ts `withDispatchNotes`). The `already-shipped` repair fences its
+   * dispatch (steps/agent.ts `readForDispatch`). The `already-shipped` repair fences its
    * retirement on this read (PR #238 review); absent when no dispatching step reported one.
    */
   dispatched?: Bead;

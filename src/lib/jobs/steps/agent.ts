@@ -32,7 +32,7 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
       agentPrompt: await loadAgentPrompt(agentTag, { projectDir: ctx.worktreePath }),
       seedPrompt: ctx.settings.seedPrompt,
     });
-    const dispatched = await withDispatchNotes(ctx.repoPath, ticket);
+    const dispatched = await readForDispatch(ctx.repoPath, ticket);
     last = await dispatchClaude(ctx, {
       beadId: ticket.id,
       prompt: ticketPrompt(dispatched),
@@ -73,12 +73,21 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
 }
 
 /**
- * The ticket as it should be dispatched: the board-snapshot bead plus its CURRENT notes blob, read
- * fresh so an operator's steer written after the run started still reaches this ticket's prompt.
- * `bd show` failing (e.g. a locked DB) must never block the run — the snapshot bead is returned.
+ * The ticket as it should be dispatched: the board-snapshot bead plus what only a fresh `bd show`
+ * can add to it. Its CURRENT notes blob, so an operator's steer written after the run started still
+ * reaches this ticket's prompt; and its description when the listing dropped it (issues.ts
+ * `ensureDescription` — the one field `bd list` omits on some bd versions), so the agent is never
+ * prompted without the contract and the `already-shipped` fence has the contract it read to hold
+ * the claim to (PR #238 review). A show that succeeds is the whole truth about the description: a
+ * bead it carries none for is dispatched with an empty one, not an unknown one.
+ *
+ * `bd show` failing (e.g. a locked DB) must never block the run — the snapshot bead is returned,
+ * attesting to nothing the listing did not carry.
  */
-export async function withDispatchNotes(repo: string, ticket: Bead): Promise<Bead> {
+export async function readForDispatch(repo: string, ticket: Bead): Promise<Bead> {
   const fresh = await beads.show(repo, ticket.id).catch(() => null);
-  return fresh?.notes ? { ...ticket, notes: fresh.notes } : ticket;
+  if (!fresh) return ticket;
+  const dispatched = fresh.notes ? { ...ticket, notes: fresh.notes } : ticket;
+  return ticket.description === undefined ? { ...dispatched, description: fresh.description ?? "" } : dispatched;
 }
 

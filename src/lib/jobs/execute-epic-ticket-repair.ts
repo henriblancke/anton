@@ -130,6 +130,9 @@ export async function repairBlockedTicket(args: {
             // would hold the retirement to the rewritten ticket and never see the drift. The
             // dispatch-time read carries the human notes the prompt did; the snapshot does not.
             dispatched: args.dispatched ?? ticket,
+            // And the run the claim was made FOR: a re-parent of the ticket or an ancestor while
+            // the agent ran hands it to another run, and `fresh` already reads as that run's.
+            runTargetId: run.target.id,
             block,
             committed: args.committed,
             now,
