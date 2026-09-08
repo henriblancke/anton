@@ -42,6 +42,7 @@ import {
   sameWorktreeState,
   worktreeHasCommitFor,
   branchContainsCommit,
+  readCommitDate,
   readCommitNaming,
   readCommitReach,
 } from "./ops";
@@ -414,6 +415,59 @@ suite("worktreeHasCommitFor (real git)", () => {
   it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
     expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
   });
+
+  // PR #238 review: asked with a base, the scan covers only what the branch carries beyond it — a
+  // ticket an earlier merge landed under its id in the base is not one THIS run committed.
+  it("with a base, sees only the commits the branch carries beyond it", async () => {
+    writeFileSync(join(repo, "old.md"), "landed earlier\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-old1: shipped in an earlier merge"]);
+    g(["checkout", "-q", "-b", "anton/run"]);
+    writeFileSync(join(repo, "new.md"), "this run\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-new1: committed by this run"]);
+
+    expect(await worktreeHasCommitFor(repo, "anton-old1")).toBe(true);
+    expect(await worktreeHasCommitFor(repo, "anton-old1", { base: "main" })).toBe(false);
+    expect(await worktreeHasCommitFor(repo, "anton-new1", { base: "main" })).toBe(true);
+    // A base that resolves to nothing fails closed to absent, as the unscoped read does.
+    expect(await worktreeHasCommitFor(repo, "anton-new1", { base: "origin/nope" })).toBe(false);
+  });
+});
+
+suite("readCommitDate (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-commitdate-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "user.name", "anton-test"], { stdio: "ignore" });
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("reads the committer date, which a rebase moves and the author date keeps", async () => {
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init"], {
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_DATE: "2020-01-01T00:00:00Z",
+        GIT_COMMITTER_DATE: "2021-06-15T12:00:00Z",
+      },
+    });
+    const sha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+    expect(Date.parse(await readCommitDate(repo, sha))).toBe(Date.parse("2021-06-15T12:00:00Z"));
+    await expect(readCommitDate(repo, "0".repeat(40))).rejects.toThrow();
+  });
 });
 
 /**
@@ -571,7 +625,11 @@ suite("readCommitNaming (real git)", () => {
     g(["commit", "-q", "--allow-empty", "-F", msg]);
     const sha = g(["rev-parse", "HEAD"]);
 
-    expect(await readCommitNaming(repo, "anton-x1e5", "main")).toEqual({ state: "found", sha });
+    expect(await readCommitNaming(repo, "anton-x1e5", "main")).toEqual({
+      state: "found",
+      sha,
+      committedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+    });
   });
 
   it("matches the id as a whole token, and answers none for a bead no commit names", async () => {
@@ -591,7 +649,7 @@ suite("readCommitNaming (real git)", () => {
 
     g(["commit", "-q", "--allow-empty", "-m", "feat: subject\n\nthis closes anton-fade."]);
     const sha = g(["rev-parse", "HEAD"]);
-    expect(await readCommitNaming(repo, "anton-fade", "main")).toEqual({ state: "found", sha });
+    expect(await readCommitNaming(repo, "anton-fade", "main")).toMatchObject({ state: "found", sha });
   });
 
   it("fails closed on a base git cannot resolve", async () => {

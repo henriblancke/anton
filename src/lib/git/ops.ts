@@ -673,12 +673,20 @@ export async function branchAheadOfRemote(
  * local, never-pushed worktree. Skipping such a ticket on board state alone would open the epic's PR
  * missing that work. A run's own ticket commits are always at the branch tip, so bounding the scan
  * is safe. Fails closed to `false` (git error → treat as absent → re-run) rather than risk a skip.
+ *
+ * `base` narrows the read to the commits the branch carries BEYOND it — `<base>..HEAD` — for the
+ * caller whose question is "did THIS run commit it", not "has it ever been committed" (PR #238
+ * review). The tip scan walks into the base's own history, so a ticket that shipped under its id
+ * in an earlier merge — then reopened and settled otherwise — reads as committed by a run that never
+ * touched it: kept out of the retirement ledger, skipped as done, and advertised as delivered by a
+ * pull request that carries nothing of it. The delta is what the run's PR will contain.
  */
 export async function worktreeHasCommitFor(
   worktreePath: string,
   ticketId: string,
+  options: { base?: string } = {},
 ): Promise<boolean> {
-  return (await branchSubjects(worktreePath)).some((s) => s.startsWith(`${ticketId}:`));
+  return (await branchSubjects(worktreePath, options)).some((s) => s.startsWith(`${ticketId}:`));
 }
 
 /**
@@ -716,16 +724,18 @@ export async function worktreeHasPreservedCommitFor(
 const BRANCH_SUBJECTS_ARGS = ["log", "--format=%s", "-n", "1000"];
 
 /**
- * The subjects at the tip of the branch checked out in `worktreePath`. Fails closed to none (git
- * error → treat as absent) rather than risk a skip — except under `strict`, where absence is the
- * permissive answer and the caller has asked to see the failure instead.
+ * The subjects at the tip of the branch checked out in `worktreePath` — or, given `base`, only
+ * those the branch carries beyond it. Fails closed to none (git error → treat as absent) rather
+ * than risk a skip — except under `strict`, where absence is the permissive answer and the caller
+ * has asked to see the failure instead.
  */
 async function branchSubjects(
   worktreePath: string,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; base?: string } = {},
 ): Promise<string[]> {
-  if (options.strict) return (await git(worktreePath, BRANCH_SUBJECTS_ARGS)).split("\n");
-  const log = await git(worktreePath, BRANCH_SUBJECTS_ARGS).catch(() => "");
+  const args = options.base ? [...BRANCH_SUBJECTS_ARGS, `${options.base}..HEAD`, "--"] : BRANCH_SUBJECTS_ARGS;
+  if (options.strict) return (await git(worktreePath, args)).split("\n");
+  const log = await git(worktreePath, args).catch(() => "");
   return log.split("\n");
 }
 
@@ -813,13 +823,26 @@ export async function readCommitReach(
   }
 }
 
+/**
+ * What a pull request's own commit list says about a BEAD — see {@link readPullRequestNaming}.
+ * Undated, unlike {@link CommitNaming}: the PR's merge is what places its work in time.
+ */
+export type PullRequestNaming =
+  | { state: "found"; sha: string }
+  | { state: "none" }
+  | { state: "unreadable"; detail: string };
+
 /** The shape a bead id takes — the gate both naming reads hold their input to before it reaches a regex. */
 const BEAD_ID = /^[A-Za-z0-9][\w.-]*$/;
 
 /** What `base`'s history says about a BEAD — see {@link readCommitNaming}. */
 export type CommitNaming =
-  /** A commit `base` contains names the bead in its message: the work filed under it has landed. */
-  | { state: "found"; sha: string }
+  /**
+   * A commit `base` contains names the bead in its message: the work filed under it has landed.
+   * `committedAt` is its committer date (ISO 8601) — when it took the shape the base holds, which
+   * for a squash or a rebase is the merge itself — so a caller can place the landing in time.
+   */
+  | { state: "found"; sha: string; committedAt: string }
   /** No commit in `base`'s history names it. */
   | { state: "none" }
   /** The question itself failed — an unresolvable base, a broken object store, a killed process. */
@@ -854,7 +877,7 @@ export async function readCommitNaming(
       `--grep=${beadId}`,
       "-n",
       "50",
-      "--format=%H%x1f%B%x00",
+      "--format=%H%x1f%cI%x1f%B%x00",
       base,
       "--",
     ]);
@@ -863,14 +886,30 @@ export async function readCommitNaming(
   }
   const named = beadNamedIn(beadId);
   for (const entry of log.split("\0")) {
-    // Split on the FIRST separator only — a body that itself carries `\x1f` must stay whole.
-    const sepIdx = entry.indexOf("\x1f");
-    if (sepIdx < 0) continue;
-    const sha = entry.slice(0, sepIdx).trim();
-    const message = entry.slice(sepIdx + 1);
-    if (sha && named.test(message)) return { state: "found", sha };
+    // Split on the first TWO separators only — a body that itself carries `\x1f` must stay whole.
+    const shaEnd = entry.indexOf("\x1f");
+    if (shaEnd < 0) continue;
+    const dateEnd = entry.indexOf("\x1f", shaEnd + 1);
+    if (dateEnd < 0) continue;
+    const sha = entry.slice(0, shaEnd).trim();
+    const committedAt = entry.slice(shaEnd + 1, dateEnd).trim();
+    const message = entry.slice(dateEnd + 1);
+    if (sha && named.test(message)) return { state: "found", sha, committedAt };
   }
   return { state: "none" };
+}
+
+/**
+ * When `sha` was committed — its committer date, ISO 8601 — or THROW. The date the
+ * `already-shipped` check places a landing at (PR #238 review): for a merge commit, a squash or a
+ * rebased head that is the moment the work entered the base, which is what a bead's reopen is
+ * measured against. The committer date, not the author date, because a rebase keeps the latter
+ * from the original work and would place a landing before it happened.
+ */
+export async function readCommitDate(repoPath: string, sha: string): Promise<string> {
+  const date = await git(repoPath, ["show", "-s", "--format=%cI", `${sha}^{commit}`, "--"]);
+  if (!date) throw new Error(`git reported no committer date for ${sha}`);
+  return date;
 }
 
 /**
@@ -900,7 +939,7 @@ export async function readPullRequestNaming(
   repoPath: string,
   ref: string,
   beadId: string,
-): Promise<CommitNaming> {
+): Promise<PullRequestNaming> {
   if (!BEAD_ID.test(beadId)) return { state: "unreadable", detail: `"${beadId}" is not a bead id` };
   const selector = ref.startsWith("gh-") ? ref.slice(3) : ref;
   if (!selector) return { state: "unreadable", detail: `"${ref}" names no pull request` };

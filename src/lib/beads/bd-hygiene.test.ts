@@ -47,6 +47,7 @@ const {
   parseEpicCloseEligible,
   parseLintReport,
   parseOrphans,
+  parseBeadHistory,
   parseRecomputeBlocked,
 } = await import("./bd");
 
@@ -441,6 +442,36 @@ describe("parseRecomputeBlocked", () => {
     expect(() => parseRecomputeBlocked('{"schema_version": 1}')).toThrow(
       /could not read rows_corrected/,
     );
+  });
+});
+
+describe("parseBeadHistory", () => {
+  const version = (CommitDate: string, status: string) => ({
+    CommitHash: "r4cqkscueunao76kiv4i143j0rq34e35",
+    Committer: "beads",
+    CommitDate,
+    Issue: { id: "anton-x", title: "x", status },
+  });
+
+  it("keeps each version's date and status, in the order bd gives them (newest first)", () => {
+    const raw = JSON.stringify([
+      version("2026-09-08T04:42:35.571-04:00", "closed"),
+      version("2026-09-08T04:42:32.125-04:00", "open"),
+      version("2026-09-08T04:42:29.477-04:00", "closed"),
+    ]);
+    expect(parseBeadHistory(raw)).toEqual([
+      { at: "2026-09-08T04:42:35.571-04:00", status: "closed" },
+      { at: "2026-09-08T04:42:32.125-04:00", status: "open" },
+      { at: "2026-09-08T04:42:29.477-04:00", status: "closed" },
+    ]);
+  });
+
+  it("throws on anything but versions — a reader measuring against a reopen must not read an empty answer", () => {
+    expect(() => parseBeadHistory('{"error": "no such issue"}')).toThrow(/expected a JSON array/);
+    expect(() => parseBeadHistory(JSON.stringify([{ CommitDate: "2026-01-01T00:00:00Z" }]))).toThrow(
+      /version 0 carries no CommitDate or Issue.status/,
+    );
+    expect(parseBeadHistory("[]")).toEqual([]);
   });
 });
 

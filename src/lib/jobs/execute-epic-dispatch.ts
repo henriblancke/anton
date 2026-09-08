@@ -79,8 +79,13 @@ export async function dispatchRunTickets(
   run: EpicRun,
   prep: Extract<RunPreparation, { done: false }>,
 ): Promise<DispatchOutcome> {
+  // Read against the run's DELTA, not the branch's whole history (PR #238 review): the question is
+  // whether THIS run committed the ticket — what its pull request will carry — and a scan that walks
+  // into the base finds a commit an earlier merge landed under the same id, keeping a ticket the
+  // board has since settled out of the retirement ledger and in the delivered set of a PR that
+  // carries nothing of it.
   const { live, held, dispatchable } = await partitionTickets(run, prep.gated, (id) =>
-    worktreeHasCommitFor(prep.worktree.path, id),
+    worktreeHasCommitFor(prep.worktree.path, id, { base: prep.runStep.baseRef }),
   );
   const ledger: DispatchLedger = {
     skipCause: new Map(),

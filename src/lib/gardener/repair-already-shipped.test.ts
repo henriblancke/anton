@@ -37,6 +37,8 @@ const unlinkMock = vi.fn<(cwd: string, a: string, b: string) => Promise<string>>
 const bdWrites = [noteMock, tagMock, linkMock, closeMock, updateMock, setPrRefMock, supersedeMock, reopenMock, unlinkMock];
 /** The under-lock re-reads the RETIREMENT makes — before its write and after it; the check never calls it. */
 const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
+/** `bd history` as the check sees it — never reopened unless a case says so. */
+const historyMock = vi.fn<(cwd: string, id: string) => Promise<{ at: string; status: string }[]>>(async () => []);
 /**
  * What the board holds for a bead apart from THIS repair's own write. Cases script this one; the
  * retirement suite's `showMock` layers the supersede over it, so a post-write read of the ticket
@@ -63,6 +65,7 @@ vi.mock("../beads/bd", async () => {
       reopen: reopenMock,
       unlink: unlinkMock,
       show: showMock,
+      history: historyMock,
     },
   };
 });
@@ -254,12 +257,21 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     for (const write of bdWrites) write.mockClear();
     loadAllIssuesMock.mockClear();
     loadAllIssuesMock.mockResolvedValue([]);
+    historyMock.mockReset().mockResolvedValue([]);
   });
 
   afterEach(() => sb.cleanup());
 
   const verify = (reason: string | undefined, board: Bead[], base = "main") =>
     verifyShippedClaim({ repoPath: repo, base, targetId: TARGET, reason, board });
+
+  /** A bead's versions as `bd history` lists them, newest first, from (date, status) pairs. */
+  const versions = (...pairs: [string, string][]) => pairs.map(([at, status]) => ({ at, status }));
+  /** A reopen an hour from now — after every commit the sandbox makes. */
+  const REOPENED_AT = new Date(Date.now() + 3_600_000).toISOString();
+  const RECLOSED_AT = new Date(Date.now() + 7_200_000).toISOString();
+  /** Shipped once, reopened for rework, closed again — the close the board holds is the second. */
+  const REWORKED = versions([RECLOSED_AT, "closed"], [REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]);
 
   it("verifies a claim whose commit, bead and PR all check out", async () => {
     setPr(85, "MERGED");
@@ -460,6 +472,115 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       proof: [`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged${mergedTail(landed)}`],
       landed: { [UNLANDED]: { via: "pr", ref: "gh-85" } },
       cited: [{ kind: "pr", ref: "gh-85" }],
+    });
+  });
+
+  // PR #238 review: a bead that shipped once, was reopened for rework, and was closed again by a run
+  // whose PR has not merged still has its FIRST landing in the base. That landing is an earlier
+  // cycle's, and a ticket must not be retired against it while the survivor's latest work is unmerged.
+  describe("a closed bead's landing is held to its current closure", () => {
+    it("refuses a naming commit in the base that predates the bead's last reopen", async () => {
+      historyMock.mockResolvedValue(REWORKED);
+
+      const verdict = await verify(`already done by ${SHIPPER}`, [
+        bead(TARGET),
+        bead(SHIPPER, { status: "closed", closed_at: RECLOSED_AT }),
+      ]);
+
+      expect(verdict.state).toBe("unverified");
+      expect(verdict).toMatchObject({
+        why: expect.stringContaining(`commit \`${landed.slice(0, 10)}\` in the history of the run's base (main) names it — but`),
+      });
+      expect(verdict).toMatchObject({ why: expect.stringContaining(`the board reopened \`${SHIPPER}\` at ${REOPENED_AT}`) });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("nothing says THAT work landed") });
+      expect(historyMock).toHaveBeenCalledWith(repo, SHIPPER);
+    });
+
+    it("verifies a landing at or after the close the board holds without reading the history", async () => {
+      historyMock.mockRejectedValue(new Error("must not be read"));
+
+      const verdict = await verify(`already done by ${SHIPPER}`, [
+        bead(TARGET),
+        bead(SHIPPER, { status: "closed", closed_at: "2020-01-01T00:00:00Z" }),
+      ]);
+
+      expect(verdict.state).toBe("verified");
+      expect(historyMock).not.toHaveBeenCalled();
+    });
+
+    it("verifies a landing that predates the close when the bead was never reopened — a hand close after the merge", async () => {
+      historyMock.mockResolvedValue(
+        versions([RECLOSED_AT, "closed"], ["2020-01-02T00:00:00Z", "in_progress"], ["2020-01-01T00:00:00Z", "open"]),
+      );
+
+      const verdict = await verify(`already done by ${SHIPPER}`, [
+        bead(TARGET),
+        bead(SHIPPER, { status: "closed", closed_at: RECLOSED_AT }),
+      ]);
+
+      expect(verdict.state).toBe("verified");
+      expect(historyMock).toHaveBeenCalledWith(repo, SHIPPER);
+    });
+
+    it("verifies a landing after the reopen — the rework itself has landed", async () => {
+      historyMock.mockResolvedValue(
+        versions([RECLOSED_AT, "closed"], ["2020-06-01T00:00:00Z", "in_progress"], ["2020-01-01T00:00:00Z", "closed"]),
+      );
+
+      const verdict = await verify(`already done by ${SHIPPER}`, [
+        bead(TARGET),
+        bead(SHIPPER, { status: "closed", closed_at: RECLOSED_AT }),
+      ]);
+
+      expect(verdict.state).toBe("verified");
+    });
+
+    it("refuses when the history cannot be read and the landing predates the close — unread is unchecked", async () => {
+      historyMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+      const verdict = await verify(`already done by ${SHIPPER}`, [
+        bead(TARGET),
+        bead(SHIPPER, { status: "closed", closed_at: RECLOSED_AT }),
+      ]);
+
+      expect(verdict.state).toBe("unverified");
+      expect(verdict).toMatchObject({
+        why: expect.stringContaining(`whether \`${SHIPPER}\` was reopened since could not be read (dolt: connection refused)`),
+      });
+    });
+
+    it("refuses a bead's own merged PR whose merge predates its last reopen", async () => {
+      setPr(85, "MERGED");
+      historyMock.mockResolvedValue(REWORKED);
+
+      const verdict = await verify(`already done by ${UNLANDED}`, [
+        bead(TARGET),
+        bead(UNLANDED, { status: "closed", closed_at: RECLOSED_AT, metadata: { pr: "gh-85" } }),
+      ]);
+
+      expect(verdict.state).toBe("unverified");
+      expect(verdict).toMatchObject({
+        why: expect.stringContaining(`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged — but`),
+      });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("is an earlier cycle's") });
+    });
+
+    it("refuses the merged PR of the run target a child rides when that merge predates the child's last reopen", async () => {
+      setPr(85, "MERGED", { carries: [`${UNLANDED}: the child's first commit`] });
+      historyMock.mockResolvedValue(REWORKED);
+      const feature = bead(OWNER, { issue_type: "feature", status: "closed", metadata: { pr: "gh-85" } });
+      const child = bead(UNLANDED, { status: "closed", closed_at: RECLOSED_AT });
+      (child as unknown as Record<string, unknown>).parent = OWNER;
+
+      const verdict = await verify(`already done by ${UNLANDED}`, [bead(TARGET), feature, child]);
+
+      expect(verdict.state).toBe("unverified");
+      expect(verdict).toMatchObject({
+        why: expect.stringContaining(
+          `(gh-85) is merged, and GitHub records commit \`${carriedOid(0).slice(0, 10)}\` in that PR naming it — but`,
+        ),
+      });
+      expect(historyMock).toHaveBeenCalledWith(repo, UNLANDED);
     });
   });
 

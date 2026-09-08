@@ -79,6 +79,7 @@ vi.mock("../beads/bd", async () => {
       supersede: (...args: unknown[]) => supersedeMock(...(args as [string, string, string])),
       sync: (...args: unknown[]) => syncMock(...(args as [])),
       show: (repo: string, id: string) => showMock(repo, id),
+      history: async () => [],
     },
   };
 });
@@ -296,7 +297,7 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
   // exactly as an abort landing before it would: nothing retired, nothing noted, nothing released.
   it("retires and writes NOTHING when the job is cancelled while a verified claim is being settled", async () => {
     const controller = new AbortController();
-    readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40) });
+    readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40), committedAt: "2026-01-01T00:00:00Z" });
     showMock.mockImplementation(async (_repo: string, id: string) => {
       // The under-lock re-read of the survivor — every check has passed, the first write is next.
       if (id === SHIPPED_ID) controller.abort();
@@ -336,7 +337,7 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
       // Lands inside the check — before the repair has decided anything, long after the settlement
       // read the signal.
       controller.abort();
-      return { state: "found", sha: "b".repeat(40) };
+      return { state: "found", sha: "b".repeat(40), committedAt: "2026-01-01T00:00:00Z" };
     });
 
     const halt = await haltOf(
@@ -357,7 +358,7 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
   });
 
   it("retires a verified claim when the signal never fires, closing the ticket against its survivor", async () => {
-    readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40) });
+    readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40), committedAt: "2026-01-01T00:00:00Z" });
 
     const halt = await haltOf({
       outcome: "blocked",

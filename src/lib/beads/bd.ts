@@ -1607,6 +1607,39 @@ export function parseDuplicateGroups(raw: string): DuplicateGroup[] {
 }
 
 /**
+ * One version of a bead, as `bd history` records it — see {@link parseBeadHistory}.
+ */
+export interface BeadVersion {
+  /** When this version was written (ISO 8601, the Dolt commit's date). */
+  at: string;
+  /** The bead's status in this version. */
+  status: string;
+}
+
+/**
+ * Read `bd history <id> --json` — every version of one bead, NEWEST FIRST, each as
+ * `{ CommitHash, Committer, CommitDate, Issue }` — down to the two fields a reader replays: when the
+ * version was written and what status it held. The bead's row itself holds no record of a REOPEN
+ * (`closed_at` is cleared by one and overwritten by the next close, `started_at` never moves), so
+ * this is the only place the board says a bead's current closure is not its first (PR #238 review).
+ *
+ * Throws on anything but an array of versions: a reader that measures evidence against the reopen
+ * this history holds must fail closed on a history it could not read, not on one that read empty.
+ */
+export function parseBeadHistory(raw: string): BeadVersion[] {
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) throw new Error("bd history: expected a JSON array of versions");
+  return parsed.map((entry, i): BeadVersion => {
+    const e = entry as Record<string, unknown> | null;
+    const issue = e?.Issue as Record<string, unknown> | null | undefined;
+    const at = str(e?.CommitDate);
+    const status = str(issue?.status);
+    if (!at || !status) throw new Error(`bd history: version ${i} carries no CommitDate or Issue.status`);
+    return { at, status };
+  });
+}
+
+/**
  * Read `bd recompute-blocked --json` (`{"rows_corrected": n}`) — or THROW. The throw is the point:
  * this verb exists to report how many stale `is_blocked` flags it repaired, and a silent 0 on an
  * unreadable answer would render a repair anton could not see as "the graph was already consistent".
@@ -2500,6 +2533,14 @@ export const beads = {
    */
   reopen: (cwd: string, id: string, reason?: string) =>
     bdWrite(cwd, ["reopen", id, ...(reason ? ["--reason", reason] : [])]),
+
+  /**
+   * Every version of a bead, newest first — the record a reopen leaves that the bead's own row does
+   * not ({@link parseBeadHistory}). Whole, not `--limit`ed: the reader wants the LAST transition out
+   * of `closed`, and a window that misses it would read a reopened bead as never reopened.
+   */
+  history: (cwd: string, id: string): Promise<BeadVersion[]> =>
+    bd(cwd, ["history", id, "--json"]).then(parseBeadHistory),
 
   /**
    * Snooze a bead (`bd defer`) / restore it (`bd undefer`) — the "not now, but not dead" state

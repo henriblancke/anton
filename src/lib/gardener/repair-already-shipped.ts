@@ -38,6 +38,7 @@ import { beads, type Bead } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import {
+  readCommitDate,
   readCommitNaming,
   readCommitReach,
   readPullRequestMerge,
@@ -162,7 +163,8 @@ function readBoard(repoPath: string): Promise<Bead[]> {
  * everyday case the prose keeps short.
  */
 type PullRequestLanding =
-  | { landed: true; sha: string }
+  /** `landedAt` is the merge commit's committer date — when the PR's work entered the base. */
+  | { landed: true; sha: string; landedAt: string }
   | { landed: false; state: PullRequestState; predicate: string };
 
 /**
@@ -200,8 +202,21 @@ async function readPullRequestLanding(
   const reach = await readCommitReach(repoPath, pr.mergeCommit, base);
   const short = pr.mergeCommit.slice(0, 10);
   switch (reach.state) {
-    case "reaches":
-      return { landed: true, sha: reach.sha };
+    case "reaches": {
+      // Dated here, with the reach, so every merged PR carries WHEN it landed: a closed bead's
+      // landing is measured against its reopen (`landingOfCurrentCycle`), and an undatable merge
+      // fails closed exactly as an unplaceable one does.
+      let landedAt: string;
+      try {
+        landedAt = await readCommitDate(repoPath, reach.sha);
+      } catch (error) {
+        return unlanded(
+          `is merged into the run's base (${base}), but when its merge commit \`${short}\` landed ` +
+            `could not be read (${error instanceof Error ? error.message : String(error)})`,
+        );
+      }
+      return { landed: true, sha: reach.sha, landedAt };
+    }
     case "outside":
       return unlanded(
         `is merged elsewhere than the run's base (${base})` +
@@ -413,6 +428,13 @@ function citesSame(a: CitedEvidence, b: CitedEvidence): boolean {
  * of it: the PR could not have held work that was filed elsewhere when it merged. So the PR has to
  * say so itself — one of the commits GitHub records for it names the bead — and a merged owner PR
  * whose commit list never mentions the bead proves nothing for it.
+ *
+ * And every one of the three is held to the bead's CURRENT closure (PR #238 review). A bead that
+ * shipped once, was reopened for rework, and was closed again by a run whose pull request has not
+ * merged still has its first landing in the base — the old commit naming it, the old merged PR —
+ * and any of those would retire another ticket against work the survivor's latest close does not
+ * describe. So a landing counts only when it postdates the bead's last reopen
+ * ({@link landingOfCurrentCycle}): what the base holds must be what this close is about.
  */
 async function closedBeadLanding(args: {
   repoPath: string;
@@ -425,13 +447,22 @@ async function closedBeadLanding(args: {
   const id = bead.id;
   const naming = await readCommitNaming(repoPath, id, base);
   switch (naming.state) {
-    case "found":
+    case "found": {
+      const cycle = await landingOfCurrentCycle(repoPath, bead, naming.committedAt);
+      if (cycle.stale) {
+        return {
+          why:
+            `\`${id}\` is closed on the board, and commit \`${naming.sha.slice(0, 10)}\` in the ` +
+            `history of the run's base (${base}) names it — but ${cycle.stale}`,
+        };
+      }
       return {
         landing: { via: "commit", sha: naming.sha },
         proof:
           `\`${id}\` is closed on the board, and commit \`${naming.sha.slice(0, 10)}\` in the ` +
           `history of the run's base (${base}) names it`,
       };
+    }
     case "unreadable":
       return {
         why:
@@ -446,6 +477,12 @@ async function closedBeadLanding(args: {
   if (ownPr) {
     const landing = await readPr(ownPr);
     if (landing.landed) {
+      const cycle = await landingOfCurrentCycle(repoPath, bead, landing.landedAt);
+      if (cycle.stale) {
+        return {
+          why: `\`${id}\` is closed on the board and its PR (${ownPr}) is merged — but ${cycle.stale}`,
+        };
+      }
       return {
         landing: { via: "pr", ref: ownPr },
         proof: `\`${id}\` is closed on the board and its PR (${ownPr}) is merged${landedTail(base, landing)}`,
@@ -468,13 +505,22 @@ async function closedBeadLanding(args: {
       const rides = `\`${id}\` is closed on the board and the PR of \`${owner.id}\`, the run target it rides, (${ownerPr})`;
       const carried = await readPullRequestNaming(repoPath, ownerPr, id);
       switch (carried.state) {
-        case "found":
+        case "found": {
+          const cycle = await landingOfCurrentCycle(repoPath, bead, landing.landedAt);
+          if (cycle.stale) {
+            return {
+              why:
+                `${rides} is merged, and GitHub records commit \`${carried.sha.slice(0, 10)}\` in ` +
+                `that PR naming it — but ${cycle.stale}`,
+            };
+          }
           return {
             landing: { via: "owner-pr", ownerId: owner.id, ref: ownerPr },
             proof:
               `${rides} is merged${landedTail(base, landing)}, and GitHub records commit ` +
               `\`${carried.sha.slice(0, 10)}\` in that PR naming it`,
           };
+        }
         case "none":
           return {
             why:
@@ -509,6 +555,72 @@ async function closedBeadLanding(args: {
       `names it, and neither it${owner ? ` nor \`${owner.id}\`, the run target it rides,` : ""} ` +
       `points at a merged PR; a ticket closes when its run commits, before the pull request merges`,
   };
+}
+
+/**
+ * Is a landing dated `landedAt` the CURRENT closure's, or a previous cycle's (PR #238 review)?
+ *
+ * The bead's row settles the common case without a history read: a landing at or after its
+ * `closed_at` cannot be an earlier cycle's, since that cycle's landing preceded its own close, which
+ * preceded the reopen, which preceded this close. In anton's own lifecycle that is every child of a
+ * run — closed on commit, landed at the merge after — so the fast path is the usual path.
+ *
+ * A landing that PREDATES the close is ambiguous: a standalone target closes seconds after its
+ * merge, a person closes a bead by hand a week after the work landed, and a reopened bead's first
+ * landing sits before its second close — the last is the one that must not count, and only the
+ * board's history tells it from the others. So the history is read, and the landing is stale when
+ * the bead was reopened after it: the close the board holds now is a later cycle's, and this landing
+ * says nothing about that cycle's work. Never reopened, or reopened before the landing, and it
+ * stands. An unreadable history fails closed, for the reason every other read here does.
+ *
+ * `bd flatten` erases the record this reads — a board squashed to one version reads as never
+ * reopened. Named, not defended against: the operator who flattens has chosen to lose history.
+ */
+async function landingOfCurrentCycle(
+  repoPath: string,
+  bead: Bead,
+  landedAt: string,
+): Promise<{ stale?: string }> {
+  const landed = Date.parse(landedAt);
+  if (Number.isNaN(landed)) {
+    return { stale: `when that landing happened could not be read ("${landedAt}" is not a date)` };
+  }
+  const closedAt = typeof bead.closed_at === "string" ? Date.parse(bead.closed_at) : NaN;
+  if (!Number.isNaN(closedAt) && landed >= closedAt) return {};
+
+  let versions;
+  try {
+    versions = await beads.history(repoPath, bead.id);
+  } catch (error) {
+    return {
+      stale:
+        `that landing (${landedAt}) predates the close the board holds, and whether \`${bead.id}\` ` +
+        `was reopened since could not be read (${error instanceof Error ? error.message : String(error)})`,
+    };
+  }
+  const reopenedAt = lastReopen(versions);
+  if (reopenedAt === undefined) return {};
+  const reopened = Date.parse(reopenedAt);
+  if (Number.isNaN(reopened) || reopened <= landed) return {};
+  return {
+    stale:
+      `that landing (${landedAt}) is an earlier cycle's — the board reopened \`${bead.id}\` at ` +
+      `${reopenedAt}, after it, so the close it holds now is later work, and nothing says THAT ` +
+      `work landed`,
+  };
+}
+
+/**
+ * When the bead last left `closed` — the newest version that is not closed and whose predecessor
+ * was — or undefined when it never has. `versions` are newest first, as `bd history` returns them.
+ */
+function lastReopen(versions: readonly { at: string; status: string }[]): string | undefined {
+  for (let i = 0; i + 1 < versions.length; i += 1) {
+    const version = versions[i]!;
+    const before = versions[i + 1]!;
+    if (version.status !== "closed" && before.status === "closed") return version.at;
+  }
+  return undefined;
 }
 
 /**

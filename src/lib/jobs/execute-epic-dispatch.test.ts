@@ -27,12 +27,13 @@ vi.mock("./execute-epic-ticket", () => ({
   runTicket: (args: { ticket: Bead }) => runTicketMock(args),
 }));
 
-const hasCommitMock = vi.fn<(worktree: string, id: string) => Promise<boolean>>();
+const hasCommitMock = vi.fn<(worktree: string, id: string, options?: { base?: string }) => Promise<boolean>>();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
     ...actual,
-    worktreeHasCommitFor: (worktree: string, id: string) => hasCommitMock(worktree, id),
+    worktreeHasCommitFor: (worktree: string, id: string, options?: { base?: string }) =>
+      hasCommitMock(worktree, id, options),
   };
 });
 
@@ -60,6 +61,7 @@ const showMock = vi.mocked(beads.show);
 const EPIC = "anton-epic";
 const SHIPPER = "anton-ship";
 const WORKTREE = "/tmp/anton-worktree";
+const BASE_REF = "origin/main";
 
 const bead = (id: string, over: Partial<Bead> = {}): Bead =>
   ({ id, title: id, status: "open", issue_type: "task", parent: EPIC, labels: [], ...over }) as Bead;
@@ -97,7 +99,7 @@ const prep = (): Extract<RunPreparation, { done: false }> =>
     done: false,
     ticketSteps: [],
     runSteps: [],
-    runStep: {},
+    runStep: { baseRef: BASE_REF },
     worktree: { path: WORKTREE },
     readiness: { blockers: [] },
     gated: new Set<string>(),
@@ -142,6 +144,22 @@ describe("a ticket the board already holds as superseded", () => {
     expect(dispatchedIds()).toEqual(["anton-b"]); // its work is here, so it is skipped, never re-run
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-a", "anton-b"]);
     expect(run.retired).toEqual([]);
+  });
+
+  // The commit that keeps a superseded ticket live has to be in THIS run's delta (PR #238 review):
+  // a `<id>:` commit an earlier merge landed in the base is on the branch's ancestry too, and read
+  // there it would keep a settled ticket out of the ledger and in the delivered set of a PR that
+  // carries none of it — an all-retired run would then try to open an empty PR.
+  it("is retired when its only commit sits in the base's history, not in the branch's delta", async () => {
+    hasCommitMock.mockImplementation(async (_worktree, id, options) => id === "anton-a" && !options?.base);
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", { base: BASE_REF });
+    expect(dispatchedIds()).toEqual(["anton-b"]);
+    expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-b"]);
+    expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "pre-existing" }]);
   });
 });
 
