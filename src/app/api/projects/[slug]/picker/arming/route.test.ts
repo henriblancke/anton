@@ -12,6 +12,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as schema from "@/lib/db/schema";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
+import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "@/lib/gardener/autonomy";
 import { getProjectSettingsBySlug, resolvePickerAutonomy } from "@/lib/projects";
 import type { ProjectSettings } from "@/lib/projects";
 
@@ -78,6 +79,32 @@ describe("POST /picker/arming", () => {
     const res = await POST(req("POST"), ctx("tmp"));
     expect(res.status).toBe(409);
     expect((await stored()).pickerApplyOverride).toEqual(signed);
+  });
+
+  /**
+   * A stale tab (or a direct call) must not leave a signature on a project whose record already
+   * supports `apply` (PR #245 review): the signature is kept for good as evidence of a bypass, and
+   * there was no floor to bypass.
+   */
+  it("refuses a project whose record already clears the bar, and stores nothing", async () => {
+    const bar = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+    await tdb.db.insert(schema.pickerVerdicts).values(
+      Array.from({ length: bar.minSettled }, (_, i) => ({
+        id: `v-${i}`,
+        projectId: "p1",
+        beadId: `anton-${i}`,
+        verdict: "accepted",
+        action: "release",
+      })),
+    );
+
+    const res = await POST(req("POST"), ctx("tmp"));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: expect.stringContaining("already clears") });
+
+    const next = await stored();
+    expect(next.pickerApplyOverride).toBeUndefined();
+    expect(next.pickerAutonomy).toBeUndefined();
   });
 
   it("refuses to arm when anton cannot tell who is asking", async () => {

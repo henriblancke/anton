@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { getDb } from "@/lib/db";
+import { earnedPickerAutonomy } from "@/lib/gardener/autonomy";
 import { systemClock } from "@/lib/jobs/queue";
 import { resolveOperator } from "@/lib/operator";
 import { pickerTrackRecord } from "@/lib/picker-veto";
@@ -33,17 +34,24 @@ export const dynamic = "force-dynamic";
  * They are separable afterwards — moving the level back to `shadow` in settings leaves the signature
  * standing, and it applies again the moment the level returns to `apply`.
  *
- * REFUSALS, both 409 and both about state the client cannot see:
+ * REFUSALS, all 409 and all about state the client cannot see:
  *   • no work policy — the structural floor. Without an armed policy the picker's plan admits every
  *     claimable target, so `apply` there is autopilot with no approval in it; there is no boundary
  *     to accept the risk OF, and a stored arming would be a signature on nothing.
  *   • already armed — a second click, or a tab rendered before someone else armed it. Overwriting
  *     would silently rewrite who signed and when, which is the one thing this record is for.
+ *   • already earned — a tab rendered before enough releases cleared the bar, or a direct call. The
+ *     signature is kept for good as evidence that this project once ran on somebody's word rather
+ *     than on its record (PR #245 review), so one written when the record already supported `apply`
+ *     would be a false audit trail: a bypass of a floor that was not holding. The operator who wants
+ *     `apply` here chooses it in settings, and the earned floor answers.
  *
- * Both are decided INSIDE the settings write transaction rather than against a snapshot read first,
- * which is what makes the second one true: two clicks landing together would otherwise both find an
- * unarmed project, and the loser would replace the winner's signature while both were told they had
- * armed it.
+ * The first two are decided INSIDE the settings write transaction rather than against a snapshot
+ * read first, which is what makes the second one true: two clicks landing together would otherwise
+ * both find an unarmed project, and the loser would replace the winner's signature while both were
+ * told they had armed it. The record is read just before it — the decision under the lock is
+ * synchronous — and that is enough: verdicts only arrive as the operator answers picks, so the
+ * worst the gap admits is a signature one release late, not one on an already-earned project.
  *
  * The signature is checked against the SAME schema that reads it back before anything is written.
  * The reader drops what it cannot parse, so an operator name it would refuse (over its length cap)
@@ -75,6 +83,7 @@ export const POST = withProject<{ slug: string }>(async (_request, { project }) 
     );
   }
   const arming = signature.data;
+  const earned = earnedPickerAutonomy(await pickerTrackRecord(getDb(), project.id));
   const result = await updateProjectSettingsIf<string>(project.slug, (current) => {
     if (!current.pickerPolicy) {
       return {
@@ -87,6 +96,13 @@ export const POST = withProject<{ slug: string }>(async (_request, { project }) 
     if (standing) {
       return {
         refuse: `apply is already armed deliberately, by ${standing.by} — nothing was changed`,
+      };
+    }
+    if (earned.eligible) {
+      return {
+        refuse:
+          "This project's record already clears the bar for apply, so there is no floor to sign " +
+          "past — choose apply in settings instead; nothing was changed",
       };
     }
     return { write: { pickerApplyOverride: arming, pickerAutonomy: "apply" } };

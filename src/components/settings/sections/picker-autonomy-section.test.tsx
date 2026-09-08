@@ -206,6 +206,33 @@ describe("PickerAutonomySection ladder (anton-z1lp)", () => {
     await waitFor(() => expect(refresh).toHaveBeenCalled());
   });
 
+  it("locked: a refused arming keeps the dialog open but takes the acknowledgement back", async () => {
+    // A retry after a 409 is a fresh decision over state that moved (PR #245 review) — the operator
+    // signs for it again rather than re-firing on the box they ticked for the last click.
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: "apply is already armed deliberately, by someone" }), {
+        status: 409,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<PickerAutonomySection slug="p1" armed stored="shadow" earned={LOCKED} />);
+    fireEvent.click(screen.getByRole("button", { name: /Arm deliberately/ }));
+    const dialog = within(screen.getByRole("dialog"));
+    fireEvent.click(dialog.getByRole("checkbox"));
+    fireEvent.click(dialog.getByRole("button", { name: /Arm apply deliberately/ }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(dialog.getByRole("alert").textContent).toContain("already armed deliberately"),
+    );
+    expect((dialog.getByRole("checkbox") as HTMLInputElement).checked).toBe(false);
+    const confirm = dialog.getByRole("button", { name: /Arm apply deliberately/ }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    // And the tab re-reads the state it was refused over.
+    expect(refresh).toHaveBeenCalled();
+  });
+
   it("earned: says the record clears the bar, and offers no bypass of a floor that is not holding", () => {
     render(<PickerAutonomySection slug="p1" armed stored="apply" earned={EARNED} />);
 

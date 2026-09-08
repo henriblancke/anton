@@ -470,6 +470,9 @@ function DeliberateArming({
     } catch (err) {
       const message = err instanceof Error ? err.message : "Request failed";
       setError(message);
+      // The acknowledgement was for THAT click. A retry after a refusal is a fresh decision — the
+      // state it is refused over has usually moved — so it has to be signed for again.
+      setAcknowledged(false);
       toast.error(message);
       // A refusal usually means the state moved under this tab (someone armed it, or the policy was
       // removed) — re-read rather than leave a control that errors on every click.
