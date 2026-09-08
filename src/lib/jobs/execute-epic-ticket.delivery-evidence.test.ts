@@ -165,15 +165,32 @@ function beadById(id: string): Bead {
   return found;
 }
 
-/** A bead as `bd supersede <id> --with <by>` leaves it: closed, carrying the `supersedes` edge to `by`. */
+/**
+ * A bead as bd would answer AFTER this run's writes: the `not-delivered` marker `bd tag` stamped
+ * layered on (and any `bd untag` removed), and — once superseded — closed with the `supersedes`
+ * edge to its survivor. The marker matters as much as the edge: the retirement's post-write reread
+ * ({@link markerOvertaken}) asserts the marker is present, not just the close, so a `shown` that
+ * dropped it would read every retirement as overtaken-and-marker-stripped (PR #238 review).
+ */
 function shown(id: string): Bead {
   const read = beadById(id);
+  const labels = new Set(read.labels ?? []);
+  for (const [, target, written] of tagMock.mock.calls as unknown as [string, string, string[]][]) {
+    if (target === id) for (const l of written ?? []) labels.add(l);
+  }
+  for (const [, target, removed] of untagMock.mock.calls as unknown as [string, string, string[]][]) {
+    if (target === id) for (const l of removed ?? []) labels.delete(l);
+  }
   const written = supersedeMock.mock.calls.find(([, target]) => target === id);
-  if (!written) return read;
   return {
     ...read,
-    status: "closed",
-    dependencies: [{ issue_id: id, depends_on_id: written[2], type: "supersedes" }],
+    labels: [...labels],
+    ...(written
+      ? {
+          status: "closed",
+          dependencies: [{ issue_id: id, depends_on_id: written[2], type: "supersedes" }],
+        }
+      : {}),
   } as Bead;
 }
 
