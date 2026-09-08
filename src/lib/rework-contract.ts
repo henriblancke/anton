@@ -493,6 +493,11 @@ function insideClosedComment(lines: readonly ScannedLine[]): boolean[] {
  * like `if ok:` / `    retry()` into two unindented criteria that describe different behaviour. The
  * delimiter lines are judged as typed, each on its own, since each begins outside the comment. Blank
  * lines file nothing, as they did line by line.
+ *
+ * A chained comment closes and reopens on one line (`--> <!--`), so a single literal run holds
+ * several samples — one per `-->`. Each is dedented on its own: bulk-filing the tail after the first
+ * `-->` would trim a later block's lines individually and flatten a multiline example carried by the
+ * note.
  */
 function flushCommentedSample(
   raw: readonly string[],
@@ -502,17 +507,25 @@ function flushCommentedSample(
 ): number {
   let end = at;
   while (end < raw.length && literal[end]) end += 1;
-  const run = raw.slice(at, end);
-  const closeAt = run.findIndex((line) => line.includes("-->"));
-  const sample = closeAt === -1 ? run : run.slice(0, closeAt);
-  const closers = closeAt === -1 ? [] : run.slice(closeAt);
-  const indents = sample.filter((line) => line.trim() !== "").map((line) => indentColumns(line));
-  const common = indents.length > 0 ? Math.min(...indents) : 0;
-  for (const line of sample) {
-    if (line.trim() === "") continue;
-    out.push({ text: dedent(line, common).replace(/\s+$/, ""), fenced: false });
+  let sample: string[] = [];
+  const flushSample = () => {
+    const indents = sample.filter((line) => line.trim() !== "").map((line) => indentColumns(line));
+    const common = indents.length > 0 ? Math.min(...indents) : 0;
+    for (const line of sample) {
+      if (line.trim() === "") continue;
+      out.push({ text: dedent(line, common).replace(/\s+$/, ""), fenced: false });
+    }
+    sample = [];
+  };
+  for (const line of raw.slice(at, end)) {
+    if (line.includes("-->")) {
+      flushSample();
+      out.push({ text: line.trim(), fenced: false });
+    } else {
+      sample.push(line);
+    }
   }
-  for (const line of closers) out.push({ text: line.trim(), fenced: false });
+  flushSample();
   return end;
 }
 

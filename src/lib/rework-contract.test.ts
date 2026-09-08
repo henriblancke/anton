@@ -581,6 +581,16 @@ describe("instructionCriteria", () => {
     // an indented block could not follow.
     expect(texts("<!--\n- x\n-->\n- y")).toEqual(["<!--", "- x", "-->", "y"]);
     expect(texts("<!--\n- x\n-->\n    code")).toEqual(["<!--", "- x", "-->", "```\ncode\n```"]);
+    // Chained comments close and reopen on one line, so a run holds several samples: each is
+    // dedented on its own, or a multiline example in a later block would flatten line by line.
+    expect(texts("<!--\nfirst\n-->  <!--\nif ok:\n    retry()\n-->")).toEqual([
+      "<!--",
+      "first",
+      "-->  <!--",
+      "if ok:",
+      "    retry()",
+      "-->",
+    ]);
   });
 
   it("still shears the lines after an unclosed `<!--` — a stray opener leaves ordinary steps behind it", () => {
