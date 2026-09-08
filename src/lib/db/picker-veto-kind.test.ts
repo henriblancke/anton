@@ -4,12 +4,14 @@
  * `picker_verdicts` recorded `✕ not now` and `Never` as one thing — a decline — so the record the
  * earned-autonomy floor reads could not tell an operator pacing their own week from an operator
  * disagreeing with the ranking. The new column splits them, and every row already on a machine has
- * to be given a meaning: an unclassified decline would count as neither, and a project would climb
- * or fall on a ledger whose history had quietly emptied.
+ * to be read: the ones that can prove a disagreement are filed as one, and the rest stay
+ * unclassified — still counted, so a project's ledger neither empties nor quietly turns into consent.
  *
  * So this suite asserts the interpretation the migration commits to, stated in its own SQL — the
- * clue it reads for each row, and the one case where the two clues disagree: a `Never` that a later
- * `not-now` painted over, which the criterion still on the row recovers.
+ * clues it reads for each row, the case where they disagree (a `Never` a later `not-now` painted
+ * over, which the criterion still on the row recovers), and the rows it refuses to read at all: a
+ * bare `not-now` is left unclassified rather than filed as pacing, because that is also what a
+ * criterion-less `Never` looks like once a repeat overwrote it (PR #245 review).
  */
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
@@ -17,7 +19,7 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "./testing";
 import * as schema from "./schema";
-import { listPickerVerdicts } from "../picker-veto";
+import { listPickerVerdicts, pickerTrackRecord } from "../picker-veto";
 
 /**
  * Only the backfill half of the migration. `makeTestDb` applies every committed migration to an
@@ -82,7 +84,11 @@ beforeEach(() => {
 afterEach(() => t.close());
 
 describe("drizzle/0030 — what the declines already on a machine meant", () => {
-  it("reads `never` as disagreement and `not-now` as pacing", async () => {
+  it("reads `never` as disagreement, and leaves a bare `not-now` unclassified", async () => {
+    // A `not-now` with no criterion is usually pacing — but it is also what a `Never` that resolved
+    // no criterion (an unconstrained policy, a failed board read) leaves behind once a later
+    // `not-now` overwrites its action. The row cannot tell those apart, so it is not read as pacing:
+    // unclassified stays counted, and only an explicit pacing row drops out of the record.
     seedVerdict({ id: "v-1", beadId: "anton-paced", verdict: "declined", action: "not-now" });
     seedVerdict({ id: "v-2", beadId: "anton-refused", verdict: "declined", action: "never" });
 
@@ -90,10 +96,22 @@ describe("drizzle/0030 — what the declines already on a machine meant", () => 
 
     expect(await kinds()).toEqual(
       new Map([
-        ["anton-paced", "pacing"],
+        ["anton-paced", undefined],
         ["anton-refused", "disagreement"],
       ]),
     );
+  });
+
+  it("keeps an ambiguous row counted — the reading that cannot invent consent", async () => {
+    seedVerdict({ id: "v-1", beadId: "anton-ambiguous", verdict: "declined", action: "not-now" });
+
+    t.sqlite.exec(BACKFILL);
+
+    expect(await pickerTrackRecord(t.db, PROJECT)).toEqual({
+      accepted: 0,
+      declined: 1,
+      settled: 1,
+    });
   });
 
   it("recovers a Never a later `not-now` painted over, from the criterion it left behind", async () => {

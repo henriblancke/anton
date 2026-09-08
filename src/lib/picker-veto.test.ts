@@ -352,6 +352,37 @@ describe("what a decline meant", () => {
     ]);
   });
 
+  it("leaves a decline nobody classified unclassified when a `✕ not now` restates it", async () => {
+    // A row `0030_picker_veto_kind` could not read — a bare `not-now`, which is also what a
+    // criterion-less `Never` leaves behind once a repeat overwrote it — is counted precisely because
+    // it may be a disagreement. A fresh pacing click is not evidence that it was pacing all along.
+    const pick = { projectId: PROJECT, beadId: "anton-legacy", planId: "d1" };
+    await test.db.insert(schema.pickerVerdicts).values({
+      id: "v-legacy",
+      projectId: PROJECT,
+      beadId: pick.beadId,
+      planId: pick.planId,
+      verdict: "declined",
+      action: "not-now",
+      vetoKind: null,
+      deferredUntil: at(NOW + PICKER_DEFER_WINDOW_MS),
+      decidedAt: at(NOW),
+    });
+    nowMs = NOW + 60_000;
+
+    await recordPickerVeto(test.db, clock, { ...pick, action: "not-now" });
+    const restated = await listPickerVerdicts(test.db, PROJECT);
+    expect(restated).toMatchObject([{ beadId: "anton-legacy", action: "not-now" }]);
+    expect(restated[0]?.vetoKind).toBeUndefined();
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ declined: 1 });
+
+    // Only a Never moves it — to the meaning it may have carried all along.
+    await recordPickerVeto(test.db, clock, { ...pick, action: "never" });
+    expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
+      { beadId: "anton-legacy", action: "never", vetoKind: "disagreement" },
+    ]);
+  });
+
   it("holds both kinds for the same window — the split is about meaning, not pacing", async () => {
     await recordPickerVeto(test.db, clock, {
       projectId: PROJECT,
@@ -884,6 +915,46 @@ describe("withdrawing an accept", () => {
       },
     ]);
     expect([...(await activeDeferrals(test.db, PROJECT, at(NOW))).keys()]).toEqual(["anton-a"]);
+  });
+
+  it("replays every veto that lost, in order — a `✕ not now` after a Never does not erase it", async () => {
+    // Two stale tabs both refused the reservation: a Never sent at a criterion, then a not-now. Kept
+    // only the latest, the replay would file a fresh pacing decline with no criterion and the
+    // withdrawal would have erased the operator's disagreement. Replayed in sequence through the
+    // standing-decline merge, the row lands exactly as the two vetoes would have.
+    const reserved = await recordPickerAccept(test.db, clock, PICK);
+    await recordPickerVeto(test.db, clock, {
+      ...PICK,
+      action: "never",
+      criterion: "labels:domain",
+      rank: 2,
+    });
+    nowMs = NOW + 60_000;
+    await recordPickerVeto(test.db, clock, { ...PICK, action: "not-now" });
+
+    const replayed = await withdrawPickerAccept(
+      test.db,
+      reserved.recorded ? reserved.id : "",
+      clock,
+    );
+
+    expect(replayed).toEqual({ beadId: "anton-a", untilMs: nowMs + PICKER_DEFER_WINDOW_MS });
+    expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
+      {
+        beadId: "anton-a",
+        verdict: "declined",
+        action: "not-now",
+        vetoKind: "disagreement",
+        criterion: "labels:domain",
+        rank: 2,
+        planId: "d1",
+      },
+    ]);
+    expect(await pickerTrackRecord(test.db, PROJECT)).toEqual({
+      accepted: 0,
+      declined: 1,
+      settled: 1,
+    });
   });
 
   it("replays it once — a withdrawal is not a decline the pick keeps re-earning", async () => {

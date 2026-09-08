@@ -227,6 +227,11 @@ function standingDecline(
  * the disagreement, turning it into evidence the operator never objected. What was said cannot be
  * unsaid by saying less: once a decline is disagreement it stays disagreement, exactly as the
  * criterion it was sent at survives the same overwrite.
+ *
+ * And a `not-now` establishes nothing about a decline nobody classified (PR #245 review). A row
+ * `0030_picker_veto_kind` left NULL is one that may be a criterion-less `Never` under a later
+ * `not-now`; the record counts it for exactly that reason, and a fresh pacing click is not evidence
+ * that it was pacing all along. Only a `Never` moves it — to disagreement.
  */
 function writeDecline(
   tx: Pick<AntonDb, "select" | "insert" | "update">,
@@ -242,8 +247,7 @@ function writeDecline(
     tx.update(schema.pickerVerdicts)
       .set({
         action: input.action,
-        vetoKind:
-          standing.vetoKind === "disagreement" ? "disagreement" : vetoKindOf(input.action),
+        vetoKind: input.action === "never" ? "disagreement" : standing.vetoKind,
         rule: input.rule ?? standing.rule,
         criterion: input.criterion ?? standing.criterion,
         rank: input.rank ?? standing.rank,
@@ -286,15 +290,23 @@ function writeDecline(
  * process that dies mid-release leaves the accept standing with nobody to withdraw it either. An
  * entry whose accept kept its run is never claimed, so entries are aged out on the next loss rather
  * than by a timer nothing else needs.
+ *
+ * EVERY loser is kept, in the order it lost (PR #245 review). Two stale tabs can both veto one
+ * reservation — a `Never` and then a `not-now` — and keeping only the latest would replay the pacing
+ * click alone, filing a fresh decline with no disagreement and no criterion: the withdrawal would
+ * have erased the `Never` that the standing-decline merge in {@link writeDecline} exists to keep.
+ * Replaying the sequence through that same merge lands exactly what the vetoes would have landed
+ * had the reservation never stood in their way.
  */
 const CONTESTED_TTL_MS = 10 * 60 * 1000;
-const contestedVetoes = new Map<string, { input: RecordVetoInput; atMs: number }>();
+const contestedVetoes = new Map<string, { inputs: RecordVetoInput[]; atMs: number }>();
 
 function holdContestedVeto(acceptId: string, input: RecordVetoInput, nowMs: number): void {
   for (const [id, held] of contestedVetoes) {
     if (nowMs - held.atMs > CONTESTED_TTL_MS) contestedVetoes.delete(id);
   }
-  contestedVetoes.set(acceptId, { input, atMs: nowMs });
+  const held = contestedVetoes.get(acceptId);
+  contestedVetoes.set(acceptId, { inputs: [...(held?.inputs ?? []), input], atMs: nowMs });
 }
 
 /** What a veto did: the hold it placed, or the release that answered this pick first. */
@@ -428,9 +440,11 @@ export async function recordPickerAccept(
  * got said the target was already running; once the run turns out not to exist, the operator is left
  * with no run, no accept and no hold on a pick they refused — so the decline they were denied is
  * filed here instead, in the same transaction, exactly as {@link recordPickerVeto} would have filed
- * it. A veto that lost to an accept whose run DID start stays lost, which is the honest outcome.
+ * it — every veto that lost, in the order they lost, so a `Never` under a later `not-now` is still a
+ * disagreement ({@link contestedVetoes}). A veto that lost to an accept whose run DID start stays
+ * lost, which is the honest outcome.
  *
- * @returns the hold a replayed veto placed, or undefined when nothing was replayed.
+ * @returns the hold the replayed vetoes placed, or undefined when nothing was replayed.
  */
 export async function withdrawPickerAccept(
   db: AntonDb,
@@ -445,7 +459,10 @@ export async function withdrawPickerAccept(
       const contested = contestedVetoes.get(id);
       if (!contested) return undefined;
       contestedVetoes.delete(id);
-      return writeDecline(tx, contested.input, clock.now());
+      const nowMs = clock.now();
+      let deferral: PickerDeferral | undefined;
+      for (const input of contested.inputs) deferral = writeDecline(tx, input, nowMs);
+      return deferral;
     },
     { behavior: "immediate" },
   );
