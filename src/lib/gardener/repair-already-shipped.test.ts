@@ -929,6 +929,50 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(tagMock).not.toHaveBeenCalled();
   });
 
+  // A survivor verified through a commit NAMING it is re-verified against the base's history at the
+  // write (PR #238 review). The base is a movable ref: another run force-fetching `origin/main`
+  // while this repair waits on its locks can drop the naming commit from it, and "still closed"
+  // says nothing about that — the evidence has to be re-asked of the base, not of the board.
+  describe("a survivor verified through a commit naming it in the base", () => {
+    it("refuses when the base no longer contains the naming commit at the write", async () => {
+      const before = execFileSync("git", ["-C", repo, "rev-parse", `${sb.landed}^`], { encoding: "utf8" }).trim();
+      showMock.mockImplementation(async (_cwd, id) => {
+        // Lands during the under-lock re-read: `main` rewound past the commit the check found.
+        if (id === SHIPPER) execFileSync("git", ["-C", repo, "update-ref", "refs/heads/main", before]);
+        return id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" });
+      });
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { why: string }).why).toContain("the board moved");
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
+        `commit \`${sb.landed.slice(0, 10)}\` is no longer in the history of the run's base (main)`,
+      );
+      expect(supersedeMock).not.toHaveBeenCalled();
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses when whether the naming commit still reaches the base cannot be read at the write", async () => {
+      showMock.mockImplementation(async (_cwd, id) => {
+        // The base ref itself gone in the window — git cannot answer, and no answer is a refusal.
+        if (id === SHIPPER) {
+          execFileSync("git", ["-C", repo, "checkout", "-q", "--detach"]);
+          execFileSync("git", ["-C", repo, "update-ref", "-d", "refs/heads/main"]);
+        }
+        return id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" });
+      });
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
+        `whether commit \`${sb.landed.slice(0, 10)}\` still reaches the run's base (main) could not be read`,
+      );
+      expect(supersedeMock).not.toHaveBeenCalled();
+    });
+  });
+
   // A survivor verified through its PR is re-verified through THAT PR (PR #238 review). "Has some
   // PR" is what the window can fake: the pointer swapped for an open PR, or the bead reopened with an
   // unmerged one attached, and a status-and-pointer reread accepts both.

@@ -20,7 +20,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "../beads/bd";
 import type { AntonResult } from "../claude/anton-result";
-import type { CommitNaming } from "../git/ops";
+import type { CommitNaming, CommitReach } from "../git/ops";
 import type { ResolvedStep } from "./run-formula";
 import type { AntonDb, Clock } from "./queue";
 import type { StepContext } from "./step-registry";
@@ -53,6 +53,10 @@ const updateRunMock = vi.fn(async () => {});
 const readWorktreeStateMock = vi.fn(async () => ({ head: "a".repeat(40), status: "" }));
 /** What the base's history says of a bead — `none` unless a case seeds a landing. */
 const readCommitNamingMock = vi.fn(async (): Promise<CommitNaming> => ({ state: "none" }));
+/** The under-lock recheck of a naming commit — it still reaches the base unless a case says otherwise. */
+const readCommitReachMock = vi.fn(
+  async (_repo: string, sha: string): Promise<CommitReach> => ({ state: "reaches", sha }),
+);
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -103,6 +107,7 @@ vi.mock("../git/ops", async () => {
     readWorktreeState: () => readWorktreeStateMock(),
     restoreWorktreeState: async () => {},
     readCommitNaming: () => readCommitNamingMock(),
+    readCommitReach: (repo: string, sha: string) => readCommitReachMock(repo, sha),
   };
 });
 

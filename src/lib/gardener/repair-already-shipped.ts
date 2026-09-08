@@ -862,9 +862,37 @@ async function retirementMoved(args: {
       if (typeof owner === "string") return owner;
       return stillMergedPr(owner, landing.ref, `\`${landing.ownerId}\`, the run target \`${replacementId}\` rides,`);
     }
-    case "commit":
-      return stillClosedSurvivor(replacement, "the commit naming it in the base");
+    case "commit": {
+      const settled = stillClosedSurvivor(replacement, "the commit naming it in the base");
+      if (settled) return settled;
+      return stillReachingCommit(repoPath, base, landing.sha, targetId);
+    }
   }
+}
+
+/**
+ * The naming commit that verified the survivor has to still be in the base's history at the write
+ * (PR #238 review). The base is a MOVABLE ref — another run force-fetching `origin/main` while this
+ * repair waits on its locks can drop the commit from it — and the check's answer was the base's
+ * history, not the commit's existence. Same bar {@link retirementMoved} holds a PR's merge to, so
+ * the same refusal: outside, absent and unreadable all mean the evidence no longer holds.
+ */
+async function stillReachingCommit(
+  repoPath: string,
+  base: string,
+  sha: string,
+  targetId: string,
+): Promise<string | undefined> {
+  const reach = await readCommitReach(repoPath, sha, base);
+  if (reach.state === "reaches") return undefined;
+  const short = sha.slice(0, 10);
+  const what =
+    reach.state === "outside"
+      ? `commit \`${short}\` is no longer in the history of the run's base (${base})`
+      : reach.state === "absent"
+        ? `commit \`${short}\` is no longer one this repository has — the run's base (${base}) cannot contain it`
+        : `whether commit \`${short}\` still reaches the run's base (${base}) could not be read (${reach.detail})`;
+  return `${what} — the evidence ${targetId}'s retirement rested on no longer holds`;
 }
 
 /**
