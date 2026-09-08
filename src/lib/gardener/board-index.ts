@@ -19,6 +19,12 @@ export interface BoardIndex {
   /** Direct children of a bead, in board order. */
   childrenOf(id: string): Bead[];
   /**
+   * Every bead beneath this one, at any depth, whatever its status — the subtree a retirement has to
+   * LOCK, not just judge (PR #238 review): a re-parent onto a closed descendant contends on that
+   * descendant alone, so a settlement that held only the parent could not order itself against it.
+   */
+  descendantsOf(id: string): Bead[];
+  /**
    * Every still-open bead beneath this one, at any depth. Retirement asks this before it settles a
    * bead: closing a parent with open children leaves them hanging off a card nothing will ever run,
    * which is the same unreachable state `detectContainerOrphans` exists to flag.
@@ -125,25 +131,27 @@ export function indexBoard(all: Bead[]): BoardIndex {
   }
 
   const childrenOf = (id: string): Bead[] => children.get(id) ?? [];
+  const descendantsOf = (id: string): Bead[] => {
+    const found: Bead[] = [];
+    const seen = new Set<string>([id]);
+    const queue = [...childrenOf(id)];
+    while (queue.length > 0) {
+      const bead = queue.shift() as Bead;
+      if (seen.has(bead.id)) continue; // a parent cycle must not spin this walk forever
+      seen.add(bead.id);
+      found.push(bead);
+      queue.push(...childrenOf(bead.id));
+    }
+    return found;
+  };
 
   return {
     all,
     byId,
     cards: boardCards(all),
     childrenOf,
-    openDescendants: (id) => {
-      const found: Bead[] = [];
-      const seen = new Set<string>([id]);
-      const queue = [...childrenOf(id)];
-      while (queue.length > 0) {
-        const bead = queue.shift() as Bead;
-        if (seen.has(bead.id)) continue; // a parent cycle must not spin this walk forever
-        seen.add(bead.id);
-        if (isOpenWork(bead)) found.push(bead);
-        queue.push(...childrenOf(bead.id));
-      }
-      return found;
-    },
+    descendantsOf,
+    openDescendants: (id) => descendantsOf(id).filter(isOpenWork),
     hasBlocksEdge: (a, b) => blocks.has(pairKey(a, b)),
     recordsBlocker: (id, blockerId) => blockers.get(id)?.has(blockerId) ?? false,
     isBlockedBy: (id, blockerId) => {

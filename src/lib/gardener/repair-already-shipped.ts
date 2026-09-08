@@ -609,16 +609,20 @@ export async function repairAlreadyShipped(args: {
     return { action: "shadow", replacementId, proof: verdict.proof, attempted };
   }
 
-  // Both beads' locks, and the ticket re-read inside them: the board this was decided against is a
-  // snapshot, and the one thing a retirement cannot survive is somebody else having settled either
-  // end of it in the window — an operator abandoning the ticket, another run closing it, the
-  // survivor being reopened because its work turned out not to have landed after all. The whole
-  // board is re-read under the same locks for the subtree question (PR #238 review): a gardener
-  // re-parent hanging work under this ticket takes the ticket's lock too (apply-steps `applyStep`),
-  // so the two orders serialize here — either that read finds the newcomer, or the re-parent's own
-  // re-check finds a closed home. Against the snapshot alone both would pass, and the newly
-  // attached ticket would sit beneath a card nothing will run.
-  return withBeadWriteLocks(repoPath, [bead.id, replacementId], async () => {
+  // Both beads' locks, the ticket's whole SUBTREE beside them, and the board re-read inside them:
+  // the board this was decided against is a snapshot, and the one thing a retirement cannot survive
+  // is somebody else having settled either end of it in the window — an operator abandoning the
+  // ticket, another run closing it, the survivor being reopened because its work turned out not to
+  // have landed after all. The subtree question is re-asked under the same locks (PR #238 review):
+  // a gardener re-parent hanging work under a bead takes that bead's lock as the new home
+  // (apply-steps `lockedBeads`) — the HOME's, not every ancestor's — so an attach under a closed
+  // descendant of this ticket would never contend on the ticket alone. Holding every descendant the
+  // check saw makes the two orders: the attach either lands before this read, which then finds the
+  // newcomer and refuses, or queues behind the supersede and meets a closed home. Against the
+  // snapshot alone both would pass, and the newly attached ticket would sit beneath a card nothing
+  // will run.
+  const subtree = index.descendantsOf(bead.id).map((b) => b.id);
+  return withBeadWriteLocks(repoPath, [bead.id, replacementId, ...subtree], async () => {
     const locked = await readBoardUnderLock(repoPath);
     const moved =
       typeof locked === "string"
@@ -630,7 +634,9 @@ export async function repairAlreadyShipped(args: {
             replacementId,
             landing,
             locked,
-          })) ?? strandedUnderLock(locked, bead.id));
+          })) ??
+          strandedUnderLock(locked, bead.id) ??
+          subtreeMoved(locked, bead.id, subtree));
     if (moved) {
       return {
         action: "escalate",
@@ -856,6 +862,28 @@ function strandedUnderLock(locked: BoardIndex, targetId: string): string | undef
     `open work was attached beneath ${targetId} since the check ` +
     `(${open.map((b) => b.id).join(", ")}) — closing it as superseded now would strand that ` +
     `work under a card no run can reach`
+  );
+}
+
+/**
+ * A bead attached beneath the ticket since the check that {@link strandedUnderLock} lets through —
+ * one already CLOSED. It strands nothing itself, but it is a home this retirement holds no lock on
+ * (the locks cover the subtree the CHECK read), so open work could land under it between this read
+ * and the supersede with nothing to order it. Refused, so that the subtree the write settles is
+ * exactly the one the locks hold.
+ */
+function subtreeMoved(
+  locked: BoardIndex,
+  targetId: string,
+  held: readonly string[],
+): string | undefined {
+  const heldSet = new Set(held);
+  const attached = locked.descendantsOf(targetId).filter((b) => !heldSet.has(b.id));
+  if (attached.length === 0) return undefined;
+  return (
+    `a bead was attached beneath ${targetId} since the check ` +
+    `(${attached.map((b) => b.id).join(", ")}) — the retirement holds no lock on it, so work ` +
+    `could still land under it before the ticket closed`
   );
 }
 

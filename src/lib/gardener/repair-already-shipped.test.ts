@@ -72,6 +72,7 @@ const {
 const { indexBoard } = await import("./board-index");
 const { repairLabel } = await import("./repair");
 const { GH_BIN_ENV } = await import("../git/ops");
+const { withBeadWriteLock } = await import("../beads/claim-lock");
 
 function has(cmd: string): boolean {
   try {
@@ -669,6 +670,49 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(loadAllIssuesMock).toHaveBeenCalledWith(repo, { strictGates: true });
     expect(supersedeMock).not.toHaveBeenCalled();
     expect(tagMock).not.toHaveBeenCalled();
+  });
+
+  // A re-parent contends on its new HOME's lock, not on every ancestor's (apply-steps
+  // `lockedBeads`), so work attached under a CLOSED descendant of the ticket never touches the
+  // ticket's own lock (PR #238 review). The retirement holds the whole subtree the check read: an
+  // attach either lands before this read — a newcomer it refuses, open or not — or queues behind it.
+  it("refuses under the lock when a bead was attached beneath a descendant since the check", async () => {
+    const closedChild = bead("anton-kid", { status: "closed" });
+    (closedChild as unknown as Record<string, unknown>).parent = TARGET;
+    const newcomer = bead("anton-new", { status: "closed" });
+    (newcomer as unknown as Record<string, unknown>).parent = "anton-kid";
+    loadAllIssuesMock.mockResolvedValue([...board(), closedChild, newcomer]);
+
+    const outcome = await retire({ board: [...board(), closedChild] });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("the board moved");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("attached beneath");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("anton-new");
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(tagMock).not.toHaveBeenCalled();
+  });
+
+  it("holds every descendant's lock, so its locked read queues behind a write on one of them", async () => {
+    const closedChild = bead("anton-kid", { status: "closed" });
+    (closedChild as unknown as Record<string, unknown>).parent = TARGET;
+    let readAt = 0;
+    loadAllIssuesMock.mockImplementation(async () => {
+      readAt = Date.now();
+      return [...board(), closedChild];
+    });
+    let releasedAt = 0;
+    const holding = withBeadWriteLock(repo, "anton-kid", async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      releasedAt = Date.now();
+    });
+
+    const outcome = await retire({ board: [...board(), closedChild] });
+    await holding;
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(readAt).toBeGreaterThanOrEqual(releasedAt);
+    expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
   });
 
   it("refuses under the lock when the board could not be re-read at all", async () => {

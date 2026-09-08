@@ -898,6 +898,87 @@ process.exit(0);`),
       }
     });
 
+    it("dispatches the tail behind a dependent the board already held as superseded (PR #238 review)", async () => {
+      // a→b→c, where a runs out of time and b was RETIRED before this run read the board — a human's
+      // rescope or an earlier attempt's `bd supersede`, so its work sits in the base under the
+      // survivor's id and no commit here carries it. The partition records b on the retired ledger
+      // and drops it from the loop, so nothing later would add it to the branch set: unless the
+      // ledger is seeded with it, the cascade from a walks through b and skips c over a mechanism
+      // that IS in the base.
+      const epicId = await beads.create(repo, {
+        title: "Cascade stops at a pre-existing retirement",
+        type: "epic",
+        acceptance: "work file exists",
+        description: "## Goal\nCascade stops at a pre-existing retirement",
+      });
+      await beads.approve(repo, epicId);
+      const mk = (title: string) => createTicket(repo, { title, parent: epicId });
+      const stalls = mk("Ticket that cannot converge");
+      const middle = mk("Ticket the board already settled as superseded");
+      const tail = mk("Ticket that builds on the middle one");
+      await beads.link(repo, middle, stalls, "blocks");
+      await beads.link(repo, tail, middle, "blocks");
+      const shipper = createTicket(repo, { title: "The bead that shipped the middle one" });
+      await beads.close(repo, shipper);
+      await beads.supersede(repo, middle, shipper);
+
+      const invLog = join(sandbox, "retired-dep-inv.jsonl");
+      const claude = writeBin(
+        binDir,
+        "claude-hang-retired-dep",
+        fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
+const id=m?m[1]:'unknown';
+fs.appendFileSync(${JSON.stringify(invLog)},id+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(id===${JSON.stringify(stalls)}){
+  fs.appendFileSync(path.join(process.cwd(),'HALF_WRITTEN.md'),'partial '+id+'\\n');
+  e({type:'system',subtype:'init',session_id:'hang'});
+  setInterval(()=>{},1000); // never exits — only the ticket budget can stop it
+  return;
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+id+'\\n');
+e({type:'system',subtype:'init',session_id:'ok'});
+e({type:'assistant',message:{content:[{type:'text',text:'implemented the ticket'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'ok',num_turns:1,is_error:false});
+process.exit(0);`),
+      );
+
+      await patchSettings({ ticketTimeoutMinutes: 0.25 });
+      const runner = makeEpicRunner(ctx);
+      process.env.ANTON_CLAUDE_BIN = claude;
+      try {
+        const jobId = await driveEpicRun(runner, {
+          projectId,
+          epicBeadId: epicId,
+        });
+
+        const invoked = readFileSync(invLog, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean);
+        // The retired ticket is settled work, so it is never dispatched…
+        expect(invoked).not.toContain(middle);
+        // …and the tail behind it STILL RAN: what it was written against is in the base.
+        expect(invoked).toContain(tail);
+
+        const shipped = await beads.show(repo, tail);
+        expect(shipped.status).toBe("closed");
+        expect(shipped.labels ?? []).not.toContain("not-delivered");
+        const retired = await beads.show(repo, middle);
+        expect(retired.status).toBe("closed");
+        expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+        const run = (await tdb.db.select().from(schema.runs)).find(
+          (r) => r.epicBeadId === epicId,
+        )!;
+        const files = filesOnBranch(run.branch!);
+        expect(files).toContain("AGENT_WORK.md");
+        expect(files).not.toContain("HALF_WRITTEN.md");
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+        await patchSettings({ ticketTimeoutMinutes: undefined });
+      }
+    });
+
     it("leaves a skipped ticket another operator took over reserved to them (anton-67xj)", async () => {
       // The reservation this protects: the run's claim cascade assigned every child to itself at the
       // start, but an operator can take one over while the run is still working. Handing the ticket

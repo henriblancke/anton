@@ -82,7 +82,11 @@ export async function dispatchRunTickets(
   const ledger: DispatchLedger = {
     skipCause: new Map(),
     skipped: new Map(),
-    onBranch: new Set(),
+    // Seeded with the retirements the board already held when the run read it (PR #238 review):
+    // their work is in the run's base, so a timeout cascade stops at one exactly as it stops at a
+    // ticket this attempt retires. Left out, a rolled-back timeout would walk THROUGH a settled
+    // ticket and skip valid work behind it.
+    onBranch: new Set(run.retired.map((r) => r.id)),
   };
   const recordSkipped = makeSkipRecorder(run, ledger);
 

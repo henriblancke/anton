@@ -843,14 +843,16 @@ export async function readCommitNaming(
   }
   let log: string;
   try {
-    // `-F` keeps the id a literal; `%x1e` separates commits, since `%B` spans lines.
+    // `-F` keeps the id a literal. Commits are separated by NUL, since `%B` spans lines and a
+    // message may carry any other byte (PR #238 review): git object content can never hold `\0`,
+    // so no body can split an entry the way one holding `\x1e` would.
     log = await git(repoPath, [
       "log",
       "-F",
       `--grep=${beadId}`,
       "-n",
       "50",
-      "--format=%H%x1f%B%x1e",
+      "--format=%H%x1f%B%x00",
       base,
       "--",
     ]);
@@ -858,7 +860,7 @@ export async function readCommitNaming(
     return { state: "unreadable", detail: `${base}: ${describeGitFailure(error)}` };
   }
   const named = new RegExp(`(?<![\\w-])${beadId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`);
-  for (const entry of log.split("\x1e")) {
+  for (const entry of log.split("\0")) {
     // Split on the FIRST separator only — a body that itself carries `\x1f` must stay whole.
     const sepIdx = entry.indexOf("\x1f");
     if (sepIdx < 0) continue;

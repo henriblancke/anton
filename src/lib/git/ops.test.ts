@@ -40,6 +40,7 @@ import {
   sameWorktreeState,
   worktreeHasCommitFor,
   branchContainsCommit,
+  readCommitNaming,
   readCommitReach,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
@@ -468,6 +469,59 @@ suite("readCommitReach (real git)", () => {
     for (const notASha of ["HEAD", "main~1", "--upload-pack=touch /tmp/x"]) {
       expect(await readCommitReach(repo, notASha, "main")).toMatchObject({ state: "unreadable" });
     }
+  });
+});
+
+/**
+ * The commit-naming read behind the closed-bead half of the `already-shipped` check. Entries are
+ * NUL-separated (PR #238 review): a message can carry any other byte, and one holding the record
+ * separator the read used to split on would cut the id it names off into a discarded fragment.
+ */
+suite("readCommitNaming (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-naming-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("finds a bead named in a squash body, even after a record- or unit-separator byte", async () => {
+    const msg = join(sandbox, "msg.txt");
+    writeFileSync(
+      msg,
+      "feat: the squash\n\nprose with a \x1e byte, and a \x1f byte, then\n\nanton-x1e5: the ticket line\n",
+    );
+    g(["commit", "-q", "--allow-empty", "-F", msg]);
+    const sha = g(["rev-parse", "HEAD"]);
+
+    expect(await readCommitNaming(repo, "anton-x1e5", "main")).toEqual({ state: "found", sha });
+  });
+
+  it("matches the id as a whole token, and answers none for a bead no commit names", async () => {
+    g(["commit", "-q", "--allow-empty", "-m", "anton-fade1: a longer id"]);
+
+    expect(await readCommitNaming(repo, "anton-fade", "main")).toEqual({ state: "none" });
+    expect(await readCommitNaming(repo, "anton-fade1", "main")).toMatchObject({ state: "found" });
+  });
+
+  it("fails closed on a base git cannot resolve", async () => {
+    const verdict = await readCommitNaming(repo, "anton-x1e5", "origin/nope");
+    expect(verdict).toMatchObject({ state: "unreadable", detail: expect.stringContaining("origin/nope") });
   });
 });
 
