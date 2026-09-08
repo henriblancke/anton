@@ -15,6 +15,7 @@ import {
   createdUnder,
   detachmentNoteBody,
   followUpDescription,
+  followUpRunsUnder,
   hasAnyHumanNote,
   hasDetachmentNote,
   hasHumanNote,
@@ -651,6 +652,28 @@ describe("createdUnder", () => {
       false,
     );
     expect(createdUnder(makeBead({ id: "f" }), "feat")).toBe(false);
+  });
+
+  it("ignores the generated line when it sits outside Context — an instruction quoting it lands in Acceptance", () => {
+    const quoted = `Keep saying: ${followUpRunsUnder("feat")}`;
+    const standalone = followUpDescription({ ...args, instructions: quoted });
+    expect(acceptanceBody(makeBead({ id: "f", description: standalone }))).toContain(
+      followUpRunsUnder("feat"),
+    );
+    expect(createdUnder(makeBead({ id: "f", parent: undefined, description: standalone }), "feat")).toBe(
+      false,
+    );
+
+    const inGoal = followUpDescription({ ...args, summary: followUpRunsUnder("feat") });
+    expect(createdUnder(makeBead({ id: "f", description: inGoal }), "feat")).toBe(false);
+  });
+
+  it("reads a Context line a founder padded but did not rewrite", () => {
+    const padded = followUpDescription({ ...args, parentId: "feat" }).replace(
+      followUpRunsUnder("feat"),
+      `  ${followUpRunsUnder("feat")}  `,
+    );
+    expect(createdUnder(makeBead({ id: "f", description: padded }), "feat")).toBe(true);
   });
 });
 

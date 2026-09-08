@@ -325,6 +325,9 @@ export const GOAL_KEYS = ["goal"];
  * gate accepts but the reader misses would hand the reviewer a bead with no bounds and no proof. */
 export const OUT_OF_SCOPE_KEYS = ["outofscope"];
 export const VERIFY_KEYS = ["verify", "verification"];
+/** Named for the same reason: the rework recovery reads a follow-up's Context back
+ * (rework-notes.ts `createdUnder`), and must section by the heading the gate judges. */
+export const CONTEXT_KEYS = ["context"];
 
 /** The four advisory sections every task/bug/chore/feature carries, in the order they read best. */
 const TICKET_RULES: SectionRule[] = [
@@ -338,7 +341,7 @@ const TICKET_RULES: SectionRule[] = [
   {
     section: "Context",
     severity: "advisory",
-    keys: ["context"],
+    keys: CONTEXT_KEYS,
     message:
       "no `## Context` section — the agent has to rediscover which files and patterns apply (rewrite the description: `bd update <id> --body-file -`)",
     promptMessage:

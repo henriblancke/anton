@@ -8,7 +8,13 @@
  * so the rendering and the comparison must not drift apart.
  */
 import type { Bead } from "./beads/bd";
-import { ACCEPTANCE_HEADING, ACCEPTANCE_KEYS, isTicketContractHeading } from "./beads/contract";
+import {
+  ACCEPTANCE_HEADING,
+  ACCEPTANCE_KEYS,
+  CONTEXT_KEYS,
+  isTicketContractHeading,
+  sectionBody,
+} from "./beads/contract";
 import { type ScannedLine, scanMarkdown } from "./beads/markdown";
 import { parseTicketNotes } from "./beads/notes";
 import type { PullRequestState } from "./git/ops";
@@ -229,9 +235,18 @@ export function followUpRunsUnder(parentId?: string): string {
  * ({@link followUpRunsUnder}) rather than the parentage, which is exactly what a detachment
  * changes. A founder who has rewritten that line has taken the Context into their own hands, and
  * with it the record of where the bead came from.
+ *
+ * Only a whole line of the Context section counts. The same sentence can sit elsewhere in the
+ * description without saying anything about parentage — a founder's instruction quoting it lands
+ * verbatim in an Acceptance box ({@link followUpAcceptance}) — and a bead created standing alone
+ * that carried it there would otherwise be read as detached, and given a note about a detachment
+ * that never happened.
  */
 export function createdUnder(bead: Bead, parentId: string): boolean {
-  return (bead.description ?? "").includes(followUpRunsUnder(parentId));
+  const context = sectionBody(bead.description, CONTEXT_KEYS);
+  if (!context) return false;
+  const generated = followUpRunsUnder(parentId);
+  return context.split(/\r?\n/).some((line) => line.trim() === generated);
 }
 
 /**
