@@ -46,6 +46,7 @@ function run(id: string, o: Partial<RunRow> = {}): RunRow {
     branch: null,
     model: null,
     agentTag: null,
+    endpointHost: null,
     formula: null,
     formulaVariant: null,
     status: "parked",
