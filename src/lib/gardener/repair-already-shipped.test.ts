@@ -17,7 +17,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Bead } from "../beads/bd";
@@ -135,12 +135,14 @@ interface Sandbox {
    * unless the case says otherwise, since the check places the merge in the base's history rather
    * than taking the state's word for it (PR #238 review). `commit: null` is a gh that names no merge
    * commit at all. `carries` is the PR's own commit list as GitHub records it — the messages, given
-   * oids by {@link carriedOid} — which is what vouches for a closed child the base names nowhere.
+   * oids by {@link carriedOid} and dated "now" unless an entry says when — which is what vouches for
+   * a closed child the base names nowhere, and what dates every merged PR's work: one undated
+   * commit naming nothing unless the case says otherwise, since a merged PR is never empty.
    */
   setPr: (
     selector: number | string,
     state: "OPEN" | "MERGED" | "CLOSED",
-    merge?: { commit?: string | null; base?: string; carries?: string[] },
+    merge?: { commit?: string | null; base?: string; carries?: (string | { message: string; at: string })[] },
   ) => void;
   /** Everything a write would move: refs, HEAD, the index and the working tree. */
   repoFingerprint: () => string;
@@ -180,7 +182,7 @@ function openSandbox(): Sandbox {
       state: string;
       mergeCommit: { oid: string } | null;
       baseRefName: string;
-      commits: { oid: string; messageHeadline: string; messageBody: string }[];
+      commits: { oid: string; messageHeadline: string; messageBody: string; authoredDate: string; committedDate: string }[];
     }
   > = {};
   const stateFile = join(dir, "pr-states.json");
@@ -216,12 +218,15 @@ process.stdout.write(JSON.stringify(pr));
         state,
         mergeCommit: commit ? { oid: commit } : null,
         baseRefName: merge.base ?? "main",
-        commits: (merge.carries ?? []).map((message, i) => {
+        commits: (merge.carries ?? ["chore: the work the PR carried"]).map((entry, i) => {
+          const { message, at } = typeof entry === "string" ? { message: entry, at: new Date().toISOString() } : entry;
           const nl = message.indexOf("\n");
           return {
             oid: carriedOid(i),
             messageHeadline: nl < 0 ? message : message.slice(0, nl),
             messageBody: nl < 0 ? "" : message.slice(nl + 1),
+            authoredDate: at,
+            committedDate: at,
           };
         }),
       };
@@ -273,6 +278,21 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
   const RECLOSED_AT = new Date(Date.now() + 7_200_000).toISOString();
   /** Shipped once, reopened for rework, closed again — the close the board holds is the second. */
   const REWORKED = versions([RECLOSED_AT, "closed"], [REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]);
+  /** Three hours from now — after {@link REOPENED_AT} and {@link RECLOSED_AT}. */
+  const AFTER_REWORK = new Date(Date.now() + 3 * 3_600_000).toISOString();
+
+  /**
+   * A commit landing on `main` AFTER the reopen — the shape of a merge that happened after it,
+   * whatever it carried. Dated by hand: the sandbox's own commits are all "now", before
+   * {@link REOPENED_AT}. `message` defaults to a squash whose message no longer names the bead.
+   */
+  const landedAfterReopen = (message = "squash: the rework, id dropped from the message"): string => {
+    const env = { ...process.env, GIT_AUTHOR_DATE: AFTER_REWORK, GIT_COMMITTER_DATE: AFTER_REWORK };
+    execFileSync("git", ["-C", repo, "commit", "-q", "--allow-empty", "-m", message], { env, stdio: "ignore" });
+    return execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  };
+  /** A commit in a PR's list, done after the reopen — the rework itself. */
+  const reworkCarried = (message: string) => ({ message, at: AFTER_REWORK });
 
   it("verifies a claim whose commit, bead and PR all check out", async () => {
     setPr(85, "MERGED");
@@ -356,7 +376,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     expect(verdict).toEqual({
       state: "verified",
       proof: [`\`${SHIPPER}\` is in_progress, but its PR (gh-85) is merged${mergedTail(landed)}`],
-      landed: { [SHIPPER]: { via: "pr", ref: "gh-85", landedAt: expect.any(String) } },
+      landed: { [SHIPPER]: { via: "pr", ref: "gh-85", workedAt: expect.any(String) } },
       cited: [{ kind: "pr", ref: "gh-85" }],
     });
     // An open bead has no `closed_at` to settle the cycle question by, so its history is always
@@ -367,7 +387,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
   // PR #238 review: a bead shipped once and REOPENED for rework keeps its merged PR pointer, and
   // that merge speaks for the work it was reopened from. Accepted as-is, another live ticket would
   // be retired against work the survivor is still redoing.
-  it("refuses a bead still open whose merged PR predates its last reopen", async () => {
+  it("refuses a bead still open whose merged PR's commits all predate its last reopen", async () => {
     setPr(85, "MERGED");
     historyMock.mockResolvedValue(versions([REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]));
 
@@ -380,8 +400,66 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     expect(verdict).toMatchObject({
       why: expect.stringContaining(`\`${SHIPPER}\` is in_progress and its PR (gh-85) is merged — but`),
     });
+    expect(verdict).toMatchObject({ why: expect.stringContaining("the newest commit in PR gh-85 is dated") });
     expect(verdict).toMatchObject({ why: expect.stringContaining(`the board reopened \`${SHIPPER}\` at ${REOPENED_AT}`) });
     expect(verdict).toMatchObject({ why: expect.stringContaining("is later work still in_progress") });
+  });
+
+  // PR #238 review: the PR was still OPEN when the bead was reopened, and merged unchanged after —
+  // its merge postdates the reopen, and every commit in it predates it. The merge's date says the
+  // rework landed; the PR's own commits say nothing of the current cycle is in it.
+  it("refuses an open bead's PR merged after its last reopen when every commit in it predates the reopen", async () => {
+    setPr(85, "MERGED", { commit: landedAfterReopen() });
+    historyMock.mockResolvedValue(versions([REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]));
+
+    const verdict = await verify(`superseded by ${SHIPPER}`, [
+      bead(TARGET),
+      bead(SHIPPER, { status: "in_progress", metadata: { pr: "gh-85" } }),
+    ]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({ why: expect.stringContaining("the newest commit in PR gh-85 is dated") });
+    expect(verdict).toMatchObject({ why: expect.stringContaining("is an earlier cycle's") });
+  });
+
+  it("verifies an open bead's merged PR when a commit in it postdates the reopen — the rework is in it", async () => {
+    setPr(85, "MERGED", {
+      commit: landedAfterReopen(),
+      carries: [`${SHIPPER}: as first shipped`, reworkCarried(`${SHIPPER}: the rework`)],
+    });
+    historyMock.mockResolvedValue(versions([REOPENED_AT, "in_progress"], ["2020-01-01T00:00:00Z", "closed"]));
+
+    const verdict = await verify(`superseded by ${SHIPPER}`, [
+      bead(TARGET),
+      bead(SHIPPER, { status: "in_progress", metadata: { pr: "gh-85" } }),
+    ]);
+
+    expect(verdict.state).toBe("verified");
+    expect((verdict as { landed: unknown }).landed).toEqual({
+      [SHIPPER]: { via: "pr", ref: "gh-85", workedAt: AFTER_REWORK },
+    });
+  });
+
+  it("refuses an open bead's merged PR whose commit list cannot be read — undated work is unchecked", async () => {
+    setPr(85, "MERGED");
+    historyMock.mockRejectedValue(new Error("must not be read"));
+    // A gh that answers the PR's state but not its commits: the file the fake reads is rewritten to
+    // a PR with no commit list at all.
+    const stateFile = join(sb.dir, "pr-states.json");
+    const states = JSON.parse(readFileSync(stateFile, "utf8")) as Record<string, Record<string, unknown>>;
+    delete states["85"]!.commits;
+    writeFileSync(stateFile, JSON.stringify(states));
+
+    const verdict = await verify(`superseded by ${SHIPPER}`, [
+      bead(TARGET),
+      bead(SHIPPER, { status: "in_progress", metadata: { pr: "gh-85" } }),
+    ]);
+
+    expect(verdict.state).toBe("unverified");
+    expect(verdict).toMatchObject({
+      why: expect.stringContaining("the commits GitHub records for it could not be read"),
+    });
+    expect(historyMock).not.toHaveBeenCalled();
   });
 
   it("refuses an open bead's merged PR when its history cannot be read — no `closed_at` answers for it", async () => {
@@ -461,7 +539,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
           `rides, (gh-85) is merged${mergedTail(landed)}, and GitHub records commit ` +
           `\`${carriedOid(1).slice(0, 10)}\` in that PR naming it`,
       ],
-      landed: { [UNLANDED]: { via: "owner-pr", ownerId: OWNER, ref: "gh-85", landedAt: expect.any(String) } },
+      landed: { [UNLANDED]: { via: "owner-pr", ownerId: OWNER, ref: "gh-85", workedAt: expect.any(String) } },
       cited: [{ kind: "pr", ref: "gh-85" }],
     });
   });
@@ -509,7 +587,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
     expect(verdict).toEqual({
       state: "verified",
       proof: [`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged${mergedTail(landed)}`],
-      landed: { [UNLANDED]: { via: "pr", ref: "gh-85", landedAt: expect.any(String) } },
+      landed: { [UNLANDED]: { via: "pr", ref: "gh-85", workedAt: expect.any(String) } },
       cited: [{ kind: "pr", ref: "gh-85" }],
     });
   });
@@ -537,24 +615,13 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       expect(historyMock).toHaveBeenCalledWith(repo, SHIPPER);
     });
 
-    /**
-     * The rework landed through a squash whose message no longer names the bead, AFTER the reopen —
-     * so the old naming commit is still the newest match in the base. Dated by hand: the sandbox's
-     * own commits are all "now", before {@link REOPENED_AT}.
-     */
-    const reworkLanded = (): string => {
-      const at = new Date(Date.now() + 3 * 3_600_000).toISOString();
-      const env = { ...process.env, GIT_AUTHOR_DATE: at, GIT_COMMITTER_DATE: at };
-      const message = "squash: the rework, id dropped from the message";
-      execFileSync("git", ["-C", repo, "commit", "-q", "--allow-empty", "-m", message], { env, stdio: "ignore" });
-      return execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-    };
-
     // PR #238 review: the naming commit was DISCOVERED, not cited, so one that fails the cycle bar
-    // is a route that gave nothing — the bead's merged PR, which postdates the reopen, still speaks.
-    it("falls through a stale naming commit to the bead's own PR when that merge postdates the reopen", async () => {
-      const rework = reworkLanded();
-      setPr(85, "MERGED", { commit: rework });
+    // is a route that gave nothing — the bead's merged PR, whose commits postdate the reopen, still
+    // speaks. The rework landed through a squash whose message no longer names the bead, so the
+    // old naming commit is still the newest match in the base.
+    it("falls through a stale naming commit to the bead's own PR when that PR carries work from after the reopen", async () => {
+      const rework = landedAfterReopen();
+      setPr(85, "MERGED", { commit: rework, carries: [reworkCarried(`${SHIPPER}: the rework`)] });
       historyMock.mockResolvedValue(REWORKED);
 
       const verdict = await verify(`already done by ${SHIPPER}`, [
@@ -567,7 +634,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
         `\`${SHIPPER}\` is closed on the board and its PR (gh-85) is merged${mergedTail(rework)}`,
       ]);
       expect((verdict as { landed: unknown }).landed).toEqual({
-        [SHIPPER]: { via: "pr", ref: "gh-85", landedAt: expect.any(String) },
+        [SHIPPER]: { via: "pr", ref: "gh-85", workedAt: expect.any(String) },
       });
     });
 
@@ -607,16 +674,41 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       expect(verdict).toMatchObject({ why: expect.stringContaining("could not be read") });
     });
 
-    it("verifies a landing at or after the close the board holds without reading the history", async () => {
+    it("verifies a PR whose work is at or after the close the board holds without reading the history", async () => {
+      setPr(85, "MERGED");
       historyMock.mockRejectedValue(new Error("must not be read"));
 
-      const verdict = await verify(`already done by ${SHIPPER}`, [
+      const verdict = await verify(`already done by ${UNLANDED}`, [
         bead(TARGET),
-        bead(SHIPPER, { status: "closed", closed_at: "2020-01-01T00:00:00Z" }),
+        bead(UNLANDED, { status: "closed", closed_at: "2020-01-01T00:00:00Z", metadata: { pr: "gh-85" } }),
       ]);
 
       expect(verdict.state).toBe("verified");
       expect(historyMock).not.toHaveBeenCalled();
+    });
+
+    // PR #238 review: a naming commit in the base is dated when it MERGED — for a squash, that is
+    // all it is dated by — and a PR left open across the reopen and merged unchanged lands one dated
+    // after both the reopen and the second close. So `closed_at` settles nothing for the commit
+    // route: the history is read, and once it shows a reopen the commit cannot say which cycle it
+    // holds. A survivor with no PR to ask is refused, with what the commit said in the refusal.
+    it("reads the history for a naming commit even after the close, and refuses once the bead was ever reopened", async () => {
+      historyMock.mockResolvedValue(
+        versions(["2020-02-01T00:00:00Z", "closed"], ["2020-01-15T00:00:00Z", "in_progress"], ["2020-01-01T00:00:00Z", "closed"]),
+      );
+
+      const verdict = await verify(`already done by ${SHIPPER}`, [
+        bead(TARGET),
+        bead(SHIPPER, { status: "closed", closed_at: "2020-02-01T00:00:00Z" }),
+      ]);
+
+      expect(verdict.state).toBe("unverified");
+      expect(historyMock).toHaveBeenCalledWith(repo, SHIPPER);
+      expect(verdict).toMatchObject({ why: expect.stringContaining("nothing says its CURRENT work LANDED") });
+      expect(verdict).toMatchObject({
+        why: expect.stringContaining(`the board reopened \`${SHIPPER}\` at 2020-01-15T00:00:00Z, and commit \`${landed.slice(0, 10)}\` dates its merge`),
+      });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("only the pull request's own commits can say") });
     });
 
     it("verifies a landing that predates the close when the bead was never reopened — a hand close after the merge", async () => {
@@ -633,17 +725,21 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       expect(historyMock).toHaveBeenCalledWith(repo, SHIPPER);
     });
 
-    it("verifies a landing after the reopen — the rework itself has landed", async () => {
+    it("verifies through the bead's PR when its commits postdate the reopen — a naming commit after it is not proof on its own", async () => {
+      setPr(85, "MERGED", { carries: [`${SHIPPER}: the rework`] });
       historyMock.mockResolvedValue(
         versions([RECLOSED_AT, "closed"], ["2020-06-01T00:00:00Z", "in_progress"], ["2020-01-01T00:00:00Z", "closed"]),
       );
 
       const verdict = await verify(`already done by ${SHIPPER}`, [
         bead(TARGET),
-        bead(SHIPPER, { status: "closed", closed_at: RECLOSED_AT }),
+        bead(SHIPPER, { status: "closed", closed_at: RECLOSED_AT, metadata: { pr: "gh-85" } }),
       ]);
 
       expect(verdict.state).toBe("verified");
+      expect(verdict.proof).toEqual([
+        `\`${SHIPPER}\` is closed on the board and its PR (gh-85) is merged${mergedTail(landed)}`,
+      ]);
     });
 
     it("refuses when the history cannot be read and the landing predates the close — unread is unchecked", async () => {
@@ -660,7 +756,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       });
     });
 
-    it("refuses a bead's own merged PR whose merge predates its last reopen", async () => {
+    it("refuses a bead's own merged PR whose commits all predate its last reopen", async () => {
       setPr(85, "MERGED");
       historyMock.mockResolvedValue(REWORKED);
 
@@ -674,6 +770,26 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
         why: expect.stringContaining(`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged — but`),
       });
       expect(verdict).toMatchObject({ why: expect.stringContaining("is an earlier cycle's") });
+    });
+
+    // PR #238 review: the merge postdates the reopen — and even the second close — while every
+    // commit in the PR predates it. The PR was open when the bead was reopened and merged unchanged.
+    it("refuses a bead's own PR merged after its reopen and re-close when every commit in it predates the reopen", async () => {
+      setPr(85, "MERGED", { commit: landedAfterReopen() });
+      historyMock.mockResolvedValue(REWORKED);
+
+      const verdict = await verify(`already done by ${UNLANDED}`, [
+        bead(TARGET),
+        bead(UNLANDED, { status: "closed", closed_at: RECLOSED_AT, metadata: { pr: "gh-85" } }),
+      ]);
+
+      expect(verdict.state).toBe("unverified");
+      expect(verdict).toMatchObject({
+        why: expect.stringContaining(`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged — but`),
+      });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("the newest commit in PR gh-85 is dated") });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("is an earlier cycle's") });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("is later work under that close") });
     });
 
     it("refuses the merged PR of the run target a child rides when that merge predates the child's last reopen", async () => {
@@ -692,6 +808,44 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
         ),
       });
       expect(historyMock).toHaveBeenCalledWith(repo, UNLANDED);
+    });
+
+    it("refuses the run target's PR merged after the child's reopen when its commits naming the child all predate it", async () => {
+      setPr(85, "MERGED", {
+        commit: landedAfterReopen(),
+        // A sibling's rework after the reopen does not date THIS child's work.
+        carries: [`${UNLANDED}: the child's first commit`, reworkCarried("anton-sibl: a sibling's rework")],
+      });
+      historyMock.mockResolvedValue(REWORKED);
+      const feature = bead(OWNER, { issue_type: "feature", status: "closed", metadata: { pr: "gh-85" } });
+      const child = bead(UNLANDED, { status: "closed", closed_at: RECLOSED_AT });
+      (child as unknown as Record<string, unknown>).parent = OWNER;
+
+      const verdict = await verify(`already done by ${UNLANDED}`, [bead(TARGET), feature, child]);
+
+      expect(verdict.state).toBe("unverified");
+      expect(verdict).toMatchObject({ why: expect.stringContaining("the newest commit in PR gh-85 naming it is dated") });
+      expect(verdict).toMatchObject({ why: expect.stringContaining("is an earlier cycle's") });
+    });
+
+    it("verifies a child through the run target's PR when the newest commit naming it postdates the reopen", async () => {
+      setPr(85, "MERGED", {
+        commit: landedAfterReopen(),
+        carries: [`${UNLANDED}: the child's first commit`, reworkCarried(`${UNLANDED}: the child's rework`)],
+      });
+      historyMock.mockResolvedValue(REWORKED);
+      const feature = bead(OWNER, { issue_type: "feature", status: "closed", metadata: { pr: "gh-85" } });
+      const child = bead(UNLANDED, { status: "closed", closed_at: RECLOSED_AT });
+      (child as unknown as Record<string, unknown>).parent = OWNER;
+
+      const verdict = await verify(`already done by ${UNLANDED}`, [bead(TARGET), feature, child]);
+
+      expect(verdict.state).toBe("verified");
+      // The proof names the rework — the newest commit naming the child — and the landing is dated by it.
+      expect(verdict.proof[0]).toContain(`GitHub records commit \`${carriedOid(1).slice(0, 10)}\` in that PR naming it`);
+      expect((verdict as { landed: unknown }).landed).toEqual({
+        [UNLANDED]: { via: "owner-pr", ownerId: OWNER, ref: "gh-85", workedAt: AFTER_REWORK },
+      });
     });
   });
 

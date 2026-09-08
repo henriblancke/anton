@@ -828,12 +828,24 @@ export async function readCommitReach(
 }
 
 /**
- * What a pull request's own commit list says about a BEAD — see {@link readPullRequestNaming}.
- * Undated, unlike {@link CommitNaming}: the PR's merge is what places its work in time.
+ * One commit GitHub records for a pull request, as much of it as the checks read — see
+ * {@link readPullRequestCommits}.
  */
-export type PullRequestNaming =
-  | { state: "found"; sha: string }
-  | { state: "none" }
+export interface PullRequestCommit {
+  sha: string;
+  /** Headline and body joined — what a bead id is looked for in. */
+  message: string;
+  /**
+   * When the WORK in it was done — the OLDER of its author and committer dates, ISO 8601. The two
+   * agree on a fresh commit; a rebase re-dates the committer side and keeps the author's, so the
+   * older is the one a rebase after a bead's reopen cannot move past that reopen (PR #238 review).
+   */
+  workedAt: string;
+}
+
+/** What GitHub records as a pull request's commits — see {@link readPullRequestCommits}. */
+export type PullRequestCommits =
+  | { state: "read"; commits: PullRequestCommit[] }
   | { state: "unreadable"; detail: string };
 
 /** The shape a bead id takes — the gate both naming reads hold their input to before it reaches a regex. */
@@ -904,19 +916,6 @@ export async function readCommitNaming(
 }
 
 /**
- * When `sha` was committed — its committer date, ISO 8601 — or THROW. The date the
- * `already-shipped` check places a landing at (PR #238 review): for a merge commit, a squash or a
- * rebased head that is the moment the work entered the base, which is what a bead's reopen is
- * measured against. The committer date, not the author date, because a rebase keeps the latter
- * from the original work and would place a landing before it happened.
- */
-export async function readCommitDate(repoPath: string, sha: string): Promise<string> {
-  const date = await git(repoPath, ["show", "-s", "--format=%cI", `${sha}^{commit}`, "--"]);
-  if (!date) throw new Error(`git reported no committer date for ${sha}`);
-  return date;
-}
-
-/**
  * `beadId` as a standalone token in prose. The boundaries reject a longer id it is the head of
  * (`anton-fade1`) and — because bd mints child ids by appending `.<n>` — a dotted child of it
  * (`anton-fade.1`) (PR #238 review): a commit naming the child has not said the parent landed. A
@@ -927,24 +926,22 @@ function beadNamedIn(beadId: string): RegExp {
 }
 
 /**
- * Does one of the commits GitHub records for a pull request name `beadId` in its message?
+ * The commits GitHub records for a pull request — each with its message and when its work was done.
  *
- * The record behind the `already-shipped` check's answer for a closed bead that carries no PR of
- * its own and that no commit in the base names (PR #238 review): the bead rides a run target whose
- * PR merged, but the board's parentage is read NOW, and a bead re-homed under that target after the
- * merge would pass on it. GitHub keeps the PR's own commit list — the `<id>: …` subjects anton
- * committed for each ticket — whatever the squash's body was rewritten to and whatever the board
- * says today, so that list is what proves the PR carried the bead.
+ * The record behind two of the `already-shipped` check's answers (PR #238 review). Whether a merged
+ * PR CARRIED a closed bead ({@link pullRequestCommitNaming}): the board's parentage is read NOW, and
+ * a bead re-homed under a run target after that target's PR merged would pass on it, while GitHub
+ * keeps the `<id>: …` subjects anton committed for each ticket whatever the squash's body was
+ * rewritten to. And whether the PR holds work from the bead's CURRENT cycle
+ * ({@link newestPullRequestCommit}): a merge is dated when the PR merged, so a PR still open when
+ * its bead was reopened and merged unchanged afterwards is dated after a reopen it carries nothing
+ * from — only its own commits say when the work in it was done.
  *
  * `unreadable` for anything short of an answer — no gh, an unreachable GitHub, a PR the ref does
- * not name — so a caller fails closed rather than reading a network failure as "not carried".
+ * not name, a commit gh dates with nothing — so a caller fails closed rather than reading a network
+ * failure as "not carried" or an undated commit as an old one.
  */
-export async function readPullRequestNaming(
-  repoPath: string,
-  ref: string,
-  beadId: string,
-): Promise<PullRequestNaming> {
-  if (!BEAD_ID.test(beadId)) return { state: "unreadable", detail: `"${beadId}" is not a bead id` };
+export async function readPullRequestCommits(repoPath: string, ref: string): Promise<PullRequestCommits> {
   const selector = ref.startsWith("gh-") ? ref.slice(3) : ref;
   if (!selector) return { state: "unreadable", detail: `"${ref}" names no pull request` };
   const gh = process.env[GH_BIN_ENV] ?? "gh";
@@ -962,14 +959,44 @@ export async function readPullRequestNaming(
   if (!Array.isArray(commits)) {
     return { state: "unreadable", detail: `${ref}: gh reported no commit list for the pull request` };
   }
-  const named = beadNamedIn(beadId);
-  for (const entry of commits as { oid?: unknown; messageHeadline?: unknown; messageBody?: unknown }[]) {
-    const text = (v: unknown): string => (typeof v === "string" ? v : "");
-    const message = `${text(entry.messageHeadline)}\n${text(entry.messageBody)}`;
-    const oid = text(entry.oid);
-    if (/^[0-9a-f]{7,40}$/i.test(oid) && named.test(message)) return { state: "found", sha: oid };
+  const text = (v: unknown): string => (typeof v === "string" ? v : "");
+  const read: PullRequestCommit[] = [];
+  for (const entry of commits as Record<string, unknown>[]) {
+    const sha = text(entry.oid);
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) continue;
+    const dates = [entry.authoredDate, entry.committedDate].map(text).filter((d) => !Number.isNaN(Date.parse(d)));
+    if (dates.length === 0) {
+      return { state: "unreadable", detail: `${ref}: gh dates commit \`${sha.slice(0, 10)}\` with nothing` };
+    }
+    const workedAt = dates.reduce((older, d) => (Date.parse(d) < Date.parse(older) ? d : older));
+    read.push({ sha, message: `${text(entry.messageHeadline)}\n${text(entry.messageBody)}`, workedAt });
   }
-  return { state: "none" };
+  return { state: "read", commits: read };
+}
+
+/** The commit whose work is newest — undefined for an empty list. */
+export function newestPullRequestCommit(
+  commits: readonly PullRequestCommit[],
+): PullRequestCommit | undefined {
+  let newest: PullRequestCommit | undefined;
+  for (const commit of commits) {
+    if (!newest || Date.parse(commit.workedAt) > Date.parse(newest.workedAt)) newest = commit;
+  }
+  return newest;
+}
+
+/**
+ * The newest commit in a PR's list naming `beadId` as a standalone token ({@link beadNamedIn}) —
+ * undefined when none does, or when `beadId` is not the shape of an id. The NEWEST, because what
+ * the caller measures against the bead's reopen is when the bead's work in that PR was last done.
+ */
+export function pullRequestCommitNaming(
+  commits: readonly PullRequestCommit[],
+  beadId: string,
+): PullRequestCommit | undefined {
+  if (!BEAD_ID.test(beadId)) return undefined;
+  const named = beadNamedIn(beadId);
+  return newestPullRequestCommit(commits.filter((commit) => named.test(commit.message)));
 }
 
 /** A failed git call in one line — its own stderr where it wrote any, else the thrown message. */

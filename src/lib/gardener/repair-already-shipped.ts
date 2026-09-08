@@ -39,11 +39,13 @@ import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { humanNotesPromptBlock } from "../beads/notes";
 import {
-  readCommitDate,
+  newestPullRequestCommit,
+  pullRequestCommitNaming,
   readCommitNaming,
   readCommitReach,
+  readPullRequestCommits,
   readPullRequestMerge,
-  readPullRequestNaming,
+  type PullRequestCommits,
   type PullRequestState,
 } from "../git/ops";
 import {
@@ -130,22 +132,25 @@ export type CitedEvidence = { kind: "commit"; sha: string } | { kind: "pr"; ref:
  * swapped, or its PR un-merging, in the window between the check and the write takes the
  * verification back, and a reread that only looked at status would never see it.
  *
- * `landedAt` is WHEN the landing entered the base — the naming commit's committer date, or the
- * merge commit's — carried so the fences can measure it against the survivor's history again
+ * The date each carries is what the fences measure against the survivor's history again
  * ({@link stillCurrentCycle}): a survivor reopened in the window — closed once more, or still open
  * and keeping its merged PR pointer — keeps this landing in the base, and it is the cycle that
- * moved, not the evidence.
+ * moved, not the evidence. A PR landing is dated by the WORK it carries (`workedAt`, the newest
+ * commit GitHub records for it), never by its merge: a merge is dated when the PR merged, and a PR
+ * still open when its bead was reopened merges unchanged with a date after a reopen it holds
+ * nothing from. A commit landing has only its `landedAt` — when it entered the base — which is why
+ * it counts only while the bead has never been reopened ({@link commitOfCurrentCycle}).
  */
 export type BeadLanding =
   /** A commit in the run's base names the bead. */
   | { via: "commit"; sha: string; landedAt: string }
   /** The bead's own PR is merged. */
-  | { via: "pr"; ref: string; landedAt: string }
+  | { via: "pr"; ref: string; workedAt: string }
   /**
    * The bead is closed, the PR of the run target it rides is merged, and a commit GitHub records
    * in that PR names the bead — the PR carried it, whatever the board says of its parentage now.
    */
-  | { via: "owner-pr"; ownerId: string; ref: string; landedAt: string };
+  | { via: "owner-pr"; ownerId: string; ref: string; workedAt: string };
 
 /**
  * The whole-board read the claim is checked against — through `loadAllIssues` rather than a bare
@@ -170,8 +175,7 @@ function readBoard(repoPath: string): Promise<Bead[]> {
  * everyday case the prose keeps short.
  */
 type PullRequestLanding =
-  /** `landedAt` is the merge commit's committer date — when the PR's work entered the base. */
-  | { landed: true; sha: string; landedAt: string }
+  | { landed: true; sha: string }
   | { landed: false; state: PullRequestState; predicate: string };
 
 /**
@@ -209,21 +213,8 @@ async function readPullRequestLanding(
   const reach = await readCommitReach(repoPath, pr.mergeCommit, base);
   const short = pr.mergeCommit.slice(0, 10);
   switch (reach.state) {
-    case "reaches": {
-      // Dated here, with the reach, so every merged PR carries WHEN it landed: a closed bead's
-      // landing is measured against its reopen (`landingOfCurrentCycle`), and an undatable merge
-      // fails closed exactly as an unplaceable one does.
-      let landedAt: string;
-      try {
-        landedAt = await readCommitDate(repoPath, reach.sha);
-      } catch (error) {
-        return unlanded(
-          `is merged into the run's base (${base}), but when its merge commit \`${short}\` landed ` +
-            `could not be read (${error instanceof Error ? error.message : String(error)})`,
-        );
-      }
-      return { landed: true, sha: reach.sha, landedAt };
-    }
+    case "reaches":
+      return { landed: true, sha: reach.sha };
     case "outside":
       return unlanded(
         `is merged elsewhere than the run's base (${base})` +
@@ -303,6 +294,15 @@ export async function verifyShippedClaim(args: {
     landings.set(ref, landing);
     return landing;
   };
+  // Likewise the PR's commit list — one read however many beads the same PR is asked for.
+  const carried = new Map<string, PullRequestCommits>();
+  const readCommits = async (ref: string): Promise<PullRequestCommits> => {
+    const cached = carried.get(ref);
+    if (cached) return cached;
+    const commits = await readPullRequestCommits(repoPath, ref);
+    carried.set(ref, commits);
+    return commits;
+  };
 
   for (const commit of commits) {
     const reach = await readCommitReach(repoPath, commit, base);
@@ -351,7 +351,7 @@ export async function verifyShippedClaim(args: {
     // shipped, whatever the bead was later labelled.
     const abandoned = beads.isAbandoned(bead);
     if (bead.status === "closed" && !abandoned) {
-      const closed = await closedBeadLanding({ repoPath, base, index, bead, readPr });
+      const closed = await closedBeadLanding({ repoPath, base, index, bead, readPr, readCommits });
       if ("why" in closed) return { state: "unverified", proof, why: closed.why };
       proof.push(closed.proof);
       landed[id] = closed.landing;
@@ -375,16 +375,16 @@ export async function verifyShippedClaim(args: {
       // and reopened for rework keeps its merged PR pointer, and that merge speaks for the work it
       // was reopened FROM, not the work it holds now. A never-closed bead awaiting its merge's
       // finalization has no reopen in its history and stands.
-      const cycle = await landingOfCurrentCycle(repoPath, bead, landing.landedAt);
-      if (cycle.stale) {
+      const work = await ownPullRequestWork({ repoPath, bead, ref: pr, readCommits });
+      if ("why" in work) {
         return {
           state: "unverified",
           proof,
-          why: `\`${id}\` is ${standing} and its PR (${pr}) is merged — but ${cycle.stale}`,
+          why: `\`${id}\` is ${standing} and its PR (${pr}) is merged — but ${work.why}`,
         };
       }
       proof.push(`\`${id}\` is ${standing}, but its PR (${pr}) is merged${landedTail(base, landing)}`);
-      landed[id] = { via: "pr", ref: pr, landedAt: landing.landedAt };
+      landed[id] = { via: "pr", ref: pr, workedAt: work.workedAt };
       cite({ kind: "pr", ref: pr });
       continue;
     }
@@ -452,16 +452,18 @@ function citesSame(a: CitedEvidence, b: CitedEvidence): boolean {
  * shipped once, was reopened for rework, and was closed again by a run whose pull request has not
  * merged still has its first landing in the base — the old commit naming it, the old merged PR —
  * and any of those would retire another ticket against work the survivor's latest close does not
- * describe. So a landing counts only when it postdates the bead's last reopen
- * ({@link landingOfCurrentCycle}): what the base holds must be what this close is about.
+ * describe. So a PR counts only when the WORK it carries postdates the bead's last reopen
+ * ({@link workOfCurrentCycle}) — its commits, not its merge, which a PR left open across a reopen
+ * and merged unchanged dates after that reopen — and a naming commit counts only while the bead has
+ * never been reopened ({@link commitOfCurrentCycle}): what the base holds must be what this close
+ * is about.
  *
  * A naming commit that fails that bar is an evidence route that gave nothing, not a refusal (PR
  * #238 review). It was DISCOVERED — the newest commit in the base naming the bead — not cited by
- * the claim, and it is the newest exactly when the current cycle's commit does not name the bead:
- * a squash whose message was edited to drop the id lands the rework and leaves the old commit as
- * the only match. The PR routes are still asked; a merged PR that postdates the reopen proves the
- * current cycle landed. What the stale commit said rides into any refusal that follows, so a human
- * reading it sees every route anton tried.
+ * the claim, and it dates its merge rather than its work: a squash of the rework lands with the
+ * same shape as a squash of the cycle the reopen undid. The PR routes are still asked; a merged PR
+ * whose commits postdate the reopen proves the current cycle landed. What the commit said rides
+ * into any refusal that follows, so a human reading it sees every route anton tried.
  */
 async function closedBeadLanding(args: {
   repoPath: string;
@@ -469,8 +471,9 @@ async function closedBeadLanding(args: {
   index: BoardIndex;
   bead: Bead;
   readPr: (ref: string) => Promise<PullRequestLanding>;
+  readCommits: (ref: string) => Promise<PullRequestCommits>;
 }): Promise<{ landing: BeadLanding; proof: string } | { why: string }> {
-  const { repoPath, base, index, bead, readPr } = args;
+  const { repoPath, base, index, bead, readPr, readCommits } = args;
   const id = bead.id;
   // The naming commit the base holds but the current cycle cannot claim — see the note above.
   let staleCommit: string | undefined;
@@ -478,7 +481,7 @@ async function closedBeadLanding(args: {
   const naming = await readCommitNaming(repoPath, id, base);
   switch (naming.state) {
     case "found": {
-      const cycle = await landingOfCurrentCycle(repoPath, bead, naming.committedAt);
+      const cycle = await commitOfCurrentCycle(repoPath, bead, { sha: naming.sha, landedAt: naming.committedAt });
       if (!cycle.stale) {
         return {
           landing: { via: "commit", sha: naming.sha, landedAt: naming.committedAt },
@@ -506,14 +509,12 @@ async function closedBeadLanding(args: {
   if (ownPr) {
     const landing = await readPr(ownPr);
     if (landing.landed) {
-      const cycle = await landingOfCurrentCycle(repoPath, bead, landing.landedAt);
-      if (cycle.stale) {
-        return {
-          why: `\`${id}\` is closed on the board and its PR (${ownPr}) is merged — but ${cycle.stale}`,
-        };
+      const work = await ownPullRequestWork({ repoPath, bead, ref: ownPr, readCommits });
+      if ("why" in work) {
+        return refuse(`\`${id}\` is closed on the board and its PR (${ownPr}) is merged — but ${work.why}`);
       }
       return {
-        landing: { via: "pr", ref: ownPr, landedAt: landing.landedAt },
+        landing: { via: "pr", ref: ownPr, workedAt: work.workedAt },
         proof: `\`${id}\` is closed on the board and its PR (${ownPr}) is merged${landedTail(base, landing)}`,
       };
     }
@@ -531,37 +532,35 @@ async function closedBeadLanding(args: {
     const landing = await readPr(ownerPr);
     if (landing.landed) {
       const rides = `\`${id}\` is closed on the board and the PR of \`${owner.id}\`, the run target it rides, (${ownerPr})`;
-      const carried = await readPullRequestNaming(repoPath, ownerPr, id);
-      switch (carried.state) {
-        case "found": {
-          const cycle = await landingOfCurrentCycle(repoPath, bead, landing.landedAt);
-          if (cycle.stale) {
-            return {
-              why:
-                `${rides} is merged, and GitHub records commit \`${carried.sha.slice(0, 10)}\` in ` +
-                `that PR naming it — but ${cycle.stale}`,
-            };
-          }
-          return {
-            landing: { via: "owner-pr", ownerId: owner.id, ref: ownerPr, landedAt: landing.landedAt },
-            proof:
-              `${rides} is merged${landedTail(base, landing)}, and GitHub records commit ` +
-              `\`${carried.sha.slice(0, 10)}\` in that PR naming it`,
-          };
-        }
-        case "none":
-          return refuse(
-            `${rides} is merged, but none of the commits GitHub records for that PR names ` +
-              `\`${id}\` — the board says it rides \`${owner.id}\` now, and nothing says it did ` +
-              `when that PR merged, so the PR is not evidence its work landed`,
-          );
-        case "unreadable":
-          return refuse(
-            `${rides} is merged, but whether a commit in that PR names \`${id}\` could not be ` +
-              `read (${carried.detail}) — whether that PR carried its work is exactly what the ` +
-              `claim rests on`,
-          );
+      const carried = await readCommits(ownerPr);
+      if (carried.state === "unreadable") {
+        return refuse(
+          `${rides} is merged, but whether a commit in that PR names \`${id}\` could not be ` +
+            `read (${carried.detail}) — whether that PR carried its work is exactly what the ` +
+            `claim rests on`,
+        );
       }
+      const naming = pullRequestCommitNaming(carried.commits, id);
+      if (!naming) {
+        return refuse(
+          `${rides} is merged, but none of the commits GitHub records for that PR names ` +
+            `\`${id}\` — the board says it rides \`${owner.id}\` now, and nothing says it did ` +
+            `when that PR merged, so the PR is not evidence its work landed`,
+        );
+      }
+      const cycle = await workOfCurrentCycle(repoPath, bead, naming.workedAt, carriedWork(ownerPr));
+      if (cycle.stale) {
+        return refuse(
+          `${rides} is merged, and GitHub records commit \`${naming.sha.slice(0, 10)}\` in ` +
+            `that PR naming it — but ${cycle.stale}`,
+        );
+      }
+      return {
+        landing: { via: "owner-pr", ownerId: owner.id, ref: ownerPr, workedAt: naming.workedAt },
+        proof:
+          `${rides} is merged${landedTail(base, landing)}, and GitHub records commit ` +
+          `\`${naming.sha.slice(0, 10)}\` in that PR naming it`,
+      };
     }
     return refuse(
       landing.state === "unknown"
@@ -585,71 +584,182 @@ async function closedBeadLanding(args: {
   );
 }
 
+/** How a refusal names the commit a PR's work was dated by — the bead's own PR, and the one it rides. */
+const ownWork = (ref: string): string => `the newest commit in PR ${ref}`;
+const carriedWork = (ref: string): string => `the newest commit in PR ${ref} naming it`;
+
 /**
- * Is a landing dated `landedAt` the bead's CURRENT cycle's, or a previous one's (PR #238 review)?
+ * The newest commit a bead's OWN merged PR carries, held to the bead's current cycle
+ * ({@link workOfCurrentCycle}). Everything in a bead's own PR is its work, so no commit has to name
+ * it — the newest is when that work was last done. `why` completes "<the PR> is merged — but …" for
+ * every reading that is not proof, an unreadable or empty commit list included: whether the PR
+ * carries this cycle's work is exactly what the claim rests on, so neither reads as "it does".
+ */
+async function ownPullRequestWork(args: {
+  repoPath: string;
+  bead: Bead;
+  ref: string;
+  readCommits: (ref: string) => Promise<PullRequestCommits>;
+}): Promise<{ workedAt: string } | { why: string }> {
+  const { repoPath, bead, ref, readCommits } = args;
+  const carried = await readCommits(ref);
+  if (carried.state === "unreadable") {
+    return {
+      why:
+        `the commits GitHub records for it could not be read (${carried.detail}) — whether it ` +
+        `carries this cycle's work is exactly what the claim rests on`,
+    };
+  }
+  const newest = newestPullRequestCommit(carried.commits);
+  if (!newest) return { why: `GitHub records no commit in it — nothing dates the work it carried` };
+  const cycle = await workOfCurrentCycle(repoPath, bead, newest.workedAt, ownWork(ref));
+  return cycle.stale ? { why: cycle.stale } : { workedAt: newest.workedAt };
+}
+
+/**
+ * Is work done at `workedAt` the bead's CURRENT cycle's, or a previous one's (PR #238 review)?
  *
- * A CLOSED bead's row settles the common case without a history read: a landing at or after its
- * `closed_at` cannot be an earlier cycle's, since that cycle's landing preceded its own close, which
- * preceded the reopen, which preceded this close. In anton's own lifecycle that is every child of a
- * run — closed on commit, landed at the merge after — so the fast path is the usual path. An OPEN
- * bead has no such row to ask: bd clears `closed_at` on reopen, and a `closed_at` that survived one
- * would be the very close the reopen undid, so its history is always read.
+ * `workedAt` dates the WORK — the newest commit a pull request carries — never the merge that
+ * landed it. A merge is dated when the PR merged, and a PR still open when its bead was reopened
+ * for rework merges unchanged with a date after that reopen: measured by its merge it would pass
+ * for the rework, measured by its commits it carries nothing from after the reopen. `what` names
+ * the commit as the refusal should read it ({@link ownWork}, {@link carriedWork}).
  *
- * A landing that PREDATES the close is ambiguous: a standalone target closes seconds after its
- * merge, a person closes a bead by hand a week after the work landed, and a reopened bead's first
- * landing sits before its second close — the last is the one that must not count, and only the
- * board's history tells it from the others. So the history is read, and the landing is stale when
- * the bead was reopened after it: what the board holds now is a later cycle's work — closed again,
- * or still open for rework — and this landing says nothing about it. Never reopened, or reopened
- * before the landing, and it stands. An unreadable history fails closed, for the reason every other
- * read here does.
+ * A CLOSED bead's row settles the common case without a history read: work at or after its
+ * `closed_at` cannot be an earlier cycle's, since that cycle's work preceded its own close, which
+ * preceded the reopen, which preceded this close. An OPEN bead has no such row to ask: bd clears
+ * `closed_at` on reopen, and a `closed_at` that survived one would be the very close the reopen
+ * undid, so its history is always read.
+ *
+ * Work that PREDATES the close is ambiguous: a run closes a ticket the moment it commits, a person
+ * closes a bead by hand a week after the work landed, and a reopened bead's first cycle's work sits
+ * before its second close — the last is the one that must not count, and only the board's history
+ * tells it from the others. So the history is read, and the work is stale when the bead was
+ * reopened after it: what the board holds now is a later cycle's — closed again, or still open for
+ * rework — and this work says nothing about it. Never reopened, or reopened before the work, and it
+ * stands. An unreadable history fails closed, for the reason every other read here does.
+ *
+ * A branch updated from its base after the reopen carries a merge commit dated then and adds no
+ * work; a rebase re-dates without adding any, but the older of a commit's two dates
+ * ({@link PullRequestCommit}) does not move with it. The first is named, not defended against: a
+ * hand on the pull request after the reopen is the operator's, and the refusal a human sees names
+ * the date it measured.
+ */
+async function workOfCurrentCycle(
+  repoPath: string,
+  bead: Bead,
+  workedAt: string,
+  what: string,
+): Promise<{ stale?: string }> {
+  const worked = Date.parse(workedAt);
+  if (Number.isNaN(worked)) {
+    return { stale: `when ${what} was committed could not be read ("${workedAt}" is not a date)` };
+  }
+  const closed = bead.status === "closed";
+  const closedAt = closed && typeof bead.closed_at === "string" ? Date.parse(bead.closed_at) : NaN;
+  if (!Number.isNaN(closedAt) && worked >= closedAt) return {};
+
+  const reopen = await lastReopenOf(repoPath, bead);
+  switch (reopen.state) {
+    case "never":
+      return {};
+    case "unreadable":
+      return {
+        stale:
+          `${what} is dated ${workedAt}, which ` +
+          `${closed ? "predates the close the board holds" : `may not be the ${bead.status} work the board holds`}, ` +
+          `and ${reopen.why}`,
+      };
+    case "reopened":
+      if (reopen.instant <= worked) return {};
+      return {
+        stale:
+          `${what} is dated ${workedAt}, which is an earlier cycle's — the board reopened ` +
+          `\`${bead.id}\` at ${reopen.at}, after it, so what it holds now ` +
+          `${closed ? "is later work under that close" : `is later work still ${bead.status}`}, ` +
+          `and nothing says THAT work landed`,
+      };
+  }
+}
+
+/**
+ * Is a commit in the base naming a closed bead its CURRENT cycle's work (PR #238 review)?
+ *
+ * Only while the bead has never been reopened. The commit is dated when it entered the base — for
+ * the squash anton merges by, the merge itself — and a merge dates nothing about the work it
+ * carries: a pull request still open when its bead was reopened and merged unchanged afterwards
+ * lands a naming commit dated after the reopen that holds only the cycle the reopen undid. So once
+ * the history shows a reopen the commit route is inconclusive either way — an earlier date is the
+ * earlier cycle's landing outright, a later one could be either — and the pull request's own
+ * commits ({@link workOfCurrentCycle}) are what can still say which cycle's work the base holds.
+ * No `closed_at` shortcut, for the same reason: a merge after the second close is still a merge.
+ */
+async function commitOfCurrentCycle(
+  repoPath: string,
+  bead: Bead,
+  naming: { sha: string; landedAt: string },
+): Promise<{ stale?: string }> {
+  const reopen = await lastReopenOf(repoPath, bead);
+  if (reopen.state === "never") return {};
+  if (reopen.state === "unreadable") return { stale: reopen.why };
+  const landed = Date.parse(naming.landedAt);
+  if (Number.isNaN(landed)) {
+    return { stale: `when that landing happened could not be read ("${naming.landedAt}" is not a date)` };
+  }
+  const holds = bead.status === "closed" ? "is later work under that close" : `is later work still ${bead.status}`;
+  if (landed < reopen.instant) {
+    return {
+      stale:
+        `that landing (${naming.landedAt}) is an earlier cycle's — the board reopened \`${bead.id}\` at ` +
+        `${reopen.at}, after it, so what it holds now ${holds}, and nothing says THAT work landed`,
+    };
+  }
+  return {
+    stale:
+      `the board reopened \`${bead.id}\` at ${reopen.at}, and commit \`${naming.sha.slice(0, 10)}\` ` +
+      `dates its merge (${naming.landedAt}), not the work it carries — a pull request opened before ` +
+      `the reopen lands unchanged with a later date — so which cycle's work the base holds only ` +
+      `the pull request's own commits can say`,
+  };
+}
+
+/**
+ * When the bead last left `closed`, from the board's history — or why that could not be read.
  *
  * `bd flatten` erases the record this reads — a board squashed to one version reads as never
  * reopened. Named, not defended against: the operator who flattens has chosen to lose history.
  */
-async function landingOfCurrentCycle(
+async function lastReopenOf(
   repoPath: string,
   bead: Bead,
-  landedAt: string,
-): Promise<{ stale?: string }> {
-  const landed = Date.parse(landedAt);
-  if (Number.isNaN(landed)) {
-    return { stale: `when that landing happened could not be read ("${landedAt}" is not a date)` };
-  }
-  const closedAt =
-    bead.status === "closed" && typeof bead.closed_at === "string" ? Date.parse(bead.closed_at) : NaN;
-  if (!Number.isNaN(closedAt) && landed >= closedAt) return {};
-
+): Promise<
+  | { state: "never" }
+  | { state: "reopened"; at: string; instant: number }
+  | { state: "unreadable"; why: string }
+> {
   let versions;
   try {
     versions = await beads.history(repoPath, bead.id);
   } catch (error) {
-    const closed = bead.status === "closed";
     return {
-      stale:
-        `that landing (${landedAt}) ${closed ? "predates the close the board holds" : `may not be the ${bead.status} work the board holds`}, ` +
-        `and whether \`${bead.id}\` was reopened since could not be read ` +
+      state: "unreadable",
+      why:
+        `whether \`${bead.id}\` was reopened since could not be read ` +
         `(${error instanceof Error ? error.message : String(error)})`,
     };
   }
-  const reopenedAt = lastReopen(versions);
-  if (reopenedAt === undefined) return {};
-  const reopened = Date.parse(reopenedAt);
-  if (Number.isNaN(reopened)) {
+  const at = lastReopen(versions);
+  if (at === undefined) return { state: "never" };
+  const instant = Date.parse(at);
+  if (Number.isNaN(instant)) {
     return {
-      stale:
-        `the board's history dates \`${bead.id}\`'s last reopen as "${reopenedAt}", which is not a ` +
-        `date — whether it was reopened before or after that landing (${landedAt}) could not be read`,
+      state: "unreadable",
+      why:
+        `the board's history dates \`${bead.id}\`'s last reopen as "${at}", which is not a date — ` +
+        `when it was reopened could not be read`,
     };
   }
-  if (reopened <= landed) return {};
-  return {
-    stale:
-      `that landing (${landedAt}) is an earlier cycle's — the board reopened \`${bead.id}\` at ` +
-      `${reopenedAt}, after it, so what it holds now ` +
-      `${bead.status === "closed" ? "is later work under that close" : `is later work still ${bead.status}`}, ` +
-      `and nothing says THAT work landed`,
-  };
+  return { state: "reopened", at, instant };
 }
 
 /**
@@ -1366,7 +1476,9 @@ async function retirementDrifted(
  * through its own PR whatever its status (the `pr` landing) passes no status fence at all: reopened
  * in the window with the pointer kept, it is the same bead holding the same merged PR, and only the
  * reopen in its history says the work it holds now is not what that merge shipped. So the check's
- * own question ({@link landingOfCurrentCycle}) is re-asked of the fresh read, whatever it reads as.
+ * own question ({@link workOfCurrentCycle}, {@link commitOfCurrentCycle}) is re-asked of the fresh
+ * read, whatever it reads as — against the date the check stored, since a merged PR's commits do
+ * not change.
  */
 async function stillCurrentCycle(
   repoPath: string,
@@ -1374,7 +1486,15 @@ async function stillCurrentCycle(
   landing: BeadLanding,
   targetId: string,
 ): Promise<string | undefined> {
-  const cycle = await landingOfCurrentCycle(repoPath, replacement, landing.landedAt);
+  const cycle =
+    landing.via === "commit"
+      ? await commitOfCurrentCycle(repoPath, replacement, landing)
+      : await workOfCurrentCycle(
+          repoPath,
+          replacement,
+          landing.workedAt,
+          landing.via === "pr" ? ownWork(landing.ref) : carriedWork(landing.ref),
+        );
   if (!cycle.stale) return undefined;
   return (
     `\`${replacement.id}\` is not ${replacement.status} on the evidence anton verified — ${cycle.stale}; ` +

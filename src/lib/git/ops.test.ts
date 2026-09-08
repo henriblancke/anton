@@ -33,7 +33,9 @@ import {
   pullRequestState,
   readFileAtRev,
   readPullRequestMerge,
-  readPullRequestNaming,
+  readPullRequestCommits,
+  newestPullRequestCommit,
+  pullRequestCommitNaming,
   readPathHistory,
   readWorktreeState,
   resolveFreshBase,
@@ -42,7 +44,6 @@ import {
   sameWorktreeState,
   worktreeHasCommitFor,
   branchContainsCommit,
-  readCommitDate,
   readCommitNaming,
   readCommitReach,
 } from "./ops";
@@ -325,36 +326,63 @@ process.exit(0);
     expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({ state: "unknown" });
   });
 
-  // The PR's own commit list is GitHub's record of what it carried — read for a closed bead the
-  // base names nowhere, so that the board's parentage today is not what vouches for it.
-  it("finds a bead named in one of the PR's recorded commits, as a whole token", async () => {
+  // The PR's own commit list is GitHub's record of what it carried and WHEN — read for a closed
+  // bead the base names nowhere, so that the board's parentage today is not what vouches for it,
+  // and for every merged PR, so that its merge's date is not what places its work in time.
+  it("reads each commit with its message and the OLDER of its two dates — the one a rebase keeps", async () => {
     process.env.ANTON_TEST_PR_STATE = "MERGED";
     process.env.ANTON_TEST_PR_COMMITS = JSON.stringify([
-      { oid: "b".repeat(40), messageHeadline: "anton-fade1: a longer id", messageBody: "" },
-      { oid: "c".repeat(40), messageHeadline: "anton-fade.1: the dotted child", messageBody: "" },
-      { oid: "d".repeat(40), messageHeadline: "feat: the subject", messageBody: "closes anton-fade." },
+      {
+        oid: "b".repeat(40),
+        messageHeadline: "anton-fade: the work",
+        messageBody: "as first written",
+        authoredDate: "2020-01-01T00:00:00Z",
+        committedDate: "2020-03-01T00:00:00Z",
+      },
+      // Not a sha — skipped, as the naming read always did.
+      { oid: "HEAD~1", messageHeadline: "anton-fade: not a commit", committedDate: "2021-01-01T00:00:00Z" },
+      { oid: "c".repeat(40), messageHeadline: "chore: authored date only", authoredDate: "2020-02-01T00:00:00Z" },
     ]);
-    expect(await readPullRequestNaming(sandbox, "gh-42", "anton-fade")).toEqual({
-      state: "found",
-      sha: "d".repeat(40),
+    expect(await readPullRequestCommits(sandbox, "gh-42")).toEqual({
+      state: "read",
+      commits: [
+        { sha: "b".repeat(40), message: "anton-fade: the work\nas first written", workedAt: "2020-01-01T00:00:00Z" },
+        { sha: "c".repeat(40), message: "chore: authored date only\n", workedAt: "2020-02-01T00:00:00Z" },
+      ],
     });
-    expect(await readPullRequestNaming(sandbox, "gh-42", "anton-fade.1")).toEqual({
-      state: "found",
-      sha: "c".repeat(40),
-    });
-    expect(await readPullRequestNaming(sandbox, "gh-42", "anton-x1e5")).toEqual({ state: "none" });
   });
 
-  it("fails closed when gh cannot read the PR, names no commit list, or the ref names nothing", async () => {
+  it("finds the NEWEST commit naming a bead, as a whole token, and the newest commit overall", async () => {
+    const commits = [
+      { sha: "b".repeat(40), message: "anton-fade1: a longer id\n", workedAt: "2020-05-01T00:00:00Z" },
+      { sha: "c".repeat(40), message: "anton-fade.1: the dotted child\n", workedAt: "2020-04-01T00:00:00Z" },
+      { sha: "d".repeat(40), message: "feat: the subject\ncloses anton-fade.", workedAt: "2020-01-01T00:00:00Z" },
+      { sha: "e".repeat(40), message: "anton-fade: the rework\n", workedAt: "2020-03-01T00:00:00Z" },
+    ];
+    expect(pullRequestCommitNaming(commits, "anton-fade")).toMatchObject({ sha: "e".repeat(40) });
+    expect(pullRequestCommitNaming(commits, "anton-fade.1")).toMatchObject({ sha: "c".repeat(40) });
+    expect(pullRequestCommitNaming(commits, "anton-x1e5")).toBeUndefined();
+    expect(pullRequestCommitNaming(commits, "not an id")).toBeUndefined();
+    expect(newestPullRequestCommit(commits)).toMatchObject({ sha: "b".repeat(40) });
+    expect(newestPullRequestCommit([])).toBeUndefined();
+  });
+
+  it("fails closed when gh cannot read the PR, names no commit list, dates a commit with nothing, or the ref names nothing", async () => {
     process.env.ANTON_TEST_PR_STATE = "__error__";
-    expect(await readPullRequestNaming(sandbox, "gh-42", "anton-fade")).toMatchObject({ state: "unreadable" });
+    expect(await readPullRequestCommits(sandbox, "gh-42")).toMatchObject({ state: "unreadable" });
     process.env.ANTON_TEST_PR_STATE = "MERGED";
-    expect(await readPullRequestNaming(sandbox, "gh-42", "anton-fade")).toMatchObject({
+    expect(await readPullRequestCommits(sandbox, "gh-42")).toMatchObject({
       state: "unreadable",
       detail: expect.stringContaining("no commit list"),
     });
-    expect(await readPullRequestNaming(sandbox, "", "anton-fade")).toMatchObject({ state: "unreadable" });
-    expect(await readPullRequestNaming(sandbox, "gh-42", "not an id")).toMatchObject({ state: "unreadable" });
+    process.env.ANTON_TEST_PR_COMMITS = JSON.stringify([
+      { oid: "b".repeat(40), messageHeadline: "anton-fade: undated", committedDate: "last tuesday" },
+    ]);
+    expect(await readPullRequestCommits(sandbox, "gh-42")).toMatchObject({
+      state: "unreadable",
+      detail: expect.stringContaining("with nothing"),
+    });
+    expect(await readPullRequestCommits(sandbox, "")).toMatchObject({ state: "unreadable" });
   });
 
   it("maps gh states to open / merged / closed, strips the gh- ref prefix", async () => {
@@ -434,41 +462,6 @@ suite("worktreeHasCommitFor (real git)", () => {
     // caller asked to see the failure, because absence is the answer that drops a ticket for it.
     expect(await worktreeHasCommitFor(repo, "anton-new1", { base: "origin/nope" })).toBe(false);
     await expect(worktreeHasCommitFor(repo, "anton-new1", { base: "origin/nope", strict: true })).rejects.toThrow();
-  });
-});
-
-suite("readCommitDate (real git)", () => {
-  let sandbox: string;
-  let repo: string;
-
-  beforeEach(() => {
-    sandbox = mkdtempSync(join(tmpdir(), "anton-commitdate-"));
-    repo = join(sandbox, "repo");
-    mkdirSync(repo);
-    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
-    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"], { stdio: "ignore" });
-    execFileSync("git", ["-C", repo, "config", "user.name", "anton-test"], { stdio: "ignore" });
-  });
-
-  afterEach(() => {
-    rmSync(sandbox, { recursive: true, force: true });
-  });
-
-  it("reads the committer date, which a rebase moves and the author date keeps", async () => {
-    writeFileSync(join(repo, "README.md"), "# sandbox\n");
-    execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" });
-    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init"], {
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        GIT_AUTHOR_DATE: "2020-01-01T00:00:00Z",
-        GIT_COMMITTER_DATE: "2021-06-15T12:00:00Z",
-      },
-    });
-    const sha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-
-    expect(Date.parse(await readCommitDate(repo, sha))).toBe(Date.parse("2021-06-15T12:00:00Z"));
-    await expect(readCommitDate(repo, "0".repeat(40))).rejects.toThrow();
   });
 });
 
