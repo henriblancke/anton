@@ -10,7 +10,7 @@
  * table sat NEXT TO the public job API and the boot lifecycle; that is what moved.
  */
 import { makeExecuteEpicHandler } from "./execute-epic";
-import { makeReviewFixHandler } from "./review-fix";
+import { makeReviewFixHandler, makeReviewFixPrHandler } from "./review-fix";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
 import { makeOrphanGroomingHandler } from "./orphan-grooming";
 import { makeSyncPushHandler } from "./sync-push";
@@ -28,6 +28,7 @@ import type { JobRunner } from "./runner";
 export function registerJobHandlers(runner: JobRunner, db: AntonDb): void {
   runner.registerHandler("execute-epic", makeExecuteEpicHandler({ db }));
   runner.registerHandler("review-fix", makeReviewFixHandler({ db }));
+  runner.registerHandler("review-fix-pr", makeReviewFixPrHandler({ db }));
   runner.registerHandler("nightly-stringer", makeNightlyStringerHandler({ db }));
   runner.registerHandler("orphan-grooming", makeOrphanGroomingHandler({ db }));
   runner.registerHandler("sync-push", makeSyncPushHandler({ db }));

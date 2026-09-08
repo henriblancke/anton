@@ -16,6 +16,7 @@ import { describeWipHold } from "../autopilot-wip";
 import { loadAllIssues } from "../beads/issues";
 import type { Bead } from "../beads/types";
 import { pickerTrackRecord } from "../picker-veto";
+import { errorText } from "../retry-helpers";
 import {
   getProjectSettings,
   resolvePickerAutonomy,
@@ -194,8 +195,4 @@ export function pickerWipLimit(db: AntonDb, projectId: string): PickerWipLimitCh
 /** One review slot's identity, shared by the two reconciliations that compare slots across reads. */
 export function slotKey(beadId: string, prNumber: number): string {
   return `${beadId}#${prNumber}`;
-}
-
-function errorText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }

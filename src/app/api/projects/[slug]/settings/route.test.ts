@@ -620,6 +620,54 @@ describe("settings route — self-review settings (anton-of1m)", () => {
   });
 });
 
+/**
+ * The per-PR fix cap (anton-kwi6). It rides the settings JSON blob like every other numeric policy
+ * knob, and is bounded at the API boundary so a value the runner would misbehave on never persists.
+ */
+describe("settings route — reviewFixConcurrency (anton-kwi6)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("defaults by absence: a fresh project persists no key", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.reviewFixConcurrency).toBeUndefined();
+    expect("reviewFixConcurrency" in persisted()).toBe(false);
+  });
+
+  it("round-trips a value in range", async () => {
+    const res = await PATCH(patchReq({ reviewFixConcurrency: 4 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewFixConcurrency).toBe(4);
+    expect(persisted().reviewFixConcurrency).toBe(4);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.reviewFixConcurrency).toBe(4);
+  });
+
+  it("rejects out-of-range and non-integer values, leaving the stored value untouched", async () => {
+    await PATCH(patchReq({ reviewFixConcurrency: 2 }), ctx("tmp"));
+    for (const bad of [0, 7, -1, 2.5, "3", []]) {
+      expect((await PATCH(patchReq({ reviewFixConcurrency: bad }), ctx("tmp"))).status).toBe(400);
+    }
+    expect(persisted().reviewFixConcurrency).toBe(2);
+  });
+
+  it('"" / null clears it back to the shipped default', async () => {
+    await PATCH(patchReq({ reviewFixConcurrency: 5 }), ctx("tmp"));
+    const res = await PATCH(patchReq({ reviewFixConcurrency: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewFixConcurrency).toBeUndefined();
+    expect("reviewFixConcurrency" in persisted()).toBe(false);
+  });
+});
+
 describe("settings route — per-label pipeline variants (anton-aa3m)", () => {
   beforeEach(async () => {
     tdb = makeTestDb();

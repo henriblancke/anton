@@ -1,5 +1,5 @@
 /**
- * The spent-attempts migration (drizzle/0032, PR #248 review), asserted against the only database
+ * The spent-attempts migration (drizzle/0033, PR #248 review), asserted against the only database
  * that can go wrong: one that already holds jobs with attempts on them.
  *
  * Before the column existed the spend estimate charged `attempts`, so on an upgrading machine that
@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { applyMigrationFile, applyMigrationsTo } from "./testing";
 
-const MIGRATION = "0032_jobs_spent_attempts.sql";
+const MIGRATION = "0033_jobs_spent_attempts.sql";
 
 /** The reverse, read out of the migration's own header so the tested recipe is the documented one. */
 function reverseStatements(): string[] {

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "./gardener/autonomy";
+import type { ProjectSettings } from "./projects";
 
 let workDir: string;
 let dbFile: string;
@@ -20,12 +21,14 @@ let resolveProjectBudgetPolicy: typeof import("./projects").resolveProjectBudget
 let resolveBudgetPolicy: typeof import("./projects").resolveBudgetPolicy;
 let DEFAULT_PROJECT_BUDGET_POLICY: typeof import("./projects").DEFAULT_PROJECT_BUDGET_POLICY;
 let updateProjectSettings: typeof import("./projects").updateProjectSettings;
+let updateProjectSettingsIf: typeof import("./projects").updateProjectSettingsIf;
 let getProjectSettingsBySlug: typeof import("./projects").getProjectSettingsBySlug;
 let isBudgetAwareEnabledAnywhere: typeof import("./projects").isBudgetAwareEnabledAnywhere;
 let budgetAwareProjectPolicies: typeof import("./projects").budgetAwareProjectPolicies;
 let resolveValueLabels: typeof import("./projects").resolveValueLabels;
 let valueLabelsSchema: typeof import("./projects").valueLabelsSchema;
 let resolvePickerAutonomy: typeof import("./projects").resolvePickerAutonomy;
+let resolvePickerApplyOverride: typeof import("./projects").resolvePickerApplyOverride;
 
 beforeAll(async () => {
   workDir = mkdtempSync(join(tmpdir(), "anton-projects-test-"));
@@ -54,12 +57,14 @@ beforeAll(async () => {
   resolveBudgetPolicy = mod.resolveBudgetPolicy;
   DEFAULT_PROJECT_BUDGET_POLICY = mod.DEFAULT_PROJECT_BUDGET_POLICY;
   updateProjectSettings = mod.updateProjectSettings;
+  updateProjectSettingsIf = mod.updateProjectSettingsIf;
   getProjectSettingsBySlug = mod.getProjectSettingsBySlug;
   isBudgetAwareEnabledAnywhere = mod.isBudgetAwareEnabledAnywhere;
   budgetAwareProjectPolicies = mod.budgetAwareProjectPolicies;
   resolveValueLabels = mod.resolveValueLabels;
   valueLabelsSchema = mod.valueLabelsSchema;
   resolvePickerAutonomy = mod.resolvePickerAutonomy;
+  resolvePickerApplyOverride = mod.resolvePickerApplyOverride;
 });
 
 afterAll(() => {
@@ -422,6 +427,45 @@ describe("updateProjectSettings is atomic against a concurrent write", () => {
   });
 });
 
+/**
+ * A conditional writer decides against the settings its write lands on, not against a snapshot read
+ * before it. Anything that answers "already done, nothing changed" with a 409 — the deliberate
+ * arming of `apply`, say — is only telling the truth if the check and the write are one act.
+ */
+describe("updateProjectSettingsIf decides under the write lock", () => {
+  it("applies the first of two racing writers and refuses the second", async () => {
+    const created = await addProject({
+      name: "Conditional Write",
+      repoPath: makeRepoDir("conditional-write"),
+    });
+    const claim = (model: string) =>
+      updateProjectSettingsIf<string>(created.slug, (current) =>
+        current.model ? { refuse: `already ${current.model}` } : { write: { model } },
+      );
+    const results = await Promise.all([claim("claude-opus-5"), claim("claude-sonnet-5")]);
+
+    const applied = results.filter((r) => r.applied);
+    expect(applied).toHaveLength(1);
+    const stored = await getProjectSettingsBySlug(created.slug);
+    expect(stored.model).toBe(applied[0]!.settings.model);
+    // The loser sees the winner's state, which is what a 409 quotes back to the operator.
+    const refused = results.find((r) => !r.applied)!;
+    expect(refused).toMatchObject({ applied: false, refused: `already ${stored.model}` });
+    expect(refused.settings.model).toBe(stored.model);
+  });
+
+  it("writes nothing when the decision refuses", async () => {
+    const created = await addProject({
+      name: "Refused Write",
+      repoPath: makeRepoDir("refused-write"),
+    });
+    await updateProjectSettings(created.slug, { model: "claude-opus-5" });
+    const result = await updateProjectSettingsIf<"nope">(created.slug, () => ({ refuse: "nope" }));
+    expect(result.applied).toBe(false);
+    expect((await getProjectSettingsBySlug(created.slug)).model).toBe("claude-opus-5");
+  });
+});
+
 describe("isBudgetAwareEnabledAnywhere (anton-7mpv.1)", () => {
   it("is false when no project has budget-aware execution on (the default)", async () => {
     const created = await addProject({ name: "Budget Off", repoPath: makeRepoDir("budget-off") });
@@ -511,5 +555,88 @@ describe("resolvePickerAutonomy (anton-qlci, anton-vkp9)", () => {
     const armed = { pickerPolicy: { types: ["bug"] } };
     expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "shadow" }, NO_RECORD)).toBe("shadow");
     expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "propose" }, NO_RECORD)).toBe("propose");
+  });
+});
+
+describe("deliberate arming (anton-d1lk)", () => {
+  const BAR = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+  const EARNED = { settled: BAR.minSettled, accepted: BAR.minSettled };
+  const NO_RECORD = { settled: 0, accepted: 0 };
+  const SIGNED = { by: "Henri Blancke", at: "2026-09-06T10:00:00.000Z" };
+  /** An armed project asking for apply with nothing yet to show for it — the floored case. */
+  const ARMED_APPLY = { pickerPolicy: { types: ["bug"] }, pickerAutonomy: "apply" as const };
+
+  it("lets a signed arming reach apply without the record", () => {
+    expect(resolvePickerAutonomy(ARMED_APPLY, NO_RECORD)).toBe("shadow");
+    expect(resolvePickerAutonomy({ ...ARMED_APPLY, pickerApplyOverride: SIGNED }, NO_RECORD)).toBe(
+      "apply",
+    );
+  });
+
+  it("returns the project to the floored level when the arming is revoked", () => {
+    // Revoking is deleting the signature; the stored level stays `apply` and the floor answers again.
+    const revoked = { ...ARMED_APPLY, pickerApplyOverride: undefined };
+    expect(resolvePickerAutonomy(revoked, NO_RECORD)).toBe("shadow");
+    expect(resolvePickerAutonomy(revoked, EARNED)).toBe("apply");
+  });
+
+  it("never lets an UNARMED project reach apply, however deliberately it was signed", () => {
+    // The structural floor is not what a signature can accept the risk of: with no work policy the
+    // plan admits every claimable target, so there is no boundary to have accepted.
+    expect(
+      resolvePickerAutonomy({ pickerAutonomy: "apply", pickerApplyOverride: SIGNED }, EARNED),
+    ).toBe("shadow");
+    expect(
+      resolvePickerAutonomy({ pickerAutonomy: "apply", pickerApplyOverride: SIGNED }, NO_RECORD),
+    ).toBe("shadow");
+  });
+
+  it("does not promote a project that never asked for apply", () => {
+    // The arming answers the floor, not the level: a signed project sitting on `shadow` stays there.
+    const shadow = { pickerPolicy: { types: ["bug"] }, pickerApplyOverride: SIGNED };
+    expect(resolvePickerAutonomy(shadow, NO_RECORD)).toBe("shadow");
+    expect(resolvePickerAutonomy({ ...shadow, pickerAutonomy: "shadow" }, NO_RECORD)).toBe("shadow");
+    expect(resolvePickerAutonomy({ ...shadow, pickerAutonomy: "propose" }, NO_RECORD)).toBe(
+      "propose",
+    );
+  });
+
+  it("ignores an arming it cannot read, rather than arming apply off a fragment", () => {
+    // settingsJson is hand-editable. A signature missing its half — or carrying an `at` that is not
+    // an instant — is not an audit trail, so the earned floor answers as if nothing were stored.
+    const fragments = [
+      {},
+      { by: "Henri Blancke" },
+      { at: SIGNED.at },
+      { by: "", at: SIGNED.at },
+      { by: "Henri Blancke", at: "yesterday" },
+    ];
+    for (const broken of fragments) {
+      const settings = { ...ARMED_APPLY, pickerApplyOverride: broken } as ProjectSettings;
+      expect(resolvePickerApplyOverride(settings)).toBeUndefined();
+      expect(resolvePickerAutonomy(settings, NO_RECORD)).toBe("shadow");
+    }
+    expect(resolvePickerApplyOverride({ ...ARMED_APPLY, pickerApplyOverride: SIGNED })).toEqual(
+      SIGNED,
+    );
+  });
+
+  it("stores the signature and clears it, through the settings store", async () => {
+    const created = await addProject({ name: "Armed", repoPath: makeRepoDir("deliberate-arm") });
+    await updateProjectSettings(created.slug, {
+      pickerPolicy: { types: ["bug"] },
+      pickerAutonomy: "apply",
+      pickerApplyOverride: SIGNED,
+    });
+    const armed = await getProjectSettingsBySlug(created.slug);
+    expect(armed.pickerApplyOverride).toEqual(SIGNED);
+    expect(resolvePickerAutonomy(armed, NO_RECORD)).toBe("apply");
+
+    await updateProjectSettings(created.slug, { pickerApplyOverride: undefined });
+    const revoked = await getProjectSettingsBySlug(created.slug);
+    expect(revoked.pickerApplyOverride).toBeUndefined();
+    // The level the operator chose survives the revoke — only the bypass is gone.
+    expect(revoked.pickerAutonomy).toBe("apply");
+    expect(resolvePickerAutonomy(revoked, NO_RECORD)).toBe("shadow");
   });
 });

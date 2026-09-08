@@ -43,7 +43,13 @@ import { resolveStepIn } from "./steps/resolve";
 import type { CookedStep } from "./steps/context";
 import type { StepDefinition } from "./steps/result";
 
-export { stepSubject, type CookedStep, type StepContext, type StepDeps } from "./steps/context";
+export {
+  stepSubject,
+  type CookedStep,
+  type SatisfiedSettlement,
+  type StepContext,
+  type StepDeps,
+} from "./steps/context";
 export {
   type StepClass,
   type StepDefinition,

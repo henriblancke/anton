@@ -173,6 +173,7 @@ describe("a superseded generation", () => {
   it.each([
     ["a claim landed first", { assignee: "another-operator" }, "held by another-operator"],
     ["its run already started", { status: "in_progress" as const }, "in_progress"],
+    ["its run already finished", { status: "closed" as const }, "closed"],
   ])("refuses a target that was already settled — %s — without advising a second approval", async (
     _case,
     moved,
@@ -188,10 +189,31 @@ describe("a superseded generation", () => {
 
     const verdict = await resolve(displayed, board);
 
+    expect(verdict).toMatchObject({ refusal: "settled" });
     const refusal = "refuse" in verdict ? verdict.refuse : "";
     expect(refusal).toContain("already taken");
     expect(refusal).toContain(detail);
     expect(refusal).not.toContain("approve it directly");
+    expect(await listPickerVerdicts(test.db, PROJECT)).toHaveLength(0);
+  });
+
+  it.each([
+    ["an unmet blocker", "blocked" as const],
+    ["a deferral", "deferred" as const],
+  ])("refuses a target idled by %s as retired — its remedy is not a refresh", async (_case, status) => {
+    // `not-open` covers every non-open status, but only some are a start somebody else made (PR #245
+    // review). A blocked or deferred target has no run and no claim: the operator needs to clear the
+    // blocker or lift the hold, and "already taken" would hide that behind a stale-surface reading.
+    const board = [BOARD[0]!, bead("target", { priority: 2, status })];
+    const displayed = await record([{ beadId: "target", rank: 1, rule: "before it moved" }], board);
+    await record([{ beadId: "urgent", rank: 1, rule: "the pass that replaced it" }], board);
+
+    const verdict = await resolve(displayed, board);
+
+    expect(verdict).toMatchObject({ refusal: "retired" });
+    const refusal = "refuse" in verdict ? verdict.refuse : "";
+    expect(refusal).toContain(`not-open — ${status}`);
+    expect(refusal).not.toContain("already taken");
     expect(await listPickerVerdicts(test.db, PROJECT)).toHaveLength(0);
   });
 

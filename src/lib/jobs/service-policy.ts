@@ -11,6 +11,7 @@ import {
   DEFAULT_CONCURRENCY,
   DEFAULT_JOB_TIMEOUT_MINUTES,
   DEFAULT_MAX_RETRIES,
+  DEFAULT_REVIEW_FIX_CONCURRENCY,
   getProjectById,
   getProjectSettings,
   resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
@@ -31,6 +32,9 @@ export async function resolvePolicy(projectId: string | undefined) {
   const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
   return {
     concurrency: settings.concurrency ?? DEFAULT_CONCURRENCY,
+    // Per-PR review fixes get their own ceiling (anton-kwi6): the fan-out is unbounded by the
+    // number of PRs in review, so without it a busy review day fills the global slot pool.
+    reviewFixConcurrency: settings.reviewFixConcurrency ?? DEFAULT_REVIEW_FIX_CONCURRENCY,
     timeoutMs: (settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES) * 60_000,
     maxAttempts: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
     // Autonomy master-switch (anton-y3l): off pauses claiming of this project's execute-epic

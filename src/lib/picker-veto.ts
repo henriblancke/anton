@@ -21,7 +21,7 @@
  * read path goes through the shared anton.db.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { and, desc, eq, gt, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, ne, or } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { PolicyCriterionKey } from "./policy/types";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -42,11 +42,32 @@ export type PickerVerdictAction = "not-now" | "never" | "release";
 /** What the operator said about the pick. `release` accepts; both vetoes decline. */
 export type PickerVerdict = "accepted" | "declined";
 
+/**
+ * What a decline MEANT, which is not the same question as which button produced it (anton-gtcd).
+ *
+ *   • `pacing`       — `✕ not now`. "Not this hour." An answer about the operator's own schedule,
+ *                      which says nothing about whether the pick was well chosen.
+ *   • `disagreement` — `Never`. An answer about the RULE that admitted the pick, which is why it
+ *                      sends the operator at the criterion to tighten.
+ *
+ * Only the second is evidence about the ranking, so only the second belongs in the record the
+ * earned-autonomy floor weighs. Both still defer, identically — the split is about what the row
+ * MEANS, never about what the veto does.
+ */
+export type PickerVetoKind = "pacing" | "disagreement";
+
+/** Which meaning an affordance carries. `Never` is the only veto that disagrees. */
+function vetoKindOf(action: Exclude<PickerVerdictAction, "release">): PickerVetoKind {
+  return action === "never" ? "disagreement" : "pacing";
+}
+
 /** One recorded answer to one pick. */
 export interface PickerVerdictRow {
   beadId: string;
   verdict: PickerVerdict;
   action: PickerVerdictAction;
+  /** What the decline meant; absent on an accept, which vetoes nothing. */
+  vetoKind?: PickerVetoKind;
   rule?: string;
   criterion?: PolicyCriterionKey;
   rank?: number;
@@ -170,6 +191,7 @@ function standingDecline(
     tx
       .select({
         id: schema.pickerVerdicts.id,
+        vetoKind: schema.pickerVerdicts.vetoKind,
         rule: schema.pickerVerdicts.rule,
         criterion: schema.pickerVerdicts.criterion,
         rank: schema.pickerVerdicts.rank,
@@ -198,6 +220,18 @@ function standingDecline(
  * Shared by the veto itself and by the REPLAY a withdrawn reservation performs
  * ({@link withdrawPickerAccept}) — one place decides what a decline does, so a replayed veto lands
  * exactly as the original would have.
+ *
+ * The extension keeps the STRONGER meaning (anton-gtcd). `action` records the last affordance that
+ * touched the row, so a `not-now` restating a pick the operator already said `Never` to overwrites
+ * it — and a record that read the meaning off `action` would have that pacing click quietly retract
+ * the disagreement, turning it into evidence the operator never objected. What was said cannot be
+ * unsaid by saying less: once a decline is disagreement it stays disagreement, exactly as the
+ * criterion it was sent at survives the same overwrite.
+ *
+ * And a `not-now` establishes nothing about a decline nobody classified (PR #245 review). A row
+ * `0030_picker_veto_kind` left NULL is one that may be a criterion-less `Never` under a later
+ * `not-now`; the record counts it for exactly that reason, and a fresh pacing click is not evidence
+ * that it was pacing all along. Only a `Never` moves it — to disagreement.
  */
 function writeDecline(
   tx: Pick<AntonDb, "select" | "insert" | "update">,
@@ -213,6 +247,7 @@ function writeDecline(
     tx.update(schema.pickerVerdicts)
       .set({
         action: input.action,
+        vetoKind: input.action === "never" ? "disagreement" : standing.vetoKind,
         rule: input.rule ?? standing.rule,
         criterion: input.criterion ?? standing.criterion,
         rank: input.rank ?? standing.rank,
@@ -229,6 +264,7 @@ function writeDecline(
         beadId: input.beadId,
         verdict: "declined",
         action: input.action,
+        vetoKind: vetoKindOf(input.action),
         rule: input.rule ?? null,
         criterion: input.criterion ?? null,
         rank: input.rank ?? null,
@@ -254,15 +290,23 @@ function writeDecline(
  * process that dies mid-release leaves the accept standing with nobody to withdraw it either. An
  * entry whose accept kept its run is never claimed, so entries are aged out on the next loss rather
  * than by a timer nothing else needs.
+ *
+ * EVERY loser is kept, in the order it lost (PR #245 review). Two stale tabs can both veto one
+ * reservation — a `Never` and then a `not-now` — and keeping only the latest would replay the pacing
+ * click alone, filing a fresh decline with no disagreement and no criterion: the withdrawal would
+ * have erased the `Never` that the standing-decline merge in {@link writeDecline} exists to keep.
+ * Replaying the sequence through that same merge lands exactly what the vetoes would have landed
+ * had the reservation never stood in their way.
  */
 const CONTESTED_TTL_MS = 10 * 60 * 1000;
-const contestedVetoes = new Map<string, { input: RecordVetoInput; atMs: number }>();
+const contestedVetoes = new Map<string, { inputs: RecordVetoInput[]; atMs: number }>();
 
 function holdContestedVeto(acceptId: string, input: RecordVetoInput, nowMs: number): void {
   for (const [id, held] of contestedVetoes) {
     if (nowMs - held.atMs > CONTESTED_TTL_MS) contestedVetoes.delete(id);
   }
-  contestedVetoes.set(acceptId, { input, atMs: nowMs });
+  const held = contestedVetoes.get(acceptId);
+  contestedVetoes.set(acceptId, { inputs: [...(held?.inputs ?? []), input], atMs: nowMs });
 }
 
 /** What a veto did: the hold it placed, or the release that answered this pick first. */
@@ -364,6 +408,9 @@ export async function recordPickerAccept(
           beadId: input.beadId,
           verdict: "accepted",
           action: "release",
+          // A release vetoes nothing, so there is no veto to classify — stated, like the criterion
+          // and the expiry beside it, rather than left to whatever a future default might be.
+          vetoKind: null,
           rule: input.rule ?? null,
           criterion: null,
           rank: input.rank ?? null,
@@ -393,9 +440,11 @@ export async function recordPickerAccept(
  * got said the target was already running; once the run turns out not to exist, the operator is left
  * with no run, no accept and no hold on a pick they refused — so the decline they were denied is
  * filed here instead, in the same transaction, exactly as {@link recordPickerVeto} would have filed
- * it. A veto that lost to an accept whose run DID start stays lost, which is the honest outcome.
+ * it — every veto that lost, in the order they lost, so a `Never` under a later `not-now` is still a
+ * disagreement ({@link contestedVetoes}). A veto that lost to an accept whose run DID start stays
+ * lost, which is the honest outcome.
  *
- * @returns the hold a replayed veto placed, or undefined when nothing was replayed.
+ * @returns the hold the replayed vetoes placed, or undefined when nothing was replayed.
  */
 export async function withdrawPickerAccept(
   db: AntonDb,
@@ -410,7 +459,10 @@ export async function withdrawPickerAccept(
       const contested = contestedVetoes.get(id);
       if (!contested) return undefined;
       contestedVetoes.delete(id);
-      return writeDecline(tx, contested.input, clock.now());
+      const nowMs = clock.now();
+      let deferral: PickerDeferral | undefined;
+      for (const input of contested.inputs) deferral = writeDecline(tx, input, nowMs);
+      return deferral;
     },
     { behavior: "immediate" },
   );
@@ -524,8 +576,8 @@ export function latestDeclinedPicks(projectId: string, planId: string): Promise<
 }
 
 /**
- * How many of the picker's picks this operator has accepted and declined — the evidence base a floor
- * on unattended starts reads, exactly as `proposalTrackRecord` serves the gardener's kinds.
+ * How many of the picker's picks this operator has accepted and DISAGREED with — the evidence base a
+ * floor on unattended starts reads, exactly as `proposalTrackRecord` serves the gardener's kinds.
  *
  * A rolling window, newest first, for the same reason that one rolls: a picker whose ranking changed
  * must not be judged forever on the record of the ranking it replaced.
@@ -534,9 +586,29 @@ export const PICKER_RECORD_WINDOW = 20;
 
 export interface PickerTrackRecord {
   accepted: number;
+  /** Disagreements only — a `✕ not now` settles nothing about the ranking and is not counted. */
   declined: number;
   settled: number;
 }
+
+/**
+ * PACING IS NOT EVIDENCE (anton-gtcd). `✕ not now` answers a question about the operator's hour, not
+ * about the ranking, so a row that means pacing is not a vote either way and is dropped outright —
+ * counting it as a decline would let a busy week read as distrust of the picker.
+ *
+ * Dropped in the QUERY, before the window applies, for the same reason the decision log narrows in
+ * its own (PR #218 review): an operator who paced through a full window since their last real
+ * disagreement would otherwise fetch nothing but `not-now` rows and filter them all away, reporting
+ * an EMPTY record over a board that has both accepts and refusals to weigh. The window rolls over
+ * evidence, so it always holds the newest {@link PICKER_RECORD_WINDOW} verdicts that say something.
+ *
+ * Only an EXPLICIT pacing row is dropped. A decline nobody classified is kept and counted, matching
+ * how `0030_picker_veto_kind` reads an ambiguous row: the reading that cannot invent consent.
+ */
+const isRankingEvidence = or(
+  isNull(schema.pickerVerdicts.vetoKind),
+  ne(schema.pickerVerdicts.vetoKind, "pacing" satisfies PickerVetoKind),
+);
 
 export async function pickerTrackRecord(
   db: AntonDb,
@@ -546,7 +618,9 @@ export async function pickerTrackRecord(
   const rows = await db
     .select({ verdict: schema.pickerVerdicts.verdict })
     .from(schema.pickerVerdicts)
-    .where(eq(schema.pickerVerdicts.projectId, projectId))
+    .where(
+      and(eq(schema.pickerVerdicts.projectId, projectId), isRankingEvidence),
+    )
     // The id breaks a `decidedAt` tie (PR #212 review): the column is second-resolution, so two
     // verdicts settled in the same second would otherwise leave the window's composition — and the
     // counts read off it — up to SQLite's row order.
@@ -614,6 +688,7 @@ export async function listPickerVerdicts(
     beadId: row.beadId,
     verdict: row.verdict as PickerVerdict,
     action: row.action as PickerVerdictAction,
+    ...(row.vetoKind ? { vetoKind: row.vetoKind as PickerVetoKind } : {}),
     ...(row.rule ? { rule: row.rule } : {}),
     ...(row.criterion
       ? { criterion: row.criterion as PolicyCriterionKey }

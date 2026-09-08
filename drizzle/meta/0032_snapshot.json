@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "0213e232-daa6-4a2c-af5a-b36135bb9c11",
-  "prevId": "d16d96af-d019-4f6b-a778-4139d2e340a1",
+  "id": "d16d96af-d019-4f6b-a778-4139d2e340a1",
+  "prevId": "ddb58185-950c-4893-b562-d8827c58508c",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -625,14 +625,6 @@
           "autoincrement": false,
           "default": 0
         },
-        "spent_attempts": {
-          "name": "spent_attempts",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
         "last_error": {
           "name": "last_error",
           "type": "text",
@@ -853,6 +845,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "veto_kind": {
+          "name": "veto_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "rule": {

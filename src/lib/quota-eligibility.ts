@@ -120,7 +120,11 @@ export async function observedWorkEligibility(
   return eligibility;
 }
 
-/** The runner's hard holds: autonomy off parks every execute-epic; a disabled schedule parks its type. */
+/**
+ * The runner's hard holds: autonomy off parks every execute-epic; a disabled schedule parks its type.
+ * A per-PR fix has no schedule row of its own — the runner holds it by its DISPATCHER's switch
+ * (`review-fix`, see `tickOnce`), so the same derivation applies here or the two would disagree.
+ */
 function isHeld(
   type: string,
   projectId: string,
@@ -128,7 +132,8 @@ function isHeld(
   disabledSchedules: ReadonlySet<string>,
 ): boolean {
   if (type === "execute-epic" && autonomyOff.has(projectId)) return true;
-  return disabledSchedules.has(scheduleGateKey(type, projectId));
+  const gate = type === "review-fix-pr" ? "review-fix" : type;
+  return disabledSchedules.has(scheduleGateKey(gate, projectId));
 }
 
 /**

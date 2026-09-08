@@ -302,7 +302,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     const r = h.makeRunner({
       handlers: {
         "execute-epic": async (ctx) => ctx.claudeReached(),
-        "review-fix": async (ctx) => ctx.claudeReached(),
+        "review-fix-pr": async (ctx) => ctx.claudeReached(),
       },
       config: { maxConcurrent: 2 },
       resolveBudgetPolicy: budgetAware,
@@ -313,7 +313,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
       },
     });
     await r.enqueue({ type: "execute-epic" });
-    await r.enqueue({ type: "review-fix" });
+    await r.enqueue({ type: "review-fix-pr" });
     expect(await r.tickOnce()).toBe(2); // both leased into the same tick → overlapping windows
     await r.whenIdle();
 

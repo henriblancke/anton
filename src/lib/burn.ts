@@ -60,7 +60,10 @@ export const TIER_SEEDS: Record<BurnTier, { sessionPct: number; weeklyPct: numbe
  */
 export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "nightly-stringer": "S",
-  "review-fix": "M",
+  // The scheduled sweep is now a dispatcher: a board read, one `gh pr view` per target and a
+  // queue write. No Claude on the tick — the fix it fans out to is what costs.
+  "review-fix": "none",
+  "review-fix-pr": "M",
   "execute-epic": "L",
   "orphan-grooming": "none",
   "sync-push": "none",

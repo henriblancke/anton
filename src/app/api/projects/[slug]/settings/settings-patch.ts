@@ -23,6 +23,7 @@ import {
   REVIEW_LOW_SCORE_ROUNDS_RANGE,
   REVIEW_MAX_ROUNDS_RANGE,
   REVIEW_MIN_SCORE_RANGE,
+  REVIEW_FIX_CONCURRENCY_RANGE,
   budgetPolicySchema,
   formulaVariantsSchema,
   pickerAutonomySchema,
@@ -80,6 +81,7 @@ const settingsField = <K extends keyof ProjectSettings & string>(
  */
 const JOB_POLICY_FIELDS: readonly FieldRule<ProjectSettings>[] = [
   settingsField("concurrency", integerInRange(CONCURRENCY_RANGE)),
+  settingsField("reviewFixConcurrency", integerInRange(REVIEW_FIX_CONCURRENCY_RANGE)),
   settingsField("jobTimeoutMinutes", integerInRange(JOB_TIMEOUT_MINUTES_RANGE)),
   settingsField("ticketTimeoutMinutes", integerInRange(TICKET_TIMEOUT_MINUTES_RANGE)),
   settingsField("maxRetries", integerInRange(MAX_RETRIES_RANGE)),

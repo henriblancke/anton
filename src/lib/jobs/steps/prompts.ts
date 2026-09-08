@@ -9,9 +9,10 @@
 import type { Bead } from "../../beads/bd";
 import { acceptanceBody } from "../../beads/contract";
 import { humanNotesPromptBlock } from "../../beads/notes";
+import { shortSha } from "../../beads/satisfied-note";
 import { ANTON_REPO_URL } from "../../repo";
 import { findingLines, type ReviewFinding } from "../review-context";
-import type { StepContext } from "./context";
+import type { SatisfiedSettlement, StepContext } from "./context";
 
 /**
  * What the `step:claude` agent is working ON: the run target, the tickets in scope, and the worktree
@@ -119,28 +120,55 @@ function standaloneContext(ticket: Bead, description: string | undefined): strin
   return context && context !== description ? context : undefined;
 }
 
-/** Why the inlined spec is authoritative, and what to do when it is empty anyway. */
+/**
+ * Why the inlined spec is authoritative, what to do when it is empty anyway, and when the step's
+ * honest outcome is `satisfied` rather than `blocked` (anton-6l0q): a ticket is one step of a run
+ * whose earlier steps committed to this same branch, so its acceptance can already be met before the
+ * agent starts. The contract defines the line; this names the moment it applies to THIS ticket.
+ */
 function ticketPromptClosing(ticketId: string): string {
-  return (
+  return [
     `The full ticket spec is inlined above so you can implement it even if the worktree's beads ` +
-    `DB is unreadable. \`bd show ${ticketId}\` gives the same content when bd is healthy. If ` +
-    `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
-    `not guess or silently bail. Follow the operating contract in your system prompt.`
-  );
+      `DB is unreadable. \`bd show ${ticketId}\` gives the same content when bd is healthy. If ` +
+      `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
+      `not guess or silently bail. Follow the operating contract in your system prompt.`,
+    ``,
+    `Before you implement, check the branch: earlier steps of this run committed here, and one of ` +
+      `them may already meet every acceptance criterion above. If it does, do not redo or ` +
+      `restate that work and do not report \`blocked\` — end with ` +
+      `\`ANTON-RESULT: satisfied — <commit sha> — <how that commit covers ${ticketId}>\`, naming ` +
+      `the commit that did it. That is the honest answer only when every criterion is met by work ` +
+      `already committed on this branch; if any is still open, do the remaining work and report ` +
+      `\`delivered\`.`,
+  ].join("\n");
 }
 
 /**
  * `advisory` — findings the self-review reported and did NOT fix (anton-omum). They never hold the PR
  * back, so the merge gate is the only place the founder would ever see them; putting them in the body
  * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
+ *
+ * `satisfied` — the tickets that settled on an EARLIER commit of this run (anton-8h4b). Their
+ * acceptance is in this diff, but no commit here carries their name, so the body attributes each to
+ * the commit that did the work rather than listing it among the deliveries: a reader matching
+ * tickets to commits would otherwise go looking for one that does not exist.
  */
-export function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] = []): string {
+export function prBody(
+  target: Bead,
+  tickets: Bead[],
+  advisory: ReviewFinding[] = [],
+  satisfied: ReadonlyMap<string, SatisfiedSettlement> = new Map(),
+): string {
   // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
   const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
+  const committed = tickets.filter((t) => !satisfied.has(t.id));
   const lines = [
     `Autonomous run for **${target.id}** — ${target.title}.`,
     ``,
-    ...(standalone ? [] : [`Tickets:`, ...tickets.map((t) => `- ${t.id} — ${t.title}`), ``]),
+    ...(standalone || committed.length === 0
+      ? []
+      : [`Tickets:`, ...committed.map((t) => `- ${t.id} — ${t.title}`), ``]),
+    ...satisfiedLines(standalone ? [] : tickets, satisfied),
     ...(advisory.length > 0
       ? [
           `### Unresolved review findings (${advisory.length}, advisory)`,
@@ -154,4 +182,36 @@ export function prBody(target: Bead, tickets: Bead[], advisory: ReviewFinding[] 
     `🤖 Generated with [anton](${ANTON_REPO_URL}) autonomous execution`,
   ];
   return lines.join("\n");
+}
+
+/**
+ * The satisfied attribution as the PR body and its stale-body fallback both render it (PR #253
+ * review): one line per ticket naming the commit that did its work. Empty when nothing settled that
+ * way. The header claims no close — a ticket whose close never landed (a budget that ran out on it,
+ * or a bd write that failed) is still open or blocked, and its line says so, since the body is where
+ * a reviewer learns it needs closing by hand.
+ */
+export function satisfiedLines(
+  tickets: Bead[],
+  satisfied: ReadonlyMap<string, SatisfiedSettlement>,
+): string[] {
+  const settled = tickets.filter((t) => satisfied.has(t.id));
+  if (settled.length === 0) return [];
+  return [
+    `Satisfied by earlier commits of this run (no commit of their own):`,
+    ...settled.map((t) => {
+      const by = satisfied.get(t.id)!;
+      const line = `- ${t.id} — ${t.title} — by ${satisfiedByLine(by)}`;
+      return by.closed
+        ? line
+        : `${line} — NOT closed: the close never landed (its budget ran out on it, or bd refused ` +
+            `the write), so it is not done on the board; review that commit and close it by hand`;
+    }),
+    ``,
+  ];
+}
+
+/** `<short sha> "<subject>"` — the subject is the attribution, since anton's commits are named for their ticket. */
+function satisfiedByLine(by: SatisfiedSettlement): string {
+  return by.subject ? `${shortSha(by.commit)} "${by.subject}"` : shortSha(by.commit);
 }

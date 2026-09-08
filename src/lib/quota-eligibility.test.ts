@@ -210,11 +210,11 @@ describe("observedWorkEligibility", () => {
   });
 
   it("still counts an autonomy-off project's other quota-burning work, and its running runs", async () => {
-    // Autonomy gates the CLAIM of execute-epic only: a review-fix leases regardless, and a run
-    // already in flight keeps spending until it settles.
+    // Autonomy gates the CLAIM of execute-epic only: a per-PR review fix leases regardless, and a
+    // run already in flight keeps spending until it settles.
     const fixing = project("fixing", { autonomy: false });
     plan(fixing, 0);
-    job(fixing, "review-fix", "queued");
+    job(fixing, "review-fix-pr", "queued");
     const finishing = project("finishing", { autonomy: false });
     plan(finishing, 0);
     job(finishing, "execute-epic", "running");
@@ -231,11 +231,12 @@ describe("observedWorkEligibility", () => {
     const stale = project("stale", { autonomy: false });
     plan(stale, 0);
     job(stale, "execute-epic", "running", new Date(NOW), new Date(NOW - 1000));
-    // The same expiry on a disabled schedule's type is held the same way.
+    // The same expiry on a disabled schedule's type is held the same way — a per-PR fix by its
+    // dispatcher's switch, since it has no schedule row of its own.
     const off = project("off");
     plan(off, 0);
     schedule(off, "review-fix", false);
-    job(off, "review-fix", "running", new Date(NOW), new Date(NOW));
+    job(off, "review-fix-pr", "running", new Date(NOW), new Date(NOW));
     // A lease still in force is a run in flight, switches or not; and a held project's expired
     // lease on an UNHELD type is reclaimable, so it still counts.
     const live = project("live", { autonomy: false });
@@ -243,7 +244,7 @@ describe("observedWorkEligibility", () => {
     job(live, "execute-epic", "running", new Date(NOW), new Date(NOW + 60_000));
     const fixing = project("fixing", { autonomy: false });
     plan(fixing, 0);
-    job(fixing, "review-fix", "running", new Date(NOW), new Date(NOW - 1000));
+    job(fixing, "review-fix-pr", "running", new Date(NOW), new Date(NOW - 1000));
 
     const eligibility = await observedWorkEligibility(tdb.db, NOW);
     expect(eligibilityOf(eligibility, stale)).toBe(false);
@@ -254,16 +255,17 @@ describe("observedWorkEligibility", () => {
 
   it("does not count a queued job whose schedule is disabled", async () => {
     // A disabled schedule caps its (type, project) bucket at 0 at claim time, not just at enqueue,
-    // so an already-queued review-fix is held exactly like an autonomy-off execute-epic.
+    // so an already-queued per-PR fix is held exactly like an autonomy-off execute-epic. The fix has
+    // no schedule row of its own: the runner holds it by the `review-fix` dispatcher's switch.
     const off = project("off");
     plan(off, 0);
     schedule(off, "review-fix", false);
-    job(off, "review-fix", "queued");
+    job(off, "review-fix-pr", "queued");
     // The gate is per (type, project): another project's disabled schedule says nothing here.
     const on = project("on");
     plan(on, 0);
     schedule(on, "review-fix", true);
-    job(on, "review-fix", "queued");
+    job(on, "review-fix-pr", "queued");
 
     const eligibility = await observedWorkEligibility(tdb.db, NOW);
     expect(eligibilityOf(eligibility, off)).toBe(false);

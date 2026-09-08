@@ -48,6 +48,7 @@ export function fakeJobContext(overrides: Partial<JobContext> = {}): FakeJobCont
     claudeReached: async () => {
       ctx.claudeSpawns += 1;
     },
+    enqueueReviewFixPr: () => undefined,
     ...overrides,
   };
   return ctx;

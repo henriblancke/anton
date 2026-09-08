@@ -179,6 +179,26 @@ describe("a decision that did not land", () => {
     expect(veto().hasAttribute("disabled")).toBe(false);
   });
 
+  it("keeps the pick SHUT when the server refused it — a retired pick is not there to decline", async () => {
+    // Nothing was written, but nothing is answerable either: the ranking no longer names this
+    // target, so handing the pick back would leave `Never` filing a decline and a hold against a
+    // pick anton has already dropped (PR #245 review).
+    const { land } = heldFetch(
+      "/approve",
+      { error: "anton-a is no longer one of anton's picks", pickRefused: "retired" },
+      409,
+    );
+    mountPick();
+
+    fireEvent.click(release());
+    land();
+
+    await waitFor(() => expect(screen.getByText("anton no longer picks this")).toBeTruthy());
+    // The start is gone for good, and the veto beside it stays shut rather than reopening.
+    expect(screen.queryByRole("button", { name: /Release/i })).toBeNull();
+    expect(veto().hasAttribute("disabled")).toBe(true);
+  });
+
   it("hands the pick back when the approval started no run — its own copy says to try again", async () => {
     // 200 with no `jobId`: the approval stands but nothing runs, and `[Release]` tells the operator
     // to release again. Settling the pick there would shut the only control that can.

@@ -30,7 +30,7 @@ export function migrationFiles(): string[] {
     .sort();
 }
 
-/** Apply one committed migration by filename (e.g. `0030_burn_sample_project.sql`). */
+/** Apply one committed migration by filename (e.g. `0031_burn_sample_project.sql`). */
 export function applyMigrationFile(sqlite: Database.Database, file: string): void {
   const raw = readFileSync(join(process.cwd(), "drizzle", file), "utf8");
   // Drizzle separates statements with a `--> statement-breakpoint` marker line.

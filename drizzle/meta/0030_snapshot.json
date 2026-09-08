@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "ddb58185-950c-4893-b562-d8827c58508c",
+  "id": "d1dcb165-d980-45ac-8210-7f5be450ba7d",
   "prevId": "c9b49030-43d6-48bd-8887-1c1ffd63e7a8",
   "tables": {
     "autopilot_disarms": {
@@ -227,13 +227,6 @@
           "notNull": true,
           "autoincrement": false
         },
-        "project_id": {
-          "name": "project_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "session_delta": {
           "name": "session_delta",
           "type": "real",
@@ -265,32 +258,9 @@
             "created_at"
           ],
           "isUnique": false
-        },
-        "burn_samples_project_type_created_idx": {
-          "name": "burn_samples_project_type_created_idx",
-          "columns": [
-            "project_id",
-            "job_type",
-            "created_at"
-          ],
-          "isUnique": false
         }
       },
-      "foreignKeys": {
-        "burn_samples_project_id_projects_id_fk": {
-          "name": "burn_samples_project_id_projects_id_fk",
-          "tableFrom": "burn_samples",
-          "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        }
-      },
+      "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}
@@ -837,6 +807,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "veto_kind": {
+          "name": "veto_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "rule": {

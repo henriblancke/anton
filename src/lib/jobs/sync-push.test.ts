@@ -35,6 +35,7 @@ function fakeCtx(over: Partial<JobContext> & { payload: unknown }): JobContext {
     report: () => {},
     claudeReached: async () => {},
     signal: new AbortController().signal,
+    enqueueReviewFixPr: () => undefined,
     ...over,
   };
 }

@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "d16d96af-d019-4f6b-a778-4139d2e340a1",
-  "prevId": "ddb58185-950c-4893-b562-d8827c58508c",
+  "id": "ddb58185-950c-4893-b562-d8827c58508c",
+  "prevId": "d1dcb165-d980-45ac-8210-7f5be450ba7d",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -690,14 +690,6 @@
           ],
           "isUnique": false,
           "where": "\"jobs\".\"status\" = 'parked'"
-        },
-        "jobs_updated_project_idx": {
-          "name": "jobs_updated_project_idx",
-          "columns": [
-            "updated_at",
-            "project_id"
-          ],
-          "isUnique": false
         }
       },
       "foreignKeys": {
@@ -845,6 +837,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "veto_kind": {
+          "name": "veto_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "rule": {

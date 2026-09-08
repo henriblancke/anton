@@ -14,13 +14,14 @@ import { PickDecisionProvider, PlanGenerationProvider } from "@/components/board
 const refresh = vi.fn();
 const success = vi.fn();
 const error = vi.fn();
+const warning = vi.fn();
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh, push: vi.fn() }) }));
 vi.mock("sonner", () => ({
   toast: {
     success: (...a: unknown[]) => success(...a),
     error: (...a: unknown[]) => error(...a),
-    warning: vi.fn(),
+    warning: (...a: unknown[]) => warning(...a),
   },
 }));
 
@@ -274,5 +275,78 @@ describe("a release the board refused for another reason", () => {
 
     await waitFor(() => expect(error).toHaveBeenCalledWith("network down"));
     expect((await screen.findByRole("alert")).textContent).toContain("network down");
+  });
+});
+
+/**
+ * A release the server refused before it wrote anything (anton-k4qr / anton-84lx).
+ *
+ * The generation on screen was superseded, the ranking was re-derived, and this target is not in it
+ * — so anton would not start it now and nothing was approved. What matters here is that the card
+ * reports that as its OWN state: the operator must not read it as the pick still waiting to be
+ * recorded, whose start the next board read brings back.
+ */
+describe("a release the re-derived ranking refused", () => {
+  const RETIRED =
+    "anton-a is no longer one of anton's picks: the plan you released from was replaced, and the " +
+    "current one leaves it out (needs-human). Nothing was approved or started — approve it " +
+    "directly if you still want this run.";
+
+  it("replaces the button with the refusal, in the route's own words", async () => {
+    stubFetch({ error: RETIRED, pickRefused: "retired" }, 409);
+    const onReleased = vi.fn();
+    mount({ onReleased });
+
+    release();
+
+    const refused = await screen.findByRole("alert");
+    expect(refused.textContent).toContain("anton no longer picks this");
+    // The sentence that names WHICH fact retired it, and what to do instead, is the server's.
+    expect(refused.getAttribute("title")).toBe(RETIRED);
+    // The button is gone: there is no start to retry, so offering one would be a lie.
+    expect(screen.queryByRole("button", { name: /release/i })).toBeNull();
+    // Not an error, and never a success: the world moved, and the card says so once.
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("no longer one of anton's picks"),
+      expect.objectContaining({ description: RETIRED }),
+    );
+    expect(error).not.toHaveBeenCalled();
+    expect(success).not.toHaveBeenCalled();
+    expect(onReleased).not.toHaveBeenCalled();
+    // Our copy of the board is provably behind, so the surface re-reads onto the ranking that stands.
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+
+  it("says ALREADY TAKEN when somebody else got there first, not that anton dropped it", async () => {
+    // A `claimed`/`not-open` exclusion is a start that exists, not a pick that retired — telling the
+    // operator to approve it directly would invite a second one.
+    const settled =
+      "anton-a is already taken (claimed — bob) — it was settled while this view was open. " +
+      "Nothing new was approved or started; the board is catching up.";
+    stubFetch({ error: settled, pickRefused: "settled" }, 409);
+    mount();
+
+    release();
+
+    const refused = await screen.findByRole("alert");
+    expect(refused.textContent).toContain("already taken");
+    expect(refused.textContent).not.toMatch(/no longer picks/i);
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("already taken"),
+      expect.objectContaining({ description: settled }),
+    );
+  });
+
+  it("keeps the ordinary 409 loud and retryable — a lost claim race is not a retired pick", async () => {
+    stubFetch({ error: "anton-a was claimed by bob — reload and retry", owner: "bob" }, 409);
+    mount();
+
+    release();
+
+    expect((await screen.findByRole("alert")).textContent).toContain("claimed by bob");
+    expect(error).toHaveBeenCalled();
+    expect(warning).not.toHaveBeenCalled();
+    // The button stays: this one IS a retry, once the surface has caught up.
+    expect(screen.getByRole("button", { name: /release/i })).toBeTruthy();
   });
 });

@@ -31,6 +31,7 @@ import {
   enqueue,
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
+  enqueueReviewFixPrIfAbsent,
   getJob,
   leaseDue,
   park,
@@ -77,6 +78,14 @@ export interface RunnerConfig {
   notWiredRetryMs: number;
   /** Max jobs in flight at once. */
   maxConcurrent: number;
+  /**
+   * Max `review-fix-pr` jobs in flight at once ACROSS projects (PR #250 review). The per-project
+   * `reviewFixConcurrency` bounds one project's fan-out, not the sum: four projects each at the
+   * default two are the whole default pool of eight, and an execute-epic, gate-check or sync-push
+   * queued behind them waits out a long fix. This is the reserve for those other types — keep it
+   * below `maxConcurrent`. The wiring (service.ts) defaults it to half the pool.
+   */
+  maxReviewFixConcurrent: number;
   /** Poll interval for the background loop. */
   tickMs: number;
   /**
@@ -97,6 +106,7 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   quotaCooloffMs: 30 * 60_000,
   notWiredRetryMs: 5 * 60_000,
   maxConcurrent: 1,
+  maxReviewFixConcurrent: 1,
   tickMs: 2_000,
   burnSampleMinIntervalMs: 60_000,
 };
@@ -109,6 +119,12 @@ export const DEFAULT_CONFIG: RunnerConfig = {
 export interface JobPolicy {
   /** Max concurrent execute-epic runs for this project. */
   concurrency: number;
+  /**
+   * Max concurrent `review-fix-pr` jobs for this project (anton-kwi6) — the per-PR fan-out's own
+   * ceiling, so a burst of review activity can't fill the global slot pool and starve execute-epic.
+   * Absent → ungated (the resolver always fills it; only a hand-built policy in a test omits it).
+   */
+  reviewFixConcurrency?: number;
   /**
    * Autonomy master-switch (anton-y3l). `false` stops the runner from *claiming* execute-epic
    * jobs for this project — they enqueue as usual (approval, retries, resumes) but stay `queued`
@@ -231,6 +247,15 @@ export interface JobContext {
    * from the settlement type misses every such exit that isn't a reschedule.
    */
   claudeReached: () => Promise<void>;
+  /**
+   * Enqueue a per-PR fix job for a run target, deduped against a live one — see
+   * `queue.enqueueReviewFixPrIfAbsent`. Handlers fan out THROUGH the runner rather than calling the
+   * queue helper bare because the runner holds the project-teardown barrier (PR #250 review): a
+   * dispatcher that inserts directly can land a fresh `queued` row after `quiesceProject` swept the
+   * project's active rows, and the delete then fails over it. Returns the new job id, or undefined
+   * when a live job already covers the target — or the project is being torn down.
+   */
+  enqueueReviewFixPr: (projectId: string, epicBeadId: string) => string | undefined;
 }
 
 /**
@@ -602,6 +627,18 @@ export class JobRunner {
   }
 
   /**
+   * Enqueue a `review-fix-pr` job for one run target, deduped against a live one. The teardown
+   * barrier is handed INTO the insert's transaction (like `resume`), not read here first: a
+   * dispatcher mid-triage can only reach the write after `quiesceProject` has raised the flag and
+   * swept, and a pre-read check would still let that write through. Refused → undefined, no row.
+   */
+  enqueueReviewFixPrIfAbsent(projectId: string, epicBeadId: string): string | undefined {
+    return enqueueReviewFixPrIfAbsent(this.db, this.clock, projectId, epicBeadId, {
+      refuseProject: (pid) => this.quiescedProjects.has(pid),
+    });
+  }
+
+  /**
    * Un-park a parked job, returning it to `queued` with a fresh attempt budget so it is picked up
    * on the next tick. The recovery path for a job that exhausted its retries (or hit a permanent
    * error a human has since resolved). Resolves true if a parked job was resumed, false otherwise.
@@ -706,14 +743,34 @@ export class JobRunner {
     // instead of reserving quota share for work that cannot lease (PR #248 review).
     const heldBucketKeys = new Set<string>(disabledSchedules);
 
+    // `review-fix-pr` has no schedule row of its own — it is dispatched by the `review-fix` poll —
+    // so its hard hold is DERIVED from the dispatcher's switch. Excluding the bucket (not merely
+    // capping it at 0) is what keeps a backlog of held per-PR fixes out of the finite scan window.
+    for (const key of disabledSchedules) {
+      const [type, projectId] = key.split("\0");
+      if (type === "review-fix") heldBucketKeys.add(scheduleGateKey("review-fix-pr", projectId));
+    }
+
     // With a policy resolver, gate execute-epic concurrency per project. Precompute each pending
     // project's cap so leaseDue can decide synchronously; other job types stay ungated (Infinity).
     let policyCapOf: ((job: JobRow) => number) | undefined;
     if (this.resolvePolicy) {
+      // One settings read per project per tick: the two capped types often name the same project,
+      // and the resolver goes to the DB.
+      const policies = new Map<string, Promise<JobPolicy>>();
+      const policyOnce = (pid: string | null) => {
+        const key = pid ?? "";
+        const cached = policies.get(key);
+        if (cached) return cached;
+        const resolved = this.policyFor(pid ?? undefined);
+        policies.set(key, resolved);
+        return resolved;
+      };
+
       const projectIds = await projectIdsWithPendingJobs(this.db, "execute-epic");
       const concByProject = new Map<string, number>();
       for (const pid of projectIds) {
-        const policy = await this.policyFor(pid ?? undefined);
+        const policy = await policyOnce(pid);
         // Autonomy master-switch: off → cap 0, so no execute-epic job for this project is leased
         // (they stay queued and resume when the switch turns back on). See JobPolicy.autonomy.
         const cap = policy.autonomy === false ? 0 : policy.concurrency;
@@ -722,10 +779,26 @@ export class JobRunner {
         // starve other work (same rationale as disabled schedules above).
         if (cap === 0) heldBucketKeys.add(scheduleGateKey("execute-epic", pid));
       }
-      policyCapOf = (job) =>
-        job.type === "execute-epic"
-          ? (concByProject.get(job.projectId ?? "") ?? DEFAULT_CONFIG.maxConcurrent)
-          : Infinity;
+
+      // The per-PR fix fan-out gets the same treatment against its own setting (anton-kwi6): the
+      // dispatcher enqueues one job per actionable PR, so without a cap a busy review day fills the
+      // global pool and starves execute-epic. This bounds ONE project; the sum over projects is
+      // bounded by `maxReviewFixConcurrent`, passed to leaseDue as `typeCapOf` below.
+      const reviewFixByProject = new Map<string, number>();
+      for (const pid of await projectIdsWithPendingJobs(this.db, "review-fix-pr")) {
+        const policy = await policyOnce(pid);
+        reviewFixByProject.set(pid ?? "", policy.reviewFixConcurrency ?? Infinity);
+      }
+
+      policyCapOf = (job) => {
+        if (job.type === "execute-epic") {
+          return concByProject.get(job.projectId ?? "") ?? DEFAULT_CONFIG.maxConcurrent;
+        }
+        if (job.type === "review-fix-pr") {
+          return reviewFixByProject.get(job.projectId ?? "") ?? DEFAULT_CONFIG.maxConcurrent;
+        }
+        return Infinity;
+      };
     }
 
     // Budget governor (anton-szld): before leasing, ask the pace-line whether autonomous work may
@@ -770,6 +843,15 @@ export class JobRunner {
     const capOf = (job: JobRow) => {
       if (job.projectId && this.quiescedProjects.has(job.projectId)) return 0;
       if (disabledSchedules.has(scheduleGateKey(job.type, job.projectId))) return 0;
+      // A per-PR fix is held by its DISPATCHER's schedule, which is the review-fix master switch:
+      // the child type has no schedule row of its own, so turning the poll off would otherwise stop
+      // dispatching while queued fixes kept leasing — the switch must stop fixing, not just polling.
+      if (
+        job.type === "review-fix-pr" &&
+        disabledSchedules.has(scheduleGateKey("review-fix", job.projectId))
+      ) {
+        return 0;
+      }
       // Value-gate hold on a reclaimable (crashed, lease-expired) row: unleasable this tick, but
       // NOT via `exclude` — see valueHeldReclaimIds above. Its expired lease keeps it out of the
       // live-load count, so it doesn't occupy a slot admitted work could use.
@@ -798,6 +880,10 @@ export class JobRunner {
       leaseMs: this.config.leaseMs,
       limit: capacity,
       capOf,
+      // The runner-wide review-fix ceiling, on top of the per-project cap in capOf: the sum of every
+      // project's fan-out must leave slots for the other job types (see RunnerConfig).
+      typeCapOf: (job) =>
+        job.type === "review-fix-pr" ? this.config.maxReviewFixConcurrent : Infinity,
       excludeBucketKeys: heldBucketKeys,
       // Never re-lease a job already dispatched in this process. Rolling dispatch keeps a running
       // job in `inFlight` while its handler works; if its lease lapses (missed renewal from sleep or
@@ -1307,6 +1393,8 @@ export class JobRunner {
             burnBefore = this.readUsageFreshSafe();
             await burnBefore;
           },
+          enqueueReviewFixPr: (projectId, epicBeadId) =>
+            this.enqueueReviewFixPrIfAbsent(projectId, epicBeadId),
         };
         effect = (await handler(ctx)) ?? undefined;
         outcome = { kind: "success" };

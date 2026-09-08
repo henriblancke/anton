@@ -33,12 +33,13 @@ import {
 import type { AntonDb, Clock } from "./queue";
 
 /**
- * The in-process lock one merged target's finalization holds (PR #199). `enqueueReviewFixIfAbsent`
- * deliberately lets two jobs reach the same target — the project-wide sweep and a gate-check's
- * targeted fix — and finalizing is a long read-decide-write sequence over the whole ticket subtree:
- * run concurrently, both read a board without a follow-up on it, each create one, and their
- * reparents then split the preserved tickets across two run targets or overwrite each other's
- * moves. Serialized, the second pass reads the board the first one left.
+ * The in-process lock one merged target's finalization holds (PR #199). Two jobs can still reach
+ * the same target — a crash-reclaimed row, or two anton instances sharing a board, since
+ * `enqueueReviewFixPrIfAbsent`'s dedupe is machine-local — and finalizing is a long
+ * read-decide-write sequence over the whole ticket subtree: run concurrently, both read a board
+ * without a follow-up on it, each create one, and their reparents then split the preserved tickets
+ * across two run targets or overwrite each other's moves. Serialized, the second pass reads the
+ * board the first one left.
  *
  * Namespaced rather than keyed on the target's own bead id on purpose: the finalization takes the
  * CHILD tickets' claim locks inside it ({@link releasePreserved}), and a caller that holds a

@@ -862,6 +862,8 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
 
     expect(err).toBeInstanceOf(TicketTimeoutError);
     expect((err as TicketTimeoutError).delivered).toBe(true);
+    // A delivery of its own settles on no earlier commit.
+    expect((err as TicketTimeoutError).satisfiedBy).toBeNull();
     expect(tagged).not.toContainEqual([LABELS.notDelivered]);
     expect(notes.join("\n")).toMatch(/stopped after the commit/);
   });
@@ -877,6 +879,131 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
     expect(isPoisonError(err)).toBe(true);
     expect((err as Error).message).toContain(BRANCH);
     expect(notes.join("\n")).toMatch(/committed on the branch/);
+  });
+});
+
+// The deadline can also land AFTER the delivery gate accepted a `satisfied` claim and BEFORE the
+// close that records it (PR #253 review) — `delivered` without `committed`. Read as a plain
+// delivery, the loop lists the ticket in the pull request under a commit the branch does not carry
+// by its name, and the note tells the operator partial work was rolled back when there was never
+// anything of its own to roll back. The timeout has to settle the claim exactly as the close would.
+suite("settleTicketTimeout — a satisfied step the deadline caught during its bookkeeping", () => {
+  let sandbox: string;
+  let repo: string;
+  let logPath: string;
+  let tdb: TestDb;
+  let tagged: string[][];
+  let notes: string[];
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const head = () => execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+  const run = (): Omit<StepContext, "tickets"> => ({
+    db: tdb.db,
+    clock: new FixedClock(1_700_000_000_000),
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
+    projectId: randomUUID(),
+    runId: randomUUID(),
+    repoPath: repo,
+    worktreePath: repo,
+    branch: BRANCH,
+    baseBranch: "main",
+    baseRef: "origin/main",
+    target: ticket,
+    settings: {} satisfies ProjectSettings,
+  });
+
+  beforeEach(() => {
+    tdb = makeTestDb();
+    sandbox = mkdtempSync(join(tmpdir(), "anton-settle-satisfied-"));
+    repo = join(sandbox, "repo");
+    logPath = join(sandbox, "session.log");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", BRANCH]);
+
+    tagged = [];
+    notes = [];
+    vi.spyOn(beads, "tag").mockImplementation(async (_repo, _id, labels) => {
+      tagged.push(labels);
+      return "";
+    });
+    vi.spyOn(beads, "note").mockImplementation(async (_repo, _id, body) => {
+      notes.push(body);
+      return "";
+    });
+    vi.spyOn(beads, "setStatus").mockResolvedValue("");
+    vi.spyOn(beads, "unassign").mockResolvedValue("");
+    vi.spyOn(beads, "untag").mockResolvedValue("");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    tdb.close();
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("carries the commit it settled on, and says nothing was rolled back", async () => {
+    // The earlier ticket's commit — the one the satisfied step's work already sits in.
+    writeFileSync(join(repo, "EARLIER.md"), "the earlier ticket's work\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-e0y1: the earlier ticket"]);
+    const earlier = head();
+    const baseline = await readWorktreeState(repo);
+
+    let err: unknown;
+    try {
+      await settleTicketTimeout({
+        run: run(),
+        ticket,
+        session: { logPath, sessionId: "sess-1" },
+        baseline,
+        // Exactly what `assertDelivered` leaves for a verified claim: the tree fact and the verdict
+        // part company, and the claim names the commit abbreviated, as the agent read it off git.
+        progress: {
+          committed: false,
+          delivered: true,
+          selfReport: { outcome: "satisfied", commit: earlier.slice(0, 8), reason: "step 1 covered it" },
+        },
+        timeoutMs: 60_000,
+        // A satisfied step has siblings by definition: an earlier ticket of the same run did its work.
+        standalone: false,
+        ranOutOfTime: true,
+      });
+    } catch (e) {
+      err = e;
+    }
+
+    expect(err).toBeInstanceOf(TicketTimeoutError);
+    const timeout = err as TicketTimeoutError;
+    expect(timeout.delivered).toBe(true);
+    expect(timeout.preservedOn).toBeNull();
+    // Resolved as the close would have: full sha and subject, the agent's note kept.
+    expect(timeout.satisfiedBy).toEqual({
+      commit: earlier,
+      subject: "anton-e0y1: the earlier ticket",
+      note: "step 1 covered it",
+    });
+    expect(timeout.message).toMatch(/already on the branch/);
+    expect(timeout.message).toContain(earlier.slice(0, 7));
+    // Delivered, so no `not-delivered` marker — the merge may close it.
+    expect(tagged).not.toContainEqual([LABELS.notDelivered]);
+    const note = notes.join("\n");
+    expect(note).toMatch(/already on the branch/);
+    expect(note).toContain(earlier.slice(0, 7));
+    expect(note).toContain("anton-e0y1: the earlier ticket");
+    expect(note).toMatch(/Nothing was rolled back/);
+    expect(note).not.toMatch(/partial work/);
+    // The evidence clause cites the commit it settled on, so the park gate reads "review and close".
+    expect(note).toContain(`committed on ${BRANCH} @ ${earlier.slice(0, 7)}`);
+    // And the branch is exactly where it was: nothing reset, the earlier commit still the tip.
+    expect(head()).toBe(earlier);
+    expect(existsSync(join(repo, "EARLIER.md"))).toBe(true);
   });
 });
 

@@ -1,5 +1,5 @@
 /**
- * The burn-sample project attribution migration (drizzle/0030, for anton-wj3d), asserted against the
+ * The burn-sample project attribution migration (drizzle/0031, for anton-wj3d), asserted against the
  * only database that can go wrong: one that already holds burn samples.
  *
  * A machine upgrading into this release carries a history of samples that genuinely do not know
@@ -21,7 +21,7 @@ import { applyMigrationFile, applyMigrationsTo } from "./testing";
 import * as schema from "./schema";
 import { getBurnAverage, getProjectBurnAverage, TIER_SEEDS } from "../burn";
 
-const MIGRATION = "0030_burn_sample_project.sql";
+const MIGRATION = "0031_burn_sample_project.sql";
 
 /**
  * The reverse, read out of the migration's own header so the documented recipe cannot drift from the

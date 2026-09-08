@@ -1,9 +1,10 @@
 "use client";
 
 import { createContext, useCallback, useContext, useMemo, useRef, useState } from "react";
-import { HourglassIcon } from "lucide-react";
+import { CircleSlashIcon, HourglassIcon } from "lucide-react";
 
 import { MetaChip } from "@/components/atoms";
+import type { ReleaseRefusal } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
@@ -41,14 +42,14 @@ export type PickDecision = {
    */
   planId?: string;
   /**
-   * This pick is the LIVE ranking's, and no recorded plan names it — so there is no generation a
-   * verdict could be written against (anton-5axf).
+   * This card is one of anton's LIVE picks — the fact a lane row carries by existing.
    *
-   * Set only by a surface that presents the pick as one. It defaults to false everywhere else, and
-   * has to: an ordinary Backlog card is not a pick at all, and its plain Approve is nobody's
-   * agreement with anton.
+   * Only half of "may this be released": the other half is whether a current generation names it
+   * (see {@link useUnrecordedPick}). Set only by a surface that presents the card as a pick, and it
+   * defaults to false everywhere else — an ordinary Backlog card is not a pick at all, and its plain
+   * Approve is nobody's agreement with anton.
    */
-  unconfirmed: boolean;
+  pick: boolean;
   /** Take the pick synchronously; `false` means another control already holds or settled it. */
   claim: () => boolean;
   /** The write landed — the pick is answered. */
@@ -59,7 +60,7 @@ export type PickDecision = {
 
 const OPEN: PickDecision = {
   state: "open",
-  unconfirmed: false,
+  pick: false,
   claim: () => true,
   settle: () => {},
   abandon: () => {},
@@ -138,13 +139,13 @@ export function useCardVeto(): PlanSurface["onVetoed"] {
 
 export function PickDecisionProvider({
   planId,
-  unconfirmed = false,
+  pick = false,
   children,
 }: {
   /** The generation the cards below were projected from; omitted when there is no plan to name. */
   planId?: string;
-  /** This pick is ranked but unrecorded, so no verdict can be bound to it ({@link PickDecision}). */
-  unconfirmed?: boolean;
+  /** The card below is one of anton's live picks — every lane row is ({@link PickDecision}). */
+  pick?: boolean;
   children: React.ReactNode;
 }) {
   const held = useRef<PickDecision["state"]>("open");
@@ -166,20 +167,19 @@ export function PickDecisionProvider({
   const value = useMemo<PickDecision>(
     () => ({
       state,
-      unconfirmed,
+      pick,
       claim,
       settle,
       abandon,
       ...(planId === undefined ? {} : { planId }),
     }),
-    [state, unconfirmed, claim, settle, abandon, planId],
+    [state, pick, claim, settle, abandon, planId],
   );
   return <PickDecisionContext.Provider value={value}>{children}</PickDecisionContext.Provider>;
 }
 
 /**
- * What stands where `[Release]` would, on a pick anton has ranked but not yet written down
- * (anton-5axf).
+ * What stands where `[Release]` would, on a pick no CURRENT generation names (anton-5axf).
  *
  * The start is withheld because the ACCEPT is: a release records the operator's agreement with a
  * named decision, and that record is the evidence earned autonomy is granted on — so a start against
@@ -187,40 +187,86 @@ export function PickDecisionProvider({
  * is withheld for the same reason and not a weaker one: it would start anton's own pick while
  * recording no answer at all, which is the same missing evidence with the button relabelled.
  *
- * Said rather than merely missing. A card ranked #1 with no control on it reads as broken, and an
- * operator who cannot tell a withheld start from a bug goes around the lane to approve from Backlog
- * — which is exactly the unevidenced start this withholds. So the card names the wait and its end:
- * one pass, no action required.
+ * RARE, and the copy has to read that way (anton-84lx). Every board read now writes the ranking it
+ * derived down (anton-f12y), so a drawn pick is normally named by a generation the moment it appears;
+ * this state is what is left when that write did not land and the standing plan has gone stale. The
+ * old copy promised a wait on the ten-minute pass, which was long enough to teach the operator to go
+ * around the lane and approve from Backlog — which is exactly the unevidenced start it withholds. So
+ * the wait it names is the real one: the next board read, which the open board is already taking.
  */
 export function PickAwaitingRecord({ className }: { className?: string }) {
   return (
     <MetaChip className={cn("pointer-events-auto", className)}>
       <HourglassIcon className="size-2.5" aria-hidden="true" />
-      {/* Terse like the chips beside it, because it shares their row on a lane-width column; the
-          sentence that explains the wait rides in the title, where the badge's own does. */}
-      <span title="anton ranks this lane live, and the pass that records its picks has not run yet. Releasing now would file an agreement against a decision nothing has written down, so this pick's start waits one pass — no action needed.">
-        anton confirms next pass
+      {/* Terse like the chips beside it, because it shares their row on a lane-width column — so the
+          label carries the clearing condition and the title carries why there is a wait at all. */}
+      <span title="anton ranks this lane live and writes the ranking down on every board read, so no current generation names this pick yet — releasing now would file an agreement against a decision nothing recorded. The next board read records it and the start comes back; no action needed.">
+        anton records this next read
+      </span>
+    </MetaChip>
+  );
+}
+
+const REFUSAL_COPY: Record<ReleaseRefusal, string> = {
+  retired: "anton no longer picks this",
+  settled: "already taken",
+};
+
+/**
+ * What stands where `[Release]` would once the server REFUSED the start (anton-k4qr / anton-84lx).
+ *
+ * Distinct from {@link PickAwaitingRecord} on purpose, and that is the whole point of it. The two
+ * states look alike from the operator's seat — the start is gone either way — but they are opposite
+ * answers: one is a record that has not caught up yet and clears itself, the other is anton having
+ * re-decided that this is not work it would start. Reported as the pending one, a refusal would have
+ * the operator waiting for a start that is never coming back.
+ *
+ * The sentence is the SERVER's: it already names which fact retired the pick and what to do instead
+ * ("approve it directly if you still want this run"), and restating it here would be a second copy
+ * to drift from the exclusion reasons it is drawn from.
+ */
+export function ReleaseRefused({
+  refusal,
+  message,
+  className,
+}: {
+  refusal: ReleaseRefusal;
+  /** The route's own refusal sentence, kept verbatim as the chip's explanation. */
+  message: string;
+  className?: string;
+}) {
+  return (
+    <MetaChip tone="partial" className={cn("pointer-events-auto", className)}>
+      <CircleSlashIcon className="size-2.5" aria-hidden="true" />
+      {/* An alert, unlike the ambient chip above: the operator clicked, and the button they clicked
+          has just been replaced by this. */}
+      <span role="alert" title={message}>
+        {REFUSAL_COPY[refusal]}
       </span>
     </MetaChip>
   );
 }
 
 /**
- * Is THIS card one of anton's live picks with no recorded decision behind it (anton-5axf)?
+ * Does THIS card offer no start, because no current generation names it (anton-5axf)?
  *
- * One question, asked the same way on every surface. The lane answers it per row, on the pick's own
- * {@link PickDecisionProvider}; the epic swimlanes have no rows, so the card asks the surface for the
- * same two halves — is it in the live ranking, and does a current generation name it (PR #226
- * review). Without that second path the grouping toggle was a way around the withheld start: the
- * server refuses the accept either way, so the button offered a start it could not evidence.
+ * One question, asked one way on every surface: the card is a live pick AND the generation on screen
+ * either does not exist or does not name it. Both halves are needed — an ordinary Backlog card fails
+ * the first, and a pick the standing plan names fails the second — and the lane and the swimlanes
+ * differ only in how they answer the first. The lane's rows say it by existing (`pick` on their own
+ * {@link PickDecisionProvider}); the swimlanes have no rows, so the surface names the live ranking
+ * instead (PR #226 review). Without that second path the grouping toggle was a way around the
+ * withheld start: the server refuses the accept either way, so the button offered a start it could
+ * not evidence.
  *
- * @param recorded the `◈ policy` mark of a plan anton still stands behind (`isPickerPick`).
+ * @param recorded the `◈ policy` mark of a plan anton still stands behind (`isPickerPick`) — the
+ * current generation naming this very target.
  */
 export function useUnrecordedPick(beadId: string, recorded: boolean): boolean {
   const decision = usePickDecision();
   const { ranked } = useContext(PlanSurfaceContext);
-  if (decision.unconfirmed) return true;
-  return ranked?.has(beadId) === true && (decision.planId === undefined || !recorded);
+  const isPick = decision.pick || ranked?.has(beadId) === true;
+  return isPick && (decision.planId === undefined || !recorded);
 }
 
 export function usePickDecision(): PickDecision {

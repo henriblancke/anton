@@ -4,7 +4,8 @@
  * beads — can be exercised without a job queue.
  *
  * The board-shape claims the hygiene report has no verb for (misfiled work, missing ordering edges,
- * retirement candidates) become approvable proposal beads, deduplicated by fingerprint so a nightly
+ * retirement candidates) — plus the re-judgement of work the patrol's own retirements PARKED
+ * (anton-dsnr) — become approvable proposal beads, deduplicated by fingerprint so a nightly
  * patrol over an unfixed board asks once — and, for the duplicates only overlapping patrols on
  * different machines can create, folded back to one ask before new ones are filed and arbitrated
  * again right after, so a twin filed by another machine is withdrawn within seconds rather than at
@@ -19,7 +20,7 @@ import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { applyArmedProposals, reportUnsettledProposals } from "../gardener/armed";
 import type { ProposalTrackRecord } from "../gardener/autonomy";
-import { detectBoard } from "../gardener/detect";
+import { detectBoard, detectDeferredRejudgements, indexWorkBoard } from "../gardener/detect";
 import {
   arbitrateEmission,
   emitProposals,
@@ -219,13 +220,25 @@ function armed(
  * File this patrol's proposals: fold the duplicates a rival patrol left standing, emit, withdraw the
  * twin another machine filed for the same claim, then record what an armed patrol would have done.
  *
+ * Returns how many asks this pass FILED and kept — what the patrol's own outcome line reports
+ * (gardener.ts). A twin arbitration withdrew is not one: it is a closed bead nobody is ever asked
+ * about, so it would be a question this pass never really put on the board. An armed apply IS one
+ * even though it settles the proposal it answered (gardener/armed.ts): the count is what this tier
+ * WROTE, not what is left open at the end of it, and the armed walk records what it did to each ask
+ * by id in the same session log.
+ *
+ * That count is what stops the tier disappearing from the pass's outcome, because a proposal is a
+ * bead this patrol wrote and several kinds rest on no hygiene finding at all — a pass that filed
+ * three asks and reported "board clean" would tell an operator the silence they were promised on a
+ * healthy board while three questions waited on the board for them.
+ *
  * Throws what emission throws — a create that keeps failing has to park the pass for a human — but
  * never before reporting and propagating whatever DID land.
  */
 export async function fileGardenerProposals(
   scope: PassScope,
   input: GardenerProposalInput,
-): Promise<void> {
+): Promise<number> {
   const { ctx } = scope;
   const repo = scope.project.repoPath;
 
@@ -240,11 +253,24 @@ export async function fileGardenerProposals(
   // made. It is the second gate arming needs and no setting can lift it, so it is derived here —
   // where the board is — rather than read again by the walks that consult it.
   const record = proposalTrackRecord(board);
-  const detections = detectBoard({
-    board,
-    hygiene: { findings: input.findings },
-    now: scope.clock.now(),
-  });
+  const now = scope.clock.now();
+  // Board SHAPE, then the one RE-JUDGEMENT (anton-30vo) — appended rather than merged into
+  // `detectBoard`, because it asks about a decision anton's own tiers made rather than about how the
+  // board hangs together (gardener/detect.ts).
+  //
+  // The order is the write budget's. Both lists are internally deterministic, so concatenating them
+  // keeps two passes over an unchanged board agreeing on which claims fit under
+  // `MAX_PROPOSALS_PER_PASS` — and putting the re-judgements last means a neglected board spends its
+  // cap on work that is still live before it spends any on work parked a quarter ago. What overflows
+  // is not lost: the next patrol files it.
+  //
+  // Every pass, on the patrol's own cadence, because the claim is a duration and costs no session to
+  // measure. Re-asking nightly is not noise either: an ask already standing suppresses on its
+  // fingerprint, and a declined one holds for the stated window (detections.ts `REASK_AFTER_DAYS`).
+  const detections = [
+    ...detectBoard({ board, hygiene: { findings: input.findings }, now }),
+    ...detectDeferredRejudgements(indexWorkBoard(board), now),
+  ];
   await ctx.heartbeat();
   // Re-check RIGHT before the first write. The board read and detection above take real time, and a
   // cancel arriving inside them is invisible to `ctx.heartbeat()` — which does not inspect the
@@ -270,6 +296,10 @@ export async function fileGardenerProposals(
     const standing = emission.created.filter((p) => !withdrawn.has(p.id));
     await shadow(scope, standing, input.observedAtMs, record);
     await armed(scope, standing, record);
+    // Counted as arbitration left it, not as arming did: an applied ask is a question this pass both
+    // asked and answered, and dropping it here would let a patrol that armed every kind report a
+    // clean board over a night of unattended writes.
+    return standing.length;
   } catch (e) {
     // The proposals a stopped pass DID file are on the board like any other, so they get the same
     // arbitration — a pass that parked on its third create must not leave the first two doubled.

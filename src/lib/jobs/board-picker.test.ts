@@ -16,8 +16,17 @@ import {
   stampBoard,
 } from "../board-picker-plan";
 import { PICKER_DEFER_WINDOW_MS, recordPickerVeto } from "../picker-veto";
-import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
-import { activeDisarm, disarmAutopilot, listDisarms, reArmAutopilot } from "../autopilot-disarm";
+import {
+  EARNED_AUTONOMY_BARS,
+  PICKER_AUTONOMY_TIER,
+  type DeliberateArming,
+} from "../gardener/autonomy";
+import {
+  activeDisarm,
+  disarmAutopilot,
+  listDisarms,
+  reArmAutopilot,
+} from "../autopilot-disarm";
 import { listOpenEscalations } from "../escalations";
 import { createSchedule } from "../schedules";
 import { LABELS } from "../beads/bd";
@@ -170,6 +179,7 @@ function fakeCtx(over: Partial<JobContext> = {}): JobContext {
     report: () => {},
     claudeReached: async () => {},
     signal: new AbortController().signal,
+    enqueueReviewFixPr: () => undefined,
     ...over,
   };
 }
@@ -182,11 +192,21 @@ function fakeCtx(over: Partial<JobContext> = {}): JobContext {
 function arm(
   t: TestDb,
   autonomy: string,
-  { policy = { types: ["task"] } as unknown, record = true }: { policy?: unknown; record?: boolean } = {},
+  {
+    policy = { types: ["task"] } as unknown,
+    record = true,
+    override,
+  }: { policy?: unknown; record?: boolean; override?: DeliberateArming } = {},
 ): void {
   t.db
     .update(schema.projects)
-    .set({ settingsJson: JSON.stringify({ pickerPolicy: policy, pickerAutonomy: autonomy }) })
+    .set({
+      settingsJson: JSON.stringify({
+        pickerPolicy: policy,
+        pickerAutonomy: autonomy,
+        ...(override ? { pickerApplyOverride: override } : {}),
+      }),
+    })
     .run();
   if (record) answerPicks(t, PICKER_BAR.minSettled, PICKER_BAR.minSettled);
 }
@@ -207,7 +227,10 @@ function answerPicks(t: TestDb, settled: number, accepted: number): void {
         projectId: "p1",
         beadId: `answered-${i}`,
         verdict: i < accepted ? "accepted" : "declined",
-        action: i < accepted ? "release" : "not-now",
+        // Declines are seeded as disagreement: pacing is not evidence about the ranking, so a
+        // `not-now` seed would leave `settled` counting rows the record does not read (anton-31gm).
+        action: i < accepted ? "release" : "never",
+        vetoKind: i < accepted ? null : "disagreement",
         planId: `plan-${i}`,
         decidedAt: new Date(NOW - (settled - i) * 60_000),
       })
@@ -818,8 +841,9 @@ describe("makeBoardPickerHandler", () => {
   });
 
   it("returns an armed picker to shadow once its record degrades", async () => {
-    // Re-asked on every pass over a rolling window, so vetoes the operator files after arming push
-    // the record back below the bar and the next pass starts nothing — no latch, nothing to clear.
+    // Re-asked on every pass over a rolling window, so the disagreements the operator files after
+    // arming push the record back below the bar and the next pass starts nothing — no latch, nothing
+    // to clear.
     board.current = [bead("t1")];
     arm(t, "apply");
     const pass = makeBoardPickerHandler({ db: t.db, clock });
@@ -831,12 +855,12 @@ describe("makeBoardPickerHandler", () => {
       recordPickerVeto(t.db, clock, {
         projectId: "p1",
         beadId: `late-${i}`,
-        action: "not-now",
+        action: "never",
         planId: `late-plan-${i}`,
       });
 
-    // One veto still clears the bar — the floor is a threshold, not a hair trigger, and a pass that
-    // stopped here would prove nothing about the one below.
+    // One refusal still clears the bar — the floor is a threshold, not a hair trigger, and a pass
+    // that stopped here would prove nothing about the one below.
     await veto(1);
     await pass(fakeCtx());
     expect(applyPickerPlan).toHaveBeenCalledTimes(2);
@@ -846,6 +870,54 @@ describe("makeBoardPickerHandler", () => {
     await veto(3);
     await pass(fakeCtx());
     expect(applyPickerPlan).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps applying through a week of `✕ not now` — pacing is not distrust (anton-31gm)", async () => {
+    // The counterpart to the degrade above. An operator who defers every pick for a week has said
+    // nothing about the RANKING, so a record that counted their schedule would disarm the picker for
+    // being asked at the wrong hour.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    for (let i = 0; i < PICKER_BAR.minSettled; i++) {
+      await recordPickerVeto(t.db, clock, {
+        projectId: "p1",
+        beadId: `paced-${i}`,
+        action: "not-now",
+        planId: `paced-plan-${i}`,
+      });
+    }
+    await pass(fakeCtx());
+
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts on a deliberate arming with no record, and the brakes still disarm it (anton-d1lk)", async () => {
+    // The signature stands in for the EVIDENCE and for nothing else. A project nobody has answered a
+    // single pick on starts work on it — and the pass names whose signature it is standing on, since
+    // that is the only place an unattended start off no record is legible. The failure breaker below
+    // it is untouched by the bypass and freezes the very next pass.
+    board.current = [bead("t1")];
+    arm(t, "apply", {
+      record: false,
+      override: { by: "Henri Blancke", at: "2026-09-06T10:00:00.000Z" },
+    });
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls.map((args) => String(args[0])).join("\n")).toContain(
+      "apply armed deliberately by Henri Blancke on 2026-09-06T10:00:00.000Z",
+    );
+
+    threeFailedRuns(t);
+    await pass(fakeCtx());
+
+    expect(await activeDisarm(t.db, "p1")).toBeDefined();
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+    info.mockRestore();
   });
 
   it("starts nothing while the project is disarmed, on this pass and every later one", async () => {

@@ -56,6 +56,7 @@ function fakeCtx(jobId = "job-1", projectId = "p1"): JobContext {
     report: () => {},
     claudeReached: async () => {},
     signal: new AbortController().signal,
+    enqueueReviewFixPr: () => undefined,
   };
 }
 

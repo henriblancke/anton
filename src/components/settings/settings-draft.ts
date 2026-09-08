@@ -7,6 +7,7 @@ import {
   DEFAULT_DAYTIME_RESERVE_PCT,
   DEFAULT_JOB_TIMEOUT_MINUTES,
   DEFAULT_MAX_RETRIES,
+  DEFAULT_REVIEW_FIX_CONCURRENCY,
   DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
   DEFAULT_REVIEW_MAX_ROUNDS,
   DEFAULT_REVIEW_MIN_SCORE,
@@ -41,6 +42,7 @@ export interface SettingsDraft {
   model: string;
   seedPrompt: string;
   reviewFixPrompt: string;
+  reviewFixConcurrency: number;
   productMasterPrompt: string;
   reviewEnabled: boolean;
   reviewAgent: string;
@@ -103,6 +105,7 @@ export function draftFromSettings(
     model: settings.model ?? "",
     seedPrompt: settings.seedPrompt ?? "",
     reviewFixPrompt: settings.reviewFixPrompt ?? "",
+    reviewFixConcurrency: settings.reviewFixConcurrency ?? DEFAULT_REVIEW_FIX_CONCURRENCY,
     productMasterPrompt: settings.productMasterPrompt ?? "",
     // Absent → ON: the self-review gate runs unless the operator turns it off (anton-3apm).
     reviewEnabled: settings.reviewEnabled ?? true,
@@ -152,6 +155,7 @@ const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
   model: ["model"],
   seedPrompt: ["seedPrompt"],
   reviewFixPrompt: ["reviewFixPrompt"],
+  reviewFixConcurrency: ["reviewFixConcurrency"],
   productMasterPrompt: ["productMasterPrompt"],
   concurrency: ["concurrency"],
   jobTimeoutMinutes: ["jobTimeoutMinutes"],
@@ -246,6 +250,7 @@ export function settingsPatchBody(
     model: orNull(draft.model),
     seedPrompt: orNull(draft.seedPrompt),
     reviewFixPrompt: orNull(draft.reviewFixPrompt),
+    reviewFixConcurrency: draft.reviewFixConcurrency,
     productMasterPrompt: orNull(draft.productMasterPrompt),
     // Self-review gate (anton-3apm). The knobs are sent even while the gate is off, so turning it
     // back on restores the operator's reviewer instead of silently resetting it.

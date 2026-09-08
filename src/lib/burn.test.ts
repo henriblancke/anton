@@ -71,9 +71,17 @@ describe("burnsClaudeQuota", () => {
   });
 
   it("includes every Claude-driven type", () => {
-    for (const t of ["execute-epic", "review-fix", "nightly-stringer", "product-master"] as const) {
+    for (const t of ["execute-epic", "review-fix-pr", "nightly-stringer", "product-master"] as const) {
       expect(burnsClaudeQuota(t)).toBe(true);
     }
+  });
+
+  // The scheduled review-fix poll became a DISPATCHER (anton-3jwh): a board read, one `gh pr view`
+  // per target and a queue write. Sampling it would blame whatever moved the meters on a job that
+  // never invoked Claude; the review-fix-pr job it fans out to is what actually costs.
+  it("excludes the review-fix dispatcher but not the per-PR fix it dispatches", () => {
+    expect(burnsClaudeQuota("review-fix")).toBe(false);
+    expect(JOB_TYPE_TIER["review-fix-pr"]).toBe("M");
   });
 });
 

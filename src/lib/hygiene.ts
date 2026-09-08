@@ -15,6 +15,7 @@
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { epochOrZero } from "./db/epoch";
 import type { AntonDb, Clock } from "./jobs/queue";
 
 /**
@@ -105,11 +106,6 @@ const COMPLETED = isNotNull(schema.hygieneReports.completedAt);
 
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
-}
-
-function toEpoch(value: unknown): number {
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value ?? 0);
 }
 
 /**
@@ -309,7 +305,7 @@ function toReport(row: typeof schema.hygieneReports.$inferSelect): HygieneReport
     id: row.id,
     projectId: row.projectId,
     jobId: row.jobId ?? undefined,
-    generatedAt: toEpoch(row.generatedAt),
+    generatedAt: epochOrZero(row.generatedAt),
     actions: {
       closedEpics: parseJson<string[]>(row.closedEpicsJson, []),
       rowsRecomputed: row.rowsRecomputed,
