@@ -1032,6 +1032,59 @@ function describeGitFailure(error: unknown): string {
 }
 
 /**
+ * True when `commit` is among the commits `branch` ADDED over `base` — reachable from the branch
+ * and not from the base — asked of the repository exactly as {@link branchContainsCommit} is.
+ *
+ * This is the evidence behind a `satisfied` self-report (anton-nuft): the agent claims an EARLIER
+ * commit of this run already did its step's work, and the gate settles on the branch, never on the
+ * claim. "On the branch" alone is too weak a test, because every commit of the base is on the branch
+ * too — the fork point, or anything merged in from `main` — and none of them is work this run did.
+ * A claim naming one is the zero-diff false success the gate exists to catch, dressed as evidence.
+ *
+ * Fails closed to `false` on every git error: an unknown or ambiguous sha, a branch or base this
+ * machine never had, an unreadable repository. Only git's own "not an ancestor of the base" (exit 1)
+ * is the answer that settles the step; a broken read of the base is no evidence that the commit is
+ * the run's own.
+ */
+export async function branchAddedCommit(
+  repoPath: string,
+  branch: string,
+  base: string,
+  commit: string,
+): Promise<boolean> {
+  if (!(await branchContainsCommit(repoPath, branch, commit))) return false;
+  try {
+    await git(repoPath, ["merge-base", "--is-ancestor", commit, base]);
+    return false;
+  } catch (e) {
+    return exitedWith(e, 1);
+  }
+}
+
+/**
+ * The full sha and subject line of `ref`, as the repository resolves it — undefined when it names
+ * nothing, or names more than one thing.
+ *
+ * This is what a satisfied step is RECORDED against (anton-8h4b): the agent names a commit by
+ * whatever abbreviation it read off `git log`, and the gate accepts it on the strength of the branch
+ * ({@link branchAddedCommit}). An abbreviation is unambiguous today and may not be next year, so the
+ * bead and the pull request cite the full sha; the subject is the attribution a reader wants, since
+ * anton subjects its own commits `<ticket-id>: <title>`.
+ */
+export async function describeCommit(
+  repoPath: string,
+  ref: string,
+): Promise<{ sha: string; subject: string } | undefined> {
+  try {
+    const out = await git(repoPath, ["log", "-1", "--format=%H%n%s", `${ref}^{commit}`, "--"]);
+    const [sha, subject = ""] = out.trim().split("\n");
+    return sha && /^[0-9a-f]{40}$/.test(sha) ? { sha, subject: subject.trim() } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * What git's history says became of `path` on this branch — the raw read behind the `ref-stale`
  * repair (anton-fzas / R5.4). It reports; it does not judge. Whether a single destination is a
  * rename anton may follow, or a pointer it must refuse to guess at, is

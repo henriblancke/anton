@@ -21,8 +21,11 @@ import { withBeadWriteLock } from "../beads/claim-lock";
 import { resumeSkipped } from "../ticket-view";
 import type { EpicRun } from "./execute-epic-run";
 import type { RunPreparation } from "./execute-epic-prepare";
+import type { TicketOutcome } from "./execute-epic-ticket";
 
-const runTicketMock = vi.fn<(args: { ticket: Bead }) => Promise<void>>();
+/** What a ticket that ran to its own commit settles as — the walk's ordinary answer. */
+const COMMITTED: TicketOutcome = { how: "committed", closed: true };
+const runTicketMock = vi.fn<(args: { ticket: Bead }) => Promise<TicketOutcome>>();
 vi.mock("./execute-epic-ticket", () => ({
   runTicket: (args: { ticket: Bead }) => runTicketMock(args),
 }));
@@ -59,6 +62,7 @@ const { PoisonEpic } = await import("./errors");
 const { beads } = await import("../beads/bd");
 const reopenMock = vi.mocked(beads.reopen);
 const showMock = vi.mocked(beads.show);
+const tagMock = vi.mocked(beads.tag);
 
 const EPIC = "anton-epic";
 const SHIPPER = "anton-ship";
@@ -75,8 +79,12 @@ const superseded = (id: string, by: string): Bead =>
     dependencies: [{ issue_id: id, depends_on_id: by, type: "supersedes" }],
   } as Partial<Bead>);
 
+/** The board as bd answers a fresh `show` — the run's snapshot, unless a case moves a bead on. */
+let board: Bead[] = [];
+
 function makeRun(tickets: Bead[], signal: AbortSignal): EpicRun {
   const target = bead(EPIC, { issue_type: "epic", status: "in_progress", parent: undefined });
+  board = [target, ...tickets];
   return {
     repo: "/tmp/anton-repo",
     targetId: EPIC,
@@ -117,11 +125,17 @@ const abandoned = (id: string): Bead =>
   bead(id, { status: "closed", labels: [LABELS.abandoned] });
 
 beforeEach(() => {
-  runTicketMock.mockReset().mockResolvedValue(undefined);
+  board = [];
+  runTicketMock.mockReset().mockResolvedValue(COMMITTED);
   hasCommitMock.mockReset().mockResolvedValue(false);
   reopenMock.mockReset().mockResolvedValue("");
-  showMock.mockReset().mockResolvedValue(undefined as unknown as Bead);
+  tagMock.mockReset().mockResolvedValue("");
+  showMock.mockReset().mockImplementation(async (_repo: string, id: string) => board.find((b) => b.id === id)!);
 });
+
+/** Every ticket the loop marked `not-delivered`. */
+const markedNotDelivered = () =>
+  tagMock.mock.calls.filter((c) => c[2].includes(LABELS.notDelivered)).map((c) => c[1]);
 
 describe("a ticket the board already holds as superseded", () => {
   it("is dropped from the run when nothing on this branch carries it", async () => {
@@ -132,7 +146,75 @@ describe("a ticket the board already holds as superseded", () => {
     expect(dispatchedIds()).toEqual(["anton-b"]);
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-b"]);
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "pre-existing" }]);
+    // Marked as work this run does not deliver (PR #238 review): reopened while the PR sits in
+    // review, it is an open child with nothing in that diff, and the marker is the only thing that
+    // keeps merge finalization from closing it as shipped.
+    expect(markedNotDelivered()).toEqual(["anton-a"]);
   });
+
+  // The snapshot says superseded; the board, read under the ticket's lock, says an operator has
+  // reopened it since (PR #238 review). The reopen is a person saying the work is NOT done, so the
+  // ticket is live work again — dispatched, not dropped on a supersede the board no longer holds.
+  it("stays LIVE when a fresh read under its lock finds it reopened since the snapshot", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    board = board.map((b) => (b.id === "anton-a" ? ({ ...b, status: "open" } as Bead) : b));
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(dispatchedIds()).toEqual(["anton-a", "anton-b"]);
+    expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-a", "anton-b"]);
+    expect(run.retired).toEqual([]);
+    expect(markedNotDelivered()).toEqual([]);
+  });
+
+  it("decides the retirement under the ticket's write lock, not on the snapshot", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER)], new AbortController().signal);
+    let release!: () => void;
+    const held = withBeadWriteLock(
+      "/tmp/anton-repo",
+      "anton-a",
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+
+    const dispatch = dispatchRunTickets(run, prep()).catch((e: Error) => e);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(showMock).not.toHaveBeenCalled();
+    expect(run.retired).toEqual([]);
+
+    // The lock holder reopens the ticket before it lets go — the run must see that read, not its own.
+    board = board.map((b) => (b.id === "anton-a" ? ({ ...b, status: "open" } as Bead) : b));
+    release();
+    await held;
+    await dispatch;
+
+    expect(run.retired).toEqual([]);
+    expect(dispatchedIds()).toEqual(["anton-a"]);
+  });
+
+  // Unreadable is not "still superseded" and not "reopened" (PR #238 review): retired, a reopen is
+  // silently reversed; kept live, a retirement an earlier attempt verified is re-run. Stop instead.
+  it("stops the run when bd cannot read the superseded ticket back", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    showMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(PoisonEpic);
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /anton-a is superseded on the board this run read, but bd would not read the ticket back/,
+    );
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
+  });
+
+  it("stops the run rather than open a PR when the marker cannot be written", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    tagMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /anton-a is retired as already shipped, but bd would not record `not-delivered` on it/,
+    );
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
+  }, 10_000);
 
   // A child that committed and closed on an earlier attempt, then was superseded by hand before the
   // retry (PR #238 review): its commit is in this branch's diff, so the PR body has to list it and
@@ -185,7 +267,7 @@ describe("a ticket the board already holds as superseded", () => {
 describe("a retirement landing under a cancelled job", () => {
   const retire = (controller?: AbortController) =>
     runTicketMock.mockImplementation(async ({ ticket }) => {
-      if (ticket.id !== "anton-a") return;
+      if (ticket.id !== "anton-a") return COMMITTED;
       // The supersede is on the board before the kill lands — the settlement lets it stand.
       controller?.abort();
       throw new TicketRetiredError("anton-a", SHIPPER, "retired anton-a as superseded by anton-ship");
@@ -200,6 +282,8 @@ describe("a retirement landing under a cancelled job", () => {
 
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "this-run" }]);
     expect(dispatchedIds()).toEqual(["anton-a"]);
+    // No board write under the kill: the resume finds the retirement on the board and marks it there.
+    expect(markedNotDelivered()).toEqual([]);
   });
 
   it("carries the run on to the next ticket under a signal that never fires", async () => {
@@ -211,6 +295,9 @@ describe("a retirement landing under a cancelled job", () => {
     expect(dispatchedIds()).toEqual(["anton-a", "anton-b"]);
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "this-run" }]);
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-b"]);
+    // Marked like a retirement the run found on the board (PR #238 review): a reopen after this
+    // is an open child in no diff, and only the marker keeps the merge from closing it as shipped.
+    expect(markedNotDelivered()).toEqual(["anton-a"]);
   });
 });
 

@@ -55,6 +55,7 @@ function fakeCtx(jobId = "job-1", projectId = "p1"): JobContext {
     heartbeat: async () => {},
     report: () => {},
     signal: new AbortController().signal,
+    enqueueReviewFixPr: () => undefined,
   };
 }
 

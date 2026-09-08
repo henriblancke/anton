@@ -615,10 +615,10 @@ describe("finalizeMergedEpic", () => {
   });
 
   it("reuses a follow-up the sweep's snapshot could not have seen (PR #199)", async () => {
-    // `enqueueReviewFixIfAbsent` lets the project-wide sweep and a gate-check's targeted fix both
-    // reach one merged target, and whichever finalizes second read the board before the first
-    // created its follow-up. Nominating off that snapshot alone would create a SECOND target and
-    // split the preserved tickets across the two.
+    // Two jobs can finalize one merged target — a crash-reclaimed row, or two anton instances
+    // sharing a board, since `enqueueReviewFixPrIfAbsent`'s dedupe is machine-local — and whichever
+    // finalizes second read the board before the first created its follow-up. Nominating off that
+    // snapshot alone would create a SECOND target and split the preserved tickets across the two.
     const concurrent = {
       ...bead("epic-7"),
       issue_type: "epic",
@@ -2221,6 +2221,19 @@ describe("undeliveredAtMerge", () => {
     ];
 
     expect(undeliveredAtMerge(children)).toEqual(new Set(["t1", "t2"]));
+  });
+
+  it("holds back a retired ticket an operator reopened while the PR sat in review", () => {
+    // Retired as already shipped (anton-5bpd): closed as superseded, its work in the run's base and
+    // in none of its diff, and marked `not-delivered` by the run for exactly this moment. Reopened,
+    // it is an open child the merge would otherwise close as shipped — and the `supersedes` edge
+    // alone says nothing to the merge, so the marker is what keeps it open (PR #238 review).
+    const reopened = {
+      ...bead("t2", "open", [LABELS.notDelivered]),
+      dependencies: [{ issue_id: "t2", depends_on_id: "shipper", type: "supersedes" }],
+    } as Bead;
+
+    expect(undeliveredAtMerge([bead("t1"), reopened])).toEqual(new Set(["t2"]));
   });
 
   it("walks through a dependent that is closed but marked not-delivered", () => {

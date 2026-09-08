@@ -228,6 +228,13 @@ export interface ProjectSettings {
    */
   concurrency?: number;
   /**
+   * Max concurrent per-PR review fixes for this project (anton-kwi6). The scheduled review-fix poll
+   * fans out one `review-fix-pr` job per actionable PR, and the runner gates that type per project
+   * against this — so a burst of review activity cannot fill the global slot pool and starve
+   * execute-epic. Absent → DEFAULT_REVIEW_FIX_CONCURRENCY.
+   */
+  reviewFixConcurrency?: number;
+  /**
    * How long a job attempt may go WITHOUT PROGRESS before the runner aborts it, in minutes
    * (anton-xbk; re-scoped from a total wall clock in anton-t1mo). Measured from the handler's last
    * `ctx.heartbeat()` — a wedge backstop, NOT the per-task budget. On expiry the run is aborted and
@@ -422,6 +429,14 @@ export function resolveVerifyGates(settings: ProjectSettings): VerifyGate[] {
 
 /** Defaults for the per-project job policy when a setting is unset. */
 export const DEFAULT_CONCURRENCY = 3;
+/**
+ * Two, not three: the global ceiling is 8 (ANTON_MAX_CONCURRENT) and {@link DEFAULT_CONCURRENCY} is
+ * already 3, so 2 still fixes PRs in parallel while leaving headroom for gate-check, sync-push and
+ * the other polls to keep their slots. This bounds ONE project; the sum across projects is bounded
+ * by the runner-wide ANTON_MAX_REVIEW_FIX_CONCURRENT (half the pool by default), which is what
+ * actually keeps those slots free when several projects have actionable PRs at once.
+ */
+export const DEFAULT_REVIEW_FIX_CONCURRENCY = 2;
 export const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2 hours without progress
 export const DEFAULT_TICKET_TIMEOUT_MINUTES = 45;
 export const DEFAULT_MAX_RETRIES = 3;
@@ -467,6 +482,7 @@ export const DEFAULT_AUTOPILOT_WIP_LIMIT = 3;
 
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
+export const REVIEW_FIX_CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const JOB_TIMEOUT_MINUTES_RANGE = { min: 5, max: 720 } as const; // 5 min … 12 h
 export const TICKET_TIMEOUT_MINUTES_RANGE = { min: 5, max: 240 } as const; // 5 min … 4 h
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;

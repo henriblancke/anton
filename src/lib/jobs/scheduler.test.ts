@@ -157,6 +157,57 @@ describe("Scheduler.tickOnce", () => {
     expect(await sched.tickOnce()).toBe(1);
   });
 
+  /**
+   * anton-y771. The coalescing key is the job TYPE, so work the poll DISPATCHES must not suppress
+   * the poll: measured on anton's own history, 505 of 10062 review-fix jobs outlived their 15-minute
+   * slot, and with a shared type a 45-minute fix on one PR swallowed the next three polls — the ones
+   * that would have found the OTHER PRs' feedback.
+   */
+  it("does not skip a due review-fix slot for a running review-fix-pr job", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "review-fix",
+      cron: "*/5 * * * *",
+    });
+    await tdb.db.insert(schema.jobs).values({
+      id: "pr-fix-1",
+      type: "review-fix-pr",
+      projectId: "p1",
+      status: "running",
+      payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "epic-1" }),
+    });
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    clock.set(base + 5 * 60_000);
+    expect(await sched.tickOnce()).toBe(1);
+    expect(jobsFor(tdb, "p1").filter((j) => j.type === "review-fix")).toHaveLength(1);
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect((row.nextRunAt as Date).getTime()).toBeGreaterThan(clock.now());
+  });
+
+  it("still skips a due review-fix slot for an in-flight dispatcher of its own type", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "review-fix",
+      cron: "*/5 * * * *",
+    });
+    await tdb.db.insert(schema.jobs).values({
+      id: "dispatcher-1",
+      type: "review-fix",
+      projectId: "p1",
+      status: "queued",
+      payloadJson: JSON.stringify({ projectId: "p1" }),
+    });
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    clock.set(base + 5 * 60_000);
+    expect(await sched.tickOnce()).toBe(0);
+    expect(jobsFor(tdb, "p1").filter((j) => j.type === "review-fix")).toHaveLength(1);
+    // The skip costs one slot, not a re-fire the moment the in-flight pass ends.
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect((row.nextRunAt as Date).getTime()).toBeGreaterThan(clock.now());
+  });
+
   it("skips disabled schedules", async () => {
     const id = await createSchedule(tdb.db, clock, {
       projectId: "p1",

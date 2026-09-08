@@ -75,9 +75,14 @@ export class Scheduler {
     if (due.length === 0) return 0;
 
     // Which (type, projectId) already have a job in flight — so we coalesce instead of piling up a
-    // second job for the same work (a review-fix sweep can outlast its 15-min slot). The overlapped
-    // slot is skipped; nextRunAt still advances so we wait for the next cron time rather than firing
-    // the moment the in-flight job finishes.
+    // second job for the same work (a pass can outlast its own slot). The overlapped slot is
+    // skipped; nextRunAt still advances so we wait for the next cron time rather than firing the
+    // moment the in-flight job finishes.
+    //
+    // The key is the job TYPE, deliberately (anton-y771): work a scheduled pass DISPATCHES carries
+    // a type of its own — `review-fix` fans out `review-fix-pr` — so a 45-minute fix on one PR does
+    // not suppress the poll that would have found the other PRs' feedback. The scheduler stays
+    // generic and never inspects a payload.
     const inflight = await this.db
       .select({ type: schema.jobs.type, projectId: schema.jobs.projectId })
       .from(schema.jobs)

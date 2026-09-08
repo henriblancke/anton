@@ -15,8 +15,10 @@
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { blockNoteEvidence } from "../beads/block-note";
+import { shortSha, type SatisfiedBy } from "../beads/satisfied-note";
 import { formatAntonResult, type AntonResult } from "../claude/anton-result";
 import {
+  describeCommit,
   preservedCommitPrefix,
   readWorktreeState,
   restoreWorktreeState,
@@ -51,12 +53,14 @@ export interface TicketProgress {
    */
   committed: boolean;
   /**
-   * Whether that evidence is THIS ticket's delivery (PR #228 review) — `committed` AND every
-   * delivery gate in `assertDelivered` accepted it. The two part company exactly where the gate
-   * refuses a commit that exists: a previous attempt's adopted `WIP` this run never affirmed, or
-   * work the agent itself declared blocked. Settlement reads THIS one, because a refused commit
-   * owes the board the `not-delivered` marker and belongs in no pull request's delivered list —
-   * `committed` alone would let a deadline landing on the refusal ship it as finished.
+   * Whether the ticket's work is delivered (PR #228 review) — `committed` AND every delivery gate in
+   * `assertDelivered` accepted it. The two part company exactly where the gate refuses a commit
+   * that exists: a previous attempt's adopted `WIP` this run never affirmed, or work the agent
+   * itself declared blocked. Settlement reads THIS one, because a refused commit owes the board the
+   * `not-delivered` marker and belongs in no pull request's delivered list — `committed` alone
+   * would let a deadline landing on the refusal ship it as finished. They part the other way for a
+   * `satisfied` step the branch bore out (anton-nuft): this ticket committed nothing, and an earlier
+   * commit of the run is its delivery.
    */
   delivered: boolean;
   /**
@@ -71,6 +75,51 @@ export interface TicketProgress {
    * retirement on this read (PR #238 review); absent when no dispatching step reported one.
    */
   dispatched?: Bead;
+}
+
+/**
+ * HOW a finished ticket settled (anton-8h4b): on a commit of its own, or on an earlier commit of the
+ * run that already did its work. The close is the same either way; what differs is what the board
+ * and the pull request may say about it — a satisfied step is closed but delivered nothing of its
+ * own, and presenting it as a delivery is the false success the gate refuses in every other shape.
+ */
+export type TicketSettlement =
+  | { how: "committed" }
+  | { how: "satisfied"; by: SatisfiedBy };
+
+/**
+ * The satisfied claim a finished ticket settled on, or null when it committed its own work. Read
+ * off the same progress the gate wrote: `delivered` without `committed` is exactly the shape
+ * `assertDelivered` produces for a verified `satisfied` self-report, and nothing else produces it.
+ */
+export function satisfiedClaim(progress: TicketProgress): { commit: string; note?: string } | null {
+  if (progress.committed || !progress.delivered) return null;
+  const report = progress.selfReport;
+  if (report?.outcome !== "satisfied" || !report.commit) return null;
+  return { commit: report.commit, note: report.reason };
+}
+
+/**
+ * Settle a finished ticket against the branch: a satisfied step is recorded against the FULL sha
+ * and subject of the commit it named, so the record outlives the abbreviation the agent read off
+ * `git log`. Best-effort resolution — the gate already accepted the commit, so a read that fails
+ * here costs the subject and the long form, never the settlement.
+ */
+export async function ticketSettlement(
+  run: Pick<StepContext, "repoPath">,
+  progress: TicketProgress,
+): Promise<TicketSettlement> {
+  const claim = satisfiedClaim(progress);
+  if (!claim) return { how: "committed" };
+  const resolved = await describeCommit(run.repoPath, claim.commit);
+  return {
+    how: "satisfied",
+    by: {
+      commit: resolved?.sha ?? claim.commit,
+      ...(resolved?.subject ? { subject: resolved.subject } : {}),
+      ...(claim.note ? { note: claim.note } : {}),
+    },
+  };
 }
 
 /**
@@ -261,6 +310,17 @@ export async function settleTicketTimeout(args: {
   // `!ctx.signal.aborted` breaks the tie when both fired: an operator's kill outranks the budget,
   // and the abort path is the one that writes nothing to a board a human is deciding on.
   if (ranOutOfTime && !ctx.signal.aborted) {
+    // A delivery with no commit of its own is a SATISFIED step the deadline caught between the
+    // gate's acceptance and its close (PR #253 review). Settled here exactly as the close would have
+    // — resolved against the repository — so the run's ledger and the bead both learn which commit
+    // it stands on; without it the pull request lists a delivery the branch carries under no such
+    // name, and the note below says work was rolled back when nothing was.
+    const satisfiedBy =
+      delivered && !committed
+        ? await ticketSettlement(run, args.progress).then((s) =>
+            s.how === "satisfied" ? s.by : null,
+          )
+        : null;
     await appendSessionLog(
       logPath,
       `[ticket-timeout] ${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m budget\n`,
@@ -335,6 +395,7 @@ export async function settleTicketTimeout(args: {
       preservedOn,
       retained,
       unmarkedOn,
+      satisfiedBy,
       ...("rolledBackWhy" in kept ? { rolledBackWhy: kept.rolledBackWhy } : {}),
     });
     // Emptying the tree is what keeps the REST of the run honest, so its failure cannot be absorbed
@@ -402,7 +463,14 @@ export async function settleTicketTimeout(args: {
           `\`${branch}\`, then resume the run`,
       );
     }
-    throw new TicketTimeoutError(ticket.id, timeoutMs, delivered, preservedOn, preservedUnknown);
+    throw new TicketTimeoutError(
+      ticket.id,
+      timeoutMs,
+      delivered,
+      preservedOn,
+      preservedUnknown,
+      satisfiedBy,
+    );
   }
 }
 
@@ -471,6 +539,11 @@ interface TimedOutWork {
   unmarkedOn?: string | null;
   /** Why the work could NOT be kept — the operator is owed the reason, not just the verdict. */
   rolledBackWhy?: string;
+  /**
+   * The earlier commit a delivered-but-uncommitted ticket settled on (PR #253 review): a satisfied
+   * step the deadline caught during its bookkeeping. Its work is on the branch under that commit.
+   */
+  satisfiedBy?: SatisfiedBy | null;
 }
 
 /**
@@ -488,6 +561,7 @@ async function blockTimedOutTicket(
 ): Promise<boolean> {
   const { repo, ticketId, worktreePath, committed, delivered, leftovers, preservedOn } = args;
   const unmarkedOn = args.unmarkedOn ?? null;
+  const satisfiedBy = args.satisfiedBy ?? null;
   await safe(() => beads.setStatus(repo, ticketId, "blocked"));
   await safe(() => beads.unassign(repo, ticketId));
   await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
@@ -508,8 +582,11 @@ async function blockTimedOutTicket(
   // "nothing committed" — PR #227 review). Read whenever anything of this ticket sits ON the branch,
   // a preserve and an unmarked adoption included: the park gate turns on that clause, and work
   // reported as "nothing committed" wins the operator the redo the preserve exists to prevent.
-  const head =
-    committed || preservedOn !== null || unmarkedOn !== null
+  // A satisfied step's evidence is the commit it settled on, not the tip: that is the sha the
+  // operator is told to review, and the one the close would have cited.
+  const head = satisfiedBy
+    ? satisfiedBy.commit
+    : committed || preservedOn !== null || unmarkedOn !== null
       ? await readWorktreeState(worktreePath)
           .then((s) => s.head)
           .catch(() => undefined)
@@ -689,9 +766,19 @@ async function blockFailedTicket(args: {
 /** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
 export function selfReportSuffix(selfReport: AntonResult | null): string {
   if (!selfReport) return "";
-  return selfReport.outcome === "delivered"
-    ? ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`
-    : ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
+  if (selfReport.outcome === "delivered") {
+    return ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`;
+  }
+  // A satisfied claim only reaches a no-delivery message when the branch did not bear it out
+  // (anton-nuft): the gate settles a verified one before any message is composed.
+  if (selfReport.outcome === "satisfied") {
+    return (
+      ` The agent self-reported ANTON-RESULT: ${formatAntonResult(selfReport)}, but that names no ` +
+      `commit this run's branch added over its base, so the claim is unverified — a false success ` +
+      `on an unchanged tree.`
+    );
+  }
+  return ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
 }
 
 /**
@@ -800,7 +887,8 @@ export function timedOutTicketNote(
         sessionId,
         branch,
         // Whoever wrote the commit, the work is ON the branch — the verdict the park gate needs.
-        committed: committed || preservedOn !== null || Boolean(args.unmarkedOn),
+        committed:
+          committed || preservedOn !== null || Boolean(args.unmarkedOn) || Boolean(args.satisfiedBy),
         head,
       })}]`,
   );
@@ -818,6 +906,17 @@ function timedOutFate(work: TimedOutWork): string {
   const { ticketId, committed, delivered, leftovers, worktreePath, preservedOn, rolledBackWhy } =
     work;
   const unmarkedOn = work.unmarkedOn ?? null;
+  // Settled on an earlier commit, so there was never anything of its own to keep or roll back.
+  if (work.satisfiedBy) {
+    const { commit, subject } = work.satisfiedBy;
+    return (
+      `Its work was already on the branch: commit ${shortSha(commit)}` +
+      `${subject ? ` ("${subject}")` : ""} — an earlier commit of this run — met its acceptance, ` +
+      `and the delivery gate had settled it on that commit when the deadline landed on the ` +
+      `bookkeeping. Nothing was rolled back; review that commit and close the ticket by hand if ` +
+      `it is complete.`
+    );
+  }
   if (committed) {
     return delivered
       ? `Its work IS committed on the branch (it was stopped after the commit) — review it and ` +

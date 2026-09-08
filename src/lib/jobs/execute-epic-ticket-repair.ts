@@ -22,6 +22,7 @@ import {
   type DepMissingOutcome,
 } from "../gardener/repair-dep-missing";
 import { refusalNote, repairRefStale, type RefStaleOutcome } from "../gardener/repair-ref-stale";
+import { resolveMergeBase } from "../git/ops";
 import { resolveRepairAutonomy } from "../projects";
 import { appendSessionLog } from "../sessions";
 import { safe } from "./execute-epic-persist";
@@ -123,7 +124,15 @@ export async function repairBlockedTicket(args: {
         : kind === "already-shipped"
         ? await repairAlreadyShipped({
             repoPath: repo,
-            base: run.baseRef,
+            // The COMMIT this checkout forked from, never the ref it was cut at (PR #238 review).
+            // `run.baseRef` is `origin/<base>` — a ref a sibling run's fetch advances mid-run, while
+            // a resumed worktree is reused exactly as it was — so a claim checked against it can
+            // verify against work this branch does not contain, and the tickets behind the retired
+            // one would then be dispatched against a mechanism the checkout lacks. Pinned per
+            // repair rather than once per run, for the same reason: it is the fork point AT THE
+            // WRITE that the retirement has to hold against. A fork point git cannot compute fails
+            // the repair, and the block stands.
+            base: await resolveMergeBase(worktreePath, run.baseRef),
             bead: fresh,
             // The contract the agent was PROMPTED with (PR #238 review): `fresh` is read after the
             // report, so an edit landing mid-session is already in it, and a fence starting there

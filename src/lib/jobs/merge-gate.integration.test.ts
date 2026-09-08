@@ -31,7 +31,7 @@ import * as schema from "../db/schema";
 import { createRun, getRunById } from "../runs";
 import { getJob, systemClock, type JobRow } from "./queue";
 import { makeGateCheckHandler } from "./gate-check";
-import { makeReviewFixHandler } from "./review-fix";
+import { makeReviewFixPrHandler } from "./review-fix";
 import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const IN_REVIEW = LABELS.stage("in-review");
@@ -59,8 +59,10 @@ describeBd("PR-merge gate e2e (real handlers · real bd/git · fake gh)", () => 
   const gateStatus = async (id: string) =>
     (await beads.gateList(repo, { all: true })).find((g) => g.id === id)?.status;
 
+  // A merged target is handed to the PER-PR job (anton-3jwh split the dispatcher from the fix), so
+  // that is the type a dispatch shows up as — never the scheduled `review-fix` poll's own.
   const reviewFixJobs = async (): Promise<JobRow[]> =>
-    tdb.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix"));
+    tdb.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr"));
 
   const reviewFixTargets = async () =>
     (await reviewFixJobs()).map((j) => JSON.parse(j.payloadJson).epicBeadId as string);
@@ -79,13 +81,13 @@ describeBd("PR-merge gate e2e (real handlers · real bd/git · fake gh)", () => 
     return getJob(tdb.db, jobId);
   }
 
-  /** Drive whatever review-fix jobs gate-check queued. Returns how many ran. */
+  /** Drive whatever review-fix-pr jobs gate-check queued. Returns how many ran. */
   async function drainReviewFix(): Promise<number> {
     const runner = makeJobRunner({
       db: tdb.db,
       clock: systemClock,
-      type: "review-fix",
-      handler: makeReviewFixHandler,
+      type: "review-fix-pr",
+      handler: makeReviewFixPrHandler,
       config: { leaseMs: 60_000 },
     });
     const leased = await runner.tickOnce();

@@ -305,11 +305,15 @@ and reschedules. Durability = **resumability, not retry-in-place**:
 Job types:
 1. **execute-epic** — approved epic → warm worktree → per ticket: `claude` (agent prompt) →
    tests → commit → when the epic's tickets are done, open one PR → `in-review`.
-2. **review-fix** — for `in-review` runs: poll the PR (via `gh`) for review comments + CI
-   status; when actionable, dispatch `claude` in the worktree to resolve, push, re-request.
-3. **nightly-stringer** — `stringer scan --delta` → `/scan-triage` prompt → beads (per project,
+2. **review-fix** — the poll, for `in-review` runs: read each PR (via `gh`) for review comments +
+   CI status and fan out one **review-fix-pr** job per PR that is actionable or merged. It triages
+   only — no worktree, no `claude` — so it always fits inside its slot.
+3. **review-fix-pr** — one PR: dispatch `claude` in its worktree to resolve the feedback, push,
+   re-request review (or finalize a merge). Capped per project by `reviewFixConcurrency`, so PRs
+   are fixed in parallel without starving execute-epic.
+4. **nightly-stringer** — `stringer scan --delta` → `/scan-triage` prompt → beads (per project,
    on cron).
-4. **orphan-grooming** — tickets with no epic → bucket into an epic, or fix in a single PR.
+5. **orphan-grooming** — tickets with no epic → bucket into an epic, or fix in a single PR.
 
 ## 5. Claude driver
 

@@ -24,9 +24,9 @@
  *      pass closed something.)
  *   4. APPLY ({@link dispatchUngated} / {@link dispatchReleased} / {@link dispatchMerged}) — the
  *      plan's three paths, in order: re-dispatch released work, mark the ad-hoc gates it came from,
- *      and hand every merged run target to review-fix, which closes it out exactly as it always has
- *      (anton-k0kj). That last move is what turns "waiting for merge" from a sweep that re-reads
- *      every open PR into one bd call per slot.
+ *      and hand every merged run target to a per-PR review-fix job, which closes it out exactly as
+ *      it always has (anton-k0kj). That last move is what turns "waiting for merge" from a sweep
+ *      that re-reads every open PR into one bd call per slot.
  *
  * IDEMPOTENCE is the property to preserve. `bd ready --gated` keeps reporting an entry for as long
  * as its step is ready — it is a view of the board, not a queue of events — so this pass must never
@@ -54,7 +54,7 @@ import {
   type PlainGateResume,
   type ResumePlan,
 } from "./gate-targets";
-import { enqueueReviewFixIfAbsent, systemClock, type AntonDb, type Clock } from "./queue";
+import { systemClock, type AntonDb, type Clock } from "./queue";
 import type { JobContext, JobEffect, JobHandler } from "./runner";
 import { resumeEpic } from "./unstick";
 
@@ -171,6 +171,12 @@ export interface PassContext {
   clock: Clock;
   projectId: string;
   repo: string;
+  /**
+   * The runner's guarded per-PR dispatch for THIS project (`JobContext.enqueueReviewFixPr`, bound
+   * to `projectId`). The pass fans out through it rather than the queue helper so a project delete
+   * that lands mid-pass refuses the insert instead of failing over the fresh row (PR #250 review).
+   */
+  enqueueReviewFixPr: (epicBeadId: string) => string | undefined;
 }
 
 /** What phase 1 learned about the project's gates — the input every later phase is scoped by. */
@@ -316,19 +322,24 @@ export async function dispatchReleased(
 }
 
 /**
- * 4c. APPLY — hand every MERGED run target to review-fix (anton-k0kj), which finalizes it exactly as
- * it always has; only its trigger moved. Deduped against a live job for the same target, and
- * re-dispatched every pass until the finalize actually lands, so a half-done finalize heals itself.
- * Returns how many review-fix jobs were ENQUEUED, not how many targets were finalized — that job
- * has not run yet, and may still be held, fail, or park.
+ * 4c. APPLY — hand every MERGED run target to the PER-PR fix job (anton-k0kj / anton-5mjt), which
+ * finalizes it exactly as it always has; only its trigger moved. Dispatching onto `review-fix-pr`
+ * rather than the dispatcher's own type is what keeps a merged target off the scheduled poll's
+ * coalescing key: a finalize in flight here used to suppress the next due `review-fix` slot, so a
+ * merge would silently cost the other PRs their review-event poll.
+ *
+ * Deduped against a live job for the same target, and re-dispatched every pass until the finalize
+ * actually lands (the target closes and loses `stage:in-review`), so a half-done finalize heals
+ * itself. Returns how many jobs were ENQUEUED, not how many targets were finalized — that job has
+ * not run yet, and may still be held, fail, or park.
  */
 export async function dispatchMerged(pass: PassContext, merged: Bead[]): Promise<number> {
   let dispatched = 0;
   for (const target of merged) {
-    const jobId = enqueueReviewFixIfAbsent(pass.db, pass.clock, pass.projectId, target.id);
+    const jobId = pass.enqueueReviewFixPr(target.id);
     if (jobId) {
       dispatched += 1;
-      console.log(`[gate-check] ${pass.projectId}: ${target.id} merged — dispatched review-fix`);
+      console.log(`[gate-check] ${pass.projectId}: ${target.id} merged — dispatched review-fix-pr`);
     }
   }
   return dispatched;
@@ -375,7 +386,7 @@ export function gatePassEffect(counts: GatePassCounts): JobEffect {
     counts.surfaced > 0 && `surfaced ${counts.surfaced} stall(s)`,
     counts.handedBack > 0 && `handed back ${counts.handedBack} gate(s)`,
     counts.resumed > 0 && `resumed ${counts.resumed} run(s)`,
-    counts.dispatched > 0 && `dispatched ${counts.dispatched} merged run(s) to review-fix`,
+    counts.dispatched > 0 && `dispatched ${counts.dispatched} merged run(s) to review-fix-pr`,
   ].filter((clause): clause is string => clause !== false);
 
   return did.length > 0
@@ -405,7 +416,13 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     const { projectId } = ctx.payload as GateCheckPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
-    const pass: PassContext = { db, clock, projectId, repo: project.repoPath };
+    const pass: PassContext = {
+      db,
+      clock,
+      projectId,
+      repo: project.repoPath,
+      enqueueReviewFixPr: (epicBeadId) => ctx.enqueueReviewFixPr(projectId, epicBeadId),
+    };
 
     const evaluation = await evaluateGates(pass, ctx);
 

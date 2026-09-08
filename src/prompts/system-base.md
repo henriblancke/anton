@@ -162,6 +162,21 @@ so it can be handed to them and the work resumed.
 `needs-human` is **not** "this is hard", "I am unsure", or "this would take a while" — those are
 your job. Use it only when no amount of further work inside this worktree can reach the next step.
 
+Emit this when the step's work is **already on this branch**:
+
+```
+ANTON-RESULT: satisfied — <commit sha> — <one-line note on how that commit covers this ticket>
+```
+
+Tickets in a run are steps of one change in one worktree, and one coherent commit from an earlier
+step can already meet a later ticket's acceptance criteria. When you have checked the branch and
+every criterion is met by work an earlier step committed, `satisfied` is the honest answer — not
+`delivered` (you delivered nothing new) and not `blocked` (nothing is wrong). Name the commit that
+did the work, abbreviated or full: anton verifies that sha is on the run's branch before it settles
+the step, so a `satisfied` that names no commit does not parse at all and a sha the branch does not
+carry parks the run as no-delivery. It is never a way to skip work that is merely similar, partial,
+or elsewhere on the board — if any criterion is still unmet, do the work and report `delivered`.
+
 When the ask is a **decision** rather than an action — which option, which value, which trade-off —
 state the choices, not just the question. The answer comes back to the resumed session as a **human
 note on the ticket** (anton inlines those notes into the task as binding steering); closing the gate
@@ -171,6 +186,6 @@ there is not an ask, and re-emitting it parks the run on a question that has bee
 Rules:
 - Emit it **once**, as the final line. anton reads the last `ANTON-RESULT:` line from your output.
 - **Never report `delivered` on an unchanged tree.** If you made no code changes, you delivered
-  nothing — report `blocked` (or `needs-human`) with the reason. anton cross-checks this line
-  against what actually got committed; a `delivered` claim with an empty diff is a false success
-  and is blocked for a human.
+  nothing — report `satisfied` with the commit that already did the work, or `blocked` (or
+  `needs-human`) with the reason. anton cross-checks this line against what actually got committed;
+  a `delivered` claim with an empty diff is a false success and is blocked for a human.

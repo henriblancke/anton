@@ -7,11 +7,13 @@
  * ticket stops short is the settlement's (execute-epic-ticket-settle.ts).
  */
 import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
+import { formatSatisfiedNote, shortSha } from "../beads/satisfied-note";
 import { readWorktreeState, type WorktreeState } from "../git/ops";
 import { updateRun } from "../runs";
 import { appendSessionLog, endSession, startJobSession, type JobSession } from "../sessions";
 import { PoisonEpic } from "./errors";
 import { mustPersist, safe } from "./execute-epic-persist";
+import type { TicketSettlement } from "./execute-epic-ticket-settle";
 import type { JobContext } from "./runner";
 import type { StepContext } from "./step-registry";
 
@@ -283,25 +285,59 @@ export function narrowToTicket(
   };
 }
 
-/** Persist this ticket's "code done" state the moment it commits. */
+/**
+ * Persist this ticket's "code done" state the moment it commits — or, for a SATISFIED step, the
+ * moment the gate accepted the earlier commit that did its work.
+ *
+ * Answers whether the bead actually CLOSED (PR #253 review): the close is best-effort, so a bd that
+ * refuses the write leaves the ticket open, and the run's ledger has to carry that fact rather than
+ * infer a close from the run's shape. A standalone target is never closed here, so it answers false.
+ */
 export async function finishTicket(
   run: Omit<StepContext, "tickets">,
   ticket: Bead,
   sessionId: string,
   closeOnDone: boolean,
-): Promise<void> {
+  settlement: TicketSettlement = { how: "committed" },
+): Promise<{ closed: boolean }> {
   const { db, clock } = run;
   const repo = run.repoPath;
+  // A satisfied step closes exactly as a committed one does, so the bead has to say which it was
+  // (anton-8h4b): without the record, a reader later sees a closed ticket with no commit under its
+  // name on the branch and cannot tell "an earlier commit covered it" from "the close was a lie".
+  // Written before the close, and the close WAITS on it (PR #253 review): the run's ledger is the
+  // only other copy, and a later park loses it before any pull request cites it. A note bd refuses
+  // therefore refuses the close too — the bead is left open for the resume to settle again, and the
+  // run halts on the same "check the beads DB" park every unrecordable board fact takes.
+  if (settlement.how === "satisfied") {
+    const recorded = await mustPersist(() =>
+      beads.note(
+        repo,
+        ticket.id,
+        formatSatisfiedNote({ by: settlement.by, sessionId, branch: run.branch }),
+      ),
+    );
+    if (!recorded) {
+      throw new PoisonEpic(
+        `${ticket.id} is satisfied by an earlier commit of this run ` +
+          `(${shortSha(settlement.by.commit)}), but bd would not record that on the bead — closing ` +
+          `it anyway would leave a closed ticket with no commit under its name and no account of ` +
+          `why, so it was left open instead. Check the beads DB, then resume the run`,
+      );
+    }
+  }
   // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
   // → done). A standalone target isn't closed until its PR merges, so instead move it to
   // stage:in-review here (dropping implementing): that is both its board state and the persisted
   // resume marker, so a retry after a failed PR step skips it rather than re-running claude on
   // committed work. endSession still records the work done either way.
+  let closed = false;
   if (closeOnDone) {
-    await safe(() => beads.close(repo, ticket.id));
+    closed = await safe(() => beads.close(repo, ticket.id));
   } else {
     await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("in-review")]));
     await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
   }
   await endSession(db, clock, sessionId, "done");
+  return { closed };
 }

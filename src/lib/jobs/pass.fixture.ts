@@ -42,6 +42,7 @@ export function fakeJobContext(overrides: Partial<JobContext> = {}): FakeJobCont
     report: (info) => {
       ctx.reported.push(info as Record<string, unknown>);
     },
+    enqueueReviewFixPr: () => undefined,
     ...overrides,
   };
   return ctx;

@@ -99,11 +99,12 @@ export const LABELS = {
   abandoned: "abandoned",
   /**
    * Work a run reserved but did NOT deliver (anton-67xj): a ticket skipped behind a timed-out one
-   * whose partial work was rolled back, or the timed-out ticket itself. Nothing from it is on the
-   * run's branch, so it is in no PR — which is exactly what merge finalization cannot see for
-   * itself: `bd` has no "this bead is not in that diff" fact, and a still-open child otherwise
-   * reads as one the run merely forgot to close. Cleared the moment a run dispatches the ticket
-   * again. See beads.isNotDelivered.
+   * whose partial work was rolled back, or the timed-out ticket itself — or one the run RETIRED as
+   * already shipped (anton-5bpd), whose work is in the run's base rather than its diff. Nothing
+   * from it is on the run's branch, so it is in no PR — which is exactly what merge finalization
+   * cannot see for itself: `bd` has no "this bead is not in that diff" fact, and a still-open child
+   * otherwise reads as one the run merely forgot to close. Cleared the moment a run dispatches the
+   * ticket again. See beads.isNotDelivered.
    */
   notDelivered: "not-delivered",
   /**

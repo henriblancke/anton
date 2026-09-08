@@ -33,6 +33,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { epochOrZero } from "./db/epoch";
 import { beads } from "./beads/bd";
 import { contractStatusOf } from "./beads/contract";
 import type { Bead } from "./beads/types";
@@ -620,11 +621,6 @@ function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
 }
 
-function toEpoch(value: unknown): number {
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value ?? 0);
-}
-
 type PlanRow = typeof schema.boardPickerPlans.$inferSelect;
 
 /** The three columns that make a plan the decision it is — what {@link restatesDecision} compares. */
@@ -664,7 +660,7 @@ function rowToPlan(row: PlanRow): BoardPickerPlan {
     projectId: row.projectId,
     planId: row.planId,
     ...(row.jobId ? { jobId: row.jobId } : {}),
-    generatedAt: toEpoch(row.generatedAt),
+    generatedAt: epochOrZero(row.generatedAt),
     stamp: {
       observedAtMs: row.boardObservedAtMs,
       digest: row.boardDigest,
