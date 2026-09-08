@@ -1145,6 +1145,20 @@ describe("what a claim NAMES", () => {
     expect(claimedCommits("anton-deadbee shipped abc-1234567 in 9c515")).toEqual([]);
   });
 
+  // A url's owner or repository can be seven hex letters wide (PR #238 review), and read as a commit
+  // it fails a claim the repository would otherwise verify. Only the sha under `/commit/` is one.
+  it("reads no sha out of a url's segments, but does read the one a commit url names", () => {
+    expect(claimedCommits("see https://github.com/abcdefg/widgets/pull/85 and 9c51510")).toEqual([
+      "9c51510",
+    ]);
+    expect(
+      claimedCommits(
+        "https://github.com/abcdefg/r/commit/0123456789ABCDEF0, then https://github.com/o/r/pull/85/commits/9c51510a",
+      ),
+    ).toEqual(["0123456789abcdef0", "9c51510a"]);
+    expect(claimedCommits("https://abcdefg.example/deadbeef/x")).toEqual([]);
+  });
+
   // A url keeps its repository (PR #238 review): reduced to `gh-85`, another repository's PR would
   // be read as whatever this one holds under that number.
   it("reads a bare number as the `gh-<n>` ref and keeps a url whole, deduped", () => {

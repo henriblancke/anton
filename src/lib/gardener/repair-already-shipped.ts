@@ -83,18 +83,39 @@ const KLASS = "already-shipped" as const;
 const SHA_PATTERN = /(?<![\w-])[0-9a-fA-F]{7,40}(?![\w-])/g;
 
 /**
+ * A url, taken whole, so no segment of it is read as a sha (PR #238 review): the owner or repository
+ * in `https://github.com/abcdefg/widgets/pull/85` stands alone between slashes exactly like a commit
+ * does, and read as one it fails a claim that is otherwise sound against a commit this repository
+ * never had. The one url segment that IS a citation — the sha under `/commit/` — is read by
+ * {@link COMMIT_URL_SHA} from the url itself, so citing a commit by its GitHub link is not the
+ * dropped citation the sha pattern's boundaries are careful to avoid.
+ */
+const URL_PATTERN = /\bhttps?:\/\/\S+/g;
+
+/** The sha a `…/commit/<sha>` (or `…/pull/<n>/commits/<sha>`) url cites. */
+const COMMIT_URL_SHA = /\/commits?\/([0-9a-fA-F]{7,40})(?![\w-])/;
+
+/** A sha or a url, whichever comes first — one pass, so the citations keep the order written. */
+const CITATION_PATTERN = new RegExp(`${URL_PATTERN.source}|${SHA_PATTERN.source}`, "g");
+
+/** Every commit the reason cites, lower-cased and de-duplicated in the order written. */
+export function claimedCommits(reason: string | undefined): string[] {
+  if (!reason) return [];
+  const cited: string[] = [];
+  for (const [token] of reason.matchAll(CITATION_PATTERN)) {
+    const sha = /^https?:/.test(token) ? COMMIT_URL_SHA.exec(token)?.[1] : token;
+    if (sha) cited.push(sha.toLowerCase());
+  }
+  return [...new Set(cited)];
+}
+
+/**
  * A pull request as it appears in prose — `#85`, `PR #85`, or a `https://…/<owner>/<repo>/pull/85`
  * url. The url's repository is captured whole with the number (PR #238 review): `gh pr view` reads
  * a bare number in the CURRENT repository, so a url pointing at another one reduced to its number
  * would be checked against whatever PR this repository happens to hold under it.
  */
 const PR_PATTERN = /\bhttps?:\/\/[^\s/]+\/[^\s/]+\/[^\s/]+\/pull\/(\d+)\b|#(\d+)\b/g;
-
-/** Every commit the reason cites, lower-cased and de-duplicated in the order written. */
-export function claimedCommits(reason: string | undefined): string[] {
-  if (!reason) return [];
-  return [...new Set([...reason.matchAll(SHA_PATTERN)].map((m) => m[0].toLowerCase()))];
-}
 
 /**
  * Every PR the reason cites, in the form {@link readPullRequestLanding} takes — so a PR named in

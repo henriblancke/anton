@@ -324,6 +324,18 @@ async function partitionTickets(
  *
  * What it retires it MARKS ({@link markRetired}), under the same lock, so the merge that lands the
  * rest of the run can still tell the ticket apart if it is reopened after this read.
+ *
+ * The lock orders only THIS process's writers (beads/claim-lock), so the marker is fenced a second
+ * time after it lands (PR #238 review), the way the repair fences its own supersede
+ * (repair-already-shipped.ts `retirementHeld`): on a shared-server board another process can reopen
+ * the ticket, re-home it and claim it between the read above and the tag, and a run that snapshotted
+ * the reopened bead BEFORE the tag landed never sees the marker at its claim gate, so the marker
+ * outlives that run's delivery and its merge reads the work as undelivered. Re-read once the tag is
+ * on the board — the only read that can have seen such a writer — the bead is either still closed
+ * as superseded, and the retirement stands, or it has moved, and the marker is WITHDRAWN before the
+ * ticket is handed back as live. What the fence cannot close is a reopen that lands after this
+ * second read: that one is seen by every snapshot taken after it, and the claim gate clears the
+ * marker (execute-epic-ticket-bookends `claimTicket`); the cross-process rest is anton-od4.
  */
 async function retireFound(run: EpicRun, ticket: Bead): Promise<RetiredTicketOutcome | undefined> {
   const { repo } = run;
@@ -337,11 +349,41 @@ async function retireFound(run: EpicRun, ticket: Bead): Promise<RetiredTicketOut
           `beads DB, then resume the run`,
       );
     }
-    const replacedBy = beads.supersededBy(live);
-    if (!replacedBy) return undefined;
+    if (!beads.supersededBy(live)) return undefined;
     await markRetired(run, ticket.id);
-    return { id: ticket.id, replacedBy, source: "pre-existing" };
+    const marked = await mustRead(repo, ticket.id);
+    if (!marked) {
+      throw new PoisonEpic(
+        `${ticket.id} is retired as already shipped and now carries \`${LABELS.notDelivered}\`, but ` +
+          `bd would not read the ticket back, so anton cannot tell whether the marker landed on a ` +
+          `ticket that is still superseded or on one another process has since reopened and claimed ` +
+          `— the run stopped rather than open a pull request on either guess. Check the beads DB, ` +
+          `then resume the run`,
+      );
+    }
+    const replacedBy = beads.supersededBy(marked);
+    if (replacedBy) return { id: ticket.id, replacedBy, source: "pre-existing" };
+    await withdrawRetiredMarker(run, ticket.id);
+    return undefined;
   });
+}
+
+/**
+ * Take back a {@link markRetired} marker whose ticket moved between the read it was decided on and
+ * the read after it landed: the bead is live work again, and a marker left on it would be read by
+ * the merge of whichever run delivers it as work that run did not do. Guarded like the write it
+ * undoes, and like the claim gate's own clear of the same marker: a run that cannot take it back
+ * must not go on to open a pull request over it.
+ */
+async function withdrawRetiredMarker(run: EpicRun, ticketId: string): Promise<void> {
+  if (!(await mustPersist(() => beads.untag(run.repo, ticketId, [LABELS.notDelivered])))) {
+    throw new PoisonEpic(
+      `${ticketId} was reopened while anton was retiring it as already shipped, and bd would not ` +
+        `clear the \`${LABELS.notDelivered}\` marker that retirement left on it — the run stopped ` +
+        `rather than leave live work marked as undelivered for the merge that will carry it. ` +
+        `Check the beads DB, then resume the run`,
+    );
+  }
 }
 
 /**

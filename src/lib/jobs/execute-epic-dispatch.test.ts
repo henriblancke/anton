@@ -65,6 +65,7 @@ const { beads } = await import("../beads/bd");
 const reopenMock = vi.mocked(beads.reopen);
 const showMock = vi.mocked(beads.show);
 const tagMock = vi.mocked(beads.tag);
+const untagMock = vi.mocked(beads.untag);
 
 const EPIC = "anton-epic";
 const SHIPPER = "anton-ship";
@@ -132,6 +133,7 @@ beforeEach(() => {
   hasCommitMock.mockReset().mockResolvedValue(false);
   reopenMock.mockReset().mockResolvedValue("");
   tagMock.mockReset().mockResolvedValue("");
+  untagMock.mockReset().mockResolvedValue("");
   showMock.mockReset().mockImplementation(async (_repo: string, id: string) => board.find((b) => b.id === id)!);
 });
 
@@ -213,6 +215,74 @@ describe("a ticket the board already holds as superseded", () => {
 
     await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
       /anton-a is retired as already shipped, but bd would not record `not-delivered` on it/,
+    );
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
+  }, 10_000);
+
+  // The lock orders only this process (PR #238 review): another process reopens and claims the
+  // ticket between the locked read and the marker landing, and a run that snapshotted the reopened
+  // bead before the tag never clears it at its claim gate. So the marker is re-read once it is on
+  // the board, and a ticket that moved gets it taken back and goes live instead of retired.
+  it("withdraws the marker and stays LIVE when the ticket moved between the read and the marker landing", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    tagMock.mockImplementation(async (_repo: string, id: string, labels: string[]) => {
+      if (id === "anton-a" && labels.includes(LABELS.notDelivered)) {
+        board = board.map((b) =>
+          b.id === "anton-a"
+            ? ({ ...b, status: "in_progress", assignee: "someone-else", labels: [LABELS.notDelivered] } as Bead)
+            : b,
+        );
+      }
+      return "";
+    });
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(markedNotDelivered()).toEqual(["anton-a"]);
+    expect(untagMock).toHaveBeenCalledWith("/tmp/anton-repo", "anton-a", [LABELS.notDelivered]);
+    expect(run.retired).toEqual([]);
+    expect(dispatchedIds()).toEqual(["anton-a", "anton-b"]);
+    expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-a", "anton-b"]);
+  });
+
+  it("keeps the retirement, unwithdrawn, when the post-write read still finds it superseded", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+
+    await dispatchRunTickets(run, prep());
+
+    expect(showMock.mock.calls.filter((c) => c[1] === "anton-a")).toHaveLength(2);
+    expect(untagMock).not.toHaveBeenCalled();
+    expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "pre-existing" }]);
+  });
+
+  // A marker on the board and a bead that will not read back is neither "still superseded" nor
+  // "reopened": stop rather than open a PR on either guess.
+  it("stops the run when bd cannot read the ticket back after the marker landed", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      const b = board.find((x) => x.id === id)!;
+      if (id === "anton-a" && markedNotDelivered().includes("anton-a")) throw new Error("dolt: connection refused");
+      return b;
+    });
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /anton-a is retired as already shipped and now carries `not-delivered`, but bd would not read the ticket back/,
+    );
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
+  }, 10_000);
+
+  it("stops the run when a marker on a ticket that moved cannot be taken back", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    tagMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "anton-a") board = board.map((b) => (b.id === "anton-a" ? ({ ...b, status: "open" } as Bead) : b));
+      return "";
+    });
+    untagMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /anton-a was reopened while anton was retiring it as already shipped, and bd would not clear the `not-delivered` marker/,
     );
     expect(dispatchedIds()).toEqual([]);
     expect(run.retired).toEqual([]);
