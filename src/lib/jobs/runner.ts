@@ -218,6 +218,15 @@ export interface JobContext {
    * Cleared automatically when the job settles — a settled job reports nothing.
    */
   report: (info: LiveJobInfo) => void;
+  /**
+   * Say that Claude is about to be invoked. Call it immediately before every spawn: this is the
+   * runner's only evidence that the attempt spent quota. An attempt that never says so is refunded
+   * from the project's spend meter at settle and its burn window is discarded, whatever it settled
+   * as — a preflight that completes or parks before Claude (an abandoned target, a target that
+   * disappeared, a lease held elsewhere) burned nothing, and inferring that from the settlement type
+   * misses every such exit that isn't a reschedule.
+   */
+  claudeReached: () => void;
 }
 
 /**
@@ -274,8 +283,6 @@ export type Action =
       runAtMs: number;
       /** Rewind the retry budget: the failure was not the job's own. */
       refundAttempt: boolean;
-      /** Also withdraw the attempt from the project's spend meter: it never reached Claude. */
-      refundSpend: boolean;
       lastError?: string;
     }
   | { action: "park"; lastError: string };
@@ -302,12 +309,11 @@ export function nextAction(
       const runAtMs = outcome.resetAt ? outcome.resetAt * 1000 : nowMs + config.quotaCooloffMs;
       // The limit is Claude's own answer, so this attempt reached it — and a multi-call handler may
       // have finished real work (a whole PR) before the wall. The retry budget comes back; the
-      // project's spend does not.
+      // project's spend does not (the handler's `claudeReached` keeps the charge — see `settle`).
       return {
         action: "reschedule",
         runAtMs,
         refundAttempt: true,
-        refundSpend: false,
         lastError: `usage-limit: resumes at ${new Date(runAtMs).toISOString()}`,
       };
     }
@@ -326,7 +332,6 @@ export function nextAction(
         action: "reschedule",
         runAtMs,
         refundAttempt: true,
-        refundSpend: true, // liveness is checked before Claude is ever invoked
         lastError: `run live elsewhere: ${outcome.error} — retries at ${new Date(runAtMs).toISOString()}`,
       };
     }
@@ -341,7 +346,6 @@ export function nextAction(
         action: "reschedule",
         runAtMs,
         refundAttempt: true,
-        refundSpend: true, // a push that found no remote invoked nothing
         lastError: `not wired to a remote: rechecks at ${new Date(runAtMs).toISOString()}`,
       };
     }
@@ -359,7 +363,6 @@ export function nextAction(
         action: "reschedule",
         runAtMs: nowMs + backoff,
         refundAttempt: false,
-        refundSpend: false,
         lastError: outcome.error,
       };
     }
@@ -1220,9 +1223,10 @@ export class JobRunner {
         ? await this.readUsageSafe()
         : null;
 
-    // Whether settling withdrew this attempt from the project's spend meter (`refundSpend`): Claude
-    // was never invoked, so the window measured nothing this job burned — see the burn close below.
-    let spendRefunded = false;
+    // Flipped by the handler's `ctx.claudeReached()` right before it spawns Claude. Off, the attempt
+    // spent nothing: settle refunds it from the project's spend meter and the burn window below is
+    // discarded (it measured nothing this job burned).
+    let claudeReached = false;
     try {
       const policy = await this.policyFor(job.projectId ?? undefined);
 
@@ -1277,6 +1281,9 @@ export class JobRunner {
           },
           signal: controller.signal,
           report: (info) => Object.assign(entry.live, info),
+          claudeReached: () => {
+            claudeReached = true;
+          },
         };
         effect = (await handler(ctx)) ?? undefined;
         outcome = { kind: "success" };
@@ -1294,8 +1301,7 @@ export class JobRunner {
         if (timeoutTimer) clearTimeout(timeoutTimer);
       }
 
-      const action = await this.settle(job, outcome, policy, effect);
-      spendRefunded = action?.action === "reschedule" && action.refundSpend;
+      await this.settle(job, outcome, policy, effect, { refundSpend: !claudeReached });
     } catch (e) {
       // Policy resolution or the settle write itself failed — log and release the slot; the lease
       // expires and the job is reclaimed on a later tick.
@@ -1308,12 +1314,12 @@ export class JobRunner {
       // it — `dispatchSeq` unchanged), and is fully fail-soft — sampleJobBurn records nothing on a
       // null read or a mid-job meter reset and swallows its own errors.
       //
-      // Never sampled when the attempt's spend was refunded: those outcomes (a lease held elsewhere,
-      // no remote to push to) bail before Claude is invoked, so the delta is whatever ELSE moved the
-      // meter — usually nothing. Recording it would let a few lease-held retries drag the type's
-      // rolling average (and the project's attributed spend) toward zero, repricing every attempt
-      // as free and letting the project run past its quota share.
-      if (burnBefore && this.dispatchSeq === seqAtStart && !spendRefunded) {
+      // Never sampled unless the handler said it reached Claude: an attempt that exited in preflight
+      // (a lease held elsewhere, an abandoned or vanished target, a run already carried to a PR)
+      // moved the meter by whatever ELSE was using Claude — usually nothing. Recording it would let
+      // a few such exits drag the type's rolling average (and the project's attributed spend)
+      // toward zero, repricing every attempt as free and letting the project run past its share.
+      if (burnBefore && this.dispatchSeq === seqAtStart && claudeReached) {
         // Stamp the throttle here, not at window open: only a window that actually takes its fresh
         // upstream read spends the interval budget — a contaminated window that bailed doesn't.
         this.lastBurnSampleAt = this.clock.now();
@@ -1364,12 +1370,20 @@ export class JobRunner {
     }
   }
 
-  /** Apply the durability policy to an outcome. Returns the action taken; null when a cancel won. */
+  /**
+   * Apply the durability policy to an outcome. Returns the action taken; null when a cancel won.
+   *
+   * `refundSpend` withdraws the attempt from the project's spend meter (`spentAttempts`) on EVERY
+   * action — complete, reschedule or park: whether Claude was invoked is the handler's report, not
+   * a property of how the attempt ended. A quota hit keeps its charge because the handler reached
+   * Claude before the wall; a poison that parked in preflight hands its attempt back.
+   */
   private async settle(
     job: JobRow,
     outcome: Outcome,
     policy: JobPolicy,
-    effect?: JobEffect,
+    effect: JobEffect | undefined,
+    opts: { refundSpend: boolean },
   ): Promise<Action | null> {
     // Re-read attempts (a heartbeat/lease may have advanced updatedAt, not attempts, but be safe).
     const fresh = (await getJob(this.db, job.id)) ?? job;
@@ -1382,17 +1396,20 @@ export class JobRunner {
     const action = nextAction(config, fresh, outcome, this.clock.now());
     switch (action.action) {
       case "complete":
-        await complete(this.db, this.clock, job.id, effect, { retried: hasPriorAttempt(fresh) });
+        await complete(this.db, this.clock, job.id, effect, {
+          retried: hasPriorAttempt(fresh),
+          refundSpend: opts.refundSpend,
+        });
         break;
       case "reschedule":
         await reschedule(this.db, this.clock, job.id, action.runAtMs, {
           lastError: action.lastError,
           refundAttempt: action.refundAttempt,
-          refundSpend: action.refundSpend,
+          refundSpend: opts.refundSpend,
         });
         break;
       case "park":
-        await park(this.db, this.clock, job.id, action.lastError);
+        await park(this.db, this.clock, job.id, action.lastError, { refundSpend: opts.refundSpend });
         break;
     }
     return action;

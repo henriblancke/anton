@@ -49,16 +49,14 @@ describe("nextAction (pure durability policy)", () => {
     });
   });
 
-  it("reschedules a quota hit to the reset time and refunds the attempt but not its spend", () => {
-    // The limit is Claude's own answer, so the attempt reached it — and a multi-call handler may
-    // have finished a whole PR before the wall. The retry budget comes back; the project's spend
-    // meter keeps the charge, as it does for every other attempt the runner sampled.
+  it("reschedules a quota hit to the reset time and refunds the attempt", () => {
+    // Only the RETRY budget is the policy's call. Whether the project's spend meter keeps the
+    // charge is the handler's `claudeReached` report, settled by the runner — never inferred here.
     const resetAt = Math.floor(now / 1000) + 3600; // seconds
     const a = nextAction(CONFIG, { attempts: 2 }, { kind: "quota", resetAt }, now);
     expect(a.action).toBe("reschedule");
     if (a.action !== "reschedule") throw new Error("unreachable");
     expect(a.refundAttempt).toBe(true);
-    expect(a.refundSpend).toBe(false);
     expect(a.runAtMs).toBe(resetAt * 1000);
   });
 
@@ -82,7 +80,6 @@ describe("nextAction (pure durability policy)", () => {
     if (a.action !== "reschedule") throw new Error("unreachable");
     expect(a.runAtMs).toBe(now + CONFIG.quotaCooloffMs);
     expect(a.refundAttempt).toBe(true);
-    expect(a.refundSpend).toBe(true); // liveness is checked before Claude is invoked
   });
 
   it("keeps the classified reason on the row a lease-held reschedule writes (anton-3dpp)", () => {
@@ -113,7 +110,6 @@ describe("nextAction (pure durability policy)", () => {
     if (a.action !== "reschedule") throw new Error("unreachable");
     expect(a.runAtMs).toBe(now + CONFIG.notWiredRetryMs);
     expect(a.refundAttempt).toBe(true);
-    expect(a.refundSpend).toBe(true); // nothing was invoked, so nothing was spent
     expect(a.lastError).toMatch(/not wired/i);
   });
 

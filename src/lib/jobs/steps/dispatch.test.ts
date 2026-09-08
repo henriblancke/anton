@@ -46,6 +46,29 @@ describe("dispatchClaude", () => {
     expect(reported).toEqual([{ sessionId: result.facts?.sessionIds?.[0], cwd: sandbox.dir }]);
   });
 
+  it("tells the runner Claude was reached before the spawn, so a crashed spawn still counts (PR #248)", async () => {
+    // The runner prices the attempt on this signal alone — an attempt that never says so is refunded
+    // from the project's spend meter and its burn window discarded. It has to fire BEFORE the
+    // driver: a spawn that dies mid-stream burned quota all the same.
+    const order: string[] = [];
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({
+      deps: {
+        runClaude: (options) => {
+          order.push("spawn");
+          return claude.run(options);
+        },
+      },
+    });
+
+    await dispatchClaude(
+      { ...ctx, ctx: { ...ctx.ctx, claudeReached: () => order.push("claudeReached") } },
+      args(),
+    );
+
+    expect(order).toEqual(["claudeReached", "spawn"]);
+  });
+
   // A run claude itself reported as failed is a step that RAN and did not achieve its work — the
   // caller decides what that means, so it comes back as `ok: false` rather than a throw.
   it("reports a failed run through the caller's own failure wording", async () => {

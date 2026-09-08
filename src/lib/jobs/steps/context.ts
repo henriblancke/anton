@@ -43,7 +43,7 @@ export interface StepContext {
   db: AntonDb;
   clock: Clock;
   /** The runner's job context: cancellation, heartbeats, and the live-session handle. */
-  ctx: Pick<JobContext, "signal" | "heartbeat" | "report">;
+  ctx: Pick<JobContext, "signal" | "heartbeat" | "report" | "claudeReached">;
   projectId: string;
   runId: string;
   /** The project repo — where bd and gh run. Never the worktree. */

@@ -9,7 +9,7 @@ import * as schema from "../db/schema";
 import { getBurnAverage } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
 import { DEFAULT_BUDGET_POLICY } from "./budget";
-import { RunAlreadyLiveError } from "./errors";
+import { PoisonEpic, RunAlreadyLiveError } from "./errors";
 import { getJob } from "./queue";
 import type { BudgetPolicyResolver } from "./runner";
 import { usage, useRunnerHarness } from "./runner.fixture";
@@ -26,7 +26,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     // 10%→30% session, 5%→8% weekly.
     const r = h.makeRunner({
       handlers: {
-        "execute-epic": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
@@ -46,7 +46,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     h.seedProjects("P");
     const r = h.makeRunner({
       handlers: {
-        "execute-epic": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
@@ -64,7 +64,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
   it("leaves the project null for a job that belongs to none", async () => {
     const r = h.makeRunner({
       handlers: {
-        "execute-epic": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
@@ -84,7 +84,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     let freshCalls = 0;
     const r = h.makeRunner({
       handlers: {
-        "execute-epic": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }), // the stale cache entry, before AND after
@@ -105,7 +105,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
   it("records NO sample on a null usage read and still completes the job", async () => {
     const r = h.makeRunner({
       handlers: {
-        "execute-epic": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       resolveBudgetPolicy: budgetAware,
       readUsage: async () => null,
@@ -120,18 +120,16 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect(rows).toHaveLength(0);
   });
 
-  it("records NO sample for an attempt whose spend was refunded (Claude never invoked)", async () => {
-    // A lease held on another machine bails before Claude runs, and settling refunds the attempt's
-    // spend. Sampling the window anyway would record whatever ELSE moved the meter (here: nothing)
-    // and, over a few retries, reprice the type at zero for the project's quota share.
+  it("records NO sample for an attempt that never reached Claude, however it settled (PR #248)", async () => {
+    // The sample is gated on the handler's own `claudeReached` signal, not on the settlement type.
+    // A preflight can end any way without ever spawning Claude — a lease held on another machine
+    // reschedules, a target that vanished poison-parks, an abandoned target simply completes — and
+    // every such window measured whatever ELSE moved the meter (here: nothing). Recording those
+    // would let a handful of stale exits reprice the type at zero for the project's quota share.
     h.seedProjects("P");
     let freshReads = 0;
     const r = h.makeRunner({
-      handlers: {
-        "execute-epic": async () => {
-          throw new RunAlreadyLiveError("run live on another machine", "foreign");
-        },
-      },
+      handlers: {},
       resolveBudgetPolicy: budgetAware,
       readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
       readUsageFresh: async () => {
@@ -139,19 +137,42 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
         return usage({ sessionPct: 10, weeklyPct: 5 });
       },
     });
-    const id = await r.enqueue({ type: "execute-epic", projectId: "P" });
-    await r.tickOnce();
-    await r.whenIdle();
-
-    expect((await getJob(h.db, id))?.status).toBe("queued");
+    const exits: Array<[string, () => Promise<void>]> = [
+      [
+        "queued",
+        async () => {
+          throw new RunAlreadyLiveError("run live on another machine", "foreign");
+        },
+      ],
+      [
+        "parked",
+        async () => {
+          throw new PoisonEpic("target epic-1 is no longer approved");
+        },
+      ],
+      ["done", async () => {}],
+    ];
+    for (const [status, handler] of exits) {
+      r.registerHandler("execute-epic", handler);
+      const id = await r.enqueue({ type: "execute-epic", projectId: "P" });
+      await r.tickOnce();
+      await r.whenIdle();
+      expect((await getJob(h.db, id))?.status).toBe(status);
+    }
     expect(freshReads).toBe(0);
     expect(await h.db.select().from(schema.burnSamples)).toHaveLength(0);
-    // The skipped window spent no throttle budget either: the next solo job still samples.
-    r.registerHandler("execute-epic", async () => {});
+
+    // None of the skipped windows spent throttle budget either: the next attempt that does reach
+    // Claude samples — even one that then fails, since a failed spawn still burned quota.
+    r.registerHandler("execute-epic", async (ctx) => {
+      ctx.claudeReached();
+      throw new Error("agent crashed after the spawn");
+    });
     await r.enqueue({ type: "execute-epic", projectId: "P" });
     await r.tickOnce();
     await r.whenIdle();
     expect(freshReads).toBe(1);
+    expect(await h.db.select().from(schema.burnSamples)).toHaveLength(1);
   });
 
   it("never fails a job when the usage read throws", async () => {
@@ -160,7 +181,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     };
     const r = h.makeRunner({
       handlers: {
-        "execute-epic": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       resolveBudgetPolicy: budgetAware,
       readUsage: boom,
@@ -181,8 +202,8 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     let reads = 0;
     const r = h.makeRunner({
       handlers: {
-        "execute-epic": async () => {},
-        "review-fix": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
+        "review-fix": async (ctx) => ctx.claudeReached(),
       },
       config: { maxConcurrent: 2 },
       resolveBudgetPolicy: budgetAware,
@@ -216,7 +237,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     let freshReads = 0;
     const r = h.makeRunner({
       handlers: {
-        "execute-epic": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       resolveBudgetPolicy: () => null,
       readUsage: async () => {
@@ -245,7 +266,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     let freshReads = 0;
     const r = h.makeRunner({
       handlers: {
-        "execute-epic": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       config: { burnSampleMinIntervalMs: 60_000 },
       resolveBudgetPolicy: budgetAware,
@@ -288,7 +309,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     const r = h.makeRunner({
       handlers: {
         "sync-push": async () => {},
-        "execute-epic": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       config: { maxConcurrent: 1, burnSampleMinIntervalMs: 60_000 },
       resolveBudgetPolicy: budgetAware,
@@ -329,7 +350,7 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     };
     const r = h.makeRunner({
       handlers: {
-        "execute-epic": async () => {},
+        "execute-epic": async (ctx) => ctx.claudeReached(),
       },
       readUsage: count,
       readUsageFresh: count,

@@ -73,7 +73,7 @@ suite("commitStep (real git)", () => {
     return {
       db: tdb.db,
       clock: new FixedClock(1_700_000_000_000),
-      ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+      ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: () => {} },
       projectId: randomUUID(),
       runId: randomUUID(),
       repoPath: repo,

@@ -88,7 +88,7 @@ suite("preserveTimedOutWork (real git)", () => {
     return {
       db: tdb.db,
       clock: new FixedClock(1_700_000_000_000),
-      ctx: { signal, heartbeat: async () => {}, report: () => {} },
+      ctx: { signal, heartbeat: async () => {}, report: () => {}, claudeReached: () => {} },
       projectId: randomUUID(),
       runId: randomUUID(),
       repoPath: repo,
@@ -668,7 +668,7 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
   const run = (signal: AbortSignal): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal, heartbeat: async () => {}, report: () => {} },
+    ctx: { signal, heartbeat: async () => {}, report: () => {}, claudeReached: () => {} },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,
@@ -772,7 +772,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
   const run = (): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: () => {} },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,
@@ -898,7 +898,7 @@ suite("settleTicketTimeout — unmarkable self-committed work stops the run", ()
   const run = (): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: () => {} },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,

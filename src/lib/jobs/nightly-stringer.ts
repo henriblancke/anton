@@ -54,6 +54,7 @@ async function triageScan(
     scanFile: scanned.scanFile,
     logPath: pass.logPath,
     signal: ctx.signal,
+    claudeReached: ctx.claudeReached,
     onEvent: pass.onEvent,
   });
   // Triage read the signals; from here the consumed --delta window is legitimately spent.

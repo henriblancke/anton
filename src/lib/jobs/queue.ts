@@ -948,12 +948,27 @@ export function toJobOutcome(
   return { outcome: effect.changed ? "ok" : "noop", outcomeNote: effect.note ?? null };
 }
 
+/**
+ * The spend meter after settling: one attempt back when the caller vouches Claude was never reached
+ * (the runner's `claudeReached` signal stayed off), else unchanged. Floored at zero — a resume that
+ * re-leases a refunded attempt must not push the meter negative.
+ */
+function spentAttemptsAfter(refundSpend: boolean | undefined) {
+  return refundSpend ? sql`MAX(${schema.jobs.spentAttempts} - 1, 0)` : schema.jobs.spentAttempts;
+}
+
+/**
+ * Settle a running job as `done`. `refundSpend` hands the attempt back off the project's spend meter
+ * (`spentAttempts`): a job can finish without ever invoking Claude — a run resumed onto a PR it had
+ * already opened, an abandoned target — and charging that attempt at the type's burn rate would
+ * spend the project's share on nothing.
+ */
 export async function complete(
   db: AntonDb,
   clock: Clock,
   jobId: string,
   effect?: JobEffect,
-  opts?: { retried?: boolean },
+  opts?: { retried?: boolean; refundSpend?: boolean },
 ): Promise<void> {
   const nowMs = clock.now();
   await db
@@ -963,6 +978,7 @@ export async function complete(
       leaseExpiresAt: null,
       lastError: null,
       ...toJobOutcome(effect, opts),
+      spentAttempts: spentAttemptsAfter(opts?.refundSpend),
       updatedAt: secDate(nowMs),
     })
     .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
@@ -1010,9 +1026,7 @@ export async function reschedule(
         attempts: opts?.refundAttempt
           ? sql`MAX(${schema.jobs.attempts} - 1, 0)`
           : schema.jobs.attempts,
-        spentAttempts: opts?.refundSpend
-          ? sql`MAX(${schema.jobs.spentAttempts} - 1, 0)`
-          : schema.jobs.spentAttempts,
+        spentAttempts: spentAttemptsAfter(opts?.refundSpend),
         updatedAt: secDate(nowMs),
       })
       .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
@@ -1213,11 +1227,19 @@ export async function park(
   clock: Clock,
   jobId: string,
   lastError: string,
+  opts?: { refundSpend?: boolean },
 ): Promise<boolean> {
   const nowMs = clock.now();
   const rows = await db
     .update(schema.jobs)
-    .set({ status: "parked", leaseExpiresAt: null, lastError, updatedAt: secDate(nowMs) })
+    .set({
+      status: "parked",
+      leaseExpiresAt: null,
+      lastError,
+      // A poison caught in preflight parks without ever invoking Claude; its attempt comes back.
+      spentAttempts: spentAttemptsAfter(opts?.refundSpend),
+      updatedAt: secDate(nowMs),
+    })
     .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...ACTIVE_STATUSES])))
     .returning({ id: schema.jobs.id });
   return rows.length > 0;

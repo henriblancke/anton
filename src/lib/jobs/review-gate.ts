@@ -122,7 +122,7 @@ export interface ReviewGateDeps {
 }
 
 /** The slice of the runner's JobContext the gate needs — narrow, so tests can fake it in two lines. */
-export type ReviewGateContext = Pick<JobContext, "signal" | "heartbeat" | "report">;
+export type ReviewGateContext = Pick<JobContext, "signal" | "heartbeat" | "report" | "claudeReached">;
 
 export interface ReviewGateArgs {
   db: AntonDb;
@@ -471,6 +471,7 @@ async function runReviewSession(args: {
           `${args.baseRev.slice(0, 12)} as ${describeReviewer(reviewer)}\n`,
       );
 
+      ctx.claudeReached();
       const result = await claude({
         cwd: worktreePath,
         prompt,
@@ -765,6 +766,7 @@ async function runGateFixSession(args: {
     let verified = false;
 
     try {
+      ctx.claudeReached();
       const result = await claude({
         cwd: worktreePath,
         prompt,

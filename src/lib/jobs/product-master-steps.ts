@@ -241,6 +241,7 @@ export async function judgeBoard(scope: PassScope, input: JudgeInput): Promise<P
     `[product-master] judging ${boardInput.board.length} bead(s) with the ${reasoningFrom.kind === "prompt" ? "operator's prompt" : "shipped contract"}\n`,
   );
 
+  scope.ctx.claudeReached();
   const result = await claude({
     cwd: scope.project.repoPath,
     prompt,

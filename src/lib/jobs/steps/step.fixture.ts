@@ -80,7 +80,7 @@ export async function openSandbox(name: string): Promise<StepSandbox & { priorSe
   const context = (overrides: Partial<StepContext> = {}): StepContext => ({
     db: tdb.db,
     clock,
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: () => {} },
     projectId,
     runId,
     repoPath: dir,

@@ -12,7 +12,7 @@ import * as schema from "../db/schema";
 import { recordBurnSample } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
 import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./budget";
-import { UsageLimitError } from "./errors";
+import { PoisonEpic, RunAlreadyLiveError, UsageLimitError } from "./errors";
 import { getJob, toMs } from "./queue";
 import type {
   BeadLabelsReader,
@@ -624,7 +624,8 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     h.seedProjects("A");
     const resetAt = Math.floor(h.clock.now() / 1000) + 3600; // seconds
     const r = budgetRunner(
-      async () => {
+      async (ctx) => {
+        ctx.claudeReached();
         throw new UsageLimitError("hit the wall", resetAt);
       },
       { readUsage: async () => usage({ sessionPct: 10 }) },
@@ -639,6 +640,55 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     expect(job?.attempts).toBe(0); // attempt refunded — quota isn't the job's fault
     expect(job?.spentAttempts).toBe(1); // but it reached Claude, so the project's spend keeps it
     expect(job?.lastError).toMatch(/usage-limit/);
+  });
+
+  it("charges the project's spend meter only for attempts the handler says reached Claude (PR #248)", async () => {
+    // `spentAttempts` prices the project's weekly share, so it must count spawns, not leases. The
+    // lease charges up front; settle hands the attempt back unless the handler flagged
+    // `claudeReached` — on EVERY exit, since a preflight can complete (abandoned target), park
+    // (target vanished) or reschedule (lease held elsewhere) without ever spawning Claude.
+    h.seedProjects("A");
+    const attempts: Array<{ handler: JobHandler; status: string; spent: number }> = [
+      { handler: async () => {}, status: "done", spent: 0 },
+      {
+        handler: async () => {
+          throw new PoisonEpic("target vanished");
+        },
+        status: "parked",
+        spent: 0,
+      },
+      {
+        handler: async () => {
+          throw new RunAlreadyLiveError("run live on another machine", "foreign");
+        },
+        status: "queued",
+        spent: 0,
+      },
+      {
+        handler: async (ctx) => {
+          ctx.claudeReached();
+          throw new Error("agent crashed after the spawn");
+        },
+        status: "queued",
+        spent: 1,
+      },
+      {
+        handler: async (ctx) => {
+          ctx.claudeReached();
+        },
+        status: "done",
+        spent: 1,
+      },
+    ];
+    for (const { handler, status, spent } of attempts) {
+      const r = budgetRunner(handler, { readUsage: async () => usage({ sessionPct: 10 }) });
+      const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+      expect(await r.tickOnce()).toBe(1);
+      await r.whenIdle();
+      const job = await getJob(h.db, id);
+      expect(job?.status).toBe(status);
+      expect(job?.spentAttempts).toBe(spent);
+    }
   });
 
   // ── Per-job value/cost gate (anton-k05r) ──
