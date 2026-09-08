@@ -256,9 +256,43 @@ describe("stepTaskBlock", () => {
     expect(block).toContain("def5678 WIP");
     expect(block).toContain("INCOMPLETE");
     expect(block).toMatch(/do not revert, re-do, or discard it/i);
+    // The inspect command spans the WHOLE preserved range, not just the newest marker's diff.
+    expect(block).toContain("git show def5678^..abc1234");
     // Settling is the implementer's job and the delivery gate's, so a generic step is never told to
     // report `delivered`/`satisfied` off the preserved work.
     expect(block).not.toContain("ANTON-RESULT");
+  });
+
+  // A timed-out attempt that self-committed its work leaves an EMPTY `WIP` marker, so pointing the
+  // generic step at `git show <marker-sha>` alone would show nothing and hide the real commits
+  // beneath it — the exact revert/redo this block exists to prevent (PR #255 review).
+  it("sends a resumed generic step to the commits beneath an empty marker, not its empty diff", () => {
+    const block = stepTaskBlock(
+      { target, tickets: [target], branch: "anton/anton-8d0f", baseBranch: "main" },
+      "claude",
+      [{ ticketId: target.id, commit: { sha: "abc1234", subject: `WIP ${target.id}: work`, files: [], earlier: [] } }],
+    );
+
+    expect(block).not.toContain("Files changed across the preserved work:");
+    expect(block).toContain("it is a marker");
+    expect(block).toContain("git log -p");
+  });
+
+  // With the fork point known the inspect range starts at the ticket baseline, so a first attempt's
+  // self-committed work beneath a marker is inspected too, not just the marker commits (anton-16pq).
+  it("inspects a resumed generic step from the ticket baseline when the fork point is known", () => {
+    const block = stepTaskBlock(
+      { target, tickets: [target], branch: "anton/anton-8d0f", baseBranch: "main" },
+      "claude",
+      [
+        {
+          ticketId: target.id,
+          commit: { sha: "abc1234", subject: `WIP ${target.id}: work`, files: ["src/a.ts"], earlier: [], baseline: "base0000" },
+        },
+      ],
+    );
+
+    expect(block).toContain("git show base0000..abc1234");
   });
 
   it("omits the continuation block when no ticket in scope has preserved work", () => {

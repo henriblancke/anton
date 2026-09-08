@@ -60,13 +60,17 @@ export function stepTaskBlock(
  * settling the ticket is the implementer's job and the delivery gate's, not this step's. It only
  * tells the agent that a previous attempt's incomplete-but-real work is already on the branch so it
  * builds on it rather than reverting, re-doing, or discarding it. Omitted when nothing is preserved.
+ *
+ * Each ticket's commits are shown with the SAME range/marker-aware inspection {@link
+ * continuationPromptBlock} uses (PR #255 review): a timed-out attempt that self-committed its work
+ * leaves an EMPTY `WIP` marker, so pointing the agent at `git show <marker-sha>` alone shows an
+ * empty diff and hides the real commits beneath it — inviting the very revert or redo this block
+ * exists to prevent. {@link preservedFilesLines} directs marker cases to `git log -p`, and {@link
+ * preservedInspectClause} spans the whole preserved range (from the baseline when known).
  */
 function stepContinuationSection(preserved: TicketPreserved[]): string[] {
   if (preserved.length === 0) return [];
   const multiple = preserved.length > 1;
-  const commitLines = preserved.flatMap(({ commit }) =>
-    [commit, ...commit.earlier].map((c) => `    ${c.sha} ${c.subject}`),
-  );
   return [
     ``,
     `## CONTINUATION — a previous attempt's work is already on this branch`,
@@ -74,12 +78,32 @@ function stepContinuationSection(preserved: TicketPreserved[]): string[] {
     `A previous attempt at ${multiple ? "these tickets" : "this ticket"} ran out of its time budget ` +
       `and was stopped. anton kept what it had built rather than deleting it, and that work is ` +
       `already committed here:`,
-    ``,
-    ...commitLines,
+    ...preserved.flatMap(({ ticketId, commit }) => stepPreservedTicketLines(ticketId, commit, multiple)),
     ``,
     `That work is INCOMPLETE — the attempts were stopped mid-ticket — but it is real and belongs on ` +
-      `this branch. Build on it: do not revert, re-do, or discard it, and do not restart from ` +
-      `scratch. Inspect it with \`git show <sha>\` before you change anything.`,
+      `this branch. Build on it: do not revert, re-do, or discard it, and do not restart from scratch.`,
+  ];
+}
+
+/**
+ * One ticket's preserved commits inside the generic step's CONTINUATION block: the commits, what
+ * they changed (or, for an empty marker, that the work is in the commits beneath it — PR #255
+ * review), and the range-aware inspect command. The ticket id heads the block only when more than
+ * one is preserved, since each carries its own range.
+ */
+function stepPreservedTicketLines(
+  ticketId: string,
+  commit: PreservedCommit,
+  multiple: boolean,
+): string[] {
+  const commitLines = [commit, ...commit.earlier].map((c) => `    ${c.sha} ${c.subject}`);
+  return [
+    ``,
+    ...(multiple ? [`For ${ticketId}:`] : []),
+    ...commitLines,
+    ...preservedFilesLines(commit),
+    ``,
+    `Inspect ${preservedInspectClause(commit)} before you change anything.`,
   ];
 }
 
