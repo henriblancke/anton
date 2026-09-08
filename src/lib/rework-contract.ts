@@ -444,10 +444,12 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       continue;
     }
     const paragraph = !THEMATIC_BREAK.test(content.trim()) && !isHeading(content);
-    // A Setext underline on the next line makes this paragraph a heading, so both are scaffolding.
-    if (paragraph && setextUnderlineFollows(raw, lines, literal, at, peeled.prefix)) {
+    // A Setext underline closing this paragraph makes every line of it a heading, so all are
+    // scaffolding — the whole run, not just the last line, is skipped.
+    const setextRun = paragraph ? setextHeadingRun(raw, lines, literal, at, peeled.prefix) : 0;
+    if (setextRun > 0) {
       inParagraph = false;
-      at += 1;
+      at += setextRun - 1;
       continue;
     }
     inParagraph = paragraph;
@@ -622,23 +624,31 @@ function blankQuoteLine(line: string, prefix: Prefix): boolean {
 }
 
 /**
- * Whether the line after `at` is a Setext underline ({@link SETEXT_UNDERLINE}) for the paragraph
- * line at `at`, judged inside that paragraph's own containers `prefix` so `> Backend` / `> =======`
- * pairs too. When it is, both lines are a heading (CommonMark) and neither files; without it the
- * underline — and, for the `=` form, the label above it — file as criteria a review cannot score,
- * and {@link doneGap} accepts a draft that states no step.
+ * How many lines the Setext heading beginning at the paragraph line `at` spans — its text lines and
+ * the underline that closes them — or 0 when no underline does. A Setext heading's text is every
+ * paragraph line up to a {@link SETEXT_UNDERLINE}, so `Backend` / `API` / `=======` is one h1, not a
+ * label above a heading; skipping only the last line would still file `Backend` as a criterion a
+ * review cannot score, and {@link doneGap} would accept a draft that states no step. The run is
+ * judged inside the paragraph's own containers `prefix`, so `> Backend` / `> =======` pairs too, and
+ * a blank line, a block start ({@link BLOCK_START}), a fence, a comment or a line that leaves the
+ * container ends the paragraph before any underline — those are not headings.
  */
-function setextUnderlineFollows(
+function setextHeadingRun(
   raw: readonly string[],
   lines: readonly ScannedLine[],
   literal: readonly boolean[],
   at: number,
   prefix: Prefix,
-): boolean {
-  const next = lines[at + 1];
-  if (!next || next.fenced || literal[at + 1]) return false;
-  const inner = peelPrefix(raw[at + 1]!, prefix);
-  return inner !== undefined && SETEXT_UNDERLINE.test(inner);
+): number {
+  for (let next = at + 1; next < lines.length; next += 1) {
+    if (lines[next]!.fenced || literal[next]) return 0;
+    const inner = peelPrefix(raw[next]!, prefix);
+    if (inner === undefined || inner.trim() === "") return 0;
+    if (SETEXT_UNDERLINE.test(inner)) return next - at + 1;
+    // A line that begins a block of its own ends the paragraph, so no underline can reach `at`.
+    if (BLOCK_START.test(inner.trimStart())) return 0;
+  }
+  return 0;
 }
 
 /** `prefix` with its innermost column `columns` further in — where an indented block's content starts. */

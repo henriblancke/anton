@@ -229,6 +229,13 @@ describe("instructionCriteria", () => {
     expect(texts("> Backend\n> =======")).toEqual([]);
     // A blank line between them ends the paragraph, so the underline is not one: both stand.
     expect(texts("Backend\n\n=======")).toEqual(["Backend", "======="]);
+    // A multiline label is one heading: every line up to the underline drops, not just the last.
+    expect(texts("Backend\nAPI\n=======\n- Fix the retry")).toEqual(["Fix the retry"]);
+    expect(texts("> Backend\n> API\n> =======")).toEqual([]);
+    expect(doneGap("Backend\nAPI\n=======", [])).toMatch(/only list markers, headings or rules/);
+    // A block start between the lines ends the paragraph, so the underline is not the label's: the
+    // first line is an ordinary step and only the heading below it drops.
+    expect(texts("Backend\n## Heading\n=======")).toEqual(["Backend", "======="]);
   });
 
   it("reads nested markers as scaffolding too — shearing one layer must not leave the next as a criterion", () => {
