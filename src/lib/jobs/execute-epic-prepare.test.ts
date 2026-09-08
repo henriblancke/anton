@@ -105,7 +105,7 @@ const { prepareEpicRun } = await import("./execute-epic-prepare");
 // run-shape seam), so its pure unit imports from there; the self-freshness mock above intercepts the
 // import regardless of which module reads it.
 const { staleCheckoutRefusal } = await import("./execute-epic-freshness");
-const { PoisonEpic } = await import("./errors");
+const { PoisonEpic, StaleCheckoutError } = await import("./errors");
 import type { EpicRun } from "./execute-epic-run";
 
 const REPO = "/tmp/anton";
@@ -368,7 +368,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
     preflightHumanTicketsMock.mockResolvedValue(preflight(clean));
   });
 
-  it("parks a new start when anton's checkout is behind its upstream", async () => {
+  it("defers a new start when anton's checkout is behind its upstream", async () => {
     checkSelfFreshnessMock.mockResolvedValue({
       checkout: { state: "behind", behind: 3, upstream: "origin/main" },
       dependencies: { state: "match" },
@@ -376,7 +376,11 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
 
     const error = await refusalFrom(clean);
 
-    expect(error).toBeInstanceOf(PoisonEpic);
+    // A reschedulable stop, NOT a poison: the runner defers the start (attempt refunded) so the
+    // restarted-on-fresh-code process runs it, instead of stranding it in `parked` for a manual
+    // resume the operator would have to find and click after already restarting anton (anton-5oc3).
+    expect(error).toBeInstanceOf(StaleCheckoutError);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
     expect(error.message).toContain("3 commit(s) behind origin/main");
     expect(error.message).toContain("git pull");
     // Read-only refusal: nothing was leased, warmed or claimed, so a run already in flight — and the
@@ -386,7 +390,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
     expect(publishRunClaimMock).not.toHaveBeenCalled();
   });
 
-  it("parks a new start when installed dependencies have drifted", async () => {
+  it("defers a new start when installed dependencies have drifted", async () => {
     checkSelfFreshnessMock.mockResolvedValue({
       checkout: { state: "current" },
       dependencies: { state: "drift", packages: ["drizzle-orm", "next"] },
@@ -394,7 +398,8 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
 
     const error = await refusalFrom(clean);
 
-    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error).toBeInstanceOf(StaleCheckoutError);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
     expect(error.message).toContain("bun install");
     expect(error.message).toContain("drizzle-orm, next");
     expect(warmRunWorktreeMock).not.toHaveBeenCalled();

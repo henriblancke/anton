@@ -259,6 +259,26 @@ export class SyncNotWiredError extends Error {
   }
 }
 
+/**
+ * A new run can't START because the anton PROCESS is behind its own latest code (anton-mh3c) — its
+ * checkout is behind upstream, or its installed packages no longer match the lockfile. Like
+ * {@link SyncNotWiredError}, this is neither a completion nor the job's own failure, and it is NOT a
+ * poison: parking would strand every job that hit it in `parked` until a human resumed each by hand,
+ * even after the fix (pull/reinstall, restart anton) cleared the condition process-wide. So the
+ * runner RESCHEDULES on a slow cadence with the attempt refunded — the stale process keeps deferring
+ * new starts, and the moment it is restarted on fresh code the next attempt passes and runs itself.
+ *
+ * The stopped state stays loudly visible independent of this reschedule: `staleBreaker`
+ * (autopilot-breaker.ts) computes the stale band live from the same self-freshness verdict, so the
+ * app shows "Anton is running old code" whether or not any job is currently deferred on it.
+ */
+export class StaleCheckoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StaleCheckoutError";
+  }
+}
+
 export function isUsageLimitError(e: unknown): e is UsageLimitError {
   return e instanceof UsageLimitError || (e as { name?: string })?.name === "UsageLimitError";
 }
@@ -293,4 +313,8 @@ export function isForeignRunOwner(e: unknown): boolean {
 
 export function isSyncNotWiredError(e: unknown): e is SyncNotWiredError {
   return e instanceof SyncNotWiredError || (e as { name?: string })?.name === "SyncNotWiredError";
+}
+
+export function isStaleCheckoutError(e: unknown): e is StaleCheckoutError {
+  return e instanceof StaleCheckoutError || (e as { name?: string })?.name === "StaleCheckoutError";
 }

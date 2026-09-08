@@ -1,12 +1,13 @@
 /**
  * The checkout-staleness preflight (anton-mh3c / anton-vzhf). Its three dependencies — the
- * self-freshness verdict, the breaker's contract line, and the poison that parks the run — live here
- * rather than in {@link prepareEpicRun}; the run-shape seam re-exports {@link assertSelfCheckoutFresh}
- * to it (anton-8x1k), so preparation reaches this gate through the one seam it already threads its
- * pipeline and lease through instead of fanning these modules out into its own top-level imports.
+ * self-freshness verdict, the breaker's contract line, and the reschedulable stop that defers the
+ * run — live here rather than in {@link prepareEpicRun}; the run-shape seam re-exports
+ * {@link assertSelfCheckoutFresh} to it (anton-8x1k), so preparation reaches this gate through the
+ * one seam it already threads its pipeline and lease through instead of fanning these modules out
+ * into its own top-level imports.
  */
 import { BREAKER_EFFECT } from "../autopilot-breaker";
-import { PoisonEpic } from "./errors";
+import { StaleCheckoutError } from "./errors";
 import { checkSelfFreshness, selfRepoRoot, type SelfFreshness } from "./self-freshness";
 
 /**
@@ -18,23 +19,28 @@ import { checkSelfFreshness, selfRepoRoot, type SelfFreshness } from "./self-fre
  * Machine-level, not board-level: the self-freshness verdict (anton-vzhf) is about the PROCESS, so
  * it is read against anton's OWN install root — not the project checkout in {@link EpicRun.repo}.
  *
- * A read-only refusal like every gate around it, and it inherits their contract: the park costs no
- * lease, worktree or claim, and a run already in flight — a separate job long past this gate — is
+ * A read-only refusal like every gate around it, and it inherits their contract: the deferral costs
+ * no lease, worktree or claim, and a run already in flight — a separate job long past this gate — is
  * untouched, only a new start is stopped ({@link BREAKER_EFFECT}). {@link prepareEpicRun} places it
  * AFTER the completion short-circuit so a target already carried to its pull request still settles
- * idempotently rather than being grounded by a staleness with nothing left to run. The PoisonEpic
- * parks the job for a human — the fix is theirs (pull/reinstall, then restart anton) — and its
- * message is the durable record the run row keeps and the run-health sweep surfaces.
+ * idempotently rather than being grounded by a staleness with nothing left to run.
+ *
+ * A {@link StaleCheckoutError}, NOT a poison: the fix is process-wide (pull/reinstall, then restart
+ * anton), so parking would leave every job that hit it stranded in `parked` until a human resumed
+ * each by hand even after the restart cleared the condition. Instead the runner reschedules the job
+ * on a slow cadence with the attempt refunded, so the restarted-on-fresh-code process runs it
+ * itself. The message is still the durable record the run row keeps and the run-health sweep
+ * surfaces, and `staleBreaker` shows the stopped state in the app independent of the deferral.
  */
 export async function assertSelfCheckoutFresh(): Promise<void> {
   const root = selfRepoRoot();
   const refusal = staleCheckoutRefusal(await checkSelfFreshness(root), root);
-  if (refusal) throw new PoisonEpic(refusal);
+  if (refusal) throw new StaleCheckoutError(refusal);
 }
 
 /**
- * The refusal a stale checkout parks a new start on (anton-mh3c), or undefined when anton is running
- * its own latest code. Names WHAT is stale and the command that clears it, and closes with the
+ * The refusal a stale checkout stops a new start with (anton-mh3c), or undefined when anton is
+ * running its own latest code. Names WHAT is stale and the command that clears it, and closes with the
  * disarm's contract line ({@link BREAKER_EFFECT}) so the operator reads the same "running work is
  * unaffected" promise a disarm makes rather than fearing a full stop.
  *
