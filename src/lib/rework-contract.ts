@@ -380,6 +380,12 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
         pendingBlanks = 0;
         continue;
       }
+      // A marker-only `>` inside a blockquote is a blank line within the block, not a line that
+      // has left it: it carries the quote but not the code indent, so hold it as a pending blank.
+      if (blankQuoteLine(line.text, code.prefix)) {
+        pendingBlanks += 1;
+        continue;
+      }
       flushCode();
     }
     if (literal[at]) {
@@ -579,6 +585,20 @@ function peelPrefix(line: string, prefix: Prefix): string | undefined {
 }
 
 const quoted = (prefix: Prefix): boolean => prefix.includes(">");
+
+/**
+ * Whether `line` is a blank line inside the blockquote `prefix` names: it carries every marker up to
+ * and including the innermost `>`, but nothing past it. CommonMark keeps such a line as a blank
+ * WITHIN the contained block rather than ending it, so an indented-code example spanning a quoted
+ * blank line — `>     first`, `>`, `>     second` — is one block, not two. Judged against the quote
+ * portion of the prefix only: the code's own indent past the `>` is exactly what a blank line lacks.
+ */
+function blankQuoteLine(line: string, prefix: Prefix): boolean {
+  const last = prefix.lastIndexOf(">");
+  if (last === -1) return false;
+  const peeled = peelPrefix(line, prefix.slice(0, last + 1));
+  return peeled !== undefined && peeled.trim() === "";
+}
 
 /** `prefix` with its innermost column `columns` further in — where an indented block's content starts. */
 function deeper(prefix: Prefix, columns: number): Prefix {

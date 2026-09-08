@@ -504,6 +504,11 @@ describe("instructionCriteria", () => {
     expect(texts("> ```\n> a\n\n> b")).toEqual(["```\na\n```", "b"]);
     // Indented code inside a callout is read the same way.
     expect(texts(">     code\n>     more\nafter")).toEqual(["```\ncode\nmore\n```", "after"]);
+    // A marker-only `>` is a blank line WITHIN the quoted code block, not a line that ends it: the
+    // example is one block containing a blank, as CommonMark reads it, not two.
+    expect(texts(">     first\n>\n>     second\nafter")).toEqual(["```\nfirst\n\nsecond\n```", "after"]);
+    // A truly blank line — no `>` — leaves the callout, so the block ends and the trailing blank drops.
+    expect(texts(">     first\n\n>     second")).toEqual(["```\nfirst\n```", "```\nsecond\n```"]);
   });
 
   it("keeps code that begins on the marker's own line — five spaces after `-` are one of padding and four of code", () => {
