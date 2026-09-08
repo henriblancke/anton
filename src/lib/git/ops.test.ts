@@ -32,6 +32,7 @@ import {
   openPullRequest,
   pullRequestState,
   readFileAtRev,
+  readPullRequestMerge,
   readPathHistory,
   readWorktreeState,
   resolveFreshBase,
@@ -259,8 +260,9 @@ describe("pullRequestState (fake gh)", () => {
   let binDir: string;
   let prevGh: string | undefined;
 
-  // Fake gh whose `pr view <selector> --json state` echoes the state passed in via ANTON_TEST_PR_STATE,
-  // or exits non-zero (as the real gh does for an unknown PR) when it's set to "__error__".
+  // Fake gh whose `pr view <selector> --json …` echoes the state passed in via ANTON_TEST_PR_STATE
+  // — plus the merge commit and base branch from ANTON_TEST_PR_MERGE_OID / ANTON_TEST_PR_BASE when
+  // set — or exits non-zero (as the real gh does for an unknown PR) when it's set to "__error__".
   function installFakeGh(): void {
     const fakeGh = join(binDir, "gh");
     writeFileSync(
@@ -270,7 +272,10 @@ const a=process.argv.slice(2);
 if(a[0]==='pr'&&a[1]==='view'){
   const st=process.env.ANTON_TEST_PR_STATE;
   if(!st||st==='__error__'){process.stderr.write('no pull requests found\\n');process.exit(1);}
-  process.stdout.write(JSON.stringify({state:st})+'\\n');process.exit(0);
+  const oid=process.env.ANTON_TEST_PR_MERGE_OID;
+  const out={state:st,mergeCommit:oid?{oid}:null};
+  if(process.env.ANTON_TEST_PR_BASE)out.baseRefName=process.env.ANTON_TEST_PR_BASE;
+  process.stdout.write(JSON.stringify(out)+'\\n');process.exit(0);
 }
 process.exit(0);
 `,
@@ -291,7 +296,29 @@ process.exit(0);
     if (prevGh === undefined) delete process.env[GH_BIN_ENV];
     else process.env[GH_BIN_ENV] = prevGh;
     delete process.env.ANTON_TEST_PR_STATE;
+    delete process.env.ANTON_TEST_PR_MERGE_OID;
+    delete process.env.ANTON_TEST_PR_BASE;
     rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("reads the merge commit and base branch beside the state, and omits what gh does not name", async () => {
+    process.env.ANTON_TEST_PR_STATE = "MERGED";
+    process.env.ANTON_TEST_PR_MERGE_OID = "a".repeat(40);
+    process.env.ANTON_TEST_PR_BASE = "develop";
+    expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({
+      state: "merged",
+      mergeCommit: "a".repeat(40),
+      baseRefName: "develop",
+    });
+    // No merge commit named — the field is absent rather than a bogus value a caller could resolve.
+    delete process.env.ANTON_TEST_PR_MERGE_OID;
+    delete process.env.ANTON_TEST_PR_BASE;
+    expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({ state: "merged" });
+    // A merge commit that is not a sha is dropped too: only a bare hex sha is ever handed to git.
+    process.env.ANTON_TEST_PR_MERGE_OID = "HEAD~1";
+    expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({ state: "merged" });
+    process.env.ANTON_TEST_PR_STATE = "__error__";
+    expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({ state: "unknown" });
   });
 
   it("maps gh states to open / merged / closed, strips the gh- ref prefix", async () => {

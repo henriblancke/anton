@@ -107,7 +107,17 @@ interface Sandbox {
   landed: string;
   /** A commit on a branch `main` does not contain. */
   unmerged: string;
-  setPr: (number: number, state: "OPEN" | "MERGED" | "CLOSED") => void;
+  /**
+   * What gh answers for a PR. A MERGED one names the commit that merged it and the branch it merged
+   * into — `landed` into `main` unless the case says otherwise, since the check places the merge in
+   * the base's history rather than taking the state's word for it (PR #238 review). `commit: null`
+   * is a gh that names no merge commit at all.
+   */
+  setPr: (
+    number: number,
+    state: "OPEN" | "MERGED" | "CLOSED",
+    merge?: { commit?: string | null; base?: string },
+  ) => void;
   /** Everything a write would move: refs, HEAD, the index and the working tree. */
   repoFingerprint: () => string;
   cleanup: () => void;
@@ -140,12 +150,12 @@ function openSandbox(): Sandbox {
   const unmerged = g(["rev-parse", "HEAD"]);
   g(["checkout", "-q", "main"]);
 
-  const prStates: Record<string, string> = {};
+  const prStates: Record<string, { state: string; mergeCommit: { oid: string } | null; baseRefName: string }> = {};
   const stateFile = join(dir, "pr-states.json");
   writeFileSync(stateFile, "{}");
   const fakeGh = join(binDir, "gh");
-  // `pr view <selector> --json state` answers from the file, and EXITS NON-ZERO for a PR it does
-  // not know — the shape of a gh that cannot reach GitHub, which must never read as a state.
+  // `pr view <selector> --json …` answers from the file, and EXITS NON-ZERO for a PR it does not
+  // know — the shape of a gh that cannot reach GitHub, which must never read as a state.
   writeFileSync(
     fakeGh,
     `#!/usr/bin/env node
@@ -153,9 +163,9 @@ const fs=require('fs');
 const a=process.argv.slice(2);
 if(a[0]!=='pr'||a[1]!=='view'){process.exit(9)}
 const states=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)},'utf8'));
-const state=states[a[2]];
-if(!state){process.stderr.write('could not resolve to a PullRequest\\n');process.exit(1)}
-process.stdout.write(JSON.stringify({state}));
+const pr=states[a[2]];
+if(!pr){process.stderr.write('could not resolve to a PullRequest\\n');process.exit(1)}
+process.stdout.write(JSON.stringify(pr));
 `,
     { mode: 0o755 },
   );
@@ -168,8 +178,13 @@ process.stdout.write(JSON.stringify({state}));
     repo,
     landed,
     unmerged,
-    setPr: (number, state) => {
-      prStates[String(number)] = state;
+    setPr: (number, state, merge = {}) => {
+      const commit = state === "MERGED" ? (merge.commit === undefined ? landed : merge.commit) : null;
+      prStates[String(number)] = {
+        state,
+        mergeCommit: commit ? { oid: commit } : null,
+        baseRefName: merge.base ?? "main",
+      };
       writeFileSync(stateFile, JSON.stringify(prStates));
     },
     repoFingerprint: () =>
@@ -181,6 +196,10 @@ process.stdout.write(JSON.stringify({state}));
     },
   };
 }
+
+/** How a proof line ends for a PR whose merge the base contains — the evidence, not the state. */
+const mergedTail = (sha: string) =>
+  `, and its merge commit \`${sha.slice(0, 10)}\` is in the history of the run's base (main)`;
 
 suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
   let sb: Sandbox;
@@ -215,7 +234,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       `commit \`${landed.slice(0, 10)}\` is in the history of the run's base (main)`,
       `\`${SHIPPER}\` is closed on the board, and commit \`${landed.slice(0, 10)}\` in the ` +
         `history of the run's base (main) names it`,
-      `PR gh-85 is merged`,
+      `PR gh-85 is merged${mergedTail(landed)}`,
     ]);
     expect((verdict as { landed: unknown }).landed).toEqual({
       [SHIPPER]: { via: "commit", sha: landed },
@@ -256,7 +275,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
 
     expect(verdict).toEqual({
       state: "verified",
-      proof: [`\`${SHIPPER}\` is in_progress, but its PR (gh-85) is merged`],
+      proof: [`\`${SHIPPER}\` is in_progress, but its PR (gh-85) is merged${mergedTail(landed)}`],
       landed: { [SHIPPER]: { via: "pr", ref: "gh-85" } },
     });
   });
@@ -320,7 +339,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
       state: "verified",
       proof: [
         `\`${UNLANDED}\` is closed on the board and the PR of \`${OWNER}\`, the run target it ` +
-          `rides, (gh-85) is merged`,
+          `rides, (gh-85) is merged${mergedTail(landed)}`,
       ],
       landed: { [UNLANDED]: { via: "owner-pr", ownerId: OWNER, ref: "gh-85" } },
     });
@@ -335,7 +354,7 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
 
     expect(verdict).toEqual({
       state: "verified",
-      proof: [`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged`],
+      proof: [`\`${UNLANDED}\` is closed on the board and its PR (gh-85) is merged${mergedTail(landed)}`],
       landed: { [UNLANDED]: { via: "pr", ref: "gh-85" } },
     });
   });
@@ -401,6 +420,56 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
 
     expect(verdict.state).toBe("unverified");
     expect(verdict).toMatchObject({ why: expect.stringContaining("is closed, not merged") });
+  });
+
+  // MERGED IS NOT LANDED (PR #238 review): a repository that merges into `develop` or a release
+  // line has merged PRs whose work `main` does not contain, and `gh` calls them merged all the same.
+  it("refuses a PR merged into a branch whose history the run's base does not share", async () => {
+    setPr(85, "MERGED", { commit: unmerged, base: "develop" });
+    const verdict = await verify("shipped in PR #85", [bead(TARGET)]);
+    expect(verdict).toMatchObject({
+      state: "unverified",
+      why: expect.stringContaining("is merged elsewhere than the run's base (main) — into `develop`"),
+    });
+    expect((verdict as { why: string }).why).toContain(unmerged.slice(0, 10));
+  });
+
+  it("refuses a bead whose PR merged elsewhere than the base, closed or not", async () => {
+    setPr(85, "MERGED", { commit: unmerged, base: "release/1.x" });
+    const open = await verify(`done by ${SHIPPER}`, [
+      bead(TARGET),
+      bead(SHIPPER, { status: "in_progress", metadata: { pr: "gh-85" } }),
+    ]);
+    expect(open).toMatchObject({
+      why: expect.stringContaining(`\`${SHIPPER}\` is in_progress and its PR (gh-85) is merged elsewhere`),
+    });
+    const closed = await verify(`done by ${UNLANDED}`, [
+      bead(TARGET),
+      bead(UNLANDED, { status: "closed", metadata: { pr: "gh-85" } }),
+    ]);
+    expect(closed).toMatchObject({
+      why: expect.stringContaining(`\`${UNLANDED}\` is closed on the board, but its PR (gh-85) is merged elsewhere`),
+    });
+  });
+
+  it("refuses a merged PR gh names no merge commit for — unplaced is not landed", async () => {
+    setPr(85, "MERGED", { commit: null });
+    const verdict = await verify("shipped in PR #85", [bead(TARGET)]);
+    expect(verdict).toMatchObject({
+      state: "unverified",
+      why: expect.stringContaining("gh named no commit for the merge"),
+    });
+  });
+
+  it("refuses a merged PR whose merge commit this repository has never seen, without fetching", async () => {
+    setPr(85, "MERGED", { commit: "f".repeat(40) });
+    const before = repoFingerprint();
+    const verdict = await verify("shipped in PR #85", [bead(TARGET)]);
+    expect(verdict).toMatchObject({
+      state: "unverified",
+      why: expect.stringContaining("is one this repository has never seen"),
+    });
+    expect(repoFingerprint()).toBe(before);
   });
 
   it("refuses one bad check even when the rest of the claim holds, keeping the passed checks", async () => {
@@ -886,7 +955,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       expect(outcome).toMatchObject({
         action: "retired",
         replacementId: UNLANDED,
-        proof: [`\`${UNLANDED}\` is in_progress, but its PR (gh-85) is merged`],
+        proof: [`\`${UNLANDED}\` is in_progress, but its PR (gh-85) is merged${mergedTail(sb.landed)}`],
       });
       expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);
     });
@@ -920,6 +989,50 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       expect(outcome).toMatchObject({ action: "escalate" });
       expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("reads as open now, not merged");
       expect(supersedeMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses when the base no longer contains the PR's merge at the write — still merged is not enough", async () => {
+      showMock.mockImplementation(async (_cwd, id) => {
+        if (id === UNLANDED) setPr(85, "MERGED", { commit: sb.unmerged, base: "develop" });
+        return id === TARGET ? bead(TARGET, { status: "in_progress" }) : viaPr()[1]!;
+      });
+
+      const outcome = await retireViaPr();
+
+      expect(outcome).toMatchObject({ action: "escalate" });
+      expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain(
+        "is merged elsewhere than the run's base (main) — into `develop`",
+      );
+      expect(supersedeMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // The settlement path reads the job's abort ONCE before handing the ticket here, and this repair
+  // then reads git, asks GitHub and waits on locks (PR #238 review). A kill landing in that window
+  // must not become a closed ticket: the live signal is re-read inside the locks, immediately
+  // before the first write, and a cancellation there writes nothing at all.
+  describe("the job's live abort signal", () => {
+    it("writes nothing when the job was cancelled while it was checking, and says so", async () => {
+      const controller = new AbortController();
+      showMock.mockImplementation(async (_cwd, id) => {
+        // Lands during the under-lock re-read — after every check has passed, before any write.
+        controller.abort();
+        return id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" });
+      });
+
+      const outcome = await retire({ signal: controller.signal });
+
+      expect(outcome).toMatchObject({ action: "cancelled" });
+      expect((outcome as { why: string }).why).toContain("the job was cancelled");
+      expect((outcome as { why: string }).why).toContain(`bd supersede ${TARGET} --with ${SHIPPER}`);
+      for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
+    });
+
+    it("retires as usual under a signal that never fires", async () => {
+      const outcome = await retire({ signal: new AbortController().signal });
+
+      expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+      expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
     });
   });
 
@@ -957,7 +1070,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
         replacementId: UNLANDED,
         proof: [
           `\`${UNLANDED}\` is closed on the board and the PR of \`${OWNER}\`, the run target it ` +
-            `rides, (gh-85) is merged`,
+            `rides, (gh-85) is merged${mergedTail(sb.landed)}`,
         ],
       });
       expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, UNLANDED);

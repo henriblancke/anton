@@ -143,6 +143,15 @@ export async function settleFailedTicket(args: {
         committed: progress.committed,
       })
     : undefined;
+  // The repair reads git, asks GitHub and waits on write locks — long enough for the job's abort to
+  // land AFTER the check above (PR #238 review). The repair re-reads the live signal before its own
+  // first write, so a kill in that window retired nothing; the same kill keeps the release from
+  // writing too, for settleAbortedTicket's reason — cancellation wins, and the ticket stays claimed
+  // for the resume. A retirement that DID land before the kill is settled for good and is released
+  // as one: the abort cannot take it back, and leaving a closed bead claimed would only be residue.
+  if (repair?.action !== "retired" && run.ctx.signal.aborted) {
+    await cancelledTicket({ ticket, session, e, why: "aborted" });
+  }
   await releaseFailedTicket({ run, ticket, session, progress, e, kinds, repair });
   // The repaired bead goes back through the ordinary queue (R5.10): a non-poison error spends one of
   // the runner's own attempts, behind its own backoff and the picker's brakes. The block it replaces
@@ -530,7 +539,6 @@ async function settleAbortedTicket(args: {
   const { run, ticket, session, e } = args;
   const { ctx } = run;
   const repo = run.repoPath;
-  const { logPath } = session;
   // An ABORTED ticket writes nothing to the board (anton-6xj0). The abort's author decides this
   // ticket's fate, not this unwinding handler: an abandon settles it (closed + `abandoned`, the
   // stage label cleared — beads.abandon does all three), a force-kill or a lost lease leaves it
@@ -549,16 +557,29 @@ async function settleAbortedTicket(args: {
       .then((b) => beads.isAbandoned(b))
       .catch(() => false));
   if (ctx.signal.aborted || settledElsewhere) {
-    const why = ctx.signal.aborted ? "aborted" : "abandoned";
-    await appendSessionLog(logPath, `[${why}] ${ticket.id} was ${why} mid-run\n`).catch(() => {});
-    // "Writes nothing to the board" covers the RUN's writes too, and the ask is one of them: the
-    // run-level catch turns a NeedsHumanError into a `human` gate blocking the target. That gate
-    // outlives the cancellation — a person must clear it by hand, and on an abandoned target
-    // gate-check never resumes anything that would. Cancellation wins; the ask travels as a plain
-    // stop instead, carrying what was asked so it still reaches the operator through the run row.
-    if (e instanceof NeedsHumanError) throw new CancelledAskError(ticket.id, why, e.ask);
-    throw e;
+    await cancelledTicket({ ticket, session, e, why: ctx.signal.aborted ? "aborted" : "abandoned" });
   }
+}
+
+/**
+ * Stop the settlement of a ticket whose fate somebody else decided — logged in the session, never
+ * on the board — by rethrowing the error the ticket halted on.
+ */
+async function cancelledTicket(args: {
+  ticket: Bead;
+  session: JobSession;
+  e: unknown;
+  why: "aborted" | "abandoned";
+}): Promise<never> {
+  const { ticket, session, e, why } = args;
+  await appendSessionLog(session.logPath, `[${why}] ${ticket.id} was ${why} mid-run\n`).catch(() => {});
+  // "Writes nothing to the board" covers the RUN's writes too, and the ask is one of them: the
+  // run-level catch turns a NeedsHumanError into a `human` gate blocking the target. That gate
+  // outlives the cancellation — a person must clear it by hand, and on an abandoned target
+  // gate-check never resumes anything that would. Cancellation wins; the ask travels as a plain
+  // stop instead, carrying what was asked so it still reaches the operator through the run row.
+  if (e instanceof NeedsHumanError) throw new CancelledAskError(ticket.id, why, e.ask);
+  throw e;
 }
 
 /**

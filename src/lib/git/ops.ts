@@ -1460,10 +1460,63 @@ export async function markPullRequestDraft(repoPath: string, selector: string): 
 export type PullRequestState = "open" | "merged" | "closed" | "unknown";
 
 /**
- * Report the lifecycle state of the PR named by a beads external ref (`gh-<n>`, a bare number, or
- * a PR url). Returns `"unknown"` when the state can't be determined — no `gh`, a network/CLI error,
- * or an unparseable ref — so callers can fail closed rather than mistake a transient failure for a
- * definitive state.
+ * What GitHub reports of a PR beyond its state — enough to place a merge in a branch's HISTORY
+ * rather than take `merged` as "landed". A repository that merges into more than one branch
+ * (`develop`, a release line) has merged PRs whose work `main` does not contain (PR #238 review).
+ */
+export interface PullRequestMerge {
+  state: PullRequestState;
+  /** The commit the merge produced — the merge, squash or rebased head — when gh reported one. */
+  mergeCommit?: string;
+  /** The branch the PR targets, as gh names it (`main`, not `origin/main`). */
+  baseRefName?: string;
+}
+
+/**
+ * Read the PR named by a beads external ref (`gh-<n>`, a bare number, or a PR url): its lifecycle
+ * state and, when it merged, the commit that merged it and the branch it merged into.
+ *
+ * `state` is `"unknown"` when it can't be determined — no `gh`, a network/CLI error, or an
+ * unparseable ref — so callers can fail closed rather than mistake a transient failure for a
+ * definitive state. The merge fields are absent whenever gh did not report them; a caller that
+ * needs the merge placed in a history treats their absence as unplaced, never as merged.
+ */
+export async function readPullRequestMerge(repoPath: string, ref: string): Promise<PullRequestMerge> {
+  // `gh pr view` accepts a number or url; `gh-<n>` is the beads form, so strip the prefix.
+  const selector = ref.startsWith("gh-") ? ref.slice(3) : ref;
+  if (!selector) return { state: "unknown" };
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  try {
+    const { stdout } = await execFileAsync(
+      gh,
+      ["pr", "view", selector, "--json", "state,mergeCommit,baseRefName"],
+      { cwd: repoPath, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    const parsed = JSON.parse(stdout) as {
+      state?: string;
+      mergeCommit?: { oid?: string } | null;
+      baseRefName?: string;
+    };
+    // gh reports state as OPEN | CLOSED | MERGED (a closed-then-merged PR reports MERGED).
+    const state = parsed.state?.toUpperCase();
+    const mapped: PullRequestState =
+      state === "OPEN" ? "open" : state === "MERGED" ? "merged" : state === "CLOSED" ? "closed" : "unknown";
+    const oid = parsed.mergeCommit?.oid;
+    return {
+      state: mapped,
+      ...(typeof oid === "string" && /^[0-9a-f]{7,40}$/i.test(oid) ? { mergeCommit: oid } : {}),
+      ...(typeof parsed.baseRefName === "string" && parsed.baseRefName
+        ? { baseRefName: parsed.baseRefName }
+        : {}),
+    };
+  } catch {
+    return { state: "unknown" };
+  }
+}
+
+/**
+ * Report the lifecycle state of the PR named by a beads external ref — {@link readPullRequestMerge}
+ * reduced to its state, for the callers that only ask whether a PR is open, merged or closed.
  *
  * Used by execute-epic to tell a STALE ref (a PR that was closed WITHOUT merging — which review-fix
  * deliberately leaves on the bead so a Run/Force run can recover the epic) apart from a ref that
@@ -1473,25 +1526,7 @@ export async function pullRequestState(
   repoPath: string,
   ref: string,
 ): Promise<PullRequestState> {
-  // `gh pr view` accepts a number or url; `gh-<n>` is the beads form, so strip the prefix.
-  const selector = ref.startsWith("gh-") ? ref.slice(3) : ref;
-  if (!selector) return "unknown";
-  const gh = process.env[GH_BIN_ENV] ?? "gh";
-  try {
-    const { stdout } = await execFileAsync(gh, ["pr", "view", selector, "--json", "state"], {
-      cwd: repoPath,
-      timeout: 120_000,
-      maxBuffer: 4 * 1024 * 1024,
-    });
-    // gh reports state as OPEN | CLOSED | MERGED (a closed-then-merged PR reports MERGED).
-    const state = (JSON.parse(stdout) as { state?: string }).state?.toUpperCase();
-    if (state === "OPEN") return "open";
-    if (state === "MERGED") return "merged";
-    if (state === "CLOSED") return "closed";
-    return "unknown";
-  } catch {
-    return "unknown";
-  }
+  return (await readPullRequestMerge(repoPath, ref)).state;
 }
 
 /**

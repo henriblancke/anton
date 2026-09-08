@@ -13,8 +13,8 @@
  * block class describes something that stopped the work; this one describes work that is finished,
  * and acting on it settles a ticket on the strength of a sentence. So the sentence is never the
  * evidence: it is only how anton learns WHAT to look for. What it looks at is what git and bd
- * already hold — a commit the run's base contains, a bead the board has closed, a PR GitHub reports
- * merged — and a claim that names none of those is a claim about nothing checkable.
+ * already hold — a commit the run's base contains, a bead the board has closed, a PR whose merge
+ * the run's base contains — and a claim that names none of those is a claim about nothing checkable.
  *
  * FAIL CLOSED, which here means three separate things:
  *
@@ -38,9 +38,9 @@ import { beads, type Bead } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import {
-  pullRequestState,
   readCommitNaming,
   readCommitReach,
+  readPullRequestMerge,
   type PullRequestState,
 } from "../git/ops";
 import { beadIdsNamedIn, indexBoard, isOpenWork, ticketOwnerOf, type BoardIndex } from "./board-index";
@@ -80,8 +80,8 @@ export function claimedCommits(reason: string | undefined): string[] {
 
 /**
  * Every PR the reason cites, as the `gh-<n>` ref beads uses — the same form
- * {@link pullRequestState} takes, so a PR named in prose and one read off a bead are checked by one
- * code path.
+ * {@link readPullRequestLanding} takes, so a PR named in prose and one read off a bead are checked
+ * by one code path.
  */
 export function claimedPullRequests(reason: string | undefined): string[] {
   if (!reason) return [];
@@ -127,6 +127,80 @@ function readBoard(repoPath: string): Promise<Bead[]> {
 }
 
 /**
+ * Whether a pull request's work is in the run's base — or, when it is not, what GitHub and git said.
+ *
+ * `predicate` completes the sentence "<the PR> …" for every reading that is not proof, so each
+ * refusal names the same fact in the same words whichever bead's PR it was asked of. `state` is
+ * kept beside it because two of the readings are worded differently by their callers: a PR gh
+ * could not read is an UNCHECKED claim, not a failed one, and a PR merely open or closed is the
+ * everyday case the prose keeps short.
+ */
+type PullRequestLanding =
+  | { landed: true; sha: string }
+  | { landed: false; state: PullRequestState; predicate: string };
+
+/**
+ * Read a PR and place its merge in the history of `base`.
+ *
+ * MERGED IS NOT LANDED (PR #238 review). `gh` reports a PR merged whatever branch it merged into,
+ * and a repository that ships through `develop` or a release line has merged PRs whose work the
+ * run's base does not contain — so the check asks where the merge commit sits, exactly as it asks
+ * of a commit named in prose: the commit gh reports for the merge has to be one `base` reaches.
+ * A merged PR gh reports no commit for is unplaced, and unplaced fails closed: the alternative is
+ * taking the state's word for the very thing the check exists to verify. Nothing is fetched, for
+ * {@link readCommitReach}'s reason — a merge this repository has not seen is `absent`, and going
+ * to the network to make it appear would make the answer depend on when it was asked.
+ */
+async function readPullRequestLanding(
+  repoPath: string,
+  base: string,
+  ref: string,
+): Promise<PullRequestLanding> {
+  const pr = await readPullRequestMerge(repoPath, ref);
+  if (pr.state !== "merged") {
+    return {
+      landed: false,
+      state: pr.state,
+      predicate: pr.state === "unknown" ? "could not be read" : `is ${pr.state}, not merged`,
+    };
+  }
+  const unlanded = (predicate: string): PullRequestLanding => ({ landed: false, state: "merged", predicate });
+  if (!pr.mergeCommit) {
+    return unlanded(
+      `is merged, and gh named no commit for the merge — anton cannot place it in the history of ` +
+        `the run's base (${base}), so it does not count as landed there`,
+    );
+  }
+  const reach = await readCommitReach(repoPath, pr.mergeCommit, base);
+  const short = pr.mergeCommit.slice(0, 10);
+  switch (reach.state) {
+    case "reaches":
+      return { landed: true, sha: reach.sha };
+    case "outside":
+      return unlanded(
+        `is merged elsewhere than the run's base (${base})` +
+          `${pr.baseRefName ? ` — into \`${pr.baseRefName}\`` : ""}: its merge commit \`${short}\` ` +
+          `is not in ${base}'s history, so what it carries has not landed in what this run builds on`,
+      );
+    case "absent":
+      return unlanded(
+        `is merged, and its merge commit \`${short}\` is one this repository has never seen — the ` +
+          `run's base (${base}) does not contain it, and anton does not fetch to make it appear`,
+      );
+    case "unreadable":
+      return unlanded(
+        `is merged, and whether its merge commit \`${short}\` reaches the run's base (${base}) ` +
+          `could not be read (${reach.detail})`,
+      );
+  }
+}
+
+/** The clause a proof line ends on for a PR whose merge the base contains — the evidence itself. */
+function landedTail(base: string, landing: { sha: string }): string {
+  return `, and its merge commit \`${landing.sha.slice(0, 10)}\` is in the history of the run's base (${base})`;
+}
+
+/**
  * Check the agent's `already-shipped` claim against the repository and the board.
  *
  * Reads only (see the module header). Returns `unverified` with the failed check stated for every
@@ -167,15 +241,15 @@ export async function verifyShippedClaim(args: {
   }
 
   const proof: string[] = [];
-  // One state per PR however many times it is named — a bead's own ref and the number written in the
-  // prose are routinely the same PR, and `gh` is a network call.
-  const prStates = new Map<string, PullRequestState>();
-  const readPr = async (ref: string): Promise<PullRequestState> => {
-    const cached = prStates.get(ref);
+  // One reading per PR however many times it is named — a bead's own ref and the number written in
+  // the prose are routinely the same PR, and `gh` is a network call.
+  const landings = new Map<string, PullRequestLanding>();
+  const readPr = async (ref: string): Promise<PullRequestLanding> => {
+    const cached = landings.get(ref);
     if (cached) return cached;
-    const state = await pullRequestState(repoPath, ref);
-    prStates.set(ref, state);
-    return state;
+    const landing = await readPullRequestLanding(repoPath, base, ref);
+    landings.set(ref, landing);
+    return landing;
   };
 
   for (const commit of commits) {
@@ -241,9 +315,9 @@ export async function verifyShippedClaim(args: {
           `${standing} and it points at no PR — nothing there says its work landed`,
       };
     }
-    const state = await readPr(pr);
-    if (state === "merged") {
-      proof.push(`\`${id}\` is ${standing}, but its PR (${pr}) is merged`);
+    const landing = await readPr(pr);
+    if (landing.landed) {
+      proof.push(`\`${id}\` is ${standing}, but its PR (${pr}) is merged${landedTail(base, landing)}`);
       landed[id] = { via: "pr", ref: pr };
       continue;
     }
@@ -251,27 +325,27 @@ export async function verifyShippedClaim(args: {
       state: "unverified",
       proof,
       why:
-        state === "unknown"
+        landing.state === "unknown"
           ? `\`${id}\` is ${standing} and anton could not read the state of its PR (${pr}) — ` +
             `whether that work landed is exactly what the claim rests on`
-          : `\`${id}\` is ${standing} and its PR (${pr}) is ${state}, not merged`,
+          : `\`${id}\` is ${standing} and its PR (${pr}) ${landing.predicate}`,
     };
   }
 
   for (const pr of prs) {
-    const state = await readPr(pr);
-    if (state === "merged") {
-      proof.push(`PR ${pr} is merged`);
+    const landing = await readPr(pr);
+    if (landing.landed) {
+      proof.push(`PR ${pr} is merged${landedTail(base, landing)}`);
       continue;
     }
     return {
       state: "unverified",
       proof,
       why:
-        state === "unknown"
+        landing.state === "unknown"
           ? `the claim names PR ${pr} and anton could not read its state — an unreadable PR is an ` +
             `unchecked claim, not a merged one`
-          : `the claim names PR ${pr}, which is ${state}, not merged`,
+          : `the claim names PR ${pr}, which ${landing.predicate}`,
     };
   }
 
@@ -296,7 +370,7 @@ async function closedBeadLanding(args: {
   base: string;
   index: BoardIndex;
   bead: Bead;
-  readPr: (ref: string) => Promise<PullRequestState>;
+  readPr: (ref: string) => Promise<PullRequestLanding>;
 }): Promise<{ landing: BeadLanding; proof: string } | { why: string }> {
   const { repoPath, base, index, bead, readPr } = args;
   const id = bead.id;
@@ -321,42 +395,42 @@ async function closedBeadLanding(args: {
 
   const ownPr = beads.getPrRef(bead);
   if (ownPr) {
-    const state = await readPr(ownPr);
-    if (state === "merged") {
+    const landing = await readPr(ownPr);
+    if (landing.landed) {
       return {
         landing: { via: "pr", ref: ownPr },
-        proof: `\`${id}\` is closed on the board and its PR (${ownPr}) is merged`,
+        proof: `\`${id}\` is closed on the board and its PR (${ownPr}) is merged${landedTail(base, landing)}`,
       };
     }
     return {
       why:
-        state === "unknown"
+        landing.state === "unknown"
           ? `\`${id}\` is closed on the board and anton could not read the state of its PR ` +
             `(${ownPr}) — whether that work landed is exactly what the claim rests on`
-          : `\`${id}\` is closed on the board, but its PR (${ownPr}) is ${state}, not merged`,
+          : `\`${id}\` is closed on the board, but its PR (${ownPr}) ${landing.predicate}`,
     };
   }
 
   const owner = ticketOwnerOf(index, bead);
   const ownerPr = owner ? beads.getPrRef(owner) : undefined;
   if (owner && ownerPr) {
-    const state = await readPr(ownerPr);
-    if (state === "merged") {
+    const landing = await readPr(ownerPr);
+    if (landing.landed) {
       return {
         landing: { via: "owner-pr", ownerId: owner.id, ref: ownerPr },
         proof:
           `\`${id}\` is closed on the board and the PR of \`${owner.id}\`, the run target it ` +
-          `rides, (${ownerPr}) is merged`,
+          `rides, (${ownerPr}) is merged${landedTail(base, landing)}`,
       };
     }
     return {
       why:
-        state === "unknown"
+        landing.state === "unknown"
           ? `\`${id}\` is closed on the board and anton could not read the state of the PR of ` +
             `\`${owner.id}\`, the run target it rides (${ownerPr}) — whether that work landed ` +
             `is exactly what the claim rests on`
           : `\`${id}\` is closed on the board, but the PR of \`${owner.id}\`, the run target it ` +
-            `rides, (${ownerPr}) is ${state}, not merged — its run committed it, and that work ` +
+            `rides, (${ownerPr}) ${landing.predicate} — its run committed it, and that work ` +
             `has not landed in ${base}`,
     };
   }
@@ -470,7 +544,14 @@ export type AlreadyShippedOutcome =
       proof: string[];
       attempted: string;
     }
-  | { action: "escalate"; why: string; evidence: string[]; prior?: RepairAttempt };
+  | { action: "escalate"; why: string; evidence: string[]; prior?: RepairAttempt }
+  /**
+   * The job was cancelled while the repair was reading — and it stopped INSIDE the locks, before its
+   * first write. Nothing was written, and nothing must be on its account either (PR #238 review):
+   * the settlement path promises an aborted ticket writes nothing to the board, so the caller
+   * records this in its own log and leaves the bead alone — no refusal note, no stamp, no status.
+   */
+  | { action: "cancelled"; why: string };
 
 /**
  * Retire a ticket whose work already landed — or refuse, which is the answer for everything that is
@@ -512,8 +593,15 @@ export async function repairAlreadyShipped(args: {
   autonomy: ProposalAutonomy;
   /** The board to check against. Read fresh when absent — the run's snapshot predates the session. */
   board?: Bead[];
+  /**
+   * The job's LIVE abort signal (PR #238 review). The caller checked it once before handing the
+   * ticket here, but this repair reads git, asks GitHub and waits on write locks — long enough for
+   * an operator's kill to land in between. Re-read inside the locks, immediately before the first
+   * write: a cancellation that arrives while the check is running retires nothing.
+   */
+  signal?: AbortSignal;
 }): Promise<AlreadyShippedOutcome> {
-  const { repoPath, base, bead, block, committed, now, autonomy } = args;
+  const { repoPath, base, bead, block, committed, now, autonomy, signal } = args;
   const claim = block.reason?.trim() || "(no reason given)";
 
   if (committed) {
@@ -629,6 +717,7 @@ export async function repairAlreadyShipped(args: {
         ? locked
         : ((await retirementMoved({
             repoPath,
+            base,
             targetId: bead.id,
             checked: index.byId.get(bead.id),
             snapshot: index,
@@ -645,6 +734,18 @@ export async function repairAlreadyShipped(args: {
           `${bead.id} blocked as \`${KLASS}\`, but the board moved between the check and the write — ` +
           `anton retired nothing rather than settle a ticket against evidence that had changed.`,
         evidence: [moved, `the retirement anton did not write: ${attempted}`],
+      };
+    }
+    // The last read is done and the first write is next: this is where the abort is asked, because
+    // it is the one point that decides whether the cancellation wrote to the board. Everything above
+    // was a read the abort does not care about; everything below is the settlement it forbids.
+    if (signal?.aborted) {
+      return {
+        action: "cancelled",
+        why:
+          `the job was cancelled while anton was checking the \`${KLASS}\` claim on ${bead.id} — ` +
+          `the check had passed, and anton wrote nothing rather than settle a ticket the ` +
+          `cancellation's author is deciding on (the retirement anton did not write: ${attempted})`,
       };
     }
     // The evidence FIRST (see the header): a note states what anton checked, and a bead carrying it
@@ -688,6 +789,8 @@ export async function repairAlreadyShipped(args: {
  */
 async function retirementMoved(args: {
   repoPath: string;
+  /** The ref the merge has to be in the history of — the same `base` the check placed it in. */
+  base: string;
   targetId: string;
   /** The target as the CHECK read it — the contract the claim was verified against. */
   checked: Bead | undefined;
@@ -698,7 +801,7 @@ async function retirementMoved(args: {
   /** The whole board, re-read inside the locks. */
   locked: BoardIndex;
 }): Promise<string | undefined> {
-  const { repoPath, targetId, checked, snapshot, replacementId, landing, locked } = args;
+  const { repoPath, base, targetId, checked, snapshot, replacementId, landing, locked } = args;
   const read = async (id: string): Promise<Bead | string> => {
     try {
       const bead = await beads.show(repoPath, id);
@@ -722,10 +825,12 @@ async function retirementMoved(args: {
   const replacement = await read(replacementId);
   if (typeof replacement === "string") return replacement;
 
-  // Still the PR that verified, and still merged. ABANDONED is not asked here, on purpose: the check
-  // itself reads a merged PR as redeeming an abandoned bead — what shipped is what shipped, whatever
-  // the bead was later labelled — and the guard holds the survivor to the check's bar, not a higher
-  // one.
+  // Still the PR that verified, and its merge still in the base — the same bar the check held it
+  // to, re-asked in full rather than as "still merged" (a PR can no more un-merge than the base can
+  // lose a commit, but a force-pushed base can, and the check's answer is the base's history).
+  // ABANDONED is not asked here, on purpose: the check itself reads a merged PR as redeeming an
+  // abandoned bead — what shipped is what shipped, whatever the bead was later labelled — and the
+  // guard holds the survivor to the check's bar, not a higher one.
   const stillMergedPr = async (holder: Bead, ref: string, whose: string): Promise<string | undefined> => {
     const now = beads.getPrRef(holder);
     if (now !== ref) {
@@ -735,11 +840,13 @@ async function retirementMoved(args: {
         `not superseded on that evidence`
       );
     }
-    const state = await pullRequestState(repoPath, ref);
-    if (state === "merged") return undefined;
+    const landing = await readPullRequestLanding(repoPath, base, ref);
+    if (landing.landed) return undefined;
     return (
-      `${whose} PR (${ref}) reads as ${state === "unknown" ? "unreadable" : state} now, not merged — ` +
-      `the evidence ${targetId}'s retirement rested on no longer holds`
+      (landing.state === "merged"
+        ? `${whose} PR (${ref}) ${landing.predicate}`
+        : `${whose} PR (${ref}) reads as ${landing.state === "unknown" ? "unreadable" : landing.state} ` +
+          `now, not merged`) + ` — the evidence ${targetId}'s retirement rested on no longer holds`
     );
   };
 

@@ -20,6 +20,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "../beads/bd";
 import type { AntonResult } from "../claude/anton-result";
+import type { CommitNaming } from "../git/ops";
 import type { ResolvedStep } from "./run-formula";
 import type { AntonDb, Clock } from "./queue";
 import type { StepContext } from "./step-registry";
@@ -31,6 +32,8 @@ const NOW = 1_700_000_000_000;
 const TICKET_ID = "anton-tick";
 /** The bead the unverifiable claim names: on the board, still open, pointing at no PR. */
 const NOT_SHIPPED_ID = "anton-open";
+/** The bead a VERIFIABLE claim names: closed, and named by a commit the run's base contains. */
+const SHIPPED_ID = "anton-done";
 
 const claimMock = vi.fn(async () => {});
 const tagMock = vi.fn(async () => {});
@@ -39,6 +42,7 @@ const setStatusMock = vi.fn(async () => {});
 const unassignMock = vi.fn(async () => {});
 const noteMock = vi.fn(async () => {});
 const closeMock = vi.fn(async () => {});
+const supersedeMock = vi.fn(async () => {});
 const syncMock = vi.fn(async () => {});
 const showMock = vi.fn(async (_repo: string, id: string) => beadById(id));
 const loadAllIssuesMock = vi.fn(async () => board());
@@ -47,6 +51,8 @@ const endSessionMock = vi.fn(async () => {});
 const appendSessionLogMock = vi.fn(async () => {});
 const updateRunMock = vi.fn(async () => {});
 const readWorktreeStateMock = vi.fn(async () => ({ head: "a".repeat(40), status: "" }));
+/** What the base's history says of a bead — `none` unless a case seeds a landing. */
+const readCommitNamingMock = vi.fn(async (): Promise<CommitNaming> => ({ state: "none" }));
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -61,6 +67,7 @@ vi.mock("../beads/bd", async () => {
       unassign: (...args: unknown[]) => unassignMock(...(args as [])),
       note: (...args: unknown[]) => noteMock(...(args as [])),
       close: (...args: unknown[]) => closeMock(...(args as [])),
+      supersede: (...args: unknown[]) => supersedeMock(...(args as [])),
       sync: (...args: unknown[]) => syncMock(...(args as [])),
       show: (repo: string, id: string) => showMock(repo, id),
     },
@@ -95,6 +102,7 @@ vi.mock("../git/ops", async () => {
     ...actual,
     readWorktreeState: () => readWorktreeStateMock(),
     restoreWorktreeState: async () => {},
+    readCommitNaming: () => readCommitNamingMock(),
   };
 });
 
@@ -117,6 +125,7 @@ function board(): Bead[] {
   return [
     ticket(),
     { id: NOT_SHIPPED_ID, title: "Work that has not landed", status: "open", labels: [] } as Bead,
+    { id: SHIPPED_ID, title: "Work that landed", status: "closed", labels: [] } as Bead,
   ];
 }
 
@@ -144,12 +153,12 @@ function steps(selfReport: AntonResult | null, committed: boolean): ResolvedStep
  * a project can give it, so a claim that still does not settle the ticket is refused by the CHECK
  * and not merely by an unarmed dial.
  */
-function run(): Omit<StepContext, "tickets"> {
+function run(signal: AbortSignal = new AbortController().signal): Omit<StepContext, "tickets"> {
   const clock: Clock = { now: () => NOW };
   return {
     db: {} as AntonDb,
     clock,
-    ctx: { signal: new AbortController().signal, heartbeat: vi.fn(), report: vi.fn() },
+    ctx: { signal, heartbeat: vi.fn(), report: vi.fn() },
     projectId: "proj-1",
     runId: "run-1",
     repoPath: REPO,
@@ -163,9 +172,9 @@ function run(): Omit<StepContext, "tickets"> {
 }
 
 /** Walk the ticket and hand back the error it halted on (failing if it did not halt). */
-async function haltOf(selfReport: AntonResult | null): Promise<Error> {
+async function haltOf(selfReport: AntonResult | null, signal?: AbortSignal): Promise<Error> {
   const caught = await runTicket({
-    run: run(),
+    run: run(signal),
     steps: steps(selfReport, false),
     ticket: ticket(),
     // The run carries this ticket alone — no sibling for a `dep-missing` repair to resolve against.
@@ -251,5 +260,55 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
     // The agent's own words ride onto the block note too, so the two records agree.
     const block = notesWritten().find((n) => n.includes("zero diff"));
     expect(block).toContain("already-shipped");
+  });
+
+  // The settlement reads the job's abort ONCE before the repair, and the repair then reads git, asks
+  // GitHub and waits on locks (PR #238 review). A kill landing in that window must leave the board
+  // exactly as an abort landing before it would: nothing retired, nothing noted, nothing released.
+  it("retires and writes NOTHING when the job is cancelled while a verified claim is being settled", async () => {
+    const controller = new AbortController();
+    readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40) });
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      // The under-lock re-read of the survivor — every check has passed, the first write is next.
+      if (id === SHIPPED_ID) controller.abort();
+      return beadById(id);
+    });
+
+    const halt = await haltOf(
+      { outcome: "blocked", klass: "already-shipped", reason: `Already implemented by ${SHIPPED_ID}` },
+      controller.signal,
+    );
+
+    // The block still propagates — the run stops on the cancellation, not on a park.
+    expect(halt.message).toMatch(/produced no delivery/);
+    // And the board is untouched: no supersede, no evidence or refusal note, no stamp, no status,
+    // and the claim left in place for the resume that follows the kill.
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(noteMock).not.toHaveBeenCalled();
+    // The only label written is the claim's own stage, stamped before the agent ran.
+    expect(labelsWritten()).toEqual(["stage:implementing"]);
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+    // The session log is where the cancellation is accounted for.
+    const logged = appendSessionLogMock.mock.calls.map((c) => (c as unknown as string[])[1]).join("");
+    expect(logged).toContain("cancelled before writing");
+    expect(logged).toContain(`[aborted] ${TICKET_ID} was aborted mid-run`);
+  });
+
+  it("retires a verified claim when the signal never fires, closing the ticket against its survivor", async () => {
+    readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40) });
+
+    const halt = await haltOf({
+      outcome: "blocked",
+      klass: "already-shipped",
+      reason: `Already implemented by ${SHIPPED_ID}`,
+    });
+
+    expect(halt.message).toContain(SHIPPED_ID);
+    expect(supersedeMock).toHaveBeenCalledWith(REPO, TICKET_ID, SHIPPED_ID);
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(unassignMock).toHaveBeenCalledWith(REPO, TICKET_ID);
   });
 });

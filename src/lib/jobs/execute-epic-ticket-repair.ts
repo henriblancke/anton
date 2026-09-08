@@ -123,6 +123,10 @@ export async function repairBlockedTicket(args: {
             committed: args.committed,
             now,
             autonomy: autonomy["already-shipped"],
+            // The LIVE signal, not the settlement's one-time read of it: this repair is the one that
+            // settles a bead for good, and an operator's kill landing while it reads GitHub must
+            // stop it before its first write (PR #238 review).
+            signal: run.ctx.signal,
           })
         : await repairRefStale({
             repoPath: repo,
@@ -148,7 +152,9 @@ export async function repairBlockedTicket(args: {
 
 /**
  * What a repair leaves behind whichever way it went: the refusal or shadow note on the bead, then
- * its own line in the session log. Both best-effort — the block stands either way.
+ * its own line in the session log. Both best-effort — the block stands either way. A repair the
+ * job's abort stopped leaves only the log line: the cancellation's author is deciding the ticket,
+ * and a note is a board write like any other.
  */
 async function recordRepairOutcome(args: {
   repo: string;
@@ -191,6 +197,8 @@ function repairLogLine(outcome: TicketRepair): string {
       return `shadow (not armed to write) — would have: ${outcome.attempted}`;
     case "escalate":
       return `escalated — ${[outcome.why, ...outcome.evidence].join(" ")}`;
+    case "cancelled":
+      return `cancelled before writing — ${outcome.why}`;
     // Named rather than left to `default`, so a future outcome shape without a `why` is a type error
     // HERE instead of an `undefined` in the log line (PR #223 review).
     case "none":
