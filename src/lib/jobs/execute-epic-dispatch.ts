@@ -345,8 +345,11 @@ async function retireFound(run: EpicRun, ticket: Bead): Promise<RetiredTicketOut
 }
 
 /**
- * Mark a retired ticket as work this run does NOT deliver — the same `not-delivered` marker a
- * skipped ticket carries, for the same reader (PR #238 review). A retirement is a closed bead whose
+ * Mark a retirement the run FOUND on the board as work this run does NOT deliver — the same
+ * `not-delivered` marker a skipped ticket carries, for the same reader (PR #238 review). A
+ * retirement this run makes itself is marked by the settlement that writes it, under the ticket's
+ * lock and before its claim is released (repair-already-shipped.ts); this covers the ones an
+ * earlier attempt, a person or the gardener settled. A retirement is a closed bead whose
  * work is in the run's BASE, not in its diff; reopened by an operator while the run's pull request
  * sits in review, it is an open child with nothing of its own in that PR, and merge finalization
  * only preserves what is `blocked` or marked — an unmarked reopen is closed as shipped by the very
@@ -703,14 +706,16 @@ async function dispatchTicket(
     // renews the lease), so returning normally here would have the queue claim and tag the next
     // ticket under a job that is already cancelled. The retirement stays on the ledger — it is
     // done, and a resume finds it on the board either way — and the loop stops here.
+    //
+    // Nothing is written to the board here: the `not-delivered` marker a retirement owes merge
+    // finalization is part of the settlement itself, written beside the supersede under the
+    // ticket's lock and before its claim is released (PR #238 review) — a marker written from this
+    // catch would land after the release, on a ticket another run may already have snapshotted.
     if (e instanceof TicketRetiredError) {
       run.retired.push({ id: e.ticketId, replacedBy: e.replacementId, source: "this-run" });
       onBranch.add(e.ticketId);
       console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
       ctx.signal.throwIfAborted();
-      // Marked only past the kill check: a board write under a cancelled job is what the settlement
-      // refused to make, and a resume finds this retirement on the board and marks it there.
-      await markRetired(run, e.ticketId);
       await ctx.heartbeat();
       return;
     }

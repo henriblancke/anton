@@ -182,6 +182,9 @@ process.exit(0);`),
       // …and the STAMP beside it, so a repeat escalates rather than repairing again (R5.6).
       const stamp = (retired.labels ?? []).find((l) => l.startsWith("repair:already-shipped:"));
       expect(stamp).toContain(repairFingerprint(shipped, "already-shipped"));
+      // …and the `not-delivered` marker (PR #238 review): reopened while the PR is in review, the
+      // ticket is an open child in no diff, and the marker is what keeps the merge from closing it.
+      expect(beads.isNotDelivered(retired)).toBe(true);
       expect(retired.assignee ?? null).toBeNull();
       expect(retired.labels ?? []).not.toContain("stage:implementing");
 

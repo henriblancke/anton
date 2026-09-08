@@ -34,7 +34,7 @@
  * {@link AlreadyShippedOutcome} is the repair, and it re-enters the check rather than reimplementing
  * any part of it.
  */
-import { beads, type Bead } from "../beads/bd";
+import { beads, LABELS, type Bead } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { humanNotesPromptBlock } from "../beads/notes";
@@ -57,6 +57,7 @@ import {
   ticketPathOf,
   type BoardIndex,
 } from "./board-index";
+import { mustPersist } from "../jobs/execute-epic-persist";
 import type { ProposalAutonomy } from "./autonomy";
 import {
   decideRepair,
@@ -913,6 +914,13 @@ export type AlreadyShippedOutcome =
       action: "retired";
       /** The repair stamp written on the ticket; absent when the stamp itself failed. */
       label?: string;
+      /**
+       * Whether the `not-delivered` marker landed beside the retirement (PR #238 review) — merge
+       * finalization's only way to tell a retired ticket reopened in review from one this run's PR
+       * carries. False only once bd refused it every time: the retirement stands, but the caller
+       * must not release the ticket, or open a pull request, on an unmarked one.
+       */
+      marked: boolean;
       /** The survivor the `supersedes` edge now points at. */
       replacementId: string;
       /** One line per check that passed — the evidence the note on the bead carries. */
@@ -951,9 +959,19 @@ export type AlreadyShippedOutcome =
  *      and possibly `gh`, so the cheap refusal runs first.
  *
  * The WRITE order is the evidence note, then the supersede, then a RE-READ of both ends, then the
- * stamp — and it is deliberately not `dep-missing`'s. A note is a statement, not a fix: written
- * first, a failure that follows leaves a bead saying truthfully what anton verified and still blocked
- * for a human, while the reverse order could settle a ticket with nothing on it explaining why.
+ * `not-delivered` marker, then the stamp — and it is deliberately not `dep-missing`'s. A note is a
+ * statement, not a fix: written first, a failure that follows leaves a bead saying truthfully what
+ * anton verified and still blocked for a human, while the reverse order could settle a ticket with
+ * nothing on it explaining why.
+ *
+ * The MARKER is part of the settlement, not the caller's afterthought (PR #238 review). A retired
+ * ticket's work is in the run's base, not its diff; reopened by an operator while the run's pull
+ * request sits in review, it is an open child in no diff that PR carries, and merge finalization
+ * closes as shipped whatever is open and unmarked. The caller releases the ticket's claim once this
+ * returns, and a release is what makes it claimable again — so a marker written after it can land
+ * after another run has snapshotted the bead, and that run's claim bookend clears only what its
+ * snapshot held. Written here, under the ticket's lock and while the claim still stands, every later
+ * claimant either snapshots the marker and clears it, or starts after that clear.
  *
  * The re-read is the cross-process half of the fence (PR #238 review). The locks the write is taken
  * under order only writers in THIS process (beads/claim-lock.ts); on a shared-server board another
@@ -1246,6 +1264,11 @@ export async function repairAlreadyShipped(args: {
         ],
       };
     }
+    // The marker first, the stamp second: the stamp guards the NEXT block, the marker guards the
+    // merge of THIS run, and only the marker's absence stops the run from opening that PR. Retried
+    // like the skip path's, and reported rather than thrown — the retirement is not taken back over
+    // it (see the header), so the caller has to know it stands unmarked.
+    const marked = await mustPersist(() => beads.tag(repoPath, bead.id, [LABELS.notDelivered]));
     let label: string | undefined;
     try {
       label = await recordRepair(repoPath, bead, KLASS, attempted, now);
@@ -1256,7 +1279,14 @@ export async function repairAlreadyShipped(args: {
       console.error(`[repair] ${bead.id} was retired as superseded but could not be stamped`, e);
       await beads.note(repoPath, bead.id, unstampedNote(KLASS, attempted)).catch(() => {});
     }
-    return { action: "retired", ...(label ? { label } : {}), replacementId, proof: verdict.proof, attempted };
+    return {
+      action: "retired",
+      ...(label ? { label } : {}),
+      marked,
+      replacementId,
+      proof: verdict.proof,
+      attempted,
+    };
   });
 }
 

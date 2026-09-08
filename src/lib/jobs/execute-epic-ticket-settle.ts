@@ -208,6 +208,21 @@ export async function settleFailedTicket(args: {
   if (repair?.action !== "retired" && run.ctx.signal.aborted) {
     await cancelledTicket({ ticket, session, e, why: "aborted" });
   }
+  // A retirement that landed UNMARKED is not released (PR #238 review). The `not-delivered` marker
+  // is written beside the supersede, under the ticket's lock, because the release below is what
+  // makes the ticket claimable again: marked after it, another run can snapshot the bead in between
+  // and deliver it with a marker its claim bookend never saw, and merge finalization then rehomes
+  // work that shipped. bd refused the marker every time, so the run stops here — the retirement
+  // stands, the claim stays on the closed bead (which keeps it out of every claimable set until a
+  // resume marks it), and no pull request opens whose merge would close a reopen of it as shipped.
+  if (repair?.action === "retired" && !repair.marked) {
+    throw new PoisonEpic(
+      `${ticket.id} is retired as already shipped, but bd would not record \`${LABELS.notDelivered}\` ` +
+        `on it — the run stopped rather than release the ticket and open a pull request whose merge ` +
+        `would close this ticket as shipped if it were reopened meanwhile. Check the beads DB, then ` +
+        `resume the run`,
+    );
+  }
   await releaseFailedTicket({ run, ticket, session, progress, e, kinds, repair });
   // The repaired bead goes back through the ordinary queue (R5.10): a non-poison error spends one of
   // the runner's own attempts, behind its own backoff and the picker's brakes. The block it replaces

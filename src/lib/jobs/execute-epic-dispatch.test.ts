@@ -6,7 +6,9 @@
  *     carries its commit, in which case its work is in the diff and the loop must count it
  *     delivered rather than tell the reviewer the PR does not contain it;
  *   • a retirement that lands under a job that has since been cancelled stays retired, but the
- *     loop stops there — `ctx.heartbeat()` never reads the signal, so nothing else would;
+ *     loop stops there — `ctx.heartbeat()` never reads the signal, so nothing else would — and the
+ *     loop writes nothing to the board for a retirement it made itself: its `not-delivered` marker
+ *     is the settlement's, written under the ticket's lock before the claim comes off;
  *   • a run left with nothing live parks on a message that names only what actually settled its
  *     tickets — "abandoned" is a different decision from "superseded";
  *   • the cross-machine reopen of a closed child is decided under that bead's write lock, so it
@@ -282,7 +284,7 @@ describe("a retirement landing under a cancelled job", () => {
 
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "this-run" }]);
     expect(dispatchedIds()).toEqual(["anton-a"]);
-    // No board write under the kill: the resume finds the retirement on the board and marks it there.
+    // No board write under the kill, and none for the marker either way — see the next case.
     expect(markedNotDelivered()).toEqual([]);
   });
 
@@ -295,9 +297,11 @@ describe("a retirement landing under a cancelled job", () => {
     expect(dispatchedIds()).toEqual(["anton-a", "anton-b"]);
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "this-run" }]);
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-b"]);
-    // Marked like a retirement the run found on the board (PR #238 review): a reopen after this
-    // is an open child in no diff, and only the marker keeps the merge from closing it as shipped.
-    expect(markedNotDelivered()).toEqual(["anton-a"]);
+    // NOT marked from the loop (PR #238 review): by the time the retirement reaches it, the
+    // settlement has released the ticket's claim and another run may already hold a snapshot of
+    // the bead — a marker written now would never be cleared by that run's claim bookend. The
+    // marker is the settlement's own write, made beside the supersede while the claim still stood.
+    expect(markedNotDelivered()).toEqual([]);
   });
 });
 

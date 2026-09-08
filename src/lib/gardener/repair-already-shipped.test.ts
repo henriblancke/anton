@@ -88,6 +88,7 @@ const { indexBoard } = await import("./board-index");
 const { repairLabel } = await import("./repair");
 const { GH_BIN_ENV } = await import("../git/ops");
 const { withBeadWriteLock } = await import("../beads/claim-lock");
+const { LABELS } = await import("../beads/bd");
 
 function has(cmd: string): boolean {
   try {
@@ -1228,6 +1229,12 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     `\`${SHIPPER}\` is closed on the board, and commit \`${sb.landed.slice(0, 10)}\` in the ` +
     `history of the run's base (main) names it`;
 
+  /** When the tag write carrying `labels` fired — the marker and the stamp are two `bd label` calls. */
+  const tagOrder = (matches: (label: string) => boolean) =>
+    tagMock.mock.invocationCallOrder[tagMock.mock.calls.findIndex(([, , labels]) => labels.some(matches))]!;
+  const markerOrder = () => tagOrder((l) => l === LABELS.notDelivered);
+  const stampOrder = () => tagOrder((l) => l.startsWith("repair:"));
+
   it("retires the ticket as superseded, with the evidence on the bead and the stamp beside it", async () => {
     const outcome = await retire();
 
@@ -1249,11 +1256,20 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     // The STAMP, so a repeat escalates rather than repairing again (R5.6).
     expect(tagMock).toHaveBeenCalledWith(repo, TARGET, [repairLabel(TARGET, "already-shipped", NOW)]);
 
+    // The `not-delivered` MARKER, written as part of the settlement rather than by the caller after
+    // it releases the claim (PR #238 review): merge finalization's one way to tell a retired ticket
+    // reopened in review from one the run's PR carries, and it has to be on the bead before any
+    // other run can snapshot it.
+    expect(tagMock).toHaveBeenCalledWith(repo, TARGET, [LABELS.notDelivered]);
+    expect((outcome as { marked: boolean }).marked).toBe(true);
+
     // Written in the order the module promises: the statement of what anton checked lands BEFORE
-    // anything is settled on the strength of it.
+    // anything is settled on the strength of it, and the marker lands before the stamp — the
+    // marker guards this run's merge, the stamp only the next block.
     const firstNote = Math.min(...noteMock.mock.invocationCallOrder);
     expect(firstNote).toBeLessThan(supersedeMock.mock.invocationCallOrder[0]!);
-    expect(supersedeMock.mock.invocationCallOrder[0]!).toBeLessThan(tagMock.mock.invocationCallOrder[0]!);
+    expect(supersedeMock.mock.invocationCallOrder[0]!).toBeLessThan(markerOrder());
+    expect(markerOrder()).toBeLessThan(stampOrder());
   });
 
   it("at `shadow` — the shipped default — works the retirement out and writes NOTHING", async () => {
@@ -2209,10 +2225,11 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
       expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
       const wrote = supersedeMock.mock.invocationCallOrder[0]!;
-      const stamped = tagMock.mock.invocationCallOrder[0]!;
       const afterWrite = showMock.mock.invocationCallOrder.filter((o) => o > wrote);
       expect(afterWrite.length).toBeGreaterThanOrEqual(2);
-      expect(Math.max(...afterWrite)).toBeLessThan(stamped);
+      // Neither the marker nor the stamp lands until the re-read has held.
+      expect(Math.max(...afterWrite)).toBeLessThan(markerOrder());
+      expect(Math.max(...afterWrite)).toBeLessThan(stampOrder());
       expect(showMock.mock.calls.slice(-afterWrite.length).map((c) => c[1])).toEqual(
         expect.arrayContaining([TARGET, SHIPPER]),
       );
@@ -2517,16 +2534,42 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
   });
 
   it("keeps the retirement when only the STAMP failed, and says the guard is not armed for it", async () => {
-    tagMock.mockRejectedValueOnce(new Error("beads db is locked"));
+    // The marker is the first tag write and lands; the stamp, second, is what bd refuses.
+    tagMock.mockImplementationOnce(async () => "").mockRejectedValueOnce(new Error("beads db is locked"));
 
     const outcome = await retire();
 
-    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER, marked: true });
     expect((outcome as { label?: string }).label).toBeUndefined();
     expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
     const notes = noteMock.mock.calls.map((c) => c[2]);
     expect(notes.some((t) => t.includes("could not stamp it"))).toBe(true);
   });
+
+  // The retirement is never taken back on judgement, and a refused marker is not evidence that the
+  // check was wrong — but the caller must not release a ticket, or open a PR, on it (PR #238 review).
+  it("keeps the retirement when the MARKER is refused every time, and reports it unmarked", async () => {
+    tagMock.mockImplementation(async (_cwd, _id, labels) => {
+      if (labels.includes(LABELS.notDelivered)) throw new Error("beads db is locked");
+      return "";
+    });
+    try {
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({
+        action: "retired",
+        replacementId: SHIPPER,
+        marked: false,
+        label: repairLabel(TARGET, "already-shipped", NOW),
+      });
+      expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+      // Retried before it was allowed to fail, like the skip path's marker.
+      expect(tagMock.mock.calls.filter(([, , labels]) => labels.includes(LABELS.notDelivered)).length).toBe(3);
+      expect(reopenMock).not.toHaveBeenCalled();
+    } finally {
+      tagMock.mockImplementation(async () => "");
+    }
+  }, 10_000);
 });
 
 describe("resolveShipper", () => {
