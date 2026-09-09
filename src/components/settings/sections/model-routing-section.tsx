@@ -1,6 +1,7 @@
 "use client";
 
 import { PlusIcon } from "lucide-react";
+import { useCallback, useState } from "react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -23,10 +24,11 @@ const ANY = "";
  * rule applies: rows are numbered, reorderable, and a row an earlier row already shadows is called
  * out where it sits rather than only at the server's 400.
  */
-export function ModelRoutingSection({ form }: { form: SettingsForm }) {
+export function ModelRoutingSection({ form, projectSlug }: { form: SettingsForm; projectSlug: string }) {
   const rows = form.draft.modelRouteRows;
   const fallback = form.draft.model.trim();
   const shadows = shadowMap(rows);
+  const { models, loading, error, refresh } = useGatewayModels(projectSlug, form.saved);
 
   return (
     <section className="flex flex-col gap-3.5">
@@ -56,6 +58,7 @@ export function ModelRoutingSection({ form }: { form: SettingsForm }) {
                 total={rows.length}
                 shadowedBy={shadows[i]}
                 form={form}
+                models={models}
               />
             ))}
           </ol>
@@ -64,7 +67,24 @@ export function ModelRoutingSection({ form }: { form: SettingsForm }) {
           <PlusIcon aria-hidden="true" />
           Add rule
         </Button>
+        {form.saved.claudeBaseUrl && form.saved.claudeAuthTokenEnv && (
+          <div className="flex items-center gap-2 text-[11px] text-subtle">
+            <Button size="sm" variant="ghost" onClick={refresh} disabled={loading}>
+              {loading ? "Loading models…" : models.length > 0 ? "Refresh gateway models" : "Load gateway models"}
+            </Button>
+            {models.length > 0 && <span>{models.length} gateway models available</span>}
+            {error && <span className="text-risk-high">{error}</span>}
+          </div>
+        )}
       </div>
+
+      {models.length > 0 && (
+        <datalist id="gateway-models">
+          {models.map((model) => (
+            <option key={model} value={model} />
+          ))}
+        </datalist>
+      )}
 
       <span className="max-w-3xl text-[11px] text-subtle">
         Rules are evaluated top down and the <strong className="font-medium">first match wins</strong>
@@ -98,6 +118,7 @@ function RouteRow({
   total,
   shadowedBy,
   form,
+  models,
 }: {
   row: ModelRouteRow;
   index: number;
@@ -105,6 +126,7 @@ function RouteRow({
   /** The 1-based rule that already matches everything this one does, if any. */
   shadowedBy?: number;
   form: SettingsForm;
+  models: string[];
 }) {
   const n = index + 1;
   const stepsApply = row.jobType === ANY || row.jobType === PIPELINE_JOB_TYPE;
@@ -164,6 +186,7 @@ function RouteRow({
           value={row.model}
           onChange={(e) => form.modelRoutes.patch(row.id, { model: e.target.value })}
           placeholder="claude-opus-5"
+          list={models.length > 0 ? "gateway-models" : undefined}
           maxLength={200}
           aria-label={`Rule ${n} model`}
           className="min-w-0 flex-1 basis-40 rounded-lg border border-border bg-background px-2.5 py-1.5 font-mono text-[12px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
@@ -191,6 +214,38 @@ function RouteRow({
       )}
     </li>
   );
+}
+
+function useGatewayModels(
+  projectSlug: string,
+  settings: Pick<SettingsForm["saved"], "claudeBaseUrl" | "claudeAuthTokenEnv">,
+) {
+  const [models, setModels] = useState<string[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | undefined>();
+  const baseUrl = settings.claudeBaseUrl?.trim();
+  const tokenEnv = settings.claudeAuthTokenEnv?.trim();
+
+  const refresh = useCallback(async () => {
+    if (!baseUrl || !tokenEnv) return;
+    setLoading(true);
+    setError(undefined);
+    try {
+      const response = await fetch(`/api/projects/${projectSlug}/settings/models`);
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok || !body || typeof body !== "object" || !("models" in body) || !Array.isArray(body.models)) {
+        throw new Error("Could not retrieve models from the configured gateway");
+      }
+      setModels(body.models.filter((model): model is string => typeof model === "string"));
+    } catch (cause) {
+      setModels([]);
+      setError(cause instanceof Error ? cause.message : "Could not retrieve gateway models");
+    } finally {
+      setLoading(false);
+    }
+  }, [baseUrl, projectSlug, tokenEnv]);
+
+  return { models, loading, error, refresh };
 }
 
 /** One matcher select. `Any` is the first option because an unasked question is the common case. */

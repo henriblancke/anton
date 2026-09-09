@@ -164,7 +164,7 @@ export function SettingsView({
     agents: <AgentsSection form={form} bundledAgents={bundledAgents} userAgents={userAgents} />,
     prompt: <PromptSection form={form} basePrompt={basePrompt} />,
     variants: <VariantsSection form={form} />,
-    "model-routing": <ModelRoutingSection form={form} />,
+    "model-routing": <ModelRoutingSection form={form} projectSlug={project.slug} />,
     execution: <ExecutionSection form={form} />,
     quota: <QuotaSection form={form} project={project} quotaProjects={quotaProjects} />,
     autopilot: <AutopilotSection form={form} />,
