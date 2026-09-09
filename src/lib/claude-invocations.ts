@@ -18,8 +18,9 @@
  *    written. Losing the row loses the fact that the invocation happened at all, which is worse than
  *    a row with nothing but its dimensions on it.
  *
- * No cost derivation lives here — a sibling ticket owns the price table. `cost_usd` is what claude
- * itself reported, stored as reported.
+ * `cost_usd` is what claude itself reported, stored as reported and NEVER read back as anton's
+ * answer to what something cost — see `model-pricing.ts`, which derives dollars from these token
+ * counts and a price table anton owns. That column is kept only as the vendor's claim.
  *
  * db-injectable, like `runs` and `picker-starts`: the handler and its tests share one connection.
  */
@@ -35,6 +36,7 @@ import {
   type DivergenceSummary,
   type InvocationFact,
 } from "./model-divergence";
+import { totalCost, type SpendCost } from "./model-pricing";
 import type { AntonDb, Clock } from "./jobs/queue";
 
 /** How an invocation ended, as claude itself reported it. */
@@ -181,6 +183,13 @@ export interface InvocationSpend {
    * project — the read carries the verdict, so it is not a column someone has to think to query.
    */
   divergence: DivergenceSummary;
+  /**
+   * What the window cost, DERIVED by anton from the stored token counts (anton-j9lf) — never the
+   * result event's `cost_usd`, which is priced against a model name that means nothing once a
+   * gateway is in the path. Carries its own unpriced remainder, so a routed project's total cannot
+   * silently read as complete.
+   */
+  cost: SpendCost;
 }
 
 /**
@@ -196,8 +205,15 @@ export async function invocationSpend(
   projectId: string,
   opts: { since?: Date; limit?: number } = {},
 ): Promise<InvocationSpend> {
-  const invocations = groupInvocations(await listInvocations(db, projectId, opts));
-  return { invocations, divergence: divergenceSummary(invocations) };
+  const rows = await listInvocations(db, projectId, opts);
+  const invocations = groupInvocations(rows);
+  return {
+    invocations,
+    divergence: divergenceSummary(invocations),
+    // Priced per ROW, not per invocation: the grain that carries the counts is (invocation, model),
+    // and an opus invocation's haiku sidecar is billed at haiku's rates.
+    cost: totalCost(rows),
+  };
 }
 
 /**

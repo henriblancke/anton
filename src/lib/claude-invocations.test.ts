@@ -331,11 +331,51 @@ describe("invocationSpend", () => {
     tdb.close();
   });
 
+  it("derives the window's cost from the stored counts, not from the reported costUsd", async () => {
+    // anton-j9lf: the result claimed $1.50 for this session. What it actually spent, priced from the
+    // counts, is ~$0.73 — and the CLI's claim is priced against a model name a gateway can make
+    // meaningless, so the read must not echo it.
+    const tdb = makeProjectDb();
+    await recordInvocation(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId },
+      result({ costUsd: 1.5, modelUsage: USAGE }),
+    );
+
+    const spend = await invocationSpend(tdb.db, tdb.projectId);
+    // opus: 438 in + 29,177 out (thinking is inside output). haiku: 1,820 in + 28 out.
+    expect(spend.cost.usd).toBeCloseTo(0.731615 + (1820 + 28 * 5) / 1e6, 10);
+    expect(spend.cost.usd).not.toBeCloseTo(1.5, 2);
+    expect(spend.cost).toMatchObject({ priced: 2, unpriced: 0, unpricedModels: [] });
+    tdb.close();
+  });
+
+  it("leaves a gateway-served model unpriced rather than counting it as free", async () => {
+    const tdb = makeProjectDb();
+    await recordInvocation(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId, modelRequested: "claude-opus-5" },
+      result({ modelUsage: [{ model: "glm-4.6", inputTokens: 900_000, outputTokens: 200_000 }] }),
+    );
+
+    const spend = await invocationSpend(tdb.db, tdb.projectId);
+    expect(spend.cost).toEqual({
+      usd: 0,
+      priced: 0,
+      unpriced: 1,
+      unpricedModels: ["glm-4.6"],
+    });
+    tdb.close();
+  });
+
   it("reads a project with no recorded calls as empty, not as clean routing", async () => {
     const tdb = makeProjectDb();
     expect(await invocationSpend(tdb.db, tdb.projectId)).toEqual({
       invocations: [],
       divergence: { invocations: 0, diverged: 0, unknown: 0, substitutions: [] },
+      cost: { usd: 0, priced: 0, unpriced: 0, unpricedModels: [] },
     });
     tdb.close();
   });
