@@ -69,6 +69,7 @@ const ticket: Bead = {
   issue_type: "task",
   parent: "anton-gate1",
   description: "## Goal\n\nA bounded loop.\n\n## Acceptance\n\n- [ ] bounded\n",
+  labels: ["risk:high"],
 };
 
 const diff: BranchDiff = {
@@ -321,6 +322,17 @@ describe("runReviewGate — convergence", () => {
     expect(blockingFindings(out.unresolved)).toEqual([]);
     expect(calls).toHaveLength(3); // review → fix → review
     expect(commitMessages).toEqual(["anton-gate1: address self-review findings (round 1)"]);
+  });
+
+  it("keeps child-ticket label routing through review fixes", async () => {
+    const { result, calls } = gate([report(4, [BLOCKING]), "fixed", report(9, [])], {
+      model: "fallback",
+      modelRoutes: [{ jobType: "execute-epic", step: "review", label: "risk:high", model: "careful" }],
+    });
+
+    await result;
+
+    expect(calls.map((call) => call.model)).toEqual(["careful", "careful", "careful"]);
   });
 
   it("pins every session report to the run's routing — so investigate hits the reviewed endpoint", async () => {

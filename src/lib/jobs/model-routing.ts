@@ -10,6 +10,20 @@ import type { JobType } from "./queue";
 import type { BuiltinStepId } from "./step-ids";
 import type { ProjectSettings } from "../projects";
 
+/** Job workers that actually dispatch Claude and can therefore be named in a model route. */
+export const MODEL_ROUTABLE_JOB_TYPES = [
+  "execute-epic",
+  "review-fix-pr",
+  "nightly-stringer",
+  "product-master",
+] as const satisfies readonly JobType[];
+
+const MODEL_ROUTABLE_JOB_TYPE_SET = new Set<string>(MODEL_ROUTABLE_JOB_TYPES);
+
+export function isModelRoutableJobType(value: unknown): value is (typeof MODEL_ROUTABLE_JOB_TYPES)[number] {
+  return typeof value === "string" && MODEL_ROUTABLE_JOB_TYPE_SET.has(value);
+}
+
 /**
  * One routing rule: the work it matches, and the model that work runs on.
  *

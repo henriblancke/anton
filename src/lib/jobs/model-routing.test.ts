@@ -4,6 +4,7 @@
  * tested once here rather than twice through them.
  */
 import { describe, expect, it } from "vitest";
+import { modelRoutesSchema } from "../projects";
 import { resolveModel, subsumes } from "./model-routing";
 
 describe("subsumes — whether an earlier rule makes a later one dead", () => {
@@ -61,5 +62,14 @@ describe("resolveModel", () => {
     expect(resolveModel(settings, { jobType: "product-master" })).toBe("fallback");
     expect(resolveModel({ model: "fallback" }, { jobType: "execute-epic", step: "review" })).toBe("fallback");
     expect(resolveModel({}, { jobType: "execute-epic" })).toBeUndefined();
+  });
+});
+
+describe("modelRoutesSchema", () => {
+  it("accepts only contexts that can invoke Claude", () => {
+    expect(modelRoutesSchema.safeParse([{ jobType: "review-fix-pr", model: "fixer" }]).success).toBe(true);
+    expect(modelRoutesSchema.safeParse([{ step: "claude", model: "custom" }]).success).toBe(true);
+    expect(modelRoutesSchema.safeParse([{ jobType: "review-fix", model: "unused" }]).success).toBe(false);
+    expect(modelRoutesSchema.safeParse([{ step: "verify", model: "unused" }]).success).toBe(false);
   });
 });

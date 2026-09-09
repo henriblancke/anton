@@ -17,8 +17,8 @@ beforeEach(async () => {
 
 afterEach(() => closeSandbox(sandbox));
 
-const args = (prompt = "do the thing") => ({
-  beadId: target.id,
+const args = (beadId = target.id, prompt = "do the thing") => ({
+  beadId,
   prompt,
   appendSystemPrompt: "the operating contract",
   failure: (text: string | undefined) => `claude reported an error: ${text ?? "unknown"}`,
@@ -65,6 +65,29 @@ describe("dispatchClaude", () => {
       },
       args(),
     );
+    expect(claude.calls[0].model).toBe("safe");
+  });
+
+  it("routes a ticket-phase custom step by the ticket's labels", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+    const ticket = { ...ctx.target, id: "anton-8d0f.1", labels: ["risk:high"] };
+
+    await dispatchClaude(
+      {
+        ...ctx,
+        step: { id: "security-pass", labels: ["step:claude"] },
+        target: { ...ctx.target, labels: ["risk:low"] },
+        tickets: [ticket],
+        settings: {
+          ...ctx.settings,
+          model: "fallback",
+          modelRoutes: [{ label: "risk:high", model: "safe" }],
+        },
+      },
+      args(ctx.target.id),
+    );
+
     expect(claude.calls[0].model).toBe("safe");
   });
 

@@ -370,6 +370,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       projectId,
       runId,
       target,
+      tickets,
       settings,
       worktreePath,
       findings: blocking,
@@ -849,6 +850,7 @@ async function runGateFixSession(args: {
   projectId: string;
   runId?: string;
   target: Bead;
+  tickets: Bead[];
   settings: ProjectSettings;
   worktreePath: string;
   findings: ReviewFinding[];
@@ -861,7 +863,7 @@ async function runGateFixSession(args: {
   /** Hash the tree a commit would write — how the gate proves the committed tree is the tested one. */
   hashTree: (worktreePath: string) => Promise<string>;
 }): Promise<{ sessionId: string; committed: boolean; verified?: VerifyGateOutcome[] }> {
-  const { db, clock, ctx, projectId, runId, target, settings, worktreePath, findings, round, maxRounds, claude, commit } =
+  const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
 
   const { prompt, appendSystemPrompt } = await buildFindingsFixPrompt({
@@ -900,7 +902,7 @@ async function runGateFixSession(args: {
         model: resolveModel(settings, {
           jobType: "execute-epic",
           step: "review",
-          labels: target.labels,
+          labels: [target, ...tickets].flatMap((bead) => bead.labels ?? []),
         }),
         routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",

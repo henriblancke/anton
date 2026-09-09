@@ -21,6 +21,15 @@ export const BUILTIN_STEP_IDS = [
 
 export type BuiltinStepId = (typeof BUILTIN_STEP_IDS)[number];
 
+/** The pipeline steps that invoke Claude and can therefore be selected by a model route. */
+export const MODEL_ROUTABLE_STEP_IDS = ["implement", "review", "claude"] as const;
+
+const MODEL_ROUTABLE_STEP_ID_SET = new Set<string>(MODEL_ROUTABLE_STEP_IDS);
+
+export function isModelRoutableStepId(value: unknown): value is (typeof MODEL_ROUTABLE_STEP_IDS)[number] {
+  return typeof value === "string" && MODEL_ROUTABLE_STEP_ID_SET.has(value);
+}
+
 const STEP_IDS = new Set<string>(BUILTIN_STEP_IDS);
 
 export function isBuiltinStepId(value: unknown): value is BuiltinStepId {

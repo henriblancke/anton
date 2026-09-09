@@ -55,9 +55,8 @@ import type { FailureBreakerConfig } from "./autopilot-failure-streak";
 import type { ScoreBreakerConfig } from "./autopilot-score-slide";
 import type { WipLimitConfig } from "./autopilot-wip";
 import type { ScoreAlarm } from "./jobs/review-alarm";
-import { isJobType } from "./jobs-filters";
-import { BUILTIN_STEP_IDS, PIPELINE_JOB_TYPE, isBuiltinStepId } from "./jobs/step-ids";
-import { subsumes, type ModelRoute } from "./jobs/model-routing";
+import { MODEL_ROUTABLE_JOB_TYPES, isModelRoutableJobType, subsumes, type ModelRoute } from "./jobs/model-routing";
+import { MODEL_ROUTABLE_STEP_IDS, PIPELINE_JOB_TYPE, isModelRoutableStepId } from "./jobs/step-ids";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
 import type { Project } from "./types";
@@ -1047,18 +1046,23 @@ export const MODEL_ROUTES_MAX = 20;
  *
  * `model` is a FREE bounded string, never an allowlist: a gateway combo name (`cc/claude-opus-5[1m]`)
  * is not knowable to anton, so validating against a catalogue would reject the exact value an
- * operator with a gateway has to write. Only what anton DOES know is checked — its own job types
- * and its own step ids — because those are the two halves a rule can name wrongly and never learn.
+ * operator with a gateway has to write. Only Claude-capable job types and steps are accepted, so a
+ * saved rule always describes a context that can actually invoke the selected model.
  */
 export const modelRoutesSchema = z
   .array(
     z
       .object({
-        jobType: z.string().refine(isJobType, { message: "unknown job type" }).optional(),
+        jobType: z
+          .string()
+          .refine(isModelRoutableJobType, {
+            message: `job type must be one of: ${MODEL_ROUTABLE_JOB_TYPES.join(", ")}`,
+          })
+          .optional(),
         step: z
           .string()
-          .refine(isBuiltinStepId, {
-            message: `step must be one of: ${BUILTIN_STEP_IDS.join(", ")}`,
+          .refine(isModelRoutableStepId, {
+            message: `step must be one of: ${MODEL_ROUTABLE_STEP_IDS.join(", ")}`,
           })
           .optional(),
         label: z.string().trim().min(1).max(120).optional(),

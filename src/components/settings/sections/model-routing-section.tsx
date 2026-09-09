@@ -4,9 +4,9 @@ import { PlusIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { JOB_TYPE_LABELS, JOB_TYPES } from "@/lib/jobs-filters";
-import { BUILTIN_STEP_IDS, PIPELINE_JOB_TYPE } from "@/lib/jobs/step-ids";
-import { subsumes, type ModelRouteMatch } from "@/lib/jobs/model-routing";
+import { JOB_TYPE_LABELS } from "@/lib/jobs-filters";
+import { MODEL_ROUTABLE_STEP_IDS, PIPELINE_JOB_TYPE } from "@/lib/jobs/step-ids";
+import { MODEL_ROUTABLE_JOB_TYPES, subsumes, type ModelRouteMatch } from "@/lib/jobs/model-routing";
 import { RowControls, SectionHeading } from "@/components/settings/settings-fields";
 import type { ModelRouteRow } from "@/components/settings/settings-types";
 import type { SettingsForm } from "@/components/settings/use-settings-form";
@@ -131,7 +131,7 @@ function RouteRow({
               ...(jobType !== ANY && jobType !== PIPELINE_JOB_TYPE ? { step: ANY } : {}),
             })
           }
-          options={JOB_TYPES.map((t) => ({ value: t, label: JOB_TYPE_LABELS[t] }))}
+          options={MODEL_ROUTABLE_JOB_TYPES.map((t) => ({ value: t, label: JOB_TYPE_LABELS[t] }))}
           anyLabel="Any job"
         />
 
@@ -139,7 +139,7 @@ function RouteRow({
           label={`Rule ${n} step`}
           value={row.step}
           onChange={(step) => form.modelRoutes.patch(row.id, { step })}
-          options={BUILTIN_STEP_IDS.map((s) => ({ value: s, label: s }))}
+          options={MODEL_ROUTABLE_STEP_IDS.map((s) => ({ value: s, label: s }))}
           anyLabel="Any step"
           disabled={!stepsApply}
           title={stepsApply ? undefined : "only an epic run walks a pipeline"}

@@ -42,8 +42,9 @@ export async function dispatchClaude(
       model: resolveModel(ctx.settings, {
         jobType: "execute-epic",
         step: ctx.step ? (stepName(ctx.step) as "implement" | "claude") : undefined,
-        labels:
-          ctx.tickets.find((ticket) => ticket.id === args.beadId)?.labels ?? ctx.target.labels,
+        // Ticket-phase steps receive exactly one ticket. Its labels are the routing context even
+        // though this session is filed under the run target by callers that share a session.
+        labels: (ctx.tickets.length === 1 ? ctx.tickets[0]?.labels : undefined) ?? ctx.target.labels,
       }),
       routing: claudeRouting(ctx.settings),
       permissionMode: ctx.settings.permissionMode ?? "bypassPermissions",
