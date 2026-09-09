@@ -25,6 +25,19 @@
  */
 import type { SelfFreshness } from "./jobs/self-freshness";
 
+/**
+ * Breaker freshness cadence (anton-5c8h). Slower than the board cards on purpose: the read behind
+ * the band costs a board read plus a `gh pr view` per PR waiting in review, and it only ever changes
+ * when a PR merges or closes — an event no keystroke on this board produces. Half the card cadence
+ * keeps a released hold on screen for at most a minute while leaving the common case (nothing held,
+ * no PR reads at all) cheap.
+ *
+ * It lives in this pure module because the poll and the SERVER read it must agree: `currentBreaker`
+ * accepts a freshness verdict up to one cadence old, so the reused window is exactly the interval
+ * after which the client asks again. Two constants would let them drift apart silently.
+ */
+export const BREAKER_POLL_MS = 60_000;
+
 /** Why anton is holding. Self-clearing, every one of them — that is what makes it a hold. */
 export type HoldReason = "wip-limit";
 

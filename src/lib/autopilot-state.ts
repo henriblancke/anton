@@ -14,7 +14,7 @@
 import { currentDisarm } from "./autopilot-disarm";
 import { currentWipHold } from "./jobs/picker-wip-hold";
 import { checkSelfFreshness, RUNNER, selfRepoRoot } from "./jobs/self-freshness";
-import { staleBreaker, type AutopilotBreaker } from "./autopilot-breaker";
+import { BREAKER_POLL_MS, staleBreaker, type AutopilotBreaker } from "./autopilot-breaker";
 import type { Project } from "./types";
 
 /** The band to show, or undefined when the autopilot is running. */
@@ -30,7 +30,9 @@ export async function currentBreaker(project: Project): Promise<AutopilotBreaker
   // actually defers work — so a stale UI must not banner a stop the current runner is not making, nor
   // a current UI hide a stale runner that is. The checkout half and the lockfile comparison are
   // filesystem reads shared by both processes, so only those two need the runner named.
-  const stale = staleBreaker(await checkSelfFreshness(selfRepoRoot(), RUNNER));
+  const stale = staleBreaker(
+    await checkSelfFreshness(selfRepoRoot(), RUNNER, { maxAgeMs: BREAKER_POLL_MS }),
+  );
   if (stale) return stale;
   // Sequential on purpose: a disarmed project needs no PR read to explain itself, and the hold's
   // read is the only one here that can spawn `gh`.

@@ -108,18 +108,22 @@ export function selfRepoRoot(): string {
  * process whose start gate defers work (PR #257 review).
  */
 export interface RunningProcess {
+  /** Which process this describes — the cache key half that keeps the two verdicts apart. */
+  id: "self" | "runner";
   buildDrift: () => BuildDrift | null | Promise<BuildDrift | null>;
   bootDependencies: () => string | null | Promise<string | null>;
 }
 
 /** This process — what the runner's own start gate asks about. */
 export const SELF: RunningProcess = {
+  id: "self",
   buildDrift: serverBuildDrift,
   bootDependencies: selfBootDependencies,
 };
 
 /** The process that executes the scheduled jobs, whichever one that is. */
 export const RUNNER: RunningProcess = {
+  id: "runner",
   buildDrift: runnerBuildDrift,
   bootDependencies: runnerBootDependencies,
 };
@@ -132,10 +136,49 @@ export const RUNNER: RunningProcess = {
  * which asks about itself — while the board injects {@link RUNNER}, since it renders in a process
  * that may not be the runner. Both pass {@link selfRepoRoot} for the filesystem halves, the root
  * `build/drift` records against.
+ *
+ * `maxAgeMs` is how old a verdict the CALLER will accept, and it defaults to 0 — no reuse — because
+ * the two callers want opposite things (PR #257 review). The start gate must never defer or admit a
+ * run on a verdict taken before the pull that changed it, so it takes the default and pays the
+ * fetch. The board, which reads this on every render and every breaker poll once per project, passes
+ * a window: the answer only moves when someone merges or an operator pulls, and a per-render fetch
+ * per project bought nothing for it. An in-flight pass is shared regardless of `maxAgeMs`, since
+ * joining one is still a read of the state right now.
  */
 export async function checkSelfFreshness(
   repoPath: string,
   running: RunningProcess = SELF,
+  { maxAgeMs = 0 }: { maxAgeMs?: number } = {},
+): Promise<SelfFreshness> {
+  const key = `${running.id}\0${repoPath}`;
+  const cache = freshnessCache();
+  const hit = cache.get(key);
+  // A pass already in flight is JOINED even by a caller that accepts no age, because sharing it
+  // costs that caller nothing: it is a read of the current state either way, and the alternative is
+  // a second `git fetch` of the same ref racing the first.
+  if (hit && (hit.inFlight || Date.now() - hit.at < maxAgeMs)) return await hit.verdict;
+
+  const verdict = checkFreshnessUncached(repoPath, running);
+  const entry: FreshnessEntry = { at: Date.now(), verdict, inFlight: true };
+  cache.set(key, entry);
+  try {
+    return await verdict;
+  } catch (e) {
+    // A rejection is not an answer, so it must never be served to a later caller. (Each of the three
+    // halves catches its own failure, so this only fires on a genuine bug in one of them.)
+    if (cache.get(key) === entry) cache.delete(key);
+    throw e;
+  } finally {
+    // Stamped on COMPLETION, not on start: a slow pass must not hand back a verdict that has already
+    // spent most of its own window.
+    entry.at = Date.now();
+    entry.inFlight = false;
+  }
+}
+
+async function checkFreshnessUncached(
+  repoPath: string,
+  running: RunningProcess,
 ): Promise<SelfFreshness> {
   const [checkout, dependencies, build] = await Promise.all([
     checkoutFreshness(repoPath),
@@ -143,6 +186,32 @@ export async function checkSelfFreshness(
     buildFreshness(running.buildDrift),
   ]);
   return { checkout, dependencies, build };
+}
+
+interface FreshnessEntry {
+  /** ms epoch this verdict SETTLED — the age clock `maxAgeMs` is read against. */
+  at: number;
+  verdict: Promise<SelfFreshness>;
+  /** Whether the pass is still running, in which case a caller joins it rather than starting another. */
+  inFlight: boolean;
+}
+
+/**
+ * Held on `globalThis` for the reason `build/drift.ts` holds its boot identity there: Next compiles
+ * the instrumentation-started runner and the request graph into SEPARATE module registries, so a
+ * module-level Map would give the board and the start gate a cache each — and a board render would
+ * then miss the pass its own poll is already running.
+ */
+const CACHE_KEY = Symbol.for("anton.jobs.selfFreshness");
+
+function freshnessCache(): Map<string, FreshnessEntry> {
+  const holder = globalThis as unknown as Record<symbol, Map<string, FreshnessEntry> | undefined>;
+  return (holder[CACHE_KEY] ??= new Map());
+}
+
+/** Drop every memoized verdict. Tests only — production entries age out on the caller's `maxAgeMs`. */
+export function resetSelfFreshnessCache(): void {
+  freshnessCache().clear();
 }
 
 /**

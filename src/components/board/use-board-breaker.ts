@@ -2,17 +2,8 @@
 
 import { useCallback, useState } from "react";
 
-import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
+import { BREAKER_POLL_MS, type AutopilotBreaker } from "@/lib/autopilot-breaker";
 import { useVisiblePoll } from "@/components/board/use-visible-poll";
-
-/**
- * Breaker freshness cadence (anton-5c8h). Slower than the cards on purpose: the read behind the band
- * costs a board read plus a `gh pr view` per PR waiting in review, and it only ever changes when a
- * PR merges or closes — an event no keystroke on this board produces. Half the card cadence keeps a
- * released hold on screen for at most a minute while leaving the common case (nothing held, no PR
- * reads at all) cheap.
- */
-export const BREAKER_POLL_MS = 60_000;
 
 /**
  * The polled breaker, once one has landed — `null` until then, so the server's streamed read is what

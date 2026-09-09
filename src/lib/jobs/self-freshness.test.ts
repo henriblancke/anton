@@ -10,7 +10,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { checkSelfFreshness, readBootDependencies } from "./self-freshness";
+import {
+  checkSelfFreshness,
+  readBootDependencies,
+  resetSelfFreshnessCache,
+  type RunningProcess,
+} from "./self-freshness";
 
 function has(cmd: string): boolean {
   try {
@@ -105,6 +110,9 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
 
   afterEach(() => {
     rmSync(sandbox, { recursive: true, force: true });
+    // The memo lives on globalThis and is keyed by process + path, so it outlives the sandbox it
+    // describes — a leaked entry would serve one case's verdict to the next.
+    resetSelfFreshnessCache();
   });
 
   it("reports how far HEAD is behind its upstream", async () => {
@@ -187,7 +195,8 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
    * against what the process booted with, the stop survives the reinstall until the restart.
    */
   describe("the reinstall a running process has not adopted (PR #257 review)", () => {
-    const running = (dependencies: string | null) => ({
+    const running = (dependencies: string | null): RunningProcess => ({
+      id: "self",
       buildDrift: () => null,
       bootDependencies: () => dependencies,
     });
@@ -228,6 +237,7 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
 
     it("reports unknown, not match, when the running process's packages could not be read", async () => {
       const { dependencies } = await checkSelfFreshness(repo, {
+        id: "self",
         buildDrift: () => null,
         bootDependencies: () => {
           throw new Error("lsof: command not found");
@@ -265,6 +275,7 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
   describe("a build source that fails", () => {
     it("reads a synchronous throw as unknown rather than escaping the check", async () => {
       const { build, checkout } = await checkSelfFreshness(repo, {
+        id: "self",
         buildDrift: () => {
           throw new Error("spawnSync lsof EAGAIN");
         },
@@ -278,11 +289,90 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
 
     it("reads a rejection as unknown too", async () => {
       const { build } = await checkSelfFreshness(repo, {
+        id: "self",
         buildDrift: () => Promise.reject(new Error("lsof: command not found")),
         bootDependencies: () => null,
       });
 
       expect(build).toEqual({ state: "unknown", reason: "lsof: command not found" });
+    });
+  });
+  /**
+   * The board reads this on every paint and every breaker poll, once per project, and each pass runs
+   * a `git fetch` — so a caller may name the age it will accept (PR #257 review). The start gate
+   * names none and always pays; only an in-flight pass is shared with it, since joining one is a
+   * read of the state right now either way.
+   */
+  describe("a verdict a caller will reuse", () => {
+    /** Counts passes by counting the process-specific half each pass reads exactly once. */
+    const counting = (): RunningProcess & { passes: () => number } => {
+      let passes = 0;
+      return {
+        id: "self",
+        buildDrift: () => {
+          passes += 1;
+          return null;
+        },
+        bootDependencies: () => null,
+        passes: () => passes,
+      };
+    };
+
+    it("fetches once for two reads inside the window", async () => {
+      const running = counting();
+
+      const first = await checkSelfFreshness(repo, running, { maxAgeMs: 60_000 });
+      const second = await checkSelfFreshness(repo, running, { maxAgeMs: 60_000 });
+
+      expect(second).toEqual(first);
+      expect(running.passes()).toBe(1);
+    });
+
+    it("fetches again once the window has passed", async () => {
+      const running = counting();
+
+      await checkSelfFreshness(repo, running, { maxAgeMs: 1 });
+      await new Promise((r) => setTimeout(r, 5));
+      await checkSelfFreshness(repo, running, { maxAgeMs: 1 });
+
+      expect(running.passes()).toBe(2);
+    });
+
+    // The gate that defers work must never admit or defer a run on a verdict taken before the pull
+    // that changed it, so it accepts no age at all.
+    it("never reuses a settled verdict for a caller that names no window", async () => {
+      const running = counting();
+
+      await checkSelfFreshness(repo, running);
+      await checkSelfFreshness(repo, running);
+
+      expect(running.passes()).toBe(2);
+    });
+
+    // Two `git fetch` of the same ref racing each other is the thing this shares away; joining costs
+    // the strict caller nothing, because it is a read of the current state either way.
+    it("joins an in-flight pass even for a caller that names no window", async () => {
+      const running = counting();
+
+      const [a, b] = await Promise.all([
+        checkSelfFreshness(repo, running),
+        checkSelfFreshness(repo, running),
+      ]);
+
+      expect(b).toEqual(a);
+      expect(running.passes()).toBe(1);
+    });
+
+    // The two verdicts answer about DIFFERENT processes, so one must never be served for the other.
+    it("keeps the self and runner verdicts apart", async () => {
+      const self = counting();
+      const runner = { ...counting(), id: "runner" as const };
+
+      await checkSelfFreshness(repo, self, { maxAgeMs: 60_000 });
+      await checkSelfFreshness(repo, runner, { maxAgeMs: 60_000 });
+
+      expect(self.passes()).toBe(1);
+      expect(runner.passes()).toBe(1);
     });
   });
 });

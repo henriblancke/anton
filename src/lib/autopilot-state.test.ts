@@ -5,7 +5,7 @@
  * disarm it never was.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AutopilotDisarm, AutopilotHold } from "./autopilot-breaker";
+import { BREAKER_POLL_MS, type AutopilotDisarm, type AutopilotHold } from "./autopilot-breaker";
 import type { SelfFreshness } from "./jobs/self-freshness";
 import type { Project } from "./types";
 
@@ -69,14 +69,17 @@ describe("currentBreaker", () => {
   });
 
   // Both process-specific halves — the build it booted from and the packages it imported — must
-  // describe the RUNNER, not whichever process renders the page (PR #257 review).
+  // describe the RUNNER, not whichever process renders the page (PR #257 review). The band also
+  // renders on every paint and re-reads on every breaker poll, once per project, so it accepts a
+  // verdict one poll interval old rather than paying a `git fetch` per render — the window is the
+  // poll cadence itself, so a cleared stop never outlives the ask that would have noticed it.
   it("asks about the process that runs the jobs, not the one serving the page", async () => {
     currentDisarm.mockResolvedValue(undefined);
     currentWipHold.mockResolvedValue(undefined);
 
     await currentBreaker(project);
 
-    expect(checkSelfFreshness).toHaveBeenCalledWith("/self", RUNNER);
+    expect(checkSelfFreshness).toHaveBeenCalledWith("/self", RUNNER, { maxAgeMs: BREAKER_POLL_MS });
   });
 
   it("falls through to the per-project brakes when anton is running its own latest code", async () => {

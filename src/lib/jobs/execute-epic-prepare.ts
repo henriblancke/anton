@@ -9,7 +9,6 @@
  */
 import { beads, type Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
-import { contractGaps, formatContractGaps } from "../beads/contract";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
 import {
   branchContainsCommit,
@@ -19,6 +18,7 @@ import {
 import type { Worktree } from "../git/worktree";
 import { PoisonEpic } from "./errors";
 import {
+  beadContractPoison,
   blockedRunPoison,
   humanHeldPoison,
   humanHeldTickets,
@@ -312,23 +312,17 @@ function assertBeadContract(run: EpicRun, gates: RunGates): void {
   // The set comes from the same helper the approve route and the board card use
   // (`contractGatedBeads`), so a target this parks on is one the board already marked and
   // approval already refused, rather than a surprise at dispatch.
-  const contractGated = contractGatedBeads(target, freshChildren);
-  const contractBlocking = contractGaps(contractGated, "blocking");
-  if (contractBlocking.length > 0) {
-    throw new PoisonEpic(
-      `epic ${epicBeadId} has beads that don't meet the bead contract: ` +
-        formatContractGaps(contractBlocking) +
-        ` — write the missing section(s), then resume the run`,
-    );
-  }
+  // The verdict itself is the board layer's (`beadContractPoison`), so the contract module stays out
+  // of this module's import graph (anton-8x1k) — the gate's PLACEMENT is what preparation owns.
+  const { poison, advisory } = beadContractPoison(
+    epicBeadId,
+    contractGatedBeads(target, freshChildren),
+  );
+  if (poison) throw poison;
   // Advisory gaps NEVER gate — they cost quality, not runnability. Logged so a degraded run is
   // visible rather than silent, then the run proceeds.
-  const contractAdvisory = contractGaps(contractGated, "advisory");
-  if (contractAdvisory.length > 0) {
-    console.warn(
-      `[execute-epic] ${epicBeadId} runs with advisory contract gaps: ` +
-        formatContractGaps(contractAdvisory),
-    );
+  if (advisory) {
+    console.warn(`[execute-epic] ${epicBeadId} runs with advisory contract gaps: ${advisory}`);
   }
 }
 
