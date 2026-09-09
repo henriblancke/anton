@@ -961,15 +961,17 @@ export type AlreadyShippedOutcome =
     }
   | { action: "escalate"; why: string; evidence: string[]; prior?: RepairAttempt }
   /**
-   * The retirement's marker window was overtaken (PR #238 review): the supersede and its
-   * `not-delivered` marker both landed, and only THEN did another process move the ticket. Either it
-   * reopened and RECLAIMED the ticket — so the repair cleared the marker off that live work and took
-   * the retirement back where it was still anton's to take, leaving the newer decision standing — or
-   * it STRIPPED the marker while anton's close stood, which leaves the retirement valid but invisible
-   * to merge finalization. Told apart from `escalate` because the caller must neither RELEASE the
-   * claim (it would block the ticket and unassign whoever now holds it) nor open a PR (whose merge
-   * could close a reopen of an unmarked retirement as shipped): it stops on the block, touching
-   * nothing on the board.
+   * The retirement's post-write window was overtaken (PR #238 review): the supersede landed, then its
+   * `not-delivered` marker, then its repair stamp — and only THEN did another process move the
+   * ticket. Either it reopened and RECLAIMED the ticket — so the repair cleared the marker, and the
+   * stamp with it, off that live work and took the retirement back where it was still anton's to
+   * take, leaving the newer decision standing — or it STRIPPED the marker while anton's close stood,
+   * which leaves the retirement valid but invisible to merge finalization. Both unordered writes are
+   * fenced this way, the marker and the stamp, because each opens the same cross-process window and
+   * the last one is the one the caller's `retired` would be read against. Told apart from `escalate`
+   * because the caller must neither RELEASE the claim (it would block the ticket and unassign whoever
+   * now holds it) nor open a PR (whose merge could close a reopen of an unmarked retirement as
+   * shipped): it stops on the block, touching nothing on the board.
    */
   | { action: "overtaken"; why: string; evidence: string[] }
   /**
@@ -1009,10 +1011,11 @@ export type AlreadyShippedOutcome =
  *      and possibly `gh`, so the cheap refusal runs first.
  *
  * The WRITE order is the evidence note, then the supersede, then a RE-READ of both ends, then the
- * `not-delivered` marker, then the stamp — and it is deliberately not `dep-missing`'s. A note is a
- * statement, not a fix: written first, a failure that follows leaves a bead saying truthfully what
- * anton verified and still blocked for a human, while the reverse order could settle a ticket with
- * nothing on it explaining why.
+ * `not-delivered` marker, then the stamp — each unordered write followed by a reread of the ticket
+ * with it on the board ({@link retirementOvertaken}) — and it is deliberately not `dep-missing`'s. A
+ * note is a statement, not a fix: written first, a failure that follows leaves a bead saying
+ * truthfully what anton verified and still blocked for a human, while the reverse order could settle
+ * a ticket with nothing on it explaining why.
  *
  * The MARKER is part of the settlement, not the caller's afterthought (PR #238 review). A retired
  * ticket's work is in the run's base, not its diff; reopened by an operator while the run's pull
@@ -1371,7 +1374,7 @@ export async function repairAlreadyShipped(args: {
     // nothing is assumed either way. Only when the tag actually landed: a marker that never wrote
     // leaves nothing on live work to clean up.
     if (marked) {
-      const overtaken = await markerOvertaken({ repoPath, targetId: bead.id, replacementId });
+      const overtaken = await retirementOvertaken({ repoPath, targetId: bead.id, replacementId });
       if (overtaken) {
         // `overtaken`, not `escalate` (PR #238 review): the ticket is either back in another run's
         // hands or a valid-but-unmarked close, and a `releaseFailedTicket` on either would stomp it —
@@ -1396,6 +1399,36 @@ export async function repairAlreadyShipped(args: {
       // settlement to protect a guard the closed bead no longer needs.
       console.error(`[repair] ${bead.id} was retired as superseded but could not be stamped`, e);
       await beads.note(repoPath, bead.id, unstampedNote(KLASS, attempted)).catch(() => {});
+    }
+    // The stamp opens the SAME window the marker did, and it is the last one (PR #238 review). The
+    // locks order this process only, so between the marker fence's reread and `recordRepair` another
+    // machine can reopen and reclaim the ticket — and this path would then stamp live work and still
+    // answer `retired`: the caller excludes the ticket from this run's PR, while the stamp it left
+    // behind suppresses every later valid `already-shipped` repair of a ticket no retirement settled.
+    // So the fence is asked once more with the stamp on the board, and the stamp is handed to it so a
+    // reopen takes it off alongside the marker. Only when the stamp actually landed: a stamp that
+    // never wrote leaves nothing on live work to clean up, and the marker fence above already
+    // answered for the window before it.
+    if (label) {
+      const overtaken = await retirementOvertaken({
+        repoPath,
+        targetId: bead.id,
+        replacementId,
+        stamp: label,
+      });
+      if (overtaken) {
+        // `overtaken` for the marker fence's reason: the ticket is back in another hand, and a
+        // `releaseFailedTicket` would block it and unassign whoever holds it. The caller stops on the
+        // block and writes nothing.
+        return {
+          action: "overtaken",
+          why:
+            `${bead.id} blocked as \`${KLASS}\`, and the board moved between the retirement and its ` +
+            `repair stamp — anton found out only on re-reading after the stamp landed, so a human ` +
+            `decides the ticket.`,
+          evidence: [overtaken, `the retirement anton wrote: ${attempted}`],
+        };
+      }
     }
     return {
       action: "retired",
@@ -1600,11 +1633,18 @@ async function withdrawRetirement(args: {
 }
 
 /**
- * Whether the `not-delivered` marker anton just wrote sits on a ticket the retirement no longer owns
- * — the marker-and-ownership reread {@link retireFound} makes after its own marker, for the reason the
- * post-write fence exists (PR #238 review; see the header). The locks order this process only, so
- * between {@link retirementHeld}'s reread and the tag another process can reopen and claim the ticket,
- * and the marker would then read to a later merge as work no run reserved sitting on live work.
+ * Whether the retirement's last write sits on a ticket the retirement no longer owns — the
+ * marker-and-ownership reread {@link retireFound} makes after its own marker AND after its stamp, for
+ * the reason the post-write fence exists (PR #238 review; see the header). The locks order this
+ * process only, so between {@link retirementHeld}'s reread and the tag another process can reopen and
+ * claim the ticket, and the marker would then read to a later merge as work no run reserved sitting
+ * on live work.
+ *
+ * Asked again after the STAMP for the same reason (PR #238 review): the stamp is one more unordered
+ * write in the same window, and a reopen landing between this fence and `recordRepair` leaves the
+ * repair suppression on live work while the caller is told `retired` — excluded from the run's PR,
+ * and immune to the next valid `already-shipped` repair of it. So the second call is handed the
+ * `stamp` it wrote, and clears it alongside the marker wherever the marker comes off.
  *
  * Still closed by anton's OWN supersede AND still marked, the retirement stands whole and nothing is
  * done — undefined. The marker is asserted alongside the supersede (PR #238 review): a writer that
@@ -1621,12 +1661,18 @@ async function withdrawRetirement(args: {
  * as shipped by this run's PR — the one thing the marker exists to prevent. Unread, nothing is
  * assumed either way, marker included. Returns the one evidence line the escalation carries.
  */
-async function markerOvertaken(args: {
+async function retirementOvertaken(args: {
   repoPath: string;
   targetId: string;
   replacementId: string;
+  /**
+   * The repair stamp this retirement wrote, when the reread follows it. Cleared alongside the marker
+   * wherever the marker comes off, because a stamp left on a ticket that is live again suppresses
+   * every later `already-shipped` repair of work no retirement settled.
+   */
+  stamp?: string;
 }): Promise<string | undefined> {
-  const { repoPath, targetId, replacementId } = args;
+  const { repoPath, targetId, replacementId, stamp } = args;
   const target = await readBead(repoPath, targetId, "after");
   const stillOurClose = typeof target !== "string" && beads.supersededBy(target) === replacementId;
   // Still anton's own close AND the marker still on it: the retirement stands whole, nothing to do.
@@ -1668,12 +1714,22 @@ async function markerOvertaken(args: {
   // run's PR is in review is a child `preservedAtMerge` no longer holds back, so merge finalization
   // would close it as shipped on a diff containing none of its work. Unread proves nothing either
   // way, so it keeps the marker for the same reason nothing else is undone on it.
+  //
+  // The STAMP comes off with it, and only with it (PR #238 review). It is written in the same
+  // unordered window and is the loop guard's suppression: left on a ticket that is live again, no
+  // later `already-shipped` repair of it will ever run, and the block a future agent raises escalates
+  // as a repair already disproved. Where the marker stays — closed under another supersede, or
+  // unread — the stamp stays for the identical reason: that is a retirement that HAPPENED, and its
+  // guard belongs on the bead.
+  const labels = live ? [LABELS.notDelivered, ...(stamp ? [stamp] : [])] : [];
   const cleared = live
-    ? (await mustPersist(() => beads.untag(repoPath, targetId, [LABELS.notDelivered])))
-      ? `anton cleared the \`${LABELS.notDelivered}\` marker it had written on ${targetId}`
-      : `anton could NOT clear the \`${LABELS.notDelivered}\` marker on ${targetId} — it sits on live ` +
-        `work, and \`bd update ${targetId} --remove-label ${LABELS.notDelivered}\` takes it off`
-    : `anton left the \`${LABELS.notDelivered}\` marker on ${targetId} — ` +
+    ? (await mustPersist(() => beads.untag(repoPath, targetId, labels)))
+      ? `anton cleared the ${clearedList(labels)} it had written on ${targetId}`
+      : `anton could NOT clear the ${clearedList(labels)} on ${targetId} — ${labels.length > 1 ? "they sit" : "it sits"} on live ` +
+        `work, and \`bd update ${targetId} ${labels.map((l) => `--remove-label ${l}`).join(" ")}\` takes ${labels.length > 1 ? "them" : "it"} off`
+    : `anton left the \`${LABELS.notDelivered}\` marker on ${targetId}` +
+      (stamp ? ` and its \`${stamp}\` repair stamp` : ``) +
+      ` — ` +
       (typeof target === "string"
         ? `the ticket could not be read, so nothing is assumed of it`
         : `the ticket is closed, not live work`) +
@@ -1681,6 +1737,12 @@ async function markerOvertaken(args: {
   const withdrawn = await withdrawRetirement({ repoPath, targetId, replacementId, held });
   return `${held.why}; ${cleared}; ${withdrawn}`;
 }
+
+/** The labels a withdrawal took off, as one clause — so one marker and marker-plus-stamp read alike. */
+const clearedList = (labels: readonly string[]): string =>
+  labels.length > 1
+    ? `\`${labels[0]}\` marker and \`${labels[1]}\` repair stamp`
+    : `\`${labels[0]}\` marker`;
 
 const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 

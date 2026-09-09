@@ -773,7 +773,7 @@ async function releaseTicketClaim(repo: string, ticketId: string): Promise<void>
 /**
  * Hand a RETIRED ticket's claim back, but only while the board still shows anton's OWN retirement on
  * it (PR #238 review). The supersede and its marker landed under the ticket's lock; this release runs
- * once that lock is dropped, so between the repair's final reread (`markerOvertaken`) and here another
+ * once that lock is dropped, so between the repair's final reread (`retirementOvertaken`) and here another
  * run or operator can reopen and reclaim the ticket — reachable even with the SAME operator, whose
  * `bd update --claim` is idempotent, so no assignee change need betray it. An unconditional unassign
  * would then strip that newer holder and leave the ticket `in_progress` but unowned.

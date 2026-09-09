@@ -181,7 +181,7 @@ function beadById(id: string): Bead {
  * A bead as bd would answer AFTER this run's writes: the `not-delivered` marker `bd tag` stamped
  * layered on (and any `bd untag` removed), the assignee any `bd assign ""` cleared, and — once
  * superseded — closed with the `supersedes` edge to its survivor. The marker matters as much as the
- * edge: the retirement's post-write reread ({@link markerOvertaken}) asserts the marker is present,
+ * edge: the retirement's post-write reread ({@link retirementOvertaken}) asserts the marker is present,
  * not just the close, so a `shown` that dropped it would read every retirement as
  * overtaken-and-marker-stripped (PR #238 review).
  *

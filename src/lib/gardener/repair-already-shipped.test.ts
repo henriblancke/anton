@@ -1249,7 +1249,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       const written = supersedeMock.mock.calls.find(([, target]) => target === id);
       const base = written ? superseded(read, written[2]) : read;
       // The `not-delivered` marker is a separate `bd label` write; the post-marker reread must find
-      // it on the board, or the marker fence (`markerOvertaken`) would read every retirement as
+      // it on the board, or the marker fence (`retirementOvertaken`) would read every retirement as
       // stripped. Cleared again when a withdraw untags it.
       const tagged = tagMock.mock.calls.some(([, id2, labels]) => id2 === id && labels.includes(LABELS.notDelivered));
       const cleared = untagMock.mock.calls.some(([, id2, labels]) => id2 === id && labels.includes(LABELS.notDelivered));
@@ -2405,6 +2405,9 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       // read once more with the marker on the board, before the stamp, to catch a reopen that raced it.
       const afterMarker = readsIn(markerOrder(), stampOrder());
       expect(afterMarker).toContain(TARGET);
+      // And once more AFTER the stamp (PR #238 review): the stamp is the last unordered write, and a
+      // reopen racing it would otherwise leave the loop guard's suppression on live work.
+      expect(readsIn(stampOrder(), Number.MAX_SAFE_INTEGER)).toContain(TARGET);
       for (const write of [reopenMock, unlinkMock, untagMock]) expect(write).not.toHaveBeenCalled();
     });
 
@@ -2520,6 +2523,68 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       expect(markerLanded()).toBe(true);
       expect(tagMock.mock.calls.some(([, , labels]) => labels.some((l) => l.startsWith("repair:")))).toBe(false);
     });
+
+    // The STAMP's own window (PR #238 review): the supersede, the marker and its fence all held, and
+    // only THEN did another process reopen and reclaim the ticket — between that fence and
+    // `recordRepair`. Without a reread after the stamp the caller is told `retired` (so the ticket is
+    // excluded from this run's PR) while the stamp it left suppresses every later valid
+    // `already-shipped` repair of a ticket no retirement settled.
+    it("clears the marker and the stamp and takes the retirement back when the ticket was reopened after the stamp landed", async () => {
+      const stampLanded = () =>
+        tagMock.mock.calls.some(([, , labels]) => labels.some((l: string) => l.startsWith("repair:")));
+      showMock.mockImplementation(async (cwd, id) => {
+        // Reopened and reclaimed the instant the stamp lands — every earlier fence read it superseded.
+        if (id === TARGET && stampLanded()) return bead(TARGET, { status: "in_progress", assignee: "other-box" });
+        const read = await boardShow(cwd, id);
+        const wrote = supersedeMock.mock.calls.find(([, target]) => target === id);
+        const base = wrote ? superseded(read, wrote[2]) : read;
+        const tagged = tagMock.mock.calls.some(([, id2, labels]) => id2 === id && labels.includes(LABELS.notDelivered));
+        return tagged ? ({ ...base, labels: [...(base.labels ?? []), LABELS.notDelivered] } as Bead) : base;
+      });
+
+      const outcome = await retire();
+
+      // `overtaken` for the marker fence's reason: the caller must not release the claim the new hand
+      // holds — an `escalate` would flow into `releaseFailedTicket` and block-and-unassign it.
+      expect(outcome).toMatchObject({ action: "overtaken" });
+      expect((outcome as { why: string }).why).toContain("between the retirement and its repair stamp");
+      // Both unordered writes come off the live ticket together — the marker so a later merge does not
+      // read it as undelivered, the stamp so a valid repair of it is not suppressed forever.
+      expect(untagMock).toHaveBeenCalledWith(repo, TARGET, [
+        LABELS.notDelivered,
+        repairLabel(TARGET, "already-shipped", NOW),
+      ]);
+      expect(evidenceOf(outcome)).toContain("reopened or reclaimed");
+      expect(evidenceOf(outcome)).toContain("repair stamp");
+      // The retirement is left to whoever reopened it: anton does not reopen a ticket already open.
+      expect(reopenMock).not.toHaveBeenCalled();
+    });
+
+    // The stamp's window, overtaken the OTHER way: the ticket is re-superseded to a different survivor
+    // after the stamp lands. That close is not anton's, so nothing is taken back — and the stamp stays
+    // with the marker, because a retirement that HAPPENED keeps its guard on the bead.
+    it("keeps the marker and the stamp when the ticket was re-superseded to another survivor after the stamp landed", async () => {
+      const OTHER = "anton-other";
+      const stampLanded = () =>
+        tagMock.mock.calls.some(([, , labels]) => labels.some((l: string) => l.startsWith("repair:")));
+      showMock.mockImplementation(async (cwd, id) => {
+        const read = await boardShow(cwd, id);
+        const wrote = supersedeMock.mock.calls.find(([, target]) => target === id);
+        const base = wrote ? superseded(read, wrote[2]) : read;
+        const tagged = tagMock.mock.calls.some(([, id2, labels]) => id2 === id && labels.includes(LABELS.notDelivered));
+        const marked = tagged ? ({ ...base, labels: [...(base.labels ?? []), LABELS.notDelivered] } as Bead) : base;
+        return id === TARGET && stampLanded() ? superseded(bead(TARGET, { labels: marked.labels }), OTHER) : marked;
+      });
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "overtaken" });
+      expect(untagMock).not.toHaveBeenCalled();
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(evidenceOf(outcome)).toContain(`left the \`${LABELS.notDelivered}\` marker on ${TARGET}`);
+      expect(evidenceOf(outcome)).toContain("repair stamp");
+    });
+
 
     it("withdraws a retirement that closed a ticket rewritten in the window, and does not stamp it", async () => {
       boardShow.mockImplementation(async (_cwd, id) =>
