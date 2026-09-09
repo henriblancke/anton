@@ -786,6 +786,22 @@ async function deliveredOrPark(
     throw new PoisonEpic(outOfTimeParkMessage(run, [...skipped.keys()]));
   }
 
+  // A resumed ticket can be delivered only by a commit already in the base. Keep it in `delivered`
+  // so mixed runs credit that settlement alongside this branch's real work, but do not let an
+  // inherited-only run reach review: its branch was cut from that same base and has no commit for
+  // `gh pr create` to compare. The runner cannot close this target as if it shipped a diff; a person
+  // settles the already-delivered board work without a PR instead.
+  if (
+    delivered.length > 0 &&
+    delivered.every((ticket) => ledger.satisfied.get(ticket.id)?.inherited === true)
+  ) {
+    throw new PoisonEpic(
+      `every ticket under ${epicBeadId} is already satisfied by commits in the base ` +
+        `(${delivered.map((ticket) => ticket.id).join(", ")}) — this branch has no diff, so there ` +
+        `is no pull request to open. Close ${epicBeadId} by hand to settle it`,
+    );
+  }
+
   // Nothing timed out and still nothing is left to show: every live ticket is human work a
   // person did outside this branch (anton-mv70) — the resume that closed the last answered gate
   // lands here with an empty set. The run phase speaks for a diff, so carrying on would review

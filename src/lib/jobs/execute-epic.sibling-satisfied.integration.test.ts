@@ -385,21 +385,17 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
     process.env.ANTON_GH_BIN = capturingGh("gh-noted", bodyDump);
     try {
       const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
-      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain("already satisfied by commits in the base");
+      expect(job?.lastError).toContain("no pull request to open");
 
       // No agent ran at all, and the close survived: the note-only settlement is a skip.
       expect(existsSync(log)).toBe(false);
       expect(await sessionsFor(noted)).toHaveLength(0);
       expect((await beads.show(repo, noted)).status).toBe("closed");
       expect(subjectsOn(`anton/${featureId}`)).not.toContain(`${noted}:`);
-
-      // And the body attributes it to the commit the NOTE named — base history, since that commit
-      // was published before the run, so the reviewer is not sent hunting this diff for it.
-      const body = readFileSync(bodyDump, "utf8");
-      expect(body).toContain(
-        `- ${noted} — Ticket settled by note alone — by ${work.sha.slice(0, 7)} "${work.subject}"`,
-      );
-      expect(body).toContain("Already satisfied by commits in the base, not by this run");
+      expect(existsSync(bodyDump)).toBe(false);
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       process.env.ANTON_GH_BIN = prevGh;
