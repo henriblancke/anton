@@ -107,6 +107,16 @@ describe("reviewContext verify-gate evidence", () => {
     expect(out).not.toContain("x".repeat(4000));
   });
 
+  it("says the gates ran and were thrown away, rather than showing results for a vanished tree", () => {
+    const out = reviewContext({ target: epic, tickets: [ticket], diff, verified: [], gatesDiscarded: true });
+    expect(out).toContain("The checks anton ran, and threw away");
+    expect(out).toMatch(/treat this run as having NO check results/);
+    expect(out).toMatch(/may also\s+have fed the gate after it/);
+    // Not the same message as a project that simply has no gates — the reviewer must know they ran.
+    expect(out).not.toContain("This project pins no verify gates");
+    expect(out).toMatch(/Running the project's checks IS expected here/);
+  });
+
   it("still asks the reviewer to run the checks when the project pins no gates", () => {
     const out = reviewContext({ target: epic, tickets: [ticket], diff });
     expect(out).not.toContain("The checks anton already ran");

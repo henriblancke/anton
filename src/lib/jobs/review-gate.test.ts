@@ -1244,6 +1244,29 @@ describe("verify-gate evidence", () => {
     expect(restored).toBe(true); // the gate's write was thrown away, not reviewed
   });
 
+  it("voids the gate RESULTS too, not just the writes — a later gate may have consumed them", async () => {
+    const sentinel = join(dir, "generated-by-gate-one");
+    const worktree = fakeWorktree();
+    let restored = false;
+    const dirty = {
+      ...worktree,
+      readState: async () => {
+        const state = await worktree.readState();
+        return existsSync(sentinel) && !restored ? { ...state, status: "?? generated.ts" } : state;
+      },
+      restoreState: async (path: string, to: WorktreeState) => {
+        restored = true;
+        return worktree.restoreState(path, to);
+      },
+    };
+    const { result, calls } = gate([report(9, [])], { testCommand: `touch ${sentinel}` }, [], dirty);
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    // The reviewer is told the gates ran and their results were discarded — never shown a "passed"
+    // for a tree that has since been reverted out from under it.
+    expect(calls[0].prompt).toContain("The checks anton ran, and threw away");
+    expect(calls[0].prompt).not.toContain("The checks anton already ran");
+  });
+
   it("re-asserts the run lease after the gates, before spending a reviewer session", async () => {
     // The gates can run for minutes; the round's earlier check is stale by the time claude starts.
     let asserts = 0;

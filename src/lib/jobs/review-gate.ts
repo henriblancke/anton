@@ -454,12 +454,7 @@ async function runReviewSession(args: {
    * this session then runs them itself.
    */
   verified?: VerifyGateOutcome[];
-}): Promise<{
-  sessionId: string;
-  reviewer: ReviewerSource;
-  report: ReviewReportResult;
-  verified: VerifyGateOutcome[];
-}> {
+}): Promise<{ sessionId: string; reviewer: ReviewerSource; report: ReviewReportResult }> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, round, maxRounds, claude } = args;
 
   const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
@@ -489,7 +484,7 @@ async function runReviewSession(args: {
     // the section below tells the reviewer the project's checks were run for it, and stopping at a
     // red `tests` would make that a lie about the lint, typecheck and build that never ran — with
     // the reviewer explicitly permitted to judge a red gate pre-existing and pass.
-    const verified =
+    const captured =
       args.verified ??
       (await captureVerifyGates(resolveVerifyGates(settings), worktreePath, ctx.signal, logPath, {
         stopOnFail: false,
@@ -510,15 +505,32 @@ async function runReviewSession(args: {
     //
     // Gated on the gates having actually RUN here: handed-down evidence (round 2+) means nothing
     // executed in this session, and a project that pins none has nothing to discard or wait for.
-    const ranGates = !args.verified && verified.length > 0;
+    const ranGates = !args.verified && captured.length > 0;
+    let verified = captured;
+    // Set when the gates dirtied the tree: the writes are reverted AND their outcomes go with them.
+    let gatesDiscarded = false;
     if (ranGates) {
       const afterGates = await args.readState(worktreePath);
       if (!sameWorktreeState(afterGates, settled)) {
+        // The OUTCOMES are void too, not just the writes (PR #254 review). `captureVerifyGates` runs
+        // the whole sequence before this check, so a gate that produced an artifact a LATER gate
+        // consumed makes that later `passed` describe the dirty tree — the build succeeded because
+        // the generated file was there, and it is about to not be. Reporting it would be the same
+        // false claim as adopting the writes, one step further in.
+        //
+        // Discarded rather than re-run on the restored tree: a gate that dirties does so
+        // deterministically — a generator generates again — so the retry buys a second full suite
+        // and the same verdict. Throwing the evidence away degrades to the honest answer, which the
+        // prompt then states outright: anton ran the gates, the results did not describe this tree,
+        // so run what you need yourself.
+        gatesDiscarded = true;
+        verified = [];
         await args.restoreState(worktreePath, settled);
         await appendSessionLog(
           logPath,
           `[review] round ${round}/${maxRounds}: the verify gates left changes git can see — ` +
-            `discarded, so the review reads the tree the PR will actually push:\n${afterGates.status}\n`,
+            `reverted, and their results discarded with them, because a gate that writes can also ` +
+            `have fed a later gate:\n${afterGates.status}\n`,
         );
       }
     }
@@ -544,6 +556,7 @@ async function runReviewSession(args: {
         baseRev: args.baseRev,
         carriedAdvisories: args.carried,
         verified,
+        gatesDiscarded,
       });
       await appendSessionLog(
         logPath,
@@ -578,7 +591,7 @@ async function runReviewSession(args: {
       });
       await appendSessionLog(logPath, `[review] round ${round}/${maxRounds}: ${describeReport(report)}\n`);
       await endSession(db, clock, sessionId, "done");
-      return { sessionId, reviewer, report, verified };
+      return { sessionId, reviewer, report };
     } catch (e) {
       // Throws PoisonError of its own when the reviewer's COMMIT could not be reverted — the one case
       // where retrying this worktree is more dangerous than losing the original error's backoff.

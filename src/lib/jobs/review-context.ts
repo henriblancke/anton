@@ -142,6 +142,12 @@ export interface ReviewRun {
    * asked to find and run the checks itself.
    */
   verified?: VerifyGateOutcome[];
+  /**
+   * Set when anton ran the gates and threw their results away because they wrote to the tree. The
+   * distinction matters to the reviewer: this is not a project without gates, it is a project whose
+   * gate results did not describe the code under review.
+   */
+  gatesDiscarded?: boolean;
 }
 
 /** One instruction file inlined into the review context, with the path it came from. */
@@ -188,6 +194,8 @@ export async function buildReviewPrompt(args: {
   carriedAdvisories?: ReviewFinding[];
   /** The gates anton already ran on this tree, so the reviewer never runs the suite itself. */
   verified?: VerifyGateOutcome[];
+  /** Gates ran but their results were discarded — they wrote to the tree. See {@link ReviewRun}. */
+  gatesDiscarded?: boolean;
 }): Promise<{ prompt: string; reviewer: ReviewerSource }> {
   const { target, tickets, diff, settings, projectDir, baseRev } = args;
   const config = resolveReviewConfig(settings);
@@ -227,6 +235,7 @@ export async function buildReviewPrompt(args: {
       instructions,
       carriedAdvisories: args.carriedAdvisories,
       verified: args.verified,
+      gatesDiscarded: args.gatesDiscarded,
     }),
   ].join("\n");
   return { prompt, reviewer };
@@ -467,8 +476,8 @@ export function reviewContext(run: ReviewRun): string {
     ...diffSection(run.diff),
     ...principlesSection(run),
     ...carriedAdvisorySection(run.carriedAdvisories ?? []),
-    ...verifiedGatesSection(run.verified ?? []),
-    ...readOnlySection(run.verified ?? []),
+    ...verifiedGatesSection(run.verified ?? [], run.gatesDiscarded ?? false),
+    ...readOnlySection(run.verified ?? [], run.gatesDiscarded ?? false),
     ...reportingFormatSection(),
   ]
     .join("\n")
@@ -804,7 +813,7 @@ function carriedAdvisorySection(advisories: ReviewFinding[]): string[] {
  * repairs what it finds and then reports clean would ship its verdict and lose its fix — the branch
  * anton pushes is the one it just judged, and the gate discards any edit made under a review.
  */
-function readOnlySection(verified: VerifyGateOutcome[]): string[] {
+function readOnlySection(verified: VerifyGateOutcome[], gatesDiscarded: boolean): string[] {
   return [
     `## This review is READ-ONLY`,
     ``,
@@ -824,11 +833,41 @@ function readOnlySection(verified: VerifyGateOutcome[]): string[] {
           `Running the project's checks is NOT: they were run for you, above. Re-run at most one`,
           `targeted test to settle one question, in the FOREGROUND. See that section for why.`,
         ]
-      : [
-          `This project pins no verify gates, so running its own read-only checks (tests, type-check,`,
-          `lint) is expected too. Run them in the FOREGROUND — see the reporting rules below, and do`,
-          `not background anything.`,
-        ]),
+      : gatesDiscarded
+        ? [
+            `Running the project's checks IS expected here — see the section above for why anton's own`,
+            `run of them does not count. Run them in the FOREGROUND, and read the reporting rules`,
+            `below before you start anything slow.`,
+          ]
+        : [
+            `This project pins no verify gates, so running its own read-only checks (tests, type-check,`,
+            `lint) is expected too. Run them in the FOREGROUND — see the reporting rules below, and do`,
+            `not background anything.`,
+          ]),
+    ``,
+  ];
+}
+
+/**
+ * Said instead of {@link verifiedGatesSection} when the gates wrote to the tree (PR #254 review).
+ *
+ * Silence would be a lie of omission in either direction: with no section the reviewer reads the
+ * "this project pins no verify gates" line and believes none exist, and with the results shown it
+ * believes checks passed on the code in front of it. Neither is true — the gates ran, and what they
+ * ran on no longer exists.
+ */
+function discardedGatesSection(): string[] {
+  return [
+    `## The checks anton ran, and threw away`,
+    ``,
+    `anton ran this project's verify gates and DISCARDED their results, because running them changed`,
+    `files git can see. Those changes have been reverted, so the tree you are reading is the one the`,
+    `PR will push — but it is no longer the tree the gates ran on, and a gate that writes may also`,
+    `have fed the gate after it. A "passed" from that sequence would describe code that no longer`,
+    `exists here.`,
+    ``,
+    `So treat this run as having NO check results. Run whatever you need to judge the work yourself,`,
+    `in the FOREGROUND, and say in your rationale which checks you were and were not able to run.`,
     ``,
   ];
 }
@@ -847,7 +886,8 @@ function readOnlySection(verified: VerifyGateOutcome[]): string[] {
  * prints its failures and its summary last, and the head of a suite log is the part that says
  * nothing.
  */
-function verifiedGatesSection(verified: VerifyGateOutcome[]): string[] {
+function verifiedGatesSection(verified: VerifyGateOutcome[], gatesDiscarded: boolean): string[] {
+  if (gatesDiscarded) return discardedGatesSection();
   if (verified.length === 0) return [];
   const red = verified.filter((g) => !g.ok);
   return [
