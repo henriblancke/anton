@@ -731,6 +731,20 @@ describe("instructionCriteria", () => {
     // `>` grants one space of padding, so four more open indented code, and shearing its bullet filed
     // `literal` while the note renders `- literal` as code.
     expect(texts("Step\n>     - literal")).toEqual(["Step", "```\n- literal\n```"]);
+    // A callout's OWN paragraph continues lazily across a line repeating no `>`, so the same two
+    // lines the quoted form writes file the same two criteria: four columns cannot open code inside
+    // an open paragraph, and the heading shape there is spelling, not scaffolding.
+    expect(texts("> Expected output:\n    ## literal")).toEqual(["Expected output:", "## literal"]);
+    expect(texts("> Expected output:\n>     ## literal")).toEqual(["Expected output:", "## literal"]);
+    // A marker still shears on a lazy line, as it does on a quoted one — a pasted bullet is a step.
+    expect(texts("> Fix retry\n    - literal")).toEqual(["Fix retry", "literal"]);
+    // A blank line ends the callout's paragraph, so the indented line after it IS code again.
+    expect(texts("> Expected output:\n\n    - literal")).toEqual([
+      "Expected output:",
+      "```\n- literal\n```",
+    ]);
+    // A line that INTERRUPTS the paragraph is no continuation, lazily or otherwise.
+    expect(texts("> a\n---")).toEqual(["a"]);
   });
 
   it("keeps code that begins on the marker's own line — five spaces after `-` are one of padding and four of code", () => {

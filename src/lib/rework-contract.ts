@@ -503,7 +503,17 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     // the same callout, while `Step` / `>     - literal` enters a NEW one and begins a block there.
     // Comparing prefixes says which — opening a list item or entering a quote both change it, so
     // either ends the paragraph above, as CommonMark has them do.
-    const inParagraph = openParagraph !== undefined && samePrefix(openParagraph, peeled.prefix);
+    //
+    // A callout's paragraph is the one exception: CommonMark continues it LAZILY across a line that
+    // repeats no `>`, so `> Expected output:` / `    ## literal` is the same two-line paragraph
+    // `>     ## literal` writes. Judged on `rel` with its indentation intact — four columns opens
+    // indented code, which may not interrupt a paragraph any more than a heading indented that far
+    // can — so the line is more of the paragraph's text ({@link continued}) rather than the code
+    // block a fresh block start there would be.
+    const lazyQuoted =
+      openParagraph !== undefined && quoted(openParagraph) && !PARA_INTERRUPT.test(rel);
+    const inParagraph =
+      openParagraph !== undefined && (lazyQuoted || samePrefix(openParagraph, peeled.prefix));
     if (content.trim() === "") {
       openParagraph = undefined;
       continue;
