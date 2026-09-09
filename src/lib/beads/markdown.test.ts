@@ -245,6 +245,20 @@ describe("unterminatedCloser", () => {
     expect(unterminatedCloser("<!DOCTYPE html>")).toBeUndefined();
   });
 
+  it("closes the construct inside the container that opened it", () => {
+    // This scanner reads fences flat, so a fence indented into a list item is recorded as an
+    // ordinary one. An unindented closer does not close it: CommonMark uses the dedent to leave the
+    // ITEM first — which ends the fence with it — and then reads the delimiter as a new top-level
+    // opener that swallows everything appended below, while this scanner still reported it closed.
+    expect(unterminatedCloser("- example\n  ```\n  old")).toBe("  ```");
+    expect(unterminatedCloser("- example\n  <!--\n  old")).toBe("  -->");
+    expect(unterminatedCloser("- example\n  <script>\n  old")).toBe("  </script>");
+    // The innermost open construct is the one whose indentation is carried.
+    expect(unterminatedCloser("  ```\nold\n  ```\n- item\n  ~~~\nmore")).toBe("  ~~~");
+    // A construct opened at the top level still closes there.
+    expect(unterminatedCloser("intro\n```ts\ncode")).toBe("```");
+  });
+
   it("opens no HTML block from a tag the render never shows or reads as text", () => {
     // Inside a fence or a comment the tag is content, not markup.
     expect(unterminatedCloser("```\n<script>\n```")).toBeUndefined();

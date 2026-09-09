@@ -662,6 +662,24 @@ describe("reconcileFollowUpDescription", () => {
     );
   });
 
+  it("closes a construct nested in a list item inside that item, not at the top level", () => {
+    // The scanner reads fences flat, so a fence indented into a list item is recorded as an
+    // ordinary one and used to be closed with an unindented delimiter. CommonMark reads that dedent
+    // as leaving the ITEM — which already ends the fence — and then opens a NEW top-level fence,
+    // swallowing the appended `## Acceptance Criteria` in every renderer while the judge still
+    // reported it. The bead read as finished with an acceptance nobody could see, and no retry
+    // reconciles a finished bead, so it could never be approved.
+    const unclosed = "## Goal\nharden the retry\n\n## Context\n- Made by hand:\n  ```ts\n  retry();";
+    const reconciled = reconcileFollowUpDescription(unclosed, edited);
+    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled).toContain(
+      "\n  retry();\n  ```\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+  });
+
   it("writes the whole contract over a blank description — there is nothing to keep", () => {
     expect(reconcileFollowUpDescription(undefined, edited)).toBe(followUpDescription(edited));
     expect(reconcileFollowUpDescription("  \n", edited)).toBe(followUpDescription(edited));

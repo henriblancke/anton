@@ -291,6 +291,16 @@ const HTML_BLOCKS: { open: RegExp; close: string }[] = [
  * anything appended lands inside it, shown as literal code or hidden outright, and never read as a
  * heading.
  *
+ * The closer carries the INDENTATION of the line that opened the construct, so it closes inside
+ * whatever container holds it. This scanner reads fences flat, with no notion of the list item a
+ * fence sits in, and an unindented delimiter under `- example` / an indented fence does not close
+ * that fence at all: CommonMark uses the dedent to leave the ITEM first, which ends the block with
+ * it, and then reads the delimiter as a fresh top-level opener that swallows everything appended
+ * below — the `## Acceptance` this scanner still reports as written. Matching the opener's own
+ * indentation closes the block where it was opened. A delimiter is only ever recognised up to three
+ * columns in ({@link FENCE}, {@link HTML_BLOCKS}), so the indentation carried is always an
+ * indentation a closer may wear.
+ *
  * The HTML blocks are the ones CommonMark ends at their own closing text ({@link HTML_BLOCKS}), not
  * at a blank line: a description trailing off inside `<script>` swallowed an appended
  * `## Acceptance` in every renderer, while this scanner — which models no HTML block — reported the
@@ -301,6 +311,9 @@ const HTML_BLOCKS: { open: RegExp; close: string }[] = [
 export function unterminatedCloser(source: string): string | undefined {
   const state: ScanState = { inComment: false };
   let html: { close: string } | undefined;
+  // The indentation of the line that opened whatever is still open, so the closer lands in the same
+  // container the opener did.
+  let indent = "";
   for (const text of source.split(/\r?\n/)) {
     // An HTML block is literal until its closing text: no fence opens and no comment starts inside
     // one, so nothing else is tracked while it stands.
@@ -308,16 +321,27 @@ export function unterminatedCloser(source: string): string | undefined {
       if (text.toLowerCase().includes(html.close)) html = undefined;
       continue;
     }
+    const openFence = state.fence !== undefined;
+    const openComment = state.inComment;
     const line = scanLine(state, text);
+    // This line opened one of them — a fence delimiter or a `<!--` that outlives the line.
+    if ((!openFence && state.fence) || (!openComment && state.inComment)) indent = indentOf(text);
     if (line.fenced || state.inComment) continue;
     // Judged on the comment-blanked text: a `<script>` inside `<!-- … -->` opens no block.
     html = HTML_BLOCKS.find((block) => block.open.test(line.masked));
-    if (html && text.toLowerCase().includes(html.close)) html = undefined;
+    if (html) {
+      if (text.toLowerCase().includes(html.close)) html = undefined;
+      else indent = indentOf(text);
+    }
   }
-  if (state.fence) return state.fence.char.repeat(state.fence.len);
-  if (state.inComment) return COMMENT_CLOSE;
-  return html?.close;
+  if (state.fence) return indent + state.fence.char.repeat(state.fence.len);
+  if (state.inComment) return indent + COMMENT_CLOSE;
+  return html && indent + html.close;
 }
+
+/** The leading whitespace of `text`, verbatim — the indentation a closer must repeat to sit in the
+ * same container as its opener ({@link unterminatedCloser}). */
+const indentOf = (text: string): string => /^[ \t]*/.exec(text)![0];
 
 /** One walk of the state machine: the lines, plus the state the last line left open. */
 function scan(source: string): { lines: ScannedLine[]; state: ScanState } {
