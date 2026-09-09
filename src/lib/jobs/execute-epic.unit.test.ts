@@ -2335,6 +2335,19 @@ describe("deliveredTickets — what the run's own steps speak for", () => {
     expect(b.asked).toEqual(["t-3"]);
   });
 
+  it("keeps a human-labelled ticket a SIBLING's commit satisfied (PR #258 review)", async () => {
+    // An agent attempted t-2 and a sibling's commit met its acceptance in full; someone relabelled
+    // it `agent:human` before the parked run resumed. Nothing on the branch carries its id, so the
+    // branch question cannot see it — but the ledger proved the work is here, and the PR body owes
+    // a reader the commit that did it. Dropping it would omit the attribution entirely.
+    const b = branch();
+    expect(
+      (await deliveredTickets([human("t-2")], new Set(), b.has, new Set(["t-2"]))).map((t) => t.id),
+    ).toEqual(["t-2"]);
+    // The ledger already answered — no git call is worth making.
+    expect(b.asked).toEqual([]);
+  });
+
   it("keeps a human-labelled ticket whose commit IS on the branch (PR #213 review)", async () => {
     // An agent committed and closed t-2 on an earlier attempt; someone labelled it `agent:human`
     // before the parked run resumed. Its code is in the diff, so the review contract and the PR body

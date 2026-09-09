@@ -32,7 +32,7 @@ import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { beads } from "../beads/bd";
+import { beads, LABELS } from "../beads/bd";
 import { formatSatisfiedNote } from "../beads/satisfied-note";
 import { commitMarker } from "../git/ops";
 import * as schema from "../db/schema";
@@ -253,6 +253,82 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       const feature = await beads.show(repo, featureId);
       expect(beads.getPrRef(feature) ?? null).not.toBeNull();
       expect(feature.labels ?? []).toContain("stage:in-review");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      process.env.ANTON_GH_BIN = prevGh;
+    }
+  });
+
+  it("credits a ticket a sibling satisfied even after it was relabelled agent:human (PR #258 review)", async () => {
+    // The label says who does the work, not what the diff contains. A ticket an agent attempted —
+    // whose acceptance a sibling's commit then met in full — can be relabelled `agent:human` before
+    // the parked run resumes. The human-work guard used to return AHEAD of the branch-delivery
+    // read, so the ticket was dropped from the run: never credited in the PR body, and left out of
+    // the cascade bookkeeping that a timeout walks. Nothing here dispatches it either way — the
+    // question is only whether the run speaks for work its branch actually carries.
+    const featureId = await beads.create(repo, {
+      title: "One commit covered a ticket that later became a person's",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the branch outranks the label.",
+    });
+    await beads.approve(repo, featureId);
+    const doer = createTicket(repo, {
+      title: "Ticket whose commit did the work",
+      parent: featureId,
+      acceptance: "work file exists",
+    });
+    const relabelled = createTicket(repo, {
+      title: "Ticket that commit satisfied, now a person's",
+      parent: featureId,
+      acceptance: "work file exists",
+    });
+    const untouched = createTicket(repo, {
+      title: "Ticket nothing on the branch claims",
+      parent: featureId,
+      acceptance: "work file exists",
+    });
+
+    await commitMarker(
+      repo,
+      `${doer}: Ticket whose commit did the work\n\nThe same change met the sibling's acceptance.`,
+      { satisfies: [relabelled] },
+    );
+    publishBase();
+    await beads.close(repo, doer);
+    await beads.close(repo, relabelled);
+    // …and only THEN does someone decide the rest of that ticket is a person's job.
+    await beads.tag(repo, relabelled, [LABELS.agentHuman]);
+
+    const log = join(sandbox, "relabelled-dispatch.log");
+    const bodyDump = join(sandbox, "relabelled-pr-body.txt");
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = loggingClaude("claude-relabelled", log);
+    const prevGh = process.env.ANTON_GH_BIN;
+    process.env.ANTON_GH_BIN = capturingGh("gh-relabelled", bodyDump);
+    try {
+      const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      // No agent ran for it — the human label and the skip agree on that much.
+      expect(dispatched(log)).toEqual([untouched]);
+      expect(await sessionsFor(relabelled)).toHaveLength(0);
+      expect((await beads.show(repo, relabelled)).status).toBe("closed");
+
+      // The difference: the run CREDITS it, because its work is on this branch under the doer's
+      // commit. Attributed to the base, since that commit was published before the run.
+      const by = commitFor(`anton/${featureId}`, doer);
+      const body = readFileSync(bodyDump, "utf8");
+      const [deliveries, attributions] = body.split(
+        "Already satisfied by commits in the base, not by this run (not in this diff):",
+      );
+      expect(attributions).toBeDefined();
+      expect(attributions).toContain(
+        `- ${relabelled} — Ticket that commit satisfied, now a person's — ` +
+          `by ${by.sha.slice(0, 7)} "${by.subject}"`,
+      );
+      expect(deliveries).not.toContain(relabelled);
+      expect(deliveries).toContain(`- ${untouched} — Ticket nothing on the branch claims`);
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       process.env.ANTON_GH_BIN = prevGh;

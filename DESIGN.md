@@ -311,7 +311,9 @@ and reschedules. Durability = **resumability, not retry-in-place**:
   trailer existed, or by an operator by hand — the `satisfied on <branch> by <sha>` clause on the
   bead's own notes, which counts only once git confirms the commit it names is reachable here. anton
   writes the trailer itself when it settles a ticket as satisfied; a human recording one by hand adds
-  the trailer line to the commit message.
+  the trailer line to the commit message. The branch is read **before** the `agent:human` guard: that
+  label says who does the work, not what the diff contains, so a ticket an agent attempted and
+  someone relabelled afterwards is still credited to the commit that covered it.
 
 Job types:
 1. **execute-epic** — approved epic → warm worktree → per ticket: `claude` (agent prompt) →
