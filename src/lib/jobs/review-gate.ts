@@ -312,6 +312,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       readState,
       restoreState,
       verified,
+      ...(args.assertLeaseHeld ? { assertLeaseHeld: args.assertLeaseHeld } : {}),
     });
     reviewer = review.reviewer;
 
@@ -445,6 +446,8 @@ async function runReviewSession(args: {
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
+  /** Re-assert the run lease after the gates, before the reviewer session is spent. */
+  assertLeaseHeld?: () => void;
   /**
    * Gate evidence already fresh for this tree — the previous round's fix session ran them after its
    * repair. Absent on round 1, and after any round whose evidence a commit has since invalidated:
@@ -491,9 +494,41 @@ async function runReviewSession(args: {
       (await captureVerifyGates(resolveVerifyGates(settings), worktreePath, ctx.signal, logPath, {
         stopOnFail: false,
       }));
-    // Re-fingerprint AFTER them. A suite writes caches and coverage; that is anton's own residue,
-    // and attributing it to the reviewer would revert the report as a worktree-modified violation.
-    const before = args.verified ? settled : await args.readState(worktreePath);
+
+    // A gate that wrote something GIT CAN SEE is DISCARDED, not adopted (PR #254 review).
+    //
+    // Adopting it as the baseline was wrong twice over. `readDiff` describes committed HEAD and
+    // `openPullRequest` pushes HEAD, so gate-written content is content the reviewer can read off
+    // disk and grade while the PR will never carry it — a clean verdict covering work that does not
+    // ship. And the residue it was meant to excuse is not even visible: `readWorktreeState` reads
+    // `git status --porcelain`, which excludes ignored files, so the build caches and coverage a
+    // suite writes never reach the fingerprint at all. What survives the filter is a tracked-file
+    // edit or a non-ignored artifact — precisely the content that must not stand.
+    //
+    // Discarding is also cheap: `restoreWorktreeState` cleans with `-fd` and no `-x`, so the ignored
+    // caches the next gate run wants are left exactly where they are.
+    //
+    // Gated on the gates having actually RUN here: handed-down evidence (round 2+) means nothing
+    // executed in this session, and a project that pins none has nothing to discard or wait for.
+    const ranGates = !args.verified && verified.length > 0;
+    if (ranGates) {
+      const afterGates = await args.readState(worktreePath);
+      if (!sameWorktreeState(afterGates, settled)) {
+        await args.restoreState(worktreePath, settled);
+        await appendSessionLog(
+          logPath,
+          `[review] round ${round}/${maxRounds}: the verify gates left changes git can see — ` +
+            `discarded, so the review reads the tree the PR will actually push:\n${afterGates.status}\n`,
+        );
+      }
+    }
+    const before = settled;
+
+    // The gates can run for many minutes — the suite itself, plus any wait on the host verify lock —
+    // so the round's own lease check is stale by now (PR #254 review). Re-assert before spending a
+    // reviewer session: another machine may already hold this run, and a verdict persisted under a
+    // lapsed lease speaks for work this process no longer owns.
+    if (ranGates) args.assertLeaseHeld?.();
 
     try {
       const diff = await args.readDiff(worktreePath, args.baseRev);

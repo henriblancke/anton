@@ -1220,21 +1220,45 @@ describe("verify-gate evidence", () => {
     expect(calls[0].prompt).toContain("This project pins no verify gates");
   });
 
-  it("does not blame the reviewer for the cache a gate wrote — the baseline is taken after them", async () => {
-    // The tree is clean until the gate runs and then carries what the gate left behind. That
-    // residue is anton's, not the reviewer's: fingerprinting before the gates would read it as a
-    // reviewer that edited the code it was judging and reject a perfectly good report.
-    const sentinel = join(dir, "cache-the-gate-wrote");
+  it("DISCARDS what a gate wrote where git can see it, rather than adopting it as the baseline", async () => {
+    // Adopting it would let the reviewer grade content off disk that `openPullRequest` never
+    // pushes; blaming the reviewer for it would reject a good report for anton's own write. The
+    // third answer is to throw it away before the reviewer runs.
+    const sentinel = join(dir, "gate-wrote-this");
     const worktree = fakeWorktree();
+    let restored = false;
     const dirty = {
       ...worktree,
       readState: async () => {
         const state = await worktree.readState();
-        return existsSync(sentinel) ? { ...state, status: "?? .cache/vitest/results.json" } : state;
+        const dirtyNow = existsSync(sentinel) && !restored;
+        return dirtyNow ? { ...state, status: "?? generated-by-the-gate.ts" } : state;
+      },
+      restoreState: async (path: string, to: WorktreeState) => {
+        restored = true;
+        return worktree.restoreState(path, to);
       },
     };
     const { result } = gate([report(9, [])], { testCommand: `touch ${sentinel}` }, [], dirty);
     await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    expect(restored).toBe(true); // the gate's write was thrown away, not reviewed
+  });
+
+  it("re-asserts the run lease after the gates, before spending a reviewer session", async () => {
+    // The gates can run for minutes; the round's earlier check is stale by the time claude starts.
+    let asserts = 0;
+    const { result, calls } = gate(
+      [report(9, [])],
+      { testCommand: "echo slow-suite" },
+      [],
+      fakeWorktree(),
+      () => {
+        asserts += 1;
+        if (asserts === 2) throw new Error("run lease lapsed");
+      },
+    );
+    await expect(result).rejects.toThrow("run lease lapsed");
+    expect(calls).toEqual([]); // no reviewer session was charged under the lapsed lease
   });
 });
 
