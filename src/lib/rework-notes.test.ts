@@ -271,18 +271,23 @@ describe("followUpDescription", () => {
     expect(description).not.toContain("<!--");
   });
 
-  it("files the lines of a closed HTML comment as boxes, escaped — a commented sample is an example, not markup", () => {
+  it("files a closed HTML comment's sample as a verbatim block — boxing each line would flatten an indented example", () => {
     const description = followUpDescription({
       ...args,
-      instructions: "Render this:\n<!--\n## heading\n- item\n-->",
+      instructions: "Render this:\n<!--\nif ok:\n    retry()\n-->",
       parentId: "feat",
     });
     expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    // The sample stands as one fenced block, so `    retry()` keeps its indentation; boxing it as
+    // `- [ ]     retry()` would render a separate list item with the leading spaces collapsed. The
+    // delimiter lines begin outside the comment and are boxed, escaped, like any other line.
     expect(acceptanceOf(description)).toEqual([
       "- [ ] Render this:",
       "- [ ] <\\!--",
-      "- [ ] ## heading",
-      "- [ ] - item",
+      "```",
+      "if ok:",
+      "    retry()",
+      "```",
       "- [ ] -->",
       "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
     ]);

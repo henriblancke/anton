@@ -208,18 +208,23 @@ const TAB_STOP = 4;
 
 /**
  * A line that opens a list item as CommonMark reads one: up to 3 leading spaces, a bullet or an
- * ordered marker, then whitespace. The marker set is {@link LIST_MARKER}'s; only where the line
- * STARTS differs, since here it decides where the item's content begins and so how far the lines
- * after it must be indented to nest in it.
+ * ordered marker, then whitespace. The bullets are CommonMark's three ONLY — the rich-text `•`
+ * {@link LIST_MARKER} shears is deliberately absent, since CommonMark reads `•` as ordinary
+ * paragraph text, not a list. Opening a synthetic container on it would misread an example beneath
+ * it: `• Expected output:` / (blank) / `    - literal` is a paragraph and a four-space code block, so
+ * `- literal` is content the note renders verbatim — treating `•` as a two-column container instead
+ * left the example only two columns in and sheared its bullet to `literal`. This regex decides where
+ * an item's content begins and so how far later lines must indent to nest, which is exactly the
+ * CommonMark structure `•` must stay out of.
  */
-const LIST_ITEM = /^( {0,3})([-*+•]|\d{1,9}[.)])(?:([ \t]+)|$)/;
+const LIST_ITEM = /^( {0,3})([-*+]|\d{1,9}[.)])(?:([ \t]+)|$)/;
 
 /**
  * A line that starts a block of its own rather than continuing a paragraph — a list item, a heading,
  * a rule, a callout. Only these end a list item's paragraph from a lesser indentation; any other
  * text there is the paragraph's lazy continuation, and the item stays open around it.
  */
-const BLOCK_START = /^ {0,3}(?:[-*+•]|\d{1,9}[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
+const BLOCK_START = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
 /**
  * A line that INTERRUPTS an open paragraph, ending it — {@link BLOCK_START}'s set, but an ordered
@@ -232,7 +237,7 @@ const BLOCK_START = /^ {0,3}(?:[-*+•]|\d{1,9}[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1
  * reads every ordered marker ({@link BLOCK_START}, {@link LIST_ITEM}), so `1. a` / `2. b` stay two
  * items — restricting that would misnest the second.
  */
-const PARA_INTERRUPT = /^ {0,3}(?:[-*+•]|0{0,8}1[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
+const PARA_INTERRUPT = /^ {0,3}(?:[-*+]|0{0,8}1[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
 /**
  * One blockquote marker peeled as a container: up to 3 spaces, then one `>` of a run that whitespace
@@ -287,9 +292,10 @@ export interface InstructionCriterion {
  * The lines INSIDE a comment that closes are literal for the same reason a fence's are: a founder
  * who types `<!--`, a Markdown sample, `-->` has authored the sample as an example, and shearing
  * `- item` to `item` and dropping `## heading` filed less than the note shows while keeping the two
- * delimiters that framed it. Each such line files as it was typed, unshorn, the sample dedented as
- * one unit so an indentation-sensitive example keeps its nesting ({@link flushCommentedSample}); the
- * delimiter lines are judged as typed like any other, since each begins outside the comment. Only
+ * delimiters that framed it. The sample files as ONE literal block, dedented as one unit so an
+ * indentation-sensitive example keeps its nesting through to the rendered Acceptance
+ * ({@link flushCommentedSample}); the delimiter lines are judged as typed like any other, since each
+ * begins outside the comment. Only
  * a comment that CLOSES is read so ({@link insideClosedComment}): after a stray `<!--` the rest of
  * the instructions are ordinary steps, and filing their labels and markers verbatim would be the
  * render's mistake in the other direction.
@@ -499,18 +505,19 @@ function insideClosedComment(lines: readonly ScannedLine[]): boolean[] {
 /**
  * File the closed HTML comment beginning at `at` as criteria, and return the index past its run.
  *
- * A commented Markdown or code sample is literal like a fence's content, so its lines file as typed
- * rather than shorn ({@link instructionCriteria}). The sample — the lines before the one carrying the
- * closing `-->` — is dedented as ONE unit by its common indentation, so an indentation-sensitive
- * example (Python, YAML) keeps its relative nesting; trimming each line on its own flattened a sample
- * like `if ok:` / `    retry()` into two unindented criteria that describe different behaviour. The
- * delimiter lines are judged as typed, each on its own, since each begins outside the comment. Blank
- * lines file nothing, as they did line by line.
+ * A commented Markdown or code sample is literal like a fence's content, so it files as ONE fenced
+ * block ({@link refenced}) rather than shorn or boxed line by line — the same shape an indented code
+ * block files as ({@link instructionCriteria}). The sample — the lines before the one carrying the
+ * closing `-->` — is dedented as one unit by its common indentation, so an indentation-sensitive
+ * example (Python, YAML) keeps its relative nesting through to the rendered Acceptance: a `- [ ]` on
+ * each line makes separate list items whose leading spaces Markdown collapses, flattening `if ok:` /
+ * `    retry()` into criteria that ask for different behaviour than the note shows, while a fenced
+ * block renders verbatim. The delimiter lines are judged as typed, each on its own, since each begins
+ * outside the comment. A sample of nothing but blank lines files nothing.
  *
  * A chained comment closes and reopens on one line (`--> <!--`), so a single literal run holds
- * several samples — one per `-->`. Each is dedented on its own: bulk-filing the tail after the first
- * `-->` would trim a later block's lines individually and flatten a multiline example carried by the
- * note.
+ * several samples — one per `-->`. Each files as its own block, dedented on its own: bulk-filing the
+ * tail after the first `-->` would flatten a later block's example carried by the note.
  */
 function flushCommentedSample(
   raw: readonly string[],
@@ -523,10 +530,10 @@ function flushCommentedSample(
   let sample: string[] = [];
   const flushSample = () => {
     const indents = sample.filter((line) => line.trim() !== "").map((line) => indentColumns(line));
-    const common = indents.length > 0 ? Math.min(...indents) : 0;
-    for (const line of sample) {
-      if (line.trim() === "") continue;
-      out.push({ text: dedent(line, common).replace(/\s+$/, ""), fenced: false });
+    if (indents.length > 0) {
+      const common = Math.min(...indents);
+      const body = sample.map((line) => (line.trim() === "" ? "" : dedent(line, common).replace(/\s+$/, "")));
+      out.push({ text: refenced(trimBlankEdges(body)), fenced: true });
     }
     sample = [];
   };
@@ -716,6 +723,15 @@ function refenced(content: string[]): string {
   const longest = Math.max(0, ...content.map((line) => /^ {0,3}(`*)/.exec(line)![1]!.length));
   const fence = "`".repeat(Math.max(3, longest + 1));
   return [fence, ...content, fence].join("\n");
+}
+
+/** `lines` with its leading and trailing blank lines dropped, keeping the blanks between content. */
+function trimBlankEdges(lines: string[]): string[] {
+  let start = 0;
+  let stop = lines.length;
+  while (start < stop && lines[start]!.trim() === "") start += 1;
+  while (stop > start && lines[stop - 1]!.trim() === "") stop -= 1;
+  return lines.slice(start, stop);
 }
 
 /**

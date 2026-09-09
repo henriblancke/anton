@@ -455,6 +455,19 @@ describe("instructionCriteria", () => {
     expect(texts("- item\n## Section\n    - code")).toEqual(["item", "```\n- code\n```"]);
   });
 
+  it("shears a rich-text `•` but never treats it as a container — CommonMark reads it as prose", () => {
+    // `•` is a paste convenience, sheared off a step's head like a bullet — but CommonMark never
+    // opens a list on it, so it must not set an item's content column. `• Expected output:` is a
+    // paragraph, and the four-space line after the blank is a code block the note renders verbatim;
+    // opening a two-column container on `•` left the example only two columns in and sheared its
+    // bullet to `literal`.
+    expect(texts("• Do the thing\n• And another")).toEqual(["Do the thing", "And another"]);
+    expect(texts("• Expected output:\n\n    - literal")).toEqual([
+      "Expected output:",
+      "```\n- literal\n```",
+    ]);
+  });
+
   it("fences an indented block with one backtick more than any run its content opens with", () => {
     expect(texts("    ````\n    inner\n    ````")).toEqual(["`````\n````\ninner\n````\n`````"]);
     expect(texts("    a `tick` inline")).toEqual(["```\na `tick` inline\n```"]);
@@ -586,45 +599,43 @@ describe("instructionCriteria", () => {
     expect(texts("- - a\n    - b")).toEqual(["a", "b"]);
   });
 
-  it("keeps the lines inside a closed HTML comment as typed — a commented Markdown sample is an example", () => {
+  it("files a closed HTML comment's sample as one literal block — a commented Markdown sample is an example", () => {
     // The scanner hides them and the note shows them; judged as bullet and heading they filed less
-    // than the note. The delimiter lines begin outside the comment, and are judged as typed.
+    // than the note. The sample files as one fenced block so shearing and boxing leave it alone; the
+    // delimiter lines begin outside the comment, and are judged as typed.
     expect(texts("Render this:\n<!--\n## heading\n- item\n-->")).toEqual([
       "Render this:",
       "<!--",
-      "## heading",
-      "- item",
+      "```\n## heading\n- item\n```",
       "-->",
     ]);
     // A comment opened mid-line, and text after the closer, read the same way.
     expect(texts("see <!-- start\n  - [ ] TODO — kept\n--> tail")).toEqual([
       "see <!-- start",
-      "- [ ] TODO — kept",
+      "```\n- [ ] TODO — kept\n```",
       "--> tail",
     ]);
-    // Indentation-sensitive content keeps its relative nesting: the sample is dedented as one unit,
-    // not trimmed line by line, or a Python/YAML example would flatten into criteria that ask for
-    // different behaviour than the note shows.
+    // Indentation-sensitive content keeps its relative nesting: the block is dedented as one unit and
+    // rendered verbatim, so a Python/YAML example survives to the Acceptance — boxing each line makes
+    // separate list items whose leading spaces Markdown collapses into a different behaviour.
     expect(texts("<!--\nif ok:\n    retry()\n-->")).toEqual([
       "<!--",
-      "if ok:",
-      "    retry()",
+      "```\nif ok:\n    retry()\n```",
       "-->",
     ]);
     // A wholly indented sample loses only its common indentation, keeping the relative structure.
-    expect(texts("<!--\n    a:\n      b: 1\n-->")).toEqual(["<!--", "a:", "  b: 1", "-->"]);
+    expect(texts("<!--\n    a:\n      b: 1\n-->")).toEqual(["<!--", "```\na:\n  b: 1\n```", "-->"]);
     // Once the comment closes the lines are ordinary steps again, and the closer ends no paragraph
     // an indented block could not follow.
-    expect(texts("<!--\n- x\n-->\n- y")).toEqual(["<!--", "- x", "-->", "y"]);
-    expect(texts("<!--\n- x\n-->\n    code")).toEqual(["<!--", "- x", "-->", "```\ncode\n```"]);
-    // Chained comments close and reopen on one line, so a run holds several samples: each is
-    // dedented on its own, or a multiline example in a later block would flatten line by line.
+    expect(texts("<!--\n- x\n-->\n- y")).toEqual(["<!--", "```\n- x\n```", "-->", "y"]);
+    expect(texts("<!--\n- x\n-->\n    code")).toEqual(["<!--", "```\n- x\n```", "-->", "```\ncode\n```"]);
+    // Chained comments close and reopen on one line, so a run holds several samples: each files as
+    // its own block, or a multiline example in a later block would flatten.
     expect(texts("<!--\nfirst\n-->  <!--\nif ok:\n    retry()\n-->")).toEqual([
       "<!--",
-      "first",
+      "```\nfirst\n```",
       "-->  <!--",
-      "if ok:",
-      "    retry()",
+      "```\nif ok:\n    retry()\n```",
       "-->",
     ]);
   });
