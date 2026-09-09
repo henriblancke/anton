@@ -138,10 +138,12 @@ export const RUNNER: RunningProcess = {
 };
 
 /**
- * All three halves of the freshness answer for anton's own checkout at `repoPath`, read in parallel.
- * The checkout half and the lockfile comparison read the filesystem, shared by every process of the
- * install; the build half and the dependency LATCH are process-specific, so the caller says WHOSE it
- * wants ({@link RunningProcess}). It defaults to {@link SELF} — right for the runner's start gate,
+ * All three halves of the freshness answer for anton's own checkout at `repoPath`. The checkout half
+ * and the lockfile comparison read the filesystem, shared by every process of the install; the build
+ * half and the dependency LATCH are process-specific, so the caller says WHOSE it wants
+ * ({@link RunningProcess}). The two filesystem reads run together and the process comparison follows
+ * them, so a pull landing mid-pass cannot leave the halves describing different disks
+ * ({@link checkFreshnessUncached}). It defaults to {@link SELF} — right for the runner's start gate,
  * which asks about itself — while the board injects {@link RUNNER}, since it renders in a process
  * that may not be the runner. Both pass {@link selfRepoRoot} for the filesystem halves, the root
  * `build/drift` records against.
@@ -185,15 +187,30 @@ export async function checkSelfFreshness(
   }
 }
 
+/**
+ * The two filesystem halves run in parallel; the PROCESS comparison is read LAST (PR #257 review).
+ *
+ * Read concurrently, the build half could compare the running process against the PRE-pull disk and
+ * answer `current`, while the checkout half — whose network fetch takes far longer — counted its
+ * distance AFTER a source-only `git pull` landed and answered `current` too. With dependencies
+ * untouched, all three halves say current and the gate admits a run onto the process the pull just
+ * made stale: a torn verdict, assembled from halves that saw different disks.
+ *
+ * Reading the process comparison after both filesystem reads have settled removes the tear. Any pull
+ * that lands during the pass is now seen by the LAST read to touch the disk: the build half compares
+ * the running process against the post-pull tree and answers `drifted`. A pull that lands entirely
+ * after the pass is not this function's problem — no half could have seen it, and the start gate
+ * takes `maxAgeMs: 0` precisely so the next start reads it fresh.
+ */
 async function checkFreshnessUncached(
   repoPath: string,
   running: RunningProcess,
 ): Promise<SelfFreshness> {
-  const [checkout, dependencies, build] = await Promise.all([
+  const [checkout, dependencies] = await Promise.all([
     checkoutFreshness(repoPath),
     dependencyFreshness(repoPath, running.bootDependencies),
-    buildFreshness(running.buildDrift),
   ]);
+  const build = await buildFreshness(running.buildDrift);
   return { checkout, dependencies, build };
 }
 

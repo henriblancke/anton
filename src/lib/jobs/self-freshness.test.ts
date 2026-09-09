@@ -297,6 +297,38 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
       expect(build).toEqual({ state: "unknown", reason: "lsof: command not found" });
     });
   });
+
+  /**
+   * A verdict must never be assembled from halves that saw DIFFERENT disks (PR #257 review). Read
+   * concurrently, the process comparison could answer against the pre-pull tree while the much
+   * slower checkout fetch counted its distance against the post-pull one — three `current` halves
+   * describing a process the pull just made stale. The process half therefore reads LAST.
+   */
+  describe("a pull that lands mid-pass", () => {
+    it("is seen by the process comparison, which reads after the filesystem halves", async () => {
+      // Stands in for the operator's `git pull` landing while the filesystem halves are in flight:
+      // it flips during the parallel group, so only a process read sequenced AFTER that group sees it.
+      let pulled = false;
+      const { build } = await checkSelfFreshness(repo, {
+        id: "self",
+        bootDependencies: () => {
+          pulled = true;
+          return null;
+        },
+        buildDrift: () =>
+          pulled
+            ? {
+                state: "outdated" as const,
+                running: { version: "1.0.0", revision: "old" },
+                onDisk: { version: "1.0.0", revision: "new" },
+                bootedAt: null,
+              }
+            : null,
+      });
+
+      expect(build).toEqual({ state: "drifted", drift: "outdated" });
+    });
+  });
   /**
    * The board reads this on every paint and every breaker poll, once per project, and each pass runs
    * a `git fetch` — so a caller may name the age it will accept (PR #257 review). The start gate
