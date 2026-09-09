@@ -563,9 +563,14 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       continue;
     }
     const paragraph = !THEMATIC_BREAK.test(content.trim()) && !isHeading(content);
+    // The containers the paragraph this line belongs to sits in — its OWN, not this line's, which a
+    // lazy continuation peels afresh at the top level: `> Backend` / `API` / `===` is one quoted
+    // paragraph, and judging `API` against `[0]` found the `===` a top-level heading needs and
+    // dropped both, leaving `Backend` alone in the acceptance while the note still shows three lines.
+    const paragraphPrefix = inParagraph && openParagraph !== undefined ? openParagraph : peeled.prefix;
     // A Setext underline closing this paragraph makes every line of it a heading, so all are
     // scaffolding — the whole run, not just the last line, is skipped.
-    const setextRun = paragraph ? setextHeadingRun(raw, lines, literal, at, peeled.prefix) : 0;
+    const setextRun = paragraph ? setextHeadingRun(raw, lines, literal, at, paragraphPrefix) : 0;
     if (setextRun > 0) {
       openParagraph = undefined;
       at += setextRun - 1;
@@ -581,7 +586,9 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       at = flushCommentedSample(lines, literal, at + 1, out, [carried.first], peeled.prefix) - 1;
       continue;
     }
-    openParagraph = paragraph ? peeled.prefix : undefined;
+    // A lazy continuation keeps the paragraph's own containers, so the next line is judged against
+    // the quote it is still inside rather than the top level it appears to sit at.
+    openParagraph = paragraph ? paragraphPrefix : undefined;
     const text = shorn(line.text);
     if (text) out.push({ text, fenced: false });
   }
@@ -911,7 +918,12 @@ function setextHeadingRun(
 ): number {
   for (let next = at + 1; next < lines.length; next += 1) {
     if (lines[next]!.fenced || literal[next]) return 0;
-    const inner = peelPrefix(raw[next]!, prefix);
+    // A callout's paragraph continues LAZILY across a line repeating no `>`, so such a line is more
+    // of the heading's text rather than the end of it: `> Backend` / `API` / `> ===` is one h1, and
+    // stopping the walk at `API` filed the label as a step a review cannot score.
+    const peeledInner = peelPrefix(raw[next]!, prefix);
+    const lazy = peeledInner === undefined && quoted(prefix);
+    const inner = lazy ? raw[next]! : peeledInner;
     if (inner === undefined || inner.trim() === "") return 0;
     // A comment that opens AND closes on one line is neither `commented` nor `literal`, so the walk
     // used to cross it — dropping an actionable paragraph as a heading and leaving doneGap to refuse
@@ -933,7 +945,10 @@ function setextHeadingRun(
     // as the main path takes it ({@link blockStartIndent}).
     const bare = peelTasks(dedent(inner, blockStartIndent(inner, 0)));
     if (openingFence(inner) || openingFence(bare)) return 0;
-    if (SETEXT_UNDERLINE.test(inner)) return next - at + 1;
+    // An underline is not paragraph continuation text, so it cannot arrive lazily: `> Backend` /
+    // `API` / `===` leaves the callout and files all three lines as the paragraph they render as,
+    // rather than a heading that would drop the founder's text.
+    if (SETEXT_UNDERLINE.test(inner)) return lazy ? 0 : next - at + 1;
     // A line that interrupts the paragraph ends it, so no underline can reach `at` — but a non-1
     // ordered marker does not interrupt, and stays part of the multiline heading. Judged on `inner`
     // with its indentation intact: a marker indented four columns past the container cannot interrupt

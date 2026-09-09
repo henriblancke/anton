@@ -745,6 +745,19 @@ describe("instructionCriteria", () => {
     ]);
     // A line that INTERRUPTS the paragraph is no continuation, lazily or otherwise.
     expect(texts("> a\n---")).toEqual(["a"]);
+    // A lazy continuation stays inside the callout for the Setext lookahead too: judged against a
+    // freshly peeled top-level prefix, `API` and the `===` below it read as an unrelated heading and
+    // were dropped, leaving `Backend` alone in the acceptance while the note showed three lines.
+    // Verified against commonmark.js 0.31.2: the callout holds one paragraph of `Backend API ===`,
+    // since an underline is not paragraph text and so cannot arrive lazily.
+    expect(texts("> Backend\nAPI\n===")).toEqual(["Backend", "API", "==="]);
+    expect(texts("> Backend\nAPI\n---")).toEqual(["Backend", "API"]);
+    // The underline arriving INSIDE the callout closes the lazily continued paragraph, so all three
+    // lines are one heading and none files — the quoted form the lazy one is equivalent to.
+    expect(texts("> Backend\nAPI\n> ===")).toEqual([]);
+    expect(texts("> Backend\n> API\n> ===")).toEqual([]);
+    // A blank line ends the paragraph, so nothing after it belongs to the callout's heading run.
+    expect(texts("> Backend\n\nAPI\n===")).toEqual(["Backend"]);
   });
 
   it("keeps code that begins on the marker's own line — five spaces after `-` are one of padding and four of code", () => {
