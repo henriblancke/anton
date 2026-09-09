@@ -6,6 +6,7 @@
  * without, {@link mustRead} for the read a guarded write is decided on.
  */
 import { beads, type Bead } from "../beads/bd";
+import { loadAllIssues } from "../beads/issues";
 
 /**
  * Swallow errors from best-effort bd side effects (already-applied labels, etc.). Reports whether
@@ -82,6 +83,13 @@ export async function mustRead(
  * is its first run-target ancestor, and an intermediate reparent moves it without touching the
  * ticket's own edge). Answers `undefined` only once bd has refused every attempt, so the caller
  * escalates on a genuinely unreachable board rather than on one contended round trip.
+ *
+ * Through {@link loadAllIssues}, never a bare `bd list --status all` (PR #238 review). On a bd
+ * variant that does not support that flag the bare form is PERMANENTLY invalid, so every retry here
+ * would refuse it identically and the caller would park a run the compatibility path can serve — that
+ * loader falls back to separate open and closed listings for exactly those versions. It also picks up
+ * the gate listing, `strictGates` like every other job-side board read: a swallowed gate failure
+ * leaves a `blocks` edge dangling, and a rejected read is the retryable failure this loop is for.
  */
 export async function mustReadBoard(
   repo: string,
@@ -89,7 +97,7 @@ export async function mustReadBoard(
 ): Promise<Bead[] | undefined> {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await beads.list(repo, ["--status", "all"]);
+      return await loadAllIssues(repo, { strictGates: true });
     } catch (e) {
       console.error(`[execute-epic] bd board read failed (attempt ${attempt}/${attempts}):`, e);
       if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
