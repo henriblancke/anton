@@ -577,14 +577,113 @@ export async function isAncestor(
  * stages files of its own — a formatter, a generator — either ships them under a message saying the
  * commit is empty, or leaves them loose in a worktree the NEXT ticket commits from, under a ticket
  * that never wrote them.
+ *
+ * `satisfies` names the OTHER tickets this commit's work also met (anton-6vxl), recorded as
+ * {@link SATISFIES_TRAILER} trailers and read back by {@link readSatisfiedClaims}. Work often
+ * lands under one ticket while completing a sibling's acceptance in full, and the `<id>:` subject
+ * holds exactly one id — so the sibling is invisible to {@link worktreeHasCommitFor}, its run
+ * zero-diffs, and a ticket that IS delivered is blocked as undelivered. Trailers carry the rest
+ * without touching the subject, so the delivery and `WIP` prefixes keep the meanings every other
+ * reader here depends on. The hook-bypass reasoning above applies unchanged: this is the same empty
+ * marker, carrying more attribution in its body.
  */
-export async function commitMarker(worktreePath: string, message: string): Promise<void> {
+export async function commitMarker(
+  worktreePath: string,
+  message: string,
+  options: { satisfies?: string[] } = {},
+): Promise<void> {
   // `--allow-empty` PERMITS an empty commit; it does not FORCE one. Anything a caller happened to
   // leave staged would ship under a message saying this commit is empty, so the index is pinned to
   // HEAD first — the working tree is left alone, where a caller's cleanliness check can still see
   // whatever is in it.
   await git(worktreePath, ["reset", "--quiet", "--mixed", "HEAD"]);
-  await gitCommit(worktreePath, ["commit", "--allow-empty", "--no-verify", "-m", message]);
+  const body = withSatisfiesTrailers(message, options.satisfies);
+  await gitCommit(worktreePath, ["commit", "--allow-empty", "--no-verify", "-m", body]);
+}
+
+/**
+ * The trailer key a marker records EXTRA ticket attribution under — the ids a commit's work
+ * satisfied beyond the one named in its `<id>:` subject (anton-6vxl).
+ *
+ * A git trailer rather than more subject text, because the subject is already a load-bearing
+ * protocol here: `<id>:` means delivered and `WIP <id>:` means preserved-and-incomplete, and both
+ * are matched by PREFIX. A second id in the subject would either change what those prefixes mean or
+ * be unreadable to the matchers; a trailer is invisible to them by construction. Git parses the
+ * trailer block itself (`%(trailers:key=…)`), so anton is not writing a body-scraping parser of its
+ * own.
+ */
+export const SATISFIES_TRAILER = "Anton-Satisfies";
+
+/**
+ * Append one {@link SATISFIES_TRAILER} line per satisfied ticket id, as its own trailer paragraph.
+ *
+ * One line per id, not a comma list: that is the trailer convention git's own parser is built for
+ * (`Co-authored-by:` works the same way), so reading them back needs no splitting rule of anton's
+ * invention. The block is separated by a blank line because git only recognises trailers in the
+ * message's LAST paragraph — appended to the prose directly, they would be prose.
+ *
+ * Ids are validated rather than trusted: a value holding a newline would forge additional trailer
+ * lines, and one holding a colon or leading whitespace can break the block's parse — so a malformed
+ * id fails loudly here rather than silently recording attribution that reads back as something else.
+ */
+function withSatisfiesTrailers(message: string, satisfies: string[] | undefined): string {
+  const ids = [...new Set(satisfies ?? [])];
+  if (ids.length === 0) return message;
+  for (const id of ids) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
+      throw new Error(`${SATISFIES_TRAILER}: unusable ticket id ${JSON.stringify(id)}`);
+    }
+  }
+  const trailers = ids.map((id) => `${SATISFIES_TRAILER}: ${id}`).join("\n");
+  return `${message.replace(/\s+$/, "")}\n\n${trailers}\n`;
+}
+
+/** A commit and the ticket ids its message claims to have satisfied (anton-6vxl). */
+export interface SatisfiedClaim {
+  /** Full sha of the commit making the claim — which commit said so, not merely that something did. */
+  sha: string;
+  subject: string;
+  /** Every id claimed via {@link SATISFIES_TRAILER}, in the order the commit lists them. */
+  ticketIds: string[];
+}
+
+/**
+ * Every sibling-attribution claim on the branch, newest commit first — commits claiming nothing are
+ * omitted entirely.
+ *
+ * Each claim carries its own sha, so a caller can say WHICH commit satisfied a ticket rather than
+ * only that the branch holds such a commit somewhere: that sha is what a bead note, a PR body or an
+ * operator investigating a skip is owed. Fails closed to none, exactly as {@link branchCommits}
+ * does and for the same reason — a `git log` that failed is not proof a ticket was satisfied, and
+ * the safe error here is re-running work rather than skipping it.
+ */
+export async function readSatisfiedClaims(
+  worktreePath: string,
+  options: { strict?: boolean } = {},
+): Promise<SatisfiedClaim[]> {
+  const commits = await branchCommits(worktreePath, options);
+  return commits.flatMap((c) =>
+    c.satisfies.length > 0 ? [{ sha: c.sha, subject: c.subject, ticketIds: c.satisfies }] : [],
+  );
+}
+
+/**
+ * True when some commit on the branch claims to have satisfied `ticketId` — the sibling-attribution
+ * counterpart to {@link worktreeHasCommitFor}, which reads only the dispatched ticket's `<id>:`
+ * subject.
+ *
+ * Returns the CLAIM, not a boolean: the caller that skips a ticket on this evidence has to be able
+ * to say which commit it skipped on. Match is EXACT, never by prefix — `anton-jz1.2` satisfying
+ * something says nothing about `anton-jz1`, the same collision {@link worktreeHasCommitFor} guards
+ * against in its subject scan. Fails closed to `undefined` with {@link readSatisfiedClaims}.
+ */
+export async function branchSatisfiesTicket(
+  worktreePath: string,
+  ticketId: string,
+  options: { strict?: boolean } = {},
+): Promise<SatisfiedClaim | undefined> {
+  const claims = await readSatisfiedClaims(worktreePath, options);
+  return claims.find((c) => c.ticketIds.includes(ticketId));
 }
 
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {
@@ -870,28 +969,62 @@ async function preservedFiles(
   return perCommit === undefined ? undefined : [...new Set(perCommit.flat())];
 }
 
-/** How far back a subject scan reads. A run's own commits are always at the branch tip. */
-const BRANCH_LOG_ARGS = ["log", "--format=%H%x00%s", "-n", "1000"];
+/**
+ * How far back a branch scan reads. A run's own commits are always at the branch tip.
+ *
+ * Three NUL-separated fields per commit — sha, subject, and the {@link SATISFIES_TRAILER} values —
+ * and `-z` to NUL-terminate each RECORD. A subject may contain anything a person can type, so every
+ * printable separator is one a commit message could forge; NUL is the one byte git refuses to store
+ * in a message at all ("a NUL byte in commit log message not allowed"), which is what makes this
+ * framing unforgeable rather than merely unlikely. The trailer VALUES are joined by US (`%x1F`)
+ * instead, since a NUL there would be indistinguishable from a field break.
+ *
+ * `%(trailers:…)` is git's own trailer parser, so a `Anton-Satisfies:`-looking line in the middle of
+ * a prose body is correctly NOT a trailer — only the message's final block is.
+ */
+const BRANCH_LOG_ARGS = [
+  "log",
+  "-z",
+  `--format=%H%x00%s%x00%(trailers:key=${SATISFIES_TRAILER},valueonly,separator=%x1F)`,
+  "-n",
+  "1000",
+];
+
+/** Splits the trailer field's US-joined values; a commit claiming nothing yields `[]`. */
+const TRAILER_VALUE_SEPARATOR = "\u001f";
 
 /**
- * The commits at the tip of the branch checked out in `worktreePath`, newest first. Fails closed to
- * none (git error → treat as absent) rather than risk a skip — except under `strict`, where absence
- * is the permissive answer and the caller has asked to see the failure instead.
- *
- * NUL between sha and subject: a subject may contain anything a person can type, so any printable
- * separator is one a commit message can forge.
+ * The commits at the tip of the branch checked out in `worktreePath`, newest first, each with the
+ * ticket ids its message claims to have satisfied. Fails closed to none (git error → treat as
+ * absent) rather than risk a skip — except under `strict`, where absence is the permissive answer
+ * and the caller has asked to see the failure instead.
  */
 async function branchCommits(
   worktreePath: string,
   options: { strict?: boolean } = {},
-): Promise<{ sha: string; subject: string }[]> {
+): Promise<{ sha: string; subject: string; satisfies: string[] }[]> {
   const log = options.strict
     ? await git(worktreePath, BRANCH_LOG_ARGS)
     : await git(worktreePath, BRANCH_LOG_ARGS).catch(() => "");
-  return log.split("\n").flatMap((line) => {
-    const [sha, ...rest] = line.split("\0");
-    return sha && rest.length > 0 ? [{ sha, subject: rest.join("\0") }] : [];
-  });
+  // `-z` NUL-TERMINATES each record and each `%x00` separates a field within it, so the stream is a
+  // flat run of NUL-delimited fields, three per commit, with one empty segment left by the final
+  // terminator. Grouping by threes is exact rather than heuristic: git stores no NUL in a commit
+  // message, so no field can contain the delimiter and no commit can shift the grouping.
+  const fields = log.split("\0");
+  const commits: { sha: string; subject: string; satisfies: string[] }[] = [];
+  for (let i = 0; i + 2 < fields.length; i += 3) {
+    const [sha, subject, trailers] = [fields[i], fields[i + 1], fields[i + 2]];
+    if (!sha || subject === undefined || trailers === undefined) continue;
+    commits.push({
+      sha,
+      subject,
+      satisfies: trailers
+        .split(TRAILER_VALUE_SEPARATOR)
+        .map((v) => v.trim())
+        .filter(Boolean),
+    });
+  }
+  return commits;
 }
 
 /** The branch's commit subjects — {@link branchCommits} for the readers that only match on text. */

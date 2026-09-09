@@ -45,6 +45,9 @@ import {
   branchAddedCommit,
   describeCommit,
   branchContainsCommit,
+  branchSatisfiesTicket,
+  readSatisfiedClaims,
+  SATISFIES_TRAILER,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
 
@@ -1618,5 +1621,138 @@ suite("commitMarker (real git · a pre-commit hook that stages and succeeds)", (
     await commitMarker(repo, "WIP anton-x1: preserved");
 
     expect(g(["log", "-1", "--format=%s"])).toBe("WIP anton-x1: preserved");
+  });
+});
+
+/**
+ * Sibling attribution (anton-6vxl): one commit naming every ticket its work satisfied, not only the
+ * ticket that was dispatched. Real git throughout — the whole mechanism is git's trailer parser and
+ * `-z` framing, so a mocked `git log` would only prove the test's own assumptions.
+ */
+suite("sibling attribution trailers (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-satisfies-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("reads back every id one commit claims, and says which commit claimed them", async () => {
+    await commitMarker(repo, "anton-96yu: the dispatched ticket\n\nwhy this marker exists", {
+      satisfies: ["anton-kwi6", "anton-5slr"],
+    });
+    const sha = g(["rev-parse", "HEAD"]);
+
+    const claims = await readSatisfiedClaims(repo);
+    expect(claims).toEqual([
+      { sha, subject: "anton-96yu: the dispatched ticket", ticketIds: ["anton-kwi6", "anton-5slr"] },
+    ]);
+
+    // The claim is attributable: the caller learns WHICH commit satisfied the sibling, which is what
+    // a bead note or an operator investigating a skip is owed.
+    expect(await branchSatisfiesTicket(repo, "anton-kwi6")).toMatchObject({ sha });
+    expect(await branchSatisfiesTicket(repo, "anton-5slr")).toMatchObject({ sha });
+    expect(await branchSatisfiesTicket(repo, "anton-never")).toBeUndefined();
+  });
+
+  it("leaves a commit that claims nothing untouched — no trailer, no claim", async () => {
+    await commitMarker(repo, "anton-96yu: no siblings claimed");
+
+    expect(g(["log", "-1", "--format=%B"]).trim()).toBe("anton-96yu: no siblings claimed");
+    expect(await readSatisfiedClaims(repo)).toEqual([]);
+    expect(await branchSatisfiesTicket(repo, "anton-96yu")).toBeUndefined();
+    // An empty `satisfies` is the same as none — no stray blank trailer block.
+    await commitMarker(repo, "anton-z9: still nothing", { satisfies: [] });
+    expect(g(["log", "-1", "--format=%B"]).trim()).toBe("anton-z9: still nothing");
+    expect(await readSatisfiedClaims(repo)).toEqual([]);
+  });
+
+  /**
+   * The subject protocol is load-bearing and matched by PREFIX, so the trailer must be invisible to
+   * it: `<id>:` still means delivered, `WIP <id>:` still means preserved-and-incomplete, and neither
+   * gains or loses a meaning by carrying sibling attribution.
+   */
+  it("keeps the delivery and preserve subjects reading exactly as before", async () => {
+    await commitMarker(repo, "anton-d1: delivered", { satisfies: ["anton-sib1"] });
+    await commitMarker(repo, "WIP anton-d2: preserved", { satisfies: ["anton-sib2"] });
+
+    expect(await worktreeHasCommitFor(repo, "anton-d1")).toBe(true);
+    expect(await worktreeHasPreservedCommitFor(repo, "anton-d2")).toBe(true);
+    // A ticket named ONLY in a trailer is not a delivery subject — the two records stay distinct.
+    expect(await worktreeHasCommitFor(repo, "anton-sib1")).toBe(false);
+    expect(await worktreeHasPreservedCommitFor(repo, "anton-sib1")).toBe(false);
+    // …and the preserved commit is still the branch tip, which the resume's range read depends on.
+    expect(await worktreeTipIsPreservedCommitFor(repo, "anton-d2")).toBe(true);
+  });
+
+  it("does not mistake trailer-shaped PROSE in a body for a claim", async () => {
+    // Git only parses the message's LAST block as trailers, and this line is followed by prose.
+    g([
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      `anton-p1: prose\n\n${SATISFIES_TRAILER}: anton-forged\n\nand then more prose follows.`,
+    ]);
+
+    expect(await readSatisfiedClaims(repo)).toEqual([]);
+  });
+
+  it("matches ids exactly, never by prefix", async () => {
+    await commitMarker(repo, "anton-a1: work", { satisfies: ["anton-jz1.2"] });
+
+    expect(await branchSatisfiesTicket(repo, "anton-jz1.2")).toBeDefined();
+    // The same collision `worktreeHasCommitFor` guards against in its subject scan.
+    expect(await branchSatisfiesTicket(repo, "anton-jz1")).toBeUndefined();
+  });
+
+  it("refuses an id that would forge extra trailer lines rather than recording it", async () => {
+    await expect(
+      commitMarker(repo, "anton-a1: work", {
+        satisfies: [`anton-ok\n${SATISFIES_TRAILER}: anton-smuggled`],
+      }),
+    ).rejects.toThrow(SATISFIES_TRAILER);
+    // Nothing was committed — the refusal is loud, not a marker recording something else.
+    expect(g(["log", "-1", "--format=%s"])).toBe("init");
+  });
+
+  it("collects claims across several commits, newest first, ignoring unrelated ones", async () => {
+    await commitMarker(repo, "anton-one: first", { satisfies: ["anton-s1"] });
+    const first = g(["rev-parse", "HEAD"]);
+    g(["commit", "-q", "--allow-empty", "-m", "an ordinary commit with no attribution"]);
+    await commitMarker(repo, "anton-two: second", { satisfies: ["anton-s2"] });
+    const second = g(["rev-parse", "HEAD"]);
+
+    expect(await readSatisfiedClaims(repo)).toEqual([
+      { sha: second, subject: "anton-two: second", ticketIds: ["anton-s2"] },
+      { sha: first, subject: "anton-one: first", ticketIds: ["anton-s1"] },
+    ]);
+  });
+
+  it("fails closed to no claims when git cannot be read", async () => {
+    const gone = join(sandbox, "not-a-repo");
+    mkdirSync(gone);
+
+    // "Unreadable" must never read as "this ticket was satisfied" — the safe error is re-running
+    // work, never skipping it.
+    expect(await readSatisfiedClaims(gone)).toEqual([]);
+    expect(await branchSatisfiesTicket(gone, "anton-s1")).toBeUndefined();
+    // …and `strict` is how a caller whose safe answer is the other one sees the failure instead.
+    await expect(readSatisfiedClaims(gone, { strict: true })).rejects.toThrow();
   });
 });
