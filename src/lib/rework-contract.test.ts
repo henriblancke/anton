@@ -572,6 +572,21 @@ describe("instructionCriteria", () => {
       { text: "```md\n## Expected\n- item\n```", fenced: true },
       { text: "next", fenced: false },
     ]);
+    // A standalone box carries its own indentation, which a block start is allowed up to three
+    // columns of: unpeeled, `  [ ] ```md` filed its opener as a step and the closer left behind
+    // opened a fence that swallowed `- next` and every contract section after it.
+    expect(instructionCriteria("  [ ] ```md\n  ## Expected\n  - item\n  ```\n- next")).toEqual([
+      { text: "```md\n## Expected\n- item\n```", fenced: true },
+      { text: "next", fenced: false },
+    ]);
+    expect(texts("   [x] ```\n   code\n   ```\n- next")).toEqual(["```\ncode\n```", "next"]);
+    expect(texts("  [ ] [ ] ```md\n  ## Expected\n  ```\n- next")).toEqual(["```md\n## Expected\n```", "next"]);
+    // Indentation inside a container is counted from the item's content column, and inside a callout
+    // from the marker.
+    expect(texts("-   [ ] ```md\n    ## E\n    ```\n- next")).toEqual(["```md\n## E\n```", "next"]);
+    expect(texts(">   [ ] ```\n>   code\n>   ```\nafter")).toEqual(["```\ncode\n```", "after"]);
+    // Four columns is indented code, not a block start, so the box stays literal content there.
+    expect(texts("para\n\n    [ ] ```md\n    x")).toEqual(["para", "```\n[ ] ```md\nx\n```"]);
   });
 
   it("keeps a fence opened inside a callout — `> ```` — and ends it where the callout ends", () => {

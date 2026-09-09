@@ -464,11 +464,18 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     }
     // A fence opens beneath a task marker as it does beneath the bullet, but the peel leaves the
     // checkbox on the content; take every one off first, as shorn does with nested boxes, so the
-    // opener is the fence itself.
-    const fenceLine = peelTasks(content);
+    // opener is the fence itself. The indentation a block start may carry comes off with them
+    // ({@link blockStartIndent}), since shorn trims a line before shearing its markers.
+    const start = blockStartIndent(content, column);
+    const fenceLine = peelTasks(dedent(content, column + start, column));
     const opener = openingFence(fenceLine);
     if (opener) {
-      nested = { opener: fenceLine, fence: opener, prefix: peeled.prefix, content: [] };
+      nested = {
+        opener: fenceLine,
+        fence: opener,
+        prefix: deeper(peeled.prefix, start),
+        content: [],
+      };
       inParagraph = false;
       continue;
     }
@@ -716,6 +723,20 @@ function setextHeadingRun(
     if (PARA_INTERRUPT.test(inner)) return 0;
   }
   return 0;
+}
+
+/**
+ * The columns of indentation `content` carries that a block start is allowed — one to three past its
+ * container's content column `column`, and none once four open indented code instead. A fence and the
+ * task markers riding in front of it are found past that indentation, as {@link shorn} shears a line
+ * it has trimmed first: without it `  [ ] ```md` filed its opener as an ordinary criterion while the
+ * column-0 `[ ] ```md` opened a fence, and the closer left behind opened one that swallowed every
+ * step after it. Held under {@link CODE_INDENT} so a four-column line stays what it was — a fence
+ * needs three columns or fewer, and a lazy continuation there is paragraph text.
+ */
+function blockStartIndent(content: string, column: number): number {
+  const indent = indentColumns(content, column) - column;
+  return indent < CODE_INDENT ? indent : 0;
 }
 
 /** `prefix` with its innermost column `columns` further in — where an indented block's content starts. */
