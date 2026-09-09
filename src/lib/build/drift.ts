@@ -208,15 +208,18 @@ function invalidateCaches(): void {
  * every request.
  * Which build is on disk moves at the speed of a deploy or a save, so a read a few seconds old is as
  * true as a fresh one — and drift the operator must act on stays visible within one page refresh.
+ *
+ * That holds for a DISPLAY surface, not for a gate that decides whether work may start: `fresh`
+ * exists for the caller that cannot accept a read taken before the pull it is asking about.
  */
 const ON_DISK_TTL_MS = 15_000;
 
 let onDiskCache: { at: number; generation: number; identity: BuildIdentity } | null = null;
 
-function onDiskIdentity(): BuildIdentity {
+function onDiskIdentity(fresh = false): BuildIdentity {
   const now = Date.now();
   const generation = cacheGeneration();
-  if (onDiskCache && onDiskCache.generation === generation && now - onDiskCache.at < ON_DISK_TTL_MS) {
+  if (!fresh && onDiskCache && onDiskCache.generation === generation && now - onDiskCache.at < ON_DISK_TTL_MS) {
     return onDiskCache.identity;
   }
   const root = appRoot();
@@ -385,6 +388,13 @@ function artifactIdentity(): BuildIdentity | null {
  * script), and inventing an "unstamped" verdict there would put a false warning on the health page
  * of every install. Saying so about a server that IS running but left no record is `anton doctor`'s
  * job — it has the pidfile and the port to prove one is up.
+ *
+ * `fresh` bypasses the on-disk TTL for the one caller that cannot tolerate it (PR #257 review): the
+ * start gate. A source-only `git pull` moves HEAD and nothing else, so the checkout half reads
+ * current the instant it lands and the dependency half never moved — while this half, answered from
+ * a read taken up to 15s earlier, still compares the running build against the PRE-pull disk. All
+ * three then say current and the gate admits a run onto the old process, which is the window it
+ * exists to close. Display surfaces keep the cached read: they repaint, a gate does not.
  */
 /**
  * The boot time a record carries, or null when what it carries cannot be a DATE (PR #217 review).
@@ -405,12 +415,12 @@ function bootedAtOf(record: { bootedAt?: unknown } | null | undefined): number |
   return Number.isFinite(new Date(bootedAt).getTime()) ? bootedAt : null;
 }
 
-export function serverBuildDrift(): BuildDrift | null {
+export function serverBuildDrift({ fresh = false }: { fresh?: boolean } = {}): BuildDrift | null {
   const db = dbPath();
   const record = db ? (readBuildRecord(buildRecordPath(db)) as (BuildIdentity & { bootedAt?: unknown }) | null) : null;
   const running = record ?? booted()?.identity ?? null;
   if (!running) return null;
-  const verdict = compareBuild(running, onDiskIdentity());
+  const verdict = compareBuild(running, onDiskIdentity(fresh));
   if (verdict.state === "current") return null;
   return { ...verdict, bootedAt: bootedAtOf(record) } as BuildDrift;
 }

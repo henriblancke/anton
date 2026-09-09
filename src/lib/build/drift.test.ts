@@ -400,6 +400,27 @@ describe("recordServerBuild / serverBuildDrift", () => {
     expect(serverBuildDrift()?.state).toBe("outdated");
   });
 
+  // The caller that cannot wait for the TTL and has nobody to invalidate for it (PR #257 review):
+  // the start gate. A source-only `git pull` by an operator fires no `checkoutMoved`, so inside the
+  // window the cached read has the gate compare this process against the pre-pull disk and admit a
+  // run onto the code the pull just superseded.
+  it("re-reads the code on disk for a caller that asks for a fresh read", async () => {
+    const app = join(dir, "app");
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const { recordServerBuild, serverBuildDrift } = await import("./drift");
+
+    recordServerBuild({ runner: true });
+    onDisk = { version: "0.4.1", revision: null };
+    expect(serverBuildDrift()).toBeNull(); // the cached read, as every display surface still sees it
+
+    expect(serverBuildDrift({ fresh: true })?.state).toBe("outdated");
+  });
+
   // `addProject` stores `resolve(repoPath)`, which never dereferences a symlink, so anton's own
   // checkout registered through one spells the same directory differently here. Read as somebody
   // else's project, the nightly's own fast-forward would leave the pre-pull read cached and the

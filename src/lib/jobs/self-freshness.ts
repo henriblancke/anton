@@ -114,10 +114,19 @@ export interface RunningProcess {
   bootDependencies: () => string | null | Promise<string | null>;
 }
 
-/** This process — what the runner's own start gate asks about. */
+/**
+ * This process — what the runner's own start gate asks about.
+ *
+ * Its build drift is read UNCACHED (PR #257 review). `build/drift` holds one read of the code on
+ * disk for 15s, a rate limit for surfaces that repaint; a gate is not one. A source-only `git pull`
+ * completing inside that window leaves the checkout half reading current (HEAD moved, the fetch is
+ * live) and the dependency half untouched, while this half still compares the running build against
+ * the pre-pull disk — so all three say current and {@link checkSelfFreshness}'s own `maxAgeMs: 0`
+ * buys nothing: the gate admits a run onto the process the pull just made stale.
+ */
 export const SELF: RunningProcess = {
   id: "self",
-  buildDrift: serverBuildDrift,
+  buildDrift: () => serverBuildDrift({ fresh: true }),
   bootDependencies: selfBootDependencies,
 };
 
