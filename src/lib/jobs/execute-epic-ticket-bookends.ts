@@ -175,11 +175,26 @@ export async function claimTicket(
  * still `in_progress` under this run's own claim is one nothing has settled, and the edge that just
  * came off can only have been the stale one.
  *
- * RETRYABLE rather than a park, and the claim is NOT handed back: this is the same verdict the
- * pre-unlink check throws for, reached one read later. The next attempt re-reads the board and
- * dispatch drops the ticket as the settled retirement it is (execute-epic-dispatch
- * `partitionTickets`) — restoring the edge here would be a third write into the same race, and
- * `unclaimAndPark` would reopen a bead that hand has closed.
+ * A detected race PUTS THE EDGE BACK before it retries (PR #238 review). The unlink has already
+ * happened, so the settlement this fence just found is on the board as a close with NO survivor —
+ * and that is not a state the next attempt drops. Dispatch reads a closed ticket with no
+ * `supersedes` edge and no commit under its own id on this branch as a cross-machine resume, reopens
+ * it and re-runs work the other hand settled (execute-epic-dispatch `reopenForRegeneration`), which
+ * is the very outcome the retry was supposed to avoid. So the edge the unlink removed is written
+ * again — through `bd supersede`, the only door that writes that type, idempotent on a bead already
+ * closed against the same survivor — restoring exactly the state the pre-unlink read observed.
+ *
+ * Only when the ticket reads CLOSED. That is the shape a retirement leaves, and it is the shape the
+ * regeneration path misreads. A race that shows up as a MOVED CLAIM on a ticket still open or
+ * in_progress is the other case: nothing was superseded, the edge this run removed was the stale one
+ * it came for, and re-closing the bead as superseded would destroy a live claim another hand holds.
+ * An ABANDONED bead needs no restore either — dispatch drops it as abandoned with or without the
+ * edge.
+ *
+ * A restore bd refuses PARKS instead of retrying, because the retry is the dangerous path: the run
+ * cannot leave a settled retirement stripped of its survivor and then hand the next attempt a
+ * ticket it will reopen and re-run. The claim is NOT handed back on either exit — the bead belongs
+ * to whoever settled it, and `unclaimAndPark` would reopen a closed retirement.
  *
  * An unreadable bead fails closed for the reason the pre-unlink read does: "could not check" is not
  * "nothing landed", and proceeding would run the ticket on exactly the race this fence exists to
@@ -202,6 +217,7 @@ async function assertUnlinkedOurStaleEdge(
   }
   const settled = retirementSettledSinceClaim(after, operator);
   if (settled) {
+    await restoreRetirementEdge(repo, ticketId, survivor, after);
     throw new Error(
       `refusing to execute ${ticketId}: it was retired as superseded by ${survivor} while anton ` +
         `was removing the stale \`supersedes\` edge a previous retirement left on it (${settled}) — ` +
@@ -210,6 +226,33 @@ async function assertUnlinkedOurStaleEdge(
         `running work another hand has already closed`,
     );
   }
+}
+
+/**
+ * Write back the `supersedes` edge {@link claimTicket}'s unlink removed from a retirement another
+ * process landed in the window — see {@link assertUnlinkedOurStaleEdge} for why the retry needs it
+ * there and why only a CLOSED ticket gets it.
+ *
+ * `bd supersede` is the only seam that writes the type (beads/link-types.ts refuses it through
+ * `link`), and it is idempotent against the same survivor on an already-closed bead: it re-draws the
+ * edge and leaves the close standing.
+ */
+async function restoreRetirementEdge(
+  repo: string,
+  ticketId: string,
+  survivor: string,
+  after: Bead,
+): Promise<void> {
+  if (after.status !== "closed" || beads.isAbandoned(after)) return;
+  if (await mustPersist(() => beads.supersede(repo, ticketId, survivor))) return;
+  throw new PoisonEpic(
+    `${ticketId} was retired as superseded by ${survivor} while anton was removing the stale ` +
+      `\`supersedes\` edge a previous retirement left on it, and bd would not write that ` +
+      `retirement's edge back — the ticket is now closed with no survivor recorded, which the next ` +
+      `attempt would read as a cross-machine resume and re-run. The run stopped rather than ` +
+      `regenerate work another hand has already settled. Re-run ` +
+      `\`bd supersede ${ticketId} --with ${survivor}\`, then resume the run`,
+  );
 }
 
 /**

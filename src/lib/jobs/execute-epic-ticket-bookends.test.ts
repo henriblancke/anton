@@ -17,6 +17,7 @@ const untagMock = vi.fn();
 const claimMock = vi.fn();
 const showMock = vi.fn();
 const unlinkMock = vi.fn();
+const supersedeMock = vi.fn();
 const setStatusMock = vi.fn();
 const unassignMock = vi.fn();
 const syncMock = vi.fn();
@@ -35,6 +36,7 @@ vi.mock("../beads/bd", async () => {
       claim: (...args: unknown[]) => claimMock(...args),
       show: (...args: unknown[]) => showMock(...args),
       unlink: (...args: unknown[]) => unlinkMock(...args),
+      supersede: (...args: unknown[]) => supersedeMock(...args),
       setStatus: (...args: unknown[]) => setStatusMock(...args),
       unassign: (...args: unknown[]) => unassignMock(...args),
       sync: (...args: unknown[]) => syncMock(...args),
@@ -144,6 +146,7 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     unassignMock.mockResolvedValue(undefined);
     syncMock.mockResolvedValue(undefined);
     unlinkMock.mockResolvedValue(undefined);
+    supersedeMock.mockResolvedValue(undefined);
     showMock.mockResolvedValue(claimed);
   });
 
@@ -242,11 +245,30 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     );
     // Retryable, so the next attempt re-reads the board and drops it as the settled retirement.
     expect(err).not.toBeInstanceOf(PoisonEpic);
-    // Nothing is restored: re-drawing the edge would be a third write into the same race, and the
-    // bead belongs to whoever settled it.
+    // …but only because the edge the unlink took off that settlement went BACK first (PR #238
+    // review). Left off, the ticket is closed with no survivor, which the next attempt reads as a
+    // cross-machine resume: it reopens the bead and re-runs work the other hand settled.
+    expect(supersedeMock).toHaveBeenCalledWith(REPO, reopened.id, SURVIVOR);
+    // The claim is still not handed back: the bead belongs to whoever settled it.
     expect(setStatusMock).not.toHaveBeenCalled();
     expect(unassignMock).not.toHaveBeenCalled();
   });
+
+  // The restore is what makes the retry safe, so a bd that refuses it PARKS rather than handing the
+  // next attempt a closed ticket with no survivor recorded (PR #238 review).
+  it("parks when the retirement's edge cannot be written back", async () => {
+    showMock.mockResolvedValueOnce(claimed).mockResolvedValue({ ...claimed, status: "closed" });
+    supersedeMock.mockRejectedValue(new Error("Command failed: bd supersede\ndatabase is locked"));
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PoisonEpic);
+    expect((err as Error).message).toMatch(/bd supersede anton-t2 --with anton-t9/);
+    expect(supersedeMock).toHaveBeenCalledTimes(3); // mustPersist retries before it gives up
+    expect(setStatusMock).not.toHaveBeenCalled();
+  }, 10_000);
 
   it("retries when the same-survivor retirement moved the claim rather than the status", async () => {
     showMock
@@ -259,6 +281,26 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     );
     expect((err as Error).message).toMatch(/while anton was removing the stale `supersedes` edge/);
     expect(err).not.toBeInstanceOf(PoisonEpic);
+    // Nothing was superseded — the ticket is still in_progress, just held by another hand — so the
+    // edge that came off was the stale one this run came for, and re-closing the bead as superseded
+    // would destroy that live claim (PR #238 review).
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
+  // An abandoned bead needs no restore either: dispatch drops it as abandoned with or without the
+  // edge, and re-superseding it would overwrite a person's recorded won't-do.
+  it("does not re-draw the edge when the ticket was abandoned in the window", async () => {
+    showMock
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValue({ ...claimed, status: "closed", labels: ["abandoned"] });
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toMatch(/while anton was removing the stale `supersedes` edge/);
+    expect(err).not.toBeInstanceOf(PoisonEpic);
+    expect(supersedeMock).not.toHaveBeenCalled();
   });
 
   // "Could not read back" is not "nothing landed": proceeding would run the ticket on exactly the

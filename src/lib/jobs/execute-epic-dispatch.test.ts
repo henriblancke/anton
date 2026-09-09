@@ -543,6 +543,27 @@ describe("a reopened retirement's gates", () => {
     expect(dispatchedIds()).toEqual(["anton-a", "anton-b"]);
   });
 
+  // The fresh read is a second opinion on the WHOLE run, not just the reopened ticket (PR #238
+  // review): a prerequisite of an ordinary sibling can reopen in the same window that reopened the
+  // retirement — a person rescoping one bead usually touches its neighbours. Kept to the reopened
+  // ids, that hold would be read off the fresh board and then discarded, and the sibling dispatched
+  // onto a prerequisite the board currently holds open.
+  it("holds an ordinary sibling whose own prerequisite reopened before the fresh read", async () => {
+    const run = makeRun(
+      [superseded("anton-a", SHIPPER), blockedBy("anton-b", OUTSIDE)],
+      new AbortController().signal,
+    );
+    board = [
+      ...board.map((b) => (b.id === "anton-a" ? ({ ...b, status: "open" } as Bead) : b)),
+      // OPEN on the fresh read: the run's own verdict was taken while it was closed, so only this
+      // read can see the hold.
+      bead(OUTSIDE, { parent: undefined }),
+    ];
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(/anton-b/);
+    expect(dispatchedIds()).toEqual(["anton-a"]);
+  });
+
   // The re-gate may only ADD holds: the earlier verdict is what the whole run was planned against,
   // and a prerequisite that closed between the two reads must not silently un-hold a sibling.
   it("keeps a hold the run's own readiness verdict already carried", async () => {

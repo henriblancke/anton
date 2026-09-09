@@ -334,7 +334,7 @@ async function partitionTickets(
   // exist yet — the false-success shape issue #46 is about. Its runnable siblings are independent
   // work, so they run now (the readiness verdict above already refused a run with none of them),
   // and the held tail parks the run after the loop rather than riding into the PR unrun.
-  const holds = reopened.length > 0 ? await regateReopened(run, gated, reopened) : gated;
+  const holds = reopened.length > 0 ? await regateReopened(run, gated, live, reopened) : gated;
   const held = live.filter((t) => holds.has(t.id));
   const dispatchable = live.filter((t) => !holds.has(t.id));
   return { live, held, dispatchable };
@@ -357,6 +357,14 @@ async function partitionTickets(
  * that reopened between the two reads must not silently un-hold a sibling), so the fresh read may
  * only ADD holds.
  *
+ * And it adds them for EVERY live ticket, not only the reopened ones (PR #238 review). The fresh
+ * read is a second opinion on the whole run, and a prerequisite of an ordinary sibling can have
+ * reopened in the same window that reopened the retirement — a person rescoping one bead usually
+ * touches its neighbours. Kept to the reopened ids, that hold would be read off the fresh board and
+ * then discarded, and the sibling would be dispatched onto a prerequisite the board currently holds
+ * open: the same false success this re-gate exists to prevent, one ticket over. Narrowed to `live`
+ * only so a hold on work outside this run never lands in the run's own set.
+ *
  * An unreadable board holds every reopened ticket rather than dispatching it: this is the read that
  * decides whether an agent runs without its prerequisite, and "could not check" is not "not
  * blocked". Held rather than thrown, because a hold is already this function's own answer — the tail
@@ -365,6 +373,7 @@ async function partitionTickets(
 async function regateReopened(
   run: EpicRun,
   gated: Set<string>,
+  live: Bead[],
   reopened: Bead[],
 ): Promise<Set<string>> {
   const board = await mustReadBoard(run.repo);
@@ -374,10 +383,13 @@ async function regateReopened(
         `${reopened.map((t) => t.id).join(", ")} after their retirements were reopened — holding ` +
         `them rather than dispatching work whose prerequisites anton could not check`,
     );
+    // Only the REOPENED ids are added here, not every live ticket: the run's own verdict already
+    // speaks for its ordinary siblings — it was computed over a board that carried them as work —
+    // and holding those too would park a whole run over one unreadable read.
     return new Set([...gated, ...reopened.map((t) => t.id)]);
   }
   const fresh = runReadiness(board, run.targetId, run.targetIsUnit);
-  return new Set([...gated, ...fresh.gated.filter((id) => reopened.some((t) => t.id === id))]);
+  return new Set([...gated, ...fresh.gated.filter((id) => live.some((t) => t.id === id))]);
 }
 
 /**
