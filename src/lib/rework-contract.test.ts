@@ -660,6 +660,22 @@ describe("instructionCriteria", () => {
     expect(texts("- step:\n  ```\n  code")).toEqual(["step:", "```\ncode\n```"]);
     // A fence at column 0 is still top-level: it is bound to no item, so it keeps swallowing.
     expect(texts("```\ncode\n\n- Fix the retry")).toEqual(["```\ncode\n\n- Fix the retry\n```"]);
+    // A closer-SHAPED line at column 0 leaves the item rather than closing its fence, and
+    // CommonMark judges it afresh as a new top-level fence — so the step after it is that fence's
+    // literal content. Filing it as an actionable criterion instead would make the acceptance say
+    // what no renderer shows. Verified against commonmark.js 0.31.2: the block after the item is
+    // `<pre><code>\n- Fix the retry\n</code></pre>`, not a list item.
+    expect(instructionCriteria("- Here's an example:\n  ```\n  some code\n```\n\n- Fix the retry")).toEqual([
+      { text: "Here's an example:", fenced: false },
+      { text: "```\nsome code\n```", fenced: true },
+      { text: "```\n\n- Fix the retry\n```", fenced: true },
+    ]);
+    // Same for `~~~` and for a longer run, which would close the nested fence had it stayed inside.
+    expect(texts("- ex:\n  ~~~\n  code\n~~~\n\n- Fix the retry")).toEqual([
+      "ex:",
+      "~~~\ncode\n~~~",
+      "~~~\n\n- Fix the retry\n~~~",
+    ]);
   });
 
   it("opens a fence under a task marker as under the bullet — `- [ ] ```md` is a checklist example", () => {
