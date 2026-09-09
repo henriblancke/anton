@@ -403,6 +403,17 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     const line = lines[at]!;
     if (line.fenced) {
       flushCode();
+      // A fence opened on its OWN line inside a list item is bound to that item, which the flat
+      // scanner cannot see: it reports the opener and every line after it as fenced, so a later
+      // line that dedents out of the item was filed as the fence's content rather than as the step
+      // it is. CommonMark ends the block where its container ends, so hand such a fence to the
+      // nested machinery, which already closes one at its container's edge.
+      const heldFence = !fence ? itemFence(line.text, items) : undefined;
+      if (heldFence) {
+        nested = heldFence;
+        inParagraph = false;
+        continue;
+      }
       items.length = 0;
       inParagraph = false;
       if (!fence) fence = { opener: line.text, content: [] };
@@ -723,6 +734,31 @@ function setextHeadingRun(
     if (PARA_INTERRUPT.test(inner)) return 0;
   }
   return 0;
+}
+
+/**
+ * The container-bound fence `text` opens inside the innermost open list item, or undefined when it
+ * opens none — it is not a fence, or no item holds it.
+ *
+ * The scanner reads fences flat, with no notion of the item they sit in ({@link scanMarkdown}), so a
+ * fence indented to an item's content column is reported as an ordinary one and everything after it
+ * — past the blank line, past the bullet that leaves the item — is reported as its content. Reading
+ * it as nested instead ends the block where the item ends, as CommonMark does: `- Here's an
+ * example:` / an indented fence / a blank / `- Fix the retry` is a code block and a SECOND step, not
+ * one block swallowing the step. Items the opener has already dedented out of are popped off
+ * `items` first, so the column it is judged against is the item it actually sits in.
+ */
+function itemFence(
+  text: string,
+  items: number[],
+): { opener: string; fence: Fence; prefix: Prefix; content: string[] } | undefined {
+  const indent = indentColumns(text);
+  while (items.length > 0 && indent < items[items.length - 1]!) items.pop();
+  const base = items[items.length - 1] ?? 0;
+  if (base === 0 || indent < base) return undefined;
+  const opener = dedent(text, base);
+  const fence = openingFence(opener);
+  return fence && { opener, fence, prefix: [base], content: [] };
 }
 
 /**

@@ -552,6 +552,28 @@ describe("instructionCriteria", () => {
     expect(texts("* ```\n  ## h\n  ```\n\n    prose")).toEqual(["```\n## h\n```", "prose"]);
   });
 
+  it("ends a fence opened on its own line inside an item where the item ends", () => {
+    // The scanner reads fences flat, with no notion of the item holding one: it reported the
+    // opener and EVERY line after it as fenced, so the blank line and the bullet that dedents out
+    // of the item were filed as the block's content and `- [ ] Fix the retry` never became a
+    // criterion — the acceptance said "see code example" where the note showed a second step.
+    // CommonMark ends the block with its container (verified against commonmark.js 0.31.2).
+    expect(instructionCriteria("- Here's an example:\n  ```\n  some code\n\n- Fix the retry")).toEqual([
+      { text: "Here's an example:", fenced: false },
+      { text: "```\nsome code\n```", fenced: true },
+      { text: "Fix the retry", fenced: false },
+    ]);
+    // The same block closed explicitly, and one left unclosed by the item ending.
+    expect(texts("- step:\n  ```js\n  const a = 1;\n  ```\n- Fix the retry")).toEqual([
+      "step:",
+      "```js\nconst a = 1;\n```",
+      "Fix the retry",
+    ]);
+    expect(texts("- step:\n  ```\n  code")).toEqual(["step:", "```\ncode\n```"]);
+    // A fence at column 0 is still top-level: it is bound to no item, so it keeps swallowing.
+    expect(texts("```\ncode\n\n- Fix the retry")).toEqual(["```\ncode\n\n- Fix the retry\n```"]);
+  });
+
   it("opens a fence under a task marker as under the bullet — `- [ ] ```md` is a checklist example", () => {
     // The peel strips the bullet but leaves the checkbox on the content, so the fence check missed
     // it: the opener filed as `- [ ] ```md`, the heading dropped, the bullet shorn, and the closer
