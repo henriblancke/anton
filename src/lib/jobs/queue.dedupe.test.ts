@@ -169,6 +169,49 @@ describe("deferQueuedJobs bypass filter (anton-d8i4)", () => {
   });
 });
 
+describe("deferQueuedJobs touches only due rows (PR #248 review)", () => {
+  const BACKOFF = "usage-limit: resumes at 2026-01-01T00:00:00.000Z";
+  const marker = `${BUDGET_DEFER_PREFIX}weekly-cap — resumes at …`;
+
+  it("leaves a backed-off row alone until its backoff elapses, then defers it", async () => {
+    // A row mid retry/usage-limit backoff cannot start before its runAt whatever the governor says,
+    // and the marker reads as DEMAND to the quota split — so stamping it now would keep an idle
+    // project in the divisor for a backoff it could never spend through.
+    const clock = { now: () => systemClock.now() };
+    const id = enqueueExecuteEpicDeduped(t.db, clock, "p1", "epic-1");
+    const backoffAt = Math.floor((clock.now() + 60 * 60_000) / 1000) * 1000;
+    t.db
+      .update(schema.jobs)
+      .set({ runAt: new Date(backoffAt), lastError: BACKOFF })
+      .where(eq(schema.jobs.id, id))
+      .run();
+
+    const untouched = await deferQueuedJobs(t.db, clock, {
+      types: ["execute-epic"],
+      projectId: "p1",
+      retryAtMs: clock.now() + 6 * 24 * 60 * 60_000,
+      lastError: marker,
+    });
+    expect(untouched).toBe(0);
+    const backedOff = await getJob(t.db, id);
+    expect(toMs(backedOff?.runAt)).toBe(backoffAt);
+    expect(backedOff?.lastError).toBe(BACKOFF);
+
+    const later = { now: () => backoffAt };
+    const retryAtMs = later.now() + 6 * 24 * 60 * 60_000;
+    const deferred = await deferQueuedJobs(t.db, later, {
+      types: ["execute-epic"],
+      projectId: "p1",
+      retryAtMs,
+      lastError: marker,
+    });
+    expect(deferred).toBe(1);
+    const held = await getJob(t.db, id);
+    expect(toMs(held?.runAt)).toBe(Math.floor(retryAtMs / 1000) * 1000);
+    expect(held?.lastError).toBe(`${marker}${BUDGET_DEFER_PRIOR_SEP}${BACKOFF}`);
+  });
+});
+
 describe("deferQueuedJobs preserves prior-attempt evidence", () => {
   const REFUNDED = "usage-limit: resumes at 2026-01-01T00:00:00.000Z";
   const marker = (reason: string) => `${BUDGET_DEFER_PREFIX}${reason} — resumes at …`;

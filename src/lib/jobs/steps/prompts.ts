@@ -10,18 +10,31 @@ import type { Bead } from "../../beads/bd";
 import { acceptanceBody } from "../../beads/contract";
 import { humanNotesPromptBlock } from "../../beads/notes";
 import { shortSha } from "../../beads/satisfied-note";
+import type { PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
 import { findingLines, type ReviewFinding } from "../review-context";
 import type { SatisfiedSettlement, StepContext } from "./context";
+
+/** A ticket in scope whose previous attempt left preserved work on the branch (anton-16pq). */
+export interface TicketPreserved {
+  ticketId: string;
+  commit: PreservedCommit;
+}
 
 /**
  * What the `step:claude` agent is working ON: the run target, the tickets in scope, and the worktree
  * it is already in. The operating contract (git/beads ownership, scope, fail-loud, the
  * `ANTON-RESULT` line) lives in the system prompt, so it isn't repeated here.
+ *
+ * `preserved` is any preserved-work continuation for the tickets in scope. A formula may run a
+ * generic step BEFORE `step:implement` (PR #255 review), so on resume this step — not the
+ * implementer — is dispatched first onto a timed-out attempt's commits; it must be told they exist
+ * or it can revert or re-do them before the implementer ever sees them.
  */
 export function stepTaskBlock(
   ctx: Pick<StepContext, "target" | "tickets" | "branch" | "baseBranch">,
   stepId: string,
+  preserved: TicketPreserved[] = [],
 ): string {
   const lines = [
     `You are running the \`${stepId}\` step of anton's run pipeline for **${ctx.target.id}** — ` +
@@ -37,7 +50,61 @@ export function stepTaskBlock(
       ...ctx.tickets.map((t) => `- ${t.id} — ${t.title}`),
     );
   }
+  lines.push(...stepContinuationSection(preserved));
   return lines.join("\n");
+}
+
+/**
+ * Continuation awareness for a GENERIC step (`step:claude`), which a formula can place before
+ * `step:implement` (PR #255 review). Unlike {@link continuationSection} it prescribes no outcome:
+ * settling the ticket is the implementer's job and the delivery gate's, not this step's. It only
+ * tells the agent that a previous attempt's incomplete-but-real work is already on the branch so it
+ * builds on it rather than reverting, re-doing, or discarding it. Omitted when nothing is preserved.
+ *
+ * Each ticket's commits are shown with the SAME range/marker-aware inspection {@link
+ * continuationPromptBlock} uses (PR #255 review): a timed-out attempt that self-committed its work
+ * leaves an EMPTY `WIP` marker, so pointing the agent at `git show <marker-sha>` alone shows an
+ * empty diff and hides the real commits beneath it — inviting the very revert or redo this block
+ * exists to prevent. {@link preservedFilesLines} directs marker cases to `git log -p`, and {@link
+ * preservedInspectClause} spans the whole preserved range (from the baseline when known).
+ */
+function stepContinuationSection(preserved: TicketPreserved[]): string[] {
+  if (preserved.length === 0) return [];
+  const multiple = preserved.length > 1;
+  return [
+    ``,
+    `## CONTINUATION — a previous attempt's work is already on this branch`,
+    ``,
+    `A previous attempt at ${multiple ? "these tickets" : "this ticket"} ran out of its time budget ` +
+      `and was stopped. anton kept what it had built rather than deleting it, and that work is ` +
+      `already committed here:`,
+    ...preserved.flatMap(({ ticketId, commit }) => stepPreservedTicketLines(ticketId, commit, multiple)),
+    ``,
+    `That work is INCOMPLETE — the attempts were stopped mid-ticket — but it is real and belongs on ` +
+      `this branch. Build on it: do not revert, re-do, or discard it, and do not restart from scratch.`,
+  ];
+}
+
+/**
+ * One ticket's preserved commits inside the generic step's CONTINUATION block: the commits, what
+ * they changed (or, for an empty marker, that the work is in the commits beneath it — PR #255
+ * review), and the range-aware inspect command. The ticket id heads the block only when more than
+ * one is preserved, since each carries its own range.
+ */
+function stepPreservedTicketLines(
+  ticketId: string,
+  commit: PreservedCommit,
+  multiple: boolean,
+): string[] {
+  const commitLines = [commit, ...commit.earlier].map((c) => `    ${c.sha} ${c.subject}`);
+  return [
+    ``,
+    ...(multiple ? [`For ${ticketId}:`] : []),
+    ...commitLines,
+    ...preservedFilesLines(commit),
+    ``,
+    `Inspect ${preservedInspectClause(commit)} before you change anything.`,
+  ];
 }
 
 /**
@@ -65,17 +132,148 @@ export function truncateField(text: string): string {
  * unreadable (issue #46 root cause #3). `bd show` is offered as a convenience, never as the sole
  * source: a bead whose spec is genuinely empty AND whose `bd show` fails is a fail-loud/blocked
  * condition, not a cue to silently produce nothing.
+ *
+ * `preserved` is the state of the BRANCH rather than of the bead (anton-16pq): a timed-out
+ * attempt's work already committed here. It reads after the spec because it only means anything
+ * once the agent knows what the ticket asks for.
  */
-export function ticketPrompt(ticket: Bead): string {
+export function ticketPrompt(ticket: Bead, preserved?: PreservedCommit): string {
   return [
     `Implement this beads ticket in the current worktree:`,
     ``,
     `Ticket: ${ticket.id} — ${ticket.title}`,
     ...ticketSpecSections(ticket),
+    ...continuationSection(preserved),
     ``,
-    ticketPromptClosing(ticket.id),
+    ticketPromptClosing(ticket.id, preserved !== undefined),
   ].join("\n");
 }
+
+/**
+ * What a RESUMED ticket is owed: the work its timed-out attempt left on this branch (anton-d967).
+ *
+ * Without it the resume is dispatched blind. The agent re-reads a ticket whose change is apparently
+ * already made, finds nothing to do, and exits having written nothing — which the delivery-evidence
+ * gate reads as a zero-diff stall and parks the run again, forever. So the block says three things:
+ * what was preserved, that it is INCOMPLETE (nobody verified this ticket finished), and that the
+ * move is to continue from it rather than restart or revert it.
+ *
+ * It also names the one case where `delivered` on an unchanged working tree is correct, because the
+ * base contract otherwise forbids exactly that. This does not soften the gate: `step:commit` adopts
+ * the preserved commit only when THIS run's agent affirms the ticket is finished, so an agent that
+ * stays silent (or reports blocked) still cannot close a ticket on a zero diff.
+ *
+ * Omitted entirely when nothing is preserved — a fresh ticket's prompt is unchanged.
+ */
+function continuationSection(preserved: PreservedCommit | undefined): string[] {
+  if (!preserved) return [];
+  return [``, continuationPromptBlock(preserved)];
+}
+
+function continuationPromptBlock(preserved: PreservedCommit): string {
+  const multiple = preserved.earlier.length > 0;
+  // Newest first, so the agent reads the freshest attempt at the top; every one is on the branch.
+  const commitLines = [preserved, ...preserved.earlier].map((c) => `    ${c.sha} ${c.subject}`);
+  return [
+    `## CONTINUATION — a previous attempt's work is already on this branch`,
+    ``,
+    multiple
+      ? `Earlier attempts at this ticket each ran out of their time budget and were stopped. anton ` +
+        `kept what they had built rather than deleting it, and that work is already committed here ` +
+        `(newest first):`
+      : `An earlier attempt at this ticket ran out of its time budget and was stopped. anton kept ` +
+        `what it had built rather than deleting it, and that work is already committed here:`,
+    ``,
+    ...commitLines,
+    ...preservedFilesLines(preserved),
+    ``,
+    multiple
+      ? `Those commits are INCOMPLETE by construction: the attempts were stopped mid-ticket, nobody ` +
+        `has confirmed the ticket is finished, and none is in any pull request's delivered list.`
+      : `That commit is INCOMPLETE by construction: the attempt was stopped mid-ticket, nobody has ` +
+        `confirmed the ticket is finished, and it is in no pull request's delivered list.`,
+    ``,
+    `Read ${preservedInspectClause(preserved)} first and CONTINUE from it — finish the acceptance ` +
+      `criteria it has not met yet. Do not restart the ticket from scratch, and do not revert or ` +
+      `re-do what is already there.`,
+    ``,
+    `If, after reading it, everything the ticket asks for is genuinely already done, do not ` +
+      `manufacture a change to prove it: say what you found and end with \`ANTON-RESULT: ` +
+      `delivered\`. The preserved work is then this ticket's delivery — this is the one case ` +
+      `where reporting \`delivered\` on an unchanged working tree is correct, because the work is ` +
+      `on the branch. Without that line the run parks and the work never reaches a pull request.`,
+  ].join("\n");
+}
+
+/**
+ * The revision to `git show`: the fork point range when the ticket's baseline is known (anton-16pq),
+ * which spans a first attempt's self-committed work beneath an empty marker as well as the markers
+ * themselves; otherwise the whole marker range when the ticket timed out more than once, or the
+ * single commit when it timed out once. The newest commit alone omits the earlier attempts' deltas.
+ */
+function preservedShowRange(preserved: PreservedCommit): string {
+  if (preserved.baseline) return `${preserved.baseline}..${preserved.sha}`;
+  const oldest = preserved.earlier.at(-1);
+  return oldest ? `${oldest.sha}^..${preserved.sha}` : preserved.sha;
+}
+
+function preservedInspectClause(preserved: PreservedCommit): string {
+  const range = preservedShowRange(preserved);
+  return range.includes("..")
+    ? `all of it (\`git show ${range}\`)`
+    : `it (\`git show ${range}\`)`;
+}
+
+/**
+ * The preserved diff, the marker's explanation, or — when git could not be read — nothing but a
+ * pointer to inspect it directly. A `[]` file list is ambiguous, so {@link PreservedCommit.newestEmpty}
+ * decides which it is (PR #255 review): an EMPTY newest commit is the marker form — the agent
+ * committed the work under its own subjects and this commit only records whose it is, so pointing at
+ * its (empty) diff would tell the agent nothing was kept. A NON-EMPTY newest commit whose range
+ * still nets to `[]` is not a marker but a range that cancels out (earlier edits undone by later
+ * ones); claiming the work is self-committed beneath it would be a lie. `undefined` files is an
+ * unreadable diff (a git failure), NOT an empty one — presenting it as a marker would falsely claim
+ * the work lives beneath a commit anton never actually read (PR #255 review).
+ */
+function preservedFilesLines(preserved: PreservedCommit): string[] {
+  if (preserved.files === undefined) {
+    return [
+      ``,
+      `anton could not read the preserved diff (a git error), so no file list is shown — inspect it ` +
+        `yourself with the command below before continuing.`,
+    ];
+  }
+  if (preserved.files.length === 0) {
+    // A non-empty newest commit whose range nets to nothing is NOT a marker (PR #255 review); only a
+    // genuinely empty newest commit sends the agent to the work beneath it. `undefined` (git could
+    // not read the newest commit's own diff) keeps the marker wording as the safe default.
+    if (preserved.newestEmpty === false) {
+      return [
+        ``,
+        `The preserved attempts cancel out to no net change against the ticket baseline — an earlier ` +
+          `attempt's edits were undone by a later one — so no file list is shown. Inspect the full ` +
+          `history (\`git log -p\`) to see what each attempt did before continuing.`,
+      ];
+    }
+    return [
+      ``,
+      `That commit is empty — it is a marker. The previous attempt committed the work itself under ` +
+        `subjects that name neither this ticket nor its incompleteness, so the changes are in the ` +
+        `commits beneath it (\`git log -p\`).`,
+    ];
+  }
+  const shown = preserved.files.slice(0, MAX_PRESERVED_FILES);
+  const rest = preserved.files.length - shown.length;
+  return [
+    ``,
+    `Files changed across the preserved work:`,
+    ...shown.map((f) => `- ${f}`),
+    ...(rest > 0 ? [`- … and ${rest} more (\`git show --stat ${preservedShowRange(preserved)}\`)`] : []),
+  ];
+}
+
+/** Enough to see the shape of the change; past that the agent is better served by `git show`. */
+const MAX_PRESERVED_FILES = 40;
 
 /**
  * The spec blocks, each omitted when the bead carries nothing for it.
@@ -125,21 +323,31 @@ function standaloneContext(ticket: Bead, description: string | undefined): strin
  * honest outcome is `satisfied` rather than `blocked` (anton-6l0q): a ticket is one step of a run
  * whose earlier steps committed to this same branch, so its acceptance can already be met before the
  * agent starts. The contract defines the line; this names the moment it applies to THIS ticket.
+ *
+ * The `satisfied` guidance is omitted for a RESUMED ticket (`preserved`): its CONTINUATION block
+ * already names the one correct unchanged-tree outcome — `delivered` — and a preserved-adoption
+ * settle can only be `delivered` (PR #255 review). `assertDelivered` refuses every other outcome
+ * once `preservedAdoption` is set, so leaving the generic `satisfied` line here after it would tell
+ * the agent to report the one thing that re-parks the resume this prompt exists to unblock.
  */
-function ticketPromptClosing(ticketId: string): string {
+function ticketPromptClosing(ticketId: string, preserved: boolean): string {
   return [
     `The full ticket spec is inlined above so you can implement it even if the worktree's beads ` +
       `DB is unreadable. \`bd show ${ticketId}\` gives the same content when bd is healthy. If ` +
       `the spec above is empty AND \`bd show\` fails, stop and report the ticket as blocked — do ` +
       `not guess or silently bail. Follow the operating contract in your system prompt.`,
-    ``,
-    `Before you implement, check the branch: earlier steps of this run committed here, and one of ` +
-      `them may already meet every acceptance criterion above. If it does, do not redo or ` +
-      `restate that work and do not report \`blocked\` — end with ` +
-      `\`ANTON-RESULT: satisfied — <commit sha> — <how that commit covers ${ticketId}>\`, naming ` +
-      `the commit that did it. That is the honest answer only when every criterion is met by work ` +
-      `already committed on this branch; if any is still open, do the remaining work and report ` +
-      `\`delivered\`.`,
+    ...(preserved
+      ? []
+      : [
+          ``,
+          `Before you implement, check the branch: earlier steps of this run committed here, and one ` +
+            `of them may already meet every acceptance criterion above. If it does, do not redo or ` +
+            `restate that work and do not report \`blocked\` — end with ` +
+            `\`ANTON-RESULT: satisfied — <commit sha> — <how that commit covers ${ticketId}>\`, naming ` +
+            `the commit that did it. That is the honest answer only when every criterion is met by work ` +
+            `already committed on this branch; if any is still open, do the remaining work and report ` +
+            `\`delivered\`.`,
+        ]),
   ].join("\n");
 }
 

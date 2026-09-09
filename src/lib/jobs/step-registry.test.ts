@@ -101,7 +101,7 @@ function context(overrides: Partial<StepContext> = {}): StepContext {
   return {
     db: tdb.db,
     clock,
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
     projectId,
     runId,
     repoPath: dir,

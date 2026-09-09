@@ -66,6 +66,13 @@ export interface SettingsDraft {
   autopilotScoreFloor: number;
   autopilotScoreWindow: number;
   budgetAware: boolean;
+  /**
+   * The declared quota share (R6.1), or `null` while the project is still on the equal split. Held
+   * unresolved — unlike the brakes above — because the default is a fact about the OTHER projects on
+   * this machine, so resolving it here would bake one page load's project count into an edit.
+   */
+  quotaSharePct: number | null;
+  reserveQuotaShare: boolean;
   daytimeReservePct: number;
   weeklyTargetPct: number;
   /** The enabled BUNDLED allowlist. User agents always run and are never members. */
@@ -122,6 +129,8 @@ export function draftFromSettings(
     autopilotScoreFloor: settings.autopilotScoreFloor ?? DEFAULT_AUTOPILOT_SCORE_FLOOR,
     autopilotScoreWindow: settings.autopilotScoreWindow ?? DEFAULT_AUTOPILOT_SCORE_WINDOW,
     budgetAware: settings.budgetAware ?? false,
+    quotaSharePct: settings.quotaSharePct ?? null,
+    reserveQuotaShare: settings.reserveQuotaShare ?? false,
     daytimeReservePct: settings.budgetPolicy?.daytimeReservePct ?? DEFAULT_DAYTIME_RESERVE_PCT,
     weeklyTargetPct: settings.budgetPolicy?.weeklyTargetPct ?? DEFAULT_WEEKLY_TARGET_PCT,
     activeAgents: new Set(settings.agents ?? bundledAgentIds),
@@ -161,6 +170,7 @@ const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
     "autopilotScoreWindow",
   ],
   budget: ["budgetAware", "daytimeReservePct", "weeklyTargetPct"],
+  quotaShare: ["quotaSharePct", "reserveQuotaShare"],
   gates: ["testCommand", "lintCommand", "typecheckCommand", "buildCommand"],
   review: [
     "reviewEnabled",
@@ -287,6 +297,11 @@ export function settingsPatchBody(
     autopilotScoreFloor: draft.autopilotScoreFloor,
     autopilotScoreWindow: draft.autopilotScoreWindow,
     budgetAware: draft.budgetAware,
+    // The declared share (R6.1). `null` is the real answer for a project still on the equal split —
+    // it clears the override, so the default tracks the machine's project count instead of freezing
+    // at whatever it happened to be when this form was opened.
+    quotaSharePct: draft.quotaSharePct,
+    reserveQuotaShare: draft.reserveQuotaShare,
     // Only the two exposed knobs; the server deep-merges into the stored policy, so knobs set via
     // the API (dayWindow, minSessionHeadroomPct, …) survive a save from this form.
     budgetPolicy: {

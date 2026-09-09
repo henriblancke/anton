@@ -29,7 +29,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import type { Worktree } from "../git/worktree";
 import type { ProjectSettings } from "../projects";
-import { COMMIT_TIMEOUT_ENV, readWorktreeState } from "../git/ops";
+import { COMMIT_TIMEOUT_ENV, readPreservedCommitFor, readWorktreeState } from "../git/ops";
 import { isPoisonError } from "./errors";
 import { TicketTimeoutError } from "./execute-epic-errors";
 import { outOfTimeParkMessage } from "./execute-epic-dispatch";
@@ -88,7 +88,7 @@ suite("preserveTimedOutWork (real git)", () => {
     return {
       db: tdb.db,
       clock: new FixedClock(1_700_000_000_000),
-      ctx: { signal, heartbeat: async () => {}, report: () => {} },
+      ctx: { signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
       projectId: randomUUID(),
       runId: randomUUID(),
       repoPath: repo,
@@ -358,12 +358,14 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(subjects().some((s) => s.startsWith(`WIP ${ticket.id}:`))).toBe(false);
   });
 
-  // …and the marker is written once. A resume that starts from a previous attempt's preserved
-  // commit, self-commits more work and times out again already has the prefix on the branch.
-  it("does not re-mark a branch that already carries this ticket's preserved commit", async () => {
+  // A resume that starts from a previous attempt's preserved commit, self-commits more work and
+  // times out again gets a FRESH marker at the tip (PR #255 review). The older marker predates the
+  // new self-commits, so reusing it would leave the newest `WIP` below them and the resume's
+  // `baseline..marker` range would omit them — the range reader wants the newest `WIP` at the tip.
+  it("re-marks the tip when self-committed work sits above a previous attempt's marker", async () => {
     write("HALF_WRITTEN.md", "work preserved by the attempt before this one\n");
     g(["add", "-A"]);
-    g(["commit", "-q", "-m", `WIP ${ticket.id}: ${ticket.title}`]);
+    g(["commit", "-q", "-m", `WIP ${ticket.id}: earlier attempt`]);
     const baseline = await readWorktreeState(repo);
     write("MORE.md", "what this attempt added, and committed itself\n");
     g(["add", "-A"]);
@@ -381,8 +383,55 @@ suite("preserveTimedOutWork (real git)", () => {
     });
 
     expect(kept).toEqual({ branch: BRANCH, retained: false });
-    expect(head()).toBe(selfCommitted);
-    expect(subjects().filter((s) => s.startsWith(`WIP ${ticket.id}:`))).toHaveLength(1);
+    // A new empty marker sits at the tip, on top of the agent's own commit; the older marker stays
+    // beneath it, so the read side collects both and spans the whole preserved delta.
+    expect(out(["rev-parse", "HEAD~1"])).toBe(selfCommitted);
+    expect(subjects().filter((s) => s.startsWith(`WIP ${ticket.id}:`))).toHaveLength(2);
+    const preserved = await readPreservedCommitFor(repo, ticket.id, "main");
+    expect(preserved?.files?.sort()).toEqual(["HALF_WRITTEN.md", "MORE.md"]);
+  });
+
+  // The SAME staleness bug on the `"error" in kept` path (PR #255 review): the preserve's OWN commit
+  // is attempted and fails WITHOUT landing, so the tip is still the agent's self-commit — not anton's
+  // `WIP`. A history-wide marker check finds the previous attempt's marker BELOW these self-commits
+  // and skips making a fresh one, leaving the newest `WIP` beneath the work it must sit above and the
+  // resume's `baseline..marker` range omitting it. The tip check makes a fresh marker instead.
+  it("re-marks the tip when the preserve commit errors above a previous attempt's marker", async () => {
+    write("HALF_WRITTEN.md", "work preserved by the attempt before this one\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", `WIP ${ticket.id}: earlier attempt`]);
+    const baseline = await readWorktreeState(repo);
+    write("MORE.md", "what this attempt added, and committed itself\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: more of the agent's own work"]);
+    const selfCommitted = head();
+    // Uncommitted work remains, so the preserve tries to commit it — a pre-commit hook rewrites the
+    // tree and rejects, which the preserve refuses to retry (the tree is no longer the gated one), so
+    // `commitPreservedTree` returns an error without HEAD moving. The empty marker is made under
+    // `--no-verify`, so it still lands.
+    write("STILL_UNCOMMITTED.md", "work the deadline cut off before the agent committed it\n");
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(
+      join(hooks, "pre-commit"),
+      "#!/bin/sh\necho rewritten > REWRITTEN.md\ngit add REWRITTEN.md\nexit 1\n",
+      { mode: 0o755 },
+    );
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ branch: BRANCH, retained: false });
+    // A fresh marker sits at the tip on top of the agent's own commit; the older marker stays beneath.
+    expect(out(["rev-parse", "HEAD~1"])).toBe(selfCommitted);
+    expect(subjects().filter((s) => s.startsWith(`WIP ${ticket.id}:`))).toHaveLength(2);
   });
 
   // The genuinely empty case the branch above must not swallow: nothing staged AND HEAD never moved
@@ -669,7 +718,7 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
   const run = (signal: AbortSignal): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal, heartbeat: async () => {}, report: () => {} },
+    ctx: { signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,
@@ -774,7 +823,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
   const run = (): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,
@@ -904,7 +953,7 @@ suite("settleTicketTimeout — a satisfied step the deadline caught during its b
   const run = (): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,
@@ -1029,7 +1078,7 @@ suite("settleTicketTimeout — unmarkable self-committed work stops the run", ()
   const run = (): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,

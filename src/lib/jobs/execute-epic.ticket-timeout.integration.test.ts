@@ -41,6 +41,10 @@
  * 10. **A run that STOPS reopens the timeouts it absorbed** (anton-67xj). A blocked ticket is the
  *    founder's cue only on a run that reaches its PR; on one that parks instead, it is a status bd
  *    refuses to claim — and the resume the park advertises dies on it at runTicket's claim gate.
+ * 11. **A resume is TOLD the preserve happened** (anton-16pq). Work kept on the branch is only
+ *    worth keeping if the next agent knows it is there: the resumed dispatch carries a CONTINUATION
+ *    block naming that commit, or the agent restarts a ticket that is half done — or finds nothing
+ *    left to do and parks the run on the zero diff it can never get past.
  *
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
@@ -276,6 +280,8 @@ process.exit(0);`),
         fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
 const id=m?m[1]:'unknown';
 fs.appendFileSync(${JSON.stringify(invLog)},id+'\\n');
+const dump=process.env.ANTON_TEST_CLAUDE_ARGV;
+if(dump){fs.appendFileSync(dump,JSON.stringify({id,prompt})+'\\n');}
 const nth=fs.readFileSync(${JSON.stringify(invLog)},'utf8').trim().split('\\n').filter(Boolean).length;
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 if(${only === "always" ? "true" : "nth===1"}){
@@ -453,6 +459,61 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
         process.env.ANTON_CLAUDE_BIN = successClaude;
         await patchSettings({ ticketTimeoutMinutes: undefined });
         if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+      }
+    });
+
+    it("tells the RESUMED ticket its preserved work is already on the branch (anton-16pq)", async () => {
+      // The stall this closes: the preserve keeps the work and parks, then the resume dispatches the
+      // agent with no idea any of it happened. It re-reads the ticket, finds the change apparently
+      // made, and exits having written nothing — a zero diff the delivery gate parks on, forever.
+      const featureId = await beads.create(repo, {
+        title: "A feature that needs two attempts",
+        type: "feature",
+        acceptance: "work file exists",
+        description: "## Goal\nOne unit of work",
+      });
+      await beads.approve(repo, featureId);
+
+      const invLog = join(sandbox, "continuation-inv.jsonl");
+      const dump = join(sandbox, "continuation-prompts.jsonl");
+      // "first": attempt 1 hangs into the deadline, the resume's dispatch runs to completion.
+      const claude = verifiableHangingClaude("claude-hang-continuation", invLog, "first");
+      await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+      const runner = makeEpicRunner(ctx);
+      process.env.ANTON_CLAUDE_BIN = claude;
+      let parkedJobId: string | undefined;
+      try {
+        parkedJobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
+        expect((await getJob(tdb.db, parkedJobId))?.status).toBe("parked");
+        const run = (await tdb.db.select().from(schema.runs)).find(
+          (r) => r.epicBeadId === featureId,
+        )!;
+        const wip = subjectsOnBranch(run.branch!).find((x) => x.startsWith(`WIP ${featureId}:`));
+        expect(wip).toBeDefined();
+
+        // The resume: same branch, HEAD already carrying that commit, and a budget it can finish in.
+        await patchSettings({ ticketTimeoutMinutes: undefined });
+        process.env.ANTON_TEST_CLAUDE_ARGV = dump;
+        await driveEpicRun(runner, { projectId, epicBeadId: featureId });
+
+        const prompts = readFileSync(dump, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l) as { id: string; prompt: string });
+        const dispatched = prompts.find((x) => x.id === featureId)!.prompt;
+
+        // What was preserved, that it is incomplete, and that the move is to finish from there.
+        expect(dispatched).toContain("CONTINUATION");
+        expect(dispatched).toContain(wip!);
+        expect(dispatched).toContain("HALF_WRITTEN.md");
+        expect(dispatched).toContain("INCOMPLETE");
+        expect(dispatched).toMatch(/do not restart the ticket from scratch/i);
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+        delete process.env.ANTON_TEST_CLAUDE_ARGV;
+        await patchSettings({ ticketTimeoutMinutes: undefined });
       }
     });
 

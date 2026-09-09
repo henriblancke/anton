@@ -215,8 +215,36 @@
     {
       "idx": 30,
       "version": "6",
-      "when": 1788912083127,
-      "tag": "0030_majestic_supreme_intelligence",
+      "when": 1788724007937,
+      "tag": "0030_picker_veto_kind",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1788734620828,
+      "tag": "0031_burn_sample_project",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1788810018109,
+      "tag": "0032_jobs_updated_idx",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1788815301862,
+      "tag": "0033_jobs_spent_attempts",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1788921627638,
+      "tag": "0034_run_base_fork_sha",
       "breakpoints": true
     }
   ]

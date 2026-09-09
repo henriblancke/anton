@@ -72,6 +72,7 @@ function job(id: string, o: Partial<JobRow> = {}): JobRow {
     runAt: secDate(NOW - HOUR),
     leaseExpiresAt: null,
     attempts: 3,
+    spentAttempts: 3,
     lastError: null,
     outcome: null,
     outcomeNote: null,

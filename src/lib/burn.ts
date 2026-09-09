@@ -1,6 +1,7 @@
 /**
  * Per-job Claude burn sampler (anton-w8ny). Records how much subscription quota each job TYPE
- * actually burns, so pacing and prioritization can reason about cost.
+ * actually burns — and, since anton-wj3d, which PROJECT spent it — so pacing, prioritization, and
+ * per-project quota shares can reason about cost.
  *
  * The runner samples live usage immediately before and after each job and persists the
  * session%/weekly% delta attributed to the job's type. The runner only opens a window when the job
@@ -22,7 +23,7 @@
  * averages in its disposable anton.db.
  */
 import { randomUUID } from "node:crypto";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { schema } from "./db";
 import type { AntonDb, Clock, JobType } from "./jobs/queue";
 import type { ClaudeUsage } from "./claude/usage";
@@ -49,11 +50,13 @@ export const TIER_SEEDS: Record<BurnTier, { sessionPct: number; weeklyPct: numbe
 };
 
 /**
- * Static tier per job type (ticket: stringer=S, review-fix=M, execute-epic=L; grooming is cheap).
+ * Static tier per job type (ticket: stringer=S, review-fix=M, execute-epic=L).
  * sync-push is a deterministic `git push` of dolt refs — it invokes no Claude at all, so it's `none`:
  * zero cost to the pacer and never worth sampling (see {@link burnsClaudeQuota}). run-health is the
  * same shape: deterministic queries over anton.db, the board, and `gh`; so is the gardener patrol,
- * which is bd hygiene verbs and nothing else.
+ * which is bd hygiene verbs and nothing else — and so is orphan-grooming, which buckets loose
+ * tickets with bd link verbs and never spawns Claude (the runner refunds every attempt of it). It
+ * stays a GOVERNED type for pacing, but a paced row of it is no claim on the quota (PR #248 review).
  */
 export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "nightly-stringer": "S",
@@ -62,7 +65,7 @@ export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "review-fix": "none",
   "review-fix-pr": "M",
   "execute-epic": "L",
-  "orphan-grooming": "S",
+  "orphan-grooming": "none",
   "sync-push": "none",
   "run-health": "none",
   unstick: "none",
@@ -108,16 +111,22 @@ export function burnDelta(
   return { sessionDelta, weeklyDelta };
 }
 
-/** Persist one burn sample for a job type. */
+/**
+ * Persist one burn sample for a job type, attributed to the project that spent it. `projectId` is
+ * explicit rather than optional so no call site can silently drop the attribution; pass null only
+ * for anton's own plumbing jobs, which belong to no project's share.
+ */
 export async function recordBurnSample(
   db: AntonDb,
   clock: Clock,
   jobType: JobType,
+  projectId: string | null,
   sample: BurnSample,
 ): Promise<void> {
   await db.insert(schema.burnSamples).values({
     id: randomUUID(),
     jobType,
+    projectId,
     sessionDelta: sample.sessionDelta,
     weeklyDelta: sample.weeklyDelta,
     createdAt: new Date(Math.floor(clock.now() / 1000) * 1000),
@@ -148,17 +157,54 @@ export async function getBurnAverage(
   jobType: JobType,
   window: number = BURN_SAMPLE_WINDOW,
 ): Promise<BurnAverage> {
-  const tier = JOB_TYPE_TIER[jobType];
-  const rows = await db
+  return averageOf(await recentSamples(db, jobType, undefined, window), jobType, window);
+}
+
+/**
+ * The same rolling average, narrowed to ONE project's samples (anton-wj3d) — what per-project spend
+ * is measured from, since the global per-type average cannot tell whose quota a job spent.
+ *
+ * Samples with no project (rows predating the column, and anton's own plumbing jobs) match no
+ * project id, so they are excluded rather than misattributed: an unattributed row cannot be charged
+ * to a project that may not have spent it. A project with no samples of its own therefore reads as
+ * fully seeded, which is the honest answer — not a borrowed one.
+ */
+export async function getProjectBurnAverage(
+  db: AntonDb,
+  projectId: string,
+  jobType: JobType,
+  window: number = BURN_SAMPLE_WINDOW,
+): Promise<BurnAverage> {
+  return averageOf(await recentSamples(db, jobType, projectId, window), jobType, window);
+}
+
+/** The most recent `window` samples for a type, optionally narrowed to one project. */
+async function recentSamples(
+  db: AntonDb,
+  jobType: JobType,
+  projectId: string | undefined,
+  window: number,
+): Promise<BurnSample[]> {
+  return db
     .select({
       sessionDelta: schema.burnSamples.sessionDelta,
       weeklyDelta: schema.burnSamples.weeklyDelta,
     })
     .from(schema.burnSamples)
-    .where(eq(schema.burnSamples.jobType, jobType))
+    .where(
+      projectId === undefined
+        ? eq(schema.burnSamples.jobType, jobType)
+        : and(
+            eq(schema.burnSamples.jobType, jobType),
+            eq(schema.burnSamples.projectId, projectId),
+          ),
+    )
     .orderBy(desc(schema.burnSamples.createdAt))
     .limit(window);
+}
 
+function averageOf(rows: BurnSample[], jobType: JobType, window: number): BurnAverage {
+  const tier = JOB_TYPE_TIER[jobType];
   if (rows.length < window) {
     // Ramp-up: pad the missing slots with the tier seed rather than discarding the real samples we
     // do have. Each real measurement pulls the average toward reality (weighted by rows.length/window)
@@ -178,9 +224,10 @@ export async function getBurnAverage(
 
 /**
  * Sample a job's burn: compare a `before` usage read against a fresh read taken after the job, and
- * persist the delta for its type. Fail-soft by contract — a null read or a reset meter records
- * nothing, and any error (a failed usage read, a DB hiccup) is swallowed so burn accounting can
- * NEVER fail a job. Returns the recorded sample, or `null` when none was.
+ * persist the delta for its type, attributed to the project the job ran for. Fail-soft by contract
+ * — a null read or a reset meter records nothing, and any error (a failed usage read, a DB hiccup)
+ * is swallowed so burn accounting can NEVER fail a job. Returns the recorded sample, or `null` when
+ * none was.
  *
  * `read` is injected (the runner passes its TTL-bypassing fresh read) so tests drive it
  * deterministically.
@@ -189,6 +236,7 @@ export async function sampleJobBurn(
   db: AntonDb,
   clock: Clock,
   jobType: JobType,
+  projectId: string | null,
   before: ClaudeUsage | null,
   read: () => Promise<ClaudeUsage | null>,
 ): Promise<BurnSample | null> {
@@ -196,7 +244,7 @@ export async function sampleJobBurn(
     const after = await read();
     const sample = burnDelta(before, after);
     if (!sample) return null;
-    await recordBurnSample(db, clock, jobType, sample);
+    await recordBurnSample(db, clock, jobType, projectId, sample);
     return sample;
   } catch {
     return null;

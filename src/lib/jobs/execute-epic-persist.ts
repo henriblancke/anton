@@ -76,6 +76,28 @@ export async function mustRead(
   return undefined;
 }
 
+/**
+ * The FULL board, retried like {@link mustRead} — for the read a guarded write is decided on when
+ * the decision needs parentage the board carries and a single bead does not (a ticket's run target
+ * is its first run-target ancestor, and an intermediate reparent moves it without touching the
+ * ticket's own edge). Answers `undefined` only once bd has refused every attempt, so the caller
+ * escalates on a genuinely unreachable board rather than on one contended round trip.
+ */
+export async function mustReadBoard(
+  repo: string,
+  attempts = 3,
+): Promise<Bead[] | undefined> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await beads.list(repo, ["--status", "all"]);
+    } catch (e) {
+      console.error(`[execute-epic] bd board read failed (attempt ${attempt}/${attempts}):`, e);
+      if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
+    }
+  }
+  return undefined;
+}
+
 const delayMs = (ms: number): Promise<void> =>
   new Promise((resolve) => {
     const t = setTimeout(resolve, ms);

@@ -25,11 +25,13 @@ import {
 const toastSuccess = vi.fn();
 const toastError = vi.fn();
 const toastMessage = vi.fn();
+const toastWarning = vi.fn();
 vi.mock("sonner", () => ({
   toast: {
     success: (...a: unknown[]) => toastSuccess(...a),
     error: (...a: unknown[]) => toastError(...a),
     message: (...a: unknown[]) => toastMessage(...a),
+    warning: (...a: unknown[]) => toastWarning(...a),
   },
 }));
 
@@ -222,9 +224,10 @@ function budgetSignal(sessionPct: number): BudgetSignal {
       weeklyPct: null,
       weeklyReason: "weekly-cap",
       weeklyInclusive: true,
+      sharePct: null,
       reserveWaiver: null,
     },
-    burn: { "execute-epic": { sessionPct: 20, weeklyPct: 3, seeded: false } },
+    burn: { "execute-epic": { sessionPct: 20, weeklyPct: 3, shareWeeklyPct: 3, seeded: false } },
   };
 }
 
@@ -602,13 +605,17 @@ describe("a lane pick the recorded plan has not caught up with (anton-5axf)", ()
     expect(within(laneRow("anton-pick1")).getByRole("button", { name: /not now/i })).toBeTruthy();
   });
 
-  it("says anton confirms the pick on the next pass, rather than leaving a bare gap", () => {
+  it("names the wait and what ends it, rather than leaving a bare gap", () => {
+    // Every board read now writes its ranking down (anton-f12y), so the honest wait is the next
+    // READ — not the ten-minute pass the old copy pointed at, which was long enough to teach the
+    // operator to go round the lane and approve from Backlog (anton-84lx).
     render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
 
-    const waiting = within(laneCard("anton-pick1")).getByText(/anton confirms next pass/i);
+    const waiting = within(laneCard("anton-pick1")).getByText(/anton records this next read/i);
+    expect(waiting.getAttribute("title")).toMatch(/next board read records it/i);
     expect(waiting.getAttribute("title")).toMatch(/no action needed/i);
     // The confirmed pick says nothing of the sort — it has its button.
-    expect(within(laneCard("anton-pick2")).queryByText(/next pass/i)).toBeNull();
+    expect(within(laneCard("anton-pick2")).queryByText(/next read/i)).toBeNull();
   });
 
   it("withholds the start when the lane has outrun the generation, mark or no mark", () => {
@@ -618,7 +625,46 @@ describe("a lane pick the recorded plan has not caught up with (anton-5axf)", ()
     render(<EpicBoard slug="tmp" initialBoard={outrun} />);
 
     expect(startButtons("anton-pick2")).toEqual([]);
-    expect(within(laneCard("anton-pick2")).getByText(/next pass/i)).toBeTruthy();
+    expect(within(laneCard("anton-pick2")).getByText(/next read/i)).toBeTruthy();
+  });
+
+  it("says nothing at all on a pick the current generation names — the chip is the exception", () => {
+    // The whole point of persisting the ranking on every read: a drawn pick is normally named by a
+    // generation the moment it appears, so this state is rare and must not be worn by a pick that
+    // has its record (anton-84lx).
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
+
+    expect(within(laneCard("anton-pick2")).queryByText(/anton records this next read/i)).toBeNull();
+    expect(startButtons("anton-pick2")).toEqual(["Release"]);
+  });
+
+  it("reports a REFUSED release as its own state, never as a pick still waiting to be recorded", async () => {
+    // The generation on screen was superseded and the re-derived ranking leaves the target out
+    // (anton-k4qr): anton would not start it now, so the start is not coming back. Reported as the
+    // withheld-start chip it would have the operator waiting for one that never does (anton-84lx).
+    stubFetch({
+      "/approve": json(
+        {
+          error:
+            "anton-pick2 is no longer one of anton's picks: the plan you released from was " +
+            "replaced, and the current one leaves it out (policy). Nothing was approved or " +
+            "started — approve it directly if you still want this run.",
+          pickRefused: "retired",
+        },
+        409,
+      ),
+    });
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
+
+    fireEvent.click(within(laneCard("anton-pick2")).getByRole("button", { name: /release/i }));
+
+    const refused = await within(laneCard("anton-pick2")).findByRole("alert");
+    expect(refused.textContent).toMatch(/anton no longer picks this/i);
+    expect(refused.getAttribute("title")).toMatch(/approve it directly/i);
+    // And it is NOT the pending chip: that one promises a start the next read brings back.
+    expect(within(laneCard("anton-pick2")).queryByText(/anton records this next read/i)).toBeNull();
+    // The button it replaced is gone, so there is nothing left to click into a refusal again.
+    expect(startButtons("anton-pick2")).toEqual([]);
   });
 
   it("leaves an ordinary Backlog card alone — it is not a pick, so it is not waiting on one", () => {

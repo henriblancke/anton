@@ -37,11 +37,12 @@ import { describeScoreSlide } from "../autopilot-score-slide";
 import { describeWipHold } from "../autopilot-wip";
 import { saveBoardPickerPlan } from "../board-picker-plan";
 import { activeDeferrals, pickerTrackRecord } from "../picker-veto";
-import { earnedPickerAutonomy } from "../gardener/autonomy";
+import { pickerApplyVerdict } from "../gardener/autonomy";
 import type { Policy } from "../policy/types";
 import {
   getProjectById,
   getProjectSettings,
+  resolvePickerApplyOverride,
   resolvePickerAutonomy,
   resolvePickerPolicy,
 } from "../projects";
@@ -168,10 +169,20 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // Said out loud, because a setting the pass silently ignores is the unexplained state this whole
     // floor exists to avoid: the operator asked for `apply` and is getting `shadow`, and the counts
     // are the only thing that tells them why, and what would lift it.
-    if (settings.pickerAutonomy === "apply" && autonomy !== "apply" && settings.pickerPolicy) {
-      console.info(
-        `[board-picker] ${projectId}: apply not earned — ${earnedPickerAutonomy(record).reason}`,
-      );
+    //
+    // A DELIBERATE arming is said out loud on every pass it carries (anton-d1lk), for the mirror
+    // reason: this project is starting work on a signature rather than on a record, and the log is
+    // where that has to be legible when nobody is looking at settings.
+    const verdict = pickerApplyVerdict(record, resolvePickerApplyOverride(settings));
+    if (settings.pickerAutonomy === "apply" && settings.pickerPolicy) {
+      if (autonomy !== "apply") {
+        console.info(`[board-picker] ${projectId}: apply not earned — ${verdict.reason}`);
+      } else if (verdict.arming === "deliberate" && verdict.deliberate) {
+        console.info(
+          `[board-picker] ${projectId}: apply armed deliberately by ${verdict.deliberate.by} ` +
+            `on ${verdict.deliberate.at} — ${verdict.earned.reason}`,
+        );
+      }
     }
     const decision = await decideOver(db, { projectId, board, observedAtMs, armed });
 

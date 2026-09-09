@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { toast } from "sonner";
 
+import { PICKER_BAR } from "@/components/settings/sections/picker-autonomy-section";
 import { SettingsView } from "@/components/settings/settings-view";
 import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
 import { REPAIR_CLASSES } from "@/lib/gardener/repair";
@@ -71,13 +72,32 @@ const FALLBACK_DRAFT: Parameters<typeof SettingsView>[0]["policyDraft"] = {
 type PickerEarned = Parameters<typeof SettingsView>[0]["pickerEarned"];
 
 /**
+ * The quota split as the server resolves it (R6). One project, nothing attributed yet — what a
+ * single-repo machine that has never declared a share looks like; the panel is its own suite.
+ */
+const QUOTA_PROJECTS: Parameters<typeof SettingsView>[0]["quotaProjects"] = [
+  {
+    id: project.id,
+    slug: project.slug,
+    name: project.name,
+    sharePct: 100,
+    declared: false,
+    governed: false,
+    reserved: false,
+    eligible: true,
+    spentWeeklyPct: null,
+    seeded: false,
+  },
+];
+
+/**
  * The picker's own accept/veto record (anton-vkp9). The default is the project every operator
  * starts on — no pick answered either way, so `apply` is locked and has to say what on.
  */
 const NO_PICKER_RECORD: PickerEarned = {
   accepted: 0,
   settled: 0,
-  eligible: false,
+  bar: PICKER_BAR,
   reason: "no answered picks yet — apply unlocks at 20 answered with 90% released",
 };
 
@@ -107,6 +127,7 @@ function renderView(
       boardUnavailable={false}
       earned={earned}
       pickerEarned={pickerEarned}
+      quotaProjects={QUOTA_PROJECTS}
     />,
   );
 }
@@ -2229,26 +2250,44 @@ describe("SettingsView picker autonomy (anton-vkp9)", () => {
     renderView({ ...ARMED }, [], [], NO_RECORD, [], {
       accepted: 12,
       settled: 15,
-      eligible: false,
+      bar: PICKER_BAR,
       reason: "12/15 released — apply unlocks at 20 answered with 90% released",
     });
 
     expect(
       screen.getByText(/12\/15 released — apply unlocks at 20 answered with 90% released/),
     ).toBeTruthy();
+    // And where it stands on each rung of the ladder, against the bar that rung is read against.
+    expect(screen.getByText("15/20")).toBeTruthy();
+    expect(screen.getByText("80%/90%")).toBeTruthy();
     expect((screen.getByLabelText("picker · apply") as HTMLInputElement).disabled).toBe(true);
     // The levels that MAKE the record are never gated — that is where the counts come from.
     expect((screen.getByLabelText("picker · shadow") as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it("names what the answered rung counts, so a paced week does not read as lost clicks", () => {
+    // `settled` counts releases and `Never` disagreements only (anton-31gm), so a label promising
+    // "released or vetoed" would contradict an operator who just deferred a dozen picks.
+    renderView({ ...ARMED }, [], [], NO_RECORD, [], {
+      accepted: 12,
+      settled: 15,
+      bar: PICKER_BAR,
+    });
+
+    expect(screen.getByText("picks you released or refused with Never")).toBeTruthy();
+    expect(screen.getByText(/is pacing, not a verdict on the ranking/)).toBeTruthy();
   });
 
   it("names the record on the way up too, once it clears the bar", () => {
     renderView({ ...ARMED }, [], [], NO_RECORD, [], {
       accepted: 19,
       settled: 20,
-      eligible: true,
+      bar: PICKER_BAR,
+      arming: "earned",
     });
 
-    expect(screen.getByText(/19\/20 released — clears the bar/)).toBeTruthy();
+    expect(screen.getByText(/this record clears the bar/)).toBeTruthy();
+    expect(screen.getByText("19 of 20 answered")).toBeTruthy();
     expect((screen.getByLabelText("picker · apply") as HTMLInputElement).disabled).toBe(false);
   });
 
@@ -2272,7 +2311,12 @@ describe("SettingsView picker autonomy (anton-vkp9)", () => {
 
   it("PATCHes the level as soon as it is chosen", async () => {
     const fetchMock = stubFetch();
-    renderView({ ...ARMED }, [], [], NO_RECORD, [], { accepted: 20, settled: 20, eligible: true });
+    renderView({ ...ARMED }, [], [], NO_RECORD, [], {
+      accepted: 20,
+      settled: 20,
+      bar: PICKER_BAR,
+      arming: "earned",
+    });
 
     fireEvent.click(screen.getByLabelText("picker · apply"));
 

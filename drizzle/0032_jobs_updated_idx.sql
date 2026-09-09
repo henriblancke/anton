@@ -1,0 +1,11 @@
+-- Index the quota-share spend estimate's read (anton-yxux / R6.3, PR #248 review). It sums job
+-- attempts over the current quota week — once per governor tick narrowed to one project, and once
+-- per settings render across all of them — and `updated_at` carried no index at all, so both were
+-- full scans of a jobs table that keeps every finished job for the life of the project.
+--
+-- `updated_at` leads because the week window is the predicate BOTH readers share; the all-project
+-- read has no project id to seek on, so a (project_id, updated_at) index would leave it scanning.
+--
+-- Reverse:
+--   DROP INDEX `jobs_updated_project_idx`;
+CREATE INDEX `jobs_updated_project_idx` ON `jobs` (`updated_at`,`project_id`);

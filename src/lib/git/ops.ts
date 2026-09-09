@@ -41,6 +41,23 @@ async function diffPaths(cwd: string, args: string[]): Promise<string[]> {
 }
 
 /**
+ * Paths a SINGLE commit changed against its first parent, read exactly as on disk — the `git show`
+ * analogue of {@link diffPaths}, untrimmed for the same reason: leading and trailing whitespace are
+ * legal in a filename, so `git()`'s `stdout.trim()` would corrupt a path that begins or ends with
+ * it (PR #255 review). ONE commit per call by design — a multi-commit `git show` interleaves a bare
+ * `\n` between sections that `-z` does not suppress on every git, folding it onto the first path of
+ * each later commit (PR #255 review).
+ */
+async function showPaths(cwd: string, sha: string): Promise<string[]> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", cwd, "show", "--name-only", "-z", "--format=", sha],
+    { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+  );
+  return stdout.split("\0").filter(Boolean);
+}
+
+/**
  * Run git and keep at most `maxChars` of its stdout, killing it the moment output overflows.
  *
  * For commands whose output has no useful upper bound. `git()` collects stdout through execFile's
@@ -750,23 +767,179 @@ export async function worktreeHasPreservedCommitFor(
   return (await branchSubjects(worktreePath, options)).some((s) => s.startsWith(prefix));
 }
 
-/** How far back a subject scan reads. A run's own commits are always at the branch tip. */
-const BRANCH_SUBJECTS_ARGS = ["log", "--format=%s", "-n", "1000"];
+/**
+ * True when the branch TIP is this ticket's preserved (`WIP <id>:`) commit — the question the
+ * self-committed-work adoption asks before deciding a fresh marker is unnecessary (PR #255 review).
+ *
+ * History-wide presence ({@link worktreeHasPreservedCommitFor}) is NOT the same question, and using
+ * it here loses work: an older marker sitting BENEATH newer self-commits does not cover them, so the
+ * resume's newest `WIP` would no longer be the preserved tip and its `baseline..tip` range would omit
+ * the latest commits. Only a marker AT the tip covers everything down to the baseline. Fails closed
+ * to `false` — the answer that makes a marker, never the one that skips it — like
+ * {@link worktreeHasPreservedCommitFor}.
+ */
+export async function worktreeTipIsPreservedCommitFor(
+  worktreePath: string,
+  ticketId: string,
+  options: { strict?: boolean } = {},
+): Promise<boolean> {
+  const prefix = preservedCommitPrefix(ticketId);
+  const [tip] = await branchCommits(worktreePath, options);
+  return tip !== undefined && tip.subject.startsWith(prefix);
+}
+
+/** A timed-out attempt's preserved commit, as the resume's dispatch prompt describes it. */
+export interface PreservedCommit {
+  /** Full sha of the NEWEST preserved commit — the tip of this ticket's preserved work. */
+  sha: string;
+  subject: string;
+  /**
+   * The paths changed across the WHOLE preserved delta (anton-16pq): a ticket can time out more than
+   * once, and each timeout adds only its own delta, so the newest commit alone omits what earlier
+   * ones kept. With {@link baseline} known this is the single diff `baseline..sha`, which also
+   * captures a first attempt's SELF-committed work living beneath an empty marker — a per-commit
+   * union would see the (empty) marker and miss it (PR #255 review). `[]` is ambiguous — the marker
+   * form (empty newest commit, work beneath) OR a range that nets to nothing though the newest
+   * commit is non-empty (earlier edits undone by later ones) — so {@link newestEmpty} disambiguates
+   * it for the prompt. `undefined` means the diff could NOT be read: a git failure is not an empty
+   * commit, and the prompt must not present a failed read as proof nothing was kept.
+   */
+  files: string[] | undefined;
+  /**
+   * The OLDER preserved commits beneath {@link sha}, newest first — non-empty only when the ticket
+   * timed out more than once. Their work is on the branch too, so the prompt sends the agent across
+   * all of them rather than only the newest.
+   */
+  earlier: { sha: string; subject: string }[];
+  /**
+   * The ticket's fork point, when it resolved to a commit — the START of the range holding ALL of
+   * this run's preserved work, self-committed commits included (anton-16pq). The prompt points
+   * `git show baseline..sha` at it. Absent when the base could not be resolved; the prompt then
+   * falls back to a marker-relative range.
+   */
+  baseline?: string;
+  /**
+   * Whether the NEWEST preserved commit is itself empty — the signal that disambiguates a `[]`
+   * {@link files} (PR #255 review). An empty newest commit is the marker form: the work is in the
+   * commits beneath it. A non-empty newest commit whose `baseline..sha` range still nets to `[]` is
+   * NOT a marker — earlier attempts' edits were undone by later ones — and the prompt must not point
+   * the agent beneath it. `undefined` when git could not be read (the newest commit's own diff), in
+   * which case the prompt keeps the pre-existing marker wording rather than guess.
+   */
+  newestEmpty?: boolean;
+}
 
 /**
- * The subjects at the tip of the branch checked out in `worktreePath` — or, given `base`, only
- * those the branch carries beyond it. Fails closed to none (git error → treat as absent) rather
- * than risk a skip — except under `strict`, where absence is the permissive answer and the caller
- * has asked to see the failure instead.
+ * The preserved commits themselves, for the prompt that tells a RESUMED ticket its earlier attempts'
+ * work is already on the branch (anton-16pq).
+ *
+ * ALL matching commits are collected, not just the newest: a ticket can time out more than once, and
+ * each preserve holds only the delta since the last, so the newest commit alone hides what the
+ * earlier ones kept — the agent must be pointed at the whole range. Fails closed to `undefined` for
+ * the same reason {@link worktreeHasPreservedCommitFor} fails closed to `false` — a git read that
+ * failed is not proof of absence, but the only cost here is a prompt that says nothing extra, and a
+ * dispatch is never worth failing over a paragraph of prose. A diff that fails AFTER the history
+ * lookup succeeds is carried as `files: undefined`, distinct from the marker's `[]`, so the prompt
+ * never reads a failed read as an empty commit.
+ *
+ * `baseRef` is the fork point to measure the preserved delta against. Resolving it lets the prompt
+ * point at `baseline..sha`, which — unlike a per-commit union — includes a first attempt's
+ * self-committed work beneath an empty marker (PR #255 review). It is OPTIONAL and best-effort: a
+ * base that will not resolve to a commit drops the range to the marker-relative fallback rather than
+ * failing the read.
  */
+export async function readPreservedCommitFor(
+  worktreePath: string,
+  ticketId: string,
+  baseRef?: string,
+): Promise<PreservedCommit | undefined> {
+  const prefix = preservedCommitPrefix(ticketId);
+  const matches = (await branchCommits(worktreePath)).filter((c) => c.subject.startsWith(prefix));
+  const [newest, ...earlier] = matches;
+  if (!newest) return undefined;
+  // Only a fork point that resolved to a real commit is usable as a `git show` range endpoint —
+  // resolveMergeBase hands back the base NAME verbatim when it names nothing, and that is no
+  // revision to diff or show.
+  const resolved = baseRef
+    ? await resolveMergeBase(worktreePath, baseRef).catch(() => undefined)
+    : undefined;
+  const baseline = resolved && /^[0-9a-f]{40}$/.test(resolved) ? resolved : undefined;
+  // The newest commit's OWN diff, kept apart from the aggregate `files`: only it tells a genuine
+  // empty marker from a range that nets to nothing (PR #255 review).
+  const newestOwnFiles = await showPaths(worktreePath, newest.sha).catch(() => undefined);
+  return {
+    sha: newest.sha,
+    subject: newest.subject,
+    earlier,
+    baseline,
+    files: await preservedFiles(worktreePath, matches, baseline),
+    newestEmpty: newestOwnFiles === undefined ? undefined : newestOwnFiles.length === 0,
+  };
+}
+
+/**
+ * The union of paths changed across the whole preserved delta — `undefined` on a git failure (an
+ * unknown/error state the prompt keeps distinct from a genuine empty marker), `[]` when nothing
+ * changed.
+ *
+ * With `baseline` known, the answer is the single diff `baseline..newest`: it spans self-committed
+ * work beneath an empty marker as well as the markers, which a per-commit union of the markers alone
+ * would miss (PR #255 review). Without a fork point it falls back to a per-commit union — one
+ * {@link showPaths} per marker, so a multi-commit `git show`'s inter-section `\n` never folds onto a
+ * path. Both read paths are `-z` (under `core.quotePath` a non-ASCII path comes back C-quoted, and
+ * the prompt would name a file not on disk) and untrimmed (leading/trailing whitespace is a legal
+ * filename), and both fail closed to `undefined`.
+ */
+async function preservedFiles(
+  worktreePath: string,
+  commits: { sha: string }[],
+  baseline: string | undefined,
+): Promise<string[] | undefined> {
+  const newest = commits[0]?.sha;
+  if (!newest) return [];
+  if (baseline) {
+    return diffPaths(worktreePath, ["--name-only", "--no-renames", baseline, newest]).catch(
+      () => undefined,
+    );
+  }
+  const perCommit = await Promise.all(commits.map((c) => showPaths(worktreePath, c.sha))).catch(
+    () => undefined,
+  );
+  return perCommit === undefined ? undefined : [...new Set(perCommit.flat())];
+}
+
+/** How far back a subject scan reads. A run's own commits are always at the branch tip. */
+const BRANCH_LOG_ARGS = ["log", "--format=%H%x00%s", "-n", "1000"];
+
+/**
+ * The commits at the tip of the branch checked out in `worktreePath`, newest first — or, given
+ * `base`, only those the branch carries beyond it (`<base>..HEAD`). Fails closed to none (git error
+ * → treat as absent) rather than risk a skip — except under `strict`, where absence is the
+ * permissive answer and the caller has asked to see the failure instead.
+ *
+ * NUL between sha and subject: a subject may contain anything a person can type, so any printable
+ * separator is one a commit message can forge.
+ */
+async function branchCommits(
+  worktreePath: string,
+  options: { strict?: boolean; base?: string } = {},
+): Promise<{ sha: string; subject: string }[]> {
+  const args = options.base ? [...BRANCH_LOG_ARGS, `${options.base}..HEAD`, "--"] : BRANCH_LOG_ARGS;
+  const log = options.strict
+    ? await git(worktreePath, args)
+    : await git(worktreePath, args).catch(() => "");
+  return log.split("\n").flatMap((line) => {
+    const [sha, ...rest] = line.split("\0");
+    return sha && rest.length > 0 ? [{ sha, subject: rest.join("\0") }] : [];
+  });
+}
+
+/** The branch's commit subjects — {@link branchCommits} for the readers that only match on text. */
 async function branchSubjects(
   worktreePath: string,
   options: { strict?: boolean; base?: string } = {},
 ): Promise<string[]> {
-  const args = options.base ? [...BRANCH_SUBJECTS_ARGS, `${options.base}..HEAD`, "--"] : BRANCH_SUBJECTS_ARGS;
-  if (options.strict) return (await git(worktreePath, args)).split("\n");
-  const log = await git(worktreePath, args).catch(() => "");
-  return log.split("\n");
+  return (await branchCommits(worktreePath, options)).map((c) => c.subject);
 }
 
 /**

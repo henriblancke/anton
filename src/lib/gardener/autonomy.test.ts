@@ -22,6 +22,7 @@ import {
   earnedAutonomyOfKind,
   earnedPickerAutonomy,
   emptyTrackRecord,
+  pickerApplyVerdict,
   resolveProposalAutonomyPolicy,
   type ProposalAutonomyPolicy,
   type ProposalTrackRecord,
@@ -291,6 +292,52 @@ describe("the same floor over the picker's record (anton-vkp9)", () => {
     const degraded = { settled: bar.minSettled, accepted: bar.minSettled - 3 };
     expect(earnedPickerAutonomy(armed).eligible).toBe(true);
     expect(earnedPickerAutonomy(degraded).eligible).toBe(false);
+  });
+});
+
+describe("the deliberate arming — an operator standing in for the record (anton-d1lk)", () => {
+  const bar = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+  const EARNED_RECORD = { settled: bar.minSettled, accepted: bar.minSettled };
+  const NO_PICKS = { settled: 0, accepted: 0 };
+  const SIGNED = { by: "Henri Blancke", at: "2026-09-06T10:00:00.000Z" };
+
+  it("refuses apply on an unearned record when nobody has signed for it", () => {
+    const verdict = pickerApplyVerdict(NO_PICKS);
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.arming).toBeUndefined();
+    // The floor's own words, unchanged: a bypass that exists does not soften the refusal for the
+    // projects that have not taken it.
+    expect(verdict.reason).toBe(earnedPickerAutonomy(NO_PICKS).reason);
+  });
+
+  it("allows apply on an unearned record once an operator has signed for it", () => {
+    const verdict = pickerApplyVerdict(NO_PICKS, SIGNED);
+    expect(verdict.allowed).toBe(true);
+    expect(verdict.arming).toBe("deliberate");
+    expect(verdict.deliberate).toEqual(SIGNED);
+    // The counts it is standing in for are still reported — an override hides nothing.
+    expect(verdict.earned.eligible).toBe(false);
+    expect(verdict.earned.reason).toBe(earnedPickerAutonomy(NO_PICKS).reason);
+  });
+
+  it("calls an earned level earned, even with a signature standing", () => {
+    // The signature stays attached — who armed it and when outlives the moment it mattered — but the
+    // level is no longer being held up by it, and saying otherwise would understate the project.
+    const verdict = pickerApplyVerdict(EARNED_RECORD, SIGNED);
+    expect(verdict.arming).toBe("earned");
+    expect(verdict.deliberate).toEqual(SIGNED);
+    expect(verdict.reason).toBeUndefined();
+  });
+
+  it("returns the project to the floor the moment the signature is revoked", () => {
+    // Revoking is dropping the arming, and nothing latches: the same record answers again.
+    expect(pickerApplyVerdict(NO_PICKS, SIGNED).allowed).toBe(true);
+    expect(pickerApplyVerdict(NO_PICKS).allowed).toBe(false);
+  });
+
+  it("leaves an earned project exactly where it was when a redundant signature is revoked", () => {
+    expect(pickerApplyVerdict(EARNED_RECORD).allowed).toBe(true);
+    expect(pickerApplyVerdict(EARNED_RECORD).arming).toBe("earned");
   });
 });
 

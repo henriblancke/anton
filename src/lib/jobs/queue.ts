@@ -671,7 +671,9 @@ export function enqueueSyncPushDeduped(
  * Atomically lease up to `limit` runnable jobs and return them. Runnable =
  *   • `queued` and due (runAt ≤ now), OR
  *   • `running` but the lease expired (crashed worker → reclaim).
- * Leasing sets status=`running`, a fresh lease, and increments `attempts`.
+ * Leasing sets status=`running`, a fresh lease, and increments `attempts`. It does NOT touch the
+ * spend meter (`spentAttempts`): that charge lands when the handler reaches Claude
+ * ({@link chargeSpentAttempt}), never at lease time — see there for why.
  *
  * The runner is single-process, so a read-then-write inside one better-sqlite3 transaction is
  * sufficient mutual exclusion.
@@ -788,14 +790,10 @@ export async function leaseDue(
     // so a cap on one job type — execute-epic concurrency, or a disabled schedule's cap-0 — never
     // counts against a different type sharing the same project (anton-7l7).
     const bucketKey = (type: string, projectId: string | null) => `${type}\0${projectId ?? ""}`;
-    const liveLoad =
-      excludeIds.length > 0
-        ? or(gt(schema.jobs.leaseExpiresAt, nowDate), inArray(schema.jobs.id, excludeIds))
-        : gt(schema.jobs.leaseExpiresAt, nowDate);
     const active = await db
       .select({ projectId: schema.jobs.projectId, type: schema.jobs.type })
       .from(schema.jobs)
-      .where(and(eq(schema.jobs.status, "running"), liveLoad));
+      .where(liveRunning(nowDate, excludeIds));
     const usedByBucket = new Map<string, number>();
     // The per-type load is tallied separately from the buckets: it spans every project, so it
     // cannot ride the (type, project) key.
@@ -867,6 +865,45 @@ export async function leaseDue(
     .returning();
 
   return leased;
+}
+
+/**
+ * The rows occupying a concurrency slot right now: `running` with a lease still in force, or still
+ * dispatched in-process (`inFlightIds`) whatever its DB lease says. One definition, shared by
+ * `leaseDue`'s per-bucket cap and {@link bucketLiveLoad}, so the governor's slot count can never
+ * disagree with the lease that follows it.
+ */
+function liveRunning(nowDate: Date, inFlightIds: readonly string[]): SQL | undefined {
+  const live =
+    inFlightIds.length > 0
+      ? or(gt(schema.jobs.leaseExpiresAt, nowDate), inArray(schema.jobs.id, inFlightIds))
+      : gt(schema.jobs.leaseExpiresAt, nowDate);
+  return and(eq(schema.jobs.status, "running"), live);
+}
+
+/**
+ * How many jobs one `(type, projectId)` bucket has live, by `leaseDue`'s own definition — what a
+ * new lease in that bucket competes with under `capOf`. The runner's value gate reads it so a
+ * candidate the bucket cannot admit this tick reserves no quota share (PR #248 review).
+ */
+export async function bucketLiveLoad(
+  db: AntonDb,
+  clock: Clock,
+  opts: { type: JobType; projectId: string | null; inFlightIds: Iterable<string> },
+): Promise<number> {
+  const rows = await db
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        liveRunning(secDate(clock.now()), [...opts.inFlightIds]),
+        eq(schema.jobs.type, opts.type),
+        opts.projectId === null
+          ? isNull(schema.jobs.projectId)
+          : eq(schema.jobs.projectId, opts.projectId),
+      ),
+    );
+  return rows.length;
 }
 
 /**
@@ -987,6 +1024,36 @@ export function toJobOutcome(
   return { outcome: effect.changed ? "ok" : "noop", outcomeNote: effect.note ?? null };
 }
 
+/**
+ * Charge one attempt to the project's spend meter (`spentAttempts`) — the runner writes it the
+ * moment the handler reports it is about to spawn Claude, once per attempt (PR #248 review).
+ *
+ * Charged at the spawn rather than at the lease because the lease is not evidence of spend: an
+ * attempt can exit in preflight without ever invoking Claude (an abandoned target, a lease held
+ * elsewhere, a run already carried to a PR), and a charge taken up front had to be handed back on
+ * every such exit. That refund needed the runner to settle — a process that dies after the lease
+ * and before the spawn left the charge on the row for good, and the reclaim leased (and charged) it
+ * again, so a preflight that crashed repeatedly could spend a project's whole share on nothing.
+ * Writing the charge only when Claude is reached leaves nothing to reconcile: a crash before the
+ * write spent nothing and is charged nothing; a crash after it burned quota and keeps the charge.
+ *
+ * Not guarded on status: the handler is about to spawn whatever the row says, and quota accounting
+ * sums every status. `updatedAt` is left alone — it is the lease's timestamp, and on a cancelled
+ * row the cancel's, which `resumeEpic` reads as evidence.
+ */
+export async function chargeSpentAttempt(db: AntonDb, jobId: string): Promise<void> {
+  await db
+    .update(schema.jobs)
+    .set({ spentAttempts: sql`${schema.jobs.spentAttempts} + 1` })
+    .where(eq(schema.jobs.id, jobId));
+}
+
+/**
+ * Settle a running job as `done`. The spend meter is untouched here: the charge, if any, landed when
+ * the handler reached Claude ({@link chargeSpentAttempt}), so a job that finished without ever
+ * invoking it — a run resumed onto a PR it had already opened, an abandoned target — was never
+ * charged and has nothing to hand back.
+ */
 export async function complete(
   db: AntonDb,
   clock: Clock,
@@ -1010,7 +1077,10 @@ export async function complete(
 /**
  * Reschedule a job to run again at `runAtMs` (used for both quota backoff and retry). Returns it
  * to `queued` and clears the lease so it is picked up when due. Optionally rewinds `attempts`
- * (quota isn't the job's fault, so it shouldn't burn the poison budget).
+ * (quota isn't the job's fault, so it shouldn't burn the poison budget). `spentAttempts` is never
+ * rewound: it counts spawns, not leases (see {@link chargeSpentAttempt}), so a quota hit keeps its
+ * charge — the limit is Claude's own answer, and a multi-call handler may have finished real work
+ * before it — while a preflight exit was never charged (PR #248 review).
  *
  * One collision is possible for sync-push (anton-x7la): its dedup index is queued-only, so while
  * this job was `running` a board write may have enqueued a fresh queued follow-up into the project's
@@ -1125,6 +1195,15 @@ function priorErrorSql(): SQL {
  * its own), never burns an attempt, and only ever moves a job *later* — a job already scheduled past
  * `retryAtMs` (e.g. a longer quota backoff) is left where it is. Returns how many rows it deferred.
  *
+ * Only DUE rows — and rows the governor itself already holds — are deferred (PR #248 review). A row
+ * still inside a retry or usage-limit backoff cannot start before that backoff elapses whatever the
+ * governor decides, and the governor's marker is read as demand by the quota split
+ * (`observedWorkEligibility`): stamping it on a backed-off row would keep a project that cannot
+ * spend in the divisor for the length of a backoff it was already idle through. Leaving the row
+ * alone loses nothing — the governor holds the bucket every tick it pays, and defers the row the
+ * tick it comes due if the budget still says so. A row already carrying the marker was due when it
+ * was first held, so a later, longer boundary may move it again and keep its note current.
+ *
  * `bypass` filters execute-epic rows by the `bypassBudget` payload flag (anton-d8i4), so the governor
  * can hold the paced ("Queue") jobs and the immediate-approved ("Approve"/run-directly) ones on
  * different boundaries: `"exclude"` matches only the paced rows (flag unset), `"only"` matches only
@@ -1171,6 +1250,10 @@ export async function deferQueuedJobs(
         opts.projectId == null
           ? isNull(schema.jobs.projectId)
           : eq(schema.jobs.projectId, opts.projectId),
+        or(
+          lte(schema.jobs.runAt, secDate(nowMs)),
+          like(schema.jobs.lastError, `${BUDGET_DEFER_PREFIX}%`),
+        ),
         lt(schema.jobs.runAt, retryDate),
         bypassFilter,
       ),
@@ -1236,7 +1319,12 @@ export async function park(
   const nowMs = clock.now();
   const rows = await db
     .update(schema.jobs)
-    .set({ status: "parked", leaseExpiresAt: null, lastError, updatedAt: secDate(nowMs) })
+    .set({
+      status: "parked",
+      leaseExpiresAt: null,
+      lastError,
+      updatedAt: secDate(nowMs),
+    })
     .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...ACTIVE_STATUSES])))
     .returning({ id: schema.jobs.id });
   return rows.length > 0;
@@ -1247,6 +1335,7 @@ export async function park(
  * ticket) triggers. Returns a `parked` job to `queued`, due now, with `attempts` reset to 0 so it
  * gets a fresh retry budget rather than parking again on the next failure. This is what stops a
  * transient error that exhausted maxAttempts from being a permanent dead end (anton-ner.2).
+ * `spentAttempts` is left alone: the retry budget is renewed, the quota those attempts burned is not.
  *
  * Un-parks a `parked` job or a `failed` (reserved terminal) one; a no-op for anything else (returns
  * false) — resuming a running/done/queued job would corrupt its lifecycle. The status guard is

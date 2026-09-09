@@ -380,6 +380,69 @@ export function earnedPickerAutonomy(record: PickerRecordCounts): EarnedPickerAu
   };
 }
 
+// ── the deliberate arming (anton-d1lk) ──
+
+/**
+ * An operator's signature on a bypass of the earned floor: WHO armed `apply` on this project, and
+ * WHEN.
+ *
+ * Two fields, because a bypass is only worth having if it is accountable. The record is a project's
+ * evidence that its picks were worth starting; an operator who arms without it is substituting their
+ * own judgement for that evidence, and this is the name they put to it. `at` is an ISO-8601 instant
+ * rather than epoch ms: the only thing that reads it is a surface saying when, and nothing here does
+ * arithmetic on it.
+ */
+export interface DeliberateArming {
+  by: string;
+  at: string;
+}
+
+/** What allows `apply`: this project's own record, or an operator's explicit override of it. */
+export type PickerArming = "earned" | "deliberate";
+
+/** Whether the picker may be armed at `apply`, on WHAT, and — when it may not — why not. */
+export interface PickerApplyVerdict {
+  /** May the picker be armed at `apply` at all? */
+  allowed: boolean;
+  /** What allows it. Absent exactly when it is not allowed. */
+  arming?: PickerArming;
+  /** The earned verdict, ALWAYS — an override never hides the counts it is standing in for. */
+  earned: EarnedPickerAutonomy;
+  /** The stored arming, whenever there is one — including when the record has since caught up. */
+  deliberate?: DeliberateArming;
+  /** Why `apply` is unavailable, with the counts. Absent exactly when it is allowed. */
+  reason?: string;
+}
+
+/**
+ * The earned floor, with the operator's own override weighed against it (anton-d1lk).
+ *
+ * The floor's whole point is that trust is EVIDENCE, so the bypass cannot be a quiet setting: it
+ * arrives as a signature ({@link DeliberateArming}) and it is reported as one. `arming` says
+ * "deliberate" exactly while the record does NOT support `apply` — so the surface that renders this
+ * can never dress an override up as an earned level — and flips to "earned" once the counts clear
+ * the bar on their own, because at that point the sentence "this project earned it" is simply true.
+ * The signature stays attached either way: who armed it and when outlives the moment it mattered.
+ *
+ * What it bypasses is the earned floor and NOTHING else. The structural floor is a fact about
+ * settings rather than about a record, so it lives with them ({@link resolvePickerAutonomy} in
+ * projects.ts) and still refuses an unarmed project; the brakes and the budget governor sit
+ * downstream of the level entirely and are untouched by any of this.
+ *
+ * Pure over (record, arming), like everything else here — the stored signature is read and validated
+ * by the caller, exactly as the counts are derived by the caller.
+ */
+export function pickerApplyVerdict(
+  record: PickerRecordCounts,
+  deliberate?: DeliberateArming,
+): PickerApplyVerdict {
+  const earned = earnedPickerAutonomy(record);
+  const signature = deliberate ? { deliberate } : {};
+  if (earned.eligible) return { allowed: true, arming: "earned", earned, ...signature };
+  if (deliberate) return { allowed: true, arming: "deliberate", earned, deliberate };
+  return { allowed: false, earned, ...(earned.reason ? { reason: earned.reason } : {}) };
+}
+
 /**
  * How far this proposal may go: the policy's answer for its kind, floored by what the move can
  * actually DO and by what the kind's own proposals have EARNED.

@@ -34,7 +34,10 @@ const TICKET_ID = "anton-tick";
 const NOT_SHIPPED_ID = "anton-open";
 /** The bead a VERIFIABLE claim names: closed, and named by a commit the run's base contains. */
 const SHIPPED_ID = "anton-done";
-/** The commit the worktree forked from — what every landing check is pinned to, not `origin/main`. */
+/**
+ * The commit the worktree forked from, as `warmRunWorktree` pinned it at CREATION — what every
+ * landing check is measured against, not `origin/main` and not a fork recomputed here.
+ */
 const FORK = "f".repeat(40);
 
 const claimMock = vi.fn(async () => {});
@@ -231,6 +234,7 @@ function run(
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: FORK,
     target: { id: EPIC_ID, title: "The epic", status: "in_progress", issue_type: "epic" } as Bead,
     settings: { repairAutonomy: { "already-shipped": autonomy } },
   } as unknown as Omit<StepContext, "tickets">;
@@ -437,33 +441,33 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
     expect(supersedeMock).toHaveBeenCalledWith(REPO, TICKET_ID, SHIPPED_ID);
     expect(setStatusMock).not.toHaveBeenCalled();
     expect(unassignMock).toHaveBeenCalledWith(REPO, TICKET_ID);
-    // Checked against the commit the WORKTREE forked from, never the moving `origin/main` the run
-    // was cut at (PR #238 review): a sibling run's fetch advances that ref, and a resumed checkout
-    // is reused as-is, so the ref can hold work this branch does not.
-    expect(resolveForkPointMock).toHaveBeenCalledWith(WORKTREE, "origin/main");
+    // Checked against the PERSISTED fork commit, never the moving `origin/main` the run was cut at
+    // and never a fork recomputed here (PR #238 review): `origin/<base>` can be force-reset backward
+    // after the worktree was made, and re-running `merge-base` then answers the rewound tip — a
+    // survivor between the two is in the checkout's real base but absent from that older history, so
+    // the check would reject a valid claim. The pin is immutable across resumes and base rewinds.
     expect(readCommitNamingMock).toHaveBeenCalledWith(REPO, SHIPPED_ID, FORK);
     expect(readCommitNamingMock).not.toHaveBeenCalledWith(REPO, SHIPPED_ID, "origin/main");
+    expect(resolveForkPointMock).not.toHaveBeenCalled();
   });
 
-  // The fork point IS the check's baseline, so a fork point git cannot compute is a check that
-  // cannot run — the repair fails and the block stands, rather than falling back to the ref. The
-  // strict resolver also refuses a base rewritten to an unrelated history (PR #238 review), and that
-  // refusal takes the same path: no fork point, no retirement.
-  it("retires nothing when the worktree's fork point cannot be computed", async () => {
+  // The rewind the pin exists for (PR #238 review): the base moved back after the worktree was cut,
+  // so a recompute would hand the check the older history. The persisted SHA is what the repair
+  // reads, so the verdict is unchanged by whatever `origin/main` now points at.
+  it("verifies against the pinned fork even when the base has since been rewound", async () => {
     readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40), committedAt: "2026-01-01T00:00:00Z" });
-    resolveForkPointMock.mockRejectedValue(new Error("origin/main and HEAD share no commit"));
+    // Were the fork recomputed here, this is the rewound answer the check would have used.
+    resolveForkPointMock.mockResolvedValue("e".repeat(40));
 
-    const halt = await haltOf({
+    await haltOf({
       outcome: "blocked",
       klass: "already-shipped",
       reason: `Already implemented by ${SHIPPED_ID}`,
     });
 
-    expect(halt.message).toMatch(/produced no delivery/);
-    expect(readCommitNamingMock).not.toHaveBeenCalled();
-    expect(supersedeMock).not.toHaveBeenCalled();
-    expect(closeMock).not.toHaveBeenCalled();
-    expect(setStatusMock).toHaveBeenCalledWith(REPO, TICKET_ID, "blocked");
+    expect(readCommitNamingMock).toHaveBeenCalledWith(REPO, SHIPPED_ID, FORK);
+    expect(readCommitNamingMock).not.toHaveBeenCalledWith(REPO, SHIPPED_ID, "e".repeat(40));
+    expect(supersedeMock).toHaveBeenCalledWith(REPO, TICKET_ID, SHIPPED_ID);
   });
 
   // The repair reads the bead fresh after the report, and an edit landing while the agent ran is

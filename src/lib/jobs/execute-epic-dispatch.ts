@@ -38,7 +38,8 @@ import {
   TicketRetiredError,
   TicketTimeoutError,
 } from "./execute-epic-errors";
-import { mustPersist, mustRead, safe } from "./execute-epic-persist";
+import { mustPersist, mustRead, mustReadBoard, safe } from "./execute-epic-persist";
+import { runTargetAbove } from "./gate-targets";
 import type { RunPreparation } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
 import { runTicket } from "./execute-epic-ticket";
@@ -369,14 +370,31 @@ async function retireFound(run: EpicRun, ticket: Bead): Promise<RetiredTicketOut
       // and this read, and returning undefined feeds the loop the stale snapshot `ticket`:
       // reopenForRegeneration sees an already-open bead and no-ops, and runTicket claims it by id and
       // runs work that now belongs to that other target. So the retirement stands down only when the
-      // bead is still parented where this run left it; a bead rehomed since stops the run rather than
+      // ticket's RUN TARGET is still this run's; a bead rehomed since stops the run rather than
       // execute another target's ticket.
-      if (beads.parentOf(live) !== beads.parentOf(ticket)) {
+      //
+      // The run target is the ticket's first run-target ANCESTOR, not its direct parent (PR #238
+      // review): under feature → task → subtask, a reparent of the intermediate task moves the
+      // subtask's owner while leaving `parentOf(subtask)` untouched, so a direct-parent compare would
+      // wave the stale snapshot through onto a target that no longer owns it. Recompute the owner from
+      // a FRESH full board — the only read that carries the ancestry above `live` — and an unreadable
+      // board stops the run rather than guess, exactly as the superseded reread does above.
+      const board = await mustReadBoard(repo);
+      if (!board) {
+        throw new PoisonEpic(
+          `${ticket.id} was superseded on the board this run read and has since been reopened, but ` +
+            `bd would not read the board back, so anton cannot recompute which run target now owns ` +
+            `it — the run stopped rather than dispatch a ticket that may belong to a different ` +
+            `target. Check the beads DB, then resume the run`,
+        );
+      }
+      const owner = runTargetAbove(board, live.id);
+      if (owner?.id !== run.targetId) {
         throw new PoisonEpic(
           `${ticket.id} was superseded on the board this run read but has since been reopened and ` +
-            `reparented onto ${beads.parentOf(live) ?? "another target"} — the run stopped rather ` +
-            `than dispatch a ticket that now belongs to a different run target. Check the beads DB, ` +
-            `then resume the run`,
+            `now runs under ${owner?.id ?? "no run target"} rather than this run's ${run.targetId} ` +
+            `— the run stopped rather than dispatch a ticket that now belongs to a different run ` +
+            `target. Check the beads DB, then resume the run`,
         );
       }
       return undefined;

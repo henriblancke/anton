@@ -22,7 +22,6 @@ import {
   type DepMissingOutcome,
 } from "../gardener/repair-dep-missing";
 import { refusalNote, repairRefStale, type RefStaleOutcome } from "../gardener/repair-ref-stale";
-import { resolveForkPoint } from "../git/ops";
 import { resolveRepairAutonomy } from "../projects";
 import { appendSessionLog } from "../sessions";
 import { safe } from "./execute-epic-persist";
@@ -129,17 +128,17 @@ export async function repairBlockedTicket(args: {
         : kind === "already-shipped"
         ? await repairAlreadyShipped({
             repoPath: repo,
-            // The COMMIT this checkout forked from, never the ref it was cut at (PR #238 review).
-            // `run.baseRef` is `origin/<base>` — a ref a sibling run's fetch advances mid-run, while
-            // a resumed worktree is reused exactly as it was — so a claim checked against it can
-            // verify against work this branch does not contain, and the tickets behind the retired
-            // one would then be dispatched against a mechanism the checkout lacks. Pinned per
-            // repair rather than once per run, for the same reason: it is the fork point AT THE
-            // WRITE that the retirement has to hold against. The STRICT resolver, not the review
-            // gate's: a base force-rewritten to an unrelated history has no fork point, and the
-            // lenient fallback to its tip would let the check accept work only that history holds.
-            // A fork point git cannot compute fails the repair, and the block stands.
-            base: await resolveForkPoint(worktreePath, run.baseRef),
+            // The COMMIT this checkout forked from, pinned at worktree CREATION (PR #238 review):
+            // `run.baseForkSha`, not a fork point recomputed here from the movable `run.baseRef`.
+            // `origin/<base>` can be force-reset BACKWARD along the same history after the worktree
+            // was cut, and re-running `merge-base` then resolves the rewound tip rather than the
+            // checkout's original fork — a survivor commit between the two is present in the base the
+            // checkout was created from but absent from the recomputed older history, so
+            // verifyShippedClaim would search only that history and reject a valid already-shipped
+            // claim. The persisted SHA is the immutable commit the branch actually forked from — the
+            // fork point AT THE WRITE the retirement has to hold against — so it is what the check
+            // verifies against, unchanged across resumes and any base rewind.
+            base: run.baseForkSha,
             bead: fresh,
             // The contract the agent was PROMPTED with (PR #238 review): `fresh` is read after the
             // report, so an edit landing mid-session is already in it, and a fence starting there

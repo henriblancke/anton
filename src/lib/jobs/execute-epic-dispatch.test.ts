@@ -54,6 +54,7 @@ vi.mock("../beads/bd", async () => {
       untag: vi.fn(async () => ""),
       reopen: vi.fn(async () => ""),
       show: vi.fn(async () => undefined),
+      list: vi.fn(async () => []),
     },
   };
 });
@@ -64,10 +65,15 @@ const { PoisonEpic } = await import("./errors");
 const { beads } = await import("../beads/bd");
 const reopenMock = vi.mocked(beads.reopen);
 const showMock = vi.mocked(beads.show);
+const listMock = vi.mocked(beads.list);
 const tagMock = vi.mocked(beads.tag);
 const untagMock = vi.mocked(beads.untag);
 
 const EPIC = "anton-epic";
+/** Another run target, for the rehome cases: the owner a reparented ticket now answers to. */
+const OTHER_EPIC = "anton-other-epic";
+/** An intermediate task between the epic and its subtask — the bead a nested rehome actually moves. */
+const MIDDLE = "anton-middle";
 const SHIPPER = "anton-ship";
 const WORKTREE = "/tmp/anton-worktree";
 const BASE_REF = "origin/main";
@@ -149,6 +155,9 @@ beforeEach(() => {
     return "";
   });
   showMock.mockReset().mockImplementation(async (_repo: string, id: string) => board.find((b) => b.id === id)!);
+  // The ancestry recompute reads the FULL board, not one bead (PR #238 review): the same mutable
+  // `board` every case moves, so a reparent shows up in the owner walk exactly as bd would report it.
+  listMock.mockReset().mockImplementation(async () => board);
 });
 
 /** Every ticket the loop marked `not-delivered`. */
@@ -191,12 +200,49 @@ describe("a ticket the board already holds as superseded", () => {
   // that other target. Stop instead of dispatching a ticket a different run target now owns.
   it("stops the run when the fresh read finds it reopened AND reparented onto another target", async () => {
     const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
-    board = board.map((b) =>
-      b.id === "anton-a" ? ({ ...b, status: "open", parent: "anton-other-epic" } as Bead) : b,
-    );
+    board = [
+      ...board.map((b) => (b.id === "anton-a" ? ({ ...b, status: "open", parent: OTHER_EPIC } as Bead) : b)),
+      bead(OTHER_EPIC, { issue_type: "epic", parent: undefined }),
+    ];
 
     await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
-      /anton-a was superseded on the board this run read but has since been reopened and reparented onto anton-other-epic/,
+      new RegExp(`anton-a was superseded on the board this run read but has since been reopened and now runs under ${OTHER_EPIC}`),
+    );
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
+    expect(markedNotDelivered()).toEqual([]);
+  });
+
+  // The rehome the DIRECT-parent compare misses (PR #238 review): under epic → task → subtask, only
+  // the intermediate task moves, so `parentOf(subtask)` is untouched while its run target is now
+  // another epic's. The owner has to be recomputed from a fresh board's ancestry, not the edge.
+  it("stops the run when an ANCESTOR is rehomed though the ticket's own parent is unchanged", async () => {
+    const subtask = superseded("anton-a", SHIPPER);
+    const run = makeRun([{ ...subtask, parent: MIDDLE } as Bead, bead("anton-b")], new AbortController().signal);
+    board = [
+      ...board.map((b) => (b.id === "anton-a" ? ({ ...b, status: "open" } as Bead) : b)),
+      // The intermediate task now hangs off another epic; the subtask's own `parent` still says MIDDLE.
+      bead(MIDDLE, { parent: OTHER_EPIC }),
+      bead(OTHER_EPIC, { issue_type: "epic", parent: undefined }),
+    ];
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      new RegExp(`anton-a was superseded on the board this run read but has since been reopened and now runs under ${OTHER_EPIC}`),
+    );
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
+    expect(markedNotDelivered()).toEqual([]);
+  });
+
+  // An unreadable board is no answer about ownership, and this write is guarded on that answer —
+  // stop rather than dispatch a ticket that may belong to another target (PR #238 review).
+  it("stops the run when the board cannot be read back to recompute the owner", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    board = board.map((b) => (b.id === "anton-a" ? ({ ...b, status: "open" } as Bead) : b));
+    listMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /bd would not read the board back, so anton cannot recompute which run target now owns it/,
     );
     expect(dispatchedIds()).toEqual([]);
     expect(run.retired).toEqual([]);
