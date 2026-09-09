@@ -552,6 +552,22 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
     expect(message).toContain("restart anton");
   });
 
+  it("names packages reinstalled under the running process, which no command in the message clears", () => {
+    // `bun install` makes the lockfile comparison match and moves no build identity — node_modules is
+    // in neither — so this is the only half that keeps the gate closed until the restart (PR #257).
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "current" },
+        dependencies: { state: "replaced" },
+        build: { state: "current" },
+      },
+      ROOT,
+    );
+
+    expect(message).toContain("its packages were reinstalled under the ones it is running");
+    expect(message).toContain("restart anton");
+  });
+
   it("names BOTH when the checkout is behind AND dependencies drifted", () => {
     const message = staleCheckoutRefusal(
       {
@@ -596,6 +612,18 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
           checkout: { state: "unreachable", reason: "x" },
           dependencies: { state: "match" },
           build: { state: "current" },
+        },
+        ROOT,
+      ),
+    ).toBeUndefined();
+    // A build identity that could not be established is the same: the runner's drift read enumerates
+    // the machine's sockets, and a start must not be refused on a check that threw.
+    expect(
+      staleCheckoutRefusal(
+        {
+          checkout: { state: "current" },
+          dependencies: { state: "match" },
+          build: { state: "unknown", reason: "lsof: command not found" },
         },
         ROOT,
       ),

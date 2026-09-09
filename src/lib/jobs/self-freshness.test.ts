@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { checkSelfFreshness } from "./self-freshness";
+import { checkSelfFreshness, readBootDependencies } from "./self-freshness";
 
 function has(cmd: string): boolean {
   try {
@@ -178,5 +178,111 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
     const { dependencies } = await checkSelfFreshness(repo);
 
     expect(dependencies.state).toBe("unknown");
+  });
+
+  /**
+   * The P1 this half exists for (PR #257 review): `bun install` is the remedy the drift verdict
+   * displays, and running it makes node_modules match the lockfile while moving NO other half —
+   * `readBuildIdentity` excludes node_modules, so the build verdict stays current too. Latched
+   * against what the process booted with, the stop survives the reinstall until the restart.
+   */
+  describe("the reinstall a running process has not adopted (PR #257 review)", () => {
+    const running = (dependencies: string | null) => ({
+      buildDrift: () => null,
+      bootDependencies: () => dependencies,
+    });
+
+    it("stays stale after the very `bun install` that clears the lockfile drift", async () => {
+      installPackage(repo, "left-pad", "1.2.0"); // the stale install the server booted with
+      const booted = await readBootDependencies(repo);
+      expect((await checkSelfFreshness(repo, running(booted))).dependencies).toEqual({
+        state: "drift",
+        packages: ["left-pad"],
+      });
+
+      installPackage(repo, "left-pad", "1.3.0"); // the operator runs the displayed remedy
+
+      const { dependencies, build } = await checkSelfFreshness(repo, running(booted));
+      // The files are fixed and the build identity never moved — this is the only half that can say
+      // the running process is still importing the old packages.
+      expect(build).toEqual({ state: "current" });
+      expect(dependencies).toEqual({ state: "replaced" });
+    });
+
+    it("clears on the restart that adopts them, and nothing else", async () => {
+      installPackage(repo, "left-pad", "1.2.0");
+      const before = await readBootDependencies(repo);
+      installPackage(repo, "left-pad", "1.3.0");
+      // The restarted process snapshots what IT imported, so it agrees with itself.
+      const after = await readBootDependencies(repo);
+      expect(after).not.toBe(before);
+
+      expect((await checkSelfFreshness(repo, running(after))).dependencies).toEqual({ state: "match" });
+    });
+
+    it("claims nothing when the process recorded no snapshot", async () => {
+      // A unit test, a script, or a server predating the field: an absence is not evidence, so it
+      // must not latch a stop that only a restart could clear.
+      expect((await checkSelfFreshness(repo, running(null))).dependencies).toEqual({ state: "match" });
+    });
+
+    it("reports unknown, not match, when the running process's packages could not be read", async () => {
+      const { dependencies } = await checkSelfFreshness(repo, {
+        buildDrift: () => null,
+        bootDependencies: () => {
+          throw new Error("lsof: command not found");
+        },
+      });
+
+      expect(dependencies.state).toBe("unknown");
+    });
+
+    // A snapshot is only comparable against the same lockfile's direct deps, so a package the
+    // lockfile no longer pins must not read as a reinstall on its own.
+    it("does not read a lockfile change alone as a reinstall", async () => {
+      const booted = await readBootDependencies(repo);
+      writeLockfile(repo, { "left-pad": "1.3.0", "right-pad": "2.0.0" });
+      installPackage(repo, "right-pad", "2.0.0");
+
+      // The new package IS a genuine reinstall under the running process — what must not happen is
+      // the opposite: a verdict that cannot tell the two apart.
+      expect((await checkSelfFreshness(repo, running(booted))).dependencies).toEqual({
+        state: "replaced",
+      });
+    });
+
+    it("leaves no snapshot to latch on when the lockfile cannot be read", async () => {
+      rmSync(join(repo, "bun.lock"), { force: true });
+      expect(await readBootDependencies(repo)).toBeNull();
+    });
+  });
+
+  /**
+   * The build half is asked through a caller-supplied source, and the runner's enumerates the
+   * machine's sockets — so it can throw. A throw must be a verdict on THAT half, never an exception
+   * out of a module whose whole contract is to answer (PR #257 review).
+   */
+  describe("a build source that fails", () => {
+    it("reads a synchronous throw as unknown rather than escaping the check", async () => {
+      const { build, checkout } = await checkSelfFreshness(repo, {
+        buildDrift: () => {
+          throw new Error("spawnSync lsof EAGAIN");
+        },
+        bootDependencies: () => null,
+      });
+
+      expect(build).toEqual({ state: "unknown", reason: "spawnSync lsof EAGAIN" });
+      // The halves that DID answer still do.
+      expect(checkout).toEqual({ state: "current" });
+    });
+
+    it("reads a rejection as unknown too", async () => {
+      const { build } = await checkSelfFreshness(repo, {
+        buildDrift: () => Promise.reject(new Error("lsof: command not found")),
+        bootDependencies: () => null,
+      });
+
+      expect(build).toEqual({ state: "unknown", reason: "lsof: command not found" });
+    });
   });
 });

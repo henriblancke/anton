@@ -69,11 +69,12 @@ export async function assertPreStartPoisonIsFresh(e: unknown): Promise<void> {
  * unaffected" promise a disarm makes rather than fearing a full stop.
  *
  * Only a verdict anton can act on counts as stale: HEAD behind its own upstream, installed packages
- * that no longer match the lockfile, or a running build the code on disk has already moved past —
- * the gap a pull/reinstall opens before the restart that adopts it. Every INDETERMINATE verdict — a
- * remote it could not reach, a branch with no upstream, a lockfile it could not read — passes exactly
- * as a clean one does: refusing a start on a check that never answered would ground an offline runner
- * on no evidence, the line anton-vzhf drew and this honours.
+ * that no longer match the lockfile, packages reinstalled under the ones the process is running, or a
+ * running build the code on disk has already moved past — the last two being the gap a pull/reinstall
+ * opens before the restart that adopts it. Every INDETERMINATE verdict — a remote it could not reach,
+ * a branch with no upstream, a lockfile it could not read, a build identity it could not establish —
+ * passes exactly as a clean one does: refusing a start on a check that never answered would ground an
+ * offline runner on no evidence, the line anton-vzhf drew and this honours.
  */
 export function staleCheckoutRefusal(
   freshness: SelfFreshness,
@@ -89,6 +90,12 @@ export function staleCheckoutRefusal(
       `its installed packages no longer match bun.lock ` +
         `(${freshness.dependencies.packages.join(", ")}) — run \`bun install\``,
     );
+  }
+  if (freshness.dependencies.state === "replaced") {
+    // `bun install` makes node_modules match the lockfile instantly and moves no build identity at
+    // all — node_modules is excluded from every one — so without this the prescribed remedy would
+    // clear the stop on a process still importing the old install (PR #257 review).
+    stale.push("its packages were reinstalled under the ones it is running");
   }
   if (freshness.build.state === "drifted") {
     // The filesystem halves above clear the moment a pull/reinstall lands, but the process keeps the

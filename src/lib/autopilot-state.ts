@@ -13,8 +13,7 @@
  */
 import { currentDisarm } from "./autopilot-disarm";
 import { currentWipHold } from "./jobs/picker-wip-hold";
-import { checkSelfFreshness, selfRepoRoot } from "./jobs/self-freshness";
-import { runnerBuildDrift } from "./build/drift";
+import { checkSelfFreshness, RUNNER, selfRepoRoot } from "./jobs/self-freshness";
 import { staleBreaker, type AutopilotBreaker } from "./autopilot-breaker";
 import type { Project } from "./types";
 
@@ -25,12 +24,13 @@ export async function currentBreaker(project: Project): Promise<AutopilotBreaker
   // in the same class as the hold's `gh` calls below, and it degrades to no band on any indeterminate
   // verdict, so an offline board never shows a false stale stop.
   //
-  // The BUILD half reads the RUNNER's identity, not this process's (PR #257 review). This band renders
-  // wherever the UI is served, which in a split `ANTON_RUNNER=off` deployment is a different process
-  // from the runner whose start gate actually defers work — so a stale UI must not banner a stop the
-  // current runner is not making, nor a current UI hide a stale runner that is. The checkout and
-  // dependency halves are filesystem reads shared by both processes, so only the build half needs it.
-  const stale = staleBreaker(await checkSelfFreshness(selfRepoRoot(), runnerBuildDrift));
+  // The PROCESS-specific halves — the build it booted from and the packages it imported — read the
+  // RUNNER's, not this process's (PR #257 review). This band renders wherever the UI is served, which
+  // in a split `ANTON_RUNNER=off` deployment is a different process from the runner whose start gate
+  // actually defers work — so a stale UI must not banner a stop the current runner is not making, nor
+  // a current UI hide a stale runner that is. The checkout half and the lockfile comparison are
+  // filesystem reads shared by both processes, so only those two need the runner named.
+  const stale = staleBreaker(await checkSelfFreshness(selfRepoRoot(), RUNNER));
   if (stale) return stale;
   // Sequential on purpose: a disarmed project needs no PR read to explain itself, and the hold's
   // read is the only one here that can spawn `gh`.

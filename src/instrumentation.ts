@@ -12,8 +12,13 @@ export async function register(): Promise<void> {
   // Ahead of the runner gate on purpose: a UI-only server goes just as stale. The gate's own answer
   // is recorded with it, so a reader can tell whether a stale build is costing the nightlies.
   const runner = process.env.ANTON_RUNNER !== "off";
+  // The packages this process is about to import are stamped WITH the build (PR #257 review): a
+  // later `bun install` replaces the modules it is executing while moving no build identity at all,
+  // since every digest there excludes node_modules. Without this snapshot the reinstall the stale
+  // band prescribes would clear the stop on a process still running the old install.
+  const { readBootDependencies } = await import("./lib/jobs/self-freshness");
   const { recordServerBuild } = await import("./lib/build/drift");
-  recordServerBuild({ runner });
+  recordServerBuild({ runner, dependencies: await readBootDependencies() });
   if (!runner) return;
   const { startRunner } = await import("./lib/jobs/service");
   await startRunner();

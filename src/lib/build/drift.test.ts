@@ -715,6 +715,76 @@ describe("serverBuildDrifts", () => {
   });
 });
 
+/**
+ * The dependency identity is recorded WITH the build because no field in the build identity can
+ * stand in for it: every digest there excludes node_modules, so a `bun install` under a running
+ * server replaces the modules it executes and moves nothing else (PR #257 review).
+ */
+describe("boot dependencies", () => {
+  /** A neighbour's record: a pid that is genuinely alive, so `recordAlive` keeps it. */
+  function neighbour(pid: number, over: Record<string, unknown> = {}) {
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(join(dir, `server-build.${pid}.json`), JSON.stringify({ ...mine, pid, startedAt: null, ...over }));
+  }
+
+  it("records the digest beside the build and reads it back for this process", async () => {
+    const { recordServerBuild, selfBootDependencies } = await freshModule();
+    recordServerBuild({ runner: true, dependencies: "abc123" });
+
+    expect(selfBootDependencies()).toBe("abc123");
+    expect(JSON.parse(readFileSync(recordPath(), "utf8")).dependencies).toBe("abc123");
+  });
+
+  it("claims nothing for a process that recorded none", async () => {
+    const { recordServerBuild, selfBootDependencies } = await freshModule();
+    recordServerBuild({ runner: true });
+
+    expect(selfBootDependencies()).toBeNull();
+  });
+
+  it("says nothing in a process that never booted a server", async () => {
+    const { selfBootDependencies, runnerBootDependencies } = await freshModule();
+    expect(selfBootDependencies()).toBeNull();
+    expect(await runnerBootDependencies()).toBeNull();
+  });
+
+  // The board renders in whichever process serves the page, and the packages that matter are the
+  // ones the RUNNER imported — the same split `runnerBuildDrift` exists for.
+  it("reads the runner's digest, not the digest of the process asking", async () => {
+    const { recordServerBuild, runnerBootDependencies } = await freshModule();
+    recordServerBuild({ runner: false, dependencies: "ui-only" });
+    neighbour(process.ppid, { runner: true, dependencies: "the-runner" });
+
+    expect(await runnerBootDependencies()).toBe("the-runner");
+  });
+
+  it("claims nothing when no live record says it is the runner", async () => {
+    const { recordServerBuild, runnerBootDependencies } = await freshModule();
+    recordServerBuild({ runner: false, dependencies: "ui-only" });
+
+    expect(await runnerBootDependencies()).toBeNull();
+  });
+
+  it("falls back to the identity it holds in memory when the record could not be written", async () => {
+    process.env.ANTON_DB = join(dir, "missing", "anton.db");
+    const { recordServerBuild, runnerBootDependencies } = await freshModule();
+    recordServerBuild({ runner: true, dependencies: "in-memory" });
+
+    expect(await runnerBootDependencies()).toBe("in-memory");
+  });
+
+  // A record predating the field carries no digest, and a hand-edited one may carry a non-string:
+  // `readBuildRecord` drops it, and an absence is read as no evidence rather than as a reinstall.
+  it("claims nothing for a record whose digest is not a string", async () => {
+    const { recordServerBuild, runnerBootDependencies } = await freshModule();
+    recordServerBuild({ runner: true, dependencies: "mine" });
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, dependencies: 42 }));
+
+    expect(await runnerBootDependencies()).toBeNull();
+  });
+});
+
 describe("runnerBuildDrift", () => {
   /** A neighbour's record: a pid that is genuinely alive, so `recordAlive` keeps it. */
   function neighbour(pid: number, over: Record<string, unknown> = {}) {

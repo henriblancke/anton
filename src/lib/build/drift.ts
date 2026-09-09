@@ -86,7 +86,12 @@ export interface ServerDrift {
 }
 
 /** What a boot record holds beyond the identity itself — `listBuildRecords` proves the pid a number. */
-type BuildRecord = BuildIdentity & { pid: number; bootedAt?: unknown; runner?: unknown };
+type BuildRecord = BuildIdentity & {
+  pid: number;
+  bootedAt?: unknown;
+  runner?: unknown;
+  dependencies?: unknown;
+};
 
 function readCwd(): string | null {
   try {
@@ -142,6 +147,12 @@ function dbPath(): string | null {
 interface Boot {
   identity: BuildIdentity;
   runner: boolean;
+  /**
+   * A digest of the packages this process imported at boot, when the caller established one. Held
+   * beside the identity rather than inside it because it is not read off the checkout: every digest
+   * in a {@link BuildIdentity} excludes `node_modules` by design (PR #257 review).
+   */
+  dependencies: string | null;
 }
 
 /**
@@ -267,12 +278,18 @@ export function checkoutMoved(repoPath: string): void {
  * actually starts the runner can never disagree — and a reader can then say which of an install's
  * servers a stale build is costing anything (PR #217 review).
  */
-export function recordServerBuild({ runner }: { runner: boolean }): void {
+export function recordServerBuild({
+  runner,
+  dependencies = null,
+}: {
+  runner: boolean;
+  dependencies?: string | null;
+}): void {
   const identity = bootIdentity();
-  (globalThis as unknown as Record<symbol, Boot>)[BOOT_KEY] = { identity, runner };
+  (globalThis as unknown as Record<symbol, Boot>)[BOOT_KEY] = { identity, runner, dependencies };
   const db = dbPath();
   if (!db) return;
-  writeBuildRecord(buildRecordPath(db), identity, { appRoot: appRoot(), runner });
+  writeBuildRecord(buildRecordPath(db), identity, { appRoot: appRoot(), runner, dependencies });
   pruneBuildRecords(db);
 }
 
@@ -486,6 +503,42 @@ export async function serverBuildDrifts(): Promise<ServerDrift[]> {
 export async function runnerBuildDrift(): Promise<BuildDrift | null> {
   const drifts = await serverBuildDrifts();
   return drifts.find((d) => d.runner === true)?.drift ?? null;
+}
+
+/**
+ * The dependency digest THIS process booted with, or null when it recorded none — the dependency
+ * counterpart of {@link serverBuildDrift}, and what a caller running INSIDE the process it reports
+ * on wants. Read from the in-memory boot rather than the record: the process asking is the process
+ * being described, and its own boot is the one thing no file can be more authoritative about.
+ */
+export function selfBootDependencies(): string | null {
+  return booted()?.dependencies ?? null;
+}
+
+/**
+ * The dependency digest the process that RUNS the scheduled jobs booted with, or null when nothing
+ * establishes one (PR #257 review).
+ *
+ * Read from the live records for the same reason {@link runnerBuildDrift} is: the board renders
+ * wherever the UI is served, and in a split `ANTON_RUNNER=off` deployment that is not the process
+ * whose start gate defers work. Unlike the drift above, this is read whether or not the runner's
+ * BUILD has drifted — a `bun install` under a running server moves no build identity at all, which
+ * is the entire reason this field exists.
+ *
+ * Null where no live record claims to be the runner, where the record predates the field, or where
+ * the runner could not establish one: an absence is not evidence, so the reader claims nothing.
+ */
+export async function runnerBootDependencies(): Promise<string | null> {
+  const db = dbPath();
+  const root = appRoot();
+  const records: BuildRecord[] =
+    db && root ? liveBuildRecords(db, root).map(({ record }: { record: BuildRecord }) => record) : [];
+  const runner = records.find((record) => runsJobs(record) === true);
+  if (runner) return typeof runner.dependencies === "string" ? runner.dependencies : null;
+  // The record write failed, or this process is the runner and left none: its in-memory boot is the
+  // one stand-in a reader has, exactly as it is for the drift verdict.
+  const boot = booted();
+  return boot?.runner ? boot.dependencies : null;
 }
 
 async function readServerDrifts(): Promise<ServerDrift[]> {

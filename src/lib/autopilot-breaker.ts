@@ -9,9 +9,10 @@
  *   • **disarm** — a quality signal tripped. The policy is frozen until a human reads the evidence
  *     and re-arms it; no pass ever lifts one.
  *   • **stale** — anton is running behind its own latest code (anton-mh3c): a fix merged after the
- *     last pull, or a lockfile bump nobody reinstalled, so it refuses to START new work rather than
- *     ship stale code. Machine-wide, not per-project. Clears when the operator updates and restarts
- *     anton — a terminal act, not a re-arm — so it carries evidence but no board buttons.
+ *     last pull, a lockfile bump nobody reinstalled, or an install replaced under the running
+ *     process, so it refuses to START new work rather than ship stale code. Machine-wide, not
+ *     per-project. Clears when the operator updates and restarts anton — a terminal act, not a
+ *     re-arm — so it carries evidence but no board buttons.
  *
  * A hold drawn like a failure is worse than no brake at all: an operator who is trained to see red
  * for "anton is pacing itself" stops reading the band, and the next real disarm — the one that means
@@ -31,9 +32,10 @@ export type HoldReason = "wip-limit";
 export type DisarmReason = "score-regression" | "consecutive-failures";
 
 /**
- * Why anton is stale. One reason — the halves (checkout behind, dependencies drifted, or a running
- * build the disk has moved past) can each or all be true, but the remedy is the same shape (update
- * and restart), so the specifics live in the detail and evidence rather than fracturing the kind.
+ * Why anton is stale. One reason — the halves (checkout behind, dependencies drifted, packages
+ * reinstalled under the running process, or a running build the disk has moved past) can each or all
+ * be true, but the remedy is the same shape (update and restart), so the specifics live in the detail
+ * and evidence rather than fracturing the kind.
  */
 export type StaleReason = "behind-own-code";
 
@@ -78,11 +80,11 @@ export interface AutopilotDisarm {
 export interface AutopilotStale {
   kind: "stale";
   reason: StaleReason;
-  /** Which halves are behind — the checkout, the installed packages, or both — in one sentence. */
+  /** Which halves are behind — the checkout, the packages, the running build — in one sentence. */
   detail: string;
   /**
-   * One line per stale half, each naming the command that clears it (`git pull` / `bun install`).
-   * The remedy lives HERE and not only in the run's park message, so the operator reads what to do
+   * One line per stale half, each naming what clears it (`git pull`, `bun install`, a restart). The
+   * remedy lives HERE and not only in the run's park message, so the operator reads what to do
    * without opening a log (R4.5).
    */
   evidence: string[];
@@ -187,12 +189,13 @@ function commits(n: number): string {
 /**
  * The stale band for a self-freshness verdict, or `undefined` when anton is running its own latest
  * code — and undefined for every INDETERMINATE verdict too (a remote it could not reach, an unread
- * lockfile), exactly as `staleCheckoutRefusal` refuses to ground a start on a check that never
- * answered. So the band renders on `behind`/`drift` alone; a clean or unknowable checkout shows
- * nothing, which is the whole "nothing renders when the checkout is clean" property.
+ * lockfile, a build identity it could not establish), exactly as `staleCheckoutRefusal` refuses to
+ * ground a start on a check that never answered. So the band renders on an ACTED-on verdict alone; a
+ * clean or unknowable checkout shows nothing, which is the whole "nothing renders when the checkout
+ * is clean" property.
  *
  * The counterpart of the run-side `staleCheckoutRefusal` (jobs/execute-epic-freshness.ts): the same
- * two halves, phrased for a card (detail + per-half evidence with its command) rather than a park line.
+ * halves, phrased for a card (detail + per-half evidence with its command) rather than a park line.
  */
 export function staleBreaker(freshness: SelfFreshness): AutopilotStale | undefined {
   const behind: string[] = [];
@@ -210,6 +213,15 @@ export function staleBreaker(freshness: SelfFreshness): AutopilotStale | undefin
     evidence.push(
       `Installed package${many ? "s" : ""} no longer ${many ? "match" : "matches"} bun.lock ` +
         `(${packages.join(", ")}) — run \`bun install\``,
+    );
+  }
+  if (freshness.dependencies.state === "replaced") {
+    // The `bun install` the drift half above prescribes fixes node_modules and moves no build
+    // identity — node_modules is in none of them — so the band must latch on the reinstall itself or
+    // the remedy silently clears the stop on a process still importing the old packages (PR #257).
+    behind.push("its running packages were reinstalled");
+    evidence.push(
+      "Packages were reinstalled under the ones anton is running — restart anton to load them",
     );
   }
   if (freshness.build.state === "drifted") {

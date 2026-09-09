@@ -17,6 +17,8 @@ vi.mock("./jobs/picker-wip-hold", () => ({ currentWipHold }));
 vi.mock("./jobs/self-freshness", () => ({
   checkSelfFreshness,
   selfRepoRoot: () => "/self",
+  // The band asks about the RUNNER's process, not whichever one renders the page — asserted below.
+  RUNNER: { buildDrift: () => null, bootDependencies: () => null },
 }));
 
 const FRESH: SelfFreshness = {
@@ -26,6 +28,7 @@ const FRESH: SelfFreshness = {
 };
 
 const { currentBreaker } = await import("./autopilot-state");
+const { RUNNER } = await import("./jobs/self-freshness");
 
 const project = { id: "p1", slug: "p1", name: "P1", repoPath: "/repo" } as Project;
 
@@ -63,6 +66,17 @@ describe("currentBreaker", () => {
     expect(breaker?.kind).toBe("stale");
     expect(currentDisarm).not.toHaveBeenCalled();
     expect(currentWipHold).not.toHaveBeenCalled();
+  });
+
+  // Both process-specific halves — the build it booted from and the packages it imported — must
+  // describe the RUNNER, not whichever process renders the page (PR #257 review).
+  it("asks about the process that runs the jobs, not the one serving the page", async () => {
+    currentDisarm.mockResolvedValue(undefined);
+    currentWipHold.mockResolvedValue(undefined);
+
+    await currentBreaker(project);
+
+    expect(checkSelfFreshness).toHaveBeenCalledWith("/self", RUNNER);
   });
 
   it("falls through to the per-project brakes when anton is running its own latest code", async () => {

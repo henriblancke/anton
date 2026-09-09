@@ -67,6 +67,24 @@ describe("staleBreaker", () => {
     ]);
   });
 
+  // The `bun install` the drift half prescribes fixes node_modules and moves no build identity, so
+  // without a latch on the reinstall itself the remedy would clear the band on a process still
+  // importing the old packages (PR #257 review).
+  it("names packages reinstalled under the running process — the half the remedy does not clear", () => {
+    const stale = staleBreaker(freshness({ dependencies: { state: "replaced" } }));
+    expect(stale?.kind).toBe("stale");
+    expect(stale?.detail).toContain("its running packages were reinstalled");
+    expect(stale?.evidence).toEqual([
+      "Packages were reinstalled under the ones anton is running — restart anton to load them",
+    ]);
+  });
+
+  it("makes no band when the build half could not be established", () => {
+    // A read that failed is not a stale process: the runner's drift enumerates the machine's
+    // sockets, and grounding the board on a check that threw is the line this module never crosses.
+    expect(staleBreaker(freshness({ build: { state: "unknown", reason: "lsof missing" } }))).toBeUndefined();
+  });
+
   it("carries one evidence line per stale half when both are behind", () => {
     const stale = staleBreaker(
       freshness({

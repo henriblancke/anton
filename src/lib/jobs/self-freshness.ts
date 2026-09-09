@@ -13,11 +13,24 @@
  * Cheap enough to run before every start: the checkout half fetches a single upstream ref (a network
  * READ, never a push), and the dependency half compares the lockfile's DIRECT deps against what is
  * installed — no `bun install`, no dependency-tree resolution.
+ *
+ * Both remedies land on the FILESYSTEM, which the running process does not follow, so two halves
+ * describe the process rather than the disk: the build it booted from, and the packages it imported
+ * ({@link readBootDependencies}). Without them the very `git pull` / `bun install` this gate
+ * prescribes would clear it while the process went on executing the old code (PR #257 review).
  */
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { serverBuildDrift, type BuildDrift, type BuildDriftState } from "../build/drift";
+import {
+  runnerBootDependencies,
+  runnerBuildDrift,
+  selfBootDependencies,
+  serverBuildDrift,
+  type BuildDrift,
+  type BuildDriftState,
+} from "../build/drift";
 import { distanceBehindUpstream } from "../git/ops";
 
 /** Where the checkout stands against its upstream — plus `unknown` for a check that could not run. */
@@ -28,10 +41,21 @@ export type CheckoutFreshness =
   | { state: "unreachable"; reason: string }
   | { state: "unknown"; reason: string };
 
-/** Whether the installed packages still match the lockfile — plus `unknown` when it cannot be told. */
+/**
+ * Whether the installed packages still match the lockfile — plus `unknown` when it cannot be told,
+ * and `replaced` for the half a reinstall cannot clear.
+ *
+ * `replaced` is the dependency mirror of {@link BuildFreshness} (PR #257 review): `bun install` makes
+ * `node_modules` match the lockfile the instant it lands, but the running process keeps the modules
+ * it imported at boot, and `readBuildIdentity` deliberately excludes `node_modules` — so installing
+ * packages moves NO other half of this verdict. Without this state the very remedy the stale band
+ * displays would clear the stop while the process still executes the old install. It latches on the
+ * boot snapshot ({@link readBootDependencies}), so only a restart clears it.
+ */
 export type DependencyFreshness =
   | { state: "match" }
   | { state: "drift"; packages: string[] }
+  | { state: "replaced" }
   | { state: "unknown"; reason: string };
 
 /**
@@ -43,11 +67,14 @@ export type DependencyFreshness =
  * cannot clear merely because the files underneath the process changed (PR #257 review).
  *
  * Sourced from the boot identity `build/drift` already records. `current` covers a process that
- * stamped none — a unit test, a script — which keeps those silent, exactly as `build/drift` does.
+ * stamped none — a unit test, a script — which keeps those silent, exactly as `build/drift` does,
+ * while `unknown` is a read that FAILED (the runner's drift enumerates the machine's sockets), kept
+ * apart from `current` for the reason every other half here keeps its failure apart from its answer.
  */
 export type BuildFreshness =
   | { state: "current" }
-  | { state: "drifted"; drift: BuildDriftState };
+  | { state: "drifted"; drift: BuildDriftState }
+  | { state: "unknown"; reason: string };
 
 export interface SelfFreshness {
   checkout: CheckoutFreshness;
@@ -72,41 +99,77 @@ export function selfRepoRoot(): string {
 }
 
 /**
- * How a caller supplies the build drift the verdict is judged against — self by default
- * ({@link serverBuildDrift}). The board passes the RUNNER's drift instead ({@link runnerBuildDrift}),
- * because a UI-only process rendering the stale band is not the process whose start gate defers work
- * (PR #257 review).
+ * WHOSE process the two process-specific halves describe — the build it booted from, and the
+ * packages it imported. Both are per-process, and neither is readable off the filesystem the other
+ * two halves share, so the caller says which process it means.
+ *
+ * {@link SELF} is right for the start gate, which asks about the process that would run the work.
+ * The board passes {@link RUNNER}, because a UI-only process rendering the stale band is not the
+ * process whose start gate defers work (PR #257 review).
  */
-export type BuildDriftSource = () => BuildDrift | null | Promise<BuildDrift | null>;
+export interface RunningProcess {
+  buildDrift: () => BuildDrift | null | Promise<BuildDrift | null>;
+  bootDependencies: () => string | null | Promise<string | null>;
+}
+
+/** This process — what the runner's own start gate asks about. */
+export const SELF: RunningProcess = {
+  buildDrift: serverBuildDrift,
+  bootDependencies: selfBootDependencies,
+};
+
+/** The process that executes the scheduled jobs, whichever one that is. */
+export const RUNNER: RunningProcess = {
+  buildDrift: runnerBuildDrift,
+  bootDependencies: runnerBootDependencies,
+};
 
 /**
  * All three halves of the freshness answer for anton's own checkout at `repoPath`, read in parallel.
- * The checkout and dependency halves read the filesystem, shared by every process of the install; the
- * build half is process-specific, so the caller says WHOSE it wants. It defaults to this process's own
- * ({@link serverBuildDrift}) — right for the runner's start gate, which asks about itself — while the
- * board injects the runner's ({@link runnerBuildDrift}), since it renders in a process that may not be
- * the runner. Both pass {@link selfRepoRoot} for the filesystem halves, the root `build/drift` records
- * against.
+ * The checkout half and the lockfile comparison read the filesystem, shared by every process of the
+ * install; the build half and the dependency LATCH are process-specific, so the caller says WHOSE it
+ * wants ({@link RunningProcess}). It defaults to {@link SELF} — right for the runner's start gate,
+ * which asks about itself — while the board injects {@link RUNNER}, since it renders in a process
+ * that may not be the runner. Both pass {@link selfRepoRoot} for the filesystem halves, the root
+ * `build/drift` records against.
  */
 export async function checkSelfFreshness(
   repoPath: string,
-  buildDrift: BuildDriftSource = serverBuildDrift,
+  running: RunningProcess = SELF,
 ): Promise<SelfFreshness> {
-  const [checkout, dependencies, drift] = await Promise.all([
+  const [checkout, dependencies, build] = await Promise.all([
     checkoutFreshness(repoPath),
-    dependencyFreshness(repoPath),
-    Promise.resolve(buildDrift()),
+    dependencyFreshness(repoPath, running.bootDependencies),
+    buildFreshness(running.buildDrift),
   ]);
-  return { checkout, dependencies, build: toBuildFreshness(drift) };
+  return { checkout, dependencies, build };
 }
 
 /**
  * A build drift, as the freshness verdict reads it. A `git pull`/`bun install` clears the checkout and
  * dependency halves at once but never reaches the modules a live process already loaded; a drift keeps
  * freshness stale until the restart that adopts them.
+ *
+ * The source is called through this rather than in the `Promise.all` array (PR #257 review), so a
+ * failure reads as a verdict on THIS half instead of escaping the whole check. Two ways it could
+ * escape: the source type admits a SYNCHRONOUS implementation, whose throw would land before
+ * `Promise.all` ever saw the array, and an async one's rejection had no catch either — while the
+ * runner's drift genuinely can throw, since finding the servers no record names enumerates the
+ * machine's sockets (health.ts already guards the same read). Either way the caller got an exception
+ * where the module promises a verdict, which is the one thing the checkout and dependency halves are
+ * built never to do.
+ *
+ * A failure is its own verdict (`unknown`), never dressed up as either answer — the rule the other
+ * two halves already follow, so a caller neither refuses a start on a check that never ran nor reads
+ * a failed read as proof the process is current.
  */
-function toBuildFreshness(drift: BuildDrift | null): BuildFreshness {
-  return drift ? { state: "drifted", drift: drift.state } : { state: "current" };
+async function buildFreshness(buildDrift: RunningProcess["buildDrift"]): Promise<BuildFreshness> {
+  try {
+    const drift = await buildDrift();
+    return drift ? { state: "drifted", drift: drift.state } : { state: "current" };
+  } catch (e) {
+    return { state: "unknown", reason: reason(e) };
+  }
 }
 
 async function checkoutFreshness(repoPath: string): Promise<CheckoutFreshness> {
@@ -177,12 +240,74 @@ async function installedVersion(repoPath: string, name: string): Promise<string 
 }
 
 /**
+ * A digest of what is installed for the lockfile's direct deps — the one field that tells a
+ * reinstall apart from the install a running process actually imported.
+ */
+function digestDeps(deps: { name: string; installed: string | undefined }[]): string {
+  const digest = createHash("sha256");
+  for (const { name, installed } of deps) {
+    digest.update(name).update("\0").update(installed ?? "").update("\0");
+  }
+  return digest.digest("hex").slice(0, 12);
+}
+
+/**
+ * The dependency identity a booting process records beside its build identity — the fix for the one
+ * staleness nothing else could see (PR #257 review).
+ *
+ * A server that boots with a current `bun.lock` and a stale `node_modules` shows `drift` and the
+ * `bun install` remedy the stale band displays. Running it makes the lockfile comparison return
+ * `match` — and moves NOTHING else: `readBuildIdentity` excludes `node_modules` at every depth, so
+ * the build half reads `current` too. The stop therefore cleared on the very command that fixed the
+ * FILES while the process went on executing the modules it imported from the OLD install, which is
+ * exactly the code this gate exists to keep out of the trunk. Latched against this snapshot, the
+ * verdict instead stays `replaced` until the restart that adopts them.
+ *
+ * Null when the lockfile cannot be read: best-effort like every stamp it mirrors, and an absence is
+ * read as no evidence rather than as a fabricated drift.
+ */
+export async function readBootDependencies(repoPath: string = selfRepoRoot()): Promise<string | null> {
+  try {
+    const lock = parseBunLock(await readFile(join(repoPath, "bun.lock"), "utf8"));
+    return digestDeps(await installedDirectDeps(repoPath, lock));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The direct deps the lockfile pins, with what is installed for each — the pair this half compares
+ * and the pair the boot snapshot digests, read once so both stand on the same view of node_modules.
+ */
+async function installedDirectDeps(
+  repoPath: string,
+  lock: BunLock,
+): Promise<{ name: string; locked: string; installed: string | undefined }[]> {
+  const root = lock.workspaces?.[""] ?? {};
+  const declared = { ...root.dependencies, ...root.devDependencies };
+  const pairs = await Promise.all(
+    Object.keys(declared)
+      .sort()
+      .map(async (name) => {
+        const locked = lockedVersion(lock, name);
+        // The lockfile pins nothing to compare against — no drift to claim, and nothing to digest.
+        if (!locked) return null;
+        return { name, locked, installed: await installedVersion(repoPath, name) };
+      }),
+  );
+  return pairs.filter((pair) => pair !== null);
+}
+
+/**
  * Whether node_modules still matches the lockfile. Compares the ROOT workspace's direct deps — the
  * ones a pulled fix adds or bumps — against their installed versions; a missing or mismatched package
  * is drift. Transitive-only churn is deliberately out of scope (the ticket's "rather than resolving
  * the full dependency tree"): resolving it costs a full install, which no per-start check can afford.
  */
-async function dependencyFreshness(repoPath: string): Promise<DependencyFreshness> {
+async function dependencyFreshness(
+  repoPath: string,
+  bootDependencies: RunningProcess["bootDependencies"],
+): Promise<DependencyFreshness> {
   let lock: BunLock;
   try {
     lock = parseBunLock(await readFile(join(repoPath, "bun.lock"), "utf8"));
@@ -190,16 +315,19 @@ async function dependencyFreshness(repoPath: string): Promise<DependencyFreshnes
     return { state: "unknown", reason: `bun.lock could not be read (${reason(e)})` };
   }
 
-  const root = lock.workspaces?.[""] ?? {};
-  const declared = { ...root.dependencies, ...root.devDependencies };
-  const drifted: string[] = [];
-  await Promise.all(
-    Object.keys(declared).map(async (name) => {
-      const locked = lockedVersion(lock, name);
-      if (!locked) return; // the lockfile pins nothing to compare against
-      if ((await installedVersion(repoPath, name)) !== locked) drifted.push(name);
-    }),
-  );
+  const deps = await installedDirectDeps(repoPath, lock);
+  const drifted = deps.filter((dep) => dep.installed !== dep.locked).map((dep) => dep.name);
+  if (drifted.length > 0) return { state: "drift", packages: drifted };
 
-  return drifted.length > 0 ? { state: "drift", packages: drifted.sort() } : { state: "match" };
+  // node_modules matches the lockfile — but the RUNNING process may still hold the install it
+  // imported at boot (PR #257 review), which only a restart replaces.
+  let booted: string | null;
+  try {
+    booted = await bootDependencies();
+  } catch (e) {
+    return { state: "unknown", reason: `the running process's dependencies could not be read (${reason(e)})` };
+  }
+  // No snapshot is no evidence — a test, a script, or a server predating this field is silent rather
+  // than latched on an absence.
+  return booted !== null && booted !== digestDeps(deps) ? { state: "replaced" } : { state: "match" };
 }
