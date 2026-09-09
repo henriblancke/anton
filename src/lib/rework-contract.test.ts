@@ -266,6 +266,19 @@ describe("instructionCriteria", () => {
     expect(texts("> Fix the retry\n> <!-- note -->\n> ===")).toEqual(["Fix the retry"]);
     // Opened MID-line it is inline HTML, not a block, so the paragraph stays open and underlines.
     expect(texts("Backend\ntail <!-- note -->\n===")).toEqual([]);
+    // Every other HTML block that interrupts a paragraph ends it the same way — conditions 1 and
+    // 3 through 6, not just the comment. Recognising only `<!--` crossed them, dropped the step as
+    // a heading, and left doneGap refusing an actionable send-back.
+    for (const opener of ["<div>", "<script>", "<?php", "<!DOCTYPE html>", "<![CDATA[", "</ul>", "<TABLE>"]) {
+      expect(texts(`Fix the retry\n${opener}\n===`)).toEqual(["Fix the retry"]);
+      expect(doneGap(`Fix the retry\n${opener}\n===`, [])).toBeNull();
+    }
+    expect(texts("> Fix the retry\n> <div>\n> ===")).toEqual(["Fix the retry"]);
+    // Condition 7 — any other complete tag alone on its line — is the one kind that may NOT
+    // interrupt a paragraph, so the run really is one multiline Setext heading and files nothing.
+    expect(texts('Backend\n<span class="x">\n===')).toEqual([]);
+    // A tag name that merely starts with a block one is not that tag: `<divider>` is type 7.
+    expect(texts("Backend\n<divider>\n===")).toEqual([]);
   });
 
   it("reads nested markers as scaffolding too — shearing one layer must not leave the next as a criterion", () => {

@@ -248,12 +248,40 @@ const QUOTE_STEP = /^ {0,3}>(?=>*(?:[ \t]|$))/;
 const COMMENT_CLOSE = "-->";
 
 /**
- * A line that begins an HTML block, which interrupts an open paragraph. CommonMark's condition 2:
- * a `<!--` at the line's start (up to 3 columns in) opens a block that runs to its `-->`, ending
- * the paragraph above it — so no Setext underline below can reach back across it. A comment opened
- * MID-line is inline HTML instead and keeps the paragraph open, which is why the head is anchored.
+ * The tag names CommonMark's HTML block condition 6 knows, verbatim from the spec's list. Matched
+ * case-insensitively after a `<` or `</`, and only when whitespace, `>`, `/>` or the line's end
+ * follows — so `<paragraph-ish>` prose is not a block.
  */
-const HTML_BLOCK_START = /^ {0,3}<!--/;
+const HTML_BLOCK_TAGS =
+  "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|" +
+  "dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|" +
+  "hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|" +
+  "section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul";
+
+/**
+ * A line that begins an HTML block, which interrupts an open paragraph — CommonMark's start
+ * conditions 1 through 6, anchored at the line's start (up to 3 columns in). Each opens a block that
+ * ends the paragraph above it, so no Setext underline below can reach back across it: `Fix the
+ * retry` / `<div>` / `===` is an actionable step, a block and a stray `===`, and reading the run as
+ * one heading dropped the step and left {@link doneGap} refusing a request that stated one. A tag
+ * opened MID-line is inline HTML instead and keeps the paragraph open, which is why the head is
+ * anchored.
+ *
+ * Condition 7 — any other complete tag alone on its line — is deliberately absent: the spec's one
+ * exception is that a type 7 block may NOT interrupt a paragraph, so `Fix the retry` / `<span x="y">`
+ * / `===` really is one multiline Setext heading and files nothing.
+ */
+const HTML_BLOCK_START = new RegExp(
+  "^ {0,3}(?:" +
+    "<(?:pre|script|style|textarea)(?:[ \\t>]|$)" +
+    "|<!--" +
+    "|<\\?" +
+    "|<![A-Za-z]" +
+    "|<!\\[CDATA\\[" +
+    `|</?(?:${HTML_BLOCK_TAGS})(?:[ \\t>]|/>|$)` +
+    ")",
+  "i",
+);
 
 /**
  * The containers a line's content sits in, outermost first: a column its text must reach, or a
