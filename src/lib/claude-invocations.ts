@@ -29,6 +29,12 @@ import { ANTHROPIC_BASE_URL_ENV } from "./claude/endpoint";
 import type { ClaudeResult, RunClaudeOptions } from "./claude/driver";
 import type { ModelUsageEntry } from "./claude/model-usage";
 import { getDb, schema } from "./db";
+import {
+  divergenceSummary,
+  groupInvocations,
+  type DivergenceSummary,
+  type InvocationFact,
+} from "./model-divergence";
 import type { AntonDb, Clock } from "./jobs/queue";
 
 /** How an invocation ended, as claude itself reported it. */
@@ -163,6 +169,37 @@ export async function listInvocations(
   return opts.limit === undefined ? query : query.limit(opts.limit);
 }
 
+/** One project's spend over a window, read as invocations rather than as rows. */
+export interface InvocationSpend {
+  /**
+   * Every invocation in the window, newest first, each carrying its requested-vs-served verdict
+   * (anton-r0y6). Regrouped from the per-(invocation, model) rows, which cannot answer it alone.
+   */
+  invocations: InvocationFact<ClaudeInvocationRow>[];
+  /**
+   * What the window says about routing. `diverged: 0` with no substitutions for an unrouted
+   * project — the read carries the verdict, so it is not a column someone has to think to query.
+   */
+  divergence: DivergenceSummary;
+}
+
+/**
+ * The spend read (anton-r0y6): one project's invocations over a window, with the model anton asked
+ * for checked against the model that answered.
+ *
+ * Divergence rides WITH the spend rather than sitting in its own column, because the question it
+ * answers — is this per-model figure attributed to the model I actually chose — is one nobody thinks
+ * to ask before reading the numbers, and by then the wrong conclusion is already drawn.
+ */
+export async function invocationSpend(
+  db: AntonDb,
+  projectId: string,
+  opts: { since?: Date; limit?: number } = {},
+): Promise<InvocationSpend> {
+  const invocations = groupInvocations(await listInvocations(db, projectId, opts));
+  return { invocations, divergence: divergenceSummary(invocations) };
+}
+
 /**
  * Wrap a claude driver so every invocation THROUGH it is metered (anton-77l9).
  *
@@ -204,4 +241,12 @@ export function projectInvocations(
   opts?: { since?: Date; limit?: number },
 ): Promise<ClaudeInvocationRow[]> {
   return listInvocations(getDb(), projectId, opts);
+}
+
+/** UI/read path for the spend read, verdict included — see {@link invocationSpend}. */
+export function projectSpend(
+  projectId: string,
+  opts?: { since?: Date; limit?: number },
+): Promise<InvocationSpend> {
+  return invocationSpend(getDb(), projectId, opts);
 }

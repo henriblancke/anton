@@ -9,7 +9,14 @@ import { describe, expect, it } from "vitest";
 import type { ClaudeResult } from "./claude/driver";
 import { createStreamState } from "./claude/driver-events";
 import { toClaudeResult } from "./claude/driver-exit";
-import { hostOf, invocationRows, listInvocations, metered, recordInvocation } from "./claude-invocations";
+import {
+  hostOf,
+  invocationRows,
+  invocationSpend,
+  listInvocations,
+  metered,
+  recordInvocation,
+} from "./claude-invocations";
 import { makeProjectDb, type TestProjectDb } from "./testing/project";
 import type { Clock } from "./jobs/queue";
 
@@ -246,6 +253,90 @@ describe("metered", () => {
 
     await expect(driver({ cwd: "/tmp/wt", prompt: "work" })).rejects.toThrow("mid-stream death");
     expect(await listInvocations(tdb.db, tdb.projectId)).toHaveLength(0);
+    tdb.close();
+  });
+});
+
+/**
+ * The spend read (anton-r0y6): the verdict rides WITH the numbers, so nobody has to think to ask
+ * whether the per-model figures belong to the model they chose.
+ */
+describe("invocationSpend", () => {
+  it("reports no divergence for an unrouted project, whose models always agree", async () => {
+    const tdb = makeProjectDb();
+    // The ordinary shape: one opus invocation that also reported its haiku sidecar. Judged per ROW
+    // this reads as a substitution in every run ever recorded — which is the noise being avoided.
+    await recordInvocation(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId, modelRequested: "claude-opus-5" },
+      result({ modelUsage: USAGE }),
+    );
+
+    const spend = await invocationSpend(tdb.db, tdb.projectId);
+    expect(spend.invocations).toHaveLength(1);
+    expect(spend.invocations[0].rows).toHaveLength(2);
+    expect(spend.divergence).toEqual({
+      invocations: 1,
+      diverged: 0,
+      unknown: 0,
+      substitutions: [],
+    });
+    tdb.close();
+  });
+
+  it("flags the invocation a gateway served with something else", async () => {
+    const tdb = makeProjectDb();
+    const dimensions = {
+      ...DIMENSIONS,
+      projectId: tdb.projectId,
+      modelRequested: "claude-opus-5",
+      baseUrl: "https://gw.example.com/v1",
+    };
+    await recordInvocation(
+      tdb.db,
+      clock,
+      dimensions,
+      result({ sessionId: "sess-1", modelUsage: [{ model: "glm-4.6", inputTokens: 900 }] }),
+    );
+
+    const spend = await invocationSpend(tdb.db, tdb.projectId);
+    expect(spend.divergence).toEqual({
+      invocations: 1,
+      diverged: 1,
+      unknown: 0,
+      substitutions: [{ requested: "claude-opus-5", served: ["glm-4.6"], count: 1 }],
+    });
+    // The endpoint that substituted is on the fact, so the finding points somewhere.
+    expect(spend.invocations[0]).toMatchObject({
+      divergence: "diverged",
+      endpointHost: "gw.example.com",
+      beadId: "anton-77l9",
+    });
+    tdb.close();
+  });
+
+  it("reads an invocation that reported no model as unknown, never as diverged", async () => {
+    const tdb = makeProjectDb();
+    await recordInvocation(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId },
+      result({ ok: false, modelUsage: [] }),
+    );
+
+    const spend = await invocationSpend(tdb.db, tdb.projectId);
+    expect(spend.invocations[0].divergence).toBe("unknown");
+    expect(spend.divergence).toMatchObject({ diverged: 0, unknown: 1, substitutions: [] });
+    tdb.close();
+  });
+
+  it("reads a project with no recorded calls as empty, not as clean routing", async () => {
+    const tdb = makeProjectDb();
+    expect(await invocationSpend(tdb.db, tdb.projectId)).toEqual({
+      invocations: [],
+      divergence: { invocations: 0, diverged: 0, unknown: 0, substitutions: [] },
+    });
     tdb.close();
   });
 });
