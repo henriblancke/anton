@@ -332,8 +332,8 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
   /**
    * The board reads this on every paint and every breaker poll, once per project, and each pass runs
    * a `git fetch` — so a caller may name the age it will accept (PR #257 review). The start gate
-   * names none and always pays; only an in-flight pass is shared with it, since joining one is a
-   * read of the state right now either way.
+   * names none and always pays, in-flight pass or not: a pass that began earlier may have fetched
+   * the upstream tip before the gate's own preflight, which is the staleness the gate refuses.
    */
   describe("a verdict a caller will reuse", () => {
     /** Counts passes by counting the process-specific half each pass reads exactly once. */
@@ -381,9 +381,9 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
       expect(running.passes()).toBe(2);
     });
 
-    // Two `git fetch` of the same ref racing each other is the thing this shares away; joining costs
-    // the strict caller nothing, because it is a read of the current state either way.
-    it("joins an in-flight pass even for a caller that names no window", async () => {
+    // An in-flight pass began BEFORE this caller did, so its fetch may predate the caller's own
+    // preflight — the gate that admits work must pay for its own fetch rather than inherit that one.
+    it("does not join an in-flight pass for a caller that names no window", async () => {
       const running = counting();
 
       const [a, b] = await Promise.all([
@@ -392,6 +392,19 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
       ]);
 
       expect(b).toEqual(a);
+      expect(running.passes()).toBe(2);
+    });
+
+    // A windowed caller still shares one, which is what keeps the board's per-project poll to a
+    // single fetch when several renders land together.
+    it("joins an in-flight pass for a caller that names a window", async () => {
+      const running = counting();
+
+      await Promise.all([
+        checkSelfFreshness(repo, running, { maxAgeMs: 60_000 }),
+        checkSelfFreshness(repo, running, { maxAgeMs: 60_000 }),
+      ]);
+
       expect(running.passes()).toBe(1);
     });
 
