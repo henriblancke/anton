@@ -28,7 +28,7 @@ const suite = has("git") ? describe : describe.skip;
  * Hand-emitted WITH trailing commas, exactly as bun writes them, so the fixture exercises the
  * parser's one tolerance rather than a plain-JSON happy path.
  */
-function writeLockfile(dir: string, deps: Record<string, string>): void {
+function writeLockfile(dir: string, deps: Record<string, string>, lockfileVersion = 1): void {
   const depLines = Object.keys(deps)
     .map((name) => `        ${JSON.stringify(name)}: ${JSON.stringify(`^${deps[name]}`)},`)
     .join("\n");
@@ -36,7 +36,7 @@ function writeLockfile(dir: string, deps: Record<string, string>): void {
     .map(([name, v]) => `    ${JSON.stringify(name)}: [${JSON.stringify(`${name}@${v}`)}, "", {}, "sha512-x"],`)
     .join("\n");
   const body = `{
-  "lockfileVersion": 1,
+  "lockfileVersion": ${lockfileVersion},
   "workspaces": {
     "": {
       "name": "fixture",
@@ -164,6 +164,16 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
 
   it("reports unknown, not match, when there is no lockfile to read", async () => {
     rmSync(join(repo, "bun.lock"), { force: true });
+
+    const { dependencies } = await checkSelfFreshness(repo);
+
+    expect(dependencies.state).toBe("unknown");
+  });
+
+  it("reports unknown, not a drift, when the lockfile format is one it cannot read", async () => {
+    // A future bun bumps the format: every field this parser reads is a version-1 assumption, so the
+    // honest answer is "could not tell", never a package list derived from a shape that moved.
+    writeLockfile(repo, { "left-pad": "1.3.0" }, 2);
 
     const { dependencies } = await checkSelfFreshness(repo);
 

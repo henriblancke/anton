@@ -134,9 +134,22 @@ interface BunLock {
  * rejects — so the sole tolerance is stripping a comma that sits right before a `}` or `]`. bun.lock
  * values are version strings, registry urls, and integrity hashes, none of which carry that byte
  * sequence, so the strip touches only structural commas.
+ *
+ * A lockfile declaring a version this parser does not know about is REFUSED rather than read on the
+ * chance its shape still fits (PR #257 review): every field below is a version-1 assumption, and a
+ * format bump that moved them would yield a package list that is confidently wrong. The throw lands
+ * in {@link dependencyFreshness}'s catch, so an unrecognised format reads as `unknown` — the
+ * fail-open verdict this module gives every check that could not answer, never a false `match` and
+ * never a fabricated drift.
  */
 function parseBunLock(text: string): BunLock {
-  return JSON.parse(text.replace(/,(\s*[}\]])/g, "$1")) as BunLock;
+  const parsed = JSON.parse(text.replace(/,(\s*[}\]])/g, "$1")) as BunLock & {
+    lockfileVersion?: number;
+  };
+  if (parsed.lockfileVersion !== undefined && parsed.lockfileVersion !== 1) {
+    throw new Error(`unsupported bun.lock lockfileVersion ${parsed.lockfileVersion}`);
+  }
+  return parsed;
 }
 
 /** The exact version the lockfile pins for `name`, or undefined when it pins nothing for it. */

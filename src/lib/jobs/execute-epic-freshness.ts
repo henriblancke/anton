@@ -7,7 +7,7 @@
  * into its own top-level imports.
  */
 import { BREAKER_EFFECT } from "../autopilot-breaker";
-import { StaleCheckoutError, STALE_CHECKOUT_REFUSAL_PREFIX } from "./errors";
+import { isPoisonError, StaleCheckoutError, STALE_CHECKOUT_REFUSAL_PREFIX } from "./errors";
 import { checkSelfFreshness, selfRepoRoot, type SelfFreshness } from "./self-freshness";
 
 /**
@@ -36,6 +36,30 @@ export async function assertSelfCheckoutFresh(): Promise<void> {
   const root = selfRepoRoot();
   const refusal = staleCheckoutRefusal(await checkSelfFreshness(root), root);
   if (refusal) throw new StaleCheckoutError(refusal);
+}
+
+/**
+ * The same refusal, asked of a PRE-START gate's permanent verdict (PR #257 review).
+ *
+ * {@link assertSelfCheckoutFresh} sits after the completion short-circuit, which is deliberate — a
+ * target already carried to its pull request must settle idempotently rather than be grounded by a
+ * staleness with nothing left to run. But `beginEpicRun` runs BEFORE that short-circuit, and its
+ * gates park PERMANENTLY: target shape, approval, proposal-ness, human ownership, readiness. A stale
+ * process decides all five on the code it booted with, so a fix that changed any of those semantics
+ * would have the old process park the job on the old rule — and a park is not undone by a restart.
+ * Nothing re-dispatches a parked job; only a person does.
+ *
+ * So a poison raised while the process is behind its own code is not trusted as permanent: the
+ * freshness verdict is re-asked and, when it is stale, the run defers on {@link StaleCheckoutError}
+ * instead — refunded and rescheduled, to be re-decided by the restarted process on fresh code. A
+ * verdict that is still poison there parks then, on rules anton actually has.
+ *
+ * Asked only on the refusal path, so an ordinary start pays nothing here and reaches the gate in its
+ * documented place — which is what keeps the completion path for an already-delivered target intact:
+ * that target passes every gate above, so it never reaches this at all.
+ */
+export async function assertPreStartPoisonIsFresh(e: unknown): Promise<void> {
+  if (isPoisonError(e)) await assertSelfCheckoutFresh();
 }
 
 /**

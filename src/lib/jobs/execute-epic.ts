@@ -20,6 +20,7 @@
  * out.
  */
 import { dispatchRunTickets } from "./execute-epic-dispatch";
+import { assertPreStartPoisonIsFresh } from "./execute-epic-freshness";
 import { prepareEpicRun } from "./execute-epic-prepare";
 import { walkRunPhase } from "./execute-epic-run-phase";
 import { concludeRunAttempt, settleStoppedRun } from "./execute-epic-settle";
@@ -37,7 +38,15 @@ export interface ExecuteEpicDeps {
 /** Build the runner handler bound to a db/clock. Register it as the "execute-epic" handler. */
 export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
   return async function executeEpic(ctx: JobContext): Promise<void> {
-    const run = await beginEpicRun({ ...deps, ctx });
+    // A pre-start gate's PERMANENT verdict is only trusted from a process running its own latest
+    // code (PR #257 review). `beginEpicRun`'s gates park for a human and nothing un-parks a job but
+    // a person, so a stale process deciding one on superseded rules would outlive the restart that
+    // fixed it. Its poisons are re-asked against the freshness verdict and defer instead when anton
+    // is behind itself; the in-place gate in `prepareEpicRun` still owns every start past this point.
+    const run = await beginEpicRun({ ...deps, ctx }).catch(async (e: unknown) => {
+      await assertPreStartPoisonIsFresh(e);
+      throw e;
+    });
     // An abandoned target: a human declared the work won't be done, and there is no run row to
     // settle. Nothing was taken, so nothing is owed back.
     if (!run) return;

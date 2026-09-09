@@ -104,7 +104,9 @@ const { prepareEpicRun } = await import("./execute-epic-prepare");
 // The staleness preflight lives in execute-epic-freshness.ts (forwarded to prepare through the
 // run-shape seam), so its pure unit imports from there; the self-freshness mock above intercepts the
 // import regardless of which module reads it.
-const { staleCheckoutRefusal } = await import("./execute-epic-freshness");
+const { assertPreStartPoisonIsFresh, staleCheckoutRefusal } = await import(
+  "./execute-epic-freshness"
+);
 const { PoisonEpic, StaleCheckoutError } = await import("./errors");
 import type { EpicRun } from "./execute-epic-run";
 
@@ -461,6 +463,41 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
     const prep = await prepareEpicRun(run(clean));
 
     expect(prep.done).toBe(true);
+    expect(checkSelfFreshnessMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("assertPreStartPoisonIsFresh — a stale process does not park permanently (PR #257)", () => {
+  /** What every pre-start gate in `beginEpicRun` refuses with — a permanent park. */
+  const poison = new PoisonEpic("target anton-x is not approved — refusing to execute");
+
+  it("converts a pre-start poison into a deferral while anton is behind its own code", async () => {
+    // The gate that raised the poison ran on code this process booted with. If the very fix being
+    // pulled changed that rule, parking would outlive the restart that fixed it — nothing un-parks
+    // a job but a person.
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "behind", behind: 2, upstream: "origin/main" },
+      dependencies: { state: "match" },
+      build: { state: "current" },
+    });
+
+    const error = await assertPreStartPoisonIsFresh(poison).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+
+    expect(error).toBeInstanceOf(StaleCheckoutError);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+  });
+
+  it("lets the poison stand when anton is running its own latest code", async () => {
+    await expect(assertPreStartPoisonIsFresh(poison)).resolves.toBeUndefined();
+  });
+
+  it("leaves a non-poison error alone without even reading the freshness verdict", async () => {
+    // A retryable failure already re-runs on the restarted process, so it costs the gate nothing —
+    // and reading freshness here would fetch anton's own remote on every ordinary retry.
+    await expect(assertPreStartPoisonIsFresh(new Error("bd list failed"))).resolves.toBeUndefined();
     expect(checkSelfFreshnessMock).not.toHaveBeenCalled();
   });
 });
