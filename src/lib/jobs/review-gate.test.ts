@@ -284,7 +284,10 @@ async function sessionKinds(): Promise<Array<{ kind: string; status: string; bea
 
 describe("runReviewGate — convergence", () => {
   it("stops after one review when nothing blocking is reported", async () => {
-    const { result, calls, commitMessages } = gate([report(9, [ADVISORY])]);
+    const { result, calls, commitMessages } = gate([report(9, [ADVISORY])], {
+      model: "fallback",
+      modelRoutes: [{ jobType: "execute-epic", step: "review", model: "review-model" }],
+    });
     const out = await result;
 
     expect(out.outcome).toBe("clean");
@@ -298,6 +301,7 @@ describe("runReviewGate — convergence", () => {
     ]);
     expect(blockingFindings(out.unresolved)).toEqual([]);
     expect(calls).toHaveLength(1); // one review, no fix
+    expect(calls[0].model).toBe("review-model");
     expect(commitMessages).toEqual([]);
   });
 

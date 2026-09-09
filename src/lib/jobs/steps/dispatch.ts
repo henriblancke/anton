@@ -8,6 +8,8 @@
 import { formatAntonResult, parseAntonResult } from "../../claude/anton-result";
 import { claudeRouting, runClaude } from "../../claude/driver";
 import { appendSessionLog, endSession, setSessionClaudeId } from "../../sessions";
+import { resolveModel } from "../model-routing";
+import { stepName } from "./resolve";
 import { stepSession, type StepContext } from "./context";
 import type { StepResult } from "./result";
 
@@ -37,7 +39,12 @@ export async function dispatchClaude(
       cwd: ctx.worktreePath,
       prompt: args.prompt,
       appendSystemPrompt: args.appendSystemPrompt,
-      model: ctx.settings.model,
+      model: resolveModel(ctx.settings, {
+        jobType: "execute-epic",
+        step: ctx.step ? (stepName(ctx.step) as "implement" | "claude") : undefined,
+        labels:
+          ctx.tickets.find((ticket) => ticket.id === args.beadId)?.labels ?? ctx.target.labels,
+      }),
       routing: claudeRouting(ctx.settings),
       permissionMode: ctx.settings.permissionMode ?? "bypassPermissions",
       signal: ctx.ctx.signal,

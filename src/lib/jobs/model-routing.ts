@@ -8,6 +8,7 @@
  */
 import type { JobType } from "./queue";
 import type { BuiltinStepId } from "./step-ids";
+import type { ProjectSettings } from "../projects";
 
 /**
  * One routing rule: the work it matches, and the model that work runs on.
@@ -57,4 +58,26 @@ export function subsumes(earlier: ModelRouteMatch, later: ModelRouteMatch): bool
   return MODEL_ROUTE_MATCHERS.every(
     (key: Matcher) => earlier[key] === undefined || earlier[key] === later[key],
   );
+}
+
+/** The facts known at one Claude invocation. Omitted step/labels mean that call has none. */
+export interface ModelRouteContext {
+  jobType: JobType;
+  step?: BuiltinStepId;
+  labels?: readonly string[];
+}
+
+/** Resolve in author order; the project's existing model remains the exact fallback. */
+export function resolveModel(
+  settings: Pick<ProjectSettings, "model" | "modelRoutes">,
+  context: ModelRouteContext,
+): string | undefined {
+  const labels = new Set(context.labels ?? []);
+  const match = settings.modelRoutes?.find(
+    (rule) =>
+      (rule.jobType === undefined || rule.jobType === context.jobType) &&
+      (rule.step === undefined || rule.step === context.step) &&
+      (rule.label === undefined || labels.has(rule.label)),
+  );
+  return match?.model ?? settings.model;
 }

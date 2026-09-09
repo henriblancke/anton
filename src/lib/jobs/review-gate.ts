@@ -14,6 +14,7 @@
  * wiring is what makes it unit-testable against a fake driver.
  */
 import { type Bead } from "../beads/bd";
+import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import {
   commitAll,
@@ -570,7 +571,11 @@ async function runReviewSession(args: {
       const result = await claude({
         cwd: worktreePath,
         prompt,
-        model: settings.model,
+        model: resolveModel(settings, {
+          jobType: "execute-epic",
+          step: "review",
+          labels: [target, ...tickets].flatMap((bead) => bead.labels ?? []),
+        }),
         routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         disallowedTools: REVIEW_DENIED_TOOLS,
@@ -892,7 +897,11 @@ async function runGateFixSession(args: {
         cwd: worktreePath,
         prompt,
         appendSystemPrompt,
-        model: settings.model,
+        model: resolveModel(settings, {
+          jobType: "execute-epic",
+          step: "review",
+          labels: target.labels,
+        }),
         routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         signal: ctx.signal,

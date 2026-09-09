@@ -4,7 +4,7 @@
  * tested once here rather than twice through them.
  */
 import { describe, expect, it } from "vitest";
-import { subsumes } from "./model-routing";
+import { resolveModel, subsumes } from "./model-routing";
 
 describe("subsumes — whether an earlier rule makes a later one dead", () => {
   it("a bare catch-all subsumes everything under it", () => {
@@ -38,5 +38,28 @@ describe("subsumes — whether an earlier rule makes a later one dead", () => {
 
   it("ignores the model — two rules differing only in model are still the same match", () => {
     expect(subsumes({ label: "risk:high" }, { label: "risk:high" })).toBe(true);
+  });
+});
+
+describe("resolveModel", () => {
+  const settings = {
+    model: "fallback",
+    modelRoutes: [
+      { jobType: "execute-epic" as const, step: "review" as const, model: "strong" },
+      { label: "risk:high", model: "safe" },
+      { jobType: "nightly-stringer" as const, model: "cheap" },
+    ],
+  };
+
+  it("uses the first matching job, step, and label rule", () => {
+    expect(resolveModel(settings, { jobType: "execute-epic", step: "review", labels: ["risk:high"] })).toBe("strong");
+    expect(resolveModel(settings, { jobType: "execute-epic", step: "implement", labels: ["risk:high"] })).toBe("safe");
+    expect(resolveModel(settings, { jobType: "nightly-stringer" })).toBe("cheap");
+  });
+
+  it("falls back byte-for-byte when no rule matches or the table is absent", () => {
+    expect(resolveModel(settings, { jobType: "product-master" })).toBe("fallback");
+    expect(resolveModel({ model: "fallback" }, { jobType: "execute-epic", step: "review" })).toBe("fallback");
+    expect(resolveModel({}, { jobType: "execute-epic" })).toBeUndefined();
   });
 });

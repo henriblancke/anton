@@ -46,6 +46,28 @@ describe("dispatchClaude", () => {
     expect(reported).toEqual([{ sessionId: result.facts?.sessionIds?.[0], cwd: sandbox.dir }]);
   });
 
+  it("routes an execute step by its step id and bead labels", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+    await dispatchClaude(
+      {
+        ...ctx,
+        step: { id: "implementation", labels: ["step:implement"] },
+        target: { ...ctx.target, labels: ["risk:high"] },
+        settings: {
+          ...ctx.settings,
+          model: "fallback",
+          modelRoutes: [
+            { jobType: "execute-epic", step: "review", model: "reviewer" },
+            { label: "risk:high", model: "safe" },
+          ],
+        },
+      },
+      args(),
+    );
+    expect(claude.calls[0].model).toBe("safe");
+  });
+
   it("tells the runner Claude was reached before the spawn, so a crashed spawn still counts (PR #248)", async () => {
     // The runner prices the attempt on this signal alone — an attempt that never says so is refunded
     // from the project's spend meter and its burn window discarded. It has to fire BEFORE the

@@ -15,6 +15,7 @@ import {
 } from "../scan-severity";
 import type { Project } from "../types";
 import { readBoardContext } from "./nightly-stringer-board";
+import { resolveModel } from "./model-routing";
 
 /**
  * The /scan-triage prompt for one scan. Three things ride along resolved rather than left to the
@@ -66,6 +67,8 @@ export async function runTriage(opts: {
   /** The runner's spend signal — the triage session is the one place this job invokes Claude. */
   claudeReached: () => Promise<void>;
   onEvent: (e: ClaudeEvent) => void;
+  /** Injectable at the call boundary so routing can be asserted without spawning Claude. */
+  claude?: typeof runClaude;
 }): Promise<TriageOutcome | undefined> {
   const { project, settings } = opts;
   const boardSection = await readBoardContext(project.repoPath, opts.logPath, project.slug);
@@ -76,10 +79,10 @@ export async function runTriage(opts: {
   });
 
   await opts.claudeReached();
-  const claudeResult = await runClaude({
+  const claudeResult = await (opts.claude ?? runClaude)({
     cwd: project.repoPath,
     prompt,
-    model: settings.model,
+    model: resolveModel(settings, { jobType: "nightly-stringer" }),
     routing: claudeRouting(settings),
     permissionMode: settings.permissionMode ?? "bypassPermissions",
     signal: opts.signal,
