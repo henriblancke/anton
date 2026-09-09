@@ -56,6 +56,13 @@ describe("verdictOf", () => {
     // restart; it must not weigh toward a per-project disarm.
     expect(verdictOf(run("a", { status: "failed", error: STALE }))).toBe("ignored");
   });
+
+  it("still ignores a deferral on a target that was later abandoned", () => {
+    // Abandoning a target marks every row it ever had abandoned, including the never-started ones —
+    // the deferral outranks that, or giving up on three deferred targets would latch the breaker on
+    // runs that attempted nothing (PR #257 review).
+    expect(verdictOf(run("a", { status: "failed", error: STALE, abandoned: true }))).toBe("ignored");
+  });
 });
 
 describe("detectFailureStreak", () => {
@@ -95,6 +102,13 @@ describe("detectFailureStreak", () => {
 
   it("does not disarm on a run of stale-checkout deferrals — nothing was attempted", () => {
     const runs = [run("c", { error: STALE }), run("b", { error: STALE }), run("a", { error: STALE })];
+    expect(detectFailureStreak(runs, THREE)).toBeUndefined();
+  });
+
+  it("stays silent when abandoned targets only ever deferred on a stale checkout", () => {
+    // Three never-started targets given up on: the abandonment rides on rows that took no lease,
+    // worktree or claim, so there is no per-project evidence to disarm on.
+    const runs = ["c", "b", "a"].map((id) => run(id, { error: STALE, abandoned: true }));
     expect(detectFailureStreak(runs, THREE)).toBeUndefined();
   });
 
