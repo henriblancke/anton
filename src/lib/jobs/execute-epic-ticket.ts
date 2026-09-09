@@ -163,20 +163,7 @@ async function walkTicketSteps(args: {
         }),
       },
     });
-    // A `blocked` or `needs-human` self-report is STICKY across a phase with several dispatching
-    // steps, by SEVERITY (see {@link selfReportRank}). A later agent — a `step:claude` the project
-    // added after `implement` — reports on its own work only, so letting its `delivered` overwrite
-    // an earlier block would close a ticket the implementer declared incomplete on the partial
-    // changes it left behind. An ask still outranks an earlier block, because it names the exact
-    // move a person owes; sticking on the block instead would drop it silently and settle the run
-    // behind no gate at all (PR #205 review). A missing/unparseable line (null) keeps whatever the
-    // phase reported before it, as it always has.
-    const reported = result.facts?.selfReport;
-    if (reported && displacesSelfReport(reported, progress.selfReport)) {
-      progress.selfReport = reported;
-    }
-    // The bead the implementer was prompted with — the read an `already-shipped` claim is about.
-    if (result.facts?.dispatched) progress.dispatched = result.facts.dispatched;
+    recordStepReport(progress, result.facts);
 
     // The agent asked for a HUMAN (anton-287p): the next step belongs to a person — a credential,
     // a dashboard click, a judgement call — not to another attempt. Judged HERE, at the step that
@@ -209,6 +196,34 @@ async function walkTicketSteps(args: {
       branchAddedCommit(run.repoPath, run.branch, run.baseRef, commit),
     );
   }
+}
+
+/**
+ * Fold one step's report into the phase's, REPORT AND DISPATCH SNAPSHOT TOGETHER (PR #238 review).
+ *
+ * A `blocked` or `needs-human` self-report is STICKY across a phase with several dispatching steps,
+ * by SEVERITY (see {@link selfReportRank}). A later agent — a `step:claude` the project added after
+ * `implement` — reports on its own work only, so letting its `delivered` overwrite an earlier block
+ * would close a ticket the implementer declared incomplete on the partial changes it left behind. An
+ * ask still outranks an earlier block, because it names the exact move a person owes; sticking on the
+ * block instead would drop it silently and settle the run behind no gate at all (PR #205 review). A
+ * missing/unparseable line (null) keeps whatever the phase reported before it.
+ *
+ * The bead the step was PROMPTED with travels with that report and only with it. They are one fact —
+ * a claim about "this ticket" is a claim about the read it was made from — and updating them
+ * independently pairs them wrongly the moment a phase has two dispatching steps: an additive
+ * `step:claude` reporting `already-shipped` after `implement` displaces the implementer's report but
+ * supplies no snapshot of its own, so the `already-shipped` repair would fence the generic step's
+ * claim against the IMPLEMENTER's read — and a human note that landed between the two would look
+ * like a note the reporting agent had seen. So a displacing report carries its own snapshot, or
+ * none: with none, the repair falls back to the run's board snapshot, whose contract fence sees any
+ * drift since and escalates rather than retiring on a read nobody attests to.
+ */
+export function recordStepReport(progress: TicketProgress, facts: StepFacts | undefined): void {
+  const reported = facts?.selfReport;
+  if (!reported || !displacesSelfReport(reported, progress.selfReport)) return;
+  progress.selfReport = reported;
+  progress.dispatched = facts?.dispatched;
 }
 
 /**

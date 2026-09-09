@@ -119,7 +119,8 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
 
 describe("claimTicket — clears a stale supersedes edge before running (PR #238 review)", () => {
   const SURVIVOR = "anton-t9";
-  // A reopened retirement: `bd reopen` returns it to `open` but leaves the `supersedes` edge behind.
+  // A reopened retirement as the run's board SNAPSHOT holds it: `bd reopen` returns it to `open`
+  // but leaves the `supersedes` edge behind.
   const reopened = {
     id: "anton-t2",
     title: "Expose the schema",
@@ -127,6 +128,12 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     labels: [],
     dependencies: [{ issue_id: "anton-t2", depends_on_id: SURVIVOR, type: "supersedes" }],
   } as unknown as Bead;
+  /**
+   * The same bead as bd answers AFTER the gate's own claim: `bd update --claim` flips it to
+   * `in_progress` and assigns the operator. That claim is the baseline the edge is judged against —
+   * an edge on a bead still reading this way can only predate it (PR #238 review).
+   */
+  const claimed = { ...reopened, status: "in_progress", assignee: "op" } as Bead;
 
   beforeEach(() => {
     vi.resetAllMocks();
@@ -137,7 +144,7 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     unassignMock.mockResolvedValue(undefined);
     syncMock.mockResolvedValue(undefined);
     unlinkMock.mockResolvedValue(undefined);
-    showMock.mockResolvedValue(reopened);
+    showMock.mockResolvedValue(claimed);
   });
 
   it("removes the stale edge on the authoritative read the claim just earned", async () => {
@@ -147,7 +154,7 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
   });
 
   it("leaves a ticket with no stale edge untouched", async () => {
-    showMock.mockResolvedValue({ ...reopened, dependencies: [] });
+    showMock.mockResolvedValue({ ...claimed, dependencies: [] });
     await claimTicket(run(), reopened, "op");
     expect(unlinkMock).not.toHaveBeenCalled();
   });
@@ -168,6 +175,38 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     // The claim the gate took is handed back so the resume's own claim gate can re-take it.
     expect(setStatusMock).toHaveBeenCalledWith(REPO, reopened.id, "open");
     expect(unassignMock).toHaveBeenCalledWith(REPO, reopened.id);
+  });
+
+  // The window the fix closes (PR #238 review): another process superseded this ticket AFTER the
+  // claim landed, so the edge on the post-claim read is a VALID retirement, not the stale pointer a
+  // reopen kept. Clearing it would run a ticket that hand already settled and record its close as
+  // ordinary delivery.
+  it("keeps a retirement that landed after the claim, and retries instead of running the ticket", async () => {
+    showMock.mockResolvedValue({ ...claimed, status: "closed" });
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toMatch(/retired as superseded by anton-t9 after this run claimed it/);
+    // Retryable, so the next attempt re-reads the board and drops it as the settled retirement.
+    expect(err).not.toBeInstanceOf(PoisonEpic);
+    expect(unlinkMock).not.toHaveBeenCalled();
+    // Nothing is handed back: the bead belongs to whoever settled it, and reopening a closed
+    // retirement is exactly what must not happen.
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(unassignMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps one whose claim moved to another operator in the same window", async () => {
+    showMock.mockResolvedValue({ ...claimed, assignee: "someone-else" });
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toMatch(/after this run claimed it/);
+    expect(unlinkMock).not.toHaveBeenCalled();
   });
 
   it("parks — restoring the claim — when bd refuses to remove the edge", async () => {

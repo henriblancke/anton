@@ -208,6 +208,42 @@ export async function getRunBaseForkSha(db: AntonDb, runId: string): Promise<str
 }
 
 /**
+ * The fork commit the most recent attempt on this epic's BRANCH pinned, whatever became of that run
+ * (PR #238 review) — the branch-scoped half of {@link getRunBaseForkSha}, and the same continuity
+ * {@link findRunFormulaForBranch} exists for.
+ *
+ * Attempts do not all share a run row: an ordinary handler failure settles the row `failed`, so
+ * `findOpenRunForEpic` returns nothing and the runner's retry opens a FRESH row while deliberately
+ * reusing the prior attempt's branch and worktree. Keyed by run id alone, that retry finds no pin and
+ * recomputes `merge-base <base> HEAD` against a base ref a sibling run's fetch can have rewound
+ * meanwhile — widening the delta back into pre-fork history, where an old `<id>:` commit reads as
+ * this run's delivery. So the pin follows the CHECKOUT, which is what it describes.
+ */
+export async function findRunBaseForkShaForBranch(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  branch: string,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({ baseForkSha: schema.runs.baseForkSha })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        eq(schema.runs.branch, branch),
+        isNotNull(schema.runs.baseForkSha),
+      ),
+    )
+    // Ordered exactly as findRunFormulaForBranch is, and for its reason: `updatedAt` is
+    // second-granular, so `writeSeq` breaks a tie by which attempt settled last.
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt))
+    .limit(1);
+  return rows[0]?.baseForkSha ?? undefined;
+}
+
+/**
  * Settle a still-PARKED run as `failed` — the run-row half of abandoning the work it was executing
  * (anton-wvcy). Nothing re-dispatches a parked run, so one whose bead has just been abandoned would
  * otherwise sit exactly as `detectParkedRuns` sees it and be escalated again on every sweep, now

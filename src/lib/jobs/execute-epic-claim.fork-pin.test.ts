@@ -18,11 +18,14 @@ import type { Bead } from "../beads/bd";
 
 const createWorktreeMock = vi.fn();
 const acquireClaimMock = vi.fn<(...a: unknown[]) => Promise<void>>();
+/** Whether the branch already existed — what tells a REUSED checkout from a first creation. */
+const branchExistsMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
 vi.mock("../git/worktree", async () => {
   const actual = await vi.importActual<typeof import("../git/worktree")>("../git/worktree");
   return {
     ...actual,
     acquireWorktreeClaim: (...a: unknown[]) => acquireClaimMock(...a),
+    branchExists: (...a: unknown[]) => branchExistsMock(...a),
     createWorktree: (...a: unknown[]) => createWorktreeMock(...a),
   };
 });
@@ -52,15 +55,16 @@ const WORKTREE = "/tmp/wt";
 const FRESH_BASE = "origin/main";
 const clock: Clock = { now: () => 1_800_000_000_000 };
 
-function makeRun(): EpicRun {
+function makeRun(runId = RUN_ID): EpicRun {
   return {
     db: t.db,
     clock,
     ctx: { signal: new AbortController().signal, heartbeat: vi.fn(async () => {}), report: vi.fn(), attempt: 1 },
     projectId: PROJECT,
     repo: "/repo",
-    runId: RUN_ID,
+    runId,
     branch: BRANCH,
+    targetId: EPIC,
     project: { defaultBranch: "main" },
     settings: {},
     lease: { assertHeld: () => {} },
@@ -79,6 +83,7 @@ beforeEach(async () => {
     repoPath: "/repo",
   });
   acquireClaimMock.mockReset().mockResolvedValue(undefined);
+  branchExistsMock.mockReset().mockResolvedValue(false);
   resolveFreshBaseMock.mockReset().mockResolvedValue(FRESH_BASE);
   resolveForkPointMock.mockReset().mockResolvedValue("f0f0f0forkcommit");
 });
@@ -103,4 +108,40 @@ it("reuses the pinned fork on resume instead of recomputing over a moved HEAD", 
 
   expect(resolveForkPointMock).not.toHaveBeenCalled();
   expect(runStep.baseForkSha).toBe("trueforkcommit");
+});
+
+it("recovers the BRANCH's pin when an ordinary failure retried onto a fresh run row (PR #238 review)", async () => {
+  // An ordinary handler error settles the row `failed`, so `findOpenRunForEpic` returns nothing and
+  // the retry opens a FRESH row over the SAME branch and worktree. Keyed by run id alone it would
+  // find no pin and recompute against a base a sibling fetch may have rewound since — the exact
+  // widening the pin exists to prevent.
+  await updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "trueforkcommit",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  branchExistsMock.mockResolvedValue(true);
+  resolveForkPointMock.mockRejectedValue(new Error("resolver must not run over a reused branch"));
+
+  const { runStep } = await warmRunWorktree(makeRun(RETRY));
+
+  expect(resolveForkPointMock).not.toHaveBeenCalled();
+  expect(runStep.baseForkSha).toBe("trueforkcommit");
+});
+
+it("resolves its OWN fork point when it just created the branch, ignoring another branch's pin", async () => {
+  // A run standing on a branch it cut itself forks HERE, at the freshly-fetched base. A pin from an
+  // earlier run of the same epic on a DIFFERENT branch describes a checkout this one does not share.
+  await updateRun(t.db, clock, RUN_ID, { baseForkSha: "oldbranchfork", branch: "anton/old", status: "failed" });
+  const FRESH = "run-3";
+  await createRun(t.db, clock, { id: FRESH, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  branchExistsMock.mockResolvedValue(false);
+
+  const { runStep } = await warmRunWorktree(makeRun(FRESH));
+
+  expect(resolveForkPointMock).toHaveBeenCalledExactlyOnceWith(WORKTREE, FRESH_BASE);
+  expect(runStep.baseForkSha).toBe("f0f0f0forkcommit");
+  expect(await getRunBaseForkSha(t.db, FRESH)).toBe("f0f0f0forkcommit");
 });

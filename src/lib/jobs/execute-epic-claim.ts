@@ -10,9 +10,14 @@ import { beads, LABELS, unclaimableStatus } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { assignChildren, formatReservedChildren } from "../beads/child-assign";
 import { resolveForkPoint, resolveFreshBase } from "../git/ops";
-import { acquireWorktreeClaim, createWorktree, type Worktree } from "../git/worktree";
+import {
+  acquireWorktreeClaim,
+  branchExists,
+  createWorktree,
+  type Worktree,
+} from "../git/worktree";
 import { resolveOperator } from "../operator";
-import { getRunBaseForkSha, updateRun } from "../runs";
+import { findRunBaseForkShaForBranch, getRunBaseForkSha, updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
 import { safe } from "./execute-epic-persist";
 import type { EpicRun } from "./execute-epic-run";
@@ -50,6 +55,11 @@ export async function warmRunWorktree(
   const worktreeClaim = claimOwnerFor(runId);
   run.worktreeClaim = worktreeClaim;
   await acquireWorktreeClaim(repo, branch, worktreeClaim);
+  // Asked BEFORE the create, which is the only moment it can be: `createWorktree` checks out an
+  // existing branch as it stands and cuts a new one off `freshBase` only when none exists, so this
+  // is what tells a REUSED checkout from a first creation — and a reused one inherits a prior
+  // attempt's fork point rather than forking here (see the pin below).
+  const reusedCheckout = await branchExists(repo, branch);
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
@@ -65,9 +75,21 @@ export async function warmRunWorktree(
   // still sits at it (PR #238 review). Persisted so dispatch partitions against the commit the branch
   // was cut from, never re-derived against `baseRef` a sibling run's fetch can rewind mid-run. A
   // resume READS the stored value rather than recomputing: its worktree already carries this run's
-  // commits, so `merge-base <base> HEAD` then would answer far behind the true fork. A row from
-  // before this column recomputes once — no worse than the old behaviour — and stores it.
-  const persistedFork = await getRunBaseForkSha(db, runId);
+  // commits, so `merge-base <base> HEAD` then would answer far behind the true fork.
+  //
+  // The pin follows the CHECKOUT, not this run row alone (PR #238 review). Attempts do not all share
+  // a row: an ordinary handler failure settles it `failed`, so the runner's retry opens a FRESH row
+  // while deliberately reusing this branch and worktree (execute-epic-prepare's branch-scoped
+  // retry). Keyed by `runId` only, that retry finds nothing pinned and recomputes against a base a
+  // sibling run's fetch may have rewound since — the exact widening the pin exists to prevent. So a
+  // run that INHERITED its branch recovers what the attempt that cut it recorded, and only one
+  // standing on a branch it just created resolves a fork point of its own. A pre-column branch has
+  // neither, and recomputes once — no worse than the old behaviour — storing the answer on its row.
+  const persistedFork =
+    (await getRunBaseForkSha(db, runId)) ??
+    (reusedCheckout
+      ? await findRunBaseForkShaForBranch(db, projectId, run.targetId, branch)
+      : undefined);
   let baseForkSha: string;
   try {
     baseForkSha = persistedFork ?? (await resolveForkPoint(worktree.path, freshBase));

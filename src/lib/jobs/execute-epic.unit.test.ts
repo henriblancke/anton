@@ -48,7 +48,12 @@ import {
 import { landableTicketIds } from "./execute-epic-dispatch";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage, stalePrBodyNote } from "./execute-epic-review";
-import { assertDelivered, displacesSelfReport, selfReportRank } from "./execute-epic-ticket";
+import {
+  assertDelivered,
+  displacesSelfReport,
+  recordStepReport,
+  selfReportRank,
+} from "./execute-epic-ticket";
 import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
 import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
 import {
@@ -2442,5 +2447,67 @@ describe("selfReportRank — where `satisfied` sits among the outcomes (anton-6l
     // And a delivery replaces a delivery, so the ordinary phase keeps its last word.
     expect(displacesSelfReport({ outcome: "delivered" }, { outcome: "delivered" })).toBe(true);
     expect(displacesSelfReport({ outcome: "delivered" }, null)).toBe(true);
+  });
+});
+
+/**
+ * PR #238 review — a step's self-report and the bead it was PROMPTED with move as ONE value. The
+ * `already-shipped` repair fences its retirement on the dispatch snapshot, so a phase that kept one
+ * step's report beside another step's snapshot would hold a claim to a read its author never saw.
+ */
+describe("recordStepReport — the report and its dispatch snapshot travel together", () => {
+  const dispatched = (id: string): Bead => ({ id, title: id, description: `## Goal\n${id}` }) as Bead;
+  const empty = (): TicketProgress => ({ committed: false, delivered: false, selfReport: null });
+
+  it("records a displacing report with the snapshot that step supplied", () => {
+    const progress = empty();
+    const implementRead = dispatched("as-implement-read-it");
+    recordStepReport(progress, { selfReport: { outcome: "delivered" }, dispatched: implementRead });
+    expect(progress.selfReport).toEqual({ outcome: "delivered" });
+    expect(progress.dispatched).toBe(implementRead);
+  });
+
+  // The bug: an additive `step:claude` after `implement` reports `already-shipped` — displacing the
+  // implementer's report — while supplying no snapshot of its own. Pairing its claim with the
+  // implementer's read would fence the retirement against a contract the reporting agent never saw,
+  // so a human note that landed between the two dispatches would look like one it had.
+  it("drops the previous step's snapshot when a displacing report brings none", () => {
+    const progress = empty();
+    recordStepReport(progress, {
+      selfReport: { outcome: "delivered" },
+      dispatched: dispatched("as-implement-read-it"),
+    });
+    recordStepReport(progress, {
+      selfReport: { outcome: "blocked", klass: "already-shipped", reason: "shipped by anton-x" },
+    });
+    expect(progress.selfReport).toEqual({
+      outcome: "blocked",
+      klass: "already-shipped",
+      reason: "shipped by anton-x",
+    });
+    expect(progress.dispatched).toBeUndefined();
+  });
+
+  it("keeps both when a report does NOT displace the phase's", () => {
+    const progress = empty();
+    const asked = dispatched("as-the-asking-step-read-it");
+    recordStepReport(progress, { selfReport: { outcome: "needs-human", reason: "a key" }, dispatched: asked });
+    // `satisfied` ranks below an ask, so neither half moves.
+    recordStepReport(progress, {
+      selfReport: { outcome: "satisfied", commit: "0a76266d" },
+      dispatched: dispatched("a-later-read"),
+    });
+    expect(progress.selfReport).toEqual({ outcome: "needs-human", reason: "a key" });
+    expect(progress.dispatched).toBe(asked);
+  });
+
+  it("leaves the phase untouched on a missing or unparseable line", () => {
+    const progress = empty();
+    const implementRead = dispatched("as-implement-read-it");
+    recordStepReport(progress, { selfReport: { outcome: "delivered" }, dispatched: implementRead });
+    recordStepReport(progress, { committed: true });
+    recordStepReport(progress, undefined);
+    expect(progress.selfReport).toEqual({ outcome: "delivered" });
+    expect(progress.dispatched).toBe(implementRead);
   });
 });

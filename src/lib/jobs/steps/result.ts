@@ -34,6 +34,11 @@ export interface StepFacts {
    * Retained because a claim about "this ticket" is a claim
    * about that read, and the `already-shipped` repair fences the retirement on it (PR #238 review):
    * a human note appended after the prompt was built is an instruction the agent never saw.
+   *
+   * It belongs to THIS step's {@link selfReport} and to no other, so a step that reports one must
+   * report both — the phase records them as a pair (execute-epic-ticket.ts `recordStepReport`), and a
+   * dispatching step supplying a report without a snapshot leaves the phase with none rather than
+   * inheriting another step's read.
    */
   dispatched?: Bead;
   /** `commit` — whether the worktree actually had a diff to commit (false ⇒ nothing delivered). */

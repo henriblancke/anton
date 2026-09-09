@@ -6,7 +6,7 @@
  * Everything here is bookkeeping the walk needs done but does not itself decide. What happens when a
  * ticket stops short is the settlement's (execute-epic-ticket-settle.ts).
  */
-import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
+import { beads, labelValueOf, LABELS, ownerOf, unclaimableStatus, type Bead } from "../beads/bd";
 import { formatSatisfiedNote, shortSha } from "../beads/satisfied-note";
 import { readWorktreeState, type WorktreeState } from "../git/ops";
 import { updateRun } from "../runs";
@@ -101,7 +101,9 @@ export async function claimTicket(
   // resume between that close and its push drops the ticket as a pre-existing retirement
   // (execute-epic-dispatch `partitionTickets`) instead of regenerating its commit — the PR then
   // omits the rerun's work. So the edge is cleared here, on the authoritative read the claim just
-  // earned; and — like the marker above — a run that cannot clear it parks before it can open that PR.
+  // earned; and — like the marker above — a run that cannot clear it parks before it can open that
+  // PR. Only an edge that PREDATES the claim is cleared: the same read sees a retirement another
+  // process landed in the window, and that one is settled work (see {@link retirementSettledSinceClaim}).
   const claimed = await beads.show(repo, ticket.id).catch(() => undefined);
   // The read is authoritative or nothing: a transient failure here tells us NOTHING about the
   // edge, and treating an unreadable bead as edge-free would run the ticket and let a surviving
@@ -117,12 +119,31 @@ export async function claimTicket(
         `dropping the rerun's work from the PR. Check the beads DB, then resume the run`,
     );
   }
-  const staleSurvivor = beads.supersedesTarget(claimed);
-  if (staleSurvivor) {
-    if (!(await mustPersist(() => beads.unlink(repo, ticket.id, staleSurvivor)))) {
+  const survivor = beads.supersedesTarget(claimed);
+  if (survivor) {
+    // …but only an edge this run's own claim proves is STALE (PR #238 review). A supersede another
+    // process wrote in the window between the claim above and this read is a valid retirement, and
+    // removing it would run the ticket that hand just settled and record its close as an ordinary
+    // delivery. What tells the two apart is the claim itself ({@link retirementSettledSinceClaim}).
+    const settled = retirementSettledSinceClaim(claimed, operator);
+    if (settled) {
+      // RETRYABLE, not a park: the next attempt re-reads the board, and dispatch drops a ticket
+      // closed as superseded with no commit under its own id exactly as it drops any retirement it
+      // finds (execute-epic-dispatch `partitionTickets`) — recording it on the run's retired ledger
+      // so the pull request says what it does not carry. Nothing is written here and the claim is
+      // NOT handed back: the bead belongs to whoever settled it, and `unclaimAndPark` would reopen
+      // a closed retirement.
+      throw new Error(
+        `refusing to execute ${ticket.id}: it was retired as superseded by ${survivor} after this ` +
+          `run claimed it (${settled}) — retrying so the next attempt re-reads the board and drops ` +
+          `the ticket as the settled retirement it is, rather than re-running work another hand ` +
+          `has already closed`,
+      );
+    }
+    if (!(await mustPersist(() => beads.unlink(repo, ticket.id, survivor)))) {
       await unclaimAndPark(repo, ticket.id);
       throw new PoisonEpic(
-        `${ticket.id} carries a stale \`supersedes\` edge to ${staleSurvivor} from a previous ` +
+        `${ticket.id} carries a stale \`supersedes\` edge to ${survivor} from a previous ` +
           `retirement but bd would not remove it — running this ticket and opening a pull request ` +
           `would make its own honest close read as superseded again, and a cross-machine resume ` +
           `drop the rerun's work from the PR. Check the beads DB, then resume the run`,
@@ -132,6 +153,37 @@ export async function claimTicket(
   void beads
     .sync(repo)
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
+}
+
+/**
+ * Why the `supersedes` edge on the post-claim read is a retirement that landed AFTER this run took
+ * the ticket — or undefined while it is the stale pointer a reopened retirement kept (PR #238
+ * review).
+ *
+ * `bd reopen` returns a retired bead to `open` and leaves its `supersedes` edge behind, which is
+ * the edge {@link claimTicket} exists to clear. But the read that finds it is taken after the claim,
+ * so it also sees a supersede another process wrote in between — and that one is VALID: the ticket
+ * is settled, and clearing the edge would run it anyway and record its close as ordinary delivery.
+ *
+ * The claim is what separates them, because `bd supersede` closes the bead as it writes the edge. A
+ * ticket still `in_progress` under this run's own assignee is one nothing has settled since the
+ * claim, so its edge can only predate it. Any other reading — closed, returned to `open`, blocked,
+ * deferred, or held by another name — is a board decision made after the claim, and the edge goes
+ * with it. The ASSIGNEE half is asked only when the run resolved an operator identity: without one
+ * bd claims under its own actor resolution, and there is no name to hold the read to.
+ */
+export function retirementSettledSinceClaim(
+  claimed: Bead,
+  operator: string | undefined,
+): string | undefined {
+  if (claimed.status !== "in_progress") {
+    return `the ticket reads ${claimed.status} now, not the in_progress this run's claim left it`;
+  }
+  const holder = ownerOf(claimed);
+  if (operator && holder !== operator) {
+    return `the ticket is ${holder ? `claimed by \`${holder}\`` : "unclaimed"} now, not held for \`${operator}\` as this run's claim left it`;
+  }
+  return undefined;
 }
 
 /** The statuses bd refuses a claim on that a LATER attempt can still find changed — see below. */
