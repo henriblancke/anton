@@ -1161,6 +1161,14 @@ async function deliveredOrPark(
     // Only when every retirement on the ledger is THIS run's: a supersede anton merely FOUND is
     // somebody else's decision, and settling the run on it would claim a verification anton never
     // performed.
+    //
+    // This verdict is reached from `run.retired`, which every attempt rebuilds in memory, so it
+    // speaks only for the attempt that wrote it — an interruption between the supersede and the run
+    // row settling leaves the retirement on the board with nothing here to recover it from, and the
+    // retry cannot reach this line at all (the target is closed and unassigned by then, so the claim
+    // gate refuses it first). The DURABLE half is asked before any of this, off the bead's own
+    // `already-shipped` repair stamp (execute-epic-recover `settleRetiredStandalone`), which makes
+    // the outcome idempotent across a restart rather than dependent on this ledger surviving.
     if (run.standaloneRun && found.length === 0) return { delivered, targetRetired: true };
     throw new PoisonEpic(
       `every ticket under ${epicBeadId} that this run could dispatch was retired rather than ` +

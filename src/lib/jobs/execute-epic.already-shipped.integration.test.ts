@@ -3,7 +3,7 @@
  * REAL job runner, REAL bd and git, a fake claude that delivers nothing for one ticket and does the
  * work for the other.
  *
- * Five claims:
+ * Six claims:
  *   • a VERIFIED claim retires the ticket as superseded — closed, pointing at the bead that shipped
  *     it, with anton's evidence in a note and the repair stamped on the bead;
  *   • THE EPIC CONTINUES: the run walks its remaining tickets, opens its one pull request and
@@ -15,7 +15,10 @@
  *     and parks the run as before, with a note saying what `apply` would have done;
  *   • a RESUME of a run that retired a ticket leaves that ticket retired: a superseded bead is
  *     closed with no commit under its own id on the branch — the shape the cross-machine resume path
- *     reads as "regenerate it here" — so nothing may reopen or re-dispatch it.
+ *     reads as "regenerate it here" — so nothing may reopen or re-dispatch it;
+ *   • an INTERRUPTED standalone retirement re-settles as the success it was: the terminal verdict is
+ *     recovered from the bead's own repair stamp rather than from the ledger the crashed attempt
+ *     held in memory — and only from ANTON's stamp, so a supersede a person wrote still parks.
  *
  * Deliberately its own sandbox, like the sibling repair suites: these cases seed extra beads and
  * settle epic children in ways the shared fixture's own assertions would collide with.
@@ -23,6 +26,7 @@
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
 import { parseTicketNotes } from "../beads/notes";
 import { indexBoard } from "../gardener/board-index";
@@ -489,5 +493,112 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       process.env.ANTON_CLAUDE_BIN = prevClaude;
       process.env.ANTON_GH_BIN = prevGh;
     }
+  });
+  // A standalone retirement is a SUCCESS, and it has to stay one across a restart (PR #238 review).
+  // The terminal verdict is reached from the run's in-memory retirement ledger, so an interruption
+  // between the supersede and the run row settling leaves the retirement on the board with nothing
+  // in the next attempt's ledger to recognise it by. That attempt cannot reach the verdict anyway:
+  // the target is closed and unassigned by then, so the claim gate refuses it first and the run
+  // parks — a successfully retired target represented as a stuck execution, counted against the
+  // consecutive-failure breaker, telling the operator to reopen a retirement anton made correctly.
+  it("re-settles an interrupted standalone retirement as DONE instead of parking on the closed target", async () => {
+    const shipper = await seedShipper("The bead that shipped the interrupted one");
+    const standalone = await beads.create(repo, {
+      title: "Interrupted already-shipped target",
+      type: "bug",
+      acceptance: "the fix is in the tree",
+      description: "## Goal\nFix it.",
+    });
+    await beads.approve(repo, standalone);
+    const runner = makeEpicRunner(ctx);
+    const prevClaude = process.env.ANTON_CLAUDE_BIN;
+    const prevGh = process.env.ANTON_GH_BIN;
+    process.env.ANTON_CLAUDE_BIN = shippedClaude(
+      "claude-shipped-interrupted",
+      standalone,
+      `Already implemented by ${shipper}`,
+    );
+    const prCalls = join(sandbox, "interrupted-pr-calls.txt");
+    process.env.ANTON_GH_BIN = writeBin(
+      binDir,
+      "gh-interrupted-retired",
+      `const fs=require('fs');const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){console.log('[]');process.exit(0);}
+fs.appendFileSync(${JSON.stringify(prCalls)},a.join(' ')+'\\n');
+console.log('https://github.com/acme/repo/pull/98');process.exit(0);`,
+    );
+    try {
+      // Attempt 1 retires the target and settles the run — the state a crash would have left on the
+      // board, minus the row. Then the row is forced back to `running` and the job re-queued, which
+      // is exactly what the next attempt finds after an interrupted one: the supersede landed, the
+      // run never settled.
+      await enqueueEpicJob(runner, { projectId, epicBeadId: standalone });
+      expect(await tickToIdle(runner)).toBe(1);
+      expect((await beads.show(repo, standalone)).status).toBe("closed");
+
+      const firstRun = (await tdb.db.select().from(schema.runs)).find(
+        (r) => r.epicBeadId === standalone,
+      )!;
+      await tdb.db
+        .update(schema.runs)
+        .set({ status: "running", endedAt: null, error: null })
+        .where(eq(schema.runs.id, firstRun.id));
+
+      const resumeJobId = await enqueueEpicJob(runner, { projectId, epicBeadId: standalone });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      // The retry recognises the retirement it made itself and finishes: no park, no PR, no reopen.
+      expect((await getJob(tdb.db, resumeJobId))?.status).toBe("done");
+      const runs = (await tdb.db.select().from(schema.runs)).filter(
+        (r) => r.epicBeadId === standalone,
+      );
+      expect(runs.every((r) => r.status === "done")).toBe(true);
+      expect(existsSync(prCalls)).toBe(false);
+      const settled = await beads.show(repo, standalone);
+      expect(settled.status).toBe("closed"); // never reopened to be re-run
+      const board = await beads.list(repo, ["--status", "all"]);
+      expect(indexBoard(board).recordsSupersedes(standalone, shipper)).toBe(true);
+      // …and the resumed row says what happened, in the words the uninterrupted run would use.
+      const resumed = runs.find((r) => r.id !== firstRun.id) ?? runs[0]!;
+      expect(resumed.error).toContain("had already shipped");
+      expect(resumed.error).toContain("opened no pull request");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prevClaude;
+      process.env.ANTON_GH_BIN = prevGh;
+    }
+  });
+
+  // The recovery is anton's OWN verified retirement only (PR #238 review). A human's `bd supersede`
+  // of a target they decided against reads identically on the bead — closed, with a `supersedes`
+  // edge — and finishing a run on it would report a settlement anton never performed as its own
+  // success. Only the `already-shipped` repair stamp tells the two apart, so an unstamped supersede
+  // falls through to the ordinary walk and parks for the person whose decision it was.
+  it("does NOT claim a supersede anton never verified — an unstamped one still parks", async () => {
+    const shipper = await seedShipper("The bead a person pointed the standalone one at");
+    const standalone = await beads.create(repo, {
+      title: "Human-superseded standalone target",
+      type: "bug",
+      acceptance: "the fix is in the tree",
+      description: "## Goal\nFix it.",
+    });
+    await beads.approve(repo, standalone);
+    // A person's decision: superseded on the board, with no repair stamp anywhere on it.
+    await beads.supersede(repo, standalone, shipper);
+    expect(
+      ((await beads.show(repo, standalone)).labels ?? []).some((l) =>
+        l.startsWith("repair:already-shipped:"),
+      ),
+    ).toBe(false);
+
+    const runner = makeEpicRunner(ctx);
+    const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: standalone });
+    await tickToIdle(runner);
+
+    // Parked for the person who made the call — never reported as a run anton finished.
+    expect((await getJob(tdb.db, jobId))?.status).not.toBe("done");
+    const runRow = (await tdb.db.select().from(schema.runs)).find(
+      (r) => r.epicBeadId === standalone,
+    );
+    expect(runRow?.status).not.toBe("done");
   });
 });
