@@ -1243,8 +1243,11 @@ describe("landableTicketIds — which prerequisites this run can still land (ant
 });
 
 describe("branchDelivery — whose commit on this branch carries a ticket (anton-ag76)", () => {
-  /** The branch as the two reads see it: `<id>:` subjects, and one commit's satisfies-trailers. */
-  const branch = (opts: { subjects?: string[]; satisfies?: string[] } = {}) => {
+  /**
+   * The branch as the reads see it: `<id>:` subjects, one commit's satisfies-trailers, and whether
+   * that commit is one the branch ADDED (`inBase` puts it in base history instead).
+   */
+  const branch = (opts: { subjects?: string[]; satisfies?: string[]; inBase?: boolean } = {}) => {
     const asked: string[] = [];
     const claim = {
       sha: "c0ffee1c0ffee1c0ffee1c0ffee1c0ffee1c0ffee",
@@ -1263,6 +1266,10 @@ describe("branchDelivery — whose commit on this branch carries a ticket (anton
           asked.push(`trailer:${id}`);
           return claim.ticketIds.includes(id) ? claim : undefined;
         },
+        branchAdded: async (sha: string) => {
+          asked.push(`added:${sha.slice(0, 7)}`);
+          return !opts.inBase;
+        },
       },
     };
   };
@@ -1278,7 +1285,27 @@ describe("branchDelivery — whose commit on this branch carries a ticket (anton
     // The whole point: no commit here is subjected `t-2:`, but a sibling's commit says its work met
     // t-2's acceptance in full. Dispatching t-2 again can only produce the zero diff that blocks it.
     const b = branch({ subjects: ["t-sibling"], satisfies: ["t-2"] });
-    expect(await branchDelivery(b.reads, "t-2")).toEqual({ how: "sibling", by: b.claim });
+    expect(await branchDelivery(b.reads, "t-2")).toEqual({
+      how: "sibling",
+      by: b.claim,
+      inherited: false,
+    });
+  });
+
+  /**
+   * PR #258 review: a trailer can come from a commit already in the BASE — merged into the trunk
+   * long before this run existed. The skip is right either way (the work is in the tree), but the
+   * pull request must not call base history an earlier commit of this run and cite a sha its diff
+   * does not contain.
+   */
+  it("flags a claim from BASE history as inherited, so the body does not credit this run", async () => {
+    const b = branch({ subjects: ["t-sibling"], satisfies: ["t-2"], inBase: true });
+    expect(await branchDelivery(b.reads, "t-2")).toEqual({
+      how: "sibling",
+      by: b.claim,
+      inherited: true,
+    });
+    expect(b.asked).toEqual(["subject:t-2", "trailer:t-2", "added:c0ffee1"]);
   });
 
   it("answers 'nothing here' when neither a subject nor a trailer claims the ticket", async () => {
@@ -1286,6 +1313,7 @@ describe("branchDelivery — whose commit on this branch carries a ticket (anton
     // lives only in another machine's unpushed worktree. Still regenerated, exactly as before.
     const b = branch({ subjects: ["t-1"], satisfies: ["t-2"] });
     expect(await branchDelivery(b.reads, "t-3")).toBeUndefined();
+    // No provenance read at all: there is no claim to place.
     expect(b.asked).toEqual(["subject:t-3", "trailer:t-3"]);
   });
 

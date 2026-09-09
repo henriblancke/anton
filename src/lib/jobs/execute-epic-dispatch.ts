@@ -12,7 +12,12 @@ import { claimGuard } from "../beads/claim";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { appendSessionLog } from "../sessions";
 import { resumeSkipped } from "../ticket-view";
-import { branchSatisfiesTicket, worktreeHasCommitFor, type SatisfiedClaim } from "../git/ops";
+import {
+  branchAddedCommit,
+  branchSatisfiesTicket,
+  worktreeHasCommitFor,
+  type SatisfiedClaim,
+} from "../git/ops";
 import { blockedTailReason, PoisonEpic } from "./errors";
 import {
   deliveredTickets,
@@ -37,7 +42,7 @@ import { mustPersist, mustRead, safe } from "./execute-epic-persist";
 import type { RunPreparation } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
 import { runTicket } from "./execute-epic-ticket";
-import type { SatisfiedSettlement } from "./step-registry";
+import type { SatisfiedSettlement, StepContext } from "./step-registry";
 
 /** What the ticket phase leaves for the run phase to speak for. */
 export interface DispatchOutcome {
@@ -358,22 +363,42 @@ function stoppedShortIds(timedOut: readonly TicketTimeoutOutcome[]): Set<string>
  * A `sibling` settlement has no commit carrying this ticket's id, so the body attributes it to the
  * commit that did the work rather than listing it among the deliveries — the same distinction
  * anton-8h4b drew for a step this run satisfied while it was running.
+ *
+ * `inherited` splits that attribution in two (PR #258 review). A trailer can come from a commit the
+ * branch ADDED — this run's own earlier work, which the reviewer reads in the diff — or from one
+ * already in the BASE, merged in from the trunk long before this run existed. Recording both as
+ * "satisfied by earlier commits of this run" tells a reviewer to look in the diff for a commit that
+ * is not there. The skip is right either way (the work is in the tree, so a re-dispatch can only
+ * zero-diff); only the claim's provenance differs.
  */
-type BranchDelivery = { how: "own-commit" } | { how: "sibling"; by: SatisfiedClaim };
+type BranchDelivery =
+  | { how: "own-commit" }
+  | { how: "sibling"; by: SatisfiedClaim; inherited: boolean };
 
-/** The two branch reads {@link branchDelivery} asks — a seam, so the predicate is unit-testable. */
+/** The branch reads {@link branchDelivery} asks — a seam, so the predicate is unit-testable. */
 export interface BranchDeliveryReads {
   /** A commit subjected `<ticketId>:` — this ticket's own delivery attribution. */
   hasCommitFor: (ticketId: string) => Promise<boolean>;
   /** A commit whose `Anton-Satisfies` trailers claim this ticket (anton-6vxl). */
   satisfiedBy: (ticketId: string) => Promise<SatisfiedClaim | undefined>;
+  /** Whether that commit is one this branch ADDED over its base, rather than base history. */
+  branchAdded: (sha: string) => Promise<boolean>;
 }
 
-/** The pair of reads over a real worktree. */
-function worktreeReads(worktreePath: string): BranchDeliveryReads {
+/**
+ * The reads over a real worktree. The subject and trailer scans run in the CHECKOUT, where the
+ * branch is the one checked out; the provenance read is asked of the REPOSITORY, which is what
+ * {@link branchAddedCommit} needs to name a branch and a fork point — the same pair the delivery
+ * gate uses to settle a `satisfied` claim (anton-nuft).
+ */
+function worktreeReads(
+  worktreePath: string,
+  run: Pick<StepContext, "repoPath" | "branch" | "baseRef">,
+): BranchDeliveryReads {
   return {
     hasCommitFor: (id) => worktreeHasCommitFor(worktreePath, id),
     satisfiedBy: (id) => branchSatisfiesTicket(worktreePath, id),
+    branchAdded: (sha) => branchAddedCommit(run.repoPath, run.branch, run.baseRef, sha),
   };
 }
 
@@ -391,6 +416,12 @@ function worktreeReads(worktreePath: string): BranchDeliveryReads {
  * machine closed then parked on before pushing has neither a subject nor a trailer here, so it
  * still regenerates. Both reads fail closed to "absent" for the same reason: a `git log` that failed
  * is not proof of delivery, and the safe error is re-running work rather than skipping it.
+ *
+ * The provenance read fails closed the other way — to `inherited` — because its two answers are not
+ * a skip-or-run decision but a sentence in the pull request. {@link branchAddedCommit} answers
+ * `false` on any git failure, and "the work is here but not in this diff" is the claim a reviewer
+ * can check against the base for themselves; the reverse would send them hunting the diff for a
+ * commit anton could not prove is in it.
  */
 export async function branchDelivery(
   reads: BranchDeliveryReads,
@@ -398,7 +429,8 @@ export async function branchDelivery(
 ): Promise<BranchDelivery | undefined> {
   if (await reads.hasCommitFor(ticketId)) return { how: "own-commit" };
   const by = await reads.satisfiedBy(ticketId);
-  return by ? { how: "sibling", by } : undefined;
+  if (!by) return undefined;
+  return { how: "sibling", by, inherited: !(await reads.branchAdded(by.sha)) };
 }
 
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
@@ -450,7 +482,7 @@ async function dispatchTicket(
   // this ticket's acceptance in full and the resume dispatched it into a guaranteed zero diff.
   const doneOnBoard = resumeSkipped(ticket, standaloneRun);
   const delivery = doneOnBoard
-    ? await branchDelivery(worktreeReads(worktree.path), ticket.id)
+    ? await branchDelivery(worktreeReads(worktree.path, runStep), ticket.id)
     : undefined;
   if (delivery) {
     if (standaloneRun) {
@@ -467,11 +499,14 @@ async function dispatchTicket(
     // same record anton-8h4b writes for a step satisfied while the run was still going. `closed` is
     // read off the bead this run found, since nothing here closed it: `resumeSkipped` also admits a
     // standalone target sitting at `stage:in-review`, which is open by design until its PR merges.
+    // `inherited` is carried through so the body can say WHERE the commit is (PR #258 review): a
+    // trailer that reached the base by an earlier merge is not in this pull request's diff.
     if (delivery.how === "sibling") {
       ledger.satisfied.set(ticket.id, {
         commit: delivery.by.sha,
         subject: delivery.by.subject,
         closed: ticket.status === "closed",
+        inherited: delivery.inherited,
       });
     }
     onBranch.add(ticket.id);
