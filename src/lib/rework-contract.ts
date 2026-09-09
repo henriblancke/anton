@@ -499,9 +499,18 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     // item yet is only four columns in at the top level, which CommonMark renders as more of the
     // item's paragraph. Trimming the line first read it as a heading, popped the item and filed the
     // line as a fenced code block, so the acceptance no longer matched the note.
+    //
+    // An HTML block starts one too, which is why it joins the test: `- Expected output:` / `<div>` /
+    // blank / `    ## literal` ends the item at the `<div>`, so the last line is a top-level code
+    // sample the note renders verbatim. Keeping the item open read it as a heading nested inside and
+    // dropped it from the acceptance.
     const indent = indentColumns(line.text);
     const matched = matchedItem(items, indent);
-    const lazy = openParagraph !== undefined && !BLOCK_START.test(dedent(line.text, matched));
+    const dedented = dedent(line.text, matched);
+    const lazy =
+      openParagraph !== undefined &&
+      !BLOCK_START.test(dedented) &&
+      !HTML_BLOCK_START.test(dedented);
     while (!lazy && items.length > 0 && indent < items[items.length - 1]!) items.pop();
     const base = items[items.length - 1] ?? 0;
     const rel = indent >= base ? dedent(line.text, base) : line.text;

@@ -619,6 +619,15 @@ describe("instructionCriteria", () => {
     ]);
     // A lazy continuation keeps the item open, so a block after it still nests in the item.
     expect(texts("- a\nlazy\n\n      code")).toEqual(["a", "lazy", "```\ncode\n```"]);
+    // An HTML block is no lazy continuation: it INTERRUPTS the item's paragraph and ends the item
+    // with it, so the sample below the blank line is four columns in at the TOP level — code the
+    // note renders verbatim. Reading `<div>` as more of the paragraph kept the item open and filed
+    // the sample as a heading nested inside it, dropping it from the acceptance.
+    expect(texts("- Expected output:\n<div>\n\n    ## literal")).toEqual([
+      "Expected output:",
+      "<div>",
+      "```\n## literal\n```",
+    ]);
     // A tab after the marker reaches the next tab stop, as CommonMark counts it.
     expect(texts("-\tstep\n\n        code")).toEqual(["step", "```\ncode\n```"]);
   });

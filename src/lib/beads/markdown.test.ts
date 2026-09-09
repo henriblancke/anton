@@ -314,6 +314,27 @@ describe("htmlBlockLines", () => {
     expect(htmlBlockLines("<div>\nx\n\n## Acceptance")).toEqual([false, false, false, false]);
     expect(htmlBlockLines("see <script> in the note\n## Acceptance")).toEqual([false, false]);
   });
+
+  it("starts no block inside one that ends at a blank line", () => {
+    // `<script>` is raw content of the `<div>` block, which the blank line ends — so the heading
+    // below renders, and nothing after it is hidden by a `</script>` nobody wrote.
+    expect(htmlBlockLines("<div>\n<script>\n\n## Acceptance Criteria\n- [ ] stale")).toEqual([
+      false,
+      false,
+      false,
+      false,
+      false,
+    ]);
+    expect(unterminatedCloser("<div>\n<script>\n\n## Acceptance Criteria")).toBeUndefined();
+    // Past the blank line the block is over, so a persistent opener there is its own block again.
+    expect(htmlBlockLines("<div>\nx\n\n<script>\n## Acceptance")).toEqual([
+      false,
+      false,
+      false,
+      true,
+      true,
+    ]);
+  });
 });
 
 describe("unquote", () => {

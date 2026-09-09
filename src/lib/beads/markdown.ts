@@ -285,6 +285,28 @@ const HTML_BLOCKS: { open: RegExp; close: string }[] = [
 ];
 
 /**
+ * A block that ends at the next BLANK line rather than at a closing tag — CommonMark's start
+ * condition 6, the named block-level tags. Tracked only to stop a persistent opener
+ * ({@link HTML_BLOCKS}) from starting inside one: its content is raw HTML like any other block's, so
+ * `<div>` / `<script>` / blank / `## Acceptance Criteria` renders that heading, while reading the
+ * `<script>` as a block of its own hid the real section and appended a second one after a closing
+ * tag nobody wrote. Its OWN lines are not hidden — the block ends at the blank line, so a heading
+ * below it is written text, which is what the `inHtml` reader answers.
+ *
+ * Condition 7 — any other complete tag alone on its line — is absent for the same reason it is
+ * absent from the send-back parser: it may not interrupt a paragraph, so recognising it here would
+ * need paragraph state this walk does not keep, and misreading prose as a block hides more than it
+ * reveals. Nothing it would cover holds a persistent opener without one of these tags above it.
+ */
+const LOOSE_HTML_BLOCK = new RegExp(
+  "^ {0,3}</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|" +
+    "dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|" +
+    "head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|" +
+    "p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ \\t>]|/>|$)",
+  "i",
+);
+
+/**
  * The line that closes whatever construct `source` ends inside — the fence's own delimiter, `-->`
  * for an HTML comment, or the closing tag of a persistent HTML block — or undefined when it ends
  * clean. For a caller that APPENDS to a body: an unclosed construct runs to the end of the text, so
@@ -338,6 +360,10 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
   // The indentation of the line that opened whatever is still open, so the closer lands in the same
   // container the opener did.
   let indent = "";
+  // A blank-terminated block (CommonMark's conditions 6 and 7) standing open. Its content is raw
+  // HTML too, so nothing inside it opens anything — a `<script>` under `<div>` is text the outer
+  // block holds, not a block of its own, and tracking one there hid a heading the render shows.
+  let looseHtml = false;
   const inHtml: boolean[] = [];
   for (const text of source.split(/\r?\n/)) {
     // An HTML block is literal until its closing text: no fence opens and no comment starts inside
@@ -345,6 +371,12 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
     if (html) {
       inHtml.push(true);
       if (text.toLowerCase().includes(html.close)) html = undefined;
+      continue;
+    }
+    if (looseHtml) {
+      // A blank line ends it, and what follows renders as Markdown again.
+      looseHtml = text.trim() !== "";
+      inHtml.push(false);
       continue;
     }
     const openFence = state.fence !== undefined;
@@ -358,6 +390,7 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
     }
     // Judged on the comment-blanked text: a `<script>` inside `<!-- … -->` opens no block.
     html = HTML_BLOCKS.find((block) => block.open.test(line.masked));
+    if (!html) looseHtml = LOOSE_HTML_BLOCK.test(line.masked);
     inHtml.push(html !== undefined);
     if (html) {
       if (text.toLowerCase().includes(html.close)) html = undefined;

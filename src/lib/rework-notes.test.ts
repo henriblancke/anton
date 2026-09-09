@@ -685,6 +685,15 @@ describe("reconcileFollowUpDescription", () => {
     const swapped = reconcileFollowUpDescription(closed, edited);
     expect(swapped).not.toContain("stale");
     expect(swapped.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // A persistent opener inside a block that ends at a BLANK line opens nothing: `<script>` is raw
+    // content of the `<div>`, so the heading past the blank renders and IS the section to swap.
+    // Tracking a `<script>` block there hid the real section, appended a second one after a closing
+    // tag nobody wrote, and left the stale boxes in the bead's effective acceptance.
+    const nested = "## Goal\ng\n\n<div>\n<script>\n\n## Acceptance Criteria\n- [ ] stale";
+    const inner = reconcileFollowUpDescription(nested, edited);
+    expect(inner).not.toContain("stale");
+    expect(inner).not.toContain("</script>");
+    expect(inner.match(/^##+ Acceptance/gm)).toHaveLength(1);
   });
 
   it("closes a construct nested in a list item inside that item, not at the top level", () => {
