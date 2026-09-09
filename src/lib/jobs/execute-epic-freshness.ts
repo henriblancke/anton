@@ -7,7 +7,7 @@
  * into its own top-level imports.
  */
 import { BREAKER_EFFECT } from "../autopilot-breaker";
-import { StaleCheckoutError } from "./errors";
+import { StaleCheckoutError, STALE_CHECKOUT_REFUSAL_PREFIX } from "./errors";
 import { checkSelfFreshness, selfRepoRoot, type SelfFreshness } from "./self-freshness";
 
 /**
@@ -73,7 +73,7 @@ export function staleCheckoutRefusal(
   }
   if (stale.length === 0) return undefined;
   return (
-    `anton is running behind its own latest code, so it will not start new work: ` +
+    `${STALE_CHECKOUT_REFUSAL_PREFIX} ` +
     `${stale.join("; ")} in ${repoPath}, then restart anton. ${BREAKER_EFFECT}`
   );
 }

@@ -318,3 +318,23 @@ export function isSyncNotWiredError(e: unknown): e is SyncNotWiredError {
 export function isStaleCheckoutError(e: unknown): e is StaleCheckoutError {
   return e instanceof StaleCheckoutError || (e as { name?: string })?.name === "StaleCheckoutError";
 }
+
+/**
+ * The stable opening of a stale-checkout deferral's message ({@link StaleCheckoutError}, built by
+ * execute-epic-freshness.ts `staleCheckoutRefusal`). Shared so the message and the settled-row
+ * predicate below cannot drift apart.
+ */
+export const STALE_CHECKOUT_REFUSAL_PREFIX =
+  "anton is running behind its own latest code, so it will not start new work:";
+
+/**
+ * Whether a SETTLED run row's error is the stale-checkout deferral — a refunded, rescheduled
+ * non-start on which no work was attempted (no lease, worktree or claim). The error is stored as a
+ * string, and the message leads the row (settleRunRow writes `${message}${orphanNotice}`), so the
+ * stable prefix identifies it. Used by the failure-streak verdict, which keeps this out of the
+ * per-project failure evidence: a machine-wide staleness that self-clears on restart must not latch
+ * a project disarm (PR #257 review).
+ */
+export function isStaleCheckoutDeferral(error: string | undefined): boolean {
+  return error !== undefined && error.startsWith(STALE_CHECKOUT_REFUSAL_PREFIX);
+}

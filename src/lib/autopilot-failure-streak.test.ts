@@ -19,6 +19,10 @@ import {
   type FailureWeight,
   type RunOutcome,
 } from "./autopilot-failure-streak";
+import { STALE_CHECKOUT_REFUSAL_PREFIX } from "./jobs/errors";
+
+/** A settled run row's error for a stale-checkout deferral, as `settleRunRow` composes it. */
+const STALE = `${STALE_CHECKOUT_REFUSAL_PREFIX} its checkout is 2 commit(s) behind origin/main — run \`git pull\``;
 
 const THREE: { threshold: number } = { threshold: 3 };
 
@@ -45,6 +49,12 @@ describe("verdictOf", () => {
   it("counts an operator's cancel as nothing", () => {
     expect(verdictOf(run("a", { status: "failed", cancelled: true }))).toBe("ignored");
     expect(verdictOf(run("b", { status: "parked", cancelled: true }))).toBe("ignored");
+  });
+
+  it("counts a stale-checkout deferral as nothing — no work was attempted", () => {
+    // The row reads `failed`, but the run refused a start on a machine-wide staleness that clears on
+    // restart; it must not weigh toward a per-project disarm.
+    expect(verdictOf(run("a", { status: "failed", error: STALE }))).toBe("ignored");
   });
 });
 
@@ -81,6 +91,20 @@ describe("detectFailureStreak", () => {
   it("stays silent when the only failures were cancelled", () => {
     const runs = [run("c", { cancelled: true }), run("b", { cancelled: true }), run("a")];
     expect(detectFailureStreak(runs, THREE)).toBeUndefined();
+  });
+
+  it("does not disarm on a run of stale-checkout deferrals — nothing was attempted", () => {
+    const runs = [run("c", { error: STALE }), run("b", { error: STALE }), run("a", { error: STALE })];
+    expect(detectFailureStreak(runs, THREE)).toBeUndefined();
+  });
+
+  it("skips a stale-checkout deferral without breaking the streak either", () => {
+    // A machine-wide staleness sitting between real failures neither counts nor resets — the runs
+    // either side are still one story, exactly as a cancel is treated.
+    const runs = [run("d"), run("c", { error: STALE }), run("b"), run("a")];
+    const streak = detectFailureStreak(runs, THREE);
+    expect(streak?.runs.map((r) => r.id)).toEqual(["a", "b", "d"]);
+    expect(streak?.weight).toBe(3);
   });
 
   it("is off when the threshold is 0 — the operator's opt-out", () => {

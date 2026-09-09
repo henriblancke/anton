@@ -466,6 +466,28 @@ export async function serverBuildDrifts(): Promise<ServerDrift[]> {
   return inflightDrifts.drifts;
 }
 
+/**
+ * The build drift of the process that RUNS the scheduled jobs, read from the live records rather
+ * than from the process asking (PR #257 review).
+ *
+ * The board's stale band must report on the server whose start gate actually defers work. In the
+ * split deployment — a UI-only `ANTON_RUNNER=off` process serving the pages beside a separate
+ * runner — {@link serverBuildDrift} would answer for the request-serving process, whose staleness
+ * stops no job: a stale UI would banner "nothing starts new work" while the runner executes fine,
+ * and a stale runner would go unbannered behind a current UI. Selecting the record that claims
+ * `runner` fixes both. Where the two are the same process (the default single-server deployment)
+ * this is exactly the self verdict.
+ *
+ * Null when the runner is current (not in the drift list) OR when no LIVE record claims to be the
+ * runner — its identity predates the flag, or none is up — where the band claims neither, the rule
+ * {@link ServerDrift.runner} documents. A record with `runner === undefined` is never treated as the
+ * runner.
+ */
+export async function runnerBuildDrift(): Promise<BuildDrift | null> {
+  const drifts = await serverBuildDrifts();
+  return drifts.find((d) => d.runner === true)?.drift ?? null;
+}
+
 async function readServerDrifts(): Promise<ServerDrift[]> {
   const db = dbPath();
   const root = appRoot();

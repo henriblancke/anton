@@ -714,3 +714,58 @@ describe("serverBuildDrifts", () => {
     expect(await serverBuildDrifts()).toEqual([]);
   });
 });
+
+describe("runnerBuildDrift", () => {
+  /** A neighbour's record: a pid that is genuinely alive, so `recordAlive` keeps it. */
+  function neighbour(pid: number, over: Record<string, unknown> = {}) {
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(join(dir, `server-build.${pid}.json`), JSON.stringify({ ...mine, pid, startedAt: null, ...over }));
+  }
+
+  // The board renders in the current UI-only process, but the band must speak for the stale runner
+  // beside it — otherwise a current UI hides the stop deferring every job.
+  it("reports the runner's drift even when the process asking is current", async () => {
+    const { recordServerBuild, runnerBuildDrift } = await freshModule();
+    recordServerBuild({ runner: false });
+    neighbour(process.ppid, { version: "0.0.1", runner: true });
+
+    const drift = await runnerBuildDrift();
+    expect(drift?.state).toBe("outdated");
+    expect(drift?.running?.version).toBe("0.0.1");
+  });
+
+  // The mirror image: this stale process runs nothing scheduled, and the current runner beside it is
+  // what the band answers for — so no stop is shown for work the runner starts fine.
+  it("says nothing when this process is stale but the runner is current", async () => {
+    const { recordServerBuild, runnerBuildDrift } = await freshModule();
+    recordServerBuild({ runner: false });
+    neighbour(process.ppid, { runner: true }); // the runner, copied while the record is still current
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
+
+    expect(await runnerBuildDrift()).toBeNull();
+  });
+
+  // A record predates the flag: it is never treated as the runner, so a drift no record attributes
+  // to the runner shows no band rather than a guessed one.
+  it("claims no runner drift when the only stale record predates the flag", async () => {
+    const { recordServerBuild, runnerBuildDrift } = await freshModule();
+    recordServerBuild({ runner: true });
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    delete mine.runner;
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
+
+    expect(await runnerBuildDrift()).toBeNull();
+  });
+
+  // The single-server deployment: the process serving the page IS the runner, so its drift is the
+  // one the band shows.
+  it("reports this process's own drift when it is the runner", async () => {
+    const { recordServerBuild, runnerBuildDrift } = await freshModule();
+    recordServerBuild({ runner: true });
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
+
+    expect((await runnerBuildDrift())?.state).toBe("outdated");
+  });
+});

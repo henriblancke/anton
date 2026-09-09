@@ -15,7 +15,7 @@
  * stay testable without a db, a repo or a job queue.
  */
 import type { RunStatus } from "@/components/runs/run-view-utils";
-import { poisonBlockerIds } from "./jobs/errors";
+import { isStaleCheckoutDeferral, poisonBlockerIds } from "./jobs/errors";
 
 /** What one run says about the environment it ran in. */
 export type RunVerdict = "delivered" | "failure" | "ignored";
@@ -103,6 +103,12 @@ export interface FailureStreak {
  *     an operator — a person saying stop is not evidence that anything went wrong. It is skipped
  *     rather than treated as a reset for the same reason: it says nothing about the environment, so
  *     it must not clear a streak either. The runs either side of it are still the same story.
+ *   • a STALE-CHECKOUT deferral counts as nothing either (PR #257 review). The row reads `failed`,
+ *     but the run never started work — it refused a start because the anton PROCESS was behind its
+ *     own code, took no lease/worktree/claim, and was rescheduled with its attempt refunded. That
+ *     is a machine-wide condition that self-clears on restart, not the per-project broken
+ *     environment this breaker latches on; counting it would disarm a project no work even ran in.
+ *     Skipped, not a reset, for the cancelled reason above: the real runs either side are one story.
  *
  * Everything still in flight (`queued`, `running`) has no outcome yet and is likewise skipped.
  */
@@ -110,6 +116,7 @@ export function verdictOf(run: RunOutcome): RunVerdict {
   if (run.status === "done") return "delivered";
   if (run.abandoned) return "failure";
   if (run.cancelled) return "ignored";
+  if (isStaleCheckoutDeferral(run.error)) return "ignored";
   if (run.status === "parked" || run.status === "failed") return "failure";
   return "ignored";
 }
