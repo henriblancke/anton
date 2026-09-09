@@ -426,6 +426,12 @@ describe("settings route — Claude gateway routing (anton-n16m)", () => {
       // persisted, so the check must scan the original case (anton-pv2p review, thread PRRT_…gdFZR).
       "https://AKIAIOSFODNN7EXAMPLE.gateway.example/v1",
       "https://AIzaSyD0123456789abcdef.gateway.example/v1",
+      // Percent-encoded: new URL() decodes the label, so the marker is absent from the raw string
+      // but present in what a reader resolves (anton-pv2p review, thread PRRT_…dZEo).
+      "https://%41KIAIOSFODNN7EXAMPLE.gateway.example/v1",
+      "https://%67hp_0123456789abcdef.gateway.example/v1",
+      // A malformed escape in the PATH must not abort the host decode.
+      "https://%41KIAIOSFODNN7EXAMPLE.gateway.example/%zz",
     ]) {
       const res = await PATCH(
         patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),

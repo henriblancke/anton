@@ -51,7 +51,7 @@ export function oneOf(allowed: ReadonlySet<string>): FieldParser<string> {
   };
 }
 
-/** Percent-decode a path segment for credential matching; a malformed escape falls back to raw. */
+/** Percent-decode a URL part for credential matching; a malformed escape falls back to raw. */
 function safeDecode(segment: string): string {
   try {
     return decodeURIComponent(segment);
@@ -61,16 +61,25 @@ function safeDecode(segment: string): string {
 }
 
 /**
- * The hostname with its original case. `new URL(...).hostname` lowercases every label, but the
- * value persisted is the raw string and several credential markers are case-sensitive (`AKIA…`,
- * `ghp_…`, `AIza…`) — so a token pasted as a label (`AKIA…​.gateway.example`) would clear the
- * lowercased check yet land in settings_json intact. Recover the label casing from `raw` and scan
- * that; fall back to the normalized form when it can't be located (e.g. an IDN punycode host, which
- * carries no ASCII credential anyway).
+ * The hostname with its original case. `new URL(...).hostname` lowercases every label AND
+ * percent-decodes it, but the value persisted is the raw string and several credential markers are
+ * case-sensitive (`AKIA…`, `ghp_…`, `AIza…`) — so a token pasted as a label
+ * (`AKIA…​.gateway.example`, or its encoded twin `%41KIA…`) would clear the normalized check yet
+ * land in settings_json intact. Recover the label casing by decoding the raw authority and locating
+ * the host in it; fall back to the normalized form when it can't be located (e.g. an IDN punycode
+ * host, which carries no ASCII credential anyway).
+ *
+ * Only the authority is decoded, never the whole URL: a malformed escape in the path would
+ * otherwise abort the decode and hand the scan back the encoded host it exists to see through.
  */
 function rawHostname(raw: string, parsed: URL): string {
-  const at = raw.toLowerCase().indexOf(parsed.hostname);
-  return at >= 0 ? raw.slice(at, at + parsed.hostname.length) : parsed.hostname;
+  const schemeEnd = raw.indexOf("://");
+  const start = schemeEnd >= 0 ? schemeEnd + 3 : 0;
+  const end = raw.slice(start).search(/[/?#]/);
+  const authority = safeDecode(raw.slice(start, end >= 0 ? start + end : undefined));
+  // lastIndexOf: the host is the tail of the authority, past any userinfo or a lookalike in it.
+  const at = authority.toLowerCase().lastIndexOf(parsed.hostname);
+  return at >= 0 ? authority.slice(at, at + parsed.hostname.length) : parsed.hostname;
 }
 
 /** An http(s) URL — a gateway base URL, not a bare host, a file path, or a stray scheme. */
