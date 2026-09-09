@@ -24,6 +24,14 @@ import type { JobContext } from "../runner";
 export interface SatisfiedSettlement extends SatisfiedBy {
   /** False when the close never landed — a budget that ran out on it, or a bd write that failed — so a person closes it. */
   closed: boolean;
+  /**
+   * True when the commit is BASE history rather than one this branch added (PR #258 review) — a
+   * resume reading an attribution trailer that reached the base by an earlier merge. The work is in
+   * the tree either way, but it is not in this pull request's diff, so the body must not send a
+   * reviewer looking for it there. Absent means branch-added, which is every settlement this run
+   * makes itself: a `satisfied` step is verified against the commits the branch added over its base.
+   */
+  inherited?: boolean;
 }
 
 /**

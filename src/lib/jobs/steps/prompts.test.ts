@@ -390,6 +390,63 @@ describe("prBody", () => {
     expect(body).not.toContain("- anton-t3 — Document the schema\n");
   });
 
+  /**
+   * PR #258 review: a resume can read an attribution trailer off a commit that reached the BASE by
+   * an earlier merge. The work is in the tree, so nothing re-does it — but no commit of this pull
+   * request carries it, and calling it "an earlier commit of this run" points the reviewer at a diff
+   * that cannot contain it.
+   */
+  it("attributes an INHERITED settlement to the base, under its own heading", () => {
+    const first: Bead = { ...target, id: "anton-t1", title: "Add the schema" };
+    const mine: Bead = { ...target, id: "anton-t2", title: "Expose the schema" };
+    const base: Bead = { ...target, id: "anton-t3", title: "Document the schema" };
+    const ranSha = "0123456789abcdef0123456789abcdef01234567";
+    const baseSha = "fedcba9876543210fedcba9876543210fedcba98";
+    const satisfied = new Map<string, SatisfiedSettlement>([
+      [mine.id, { commit: ranSha, subject: "anton-t1: Add the schema", closed: true }],
+      [base.id, { commit: baseSha, subject: "older: shipped on main", closed: true, inherited: true }],
+    ]);
+
+    const body = prBody(target, [first, mine, base], [], satisfied);
+
+    // Two headings, and each ticket sits under exactly the one that tells the reviewer where to look.
+    const [deliveries, ranHere = "", fromBase = ""] = body.split(
+      /Satisfied by earlier commits of this run \(no commit of their own\):|Already satisfied by commits in the base, not by this run \(not in this diff\):/,
+    );
+    expect(deliveries).toContain("Tickets:\n- anton-t1 — Add the schema\n");
+    expect(ranHere).toContain(`- anton-t2 — Expose the schema — by 0123456 "anton-t1: Add the schema"\n`);
+    expect(ranHere).not.toContain("anton-t3");
+    expect(fromBase).toContain(`- anton-t3 — Document the schema — by fedcba9 "older: shipped on main"\n`);
+    // Neither is listed as a delivery of its own, and neither is named twice.
+    expect(deliveries).not.toContain("anton-t2");
+    expect(deliveries).not.toContain("anton-t3");
+    expect(body.match(/anton-t3/g)).toHaveLength(1);
+  });
+
+  it("omits the base heading entirely when nothing was inherited", () => {
+    const first: Bead = { ...target, id: "anton-t1", title: "Add the schema" };
+    const second: Bead = { ...target, id: "anton-t2", title: "Expose the schema" };
+    const satisfied = new Map<string, SatisfiedSettlement>([
+      [second.id, { commit: "0123456789abcdef0123456789abcdef01234567", closed: true, inherited: false }],
+    ]);
+
+    const body = prBody(target, [first, second], [], satisfied);
+    expect(body).toContain("Satisfied by earlier commits of this run");
+    expect(body).not.toContain("not by this run");
+  });
+
+  it("says a NOT-closed inherited settlement needs closing by hand, same as one of this run's", () => {
+    const first: Bead = { ...target, id: "anton-t1", title: "Add the schema" };
+    const second: Bead = { ...target, id: "anton-t2", title: "Expose the schema" };
+    const satisfied = new Map<string, SatisfiedSettlement>([
+      [second.id, { commit: "fedcba9876543210fedcba9876543210fedcba98", closed: false, inherited: true }],
+    ]);
+
+    const body = prBody(target, [first, second], [], satisfied);
+    expect(body).toContain("not by this run (not in this diff):");
+    expect(body).toContain("- anton-t2 — Expose the schema — by fedcba9 — NOT closed:");
+  });
+
   it("says nothing of a standalone target's own settlement — it is never closed before its PR merges", () => {
     const sha = "0123456789abcdef0123456789abcdef01234567";
     const satisfied = new Map<string, SatisfiedSettlement>([[target.id, { commit: sha, closed: false }]]);
