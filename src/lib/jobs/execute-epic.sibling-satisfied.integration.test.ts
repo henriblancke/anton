@@ -10,7 +10,9 @@
  * Three propositions, and the middle one is the whole point of pinning them together — the widening
  * must not cost the cross-machine reasoning it was carved out of:
  *   1. a sibling-satisfied ticket is SKIPPED, stays closed, and is attributed in the PR body to the
- *      commit that did its work rather than listed among the deliveries;
+ *      commit that did its work rather than listed among the deliveries — and, since that commit
+ *      was published to the base before the run, to the BASE rather than to this run (PR #258
+ *      review): the reviewer is never sent looking for a sha this diff does not contain;
  *   2. a ticket nothing on this branch claims is dispatched exactly as before;
  *   3. a ticket closed on the board with neither a subject nor a trailer anywhere on this branch is
  *      still REGENERATED — the commit lives only in another machine's unpushed worktree.
@@ -231,8 +233,13 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       const by = commitFor(branch, doer);
 
       const body = readFileSync(bodyDump, "utf8");
-      const [deliveries, attributions] = body.split("Satisfied by earlier commits of this run");
+      // The commit was published to `origin/main` before the run, so it is BASE history — the body
+      // must attribute it to the base rather than to a commit of this run's diff (PR #258 review).
+      const [deliveries, attributions] = body.split(
+        "Already satisfied by commits in the base, not by this run (not in this diff):",
+      );
       expect(attributions).toBeDefined();
+      expect(body).not.toContain("Satisfied by earlier commits of this run");
       expect(attributions).toContain(
         `- ${satisfied} — Ticket that commit also satisfied — by ${by.sha.slice(0, 7)} "${by.subject}"`,
       );
@@ -364,6 +371,9 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       // …and the pull request attributes it to that marker instead of listing it as a delivery.
       const body = readFileSync(bodyDump, "utf8");
       const [deliveries, attributions] = body.split("Satisfied by earlier commits of this run");
+      // Branch-ADDED, unlike the first case: this run made the marker itself, so the diff carries it
+      // and the body says so rather than crediting the base (PR #258 review).
+      expect(body).not.toContain("not by this run");
       // The body cites the MARKER (which is what the branch read found) — and its subject names the
       // commit that actually did the work, so a reviewer is never left hunting for a diff.
       expect(attributions).toContain(
