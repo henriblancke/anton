@@ -299,6 +299,36 @@ describe("followUpDescription", () => {
     }
   });
 
+  it("escapes an HTML-block-shaped summary — bare, it swallows every section under the Goal", () => {
+    // These five openers run to their own closing tag, not to the blank line the Goal ends with, so
+    // Acceptance, Context, Out of scope and Verify render inside the block: a founder opening the
+    // follow-up sees a Goal and nothing else. The scanner models no HTML block, so it would report a
+    // complete contract over a description that shows none — the false green the escape prevents.
+    for (const summary of ["<script>", "<pre>", "<style>", "<textarea>", "<?php", "<!DOCTYPE html>"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(goalOf(description)).toBe(`\\${summary}`);
+    }
+  });
+
+  it("leaves an HTML block that ends at the blank line as typed — the sections below it survive", () => {
+    // Conditions 6 and 7 close at a blank line, which is what follows the Goal, so `<div>` needs no
+    // escape; a `<!--` is already neutralised as text before the block check runs.
+    for (const summary of ["<div>", '<span data-x="y">', "<!-- note -->"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(goalOf(description)).toBe(summary.replace("<!--", "<\\!--"));
+    }
+  });
+
+  it("leaves an HTML tag mid-summary alone — only the line's head opens a block", () => {
+    for (const summary of ["the <script> tag is dropped", "keep <pre> in the output"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(goalOf(description)).toBe(summary);
+    }
+  });
+
   it("leaves a heading- or rule-shaped summary alone mid-line — only the head opens a block", () => {
     for (const summary of ["drop the ## Backend label", "the --- rule renders wrong"]) {
       const description = followUpDescription({ ...args, summary, parentId: "feat" });

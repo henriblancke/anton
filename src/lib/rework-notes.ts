@@ -330,6 +330,18 @@ function markdownSafe(text: string): string {
 const FENCE_HEAD = /^(?:`{3,}|~{3,})/;
 
 /**
+ * An HTML block opener that runs PAST the blank line under it — CommonMark's start conditions 1
+ * through 5, which end only at their own closing tag (`</script>`, `-->`, `?>`, `>`, `]]>`) or the
+ * document's end, not at a blank line. A summary that is one of them swallows every section written
+ * below the Goal in anything that renders the description ({@link goalBody}).
+ *
+ * The other openers are deliberately absent. Condition 6's `<div>` and condition 7's `<span x="y">`
+ * end at the blank line the Goal is followed by, so the sections below survive; a `<!--` is already
+ * neutralised as text by {@link markdownSafe} before this is tested.
+ */
+const HTML_BLOCK_HEAD = /^(?:<(?:pre|script|style|textarea)(?:[ \t>]|$)|<\?|<![A-Za-z]|<!\[CDATA\[)/i;
+
+/**
  * A thematic break — 3+ `-`/`*`/`_` of one kind, spaces between allowed — as CommonMark and the
  * contract judge (lib/beads/contract.ts) both read it. It renders as a rule, not text, so a Goal
  * holding only one states nothing ({@link goalBody}).
@@ -346,8 +358,13 @@ const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
  * every heading below it is literal content to the scanner (lib/beads/markdown.ts) and the bead
  * files with no Acceptance, Context, Out of scope or Verify — the approve route then refuses the
  * follow-up the rework just created. A heading opens a spurious section of its own and leaves the
- * Goal empty; a thematic break renders as a rule, which is not text either. All three are
- * neutralised the same way: a backslash on the line's head, the trick {@link markdownSafe} plays on
+ * Goal empty; a thematic break renders as a rule, which is not text either. A `<script>`, `<pre>`,
+ * `<style>`, `<textarea>`, `<?`, `<!DOCTYPE` or `<![CDATA[` head opens an HTML block that runs to
+ * its own closing tag rather than ending at the blank line under the Goal
+ * ({@link HTML_BLOCK_HEAD}), so every section below it is swallowed wherever the description is
+ * rendered — while the scanner, which models no HTML block, reads the sections and reports a
+ * contract the founder cannot see. All are neutralised the same way: a backslash on the line's
+ * head, the trick {@link markdownSafe} plays on
  * `<!--` — CommonMark renders the identical characters, and no scanner reads the line as a block.
  * Only the head is escaped, since only a construct at the line's start opens a block; the
  * {@link oneLine} collapse already means there is no second line to open one.
@@ -359,7 +376,11 @@ const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
  */
 function goalBody(summary: string): string {
   const text = markdownSafe(oneLine(summary));
-  const block = FENCE_HEAD.test(text) || isHeading(text) || THEMATIC_BREAK.test(text);
+  const block =
+    FENCE_HEAD.test(text) ||
+    HTML_BLOCK_HEAD.test(text) ||
+    isHeading(text) ||
+    THEMATIC_BREAK.test(text);
   return block ? `\\${text}` : text;
 }
 
