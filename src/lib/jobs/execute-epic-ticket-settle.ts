@@ -789,11 +789,20 @@ async function releaseTicketClaim(repo: string, ticketId: string): Promise<void>
  *     closed as superseded by the survivor anton retired it against. A reopen flips the status off
  *     `closed`, which is what `supersededBy` gates on — so this is the one fence that catches a
  *     same-operator reclaim no assignee comparison can see.
- *  3. The assignee comes off through the CONDITIONAL swap ({@link swapUnderLock}), which re-verifies
- *     the owner after its write. That is what covers the cross-process half the lock cannot: a holder
- *     that landed from another machine is found by the verify and reported as the loser's owner
- *     instead of being overwritten. The stage label follows only once that swap says the claim was
- *     ours to take off — a board that reads otherwise keeps both.
+ *  3. The assignee comes off through the CONDITIONAL swap ({@link swapUnderLock}), taking its OWN
+ *     pre-write read rather than the gate's (PR #238 review). Handing `fresh` in as `current` would
+ *     suppress that read — the one thing that makes the helper a compare-and-swap — and leave the
+ *     window from the gate's read to the write covered by nothing but the post-write verify, which
+ *     sees the desired unassigned state and so cannot tell an overwritten claim from a clean
+ *     release. Re-read adjacent to the write, a holder that landed from another machine is found
+ *     before the write and reported as the loser's owner. The stage label follows only once that
+ *     swap says the claim was ours to take off — a board that reads otherwise keeps both.
+ *  4. And the retirement is asked ONE more time with the release on the board ({@link
+ *     retirementReopenedDuringRelease}), because the swap's own read can only compare an ASSIGNEE:
+ *     a same-operator reclaim after a reopen writes the identical name, so the compare passes and
+ *     the release strips a claim the reopen made valid. Only a read taken after the write can have
+ *     seen that writer. Reopened, the claim is put back the way it was found and the stage label is
+ *     left alone.
  *
  * The expected owner is the fresh read's own, not `operator`: when the run resolved no operator, bd's
  * assignee is not a name anton can compare against (gardener/repair-already-shipped.ts
@@ -818,9 +827,9 @@ async function releaseRetiredClaim(
     if (!fresh || beads.supersededBy(fresh) !== replacementId) return;
     const holder = ownerOf(fresh);
     if (operator && holder !== operator) return;
-    // `fresh` was read under this lock, so it IS the swap's in-lock read — handed in rather than paid
-    // for twice. A swap that LOST names the holder that beat us, and neither write lands.
-    const swap = await swapUnderLock(repo, ticketId)(holder, undefined, fresh).catch((e) => {
+    // No `current`: the swap takes its own read immediately before the write (see the header). A
+    // swap that LOST names the holder that beat us, and neither write lands.
+    const swap = await swapUnderLock(repo, ticketId)(holder, undefined).catch((e) => {
       console.error(`[execute-epic] could not release ${ticketId}'s retired claim`, e);
       return { ok: false, owner: holder } as const;
     });
@@ -832,8 +841,54 @@ async function releaseRetiredClaim(
       );
       return;
     }
+    if (await retirementReopenedDuringRelease(repo, ticketId, replacementId, holder)) return;
     await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
   });
+}
+
+/**
+ * The fence after the release: whether the retirement it released was reopened and reclaimed while
+ * it was releasing it — and if so, put the claim back (PR #238 review).
+ *
+ * The swap's compare covers a DIFFERENT owner landing in the window. What it cannot see is the same
+ * one: another process reopening the ticket and re-claiming it under the operator anton's own claim
+ * already named writes the identical assignee, so the compare passes and the release strips a claim
+ * that reopen made valid — leaving an `in_progress` ticket with no owner, which `bd update --claim`
+ * refuses outright, so the rerun the reopen was for can never claim it.
+ *
+ * Status is what tells them apart, and only a read taken with the release ON the board can have seen
+ * the writer — the same after-the-write fence the retirement paths use (execute-epic-dispatch
+ * `retireFound`). Still closed as superseded by the survivor anton retired it against, nothing moved
+ * and the release stands. Anything else is a reopen, and the assignee goes back to the holder the
+ * release found — conditionally, so a third hand that has claimed it since keeps it.
+ *
+ * An unreadable bead leaves the release as it stands and says so: this runs on a stopping path where
+ * every write is best-effort, and a restore attempted on an unverified read could just as easily
+ * re-claim a ticket nothing reopened.
+ */
+async function retirementReopenedDuringRelease(
+  repo: string,
+  ticketId: string,
+  replacementId: string,
+  holder: string | undefined,
+): Promise<boolean> {
+  const after = await mustRead(repo, ticketId);
+  if (!after) {
+    console.warn(
+      `[execute-epic] released ${ticketId}'s retired claim but could not read the ticket back — ` +
+        `if another hand reopened it in that window, its claim is off and a human has to hand it back`,
+    );
+    return false;
+  }
+  if (beads.supersededBy(after) === replacementId) return false;
+  console.warn(
+    `[execute-epic] ${ticketId} was reopened while anton was releasing the claim its retirement ` +
+      `held — putting the claim back${holder ? ` for ${holder}` : ""} so the rerun that reopen is ` +
+      `for can take it`,
+  );
+  if (!holder) return true;
+  await safe(() => swapUnderLock(repo, ticketId)(undefined, holder));
+  return true;
 }
 
 /** Block the bead for a human, with the note that says which failure this was and where its evidence is. */

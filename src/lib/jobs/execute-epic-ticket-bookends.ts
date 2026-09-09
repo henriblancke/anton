@@ -149,10 +149,67 @@ export async function claimTicket(
           `drop the rerun's work from the PR. Check the beads DB, then resume the run`,
       );
     }
+    await assertUnlinkedOurStaleEdge(repo, ticket.id, survivor, operator);
   }
   void beads
     .sync(repo)
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
+}
+
+/**
+ * The fence after the stale-edge unlink: prove the edge it removed was the STALE one the pre-unlink
+ * read saw, and not a retirement another process landed in between (PR #238 review).
+ *
+ * The bead lock orders this process only. On a shared-server board another hand can `bd supersede`
+ * the ticket against the SAME survivor between {@link retirementSettledSinceClaim}'s read and the
+ * unlink — and because the survivor matches, the unlink strips the NEW retirement's edge rather than
+ * the reopened one's. Nothing downstream can tell: `claimTicket` returns, the agent runs a ticket
+ * that hand has already closed, and the run's own close records it as an ordinary delivery, losing
+ * the survivor the other process recorded. `mustPersist`'s retries widen the same window — each
+ * attempt is a fresh write against a board that may have moved since the last.
+ *
+ * So the same questions are asked once more with the unlink ON the board, exactly as the retirement
+ * fences do (execute-epic-dispatch `retireFound`, gardener/repair-already-shipped.ts
+ * `retirementHeld`): only a read taken after the write can have seen such a writer. The claim is
+ * still what separates the two cases, so the check is `retirementSettledSinceClaim` again — a ticket
+ * still `in_progress` under this run's own claim is one nothing has settled, and the edge that just
+ * came off can only have been the stale one.
+ *
+ * RETRYABLE rather than a park, and the claim is NOT handed back: this is the same verdict the
+ * pre-unlink check throws for, reached one read later. The next attempt re-reads the board and
+ * dispatch drops the ticket as the settled retirement it is (execute-epic-dispatch
+ * `partitionTickets`) — restoring the edge here would be a third write into the same race, and
+ * `unclaimAndPark` would reopen a bead that hand has closed.
+ *
+ * An unreadable bead fails closed for the reason the pre-unlink read does: "could not check" is not
+ * "nothing landed", and proceeding would run the ticket on exactly the race this fence exists to
+ * catch.
+ */
+async function assertUnlinkedOurStaleEdge(
+  repo: string,
+  ticketId: string,
+  survivor: string,
+  operator: string | undefined,
+): Promise<void> {
+  const after = await beads.show(repo, ticketId).catch(() => undefined);
+  if (!after) {
+    throw new Error(
+      `refusing to execute ${ticketId}: anton removed the \`supersedes\` edge to ${survivor} that ` +
+        `a previous retirement left on it, but bd would not read the ticket back, so anton cannot ` +
+        `tell whether the edge it removed was that stale one or a retirement another process wrote ` +
+        `while it was removing it — retrying so the next attempt decides on a board it can read`,
+    );
+  }
+  const settled = retirementSettledSinceClaim(after, operator);
+  if (settled) {
+    throw new Error(
+      `refusing to execute ${ticketId}: it was retired as superseded by ${survivor} while anton ` +
+        `was removing the stale \`supersedes\` edge a previous retirement left on it (${settled}) — ` +
+        `the edge anton removed was that new retirement's, so retrying lets the next attempt ` +
+        `re-read the board and drop the ticket as the settled retirement it is, rather than ` +
+        `running work another hand has already closed`,
+    );
+  }
 }
 
 /**

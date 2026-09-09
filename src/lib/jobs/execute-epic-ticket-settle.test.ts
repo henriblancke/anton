@@ -12,6 +12,7 @@ import { LABELS, type Bead } from "../beads/bd";
 import type { StepContext } from "./step-registry";
 
 const unassignMock = vi.fn(async () => "");
+const assignMock = vi.fn(async () => "");
 const untagMock = vi.fn(async () => "");
 const setStatusMock = vi.fn(async () => "");
 const noteMock = vi.fn(async () => "");
@@ -25,6 +26,7 @@ vi.mock("../beads/bd", async () => {
     beads: {
       ...actual.beads,
       unassign: (...args: unknown[]) => unassignMock(...(args as [])),
+      assign: (...args: unknown[]) => assignMock(...(args as [])),
       untag: (...args: unknown[]) => untagMock(...(args as [])),
       setStatus: (...args: unknown[]) => setStatusMock(...(args as [])),
       note: (...args: unknown[]) => noteMock(...(args as [])),
@@ -104,6 +106,10 @@ function boardHolding(bead: Bead): void {
     live = { ...live, assignee: "" } as Bead;
     return "";
   });
+  assignMock.mockImplementation(async (...args: unknown[]) => {
+    live = { ...live, assignee: args[2] as string } as Bead;
+    return "";
+  });
 }
 
 const retired = (marked: boolean) => ({
@@ -116,8 +122,10 @@ const retired = (marked: boolean) => ({
 
 describe("settling a ticket the repair RETIRED", () => {
   beforeEach(() => {
-    for (const m of [unassignMock, untagMock, setStatusMock, noteMock, showMock, repairMock]) m.mockReset();
+    for (const m of [unassignMock, assignMock, untagMock, setStatusMock, noteMock, showMock, repairMock])
+      m.mockReset();
     unassignMock.mockResolvedValue("");
+    assignMock.mockResolvedValue("");
     untagMock.mockResolvedValue("");
     setStatusMock.mockResolvedValue("");
     noteMock.mockResolvedValue("");
@@ -242,6 +250,89 @@ describe("settling a ticket the repair RETIRED", () => {
 
     expect(unassignMock).not.toHaveBeenCalled();
     expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  // The window the gate's read cannot cover (PR #238 review): a claim landing between it and the
+  // write. The swap must take its OWN read immediately before the write — handed the gate's read as
+  // `current`, it would compare against a stale snapshot and overwrite that claim.
+  it("loses the release to a claim that lands between the gate's read and the write", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    let live = retiredRead("anton-op");
+    let gateRead = false;
+    showMock.mockImplementation(async () => {
+      const answer = live;
+      // The gate's read is the LAST one that still shows anton's own claim; another machine claims
+      // it before the swap's own pre-write read, which is the next one.
+      if (gateRead) live = retiredRead("other-machine");
+      if (answer.status === "closed" && answer.assignee === "anton-op") gateRead = true;
+      return answer;
+    });
+
+    await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
+
+    // Caught BEFORE the write, so nothing was overwritten and nothing came off.
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  // The half no assignee comparison can see (PR #238 review): another process reopens the ticket and
+  // re-claims it under the SAME operator anton's claim already names, so the swap's compare passes
+  // and the release strips a claim the reopen made valid — leaving in_progress with no owner, which
+  // `bd update --claim` refuses, so the rerun the reopen was for could never claim it.
+  it("puts the claim back when a reopen re-claimed the ticket under the same operator", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    // Reopened and re-claimed by another process under the SAME operator, in the window the release
+    // writes into: the swap's compare sees the identical name and passes, and the unassign strips
+    // that newer claim. Only a read taken after the write can see what happened.
+    let reopened = false;
+    let live = retiredRead("anton-op");
+    showMock.mockImplementation(async () => live);
+    unassignMock.mockImplementation(async () => {
+      reopened = true;
+      live = { id: ticket.id, status: "in_progress", assignee: "" } as unknown as Bead;
+      return "";
+    });
+    assignMock.mockImplementation(async (...args: unknown[]) => {
+      live = { ...live, assignee: args[2] as string } as Bead;
+      return "";
+    });
+
+    await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
+    expect(reopened).toBe(true);
+
+    expect(unassignMock).toHaveBeenCalledWith("/tmp/anton", "anton-a");
+    // Handed back to the holder the release found, and the stage label left alone.
+    expect(assignMock).toHaveBeenCalledWith("/tmp/anton", "anton-a", "anton-op");
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  // Best-effort like every write on this stopping path: an unreadable fence leaves the release as it
+  // stands rather than re-claiming a ticket nothing reopened.
+  it("leaves the release standing when the fence's read fails", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    // Readable up to and including the swap's post-write verify — the FIRST read after the release
+    // — and broken from the fence's read, the second, onward.
+    let readsAfterRelease = 0;
+    let live = retiredRead("anton-op");
+    let released = false;
+    showMock.mockImplementation(async () => {
+      if (released) readsAfterRelease += 1;
+      if (readsAfterRelease > 1) throw new Error("bd offline");
+      return live;
+    });
+    unassignMock.mockImplementation(async () => {
+      live = { ...live, assignee: "" } as Bead;
+      released = true;
+      return "";
+    });
+
+    await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
+
+    expect(unassignMock).toHaveBeenCalledWith("/tmp/anton", "anton-a");
+    // Nothing is re-claimed on an unverified read — that could just as easily re-claim a ticket
+    // nothing reopened — so the release stands whole, stage label included.
+    expect(assignMock).not.toHaveBeenCalled();
+    expect(untagMock).toHaveBeenCalledWith("/tmp/anton", "anton-a", [LABELS.stage("implementing")]);
   });
 });
 

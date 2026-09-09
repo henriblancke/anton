@@ -24,6 +24,7 @@ import {
   orderTickets,
   reorderForPrereq,
   reorderNote,
+  runReadiness,
   skipNote,
   skippedDependents,
   type PrereqEdge,
@@ -280,6 +281,9 @@ async function partitionTickets(
   // And only on a read taken NOW, under the ticket's write lock ({@link retireFound}): `tickets` is
   // the run's snapshot, and a supersede an operator has since reopened is live work again.
   const live: Bead[] = [];
+  // Tickets a reopen brought back after the readiness verdict was computed. `gated` cannot speak for
+  // them — see {@link regateReopened}.
+  const reopened: Bead[] = [];
   let abandoned = 0;
   for (const ticket of orderTickets(tickets, all)) {
     if (beads.isAbandoned(ticket)) {
@@ -305,6 +309,7 @@ async function partitionTickets(
     // and BEFORE the loop, so a spec with no definition of done parks the run rather than
     // dispatching an agent self-review can't score.
     assertRerunGates(run, found.live);
+    reopened.push(found.live);
     live.push(found.live);
   }
   if (live.length === 0) {
@@ -329,9 +334,50 @@ async function partitionTickets(
   // exist yet — the false-success shape issue #46 is about. Its runnable siblings are independent
   // work, so they run now (the readiness verdict above already refused a run with none of them),
   // and the held tail parks the run after the loop rather than riding into the PR unrun.
-  const held = live.filter((t) => gated.has(t.id));
-  const dispatchable = live.filter((t) => !gated.has(t.id));
+  const holds = reopened.length > 0 ? await regateReopened(run, gated, reopened) : gated;
+  const held = live.filter((t) => holds.has(t.id));
+  const dispatchable = live.filter((t) => !holds.has(t.id));
   return { live, held, dispatchable };
+}
+
+/**
+ * The gate set, recomputed from a FRESH board once a reopen has put a snapshot-superseded ticket
+ * back into the run (PR #238 review).
+ *
+ * `gated` came from the readiness verdict, and that verdict was computed over a board where these
+ * tickets read as CLOSED — a closed child is not work, so the graph dropped it and its blockers with
+ * it. Reinstated on `gated` alone, a reopened ticket can therefore never be held: the set that would
+ * have to name it was computed before it existed as work. Its external prerequisite is still open,
+ * and the run claims it and dispatches an agent onto a premise that has not shipped — the false
+ * success the hold exists to prevent.
+ *
+ * So readiness is asked again, of the board as it reads NOW: only that read carries the reopened
+ * ticket as work, and only it can see the edges that hold it. The two verdicts are UNIONED rather
+ * than swapped — the earlier one is what the whole run was planned against (a closed prerequisite
+ * that reopened between the two reads must not silently un-hold a sibling), so the fresh read may
+ * only ADD holds.
+ *
+ * An unreadable board holds every reopened ticket rather than dispatching it: this is the read that
+ * decides whether an agent runs without its prerequisite, and "could not check" is not "not
+ * blocked". Held rather than thrown, because a hold is already this function's own answer — the tail
+ * parks with the blocker named, which is the same operator-facing stop a throw would produce.
+ */
+async function regateReopened(
+  run: EpicRun,
+  gated: Set<string>,
+  reopened: Bead[],
+): Promise<Set<string>> {
+  const board = await mustReadBoard(run.repo);
+  if (!board) {
+    console.warn(
+      `[execute-epic] ${run.targetId}: could not re-read the board to re-gate ` +
+        `${reopened.map((t) => t.id).join(", ")} after their retirements were reopened — holding ` +
+        `them rather than dispatching work whose prerequisites anton could not check`,
+    );
+    return new Set([...gated, ...reopened.map((t) => t.id)]);
+  }
+  const fresh = runReadiness(board, run.targetId, run.targetIsUnit);
+  return new Set([...gated, ...fresh.gated.filter((id) => reopened.some((t) => t.id === id))]);
 }
 
 /**

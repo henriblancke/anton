@@ -223,4 +223,61 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     expect(setStatusMock).toHaveBeenCalledWith(REPO, reopened.id, "open");
     expect(unassignMock).toHaveBeenCalledWith(REPO, reopened.id);
   }, 10_000);
+
+  // The window the pre-unlink check cannot see (PR #238 review): another process supersedes the
+  // ticket against the SAME survivor between that check and the unlink, so the write strips the NEW
+  // retirement's edge rather than the reopened one's — and because the survivor matches, nothing
+  // downstream can tell. Only a read taken with the unlink on the board can have seen that writer.
+  it("retries instead of running when a retirement landed while the edge was being removed", async () => {
+    showMock
+      .mockResolvedValueOnce(claimed) // pre-unlink: still ours, so the edge reads as stale
+      .mockResolvedValue({ ...claimed, status: "closed" }); // post-unlink: another hand settled it
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toMatch(
+      /retired as superseded by anton-t9 while anton was removing the stale `supersedes` edge/,
+    );
+    // Retryable, so the next attempt re-reads the board and drops it as the settled retirement.
+    expect(err).not.toBeInstanceOf(PoisonEpic);
+    // Nothing is restored: re-drawing the edge would be a third write into the same race, and the
+    // bead belongs to whoever settled it.
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(unassignMock).not.toHaveBeenCalled();
+  });
+
+  it("retries when the same-survivor retirement moved the claim rather than the status", async () => {
+    showMock
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValue({ ...claimed, assignee: "someone-else" });
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toMatch(/while anton was removing the stale `supersedes` edge/);
+    expect(err).not.toBeInstanceOf(PoisonEpic);
+  });
+
+  // "Could not read back" is not "nothing landed": proceeding would run the ticket on exactly the
+  // race this fence exists to catch.
+  it("retries when the ticket cannot be read back after the edge came off", async () => {
+    showMock.mockResolvedValueOnce(claimed).mockRejectedValue(new Error("database is locked"));
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toMatch(/bd would not read the ticket back/);
+    expect(err).not.toBeInstanceOf(PoisonEpic);
+  });
+
+  it("runs the ticket when the post-unlink read still shows this run's own claim", async () => {
+    await claimTicket(run(), reopened, "op");
+    expect(unlinkMock).toHaveBeenCalledWith(REPO, reopened.id, SURVIVOR);
+    // Two reads: the one the unlink is decided on, and the one that fences it.
+    expect(showMock).toHaveBeenCalledTimes(2);
+  });
 });

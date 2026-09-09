@@ -102,6 +102,9 @@ function makeRun(tickets: Bead[], signal: AbortSignal): EpicRun {
     targetId: EPIC,
     ctx: { signal, heartbeat: vi.fn(async () => {}), report: vi.fn() },
     standaloneRun: false,
+    // The target IS an epic, so every board the run re-reads is judged by the graph rollup rather
+    // than the standalone path — what the reopened-retirement re-gate reads (PR #238 review).
+    targetIsUnit: true,
     lease: { assertHeld: () => {} },
     settings: { agents: [] },
     target,
@@ -486,6 +489,105 @@ describe("a ticket the board already holds as superseded", () => {
     );
     expect(dispatchedIds()).toEqual([]);
     expect(run.retired).toEqual([]);
+  });
+});
+
+// The gate set was computed over a board where these tickets read CLOSED, so it cannot name them —
+// a closed child is not work, and the readiness graph dropped it and its blockers with it. Reinstated
+// on that set alone, a reopened ticket can never be held, and the run dispatches it over a
+// prerequisite that has not shipped (PR #238 review).
+describe("a reopened retirement's gates", () => {
+  /** An open bead OUTSIDE this run that `blocked` waits on — the prerequisite the hold exists for. */
+  const OUTSIDE = "anton-outside";
+  const blockedBy = (id: string, blocker: string): Bead =>
+    bead(id, { dependencies: [{ issue_id: id, depends_on_id: blocker, type: "blocks" }] } as Partial<Bead>);
+
+  it("holds the ticket when the fresh board shows an external prerequisite still open", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    // Reopened since the snapshot, and blocked by work in another run that has not landed.
+    board = [
+      ...board.map((b) =>
+        b.id === "anton-a"
+          ? ({
+              ...b,
+              status: "open",
+              dependencies: [{ issue_id: "anton-a", depends_on_id: OUTSIDE, type: "blocks" }],
+            } as Bead)
+          : b,
+      ),
+      bead(OUTSIDE, { parent: undefined }),
+    ];
+
+    // The tail parks rather than delivering: `anton-a` is held, `anton-b` ran.
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(/anton-a/);
+    expect(dispatchedIds()).toEqual(["anton-b"]);
+  });
+
+  it("dispatches it when the fresh board shows that prerequisite closed", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    board = [
+      ...board.map((b) =>
+        b.id === "anton-a"
+          ? ({
+              ...b,
+              status: "open",
+              dependencies: [{ issue_id: "anton-a", depends_on_id: OUTSIDE, type: "blocks" }],
+            } as Bead)
+          : b,
+      ),
+      bead(OUTSIDE, { status: "closed", parent: undefined }),
+    ];
+
+    await dispatchRunTickets(run, prep());
+
+    expect(dispatchedIds()).toEqual(["anton-a", "anton-b"]);
+  });
+
+  // The re-gate may only ADD holds: the earlier verdict is what the whole run was planned against,
+  // and a prerequisite that closed between the two reads must not silently un-hold a sibling.
+  it("keeps a hold the run's own readiness verdict already carried", async () => {
+    const run = makeRun(
+      [superseded("anton-a", SHIPPER), blockedBy("anton-b", OUTSIDE)],
+      new AbortController().signal,
+    );
+    board = [
+      ...board.map((b) => (b.id === "anton-a" ? ({ ...b, status: "open" } as Bead) : b)),
+      // Closed on the FRESH read, so the re-gate would clear anton-b's hold if it replaced the set.
+      bead(OUTSIDE, { status: "closed", parent: undefined }),
+    ];
+    const p = prep();
+    p.gated = new Set(["anton-b"]);
+
+    await expect(dispatchRunTickets(run, p)).rejects.toThrow(/anton-b/);
+    expect(dispatchedIds()).toEqual(["anton-a"]);
+  });
+
+  // "Could not check" is not "not blocked": this read is what decides whether an agent runs without
+  // its prerequisite, so an unreadable board holds the reopened ticket instead of dispatching it.
+  it("holds the reopened ticket when the board cannot be re-read to re-gate it", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    board = board.map((b) => (b.id === "anton-a" ? ({ ...b, status: "open" } as Bead) : b));
+    // Readable for the ownership recompute, then broken for the re-gate that follows it.
+    let reads = 0;
+    listMock.mockImplementation(async () => {
+      reads += 1;
+      if (reads > 1) throw new Error("dolt: connection refused");
+      return board;
+    });
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(/anton-a/);
+    expect(dispatchedIds()).toEqual(["anton-b"]);
+  });
+
+  // A run with no reopened retirement pays for no extra board read — the gate set it was planned
+  // with already speaks for every ticket in it.
+  it("does not re-read the board when no retirement was reopened", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+
+    await dispatchRunTickets(run, prep());
+
+    expect(listMock).not.toHaveBeenCalled();
+    expect(dispatchedIds()).toEqual(["anton-b"]);
   });
 });
 
