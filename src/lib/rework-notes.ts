@@ -14,7 +14,13 @@ import {
   CONTEXT_KEYS,
   isTicketContractHeading,
 } from "./beads/contract";
-import { type Heading, type ScannedLine, scanMarkdown, unterminatedCloser } from "./beads/markdown";
+import {
+  type Heading,
+  isHeading,
+  type ScannedLine,
+  scanMarkdown,
+  unterminatedCloser,
+} from "./beads/markdown";
 import { parseTicketNotes } from "./beads/notes";
 import type { PullRequestState } from "./git/ops";
 import type { ReviewFinding } from "./jobs/review-context";
@@ -320,22 +326,41 @@ function markdownSafe(text: string): string {
   return text.replace(/<!--/g, "<\\!--");
 }
 
+/** A fence delimiter at a line's head — the only place one opens a block ({@link goalBody}). */
+const FENCE_HEAD = /^(?:`{3,}|~{3,})/;
+
+/**
+ * A thematic break — 3+ `-`/`*`/`_` of one kind, spaces between allowed — as CommonMark and the
+ * contract judge (lib/beads/contract.ts) both read it. It renders as a rule, not text, so a Goal
+ * holding only one states nothing ({@link goalBody}).
+ */
+const THEMATIC_BREAK = /^([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
+
 /**
  * The summary as the Goal section's body: {@link markdownSafe}, on one line, and with a leading
- * fence delimiter neutralised.
+ * BLOCK construct neutralised.
  *
- * The summary is the bead's title, and a founder sending back a request ABOUT fences types one
- * ("```md swallows the section"). Written bare under `## Goal` it opens a fenced block that runs to
- * the end of the description: every heading below it is literal content to the scanner
- * (lib/beads/markdown.ts), so the bead files with no Acceptance, Context, Out of scope or Verify
- * and the approve route refuses the follow-up the rework just created. Backslash-escaping the first
- * delimiter character is the same trick {@link markdownSafe} plays on `<!--` — CommonMark renders
- * the identical text, and no scanner reads the line as a fence. Only the head is escaped, since
- * only a delimiter at the line's start opens a block; the {@link oneLine} collapse already means
- * there is no second line to open one.
+ * The summary is the bead's title, and a founder sending back a request ABOUT markdown types its
+ * scaffolding ("```md swallows the section", "## Backend"). Written bare under `## Goal` each opens
+ * a block rather than the paragraph the Goal is: a fence runs to the end of the description, so
+ * every heading below it is literal content to the scanner (lib/beads/markdown.ts) and the bead
+ * files with no Acceptance, Context, Out of scope or Verify — the approve route then refuses the
+ * follow-up the rework just created. A heading opens a spurious section of its own and leaves the
+ * Goal empty; a thematic break renders as a rule, which is not text either. All three are
+ * neutralised the same way: a backslash on the line's head, the trick {@link markdownSafe} plays on
+ * `<!--` — CommonMark renders the identical characters, and no scanner reads the line as a block.
+ * Only the head is escaped, since only a construct at the line's start opens a block; the
+ * {@link oneLine} collapse already means there is no second line to open one.
+ *
+ * A summary that is only a bare list marker or the formula's `TODO —` prompt is deliberately left
+ * as typed. Escaping those would make the contract judge report a written Goal where the founder
+ * wrote nothing — the false green the gate exists to prevent — and unlike a fence or a heading
+ * neither breaks the sections around it.
  */
 function goalBody(summary: string): string {
-  return markdownSafe(oneLine(summary)).replace(/^(`{3,}|~{3,})/, "\\$1");
+  const text = markdownSafe(oneLine(summary));
+  const block = FENCE_HEAD.test(text) || isHeading(text) || THEMATIC_BREAK.test(text);
+  return block ? `\\${text}` : text;
 }
 
 /** Why this bead exists — and, for a REDIRECTED send-back, why it exists here rather than on the original. */

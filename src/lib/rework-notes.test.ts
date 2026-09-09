@@ -110,6 +110,7 @@ describe("followUpDescription", () => {
   ];
   const acceptanceOf = (description: string) =>
     description.split("## Acceptance Criteria\n")[1].split("\n\n## Context")[0].split("\n");
+  const goalOf = (description: string) => description.split("## Goal\n")[1]!.split("\n")[0];
 
   it("writes a bead the contract judges as complete — an unshaped one poison-parks the runner", () => {
     const description = followUpDescription({ ...args, parentId: "feat" });
@@ -283,6 +284,38 @@ describe("followUpDescription", () => {
         `- [ ] ${INSTRUCTIONS}`,
         "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
       ]);
+    }
+  });
+
+  it("escapes a heading- or rule-shaped summary — bare, the Goal states nothing", () => {
+    // A fence is not the only block a summary can be. `## Backend` opens a section of its own and
+    // leaves the Goal empty; `---` renders as a rule, which is not text either — the judge reports
+    // no Goal for both, and the founder's own words are what the section is supposed to hold.
+    for (const summary of ["## Backend", "# Backend", "###### Backend", "---", "***", "___"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(description).toContain(`## Goal\n\\${summary}\n`);
+      expect(goalOf(description)).toBe(`\\${summary}`);
+    }
+  });
+
+  it("leaves a heading- or rule-shaped summary alone mid-line — only the head opens a block", () => {
+    for (const summary of ["drop the ## Backend label", "the --- rule renders wrong"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(description).toContain(`## Goal\n${summary}\n`);
+    }
+  });
+
+  it("leaves a bare marker or TODO summary as typed — escaping it would fake a written Goal", () => {
+    // These say nothing, and the judge is right to say so. Backslashing them would turn the
+    // placeholder into prose the gate reads as authored — the false green the gate exists to catch.
+    for (const summary of ["- ", "1. ", "TODO — fill this in"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(description).toContain(`## Goal\n${summary.trim()}\n`);
+      expect(
+        validateBeadContract(makeBead({ id: "anton-new", description })).map((v) => v.section),
+      ).toEqual(["Goal"]);
     }
   });
 
