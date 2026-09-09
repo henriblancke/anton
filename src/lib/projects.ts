@@ -1501,7 +1501,8 @@ async function deleteSessionLogs(db: AntonDb, projectId: string): Promise<void> 
 /**
  * Teardown step 4 — drop the project's anton.db rows atomically, children before parents (no ON
  * DELETE CASCADE in the schema): sessions → runs → jobs → schedules → run-health → picker plan →
- * picker verdicts → picker starts → hygiene → scan summaries → autopilot disarms → escalations →
+ * picker verdicts → picker starts → claude invocations → hygiene → scan summaries → autopilot
+ * disarms → escalations →
  * burn samples (detached, not deleted) → projects.
  */
 function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
@@ -1521,6 +1522,14 @@ function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
         .where(eq(schema.pickerVerdicts.projectId, projectId))
         .run();
       tx.delete(schema.pickerStarts).where(eq(schema.pickerStarts.projectId, projectId)).run();
+      // The spend ledger references the project, so it goes before the project DELETE or the whole
+      // teardown rolls back on the foreign key. DELETED, not detached like burn samples: those are a
+      // property of the MACHINE and outlive the project, while what a project's own tasks spent is
+      // meaningless once the project is gone.
+      tx
+        .delete(schema.claudeInvocations)
+        .where(eq(schema.claudeInvocations.projectId, projectId))
+        .run();
       tx.delete(schema.hygieneReports).where(eq(schema.hygieneReports.projectId, projectId)).run();
       tx.delete(schema.scanSummaries).where(eq(schema.scanSummaries.projectId, projectId)).run();
       // Before the escalations they point at, and before the project they reference: a project

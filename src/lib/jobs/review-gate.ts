@@ -14,6 +14,7 @@
  * wiring is what makes it unit-testable against a fake driver.
  */
 import { type Bead } from "../beads/bd";
+import { metered } from "../claude-invocations";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import {
   commitAll,
@@ -125,7 +126,10 @@ export interface ReviewGateDeps {
 }
 
 /** The slice of the runner's JobContext the gate needs — narrow, so tests can fake it in two lines. */
-export type ReviewGateContext = Pick<JobContext, "signal" | "heartbeat" | "report" | "claudeReached">;
+export type ReviewGateContext = Pick<
+  JobContext,
+  "signal" | "heartbeat" | "report" | "claudeReached" | "jobId" | "type"
+>;
 
 export interface ReviewGateArgs {
   db: AntonDb;
@@ -260,7 +264,23 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const rounds: ReviewRound[] = args.rounds ?? [];
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, baseBranch } = args;
   const config = resolveReviewConfig(settings);
-  const claude = args.deps?.runClaude ?? runClaude;
+  const driver = args.deps?.runClaude ?? runClaude;
+  // The gate's two kinds of session are metered apart (anton-77l9). They are dispatched from one
+  // driver but spend very differently — a review reads a diff, a fix rewrites the tree and re-runs
+  // the gates — and a ledger that filed both under one step could not tell which half of a run's
+  // review budget went where.
+  const meter = (step: string) =>
+    metered(db, clock, {
+      projectId,
+      jobType: ctx.type,
+      jobId: ctx.jobId,
+      step,
+      runId,
+      beadId: target.id,
+      modelRequested: settings.model,
+    }, driver);
+  const claude = meter("review");
+  const fixClaude = meter("review-fix");
   const readDiff = args.deps?.diff ?? diffAgainstBase;
   const mergeBase = args.deps?.mergeBase ?? resolveMergeBase;
   const commit = args.deps?.commit ?? commitAll;
@@ -374,7 +394,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       findings: blocking,
       round,
       maxRounds: config.maxRounds,
-      claude,
+      claude: fixClaude,
       commit,
       readState,
       restoreState,

@@ -88,7 +88,7 @@ suite("preserveTimedOutWork (real git)", () => {
     return {
       db: tdb.db,
       clock: new FixedClock(1_700_000_000_000),
-      ctx: { signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
+      ctx: { signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {}, jobId: "job-test", type: "execute-epic" },
       projectId: randomUUID(),
       runId: randomUUID(),
       repoPath: repo,
@@ -717,7 +717,7 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
   const run = (signal: AbortSignal): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
+    ctx: { signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {}, jobId: "job-test", type: "execute-epic" },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,
@@ -821,7 +821,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
   const run = (): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {}, jobId: "job-test", type: "execute-epic" },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,
@@ -950,7 +950,7 @@ suite("settleTicketTimeout — a satisfied step the deadline caught during its b
   const run = (): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {}, jobId: "job-test", type: "execute-epic" },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,
@@ -1074,7 +1074,7 @@ suite("settleTicketTimeout — unmarkable self-committed work stops the run", ()
   const run = (): Omit<StepContext, "tickets"> => ({
     db: tdb.db,
     clock: new FixedClock(1_700_000_000_000),
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {}, jobId: "job-test", type: "execute-epic" },
     projectId: randomUUID(),
     runId: randomUUID(),
     repoPath: repo,

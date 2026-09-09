@@ -4,7 +4,13 @@
  * the contract between anton's resolved context and the skill's rules — can be asserted without
  * driving a scan.
  */
-import { claudeRouting, runClaude, type ClaudeEvent } from "../claude/driver";
+import {
+  claudeRouting,
+  runClaude,
+  type ClaudeEvent,
+  type ClaudeResult,
+  type RunClaudeOptions,
+} from "../claude/driver";
 import { loadSkill } from "../claude/prompt";
 import { resolveScanSeverity, type ProjectSettings } from "../projects";
 import { parseTriageOutcome, type TriageOutcome } from "../scan-health";
@@ -66,6 +72,12 @@ export async function runTriage(opts: {
   /** The runner's spend signal — the triage session is the one place this job invokes Claude. */
   claudeReached: () => Promise<void>;
   onEvent: (e: ClaudeEvent) => void;
+  /**
+   * The claude driver, so the pass hands in a METERED one (anton-77l9) — a nightly triage spends
+   * real quota, and a ledger that held only the ticket pipeline would report a project's bill as
+   * smaller than it is. Defaults to the bare driver for a caller invoking triage directly.
+   */
+  claude?: (options: RunClaudeOptions) => Promise<ClaudeResult>;
 }): Promise<TriageOutcome | undefined> {
   const { project, settings } = opts;
   const boardSection = await readBoardContext(project.repoPath, opts.logPath, project.slug);
@@ -76,7 +88,7 @@ export async function runTriage(opts: {
   });
 
   await opts.claudeReached();
-  const claudeResult = await runClaude({
+  const claudeResult = await (opts.claude ?? runClaude)({
     cwd: project.repoPath,
     prompt,
     model: settings.model,

@@ -73,7 +73,7 @@ suite("commitStep (real git)", () => {
     return {
       db: tdb.db,
       clock: new FixedClock(1_700_000_000_000),
-      ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
+      ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {}, jobId: "job-test", type: "execute-epic" },
       projectId: randomUUID(),
       runId: randomUUID(),
       repoPath: repo,

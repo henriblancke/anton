@@ -80,7 +80,7 @@ describe("dispatchClaude", () => {
   // A run claude itself reported as failed is a step that RAN and did not achieve its work — the
   // caller decides what that means, so it comes back as `ok: false` rather than a throw.
   it("reports a failed run through the caller's own failure wording", async () => {
-    const claude = fakeClaude({ ok: false, text: "the model gave up" });
+    const claude = fakeClaude({ ok: false, text: "the model gave up", modelUsage: [] });
 
     const result = await dispatchClaude(
       sandbox.context({ deps: { runClaude: claude.run } }),
@@ -125,5 +125,59 @@ describe("dispatchClaude", () => {
     const rows = await sandbox.tdb.db.select().from(schema.sessions);
     expect(rows).toHaveLength(1);
     expect(rows[0].status).toBe("running");
+  });
+
+  /**
+   * The spend ledger is wired HERE (anton-77l9) rather than in each step, for the same reason this
+   * dispatch is shared: the ledger's whole value is holding every invocation, and a per-step
+   * recording call is one a new step forgets.
+   */
+  it("records the invocation's per-model usage against the run's dimensions", async () => {
+    const claude = fakeClaude({
+      ok: true,
+      text: "ANTON-RESULT: delivered",
+      sessionId: "sess-9",
+      numTurns: 12,
+      costUsd: 2.5,
+      durationMs: 90_000,
+      modelUsage: [
+        { model: "claude-opus-5[1m]", inputTokens: 438, outputTokens: 29177 },
+        { model: "claude-haiku-4-5-20251001", inputTokens: 1820, outputTokens: 28 },
+      ],
+    });
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+
+    await dispatchClaude(ctx, args());
+
+    const rows = await sandbox.tdb.db.select().from(schema.claudeInvocations);
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.modelReported).sort()).toEqual([
+      "claude-haiku-4-5-20251001",
+      "claude-opus-5[1m]",
+    ]);
+    // The dimensions the run knows at dispatch, which nothing can reconstruct later.
+    expect(rows[0]).toMatchObject({
+      projectId: sandbox.projectId,
+      jobType: "execute-epic",
+      jobId: "job-test",
+      runId: ctx.runId,
+      beadId: target.id,
+      claudeSessionId: "sess-9",
+      numTurns: 12,
+      outcome: "ok",
+    });
+  });
+
+  it("still records an invocation whose result reported no readable usage", async () => {
+    // The failure the ledger cannot report is a missing row: it would understate spend in silence.
+    const claude = fakeClaude({ ok: false, text: "the model gave up", modelUsage: [] });
+
+    await dispatchClaude(sandbox.context({ deps: { runClaude: claude.run } }), args());
+
+    const rows = await sandbox.tdb.db.select().from(schema.claudeInvocations);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].modelReported).toBeNull();
+    expect(rows[0].inputTokens).toBeNull();
+    expect(rows[0].outcome).toBe("error");
   });
 });

@@ -686,3 +686,84 @@ export const sessions = sqliteTable(
     index("sessions_job_idx").on(table.jobId),
   ],
 );
+
+/**
+ * One row per `claude` invocation and model (anton-77l9) — the fact table every question about what
+ * a task SPENT is answered from.
+ *
+ * Recorded from the result event at the moment the invocation ends, with the dimensions as they
+ * stood then: the project, the job type and pipeline step that dispatched it, the run and bead it
+ * was for, the model anton REQUESTED next to the one the result reported, and the endpoint host it
+ * went to. None of that is reconstructible later — settings change, a formula is edited, a bead is
+ * relabelled, a gateway is pointed elsewhere — which is the same reason `runs` records `model`,
+ * `agent_tag`, `formula` and `formula_variant` rather than deriving them. Cost is NOT derived here;
+ * a sibling ticket owns the price table.
+ *
+ * Grain: one row per (invocation, model). A session that used a subagent reports usage under both
+ * models, and one row per model is what lets a later reader attribute the haiku tokens and the opus
+ * tokens separately rather than summing them into a figure that prices as neither. An invocation
+ * whose `modelUsage` was absent, empty or unreadable still gets exactly ONE row — `model_reported`
+ * null, the counts null — because the fact that the invocation happened is what the table is for,
+ * and a dropped row understates spend silently.
+ *
+ * `modelUsage` is cumulative per session, so these counts are the LATEST result's, never a sum
+ * across the results of one session (see claude/model-usage.ts).
+ */
+export const claudeInvocations = sqliteTable(
+  "claude_invocations",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id").references(() => projects.id),
+    /** The queue job type that dispatched this invocation (`execute-epic`, `review-fix-pr`, …). */
+    jobType: text("job_type"),
+    jobId: text("job_id"),
+    /**
+     * The formula step that dispatched it (`implement`, `review`, a project's own `step:claude` id),
+     * or the pass's own name for an invocation outside the ticket pipeline. What separates two
+     * invocations of one run that spent very differently.
+     */
+    step: text("step"),
+    runId: text("run_id"),
+    /** The bead the invocation was for — the ticket, or the run target for a run-phase step. */
+    beadId: text("bead_id"),
+    /** Claude's own session id, so a row joins to its session log and its sibling invocations. */
+    claudeSessionId: text("claude_session_id"),
+    /** The model anton ASKED for (`--model`), null when the run took claude's default. */
+    modelRequested: text("model_requested"),
+    /**
+     * The model id the result reported the usage UNDER. A gateway spells ids its own way and may
+     * serve a different model than was requested, so the two are recorded separately rather than
+     * assumed equal — the divergence is a sibling ticket's question, and it can only be asked if
+     * both are stored. Null on an invocation with unknown usage.
+     */
+    modelReported: text("model_reported"),
+    /**
+     * The HOST the invocation's traffic went to — a gateway's, or null for the Claude API. The host
+     * only: a base URL can carry a path and a query, and neither is a dimension worth keeping next
+     * to the risk of a credential landing in one.
+     */
+    endpointHost: text("endpoint_host"),
+    inputTokens: integer("input_tokens"),
+    outputTokens: integer("output_tokens"),
+    thinkingTokens: integer("thinking_tokens"),
+    cacheReadInputTokens: integer("cache_read_input_tokens"),
+    cacheCreationInputTokens: integer("cache_creation_input_tokens"),
+    webSearchRequests: integer("web_search_requests"),
+    numTurns: integer("num_turns"),
+    /** What claude itself reported the session cost. Kept as REPORTED, not as anton's own derivation. */
+    costUsd: real("cost_usd"),
+    durationMs: integer("duration_ms"),
+    durationApiMs: integer("duration_api_ms"),
+    /** ok | error — whether claude reported the invocation itself as failed. */
+    outcome: text("outcome").notNull(),
+    recordedAt: ts("recorded_at").notNull().default(now),
+  },
+  (table) => [
+    // The read every later question starts from: one project's spend over a window. `recorded_at`
+    // trails the project id because the project is always known and always an equality predicate,
+    // while the window is a range — the reverse order would leave the seek to the range.
+    index("claude_invocations_project_idx").on(table.projectId, table.recordedAt),
+    // Serves "what did this run spend", which is a run detail read and not a scan of the table.
+    index("claude_invocations_run_idx").on(table.runId),
+  ],
+);
