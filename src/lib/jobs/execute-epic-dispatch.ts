@@ -10,11 +10,15 @@
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { claimGuard } from "../beads/claim";
 import { contractGaps, formatContractGaps } from "../beads/contract";
+import { latestSatisfiedRecord } from "../beads/satisfied-note";
 import { appendSessionLog } from "../sessions";
 import { resumeSkipped } from "../ticket-view";
 import {
   branchAddedCommit,
+  branchContainsCommit,
   branchSatisfiesTicket,
+  describeCommit,
+  satisfiedMarkerTarget,
   worktreeHasCommitFor,
   type SatisfiedClaim,
 } from "../git/ops";
@@ -54,10 +58,10 @@ export interface DispatchOutcome {
    * that commit instead of listing them as deliveries.
    *
    * Two ways in, and the PR body cannot tell them apart because it must not: a step this attempt
-   * dispatched and settled as `satisfied`, and a ticket a RESUME skipped because a sibling's commit
-   * already claims it (anton-ag76). The second is read back off the branch's attribution trailers
-   * rather than remembered, which is what lets it survive a run boundary at all — the settlement's
-   * bead note was written by the earlier attempt, and the commit it names is still here.
+   * dispatched and settled as `satisfied`, and a ticket a RESUME skipped because an earlier
+   * settlement already covers it (anton-ag76). The second is read back off the branch's attribution
+   * trailers — or, for a settlement written before those existed, off the bead's own note verified
+   * against the branch — rather than remembered, which is what lets it survive a run boundary.
    */
   satisfied: Map<string, SatisfiedSettlement>;
   /** Tickets this run never dispatched, and the timeout each is waiting behind. */
@@ -381,6 +385,8 @@ export interface BranchDeliveryReads {
   hasCommitFor: (ticketId: string) => Promise<boolean>;
   /** A commit whose `Anton-Satisfies` trailers claim this ticket (anton-6vxl). */
   satisfiedBy: (ticketId: string) => Promise<SatisfiedClaim | undefined>;
+  /** The settlement this bead's OWN notes record, verified against this branch (PR #258 review). */
+  notedSatisfiedBy: (ticket: Bead) => Promise<SatisfiedClaim | undefined>;
   /** Whether that commit is one this branch ADDED over its base, rather than base history. */
   branchAdded: (sha: string) => Promise<boolean>;
 }
@@ -398,8 +404,45 @@ function worktreeReads(
   return {
     hasCommitFor: (id) => worktreeHasCommitFor(worktreePath, id),
     satisfiedBy: (id) => branchSatisfiesTicket(worktreePath, id),
+    notedSatisfiedBy: (ticket) => notedSatisfaction(run, ticket),
     branchAdded: (sha) => branchAddedCommit(run.repoPath, run.branch, run.baseRef, sha),
   };
+}
+
+/**
+ * The settlement a bead's OWN notes record, verified against this branch — the upgrade path for a
+ * ticket settled before commits carried attribution trailers (PR #258 review).
+ *
+ * The bead note (anton-8h4b) shipped a release ahead of the trailer, so a ticket settled in between
+ * — or one an operator closed by hand after writing the same clause — is closed on the board with a
+ * full account of WHICH commit did its work and nothing on the branch saying so. Read only from the
+ * branch, that is indistinguishable from the cross-machine shape, and the resume reopens a settled
+ * ticket and dispatches it into the identical zero diff the trailer exists to prevent.
+ *
+ * The note is a POINTER, never the evidence: what settles it is `git` confirming the commit it names
+ * is reachable here, exactly as {@link branchAddedCommit} settles a live `satisfied` claim
+ * (anton-nuft) — and the note's own branch must be this run's, since a sha reachable from an
+ * unrelated branch is no proof this one carries the work. So a note naming a commit this branch
+ * never got still regenerates, which is what keeps the cross-machine reasoning intact.
+ *
+ * Fails closed to `undefined` on every read that cannot answer, for the reason the branch reads do:
+ * re-running work is the safe error, skipping it is not.
+ */
+async function notedSatisfaction(
+  run: Pick<StepContext, "repoPath" | "branch">,
+  ticket: Bead,
+): Promise<SatisfiedClaim | undefined> {
+  const record = latestSatisfiedRecord(ticket.notes);
+  if (!record || record.branch !== run.branch) return undefined;
+  if (!(await branchContainsCommit(run.repoPath, run.branch, record.commit))) return undefined;
+  // The full sha and subject, so the pull request cites the work rather than the note's abbreviation
+  // — and so a note pointing at the attribution MARKER of an earlier settlement is followed to the
+  // commit that did the work, the same hop `ticketSettlement` takes.
+  const named = await describeCommit(run.repoPath, record.commit);
+  if (!named) return undefined;
+  const throughMarker = satisfiedMarkerTarget(named.subject);
+  const work = throughMarker ? await describeCommit(run.repoPath, throughMarker) : named;
+  return work ? { sha: work.sha, subject: work.subject, ticketIds: [ticket.id] } : undefined;
 }
 
 /**
@@ -425,10 +468,12 @@ function worktreeReads(
  */
 export async function branchDelivery(
   reads: BranchDeliveryReads,
-  ticketId: string,
+  ticket: Bead,
 ): Promise<BranchDelivery | undefined> {
-  if (await reads.hasCommitFor(ticketId)) return { how: "own-commit" };
-  const by = await reads.satisfiedBy(ticketId);
+  if (await reads.hasCommitFor(ticket.id)) return { how: "own-commit" };
+  // The trailer first, the bead's own note second: the trailer is this branch's own word, while the
+  // note is a claim the note's writer made that only `git` can settle (see notedSatisfaction).
+  const by = (await reads.satisfiedBy(ticket.id)) ?? (await reads.notedSatisfiedBy(ticket));
   if (!by) return undefined;
   return { how: "sibling", by, inherited: !(await reads.branchAdded(by.sha)) };
 }
@@ -475,14 +520,15 @@ async function dispatchTicket(
   // same-machine resume the worktree is reused and the commit is present, so this skips as
   // before — no redundant re-run.
   //
-  // "Present" means present under ANY name (anton-ag76): a commit subjected `<id>:`, or a
-  // sibling's commit whose trailers claim this ticket. That widening leaves the cross-machine
-  // reasoning above untouched — a ticket closed elsewhere whose commit never reached this branch
-  // carries neither, so it still regenerates — while closing the case where a sibling's commit met
-  // this ticket's acceptance in full and the resume dispatched it into a guaranteed zero diff.
+  // "Present" means present under ANY name (anton-ag76): a commit subjected `<id>:`, a sibling's
+  // commit whose trailers claim this ticket, or a settlement the bead's own note records and git
+  // bears out. That widening leaves the cross-machine reasoning above untouched — a ticket closed
+  // elsewhere whose commit never reached this branch is claimed by none of the three, so it still
+  // regenerates — while closing the case where a sibling's commit met this ticket's acceptance in
+  // full and the resume dispatched it into a guaranteed zero diff.
   const doneOnBoard = resumeSkipped(ticket, standaloneRun);
   const delivery = doneOnBoard
-    ? await branchDelivery(worktreeReads(worktree.path, runStep), ticket.id)
+    ? await branchDelivery(worktreeReads(worktree.path, runStep), ticket)
     : undefined;
   if (delivery) {
     if (standaloneRun) {

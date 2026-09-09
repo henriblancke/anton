@@ -30,9 +30,10 @@
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beads } from "../beads/bd";
+import { formatSatisfiedNote } from "../beads/satisfied-note";
 import { commitMarker } from "../git/ops";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob } from "./queue";
@@ -255,6 +256,122 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       process.env.ANTON_GH_BIN = prevGh;
+    }
+  });
+
+  it("skips a ticket whose only evidence is its own satisfied NOTE, when git bears the note out (PR #258 review)", async () => {
+    // The upgrade path. The bead note (anton-8h4b) shipped a release ahead of the commit trailer, so
+    // a ticket settled in between — or one an operator closed by hand after writing the same clause —
+    // is closed with a full account of which commit did its work and NO trailer anywhere on the
+    // branch. Read from the branch alone that is the cross-machine shape, and the resume reopens it
+    // and dispatches an agent into the zero diff. The note is only a pointer: what settles it is git
+    // confirming the commit it names is reachable here.
+    const featureId = await beads.create(repo, {
+      title: "Settled by a note, before trailers existed",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nProve a note-only settlement survives the resume.",
+    });
+    await beads.approve(repo, featureId);
+    const doer = createTicket(repo, {
+      title: "Ticket whose commit did the work",
+      parent: featureId,
+      acceptance: "work file exists",
+    });
+    const noted = createTicket(repo, {
+      title: "Ticket settled by note alone",
+      parent: featureId,
+      acceptance: "work file exists",
+    });
+
+    // The prior attempt's commit, carrying NO satisfies-trailer — the whole point of this case.
+    await commitMarker(repo, `${doer}: Ticket whose commit did the work\n\nOne change, two tickets.`);
+    publishBase();
+    const work = commitFor("main", doer);
+    // …and the record the older release left: on the bead, naming the run's branch and that commit.
+    await beads.note(
+      repo,
+      noted,
+      formatSatisfiedNote({
+        by: { commit: work.sha, subject: work.subject },
+        sessionId: "older-release",
+        branch: `anton/${featureId}`,
+      }),
+    );
+    await beads.close(repo, doer);
+    await beads.close(repo, noted);
+
+    const log = join(sandbox, "noted-dispatch.log");
+    const bodyDump = join(sandbox, "noted-pr-body.txt");
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = loggingClaude("claude-noted", log);
+    const prevGh = process.env.ANTON_GH_BIN;
+    process.env.ANTON_GH_BIN = capturingGh("gh-noted", bodyDump);
+    try {
+      const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      // No agent ran at all, and the close survived: the note-only settlement is a skip.
+      expect(existsSync(log)).toBe(false);
+      expect(await sessionsFor(noted)).toHaveLength(0);
+      expect((await beads.show(repo, noted)).status).toBe("closed");
+      expect(subjectsOn(`anton/${featureId}`)).not.toContain(`${noted}:`);
+
+      // And the body attributes it to the commit the NOTE named — base history, since that commit
+      // was published before the run, so the reviewer is not sent hunting this diff for it.
+      const body = readFileSync(bodyDump, "utf8");
+      expect(body).toContain(
+        `- ${noted} — Ticket settled by note alone — by ${work.sha.slice(0, 7)} "${work.subject}"`,
+      );
+      expect(body).toContain("Already satisfied by commits in the base, not by this run");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      process.env.ANTON_GH_BIN = prevGh;
+    }
+  });
+
+  it("still regenerates when the note names a commit this branch does NOT carry", async () => {
+    // The note is a claim, never the evidence. A ticket another machine settled and closed wrote the
+    // same note there, and its commit lives only in that machine's unpushed worktree — so trusting
+    // the note would open the epic's single PR missing that work while the board calls it done.
+    const featureId = await beads.create(repo, {
+      title: "A note whose commit never reached this branch",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the note is verified against git, not believed.",
+    });
+    await beads.approve(repo, featureId);
+    const elsewhere = createTicket(repo, {
+      title: "Ticket settled on another machine",
+      parent: featureId,
+      acceptance: "work file exists",
+    });
+
+    publishBase();
+    await beads.note(
+      repo,
+      elsewhere,
+      formatSatisfiedNote({
+        // A well-formed sha this repository has never held — the other machine's commit.
+        by: { commit: "f".repeat(40), subject: "someone else's commit" },
+        sessionId: "other-machine",
+        branch: `anton/${featureId}`,
+      }),
+    );
+    await beads.close(repo, elsewhere);
+
+    const log = join(sandbox, "noted-unreachable-dispatch.log");
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = loggingClaude("claude-noted-unreachable", log);
+    try {
+      const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+      // Regenerated here, exactly as a ticket with no note at all would be.
+      expect(dispatched(log)).toEqual([elsewhere]);
+      expect(subjectsOn(`anton/${featureId}`)).toContain(`${elsewhere}:`);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
     }
   });
 
