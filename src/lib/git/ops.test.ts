@@ -24,6 +24,7 @@ import {
   commitAll,
   commitMarker,
   DEFAULT_DIFF_PATCH_CHARS,
+  deletionPatch,
   diffAgainstBase,
   findOpenPullRequest,
   listDirBlobsAtRev,
@@ -1120,6 +1121,133 @@ suite("diffAgainstBase (real git)", () => {
     expect(diff.files).toEqual(["vendored.txt"]);
     expect(diff.patch).toContain("patch truncated at 200000 chars");
     expect(diff.patch.length).toBeLessThan(DEFAULT_DIFF_PATCH_CHARS + 200);
+  });
+});
+
+// anton-hx4b: the deletion rescue pass is reached through `diffAgainstBase` only by forcing the
+// main patch to truncate, which costs a filler commit per case and blurs WHICH allocation rule a
+// failure belongs to. Driven directly, each branch of the budget split gets a case of its own.
+suite("deletionPatch (real git · one case per budget branch)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  /** Delete `paths` on the branch, after seeding them into the base so their removal is a `D`. */
+  const seedAndDelete = (files: Record<string, string>) => {
+    for (const [path, body] of Object.entries(files)) writeFileSync(join(repo, path), body);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "seed"]);
+    g(["checkout", "-q", "main"]);
+    g(["merge", "-q", "--ff-only", "anton/epic-1"]);
+    g(["checkout", "-q", "anton/epic-1"]);
+    for (const path of Object.keys(files)) rmSync(join(repo, path));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: drop them"]);
+  };
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-delpatch-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", "anton/epic-1"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("returns nothing at all when the branch deleted no file", async () => {
+    writeFileSync(join(repo, "added.ts"), "export const a = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: add only"]);
+
+    expect(await deletionPatch(repo, "main", 4_000)).toEqual({});
+  });
+
+  it("quotes a removal whole when its even share of the budget covers it", async () => {
+    seedAndDelete({ "guard.ts": "export const requireAuth = () => true;\n" });
+
+    const { patch, incomplete, unshown } = await deletionPatch(repo, "main", 4_000);
+
+    expect(patch).toContain("-export const requireAuth = () => true;");
+    // Quoted whole, so there is no truncation note and no under-coverage to report.
+    expect(patch).not.toContain("truncated at");
+    expect(incomplete).toBeUndefined();
+    expect(unshown).toBeUndefined();
+  });
+
+  it("spends the FLOOR slice when the even share falls under it, so the tail is still quoted", async () => {
+    // 12 removals of a 4_000 budget put the even share at 333 — under the floor. Treating the floor
+    // as a cutoff instead of a spend quoted the first file and NAMED the other eleven, though every
+    // one of them is small enough for the budget to pay a usable slice for.
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 12; i++) files[`f${i}.ts`] = `export const guard${i} = () => true;\n`;
+    seedAndDelete(files);
+
+    const { patch, unshown } = await deletionPatch(repo, "main", 4_000);
+
+    for (let i = 0; i < 12; i++) expect(patch).toContain(`-export const guard${i} = () => true;`);
+    expect(unshown).toBeUndefined();
+  });
+
+  it("cuts a removal larger than its slice and says so, per file", async () => {
+    seedAndDelete({ "big.ts": "// filler line\n".repeat(2_000) });
+
+    const { patch } = await deletionPatch(repo, "main", 300);
+
+    expect(patch).toContain("deletion of big.ts truncated at 300 chars");
+    // The cut is where the memory is spent: only the note follows the bounded text.
+    expect(patch!.length).toBeLessThan(300 + 100);
+  });
+
+  it("names — and counts — the removals left once the budget cannot buy a floor slice", async () => {
+    // Honest under-coverage: past `max / MIN_DELETION_SLICE_CHARS` files no cut of the share fixes
+    // it, so the reviewer is told which removals it is NOT seeing rather than reading a partial
+    // list as the whole set.
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 12; i++) files[`f${i}.ts`] = "// filler line\n".repeat(200);
+    seedAndDelete(files);
+
+    const { patch, unshown } = await deletionPatch(repo, "main", 2_000);
+
+    expect(patch).toContain("further deleted file(s) not shown");
+    expect(patch).toContain("f11.ts");
+    expect(unshown).toBeGreaterThan(0);
+    expect(patch!.length).toBeLessThan(2_000 + 500);
+  });
+
+  it("holds the bound when the budget cannot pay for even the first removal", async () => {
+    // A zero budget is still a bound, not an error: the first file is always ASKED for (a caller
+    // wanting the deletions bounded is not asking for them withheld), and what comes back is empty
+    // rather than a diff header masquerading as content.
+    seedAndDelete({ "guard.ts": "export const requireAuth = () => true;\n" });
+
+    const { patch, unshown, incomplete } = await deletionPatch(repo, "main", 0);
+
+    expect(patch).toBeUndefined();
+    expect(unshown).toBeUndefined();
+    expect(incomplete).toBeUndefined();
+  });
+
+  it("reports a failed pass as incomplete instead of as an empty deletion list", async () => {
+    // The reviewer has no route to a deleted file, so a swallowed failure reads as "nothing was
+    // removed" and every removal is approved by a verdict nobody formed over it.
+    seedAndDelete({ "guard.ts": "export const requireAuth = () => true;\n" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const { patch, incomplete } = await deletionPatch(repo, "no-such-rev", 4_000);
+
+    expect(incomplete).toBe(true);
+    expect(patch).toBeUndefined();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 });
 
