@@ -271,6 +271,31 @@ describe("followUpDescription", () => {
     expect(description).not.toContain("<!--");
   });
 
+  it("escapes a fence-shaped summary — bare, it would fence every section under the Goal", () => {
+    for (const summary of ["```", "```md swallows the section", "~~~"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      // Unescaped, the delimiter opens a block that runs to the end of the description: the scanner
+      // reads Acceptance, Context, Out of scope and Verify as literal content, and the approve route
+      // refuses the follow-up the rework just created.
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(description).toContain(`## Goal\n\\${summary}\n`);
+      expect(acceptanceOf(description)).toEqual([
+        `- [ ] ${INSTRUCTIONS}`,
+        "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+      ]);
+    }
+  });
+
+  it("leaves a fence delimiter mid-summary alone — only the line's head opens a block", () => {
+    const description = followUpDescription({
+      ...args,
+      summary: "the ``` closer is dropped",
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain("## Goal\nthe ``` closer is dropped\n");
+  });
+
   it("files a closed HTML comment's sample as a verbatim block — boxing each line would flatten an indented example", () => {
     const description = followUpDescription({
       ...args,

@@ -101,7 +101,7 @@ export function followUpDescription(args: FollowUpContractArgs): string {
   const { summary, instructions, findings, ticket, targetId, parentId, pipeline } = args;
   return [
     `## Goal`,
-    markdownSafe(oneLine(summary)),
+    goalBody(summary),
     ``,
     `## ${ACCEPTANCE_HEADING}`,
     ...followUpAcceptance(instructions, findings),
@@ -318,6 +318,24 @@ function oneLine(text: string): string {
  */
 function markdownSafe(text: string): string {
   return text.replace(/<!--/g, "<\\!--");
+}
+
+/**
+ * The summary as the Goal section's body: {@link markdownSafe}, on one line, and with a leading
+ * fence delimiter neutralised.
+ *
+ * The summary is the bead's title, and a founder sending back a request ABOUT fences types one
+ * ("```md swallows the section"). Written bare under `## Goal` it opens a fenced block that runs to
+ * the end of the description: every heading below it is literal content to the scanner
+ * (lib/beads/markdown.ts), so the bead files with no Acceptance, Context, Out of scope or Verify
+ * and the approve route refuses the follow-up the rework just created. Backslash-escaping the first
+ * delimiter character is the same trick {@link markdownSafe} plays on `<!--` — CommonMark renders
+ * the identical text, and no scanner reads the line as a fence. Only the head is escaped, since
+ * only a delimiter at the line's start opens a block; the {@link oneLine} collapse already means
+ * there is no second line to open one.
+ */
+function goalBody(summary: string): string {
+  return markdownSafe(oneLine(summary)).replace(/^(`{3,}|~{3,})/, "\\$1");
 }
 
 /** Why this bead exists — and, for a REDIRECTED send-back, why it exists here rather than on the original. */
