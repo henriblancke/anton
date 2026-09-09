@@ -1420,9 +1420,15 @@ function writeStampFile(path, value) {
  * record written before this field existed carries null — unknown, which no reader may read as
  * either answer.
  *
+ * `dependencies` is a digest of the packages this process IMPORTED, and it is the one identity field
+ * no other can stand in for (PR #257 review): every digest above deliberately excludes
+ * `node_modules`, so a `bun install` under a running server replaces the modules it is executing
+ * while leaving version, commit and both worktree digests untouched. Written by the caller, which is
+ * where the lockfile is read; null where nothing established one, and read as no evidence.
+ *
  * @param {string} path
  * @param {BuildIdentity} identity
- * @param {{pid?: number, bootedAt?: number, startedAt?: string|null, appRoot?: string|null, runner?: boolean|null}} [stamp]
+ * @param {{pid?: number, bootedAt?: number, startedAt?: string|null, appRoot?: string|null, runner?: boolean|null, dependencies?: string|null}} [stamp]
  */
 export function writeBuildRecord(
   path,
@@ -1433,9 +1439,10 @@ export function writeBuildRecord(
     startedAt = processStartedAt(pid),
     appRoot = null,
     runner = null,
+    dependencies = null,
   } = {},
 ) {
-  return writeStampFile(path, { ...identity, pid, bootedAt, startedAt, appRoot, runner });
+  return writeStampFile(path, { ...identity, pid, bootedAt, startedAt, appRoot, runner, dependencies });
 }
 
 /**
@@ -1466,7 +1473,16 @@ export function recordFromInstall(record, appRoot) {
  * The record fields that are a STRING or nothing — the identity half, which readers compare with
  * `===` and print with `slice`. `pid` and `builtAt` are numbers by design and are left alone.
  */
-const RECORD_STRING_FIELDS = ["version", "revision", "worktree", "source", "env", "startedAt", "appRoot"];
+const RECORD_STRING_FIELDS = [
+  "version",
+  "revision",
+  "worktree",
+  "source",
+  "env",
+  "startedAt",
+  "appRoot",
+  "dependencies",
+];
 
 /**
  * The record a running server left, or null when there is none (or it is unreadable/malformed).

@@ -5,7 +5,7 @@
  * sibling `runner.lifecycle.test.ts`.
  */
 import { describe, expect, it } from "vitest";
-import { RunAlreadyLiveError, SyncNotWiredError } from "./errors";
+import { RunAlreadyLiveError, StaleCheckoutError, SyncNotWiredError } from "./errors";
 import { BUDGET_DEFER_PREFIX, BUDGET_DEFER_PRIOR_SEP } from "./queue";
 import { classifyError, hasPriorAttempt, nextAction } from "./runner";
 import { CONFIG } from "./runner.fixture";
@@ -117,6 +117,33 @@ describe("nextAction (pure durability policy)", () => {
     expect(classifyError(new SyncNotWiredError("no remote"))).toEqual({
       kind: "not-wired",
       error: "no remote",
+    });
+  });
+
+  it("reschedules a stale-checkout start on a slow cadence and refunds the attempt (anton-mh3c)", () => {
+    // anton is behind its own code, so a new start is refused. It self-clears when the operator
+    // restarts anton on fresh code — so it must never park (which would strand every job that hit it
+    // for a manual resume even after the restart), and it never burns attempts toward a park either.
+    const a = nextAction(
+      CONFIG,
+      { attempts: 3 },
+      { kind: "stale-checkout", error: "its checkout is 3 commit(s) behind origin/main" },
+      now,
+    );
+    expect(a.action).toBe("reschedule");
+    if (a.action !== "reschedule") throw new Error("unreachable");
+    expect(a.runAtMs).toBe(now + CONFIG.staleCheckoutRetryMs);
+    expect(a.refundAttempt).toBe(true);
+    // The classified reason — what is stale and the command that clears it — is the row's only
+    // durable record for the run-health sweep, so the reschedule keeps it.
+    expect(a.lastError).toContain("3 commit(s) behind origin/main");
+    expect(a.lastError).toContain(new Date(now + CONFIG.staleCheckoutRetryMs).toISOString());
+  });
+
+  it("classifies StaleCheckoutError as a stale-checkout outcome (anton-mh3c)", () => {
+    expect(classifyError(new StaleCheckoutError("behind its own code"))).toEqual({
+      kind: "stale-checkout",
+      error: "behind its own code",
     });
   });
 

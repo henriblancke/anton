@@ -38,6 +38,7 @@ import {
 } from "../autopilot-disarm";
 import { getProjectSettings, resolveScoreBreaker } from "../projects";
 import { listRecentRunOutcomes } from "../runs";
+import { isStaleCheckoutDeferral } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 
 /**
@@ -124,6 +125,14 @@ async function readScoreSeries(
       // A queued or running run has not been reviewed yet. Skipped rather than counted as a gap: it
       // is not evidence the series is broken, only that it has not happened.
       if (run.status === "queued" || run.status === "running") continue;
+      // A stale-checkout deferral is not an attempt either (PR #257 review). The row reads `failed`,
+      // but the run refused to START — no lease, no worktree, no claim, no agent, and its attempt
+      // refunded and rescheduled — so it can no more have been reviewed than a queued row can. Left
+      // in, it is the target's newest row and therefore a GAP, and one gap suppresses the whole
+      // verdict: a single deferred target would disable score-regression detection for the project
+      // until that target ran again, or forever if it was abandoned. Skipped for the same reason the
+      // failure breaker ignores it — the real attempts either side are the series.
+      if (isStaleCheckoutDeferral(run.error)) continue;
       // One entry per TARGET, and it is the target's NEWEST attempt: a feature retried three times
       // is one piece of work being judged, and counting each attempt would let a single bad review
       // fill the window on its own. When that newest attempt left no score, the target reads as a

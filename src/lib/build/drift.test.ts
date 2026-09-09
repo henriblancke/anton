@@ -400,6 +400,27 @@ describe("recordServerBuild / serverBuildDrift", () => {
     expect(serverBuildDrift()?.state).toBe("outdated");
   });
 
+  // The caller that cannot wait for the TTL and has nobody to invalidate for it (PR #257 review):
+  // the start gate. A source-only `git pull` by an operator fires no `checkoutMoved`, so inside the
+  // window the cached read has the gate compare this process against the pre-pull disk and admit a
+  // run onto the code the pull just superseded.
+  it("re-reads the code on disk for a caller that asks for a fresh read", async () => {
+    const app = join(dir, "app");
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const { recordServerBuild, serverBuildDrift } = await import("./drift");
+
+    recordServerBuild({ runner: true });
+    onDisk = { version: "0.4.1", revision: null };
+    expect(serverBuildDrift()).toBeNull(); // the cached read, as every display surface still sees it
+
+    expect(serverBuildDrift({ fresh: true })?.state).toBe("outdated");
+  });
+
   // `addProject` stores `resolve(repoPath)`, which never dereferences a symlink, so anton's own
   // checkout registered through one spells the same directory differently here. Read as somebody
   // else's project, the nightly's own fast-forward would leave the pre-pull read cached and the
@@ -712,5 +733,130 @@ describe("serverBuildDrifts", () => {
   it("says nothing in a process that never booted a server", async () => {
     const { serverBuildDrifts } = await freshModule();
     expect(await serverBuildDrifts()).toEqual([]);
+  });
+});
+
+/**
+ * The dependency identity is recorded WITH the build because no field in the build identity can
+ * stand in for it: every digest there excludes node_modules, so a `bun install` under a running
+ * server replaces the modules it executes and moves nothing else (PR #257 review).
+ */
+describe("boot dependencies", () => {
+  /** A neighbour's record: a pid that is genuinely alive, so `recordAlive` keeps it. */
+  function neighbour(pid: number, over: Record<string, unknown> = {}) {
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(join(dir, `server-build.${pid}.json`), JSON.stringify({ ...mine, pid, startedAt: null, ...over }));
+  }
+
+  it("records the digest beside the build and reads it back for this process", async () => {
+    const { recordServerBuild, selfBootDependencies } = await freshModule();
+    recordServerBuild({ runner: true, dependencies: "abc123" });
+
+    expect(selfBootDependencies()).toBe("abc123");
+    expect(JSON.parse(readFileSync(recordPath(), "utf8")).dependencies).toBe("abc123");
+  });
+
+  it("claims nothing for a process that recorded none", async () => {
+    const { recordServerBuild, selfBootDependencies } = await freshModule();
+    recordServerBuild({ runner: true });
+
+    expect(selfBootDependencies()).toBeNull();
+  });
+
+  it("says nothing in a process that never booted a server", async () => {
+    const { selfBootDependencies, runnerBootDependencies } = await freshModule();
+    expect(selfBootDependencies()).toBeNull();
+    expect(await runnerBootDependencies()).toBeNull();
+  });
+
+  // The board renders in whichever process serves the page, and the packages that matter are the
+  // ones the RUNNER imported — the same split `runnerBuildDrift` exists for.
+  it("reads the runner's digest, not the digest of the process asking", async () => {
+    const { recordServerBuild, runnerBootDependencies } = await freshModule();
+    recordServerBuild({ runner: false, dependencies: "ui-only" });
+    neighbour(process.ppid, { runner: true, dependencies: "the-runner" });
+
+    expect(await runnerBootDependencies()).toBe("the-runner");
+  });
+
+  it("claims nothing when no live record says it is the runner", async () => {
+    const { recordServerBuild, runnerBootDependencies } = await freshModule();
+    recordServerBuild({ runner: false, dependencies: "ui-only" });
+
+    expect(await runnerBootDependencies()).toBeNull();
+  });
+
+  it("falls back to the identity it holds in memory when the record could not be written", async () => {
+    process.env.ANTON_DB = join(dir, "missing", "anton.db");
+    const { recordServerBuild, runnerBootDependencies } = await freshModule();
+    recordServerBuild({ runner: true, dependencies: "in-memory" });
+
+    expect(await runnerBootDependencies()).toBe("in-memory");
+  });
+
+  // A record predating the field carries no digest, and a hand-edited one may carry a non-string:
+  // `readBuildRecord` drops it, and an absence is read as no evidence rather than as a reinstall.
+  it("claims nothing for a record whose digest is not a string", async () => {
+    const { recordServerBuild, runnerBootDependencies } = await freshModule();
+    recordServerBuild({ runner: true, dependencies: "mine" });
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, dependencies: 42 }));
+
+    expect(await runnerBootDependencies()).toBeNull();
+  });
+});
+
+describe("runnerBuildDrift", () => {
+  /** A neighbour's record: a pid that is genuinely alive, so `recordAlive` keeps it. */
+  function neighbour(pid: number, over: Record<string, unknown> = {}) {
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(join(dir, `server-build.${pid}.json`), JSON.stringify({ ...mine, pid, startedAt: null, ...over }));
+  }
+
+  // The board renders in the current UI-only process, but the band must speak for the stale runner
+  // beside it — otherwise a current UI hides the stop deferring every job.
+  it("reports the runner's drift even when the process asking is current", async () => {
+    const { recordServerBuild, runnerBuildDrift } = await freshModule();
+    recordServerBuild({ runner: false });
+    neighbour(process.ppid, { version: "0.0.1", runner: true });
+
+    const drift = await runnerBuildDrift();
+    expect(drift?.state).toBe("outdated");
+    expect(drift?.running?.version).toBe("0.0.1");
+  });
+
+  // The mirror image: this stale process runs nothing scheduled, and the current runner beside it is
+  // what the band answers for — so no stop is shown for work the runner starts fine.
+  it("says nothing when this process is stale but the runner is current", async () => {
+    const { recordServerBuild, runnerBuildDrift } = await freshModule();
+    recordServerBuild({ runner: false });
+    neighbour(process.ppid, { runner: true }); // the runner, copied while the record is still current
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
+
+    expect(await runnerBuildDrift()).toBeNull();
+  });
+
+  // A record predates the flag: it is never treated as the runner, so a drift no record attributes
+  // to the runner shows no band rather than a guessed one.
+  it("claims no runner drift when the only stale record predates the flag", async () => {
+    const { recordServerBuild, runnerBuildDrift } = await freshModule();
+    recordServerBuild({ runner: true });
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    delete mine.runner;
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
+
+    expect(await runnerBuildDrift()).toBeNull();
+  });
+
+  // The single-server deployment: the process serving the page IS the runner, so its drift is the
+  // one the band shows.
+  it("reports this process's own drift when it is the runner", async () => {
+    const { recordServerBuild, runnerBuildDrift } = await freshModule();
+    recordServerBuild({ runner: true });
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
+
+    expect((await runnerBuildDrift())?.state).toBe("outdated");
   });
 });

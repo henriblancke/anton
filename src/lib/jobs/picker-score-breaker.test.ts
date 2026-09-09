@@ -15,6 +15,7 @@ import { activeDisarm, disarmAutopilot, reArmAutopilot } from "../autopilot-disa
 import { listOpenEscalations, toEscalationView } from "../escalations";
 import type { Clock } from "./queue";
 import { checkScoreSlide } from "./picker-score-breaker";
+import { STALE_CHECKOUT_REFUSAL_PREFIX } from "./errors";
 import { insertProject } from "@/lib/testing/project";
 
 const PROJECT = "p1";
@@ -41,6 +42,7 @@ async function run(input: {
   atMinutes: number;
   status?: string;
   score?: number;
+  error?: string;
 }): Promise<void> {
   const at = new Date(T0 + input.atMinutes * MINUTE);
   await t.db.insert(schema.runs).values({
@@ -49,6 +51,7 @@ async function run(input: {
     epicBeadId: input.epic,
     status: input.status ?? "done",
     reviewScore: input.score,
+    error: input.error,
     startedAt: at,
     endedAt: at,
     updatedAt: at,
@@ -191,6 +194,23 @@ describe("checkScoreSlide", () => {
     project();
     await threeLowRuns();
     await run({ id: "r4", epic: "anton-d", atMinutes: 45, status: "running" });
+
+    expect((await checkScoreSlide(t.db, clock, { projectId: PROJECT }))?.latched).toBe(true);
+  });
+
+  it("skips a stale-checkout deferral rather than reading it as a gap", async () => {
+    project();
+    await threeLowRuns();
+    // anton was behind its own code, so this start was refused before any work: no lease, no
+    // worktree, no agent, the attempt refunded. It never reached the review gate because it never
+    // ran, so counting it as an unscored attempt would suppress the verdict on the three real ones.
+    await run({
+      id: "r4",
+      epic: "anton-c",
+      atMinutes: 45,
+      status: "failed",
+      error: `${STALE_CHECKOUT_REFUSAL_PREFIX} its checkout is 2 commit(s) behind origin/main`,
+    });
 
     expect((await checkScoreSlide(t.db, clock, { projectId: PROJECT }))?.latched).toBe(true);
   });

@@ -10,6 +10,7 @@ import { beads, gateReason, HUMAN_AGENT, labelValueOf, type Bead } from "../bead
 import { latestBlockNoteCommit } from "../beads/block-note";
 import { ownerOf } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
+import { contractGaps, formatContractGaps } from "../beads/contract";
 import { parseTicketNotes } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import { blockedByPoison, PoisonEpic } from "./errors";
@@ -851,4 +852,36 @@ export async function deliveredTickets(
     delivered.push(ticket);
   }
   return delivered;
+}
+
+/**
+ * The park a run takes when its target or a ticket it would dispatch leaves the agent no definition
+ * of done (anton-j9zs), plus the advisory gaps that only cost quality — `undefined` when nothing
+ * blocks.
+ *
+ * A BOARD verdict, so it lives here rather than in {@link prepareEpicRun}: the gate reads only beads
+ * and returns the park, which keeps the contract and ticket-view modules out of preparation's own
+ * import graph (anton-8x1k, criterion 1). The caller supplies the set the run actually dispatches
+ * ({@link contractGatedBeads} over the freshest board it holds), so the gate cannot disagree with
+ * the approve route or the board card about which specs strand a run.
+ *
+ * Advisory gaps are RETURNED rather than logged here, because a board module has no business
+ * deciding whether a degraded run is worth a line in the job log — the caller warns.
+ */
+export function beadContractPoison(
+  beadId: string,
+  gated: Bead[],
+): { poison?: PoisonEpic; advisory?: string } {
+  const blocking = contractGaps(gated, "blocking");
+  if (blocking.length > 0) {
+    return {
+      poison: new PoisonEpic(
+        `epic ${beadId} has beads that don't meet the bead contract: ` +
+          formatContractGaps(blocking) +
+          ` — write the missing section(s), then resume the run`,
+      ),
+    };
+  }
+  const advisory = contractGaps(gated, "advisory");
+  return advisory.length > 0 ? { advisory: formatContractGaps(advisory) } : {};
 }

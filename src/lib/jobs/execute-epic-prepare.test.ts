@@ -28,6 +28,7 @@ const pullMock = vi.fn();
 const updateRunMock = vi.fn();
 const validateRunFormulaMock = vi.fn();
 const hasPreservedCommitMock = vi.fn();
+const checkSelfFreshnessMock = vi.fn();
 
 vi.mock("./execute-epic-recover", () => ({
   refreshRunBoard: (...args: unknown[]) => refreshRunBoardMock(...args),
@@ -85,6 +86,14 @@ vi.mock("../git/ops", async () => {
   };
 });
 
+// The self-freshness gate (anton-mh3c) would otherwise fetch anton's OWN checkout on every start —
+// a real network read against process.cwd(). Stubbed to a clean verdict by default, so only the
+// tests that ask for a stale one exercise the refusal.
+vi.mock("./self-freshness", () => ({
+  checkSelfFreshness: (...args: unknown[]) => checkSelfFreshnessMock(...args),
+  selfRepoRoot: () => "/anton",
+}));
+
 vi.mock("./formula-floor", () => ({ assertRunFormulaFloor: () => {} }));
 
 vi.mock("./execute-epic-formula", () => ({
@@ -92,7 +101,13 @@ vi.mock("./execute-epic-formula", () => ({
 }));
 
 const { prepareEpicRun } = await import("./execute-epic-prepare");
-const { PoisonEpic } = await import("./errors");
+// The staleness preflight lives in execute-epic-freshness.ts (forwarded to prepare through the
+// run-shape seam), so its pure unit imports from there; the self-freshness mock above intercepts the
+// import regardless of which module reads it.
+const { assertPreStartPoisonIsFresh, staleCheckoutRefusal } = await import(
+  "./execute-epic-freshness"
+);
+const { PoisonEpic, StaleCheckoutError } = await import("./errors");
 import type { EpicRun } from "./execute-epic-run";
 
 const REPO = "/tmp/anton";
@@ -180,6 +195,13 @@ beforeEach(() => {
   pullMock.mockResolvedValue(undefined);
   publishRunClaimMock.mockResolvedValue(undefined);
   hasPreservedCommitMock.mockResolvedValue(false);
+  // anton is running its own latest code by default, so the self-freshness gate lets every start
+  // through — only the tests that hand it a stale verdict exercise the refusal.
+  checkSelfFreshnessMock.mockResolvedValue({
+    checkout: { state: "current" },
+    dependencies: { state: "match" },
+    build: { state: "current" },
+  });
   // No human work by default: nothing written, nothing adopted.
   preflightHumanTicketsMock.mockImplementation((args: { board: Bead[] }) =>
     Promise.resolve({ ...preflight(args.board), armed: false }),
@@ -338,5 +360,273 @@ describe("prepareEpicRun — a held child is caught on every board the run adopt
     expect(warmRunWorktreeMock).toHaveBeenCalled();
     expect(claimRunTargetMock).toHaveBeenCalled();
     expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+});
+
+describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)", () => {
+  const clean = board(ticket("t-1"));
+
+  beforeEach(() => {
+    loadAllIssuesMock.mockResolvedValue(clean);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(clean));
+  });
+
+  it("defers a new start when anton's checkout is behind its upstream", async () => {
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "behind", behind: 3, upstream: "origin/main" },
+      dependencies: { state: "match" },
+      build: { state: "current" },
+    });
+
+    const error = await refusalFrom(clean);
+
+    // A reschedulable stop, NOT a poison: the runner defers the start (attempt refunded) so the
+    // restarted-on-fresh-code process runs it, instead of stranding it in `parked` for a manual
+    // resume the operator would have to find and click after already restarting anton (anton-5oc3).
+    expect(error).toBeInstanceOf(StaleCheckoutError);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("3 commit(s) behind origin/main");
+    expect(error.message).toContain("git pull");
+    // Read-only refusal: nothing was leased, warmed or claimed, so a run already in flight — and the
+    // board itself — is untouched.
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+    expect(claimRunTargetMock).not.toHaveBeenCalled();
+    expect(publishRunClaimMock).not.toHaveBeenCalled();
+  });
+
+  it("defers a new start when installed dependencies have drifted", async () => {
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "current" },
+      dependencies: { state: "drift", packages: ["drizzle-orm", "next"] },
+      build: { state: "current" },
+    });
+
+    const error = await refusalFrom(clean);
+
+    expect(error).toBeInstanceOf(StaleCheckoutError);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("bun install");
+    expect(error.message).toContain("drizzle-orm, next");
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+  });
+
+  it("defers a new start when the running build lags the code on disk, filesystem clean", async () => {
+    // The pull/reinstall the other halves ask for lands on disk instantly but never reaches the
+    // modules a live process booted with — so the gate must still refuse until anton restarts.
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "current" },
+      dependencies: { state: "match" },
+      build: { state: "drifted", drift: "outdated" },
+    });
+
+    const error = await refusalFrom(clean);
+
+    expect(error).toBeInstanceOf(StaleCheckoutError);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("moved past the build it is running");
+    expect(error.message).toContain("restart anton");
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+  });
+
+  it("dispatches normally when anton is running its own latest code", async () => {
+    const prep = await prepareEpicRun(run(clean));
+
+    expect(prep.done).toBe(false);
+    expect(warmRunWorktreeMock).toHaveBeenCalled();
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
+  it("dispatches normally on an INDETERMINATE verdict — the check that could not run grounds nothing", async () => {
+    // An offline runner: the remote was unreachable and the lockfile unreadable. Neither is evidence
+    // of staleness, so the start proceeds exactly as a clean verdict would.
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "unreachable", reason: "connection refused" },
+      dependencies: { state: "unknown", reason: "bun.lock could not be read" },
+      build: { state: "current" },
+    });
+
+    const prep = await prepareEpicRun(run(clean));
+
+    expect(prep.done).toBe(false);
+    expect(warmRunWorktreeMock).toHaveBeenCalled();
+  });
+
+  it("still settles a target already carried to its PR, stale checkout or not", async () => {
+    // The completion short-circuit runs BEFORE this gate, so a finished target is not grounded by a
+    // staleness it has no work left to run against.
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "behind", behind: 1, upstream: "origin/main" },
+      dependencies: { state: "match" },
+    });
+    settleCompletedRunMock.mockResolvedValue(true);
+
+    const prep = await prepareEpicRun(run(clean));
+
+    expect(prep.done).toBe(true);
+    expect(checkSelfFreshnessMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("assertPreStartPoisonIsFresh — a stale process does not park permanently (PR #257)", () => {
+  /** What every pre-start gate in `beginEpicRun` refuses with — a permanent park. */
+  const poison = new PoisonEpic("target anton-x is not approved — refusing to execute");
+
+  it("converts a pre-start poison into a deferral while anton is behind its own code", async () => {
+    // The gate that raised the poison ran on code this process booted with. If the very fix being
+    // pulled changed that rule, parking would outlive the restart that fixed it — nothing un-parks
+    // a job but a person.
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "behind", behind: 2, upstream: "origin/main" },
+      dependencies: { state: "match" },
+      build: { state: "current" },
+    });
+
+    const error = await assertPreStartPoisonIsFresh(poison).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+
+    expect(error).toBeInstanceOf(StaleCheckoutError);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+  });
+
+  it("lets the poison stand when anton is running its own latest code", async () => {
+    await expect(assertPreStartPoisonIsFresh(poison)).resolves.toBeUndefined();
+  });
+
+  it("leaves a non-poison error alone without even reading the freshness verdict", async () => {
+    // A retryable failure already re-runs on the restarted process, so it costs the gate nothing —
+    // and reading freshness here would fetch anton's own remote on every ordinary retry.
+    await expect(assertPreStartPoisonIsFresh(new Error("bd list failed"))).resolves.toBeUndefined();
+    expect(checkSelfFreshnessMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("staleCheckoutRefusal — the message names the staleness and its fix (anton-mh3c)", () => {
+  const ROOT = "/opt/anton";
+
+  it("names the checkout distance and `git pull` when HEAD is behind", () => {
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "behind", behind: 2, upstream: "origin/main" },
+        dependencies: { state: "match" },
+        build: { state: "current" },
+      },
+      ROOT,
+    );
+
+    expect(message).toContain("2 commit(s) behind origin/main");
+    expect(message).toContain("git pull");
+    expect(message).toContain(ROOT);
+    // The disarm's contract, so the operator reads "only new starts stop", not "everything stopped".
+    expect(message).toContain("Work already running is unaffected");
+  });
+
+  it("names the drifted packages and `bun install` when dependencies have drifted", () => {
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "current" },
+        dependencies: { state: "drift", packages: ["left-pad"] },
+        build: { state: "current" },
+      },
+      ROOT,
+    );
+
+    expect(message).toContain("bun install");
+    expect(message).toContain("left-pad");
+  });
+
+  it("names a running build the disk has moved past, even with the filesystem halves clean", () => {
+    // The pull/reinstall that clears the checkout and dependency halves does not reach a live
+    // process's boot-time modules, so the gate must still refuse a start until anton restarts.
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "current" },
+        dependencies: { state: "match" },
+        build: { state: "drifted", drift: "outdated" },
+      },
+      ROOT,
+    );
+
+    expect(message).toContain("the code on disk has already moved past the build it is running");
+    expect(message).toContain("restart anton");
+  });
+
+  it("names packages reinstalled under the running process, which no command in the message clears", () => {
+    // `bun install` makes the lockfile comparison match and moves no build identity — node_modules is
+    // in neither — so this is the only half that keeps the gate closed until the restart (PR #257).
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "current" },
+        dependencies: { state: "replaced" },
+        build: { state: "current" },
+      },
+      ROOT,
+    );
+
+    expect(message).toContain("its packages were reinstalled under the ones it is running");
+    expect(message).toContain("restart anton");
+  });
+
+  it("names BOTH when the checkout is behind AND dependencies drifted", () => {
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "behind", behind: 1, upstream: "origin/main" },
+        dependencies: { state: "drift", packages: ["next"] },
+        build: { state: "current" },
+      },
+      ROOT,
+    );
+
+    expect(message).toContain("git pull");
+    expect(message).toContain("bun install");
+  });
+
+  it("returns undefined for a clean verdict", () => {
+    expect(
+      staleCheckoutRefusal(
+        {
+          checkout: { state: "current" },
+          dependencies: { state: "match" },
+          build: { state: "current" },
+        },
+        ROOT,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined for every INDETERMINATE verdict — a check that could not run is not staleness", () => {
+    expect(
+      staleCheckoutRefusal(
+        {
+          checkout: { state: "no-upstream" },
+          dependencies: { state: "unknown", reason: "x" },
+          build: { state: "current" },
+        },
+        ROOT,
+      ),
+    ).toBeUndefined();
+    expect(
+      staleCheckoutRefusal(
+        {
+          checkout: { state: "unreachable", reason: "x" },
+          dependencies: { state: "match" },
+          build: { state: "current" },
+        },
+        ROOT,
+      ),
+    ).toBeUndefined();
+    // A build identity that could not be established is the same: the runner's drift read enumerates
+    // the machine's sockets, and a start must not be refused on a check that threw.
+    expect(
+      staleCheckoutRefusal(
+        {
+          checkout: { state: "current" },
+          dependencies: { state: "match" },
+          build: { state: "unknown", reason: "lsof: command not found" },
+        },
+        ROOT,
+      ),
+    ).toBeUndefined();
   });
 });

@@ -86,7 +86,12 @@ export interface ServerDrift {
 }
 
 /** What a boot record holds beyond the identity itself — `listBuildRecords` proves the pid a number. */
-type BuildRecord = BuildIdentity & { pid: number; bootedAt?: unknown; runner?: unknown };
+type BuildRecord = BuildIdentity & {
+  pid: number;
+  bootedAt?: unknown;
+  runner?: unknown;
+  dependencies?: unknown;
+};
 
 function readCwd(): string | null {
   try {
@@ -142,6 +147,12 @@ function dbPath(): string | null {
 interface Boot {
   identity: BuildIdentity;
   runner: boolean;
+  /**
+   * A digest of the packages this process imported at boot, when the caller established one. Held
+   * beside the identity rather than inside it because it is not read off the checkout: every digest
+   * in a {@link BuildIdentity} excludes `node_modules` by design (PR #257 review).
+   */
+  dependencies: string | null;
 }
 
 /**
@@ -197,15 +208,18 @@ function invalidateCaches(): void {
  * every request.
  * Which build is on disk moves at the speed of a deploy or a save, so a read a few seconds old is as
  * true as a fresh one — and drift the operator must act on stays visible within one page refresh.
+ *
+ * That holds for a DISPLAY surface, not for a gate that decides whether work may start: `fresh`
+ * exists for the caller that cannot accept a read taken before the pull it is asking about.
  */
 const ON_DISK_TTL_MS = 15_000;
 
 let onDiskCache: { at: number; generation: number; identity: BuildIdentity } | null = null;
 
-function onDiskIdentity(): BuildIdentity {
+function onDiskIdentity(fresh = false): BuildIdentity {
   const now = Date.now();
   const generation = cacheGeneration();
-  if (onDiskCache && onDiskCache.generation === generation && now - onDiskCache.at < ON_DISK_TTL_MS) {
+  if (!fresh && onDiskCache && onDiskCache.generation === generation && now - onDiskCache.at < ON_DISK_TTL_MS) {
     return onDiskCache.identity;
   }
   const root = appRoot();
@@ -267,12 +281,18 @@ export function checkoutMoved(repoPath: string): void {
  * actually starts the runner can never disagree — and a reader can then say which of an install's
  * servers a stale build is costing anything (PR #217 review).
  */
-export function recordServerBuild({ runner }: { runner: boolean }): void {
+export function recordServerBuild({
+  runner,
+  dependencies = null,
+}: {
+  runner: boolean;
+  dependencies?: string | null;
+}): void {
   const identity = bootIdentity();
-  (globalThis as unknown as Record<symbol, Boot>)[BOOT_KEY] = { identity, runner };
+  (globalThis as unknown as Record<symbol, Boot>)[BOOT_KEY] = { identity, runner, dependencies };
   const db = dbPath();
   if (!db) return;
-  writeBuildRecord(buildRecordPath(db), identity, { appRoot: appRoot(), runner });
+  writeBuildRecord(buildRecordPath(db), identity, { appRoot: appRoot(), runner, dependencies });
   pruneBuildRecords(db);
 }
 
@@ -368,6 +388,13 @@ function artifactIdentity(): BuildIdentity | null {
  * script), and inventing an "unstamped" verdict there would put a false warning on the health page
  * of every install. Saying so about a server that IS running but left no record is `anton doctor`'s
  * job — it has the pidfile and the port to prove one is up.
+ *
+ * `fresh` bypasses the on-disk TTL for the one caller that cannot tolerate it (PR #257 review): the
+ * start gate. A source-only `git pull` moves HEAD and nothing else, so the checkout half reads
+ * current the instant it lands and the dependency half never moved — while this half, answered from
+ * a read taken up to 15s earlier, still compares the running build against the PRE-pull disk. All
+ * three then say current and the gate admits a run onto the old process, which is the window it
+ * exists to close. Display surfaces keep the cached read: they repaint, a gate does not.
  */
 /**
  * The boot time a record carries, or null when what it carries cannot be a DATE (PR #217 review).
@@ -388,12 +415,12 @@ function bootedAtOf(record: { bootedAt?: unknown } | null | undefined): number |
   return Number.isFinite(new Date(bootedAt).getTime()) ? bootedAt : null;
 }
 
-export function serverBuildDrift(): BuildDrift | null {
+export function serverBuildDrift({ fresh = false }: { fresh?: boolean } = {}): BuildDrift | null {
   const db = dbPath();
   const record = db ? (readBuildRecord(buildRecordPath(db)) as (BuildIdentity & { bootedAt?: unknown }) | null) : null;
   const running = record ?? booted()?.identity ?? null;
   if (!running) return null;
-  const verdict = compareBuild(running, onDiskIdentity());
+  const verdict = compareBuild(running, onDiskIdentity(fresh));
   if (verdict.state === "current") return null;
   return { ...verdict, bootedAt: bootedAtOf(record) } as BuildDrift;
 }
@@ -464,6 +491,64 @@ export async function serverBuildDrifts(): Promise<ServerDrift[]> {
     inflightDrifts = { generation, drifts };
   }
   return inflightDrifts.drifts;
+}
+
+/**
+ * The build drift of the process that RUNS the scheduled jobs, read from the live records rather
+ * than from the process asking (PR #257 review).
+ *
+ * The board's stale band must report on the server whose start gate actually defers work. In the
+ * split deployment — a UI-only `ANTON_RUNNER=off` process serving the pages beside a separate
+ * runner — {@link serverBuildDrift} would answer for the request-serving process, whose staleness
+ * stops no job: a stale UI would banner "nothing starts new work" while the runner executes fine,
+ * and a stale runner would go unbannered behind a current UI. Selecting the record that claims
+ * `runner` fixes both. Where the two are the same process (the default single-server deployment)
+ * this is exactly the self verdict.
+ *
+ * Null when the runner is current (not in the drift list) OR when no LIVE record claims to be the
+ * runner — its identity predates the flag, or none is up — where the band claims neither, the rule
+ * {@link ServerDrift.runner} documents. A record with `runner === undefined` is never treated as the
+ * runner.
+ */
+export async function runnerBuildDrift(): Promise<BuildDrift | null> {
+  const drifts = await serverBuildDrifts();
+  return drifts.find((d) => d.runner === true)?.drift ?? null;
+}
+
+/**
+ * The dependency digest THIS process booted with, or null when it recorded none — the dependency
+ * counterpart of {@link serverBuildDrift}, and what a caller running INSIDE the process it reports
+ * on wants. Read from the in-memory boot rather than the record: the process asking is the process
+ * being described, and its own boot is the one thing no file can be more authoritative about.
+ */
+export function selfBootDependencies(): string | null {
+  return booted()?.dependencies ?? null;
+}
+
+/**
+ * The dependency digest the process that RUNS the scheduled jobs booted with, or null when nothing
+ * establishes one (PR #257 review).
+ *
+ * Read from the live records for the same reason {@link runnerBuildDrift} is: the board renders
+ * wherever the UI is served, and in a split `ANTON_RUNNER=off` deployment that is not the process
+ * whose start gate defers work. Unlike the drift above, this is read whether or not the runner's
+ * BUILD has drifted — a `bun install` under a running server moves no build identity at all, which
+ * is the entire reason this field exists.
+ *
+ * Null where no live record claims to be the runner, where the record predates the field, or where
+ * the runner could not establish one: an absence is not evidence, so the reader claims nothing.
+ */
+export async function runnerBootDependencies(): Promise<string | null> {
+  const db = dbPath();
+  const root = appRoot();
+  const records: BuildRecord[] =
+    db && root ? liveBuildRecords(db, root).map(({ record }: { record: BuildRecord }) => record) : [];
+  const runner = records.find((record) => runsJobs(record) === true);
+  if (runner) return typeof runner.dependencies === "string" ? runner.dependencies : null;
+  // The record write failed, or this process is the runner and left none: its in-memory boot is the
+  // one stand-in a reader has, exactly as it is for the drift verdict.
+  const boot = booted();
+  return boot?.runner ? boot.dependencies : null;
 }
 
 async function readServerDrifts(): Promise<ServerDrift[]> {

@@ -14,6 +14,7 @@ import {
   HOLD_REASSURANCE,
   clearingCondition,
   investigateHref,
+  isDisarm,
   isHold,
   type AutopilotBreaker,
 } from "@/lib/autopilot-breaker";
@@ -42,6 +43,11 @@ import { cn } from "@/lib/utils";
  *
  * A hold carries no buttons at all, for the same reason. Every affordance on a self-clearing state
  * is an invitation to override a limit the operator set for themselves.
+ *
+ * A STALE stop (anton-mh3c) shares the disarm's red register — it needs a human — but also carries no
+ * buttons: there is no policy to re-arm and no page to investigate, only a command to run. It clears
+ * itself the moment anton is updated and restarted, so its remedy lives in the evidence (the exact
+ * `git pull` / `bun install`) and the clearing sentence, not in an action on this board.
  */
 /**
  * The band as the board mounts it: the breaker read, resolved HERE rather than in the page.
@@ -110,8 +116,8 @@ export function AutopilotBreakerHeader({
           {!hold && breaker.evidence.length > 0 ? (
             <div className="mt-1 flex flex-col gap-1">
               <h3 className="font-mono text-[10px] tracking-wide text-subtle uppercase">Evidence</h3>
-              {/* Every line, never truncated — this list IS the decision the Re-arm button asks for,
-                  and an operator clipping it would be re-arming on a summary of a summary. */}
+              {/* Every line, never truncated: for a disarm it IS the decision Re-arm asks for, and
+                  for a stale stop it is the exact command to run — clipping either loses the point. */}
               <ul className="flex flex-col gap-0.5">
                 {breaker.evidence.map((line) => (
                   <li key={line} className="font-mono text-[11px] text-muted-foreground">
@@ -123,7 +129,7 @@ export function AutopilotBreakerHeader({
           ) : null}
         </div>
 
-        {!hold ? (
+        {isDisarm(breaker) ? (
           <div className="flex shrink-0 items-center gap-1.5">
             <Link
               href={investigateHref(slug, breaker.reason)}
