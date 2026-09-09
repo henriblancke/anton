@@ -245,6 +245,16 @@ const PARA_INTERRUPT = /^ {0,3}(?:[-*+]|0{0,8}1[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1
  */
 const QUOTE_STEP = /^ {0,3}>(?=>*(?:[ \t]|$))/;
 
+const COMMENT_CLOSE = "-->";
+
+/**
+ * A line that begins an HTML block, which interrupts an open paragraph. CommonMark's condition 2:
+ * a `<!--` at the line's start (up to 3 columns in) opens a block that runs to its `-->`, ending
+ * the paragraph above it — so no Setext underline below can reach back across it. A comment opened
+ * MID-line is inline HTML instead and keeps the paragraph open, which is why the head is anchored.
+ */
+const HTML_BLOCK_START = /^ {0,3}<!--/;
+
 /**
  * The containers a line's content sits in, outermost first: a column its text must reach, or a
  * blockquote marker it must carry. A code block or fence opened after container markers keeps
@@ -518,6 +528,10 @@ function insideClosedComment(lines: readonly ScannedLine[]): boolean[] {
  * A chained comment closes and reopens on one line (`--> <!--`), so a single literal run holds
  * several samples — one per `-->`. Each files as its own block, dedented on its own: bulk-filing the
  * tail after the first `-->` would flatten a later block's example carried by the note.
+ *
+ * A closing line can also CARRY the sample's last line (`    retry() -->`). Its content joins the
+ * block rather than filing whole, which would shear the indentation off and show the delimiter as
+ * requirement text — the same criteria the closer-on-its-own-line form files.
  */
 function flushCommentedSample(
   raw: readonly string[],
@@ -538,12 +552,19 @@ function flushCommentedSample(
     sample = [];
   };
   for (const line of raw.slice(at, end)) {
-    if (line.includes("-->")) {
-      flushSample();
-      out.push({ text: line.trim(), fenced: false });
-    } else {
+    const closes = line.indexOf(COMMENT_CLOSE);
+    if (closes === -1) {
       sample.push(line);
+      continue;
     }
+    // A closer can carry the sample's last line: `    retry() -->` is both. It joins the block it
+    // continues rather than filing whole, which would shear its indentation off and show the
+    // delimiter as requirement text. Only when a sample is open — a comment whose whole body sits
+    // on this one line (`Keep a matched <!-- x --> as text.`) is a sentence, and files as typed.
+    const carried = sample.length > 0 && line.slice(0, closes).trim() !== "";
+    if (carried) sample.push(line.slice(0, closes));
+    flushSample();
+    out.push({ text: (carried ? line.slice(closes) : line).trim(), fenced: false });
   }
   flushSample();
   return end;
@@ -667,8 +688,9 @@ function blankQuoteLine(line: string, prefix: Prefix): boolean {
  * label above a heading; skipping only the last line would still file `Backend` as a criterion a
  * review cannot score, and {@link doneGap} would accept a draft that states no step. The run is
  * judged inside the paragraph's own containers `prefix`, so `> Backend` / `> =======` pairs too, and
- * a blank line, a line that interrupts the paragraph ({@link PARA_INTERRUPT}), a fence, a comment or
- * a line that leaves the container ends the paragraph before any underline — those are not headings.
+ * a blank line, a line that interrupts the paragraph ({@link PARA_INTERRUPT}), a fence, a comment
+ * — whether it stays open or closes on its own line ({@link HTML_BLOCK_START}) — or a line that
+ * leaves the container ends the paragraph before any underline: those are not headings.
  */
 function setextHeadingRun(
   raw: readonly string[],
@@ -681,6 +703,10 @@ function setextHeadingRun(
     if (lines[next]!.fenced || literal[next]) return 0;
     const inner = peelPrefix(raw[next]!, prefix);
     if (inner === undefined || inner.trim() === "") return 0;
+    // A comment that opens AND closes on one line is neither `commented` nor `literal`, so the walk
+    // used to cross it — dropping an actionable paragraph as a heading and leaving doneGap to refuse
+    // a request that stated a step. It opens an HTML block, which ends the paragraph like any other.
+    if (HTML_BLOCK_START.test(inner)) return 0;
     if (SETEXT_UNDERLINE.test(inner)) return next - at + 1;
     // A line that interrupts the paragraph ends it, so no underline can reach `at` — but a non-1
     // ordered marker does not interrupt, and stays part of the multiline heading. Judged on `inner`

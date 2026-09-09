@@ -258,6 +258,14 @@ describe("instructionCriteria", () => {
     expect(texts("Backend\n  ## API\n===")).toEqual(["Backend", "==="]);
     // List STRUCTURE is untouched: `1. a` / `2. b` stay two separate items.
     expect(texts("1. first\n2. second")).toEqual(["first", "second"]);
+    // A comment that opens AND closes on one line is hidden from `commented`, so the run-walk used
+    // to cross it and drop an actionable paragraph as a heading — leaving doneGap to refuse a draft
+    // that stated a step. It opens an HTML block, which ends the paragraph above it.
+    expect(texts("Fix the retry\n<!-- note -->\n===")).toEqual(["Fix the retry"]);
+    expect(doneGap("Fix the retry\n<!-- note -->\n===", [])).toBeNull();
+    expect(texts("> Fix the retry\n> <!-- note -->\n> ===")).toEqual(["Fix the retry"]);
+    // Opened MID-line it is inline HTML, not a block, so the paragraph stays open and underlines.
+    expect(texts("Backend\ntail <!-- note -->\n===")).toEqual([]);
   });
 
   it("reads nested markers as scaffolding too — shearing one layer must not leave the next as a criterion", () => {
@@ -625,6 +633,19 @@ describe("instructionCriteria", () => {
     ]);
     // A wholly indented sample loses only its common indentation, keeping the relative structure.
     expect(texts("<!--\n    a:\n      b: 1\n-->")).toEqual(["<!--", "```\na:\n  b: 1\n```", "-->"]);
+    // The sample can end on the closing line itself. Filing that line whole shears its indentation
+    // off and shows `-->` as requirement text, so its content joins the block it belongs to — the
+    // same criteria the closer-on-its-own-line form above files.
+    expect(texts("<!--\nif ok:\n    retry() -->")).toEqual([
+      "<!--",
+      "```\nif ok:\n    retry()\n```",
+      "-->",
+    ]);
+    expect(texts("<!--\nif ok:\n    retry() --> tail")).toEqual([
+      "<!--",
+      "```\nif ok:\n    retry()\n```",
+      "--> tail",
+    ]);
     // Once the comment closes the lines are ordinary steps again, and the closer ends no paragraph
     // an indented block could not follow.
     expect(texts("<!--\n- x\n-->\n- y")).toEqual(["<!--", "```\n- x\n```", "-->", "y"]);
