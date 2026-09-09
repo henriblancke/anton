@@ -45,7 +45,7 @@ import {
   humanGateReason,
   HUMAN_GATE_ARMED_LABEL,
 } from "./execute-epic-human-gate";
-import { landableTicketIds } from "./execute-epic-dispatch";
+import { branchDelivery, landableTicketIds } from "./execute-epic-dispatch";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage, stalePrBodyNote } from "./execute-epic-review";
 import { assertDelivered, displacesSelfReport, selfReportRank } from "./execute-epic-ticket";
@@ -1242,6 +1242,137 @@ describe("landableTicketIds — which prerequisites this run can still land (ant
   });
 });
 
+describe("branchDelivery — whose commit on this branch carries a ticket (anton-ag76)", () => {
+  /**
+   * The branch as the reads see it: `<id>:` subjects, one commit's satisfies-trailers, and whether
+   * that commit is one the branch ADDED (`inBase` puts it in base history instead).
+   */
+  const branch = (
+    opts: {
+      subjects?: string[];
+      satisfies?: string[];
+      /** Ticket ids whose BEAD NOTE records a settlement this branch bears out (PR #258 review). */
+      noted?: string[];
+      inBase?: boolean;
+    } = {},
+  ) => {
+    const asked: string[] = [];
+    const claim = {
+      sha: "c0ffee1c0ffee1c0ffee1c0ffee1c0ffee1c0ffee",
+      subject: "t-sibling: the commit that did the work",
+      ticketIds: opts.satisfies ?? [],
+    };
+    const noted = (id: string) => ({
+      sha: "dabbad0dabbad0dabbad0dabbad0dabbad0dabba",
+      subject: "t-sibling: the commit the bead's note names",
+      ticketIds: [id],
+    });
+    return {
+      claim,
+      noted,
+      asked,
+      reads: {
+        hasCommitFor: async (id: string) => {
+          asked.push(`subject:${id}`);
+          return (opts.subjects ?? []).includes(id);
+        },
+        satisfiedBy: async (id: string) => {
+          asked.push(`trailer:${id}`);
+          return claim.ticketIds.includes(id) ? claim : undefined;
+        },
+        notedSatisfiedBy: async (t: Bead) => {
+          asked.push(`note:${t.id}`);
+          return (opts.noted ?? []).includes(t.id) ? noted(t.id) : undefined;
+        },
+        branchAdded: async (sha: string) => {
+          asked.push(`added:${sha.slice(0, 7)}`);
+          return !opts.inBase;
+        },
+      },
+    };
+  };
+
+  /** The bead as the dispatch hands it over — only its id is read by the predicate. */
+  const bead = (id: string): Bead => ({ id, title: id, status: "closed" });
+
+  it("reads a ticket's OWN commit as delivery, without asking about siblings", async () => {
+    const b = branch({ subjects: ["t-1"] });
+    expect(await branchDelivery(b.reads, bead("t-1"))).toEqual({ how: "own-commit" });
+    // The subject read is the cheaper, more specific answer; a hit settles it.
+    expect(b.asked).toEqual(["subject:t-1"]);
+  });
+
+  it("reads a SIBLING's claim as delivery, naming the commit that made it", async () => {
+    // The whole point: no commit here is subjected `t-2:`, but a sibling's commit says its work met
+    // t-2's acceptance in full. Dispatching t-2 again can only produce the zero diff that blocks it.
+    const b = branch({ subjects: ["t-sibling"], satisfies: ["t-2"] });
+    expect(await branchDelivery(b.reads, bead("t-2"))).toEqual({
+      how: "sibling",
+      by: b.claim,
+      inherited: false,
+    });
+  });
+
+  /**
+   * PR #258 review: a trailer can come from a commit already in the BASE — merged into the trunk
+   * long before this run existed. The skip is right either way (the work is in the tree), but the
+   * pull request must not call base history an earlier commit of this run and cite a sha its diff
+   * does not contain.
+   */
+  it("flags a claim from BASE history as inherited, so the body does not credit this run", async () => {
+    const b = branch({ subjects: ["t-sibling"], satisfies: ["t-2"], inBase: true });
+    expect(await branchDelivery(b.reads, bead("t-2"))).toEqual({
+      how: "sibling",
+      by: b.claim,
+      inherited: true,
+    });
+    expect(b.asked).toEqual(["subject:t-2", "trailer:t-2", "added:c0ffee1"]);
+  });
+
+  it("answers 'nothing here' when neither a subject nor a trailer claims the ticket", async () => {
+    // The cross-machine shape (anton-5slr / anton-jz1): closed on the shared board, but its commit
+    // lives only in another machine's unpushed worktree. Still regenerated, exactly as before.
+    const b = branch({ subjects: ["t-1"], satisfies: ["t-2"] });
+    expect(await branchDelivery(b.reads, bead("t-3"))).toBeUndefined();
+    // No provenance read at all: there is no claim to place.
+    expect(b.asked).toEqual(["subject:t-3", "trailer:t-3", "note:t-3"]);
+  });
+
+  /**
+   * PR #258 review: the bead NOTE (anton-8h4b) shipped a release ahead of the commit trailer, so a
+   * ticket settled in between — or one an operator closed by hand after writing the same clause — is
+   * closed with a full account of which commit did its work and no trailer anywhere on the branch.
+   * Without this fallback the resume reads that as the cross-machine shape and re-dispatches it into
+   * the zero diff the trailer exists to prevent.
+   */
+  it("falls back to the bead's OWN satisfied note when no trailer claims the ticket", async () => {
+    const b = branch({ subjects: ["t-sibling"], noted: ["t-2"] });
+    expect(await branchDelivery(b.reads, bead("t-2"))).toEqual({
+      how: "sibling",
+      by: b.noted("t-2"),
+      inherited: false,
+    });
+    // Asked in order of authority: the branch's own trailer before the note's pointer.
+    expect(b.asked).toEqual(["subject:t-2", "trailer:t-2", "note:t-2", "added:dabbad0"]);
+  });
+
+  it("prefers the TRAILER over the note when both speak for the ticket", async () => {
+    const b = branch({ subjects: ["t-sibling"], satisfies: ["t-2"], noted: ["t-2"] });
+    expect(await branchDelivery(b.reads, bead("t-2"))).toEqual({
+      how: "sibling",
+      by: b.claim,
+      inherited: false,
+    });
+    expect(b.asked).not.toContain("note:t-2");
+  });
+
+  it("fails closed to 'nothing here' when the branch read finds nothing — never to a skip", async () => {
+    // Both underlying reads swallow a failed `git log` into an empty answer, and that must land on
+    // re-running work rather than skipping it.
+    expect(await branchDelivery(branch().reads, bead("t-1"))).toBeUndefined();
+  });
+});
+
 describe("ticketPrompt", () => {
   it("inlines the full spec (description/acceptance/context) so it survives a dead in-worktree bd", () => {
     const p = ticketPrompt({
@@ -2202,6 +2333,19 @@ describe("deliveredTickets — what the run's own steps speak for", () => {
     ).toEqual(["t-1"]);
     // Only a human ticket is worth a git call — the label is what makes the branch the tie-breaker.
     expect(b.asked).toEqual(["t-3"]);
+  });
+
+  it("keeps a human-labelled ticket a SIBLING's commit satisfied (PR #258 review)", async () => {
+    // An agent attempted t-2 and a sibling's commit met its acceptance in full; someone relabelled
+    // it `agent:human` before the parked run resumed. Nothing on the branch carries its id, so the
+    // branch question cannot see it — but the ledger proved the work is here, and the PR body owes
+    // a reader the commit that did it. Dropping it would omit the attribution entirely.
+    const b = branch();
+    expect(
+      (await deliveredTickets([human("t-2")], new Set(), b.has, new Set(["t-2"]))).map((t) => t.id),
+    ).toEqual(["t-2"]);
+    // The ledger already answered — no git call is worth making.
+    expect(b.asked).toEqual([]);
   });
 
   it("keeps a human-labelled ticket whose commit IS on the branch (PR #213 review)", async () => {

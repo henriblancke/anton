@@ -10,9 +10,18 @@
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { claimGuard } from "../beads/claim";
 import { contractGaps, formatContractGaps } from "../beads/contract";
+import { latestSatisfiedRecord } from "../beads/satisfied-note";
 import { appendSessionLog } from "../sessions";
 import { resumeSkipped } from "../ticket-view";
-import { worktreeHasCommitFor } from "../git/ops";
+import {
+  branchAddedCommit,
+  branchContainsCommit,
+  branchSatisfiesTicket,
+  describeCommit,
+  satisfiedMarkerTarget,
+  worktreeHasCommitFor,
+  type SatisfiedClaim,
+} from "../git/ops";
 import { blockedTailReason, PoisonEpic } from "./errors";
 import {
   deliveredTickets,
@@ -37,18 +46,22 @@ import { mustPersist, mustRead, safe } from "./execute-epic-persist";
 import type { RunPreparation } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
 import { runTicket } from "./execute-epic-ticket";
-import type { SatisfiedSettlement } from "./step-registry";
+import type { SatisfiedSettlement, StepContext } from "./step-registry";
 
 /** What the ticket phase leaves for the run phase to speak for. */
 export interface DispatchOutcome {
   /** The tickets whose work is actually on the branch — the PR body and review contract's set. */
   delivered: Bead[];
   /**
-   * The subset of {@link delivered} that settled on an EARLIER commit of this run rather than one of
+   * The subset of {@link delivered} that settled on ANOTHER commit on this branch rather than one of
    * its own (anton-8h4b), and the commit each was settled against. The PR body attributes these to
-   * that commit instead of listing them as deliveries. A ledger of THIS attempt only, and that is
-   * enough: a satisfied ticket has no commit under its own name, so a resume never skips it as
-   * done-on-branch — it re-runs and settles again here.
+   * that commit instead of listing them as deliveries.
+   *
+   * Two ways in, and the PR body cannot tell them apart because it must not: a step this attempt
+   * dispatched and settled as `satisfied`, and a ticket a RESUME skipped because an earlier
+   * settlement already covers it (anton-ag76). The second is read back off the branch's attribution
+   * trailers — or, for a settlement written before those existed, off the bead's own note verified
+   * against the branch — rather than remembered, which is what lets it survive a run boundary.
    */
   satisfied: Map<string, SatisfiedSettlement>;
   /** Tickets this run never dispatched, and the timeout each is waiting behind. */
@@ -347,6 +360,124 @@ function stoppedShortIds(timedOut: readonly TicketTimeoutOutcome[]): Set<string>
   return new Set(timedOut.filter((t) => !t.delivered).map((t) => t.id));
 }
 
+/**
+ * How a ticket's work reaches THIS branch — under its own name, or under a sibling's (anton-ag76).
+ *
+ * Both are delivery and the skip treats them alike; what differs is what the pull request may say.
+ * A `sibling` settlement has no commit carrying this ticket's id, so the body attributes it to the
+ * commit that did the work rather than listing it among the deliveries — the same distinction
+ * anton-8h4b drew for a step this run satisfied while it was running.
+ *
+ * `inherited` splits that attribution in two (PR #258 review). A trailer can come from a commit the
+ * branch ADDED — this run's own earlier work, which the reviewer reads in the diff — or from one
+ * already in the BASE, merged in from the trunk long before this run existed. Recording both as
+ * "satisfied by earlier commits of this run" tells a reviewer to look in the diff for a commit that
+ * is not there. The skip is right either way (the work is in the tree, so a re-dispatch can only
+ * zero-diff); only the claim's provenance differs.
+ */
+type BranchDelivery =
+  | { how: "own-commit" }
+  | { how: "sibling"; by: SatisfiedClaim; inherited: boolean };
+
+/** The branch reads {@link branchDelivery} asks — a seam, so the predicate is unit-testable. */
+export interface BranchDeliveryReads {
+  /** A commit subjected `<ticketId>:` — this ticket's own delivery attribution. */
+  hasCommitFor: (ticketId: string) => Promise<boolean>;
+  /** A commit whose `Anton-Satisfies` trailers claim this ticket (anton-6vxl). */
+  satisfiedBy: (ticketId: string) => Promise<SatisfiedClaim | undefined>;
+  /** The settlement this bead's OWN notes record, verified against this branch (PR #258 review). */
+  notedSatisfiedBy: (ticket: Bead) => Promise<SatisfiedClaim | undefined>;
+  /** Whether that commit is one this branch ADDED over its base, rather than base history. */
+  branchAdded: (sha: string) => Promise<boolean>;
+}
+
+/**
+ * The reads over a real worktree. The subject and trailer scans run in the CHECKOUT, where the
+ * branch is the one checked out; the provenance read is asked of the REPOSITORY, which is what
+ * {@link branchAddedCommit} needs to name a branch and a fork point — the same pair the delivery
+ * gate uses to settle a `satisfied` claim (anton-nuft).
+ */
+function worktreeReads(
+  worktreePath: string,
+  run: Pick<StepContext, "repoPath" | "branch" | "baseRef">,
+): BranchDeliveryReads {
+  return {
+    hasCommitFor: (id) => worktreeHasCommitFor(worktreePath, id),
+    satisfiedBy: (id) => branchSatisfiesTicket(worktreePath, id),
+    notedSatisfiedBy: (ticket) => notedSatisfaction(run, ticket),
+    branchAdded: (sha) => branchAddedCommit(run.repoPath, run.branch, run.baseRef, sha),
+  };
+}
+
+/**
+ * The settlement a bead's OWN notes record, verified against this branch — the upgrade path for a
+ * ticket settled before commits carried attribution trailers (PR #258 review).
+ *
+ * The bead note (anton-8h4b) shipped a release ahead of the trailer, so a ticket settled in between
+ * — or one an operator closed by hand after writing the same clause — is closed on the board with a
+ * full account of WHICH commit did its work and nothing on the branch saying so. Read only from the
+ * branch, that is indistinguishable from the cross-machine shape, and the resume reopens a settled
+ * ticket and dispatches it into the identical zero diff the trailer exists to prevent.
+ *
+ * The note is a POINTER, never the evidence: what settles it is `git` confirming the commit it names
+ * is reachable here, exactly as {@link branchAddedCommit} settles a live `satisfied` claim
+ * (anton-nuft) — and the note's own branch must be this run's, since a sha reachable from an
+ * unrelated branch is no proof this one carries the work. So a note naming a commit this branch
+ * never got still regenerates, which is what keeps the cross-machine reasoning intact.
+ *
+ * Fails closed to `undefined` on every read that cannot answer, for the reason the branch reads do:
+ * re-running work is the safe error, skipping it is not.
+ */
+async function notedSatisfaction(
+  run: Pick<StepContext, "repoPath" | "branch">,
+  ticket: Bead,
+): Promise<SatisfiedClaim | undefined> {
+  const record = latestSatisfiedRecord(ticket.notes);
+  if (!record || record.branch !== run.branch) return undefined;
+  if (!(await branchContainsCommit(run.repoPath, run.branch, record.commit))) return undefined;
+  // The full sha and subject, so the pull request cites the work rather than the note's abbreviation
+  // — and so a note pointing at the attribution MARKER of an earlier settlement is followed to the
+  // commit that did the work, the same hop `ticketSettlement` takes.
+  const named = await describeCommit(run.repoPath, record.commit);
+  if (!named) return undefined;
+  const throughMarker = satisfiedMarkerTarget(named.subject);
+  const work = throughMarker ? await describeCommit(run.repoPath, throughMarker) : named;
+  return work ? { sha: work.sha, subject: work.subject, ticketIds: [ticket.id] } : undefined;
+}
+
+/**
+ * Whether this branch already carries a ticket's work, and under whose name — `undefined` when
+ * nothing here claims it.
+ *
+ * The sibling read is what stops a resume re-dispatching a ticket into a guaranteed zero diff
+ * (anton-ag76). Work often lands under one ticket while meeting a sibling's acceptance in full, and
+ * the `<id>:` subject holds exactly one id — so on the next attempt the ticket looked undelivered,
+ * its agent found nothing left to do, and the no-delivery gate blocked a ticket that IS delivered.
+ *
+ * The cross-machine reasoning anton-5slr documents survives intact, because this only ever widens
+ * what counts as evidence ON THIS BRANCH — never what the BOARD alone may settle. A ticket another
+ * machine closed then parked on before pushing has neither a subject nor a trailer here, so it
+ * still regenerates. Both reads fail closed to "absent" for the same reason: a `git log` that failed
+ * is not proof of delivery, and the safe error is re-running work rather than skipping it.
+ *
+ * The provenance read fails closed the other way — to `inherited` — because its two answers are not
+ * a skip-or-run decision but a sentence in the pull request. {@link branchAddedCommit} answers
+ * `false` on any git failure, and "the work is here but not in this diff" is the claim a reviewer
+ * can check against the base for themselves; the reverse would send them hunting the diff for a
+ * commit anton could not prove is in it.
+ */
+export async function branchDelivery(
+  reads: BranchDeliveryReads,
+  ticket: Bead,
+): Promise<BranchDelivery | undefined> {
+  if (await reads.hasCommitFor(ticket.id)) return { how: "own-commit" };
+  // The trailer first, the bead's own note second: the trailer is this branch's own word, while the
+  // note is a claim the note's writer made that only `git` can settle (see notedSatisfaction).
+  const by = (await reads.satisfiedBy(ticket.id)) ?? (await reads.notedSatisfiedBy(ticket));
+  if (!by) return undefined;
+  return { how: "sibling", by, inherited: !(await reads.branchAdded(by.sha)) };
+}
+
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
 async function dispatchTicket(
   run: EpicRun,
@@ -362,22 +493,6 @@ async function dispatchTicket(
   const { isResumeSkipped, worktree, runStep, ticketSteps } = prep;
   const { onBranch } = ledger;
   lease.assertHeld(); // yield before starting a ticket if the shared lease has lapsed
-  // Human work never reaches an agent, whatever the readiness verdict said (anton-mv70). A
-  // FINISHED one is skipped here rather than below, because a person's work leaves no commit:
-  // the resume check below reads "closed with nothing on this branch" as a cross-machine
-  // resume and would reopen it and regenerate it under the default agent — the exact failure
-  // the label exists to prevent. An OPEN one is a broken state: 0b-pre armed its gate and the
-  // graph holds it, so reaching here means the board disagrees with the gate it carries. Park
-  // loudly instead of improvising; the gate is on the board either way, and answering it is
-  // what moves this run on.
-  if (beads.isHumanWork(ticket)) {
-    if (isResumeSkipped(ticket)) return;
-    throw new PoisonEpic(
-      `${ticket.id} is labelled ${LABELS.agentHuman} — a person executes it, so no agent can ` +
-        `run it. It should be held by a human gate for this run: do the work, resolve that ` +
-        `gate, and the resumed run closes ${ticket.id} and carries on without it`,
-    );
-  }
   // A ticket marked done on the board — a closed epic child, or a standalone target moved to
   // stage:in-review — is only safe to SKIP if its commit is actually present on THIS
   // worktree's branch (anton-jz1). Board state propagates cross-machine via `bd sync`, but the
@@ -388,8 +503,39 @@ async function dispatchTicket(
   // board still marks it done. Re-run it here so its commit lands on this branch. On a
   // same-machine resume the worktree is reused and the commit is present, so this skips as
   // before — no redundant re-run.
+  //
+  // "Present" means present under ANY name (anton-ag76): a commit subjected `<id>:`, a sibling's
+  // commit whose trailers claim this ticket, or a settlement the bead's own note records and git
+  // bears out. That widening leaves the cross-machine reasoning above untouched — a ticket closed
+  // elsewhere whose commit never reached this branch is claimed by none of the three, so it still
+  // regenerates — while closing the case where a sibling's commit met this ticket's acceptance in
+  // full and the resume dispatched it into a guaranteed zero diff.
   const doneOnBoard = resumeSkipped(ticket, standaloneRun);
-  if (doneOnBoard && (await worktreeHasCommitFor(worktree.path, ticket.id))) {
+  const delivery = doneOnBoard
+    ? await branchDelivery(worktreeReads(worktree.path, runStep), ticket)
+    : undefined;
+  // Human work never reaches an agent, whatever the readiness verdict said (anton-mv70) — but the
+  // branch is asked FIRST, because the label says who does the work, not what the diff contains.
+  // A FINISHED human ticket with nothing here is skipped rather than falling through: a person's
+  // work leaves no commit, so the cross-machine branch below would read "closed with nothing on
+  // this branch" as a resume, reopen it, and regenerate it under the default agent — the exact
+  // failure the label exists to prevent. One a SIBLING satisfied is the opposite case (PR #258
+  // review): a ticket an agent attempted before someone relabelled it `agent:human` has its work
+  // in this diff under another commit's name, and returning here would drop it from the ledger —
+  // omitting it from the PR's attribution and leaving the timeout cascade around it standing. So it
+  // falls through to the delivery record, which never dispatches anything either way.
+  // An OPEN one with nothing here is a broken state: 0b-pre armed its gate and the graph holds it,
+  // so reaching here means the board disagrees with the gate it carries. Park loudly instead of
+  // improvising; the gate is on the board either way, and answering it is what moves this run on.
+  if (beads.isHumanWork(ticket) && !delivery) {
+    if (isResumeSkipped(ticket)) return;
+    throw new PoisonEpic(
+      `${ticket.id} is labelled ${LABELS.agentHuman} — a person executes it, so no agent can ` +
+        `run it. It should be held by a human gate for this run: do the work, resolve that ` +
+        `gate, and the resumed run closes ${ticket.id} and carries on without it`,
+    );
+  }
+  if (delivery) {
     if (standaloneRun) {
       // Resume after a failed PR step: this standalone ticket committed and moved to in-review
       // on a prior attempt. Step 2 above re-tagged the target stage:implementing (it can't
@@ -398,6 +544,21 @@ async function dispatchTicket(
       // stage labels into merge-finalize, which strips only in-review and would otherwise
       // leave a stale implementing label (making a reopened bead derive as in-progress).
       await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+    }
+    // A sibling-satisfied skip has NO commit carrying this ticket's id, so the pull request must
+    // attribute it to the commit that did the work rather than list it among the deliveries — the
+    // same record anton-8h4b writes for a step satisfied while the run was still going. `closed` is
+    // read off the bead this run found, since nothing here closed it: `resumeSkipped` also admits a
+    // standalone target sitting at `stage:in-review`, which is open by design until its PR merges.
+    // `inherited` is carried through so the body can say WHERE the commit is (PR #258 review): a
+    // trailer that reached the base by an earlier merge is not in this pull request's diff.
+    if (delivery.how === "sibling") {
+      ledger.satisfied.set(ticket.id, {
+        commit: delivery.by.sha,
+        subject: delivery.by.subject,
+        closed: ticket.status === "closed",
+        inherited: delivery.inherited,
+      });
     }
     onBranch.add(ticket.id);
     // Rebuild the cascade around it (PR #199 review). `skipCause` was computed at the
@@ -607,10 +768,13 @@ async function deliveredOrPark(
   //     and someone relabelled `agent:human` afterwards is still in this diff, and dropping it
   //     would hide work the reviewer must read — and, when it is the only ticket, make the
   //     no-delivery park below claim an empty branch that has commits on it.
+  //     A human ticket a SIBLING's commit satisfied stays too (PR #258 review): the ledger proved
+  //     the work is on this branch under another name, so the branch question above cannot see it.
   const delivered = await deliveredTickets(
     live.filter((t) => !skipped.has(t.id)),
     stoppedShort,
     (id) => worktreeHasCommitFor(worktree.path, id),
+    new Set(ledger.satisfied.keys()),
   );
 
   // Nothing survived, so this run has nothing to show (anton-t1mo). Absorbing the timeouts is

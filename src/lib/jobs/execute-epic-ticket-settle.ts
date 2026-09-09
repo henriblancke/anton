@@ -23,6 +23,7 @@ import {
   readWorktreeState,
   restoreWorktreeState,
   sameWorktreeState,
+  satisfiedMarkerTarget,
   type WorktreeState,
 } from "../git/ops";
 import { appendSessionLog, endSession, type JobSession } from "../sessions";
@@ -97,6 +98,13 @@ export function satisfiedClaim(progress: TicketProgress): { commit: string; note
  * and subject of the commit it named, so the record outlives the abbreviation the agent read off
  * `git log`. Best-effort resolution — the gate already accepted the commit, so a read that fails
  * here costs the subject and the long form, never the settlement.
+ *
+ * A commit that is itself an ATTRIBUTION MARKER is followed to the work it credits (PR #258
+ * review). The close of the previous satisfied ticket writes that marker at the branch tip, so the
+ * next satisfied agent honestly reads it off `git log` and names it — and recording that would
+ * credit this ticket to an empty commit made for a sibling, leaving a reader (and the pull request)
+ * one hop short of the diff. One hop is all it takes: a marker always names the work by full sha,
+ * never another marker.
  */
 export async function ticketSettlement(
   run: Pick<StepContext, "repoPath">,
@@ -104,11 +112,15 @@ export async function ticketSettlement(
 ): Promise<TicketSettlement> {
   const claim = satisfiedClaim(progress);
   if (!claim) return { how: "committed" };
-  const resolved = await describeCommit(run.repoPath, claim.commit);
+  const named = await describeCommit(run.repoPath, claim.commit);
+  const throughMarker = named ? satisfiedMarkerTarget(named.subject) : undefined;
+  const resolved = throughMarker ? await describeCommit(run.repoPath, throughMarker) : named;
   return {
     how: "satisfied",
     by: {
-      commit: resolved?.sha ?? claim.commit,
+      // A marker's own sha is never the recorded one: its subject already carries the work's full
+      // sha, so even a describe that fails on the target has told us more than the marker would.
+      commit: resolved?.sha ?? throughMarker ?? claim.commit,
       ...(resolved?.subject ? { subject: resolved.subject } : {}),
       ...(claim.note ? { note: claim.note } : {}),
     },
