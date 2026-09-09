@@ -696,6 +696,32 @@ describe("instructionCriteria", () => {
       "```\nif ok:\n    retry()\n```",
       "--> tail",
     ]);
+    // It can begin on the OPENER line too, which begins outside the comment and so is never
+    // `literal`: filed whole it became a checkbox of its own with `retry()` dedented alone beside
+    // it, asking for behaviour the note does not show. The delimiter is granted one column of
+    // padding, so this files the criteria the closer-on-its-own-line form above files.
+    expect(texts("<!-- if ok:\n    retry()\n-->")).toEqual([
+      "<!--",
+      "```\nif ok:\n    retry()\n```",
+      "-->",
+    ]);
+    expect(texts("<!-- if ok:\n    retry() -->")).toEqual([
+      "<!--",
+      "```\nif ok:\n    retry()\n```",
+      "-->",
+    ]);
+    // A chained opener carries its sample the same way — the split is at the LAST `<!--`, since a
+    // `--> <!--` opens on the line it closed.
+    expect(texts("<!--\nfirst\n-->  <!-- if ok:\n    retry()\n-->")).toEqual([
+      "<!--",
+      "```\nfirst\n```",
+      "-->  <!--",
+      "```\nif ok:\n    retry()\n```",
+      "-->",
+    ]);
+    // A bare opener carries no sample, and one with prose of its own renders that prose — it stays
+    // the sentence it was typed as, as the mid-line case above files it.
+    expect(texts("<!-- \nif ok:\n-->")).toEqual(["<!--", "```\nif ok:\n```", "-->"]);
     // Once the comment closes the lines are ordinary steps again, and the closer ends no paragraph
     // an indented block could not follow.
     expect(texts("<!--\n- x\n-->\n- y")).toEqual(["<!--", "```\n- x\n```", "-->", "y"]);

@@ -245,6 +245,8 @@ const PARA_INTERRUPT = /^ {0,3}(?:[-*+]|0{0,8}1[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1
  */
 const QUOTE_STEP = /^ {0,3}>(?=>*(?:[ \t]|$))/;
 
+const COMMENT_OPEN = "<!--";
+
 const COMMENT_CLOSE = "-->";
 
 /**
@@ -333,7 +335,9 @@ export interface InstructionCriterion {
  * delimiters that framed it. The sample files as ONE literal block, dedented as one unit so an
  * indentation-sensitive example keeps its nesting through to the rendered Acceptance
  * ({@link flushCommentedSample}); the delimiter lines are judged as typed like any other, since each
- * begins outside the comment. Only
+ * begins outside the comment — but a delimiter that CARRIES a line of the sample (`<!-- if ok:`,
+ * `    retry() -->`) contributes it to the block, since only the delimiter itself is punctuation
+ * ({@link openedSample}). Only
  * a comment that CLOSES is read so ({@link insideClosedComment}): after a stray `<!--` the rest of
  * the instructions are ordinary steps, and filing their labels and markers verbatim would be the
  * render's mistake in the other direction.
@@ -472,7 +476,7 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     }
     if (literal[at]) {
       inParagraph = false;
-      at = flushCommentedSample(raw, literal, at, out) - 1;
+      at = flushCommentedSample(lines, literal, at, out) - 1;
       continue;
     }
     // A line indented less than the innermost item's content leaves it — unless it is the lazy
@@ -527,6 +531,16 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       at += setextRun - 1;
       continue;
     }
+    // The sample of a closed comment can begin on the OPENER line, which is not itself `commented`
+    // and so was filed whole: `<!-- if ok:` / `    retry()` / `-->` emitted the opener as its own
+    // checkbox and dedented `retry()` alone, losing the nesting the note keeps.
+    const carried = openedSample(line, literal[at + 1] === true);
+    if (carried !== undefined) {
+      inParagraph = false;
+      out.push({ text: line.text.slice(0, carried.at).trim(), fenced: false });
+      at = flushCommentedSample(lines, literal, at + 1, out, [carried.first]) - 1;
+      continue;
+    }
     inParagraph = paragraph;
     const text = shorn(line.text);
     if (text) out.push({ text, fenced: false });
@@ -577,17 +591,21 @@ function insideClosedComment(lines: readonly ScannedLine[]): boolean[] {
  *
  * A closing line can also CARRY the sample's last line (`    retry() -->`). Its content joins the
  * block rather than filing whole, which would shear the indentation off and show the delimiter as
- * requirement text — the same criteria the closer-on-its-own-line form files.
+ * requirement text — the same criteria the closer-on-its-own-line form files. An OPENER line carries
+ * the sample's FIRST line the same way (`<!-- if ok:`); a chained `-->  <!-- if ok:` does both at
+ * once ({@link openedSample}). The run's own opener is never `literal` — it begins outside the
+ * comment — so the caller hands its carried line in as `opening`.
  */
 function flushCommentedSample(
-  raw: readonly string[],
+  lines: readonly ScannedLine[],
   literal: readonly boolean[],
   at: number,
   out: InstructionCriterion[],
+  opening: string[] = [],
 ): number {
   let end = at;
-  while (end < raw.length && literal[end]) end += 1;
-  let sample: string[] = [];
+  while (end < lines.length && literal[end]) end += 1;
+  let sample: string[] = [...opening];
   const flushSample = () => {
     const indents = sample.filter((line) => line.trim() !== "").map((line) => indentColumns(line));
     if (indents.length > 0) {
@@ -597,7 +615,8 @@ function flushCommentedSample(
     }
     sample = [];
   };
-  for (const line of raw.slice(at, end)) {
+  for (let next = at; next < end; next += 1) {
+    const line = lines[next]!.text;
     const closes = line.indexOf(COMMENT_CLOSE);
     if (closes === -1) {
       sample.push(line);
@@ -610,10 +629,46 @@ function flushCommentedSample(
     const carried = sample.length > 0 && line.slice(0, closes).trim() !== "";
     if (carried) sample.push(line.slice(0, closes));
     flushSample();
-    out.push({ text: (carried ? line.slice(closes) : line).trim(), fenced: false });
+    // A chained line can carry the NEXT sample's first line too: `-->  <!-- if ok:` is a closer, an
+    // opener, and the start of a second example. What files is the delimiters; the tail is sample.
+    const opened = openedSample(lines[next]!, literal[next + 1] === true);
+    const from = carried ? closes : 0;
+    out.push({ text: line.slice(from, opened?.at ?? line.length).trim(), fenced: false });
+    if (opened) sample.push(opened.first);
   }
   flushSample();
   return end;
+}
+
+/**
+ * The sample's first line, where the opener `line` carries it — or undefined when it carries none.
+ * `continues` is whether the comment it opens runs on into a `literal` line, the sample the caller
+ * is about to file.
+ *
+ * A comment's sample can begin on the opener line itself: `<!-- if ok:` / `    retry()` / `-->` is
+ * one indentation-sensitive example, but the opener begins OUTSIDE the comment, so it is never
+ * `literal` and used to file whole — a checkbox of its own, with `retry()` dedented alone beside it,
+ * which asks for different behaviour than the note shows. Splitting at the LAST `<!--` (a chained
+ * `--> <!--` opens on the line it closed) hands the delimiter back for judging as typed and the tail
+ * to the sample: the mirror of a closer carrying the sample's last line
+ * ({@link flushCommentedSample}).
+ *
+ * Only a line whose `visible` render is nothing but the delimiter carries a sample. A line with prose
+ * of its own — `see <!-- start` — is the sentence it was typed as, and files whole like every other
+ * delimiter line; a bare `<!--` carries nothing to file.
+ *
+ * The delimiter is granted ONE column of padding, as CommonMark grants a `>` marker one
+ * ({@link unquoteOne}), so `<!-- if ok:` dedents to the block the opener-on-its-own-line form files
+ * rather than one column shallower.
+ */
+function openedSample(line: ScannedLine, continues: boolean): { at: number; first: string } | undefined {
+  if (!continues || line.visible.trim() !== "") return undefined;
+  const opens = line.text.lastIndexOf(COMMENT_OPEN);
+  if (opens === -1) return undefined;
+  const at = opens + COMMENT_OPEN.length;
+  const tail = line.text.slice(at);
+  if (tail.trim() === "") return undefined;
+  return { at, first: /^[ \t]/.test(tail) ? tail.slice(1) : tail };
 }
 
 /**
