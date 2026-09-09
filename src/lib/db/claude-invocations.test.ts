@@ -1,5 +1,5 @@
 /**
- * The spend-ledger migration (drizzle/0034), asserted against the database that can actually go
+ * The spend-ledger migration (drizzle/0035), asserted against the database that can actually go
  * wrong: an existing anton.db with a project, a run and a job already in it.
  *
  * The table is purely additive, so what the migration must prove is that it applies to a POPULATED
@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { applyMigrationFile, applyMigrationsTo } from "./testing";
 
-const MIGRATION = "0034_claude_invocations.sql";
+const MIGRATION = "0035_claude_invocations.sql";
 
 /** The reverse, read out of the migration's own header so the tested recipe is the documented one. */
 function reverseStatements(): string[] {
@@ -50,7 +50,7 @@ beforeEach(() => {
 
 afterEach(() => sqlite.close());
 
-describe("drizzle/0034 — the per-invocation spend ledger", () => {
+describe("drizzle/0035 — the per-invocation spend ledger", () => {
   it("applies to a populated db and leaves every existing row untouched", () => {
     applyMigrationFile(sqlite, MIGRATION);
 

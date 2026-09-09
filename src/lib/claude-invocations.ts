@@ -26,7 +26,6 @@
  */
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gte } from "drizzle-orm";
-import { ANTHROPIC_BASE_URL_ENV } from "./claude/endpoint";
 import type { ClaudeResult, RunClaudeOptions } from "./claude/driver";
 import type { ModelUsageEntry } from "./claude/model-usage";
 import { getDb, schema } from "./db";
@@ -155,15 +154,18 @@ export type ClaudeInvocationRow = typeof schema.claudeInvocations.$inferSelect;
 /** One project's invocations, newest first — the read every spend question starts from. */
 export async function listInvocations(
   db: AntonDb,
-  projectId: string,
+  projectId: string | undefined,
   opts: { since?: Date; limit?: number } = {},
 ): Promise<ClaudeInvocationRow[]> {
-  const where = opts.since
-    ? and(
-        eq(schema.claudeInvocations.projectId, projectId),
-        gte(schema.claudeInvocations.recordedAt, opts.since),
-      )
-    : eq(schema.claudeInvocations.projectId, projectId);
+  const projectFilter = projectId
+    ? eq(schema.claudeInvocations.projectId, projectId)
+    : undefined;
+  const sinceFilter = opts.since
+    ? gte(schema.claudeInvocations.recordedAt, opts.since)
+    : undefined;
+  const where = projectFilter && sinceFilter
+    ? and(projectFilter, sinceFilter)
+    : projectFilter ?? sinceFilter;
   const query = db
     .select()
     .from(schema.claudeInvocations)
@@ -203,7 +205,7 @@ export interface InvocationSpend {
  */
 export async function invocationSpend(
   db: AntonDb,
-  projectId: string,
+  projectId: string | undefined,
   opts: { since?: Date; limit?: number } = {},
 ): Promise<InvocationSpend> {
   const rows = await listInvocations(db, projectId, opts);
@@ -246,7 +248,11 @@ export function metered(
       // The model as SPAWNED, which is what the result's usage answers for — the caller's dimension
       // is only the default for a driver invoked with no model of its own.
       modelRequested: options.model ?? dimensions.modelRequested,
-      baseUrl: dimensions.baseUrl ?? process.env[ANTHROPIC_BASE_URL_ENV],
+      // Record the route this invocation actually received. A routed child gets its endpoint via
+      // the spawn-only env delta, so anton's own process.env is deliberately not authoritative.
+      baseUrl:
+        dimensions.baseUrl ??
+        (options.routing.routed ? options.routing.baseUrl : undefined),
     }, result);
     return result;
   };
@@ -280,7 +286,7 @@ export function projectSpend(
  */
 export async function spendBreakdowns(
   db: AntonDb,
-  projectId: string,
+  projectId: string | undefined,
   opts: { since?: Date } = {},
 ): Promise<{ model: SpendBreakdown; task: SpendBreakdown; divergence: DivergenceSummary }> {
   const rows = await listInvocations(db, projectId, opts);

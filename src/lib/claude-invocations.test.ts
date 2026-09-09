@@ -22,6 +22,7 @@ import { makeProjectDb, type TestProjectDb } from "./testing/project";
 import type { Clock } from "./jobs/queue";
 
 const clock: Clock = { now: () => 1_700_000_000_000 };
+const routing = { routed: false } as const;
 
 const DIMENSIONS = {
   jobType: "execute-epic",
@@ -196,7 +197,7 @@ describe("metered", () => {
       async () => reply,
     );
 
-    await expect(driver({ cwd: "/tmp/wt", prompt: "work" })).resolves.toBe(reply);
+    await expect(driver({ cwd: "/tmp/wt", prompt: "work", routing })).resolves.toBe(reply);
     expect(await listInvocations(tdb.db, tdb.projectId)).toHaveLength(2);
     tdb.close();
   });
@@ -210,10 +211,49 @@ describe("metered", () => {
       async () => result({ modelUsage: USAGE.slice(0, 1) }),
     );
 
-    await driver({ cwd: "/tmp/wt", prompt: "work", model: "cc/claude-sonnet-5" });
+    await driver({ cwd: "/tmp/wt", prompt: "work", model: "cc/claude-sonnet-5", routing });
 
     const [row] = await listInvocations(tdb.db, tdb.projectId);
     expect(row.modelRequested).toBe("cc/claude-sonnet-5");
+    tdb.close();
+  });
+
+  it("records the endpoint from the invocation's routed spawn options", async () => {
+    const tdb = makeProjectDb();
+    const driver = metered(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId },
+      async () => result({ modelUsage: USAGE.slice(0, 1) }),
+    );
+
+    await driver({
+      cwd: "/tmp/wt",
+      prompt: "work",
+      routing: {
+        routed: true,
+        baseUrl: "https://gateway.example.com/v1/messages?secret=nope",
+        authTokenEnv: "TEST_GATEWAY_TOKEN",
+        gatewayModelDiscovery: false,
+      },
+    });
+
+    const [row] = await listInvocations(tdb.db, tdb.projectId);
+    expect(row.endpointHost).toBe("gateway.example.com");
+    tdb.close();
+  });
+
+  it("can query the ledger across all projects", async () => {
+    const tdb = makeProjectDb();
+    await recordInvocation(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId },
+      result({ modelUsage: USAGE.slice(0, 1) }),
+    );
+
+    expect(await listInvocations(tdb.db, undefined)).toHaveLength(1);
+    expect((await spendBreakdowns(tdb.db, undefined)).model.recorded).toBe(true);
     tdb.close();
   });
 
@@ -236,8 +276,8 @@ describe("metered", () => {
       async () => results[next++],
     );
 
-    await driver({ cwd: "/tmp/wt", prompt: "first" });
-    await driver({ cwd: "/tmp/wt", prompt: "second" });
+    await driver({ cwd: "/tmp/wt", prompt: "first", routing });
+    await driver({ cwd: "/tmp/wt", prompt: "second", routing });
 
     const rows = await listInvocations(tdb.db, tdb.projectId);
     // Two invocations, each holding the total its own result reported — 340, not 100 + 340 = 440.
@@ -252,7 +292,7 @@ describe("metered", () => {
       throw new Error("mid-stream death");
     });
 
-    await expect(driver({ cwd: "/tmp/wt", prompt: "work" })).rejects.toThrow("mid-stream death");
+    await expect(driver({ cwd: "/tmp/wt", prompt: "work", routing })).rejects.toThrow("mid-stream death");
     expect(await listInvocations(tdb.db, tdb.projectId)).toHaveLength(0);
     tdb.close();
   });
