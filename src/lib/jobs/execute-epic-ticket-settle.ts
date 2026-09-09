@@ -15,6 +15,8 @@
  */
 import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
 import { blockNoteEvidence } from "../beads/block-note";
+import { swapUnderLock } from "../beads/claim";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { shortSha, type SatisfiedBy } from "../beads/satisfied-note";
 import { formatAntonResult, type AntonResult } from "../claude/anton-result";
 import {
@@ -772,11 +774,34 @@ async function releaseTicketClaim(repo: string, ticketId: string): Promise<void>
  * once that lock is dropped, so between the repair's final reread (`markerOvertaken`) and here another
  * run or operator can reopen and reclaim the ticket — reachable even with the SAME operator, whose
  * `bd update --claim` is idempotent, so no assignee change need betray it. An unconditional unassign
- * would then strip that newer holder and leave the ticket `in_progress` but unowned. So re-read and
- * release only while the ticket is still closed as superseded by the survivor anton retired it
- * against, and still carries this run's own assignee; a board that reads otherwise — reopened,
- * reclaimed, reassigned, or simply unreadable — has been taken back by another hand, and its claim is
- * left exactly as it stands.
+ * would then strip that newer holder and leave the ticket `in_progress` but unowned.
+ *
+ * So the release is the project's claim protocol, not a read followed by a bare write (PR #238
+ * review). Three things make it one:
+ *
+ *  1. The ticket's WRITE LOCK wraps the whole read-decide-write sequence, so it is ordered against
+ *     every other claim write in this process — a worker's `claimVerified`, a human's Claim CAS, the
+ *     skip path's own guarded writes (beads/claim-lock.ts). Read-then-write outside it is exactly the
+ *     lost update this releases into.
+ *  2. The retirement is re-read INSIDE that lock and the release refused unless the ticket is still
+ *     closed as superseded by the survivor anton retired it against. A reopen flips the status off
+ *     `closed`, which is what `supersededBy` gates on — so this is the one fence that catches a
+ *     same-operator reclaim no assignee comparison can see.
+ *  3. The assignee comes off through the CONDITIONAL swap ({@link swapUnderLock}), which re-verifies
+ *     the owner after its write. That is what covers the cross-process half the lock cannot: a holder
+ *     that landed from another machine is found by the verify and reported as the loser's owner
+ *     instead of being overwritten. The stage label follows only once that swap says the claim was
+ *     ours to take off — a board that reads otherwise keeps both.
+ *
+ * The expected owner is the fresh read's own, not `operator`: when the run resolved no operator, bd's
+ * assignee is not a name anton can compare against (gardener/repair-already-shipped.ts
+ * `claimReclaimedSinceDispatch` declines the same comparison for the same reason), so the swap is
+ * held to what the in-lock read saw rather than to an identity anton does not have. With an operator,
+ * a mismatch is refused before the swap so the release never even attempts a claim that is not this
+ * run's.
+ *
+ * Best-effort throughout, like every write on this stopping path: a refused bd call costs the
+ * release, never the run's own error.
  */
 async function releaseRetiredClaim(
   repo: string,
@@ -784,14 +809,29 @@ async function releaseRetiredClaim(
   replacementId: string,
   operator: string | undefined,
 ): Promise<void> {
-  // mustRead, not a swallowed `show`: an unreadable board must not turn this compare-and-swap into an
-  // unconditional release (see execute-epic-persist). A reopen flips the status off `closed`, which
-  // is what `supersededBy` gates on — so it also catches a same-operator reclaim no assignee check
-  // would.
-  const fresh = await mustRead(repo, ticketId);
-  if (!fresh || beads.supersededBy(fresh) !== replacementId) return;
-  if (operator && ownerOf(fresh) !== operator) return;
-  await releaseTicketClaim(repo, ticketId);
+  await withBeadWriteLock(repo, ticketId, async () => {
+    // mustRead, not a swallowed `show`: an unreadable board must not turn this compare-and-swap into
+    // an unconditional release (see execute-epic-persist).
+    const fresh = await mustRead(repo, ticketId);
+    if (!fresh || beads.supersededBy(fresh) !== replacementId) return;
+    const holder = ownerOf(fresh);
+    if (operator && holder !== operator) return;
+    // `fresh` was read under this lock, so it IS the swap's in-lock read — handed in rather than paid
+    // for twice. A swap that LOST names the holder that beat us, and neither write lands.
+    const swap = await swapUnderLock(repo, ticketId)(holder, undefined, fresh).catch((e) => {
+      console.error(`[execute-epic] could not release ${ticketId}'s retired claim`, e);
+      return { ok: false, owner: holder } as const;
+    });
+    if (!swap.ok) {
+      console.warn(
+        `[execute-epic] left ${ticketId}'s claim as it stands${swap.owner ? ` (held by ${swap.owner})` : ""} — ` +
+          `its assignee moved while anton was releasing the retirement, so the claim is not anton's ` +
+          `to take off`,
+      );
+      return;
+    }
+    await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
+  });
 }
 
 /** Block the bead for a human, with the note that says which failure this was and where its evidence is. */

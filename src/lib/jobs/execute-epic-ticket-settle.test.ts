@@ -92,6 +92,20 @@ const retiredRead = (assignee?: string): Bead =>
     dependencies: [{ dependency_type: "supersedes", id: SHIPPER }],
   }) as unknown as Bead;
 
+/**
+ * A STATEFUL board for the release's CAS: the swap reads, writes, then re-reads to verify (see
+ * beads/claim.ts), so a constant `show` would report every real release as lost on its own
+ * post-write read. This makes `unassign` actually clear the assignee the next read returns.
+ */
+function boardHolding(bead: Bead): void {
+  let live = bead;
+  showMock.mockImplementation(async () => live);
+  unassignMock.mockImplementation(async () => {
+    live = { ...live, assignee: "" } as Bead;
+    return "";
+  });
+}
+
 const retired = (marked: boolean) => ({
   action: "retired" as const,
   marked,
@@ -102,9 +116,14 @@ const retired = (marked: boolean) => ({
 
 describe("settling a ticket the repair RETIRED", () => {
   beforeEach(() => {
-    for (const m of [unassignMock, untagMock, setStatusMock, noteMock, showMock, repairMock]) m.mockClear();
-    // The release CASes on a fresh read: by default the board still shows anton's own retirement.
-    showMock.mockResolvedValue(retiredRead());
+    for (const m of [unassignMock, untagMock, setStatusMock, noteMock, showMock, repairMock]) m.mockReset();
+    unassignMock.mockResolvedValue("");
+    untagMock.mockResolvedValue("");
+    setStatusMock.mockResolvedValue("");
+    noteMock.mockResolvedValue("");
+    // The release CASes on a fresh read: by default the board still shows anton's own retirement,
+    // claimed by this run.
+    boardHolding(retiredRead("anton-op"));
   });
 
   it("releases only the claim on a marked retirement, and hands the loop the retirement", async () => {
@@ -116,6 +135,18 @@ describe("settling a ticket the repair RETIRED", () => {
     expect(untagMock).toHaveBeenCalledWith("/tmp/anton", "anton-a", [LABELS.stage("implementing")]);
     // Neither `blocked` nor `open`: the retirement is a recorded outcome, and both would rewrite it.
     expect(setStatusMock).not.toHaveBeenCalled();
+  });
+
+  // An already-unassigned retirement has no claim to take off, so the CAS writes nothing rather than
+  // spawning a bd call to set what already holds — but the stage label still comes off.
+  it("skips the assignee write on a retirement nothing holds", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    boardHolding(retiredRead());
+
+    await expect(settle()).rejects.toBeInstanceOf(TicketRetiredError);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(untagMock).toHaveBeenCalledWith("/tmp/anton", "anton-a", [LABELS.stage("implementing")]);
   });
 
   it("stops the run BEFORE the release on a retirement that landed unmarked", async () => {
@@ -139,7 +170,7 @@ describe("settling a ticket the repair RETIRED", () => {
   it("leaves a reopened-and-reclaimed ticket's claim alone", async () => {
     repairMock.mockResolvedValue(retired(true));
     // A concurrent run reopened it: no longer closed, so it is no longer anton's retirement close.
-    showMock.mockResolvedValue({ id: ticket.id, status: "in_progress", assignee: "someone-else" } as unknown as Bead);
+    boardHolding({ id: ticket.id, status: "in_progress", assignee: "someone-else" } as unknown as Bead);
 
     await expect(settle()).rejects.toBeInstanceOf(TicketRetiredError);
 
@@ -147,11 +178,43 @@ describe("settling a ticket the repair RETIRED", () => {
     expect(untagMock).not.toHaveBeenCalled();
   });
 
+  // A same-operator reopen-and-reclaim, the case no assignee comparison can see: `bd update --claim`
+  // is idempotent, so the newer holder's name is this run's own. The status half of the CAS is what
+  // catches it — a reopen is no longer `closed`, so it is no longer anton's retirement.
+  it("leaves a same-operator reclaim's claim alone", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    boardHolding({ id: ticket.id, status: "in_progress", assignee: "anton-op" } as unknown as Bead);
+
+    await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  // The cross-process leg the in-process lock cannot order: the pre-write read still shows anton's
+  // own claimed retirement, and another machine's claim lands before the unassign. The swap's
+  // POST-write verify is the only thing that can see it — the assignee reads back as the newcomer,
+  // so the release reports lost and the stage label stays on the live claim.
+  it("does not strip the stage label when another machine's claim wins the release", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    let live = retiredRead("anton-op");
+    showMock.mockImplementation(async () => live);
+    unassignMock.mockImplementation(async () => {
+      live = retiredRead("other-machine");
+      return "";
+    });
+
+    await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
+
+    expect(unassignMock).toHaveBeenCalledWith("/tmp/anton", "anton-a");
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
   // Reassigned without reopening — still closed and superseded, but a different assignee now holds
   // it; the CAS's assignee half keeps the release from taking that claim off.
   it("leaves a reassigned retirement's claim alone", async () => {
     repairMock.mockResolvedValue(retired(true));
-    showMock.mockResolvedValue(retiredRead("someone-else"));
+    boardHolding(retiredRead("someone-else"));
 
     await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
 
@@ -161,7 +224,7 @@ describe("settling a ticket the repair RETIRED", () => {
 
   it("releases when the fresh read still shows this run's own retirement claim", async () => {
     repairMock.mockResolvedValue(retired(true));
-    showMock.mockResolvedValue(retiredRead("anton-op"));
+    boardHolding(retiredRead("anton-op"));
 
     await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
 

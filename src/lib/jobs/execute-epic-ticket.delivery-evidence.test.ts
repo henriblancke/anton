@@ -137,11 +137,20 @@ const EPIC_ID = "anton-epic";
  * The ticket under test: claimed, hanging under the run's epic, and citing no paths, so `ref-stale`
  * has nothing to say about it.
  */
+/**
+ * The assignee `claimTicket`'s `bd update --claim` left on the ticket. Carried on the fixture because
+ * the retired release is a compare-and-swap over exactly this field (PR #238 review): an unclaimed
+ * bead has nothing to hand back, so a fixture without it would exercise the swap's no-op leg and
+ * never the release the retirement owes the board.
+ */
+const HOLDER = "anton-op";
+
 function ticket(): Bead {
   return {
     id: TICKET_ID,
     title: "A ticket the agent delivered nothing for",
     status: "in_progress",
+    assignee: HOLDER,
     description: "## Goal\nShip it.",
     labels: ["stage:implementing"],
     parent: EPIC_ID,
@@ -170,10 +179,15 @@ function beadById(id: string): Bead {
 
 /**
  * A bead as bd would answer AFTER this run's writes: the `not-delivered` marker `bd tag` stamped
- * layered on (and any `bd untag` removed), and — once superseded — closed with the `supersedes`
- * edge to its survivor. The marker matters as much as the edge: the retirement's post-write reread
- * ({@link markerOvertaken}) asserts the marker is present, not just the close, so a `shown` that
- * dropped it would read every retirement as overtaken-and-marker-stripped (PR #238 review).
+ * layered on (and any `bd untag` removed), the assignee any `bd assign ""` cleared, and — once
+ * superseded — closed with the `supersedes` edge to its survivor. The marker matters as much as the
+ * edge: the retirement's post-write reread ({@link markerOvertaken}) asserts the marker is present,
+ * not just the close, so a `shown` that dropped it would read every retirement as
+ * overtaken-and-marker-stripped (PR #238 review).
+ *
+ * The ASSIGNEE is replayed for the same reason (PR #238 review): the retired release is a
+ * compare-and-swap that re-reads the assignee to verify its own write, so a `shown` that kept
+ * answering with the old holder would report every real release as lost to a phantom claim.
  */
 function shown(id: string): Bead {
   const read = beadById(id);
@@ -185,9 +199,13 @@ function shown(id: string): Bead {
     if (target === id) for (const l of removed ?? []) labels.delete(l);
   }
   const written = supersedeMock.mock.calls.find(([, target]) => target === id);
+  const released = (unassignMock.mock.calls as unknown as [string, string][]).some(
+    ([, target]) => target === id,
+  );
   return {
     ...read,
     labels: [...labels],
+    ...(released ? { assignee: "" } : {}),
     ...(written
       ? {
           status: "closed",
