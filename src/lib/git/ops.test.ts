@@ -33,12 +33,15 @@ import {
   pullRequestState,
   readFileAtRev,
   readPathHistory,
+  readPreservedCommitFor,
   readWorktreeState,
   resolveFreshBase,
   resolveMergeBase,
   restoreWorktreeState,
   sameWorktreeState,
   worktreeHasCommitFor,
+  worktreeHasPreservedCommitFor,
+  worktreeTipIsPreservedCommitFor,
   branchAddedCommit,
   describeCommit,
   branchContainsCommit,
@@ -351,6 +354,140 @@ suite("worktreeHasCommitFor (real git)", () => {
 
   it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
     expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
+  });
+
+  /**
+   * What the resumed ticket's CONTINUATION block is written from (anton-16pq). Nothing preserved
+   * means no block at all, so "absent" has to be the answer for a branch that carries only other
+   * tickets' commits — a fresh ticket's prompt must not gain a paragraph.
+   */
+  describe("readPreservedCommitFor", () => {
+    it("reads the preserved commit's sha, subject and files", async () => {
+      writeFileSync(join(repo, "half-written.md"), "partial\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: Ship the thing\n\nINCOMPLETE — stopped at its budget"]);
+
+      const preserved = await readPreservedCommitFor(repo, "anton-d9");
+
+      expect(preserved?.subject).toBe("WIP anton-d9: Ship the thing");
+      expect(preserved?.sha).toMatch(/^[0-9a-f]{40}$/);
+      expect(preserved?.files).toEqual(["half-written.md"]);
+    });
+
+    // The marker form: the agent committed the work itself, so the preserved commit is EMPTY and
+    // the prompt must not present its diff as what was kept. `newestEmpty` is what says so.
+    it("reports no files and an empty newest commit for a marker commit", async () => {
+      g(["commit", "-q", "--allow-empty", "-m", "WIP anton-d9: Ship the thing"]);
+
+      const preserved = await readPreservedCommitFor(repo, "anton-d9");
+      expect(preserved?.files).toEqual([]);
+      expect(preserved?.newestEmpty).toBe(true);
+    });
+
+    // A net-zero range is NOT a marker: attempt one's added file is removed by attempt two, so the
+    // aggregate `baseline..newest` diff is `[]` even though the newest commit itself is non-empty.
+    // `newestEmpty: false` is what lets the prompt tell the two apart (PR #255 review).
+    it("distinguishes a non-empty newest commit whose range nets to nothing from a marker", async () => {
+      g(["checkout", "-q", "-b", "feature"]);
+      writeFileSync(join(repo, "toggle.md"), "added\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: first attempt (adds the file)"]);
+      rmSync(join(repo, "toggle.md"));
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: second attempt (removes it)"]);
+
+      const preserved = await readPreservedCommitFor(repo, "anton-d9", "main");
+      // The added-then-removed file leaves no net change across the range…
+      expect(preserved?.files).toEqual([]);
+      // …but the newest commit is a real removal, not an empty marker.
+      expect(preserved?.newestEmpty).toBe(false);
+    });
+
+    // A ticket can time out more than once; the freshest preserve is the tree the agent is looking
+    // at, so the newest match is the tip — but every earlier attempt's delta is on the branch too and
+    // must come along in `files`/`earlier`, or the resume is pointed at only the newest delta.
+    it("collects every preserved attempt when a ticket timed out twice", async () => {
+      writeFileSync(join(repo, "first.md"), "first\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: first attempt"]);
+      writeFileSync(join(repo, "second.md"), "second\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: second attempt"]);
+
+      const preserved = await readPreservedCommitFor(repo, "anton-d9");
+
+      expect(preserved?.subject).toBe("WIP anton-d9: second attempt");
+      expect(preserved?.files?.sort()).toEqual(["first.md", "second.md"]);
+      expect(preserved?.earlier.map((c) => c.subject)).toEqual(["WIP anton-d9: first attempt"]);
+    });
+
+    // A first timeout can leave the agent's OWN commits with an EMPTY marker recording them, and a
+    // second a non-empty WIP commit. The self-committed work lives BENEATH the marker, so a
+    // per-marker union misses it — the fork point makes `files` the whole delta (PR #255 review).
+    it("spans self-committed work beneath an empty marker when the fork point is known", async () => {
+      g(["checkout", "-q", "-b", "feature"]);
+      writeFileSync(join(repo, "self.md"), "self\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "the agent's own subject"]);
+      g(["commit", "-q", "--allow-empty", "-m", "WIP anton-d9: first attempt (marker)"]);
+      writeFileSync(join(repo, "wip.md"), "wip\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: second attempt"]);
+
+      const preserved = await readPreservedCommitFor(repo, "anton-d9", "main");
+
+      expect(preserved?.baseline).toMatch(/^[0-9a-f]{40}$/);
+      // The self-committed file AND the second attempt's — not just the WIP commits' own deltas.
+      expect(preserved?.files?.sort()).toEqual(["self.md", "wip.md"]);
+      expect(preserved?.earlier.map((c) => c.subject)).toEqual([
+        "WIP anton-d9: first attempt (marker)",
+      ]);
+    });
+
+    // `git()`'s `stdout.trim()` would strip a leading-space filename emitted at the start of the
+    // diff; the untrimmed reads keep it, on both the fork-point and the fallback path (PR #255).
+    it("preserves leading whitespace in a changed path", async () => {
+      g(["checkout", "-q", "-b", "feature"]);
+      writeFileSync(join(repo, " lead.md"), "x\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "WIP anton-d9: whitespace path"]);
+
+      expect((await readPreservedCommitFor(repo, "anton-d9", "main"))?.files).toEqual([" lead.md"]);
+      expect((await readPreservedCommitFor(repo, "anton-d9"))?.files).toEqual([" lead.md"]);
+    });
+
+    it("is undefined for a ticket nothing was preserved for, and for the delivery subject", async () => {
+      writeFileSync(join(repo, "work.md"), "work\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "anton-d9: Ship the thing"]);
+
+      expect(await readPreservedCommitFor(repo, "anton-d9")).toBeUndefined();
+      expect(await readPreservedCommitFor(repo, "anton-other")).toBeUndefined();
+    });
+  });
+
+  // Adoption of self-committed work asks whether the TIP is the marker — a marker deeper in history
+  // does not cover the self-commits above it, so history-wide presence is the wrong question (PR #255).
+  describe("worktreeTipIsPreservedCommitFor", () => {
+    it("is true only when the branch tip is this ticket's marker", async () => {
+      g(["commit", "-q", "--allow-empty", "-m", "WIP anton-d9: Ship the thing"]);
+
+      expect(await worktreeTipIsPreservedCommitFor(repo, "anton-d9")).toBe(true);
+      // A prefix collision must not false-positive.
+      expect(await worktreeTipIsPreservedCommitFor(repo, "anton-d")).toBe(false);
+    });
+
+    it("is false when the marker sits BELOW newer self-commits, though history still carries it", async () => {
+      g(["commit", "-q", "--allow-empty", "-m", "WIP anton-d9: first attempt (marker)"]);
+      writeFileSync(join(repo, "more.md"), "more\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "-m", "the agent's own subject"]);
+
+      // History-wide would say yes; the tip check — the one adoption must use — says no, because the
+      // marker no longer covers the self-commit above it.
+      expect(await worktreeHasPreservedCommitFor(repo, "anton-d9")).toBe(true);
+      expect(await worktreeTipIsPreservedCommitFor(repo, "anton-d9")).toBe(false);
+    });
   });
 });
 

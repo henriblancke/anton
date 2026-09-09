@@ -8,6 +8,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Bead } from "../../beads/bd";
+import type { PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
 import type { SatisfiedSettlement } from "./context";
 import { prBody, stepTaskBlock, ticketPrompt, truncateField } from "./prompts";
@@ -90,6 +91,118 @@ describe("ticketPrompt", () => {
   });
 });
 
+describe("ticketPrompt — the continuation block (anton-16pq)", () => {
+  const preserved: PreservedCommit = {
+    sha: "abc1234",
+    subject: "WIP anton-t1: Ship the thing",
+    files: ["src/a.ts", "src/b.ts"],
+    earlier: [],
+  };
+
+  // Silence is what parked the run: the resume re-read the spec, found its change apparently made,
+  // and exited having written nothing.
+  it("tells a resumed ticket what was preserved, that it is incomplete, and to continue from it", () => {
+    const prompt = ticketPrompt(ticket({ description: "## Goal\n\nShip it." }), preserved);
+
+    expect(prompt).toContain("CONTINUATION");
+    expect(prompt).toContain("abc1234 WIP anton-t1: Ship the thing");
+    expect(prompt).toContain("- src/a.ts");
+    expect(prompt).toContain("- src/b.ts");
+    expect(prompt).toContain("INCOMPLETE");
+    expect(prompt).toContain("git show abc1234");
+    expect(prompt).toMatch(/do not restart the ticket from scratch/i);
+    // The one case where the base contract's "never report delivered on an unchanged tree" does not
+    // apply — without saying so, an honest agent parks the run it could have finished.
+    expect(prompt).toContain("ANTON-RESULT: delivered");
+  });
+
+  // The generic closing's `satisfied` guidance would follow the continuation block and contradict
+  // it: a preserved-adoption settle can only be `delivered`, so telling the agent to report
+  // `satisfied` re-parks the resume this block exists to unblock (PR #255 review).
+  it("omits the satisfied closing for a resumed ticket, leaving delivered as the only outcome", () => {
+    const prompt = ticketPrompt(ticket({ description: "## Goal\n\nShip it." }), preserved);
+
+    expect(prompt).not.toContain("ANTON-RESULT: satisfied");
+    expect(prompt).toContain("ANTON-RESULT: delivered");
+  });
+
+  // The block is state of the BRANCH, so it only means anything once the agent knows what the
+  // ticket asks for.
+  it("places the block after the spec", () => {
+    const prompt = ticketPrompt(ticket({ description: "## Goal\n\nShip it." }), preserved);
+
+    expect(prompt.indexOf("CONTINUATION")).toBeGreaterThan(prompt.indexOf("Ship it."));
+  });
+
+  // An empty preserved commit is the marker form: the previous agent committed the work itself, so
+  // pointing at this commit's diff would say nothing was kept.
+  it("sends the agent to the commits beneath a marker rather than to its empty diff", () => {
+    const prompt = ticketPrompt(ticket(), { ...preserved, files: [] });
+
+    expect(prompt).not.toContain("Files changed across the preserved work:");
+    expect(prompt).toContain("it is a marker");
+    expect(prompt).toContain("git log -p");
+  });
+
+  // A net-zero range is NOT a marker: the newest commit is non-empty (an earlier attempt's edits
+  // were undone by a later one), so telling the agent the work is self-committed beneath it lies.
+  it("does not claim a marker when the range nets to nothing but the newest commit is non-empty", () => {
+    const prompt = ticketPrompt(ticket(), { ...preserved, files: [], newestEmpty: false });
+
+    expect(prompt).not.toContain("it is a marker");
+    expect(prompt).not.toContain("Files changed across the preserved work:");
+    expect(prompt).toContain("cancel out to no net change");
+    expect(prompt).toContain("git log -p");
+  });
+
+  // A ticket can time out more than once; every preserved commit's work is on the branch, so the
+  // agent must be pointed at the whole range, not just the newest delta (anton-16pq, PR #255 review).
+  it("lists every preserved attempt and inspects the whole range when a ticket timed out twice", () => {
+    const prompt = ticketPrompt(ticket(), {
+      ...preserved,
+      files: ["src/a.ts", "src/b.ts"],
+      earlier: [{ sha: "old5678", subject: "WIP anton-t1: first attempt" }],
+    });
+
+    expect(prompt).toContain("abc1234 WIP anton-t1: Ship the thing");
+    expect(prompt).toContain("old5678 WIP anton-t1: first attempt");
+    // The range covers both attempts, not just the newest commit's delta.
+    expect(prompt).toContain("git show old5678^..abc1234");
+    expect(prompt).toContain("Those commits are INCOMPLETE");
+  });
+
+  // With the fork point known the range starts at the ticket BASELINE, so the agent inspects a first
+  // attempt's self-committed work beneath an empty marker too, not just the marker commits (anton-16pq).
+  it("inspects from the ticket baseline when the fork point is known", () => {
+    const prompt = ticketPrompt(ticket(), {
+      ...preserved,
+      earlier: [{ sha: "old5678", subject: "WIP anton-t1: first attempt" }],
+      baseline: "base0000",
+    });
+
+    expect(prompt).toContain("git show base0000..abc1234");
+    expect(prompt).not.toContain("old5678^..abc1234");
+  });
+
+  // A git failure is not an empty commit: presenting `undefined` files as a marker would falsely tell
+  // the agent the work lives beneath a commit anton never actually read (PR #255 review).
+  it("does not claim an empty marker when the preserved diff could not be read", () => {
+    const prompt = ticketPrompt(ticket(), { ...preserved, files: undefined });
+
+    expect(prompt).not.toContain("it is a marker");
+    expect(prompt).not.toContain("Files changed across the preserved work:");
+    expect(prompt).toContain("could not read the preserved diff");
+  });
+
+  // The whole point of the gate this feeds: a fresh ticket must read exactly as it did before.
+  it("leaves a fresh ticket's prompt byte-identical", () => {
+    const fresh = ticket({ description: "## Goal\n\nShip it.", acceptance_criteria: "- [ ] ships" });
+
+    expect(ticketPrompt(fresh, undefined)).toBe(ticketPrompt(fresh));
+    expect(ticketPrompt(fresh)).not.toContain("CONTINUATION");
+  });
+});
+
 describe("truncateField", () => {
   it("passes a normal field through, trimmed", () => {
     expect(truncateField("  hello  ")).toBe("hello");
@@ -116,6 +229,79 @@ describe("stepTaskBlock", () => {
     expect(block).toContain("anton/anton-8d0f");
     expect(block).toContain("forked from main");
     expect(block).toContain(`- ${target.id} — ${target.title}`);
+  });
+
+  // A formula may run a generic step before `step:implement` (PR #255 review), so on resume this
+  // step is dispatched first onto a timed-out attempt's preserved commits and must be told they
+  // exist — but not told to settle the ticket, which is the implementer's job and the gate's.
+  it("injects continuation awareness for a resumed step but prescribes no outcome", () => {
+    const block = stepTaskBlock(
+      { target, tickets: [target], branch: "anton/anton-8d0f", baseBranch: "main" },
+      "claude",
+      [
+        {
+          ticketId: target.id,
+          commit: {
+            sha: "abc1234",
+            subject: `WIP ${target.id}: work so far`,
+            files: ["src/a.ts"],
+            earlier: [{ sha: "def5678", subject: `WIP ${target.id}: first pass` }],
+          },
+        },
+      ],
+    );
+
+    expect(block).toContain("CONTINUATION");
+    expect(block).toContain("abc1234 WIP");
+    expect(block).toContain("def5678 WIP");
+    expect(block).toContain("INCOMPLETE");
+    expect(block).toMatch(/do not revert, re-do, or discard it/i);
+    // The inspect command spans the WHOLE preserved range, not just the newest marker's diff.
+    expect(block).toContain("git show def5678^..abc1234");
+    // Settling is the implementer's job and the delivery gate's, so a generic step is never told to
+    // report `delivered`/`satisfied` off the preserved work.
+    expect(block).not.toContain("ANTON-RESULT");
+  });
+
+  // A timed-out attempt that self-committed its work leaves an EMPTY `WIP` marker, so pointing the
+  // generic step at `git show <marker-sha>` alone would show nothing and hide the real commits
+  // beneath it — the exact revert/redo this block exists to prevent (PR #255 review).
+  it("sends a resumed generic step to the commits beneath an empty marker, not its empty diff", () => {
+    const block = stepTaskBlock(
+      { target, tickets: [target], branch: "anton/anton-8d0f", baseBranch: "main" },
+      "claude",
+      [{ ticketId: target.id, commit: { sha: "abc1234", subject: `WIP ${target.id}: work`, files: [], earlier: [] } }],
+    );
+
+    expect(block).not.toContain("Files changed across the preserved work:");
+    expect(block).toContain("it is a marker");
+    expect(block).toContain("git log -p");
+  });
+
+  // With the fork point known the inspect range starts at the ticket baseline, so a first attempt's
+  // self-committed work beneath a marker is inspected too, not just the marker commits (anton-16pq).
+  it("inspects a resumed generic step from the ticket baseline when the fork point is known", () => {
+    const block = stepTaskBlock(
+      { target, tickets: [target], branch: "anton/anton-8d0f", baseBranch: "main" },
+      "claude",
+      [
+        {
+          ticketId: target.id,
+          commit: { sha: "abc1234", subject: `WIP ${target.id}: work`, files: ["src/a.ts"], earlier: [], baseline: "base0000" },
+        },
+      ],
+    );
+
+    expect(block).toContain("git show base0000..abc1234");
+  });
+
+  it("omits the continuation block when no ticket in scope has preserved work", () => {
+    const block = stepTaskBlock(
+      { target, tickets: [target], branch: "anton/anton-8d0f", baseBranch: "main" },
+      "claude",
+    );
+
+    expect(block).not.toContain("CONTINUATION");
   });
 });
 

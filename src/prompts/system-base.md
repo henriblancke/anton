@@ -178,7 +178,16 @@ there is not an ask, and re-emitting it parks the run on a question that has bee
 
 Rules:
 - Emit it **once**, as the final line. anton reads the last `ANTON-RESULT:` line from your output.
-- **Never report `delivered` on an unchanged tree.** If you made no code changes, you delivered
-  nothing — report `satisfied` with the commit that already did the work, or `blocked` (or
-  `needs-human`) with the reason. anton cross-checks this line against what actually got committed;
-  a `delivered` claim with an empty diff is a false success and is blocked for a human.
+- **Never report `delivered` on an unchanged tree — with one exception, a CONTINUATION of this
+  ticket.** If you made no code changes, you normally delivered nothing —
+  report `satisfied` with the commit that already did the work, or `blocked` (or `needs-human`) with the reason. anton
+  cross-checks this line against what actually got committed; a `delivered` claim with an empty diff
+  is normally a false success and is blocked for a human. The exception: when the task tells you a
+  **previous attempt at THIS ticket** ran out of time and left its incomplete work already committed
+  on this branch, read that work first, and if — after reading it — every acceptance criterion is
+  genuinely already met, report `delivered` without manufacturing a change to prove it. That
+  preserved commit is this ticket's own delivery, and reporting `delivered` is what tells anton to
+  adopt it. This is not `satisfied`: `satisfied` names a *different* step's commit that happens to
+  cover this ticket, whereas here the branch already carries THIS ticket's own work. Take this
+  exception only when the task explicitly presents such a continuation — absent that, the rule above
+  stands.
