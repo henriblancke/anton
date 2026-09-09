@@ -551,6 +551,29 @@ describe("instructionCriteria", () => {
     expect(texts("Step\n>     ## literal")).toEqual(["Step", "```\n## literal\n```"]);
   });
 
+  it("continues a paragraph indented out of a WIDE list item — four columns starts no block", () => {
+    // A wide marker puts its content deeper than the indentation a block start may carry: `123. `
+    // starts content at column five, so a four-space line has LEFT the item and yet can start
+    // nothing at the top level either — CommonMark renders it as more of the item's paragraph.
+    // Judging the trimmed line instead read it as a heading, popped the item and filed the line as
+    // a fenced code block, so the acceptance asked for something the note never showed.
+    expect(texts("123. Expected output:\n    ## literal")).toEqual([
+      "Expected output:",
+      "## literal",
+    ]);
+    // Its markers still shear, as they do on any continuation line.
+    expect(texts("123. Expected output:\n    - literal")).toEqual(["Expected output:", "literal"]);
+    // Under a NARROW marker the same four columns are only one past the item's content, where a
+    // heading does start — so the line is the scaffolding it renders as and files nothing.
+    expect(texts("1. Expected output:\n    ## literal")).toEqual(["Expected output:"]);
+    // A blank line closes the paragraph, so the line is the code block it renders as — indented
+    // four columns past nothing, since the item closed with it.
+    expect(texts("123. Expected output:\n\n    ## literal")).toEqual([
+      "Expected output:",
+      "```\n## literal\n```",
+    ]);
+  });
+
   it("shears a rich-text `•` but never treats it as a container — CommonMark reads it as prose", () => {
     // `•` is a paste convenience, sheared off a step's head like a bullet — but CommonMark never
     // opens a list on it, so it must not set an item's content column. `• Expected output:` is a

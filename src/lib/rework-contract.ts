@@ -491,8 +491,17 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     }
     // A line indented less than the innermost item's content leaves it — unless it is the lazy
     // continuation of the item's paragraph, which stays inside from any indentation.
+    //
+    // Whether it starts a block is judged from the innermost container it still MATCHES, with its
+    // indentation past that column intact: a start needs three columns or fewer, and four opens
+    // indented code, which may not interrupt a paragraph. Under a wide marker the two differ —
+    // `123. Expected output:` has its content at column 5, so `    ## literal` sits outside the
+    // item yet is only four columns in at the top level, which CommonMark renders as more of the
+    // item's paragraph. Trimming the line first read it as a heading, popped the item and filed the
+    // line as a fenced code block, so the acceptance no longer matched the note.
     const indent = indentColumns(line.text);
-    const lazy = openParagraph !== undefined && !BLOCK_START.test(line.text.trimStart());
+    const matched = matchedItem(items, indent);
+    const lazy = openParagraph !== undefined && !BLOCK_START.test(dedent(line.text, matched));
     while (!lazy && items.length > 0 && indent < items[items.length - 1]!) items.pop();
     const base = items[items.length - 1] ?? 0;
     const rel = indent >= base ? dedent(line.text, base) : line.text;
@@ -996,6 +1005,19 @@ function itemFence(
 function blockStartIndent(content: string, column: number): number {
   const indent = indentColumns(content, column) - column;
   return indent < CODE_INDENT ? indent : 0;
+}
+
+/**
+ * The content column of the innermost open item a line indented `indent` still reaches — 0 when it
+ * reaches none. Where a block start on that line is judged from ({@link instructionCriteria}): the
+ * columns past this one are the indentation CommonMark allows a start, and four of them open
+ * indented code instead.
+ */
+function matchedItem(items: readonly number[], indent: number): number {
+  for (let at = items.length - 1; at >= 0; at -= 1) {
+    if (indent >= items[at]!) return items[at]!;
+  }
+  return 0;
 }
 
 /** `prefix` with its innermost column `columns` further in — where an indented block's content starts. */

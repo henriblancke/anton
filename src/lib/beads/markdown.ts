@@ -268,15 +268,55 @@ export function scanMarkdown(source: string): ScannedLine[] {
 }
 
 /**
- * The line that closes whatever construct `source` ends inside — the fence's own delimiter, or
- * `-->` for an HTML comment — or undefined when it ends clean. For a caller that APPENDS to a body:
- * an unclosed fence or comment runs to the end of the text, so anything appended lands inside it,
- * shown as literal code or hidden outright, and never read as a heading.
+ * A persistent HTML block's opener and the tag that closes it — CommonMark's start conditions 1, 3,
+ * 4 and 5, the ones that end at their OWN closing text rather than at a blank line
+ * ({@link unterminatedCloser}). Condition 2's `<!--` is the comment state machine's already.
+ * Conditions 6 and 7 are absent because a blank line ends them, so nothing appended after one lands
+ * inside it.
+ */
+const HTML_BLOCKS: { open: RegExp; close: string }[] = [
+  { open: /^ {0,3}<pre(?:[ \t>]|$)/i, close: "</pre>" },
+  { open: /^ {0,3}<script(?:[ \t>]|$)/i, close: "</script>" },
+  { open: /^ {0,3}<style(?:[ \t>]|$)/i, close: "</style>" },
+  { open: /^ {0,3}<textarea(?:[ \t>]|$)/i, close: "</textarea>" },
+  { open: /^ {0,3}<\?/, close: "?>" },
+  { open: /^ {0,3}<!\[CDATA\[/, close: "]]>" },
+  { open: /^ {0,3}<![A-Za-z]/, close: ">" },
+];
+
+/**
+ * The line that closes whatever construct `source` ends inside — the fence's own delimiter, `-->`
+ * for an HTML comment, or the closing tag of a persistent HTML block — or undefined when it ends
+ * clean. For a caller that APPENDS to a body: an unclosed construct runs to the end of the text, so
+ * anything appended lands inside it, shown as literal code or hidden outright, and never read as a
+ * heading.
+ *
+ * The HTML blocks are the ones CommonMark ends at their own closing text ({@link HTML_BLOCKS}), not
+ * at a blank line: a description trailing off inside `<script>` swallowed an appended
+ * `## Acceptance` in every renderer, while this scanner — which models no HTML block — reported the
+ * section as written, so the bead read as complete and could never be approved. They are walked
+ * here rather than in {@link ScanState} because only an APPENDING caller needs them: a heading
+ * inside one is still a heading to the judge, which reads the same text the scanner does.
  */
 export function unterminatedCloser(source: string): string | undefined {
-  const { state } = scan(source);
+  const state: ScanState = { inComment: false };
+  let html: { close: string } | undefined;
+  for (const text of source.split(/\r?\n/)) {
+    // An HTML block is literal until its closing text: no fence opens and no comment starts inside
+    // one, so nothing else is tracked while it stands.
+    if (html) {
+      if (text.toLowerCase().includes(html.close)) html = undefined;
+      continue;
+    }
+    const line = scanLine(state, text);
+    if (line.fenced || state.inComment) continue;
+    // Judged on the comment-blanked text: a `<script>` inside `<!-- … -->` opens no block.
+    html = HTML_BLOCKS.find((block) => block.open.test(line.masked));
+    if (html && text.toLowerCase().includes(html.close)) html = undefined;
+  }
   if (state.fence) return state.fence.char.repeat(state.fence.len);
-  return state.inComment ? COMMENT_CLOSE : undefined;
+  if (state.inComment) return COMMENT_CLOSE;
+  return html?.close;
 }
 
 /** One walk of the state machine: the lines, plus the state the last line left open. */

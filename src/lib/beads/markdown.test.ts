@@ -225,6 +225,36 @@ describe("unterminatedCloser", () => {
   it("does not read a `<!--` inside a fence as a comment — the render treats it as content", () => {
     expect(unterminatedCloser("```\n<!-- literal\n```")).toBeUndefined();
   });
+
+  it("is the closing tag of a persistent HTML block the body ends inside", () => {
+    // These blocks end at their own closing text, not at a blank line, so anything appended after
+    // one lands inside it — hidden in every renderer while this scanner still read the heading,
+    // reporting a section the founder could not see.
+    expect(unterminatedCloser("## Goal\ng\n\n<script>\nvar x = 1;")).toBe("</script>");
+    expect(unterminatedCloser("<pre>\ncode")).toBe("</pre>");
+    expect(unterminatedCloser("<STYLE>\n.a{}")).toBe("</style>");
+    expect(unterminatedCloser("<textarea>\nx")).toBe("</textarea>");
+    expect(unterminatedCloser("<?php\nx")).toBe("?>");
+    expect(unterminatedCloser("<![CDATA[\nx")).toBe("]]>");
+    expect(unterminatedCloser("<!DOCTYPE html")).toBe(">");
+  });
+
+  it("is undefined once the HTML block closes, on its own line or the opener's", () => {
+    expect(unterminatedCloser("<script>\nvar x = 1;\n</script>")).toBeUndefined();
+    expect(unterminatedCloser("<script>alert(1)</script>")).toBeUndefined();
+    expect(unterminatedCloser("<!DOCTYPE html>")).toBeUndefined();
+  });
+
+  it("opens no HTML block from a tag the render never shows or reads as text", () => {
+    // Inside a fence or a comment the tag is content, not markup.
+    expect(unterminatedCloser("```\n<script>\n```")).toBeUndefined();
+    expect(unterminatedCloser("<!-- <script> -->")).toBeUndefined();
+    // A blank line ends conditions 6 and 7, so a section appended below one is read as written.
+    expect(unterminatedCloser("<div>\nx")).toBeUndefined();
+    expect(unterminatedCloser('<span x="y">')).toBeUndefined();
+    // A tag opened MID-line is inline HTML, which starts no block at all.
+    expect(unterminatedCloser("see <script> in the note")).toBeUndefined();
+  });
 });
 
 describe("unquote", () => {

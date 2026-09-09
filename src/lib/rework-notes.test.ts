@@ -646,6 +646,22 @@ describe("reconcileFollowUpDescription", () => {
     );
   });
 
+  it("closes a persistent HTML block the hand-made description ends inside — one runs past the blank line", () => {
+    // `<script>` and its kind end at their own closing tag, not at a blank line, so an appended
+    // `## Acceptance` was swallowed in every renderer while the judge — blind to HTML blocks — read
+    // the section as written. The bead then counted as finished with no acceptance a founder could
+    // see, and no retry reconciles a finished bead, so it could never be approved.
+    const unclosed = "## Goal\nharden the retry\n\n## Context\nMade by hand:\n<script>\nretry();";
+    const reconciled = reconcileFollowUpDescription(unclosed, edited);
+    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled).toContain(
+      "\nretry();\n</script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+  });
+
   it("writes the whole contract over a blank description — there is nothing to keep", () => {
     expect(reconcileFollowUpDescription(undefined, edited)).toBe(followUpDescription(edited));
     expect(reconcileFollowUpDescription("  \n", edited)).toBe(followUpDescription(edited));
