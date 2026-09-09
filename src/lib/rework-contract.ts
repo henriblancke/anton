@@ -379,7 +379,9 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
   let pendingBlanks = 0;
   // Content column of every open list item, innermost last.
   const items: number[] = [];
-  let inParagraph = false;
+  // The containers the open paragraph sits in, or undefined when none is open: a line continues a
+  // paragraph only from inside the SAME containers ({@link samePrefix}).
+  let openParagraph: Prefix | undefined;
 
   // The state after a nested fence is clean — a fence closes every comment — so a fresh scan of
   // what follows is the scan the scanner would have made had it seen the fence.
@@ -443,11 +445,11 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       const heldFence = !fence ? itemFence(line.text, items) : undefined;
       if (heldFence) {
         nested = heldFence;
-        inParagraph = false;
+        openParagraph = undefined;
         continue;
       }
       items.length = 0;
-      inParagraph = false;
+      openParagraph = undefined;
       if (!fence) fence = { opener: line.text, content: [] };
       else if (line.delimiter) flushFence(line.text);
       else fence.content.push(line.text);
@@ -456,7 +458,7 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     if (line.text.trim() === "") {
       if (code && quoted(code.prefix)) flushCode();
       else if (code) pendingBlanks += 1;
-      inParagraph = false;
+      openParagraph = undefined;
       continue;
     }
     if (code) {
@@ -475,27 +477,40 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       flushCode();
     }
     if (literal[at]) {
-      inParagraph = false;
+      openParagraph = undefined;
       at = flushCommentedSample(lines, literal, at, out) - 1;
       continue;
     }
     // A line indented less than the innermost item's content leaves it — unless it is the lazy
     // continuation of the item's paragraph, which stays inside from any indentation.
     const indent = indentColumns(line.text);
-    const lazy = inParagraph && !BLOCK_START.test(line.text.trimStart());
+    const lazy = openParagraph !== undefined && !BLOCK_START.test(line.text.trimStart());
     while (!lazy && items.length > 0 && indent < items[items.length - 1]!) items.pop();
     const base = items[items.length - 1] ?? 0;
     const rel = indent >= base ? dedent(line.text, base) : line.text;
-    if (THEMATIC_BREAK.test(rel.trim()) || isHeading(rel)) {
-      inParagraph = false;
-      continue;
-    }
     const peeled = peelContainers(rel, base);
     items.push(...peeled.opened);
-    if (peeled.fresh) inParagraph = false;
     const { text: content, column } = peeled;
+    // A paragraph continues only inside the containers it opened in: `> a` / `>     code` re-enters
+    // the same callout, while `Step` / `>     - literal` enters a NEW one and begins a block there.
+    // Comparing prefixes says which — opening a list item or entering a quote both change it, so
+    // either ends the paragraph above, as CommonMark has them do.
+    const inParagraph = openParagraph !== undefined && samePrefix(openParagraph, peeled.prefix);
     if (content.trim() === "") {
-      inParagraph = false;
+      openParagraph = undefined;
+      continue;
+    }
+    // A line {@link CODE_INDENT} columns past its container's content while a paragraph is open can
+    // start no block at all — a heading, a rule and a fence each need three columns or fewer, and
+    // indented code cannot interrupt a paragraph — so CommonMark renders it as more of that
+    // paragraph's TEXT. Its heading or rule shape is spelling, not scaffolding: `Expected output:` /
+    // `    ## literal` is one paragraph of two authored lines, and dropping the second as a label
+    // filed a contract asking for less than the note shows. Markers still shear ({@link continued}),
+    // as they do on the same line indented under a list item — a founder pasting bullets means steps
+    // wherever they land — but a line here never yields NOTHING.
+    if (inParagraph && indentColumns(content, column) - column >= CODE_INDENT) {
+      const text = continued(content);
+      if (text) out.push({ text, fenced: false });
       continue;
     }
     if (!inParagraph && indentColumns(content, column) - column >= CODE_INDENT) {
@@ -503,6 +518,13 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
         prefix: deeper(peeled.prefix, CODE_INDENT),
         content: [dedent(content, column + CODE_INDENT, column)],
       };
+      continue;
+    }
+    // A rule or a heading standing at its container's own content column is scaffolding, judged
+    // before any marker is peeled so `   ---` reads as the rule it renders as. Deeper than that it
+    // is never either — the two branches above have already taken it as paragraph text or as code.
+    if (THEMATIC_BREAK.test(rel.trim()) || isHeading(rel)) {
+      openParagraph = undefined;
       continue;
     }
     // A fence opens beneath a task marker as it does beneath the bullet, but the peel leaves the
@@ -519,7 +541,7 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
         prefix: deeper(peeled.prefix, start),
         content: [],
       };
-      inParagraph = false;
+      openParagraph = undefined;
       continue;
     }
     const paragraph = !THEMATIC_BREAK.test(content.trim()) && !isHeading(content);
@@ -527,7 +549,7 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     // scaffolding — the whole run, not just the last line, is skipped.
     const setextRun = paragraph ? setextHeadingRun(raw, lines, literal, at, peeled.prefix) : 0;
     if (setextRun > 0) {
-      inParagraph = false;
+      openParagraph = undefined;
       at += setextRun - 1;
       continue;
     }
@@ -536,12 +558,12 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     // checkbox and dedented `retry()` alone, losing the nesting the note keeps.
     const carried = openedSample(line, literal[at + 1] === true);
     if (carried !== undefined) {
-      inParagraph = false;
+      openParagraph = undefined;
       out.push({ text: line.text.slice(0, carried.at).trim(), fenced: false });
       at = flushCommentedSample(lines, literal, at + 1, out, [carried.first]) - 1;
       continue;
     }
-    inParagraph = paragraph;
+    openParagraph = paragraph ? peeled.prefix : undefined;
     const text = shorn(line.text);
     if (text) out.push({ text, fenced: false });
   }
@@ -726,17 +748,20 @@ function dedent(line: string, to: number, from = 0): string {
  * must carry to sit inside the same containers. Items opened before any `>` are reported for the
  * caller's stack, whose columns count from the line's start; those after one are not, since the
  * stack has no way to say "after the marker" — the prefix does.
+ *
+ * Whether a container was ENTERED here rather than continued is the caller's question about the open
+ * paragraph, and `prefix` answers it: a line that opened an item or a quote carries a prefix its
+ * predecessor did not ({@link samePrefix}).
  */
 function peelContainers(
   rel: string,
   base: number,
-): { text: string; column: number; prefix: Prefix; opened: number[]; fresh: boolean } {
+): { text: string; column: number; prefix: Prefix; opened: number[] } {
   const prefix: Prefix = [base];
   const opened: number[] = [];
   let text = rel;
   let column = base;
   let quoted = false;
-  let fresh = false;
   for (;;) {
     const item = LIST_ITEM.exec(text);
     if (item) {
@@ -746,20 +771,25 @@ function peelContainers(
       prefix[prefix.length - 1] = content;
       if (!quoted) opened.push(content);
       column = content;
-      fresh = true;
       continue;
     }
     const quote = QUOTE_STEP.exec(text);
-    if (!quote) return { text, column, prefix, opened, fresh };
+    if (!quote) return { text, column, prefix, opened };
     text = unquoteOne(text.slice(quote[0].length));
     prefix.push(">", 0);
     column = 0;
     quoted = true;
-    // A blockquote begins a new block, never a paragraph's lazy continuation, so entering one
-    // resets paragraph state as opening an item does — without it `Step\n>     - literal` keeps
-    // `inParagraph` true and shears the quoted indented code that CommonMark renders verbatim.
-    fresh = true;
   }
+}
+
+/**
+ * Do these two lines sit in the SAME containers? A paragraph is only continued from inside the
+ * containers it opened in: `> a` / `>     code` re-enters one callout, so the second line is more of
+ * the first's paragraph, while `Step` / `>     - literal` ENTERS a callout and begins a block there
+ * — CommonMark never lazily continues a paragraph into a container it was not already in.
+ */
+function samePrefix(a: Prefix, b: Prefix): boolean {
+  return a.length === b.length && a.every((step, at) => step === b[at]);
 }
 
 /** The text after a `>` marker: CommonMark grants the marker one space, and no more. */
@@ -953,6 +983,27 @@ function shorn(line: string): string {
   let text = line.trim();
   for (;;) {
     if (THEMATIC_BREAK.test(text) || isHeading(text)) return "";
+    const next = text.replace(QUOTE_MARKER, "").trim().replace(LIST_MARKER, "");
+    if (next === text) return PROMPT_LINE.test(text) ? "" : text;
+    text = next;
+  }
+}
+
+/**
+ * A line CONTINUING an open paragraph, shorn — {@link shorn} without the rules that yield nothing
+ * for a heading or a rule.
+ *
+ * Those two rules read a shape as scaffolding: `## Backend` labels the steps below it and `---`
+ * separates two thoughts, so neither is a step. A line that cannot interrupt the paragraph above it
+ * is neither — CommonMark renders it as more of that paragraph's text, so `Expected output:` /
+ * `    ## literal` is one paragraph of two lines and the founder authored both. Dropping the second
+ * filed a contract that asked for less than the note beside it shows. Markers still shear (a pasted
+ * bullet is a step in either position), and the formula's prompt still yields nothing: a `TODO —`
+ * placeholder is unwritten wherever it lands.
+ */
+function continued(line: string): string {
+  let text = line.trim();
+  for (;;) {
     const next = text.replace(QUOTE_MARKER, "").trim().replace(LIST_MARKER, "");
     if (next === text) return PROMPT_LINE.test(text) ? "" : text;
     text = next;

@@ -476,6 +476,29 @@ describe("instructionCriteria", () => {
     expect(texts("- item\n## Section\n    - code")).toEqual(["item", "```\n- code\n```"]);
   });
 
+  it("keeps a heading- or rule-shaped paragraph continuation — indented there, it is text", () => {
+    // Four columns in with no blank line between, CommonMark renders the line as more of the open
+    // paragraph: it can start no block there, so its `##` or `---` is spelling, not scaffolding.
+    // Judging it as a label dropped it outright while the note beside it still showed the line.
+    expect(texts("Expected output:\n    ## literal")).toEqual(["Expected output:", "## literal"]);
+    expect(texts("Fix retry\n    ---")).toEqual(["Fix retry", "---"]);
+    expect(texts("Fix retry\n\t## literal")).toEqual(["Fix retry", "## literal"]);
+    // Its markers shear as they do on the same line under a list item — a pasted bullet is a step.
+    expect(texts("Fix retry\n    - literal")).toEqual(["Fix retry", "literal"]);
+    // The formula's prompt is unwritten wherever it lands, continuation or not.
+    expect(texts("Fix retry\n    TODO — a concrete statement")).toEqual(["Fix retry"]);
+    // A blank line first closes the paragraph, so the same line is the code block it renders as.
+    expect(texts("Expected output:\n\n    ## literal")).toEqual([
+      "Expected output:",
+      "```\n## literal\n```",
+    ]);
+    // A quoted paragraph continues the same way, inside the callout's own columns.
+    expect(texts("> Expected output:\n>     ## literal")).toEqual(["Expected output:", "## literal"]);
+    // But ENTERING a container begins a block there, so the same line quoted under unquoted prose
+    // is the code CommonMark renders — a paragraph is never continued into a container it left.
+    expect(texts("Step\n>     ## literal")).toEqual(["Step", "```\n## literal\n```"]);
+  });
+
   it("shears a rich-text `•` but never treats it as a container — CommonMark reads it as prose", () => {
     // `•` is a paste convenience, sheared off a step's head like a bullet — but CommonMark never
     // opens a list on it, so it must not set an item's content column. `• Expected output:` is a
