@@ -84,10 +84,11 @@ const bead = (id: string, over: Partial<Bead> = {}): Bead =>
   ({ id, title: id, status: "open", issue_type: "task", parent: EPIC, labels: [], ...over }) as Bead;
 
 /** A child closed as superseded by `by` — the `supersedes` edge `bd supersede` writes beside the close. */
-const superseded = (id: string, by: string): Bead =>
+const superseded = (id: string, by: string, over: Partial<Bead> = {}): Bead =>
   bead(id, {
     status: "closed",
     dependencies: [{ issue_id: id, depends_on_id: by, type: "supersedes" }],
+    ...over,
   } as Partial<Bead>);
 
 /** The board as bd answers a fresh `show` — the run's snapshot, unless a case moves a bead on. */
@@ -128,6 +129,8 @@ const prep = (): Extract<RunPreparation, { done: false }> =>
   }) as unknown as Extract<RunPreparation, { done: false }>;
 
 const dispatchedIds = () => runTicketMock.mock.calls.map((c) => c[0].ticket.id);
+/** The bead a dispatch actually received — the snapshot, or the fresh read that replaced it. */
+const dispatchedBead = (id: string) => runTicketMock.mock.calls.find((c) => c[0].ticket.id === id)?.[0].ticket;
 
 /** A contract the run's re-gate accepts, for a child the loop is about to regenerate. */
 const CONTRACT = "## Goal\nShip X.\n\n## Acceptance\nWorks.";
@@ -192,6 +195,48 @@ describe("a ticket the board already holds as superseded", () => {
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-a", "anton-b"]);
     expect(run.retired).toEqual([]);
     expect(markedNotDelivered()).toEqual([]);
+  });
+
+  // The reopen that carries a NEW contract (PR #238 review). An operator who reopens a superseded
+  // ticket usually rewrites what it asks for — that is what the rerun is for — and the run's
+  // snapshot still holds the pre-reopen spec. `readForDispatch` only fills a description the
+  // snapshot LACKS, so handing the loop the snapshot would dispatch the agent against the retired
+  // requirements and close the ticket against them. The fresh bead is what travels on.
+  it("dispatches the bead the fresh read carried, not the snapshot's superseded contract", async () => {
+    const REOPENED = "## Goal\nShip Y instead.\n\n## Acceptance\nY works.";
+    const run = makeRun(
+      [superseded("anton-a", SHIPPER, { description: CONTRACT }), bead("anton-b")],
+      new AbortController().signal,
+    );
+    board = board.map((b) =>
+      b.id === "anton-a" ? ({ ...b, status: "open", description: REOPENED } as Bead) : b,
+    );
+
+    await dispatchRunTickets(run, prep());
+
+    expect(dispatchedIds()).toEqual(["anton-a", "anton-b"]);
+    expect(dispatchedBead("anton-a")?.description).toBe(REOPENED);
+    expect(dispatchedBead("anton-a")?.status).toBe("open");
+  });
+
+  // The reopened ticket escaped steps 0b/0c as `closed` work that would not re-run — and it does
+  // run (PR #238 review). So it owes the same re-gates the cross-machine resume re-applies: a
+  // reopen that stripped the definition of done must park the run, not dispatch an agent whose work
+  // self-review has no rubric to score.
+  it("parks the run when the reopen left the ticket without a definition of done", async () => {
+    const run = makeRun(
+      [superseded("anton-a", SHIPPER, { description: CONTRACT }), bead("anton-b")],
+      new AbortController().signal,
+    );
+    (run.target as Bead).description = CONTRACT;
+    board = board.map((b) =>
+      b.id === "anton-a" ? ({ ...b, status: "open", description: "## Goal\nShip Y." } as Bead) : b,
+    );
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /has beads that don't meet the bead contract[\s\S]*anton-a/,
+    );
+    expect(dispatchedIds()).toEqual([]);
   });
 
   // A reopen on a shared-server board can also REHOME the ticket onto another run's target
@@ -322,6 +367,10 @@ describe("a ticket the board already holds as superseded", () => {
     expect(run.retired).toEqual([]);
     expect(dispatchedIds()).toEqual(["anton-a", "anton-b"]);
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-a", "anton-b"]);
+    // The bead handed on is the post-marker read MINUS the marker the withdraw took off the board:
+    // carried forward, the claim bookend would `mustPersist` an untag for a label already gone and
+    // park the run on a race that is already settled.
+    expect(dispatchedBead("anton-a")?.labels).not.toContain(LABELS.notDelivered);
   });
 
   it("keeps the retirement, unwithdrawn, when the post-write read still finds it superseded", async () => {
