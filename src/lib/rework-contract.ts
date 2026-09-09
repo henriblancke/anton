@@ -485,7 +485,8 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     }
     if (literal[at]) {
       openParagraph = undefined;
-      at = flushCommentedSample(lines, literal, at, out) - 1;
+      const prefix = containerPrefix(line.text, items);
+      at = flushCommentedSample(lines, literal, at, out, [], prefix) - 1;
       continue;
     }
     // A line indented less than the innermost item's content leaves it — unless it is the lazy
@@ -563,11 +564,11 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     // The sample of a closed comment can begin on the OPENER line, which is not itself `commented`
     // and so was filed whole: `<!-- if ok:` / `    retry()` / `-->` emitted the opener as its own
     // checkbox and dedented `retry()` alone, losing the nesting the note keeps.
-    const carried = openedSample(line, literal[at + 1] === true);
+    const carried = openedSample(content, peelVisible(line.visible, peeled.prefix), literal[at + 1] === true);
     if (carried !== undefined) {
       openParagraph = undefined;
-      out.push({ text: line.text.slice(0, carried.at).trim(), fenced: false });
-      at = flushCommentedSample(lines, literal, at + 1, out, [carried.first]) - 1;
+      out.push({ text: content.slice(0, carried.at).trim(), fenced: false });
+      at = flushCommentedSample(lines, literal, at + 1, out, [carried.first], peeled.prefix) - 1;
       continue;
     }
     openParagraph = paragraph ? peeled.prefix : undefined;
@@ -631,14 +632,18 @@ function flushCommentedSample(
   at: number,
   out: InstructionCriterion[],
   opening: string[] = [],
+  prefix: Prefix = [0],
 ): number {
   let end = at;
   while (end < lines.length && literal[end]) end += 1;
   let sample: string[] = [...opening];
   // Whether the comment holding this run was opened by a delimiter-only line — the line above the
   // run, which begins outside the comment and so is never itself `literal`. A chained closer can
-  // reopen one, so it is re-judged on every closing line below.
-  let openedBlock = lines[at - 1]?.visible.trim() === "";
+  // reopen one, so it is re-judged on every closing line below. Judged past the containers too:
+  // inside `- <!-- if ok:` the bullet is not prose the opener carries.
+  const above = lines[at - 1];
+  let openedBlock =
+    above !== undefined && peelVisible(above.visible, prefix).trim() === "";
   const flushSample = () => {
     const indents = sample.filter((line) => line.trim() !== "").map((line) => indentColumns(line));
     if (indents.length > 0) {
@@ -649,7 +654,10 @@ function flushCommentedSample(
     sample = [];
   };
   for (let next = at; next < end; next += 1) {
-    const line = lines[next]!.text;
+    // The sample's lines carry their containers' markers, which are not part of the example: a
+    // blockquoted `>     retry()` dedents to the code the note renders, while keeping the `>` left
+    // the common-indent pass at zero and refenced a quoted Markdown fragment instead.
+    const line = peelPrefix(lines[next]!.text, prefix) ?? lines[next]!.text;
     const closes = line.indexOf(COMMENT_CLOSE);
     if (closes === -1) {
       sample.push(line);
@@ -673,13 +681,13 @@ function flushCommentedSample(
     flushSample();
     // A chained line can carry the NEXT sample's first line too: `-->  <!-- if ok:` is a closer, an
     // opener, and the start of a second example. What files is the delimiters; the tail is sample.
-    const opened = openedSample(lines[next]!, literal[next + 1] === true);
+    const opened = openedSample(line, peelVisible(lines[next]!.visible, prefix), literal[next + 1] === true);
     const from = carried ? closes : 0;
     out.push({ text: line.slice(from, opened?.at ?? line.length).trim(), fenced: false });
     if (opened) sample.push(opened.first);
     // A chained `--> <!--` reopens on the line it closed: the next run is a block exactly when this
     // line renders as nothing but its delimiters.
-    openedBlock = lines[next]!.visible.trim() === "";
+    openedBlock = peelVisible(lines[next]!.visible, prefix).trim() === "";
   }
   flushSample();
   return end;
@@ -706,14 +714,51 @@ function flushCommentedSample(
  * ({@link unquoteOne}), so `<!-- if ok:` dedents to the block the opener-on-its-own-line form files
  * rather than one column shallower.
  */
-function openedSample(line: ScannedLine, continues: boolean): { at: number; first: string } | undefined {
-  if (!continues || line.visible.trim() !== "") return undefined;
-  const opens = line.text.lastIndexOf(COMMENT_OPEN);
+function openedSample(text: string, visible: string, continues: boolean): { at: number; first: string } | undefined {
+  if (!continues || visible.trim() !== "") return undefined;
+  const opens = text.lastIndexOf(COMMENT_OPEN);
   if (opens === -1) return undefined;
   const at = opens + COMMENT_OPEN.length;
-  const tail = line.text.slice(at);
+  const tail = text.slice(at);
   if (tail.trim() === "") return undefined;
   return { at, first: /^[ \t]/.test(tail) ? tail.slice(1) : tail };
+}
+
+/**
+ * The `visible` render of a line past the containers `prefix` names, or as it stands when it carries
+ * none of them. A container marker is not prose the line says: inside `- <!-- if ok:` the bullet is
+ * the item that holds the comment, and judging the unpeeled `- ` as text refused the carried sample
+ * and filed the opener as a criterion of its own. A markdown renderer strips the comment from
+ * `visible` but leaves the markers, so they come off here — a `>` bearing the same one space
+ * CommonMark grants it ({@link peelPrefix}).
+ *
+ * A line that OPENS its container carries the markers themselves rather than the columns they
+ * establish, so the column prefix cannot peel them: `- <!-- if ok:` renders as `- `, not as
+ * nothing, and the carried sample was refused while the opener filed as a criterion of its own.
+ * Those come off by the same left-to-right walk the content took ({@link peelContainers}).
+ */
+function peelVisible(visible: string, prefix: Prefix): string {
+  return peelPrefix(visible, prefix) ?? peelContainers(visible, 0).text;
+}
+
+/**
+ * The containers the innermost open list item names, for a line inside a closed comment. Such a line
+ * is literal, so it never reaches the container peel every ordinary line goes through
+ * ({@link peelContainers}) — but its markers are still not part of the example, and it can carry the
+ * `>` of a callout the scanner tracks no more than the caller's `items` stack does. The item columns
+ * are what the stack holds; a quoted comment's marker is peeled from the run's own lines
+ * ({@link flushCommentedSample}), whose prefix this seeds.
+ */
+function containerPrefix(text: string, items: readonly number[]): Prefix {
+  const base = items[items.length - 1] ?? 0;
+  const indent = indentColumns(text);
+  const prefix: Prefix = [indent >= base ? base : 0];
+  let rest = dedent(text, prefix[0] as number);
+  while (QUOTE_STEP.test(rest)) {
+    rest = unquoteOne(rest.slice(QUOTE_STEP.exec(rest)![0].length));
+    prefix.push(">", 0);
+  }
+  return prefix;
 }
 
 /**

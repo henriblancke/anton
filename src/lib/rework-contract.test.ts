@@ -822,6 +822,53 @@ describe("instructionCriteria", () => {
     ]);
   });
 
+  it("peels a commented sample's container markers — a quoted or listed example is not a quoted fragment", () => {
+    // The sample's lines carry the markers of the container holding the comment, which are not part
+    // of the example. Keeping them left the common-indent pass at zero and refenced `> if ok:` /
+    // `>     retry()` verbatim, so the Acceptance recorded a Markdown fragment while the note showed
+    // an indentation-sensitive sample.
+    expect(texts("> <!--\n> if ok:\n>     retry()\n> -->")).toEqual([
+      "<!--",
+      "```\nif ok:\n    retry()\n```",
+      "-->",
+    ]);
+    expect(texts(">> <!--\n>> if ok:\n>>     retry()\n>> -->")).toEqual([
+      "<!--",
+      "```\nif ok:\n    retry()\n```",
+      "-->",
+    ]);
+    expect(texts("- <!--\n  if ok:\n      retry()\n  -->")).toEqual([
+      "<!--",
+      "```\nif ok:\n    retry()\n```",
+      "-->",
+    ]);
+    // A closer carrying the sample's last line reads the same inside a container.
+    expect(texts("> <!--\n> if ok:\n>     retry() -->")).toEqual([
+      "<!--",
+      "```\nif ok:\n    retry()\n```",
+      "-->",
+    ]);
+    // An OPENER carrying the sample's first line is judged on its peeled render: `- <!-- if ok:`
+    // renders as `- `, not as nothing, so the carried line was refused and the opener filed as a
+    // criterion of its own with `retry()` dedented alone beside it.
+    expect(texts("- <!-- if ok:\n      retry()\n  -->")).toEqual([
+      "<!--",
+      "```\nif ok:\n    retry()\n```",
+      "-->",
+    ]);
+    expect(texts("> <!-- if ok:\n>     retry()\n> -->")).toEqual([
+      "<!--",
+      "```\nif ok:\n    retry()\n```",
+      "-->",
+    ]);
+    // A container line with prose of its own is still the sentence it was typed as.
+    expect(texts("> see <!-- start\n>   - [ ] TODO — kept\n> --> tail")).toEqual([
+      "see <!-- start",
+      "```\n- [ ] TODO — kept\n```",
+      "--> tail",
+    ]);
+  });
+
   it("still shears the lines after an unclosed `<!--` — a stray opener leaves ordinary steps behind it", () => {
     expect(texts("Handle an unmatched <!-- in the parser.\n- then this\n## Backend\n- and that")).toEqual([
       "Handle an unmatched <!-- in the parser.",
