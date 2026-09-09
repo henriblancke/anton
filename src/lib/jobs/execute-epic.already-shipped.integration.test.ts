@@ -21,7 +21,7 @@
  * settle epic children in ways the shared fixture's own assertions would collide with.
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beads } from "../beads/bd";
 import { parseTicketNotes } from "../beads/notes";
@@ -245,6 +245,66 @@ process.exit(0);`),
       expect(indexBoard(board).recordsSupersedes(shipped, shipper)).toBe(true);
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  // A STANDALONE target the run retired itself is FINISHED, not parked (PR #238 review). Every
+  // remedy the epic-level park asks for is already done: the target is closed as superseded with
+  // anton's evidence on it, nothing was committed, so there is no PR to open and no ticket left to
+  // run. Parked, the row settles FAILED and the runner parks the job permanently — a successfully
+  // retired target represented as a stuck execution, and one that counts against the breaker.
+  it("finishes the run as DONE when the only ticket is a standalone target it retired", async () => {
+    const shipper = await seedShipper("The bead that shipped the standalone one");
+    const standalone = await beads.create(repo, {
+      title: "Standalone already-shipped target",
+      type: "bug",
+      acceptance: "the fix is in the tree",
+      description: "## Goal\nFix it.",
+    });
+    await beads.approve(repo, standalone);
+    const runner = makeEpicRunner(ctx);
+    const prevClaude = process.env.ANTON_CLAUDE_BIN;
+    const prevGh = process.env.ANTON_GH_BIN;
+    process.env.ANTON_CLAUDE_BIN = shippedClaude(
+      "claude-shipped-standalone",
+      standalone,
+      `Already implemented by ${shipper}`,
+    );
+    // Any `gh pr create` here would be the bug: nothing was committed, so the run must reach its
+    // finish without ever opening a pull request.
+    const prCalls = join(sandbox, "standalone-pr-calls.txt");
+    process.env.ANTON_GH_BIN = writeBin(
+      binDir,
+      "gh-standalone-retired",
+      `const fs=require('fs');const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){console.log('[]');process.exit(0);}
+fs.appendFileSync(${JSON.stringify(prCalls)},a.join(' ')+'\\n');
+console.log('https://github.com/acme/repo/pull/99');process.exit(0);`,
+    );
+    try {
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: standalone });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      // The job and its run are DONE, not parked: nothing is left for a person to decide.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      const runRow = (await tdb.db.select().from(schema.runs)).find(
+        (r) => r.epicBeadId === standalone,
+      )!;
+      expect(runRow.status).toBe("done");
+      expect(existsSync(prCalls)).toBe(false); // no pull request on an empty diff
+
+      // The retirement itself is real: closed as superseded, pointing at the survivor.
+      const retired = await beads.show(repo, standalone);
+      expect(retired.status).toBe("closed");
+      const board = await beads.list(repo, ["--status", "all"]);
+      expect(indexBoard(board).recordsSupersedes(standalone, shipper)).toBe(true);
+
+      // …and the row still says what happened, worded for a run that opened no PR.
+      expect(runRow.error).toContain("had already shipped");
+      expect(runRow.error).toContain("opened no pull request");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prevClaude;
+      process.env.ANTON_GH_BIN = prevGh;
     }
   });
 

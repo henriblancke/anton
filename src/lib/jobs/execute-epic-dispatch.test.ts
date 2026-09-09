@@ -94,7 +94,7 @@ const superseded = (id: string, by: string, over: Partial<Bead> = {}): Bead =>
 /** The board as bd answers a fresh `show` — the run's snapshot, unless a case moves a bead on. */
 let board: Bead[] = [];
 
-function makeRun(tickets: Bead[], signal: AbortSignal): EpicRun {
+function makeRun(tickets: Bead[], signal: AbortSignal, over: Partial<EpicRun> = {}): EpicRun {
   const target = bead(EPIC, { issue_type: "epic", status: "in_progress", parent: undefined });
   board = [target, ...tickets];
   return {
@@ -116,7 +116,23 @@ function makeRun(tickets: Bead[], signal: AbortSignal): EpicRun {
     operator: "op-1",
     ticketTimeoutMs: Infinity,
     childCascade: null,
+    ...over,
   } as unknown as EpicRun;
+}
+
+/**
+ * A standalone run: the target IS its own only ticket (`beads.groupsChildren` reads a childless
+ * target that way), so retiring it retires the whole run.
+ */
+function makeStandaloneRun(target: Bead, signal: AbortSignal): EpicRun {
+  const run = makeRun([target], signal, {
+    standaloneRun: true,
+    target,
+    tickets: [target],
+    all: [target, bead(SHIPPER, { status: "closed", parent: undefined })],
+  });
+  board = [target, bead(SHIPPER, { status: "closed", parent: undefined })];
+  return run;
 }
 
 const prep = (): Extract<RunPreparation, { done: false }> =>
@@ -441,6 +457,36 @@ describe("a ticket the board already holds as superseded", () => {
     expect(run.retired).toEqual([]);
   }, 10_000);
 
+  // The post-marker live exit owes the SAME ownership fence as the pre-marker one (PR #238 review):
+  // it hands the loop a ticket to dispatch, and a reopen in the marker window can rehome the bead
+  // onto another run's target just as easily. Unfenced, `runTicket` would claim it by id and execute
+  // work that now belongs elsewhere.
+  it("stops the run when the ticket is reopened AND rehomed in the marker window", async () => {
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    tagMock.mockImplementation(async (_repo: string, id: string, labels: string[]) => {
+      if (id === "anton-a" && labels.includes(LABELS.notDelivered)) {
+        board = [
+          ...board.map((b) =>
+            b.id === "anton-a"
+              ? ({ ...b, status: "open", parent: OTHER_EPIC, labels: [LABELS.notDelivered] } as Bead)
+              : b,
+          ),
+          bead(OTHER_EPIC, { issue_type: "epic", parent: undefined }),
+        ];
+      }
+      return "";
+    });
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      new RegExp(`anton-a was superseded on the board this run read but has since been reopened and now runs under ${OTHER_EPIC}`),
+    );
+    // The marker comes off FIRST: the bead is another target's live work now, and a `not-delivered`
+    // label left on it would be read by whichever run delivers it as work that run did not do.
+    expect(untagMock).toHaveBeenCalledWith("/tmp/anton-repo", "anton-a", [LABELS.notDelivered]);
+    expect(dispatchedIds()).toEqual([]);
+    expect(run.retired).toEqual([]);
+  }, 10_000);
+
   // A child that committed and closed on an earlier attempt, then was superseded by hand before the
   // retry (PR #238 review): its commit is in this branch's diff, so the PR body has to list it and
   // the retirement notice must not claim the PR leaves it out.
@@ -681,6 +727,42 @@ describe("a run left with nothing live", () => {
 
     expect(message).toContain("been abandoned");
     expect(message).toContain("already settled as superseded on the board");
+  });
+});
+
+// A STANDALONE target the run retired itself is FINISHED, not parked (PR #238 review): the target
+// IS the retired ticket, closed as superseded with anton's evidence on it, so there is no PR to
+// open, no ticket left to run and nothing for a person to decide. Parked, the row settles FAILED
+// and the runner parks the job permanently — a successfully retired target represented as a stuck
+// execution.
+describe("a standalone target this run retired as already shipped", () => {
+  const standaloneTarget = () =>
+    bead(EPIC, { issue_type: "task", status: "in_progress", parent: undefined });
+
+  it("answers a terminal run rather than parking", async () => {
+    const run = makeStandaloneRun(standaloneTarget(), new AbortController().signal);
+    runTicketMock.mockImplementation(async () => {
+      throw new TicketRetiredError(EPIC, SHIPPER, `retired ${EPIC} as superseded by ${SHIPPER}`);
+    });
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(outcome.targetRetired).toBe(true);
+    expect(outcome.delivered).toEqual([]);
+    expect(run.retired).toEqual([{ id: EPIC, replacedBy: SHIPPER, source: "this-run" }]);
+  });
+
+  // An EPIC whose every dispatchable ticket was retired still parks: the epic itself is open with
+  // no work left in it, and only a person decides whether it is now empty or still wants work.
+  it("still parks the epic whose children were all retired", async () => {
+    const run = makeRun([bead("anton-a")], new AbortController().signal);
+    runTicketMock.mockImplementation(async () => {
+      throw new TicketRetiredError("anton-a", SHIPPER, "retired anton-a as superseded");
+    });
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      new RegExp(`every ticket under ${EPIC} that this run could dispatch was retired rather than run`),
+    );
   });
 });
 

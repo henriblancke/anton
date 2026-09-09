@@ -60,6 +60,14 @@ export interface DispatchOutcome {
   satisfied: Map<string, SatisfiedSettlement>;
   /** Tickets this run never dispatched, and the timeout each is waiting behind. */
   skipped: Map<string, SkipCause>;
+  /**
+   * The run's ONLY ticket was its standalone target, and THIS attempt verified and retired it as
+   * already shipped (PR #238 review). There is nothing to review, no pull request to open, and
+   * nothing left for a person to decide — the target is already closed as superseded with anton's
+   * evidence on the bead — so the run phase finishes the run as a delivered-nothing SUCCESS rather
+   * than parking a job on work the board has settled.
+   */
+  targetRetired: boolean;
 }
 
 /** What the loop learns as it goes, and what the tail and the delivery verdict then read. */
@@ -162,8 +170,10 @@ export async function dispatchRunTickets(
   // verdict below.
   const stoppedShort = stoppedShortIds(run.timedOut);
   await settleHeldTail(run, prep, { held, dispatchable, ledger, stoppedShort, recordSkipped });
+  const verdict = await deliveredOrPark(run, prep, live, ledger, stoppedShort);
   return {
-    delivered: await deliveredOrPark(run, prep, live, ledger, stoppedShort),
+    delivered: verdict.delivered,
+    targetRetired: verdict.targetRetired,
     satisfied: ledger.satisfied,
     skipped: ledger.skipped,
   };
@@ -462,30 +472,7 @@ async function retireFound(run: EpicRun, ticket: Bead): Promise<FoundRetirement>
       // ticket's RUN TARGET is still this run's; a bead rehomed since stops the run rather than
       // execute another target's ticket.
       //
-      // The run target is the ticket's first run-target ANCESTOR, not its direct parent (PR #238
-      // review): under feature → task → subtask, a reparent of the intermediate task moves the
-      // subtask's owner while leaving `parentOf(subtask)` untouched, so a direct-parent compare would
-      // wave the stale snapshot through onto a target that no longer owns it. Recompute the owner from
-      // a FRESH full board — the only read that carries the ancestry above `live` — and an unreadable
-      // board stops the run rather than guess, exactly as the superseded reread does above.
-      const board = await mustReadBoard(repo);
-      if (!board) {
-        throw new PoisonEpic(
-          `${ticket.id} was superseded on the board this run read and has since been reopened, but ` +
-            `bd would not read the board back, so anton cannot recompute which run target now owns ` +
-            `it — the run stopped rather than dispatch a ticket that may belong to a different ` +
-            `target. Check the beads DB, then resume the run`,
-        );
-      }
-      const owner = runTargetAbove(board, live.id);
-      if (owner?.id !== run.targetId) {
-        throw new PoisonEpic(
-          `${ticket.id} was superseded on the board this run read but has since been reopened and ` +
-            `now runs under ${owner?.id ?? "no run target"} rather than this run's ${run.targetId} ` +
-            `— the run stopped rather than dispatch a ticket that now belongs to a different run ` +
-            `target. Check the beads DB, then resume the run`,
-        );
-      }
+      await assertRunTargetStillOwns(run, live);
       // The FRESH bead, not the snapshot (PR #238 review). A reopen usually rewrites the contract
       // the rerun exists to satisfy, and the snapshot still holds the pre-reopen one — dispatched
       // on it, the agent works to superseded requirements and the ticket closes against them.
@@ -523,6 +510,15 @@ async function retireFound(run: EpicRun, ticket: Bead): Promise<FoundRetirement>
       return { retired: { id: ticket.id, replacedBy, source: "pre-existing" } };
     }
     await withdrawRetiredMarker(run, ticket.id);
+    // Live again, so it owes the SAME ownership fence the pre-marker live path pays (PR #238
+    // review): this exit hands the loop a ticket to dispatch just as that one does, and a reopen on
+    // a shared-server board can rehome the bead onto another run's target in this window as easily
+    // as in the earlier one. Unfenced, `regateReopened` would only recompute readiness and
+    // `runTicket` would claim by id and execute work that now belongs elsewhere. Asked AFTER the
+    // withdraw so a bead that did move is handed back unmarked either way — a `not-delivered` label
+    // left on another target's live ticket is read by whichever run delivers it as work that run did
+    // not do.
+    await assertRunTargetStillOwns(run, marked);
     // Live again on the post-marker read, so the same rule applies: `marked` IS that read, so it is
     // the bead the loop dispatches — the snapshot's contract predates the reopen. Minus the marker
     // the withdraw above just took OFF the board: `marked` was read before it, and a bead handed on
@@ -531,6 +527,39 @@ async function retireFound(run: EpicRun, ticket: Bead): Promise<FoundRetirement>
     // already been settled.
     return { live: { ...marked, labels: (marked.labels ?? []).filter((l) => l !== LABELS.notDelivered) } };
   });
+}
+
+/**
+ * Refuse to hand a reopened retirement back to the loop unless THIS run's target still owns it
+ * (PR #238 review) — the fence both of {@link retireFound}'s live exits pay, so neither can dispatch
+ * a ticket a rehome moved onto another run.
+ *
+ * The run target is the ticket's first run-target ANCESTOR, not its direct parent: under
+ * feature → task → subtask, a reparent of the intermediate task moves the subtask's owner while
+ * leaving `parentOf(subtask)` untouched, so a direct-parent compare would wave the ticket through
+ * onto a target that no longer owns it. Recompute the owner from a FRESH full board — the only read
+ * that carries the ancestry above the bead — and an unreadable board stops the run rather than
+ * guess, exactly as the superseded reread does.
+ */
+async function assertRunTargetStillOwns(run: EpicRun, live: Bead): Promise<void> {
+  const board = await mustReadBoard(run.repo);
+  if (!board) {
+    throw new PoisonEpic(
+      `${live.id} was superseded on the board this run read and has since been reopened, but ` +
+        `bd would not read the board back, so anton cannot recompute which run target now owns ` +
+        `it — the run stopped rather than dispatch a ticket that may belong to a different ` +
+        `target. Check the beads DB, then resume the run`,
+    );
+  }
+  const owner = runTargetAbove(board, live.id);
+  if (owner?.id !== run.targetId) {
+    throw new PoisonEpic(
+      `${live.id} was superseded on the board this run read but has since been reopened and ` +
+        `now runs under ${owner?.id ?? "no run target"} rather than this run's ${run.targetId} ` +
+        `— the run stopped rather than dispatch a ticket that now belongs to a different run ` +
+        `target. Check the beads DB, then resume the run`,
+    );
+  }
 }
 
 /**
@@ -1056,7 +1085,7 @@ async function deliveredOrPark(
   live: Bead[],
   ledger: DispatchLedger,
   stoppedShort: Set<string>,
-): Promise<Bead[]> {
+): Promise<{ delivered: Bead[]; targetRetired: boolean }> {
   const { targetId: epicBeadId, timedOut } = run;
   const { skipped } = ledger;
   const { worktree } = prep;
@@ -1121,18 +1150,24 @@ async function deliveredOrPark(
   // verified and retired itself, and "anton verified that" is only true of the second half.
   const notRetired = live.filter((t) => !retired.has(t.id));
   if (delivered.length === 0 && run.retired.length > 0 && notRetired.length === 0) {
-    const { verified, found } = byProvenance(run.retired);
+    const { found } = byProvenance(run.retired);
+    // A STANDALONE target this attempt verified and retired itself is FINISHED, not parked
+    // (PR #238 review). The park below asks a person to close the target by hand or give it work —
+    // both already answered here: the target IS the retired ticket, closed as superseded with
+    // anton's evidence on it, so there is no PR to open, no ticket left to run and no decision
+    // left to make. Parked, `settleRunRow` writes the run FAILED and the runner parks the job
+    // permanently, which represents a successfully retired target as a stuck execution and counts
+    // against the consecutive-failure breaker. The run phase finishes it as done instead.
+    // Only when every retirement on the ledger is THIS run's: a supersede anton merely FOUND is
+    // somebody else's decision, and settling the run on it would claim a verification anton never
+    // performed.
+    if (run.standaloneRun && found.length === 0) return { delivered, targetRetired: true };
     throw new PoisonEpic(
-      run.standaloneRun && found.length === 0
-        ? `${epicBeadId} had ALREADY SHIPPED (${retirements(verified)}) — anton verified that ` +
-          `against the repository and the board and closed it as superseded, with the evidence on ` +
-          `the bead. Nothing was committed here, so there is no pull request to open and nothing ` +
-          `is left to run; read the bead if you want to check what anton checked`
-        : `every ticket under ${epicBeadId} that this run could dispatch was retired rather than ` +
-          `run: ${retirementClauses(run.retired).join("; ")} — each is closed on the board, ` +
-          `pointing at what it is superseded by, and nothing was committed here, so there is no ` +
-          `pull request to open. Close ${epicBeadId} by hand to settle it, or give it work that ` +
-          `has not landed yet and resume the run`,
+      `every ticket under ${epicBeadId} that this run could dispatch was retired rather than ` +
+        `run: ${retirementClauses(run.retired).join("; ")} — each is closed on the board, ` +
+        `pointing at what it is superseded by, and nothing was committed here, so there is no ` +
+        `pull request to open. Close ${epicBeadId} by hand to settle it, or give it work that ` +
+        `has not landed yet and resume the run`,
     );
   }
 
@@ -1167,7 +1202,7 @@ async function deliveredOrPark(
         `by hand to settle it, or give it a ticket an agent can deliver and resume the run`,
     );
   }
-  return delivered;
+  return { delivered, targetRetired: false };
 }
 
 /**

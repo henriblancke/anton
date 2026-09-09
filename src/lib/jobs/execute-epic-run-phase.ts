@@ -29,7 +29,12 @@ export async function walkRunPhase(
   dispatched: DispatchOutcome,
 ): Promise<void> {
   const carry: RunPhaseCarry = { advisories: [], staleBodyFallback: null };
-  for (const { step: cooked, definition } of prep.runSteps) {
+  // A standalone target THIS attempt verified and retired as already shipped has nothing for these
+  // steps to speak for (PR #238 review): the bead is closed as superseded with anton's evidence on
+  // it, and no commit is on the branch — so there is no diff to review and no pull request to open
+  // (`gh pr create` would fail on an empty diff). Skip to the finish, which settles the row as done
+  // rather than parking a run on a target the board has already settled.
+  for (const { step: cooked, definition } of dispatched.targetRetired ? [] : prep.runSteps) {
     // A step boundary is a lease checkpoint: never dispatch run-level work — and never open a
     // PR — under a lease this run can no longer prove it holds.
     run.lease.assertHeld();
@@ -54,7 +59,7 @@ export async function walkRunPhase(
     }
     await runOtherStep(run, dispatch);
   }
-  await finishRun(run, prep, dispatched.skipped, carry);
+  await finishRun(run, prep, dispatched.skipped, carry, dispatched.targetRetired);
 }
 
 /** Open the run's ONE pull request, stamp the ref, and move the target into review. */
@@ -133,6 +138,8 @@ async function finishRun(
   prep: Extract<RunPreparation, { done: false }>,
   skipped: Map<string, SkipCause>,
   carry: RunPhaseCarry,
+  /** The run opened no pull request: its standalone target was retired as already shipped. */
+  targetRetired: boolean,
 ): Promise<void> {
   const { db, clock, ctx, projectId, repo, runId, targetId: epicBeadId, timedOut, retired } = run;
   const { worktree } = prep;
@@ -174,7 +181,13 @@ async function finishRun(
             `this run read it: ${names(preExisting)}. anton did not verify those; each bead ` +
             `carries the record of whoever did.`
           : null,
-        `None of them is in this PR.`,
+        // Worded for the run that actually happened (PR #238 review): a retired STANDALONE target
+        // left nothing on the branch, so no pull request was opened at all, and "None of them is in
+        // this PR" would point the founder at one that does not exist.
+        targetRetired
+          ? `Nothing was committed here, so this run opened no pull request and nothing is left ` +
+            `to run.`
+          : `None of them is in this PR.`,
       ]
         .filter(Boolean)
         .join(" ")
