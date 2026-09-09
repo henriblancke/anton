@@ -17,6 +17,7 @@ import type {
   DiscoveredAgent,
   EditableSettings,
   FormulaVariant,
+  ModelRouteRow,
 } from "@/components/settings/settings-types";
 
 /** A row identified by a stable local id — what the ordered lists (variants, value labels) hold. */
@@ -40,6 +41,13 @@ export interface SettingsForm {
     add: () => void;
     patch: (id: string, patch: Partial<FormulaVariant>) => void;
     /** Move a mapping one place — the list's order is the precedence an operator tunes. */
+    move: (id: string, delta: -1 | 1) => void;
+    remove: (id: string) => void;
+  };
+  modelRoutes: {
+    add: () => void;
+    patch: (id: string, patch: Partial<Omit<ModelRouteRow, "id">>) => void;
+    /** Move a rule one place — the list's order is the evaluation order an operator tunes. */
     move: (id: string, delta: -1 | 1) => void;
     remove: (id: string) => void;
   };
@@ -110,7 +118,9 @@ export function useSettingsForm({
   const [saving, setSaving] = useState(false);
   // Local row ids only — never persisted, and never reused, so a React key is stable for the life
   // of the row it was minted for.
-  const nextRowId = useRef(draft.variantRows.length + draft.valueLabelRows.length);
+  const nextRowId = useRef(
+    draft.variantRows.length + draft.modelRouteRows.length + draft.valueLabelRows.length,
+  );
   // The tail of this page's settings PATCHes and how many are still open — together they run one at
   // a time without deferring a lone write (see {@link patchSettings}).
   const writes = useRef<Promise<void>>(Promise.resolve());
@@ -120,7 +130,7 @@ export function useSettingsForm({
     setDraft((prev) => ({ ...prev, [key]: value }));
   }
 
-  function updateRows<K extends "variantRows" | "valueLabelRows">(
+  function updateRows<K extends "variantRows" | "modelRouteRows" | "valueLabelRows">(
     key: K,
     fn: (rows: SettingsDraft[K]) => SettingsDraft[K],
   ) {
@@ -198,6 +208,19 @@ export function useSettingsForm({
         ),
       move: (id, delta) => updateRows("variantRows", (rows) => moved(rows, id, delta)),
       remove: (id) => updateRows("variantRows", (rows) => rows.filter((r) => r.id !== id)),
+    },
+    modelRoutes: {
+      add: () =>
+        updateRows("modelRouteRows", (rows) => [
+          ...rows,
+          { id: `new-${nextRowId.current++}`, jobType: "", step: "", label: "", model: "" },
+        ]),
+      patch: (id, patch) =>
+        updateRows("modelRouteRows", (rows) =>
+          rows.map((r) => (r.id === id ? { ...r, ...patch } : r)),
+        ),
+      move: (id, delta) => updateRows("modelRouteRows", (rows) => moved(rows, id, delta)),
+      remove: (id) => updateRows("modelRouteRows", (rows) => rows.filter((r) => r.id !== id)),
     },
     valueLabels: {
       add: () =>

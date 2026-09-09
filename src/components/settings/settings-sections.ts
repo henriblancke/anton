@@ -35,6 +35,14 @@ export const SECTIONS = [
     group: "While a run works",
     dirtyKeys: ["formulaVariants"],
   },
+  // After the pipeline it routes over: a step is only meaningful once an operator knows what the
+  // steps are, and both answer "let the work itself decide" over the same units.
+  {
+    id: "model-routing",
+    label: "Model routing",
+    group: "While a run works",
+    dirtyKeys: ["modelRoutes"],
+  },
   {
     id: "execution",
     label: "Concurrency & limits",

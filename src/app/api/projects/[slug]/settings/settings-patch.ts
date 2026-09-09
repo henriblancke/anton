@@ -26,6 +26,7 @@ import {
   REVIEW_FIX_CONCURRENCY_RANGE,
   budgetPolicySchema,
   formulaVariantsSchema,
+  modelRoutesSchema,
   pickerAutonomySchema,
   pickerPolicySchema,
   proposalAutonomySchema,
@@ -190,6 +191,13 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
       schemaValue(formulaVariantsSchema, messageDetail("invalid entry"), {
         clearOnEmptyArray: true,
       }),
+    ),
+    // The model routing table (anton-uu7r). Replaced wholesale and cleared on `[]`, like the
+    // variants above: the list's ORDER is its precedence, so a merge would make reordering — or
+    // dropping a rule — silently impossible.
+    settingsField(
+      "modelRoutes",
+      schemaValue(modelRoutesSchema, pathDetail, { clearOnEmptyArray: true }),
     ),
     settingsField("runHealth", schemaValue(runHealthThresholdsSchema, messageDetail("out of range"))),
     settingsField("scanSeverity", schemaValue(scanSeverityPolicySchema, pathDetail)),

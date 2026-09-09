@@ -23,6 +23,27 @@ export interface VariantRow extends FormulaVariant {
 }
 
 /**
+ * One model routing rule (anton-uu7r), mirrored from the server's ModelRoute. Every matcher is
+ * optional and they AND together; `""` is how the form spells "this rule does not ask".
+ */
+export interface ModelRoute {
+  jobType?: string;
+  step?: string;
+  label?: string;
+  model: string;
+}
+
+/** A routing rule being edited. Matchers are held as `""` rather than absent — a select has a
+ *  value — and the save drops the empty ones. */
+export interface ModelRouteRow {
+  id: string;
+  jobType: string;
+  step: string;
+  label: string;
+  model: string;
+}
+
+/**
  * A `ns:` group of the labels this project's board actually uses (anton-prng), mirrored from the
  * server's LabelNamespace. `namespace` is `""` for bare labels like `approved`.
  */
@@ -63,6 +84,9 @@ export interface EditableSettings {
   buildCommand?: string;
   /** Per-label pipeline variants (anton-aa3m), in precedence order — first matching label wins. */
   formulaVariants?: FormulaVariant[];
+  /** The model routing table (anton-uu7r), in evaluation order — first match wins, `model` is the
+   *  fallback. Absent/empty = every job runs on `model`. */
+  modelRoutes?: ModelRoute[];
   concurrency?: number;
   /** Max concurrent per-PR review fixes (anton-kwi6); absent = DEFAULT_REVIEW_FIX_CONCURRENCY. */
   reviewFixConcurrency?: number;
