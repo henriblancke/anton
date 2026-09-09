@@ -83,6 +83,16 @@ export function httpUrl(max: number): FieldParser<string> {
           `and keep the token in the auth-token env var`,
       );
     }
+    // A token also hides as a hostname label (`https://sk-secret.gateway.example/v1`): empty
+    // userinfo, no query, no path segment carries it, so only a scan of the host labels themselves
+    // keeps the no-secret-in-database guarantee. Same detector as the path — shape only, so a
+    // legitimate subdomain (`api`, `eu`) rides through.
+    if (parsed.hostname.split(".").some((label) => hasCredentialMarker(label))) {
+      return reject(
+        `${key} must not embed a credential in its hostname — paste the base URL without the token, ` +
+          `and keep it in the auth-token env var`,
+      );
+    }
     // A query or fragment is the other place a secret hides in a URL (`?api_key=…`, `#token=…`);
     // a gateway BASE URL has no use for either, so forbid both outright rather than sniff for
     // credential-shaped params — same guarantee, no persisted secret.

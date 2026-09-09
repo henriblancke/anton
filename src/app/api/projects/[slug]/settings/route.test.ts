@@ -418,6 +418,21 @@ describe("settings route — Claude gateway routing (anton-n16m)", () => {
     expect("claudeBaseUrl" in persisted()).toBe(false);
   });
 
+  it("PATCH rejects a base URL embedding a credential in its hostname — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://sk-secret.gateway.example/v1",
+      "https://ghp_0123456789abcdef.gateway.example/v1",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
   it("PATCH accepts a versioned base-URL path — a token-free path is not a credential", async () => {
     const res = await PATCH(
       patchReq({
