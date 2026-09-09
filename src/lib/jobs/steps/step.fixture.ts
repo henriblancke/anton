@@ -88,6 +88,7 @@ export async function openSandbox(name: string): Promise<StepSandbox & { priorSe
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target,
     tickets: [target],
     settings: {},

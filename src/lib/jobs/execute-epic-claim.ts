@@ -9,10 +9,10 @@
 import { beads, LABELS, unclaimableStatus } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { assignChildren, formatReservedChildren } from "../beads/child-assign";
-import { resolveFreshBase } from "../git/ops";
+import { resolveForkPoint, resolveFreshBase } from "../git/ops";
 import { acquireWorktreeClaim, createWorktree, type Worktree } from "../git/worktree";
 import { resolveOperator } from "../operator";
-import { updateRun } from "../runs";
+import { getRunBaseForkSha, updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
 import { safe } from "./execute-epic-persist";
 import type { EpicRun } from "./execute-epic-run";
@@ -61,10 +61,32 @@ export async function warmRunWorktree(
     signal: ctx.signal,
   });
   run.worktree = worktree;
+  // Pin the fork COMMIT now, while origin/<base> is freshly fetched and — on a FIRST creation — HEAD
+  // still sits at it (PR #238 review). Persisted so dispatch partitions against the commit the branch
+  // was cut from, never re-derived against `baseRef` a sibling run's fetch can rewind mid-run. A
+  // resume READS the stored value rather than recomputing: its worktree already carries this run's
+  // commits, so `merge-base <base> HEAD` then would answer far behind the true fork. A row from
+  // before this column recomputes once — no worse than the old behaviour — and stores it.
+  const persistedFork = await getRunBaseForkSha(db, runId);
+  let baseForkSha: string;
+  try {
+    baseForkSha = persistedFork ?? (await resolveForkPoint(worktree.path, freshBase));
+  } catch (e) {
+    // Only reachable when a legacy row (no pinned fork) resumes over a worktree whose base was
+    // rewritten to an unrelated history — a fresh creation forks off `freshBase` and always shares
+    // it. Partitioning the run's tickets against a moving ref instead could read work this checkout
+    // never forked from as its own delivery, so stop rather than guess a fork point.
+    throw new PoisonEpic(
+      `anton could not resolve the commit \`${worktree.branch}\` forked from ${freshBase} in ` +
+        `${worktree.path} (${e instanceof Error ? e.message : String(e)}) — refusing to partition ` +
+        `the run's tickets against a moving base. Repair the worktree, then resume the run`,
+    );
+  }
   await updateRun(db, clock, runId, {
     worktreePath: worktree.path,
     branch: worktree.branch,
     attempts: ctx.attempt,
+    ...(persistedFork ? {} : { baseForkSha }),
   });
   await ctx.heartbeat();
 
@@ -83,6 +105,7 @@ export async function warmRunWorktree(
     branch: worktree.branch,
     baseBranch,
     baseRef: freshBase,
+    baseForkSha,
     target,
     settings,
     assertLeaseHeld: lease.assertHeld,

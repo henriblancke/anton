@@ -15,7 +15,7 @@ import { withBeadWriteLock } from "../beads/claim-lock";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { appendSessionLog } from "../sessions";
 import { resumeSkipped } from "../ticket-view";
-import { resolveForkPoint, worktreeHasCommitFor } from "../git/ops";
+import { worktreeHasCommitFor } from "../git/ops";
 import { blockedTailReason, PoisonEpic } from "./errors";
 import {
   deliveredTickets,
@@ -101,27 +101,16 @@ export async function dispatchRunTickets(
   // than read as absence. Taken for absence, a ticket whose commit IS in this delta leaves the
   // delivered set and the PR body while its diff ships, or an all-retired run parks without opening
   // the pull request that carries it.
-  // Pin the fork COMMIT before partitioning, never the mutable ref the run recorded (PR #238 review).
-  // `prep.runStep.baseRef` is `origin/<base>` — a ref a sibling run's fetch can advance or rewind
-  // mid-run — and the read below is `<base>..HEAD`: measured against the moving ref, a base rewound
-  // behind the fork point widens the window into pre-fork history, where an old `<ticketId>:` commit
-  // reads as this run's delivery and keeps a superseded ticket live for a PR that carries nothing of
-  // it. The merge-base commit is immutable once resolved, so every ticket is partitioned against the
-  // same fork the checkout was actually cut from — as the already-shipped verifier does. The STRICT
-  // resolver: a base rewritten to an unrelated history has no fork point, and reading the branch tip
-  // instead would count work only that history holds; a fork point git cannot compute stops the run.
-  let forkPoint: string;
-  try {
-    forkPoint = await resolveForkPoint(prep.worktree.path, prep.runStep.baseRef);
-  } catch (e) {
-    throw new PoisonEpic(
-      `anton could not resolve the commit \`${prep.worktree.branch}\` forked from ` +
-        `${prep.runStep.baseRef} in ${prep.worktree.path} ` +
-        `(${e instanceof Error ? e.message : String(e)}) — refusing to partition the run's tickets ` +
-        `against a moving base, which could read work this checkout never forked from as its own ` +
-        `delivery. Repair the worktree, then resume the run`,
-    );
-  }
+  // Partition against the fork COMMIT pinned at worktree creation, never the mutable ref the run
+  // recorded (PR #238 review). The read below is `<fork>..HEAD`: measured against `baseRef`
+  // (`origin/<base>`, a ref a sibling run's fetch can advance or rewind mid-run), a base rewound
+  // behind the fork point would widen the window into pre-fork history, where an old `<ticketId>:`
+  // commit reads as this run's delivery and keeps a superseded ticket live for a PR that carries
+  // nothing of it. {@link warmRunWorktree} resolves the fork once — when origin/<base> is fresh and
+  // HEAD still sits at it — and persists it, so every ticket is partitioned against the same commit
+  // the checkout was actually cut from, and a resume reads the stored value rather than recomputing
+  // over a worktree whose HEAD has since moved on.
+  const forkPoint = prep.runStep.baseForkSha;
   const { live, held, dispatchable } = await partitionTickets(run, prep.gated, async (id) => {
     try {
       return await worktreeHasCommitFor(prep.worktree.path, id, { base: forkPoint, strict: true });

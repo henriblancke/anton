@@ -14,6 +14,7 @@ import * as schema from "./db/schema";
 import {
   createRun,
   findRunFormulaForBranch,
+  getRunBaseForkSha,
   listDeliveriesByBead,
   listRecentRunOutcomes,
   updateRun,
@@ -206,6 +207,27 @@ describe("listRecentRunOutcomes", () => {
  * weighs a later failure double until the bead it was made on next DELIVERS, and a delivery that old
  * is behind the streak window the breaker walks.
  */
+describe("getRunBaseForkSha (anton-5bpd)", () => {
+  const NOW = 1_800_000_000_000;
+  const clock: Clock = { now: () => NOW };
+
+  it("round-trips the fork sha a run pinned at creation", async () => {
+    await createRun(t.db, clock, { id: "r-fork", projectId: PROJECT, epicBeadId: EPIC });
+    await updateRun(t.db, clock, "r-fork", { baseForkSha: "f0f0f0forkcommit" });
+
+    expect(await getRunBaseForkSha(t.db, "r-fork")).toBe("f0f0f0forkcommit");
+  });
+
+  // A first attempt has pinned nothing yet — the caller must resolve and store it, not read a stale
+  // value. A row from before the column existed reads the same way.
+  it("is undefined for a run that has not pinned one", async () => {
+    await createRun(t.db, clock, { id: "r-unpinned", projectId: PROJECT, epicBeadId: EPIC });
+
+    expect(await getRunBaseForkSha(t.db, "r-unpinned")).toBeUndefined();
+    expect(await getRunBaseForkSha(t.db, "r-missing")).toBeUndefined();
+  });
+});
+
 describe("listDeliveriesByBead", () => {
   const SETTLED = 1_800_000_000_000;
   const sec = (ms: number) => Math.floor(ms / 1000);

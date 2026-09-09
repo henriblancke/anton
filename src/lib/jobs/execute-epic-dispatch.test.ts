@@ -34,14 +34,12 @@ vi.mock("./execute-epic-ticket", () => ({
 
 type HasCommitOptions = { base?: string; strict?: boolean };
 const hasCommitMock = vi.fn<(worktree: string, id: string, options?: HasCommitOptions) => Promise<boolean>>();
-const forkPointMock = vi.fn<(worktree: string, base: string) => Promise<string>>();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
     ...actual,
     worktreeHasCommitFor: (worktree: string, id: string, options?: HasCommitOptions) =>
       hasCommitMock(worktree, id, options),
-    resolveForkPoint: (worktree: string, base: string) => forkPointMock(worktree, base),
   };
 });
 
@@ -116,7 +114,7 @@ const prep = (): Extract<RunPreparation, { done: false }> =>
     done: false,
     ticketSteps: [],
     runSteps: [],
-    runStep: { baseRef: BASE_REF },
+    runStep: { baseRef: BASE_REF, baseForkSha: FORK_POINT },
     worktree: { path: WORKTREE, branch: "anton/anton-epic" },
     readiness: { blockers: [] },
     gated: new Set<string>(),
@@ -135,7 +133,6 @@ beforeEach(() => {
   board = [];
   runTicketMock.mockReset().mockResolvedValue(COMMITTED);
   hasCommitMock.mockReset().mockResolvedValue(false);
-  forkPointMock.mockReset().mockResolvedValue(FORK_POINT);
   reopenMock.mockReset().mockResolvedValue("");
   // Faithful default: a tag/untag the subsequent `show` reads back on the board bead, so the
   // post-write reread in retireFound sees the marker it just wrote (PR #238 review).
@@ -373,27 +370,10 @@ describe("a ticket the board already holds as superseded", () => {
 
     const outcome = await dispatchRunTickets(run, prep());
 
-    expect(forkPointMock).toHaveBeenCalledWith(WORKTREE, BASE_REF);
     expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", { base: FORK_POINT, strict: true });
     expect(dispatchedIds()).toEqual(["anton-b"]);
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-b"]);
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "pre-existing" }]);
-  });
-
-  // A fork point git cannot compute — the base rewritten to an unrelated history, or the read itself
-  // broken — is not "no commit here" (PR #238 review): partitioning against the moving ref instead
-  // could read work this checkout never forked from as its own delivery, so the run stops.
-  it("stops the run when the fork point cannot be resolved", async () => {
-    forkPointMock.mockRejectedValue(new Error("origin/main and HEAD share no commit"));
-    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
-
-    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(PoisonEpic);
-    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
-      /could not resolve the commit `anton\/anton-epic` forked from origin\/main[\s\S]*share no commit/,
-    );
-    expect(hasCommitMock).not.toHaveBeenCalled();
-    expect(dispatchedIds()).toEqual([]);
-    expect(run.retired).toEqual([]);
   });
 
   // The delta scan failing is not "no commit here" (PR #238 review): the base ref gone or git broken

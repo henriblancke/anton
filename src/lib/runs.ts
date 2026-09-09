@@ -163,6 +163,8 @@ export type RunPatch = Partial<{
   /** The pipeline this run walked (anton-aa3m) — written once the formula is selected + validated. */
   formula: string | null;
   formulaVariant: string | null;
+  /** The commit this run's branch forked from, pinned at worktree creation (anton-5bpd) — see schema. */
+  baseForkSha: string | null;
   attempts: number;
   error: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
@@ -188,6 +190,21 @@ export async function updateRun(
     else set[k] = v;
   }
   await db.update(schema.runs).set(set).where(eq(schema.runs.id, id));
+}
+
+/**
+ * The fork commit a prior attempt on this run pinned at worktree creation (anton-5bpd), or undefined
+ * when none did — a first attempt, or a row written before the column existed. Read on resume so the
+ * fork point is the one the branch was actually cut from, never recomputed against a base ref a
+ * sibling run's fetch may have rewound since (see the column's own note).
+ */
+export async function getRunBaseForkSha(db: AntonDb, runId: string): Promise<string | undefined> {
+  const rows = await db
+    .select({ baseForkSha: schema.runs.baseForkSha })
+    .from(schema.runs)
+    .where(eq(schema.runs.id, runId))
+    .limit(1);
+  return rows[0]?.baseForkSha ?? undefined;
 }
 
 /**

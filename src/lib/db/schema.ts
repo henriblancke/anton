@@ -42,6 +42,15 @@ export const runs = sqliteTable("runs", {
   // and settings or the target's labels may have changed by the time anyone asks.
   formula: text("formula"),
   formulaVariant: text("formula_variant"),
+  // The commit this run's branch forked from its base, pinned at worktree CREATION (PR #238 review).
+  // Dispatch partitions the run's tickets against `base_fork_sha..HEAD`; recomputing the fork with
+  // `merge-base <base> HEAD` at dispatch reads the base REF, which a sibling run's fetch can rewind
+  // behind the true fork point — widening the delta into pre-fork history, where an old `<id>:`
+  // commit reads as this run's delivery and keeps a superseded ticket live for a PR carrying none of
+  // its work. Resolved once when origin/<base> is fresh and HEAD still sits at it, then reused across
+  // resumes (a reused worktree's HEAD has moved on, so recomputing then is wrong). Null on rows
+  // written before this column existed, which fall back to recomputing.
+  baseForkSha: text("base_fork_sha"),
   // queued | running | parked | done | failed
   status: text("status").notNull().default("queued"),
   // The self-review score THIS attempt earned (anton-cekf), 0-10, null until its review gate reports

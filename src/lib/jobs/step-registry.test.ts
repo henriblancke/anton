@@ -109,6 +109,7 @@ function context(overrides: Partial<StepContext> = {}): StepContext {
     branch: "anton/anton-step1",
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target,
     tickets: [target],
     settings,
