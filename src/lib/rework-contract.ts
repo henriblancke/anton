@@ -227,17 +227,24 @@ const LIST_ITEM = /^( {0,3})([-*+]|\d{1,9}[.)])(?:([ \t]+)|$)/;
 const BLOCK_START = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
 /**
- * A line that INTERRUPTS an open paragraph, ending it — {@link BLOCK_START}'s set, but an ordered
- * marker only when its start number is 1. CommonMark lets an ordered list break a paragraph only
- * when it starts at 1 and no other number: `Backend\n2. API\n===` is one multiline Setext heading,
- * not a label above a list, since `2.` does not interrupt. The start number is a VALUE, not a
- * spelling — leading zeros are stripped, so `01.` and `001.` start at 1 and interrupt just as `1.`
- * does; `0{0,8}1` matches those (and nothing longer than {@link LIST_ITEM}'s nine-digit bound).
+ * A line that INTERRUPTS an open paragraph, ending it — {@link BLOCK_START}'s set, but a list marker
+ * only when it can break a paragraph: an ordered one whose start number is 1, and either kind
+ * carrying CONTENT. CommonMark lets an ordered list break a paragraph only when it starts at 1 and no
+ * other number: `Backend\n2. API\n===` is one multiline Setext heading, not a label above a list,
+ * since `2.` does not interrupt. The start number is a VALUE, not a spelling — leading zeros are
+ * stripped, so `01.` and `001.` start at 1 and interrupt just as `1.` does; `0{0,8}1` matches those
+ * (and nothing longer than {@link LIST_ITEM}'s nine-digit bound). A CONTENTLESS item may not
+ * interrupt one either, whichever marker it wears: `Backend\n*\n===` (likewise `+`, `1.`, or a marker
+ * trailed by nothing but spaces) is one Setext heading stating no step, and reading the bare marker
+ * as an interrupt filed the label and its underline as criteria and let a heading-only send-back pass
+ * {@link doneGap}. Hence `[ \t]+\S`: whitespace after the marker, then something for the item to
+ * hold. A blockquote or ATX marker interrupts while empty, as CommonMark has them — an empty callout
+ * and a bare `#` both open their block.
  * Used only to find where a Setext paragraph ends ({@link setextHeadingRun}); list STRUCTURE still
  * reads every ordered marker ({@link BLOCK_START}, {@link LIST_ITEM}), so `1. a` / `2. b` stay two
  * items — restricting that would misnest the second.
  */
-const PARA_INTERRUPT = /^ {0,3}(?:[-*+]|0{0,8}1[.)])(?:\s|$)|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
+const PARA_INTERRUPT = /^ {0,3}(?:[-*+]|0{0,8}1[.)])[ \t]+\S|^ {0,3}>|^ {0,3}#{1,6}(?:\s|$)|^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
 
 /**
  * One blockquote marker peeled as a container: up to 3 spaces, then one `>` of a run that whitespace
@@ -861,7 +868,16 @@ function setextHeadingRun(
     // dropped both and left doneGap refusing a request that stated a step. Judged on the peeled
     // `inner`, whose own {@link openingFence} bound of three columns is what keeps a deeper line
     // indented code — which cannot interrupt a paragraph and so stays part of the heading.
-    if (openingFence(inner)) return 0;
+    // Task markers come off first, as the main parser takes them off before its own fence check
+    // ({@link peelTasks}): this module opens a fence beneath `[ ] ` — GFM makes the box the item
+    // paragraph's text, not scaffolding a fence must clear — so the two paths must agree on where one
+    // opens. They did not while a CLOSED `> [ ] ``` ` / `> expected` / `> ``` ` fence was found here
+    // (its own closer stopped the walk) and an UNCLOSED one was not: `> Fix the retry` / `> [ ] ``` `
+    // / `> expected` / `> ===` was consumed whole as a Setext heading, and doneGap refused a
+    // send-back that stated a step. The indentation a fence may carry comes off with the markers,
+    // as the main path takes it ({@link blockStartIndent}).
+    const bare = peelTasks(dedent(inner, blockStartIndent(inner, 0)));
+    if (openingFence(inner) || openingFence(bare)) return 0;
     if (SETEXT_UNDERLINE.test(inner)) return next - at + 1;
     // A line that interrupts the paragraph ends it, so no underline can reach `at` — but a non-1
     // ordered marker does not interrupt, and stays part of the multiline heading. Judged on `inner`

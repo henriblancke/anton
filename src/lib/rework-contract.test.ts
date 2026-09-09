@@ -294,8 +294,43 @@ describe("instructionCriteria", () => {
     // A fence indented four columns past the container is indented CODE, which cannot interrupt a
     // paragraph — so that run really is one multiline Setext heading and still files nothing.
     expect(texts("Fix the retry\n    ```\n    expected\n===")).toEqual([]);
+    // A task marker in front of the fence hides it from the walk unless the box comes off first, as
+    // the main parser takes it off before its own fence check. An UNCLOSED one is where the two
+    // disagreed: the closed form stopped the walk at its own closer, while this ran to the `===` and
+    // filed nothing — leaving doneGap refusing a request that stated a step.
+    expect(texts("> Fix the retry\n> [ ] ```\n> expected\n> ===")).toEqual([
+      "Fix the retry",
+      "```\nexpected\n===\n```",
+    ]);
+    expect(doneGap("> Fix the retry\n> [ ] ```\n> expected\n> ===", [])).toBeNull();
+    // Nested boxes and the indentation a fence may carry come off with them, as the main path takes
+    // both — the peel is to a fixed point, not one layer.
+    expect(doneGap("> Fix the retry\n> [ ] [x] ```\n> expected\n> ===", [])).toBeNull();
+    expect(doneGap("> Fix the retry\n>   [ ] ```\n> expected\n> ===", [])).toBeNull();
     // A plain quoted label still underlines: only a fence ends the paragraph, not the peel itself.
     expect(texts("> Backend\n> ===")).toEqual([]);
+  });
+
+  it("does not let a CONTENTLESS list item interrupt a Setext paragraph — a bare marker opens no list", () => {
+    // CommonMark lets a list break a paragraph only when the item holds something: `Backend\n*\n===`
+    // is one Setext h1 stating no step, so reading the bare `*` as an interrupt filed the label and
+    // its underline as criteria and let a heading-only send-back pass doneGap.
+    for (const marker of ["*", "+", "1.", "1)", "*   "]) {
+      expect(texts(`Backend\n${marker}\n===`)).toEqual([]);
+      expect(doneGap(`Backend\n${marker}\n===`, [])).toMatch(/only list markers, headings or rules/);
+    }
+    // A bare `-` is not a contentless item at all: it UNDERLINES the label as an h2, so the heading
+    // closes on it and the `===` below opens a paragraph of its own.
+    expect(texts("Backend\n-\n===")).toEqual(["==="]);
+    // An item that holds content still interrupts, so the label below it is an ordinary criterion.
+    expect(texts("Backend\n* API\n===")).toEqual(["Backend", "API", "==="]);
+    // A blockquote and an ATX heading open their block while empty, as CommonMark has them — both
+    // still end the paragraph, so no underline below reaches the label.
+    expect(texts("Backend\n>\n===")).toEqual(["Backend", "==="]);
+    expect(texts("Backend\n#\n===")).toEqual(["Backend", "==="]);
+    // List STRUCTURE is untouched: a bare marker inside a list is still scaffolding that files
+    // nothing, and consecutive items still shear one by one.
+    expect(texts("- a\n- b")).toEqual(["a", "b"]);
   });
 
   it("reads nested markers as scaffolding too — shearing one layer must not leave the next as a criterion", () => {
