@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { isHeading, renderedLines, scanMarkdown, unquote, unterminatedCloser } from "./markdown";
+import {
+  htmlBlockLines,
+  isHeading,
+  renderedLines,
+  scanMarkdown,
+  unquote,
+  unterminatedCloser,
+} from "./markdown";
 
 /** The lines a body renders, as the consumers read them: text only, fence flag dropped. */
 const rendered = (source: string) => renderedLines(source).map((line) => line.text);
@@ -268,6 +275,44 @@ describe("unterminatedCloser", () => {
     expect(unterminatedCloser('<span x="y">')).toBeUndefined();
     // A tag opened MID-line is inline HTML, which starts no block at all.
     expect(unterminatedCloser("see <script> in the note")).toBeUndefined();
+  });
+});
+
+describe("htmlBlockLines", () => {
+  it("marks every line a persistent HTML block holds, the opener included", () => {
+    // A heading inside one renders as raw script text, or as nothing at all, while the scanner —
+    // which models no HTML block — reports it as a section. A caller deciding whether a section is
+    // THERE must not count it.
+    expect(htmlBlockLines("## Goal\ng\n\n<script>\n## Acceptance Criteria\n- [ ] old")).toEqual([
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+    ]);
+    expect(htmlBlockLines("<script>\nx\n</script>\n\n## Acceptance")).toEqual([
+      true,
+      true,
+      true,
+      false,
+      false,
+    ]);
+    // A block that opens and closes on one line holds only that line.
+    expect(htmlBlockLines("<script>alert(1)</script>\n## Acceptance")).toEqual([true, false]);
+  });
+
+  it("opens no block where the render reads the tag as content or ends it at a blank line", () => {
+    expect(htmlBlockLines("```\n<script>\n```\n## Acceptance")).toEqual([
+      false,
+      false,
+      false,
+      false,
+    ]);
+    expect(htmlBlockLines("<!-- <script> -->\n## Acceptance")).toEqual([false, false]);
+    // Conditions 6 and 7 end at the blank line, so the heading below is written text.
+    expect(htmlBlockLines("<div>\nx\n\n## Acceptance")).toEqual([false, false, false, false]);
+    expect(htmlBlockLines("see <script> in the note\n## Acceptance")).toEqual([false, false]);
   });
 });
 

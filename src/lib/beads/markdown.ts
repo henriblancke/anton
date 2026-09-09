@@ -309,15 +309,41 @@ const HTML_BLOCKS: { open: RegExp; close: string }[] = [
  * inside one is still a heading to the judge, which reads the same text the scanner does.
  */
 export function unterminatedCloser(source: string): string | undefined {
+  return walkHtmlBlocks(source).closer;
+}
+
+/**
+ * For each line of `source`, whether a persistent HTML block ({@link HTML_BLOCKS}) holds it — the
+ * opener line included. Such a line renders as raw HTML, or as nothing at all, whatever it says: a
+ * `## Acceptance Criteria` inside a `<script>` is a heading to every reader of {@link scanMarkdown}
+ * (which models no HTML block) and a section nobody can see in the description itself.
+ *
+ * For a caller that decides whether a section is THERE before writing one. Reading the hidden
+ * heading as present skips the closer {@link unterminatedCloser} would have written and files a
+ * bead whose rendered contract is missing the section its judge reports as written — and a bead
+ * that reads as complete is never reconciled again.
+ */
+export function htmlBlockLines(source: string): boolean[] {
+  return walkHtmlBlocks(source).inHtml;
+}
+
+/**
+ * One walk of the persistent HTML blocks over `source`: which lines they hold, and the closer for
+ * whatever construct the text ends inside. Both answers come from the same pass so the two readers
+ * cannot disagree about where a block began or whether it ever closed.
+ */
+function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | undefined } {
   const state: ScanState = { inComment: false };
   let html: { close: string } | undefined;
   // The indentation of the line that opened whatever is still open, so the closer lands in the same
   // container the opener did.
   let indent = "";
+  const inHtml: boolean[] = [];
   for (const text of source.split(/\r?\n/)) {
     // An HTML block is literal until its closing text: no fence opens and no comment starts inside
     // one, so nothing else is tracked while it stands.
     if (html) {
+      inHtml.push(true);
       if (text.toLowerCase().includes(html.close)) html = undefined;
       continue;
     }
@@ -326,17 +352,24 @@ export function unterminatedCloser(source: string): string | undefined {
     const line = scanLine(state, text);
     // This line opened one of them — a fence delimiter or a `<!--` that outlives the line.
     if ((!openFence && state.fence) || (!openComment && state.inComment)) indent = indentOf(text);
-    if (line.fenced || state.inComment) continue;
+    if (line.fenced || state.inComment) {
+      inHtml.push(false);
+      continue;
+    }
     // Judged on the comment-blanked text: a `<script>` inside `<!-- … -->` opens no block.
     html = HTML_BLOCKS.find((block) => block.open.test(line.masked));
+    inHtml.push(html !== undefined);
     if (html) {
       if (text.toLowerCase().includes(html.close)) html = undefined;
       else indent = indentOf(text);
     }
   }
-  if (state.fence) return indent + state.fence.char.repeat(state.fence.len);
-  if (state.inComment) return indent + COMMENT_CLOSE;
-  return html && indent + html.close;
+  const closer = state.fence
+    ? indent + state.fence.char.repeat(state.fence.len)
+    : state.inComment
+      ? indent + COMMENT_CLOSE
+      : html && indent + html.close;
+  return { inHtml, closer: closer || undefined };
 }
 
 /** The leading whitespace of `text`, verbatim — the indentation a closer must repeat to sit in the

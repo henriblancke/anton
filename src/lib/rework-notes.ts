@@ -16,6 +16,7 @@ import {
 } from "./beads/contract";
 import {
   type Heading,
+  htmlBlockLines,
   isHeading,
   type ScannedLine,
   scanMarkdown,
@@ -167,10 +168,17 @@ export function reconcileFollowUpDescription(
  * ends inside ({@link unterminatedCloser}). Appended verbatim, the heading would land in that
  * construct, where the judge reads no section at all; the pass would then note the bead finished,
  * and no retry reconciles a finished bead, leaving one that can never be approved.
+ *
+ * A heading inside a persistent HTML block ({@link htmlBlockLines}) is no section to swap either,
+ * for the mirror reason: `<script>` and its kind run past the blank line to their own closing tag,
+ * so the description RENDERS no Acceptance while the scanner — which models no HTML block — reports
+ * one. Swapping the hidden boxes skipped the closer and filed a bead whose acceptance nobody can
+ * see; ignoring them appends a real section after the block is closed.
  */
 function replaceAcceptance(description: string, boxes: string[]): string {
   const lines = scanMarkdown(description);
-  const sections = sectionsNamed(lines, ACCEPTANCE_KEYS);
+  const inHtml = htmlBlockLines(description);
+  const sections = sectionsNamed(lines, ACCEPTANCE_KEYS).filter(({ start }) => !inHtml[start]);
   if (sections.length === 0) {
     const kept = description.trimEnd();
     const closer = unterminatedCloser(kept);

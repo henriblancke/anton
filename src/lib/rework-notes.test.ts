@@ -662,6 +662,31 @@ describe("reconcileFollowUpDescription", () => {
     );
   });
 
+  it("ignores an Acceptance heading buried in a persistent HTML block — it renders no section", () => {
+    // `<script>` runs past the blank line to its own closing tag, so the description RENDERS no
+    // Acceptance while the scanner — which models no HTML block — reports the hidden heading as one.
+    // Swapping those boxes skipped the closer and filed a bead whose acceptance nobody can see:
+    // the judge then reported no gap, the pass noted the bead finished, and no retry reconciles a
+    // finished bead. The hidden heading is not a section, so the block is closed and a real one
+    // appended below it.
+    const hidden = "## Goal\nharden the retry\n\n<script>\n## Acceptance Criteria\n- [ ] hidden";
+    const reconciled = reconcileFollowUpDescription(hidden, edited);
+    expect(reconciled.startsWith(hidden)).toBe(true);
+    expect(reconciled).toContain(
+      "- [ ] hidden\n</script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
+    // What the judge reads as this bead's acceptance is the request's boxes — the hidden ones are
+    // inside the block, above the closer, so no renderer and no reader shows them as criteria.
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+    // A block that CLOSES leaves the heading below it visible, so that section is swapped as ever.
+    const closed = "## Goal\ng\n\n<script>\nx\n</script>\n\n## Acceptance Criteria\n- [ ] stale";
+    const swapped = reconcileFollowUpDescription(closed, edited);
+    expect(swapped).not.toContain("stale");
+    expect(swapped.match(/^##+ Acceptance/gm)).toHaveLength(1);
+  });
+
   it("closes a construct nested in a list item inside that item, not at the top level", () => {
     // The scanner reads fences flat, so a fence indented into a list item is recorded as an
     // ordinary one and used to be closed with an unindented delimiter. CommonMark reads that dedent
