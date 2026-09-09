@@ -835,7 +835,8 @@ function blankQuoteLine(line: string, prefix: Prefix): boolean {
  * label above a heading; skipping only the last line would still file `Backend` as a criterion a
  * review cannot score, and {@link doneGap} would accept a draft that states no step. The run is
  * judged inside the paragraph's own containers `prefix`, so `> Backend` / `> =======` pairs too, and
- * a blank line, a line that interrupts the paragraph ({@link PARA_INTERRUPT}), a fence, a comment
+ * a blank line, a line that interrupts the paragraph ({@link PARA_INTERRUPT}), a fence — the
+ * scanner's own, or one opened past the container markers where it sees none — a comment
  * — whether it stays open or closes on its own line ({@link HTML_BLOCK_START}) — or a line that
  * leaves the container ends the paragraph before any underline: those are not headings.
  */
@@ -854,6 +855,13 @@ function setextHeadingRun(
     // used to cross it — dropping an actionable paragraph as a heading and leaving doneGap to refuse
     // a request that stated a step. It opens an HTML block, which ends the paragraph like any other.
     if (HTML_BLOCK_START.test(inner)) return 0;
+    // A fence opened AFTER container markers is invisible to the flat scanner, so `fenced` above
+    // never fires for it and the walk crossed the block: `> Fix the retry` / `> ``` ` / `> expected`
+    // / `> ``` ` / `> ===` is a step, a sample and a stray `===`, and reading the run as one heading
+    // dropped both and left doneGap refusing a request that stated a step. Judged on the peeled
+    // `inner`, whose own {@link openingFence} bound of three columns is what keeps a deeper line
+    // indented code — which cannot interrupt a paragraph and so stays part of the heading.
+    if (openingFence(inner)) return 0;
     if (SETEXT_UNDERLINE.test(inner)) return next - at + 1;
     // A line that interrupts the paragraph ends it, so no underline can reach `at` — but a non-1
     // ordered marker does not interrupt, and stays part of the multiline heading. Judged on `inner`

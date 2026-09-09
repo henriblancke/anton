@@ -279,6 +279,23 @@ describe("instructionCriteria", () => {
     expect(texts('Backend\n<span class="x">\n===')).toEqual([]);
     // A tag name that merely starts with a block one is not that tag: `<divider>` is type 7.
     expect(texts("Backend\n<divider>\n===")).toEqual([]);
+    // A fence opened PAST the container markers is invisible to the flat scanner, so the run-walk
+    // crossed the whole block and read step, sample and stray `===` as one heading — filing nothing
+    // and leaving doneGap refusing a request that stated a step.
+    expect(texts("> Fix the retry\n> ```\n> expected\n> ```\n> ===")).toEqual([
+      "Fix the retry",
+      "```\nexpected\n```",
+      "===",
+    ]);
+    expect(doneGap("> Fix the retry\n> ```\n> expected\n> ```\n> ===", [])).toBeNull();
+    // Tildes and a nested callout open one the same way.
+    expect(doneGap("> Fix the retry\n> ~~~\n> expected\n> ~~~\n> ===", [])).toBeNull();
+    expect(doneGap(">> Fix the retry\n>> ```\n>> expected\n>> ```\n>> ===", [])).toBeNull();
+    // A fence indented four columns past the container is indented CODE, which cannot interrupt a
+    // paragraph — so that run really is one multiline Setext heading and still files nothing.
+    expect(texts("Fix the retry\n    ```\n    expected\n===")).toEqual([]);
+    // A plain quoted label still underlines: only a fence ends the paragraph, not the peel itself.
+    expect(texts("> Backend\n> ===")).toEqual([]);
   });
 
   it("reads nested markers as scaffolding too — shearing one layer must not leave the next as a criterion", () => {
