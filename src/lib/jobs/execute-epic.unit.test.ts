@@ -45,7 +45,7 @@ import {
   humanGateReason,
   HUMAN_GATE_ARMED_LABEL,
 } from "./execute-epic-human-gate";
-import { landableTicketIds } from "./execute-epic-dispatch";
+import { branchDelivery, landableTicketIds } from "./execute-epic-dispatch";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage, stalePrBodyNote } from "./execute-epic-review";
 import { assertDelivered, displacesSelfReport, selfReportRank } from "./execute-epic-ticket";
@@ -1239,6 +1239,60 @@ describe("landableTicketIds — which prerequisites this run can still land (ant
   it("keeps a timeout that delivered before the deadline — its work is on the branch", () => {
     const timedOut = [{ id: "schema", delivered: true }];
     expect(landableTicketIds(board(), ledger(), timedOut)).toContain("schema");
+  });
+});
+
+describe("branchDelivery — whose commit on this branch carries a ticket (anton-ag76)", () => {
+  /** The branch as the two reads see it: `<id>:` subjects, and one commit's satisfies-trailers. */
+  const branch = (opts: { subjects?: string[]; satisfies?: string[] } = {}) => {
+    const asked: string[] = [];
+    const claim = {
+      sha: "c0ffee1c0ffee1c0ffee1c0ffee1c0ffee1c0ffee",
+      subject: "t-sibling: the commit that did the work",
+      ticketIds: opts.satisfies ?? [],
+    };
+    return {
+      claim,
+      asked,
+      reads: {
+        hasCommitFor: async (id: string) => {
+          asked.push(`subject:${id}`);
+          return (opts.subjects ?? []).includes(id);
+        },
+        satisfiedBy: async (id: string) => {
+          asked.push(`trailer:${id}`);
+          return claim.ticketIds.includes(id) ? claim : undefined;
+        },
+      },
+    };
+  };
+
+  it("reads a ticket's OWN commit as delivery, without asking about siblings", async () => {
+    const b = branch({ subjects: ["t-1"] });
+    expect(await branchDelivery(b.reads, "t-1")).toEqual({ how: "own-commit" });
+    // The subject read is the cheaper, more specific answer; a hit settles it.
+    expect(b.asked).toEqual(["subject:t-1"]);
+  });
+
+  it("reads a SIBLING's claim as delivery, naming the commit that made it", async () => {
+    // The whole point: no commit here is subjected `t-2:`, but a sibling's commit says its work met
+    // t-2's acceptance in full. Dispatching t-2 again can only produce the zero diff that blocks it.
+    const b = branch({ subjects: ["t-sibling"], satisfies: ["t-2"] });
+    expect(await branchDelivery(b.reads, "t-2")).toEqual({ how: "sibling", by: b.claim });
+  });
+
+  it("answers 'nothing here' when neither a subject nor a trailer claims the ticket", async () => {
+    // The cross-machine shape (anton-5slr / anton-jz1): closed on the shared board, but its commit
+    // lives only in another machine's unpushed worktree. Still regenerated, exactly as before.
+    const b = branch({ subjects: ["t-1"], satisfies: ["t-2"] });
+    expect(await branchDelivery(b.reads, "t-3")).toBeUndefined();
+    expect(b.asked).toEqual(["subject:t-3", "trailer:t-3"]);
+  });
+
+  it("fails closed to 'nothing here' when the branch read finds nothing — never to a skip", async () => {
+    // Both underlying reads swallow a failed `git log` into an empty answer, and that must land on
+    // re-running work rather than skipping it.
+    expect(await branchDelivery(branch().reads, "t-1")).toBeUndefined();
   });
 });
 
