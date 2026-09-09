@@ -493,22 +493,6 @@ async function dispatchTicket(
   const { isResumeSkipped, worktree, runStep, ticketSteps } = prep;
   const { onBranch } = ledger;
   lease.assertHeld(); // yield before starting a ticket if the shared lease has lapsed
-  // Human work never reaches an agent, whatever the readiness verdict said (anton-mv70). A
-  // FINISHED one is skipped here rather than below, because a person's work leaves no commit:
-  // the resume check below reads "closed with nothing on this branch" as a cross-machine
-  // resume and would reopen it and regenerate it under the default agent — the exact failure
-  // the label exists to prevent. An OPEN one is a broken state: 0b-pre armed its gate and the
-  // graph holds it, so reaching here means the board disagrees with the gate it carries. Park
-  // loudly instead of improvising; the gate is on the board either way, and answering it is
-  // what moves this run on.
-  if (beads.isHumanWork(ticket)) {
-    if (isResumeSkipped(ticket)) return;
-    throw new PoisonEpic(
-      `${ticket.id} is labelled ${LABELS.agentHuman} — a person executes it, so no agent can ` +
-        `run it. It should be held by a human gate for this run: do the work, resolve that ` +
-        `gate, and the resumed run closes ${ticket.id} and carries on without it`,
-    );
-  }
   // A ticket marked done on the board — a closed epic child, or a standalone target moved to
   // stage:in-review — is only safe to SKIP if its commit is actually present on THIS
   // worktree's branch (anton-jz1). Board state propagates cross-machine via `bd sync`, but the
@@ -530,6 +514,27 @@ async function dispatchTicket(
   const delivery = doneOnBoard
     ? await branchDelivery(worktreeReads(worktree.path, runStep), ticket)
     : undefined;
+  // Human work never reaches an agent, whatever the readiness verdict said (anton-mv70) — but the
+  // branch is asked FIRST, because the label says who does the work, not what the diff contains.
+  // A FINISHED human ticket with nothing here is skipped rather than falling through: a person's
+  // work leaves no commit, so the cross-machine branch below would read "closed with nothing on
+  // this branch" as a resume, reopen it, and regenerate it under the default agent — the exact
+  // failure the label exists to prevent. One a SIBLING satisfied is the opposite case (PR #258
+  // review): a ticket an agent attempted before someone relabelled it `agent:human` has its work
+  // in this diff under another commit's name, and returning here would drop it from the ledger —
+  // omitting it from the PR's attribution and leaving the timeout cascade around it standing. So it
+  // falls through to the delivery record, which never dispatches anything either way.
+  // An OPEN one with nothing here is a broken state: 0b-pre armed its gate and the graph holds it,
+  // so reaching here means the board disagrees with the gate it carries. Park loudly instead of
+  // improvising; the gate is on the board either way, and answering it is what moves this run on.
+  if (beads.isHumanWork(ticket) && !delivery) {
+    if (isResumeSkipped(ticket)) return;
+    throw new PoisonEpic(
+      `${ticket.id} is labelled ${LABELS.agentHuman} — a person executes it, so no agent can ` +
+        `run it. It should be held by a human gate for this run: do the work, resolve that ` +
+        `gate, and the resumed run closes ${ticket.id} and carries on without it`,
+    );
+  }
   if (delivery) {
     if (standaloneRun) {
       // Resume after a failed PR step: this standalone ticket committed and moved to in-review
@@ -763,10 +768,13 @@ async function deliveredOrPark(
   //     and someone relabelled `agent:human` afterwards is still in this diff, and dropping it
   //     would hide work the reviewer must read — and, when it is the only ticket, make the
   //     no-delivery park below claim an empty branch that has commits on it.
+  //     A human ticket a SIBLING's commit satisfied stays too (PR #258 review): the ledger proved
+  //     the work is on this branch under another name, so the branch question above cannot see it.
   const delivered = await deliveredTickets(
     live.filter((t) => !skipped.has(t.id)),
     stoppedShort,
     (id) => worktreeHasCommitFor(worktree.path, id),
+    new Set(ledger.satisfied.keys()),
   );
 
   // Nothing survived, so this run has nothing to show (anton-t1mo). Absorbing the timeouts is

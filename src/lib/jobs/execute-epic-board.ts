@@ -838,16 +838,24 @@ export function reorderNote(args: {
  * attempt and relabelled `agent:human` before the parked run resumed is still in the diff (PR #213
  * review). So the branch is asked, and only a human ticket with nothing on it is dropped; anything
  * whose commit is present stays, because a reviewer must read every change the PR carries.
+ *
+ * "Present" means present under ANY name, the same widening the resume skip reads (PR #258 review):
+ * `satisfied` holds the tickets this run settled on ANOTHER commit, so a human-relabelled ticket a
+ * sibling's commit covers is in the diff without carrying its own id. Dropping it would omit it from
+ * the attribution the PR body owes, which is where a reader learns which commit did its work.
  */
 export async function deliveredTickets(
   live: Bead[],
   stopped: Set<string>,
   hasCommitFor: (ticketId: string) => Promise<boolean>,
+  /** Ids the branch delivers under another commit's name — the dispatch ledger's `satisfied` set. */
+  satisfied: ReadonlySet<string> = new Set(),
 ): Promise<Bead[]> {
   const delivered: Bead[] = [];
   for (const ticket of live) {
     if (stopped.has(ticket.id)) continue;
-    if (beads.isHumanWork(ticket) && !(await hasCommitFor(ticket.id))) continue;
+    if (beads.isHumanWork(ticket) && !satisfied.has(ticket.id) && !(await hasCommitFor(ticket.id)))
+      continue;
     delivered.push(ticket);
   }
   return delivered;
