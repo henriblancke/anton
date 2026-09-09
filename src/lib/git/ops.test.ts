@@ -49,6 +49,8 @@ import {
   branchContainsCommit,
   branchSatisfiesTicket,
   readSatisfiedClaims,
+  satisfiedMarkerSubject,
+  satisfiedMarkerTarget,
   SATISFIES_TRAILER,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
@@ -1893,6 +1895,24 @@ suite("sibling attribution trailers (real git)", () => {
     ]);
 
     expect(await readSatisfiedClaims(repo)).toEqual([]);
+  });
+
+  /**
+   * The marker subject the satisfied close writes (PR #258 review) — read back so a settlement can
+   * follow it to the work rather than record the marker a sibling's close left at the tip.
+   */
+  it("round-trips the attribution marker subject, and refuses what is not one", () => {
+    const work = "a".repeat(40);
+    const subject = satisfiedMarkerSubject("anton-kwi6", work);
+
+    expect(subject).toBe(`anton: anton-kwi6 satisfied by ${work}`);
+    expect(satisfiedMarkerTarget(subject)).toBe(work);
+    // Not a marker: an ordinary delivery, a preserve, an abbreviation (indistinguishable from prose
+    // ending in hex), and a subject that merely reads like one.
+    expect(satisfiedMarkerTarget("anton-kwi6: Operator control")).toBeUndefined();
+    expect(satisfiedMarkerTarget("WIP anton-kwi6: preserved")).toBeUndefined();
+    expect(satisfiedMarkerTarget("anton: anton-kwi6 satisfied by 41af614")).toBeUndefined();
+    expect(satisfiedMarkerTarget(`anton: anton-kwi6 satisfied by ${work} and then some`)).toBeUndefined();
   });
 
   it("matches ids exactly, never by prefix", async () => {

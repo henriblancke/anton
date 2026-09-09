@@ -168,13 +168,23 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       expect(outcomes.get(third)).toBe("satisfied");
 
       // The branch carries exactly ONE ticket commit — the first's. Nothing was committed under the
-      // satisfied steps' names, and no marker was minted to pretend otherwise.
+      // satisfied steps' delivery attribution (`<id>:`) or its preserved one (`WIP <id>:`), so no
+      // reader mistakes either for work of their own. What they DO carry is an attribution marker
+      // apiece, whose subject credits the commit that did the work — the record a later attempt
+      // reads to see them as delivered rather than dispatching them into a zero diff (PR #258
+      // review). Each names the work itself, never the sibling marker that happened to be at the
+      // tip when its agent read `git log`.
       const branch = `anton/${featureId}`;
       const firstCommit = commitFor(branch, first);
       expect(firstCommit.subject).toBe(`${first}: Add the work file`);
-      const subjects = execFileSync("git", ["log", branch, "--format=%s"], { cwd: repo, encoding: "utf8" });
-      expect(subjects).not.toContain(second);
-      expect(subjects).not.toContain(third);
+      const subjects = execFileSync("git", ["log", branch, "--format=%s"], { cwd: repo, encoding: "utf8" })
+        .trim()
+        .split("\n");
+      for (const id of [second, third]) {
+        // Both protocol prefixes, asserted as PREFIXES — which is how every reader matches them.
+        expect(subjects.filter((s) => s.startsWith(`${id}:`) || s.startsWith(`WIP ${id}:`))).toEqual([]);
+        expect(subjects).toContain(`anton: ${id} satisfied by ${firstCommit.sha}`);
+      }
 
       // Every step is closed — the gate settled the satisfied ones on the branch's evidence — and
       // none is marked undelivered: their acceptance IS in this PR.
