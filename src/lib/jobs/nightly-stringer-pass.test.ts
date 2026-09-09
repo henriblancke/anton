@@ -45,7 +45,11 @@ it("opens the session the pass speaks through and reports it as the live handle"
 
   expect(pass.project.slug).toBe("sandbox");
   expect(pass.triaged).toBe(false);
-  expect(ctx.reported).toEqual([{ sessionId: pass.sessionId, cwd: "/tmp/sandbox" }]);
+  // Routing rides along (anton-7poz) so an investigate terminal reaches the same gateway; an
+  // unconfigured project reports UNROUTED.
+  expect(ctx.reported).toEqual([
+    { sessionId: pass.sessionId, cwd: "/tmp/sandbox", routing: { routed: false } },
+  ]);
   expect(readFileSync(pass.logPath, "utf8")).toContain("[stringer] hello");
 
   const [row] = await t.db.select().from(schema.sessions);

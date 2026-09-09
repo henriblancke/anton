@@ -259,6 +259,26 @@ export class SyncNotWiredError extends Error {
   }
 }
 
+/**
+ * A new run can't START because the anton PROCESS is behind its own latest code (anton-mh3c) — its
+ * checkout is behind upstream, or its installed packages no longer match the lockfile. Like
+ * {@link SyncNotWiredError}, this is neither a completion nor the job's own failure, and it is NOT a
+ * poison: parking would strand every job that hit it in `parked` until a human resumed each by hand,
+ * even after the fix (pull/reinstall, restart anton) cleared the condition process-wide. So the
+ * runner RESCHEDULES on a slow cadence with the attempt refunded — the stale process keeps deferring
+ * new starts, and the moment it is restarted on fresh code the next attempt passes and runs itself.
+ *
+ * The stopped state stays loudly visible independent of this reschedule: `staleBreaker`
+ * (autopilot-breaker.ts) computes the stale band live from the same self-freshness verdict, so the
+ * app shows "Anton is running old code" whether or not any job is currently deferred on it.
+ */
+export class StaleCheckoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StaleCheckoutError";
+  }
+}
+
 export function isUsageLimitError(e: unknown): e is UsageLimitError {
   return e instanceof UsageLimitError || (e as { name?: string })?.name === "UsageLimitError";
 }
@@ -293,4 +313,28 @@ export function isForeignRunOwner(e: unknown): boolean {
 
 export function isSyncNotWiredError(e: unknown): e is SyncNotWiredError {
   return e instanceof SyncNotWiredError || (e as { name?: string })?.name === "SyncNotWiredError";
+}
+
+export function isStaleCheckoutError(e: unknown): e is StaleCheckoutError {
+  return e instanceof StaleCheckoutError || (e as { name?: string })?.name === "StaleCheckoutError";
+}
+
+/**
+ * The stable opening of a stale-checkout deferral's message ({@link StaleCheckoutError}, built by
+ * execute-epic-freshness.ts `staleCheckoutRefusal`). Shared so the message and the settled-row
+ * predicate below cannot drift apart.
+ */
+export const STALE_CHECKOUT_REFUSAL_PREFIX =
+  "anton is running behind its own latest code, so it will not start new work:";
+
+/**
+ * Whether a SETTLED run row's error is the stale-checkout deferral — a refunded, rescheduled
+ * non-start on which no work was attempted (no lease, worktree or claim). The error is stored as a
+ * string, and the message leads the row (settleRunRow writes `${message}${orphanNotice}`), so the
+ * stable prefix identifies it. Used by the failure-streak verdict, which keeps this out of the
+ * per-project failure evidence: a machine-wide staleness that self-clears on restart must not latch
+ * a project disarm (PR #257 review).
+ */
+export function isStaleCheckoutDeferral(error: string | undefined): boolean {
+  return error !== undefined && error.startsWith(STALE_CHECKOUT_REFUSAL_PREFIX);
 }

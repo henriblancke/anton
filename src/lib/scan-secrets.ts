@@ -273,8 +273,19 @@ export function entropyOf(value: string): number {
  * only, and never silent — {@link describeSecretFilter} names every dropped line and value in the
  * session log.
  */
+/**
+ * Whether a value carries a shape anton recognises as a credential wherever it sits — a `sk-…`
+ * token, a JWT, an AWS key id, a PEM block ({@link CREDENTIAL_MARKERS}). Unlike
+ * {@link isCredentialShaped} this makes no entropy or word judgement, so it never fires on a
+ * low-entropy identifier that merely looks unusual: the caller that wants to reject only
+ * unmistakable credentials (a token pasted into a URL path) uses this narrower test.
+ */
+export function hasCredentialMarker(value: string): boolean {
+  return CREDENTIAL_MARKERS.some((marker) => marker.test(value));
+}
+
 export function isCredentialShaped(value: string): boolean {
-  if (CREDENTIAL_MARKERS.some((marker) => marker.test(value))) return true;
+  if (hasCredentialMarker(value)) return true;
   if (!PLACEHOLDER_SHAPE.test(value)) return true;
   if (!looksWritten(value)) return true;
   return entropyOf(value) >= ENTROPY_FLOOR;

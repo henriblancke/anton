@@ -58,6 +58,7 @@ function parkedRun(o: Partial<RunRow> = {}): RunRow {
     branch: null,
     model: null,
     agentTag: null,
+    endpointHost: null,
     formula: null,
     formulaVariant: null,
     baseForkSha: null,

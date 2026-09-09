@@ -12,8 +12,20 @@ import { isUnit } from "../epic-graph";
 import { runTickets } from "../ticket-view";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
 import { fingerprintLabelOf, isProposalBead } from "../gardener/detections";
-import { getProjectById, getProjectSettings, resolveTicketTimeoutMs } from "../projects";
-import { createRun, findOpenRunForEpic, updateRun } from "../runs";
+import {
+  getProjectById,
+  getProjectSettings,
+  resolveTicketTimeoutMs,
+  type ProjectSettings,
+} from "../projects";
+import { claudeRouting } from "../claude/driver-routing";
+import {
+  ANTHROPIC_DEFAULT_ENDPOINT_HOST,
+  createRun,
+  endpointHostFromBaseUrl,
+  findOpenRunForEpic,
+  updateRun,
+} from "../runs";
 import { PoisonEpic } from "./errors";
 import { blockedRunPoison, runReadiness } from "./execute-epic-board";
 import { humanTargetPoison } from "./execute-epic-human-gate";
@@ -90,6 +102,11 @@ export async function beginEpicRun(args: {
     epicBeadId,
     branch,
     model: settings.model,
+    // Record where this run will actually drive its traffic (anton-oom5). Derived from the SAME
+    // routing resolver the spawn honors (claudeRouting), not the raw base URL, so a base URL that
+    // resolves unrouted (no token env) records the Claude API host it truly drives — never a
+    // gateway it never reached.
+    endpointHost: resolveEndpointHost(settings),
   });
 
   return makeEpicRun({
@@ -238,6 +255,20 @@ export function selectRunTickets(
   return { standaloneRun, tickets };
 }
 
+/**
+ * The endpoint host this run will drive (anton-oom5) — resolved through `claudeRouting`, the same
+ * decision the spawn env delta honors, so the recorded provenance is where traffic actually goes.
+ * A routed project records its gateway host (never the token — {@link endpointHostFromBaseUrl}
+ * keeps only `URL.host`); an unrouted one — including a base URL that resolves unrouted for want of
+ * a token env — records the Claude API default.
+ */
+function resolveEndpointHost(settings: ProjectSettings): string {
+  const routing = claudeRouting(settings);
+  return routing.routed
+    ? endpointHostFromBaseUrl(routing.baseUrl)
+    : ANTHROPIC_DEFAULT_ENDPOINT_HOST;
+}
+
 /** Resume an open run or start a new one. */
 async function openRunRow(args: {
   db: AntonDb;
@@ -247,8 +278,9 @@ async function openRunRow(args: {
   epicBeadId: string;
   branch: string;
   model: string | undefined;
+  endpointHost: string;
 }): Promise<{ runId: string; existing: Awaited<ReturnType<typeof findOpenRunForEpic>> }> {
-  const { db, clock, ctx, projectId, epicBeadId, branch, model } = args;
+  const { db, clock, ctx, projectId, epicBeadId, branch, model, endpointHost } = args;
   const existing = await findOpenRunForEpic(db, projectId, epicBeadId);
   const runId = existing?.id ?? randomUUID();
   if (!existing) {
@@ -259,6 +291,7 @@ async function openRunRow(args: {
       jobId: ctx.jobId,
       branch,
       model,
+      endpointHost,
       status: "running",
     });
     return { runId, existing };
@@ -279,6 +312,9 @@ async function openRunRow(args: {
     error: null,
     reviewScore: null,
     attemptStartedAt: clock.now(),
+    // The resumed attempt drives the freshly resolved endpoint (anton-oom5). Rewrite the provenance
+    // so a resume after the project's gateway setting changed isn't attributed to the old route.
+    endpointHost,
   });
   return { runId, existing };
 }

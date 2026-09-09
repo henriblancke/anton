@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "2c02f647-7503-423a-9e2f-61cbf077ea3d",
-  "prevId": "0213e232-daa6-4a2c-af5a-b36135bb9c11",
+  "id": "9530244e-3834-4e14-aa02-fc8986e2ded5",
+  "prevId": "2c02f647-7503-423a-9e2f-61cbf077ea3d",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -1167,6 +1167,13 @@
         },
         "formula_variant": {
           "name": "formula_variant",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "base_fork_sha": {
+          "name": "base_fork_sha",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

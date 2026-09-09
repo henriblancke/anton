@@ -11,6 +11,9 @@
  *                              (queue.resumeJob) un-parks a job back to `queued` with a fresh budget.
  *   • Undeliverable-yet      — `SyncNotWiredError` → recheck on a slow cadence, attempt refunded:
  *                              the work isn't done, but only a human wiring a remote can unblock it.
+ *   • Stale process          — `StaleCheckoutError` → recheck on a slow cadence, attempt refunded:
+ *                              anton is behind its own code, so it defers new starts until it is
+ *                              restarted on fresh code (anton-mh3c) rather than parking each job.
  *
  * The decision logic (`nextAction`) is a pure function so it can be unit-tested without timers.
  * See DESIGN.md §4.
@@ -55,6 +58,7 @@ import { reconcileInterruptedRuns } from "../runs";
 import {
   isPoisonError,
   isRunAlreadyLiveError,
+  isStaleCheckoutError,
   isSyncNotWiredError,
   isUsageLimitError,
 } from "./errors";
@@ -66,6 +70,7 @@ import {
   getProjectBurnAverage,
   sampleJobBurn,
 } from "../burn";
+import type { ClaudeRouting } from "../claude/driver-routing";
 import { getClaudeUsageCached, getClaudeUsageFresh, type ClaudeUsage } from "../claude/usage";
 import { admitJob, budgetGate, jobValueScore, type BudgetPolicy } from "./budget";
 
@@ -82,6 +87,13 @@ export interface RunnerConfig {
   quotaCooloffMs: number;
   /** Recheck cadence for a job blocked on a project with no Dolt remote (see `SyncNotWiredError`). */
   notWiredRetryMs: number;
+  /**
+   * Recheck cadence for a new start deferred because anton is behind its own code (see
+   * `StaleCheckoutError`). The condition clears when the operator restarts anton on fresh code, so
+   * this only bounds how soon the still-stale process re-checks — and, after a restart, how long a
+   * deferred row waits before the fresh process leases it.
+   */
+  staleCheckoutRetryMs: number;
   /** Max jobs in flight at once. */
   maxConcurrent: number;
   /**
@@ -111,6 +123,7 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   backoffMaxMs: 5 * 60_000,
   quotaCooloffMs: 30 * 60_000,
   notWiredRetryMs: 5 * 60_000,
+  staleCheckoutRetryMs: 5 * 60_000,
   maxConcurrent: 1,
   maxReviewFixConcurrent: 1,
   tickMs: 2_000,
@@ -222,6 +235,13 @@ export type LiveRunCheck = (
 export interface LiveJobInfo {
   sessionId?: string;
   cwd?: string;
+  /**
+   * The routing this job's headless spawn is pinned to — its settings snapshot at run start
+   * (anton-7poz). Reported so an investigate terminal can hit the SAME endpoint the live session
+   * does, even after project settings drift mid-run. Absent for jobs that don't report it; the
+   * terminal then falls back to routing on the project's current settings.
+   */
+  routing?: ClaudeRouting;
 }
 
 /** The synchronous live read for an in-flight job: what it reported, plus its type. */
@@ -296,6 +316,7 @@ export type Outcome =
   | { kind: "quota"; resetAt?: number }
   | { kind: "lease-held"; error: string }
   | { kind: "not-wired"; error: string }
+  | { kind: "stale-checkout"; error: string }
   | { kind: "poison"; error: string }
   | { kind: "error"; error: string };
 
@@ -341,6 +362,7 @@ export function classifyError(e: unknown): Outcome {
   if (isUsageLimitError(e)) return { kind: "quota", resetAt: e.resetAt };
   if (isRunAlreadyLiveError(e)) return { kind: "lease-held", error: e.message };
   if (isSyncNotWiredError(e)) return { kind: "not-wired", error: e.message };
+  if (isStaleCheckoutError(e)) return { kind: "stale-checkout", error: e.message };
   if (isPoisonError(e)) return { kind: "poison", error: e.message };
   return { kind: "error", error: e instanceof Error ? e.message : String(e) };
 }
@@ -397,6 +419,22 @@ export function nextAction(
         runAtMs,
         refundAttempt: true,
         lastError: `not wired to a remote: rechecks at ${new Date(runAtMs).toISOString()}`,
+      };
+    }
+    case "stale-checkout": {
+      // anton is behind its own latest code (anton-mh3c), so a new start is refused. Not the job's
+      // failure and NOT a poison: parking would strand it in `parked` until a human resumed it by
+      // hand even after the process-wide fix (pull/reinstall, restart anton) cleared the condition.
+      // Reschedule on a slow cadence with the attempt refunded instead — the still-stale process
+      // keeps deferring, and once restarted on fresh code the next attempt passes and runs itself.
+      // KEEP the classified reason (like lease-held/not-wired): it names WHAT is stale and the
+      // command that clears it, and is the only durable record on the row for the run-health sweep.
+      const runAtMs = nowMs + config.staleCheckoutRetryMs;
+      return {
+        action: "reschedule",
+        runAtMs,
+        refundAttempt: true,
+        lastError: `${outcome.error} — rechecks at ${new Date(runAtMs).toISOString()}`,
       };
     }
     case "poison":

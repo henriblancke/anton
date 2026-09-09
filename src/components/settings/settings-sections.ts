@@ -19,6 +19,9 @@ export const SECTIONS = [
     group: "The project",
     dirtyKeys: ["model"],
   },
+  // Beside General: routing is a fact about the project's identity — which endpoint it drives —
+  // and it shares the model knob's concern (anton-n16m).
+  { id: "gateway", label: "Claude gateway", group: "The project", dirtyKeys: ["gateway"] },
   { id: "agents", label: "Active agents", group: "The project", dirtyKeys: ["agents"] },
   {
     id: "prompt",

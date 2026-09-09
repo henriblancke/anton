@@ -219,32 +219,54 @@ export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promis
   });
 }
 
+/** One verify gate as it actually ran — the evidence {@link captureVerifyGates} hands its caller. */
+export interface VerifyGateOutcome extends VerifyGate {
+  ok: boolean;
+  code: number | null;
+  /** Combined stdout+stderr, verbatim. A caller that puts this in a prompt truncates it itself. */
+  output: string;
+}
+
 /**
- * Run the operator's verify gates in order (anton-3oh8), logging each to the session and throwing
- * on the first non-zero exit — the same fail path as the historical single test gate. `onFail`
- * builds the caller-specific error message (execute-epic names the ticket; review-fix names the
- * PR). An empty gate list is a no-op, preserving unchanged behavior when nothing is configured.
+ * Run the operator's verify gates in order (anton-3oh8) and REPORT what each did. The reporting
+ * half of {@link runVerifyGates}, which is the throwing half.
+ *
+ * `stopOnFail` (the default) stops at the first red, where the throwing half stops: for ENFORCEMENT
+ * the first failure is the whole answer and the gates after it would judge a tree already known to
+ * be broken. Pass `false` when the outcomes are EVIDENCE someone will reason from (PR #254 review):
+ * a caller that stops early knows only that one gate failed, while a reader told "the checks were
+ * run for you" would take the silence of lint, typecheck and build for their success.
  *
  * The whole sequence runs under a host-wide lock (anton-0oi): concurrent runs each starting a full
  * suite starve each other into timeout failures that belong to neither change. The lock is advisory
  * — if a peer holds it too long we run anyway, because a slow gate beats a wedged queue.
+ *
+ * Separated out for the review gate (anton-3jwh's fallout): the reviewer used to run the suite
+ * ITSELF, from inside its agent session, which is the one suite run on this machine that took no
+ * lock — so it neither waited for the runs anton was serializing nor made them wait for it. Handing
+ * it these outcomes instead puts the last suite run in the pipeline back under the same lock as
+ * every other. A red gate is returned, not thrown: at review time that is a finding for the reviewer
+ * to report and the fix session to repair, which is the loop that already exists.
  */
-export async function runVerifyGates(
+export async function captureVerifyGates(
   gates: VerifyGate[],
   cwd: string,
   signal: AbortSignal | undefined,
   logPath: string,
-  onFail: (gate: VerifyGate, code: number | null) => string,
-): Promise<void> {
-  if (gates.length === 0) return; // no gates: never take the lock
+  options: { stopOnFail?: boolean } = {},
+): Promise<VerifyGateOutcome[]> {
+  if (gates.length === 0) return []; // no gates: never take the lock
+  const stopOnFail = options.stopOnFail ?? true;
 
+  const outcomes: VerifyGateOutcome[] = [];
   await withHostLock(
     VERIFY_GATE_LOCK,
     async () => {
       for (const gate of gates) {
         const res = await runShell(gate.command, cwd, signal);
         await appendSessionLog(logPath, `\n[${gate.label}] ${gate.command}\n${res.output}\n`);
-        if (!res.ok) throw new Error(onFail(gate, res.code));
+        outcomes.push({ ...gate, ok: res.ok, code: res.code, output: res.output });
+        if (!res.ok && stopOnFail) return;
       }
     },
     {
@@ -258,4 +280,22 @@ export async function runVerifyGates(
       },
     },
   );
+  return outcomes;
+}
+
+/**
+ * Run the operator's verify gates in order, logging each to the session and throwing on the first
+ * non-zero exit — the same fail path as the historical single test gate. `onFail` builds the
+ * caller-specific error message (execute-epic names the ticket; review-fix names the PR). An empty
+ * gate list is a no-op, preserving unchanged behavior when nothing is configured.
+ */
+export async function runVerifyGates(
+  gates: VerifyGate[],
+  cwd: string,
+  signal: AbortSignal | undefined,
+  logPath: string,
+  onFail: (gate: VerifyGate, code: number | null) => string,
+): Promise<void> {
+  const red = (await captureVerifyGates(gates, cwd, signal, logPath)).find((o) => !o.ok);
+  if (red) throw new Error(onFail(red, red.code));
 }

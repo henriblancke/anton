@@ -136,6 +136,14 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
    * an edge on a bead still reading this way can only predate it (PR #238 review).
    */
   const claimed = { ...reopened, status: "in_progress", assignee: "op" } as Bead;
+  /**
+   * The same bead once the unlink has landed — the edge is OFF the board, which is what every read
+   * taken after it sees. The restore's own read is one of those (PR #238 review), and it re-draws
+   * the edge only on a ticket that still reads as the retirement anton unlinked.
+   */
+  const unlinked = { ...claimed, dependencies: [] } as Bead;
+  /** …and as the hand that raced the unlink left it: closed as superseded, its edge stripped. */
+  const settledElsewhere = { ...unlinked, status: "closed" } as Bead;
 
   beforeEach(() => {
     vi.resetAllMocks();
@@ -234,7 +242,7 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
   it("retries instead of running when a retirement landed while the edge was being removed", async () => {
     showMock
       .mockResolvedValueOnce(claimed) // pre-unlink: still ours, so the edge reads as stale
-      .mockResolvedValue({ ...claimed, status: "closed" }); // post-unlink: another hand settled it
+      .mockResolvedValue(settledElsewhere); // post-unlink: another hand settled it
 
     const err = await claimTicket(run(), reopened, "op").then(
       () => undefined,
@@ -257,7 +265,7 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
   // The restore is what makes the retry safe, so a bd that refuses it PARKS rather than handing the
   // next attempt a closed ticket with no survivor recorded (PR #238 review).
   it("parks when the retirement's edge cannot be written back", async () => {
-    showMock.mockResolvedValueOnce(claimed).mockResolvedValue({ ...claimed, status: "closed" });
+    showMock.mockResolvedValueOnce(claimed).mockResolvedValue(settledElsewhere);
     supersedeMock.mockRejectedValue(new Error("Command failed: bd supersede\ndatabase is locked"));
 
     const err = await claimTicket(run(), reopened, "op").then(
@@ -266,14 +274,14 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     );
     expect(err).toBeInstanceOf(PoisonEpic);
     expect((err as Error).message).toMatch(/bd supersede anton-t2 --with anton-t9/);
-    expect(supersedeMock).toHaveBeenCalledTimes(3); // mustPersist retries before it gives up
+    expect(supersedeMock).toHaveBeenCalledTimes(3); // it re-reads and re-writes before giving up
     expect(setStatusMock).not.toHaveBeenCalled();
   }, 10_000);
 
   it("retries when the same-survivor retirement moved the claim rather than the status", async () => {
     showMock
       .mockResolvedValueOnce(claimed)
-      .mockResolvedValue({ ...claimed, assignee: "someone-else" });
+      .mockResolvedValue({ ...unlinked, assignee: "someone-else" });
 
     const err = await claimTicket(run(), reopened, "op").then(
       () => undefined,
@@ -292,7 +300,7 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
   it("does not re-draw the edge when the ticket was abandoned in the window", async () => {
     showMock
       .mockResolvedValueOnce(claimed)
-      .mockResolvedValue({ ...claimed, status: "closed", labels: ["abandoned"] });
+      .mockResolvedValue({ ...settledElsewhere, labels: ["abandoned"] });
 
     const err = await claimTicket(run(), reopened, "op").then(
       () => undefined,
@@ -302,6 +310,83 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     expect(err).not.toBeInstanceOf(PoisonEpic);
     expect(supersedeMock).not.toHaveBeenCalled();
   });
+
+  // The window the fence's OWN read cannot see (PR #238 review): the fence read the settlement, and
+  // another hand reopens the ticket before the restore writes. Written unconditionally off that
+  // stale read, `bd supersede` would re-close a live bead and stamp the old survivor over the
+  // reopen — so the restore re-reads and re-proves the retirement immediately before it writes.
+  it("does not re-draw the edge when the ticket was reopened between the fence and the restore", async () => {
+    showMock
+      .mockResolvedValueOnce(claimed) // pre-unlink: the edge reads as stale
+      .mockResolvedValueOnce(settledElsewhere) // the fence: another hand settled it
+      .mockResolvedValue({ ...unlinked, status: "open", assignee: undefined }); // …then reopened it
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    // Still retryable — the fence's finding stands, and the next attempt decides on a fresh board.
+    expect((err as Error).message).toMatch(/while anton was removing the stale `supersedes` edge/);
+    expect(err).not.toBeInstanceOf(PoisonEpic);
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
+  // The same window, settled the other way: another hand re-superseded the ticket against a
+  // DIFFERENT survivor. Re-drawing anton's edge would overwrite that newer decision.
+  it("does not overwrite a retirement against another survivor landed since the fence", async () => {
+    const reretired = {
+      ...settledElsewhere,
+      dependencies: [{ issue_id: "anton-t2", depends_on_id: "anton-t7", type: "supersedes" }],
+    } as unknown as Bead;
+    showMock
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValueOnce(settledElsewhere)
+      .mockResolvedValue(reretired);
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toMatch(/while anton was removing the stale `supersedes` edge/);
+    expect(err).not.toBeInstanceOf(PoisonEpic);
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
+  // A retry re-reads too, so a board that moved between attempts stops the write rather than
+  // repeating it: `mustPersist`'s loop would have written blind on every attempt after the first.
+  it("re-reads before EVERY restore attempt, so a reopen mid-retry stops the write", async () => {
+    showMock
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValueOnce(settledElsewhere)
+      .mockResolvedValueOnce(settledElsewhere) // attempt 1 reads a settled ticket…
+      .mockResolvedValue({ ...unlinked, status: "open", assignee: undefined }); // …then it reopens
+    supersedeMock.mockRejectedValueOnce(new Error("Command failed: bd supersede\ndatabase is locked"));
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).not.toBeInstanceOf(PoisonEpic);
+    // One attempt only: the second read found a live ticket and the restore stood down.
+    expect(supersedeMock).toHaveBeenCalledTimes(1);
+  }, 10_000);
+
+  // The restore's own read failing is not "nothing landed" either — it parks on the same message a
+  // refused write does, because the ticket is still closed with no survivor recorded.
+  it("parks when the restore cannot read the ticket back", async () => {
+    showMock
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValueOnce(settledElsewhere)
+      .mockRejectedValue(new Error("database is locked"));
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PoisonEpic);
+    expect((err as Error).message).toMatch(/bd supersede anton-t2 --with anton-t9/);
+    expect(supersedeMock).not.toHaveBeenCalled();
+  }, 10_000);
 
   // "Could not read back" is not "nothing landed": proceeding would run the ticket on exactly the
   // race this fence exists to catch.

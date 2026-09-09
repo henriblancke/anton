@@ -280,6 +280,233 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
 });
 
 /**
+ * Claude gateway routing (anton-n16m): a project points at a gateway from settings without touching
+ * the shell that launched anton and without handing anton a secret. The base URL is validated as
+ * http(s), the token field takes an env var NAME (not a value), discovery is a boolean, each clears
+ * to its default, and a base URL saved with no token env var name is refused.
+ */
+describe("settings route — Claude gateway routing (anton-n16m)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("defaults by absence: a fresh project persists none of the three keys", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    const { settings } = await get.json();
+    expect(settings.claudeBaseUrl).toBeUndefined();
+    expect(settings.claudeAuthTokenEnv).toBeUndefined();
+    expect(settings.claudeGatewayModelDiscovery).toBeUndefined();
+  });
+
+  it("PATCH persists a base URL with its token env var and discovery, and GET restores them", async () => {
+    const res = await PATCH(
+      patchReq({
+        claudeBaseUrl: "http://localhost:20128",
+        claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+        claudeGatewayModelDiscovery: true,
+      }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings).toMatchObject({
+      claudeBaseUrl: "http://localhost:20128",
+      claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+      claudeGatewayModelDiscovery: true,
+    });
+    expect(persisted()).toMatchObject({
+      claudeBaseUrl: "http://localhost:20128",
+      claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+      claudeGatewayModelDiscovery: true,
+    });
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings).toMatchObject({
+      claudeBaseUrl: "http://localhost:20128",
+      claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+      claudeGatewayModelDiscovery: true,
+    });
+  });
+
+  it('PATCH "" / null clears each field back to the default (keys removed)', async () => {
+    await PATCH(
+      patchReq({
+        claudeBaseUrl: "https://gateway.example.dev/v1",
+        claudeAuthTokenEnv: "GATEWAY_TOKEN",
+        claudeGatewayModelDiscovery: true,
+      }),
+      ctx("tmp"),
+    );
+    // Clearing the base URL first: an empty base URL removes the credential requirement, so the
+    // token env var can clear in the same patch without tripping the cross-check.
+    const res = await PATCH(
+      patchReq({ claudeBaseUrl: "", claudeAuthTokenEnv: null, claudeGatewayModelDiscovery: null }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    const { settings } = await res.json();
+    expect(settings.claudeBaseUrl).toBeUndefined();
+    expect(settings.claudeAuthTokenEnv).toBeUndefined();
+    expect(settings.claudeGatewayModelDiscovery).toBeUndefined();
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+    expect("claudeAuthTokenEnv" in persisted()).toBe(false);
+    expect("claudeGatewayModelDiscovery" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL that isn't an http(s) URL, leaving settings untouched", async () => {
+    for (const bad of ["not a url", "ftp://gateway.dev", "localhost:20128", 42]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL carrying credentials — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://user:sk-secret@gateway.example/v1",
+      "https://sk-secret@gateway.example/v1",
+      "http://user:pass@localhost:20128",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL with a query or fragment — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://gateway.example/v1?api_key=sk-secret",
+      "https://gateway.example/v1#token=sk-secret",
+      "https://gateway.example/v1?foo=bar",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL embedding a credential in its path — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://gateway.example/api/sk-secret/v1",
+      "https://gateway.example/sk-ant-abc123",
+      "https://gateway.example/ghp_0123456789abcdef/v1",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL embedding a credential in its hostname — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://sk-secret.gateway.example/v1",
+      "https://ghp_0123456789abcdef.gateway.example/v1",
+      // Case-sensitive markers: new URL() lowercases the label, but the raw string is what gets
+      // persisted, so the check must scan the original case (anton-pv2p review, thread PRRT_…gdFZR).
+      "https://AKIAIOSFODNN7EXAMPLE.gateway.example/v1",
+      "https://AIzaSyD0123456789abcdef.gateway.example/v1",
+      // Percent-encoded: new URL() decodes the label, so the marker is absent from the raw string
+      // but present in what a reader resolves (anton-pv2p review, thread PRRT_…dZEo).
+      "https://%41KIAIOSFODNN7EXAMPLE.gateway.example/v1",
+      "https://%67hp_0123456789abcdef.gateway.example/v1",
+      // A malformed escape in the PATH must not abort the host decode.
+      "https://%41KIAIOSFODNN7EXAMPLE.gateway.example/%zz",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH accepts a versioned base-URL path — a token-free path is not a credential", async () => {
+    const res = await PATCH(
+      patchReq({
+        claudeBaseUrl: "https://gateway.example/v1/openai",
+        claudeAuthTokenEnv: "GATEWAY_TOKEN",
+      }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    expect(persisted().claudeBaseUrl).toBe("https://gateway.example/v1/openai");
+  });
+
+  it("PATCH rejects a token VALUE in the env-var-name field — a secret must not be stored", async () => {
+    // "AKIAIOSFODNN7EXAMPLE" is all-uppercase, so it satisfies the identifier pattern; the
+    // credential detector still rejects it, keeping a pasted AWS key out of settings_json.
+    for (const bad of [
+      "sk-ant-abc123",
+      "anthropic-auth-token",
+      "MY TOKEN",
+      "1TOKEN",
+      "AKIAIOSFODNN7EXAMPLE",
+      42,
+    ]) {
+      const res = await PATCH(patchReq({ claudeAuthTokenEnv: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeAuthTokenEnv/);
+    }
+    expect("claudeAuthTokenEnv" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a non-boolean claudeGatewayModelDiscovery", async () => {
+    for (const bad of ["yes", 1, {}]) {
+      const res = await PATCH(patchReq({ claudeGatewayModelDiscovery: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+    expect("claudeGatewayModelDiscovery" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL saved with no token env var name, and names the fix", async () => {
+    const res = await PATCH(patchReq({ claudeBaseUrl: "http://localhost:20128" }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/claudeAuthTokenEnv/);
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("cross-checks the base URL against the STORED token env var, not just the patched fields", async () => {
+    // The token env var is already stored; a later patch may set the base URL alone.
+    await PATCH(patchReq({ claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }), ctx("tmp"));
+    const res = await PATCH(patchReq({ claudeBaseUrl: "http://localhost:20128" }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted()).toMatchObject({
+      claudeBaseUrl: "http://localhost:20128",
+      claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+    });
+
+    // Clearing the stored token env var while a base URL stands is the same contradiction, refused.
+    const orphaned = await PATCH(patchReq({ claudeAuthTokenEnv: null }), ctx("tmp"));
+    expect(orphaned.status).toBe(400);
+    expect((await orphaned.json()).error).toMatch(/claudeAuthTokenEnv/);
+    expect(persisted().claudeAuthTokenEnv).toBe("ANTHROPIC_AUTH_TOKEN");
+  });
+});
+
+/**
  * The product-master pass's prompt override (anton-d2sx) — the settings precedence pattern applied to
  * the one automation whose behaviour is a reasoning contract. Only the JUDGMENT is swappable; the
  * board context and the wire format stay anton's, which is what the pass's own suite asserts.

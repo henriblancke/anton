@@ -15,7 +15,7 @@
  * stay testable without a db, a repo or a job queue.
  */
 import type { RunStatus } from "@/components/runs/run-view-utils";
-import { poisonBlockerIds } from "./jobs/errors";
+import { isStaleCheckoutDeferral, poisonBlockerIds } from "./jobs/errors";
 
 /** What one run says about the environment it ran in. */
 export type RunVerdict = "delivered" | "failure" | "ignored";
@@ -93,12 +93,22 @@ export interface FailureStreak {
 /**
  * How one run counts.
  *
- * Three rules, and the order between them is the point:
+ * Four rules, and the order between them is the point:
  *
  *   • `done` is a DELIVERY, and a delivery ends any streak behind it — whatever was wrong, work is
  *     landing again.
+ *   • a STALE-CHECKOUT deferral counts as nothing (PR #257 review). The row reads `failed`, but the
+ *     run never started work — it refused a start because the anton PROCESS was behind its own code,
+ *     took no lease/worktree/claim, and was rescheduled with its attempt refunded. That is a
+ *     machine-wide condition that self-clears on restart, not the per-project broken environment
+ *     this breaker latches on; counting it would disarm a project no work even ran in. Skipped, not
+ *     a reset, for the cancelled reason below: the real runs either side are one story. Read BEFORE
+ *     abandonment, because abandoning a target marks every row it ever had abandoned — including the
+ *     never-started ones — and three such give-ups would otherwise latch the breaker on runs that
+ *     attempted nothing.
  *   • an ABANDONED run counts as a failure (R4.4). Abandoning work also kills its job, so an
- *     abandoned run is a cancelled one too; the abandonment is what matters, so it is read first.
+ *     abandoned run is a cancelled one too; the abandonment is what matters, so it outranks the
+ *     cancel.
  *   • a CANCELLED run counts as nothing. jobs/queue.ts documents `cancelled` as terminally killed by
  *     an operator — a person saying stop is not evidence that anything went wrong. It is skipped
  *     rather than treated as a reset for the same reason: it says nothing about the environment, so
@@ -108,6 +118,7 @@ export interface FailureStreak {
  */
 export function verdictOf(run: RunOutcome): RunVerdict {
   if (run.status === "done") return "delivered";
+  if (isStaleCheckoutDeferral(run.error)) return "ignored";
   if (run.abandoned) return "failure";
   if (run.cancelled) return "ignored";
   if (run.status === "parked" || run.status === "failed") return "failure";

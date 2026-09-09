@@ -14,7 +14,7 @@
  * wiring is what makes it unit-testable against a fake driver.
  */
 import { type Bead } from "../beads/bd";
-import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
+import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import {
   commitAll,
   diffAgainstBase,
@@ -22,6 +22,7 @@ import {
   resolveMergeBase,
   restoreWorktreeState,
   sameWorktreeState,
+  stageAllAndHashTree,
   type BranchDiff,
   type WorktreeState,
 } from "../git/ops";
@@ -40,7 +41,7 @@ import {
   type ReviewerSource,
 } from "./review-context";
 import type { JobContext } from "./runner";
-import { runVerifyGates } from "./shell";
+import { captureVerifyGates, type VerifyGateOutcome } from "./shell";
 
 /** One review (and the fix it dispatched, if any) — the record the call-site persists per round. */
 export interface ReviewRound {
@@ -119,6 +120,8 @@ export interface ReviewGateDeps {
   readState?: (worktreePath: string) => Promise<WorktreeState>;
   /** Undo whatever a review wrote, back to the fingerprint taken before it ran. */
   restoreState?: (worktreePath: string, state: WorktreeState) => Promise<void>;
+  /** Hash the tree a commit would write — the fix session's proof across its own commit hooks. */
+  hashTree?: (worktreePath: string) => Promise<string>;
 }
 
 /** The slice of the runner's JobContext the gate needs — narrow, so tests can fake it in two lines. */
@@ -263,6 +266,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const commit = args.deps?.commit ?? commitAll;
   const readState = args.deps?.readState ?? readWorktreeState;
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
+  const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
 
   // Pin the fork point once, for every round: `baseBranch` is a MOVABLE ref (`origin/<base>`), and a
   // sibling run's fetch or a resumed worktree can advance it while this gate runs. Re-resolving it
@@ -278,6 +282,12 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
    * here is handed what that gate left rather than starting blind (see {@link ReviewGateArgs.carried}).
    */
   let carried: ReviewFinding[] = args.carried ?? [];
+  /**
+   * Gate evidence still valid for the tree the next round will read. Undefined on round 1 (the
+   * review session runs them), then carried from each fix session, which already runs the gates on
+   * exactly the content it commits — so a converging review never runs the suite twice per round.
+   */
+  let verified: VerifyGateOutcome[] | undefined;
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();
@@ -301,6 +311,8 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       claude,
       readState,
       restoreState,
+      verified,
+      ...(args.assertLeaseHeld ? { assertLeaseHeld: args.assertLeaseHeld } : {}),
     });
     reviewer = review.reviewer;
 
@@ -366,9 +378,13 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       commit,
       readState,
       restoreState,
+      hashTree,
     });
     entry.fixSessionId = fix.sessionId;
     entry.fixCommitted = fix.committed;
+    // The fix ran the gates on what it committed, so the next round is handed that evidence rather
+    // than re-running the suite to learn the same thing.
+    verified = fix.verified;
 
     // Nothing changed: the next review would read the identical diff and report the identical
     // findings. Stop and let the call-site decide, rather than burning the remaining rounds.
@@ -430,6 +446,14 @@ async function runReviewSession(args: {
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
+  /** Re-assert the run lease after the gates, before the reviewer session is spent. */
+  assertLeaseHeld?: () => void;
+  /**
+   * Gate evidence already fresh for this tree — the previous round's fix session ran them after its
+   * repair. Absent on round 1, and after any round whose evidence a commit has since invalidated:
+   * this session then runs them itself.
+   */
+  verified?: VerifyGateOutcome[];
 }): Promise<{ sessionId: string; reviewer: ReviewerSource; report: ReviewReportResult }> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, round, maxRounds, claude } = args;
 
@@ -439,10 +463,12 @@ async function runReviewSession(args: {
     kind: "review",
     beadId: target.id,
   });
-  ctx.report({ sessionId, cwd: worktreePath });
+  // Pin the report to this run's routing (anton-7poz) so an investigate terminal hits the endpoint
+  // under review even on an all-tickets-skipped resume, where openTicketSession never seeded it.
+  ctx.report({ sessionId, cwd: worktreePath, routing: claudeRouting(settings) });
 
   try {
-    const before = await settleBaseline({
+    const settled = await settleBaseline({
       worktreePath,
       logPath,
       round,
@@ -450,6 +476,73 @@ async function runReviewSession(args: {
       readState: args.readState,
       restoreState: args.restoreState,
     });
+
+    // The project's gates, run HERE rather than by the reviewer (anton-3jwh's fallout): under the
+    // host-wide verify lock, on the settled tree, with their output handed to the reviewer as
+    // evidence. A reviewer left to run the suite itself takes no lock, so it competes with every
+    // run anton is serializing — and the loser backgrounds the suite and ends its turn waiting for
+    // a notification a headless session cannot receive, which parks a finished run.
+    // `stopOnFail: false` because these outcomes are EVIDENCE, not enforcement (PR #254 review):
+    // the section below tells the reviewer the project's checks were run for it, and stopping at a
+    // red `tests` would make that a lie about the lint, typecheck and build that never ran — with
+    // the reviewer explicitly permitted to judge a red gate pre-existing and pass.
+    const captured =
+      args.verified ??
+      (await captureVerifyGates(resolveVerifyGates(settings), worktreePath, ctx.signal, logPath, {
+        stopOnFail: false,
+      }));
+
+    // A gate that wrote something GIT CAN SEE is DISCARDED, not adopted (PR #254 review).
+    //
+    // Adopting it as the baseline was wrong twice over. `readDiff` describes committed HEAD and
+    // `openPullRequest` pushes HEAD, so gate-written content is content the reviewer can read off
+    // disk and grade while the PR will never carry it — a clean verdict covering work that does not
+    // ship. And the residue it was meant to excuse is not even visible: `readWorktreeState` reads
+    // `git status --porcelain`, which excludes ignored files, so the build caches and coverage a
+    // suite writes never reach the fingerprint at all. What survives the filter is a tracked-file
+    // edit or a non-ignored artifact — precisely the content that must not stand.
+    //
+    // Discarding is also cheap: `restoreWorktreeState` cleans with `-fd` and no `-x`, so the ignored
+    // caches the next gate run wants are left exactly where they are.
+    //
+    // Gated on the gates having actually RUN here: handed-down evidence (round 2+) means nothing
+    // executed in this session, and a project that pins none has nothing to discard or wait for.
+    const ranGates = !args.verified && captured.length > 0;
+    let verified = captured;
+    // Set when the gates dirtied the tree: the writes are reverted AND their outcomes go with them.
+    let gatesDiscarded = false;
+    if (ranGates) {
+      const afterGates = await args.readState(worktreePath);
+      if (!sameWorktreeState(afterGates, settled)) {
+        // The OUTCOMES are void too, not just the writes (PR #254 review). `captureVerifyGates` runs
+        // the whole sequence before this check, so a gate that produced an artifact a LATER gate
+        // consumed makes that later `passed` describe the dirty tree — the build succeeded because
+        // the generated file was there, and it is about to not be. Reporting it would be the same
+        // false claim as adopting the writes, one step further in.
+        //
+        // Discarded rather than re-run on the restored tree: a gate that dirties does so
+        // deterministically — a generator generates again — so the retry buys a second full suite
+        // and the same verdict. Throwing the evidence away degrades to the honest answer, which the
+        // prompt then states outright: anton ran the gates, the results did not describe this tree,
+        // so run what you need yourself.
+        gatesDiscarded = true;
+        verified = [];
+        await args.restoreState(worktreePath, settled);
+        await appendSessionLog(
+          logPath,
+          `[review] round ${round}/${maxRounds}: the verify gates left changes git can see — ` +
+            `reverted, and their results discarded with them, because a gate that writes can also ` +
+            `have fed a later gate:\n${afterGates.status}\n`,
+        );
+      }
+    }
+    const before = settled;
+
+    // The gates can run for many minutes — the suite itself, plus any wait on the host verify lock —
+    // so the round's own lease check is stale by now (PR #254 review). Re-assert before spending a
+    // reviewer session: another machine may already hold this run, and a verdict persisted under a
+    // lapsed lease speaks for work this process no longer owns.
+    if (ranGates) args.assertLeaseHeld?.();
 
     try {
       const diff = await args.readDiff(worktreePath, args.baseRev);
@@ -464,6 +557,8 @@ async function runReviewSession(args: {
         // own diff could not have written, and that no commit landing on the base mid-review moves.
         baseRev: args.baseRev,
         carriedAdvisories: args.carried,
+        verified,
+        gatesDiscarded,
       });
       await appendSessionLog(
         logPath,
@@ -476,6 +571,7 @@ async function runReviewSession(args: {
         cwd: worktreePath,
         prompt,
         model: settings.model,
+        routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         disallowedTools: REVIEW_DENIED_TOOLS,
         settingSources: [...REVIEW_SETTING_SOURCES],
@@ -698,6 +794,29 @@ async function discardSessionWrites(args: {
 }
 
 /**
+ * The tree a commit would write from this worktree, or `undefined` when git could not say.
+ *
+ * The hash decides ONLY whether the fix session's gate outcomes still describe the committed tree,
+ * so failing to take it must never fail a session that has already verified and committed its work.
+ * An unreadable hash degrades to "unproven", and the next review round runs the gates itself.
+ */
+async function hashTreeOrUnknown(
+  hashTree: (worktreePath: string) => Promise<string>,
+  worktreePath: string,
+): Promise<string | undefined> {
+  try {
+    return await hashTree(worktreePath);
+  } catch {
+    return undefined;
+  }
+}
+
+/** A tree hash for the log line, naming the unreadable case rather than printing `undefined`. */
+function describeTree(tree: string | undefined): string {
+  return tree ? tree.slice(0, 12) : "unreadable";
+}
+
+/**
  * One fix: a fresh claude session over the round's blocking findings, the operator's verify gates,
  * then a commit onto the run's branch. Advisory findings are deliberately NOT dispatched — they are
  * surfaced to the founder, and letting the fixer roam past the blocking list widens the diff with
@@ -734,7 +853,9 @@ async function runGateFixSession(args: {
   commit: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
-}): Promise<{ sessionId: string; committed: boolean }> {
+  /** Hash the tree a commit would write — how the gate proves the committed tree is the tested one. */
+  hashTree: (worktreePath: string) => Promise<string>;
+}): Promise<{ sessionId: string; committed: boolean; verified?: VerifyGateOutcome[] }> {
   const { db, clock, ctx, projectId, runId, target, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
 
@@ -753,7 +874,7 @@ async function runGateFixSession(args: {
     kind: "review-fix",
     beadId: target.id,
   });
-  ctx.report({ sessionId, cwd: worktreePath });
+  ctx.report({ sessionId, cwd: worktreePath, routing: claudeRouting(settings) });
 
   try {
     await appendSessionLog(
@@ -772,6 +893,7 @@ async function runGateFixSession(args: {
         prompt,
         appendSystemPrompt,
         model: settings.model,
+        routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         signal: ctx.signal,
         onEvent,
@@ -795,16 +917,32 @@ async function runGateFixSession(args: {
         );
       }
 
-      await runVerifyGates(
-        resolveVerifyGates(settings),
-        worktreePath,
-        ctx.signal,
-        logPath,
-        (gate, code) => `${gate.label} gate failed after review round ${round} for ${target.id} (exit ${code})`,
-      );
+      // Captured, not merely enforced: these gates run on exactly the content committed below, so
+      // they are also the evidence the NEXT round's reviewer is handed — which is what spares that
+      // reviewer from running the suite again to learn what this session just learned.
+      const gates = await captureVerifyGates(resolveVerifyGates(settings), worktreePath, ctx.signal, logPath);
+      const red = gates.find((g) => !g.ok);
+      if (red) {
+        throw new Error(
+          `${red.label} gate failed after review round ${round} for ${target.id} (exit ${red.code})`,
+        );
+      }
 
+      // The gates ran on the tree as it stands; `commitAll` then runs the PROJECT'S HOOKS, and a
+      // lint-staged that rewrites files leaves HEAD holding content those gates never saw —
+      // git/ops.ts documents exactly this hazard, and this repo's own pre-commit hook does it.
+      // Hashing either side of the commit is how the evidence proves it describes the committed
+      // tree; when it does not, it is dropped and the next round runs the gates itself.
+      const testedTree = await hashTreeOrUnknown(args.hashTree, worktreePath);
       const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`);
+      // Set the instant the commit lands, BEFORE the second hash: past here the round's work is
+      // verified and committed, and the rollback below must not touch it however this session ends.
+      // Hashing after it would otherwise put a good, gate-passing fix behind `discardSessionWrites`.
       verified = true;
+      const committedTree = await hashTreeOrUnknown(args.hashTree, worktreePath);
+      // Proven only when both hashes were readable AND equal. An unreadable hash is evidence that
+      // cannot be trusted, which is the same answer as evidence that is stale.
+      const treeProven = testedTree !== undefined && testedTree === committedTree;
       // Nothing staged is only "no progress" if HEAD also stood still — otherwise the fixer committed
       // its own work and the branch already carries the repair the next review will read.
       const selfCommitted = !committed && afterFix.head !== before.head;
@@ -816,8 +954,21 @@ async function runGateFixSession(args: {
             ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
             : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
       );
+      if (!treeProven) {
+        await appendSessionLog(
+          logPath,
+          `[review-fix] round ${round}/${maxRounds}: the gates' evidence is not provably the committed ` +
+            `tree (${describeTree(testedTree)} → ${describeTree(committedTree)}) — a commit hook that ` +
+            `rewrites files does exactly this — so the next review runs them itself rather than ` +
+            `trusting evidence for a tree it is not reading\n`,
+        );
+      }
       await endSession(db, clock, sessionId, "done");
-      return { sessionId, committed: committed || selfCommitted };
+      return {
+        sessionId,
+        committed: committed || selfCommitted,
+        ...(treeProven ? { verified: gates } : {}),
+      };
     } catch (e) {
       // Gates run before the commit so a failure leaves the fix uncommitted — unless the fixer
       // committed its own work first, which project instructions routinely tell an agent to do. Then

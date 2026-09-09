@@ -1,18 +1,34 @@
 /**
- * The precedence between the two brakes (anton-wy9y / R4.1). One band, two things that can be true
- * at once — and getting the order wrong tells an operator "nothing for you to do" about a policy
- * that is frozen until they act.
+ * The precedence between the brakes (anton-wy9y / R4.1, anton-mh3c). One band, several things that
+ * can be true at once — and getting the order wrong tells an operator "nothing for you to do" about a
+ * policy that is frozen until they act, or leaves a stale process explaining itself as a quality
+ * disarm it never was.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AutopilotDisarm, AutopilotHold } from "./autopilot-breaker";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { BREAKER_POLL_MS, type AutopilotDisarm, type AutopilotHold } from "./autopilot-breaker";
+import type { SelfFreshness } from "./jobs/self-freshness";
 import type { Project } from "./types";
 
 const currentDisarm = vi.hoisted(() => vi.fn());
 const currentWipHold = vi.hoisted(() => vi.fn());
+const checkSelfFreshness = vi.hoisted(() => vi.fn());
 vi.mock("./autopilot-disarm", () => ({ currentDisarm }));
 vi.mock("./jobs/picker-wip-hold", () => ({ currentWipHold }));
+vi.mock("./jobs/self-freshness", () => ({
+  checkSelfFreshness,
+  selfRepoRoot: () => "/self",
+  // The band asks about the RUNNER's process, not whichever one renders the page — asserted below.
+  RUNNER: { buildDrift: () => null, bootDependencies: () => null },
+}));
+
+const FRESH: SelfFreshness = {
+  checkout: { state: "current" },
+  dependencies: { state: "match" },
+  build: { state: "current" },
+};
 
 const { currentBreaker } = await import("./autopilot-state");
+const { RUNNER } = await import("./jobs/self-freshness");
 
 const project = { id: "p1", slug: "p1", name: "P1", repoPath: "/repo" } as Project;
 
@@ -24,6 +40,7 @@ const disarm: AutopilotDisarm = {
 };
 const hold: AutopilotHold = { kind: "hold", reason: "wip-limit", detail: "3 open PRs" };
 
+beforeEach(() => checkSelfFreshness.mockResolvedValue(FRESH));
 afterEach(() => vi.clearAllMocks());
 
 describe("currentBreaker", () => {
@@ -32,6 +49,44 @@ describe("currentBreaker", () => {
     currentWipHold.mockResolvedValue(undefined);
 
     expect(await currentBreaker(project)).toBeUndefined();
+  });
+
+  it("shows a stale stop over everything, and never pays for the board reads to find that out", async () => {
+    // A process behind its own code refuses to start ANY run, so nothing a disarm or hold clears
+    // would let work start while it stands — the stale band wins, and the per-project reads never run.
+    checkSelfFreshness.mockResolvedValue({
+      checkout: { state: "behind", behind: 2, upstream: "origin/main" },
+      dependencies: { state: "match" },
+      build: { state: "current" },
+    } satisfies SelfFreshness);
+    currentDisarm.mockResolvedValue(disarm);
+    currentWipHold.mockResolvedValue(hold);
+
+    const breaker = await currentBreaker(project);
+    expect(breaker?.kind).toBe("stale");
+    expect(currentDisarm).not.toHaveBeenCalled();
+    expect(currentWipHold).not.toHaveBeenCalled();
+  });
+
+  // Both process-specific halves — the build it booted from and the packages it imported — must
+  // describe the RUNNER, not whichever process renders the page (PR #257 review). The band also
+  // renders on every paint and re-reads on every breaker poll, once per project, so it accepts a
+  // verdict one poll interval old rather than paying a `git fetch` per render — the window is the
+  // poll cadence itself, so a cleared stop never outlives the ask that would have noticed it.
+  it("asks about the process that runs the jobs, not the one serving the page", async () => {
+    currentDisarm.mockResolvedValue(undefined);
+    currentWipHold.mockResolvedValue(undefined);
+
+    await currentBreaker(project);
+
+    expect(checkSelfFreshness).toHaveBeenCalledWith("/self", RUNNER, { maxAgeMs: BREAKER_POLL_MS });
+  });
+
+  it("falls through to the per-project brakes when anton is running its own latest code", async () => {
+    currentDisarm.mockResolvedValue(disarm);
+    currentWipHold.mockResolvedValue(hold);
+
+    expect(await currentBreaker(project)).toBe(disarm);
   });
 
   it("shows the hold when only the review queue is full", async () => {

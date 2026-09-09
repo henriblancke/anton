@@ -49,7 +49,7 @@
  */
 import { existsSync } from "node:fs";
 import { beads, type Bead } from "../beads/bd";
-import { runClaude } from "../claude/driver";
+import { claudeRouting, runClaude } from "../claude/driver";
 import {
   branchAheadOfRemote,
   commitAll,
@@ -557,8 +557,9 @@ async function runFixSession(args: {
     beadId: epic.id,
   });
   // Live handle (anton-susu): review-fix writes no run row, so this is how observe finds the
-  // in-flight session + worktree.
-  ctx.report({ sessionId, cwd: worktree.path });
+  // in-flight session + worktree. The captured routing rides along (anton-7poz) so an investigate
+  // terminal hits the SAME gateway this fix session does, even if settings drift mid-run.
+  ctx.report({ sessionId, cwd: worktree.path, routing: claudeRouting(settings) });
 
   try {
     await appendSessionLog(
@@ -581,6 +582,7 @@ async function runFixSession(args: {
       prompt,
       appendSystemPrompt,
       model: settings.model,
+      routing: claudeRouting(settings),
       permissionMode: settings.permissionMode ?? "bypassPermissions",
       signal: ctx.signal,
       onEvent,

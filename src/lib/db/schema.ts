@@ -36,6 +36,13 @@ export const runs = sqliteTable("runs", {
   branch: text("branch"),
   model: text("model"),
   agentTag: text("agent_tag"),
+  // The endpoint host this run drove (anton-oom5): the gateway's host when a project is routed,
+  // else the Anthropic default `api.anthropic.com`, so a bad run can be attributed to the gateway or
+  // cleared of it without re-running it. The HOST only — never the token, never a URL carrying
+  // userinfo (see `endpointHostFromBaseUrl`). NULL only on rows written before this column existed:
+  // an unrouted run records the default explicitly, so an old row and an unrouted new row are not
+  // confusable. Not backfilled.
+  endpointHost: text("endpoint_host"),
   // The pipeline this run walked (anton-aa3m): the formula file's absolute path, and the bead label
   // that selected it when a per-label variant applied (null = the project/bundled default). Recorded
   // rather than inferred — per-project pipelines make "why did this run do that" project-specific,

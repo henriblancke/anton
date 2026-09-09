@@ -12,7 +12,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "./db/testing";
 import * as schema from "./db/schema";
 import {
+  ANTHROPIC_DEFAULT_ENDPOINT_HOST,
   createRun,
+  endpointHostFromBaseUrl,
   findRunFormulaForBranch,
   getRunBaseForkSha,
   listDeliveriesByBead,
@@ -298,5 +300,53 @@ describe("listDeliveriesByBead", () => {
     expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(
       new Map([[EPIC, [sec(SETTLED)]]]),
     );
+  });
+});
+
+/** The endpoint a run drove is recorded as provenance (anton-oom5). */
+describe("endpoint host", () => {
+  const clock: Clock = { now: () => 1_800_000_000_000 };
+
+  it("reduces a routing base URL to its host, never carrying userinfo or a token", () => {
+    const host = endpointHostFromBaseUrl("https://user:sk-secret-token@gateway.example:20128/v1");
+    expect(host).toBe("gateway.example:20128");
+    expect(host).not.toContain("sk-secret-token");
+    expect(host).not.toContain("user");
+    expect(host).not.toContain("@");
+  });
+
+  it("keeps the port, which is how a local gateway is told from Anthropic direct", () => {
+    expect(endpointHostFromBaseUrl("http://localhost:20128")).toBe("localhost:20128");
+  });
+
+  it("treats a missing or unparseable base URL as unrouted — the Anthropic default", () => {
+    expect(endpointHostFromBaseUrl(undefined)).toBe(ANTHROPIC_DEFAULT_ENDPOINT_HOST);
+    expect(endpointHostFromBaseUrl("")).toBe(ANTHROPIC_DEFAULT_ENDPOINT_HOST);
+    expect(endpointHostFromBaseUrl("   ")).toBe(ANTHROPIC_DEFAULT_ENDPOINT_HOST);
+    expect(endpointHostFromBaseUrl("not a url")).toBe(ANTHROPIC_DEFAULT_ENDPOINT_HOST);
+  });
+
+  async function endpointHostOf(id: string): Promise<string | null> {
+    const row = t.sqlite.prepare("select endpoint_host from runs where id = ?").get(id) as {
+      endpoint_host: string | null;
+    };
+    return row.endpoint_host;
+  }
+
+  it("records the Anthropic default for an unrouted run, distinct from a pre-column NULL", async () => {
+    await createRun(t.db, clock, { id: "unrouted", projectId: PROJECT, epicBeadId: EPIC });
+
+    expect(await endpointHostOf("unrouted")).toBe(ANTHROPIC_DEFAULT_ENDPOINT_HOST);
+  });
+
+  it("records the gateway host for a routed run", async () => {
+    await createRun(t.db, clock, {
+      id: "routed",
+      projectId: PROJECT,
+      epicBeadId: EPIC,
+      endpointHost: endpointHostFromBaseUrl("https://token@router.local:20128"),
+    });
+
+    expect(await endpointHostOf("routed")).toBe("router.local:20128");
   });
 });

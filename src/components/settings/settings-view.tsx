@@ -16,6 +16,7 @@ import { AutopilotSection } from "@/components/settings/sections/autopilot-secti
 import { DangerSection } from "@/components/settings/sections/danger-section";
 import { ExecutionSection } from "@/components/settings/sections/execution-section";
 import { GatesSection } from "@/components/settings/sections/gates-section";
+import { GatewaySection } from "@/components/settings/sections/gateway-section";
 import { GeneralSection } from "@/components/settings/sections/general-section";
 import {
   PickerAutonomySection,
@@ -158,6 +159,7 @@ export function SettingsView({
   // choice a lookup rather than a fifteen-arm chain — only the one this renders ever mounts.
   const panels: Record<SectionId, ReactNode> = {
     general: <GeneralSection project={project} form={form} />,
+    gateway: <GatewaySection form={form} />,
     agents: <AgentsSection form={form} bundledAgents={bundledAgents} userAgents={userAgents} />,
     prompt: <PromptSection form={form} basePrompt={basePrompt} />,
     variants: <VariantsSection form={form} />,

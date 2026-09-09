@@ -220,4 +220,26 @@ describe("openPassSession", () => {
     expect(sessionText(row.logPath)).toContain("[product-master] 0 claim(s) reported\n");
     expect((await sessionRow()).status).toBe("done");
   });
+
+  // anton-7poz: a pass that pins its spawn to captured routing reports it on the live handle, so an
+  // investigate terminal opened mid-pass hits the same gateway even after project settings drift.
+  it("reports the captured routing on the live handle", async () => {
+    await enqueue("job-10", "product-master");
+    const ctx = fakeJobContext({ jobId: "job-10", type: "product-master" });
+    const routing = {
+      routed: true,
+      baseUrl: "https://gateway.example/api",
+      authTokenEnv: "GATEWAY_TOKEN",
+      gatewayModelDiscovery: false,
+    } as const;
+    const session = await openPassSession(t.db, clock, {
+      ctx,
+      projectId,
+      kind: "product-master",
+      cwd: REPO,
+      routing,
+    });
+
+    expect(ctx.reported).toEqual([{ sessionId: session.sessionId, cwd: REPO, routing }]);
+  });
 });

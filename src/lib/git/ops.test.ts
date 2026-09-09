@@ -38,6 +38,7 @@ import {
   pullRequestCommitNaming,
   pullRequestCommitUnder,
   readPathHistory,
+  distanceBehindUpstream,
   readPreservedCommitFor,
   readWorktreeState,
   resolveFreshBase,
@@ -1093,6 +1094,59 @@ suite("resolveFreshBase (real git)", () => {
     expect(ref).toBe("main");
     // No remote → no fetch attempt → no warning.
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+suite("distanceBehindUpstream concurrency (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+  let bare: string;
+
+  const g = (cwd: string, args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-distbehind-"));
+    repo = join(sandbox, "repo");
+    bare = join(sandbox, "remote.git");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "--bare", "-q", "-b", "main", bare], { stdio: "ignore" });
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(repo, ["config", "user.email", "t@example.com"]);
+    g(repo, ["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(repo, ["add", "-A"]);
+    g(repo, ["commit", "-q", "-m", "init"]);
+    g(repo, ["remote", "add", "origin", bare]);
+    // `-u` sets branch.main.remote/.merge so distanceBehindUpstream has an upstream to read.
+    g(repo, ["push", "-q", "-u", "origin", "main"]);
+
+    // Advance origin by one commit so the local tracking ref is a step behind.
+    const other = join(sandbox, "other");
+    execFileSync("git", ["clone", "-q", bare, other], { stdio: "ignore" });
+    g(other, ["config", "user.email", "t@example.com"]);
+    g(other, ["config", "user.name", "anton-test"]);
+    writeFileSync(join(other, "next.md"), "next\n");
+    g(other, ["add", "-A"]);
+    g(other, ["commit", "-q", "-m", "ahead"]);
+    g(other, ["push", "-q", "origin", "main"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  // The breaker poll and the execute-epic preflight fetch the SAME upstream tracking ref from one
+  // process; unserialized, the loser of git's per-ref lock returns `unreachable`, which the stale
+  // gate treats as indeterminate and lets a behind checkout start. Serialized, every concurrent read
+  // returns the one true verdict.
+  it("returns a single deterministic verdict under many concurrent reads (no ref-lock race)", async () => {
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => distanceBehindUpstream(repo)),
+    );
+    for (const r of results) {
+      expect(r).toEqual({ state: "behind", behind: 1, upstream: "origin/main" });
+    }
   });
 });
 
