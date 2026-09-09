@@ -3,7 +3,8 @@
  * worktree, push the branch, and open one PR via `gh`. The `gh` binary is injectable
  * (ANTON_GH_BIN) so tests can point it at a fake. See DESIGN.md §4/§5.
  */
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
@@ -653,6 +654,35 @@ function withSatisfiesTrailers(message: string, satisfies: string[] | undefined)
   }
   const trailers = ids.map((id) => `${SATISFIES_TRAILER}: ${id}`).join("\n");
   return `${message.replace(/\s+$/, "")}\n\n${trailers}\n`;
+}
+
+/**
+ * The subject an ATTRIBUTION marker carries — the empty commit that credits `ticketId` to the
+ * commit which actually did its work (PR #258 review).
+ *
+ * Deliberately not `<id>:` or `WIP <id>:`: both are matched by prefix and both mean a commit of the
+ * ticket's OWN, which a satisfied ticket never produced. The satisfying commit is named in the
+ * subject by FULL sha, so the marker is readable by a person at a glance and resolvable by
+ * {@link satisfiedMarkerTarget} without a second lookup — the marker sits at the branch tip when it
+ * is written, so the NEXT satisfied ticket's agent names IT, and following the reference is what
+ * keeps every marker pointing at the work rather than at a chain of markers.
+ */
+export function satisfiedMarkerSubject(ticketId: string, commit: string): string {
+  return `anton: ${ticketId} satisfied by ${commit}`;
+}
+
+/** Same id shape {@link withSatisfiesTrailers} accepts — anything else is not a marker anton wrote. */
+const SATISFIED_MARKER_SUBJECT = /^anton: [A-Za-z0-9][A-Za-z0-9._-]* satisfied by ([0-9a-f]{40})$/;
+
+/**
+ * The commit an attribution marker credits, or `undefined` when this subject is not one.
+ *
+ * Read by the settlement so a ticket satisfied while a marker sat at the tip is recorded against
+ * the WORK, not against the marker for a sibling. Only a full sha is followed: an abbreviation
+ * cannot be told from prose that happens to end in hex, and the writer above always emits one.
+ */
+export function satisfiedMarkerTarget(subject: string): string | undefined {
+  return SATISFIED_MARKER_SUBJECT.exec(subject.trim())?.[1];
 }
 
 /** A commit and the ticket ids its message claims to have satisfied (anton-6vxl). */

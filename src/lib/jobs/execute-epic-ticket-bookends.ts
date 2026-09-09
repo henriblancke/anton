@@ -8,7 +8,13 @@
  */
 import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
 import { formatSatisfiedNote, shortSha } from "../beads/satisfied-note";
-import { readWorktreeState, type WorktreeState } from "../git/ops";
+import type { SatisfiedBy } from "../beads/satisfied-note";
+import {
+  commitMarker,
+  readWorktreeState,
+  satisfiedMarkerSubject,
+  type WorktreeState,
+} from "../git/ops";
 import { updateRun } from "../runs";
 import { appendSessionLog, endSession, startJobSession, type JobSession } from "../sessions";
 import { PoisonEpic } from "./errors";
@@ -325,6 +331,18 @@ export async function finishTicket(
           `why, so it was left open instead. Check the beads DB, then resume the run`,
       );
     }
+    // …and the BRANCH has to speak for it too, before the board says it is done (PR #258 review).
+    // The note above is what a reader of the bead needs; only this trailer is what a RESUME reads.
+    // Without it, a run that closes this ticket and then parks before its pull request opens hands
+    // the next attempt a ticket closed on the board and claimed by nothing on the branch — the
+    // cross-machine shape — so it reopens the bead and dispatches an agent into the identical zero
+    // diff this whole mechanism exists to prevent.
+    //
+    // After the note and before the close, so every failure converges rather than stranding the
+    // ticket: a trailer anton could not write leaves the bead open, and the resume re-dispatches,
+    // re-verifies the same claim and writes it then. Recorded once the gate has accepted the claim,
+    // never on the agent's word alone — this is the same settlement the note cites.
+    await recordSatisfiedOnBranch(run, ticket, settlement.by);
   }
   // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
   // → done). A standalone target isn't closed until its PR merges, so instead move it to
@@ -340,4 +358,49 @@ export async function finishTicket(
   }
   await endSession(db, clock, sessionId, "done");
   return { closed };
+}
+
+/**
+ * Record on the BRANCH that `ticket` was satisfied by `by.commit` — an empty marker carrying the
+ * `Anton-Satisfies` trailer the resume's skip rule reads (anton-ag76).
+ *
+ * The subject deliberately does NOT lead with a ticket id: `<id>:` is this project's delivery
+ * attribution and `WIP <id>:` its preserved-and-incomplete one, both matched by prefix, and this
+ * ticket delivered no commit of its own — claiming either would present it as a delivery in the pull
+ * request body and lose the very distinction anton-8h4b drew. The trailer is invisible to both
+ * matchers by construction, so it is the only place this attribution can live.
+ *
+ * A git failure here HALTS rather than degrading to a silent close: the alternative is a closed
+ * ticket the next resume cannot account for, which is the false success every other gate here
+ * refuses. The park is mechanical — a person clears whatever git refused and resumes.
+ */
+async function recordSatisfiedOnBranch(
+  run: Omit<StepContext, "tickets">,
+  ticket: Bead,
+  by: SatisfiedBy,
+): Promise<void> {
+  const cited = by.subject ? `${shortSha(by.commit)} "${by.subject}"` : shortSha(by.commit);
+  try {
+    await commitMarker(
+      run.worktreePath,
+      // The satisfying commit is named in the SUBJECT by full sha, so a reviewer meeting this marker
+      // in the pull request body reads which commit did the work without a second lookup — and so
+      // the NEXT satisfied ticket, whose agent names this marker (it is the tip), is recorded
+      // against the work rather than against this marker (see `satisfiedMarkerTarget`).
+      `${satisfiedMarkerSubject(ticket.id, by.commit)}\n\n` +
+        `${cited} already met this ticket's acceptance, so the ticket produced no commit of its ` +
+        `own. This empty commit records the attribution no subject on this branch carries — it is ` +
+        `what a later attempt reads to see the ticket as delivered instead of dispatching it into ` +
+        `a zero diff.`,
+      { satisfies: [ticket.id] },
+    );
+  } catch (e) {
+    throw new PoisonEpic(
+      `${ticket.id} is satisfied by ${shortSha(by.commit)}, but anton could not record that on ` +
+        `${run.branch} (${e instanceof Error ? e.message : String(e)}) — nothing on the branch would ` +
+        `then account for the ticket, so a later attempt would reopen it and run an agent against ` +
+        `work that is already there. Left unclosed instead: clear whatever git refused in ` +
+        `${run.worktreePath}, then resume the run`,
+    );
+  }
 }

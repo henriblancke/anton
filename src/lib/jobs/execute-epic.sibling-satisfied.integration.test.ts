@@ -15,10 +15,16 @@
  *   3. a ticket closed on the board with neither a subject nor a trailer anywhere on this branch is
  *      still REGENERATED — the commit lives only in another machine's unpushed worktree.
  *
- * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. The branch state a resume would
- * find is synthesized on `origin/main` (which the run's worktree branches off) — the sibling's
- * commit is written with the real {@link commitMarker}, so the trailers under test are the ones
- * anton writes. Skipped without bd + git.
+ * A fourth case (PR #258 review) closes the loop between the two halves of the mechanism: rather
+ * than synthesizing the branch, it lets a FIRST run settle a ticket as `satisfied` and stop before
+ * its pull request opens, then resumes — the shape a real interruption takes. The trailer the resume
+ * reads has to be one the production close wrote, or the resume regenerates the ticket into the very
+ * zero diff the other three cases prove it avoids.
+ *
+ * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. The branch state the first
+ * three cases resume from is synthesized on `origin/main` (which the run's worktree branches off) —
+ * the sibling's commit is written with the real {@link commitMarker}, so the trailers under test are
+ * the ones anton writes. Skipped without bd + git.
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -27,7 +33,7 @@ import { join } from "node:path";
 import { beads } from "../beads/bd";
 import { commitMarker } from "../git/ops";
 import * as schema from "../db/schema";
-import { getJob } from "./queue";
+import { getJob, park, resumeJob } from "./queue";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
 import {
@@ -40,6 +46,7 @@ import {
   createTicket,
   makeEpicRunner,
   driveEpicRun,
+  tickToIdle,
   type ExecuteEpicSandbox,
 } from "./execute-epic.fixture";
 
@@ -84,6 +91,34 @@ e({type:'result',subtype:'success',result:'done',session_id:'sib',num_turns:1,is
 process.exit(0);`),
     );
 
+  /**
+   * A claude that does the work ONCE and, on every later dispatch, finds it already committed,
+   * changes nothing and reports `satisfied` naming the abbreviated HEAD it read off the branch —
+   * exactly what an honest agent does in that spot. Each dispatch's ticket id and outcome go to `log`.
+   */
+  const onceClaude = (name: string, log: string) =>
+    writeBin(
+      binDir,
+      name,
+      fakeClaudeReadingStdin(`const cp=require('child_process');
+const m=prompt.match(/Ticket: (\\S+)/);const id=m?m[1]:'unknown';
+const work=path.join(process.cwd(),'AGENT_WORK.md');
+let text;
+if(fs.existsSync(work)){
+  const head=cp.execSync('git rev-parse --short HEAD',{cwd:process.cwd(),encoding:'utf8'}).trim();
+  text='The branch already carries this change.\\n\\nANTON-RESULT: satisfied — '+head+' — the sibling commit already meets every criterion here';
+}else{
+  fs.writeFileSync(work,'work\\n');
+  text='Implemented.\\n\\nANTON-RESULT: delivered';
+}
+fs.appendFileSync(${JSON.stringify(log)},id+' '+(text.includes('satisfied')?'satisfied':'delivered')+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'sib2'});
+e({type:'assistant',message:{content:[{type:'text',text}]}});
+e({type:'result',subtype:'success',result:text,session_id:'sib2',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
   /** A `gh` that dumps the `--body` it was handed; reports no open PR, like the fixture's default. */
   const capturingGh = (name: string, bodyDump: string) =>
     writeBin(
@@ -112,6 +147,18 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       .trim()
       .split("\n");
     return { sha: sha!, subject: subject! };
+  };
+
+  /** The commit on `branch` whose subject is exactly `subject`, full sha and subject. */
+  const commitForSubject = (branch: string, subject: string) => {
+    const [sha, found] = execFileSync(
+      "git",
+      ["log", branch, "--format=%H%n%s", "-1", "--fixed-strings", "--grep", subject],
+      { cwd: repo, encoding: "utf8" },
+    )
+      .trim()
+      .split("\n");
+    return { sha: sha!, subject: found! };
   };
 
   const subjectsOn = (branch: string): string =>
@@ -245,6 +292,94 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       expect((await beads.show(repo, featureId)).labels ?? []).toContain("stage:in-review");
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+  });
+
+  it("carries a real satisfied close across an interruption — first run settles it, the resume skips it (PR #258 review)", async () => {
+    // The two halves of the mechanism, joined. Nothing here is synthesized: a first run settles the
+    // second ticket as `satisfied` on the first's commit, closes it, and then DIES at the PR step —
+    // the shape a park or a crash takes, before the epic's single pull request ever opens. The
+    // resume finds that ticket closed on the board with no commit under its name, which is the exact
+    // cross-machine shape it must NOT read this as: only the trailer the close wrote tells the two
+    // apart, so without it the resume reopens the ticket and dispatches an agent into a zero diff.
+    const featureId = await beads.create(repo, {
+      title: "One commit covers both, across a resume",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the satisfied close survives an interruption.",
+    });
+    await beads.approve(repo, featureId);
+    const doer = createTicket(repo, {
+      title: "Ticket that does the work",
+      parent: featureId,
+      acceptance: "work file exists",
+    });
+    const satisfied = createTicket(repo, {
+      title: "Ticket the same commit satisfies",
+      parent: featureId,
+      acceptance: "work file exists",
+    });
+    // Ordered so the run walks doer → satisfied: the first leaves the diff, the second finds it.
+    await beads.link(repo, satisfied, doer, "blocks");
+
+    const log = join(sandbox, "interrupted-dispatch.log");
+    const bodyDump = join(sandbox, "interrupted-pr-body.txt");
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = onceClaude("claude-interrupted", log);
+    const prevGh = process.env.ANTON_GH_BIN;
+    // Attempt 1: gh fails outright, so the run dies at the PR step with both tickets settled.
+    process.env.ANTON_GH_BIN = writeBin(binDir, "gh-interrupted", `console.error('gh boom');process.exit(1);`);
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
+      expect((await getJob(tdb.db, jobId))?.status).not.toBe("done");
+
+      // Both tickets settled: the first delivered, the second satisfied on its commit — and BOTH are
+      // closed, which is what makes the resume's read the dangerous one.
+      expect(dispatched(log)).toEqual([`${doer} delivered`, `${satisfied} satisfied`]);
+      expect((await beads.show(repo, doer)).status).toBe("closed");
+      expect((await beads.show(repo, satisfied)).status).toBe("closed");
+
+      // Attempt 2: same branch, working gh. The satisfied ticket is NOT re-dispatched — the trailer
+      // its own close wrote is what the resume reads, so no second session and no zero diff.
+      process.env.ANTON_GH_BIN = capturingGh("gh-interrupted-ok", bodyDump);
+      expect(await park(tdb.db, clock, jobId, "test: simulate an interruption")).toBe(true);
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await tickToIdle(runner);
+
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      // Unchanged: the resume dispatched no agent at all.
+      expect(dispatched(log)).toEqual([`${doer} delivered`, `${satisfied} satisfied`]);
+      expect(await sessionsFor(satisfied)).toHaveLength(1);
+      expect((await beads.show(repo, satisfied)).status).toBe("closed");
+
+      // The branch still carries no commit under the satisfied ticket's name — the marker claims it
+      // in a trailer, whose subject is where a reviewer reads which commit did the work.
+      const branch = `anton/${featureId}`;
+      expect(subjectsOn(branch)).not.toContain(`${satisfied}:`);
+      const work = commitFor(branch, doer);
+      const marker = commitForSubject(branch, `anton: ${satisfied} satisfied by ${work.sha}`);
+      expect(subjectsOn(branch)).toContain(`anton: ${satisfied} satisfied by ${work.sha}`);
+
+      // …and the pull request attributes it to that marker instead of listing it as a delivery.
+      const body = readFileSync(bodyDump, "utf8");
+      const [deliveries, attributions] = body.split("Satisfied by earlier commits of this run");
+      // The body cites the MARKER (which is what the branch read found) — and its subject names the
+      // commit that actually did the work, so a reviewer is never left hunting for a diff.
+      expect(attributions).toContain(
+        `- ${satisfied} — Ticket the same commit satisfies — by ` +
+          `${marker.sha.slice(0, 7)} "anton: ${satisfied} satisfied by ${work.sha}"`,
+      );
+      expect(deliveries).toContain(`- ${doer} — Ticket that does the work`);
+      expect(deliveries).not.toContain(satisfied);
+      // Exactly ONE marker for this ticket — the resume added none of its own, and the one the
+      // first run wrote credits the doer's commit rather than any marker beside it.
+      expect(subjectsOn(branch).match(new RegExp(`^anton: ${satisfied} `, "gm")) ?? []).toHaveLength(1);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      process.env.ANTON_GH_BIN = prevGh;
+      // Park so a later clock-advancing tick in another suite can't re-dispatch this job.
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   });
 });
