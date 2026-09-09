@@ -3,7 +3,7 @@
  * worktree, push the branch, and open one PR via `gh`. The `gh` binary is injectable
  * (ANTON_GH_BIN) so tests can point it at a fake. See DESIGN.md §4/§5.
  */
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -59,6 +59,24 @@ async function showPaths(cwd: string, sha: string): Promise<string[]> {
 }
 
 /**
+ * Cap on the stderr kept from a spawned git. A command that fails on every path would otherwise
+ * trade one unbounded buffer for another, and 4 KiB is plenty for the message a rejection carries.
+ */
+const MAX_STDERR_CHARS = 4096;
+
+/**
+ * Start collecting a spawned git's stderr, bounded at {@link MAX_STDERR_CHARS}; the returned getter
+ * reads back what arrived, trimmed. Shared by every `spawn` here so the bound is stated once.
+ */
+function boundedStderr(child: ChildProcess): () => string {
+  let text = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    if (text.length < MAX_STDERR_CHARS) text += chunk.toString("utf8");
+  });
+  return () => text.trim();
+}
+
+/**
  * Run git and keep at most `maxChars` of its stdout, killing it the moment output overflows.
  *
  * For commands whose output has no useful upper bound. `git()` collects stdout through execFile's
@@ -80,8 +98,8 @@ function gitBounded(
     // Decode incrementally so the cap counts characters, not bytes, and a multi-byte sequence split
     // across two chunks is never mangled.
     const decoder = new StringDecoder("utf8");
+    const stderr = boundedStderr(child);
     let text = "";
-    let stderr = "";
     let truncated = false;
     let settled = false;
     const finish = (act: () => void) => {
@@ -99,17 +117,11 @@ function gitBounded(
       child.stdout?.destroy();
       child.kill("SIGKILL");
     });
-    // Bounded too: a command failing on every path would otherwise trade one unbounded buffer for
-    // another. 4 KiB is plenty for the message a rejection carries.
-    child.stderr?.on("data", (chunk: Buffer) => {
-      if (stderr.length < 4096) stderr += chunk.toString("utf8");
-    });
-
     child.on("error", (e) => finish(() => reject(e)));
     child.on("close", (code) =>
       finish(() => {
         if (!truncated && code !== 0) {
-          reject(new Error(`git ${args[0]} failed (exit ${code}): ${stderr.trim()}`));
+          reject(new Error(`git ${args[0]} failed (exit ${code}): ${stderr()}`));
           return;
         }
         resolve({ text: truncated ? text : text + decoder.end(), truncated });
@@ -146,6 +158,82 @@ function commitTimeoutMs(): number {
 }
 
 /**
+ * Deliver `sig` to a commit's whole process GROUP — git and every hook it started — falling back to
+ * the direct child handle when there is no group to signal (Windows, or a spawn that never formed
+ * one).
+ */
+function signalCommitGroup(child: ChildProcess, sig: NodeJS.Signals): void {
+  if (process.platform !== "win32" && child.pid) {
+    try {
+      process.kill(-child.pid, sig);
+      return;
+    } catch {
+      // The group may never have formed (spawn failed); fall back to the direct child handle.
+    }
+  }
+  child.kill(sig);
+}
+
+/** Whether every member of the commit's group is gone — git AND the hooks it started. */
+function commitGroupGone(child: ChildProcess): boolean {
+  if (!child.pid) return true; // spawn failed — there is no group to wait on
+  if (process.platform === "win32") return child.exitCode !== null || child.signalCode !== null;
+  try {
+    process.kill(-child.pid, 0);
+    return false;
+  } catch (err) {
+    // EPERM means members we cannot signal are still there; only ESRCH proves the group empty.
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+/**
+ * Kill a commit's process group and resolve only once it is GONE — SIGTERM, SIGKILL after the
+ * grace, then poll until the group reports `ESRCH`.
+ *
+ * Bounded for the same reason `runShell`'s wait is: a group that cannot be reaped must not wedge the
+ * run, and the caller's own cleanliness check is what catches whatever such a survivor writes. So
+ * this ALWAYS resolves — the verdict it gates is the caller's to emit.
+ */
+function reapCommitGroup(child: ChildProcess): Promise<void> {
+  return new Promise((done) => {
+    signalCommitGroup(child, "SIGTERM");
+    const escalate = setTimeout(() => {
+      if (!commitGroupGone(child)) signalCommitGroup(child, "SIGKILL");
+    }, COMMIT_KILL_GRACE_MS);
+    const deadline = Date.now() + COMMIT_KILL_GRACE_MS + REAP_CEILING_MS;
+    const wait = () => {
+      if (commitGroupGone(child) || Date.now() >= deadline) {
+        clearTimeout(escalate);
+        done();
+        return;
+      }
+      setTimeout(wait, REAP_POLL_MS);
+    };
+    wait();
+  });
+}
+
+/**
+ * The rejection a commit killed by its own budget carries. `killed: true` is load-bearing: callers
+ * tell a timeout from git's own non-zero exit by it (see {@link exitedWith}).
+ */
+function commitTimedOut(args: string[], timeoutMs: number, stderr: string): Error {
+  return Object.assign(
+    new Error(
+      `git ${args[0]} timed out after ${timeoutMs}ms and was killed with everything it spawned: ` +
+        stderr,
+    ),
+    { killed: true },
+  );
+}
+
+/** The rejection git's own non-zero exit carries, tagged with the status callers branch on. */
+function commitFailed(args: string[], code: number | null, stderr: string): Error {
+  return Object.assign(new Error(`git ${args[0]} failed (exit ${code}): ${stderr}`), { code });
+}
+
+/**
  * Run a `git commit` and return only once it — and every hook it spawned — is GONE (PR #228 review).
  *
  * Committing is the one git command anton runs that executes PROJECT code: `pre-commit` and
@@ -157,11 +245,8 @@ function commitTimeoutMs(): number {
  * it clean: a late hook write then lands after the check and is swept into the next ticket's commit,
  * or is thrown away with the failed run's worktree.
  *
- * So the commit leads a process group of its own and a kill is delivered to the GROUP and waited
- * on — SIGTERM, then SIGKILL after the grace, then poll until the group reports `ESRCH` — before any
- * verdict is returned. The wait is bounded for the same reason `runShell`'s is: a group that cannot
- * be reaped must not wedge the run, and the caller's own cleanliness check is what catches whatever
- * such a survivor writes.
+ * So the commit leads a process group of its own, and a timeout hands that group to
+ * {@link reapCommitGroup} before any verdict is returned.
  *
  * Only the KILL path reaps. A commit that ends on its own already waited for its hooks — git runs
  * them synchronously — so there is nothing left to wait for.
@@ -174,97 +259,29 @@ function gitCommit(cwd: string, args: string[]): Promise<void> {
       stdio: ["ignore", "ignore", "pipe"],
       detached: process.platform !== "win32",
     });
-
-    let stderr = "";
-    let settled = false;
+    const stderr = boundedStderr(child);
+    const timeoutMs = commitTimeoutMs();
     let killing = false;
-    /** The budget, the SIGKILL escalation and the reap poll — all released on the way out. */
-    const timers: NodeJS.Timeout[] = [];
-    const after = (ms: number, fn: () => void) => {
-      timers.push(setTimeout(fn, ms));
-    };
-
+    let settled = false;
     const settle = (emit: () => void) => {
       if (settled) return;
       settled = true;
-      for (const t of timers) clearTimeout(t);
+      clearTimeout(budget);
       emit();
     };
 
-    const killGroup = (sig: NodeJS.Signals) => {
-      if (process.platform !== "win32" && child.pid) {
-        try {
-          process.kill(-child.pid, sig);
-          return;
-        } catch {
-          // The group may never have formed (spawn failed); fall back to the direct child handle.
-        }
-      }
-      child.kill(sig);
-    };
-
-    /** Whether every member of the commit's group is gone — git AND the hooks it started. */
-    const groupGone = (): boolean => {
-      if (!child.pid) return true; // spawn failed — there is no group to wait on
-      if (process.platform === "win32") return child.exitCode !== null || child.signalCode !== null;
-      try {
-        process.kill(-child.pid, 0);
-        return false;
-      } catch (err) {
-        // EPERM means members we cannot signal are still there; only ESRCH proves the group empty.
-        return (err as NodeJS.ErrnoException).code === "ESRCH";
-      }
-    };
-
-    const killAndReap = (emit: () => void) => {
-      if (killing) return;
+    const budget = setTimeout(() => {
       killing = true;
-      killGroup("SIGTERM");
-      after(COMMIT_KILL_GRACE_MS, () => {
-        if (!groupGone()) killGroup("SIGKILL");
-      });
-      const deadline = Date.now() + COMMIT_KILL_GRACE_MS + REAP_CEILING_MS;
-      const wait = () => {
-        if (groupGone() || Date.now() >= deadline) {
-          settle(emit);
-          return;
-        }
-        after(REAP_POLL_MS, wait);
-      };
-      wait();
-    };
-
-    const timeoutMs = commitTimeoutMs();
-    after(timeoutMs, () => {
-      killAndReap(() =>
-        reject(
-          Object.assign(
-            new Error(
-              `git ${args[0]} timed out after ${timeoutMs}ms and was killed with everything it ` +
-                `spawned: ${stderr.trim()}`,
-            ),
-            { killed: true },
-          ),
-        ),
+      void reapCommitGroup(child).then(() =>
+        settle(() => reject(commitTimedOut(args, timeoutMs, stderr()))),
       );
-    });
+    }, timeoutMs);
 
-    child.stderr?.on("data", (chunk: Buffer) => {
-      if (stderr.length < 4096) stderr += chunk.toString("utf8");
-    });
     child.on("error", (err) => settle(() => reject(err)));
     child.on("close", (code) => {
       // A kill in flight owns the verdict: its group may still hold live writers.
       if (killing) return;
-      settle(() =>
-        code === 0
-          ? resolve()
-          : reject(
-              Object.assign(new Error(`git ${args[0]} failed (exit ${code}): ${stderr.trim()}`), {
-                code,
-              }),
-            ),
-      );
+      settle(() => (code === 0 ? resolve() : reject(commitFailed(args, code, stderr()))));
     });
   });
 }
@@ -1481,8 +1498,12 @@ const MIN_DELETION_SLICE_CHARS = 500;
  * but it is REPORTED (`incomplete`), never swallowed. The reviewer has no other route to a deleted
  * file, so an empty result it isn't warned about reads as "nothing was removed", and the removals it
  * never saw are approved by its verdict. Whatever the pass collected before the failure still ships.
+ *
+ * Exported for the unit tests, which drive the budget allocation a case at a time: reaching it
+ * through {@link diffAgainstBase} costs a truncation-forcing filler commit per case and hides which
+ * allocation rule a failure belongs to.
  */
-async function deletionPatch(
+export async function deletionPatch(
   worktreePath: string,
   from: string,
   max: number,
