@@ -2439,6 +2439,60 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       expect(tagMock.mock.calls.some(([, , labels]) => labels.some((l) => l.startsWith("repair:")))).toBe(false);
     });
 
+    // The overtaking retirement (PR #238 review): another process re-supersedes the ticket to a
+    // DIFFERENT survivor after the marker lands. The close is not anton's, so the retirement is not
+    // taken back — but the ticket is still a closed, undelivered retirement carried by no PR, and
+    // stripping the marker off it would let a later merge close a reopen of it as shipped. So the
+    // marker STAYS; only a reread proving the ticket LIVE takes it off.
+    it("keeps the marker when the ticket was re-superseded to another survivor after the marker landed", async () => {
+      const OTHER = "anton-othr";
+      const markerLanded = () => tagMock.mock.calls.some(([, , labels]) => labels.includes(LABELS.notDelivered));
+      showMock.mockImplementation(async (cwd, id) => {
+        const read = await boardShow(cwd, id);
+        const wrote = supersedeMock.mock.calls.find(([, target]) => target === id);
+        const base = wrote ? superseded(read, wrote[2]) : read;
+        const tagged = markerLanded() && id === TARGET;
+        const marked = tagged ? ({ ...base, labels: [...(base.labels ?? []), LABELS.notDelivered] } as Bead) : base;
+        // Closed against somebody ELSE's survivor the instant the marker lands.
+        return id === TARGET && markerLanded() ? superseded(bead(TARGET, { labels: marked.labels }), OTHER) : marked;
+      });
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "overtaken" });
+      expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+      expect(tagMock).toHaveBeenCalledWith(repo, TARGET, [LABELS.notDelivered]);
+      expect(evidenceOf(outcome)).toContain(`superseded by ${OTHER}`);
+      expect(evidenceOf(outcome)).toContain("stands");
+      // The marker is what keeps a reopen of this retirement out of a later merge's shipped set, so
+      // it is left exactly where it was — and the overtaking close is left standing too.
+      expect(evidenceOf(outcome)).toContain(`left the \`${LABELS.notDelivered}\` marker on ${TARGET}`);
+      expect(untagMock).not.toHaveBeenCalled();
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(tagMock.mock.calls.some(([, , labels]) => labels.some((l) => l.startsWith("repair:")))).toBe(false);
+    });
+
+    // Unread after the marker is the third shape (PR #238 review): the reread proved nothing, so the
+    // marker is not stripped for the same reason the retirement is not taken back.
+    it("keeps the marker when the ticket could not be re-read after the marker landed", async () => {
+      const markerLanded = () => tagMock.mock.calls.some(([, , labels]) => labels.includes(LABELS.notDelivered));
+      showMock.mockImplementation(async (cwd, id) => {
+        if (id === TARGET && markerLanded()) throw new Error("dolt server went away");
+        const read = await boardShow(cwd, id);
+        const wrote = supersedeMock.mock.calls.find(([, target]) => target === id);
+        return wrote ? superseded(read, wrote[2]) : read;
+      });
+
+      const outcome = await retire();
+
+      expect(outcome).toMatchObject({ action: "overtaken" });
+      expect(tagMock).toHaveBeenCalledWith(repo, TARGET, [LABELS.notDelivered]);
+      expect(evidenceOf(outcome)).toContain("could not be re-read after the retirement");
+      expect(evidenceOf(outcome)).toContain(`left the \`${LABELS.notDelivered}\` marker on ${TARGET}`);
+      expect(untagMock).not.toHaveBeenCalled();
+      expect(reopenMock).not.toHaveBeenCalled();
+    });
+
     // The other way the marker window is overtaken (PR #238 review): the ticket stays closed as
     // anton's own supersede, but a concurrent writer STRIPS the `not-delivered` marker after it
     // landed. The retirement is valid, so nothing is reopened — but unmarked it is invisible to merge

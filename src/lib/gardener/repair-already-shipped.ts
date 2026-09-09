@@ -1365,8 +1365,9 @@ export async function repairAlreadyShipped(args: {
     // reopen and claim the ticket, and the marker would then sit on live work a later merge carries as
     // undelivered. So the ticket is read once more with the marker on the board — the marker-and-
     // ownership reread {@link retireFound} makes for the same reason. Reopened or reclaimed, the marker
-    // is cleared and the retirement taken back before it is accepted; the marker stripped while the
-    // close still stands, the retirement holds and anton reports it could not keep the marker; unread,
+    // is cleared and the retirement taken back before it is accepted; overtaken by somebody else's
+    // supersede, the marker STAYS on the still-closed ticket; the marker stripped while anton's close
+    // still stands, the retirement holds and anton reports it could not keep the marker; unread,
     // nothing is assumed either way. Only when the tag actually landed: a marker that never wrote
     // leaves nothing on live work to clean up.
     if (marked) {
@@ -1611,11 +1612,14 @@ async function withdrawRetirement(args: {
  * the retirement would read as marked when the board no longer carries the marker merge finalization
  * needs. Still that close but the marker STRIPPED — the retirement is valid, nothing is reopened and
  * there is no live work to clear, but unmarked it must not reach a PR, so the line says so and the
- * caller stops. Reopened or reclaimed — no longer that close — the marker is on work this retirement
- * does not own: cleared, and the retirement taken back where it is still anton's to take
+ * caller stops. Reopened or reclaimed — LIVE work again — the marker is on a ticket a run could pick
+ * up: cleared, and the retirement taken back where it is still anton's to take
  * ({@link withdrawRetirement} acts only on an `overtaken`/`unread` read the way it does on the
- * pre-write fence's). Unread, nothing is assumed either way. Returns the one evidence line the
- * escalation carries.
+ * pre-write fence's). Closed under SOMEBODY ELSE'S supersede, the marker STAYS (PR #238 review):
+ * that is a valid retirement carried by no PR, `withdrawRetirement` leaves the overtaking close
+ * standing, and stripping the marker off it would let merge finalization close a later reopen of it
+ * as shipped by this run's PR — the one thing the marker exists to prevent. Unread, nothing is
+ * assumed either way, marker included. Returns the one evidence line the escalation carries.
  */
 async function markerOvertaken(args: {
   repoPath: string;
@@ -1642,6 +1646,9 @@ async function markerOvertaken(args: {
       `review could be closed as shipped by this run's PR, so the run stops rather than open one`
     );
   }
+  // Not anton's close reads TWO ways, and only one of them puts the marker on work a run could pick
+  // up: the ticket is live again, or it is closed under somebody else's supersede (PR #238 review).
+  const live = typeof target !== "string" && isOpenWork(target);
   const held: Exclude<RetirementVerdict, { state: "held" }> =
     typeof target === "string"
       ? { state: "unread", why: target }
@@ -1649,14 +1656,28 @@ async function markerOvertaken(args: {
           state: "overtaken",
           why:
             `${targetId} is ${target.status}` +
-            `${isOpenWork(target) ? "" : `, superseded by ${beads.supersededBy(target) ?? "nothing"}`}` +
-            ` now — reopened or reclaimed since the retirement's fence, and the ` +
-            `\`${LABELS.notDelivered}\` marker anton wrote would sit on live work`,
+            `${live ? "" : `, superseded by ${beads.supersededBy(target) ?? "nothing"}`}` +
+            (live
+              ? ` now — reopened or reclaimed since the retirement's fence, and the ` +
+                `\`${LABELS.notDelivered}\` marker anton wrote would sit on live work`
+              : ` now — retired since the retirement's fence by a decision that is not anton's, and stands`),
         };
-  const cleared = (await mustPersist(() => beads.untag(repoPath, targetId, [LABELS.notDelivered])))
-    ? `anton cleared the \`${LABELS.notDelivered}\` marker it had written on ${targetId}`
-    : `anton could NOT clear the \`${LABELS.notDelivered}\` marker on ${targetId} — it sits on live ` +
-      `work, and \`bd update ${targetId} --remove-label ${LABELS.notDelivered}\` takes it off`;
+  // The marker comes off ONLY where the reread PROVED the ticket live again (PR #238 review). Closed
+  // under another supersede it is still a valid retirement carried by no PR — withdrawRetirement
+  // deliberately leaves that overtaking close standing — and an unmarked one reopened while this
+  // run's PR is in review is a child `preservedAtMerge` no longer holds back, so merge finalization
+  // would close it as shipped on a diff containing none of its work. Unread proves nothing either
+  // way, so it keeps the marker for the same reason nothing else is undone on it.
+  const cleared = live
+    ? (await mustPersist(() => beads.untag(repoPath, targetId, [LABELS.notDelivered])))
+      ? `anton cleared the \`${LABELS.notDelivered}\` marker it had written on ${targetId}`
+      : `anton could NOT clear the \`${LABELS.notDelivered}\` marker on ${targetId} — it sits on live ` +
+        `work, and \`bd update ${targetId} --remove-label ${LABELS.notDelivered}\` takes it off`
+    : `anton left the \`${LABELS.notDelivered}\` marker on ${targetId} — ` +
+      (typeof target === "string"
+        ? `the ticket could not be read, so nothing is assumed of it`
+        : `the ticket is closed, not live work`) +
+      `, and the marker is what keeps a later reopen of it out of a merge's shipped set`;
   const withdrawn = await withdrawRetirement({ repoPath, targetId, replacementId, held });
   return `${held.why}; ${cleared}; ${withdrawn}`;
 }
