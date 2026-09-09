@@ -713,7 +713,7 @@ suite("readCommitReach (real git)", () => {
   });
 
   afterEach(() => {
-    rmSync(sandbox, { recursive: true, force: true });
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   it("reads a commit the base contains, and one it does not", async () => {
@@ -770,7 +770,7 @@ suite("readCommitNaming (real git)", () => {
   });
 
   afterEach(() => {
-    rmSync(sandbox, { recursive: true, force: true });
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   it("finds a bead named in a squash body, even after a record- or unit-separator byte", async () => {
@@ -845,8 +845,12 @@ suite("branchAddedCommit (real git)", () => {
     commitFile("README.md", "init");
   });
 
+  // Retried, like the bd suites' teardown: the rejection paths here resolve the moment `git
+  // merge-base --is-ancestor` exits non-zero, while the child is still tearing down its own hold on
+  // .git/objects — a bare rmSync then walks the dir underneath it and dies ENOTEMPTY with every
+  // assertion already green (PR #238 CI).
   afterEach(() => {
-    rmSync(sandbox, { recursive: true, force: true });
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   it("accepts a commit the run's branch added over its base, by short sha", async () => {
@@ -1133,7 +1137,7 @@ suite("distanceBehindUpstream concurrency (real git)", () => {
   });
 
   afterEach(() => {
-    rmSync(sandbox, { recursive: true, force: true });
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   // The breaker poll and the execute-epic preflight fetch the SAME upstream tracking ref from one
@@ -1540,7 +1544,7 @@ suite("resolveForkPoint (real git)", () => {
   });
 
   afterEach(() => {
-    rmSync(sandbox, { recursive: true, force: true });
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   it("pins the fork point as a SHA, like the lenient resolver", async () => {

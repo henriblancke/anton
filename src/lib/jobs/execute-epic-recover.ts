@@ -120,7 +120,17 @@ export async function settleCompletedRun(run: EpicRun, leaseTarget: Bead): Promi
   //     construction — the run phase skips every step including `pr` — so the two states do not
   //     overlap on any board anton itself wrote, and one that holds both is odd enough to be worth a
   //     person's eyes rather than either module's guess.
-  if (!beads.getPrRef(leaseTarget) && standaloneRun && (await settleRetiredStandalone(run, leaseTarget))) {
+  //     Asked of the REFRESHED board, not of the snapshot verdict (PR #238 review).
+  //     `refreshRunBoard` adopts a fresh `run.all` but deliberately leaves `run.standaloneRun`
+  //     alone — the shape is recomputed in 0a-ter, AFTER this short-circuit. So on a retry whose
+  //     fresh board has since gained a child under the target, the stale `true` still reads it as
+  //     its own single ticket: a stamped, superseded target would settle the whole run `done` here
+  //     and strand that newly-added work beneath a closed target, with no run path left to reach
+  //     it. Re-derived in `execute-epic-prepare`'s own words (`groupsChildren` over `runTickets`)
+  //     so the two cannot disagree, and kept local — 0a-ter still owns the assignment to `run`.
+  const standaloneNow =
+    standaloneRun && !beads.groupsChildren(run.target, runTickets(all, epicBeadId));
+  if (!beads.getPrRef(leaseTarget) && standaloneNow && (await settleRetiredStandalone(run, leaseTarget))) {
     return true;
   }
   // 0a. Revalidate the target still needs execution (anton-jz1). A job that parked on a foreign
