@@ -60,6 +60,19 @@ function safeDecode(segment: string): string {
   }
 }
 
+/**
+ * The hostname with its original case. `new URL(...).hostname` lowercases every label, but the
+ * value persisted is the raw string and several credential markers are case-sensitive (`AKIA…`,
+ * `ghp_…`, `AIza…`) — so a token pasted as a label (`AKIA…​.gateway.example`) would clear the
+ * lowercased check yet land in settings_json intact. Recover the label casing from `raw` and scan
+ * that; fall back to the normalized form when it can't be located (e.g. an IDN punycode host, which
+ * carries no ASCII credential anyway).
+ */
+function rawHostname(raw: string, parsed: URL): string {
+  const at = raw.toLowerCase().indexOf(parsed.hostname);
+  return at >= 0 ? raw.slice(at, at + parsed.hostname.length) : parsed.hostname;
+}
+
 /** An http(s) URL — a gateway base URL, not a bare host, a file path, or a stray scheme. */
 export function httpUrl(max: number): FieldParser<string> {
   return (raw, key) => {
@@ -87,7 +100,11 @@ export function httpUrl(max: number): FieldParser<string> {
     // userinfo, no query, no path segment carries it, so only a scan of the host labels themselves
     // keeps the no-secret-in-database guarantee. Same detector as the path — shape only, so a
     // legitimate subdomain (`api`, `eu`) rides through.
-    if (parsed.hostname.split(".").some((label) => hasCredentialMarker(label))) {
+    if (
+      rawHostname(raw, parsed)
+        .split(".")
+        .some((label) => hasCredentialMarker(label))
+    ) {
       return reject(
         `${key} must not embed a credential in its hostname — paste the base URL without the token, ` +
           `and keep it in the auth-token env var`,
@@ -106,6 +123,13 @@ export function httpUrl(max: number): FieldParser<string> {
     // a base URL is legitimately versioned (`/v1`, `/openai`) — so reject only segments carrying a
     // shape anton recognises as a credential, the same detector it uses elsewhere. Word/entropy
     // heuristics stay out: they would reject `/v1` and public ids like a Cloudflare account tag.
+    //
+    // Boundary: hasCredentialMarker is `^`-anchored (host labels and path segments alike), so it
+    // catches a token that IS a whole segment/label — the plausible accidental-paste forms — but not
+    // one buried as the suffix of a longer token (`…/prefix-AKIA4xyz`). That's an unusual structure
+    // no gateway base URL requires, and dropping the anchor would false-positive on ordinary
+    // segments that merely start with a known prefix (`/api-v1-gw`). The absolute userinfo/query/
+    // fragment rejections above cover the URL components where a secret actually rides.
     if (parsed.pathname.split("/").some((segment) => hasCredentialMarker(safeDecode(segment)))) {
       return reject(
         `${key} must not embed a credential in its path — paste the base URL without the token, ` +

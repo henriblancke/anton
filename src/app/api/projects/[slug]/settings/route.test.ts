@@ -422,6 +422,10 @@ describe("settings route — Claude gateway routing (anton-n16m)", () => {
     for (const bad of [
       "https://sk-secret.gateway.example/v1",
       "https://ghp_0123456789abcdef.gateway.example/v1",
+      // Case-sensitive markers: new URL() lowercases the label, but the raw string is what gets
+      // persisted, so the check must scan the original case (anton-pv2p review, thread PRRT_…gdFZR).
+      "https://AKIAIOSFODNN7EXAMPLE.gateway.example/v1",
+      "https://AIzaSyD0123456789abcdef.gateway.example/v1",
     ]) {
       const res = await PATCH(
         patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
