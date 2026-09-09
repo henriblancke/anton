@@ -18,11 +18,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
 import { proposalFingerprint } from "../gardener/detections";
+import type { ProjectSettings } from "../projects";
 import { PoisonEpic } from "./errors";
 
 const loadAllIssuesMock = vi.fn();
 const createRunMock = vi.fn();
+const updateRunMock = vi.fn();
 const findOpenRunForEpicMock = vi.fn();
+
+// The settings a start reads — mutable so a case can route the project before starting it.
+let projectSettings: ProjectSettings = {};
 
 vi.mock("../beads/issues", () => ({
   loadAllIssues: (...args: unknown[]) => loadAllIssuesMock(...args),
@@ -33,7 +38,7 @@ vi.mock("../projects", async () => {
   return {
     ...actual,
     getProjectById: async () => ({ id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/anton-start" }),
-    getProjectSettings: async () => ({}),
+    getProjectSettings: async () => projectSettings,
   };
 });
 
@@ -44,6 +49,7 @@ vi.mock("../runs", async () => {
     ...actual,
     findOpenRunForEpic: (...args: unknown[]) => findOpenRunForEpicMock(...args),
     createRun: (...args: unknown[]) => createRunMock(...args),
+    updateRun: (...args: unknown[]) => updateRunMock(...args),
   };
 });
 
@@ -89,7 +95,9 @@ async function start(board: Bead[], targetId: string): Promise<unknown> {
 beforeEach(() => {
   loadAllIssuesMock.mockReset();
   createRunMock.mockReset();
+  updateRunMock.mockReset();
   findOpenRunForEpicMock.mockReset().mockResolvedValue(undefined);
+  projectSettings = {};
 });
 
 describe("beginEpicRun — a proposal target (anton-x37c)", () => {
@@ -141,5 +149,57 @@ describe("beginEpicRun — a proposal target (anton-x37c)", () => {
     await start([bead("t1")], "t1");
 
     expect(createRunMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("beginEpicRun — the created run records its endpoint host (anton-oom5)", () => {
+  // The one input a board read can never carry: where a run's traffic went. A routed project must
+  // stamp its gateway onto the row it opens, or the provenance defaults to the Claude API for work
+  // that never touched it.
+  const endpointHostOf = () => createRunMock.mock.calls[0]?.[2]?.endpointHost;
+
+  it("stamps the gateway host a routed project drives", async () => {
+    projectSettings = {
+      claudeBaseUrl: "https://token@router.local:20128/v1",
+      claudeAuthTokenEnv: "GATEWAY_TOKEN",
+    };
+
+    await start([bead("t1")], "t1");
+
+    expect(createRunMock).toHaveBeenCalledTimes(1);
+    // The HOST only — never the userinfo token that rode on the base URL.
+    expect(endpointHostOf()).toBe("router.local:20128");
+  });
+
+  it("stamps the Claude API default for an unrouted project", async () => {
+    await start([bead("t1")], "t1");
+
+    expect(endpointHostOf()).toBe("api.anthropic.com");
+  });
+
+  it("stamps the Claude API default when a base URL resolves unrouted for want of a token env", async () => {
+    // The base URL alone does not route — the run drives the Claude API, and the provenance must say
+    // so rather than claiming a gateway it never reached.
+    projectSettings = { claudeBaseUrl: "https://router.local:20128/v1" };
+
+    await start([bead("t1")], "t1");
+
+    expect(endpointHostOf()).toBe("api.anthropic.com");
+  });
+
+  it("refreshes the provenance on resume — the reopened attempt drives the current gateway", async () => {
+    // A parked run resumed after its project's gateway setting changed drives the newly resolved
+    // endpoint, so the reused row must move with it rather than keep the old route it was opened on.
+    findOpenRunForEpicMock.mockResolvedValue({ id: "existing-run" });
+    projectSettings = {
+      claudeBaseUrl: "https://token@router.local:20128/v1",
+      claudeAuthTokenEnv: "GATEWAY_TOKEN",
+    };
+
+    await start([bead("t1")], "t1");
+
+    expect(createRunMock).not.toHaveBeenCalled();
+    expect(updateRunMock).toHaveBeenCalledTimes(1);
+    expect(updateRunMock.mock.calls[0][3]).toMatchObject({ endpointHost: "router.local:20128" });
   });
 });

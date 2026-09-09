@@ -168,6 +168,7 @@ export function RunDetailView({ slug, runId }: { slug: string; runId: string }) 
               <MetaRow label="ticket" value={run.ticketBeadId ?? "—"} mono copy />
               <MetaRow label="agent" value={run.agentTag} mono dotClass={run.agentTag ? agentDotClass(run.agentTag) : undefined} />
               <MetaRow label="model" value={run.model ?? "default"} mono />
+              <MetaRow label="endpoint" value={run.endpointHost ?? "—"} mono />
               <MetaRow label="branch" value={run.branch ?? "—"} mono copy />
               <MetaRow label="worktree" value={run.worktreePath ?? "—"} mono title={run.worktreePath} copy />
               <MetaRow

@@ -44,8 +44,12 @@ const project: Project = {
   createdAt: 0,
 };
 
+// getProjectSettings is part of this mock because the spawn path resolves routing through it
+// (anton-7poz): a partial mock 500s the spawn, and node-pty self-skips locally, so CI is the only
+// place that sees it. Empty settings = unrouted, which is what a bash-backed test pty wants.
 vi.mock("@/lib/projects", () => ({
   getProjectBySlug: async (slug: string) => (slug === project.slug ? project : null),
+  getProjectSettings: async () => ({}),
 }));
 
 // Persistence is out of scope here — stub it so the routes never touch anton.db.

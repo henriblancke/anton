@@ -33,7 +33,6 @@ import {
   runHealthThresholdsSchema,
   scanSeverityPolicySchema,
   valueLabelsSchema,
-  getProjectSettingsBySlug,
   type ProjectSettings,
 } from "@/lib/projects";
 import { QUOTA_SHARE_RANGE } from "@/lib/quota-share";
@@ -43,7 +42,9 @@ import {
   applyFieldRules,
   booleanValue,
   boundedString,
+  envVarName,
   fieldRule,
+  httpUrl,
   integerInRange,
   isClear,
   messageDetail,
@@ -67,6 +68,10 @@ const ALLOWED_MODELS = new Set([
 const MAX_PROMPT = 8000;
 /** Upper bound on an operator verify-gate command (anton-3oh8) — generous for a chained gate. */
 const MAX_COMMAND = 1000;
+/** Upper bound on a gateway base URL (anton-n16m) — well past any real endpoint. */
+const MAX_URL = 2000;
+/** Upper bound on an env-var name (anton-n16m) — no shell allows one near this long. */
+const MAX_ENV_NAME = 256;
 
 const settingsField = <K extends keyof ProjectSettings & string>(
   key: K,
@@ -151,6 +156,13 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
 
     settingsField("model", oneOf(ALLOWED_MODELS)),
 
+    // Gateway routing (anton-n16m). The base URL is validated as http(s); the token env var as a
+    // NAME, never a value — the secret stays in anton's environment. The base-url-needs-a-token
+    // cross-check runs after this group in buildSettingsPatch.
+    settingsField("claudeBaseUrl", httpUrl(MAX_URL)),
+    settingsField("claudeAuthTokenEnv", envVarName(MAX_ENV_NAME)),
+    settingsField("claudeGatewayModelDiscovery", booleanValue),
+
     // Operator prompt overrides — cleared, each falls back to the shipped contract.
     settingsField("seedPrompt", boundedString(MAX_PROMPT)),
     settingsField("reviewFixPrompt", boundedString(MAX_PROMPT)),
@@ -209,17 +221,16 @@ const ALARM_KEYS = ["reviewMinScore", "reviewMaxRounds", "reviewLowScoreRounds"]
  * (lib/jobs/review-alarm.ts), so a streak longer than the round cap can never trip: the loop hits
  * the cap and parks as `unresolved` — or opens the PR on a clean-but-low round — while the alarm
  * stays silently dead. Neither knob is wrong on its own, so the contradiction is only visible
- * against the values a run will resolve: the patched one, else the stored one, else the default.
+ * against the values a run will resolve: the patched one, else the one standing at write time, else
+ * the default.
  */
-async function checkReviewAlarmReachable(
-  body: Record<string, unknown>,
+function checkReviewAlarmReachable(
   patch: Partial<ProjectSettings>,
-  slug: string,
-): Promise<string | null> {
-  if (!ALARM_KEYS.some((key) => key in body)) return null;
-  const stored = await getProjectSettingsBySlug(slug);
+  current: ProjectSettings,
+): string | null {
+  if (!ALARM_KEYS.some((key) => key in patch)) return null;
   const effective = (key: (typeof ALARM_KEYS)[number], fallback: number): number =>
-    (key in patch ? patch[key] : stored[key]) ?? fallback;
+    (key in patch ? patch[key] : current[key]) ?? fallback;
   const minScore = effective("reviewMinScore", DEFAULT_REVIEW_MIN_SCORE);
   const maxRounds = effective("reviewMaxRounds", DEFAULT_REVIEW_MAX_ROUNDS);
   const lowScoreRounds = effective("reviewLowScoreRounds", DEFAULT_REVIEW_LOW_SCORE_ROUNDS);
@@ -234,9 +245,47 @@ async function checkReviewAlarmReachable(
 }
 
 /**
- * Validates the PATCH body into `patch`, returning the first 400 message or null. The alarm
- * cross-check runs between the two groups because it reads the job-policy numbers this patch sets
- * against the ones already stored.
+ * A gateway base URL is inert without the env var name anton reads its token from at spawn time
+ * (anton-n16m): the driver would point at the gateway with no credential. Neither field is wrong on
+ * its own, so — like the alarm cross-check — the contradiction is only visible against the values a
+ * run will resolve: the patched one, else the one standing at write time.
+ */
+function checkGatewayCredentialed(
+  patch: Partial<ProjectSettings>,
+  current: ProjectSettings,
+): string | null {
+  if (!("claudeBaseUrl" in patch || "claudeAuthTokenEnv" in patch)) return null;
+  const baseUrl = "claudeBaseUrl" in patch ? patch.claudeBaseUrl : current.claudeBaseUrl;
+  const tokenEnv = "claudeAuthTokenEnv" in patch ? patch.claudeAuthTokenEnv : current.claudeAuthTokenEnv;
+  if (baseUrl && !tokenEnv) {
+    return (
+      `claudeBaseUrl needs claudeAuthTokenEnv — the name of the env var anton reads the gateway ` +
+      `token from at spawn time. Set the token env var name, or clear the base URL.`
+    );
+  }
+  return null;
+}
+
+/**
+ * The cross-field checks that read settings as they STAND. Both weigh a patched field against a
+ * sibling that may not be in this patch, so they must run against the settings AT WRITE TIME — i.e.
+ * inside `updateProjectSettingsIf`'s transaction — not a pre-write snapshot. Two overlapping PATCHes
+ * could each pass against a snapshot and then commit a combination neither validated (e.g. one saves
+ * `{baseUrl, tokenEnv}` while another clears `tokenEnv`, leaving a base URL with no credential).
+ * Deciding under the write lock is what makes the refusal true (anton-n16m).
+ */
+export function checkSettingsCrossFields(
+  patch: Partial<ProjectSettings>,
+  current: ProjectSettings,
+): string | null {
+  return checkReviewAlarmReachable(patch, current) ?? checkGatewayCredentialed(patch, current);
+}
+
+/**
+ * Validates the PATCH body into `patch`, returning the first 400 message or null. Field parsing only
+ * — the cross-field checks that read a sibling's stored value run at write time via
+ * {@link checkSettingsCrossFields}, so an overlapping write can't slip a contradiction past a stale
+ * snapshot.
  */
 export async function buildSettingsPatch(
   body: Record<string, unknown>,
@@ -246,9 +295,6 @@ export async function buildSettingsPatch(
 
   const numericError = await applyFieldRules(JOB_POLICY_FIELDS, body, patch);
   if (numericError) return { error: numericError };
-
-  const alarmError = await checkReviewAlarmReachable(body, patch, slug);
-  if (alarmError) return { error: alarmError };
 
   const fieldError = await applyFieldRules(projectFields(createAgentResolver(slug)), body, patch);
   if (fieldError) return { error: fieldError };

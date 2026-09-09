@@ -33,6 +33,7 @@
 import { loadAllIssues } from "../beads/issues";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
 import { runClaude } from "../claude/driver";
+import { claudeRouting } from "../claude/driver-routing";
 import { getProjectSettings, resolveAutonomyPolicy } from "../projects";
 import { remainingApplyBudget } from "./pass-budget";
 import {
@@ -85,12 +86,14 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
     // `jobId` is the durable half of the link: this pass writes no run row, so once it settles the
     // jobs page is the only route to its log — including the shadow records (anton-lmps). The live
     // handle (anton-susu) names the project repo itself: no worktree, because nothing here touches
-    // code.
+    // code. Its captured routing rides along (anton-7poz) so an investigate terminal opened mid-pass
+    // hits the SAME gateway the judge session does, even after project settings drift.
     const session = await openPassSession(db, clock, {
       ctx,
       projectId,
       kind: "product-master",
       cwd: repo,
+      routing: claudeRouting(settings),
     });
     const log = session.log;
 

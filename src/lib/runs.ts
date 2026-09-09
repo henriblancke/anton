@@ -21,6 +21,29 @@ export type { RunDetail, RunStatus, RunSummary };
 
 export type RunRow = typeof schema.runs.$inferSelect;
 
+/**
+ * What an unrouted run records for its endpoint (anton-oom5): the Anthropic direct host, stored
+ * explicitly so an unrouted new row and a pre-column NULL row are never confusable.
+ */
+export const ANTHROPIC_DEFAULT_ENDPOINT_HOST = "api.anthropic.com";
+
+/**
+ * The endpoint host a run drove, derived from a routing base URL (anton-oom5). The HOST only —
+ * `URL.host` carries hostname and port but never userinfo, so a base URL of the form
+ * `https://user:token@gateway:20128/v1` yields `gateway:20128` and the stored provenance can never
+ * leak the token. A missing or unparseable base URL is an unrouted run, which records the Anthropic
+ * default; falling back to the default on a parse failure keeps a malformed config from ever
+ * storing raw URL text (and its possible credentials).
+ */
+export function endpointHostFromBaseUrl(baseUrl?: string | null): string {
+  if (!baseUrl || !baseUrl.trim()) return ANTHROPIC_DEFAULT_ENDPOINT_HOST;
+  try {
+    return new URL(baseUrl).host || ANTHROPIC_DEFAULT_ENDPOINT_HOST;
+  } catch {
+    return ANTHROPIC_DEFAULT_ENDPOINT_HOST;
+  }
+}
+
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
 }
@@ -34,6 +57,7 @@ function toSummary(row: typeof schema.runs.$inferSelect): RunSummary {
     branch: row.branch ?? undefined,
     model: row.model ?? undefined,
     agentTag: row.agentTag ?? undefined,
+    endpointHost: row.endpointHost ?? undefined,
     status: row.status as RunStatus,
     attempts: row.attempts,
     startedAt: toEpoch(row.startedAt),
@@ -126,6 +150,12 @@ export interface CreateRunInput {
   branch?: string;
   model?: string;
   agentTag?: string;
+  /**
+   * The endpoint host this run drove (anton-oom5). Already reduced to a host by
+   * `endpointHostFromBaseUrl` — the write path never sees a token. Omitted ⇒ the Anthropic default,
+   * so an unrouted run records the endpoint just as explicitly as a routed one.
+   */
+  endpointHost?: string;
   status?: RunStatus;
 }
 
@@ -142,6 +172,7 @@ export async function createRun(db: AntonDb, clock: Clock, input: CreateRunInput
     branch: input.branch,
     model: input.model,
     agentTag: input.agentTag,
+    endpointHost: input.endpointHost ?? ANTHROPIC_DEFAULT_ENDPOINT_HOST,
     status: input.status ?? "running",
     startedAt: secDate(nowMs),
     attemptStartedAt: secDate(nowMs),
@@ -160,6 +191,12 @@ export type RunPatch = Partial<{
   branch: string | null;
   model: string | null;
   agentTag: string | null;
+  /**
+   * The endpoint host this run drove (anton-oom5). Rewritten on resume: a parked run reopened after
+   * its project's gateway setting changed drives the newly resolved endpoint, so the recorded
+   * provenance must move with it rather than attribute resumed traffic to the old route.
+   */
+  endpointHost: string;
   /** The pipeline this run walked (anton-aa3m) — written once the formula is selected + validated. */
   formula: string | null;
   formulaVariant: string | null;

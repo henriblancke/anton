@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { getProjectSettingsBySlug, updateProjectSettings } from "@/lib/projects";
-import { buildSettingsPatch } from "./settings-patch";
+import { getProjectSettingsBySlug, updateProjectSettingsIf } from "@/lib/projects";
+import { buildSettingsPatch, checkSettingsCrossFields } from "./settings-patch";
 
 export const dynamic = "force-dynamic";
 
@@ -23,8 +23,16 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
   }
 
   try {
-    const settings = await updateProjectSettings(slug, result.patch);
-    return NextResponse.json({ settings });
+    // The cross-field checks decide under the write lock, against the settings as they stand, so two
+    // overlapping PATCHes can't each pass a stale snapshot and commit a combination neither validated.
+    const outcome = await updateProjectSettingsIf(slug, (current) => {
+      const crossError = checkSettingsCrossFields(result.patch, current);
+      return crossError ? { refuse: crossError } : { write: result.patch };
+    });
+    if (!outcome.applied) {
+      return NextResponse.json({ error: outcome.refused }, { status: 400 });
+    }
+    return NextResponse.json({ settings: outcome.settings });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to update settings";
     return NextResponse.json({ error: message }, { status: 400 });

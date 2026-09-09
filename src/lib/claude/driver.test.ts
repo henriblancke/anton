@@ -7,7 +7,13 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { isRecoverableClaudeError, isUsageLimitError, type RecoverableClaudeError } from "../jobs/errors";
-import { ABORT_GRACE_ENV, CLAUDE_BIN_ENV, runClaude, type ClaudeEvent, type RunClaudeOptions } from "./driver";
+import { ABORT_GRACE_ENV, CLAUDE_BIN_ENV, runClaude, UNROUTED, type ClaudeEvent, type RunClaudeOptions } from "./driver";
+import {
+  ANTHROPIC_AUTH_TOKEN_ENV,
+  ANTHROPIC_BASE_URL_ENV,
+  GATEWAY_MODEL_DISCOVERY_ENV,
+  type ClaudeRouting,
+} from "./driver-routing";
 
 /**
  * `groupAlive` is answered through a hook so a test can hold a group "alive" on demand. SIGKILL
@@ -208,6 +214,28 @@ function writeFakeExitedClaudeHoldingPipe(name: string, holdMs: number): string 
   return path;
 }
 
+/**
+ * A fake that dumps the three routing env vars it was spawned with (anton-72hj) to `dumpPath` — a
+ * deleted var records `null`, a set one its value — then reports success. Proves the routing delta
+ * reached the CHILD's environment, not merely the parent's.
+ */
+function writeFakeEnvDumpClaude(name: string, dumpPath: string): string {
+  const path = join(dir, name);
+  const body = [
+    "#!/usr/bin/env node",
+    "const fs = require('node:fs');",
+    `const keys = ${JSON.stringify([ANTHROPIC_BASE_URL_ENV, ANTHROPIC_AUTH_TOKEN_ENV, GATEWAY_MODEL_DISCOVERY_ENV])};`,
+    "const env = {};",
+    "for (const k of keys) { env[k] = k in process.env ? process.env[k] : null; }",
+    `fs.writeFileSync(${JSON.stringify(dumpPath)}, JSON.stringify(env));`,
+    "process.stdout.write(JSON.stringify({ type: 'result', is_error: false, session_id: 'sess-env', result: 'ok' }) + '\\n');",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
 /** A fake that emits each event `gapMs` apart — slow but demonstrably alive. */
 function writeFakeDripClaude(name: string, gapMs: number, events: FakeClaudeEvent[]): string {
   const path = join(dir, name);
@@ -236,7 +264,7 @@ function writeFakeDripClaude(name: string, gapMs: number, events: FakeClaudeEven
 async function runClaudeExpectingError(bin: string, opts: Partial<RunClaudeOptions> = {}): Promise<unknown> {
   process.env[CLAUDE_BIN_ENV] = bin;
   try {
-    await runClaude({ cwd: dir, prompt: "do the thing", ...opts });
+    await runClaude({ cwd: dir, prompt: "do the thing", routing: UNROUTED, ...opts });
   } catch (err) {
     return err;
   }
@@ -278,6 +306,7 @@ describe("runClaude", () => {
     const result = await runClaude({
       cwd: dir,
       prompt: "do the thing",
+      routing: UNROUTED,
       onEvent: (e) => events.push(e),
     });
 
@@ -300,7 +329,9 @@ describe("runClaude", () => {
     const saved = process.env[CLAUDE_BIN_ENV];
     delete process.env[CLAUDE_BIN_ENV];
     try {
-      await expect(runClaude({ cwd: dir, prompt: "do the thing" })).rejects.toThrow(CLAUDE_BIN_ENV);
+      await expect(runClaude({ cwd: dir, prompt: "do the thing", routing: UNROUTED })).rejects.toThrow(
+        CLAUDE_BIN_ENV,
+      );
     } finally {
       if (saved === undefined) delete process.env[CLAUDE_BIN_ENV];
       else process.env[CLAUDE_BIN_ENV] = saved;
@@ -481,7 +512,7 @@ describe("runClaude", () => {
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 
-    const result = await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket" });
+    const result = await runClaude({ cwd: dir, prompt: "work the anton-b9l ticket", routing: UNROUTED });
 
     expect(result.ok).toBe(true);
     expect(result.isError).toBe(false);
@@ -722,7 +753,7 @@ describe("runClaude", () => {
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 
-    const result = await runClaude({ cwd: dir, prompt: "work the anton-ner epic" });
+    const result = await runClaude({ cwd: dir, prompt: "work the anton-ner epic", routing: UNROUTED });
 
     expect(result.ok).toBe(true);
     expect(result.isError).toBe(false);
@@ -743,6 +774,7 @@ describe("runClaude", () => {
     const result = await runClaude({
       cwd: dir,
       prompt: "do the thing",
+      routing: UNROUTED,
       model: "sonnet",
       appendSystemPrompt: "extra instructions",
       permissionMode: "acceptEdits",
@@ -775,6 +807,7 @@ describe("runClaude", () => {
     const result = await runClaude({
       cwd: dir,
       prompt: "review the diff",
+      routing: UNROUTED,
       permissionMode: "bypassPermissions",
       disallowedTools: ["Bash(git:*)", "Bash(gh:*)"],
     });
@@ -804,13 +837,13 @@ describe("runClaude", () => {
     chmodSync(path, 0o755);
     process.env[CLAUDE_BIN_ENV] = path;
 
-    await runClaude({ cwd: dir, prompt: "review the diff", settingSources: ["user"] });
+    await runClaude({ cwd: dir, prompt: "review the diff", routing: UNROUTED, settingSources: ["user"] });
     let argv = JSON.parse(readFileSync(dumpPath, "utf8")) as string[];
     expect(argv[argv.indexOf("--setting-sources") + 1]).toBe("user");
 
     // Every other session keeps Claude Code's own default — the project's hooks are meant to apply
     // to an implementer.
-    await runClaude({ cwd: dir, prompt: "implement the ticket" });
+    await runClaude({ cwd: dir, prompt: "implement the ticket", routing: UNROUTED });
     argv = JSON.parse(readFileSync(dumpPath, "utf8")) as string[];
     expect(argv).not.toContain("--setting-sources");
   });
@@ -848,6 +881,7 @@ describe("runClaude", () => {
     const result = await runClaude({
       cwd: dir,
       prompt: promptBody,
+      routing: UNROUTED,
       appendSystemPrompt: systemBody,
     });
 
@@ -925,7 +959,7 @@ describe("runClaude", () => {
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 
-    const result = await runClaude({ cwd: dir, prompt: "do the thing" });
+    const result = await runClaude({ cwd: dir, prompt: "do the thing", routing: UNROUTED });
     expect(result.ok).toBe(false);
     expect(result.isError).toBe(true);
   });
@@ -1028,7 +1062,7 @@ describe("runClaude", () => {
     chmodSync(path, 0o755);
     process.env[CLAUDE_BIN_ENV] = path;
 
-    const result = await runClaude({ cwd: dir, prompt: "continue", resumeSessionId: "sess-abc" });
+    const result = await runClaude({ cwd: dir, prompt: "continue", routing: UNROUTED, resumeSessionId: "sess-abc" });
 
     expect(result.ok).toBe(true);
     const argv: string[] = JSON.parse(readFileSync(argvPath, "utf8"));
@@ -1051,7 +1085,7 @@ describe("runClaude", () => {
     ]);
     process.env[CLAUDE_BIN_ENV] = bin;
 
-    const result = await runClaude({ cwd: dir, prompt: "continue", resumeSessionId: "sess-rl" });
+    const result = await runClaude({ cwd: dir, prompt: "continue", routing: UNROUTED, resumeSessionId: "sess-rl" });
 
     expect(result.ok).toBe(true);
     expect(result.text).toContain("ANTON-RESULT: blocked");
@@ -1100,7 +1134,7 @@ describe("runClaude", () => {
     spawnHooks.groupAlive = () => !groupGone;
 
     try {
-      const run = runClaude({ cwd: dir, prompt: "wedge", stallTimeoutMs: 500 });
+      const run = runClaude({ cwd: dir, prompt: "wedge", routing: UNROUTED, stallTimeoutMs: 500 });
       const outcome = await Promise.race([
         run.then(() => "settled", () => "settled"),
         new Promise((r) => setTimeout(() => r("waiting"), 1_200)),
@@ -1128,7 +1162,7 @@ describe("runClaude", () => {
 
       let up = () => {};
       const started = new Promise<void>((resolve) => { up = resolve; });
-      const run = runClaude({ cwd: dir, prompt: "cancel me", signal: control.signal, onEvent: up });
+      const run = runClaude({ cwd: dir, prompt: "cancel me", routing: UNROUTED, signal: control.signal, onEvent: up });
       // Abort only once the fake is up and has trapped SIGTERM — before that it would die on the
       // default disposition and prove nothing. It writes its first event after installing the trap,
       // so that event is the proof; a fixed sleep only guesses at it.
@@ -1153,7 +1187,7 @@ describe("runClaude", () => {
       const control = new AbortController();
 
       try {
-        const run = runClaude({ cwd: dir, prompt: "trap sigterm", signal: control.signal });
+        const run = runClaude({ cwd: dir, prompt: "trap sigterm", routing: UNROUTED, signal: control.signal });
         await waitForFile(pidPath);
         control.abort();
 
@@ -1181,7 +1215,7 @@ describe("runClaude", () => {
       const control = new AbortController();
 
       try {
-        const run = runClaude({ cwd: dir, prompt: "cancel my tree", signal: control.signal });
+        const run = runClaude({ cwd: dir, prompt: "cancel my tree", routing: UNROUTED, signal: control.signal });
         // The descendant's pid file is written by the descendant itself: waiting for it is what
         // makes "the group still holds a writer" true at the moment of the abort.
         await waitForFile(pidPath);
@@ -1208,7 +1242,7 @@ describe("runClaude", () => {
       process.env[CLAUDE_BIN_ENV] = bin;
       const control = new AbortController();
 
-      const run = runClaude({ cwd: dir, prompt: "cancel after exit", signal: control.signal });
+      const run = runClaude({ cwd: dir, prompt: "cancel after exit", routing: UNROUTED, signal: control.signal });
       // Long enough for the fake to have finished and exited, short enough that its descendant is
       // still holding the pipe: the window where only the signal knows the run was cancelled.
       await new Promise((r) => setTimeout(r, 500));
@@ -1232,9 +1266,108 @@ describe("runClaude", () => {
     // 3 gaps of 600ms = 1.8s of runtime under a 1.5s budget — the session outlives the timeout while
     // no single silence does. That gap is the whole point: a session-length timer kills this, a
     // per-chunk rearm lets it finish.
-    const result = await runClaude({ cwd: dir, prompt: "slow but alive", stallTimeoutMs: 1_500 });
+    const result = await runClaude({ cwd: dir, prompt: "slow but alive", routing: UNROUTED, stallTimeoutMs: 1_500 });
 
     expect(result.ok).toBe(true);
     expect(result.text).toBe("done");
+  });
+});
+
+describe("runClaude routing (anton-72hj)", () => {
+  const TOKEN_VAR = "ANTON_TEST_GATEWAY_TOKEN";
+  const TOKEN_VALUE = "super-secret-gateway-token-9f3a";
+  const routed: ClaudeRouting = {
+    routed: true,
+    baseUrl: "http://localhost:20128",
+    authTokenEnv: TOKEN_VAR,
+    gatewayModelDiscovery: true,
+  };
+
+  /** Set an env var for one test and restore it — the routing delta reads the real process env. */
+  function withEnv(vars: Record<string, string | undefined>, body: () => Promise<void>): Promise<void> {
+    const saved = new Map(Object.keys(vars).map((k) => [k, process.env[k]]));
+    for (const [k, v] of Object.entries(vars)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    return body().finally(() => {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    });
+  }
+
+  it("clears an ambient ANTHROPIC_BASE_URL from the child for an unrouted project", async () => {
+    const dumpPath = join(dir, "env-unrouted.json");
+    const bin = writeFakeEnvDumpClaude("env-unrouted-claude", dumpPath);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    // anton's OWN environment carries a gateway base URL; an unrouted project must not inherit it.
+    await withEnv({ [ANTHROPIC_BASE_URL_ENV]: "https://ambient.example/v1" }, async () => {
+      const result = await runClaude({ cwd: dir, prompt: "unrouted", routing: UNROUTED });
+      expect(result.ok).toBe(true);
+    });
+
+    const childEnv = JSON.parse(readFileSync(dumpPath, "utf8")) as Record<string, string | null>;
+    expect(childEnv[ANTHROPIC_BASE_URL_ENV]).toBeNull();
+    expect(childEnv[ANTHROPIC_AUTH_TOKEN_ENV]).toBeNull();
+    expect(childEnv[GATEWAY_MODEL_DISCOVERY_ENV]).toBeNull();
+  });
+
+  it("sets all three gateway vars in the child when routed, reading the token at spawn time", async () => {
+    const dumpPath = join(dir, "env-routed.json");
+    const bin = writeFakeEnvDumpClaude("env-routed-claude", dumpPath);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    await withEnv({ [TOKEN_VAR]: TOKEN_VALUE }, async () => {
+      const result = await runClaude({ cwd: dir, prompt: "routed", routing: routed });
+      expect(result.ok).toBe(true);
+    });
+
+    const childEnv = JSON.parse(readFileSync(dumpPath, "utf8")) as Record<string, string | null>;
+    expect(childEnv[ANTHROPIC_BASE_URL_ENV]).toBe("http://localhost:20128");
+    expect(childEnv[ANTHROPIC_AUTH_TOKEN_ENV]).toBe(TOKEN_VALUE);
+    expect(childEnv[GATEWAY_MODEL_DISCOVERY_ENV]).toBe("1");
+  });
+
+  it("fails the run LOUD when the routed project's named token var is unset", async () => {
+    // No process spawned: the delta throws before spawn, so the run rejects naming both the variable
+    // and the setting rather than silently launching a gateway session with no credential.
+    const bin = writeFakeEnvDumpClaude("env-missing-token-claude", join(dir, "env-missing.json"));
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    await withEnv({ [TOKEN_VAR]: undefined }, async () => {
+      await expect(runClaude({ cwd: dir, prompt: "routed", routing: routed })).rejects.toThrow(TOKEN_VAR);
+    });
+  });
+
+  it("never lets the gateway token reach a streamed event or an error message", async () => {
+    // A routed session whose fake FAILS (exit 1) with generic output: the driver holds the token only
+    // in the child's env, never in argv or the stream, so neither the surfaced error nor any event
+    // text may carry the value.
+    const bin = writeFakeClaude(
+      "routed-fail-claude",
+      [
+        { type: "system", subtype: "init", session_id: "sess-routed-fail" },
+        { type: "result", subtype: "error", is_error: true, result: "the agent could not finish" },
+      ],
+      1,
+    );
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    const events: ClaudeEvent[] = [];
+    let message = "";
+    await withEnv({ [TOKEN_VAR]: TOKEN_VALUE }, async () => {
+      try {
+        await runClaude({ cwd: dir, prompt: "routed", routing: routed, onEvent: (e) => events.push(e) });
+      } catch (e) {
+        message = (e as Error).message;
+      }
+    });
+
+    expect(message).not.toBe("");
+    expect(message).not.toContain(TOKEN_VALUE);
+    expect(JSON.stringify(events)).not.toContain(TOKEN_VALUE);
   });
 });

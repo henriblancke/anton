@@ -15,6 +15,7 @@
  * shared `UsageLimitError` so the runner parks + reschedules (never a plain throw).
  */
 import { consumeLine, createLineReader, createStreamState, type ClaudeEvent } from "./driver-events";
+import type { ClaudeRouting } from "./driver-routing";
 import { exitError, toClaudeResult, type ClaudeResult } from "./driver-exit";
 import {
   abortGraceMs, buildClaudeArgs, createStallWatchdog, groupAlive, killTree, resolveClaudeBin,
@@ -22,6 +23,8 @@ import {
 } from "./driver-spawn";
 
 export { ABORT_GRACE_ENV, CLAUDE_BIN_ENV } from "./driver-spawn";
+export { UNROUTED, claudeRouting } from "./driver-routing";
+export type { ClaudeRouting } from "./driver-routing";
 export type { ClaudeEvent } from "./driver-events";
 export type { ClaudeResult } from "./driver-exit";
 
@@ -30,6 +33,14 @@ export interface RunClaudeOptions extends ClaudeCliOptions {
   cwd: string;
   /** The task prompt — delivered on the child's stdin, never on argv (anton-14tj). */
   prompt: string;
+  /**
+   * Where this run's Claude traffic goes (anton-72hj): the project's gateway, or {@link UNROUTED}
+   * for the Claude API. REQUIRED with an explicit unrouted value — a call site that forgets it fails
+   * to COMPILE rather than silently inheriting anton's ambient environment, which is the very
+   * misroute this field exists to prevent. Resolved from `ProjectSettings` by {@link claudeRouting};
+   * applied over `process.env` at spawn time by `spawnClaude`.
+   */
+  routing: ClaudeRouting;
   /** The composed system prompt — written to a temp file and passed via --append-system-prompt-file. */
   appendSystemPrompt?: string;
   /** Abort the child (lease lost / run cancelled). */

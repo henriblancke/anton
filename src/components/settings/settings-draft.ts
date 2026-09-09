@@ -40,6 +40,10 @@ import type {
  */
 export interface SettingsDraft {
   model: string;
+  /** Gateway routing (anton-n16m). Base URL and the token's env-var NAME; "" clears each. */
+  claudeBaseUrl: string;
+  claudeAuthTokenEnv: string;
+  claudeGatewayModelDiscovery: boolean;
   seedPrompt: string;
   reviewFixPrompt: string;
   reviewFixConcurrency: number;
@@ -103,6 +107,9 @@ export function draftFromSettings(
 ): SettingsDraft {
   return {
     model: settings.model ?? "",
+    claudeBaseUrl: settings.claudeBaseUrl ?? "",
+    claudeAuthTokenEnv: settings.claudeAuthTokenEnv ?? "",
+    claudeGatewayModelDiscovery: settings.claudeGatewayModelDiscovery ?? false,
     seedPrompt: settings.seedPrompt ?? "",
     reviewFixPrompt: settings.reviewFixPrompt ?? "",
     reviewFixConcurrency: settings.reviewFixConcurrency ?? DEFAULT_REVIEW_FIX_CONCURRENCY,
@@ -153,6 +160,7 @@ export function draftFromSettings(
  */
 const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
   model: ["model"],
+  gateway: ["claudeBaseUrl", "claudeAuthTokenEnv", "claudeGatewayModelDiscovery"],
   seedPrompt: ["seedPrompt"],
   reviewFixPrompt: ["reviewFixPrompt"],
   reviewFixConcurrency: ["reviewFixConcurrency"],
@@ -248,6 +256,11 @@ export function settingsPatchBody(
   return {
     // "" clears the override → driver runs with no --model / no seed / the default review-fix prompt.
     model: orNull(draft.model),
+    // Gateway routing (anton-n16m). "" clears the base URL and the token env-var name back to the
+    // Claude API; the boolean rides along so re-enabling a gateway restores the operator's choice.
+    claudeBaseUrl: orNull(draft.claudeBaseUrl),
+    claudeAuthTokenEnv: orNull(draft.claudeAuthTokenEnv),
+    claudeGatewayModelDiscovery: draft.claudeGatewayModelDiscovery,
     seedPrompt: orNull(draft.seedPrompt),
     reviewFixPrompt: orNull(draft.reviewFixPrompt),
     reviewFixConcurrency: draft.reviewFixConcurrency,

@@ -5,6 +5,7 @@
  * Knows nothing about project settings — the concrete table lives in ./settings-patch.
  */
 import type { ZodError, ZodType } from "zod";
+import { hasCredentialMarker } from "@/lib/scan-secrets";
 
 export type FieldResult<V> = { ok: true; value: V | undefined } | { ok: false; error: string };
 
@@ -46,6 +47,137 @@ export function oneOf(allowed: ReadonlySet<string>): FieldParser<string> {
   return (raw, key) => {
     if (isClear(raw)) return accept(undefined);
     if (typeof raw !== "string" || !allowed.has(raw)) return reject(`Unsupported ${key}: ${raw}`);
+    return accept(raw);
+  };
+}
+
+/** Percent-decode a URL part for credential matching; a malformed escape falls back to raw. */
+function safeDecode(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+/**
+ * The hostname with its original case. `new URL(...).hostname` lowercases every label AND
+ * percent-decodes it, but the value persisted is the raw string and several credential markers are
+ * case-sensitive (`AKIA…`, `ghp_…`, `AIza…`) — so a token pasted as a label
+ * (`AKIA…​.gateway.example`, or its encoded twin `%41KIA…`) would clear the normalized check yet
+ * land in settings_json intact. Recover the label casing by decoding the raw authority and locating
+ * the host in it; fall back to the normalized form when it can't be located (e.g. an IDN punycode
+ * host, which carries no ASCII credential anyway).
+ *
+ * Only the authority is decoded, never the whole URL: a malformed escape in the path would
+ * otherwise abort the decode and hand the scan back the encoded host it exists to see through.
+ */
+function rawHostname(raw: string, parsed: URL): string {
+  const schemeEnd = raw.indexOf("://");
+  const start = schemeEnd >= 0 ? schemeEnd + 3 : 0;
+  const end = raw.slice(start).search(/[/?#]/);
+  const authority = safeDecode(raw.slice(start, end >= 0 ? start + end : undefined));
+  // lastIndexOf: the host is the tail of the authority, past any userinfo or a lookalike in it.
+  const at = authority.toLowerCase().lastIndexOf(parsed.hostname);
+  return at >= 0 ? authority.slice(at, at + parsed.hostname.length) : parsed.hostname;
+}
+
+/** An http(s) URL — a gateway base URL, not a bare host, a file path, or a stray scheme. */
+export function httpUrl(max: number): FieldParser<string> {
+  return (raw, key) => {
+    if (isClear(raw)) return accept(undefined);
+    if (typeof raw !== "string") return reject(`${key} must be a string`);
+    if (raw.length > max) return reject(`${key} too long (max ${max} chars)`);
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      return reject(`${key} must be a valid http(s) URL`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return reject(`${key} must be an http(s) URL`);
+    }
+    // Userinfo is a secret in a URL's clothing — storing it verbatim would land a credential in
+    // settings_json, exactly the "no secret in anton.db" guarantee this feature rests on.
+    if (parsed.username || parsed.password) {
+      return reject(
+        `${key} must not include credentials — paste the URL without userinfo, ` +
+          `and keep the token in the auth-token env var`,
+      );
+    }
+    // A token also hides as a hostname label (`https://sk-secret.gateway.example/v1`): empty
+    // userinfo, no query, no path segment carries it, so only a scan of the host labels themselves
+    // keeps the no-secret-in-database guarantee. Same detector as the path — shape only, so a
+    // legitimate subdomain (`api`, `eu`) rides through.
+    if (
+      rawHostname(raw, parsed)
+        .split(".")
+        .some((label) => hasCredentialMarker(label))
+    ) {
+      return reject(
+        `${key} must not embed a credential in its hostname — paste the base URL without the token, ` +
+          `and keep it in the auth-token env var`,
+      );
+    }
+    // A query or fragment is the other place a secret hides in a URL (`?api_key=…`, `#token=…`);
+    // a gateway BASE URL has no use for either, so forbid both outright rather than sniff for
+    // credential-shaped params — same guarantee, no persisted secret.
+    if (parsed.search || parsed.hash) {
+      return reject(
+        `${key} must not include a query or fragment — paste the base URL only, ` +
+          `and keep any token in the auth-token env var`,
+      );
+    }
+    // The path is the last place a token hides (`…/sk-secret/v1`). It can't be forbidden outright —
+    // a base URL is legitimately versioned (`/v1`, `/openai`) — so reject only segments carrying a
+    // shape anton recognises as a credential, the same detector it uses elsewhere. Word/entropy
+    // heuristics stay out: they would reject `/v1` and public ids like a Cloudflare account tag.
+    //
+    // Boundary: hasCredentialMarker is `^`-anchored (host labels and path segments alike), so it
+    // catches a token that IS a whole segment/label — the plausible accidental-paste forms — but not
+    // one buried as the suffix of a longer token (`…/prefix-AKIA4xyz`). That's an unusual structure
+    // no gateway base URL requires, and dropping the anchor would false-positive on ordinary
+    // segments that merely start with a known prefix (`/api-v1-gw`). The absolute userinfo/query/
+    // fragment rejections above cover the URL components where a secret actually rides.
+    if (parsed.pathname.split("/").some((segment) => hasCredentialMarker(safeDecode(segment)))) {
+      return reject(
+        `${key} must not embed a credential in its path — paste the base URL without the token, ` +
+          `and keep it in the auth-token env var`,
+      );
+    }
+    return accept(raw);
+  };
+}
+
+/** A POSIX env-var NAME: an uppercase identifier, never a value that happens to look like one. */
+const ENV_VAR_NAME = /^[A-Z_][A-Z0-9_]*$/;
+
+/**
+ * The NAME of an environment variable, e.g. `ANTHROPIC_AUTH_TOKEN` — not its value. A pasted token
+ * (lowercase, dashes, an `sk-…` prefix) fails the pattern, and an all-uppercase credential that
+ * slips past it (`AKIA…`) is caught by the credential detector, so a secret can never be stored
+ * here by mistake: only the name of the var anton reads it from is kept.
+ */
+export function envVarName(max: number): FieldParser<string> {
+  return (raw, key) => {
+    if (isClear(raw)) return accept(undefined);
+    if (typeof raw !== "string") return reject(`${key} must be a string`);
+    if (raw.length > max) return reject(`${key} too long (max ${max} chars)`);
+    if (!ENV_VAR_NAME.test(raw)) {
+      return reject(
+        `${key} must be an environment variable NAME like ANTHROPIC_AUTH_TOKEN ` +
+          `([A-Z_][A-Z0-9_]*), not a token value`,
+      );
+    }
+    // An all-uppercase credential (`AKIA…`, `SK_LIVE…`) satisfies the identifier pattern, so the
+    // shape check alone would let a pasted secret land in settings_json — the one thing this field
+    // exists to prevent. Reject anything the credential detector recognises outright.
+    if (hasCredentialMarker(raw)) {
+      return reject(
+        `${key} looks like a credential value, not an environment variable name — ` +
+          `paste the NAME of the env var anton reads the token from, not the token itself`,
+      );
+    }
     return accept(raw);
   };
 }

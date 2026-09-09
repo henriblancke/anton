@@ -36,6 +36,11 @@ export interface RunSummary {
   branch?: string;
   model?: string;
   agentTag?: string;
+  /**
+   * The endpoint host this run drove (anton-oom5) — the gateway's host when routed, else the
+   * Anthropic default. Absent only on rows written before the column existed.
+   */
+  endpointHost?: string;
   status: RunStatus;
   attempts: number;
   startedAt?: number;

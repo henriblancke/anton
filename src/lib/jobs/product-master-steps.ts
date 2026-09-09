@@ -10,6 +10,7 @@
  */
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
+import { claudeRouting } from "../claude/driver";
 import type { RunClaudeOptions, runClaude } from "../claude/driver";
 import { applyArmedProposals, movedTheBoard, reportUnsettledProposals } from "../gardener/armed";
 import type { GardenerDetection } from "../gardener/detections";
@@ -246,6 +247,7 @@ export async function judgeBoard(scope: PassScope, input: JudgeInput): Promise<P
     cwd: scope.project.repoPath,
     prompt,
     model: settings.model,
+    routing: claudeRouting(settings),
     permissionMode: settings.permissionMode ?? "bypassPermissions",
     disallowedTools: PM_DENIED_TOOLS,
     signal: scope.ctx.signal,

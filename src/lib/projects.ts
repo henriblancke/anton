@@ -132,6 +132,29 @@ export async function getProjectById(db: AntonDb, id: string): Promise<Project |
 /** Parsed project settings (settingsJson). All optional; sensible defaults applied by callers. */
 export interface ProjectSettings {
   model?: string;
+  /**
+   * Route this project through a Claude-compatible gateway instead of the Claude API (anton-n16m):
+   * the base URL the driver points at, e.g. `https://api.9router.dev/v1`. Absent → the Claude API.
+   * Stored and validated only here; the run reads it when it records its endpoint host
+   * (`endpointHostFromBaseUrl`) and a later step drives it at spawn time. A base URL without
+   * {@link claudeAuthTokenEnv} is refused at the API boundary — a gateway with no credential is a
+   * misconfiguration, not a state to persist.
+   */
+  claudeBaseUrl?: string;
+  /**
+   * The NAME of the environment variable anton reads the gateway token from at spawn time
+   * (anton-n16m) — never the token itself. The secret lives in anton's own environment, so nothing
+   * sensitive touches this row; a value shaped like a token rather than a var name is rejected at the
+   * boundary. Absent → no gateway credential, which is only valid when {@link claudeBaseUrl} is also
+   * absent.
+   */
+  claudeAuthTokenEnv?: string;
+  /**
+   * Whether anton asks the gateway which models it serves (anton-n16m). Absent → off, so a project
+   * that only points at a gateway keeps the shipped model list until it opts in. Only meaningful
+   * alongside {@link claudeBaseUrl}.
+   */
+  claudeGatewayModelDiscovery?: boolean;
   testCommand?: string;
   /**
    * Optional operator-pinned verify gates (anton-3oh8), run in the worktree after the agent and

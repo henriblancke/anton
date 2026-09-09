@@ -239,6 +239,13 @@
       "when": 1788815301862,
       "tag": "0033_jobs_spent_attempts",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1788898577006,
+      "tag": "0034_run_endpoint_host",
+      "breakpoints": true
     }
   ]
 }

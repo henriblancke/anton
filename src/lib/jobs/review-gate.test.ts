@@ -115,14 +115,17 @@ let tdb: TestProjectDb;
 let projectId: string;
 let priorSessionsRoot: string | undefined;
 const clock = new TickingClock(1_700_000_000_000);
+/** What each session reported live — asserted so an investigate terminal can hit the right endpoint. */
+let reportedInfos: Parameters<ReviewGateContext["report"]>[0][] = [];
 const ctx: ReviewGateContext = {
   signal: new AbortController().signal,
   heartbeat: async () => {},
-  report: () => {},
+  report: (info) => reportedInfos.push(info),
   claudeReached: async () => {},
 };
 
 beforeEach(async () => {
+  reportedInfos = [];
   dir = mkdtempSync(join(tmpdir(), "anton-review-gate-"));
   // A real one-commit repo even though claude, the diff and the worktree state are all faked: the
   // gate reads its trusted inputs (the rulebook) at the base commit and FAILS on a read it cannot
@@ -314,6 +317,25 @@ describe("runReviewGate — convergence", () => {
     expect(blockingFindings(out.unresolved)).toEqual([]);
     expect(calls).toHaveLength(3); // review → fix → review
     expect(commitMessages).toEqual(["anton-gate1: address self-review findings (round 1)"]);
+  });
+
+  it("pins every session report to the run's routing — so investigate hits the reviewed endpoint", async () => {
+    // A same-machine resume that skips every runTicket never seeds the live handle with routing;
+    // the gate's own reports must carry it, or an investigate terminal falls back to current settings.
+    const routed: ProjectSettings = { claudeBaseUrl: "https://gw.example/api", claudeAuthTokenEnv: "GW_TOKEN" };
+    const { result } = gate([report(4, [BLOCKING]), "fixed", report(9, [])], routed);
+    await result;
+
+    // review → fix → re-review: each session's live report carries the pinned gateway route.
+    expect(reportedInfos).toHaveLength(3);
+    for (const info of reportedInfos) {
+      expect(info.routing).toEqual({
+        routed: true,
+        baseUrl: "https://gw.example/api",
+        authTokenEnv: "GW_TOKEN",
+        gatewayModelDiscovery: false,
+      });
+    }
   });
 
   it("dispatches only the BLOCKING findings to the fix session", async () => {

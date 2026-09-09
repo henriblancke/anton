@@ -1,0 +1,12 @@
+-- Record which endpoint a run drove (anton-oom5), so a bad run can be attributed to the gateway or
+-- cleared of it without re-running it — the one provenance dimension `runs` was missing beside
+-- model, agent_tag and formula.
+--
+-- Nullable and NOT backfilled on purpose: a row that predates this column stays NULL, while every
+-- new run records its host (an unrouted run records the Anthropic default explicitly), so an old
+-- row and an unrouted new row are never confusable. The value is a HOST only — never a token, never
+-- a URL carrying userinfo (see `endpointHostFromBaseUrl` in src/lib/runs.ts).
+--
+-- Reverse:
+--   ALTER TABLE `runs` DROP COLUMN `endpoint_host`;
+ALTER TABLE `runs` ADD `endpoint_host` text;

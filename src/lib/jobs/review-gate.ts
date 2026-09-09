@@ -14,7 +14,7 @@
  * wiring is what makes it unit-testable against a fake driver.
  */
 import { type Bead } from "../beads/bd";
-import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
+import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import {
   commitAll,
   diffAgainstBase,
@@ -463,7 +463,9 @@ async function runReviewSession(args: {
     kind: "review",
     beadId: target.id,
   });
-  ctx.report({ sessionId, cwd: worktreePath });
+  // Pin the report to this run's routing (anton-7poz) so an investigate terminal hits the endpoint
+  // under review even on an all-tickets-skipped resume, where openTicketSession never seeded it.
+  ctx.report({ sessionId, cwd: worktreePath, routing: claudeRouting(settings) });
 
   try {
     const settled = await settleBaseline({
@@ -569,6 +571,7 @@ async function runReviewSession(args: {
         cwd: worktreePath,
         prompt,
         model: settings.model,
+        routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         disallowedTools: REVIEW_DENIED_TOOLS,
         settingSources: [...REVIEW_SETTING_SOURCES],
@@ -871,7 +874,7 @@ async function runGateFixSession(args: {
     kind: "review-fix",
     beadId: target.id,
   });
-  ctx.report({ sessionId, cwd: worktreePath });
+  ctx.report({ sessionId, cwd: worktreePath, routing: claudeRouting(settings) });
 
   try {
     await appendSessionLog(
@@ -890,6 +893,7 @@ async function runGateFixSession(args: {
         prompt,
         appendSystemPrompt,
         model: settings.model,
+        routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         signal: ctx.signal,
         onEvent,
