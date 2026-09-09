@@ -14,6 +14,7 @@ import {
   invocationRows,
   invocationSpend,
   listInvocations,
+  spendBreakdowns,
   metered,
   recordInvocation,
 } from "./claude-invocations";
@@ -377,6 +378,65 @@ describe("invocationSpend", () => {
       divergence: { invocations: 0, diverged: 0, unknown: 0, substitutions: [] },
       cost: { usd: 0, priced: 0, unpriced: 0, unpricedModels: [] },
     });
+    tdb.close();
+  });
+});
+
+describe("spendBreakdowns", () => {
+  it("folds one window both ways from ONE read, so the two totals cannot disagree", async () => {
+    const tdb = makeProjectDb();
+    await recordInvocation(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId, step: "implement" },
+      result({ sessionId: "sess-1", modelUsage: USAGE }),
+    );
+    await recordInvocation(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId, step: "review" },
+      result({ sessionId: "sess-2", modelUsage: [{ model: "claude-sonnet-5", inputTokens: 5_000 }] }),
+    );
+
+    const { model, task } = await spendBreakdowns(tdb.db, tdb.projectId);
+    expect(model.groups.map((g) => g.label).sort()).toEqual([
+      "claude-haiku-4-5-20251001",
+      "claude-opus-5[1m]",
+      "claude-sonnet-5",
+    ]);
+    expect(task.groups.map((g) => g.label).sort()).toEqual(["implement", "review"]);
+    // Same rows, so the same dollars — the reason both folds come from one query.
+    expect(task.usd).toBe(model.usd);
+    expect(task.tokens.total).toBe(model.tokens.total);
+    tdb.close();
+  });
+
+  it("reads a project with no recorded calls as EMPTY, never as zero spend", async () => {
+    const tdb = makeProjectDb();
+
+    const { model, task } = await spendBreakdowns(tdb.db, tdb.projectId);
+    for (const breakdown of [model, task]) {
+      expect(breakdown.recorded).toBe(false);
+      expect(breakdown.groups).toEqual([]);
+      expect(breakdown.rows).toBe(0);
+      // The load-bearing assertion: an unmetered project has NO dollar figure, not a zero one.
+      expect(breakdown.usd).toBeUndefined();
+    }
+    tdb.close();
+  });
+
+  it("excludes rows outside the chosen window rather than reporting them as this window's", async () => {
+    const tdb = makeProjectDb();
+    await recordInvocation(
+      tdb.db,
+      { now: () => clock.now() - 30 * 86_400_000 },
+      { ...DIMENSIONS, projectId: tdb.projectId },
+      result({ modelUsage: [{ model: "claude-opus-5", inputTokens: 100 }] }),
+    );
+
+    const since = new Date(clock.now() - 86_400_000);
+    expect((await spendBreakdowns(tdb.db, tdb.projectId, { since })).model.recorded).toBe(false);
+    expect((await spendBreakdowns(tdb.db, tdb.projectId)).model.recorded).toBe(true);
     tdb.close();
   });
 });

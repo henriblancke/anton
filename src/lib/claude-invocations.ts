@@ -37,6 +37,7 @@ import {
   type InvocationFact,
 } from "./model-divergence";
 import { totalCost, type SpendCost } from "./model-pricing";
+import { breakdownBy, type SpendBreakdown } from "./spend-breakdown";
 import type { AntonDb, Clock } from "./jobs/queue";
 
 /** How an invocation ended, as claude itself reported it. */
@@ -265,4 +266,37 @@ export function projectSpend(
   opts?: { since?: Date; limit?: number },
 ): Promise<InvocationSpend> {
   return invocationSpend(getDb(), projectId, opts);
+}
+
+/**
+ * One project's spend over a window, folded BOTH ways (anton-1kdm) — the read the spend page makes.
+ *
+ * Both dimensions come from one query rather than two. They are folds of the same rows, and issuing
+ * two reads would let the model total and the task total disagree whenever an invocation lands
+ * between them — two numbers that must sum to the same dollar figure, visibly not doing so.
+ *
+ * NO `limit`: a breakdown that silently dropped the oldest rows of its own window would report a
+ * total that is not the window's total, which is the failure mode this whole feature exists to end.
+ */
+export async function spendBreakdowns(
+  db: AntonDb,
+  projectId: string,
+  opts: { since?: Date } = {},
+): Promise<{ model: SpendBreakdown; task: SpendBreakdown; divergence: DivergenceSummary }> {
+  const rows = await listInvocations(db, projectId, opts);
+  return {
+    model: breakdownBy(rows, "model"),
+    task: breakdownBy(rows, "task"),
+    // Carried along for the same reason `invocationSpend` carries it: a per-model figure attributed
+    // to a model that did not serve the call is worse than no figure, and nobody thinks to ask.
+    divergence: divergenceSummary(groupInvocations(rows)),
+  };
+}
+
+/** UI/read path for the two breakdowns over the shared anton.db — see {@link spendBreakdowns}. */
+export function projectSpendBreakdowns(
+  projectId: string,
+  opts?: { since?: Date },
+): Promise<{ model: SpendBreakdown; task: SpendBreakdown; divergence: DivergenceSummary }> {
+  return spendBreakdowns(getDb(), projectId, opts);
 }
