@@ -584,6 +584,40 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).not.toContain("the real old box");
   });
 
+  it("keeps a dropped duplicate as an empty boundary — it terminated the peer section after it", () => {
+    // `## Acceptance`, a nested `### Acceptance Criteria`, then a peer `### Success`: the judge reads
+    // Success as its own section only because the duplicate closed the shallower Acceptance. Dropping
+    // that heading outright re-parented Success under the survivor, folding founder-authored boxes
+    // back into the very acceptance this reconcile replaces.
+    const nested = [
+      "## Acceptance",
+      "- [ ] the old box",
+      "### Acceptance Criteria",
+      "- [ ] the nested duplicate's box",
+      "### Success",
+      "- [ ] a founder-authored peer",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(nested, edited);
+
+    expect(reconciled).not.toContain("old box");
+    expect(reconciled).not.toContain("nested duplicate");
+    // The peer keeps its text and stays OUTSIDE Acceptance.
+    expect(reconciled).toContain("### Success\n- [ ] a founder-authored peer");
+    expect(reconciled).toContain("## Context\nKept.");
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toBe(
+      [
+        "- [ ] Guard the null branch.",
+        "- [ ] Cover the exhausted path.",
+        "- [ ] src/retry.ts:12 — retries on a 4xx",
+        "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+      ].join("\n"),
+    );
+  });
+
   it("reconciles every Acceptance section — the judge concatenates repeated headings, so a stale later copy would still govern", () => {
     const repeated = [
       "## Goal",

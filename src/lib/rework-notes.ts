@@ -14,7 +14,7 @@ import {
   CONTEXT_KEYS,
   isTicketContractHeading,
 } from "./beads/contract";
-import { type ScannedLine, scanMarkdown, unterminatedCloser } from "./beads/markdown";
+import { type Heading, type ScannedLine, scanMarkdown, unterminatedCloser } from "./beads/markdown";
 import { parseTicketNotes } from "./beads/notes";
 import type { PullRequestState } from "./git/ops";
 import type { ReviewFinding } from "./jobs/review-context";
@@ -175,8 +175,24 @@ function replaceAcceptance(description: string, boxes: string[]): string {
   const pieces = [[...texts(0, first!.start + 1), ...boxes]];
   // Text between a dropped copy and the next: verbatim, minus the blank lines that led into the copy.
   let cursor = first!.end;
+  // The heading that governs what follows, as the judge scopes sections — the surviving Acceptance
+  // until a kept heading supersedes it.
+  let governing = lines[first!.start]!.heading!;
   for (const { start, end } of duplicates) {
     pieces.push(withoutTrailingBlank(texts(cursor, start)));
+    governing = lastHeadingIn(lines, cursor, start) ?? governing;
+    // A dropped copy can be load-bearing: it TERMINATED the section after it. `## Acceptance`, a
+    // nested `### Acceptance Criteria`, then a peer `### Success` — the judge reads Success as its
+    // own section only because the duplicate closed the shallower Acceptance. Dropping the heading
+    // outright re-parents Success under the survivor, folding founder-authored or stale boxes back
+    // into the very acceptance this reconcile exists to replace. So the heading stays as an empty
+    // boundary, its stale body gone: the judge concatenates repeated headings, and an empty body
+    // adds nothing to the boxes above while still closing the section.
+    const next = lines[end]?.heading;
+    if (next && next.depth > governing.depth && !isTicketContractHeading(next)) {
+      pieces.push([lines[start]!.text]);
+      governing = lines[start]!.heading!;
+    }
     cursor = end;
   }
   pieces.push(texts(cursor, lines.length));
@@ -201,6 +217,15 @@ function sectionsNamed(lines: ScannedLine[], keys: string[]): { start: number; e
     out.push({ start, end });
   });
   return out;
+}
+
+/** The last heading in `lines` over [from, to), or undefined when the range opens no section. */
+function lastHeadingIn(lines: ScannedLine[], from: number, to: number): Heading | undefined {
+  for (let at = to - 1; at >= from; at -= 1) {
+    const heading = lines[at]?.heading;
+    if (heading) return heading;
+  }
+  return undefined;
 }
 
 function withoutTrailingBlank(texts: string[]): string[] {

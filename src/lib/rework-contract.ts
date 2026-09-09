@@ -606,6 +606,10 @@ function flushCommentedSample(
   let end = at;
   while (end < lines.length && literal[end]) end += 1;
   let sample: string[] = [...opening];
+  // Whether the comment holding this run was opened by a delimiter-only line — the line above the
+  // run, which begins outside the comment and so is never itself `literal`. A chained closer can
+  // reopen one, so it is re-judged on every closing line below.
+  let openedBlock = lines[at - 1]?.visible.trim() === "";
   const flushSample = () => {
     const indents = sample.filter((line) => line.trim() !== "").map((line) => indentColumns(line));
     if (indents.length > 0) {
@@ -624,9 +628,18 @@ function flushCommentedSample(
     }
     // A closer can carry the sample's last line: `    retry() -->` is both. It joins the block it
     // continues rather than filing whole, which would shear its indentation off and show the
-    // delimiter as requirement text. Only when a sample is open — a comment whose whole body sits
-    // on this one line (`Keep a matched <!-- x --> as text.`) is a sentence, and files as typed.
-    const carried = sample.length > 0 && line.slice(0, closes).trim() !== "";
+    // delimiter as requirement text.
+    //
+    // Two things make a prefix sample rather than prose. Sample lines already stand above it, so the
+    // block is plainly open — or nothing does, and the run's FIRST line carries the whole body
+    // (`<!--` / `    retry() -->`), which is a sample exactly when the comment was opened by a line
+    // that renders as nothing but its delimiter. That second test is what tells the block form from
+    // a sentence: `Handle an unmatched <!--` / `Keep a matched <!-- x --> as text.` opens its comment
+    // mid-prose, so the continuation is more prose and files as the sentence it was typed as, while
+    // a bare `<!--` opens a block whose body is an example. Requiring preceding lines alone refused
+    // the one-line body and filed `retry() -->` with its indentation shorn and the delimiter shown
+    // as requirement text.
+    const carried = (sample.length > 0 || openedBlock) && line.slice(0, closes).trim() !== "";
     if (carried) sample.push(line.slice(0, closes));
     flushSample();
     // A chained line can carry the NEXT sample's first line too: `-->  <!-- if ok:` is a closer, an
@@ -635,6 +648,9 @@ function flushCommentedSample(
     const from = carried ? closes : 0;
     out.push({ text: line.slice(from, opened?.at ?? line.length).trim(), fenced: false });
     if (opened) sample.push(opened.first);
+    // A chained `--> <!--` reopens on the line it closed: the next run is a block exactly when this
+    // line renders as nothing but its delimiters.
+    openedBlock = lines[next]!.visible.trim() === "";
   }
   flushSample();
   return end;

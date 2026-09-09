@@ -696,6 +696,16 @@ describe("instructionCriteria", () => {
       "```\nif ok:\n    retry()\n```",
       "--> tail",
     ]);
+    // The body can begin AND end on the closing line, the run's first line: `<!--` / `    retry() -->`.
+    // Requiring a sample to have already accumulated refused exactly that line, filing `retry() -->`
+    // as an ordinary criterion — the delimiter shown as requirement text and the indentation shorn.
+    expect(texts("<!--\n    retry() -->")).toEqual(["<!--", "```\nretry()\n```", "-->"]);
+    expect(texts("<!--\nretry() -->")).toEqual(["<!--", "```\nretry()\n```", "-->"]);
+    // A comment whose whole body sits on one line begins OUTSIDE the comment, so it is part of no
+    // run and stays the sentence it was typed as.
+    expect(texts("Keep a matched <!-- x --> as text.")).toEqual([
+      "Keep a matched <!-- x --> as text.",
+    ]);
     // It can begin on the OPENER line too, which begins outside the comment and so is never
     // `literal`: filed whole it became a checkbox of its own with `retry()` dedented alone beside
     // it, asking for behaviour the note does not show. The delimiter is granted one column of
