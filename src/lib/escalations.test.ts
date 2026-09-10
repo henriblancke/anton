@@ -488,8 +488,9 @@ describe("a dismissed stall stays down", () => {
       await dismissMany(total);
 
       const first = await listDismissedEscalations(t.db, "p1");
+      const last = first.at(-1)!;
       const second = await listDismissedEscalations(t.db, "p1", {
-        offset: DISMISSED_PAGE,
+        before: { dismissedAt: last.dismissedAt!.getTime() / 1000, id: last.id },
       });
       expect(first).toHaveLength(DISMISSED_PAGE);
       expect(second).toHaveLength(12);
@@ -595,7 +596,7 @@ describe("restoreEscalation", () => {
     const { escalation } = await raise();
     await settleEscalation(t.db, clock, escalation.id, "dismissed", true);
 
-    expect(await restoreEscalation(t.db, clock, "p1", escalation.id)).toBe(true);
+    expect(await restoreEscalation(t.db, clock, "p1", escalation.id)).toBe("restored");
     const [open] = await listOpenEscalations(t.db, "p1");
     expect(open?.id).toBe(escalation.id);
     // Not "dismissed" any more: leaving the word would have the two lists disagreeing about one row.
@@ -622,14 +623,14 @@ describe("restoreEscalation", () => {
       finding: { ...finding(), reason: "parked again, differently" },
     });
 
-    expect(await restoreEscalation(t.db, clock, "p1", escalation.id)).toBe(false);
+    expect(await restoreEscalation(t.db, clock, "p1", escalation.id)).toBe("conflicted");
   });
 
   it("refuses a row nobody dismissed, and one from another project", async () => {
     const { escalation } = await raise();
-    expect(await restoreEscalation(t.db, clock, "p1", escalation.id)).toBe(false);
+    expect(await restoreEscalation(t.db, clock, "p1", escalation.id)).toBe("already-restored");
     await settleEscalation(t.db, clock, escalation.id, "dismissed", true);
-    expect(await restoreEscalation(t.db, clock, "p2", escalation.id)).toBe(false);
+    expect(await restoreEscalation(t.db, clock, "p2", escalation.id)).toBe("not-dismissed");
   });
 
   it("reads and writes in one transaction, so a raise cannot land between them", async () => {
@@ -648,7 +649,7 @@ describe("restoreEscalation", () => {
       },
     });
 
-    expect(await restoreEscalation(tracked, clock, "p1", escalation.id)).toBe(true);
+    expect(await restoreEscalation(tracked, clock, "p1", escalation.id)).toBe("restored");
     // Every read and write went through the transaction, not the connection beside it.
     expect(calls).toEqual(["transaction"]);
   });
@@ -664,7 +665,7 @@ describe("restoreEscalation", () => {
         });
       },
     } as unknown as typeof t.db;
-    expect(await restoreEscalation(conflicted, clock, "p1", "esc-1")).toBe(false);
+    expect(await restoreEscalation(conflicted, clock, "p1", "esc-1")).toBe("conflicted");
   });
 
   it("still throws anything that is not a uniqueness conflict", async () => {

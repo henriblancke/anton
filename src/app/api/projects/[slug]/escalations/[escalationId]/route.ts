@@ -76,7 +76,9 @@ const FAILURE_MESSAGES = {
   "not-dismissable":
     "This alert can't be dismissed — a wait on a person leaves its gate open, and a disarm keeps every card stopped. Answer it, or re-arm anton",
   "not-dismissed":
-    "There is nothing to restore — this alert was never dismissed, or it has already been raised again",
+    "There is nothing to restore — this alert was never dismissed, or it was already restored",
+  "restore-conflicted":
+    "This alert is already open elsewhere; its dismissal remains available to restore after that alert is settled",
   contested: "Another machine has picked this work back up — it is running again, so nothing was changed",
   unverified:
     "anton could not read the shared board, so it can't rule out another machine running this work — nothing was changed. Try again once bd can reach the remote",

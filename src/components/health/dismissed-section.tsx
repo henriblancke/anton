@@ -40,16 +40,12 @@ export function DismissedSection({
   const router = useRouter();
   const [older, setOlder] = useState<EscalationView[]>([]);
   const [loading, setLoading] = useState(false);
-  const [restart, setRestart] = useState<{ fromTotal: number; total: number } | null>(null);
+  const [cursor, setCursor] = useState<DismissedCursor | null | undefined>(undefined);
   // Deduped, because the two halves CAN overlap: restoring a row re-renders the server page, whose
   // first page then pulls one row up out of the range `older` already holds. Undeduped that is a
   // repeated React key and the same decision offered twice.
   const rows = dedupeById([...dismissed, ...older]);
-  const sourceTotal = total ?? dismissed.length;
-  // While `router.refresh()` is fetching the restarted first page, use the changed total from the
-  // rejected page. Once the new server props arrive, `fromTotal` no longer matches and this returns
-  // to deriving directly from them — no effect or second render is needed.
-  const all = restart?.fromTotal === sourceTotal ? restart.total : sourceTotal;
+  const all = total ?? dismissed.length;
 
   if (dismissed.length === 0) return null;
 
@@ -66,28 +62,25 @@ export function DismissedSection({
   async function showOlder() {
     setLoading(true);
     try {
-      // Count raw page entries, not the deduped rendered rows. A refreshed first page can overlap
-      // `older` after a restore; using `rows.length` would then ask one entry too early or late.
-      const offset = dismissed.length + older.length;
-      const res = await fetch(`/api/projects/${slug}/escalations/dismissed?offset=${offset}`, {
+      // A cursor survives concurrent insertions and restores; an offset can skip a suppression as
+      // soon as one row shifts across its boundary.
+      const before = cursor === undefined ? cursorFor(dismissed) : cursor;
+      if (!before) return;
+      const res = await fetch(
+        `/api/projects/${slug}/escalations/dismissed?before=${before.dismissedAt}&beforeId=${encodeURIComponent(before.id)}`,
+        {
         cache: "no-store",
-      });
+        },
+      );
       const body = (await res.json().catch(() => null)) as {
         dismissed?: EscalationView[];
         total?: number;
+        nextCursor?: DismissedCursor | null;
         error?: string;
       } | null;
       if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
-      // Offset pagination has no stable position if another operator changes the collection while
-      // this request is in flight. Discard this potentially shifted page and restart from the new
-      // server-rendered first page instead of permanently skipping its boundary row.
-      if (typeof body?.total === "number" && body.total !== all) {
-        setOlder([]);
-        setRestart({ fromTotal: sourceTotal, total: body.total });
-        router.refresh();
-        return;
-      }
       setOlder((prev) => [...prev, ...(body?.dismissed ?? [])]);
+      setCursor(body?.nextCursor ?? null);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to load older dismissals");
     } finally {
@@ -139,7 +132,7 @@ export function DismissedSection({
           </ul>
           {/* Every row still here is an active suppression, so "the rest" is not an archive — it is
               the only place those decisions can be undone. The button stays until the list is whole. */}
-          {rows.length < all ? (
+          {rows.length < all && (cursor === undefined ? cursorFor(dismissed) : cursor) ? (
             <div className="flex items-center gap-2 pt-2">
               <Button
                 type="button"
@@ -159,6 +152,13 @@ export function DismissedSection({
       </div>
     </section>
   );
+}
+
+type DismissedCursor = { dismissedAt: number; id: string };
+
+function cursorFor(rows: EscalationView[]): DismissedCursor | null {
+  const last = rows.at(-1);
+  return last?.dismissedAt == null ? null : { dismissedAt: last.dismissedAt, id: last.id };
 }
 
 /** First occurrence wins — the server-rendered page is fresher than anything paged in earlier. */
@@ -197,9 +197,8 @@ function RestoreButton({
         reason?: string;
       } | null;
       if (!res.ok) {
-        // `not-dismissed` is the precise race outcome where another actor already restored it or
-        // the sweep re-raised it. The row no longer belongs in this list; every other failure may
-        // still leave a durable suppression behind, so keep its paged-in copy visible for retry.
+        // Only an explicit prior restoration means this row no longer belongs in the list. A live
+        // escalation for the same finding leaves this dismissal intact, so it stays reachable.
         if (body?.reason === "not-dismissed") {
           onRestored(escalationId);
           toast.success("Already restored — it's back under Needs you");

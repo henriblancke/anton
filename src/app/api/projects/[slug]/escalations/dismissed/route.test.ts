@@ -30,7 +30,7 @@ const req = (query = "") => new Request(`http://t/${query}`);
 interface Body {
   dismissed?: { id: string }[];
   total?: number;
-  offset?: number;
+  nextCursor?: { dismissedAt: number; id: string } | null;
   error?: string;
 }
 
@@ -79,8 +79,10 @@ describe("GET /api/projects/[slug]/escalations/dismissed", () => {
     for (let n = 0; n < total; n++) ids.add(await dismissed(n));
 
     const first = (await (await GET(req(), ctx("alpha"))).json()) as Body;
+    const cursor = first.nextCursor;
+    expect(cursor).toBeTruthy();
     const second = (await (
-      await GET(req(`?offset=${DISMISSED_PAGE}`), ctx("alpha"))
+      await GET(req(`?before=${cursor?.dismissedAt}&beforeId=${cursor?.id}`), ctx("alpha"))
     ).json()) as Body;
 
     expect(first.dismissed).toHaveLength(DISMISSED_PAGE);
@@ -99,17 +101,21 @@ describe("GET /api/projects/[slug]/escalations/dismissed", () => {
     expect(body.total).toBe(0);
   });
 
-  it("refuses a nonsense offset rather than silently answering page one", async () => {
+  it("refuses malformed cursor parts rather than silently answering page one", async () => {
     await dismissed(1);
-    for (const q of ["?offset=-1", "?offset=abc", "?offset=1.5"]) {
+    for (const q of ["?before=-1&beforeId=x", "?before=abc&beforeId=x", "?before=1"]) {
       const res = await GET(req(q), ctx("alpha"));
       expect(res.status).toBe(400);
     }
   });
 
-  it("answers an offset past the end with an empty page, not an error", async () => {
+  it("answers a cursor past the end with an empty page, not an error", async () => {
     await dismissed(1);
-    const res = await GET(req("?offset=500"), ctx("alpha"));
+    const first = (await (await GET(req(), ctx("alpha"))).json()) as Body;
+    const res = await GET(
+      req(`?before=${first.nextCursor?.dismissedAt}&beforeId=00000000`),
+      ctx("alpha"),
+    );
     expect(res.status).toBe(200);
     const body = (await res.json()) as Body;
     expect(body.dismissed).toEqual([]);

@@ -92,7 +92,7 @@ export function AttentionStrip({
     >
       <RegisterIcon register={register} />
       <h2 id="attention-strip-heading" className="text-xs font-medium text-foreground">
-        Needs you
+        {register === "quiet" ? "On hold" : "Needs you"}
       </h2>
 
       {/* Counted apart, because one number covering both answers neither question a founder asks of

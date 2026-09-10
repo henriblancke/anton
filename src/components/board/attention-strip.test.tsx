@@ -112,6 +112,8 @@ describe("AttentionStrip", () => {
     const { container } = mount({ breaker: hold });
     expect(screen.getByText("Review queue is full")).toBeTruthy();
     expect(screen.queryByText("Re-arm")).toBeNull();
+    expect(screen.getByRole("heading", { name: "On hold" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Needs you" })).toBeNull();
     // A hold is not a failure and must not be drawn as one: red here would teach the operator to
     // discount the band, and the state that pays for that lesson is the disarm.
     expect(container.querySelector("section")?.className).not.toContain("destructive");

@@ -107,8 +107,7 @@ describe("DismissedSection", () => {
 
       await waitFor(() => expect(screen.getByText("run parked 9h: usage limit")).toBeTruthy());
       const [url] = fetchMock.mock.calls[0] as unknown as [string];
-      // Offset is what is already on screen, so the next page starts where this one ended.
-      expect(url).toBe("/api/projects/anton/escalations/dismissed?offset=1");
+      expect(url).toMatch(/^\/api\/projects\/anton\/escalations\/dismissed\?before=\d+&beforeId=esc-1$/);
       // And the row that arrived carries its own way back — the point of reaching it at all.
       expect(screen.getAllByRole("button", { name: "Restore" })).toHaveLength(2);
       // Nothing left to ask for.
@@ -143,7 +142,7 @@ describe("DismissedSection", () => {
       // client state the refresh never reaches. Left there, it keeps a `Restore` that can only 409.
       const older = { ...dismissed({ id: "esc-2" }), reason: "run parked 9h: usage limit" };
       const fetchMock = vi.fn(async (url: string) =>
-        url.includes("/dismissed?offset=")
+        url.includes("/dismissed?")
           ? new Response(JSON.stringify({ dismissed: [older], total: 2 }), { status: 200 })
           : new Response(JSON.stringify({}), { status: 200 }),
       );
@@ -164,7 +163,7 @@ describe("DismissedSection", () => {
     it("keeps a paged-in row when its restore request fails", async () => {
       const older = { ...dismissed({ id: "esc-2" }), reason: "still suppressed" };
       const fetchMock = vi.fn(async (url: string) =>
-        url.includes("/dismissed?offset=")
+        url.includes("/dismissed?")
           ? new Response(JSON.stringify({ dismissed: [older], total: 2 }), { status: 200 })
           : new Response(JSON.stringify({ error: "database unavailable" }), { status: 500 }),
       );
@@ -182,7 +181,7 @@ describe("DismissedSection", () => {
       expect(refresh).not.toHaveBeenCalled();
     });
 
-    it("restarts pagination if another operator changes the total mid-walk", async () => {
+    it("continues from its cursor when the total changes mid-walk", async () => {
       const shifted = { ...dismissed({ id: "esc-2" }), reason: "must not be accepted" };
       const fetchMock = vi.fn(async () =>
         new Response(JSON.stringify({ dismissed: [shifted], total: 1 }), { status: 200 }),
@@ -193,10 +192,8 @@ describe("DismissedSection", () => {
       fireEvent.click(screen.getByRole("button", { name: /^Show$/ }));
       fireEvent.click(screen.getByRole("button", { name: /Show older/ }));
 
-      await waitFor(() => expect(refresh).toHaveBeenCalled());
-      // The returned offset page was based on a changed collection, so it cannot be allowed to
-      // advance the walk and hide the record at its boundary.
-      expect(screen.queryByText("must not be accepted")).toBeNull();
+      await waitFor(() => expect(screen.getByText("must not be accepted")).toBeTruthy());
+      expect(refresh).not.toHaveBeenCalled();
     });
 
     it("keeps the list it has when an older page fails to load", async () => {

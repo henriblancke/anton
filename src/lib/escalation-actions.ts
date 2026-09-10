@@ -95,6 +95,7 @@ export type EscalationActionFailure =
   | "no-target"
   | "not-dismissable"
   | "not-dismissed"
+  | "restore-conflicted"
   | "contested"
   | "unverified";
 
@@ -137,8 +138,9 @@ async function restoreStall(
   projectId: string,
   view: EscalationView,
 ): Promise<EscalationActionResult> {
-  if (!(await restoreEscalation(db, systemClock, projectId, view.id))) {
-    return { ok: false, reason: "not-dismissed" };
+  const result = await restoreEscalation(db, systemClock, projectId, view.id);
+  if (result !== "restored") {
+    return { ok: false, reason: result === "conflicted" ? "restore-conflicted" : "not-dismissed" };
   }
   return { ok: true, action: "restore", escalation: view, detail: "restored" };
 }

@@ -22,7 +22,9 @@ const actOnBead = vi.fn<(...args: unknown[]) => Promise<string>>();
 const actOnJob = vi.fn<(...args: unknown[]) => Promise<string>>();
 const readTargetState = vi.fn<(...args: unknown[]) => Promise<string>>();
 const restartedLocally = vi.fn<(projectId: string, epicBeadId: string) => boolean>();
-const restoreEscalation = vi.fn<(...args: unknown[]) => Promise<boolean>>();
+const restoreEscalation = vi.fn<
+  (...args: unknown[]) => Promise<"restored" | "already-restored" | "conflicted" | "not-dismissed">
+>();
 
 vi.mock("./db", async () => {
   const actual = await vi.importActual<typeof import("./db")>("./db");
@@ -358,7 +360,7 @@ describe("actOnEscalation — dismiss", () => {
 describe("actOnEscalation — restore", () => {
   it("lifts a dismissal on a settled row", async () => {
     open({ status: "resolved", resolution: "dismissed" });
-    restoreEscalation.mockResolvedValue(true);
+    restoreEscalation.mockResolvedValue("restored");
 
     expect(await actOnEscalation(project, "esc-1", "restore")).toMatchObject({
       ok: true,
@@ -373,11 +375,11 @@ describe("actOnEscalation — restore", () => {
     // The store refuses a row nobody dismissed, and one an open row already covers — the second is
     // the sweep having re-raised the finding, which is the outcome the click wanted anyway.
     open({ status: "resolved" });
-    restoreEscalation.mockResolvedValue(false);
+    restoreEscalation.mockResolvedValue("conflicted");
 
     expect(await actOnEscalation(project, "esc-1", "restore")).toEqual({
       ok: false,
-      reason: "not-dismissed",
+      reason: "restore-conflicted",
     });
   });
 });

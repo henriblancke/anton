@@ -15,7 +15,7 @@
  * path goes through the shared anton.db.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { and, count, desc, eq, isNotNull } from "drizzle-orm";
+import { and, count, desc, eq, isNotNull, lt, or } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
 import { isUniqueViolation, type AntonDb, type Clock } from "./jobs/queue";
@@ -472,12 +472,14 @@ async function signatureFor(db: AntonDb, id: string): Promise<string | null> {
  * The resolution is cleared with the stamp: a restored row is not "dismissed" any more, and leaving
  * the word there would leave the Dismissed list and the open list disagreeing about one row.
  */
+export type RestoreEscalationResult = "restored" | "already-restored" | "conflicted" | "not-dismissed";
+
 export async function restoreEscalation(
   db: AntonDb,
   clock: Clock,
   projectId: string,
   id: string,
-): Promise<boolean> {
+): Promise<RestoreEscalationResult> {
   const nowMs = clock.now();
 
   try {
@@ -488,7 +490,8 @@ export async function restoreEscalation(
         .where(and(eq(schema.escalations.projectId, projectId), eq(schema.escalations.id, id)))
         .limit(1)
         .all()[0];
-      if (!row || row.dismissedAt == null) return false;
+      if (!row) return "not-dismissed";
+      if (row.dismissedAt == null) return "already-restored";
 
       const live = tx
         .select({ id: schema.escalations.id })
@@ -502,7 +505,7 @@ export async function restoreEscalation(
         )
         .limit(1)
         .all();
-      if (live.length > 0) return false;
+      if (live.length > 0) return "conflicted";
 
       const rows = tx
         .update(schema.escalations)
@@ -510,13 +513,13 @@ export async function restoreEscalation(
         .where(and(eq(schema.escalations.id, id), isNotNull(schema.escalations.dismissedAt)))
         .returning({ id: schema.escalations.id })
         .all();
-      return rows.length > 0;
+      return rows.length > 0 ? "restored" : "already-restored";
     });
   } catch (e) {
     // The partial index rejected the update: an open row for this finding landed from outside this
     // connection. The alert is back either way, so this is the same quiet "already back" the
     // in-transaction check reports — not a 500.
-    if (isUniqueViolation(e)) return false;
+    if (isUniqueViolation(e)) return "conflicted";
     throw e;
   }
 }
@@ -535,15 +538,28 @@ export async function restoreEscalation(
 export async function listDismissedEscalations(
   db: AntonDb,
   projectId: string,
-  opts: { limit?: number; offset?: number } = {},
+  opts: { limit?: number; offset?: number; before?: { dismissedAt: number; id: string } } = {},
 ): Promise<EscalationRow[]> {
-  const { limit = DISMISSED_PAGE, offset = 0 } = opts;
+  const { limit = DISMISSED_PAGE, offset = 0, before } = opts;
+  const beforeCondition = before
+    ? or(
+        lt(schema.escalations.dismissedAt, secDate(before.dismissedAt * 1000)),
+        and(
+          eq(schema.escalations.dismissedAt, secDate(before.dismissedAt * 1000)),
+          lt(schema.escalations.id, before.id),
+        ),
+      )
+    : undefined;
   return (
     db
       .select()
       .from(schema.escalations)
       .where(
-        and(eq(schema.escalations.projectId, projectId), isNotNull(schema.escalations.dismissedAt)),
+        and(
+          eq(schema.escalations.projectId, projectId),
+          isNotNull(schema.escalations.dismissedAt),
+          beforeCondition,
+        ),
       )
       // Tie-broken by id so the ordering is TOTAL: `dismissedAt` is stored to the second, and one bulk
       // dismissal stamps every row it touches with the same one. Ordering by it alone leaves the
@@ -583,7 +599,7 @@ export async function openEscalations(projectId: string): Promise<EscalationView
  */
 export async function dismissedEscalations(
   projectId: string,
-  opts: { limit?: number; offset?: number } = {},
+  opts: { limit?: number; offset?: number; before?: { dismissedAt: number; id: string } } = {},
 ): Promise<{ rows: EscalationView[]; total: number }> {
   const db = getDb();
   const [rows, total] = await Promise.all([
