@@ -26,7 +26,7 @@ import type { EpicRun } from "./execute-epic-run";
  */
 export async function refreshRunBoard(
   run: EpicRun,
-): Promise<{ preCheckTrusted: boolean; leaseTarget: Bead }> {
+): Promise<{ preCheckTrusted: boolean; currentBoardTrusted: boolean; leaseTarget: Bead }> {
   const { repo, targetId: epicBeadId } = run;
   // 0. Cross-machine double-run guard (anton-jz1). A queued job that reschedules (quota/backoff)
   //    re-enters this handler WITHOUT the enqueue-time liveRunCheck. If a Force run started on
@@ -50,6 +50,7 @@ export async function refreshRunBoard(
   //    the post-publish race arbitration (step 1b) must NOT steal the lease from it by owner order
   //    when our pre-check couldn't rule it out (anton-jz1).
   let preCheckTrusted = true;
+  let currentBoardTrusted = false;
   try {
     await beads.pull(repo);
   } catch {
@@ -87,11 +88,12 @@ export async function refreshRunBoard(
       // read `leaseTarget`. Leaving it stale would let a run whose completion/lease is visible in
       // this fresh list fall through into worktree/PR handling instead of finishing idempotently.
       leaseTarget = freshTarget;
+      currentBoardTrusted = true;
     }
   } catch {
     // keep the pre-pull snapshot
   }
-  return { preCheckTrusted, leaseTarget };
+  return { preCheckTrusted, currentBoardTrusted, leaseTarget };
 }
 
 /**
@@ -99,7 +101,11 @@ export async function refreshRunBoard(
  * crashed attempt, or by the run that held the lease this one parked on. Answers `true` once the
  * attempt is settled `done`; the caller returns without executing anything.
  */
-export async function settleCompletedRun(run: EpicRun, leaseTarget: Bead): Promise<boolean> {
+export async function settleCompletedRun(
+  run: EpicRun,
+  leaseTarget: Bead,
+  currentBoardTrusted = true,
+): Promise<boolean> {
   const { db, clock, ctx, projectId, repo, runId, branch, targetId: epicBeadId, lease } = run;
   const { all, standaloneRun } = run;
   // 0a-pre. The target is its own single ticket and THIS anton already retired it as already
@@ -130,7 +136,12 @@ export async function settleCompletedRun(run: EpicRun, leaseTarget: Bead): Promi
   //     so the two cannot disagree, and kept local — 0a-ter still owns the assignment to `run`.
   const standaloneNow =
     standaloneRun && !beads.groupsChildren(run.target, runTickets(all, epicBeadId));
-  if (!beads.getPrRef(leaseTarget) && standaloneNow && (await settleRetiredStandalone(run, leaseTarget))) {
+  if (
+    currentBoardTrusted &&
+    !beads.getPrRef(leaseTarget) &&
+    standaloneNow &&
+    (await settleRetiredStandalone(run, leaseTarget))
+  ) {
     return true;
   }
   // 0a. Revalidate the target still needs execution (anton-jz1). A job that parked on a foreign
@@ -332,6 +343,10 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
   if (!stamped || beads.supersededBy(stamped) !== survivor) return false;
   const repair = priorRepair(stamped, "already-shipped");
   if (!repair) return false;
+  // A stamp survives reopen/re-supersede cycles. It proves only the closure it followed, not a
+  // later human retirement: a current close after the stamp must take the ordinary parked path.
+  const closedAt = stamped.closed_at ? Date.parse(stamped.closed_at) : Number.NaN;
+  if (!Number.isFinite(closedAt) || repair.at < closedAt) return false;
 
   // This attempt's own leftover lease, exactly as the live-PR short-circuit adopts it: a crash after
   // the supersede but before the cleanup leaves an unexpired `run-lease:…:<runId>` this run

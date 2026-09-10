@@ -5,7 +5,12 @@
  * A satisfied step's attribution note is NOT best-effort: it is what makes the close honest, so a
  * note bd refuses stops the close and halts the run rather than closing a bead that cannot say why.
  *
- * Mocked at the bd seam: a close that FAILS is a state a real board can't be asked for on demand.
+ * Neither is its BRANCH attribution (PR #258 review): a satisfied ticket has no commit of its own,
+ * so the `Anton-Satisfies` marker is the only thing a later attempt can read to see it as delivered.
+ * A close written without one is the closed-but-unaccounted-for bead the resume regenerates.
+ *
+ * Mocked at the bd and git seams: a close (or a commit) that FAILS is a state a real board and a
+ * real repository can't be asked for on demand.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "../beads/bd";
@@ -22,6 +27,12 @@ const setStatusMock = vi.fn();
 const unassignMock = vi.fn();
 const syncMock = vi.fn();
 const endSessionMock = vi.fn();
+const commitMarkerMock = vi.fn();
+
+vi.mock("../git/ops", async () => {
+  const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
+  return { ...actual, commitMarker: (...args: unknown[]) => commitMarkerMock(...args) };
+});
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -54,18 +65,25 @@ import { PoisonEpic } from "./errors";
 import type { StepContext } from "./step-registry";
 
 const REPO = "/tmp/anton";
+const WORKTREE = "/tmp/anton-worktrees/anton-f1";
 const ticket = { id: "anton-t2", title: "Expose the schema", status: "in_progress" } as Bead;
 const satisfied = {
   how: "satisfied" as const,
   by: { commit: "0123456789abcdef0123456789abcdef01234567", subject: "anton-t1: Add the schema" },
 };
 
-/** The minimal run `finishTicket` reads: the repo it writes to, the branch its note names, and the session store. */
+/**
+ * The minimal run `finishTicket` reads: the repo it writes to, the worktree its marker lands in, the
+ * branch its note names, and the session store.
+ */
 function run(): Omit<StepContext, "tickets"> {
-  return { repoPath: REPO, branch: "anton/anton-f1", db: {}, clock: { now: () => 0 } } as unknown as Omit<
-    StepContext,
-    "tickets"
-  >;
+  return {
+    repoPath: REPO,
+    worktreePath: WORKTREE,
+    branch: "anton/anton-f1",
+    db: {},
+    clock: { now: () => 0 },
+  } as unknown as Omit<StepContext, "tickets">;
 }
 
 describe("finishTicket — reports whether the close landed (PR #253 review)", () => {
@@ -76,6 +94,7 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
     tagMock.mockResolvedValue(undefined);
     untagMock.mockResolvedValue(undefined);
     endSessionMock.mockResolvedValue(undefined);
+    commitMarkerMock.mockResolvedValue(undefined);
   });
 
   it("answers closed when bd accepted the close", async () => {
@@ -117,6 +136,60 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
     expect(tagMock).toHaveBeenCalledWith(REPO, ticket.id, ["stage:in-review"]);
     expect(untagMock).toHaveBeenCalledWith(REPO, ticket.id, ["stage:implementing"]);
   });
+
+  // PR #258 review: the close is what a NEXT attempt reads as "done", and for a satisfied ticket the
+  // branch carries nothing under its name — so the trailer has to be there before the close is.
+  it("records the satisfied ticket on the BRANCH before closing it (PR #258 review)", async () => {
+    const order: string[] = [];
+    commitMarkerMock.mockImplementation(() => {
+      order.push("marker");
+      return Promise.resolve();
+    });
+    closeMock.mockImplementation(() => {
+      order.push("close");
+      return Promise.resolve();
+    });
+
+    await expect(finishTicket(run(), ticket, "s1", true, satisfied)).resolves.toEqual({ closed: true });
+
+    expect(order).toEqual(["marker", "close"]);
+    // Written into the WORKTREE (where the branch is checked out), naming the satisfying commit in
+    // its subject and claiming THIS ticket in its trailer — the pair the resume's skip rule reads.
+    expect(commitMarkerMock).toHaveBeenCalledWith(
+      WORKTREE,
+      expect.stringContaining(`anton: ${ticket.id} satisfied by 0123456`),
+      { satisfies: [ticket.id] },
+    );
+    const [, message] = commitMarkerMock.mock.calls[0] as [string, string];
+    expect(message).toContain('"anton-t1: Add the schema"');
+    // NOT a `<id>:` or `WIP <id>:` subject: both are matched by prefix and both mean a commit of the
+    // ticket's own, which a satisfied step never produced.
+    expect(message.startsWith(ticket.id)).toBe(false);
+    expect(message.startsWith(`WIP ${ticket.id}`)).toBe(false);
+  });
+
+  it("does NOT close a satisfied step whose branch attribution git refused (PR #258 review)", async () => {
+    // A close with no trailer is worse than no close: the next attempt finds the ticket done on the
+    // board and claimed by nothing on the branch — the cross-machine shape — so it reopens the bead
+    // and dispatches an agent into the zero diff this mechanism exists to prevent. Left open, the
+    // resume re-verifies the same claim and writes the trailer then.
+    commitMarkerMock.mockRejectedValue(new Error("fatal: cannot lock ref 'HEAD'"));
+
+    const err = await finishTicket(run(), ticket, "s1", true, satisfied).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PoisonEpic);
+    expect((err as Error).message).toMatch(/could not record that on anton\/anton-f1/);
+    expect((err as Error).message).toContain("cannot lock ref");
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(endSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves a committed ticket's branch alone — no marker, since its own commit names it", async () => {
+    await expect(finishTicket(run(), ticket, "s1", true)).resolves.toEqual({ closed: true });
+    expect(commitMarkerMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("claimTicket — clears a stale supersedes edge before running (PR #238 review)", () => {
@@ -143,7 +216,13 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
    */
   const unlinked = { ...claimed, dependencies: [] } as Bead;
   /** …and as the hand that raced the unlink left it: closed as superseded, its edge stripped. */
-  const settledElsewhere = { ...unlinked, status: "closed" } as Bead;
+  const settledElsewhere = {
+    ...unlinked,
+    status: "closed",
+    // `closed_at` identifies this closure cycle. A later reopen/ordinary-close must not be
+    // converted back into this old retirement by the edge-restoration retry.
+    closed_at: "2026-09-09T00:00:00.000Z",
+  } as Bead;
 
   beforeEach(() => {
     vi.resetAllMocks();
@@ -348,6 +427,23 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
       (e: unknown) => e,
     );
     expect((err as Error).message).toMatch(/while anton was removing the stale `supersedes` edge/);
+    expect(err).not.toBeInstanceOf(PoisonEpic);
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
+  it("does not convert a newer plain closure into the old retirement", async () => {
+    showMock
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValueOnce(settledElsewhere)
+      .mockResolvedValue({
+        ...settledElsewhere,
+        closed_at: "2026-09-09T00:01:00.000Z",
+      });
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
     expect(err).not.toBeInstanceOf(PoisonEpic);
     expect(supersedeMock).not.toHaveBeenCalled();
   });

@@ -24,6 +24,7 @@ import {
   commitAll,
   commitMarker,
   DEFAULT_DIFF_PATCH_CHARS,
+  deletionPatch,
   diffAgainstBase,
   findOpenPullRequest,
   listDirBlobsAtRev,
@@ -54,6 +55,11 @@ import {
   branchContainsCommit,
   readCommitNaming,
   readCommitReach,
+  branchSatisfiesTicket,
+  readSatisfiedClaims,
+  satisfiedMarkerSubject,
+  satisfiedMarkerTarget,
+  SATISFIES_TRAILER,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
 
@@ -1449,6 +1455,133 @@ suite("diffAgainstBase (real git)", () => {
   });
 });
 
+// anton-hx4b: the deletion rescue pass is reached through `diffAgainstBase` only by forcing the
+// main patch to truncate, which costs a filler commit per case and blurs WHICH allocation rule a
+// failure belongs to. Driven directly, each branch of the budget split gets a case of its own.
+suite("deletionPatch (real git · one case per budget branch)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  /** Delete `paths` on the branch, after seeding them into the base so their removal is a `D`. */
+  const seedAndDelete = (files: Record<string, string>) => {
+    for (const [path, body] of Object.entries(files)) writeFileSync(join(repo, path), body);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "seed"]);
+    g(["checkout", "-q", "main"]);
+    g(["merge", "-q", "--ff-only", "anton/epic-1"]);
+    g(["checkout", "-q", "anton/epic-1"]);
+    for (const path of Object.keys(files)) rmSync(join(repo, path));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: drop them"]);
+  };
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-delpatch-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", "anton/epic-1"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("returns nothing at all when the branch deleted no file", async () => {
+    writeFileSync(join(repo, "added.ts"), "export const a = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: add only"]);
+
+    expect(await deletionPatch(repo, "main", 4_000)).toEqual({});
+  });
+
+  it("quotes a removal whole when its even share of the budget covers it", async () => {
+    seedAndDelete({ "guard.ts": "export const requireAuth = () => true;\n" });
+
+    const { patch, incomplete, unshown } = await deletionPatch(repo, "main", 4_000);
+
+    expect(patch).toContain("-export const requireAuth = () => true;");
+    // Quoted whole, so there is no truncation note and no under-coverage to report.
+    expect(patch).not.toContain("truncated at");
+    expect(incomplete).toBeUndefined();
+    expect(unshown).toBeUndefined();
+  });
+
+  it("spends the FLOOR slice when the even share falls under it, so the tail is still quoted", async () => {
+    // 12 removals of a 4_000 budget put the even share at 333 — under the floor. Treating the floor
+    // as a cutoff instead of a spend quoted the first file and NAMED the other eleven, though every
+    // one of them is small enough for the budget to pay a usable slice for.
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 12; i++) files[`f${i}.ts`] = `export const guard${i} = () => true;\n`;
+    seedAndDelete(files);
+
+    const { patch, unshown } = await deletionPatch(repo, "main", 4_000);
+
+    for (let i = 0; i < 12; i++) expect(patch).toContain(`-export const guard${i} = () => true;`);
+    expect(unshown).toBeUndefined();
+  });
+
+  it("cuts a removal larger than its slice and says so, per file", async () => {
+    seedAndDelete({ "big.ts": "// filler line\n".repeat(2_000) });
+
+    const { patch } = await deletionPatch(repo, "main", 300);
+
+    expect(patch).toContain("deletion of big.ts truncated at 300 chars");
+    // The cut is where the memory is spent: only the note follows the bounded text.
+    expect(patch!.length).toBeLessThan(300 + 100);
+  });
+
+  it("names — and counts — the removals left once the budget cannot buy a floor slice", async () => {
+    // Honest under-coverage: past `max / MIN_DELETION_SLICE_CHARS` files no cut of the share fixes
+    // it, so the reviewer is told which removals it is NOT seeing rather than reading a partial
+    // list as the whole set.
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 12; i++) files[`f${i}.ts`] = "// filler line\n".repeat(200);
+    seedAndDelete(files);
+
+    const { patch, unshown } = await deletionPatch(repo, "main", 2_000);
+
+    expect(patch).toContain("further deleted file(s) not shown");
+    expect(patch).toContain("f11.ts");
+    expect(unshown).toBeGreaterThan(0);
+    expect(patch!.length).toBeLessThan(2_000 + 500);
+  });
+
+  it("holds the bound when the budget cannot pay for even the first removal", async () => {
+    // A zero budget is still a bound, not an error: the first file is always ASKED for (a caller
+    // wanting the deletions bounded is not asking for them withheld), and what comes back is empty
+    // rather than a diff header masquerading as content.
+    seedAndDelete({ "guard.ts": "export const requireAuth = () => true;\n" });
+
+    const { patch, unshown, incomplete } = await deletionPatch(repo, "main", 0);
+
+    expect(patch).toBeUndefined();
+    expect(unshown).toBeUndefined();
+    expect(incomplete).toBeUndefined();
+  });
+
+  it("reports a failed pass as incomplete instead of as an empty deletion list", async () => {
+    // The reviewer has no route to a deleted file, so a swallowed failure reads as "nothing was
+    // removed" and every removal is approved by a verdict nobody formed over it.
+    seedAndDelete({ "guard.ts": "export const requireAuth = () => true;\n" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const { patch, incomplete } = await deletionPatch(repo, "no-such-rev", 4_000);
+
+    expect(incomplete).toBe(true);
+    expect(patch).toBeUndefined();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});
+
 suite("resolveMergeBase (real git)", () => {
   let sandbox: string;
   let repo: string;
@@ -1999,5 +2132,156 @@ suite("commitMarker (real git · a pre-commit hook that stages and succeeds)", (
     await commitMarker(repo, "WIP anton-x1: preserved");
 
     expect(g(["log", "-1", "--format=%s"])).toBe("WIP anton-x1: preserved");
+  });
+});
+
+/**
+ * Sibling attribution (anton-6vxl): one commit naming every ticket its work satisfied, not only the
+ * ticket that was dispatched. Real git throughout — the whole mechanism is git's trailer parser and
+ * `-z` framing, so a mocked `git log` would only prove the test's own assumptions.
+ */
+suite("sibling attribution trailers (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-satisfies-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("reads back every id one commit claims, and says which commit claimed them", async () => {
+    await commitMarker(repo, "anton-96yu: the dispatched ticket\n\nwhy this marker exists", {
+      satisfies: ["anton-kwi6", "anton-5slr"],
+    });
+    const sha = g(["rev-parse", "HEAD"]);
+
+    const claims = await readSatisfiedClaims(repo);
+    expect(claims).toEqual([
+      { sha, subject: "anton-96yu: the dispatched ticket", ticketIds: ["anton-kwi6", "anton-5slr"] },
+    ]);
+
+    // The claim is attributable: the caller learns WHICH commit satisfied the sibling, which is what
+    // a bead note or an operator investigating a skip is owed.
+    expect(await branchSatisfiesTicket(repo, "anton-kwi6")).toMatchObject({ sha });
+    expect(await branchSatisfiesTicket(repo, "anton-5slr")).toMatchObject({ sha });
+    expect(await branchSatisfiesTicket(repo, "anton-never")).toBeUndefined();
+  });
+
+  it("leaves a commit that claims nothing untouched — no trailer, no claim", async () => {
+    await commitMarker(repo, "anton-96yu: no siblings claimed");
+
+    expect(g(["log", "-1", "--format=%B"]).trim()).toBe("anton-96yu: no siblings claimed");
+    expect(await readSatisfiedClaims(repo)).toEqual([]);
+    expect(await branchSatisfiesTicket(repo, "anton-96yu")).toBeUndefined();
+    // An empty `satisfies` is the same as none — no stray blank trailer block.
+    await commitMarker(repo, "anton-z9: still nothing", { satisfies: [] });
+    expect(g(["log", "-1", "--format=%B"]).trim()).toBe("anton-z9: still nothing");
+    expect(await readSatisfiedClaims(repo)).toEqual([]);
+  });
+
+  /**
+   * The subject protocol is load-bearing and matched by PREFIX, so the trailer must be invisible to
+   * it: `<id>:` still means delivered, `WIP <id>:` still means preserved-and-incomplete, and neither
+   * gains or loses a meaning by carrying sibling attribution.
+   */
+  it("keeps the delivery and preserve subjects reading exactly as before", async () => {
+    await commitMarker(repo, "anton-d1: delivered", { satisfies: ["anton-sib1"] });
+    await commitMarker(repo, "WIP anton-d2: preserved", { satisfies: ["anton-sib2"] });
+
+    expect(await worktreeHasCommitFor(repo, "anton-d1")).toBe(true);
+    expect(await worktreeHasPreservedCommitFor(repo, "anton-d2")).toBe(true);
+    // A ticket named ONLY in a trailer is not a delivery subject — the two records stay distinct.
+    expect(await worktreeHasCommitFor(repo, "anton-sib1")).toBe(false);
+    expect(await worktreeHasPreservedCommitFor(repo, "anton-sib1")).toBe(false);
+    // …and the preserved commit is still the branch tip, which the resume's range read depends on.
+    expect(await worktreeTipIsPreservedCommitFor(repo, "anton-d2")).toBe(true);
+  });
+
+  it("does not mistake trailer-shaped PROSE in a body for a claim", async () => {
+    // Git only parses the message's LAST block as trailers, and this line is followed by prose.
+    g([
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      `anton-p1: prose\n\n${SATISFIES_TRAILER}: anton-forged\n\nand then more prose follows.`,
+    ]);
+
+    expect(await readSatisfiedClaims(repo)).toEqual([]);
+  });
+
+  /**
+   * The marker subject the satisfied close writes (PR #258 review) — read back so a settlement can
+   * follow it to the work rather than record the marker a sibling's close left at the tip.
+   */
+  it("round-trips the attribution marker subject, and refuses what is not one", () => {
+    const work = "a".repeat(40);
+    const subject = satisfiedMarkerSubject("anton-kwi6", work);
+
+    expect(subject).toBe(`anton: anton-kwi6 satisfied by ${work}`);
+    expect(satisfiedMarkerTarget(subject)).toBe(work);
+    // Not a marker: an ordinary delivery, a preserve, an abbreviation (indistinguishable from prose
+    // ending in hex), and a subject that merely reads like one.
+    expect(satisfiedMarkerTarget("anton-kwi6: Operator control")).toBeUndefined();
+    expect(satisfiedMarkerTarget("WIP anton-kwi6: preserved")).toBeUndefined();
+    expect(satisfiedMarkerTarget("anton: anton-kwi6 satisfied by 41af614")).toBeUndefined();
+    expect(satisfiedMarkerTarget(`anton: anton-kwi6 satisfied by ${work} and then some`)).toBeUndefined();
+  });
+
+  it("matches ids exactly, never by prefix", async () => {
+    await commitMarker(repo, "anton-a1: work", { satisfies: ["anton-jz1.2"] });
+
+    expect(await branchSatisfiesTicket(repo, "anton-jz1.2")).toBeDefined();
+    // The same collision `worktreeHasCommitFor` guards against in its subject scan.
+    expect(await branchSatisfiesTicket(repo, "anton-jz1")).toBeUndefined();
+  });
+
+  it("refuses an id that would forge extra trailer lines rather than recording it", async () => {
+    await expect(
+      commitMarker(repo, "anton-a1: work", {
+        satisfies: [`anton-ok\n${SATISFIES_TRAILER}: anton-smuggled`],
+      }),
+    ).rejects.toThrow(SATISFIES_TRAILER);
+    // Nothing was committed — the refusal is loud, not a marker recording something else.
+    expect(g(["log", "-1", "--format=%s"])).toBe("init");
+  });
+
+  it("collects claims across several commits, newest first, ignoring unrelated ones", async () => {
+    await commitMarker(repo, "anton-one: first", { satisfies: ["anton-s1"] });
+    const first = g(["rev-parse", "HEAD"]);
+    g(["commit", "-q", "--allow-empty", "-m", "an ordinary commit with no attribution"]);
+    await commitMarker(repo, "anton-two: second", { satisfies: ["anton-s2"] });
+    const second = g(["rev-parse", "HEAD"]);
+
+    expect(await readSatisfiedClaims(repo)).toEqual([
+      { sha: second, subject: "anton-two: second", ticketIds: ["anton-s2"] },
+      { sha: first, subject: "anton-one: first", ticketIds: ["anton-s1"] },
+    ]);
+  });
+
+  it("fails closed to no claims when git cannot be read", async () => {
+    const gone = join(sandbox, "not-a-repo");
+    mkdirSync(gone);
+
+    // "Unreadable" must never read as "this ticket was satisfied" — the safe error is re-running
+    // work, never skipping it.
+    expect(await readSatisfiedClaims(gone)).toEqual([]);
+    expect(await branchSatisfiesTicket(gone, "anton-s1")).toBeUndefined();
+    // …and `strict` is how a caller whose safe answer is the other one sees the failure instead.
+    await expect(readSatisfiedClaims(gone, { strict: true })).rejects.toThrow();
   });
 });

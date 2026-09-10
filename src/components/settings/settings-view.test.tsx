@@ -10,6 +10,8 @@ import { toast } from "sonner";
 import { PICKER_BAR } from "@/components/settings/sections/picker-autonomy-section";
 import { SettingsView } from "@/components/settings/settings-view";
 import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
+import { MODEL_ROUTABLE_JOB_TYPES } from "@/lib/jobs/model-routing";
+import { MODEL_ROUTABLE_STEP_IDS } from "@/lib/jobs/step-ids";
 import { REPAIR_CLASSES } from "@/lib/gardener/repair";
 import type { Project } from "@/lib/types";
 
@@ -557,6 +559,151 @@ describe("SettingsView pipeline variants (anton-aa3m)", () => {
 
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
     expect(body.formulaVariants).toEqual([]);
+  });
+});
+
+describe("SettingsView model routing (anton-uu7r)", () => {
+  showing("model-routing");
+
+  it("presents an empty table as the DEFAULT, naming the model everything falls back to", () => {
+    renderView({ model: "claude-sonnet-5" });
+    const empty = screen.getByText(/No routing rules/);
+    expect(empty.textContent).toMatch(/claude-sonnet-5/);
+    expect(empty.textContent).toMatch(/That is the norm/);
+  });
+
+  it("states the evaluation rule: first match wins, settings.model is the fallback", () => {
+    renderView({ model: "claude-sonnet-5" });
+    // Said in the heading AND spelled out in the body — the rule that decides which model applies
+    // is not something an operator should have to infer from row order alone.
+    expect(screen.getAllByText(/first match wins/i).length).toBeGreaterThan(1);
+    expect(screen.getByText(/work matching no rule runs on the default model/i)).toBeTruthy();
+  });
+
+  it("seeds the rows from the persisted table, numbered in evaluation order", () => {
+    renderView({
+      modelRoutes: [
+        { jobType: "execute-epic", step: "review", model: "claude-opus-5" },
+        { label: "risk:high", model: "cc/claude-opus-5[1m]" },
+      ],
+    });
+    expect((screen.getByLabelText("Rule 1 job type") as HTMLSelectElement).value).toBe(
+      "execute-epic",
+    );
+    expect((screen.getByLabelText("Rule 1 step") as HTMLSelectElement).value).toBe("review");
+    expect((screen.getByLabelText("Rule 2 bead label") as HTMLInputElement).value).toBe("risk:high");
+    // A gateway combo name round-trips untouched — anton knows no catalogue to normalize it against.
+    expect((screen.getByLabelText("Rule 2 model") as HTMLInputElement).value).toBe(
+      "cc/claude-opus-5[1m]",
+    );
+  });
+
+  it("PATCHes an added rule on Save, omitting unasked matchers and dropping the modelless row", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.click(screen.getByRole("button", { name: /add rule/i }));
+    fireEvent.change(screen.getByLabelText("Rule 1 job type"), {
+      target: { value: "execute-epic" },
+    });
+    fireEvent.change(screen.getByLabelText("Rule 1 model"), {
+      target: { value: " cc/claude-opus-5[1m] " },
+    });
+    // A row the operator started and abandoned must not fail the save.
+    fireEvent.click(screen.getByRole("button", { name: /add rule/i }));
+    fireEvent.change(screen.getByLabelText("Rule 2 bead label"), { target: { value: "size:S" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.modelRoutes).toEqual([
+      { jobType: "execute-epic", model: "cc/claude-opus-5[1m]" },
+    ]);
+  });
+
+  it("reorders a rule — the list's order is the evaluation order, so it must be editable", () => {
+    const fetchMock = stubFetch();
+    renderView({
+      modelRoutes: [
+        { label: "risk:high", model: "claude-opus-5" },
+        { label: "size:S", model: "claude-haiku-4-5" },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Move rule 2 up" }));
+    expect((screen.getByLabelText("Rule 1 bead label") as HTMLInputElement).value).toBe("size:S");
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.modelRoutes).toEqual([
+      { label: "size:S", model: "claude-haiku-4-5" },
+      { label: "risk:high", model: "claude-opus-5" },
+    ]);
+  });
+
+  it("removes a rule, and an emptied table clears the routing", () => {
+    const fetchMock = stubFetch();
+    renderView({ modelRoutes: [{ label: "risk:high", model: "claude-opus-5" }] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove rule 1" }));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.modelRoutes).toEqual([]);
+  });
+
+  it("flags a rule an earlier rule shadows, where it sits — not only at the server's 400", () => {
+    renderView({
+      modelRoutes: [
+        { jobType: "execute-epic", model: "claude-sonnet-5" },
+        { jobType: "execute-epic", step: "review", model: "claude-opus-5" },
+      ],
+    });
+    expect(screen.getByRole("status").textContent).toMatch(/Rule 1 above already matches/);
+
+    // Reordering narrowest-first is the fix, and the warning goes with it.
+    fireEvent.click(screen.getByRole("button", { name: "Move rule 2 up" }));
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("disables the step matcher for a job type that walks no pipeline, and drops a set one", () => {
+    renderView({ modelRoutes: [{ jobType: "execute-epic", step: "verify", model: "claude-opus-5" }] });
+
+    expect((screen.getByLabelText("Rule 1 step") as HTMLSelectElement).disabled).toBe(false);
+    fireEvent.change(screen.getByLabelText("Rule 1 job type"), {
+      target: { value: "review-fix-pr" },
+    });
+
+    const step = screen.getByLabelText("Rule 1 step") as HTMLSelectElement;
+    expect(step.disabled).toBe(true);
+    // Cleared, not merely greyed out: an invisible matcher would fail the save with nothing on
+    // screen to explain it.
+    expect(step.value).toBe("");
+  });
+
+  it("disables the label matcher for a job without bead context, and drops a set one", () => {
+    renderView({ modelRoutes: [{ jobType: "execute-epic", label: "risk:high", model: "claude-opus-5" }] });
+
+    fireEvent.change(screen.getByLabelText("Rule 1 job type"), {
+      target: { value: "nightly-stringer" },
+    });
+
+    const label = screen.getByLabelText("Rule 1 bead label") as HTMLInputElement;
+    expect(label.disabled).toBe(true);
+    expect(label.value).toBe("");
+  });
+
+  it("offers every job type and step that can invoke Claude", () => {
+    renderView({ modelRoutes: [{ model: "claude-opus-5" }] });
+
+    const jobOptions = within(screen.getByLabelText("Rule 1 job type"))
+      .getAllByRole("option")
+      .map((o) => (o as HTMLOptionElement).value);
+    expect(jobOptions).toEqual(["", ...MODEL_ROUTABLE_JOB_TYPES]);
+
+    const stepOptions = within(screen.getByLabelText("Rule 1 step"))
+      .getAllByRole("option")
+      .map((o) => (o as HTMLOptionElement).value);
+    expect(stepOptions).toEqual(["", ...MODEL_ROUTABLE_STEP_IDS]);
   });
 });
 

@@ -29,6 +29,8 @@ import type {
   DiscoveredAgent,
   EditableSettings,
   FormulaVariant,
+  ModelRoute,
+  ModelRouteRow,
   ValueLabelRow,
   VariantRow,
 } from "@/components/settings/settings-types";
@@ -83,6 +85,8 @@ export interface SettingsDraft {
   activeAgents: Set<string>;
   /** Per-label pipeline variants (anton-aa3m). Array order IS the precedence. */
   variantRows: VariantRow[];
+  /** The model routing table (anton-uu7r). Array order IS the evaluation order. */
+  modelRouteRows: ModelRouteRow[];
   /** Nominated value labels (anton-prng). Array order IS the band order. */
   valueLabelRows: ValueLabelRow[];
   /** Per-kind proposal autonomy (anton-nbyy), held RESOLVED — "absent" is not a level. */
@@ -144,6 +148,15 @@ export function draftFromSettings(
     // Rows carry a stable local id purely as a React key — reordering with index keys would move
     // the operator's cursor between inputs.
     variantRows: (settings.formulaVariants ?? []).map((v, i) => ({ id: `v${i}`, ...v })),
+    // Matchers held as `""` — the form's selects and inputs always have a value, and the save turns
+    // an empty one back into the absent matcher that means "this rule does not ask".
+    modelRouteRows: (settings.modelRoutes ?? []).map((r, i) => ({
+      id: `mr${i}`,
+      jobType: r.jobType ?? "",
+      step: r.step ?? "",
+      label: r.label ?? "",
+      model: r.model,
+    })),
     valueLabelRows: (settings.valueLabels ?? []).map((label, i) => ({ id: `vl${i}`, label })),
     proposalAutonomy: resolveProposalAutonomy(settings.proposalAutonomy, earned),
     repairAutonomy: resolveRepairAutonomy(settings.repairAutonomy),
@@ -223,6 +236,7 @@ export function dirtyFields(
       [...saved.activeAgents],
     ),
     formulaVariants: !sameVariants(draft.variantRows, saved.variantRows),
+    modelRoutes: !sameRoutes(draft.modelRouteRows, saved.modelRouteRows),
     valueLabels: !sameLabels(
       nominatedLabels(draft.valueLabelRows),
       nominatedLabels(saved.valueLabelRows),
@@ -283,6 +297,10 @@ export function settingsPatchBody(
     lintCommand: orNull(draft.lintCommand),
     typecheckCommand: orNull(draft.typecheckCommand),
     buildCommand: orNull(draft.buildCommand),
+    // The model routing table (anton-uu7r), in the order shown — that order is the evaluation
+    // order. A row naming no model is scaffolding, not a rule, so it's dropped rather than 400ing
+    // the whole save; [] clears the table (every job back to the default model).
+    modelRoutes: stagedRoutes(draft.modelRouteRows),
     // Per-label pipeline variants (anton-aa3m), in the order shown — that order is the precedence.
     // A half-filled row is scaffolding, not a mapping, so it's dropped rather than 400ing the whole
     // save; [] clears the map (every run walks the project's default).
@@ -364,6 +382,35 @@ function sameVariants(rows: VariantRow[], stored: FormulaVariant[]): boolean {
   const staged = stagedVariants(rows);
   if (staged.length !== stored.length) return false;
   return staged.every((v, i) => v.label === stored[i].label && v.formula === stored[i].formula);
+}
+
+/**
+ * The rules a save would send: trimmed, with a matcher left blank omitted rather than sent as `""`
+ * (the server's matchers are absent-or-set, and `""` is neither), and a row naming no model dropped
+ * as the scaffolding it is.
+ *
+ * Unreachable rows are NOT pruned here, unlike the variants' duplicate labels: a shadowed rule is a
+ * mistake about precedence the operator has to see and reorder, and silently dropping it would save
+ * a table that does not match the one on screen.
+ */
+export function stagedRoutes(rows: ModelRouteRow[]): ModelRoute[] {
+  return rows
+    .map((r) => ({
+      ...(r.jobType.trim() ? { jobType: r.jobType.trim() } : {}),
+      ...(r.step.trim() ? { step: r.step.trim() } : {}),
+      ...(r.label.trim() ? { label: r.label.trim() } : {}),
+      model: r.model.trim(),
+    }))
+    .filter((r) => r.model !== "");
+}
+
+/** Ordered rule equality — the list's order is the evaluation order, so a reorder IS an edit. */
+function sameRoutes(rows: ModelRouteRow[], stored: ModelRouteRow[]): boolean {
+  const [staged, savedRules] = [stagedRoutes(rows), stagedRoutes(stored)];
+  return (
+    staged.length === savedRules.length &&
+    staged.every((r, i) => JSON.stringify(r) === JSON.stringify(savedRules[i]))
+  );
 }
 
 /**

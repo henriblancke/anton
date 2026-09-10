@@ -3,6 +3,7 @@
  * worktree, push the branch, and open one PR via `gh`. The `gh` binary is injectable
  * (ANTON_GH_BIN) so tests can point it at a fake. See DESIGN.md §4/§5.
  */
+import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
@@ -59,6 +60,24 @@ async function showPaths(cwd: string, sha: string): Promise<string[]> {
 }
 
 /**
+ * Cap on the stderr kept from a spawned git. A command that fails on every path would otherwise
+ * trade one unbounded buffer for another, and 4 KiB is plenty for the message a rejection carries.
+ */
+const MAX_STDERR_CHARS = 4096;
+
+/**
+ * Start collecting a spawned git's stderr, bounded at {@link MAX_STDERR_CHARS}; the returned getter
+ * reads back what arrived, trimmed. Shared by every `spawn` here so the bound is stated once.
+ */
+function boundedStderr(child: ChildProcess): () => string {
+  let text = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    if (text.length < MAX_STDERR_CHARS) text += chunk.toString("utf8");
+  });
+  return () => text.trim();
+}
+
+/**
  * Run git and keep at most `maxChars` of its stdout, killing it the moment output overflows.
  *
  * For commands whose output has no useful upper bound. `git()` collects stdout through execFile's
@@ -80,8 +99,8 @@ function gitBounded(
     // Decode incrementally so the cap counts characters, not bytes, and a multi-byte sequence split
     // across two chunks is never mangled.
     const decoder = new StringDecoder("utf8");
+    const stderr = boundedStderr(child);
     let text = "";
-    let stderr = "";
     let truncated = false;
     let settled = false;
     const finish = (act: () => void) => {
@@ -99,17 +118,11 @@ function gitBounded(
       child.stdout?.destroy();
       child.kill("SIGKILL");
     });
-    // Bounded too: a command failing on every path would otherwise trade one unbounded buffer for
-    // another. 4 KiB is plenty for the message a rejection carries.
-    child.stderr?.on("data", (chunk: Buffer) => {
-      if (stderr.length < 4096) stderr += chunk.toString("utf8");
-    });
-
     child.on("error", (e) => finish(() => reject(e)));
     child.on("close", (code) =>
       finish(() => {
         if (!truncated && code !== 0) {
-          reject(new Error(`git ${args[0]} failed (exit ${code}): ${stderr.trim()}`));
+          reject(new Error(`git ${args[0]} failed (exit ${code}): ${stderr()}`));
           return;
         }
         resolve({ text: truncated ? text : text + decoder.end(), truncated });
@@ -146,6 +159,82 @@ function commitTimeoutMs(): number {
 }
 
 /**
+ * Deliver `sig` to a commit's whole process GROUP — git and every hook it started — falling back to
+ * the direct child handle when there is no group to signal (Windows, or a spawn that never formed
+ * one).
+ */
+function signalCommitGroup(child: ChildProcess, sig: NodeJS.Signals): void {
+  if (process.platform !== "win32" && child.pid) {
+    try {
+      process.kill(-child.pid, sig);
+      return;
+    } catch {
+      // The group may never have formed (spawn failed); fall back to the direct child handle.
+    }
+  }
+  child.kill(sig);
+}
+
+/** Whether every member of the commit's group is gone — git AND the hooks it started. */
+function commitGroupGone(child: ChildProcess): boolean {
+  if (!child.pid) return true; // spawn failed — there is no group to wait on
+  if (process.platform === "win32") return child.exitCode !== null || child.signalCode !== null;
+  try {
+    process.kill(-child.pid, 0);
+    return false;
+  } catch (err) {
+    // EPERM means members we cannot signal are still there; only ESRCH proves the group empty.
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+/**
+ * Kill a commit's process group and resolve only once it is GONE — SIGTERM, SIGKILL after the
+ * grace, then poll until the group reports `ESRCH`.
+ *
+ * Bounded for the same reason `runShell`'s wait is: a group that cannot be reaped must not wedge the
+ * run, and the caller's own cleanliness check is what catches whatever such a survivor writes. So
+ * this ALWAYS resolves — the verdict it gates is the caller's to emit.
+ */
+function reapCommitGroup(child: ChildProcess): Promise<void> {
+  return new Promise((done) => {
+    signalCommitGroup(child, "SIGTERM");
+    const escalate = setTimeout(() => {
+      if (!commitGroupGone(child)) signalCommitGroup(child, "SIGKILL");
+    }, COMMIT_KILL_GRACE_MS);
+    const deadline = Date.now() + COMMIT_KILL_GRACE_MS + REAP_CEILING_MS;
+    const wait = () => {
+      if (commitGroupGone(child) || Date.now() >= deadline) {
+        clearTimeout(escalate);
+        done();
+        return;
+      }
+      setTimeout(wait, REAP_POLL_MS);
+    };
+    wait();
+  });
+}
+
+/**
+ * The rejection a commit killed by its own budget carries. `killed: true` is load-bearing: callers
+ * tell a timeout from git's own non-zero exit by it (see {@link exitedWith}).
+ */
+function commitTimedOut(args: string[], timeoutMs: number, stderr: string): Error {
+  return Object.assign(
+    new Error(
+      `git ${args[0]} timed out after ${timeoutMs}ms and was killed with everything it spawned: ` +
+        stderr,
+    ),
+    { killed: true },
+  );
+}
+
+/** The rejection git's own non-zero exit carries, tagged with the status callers branch on. */
+function commitFailed(args: string[], code: number | null, stderr: string): Error {
+  return Object.assign(new Error(`git ${args[0]} failed (exit ${code}): ${stderr}`), { code });
+}
+
+/**
  * Run a `git commit` and return only once it — and every hook it spawned — is GONE (PR #228 review).
  *
  * Committing is the one git command anton runs that executes PROJECT code: `pre-commit` and
@@ -157,11 +246,8 @@ function commitTimeoutMs(): number {
  * it clean: a late hook write then lands after the check and is swept into the next ticket's commit,
  * or is thrown away with the failed run's worktree.
  *
- * So the commit leads a process group of its own and a kill is delivered to the GROUP and waited
- * on — SIGTERM, then SIGKILL after the grace, then poll until the group reports `ESRCH` — before any
- * verdict is returned. The wait is bounded for the same reason `runShell`'s is: a group that cannot
- * be reaped must not wedge the run, and the caller's own cleanliness check is what catches whatever
- * such a survivor writes.
+ * So the commit leads a process group of its own, and a timeout hands that group to
+ * {@link reapCommitGroup} before any verdict is returned.
  *
  * Only the KILL path reaps. A commit that ends on its own already waited for its hooks — git runs
  * them synchronously — so there is nothing left to wait for.
@@ -174,97 +260,29 @@ function gitCommit(cwd: string, args: string[]): Promise<void> {
       stdio: ["ignore", "ignore", "pipe"],
       detached: process.platform !== "win32",
     });
-
-    let stderr = "";
-    let settled = false;
+    const stderr = boundedStderr(child);
+    const timeoutMs = commitTimeoutMs();
     let killing = false;
-    /** The budget, the SIGKILL escalation and the reap poll — all released on the way out. */
-    const timers: NodeJS.Timeout[] = [];
-    const after = (ms: number, fn: () => void) => {
-      timers.push(setTimeout(fn, ms));
-    };
-
+    let settled = false;
     const settle = (emit: () => void) => {
       if (settled) return;
       settled = true;
-      for (const t of timers) clearTimeout(t);
+      clearTimeout(budget);
       emit();
     };
 
-    const killGroup = (sig: NodeJS.Signals) => {
-      if (process.platform !== "win32" && child.pid) {
-        try {
-          process.kill(-child.pid, sig);
-          return;
-        } catch {
-          // The group may never have formed (spawn failed); fall back to the direct child handle.
-        }
-      }
-      child.kill(sig);
-    };
-
-    /** Whether every member of the commit's group is gone — git AND the hooks it started. */
-    const groupGone = (): boolean => {
-      if (!child.pid) return true; // spawn failed — there is no group to wait on
-      if (process.platform === "win32") return child.exitCode !== null || child.signalCode !== null;
-      try {
-        process.kill(-child.pid, 0);
-        return false;
-      } catch (err) {
-        // EPERM means members we cannot signal are still there; only ESRCH proves the group empty.
-        return (err as NodeJS.ErrnoException).code === "ESRCH";
-      }
-    };
-
-    const killAndReap = (emit: () => void) => {
-      if (killing) return;
+    const budget = setTimeout(() => {
       killing = true;
-      killGroup("SIGTERM");
-      after(COMMIT_KILL_GRACE_MS, () => {
-        if (!groupGone()) killGroup("SIGKILL");
-      });
-      const deadline = Date.now() + COMMIT_KILL_GRACE_MS + REAP_CEILING_MS;
-      const wait = () => {
-        if (groupGone() || Date.now() >= deadline) {
-          settle(emit);
-          return;
-        }
-        after(REAP_POLL_MS, wait);
-      };
-      wait();
-    };
-
-    const timeoutMs = commitTimeoutMs();
-    after(timeoutMs, () => {
-      killAndReap(() =>
-        reject(
-          Object.assign(
-            new Error(
-              `git ${args[0]} timed out after ${timeoutMs}ms and was killed with everything it ` +
-                `spawned: ${stderr.trim()}`,
-            ),
-            { killed: true },
-          ),
-        ),
+      void reapCommitGroup(child).then(() =>
+        settle(() => reject(commitTimedOut(args, timeoutMs, stderr()))),
       );
-    });
+    }, timeoutMs);
 
-    child.stderr?.on("data", (chunk: Buffer) => {
-      if (stderr.length < 4096) stderr += chunk.toString("utf8");
-    });
     child.on("error", (err) => settle(() => reject(err)));
     child.on("close", (code) => {
       // A kill in flight owns the verdict: its group may still hold live writers.
       if (killing) return;
-      settle(() =>
-        code === 0
-          ? resolve()
-          : reject(
-              Object.assign(new Error(`git ${args[0]} failed (exit ${code}): ${stderr.trim()}`), {
-                code,
-              }),
-            ),
-      );
+      settle(() => (code === 0 ? resolve() : reject(commitFailed(args, code, stderr()))));
     });
   });
 }
@@ -604,14 +622,142 @@ export async function isAncestor(
  * stages files of its own — a formatter, a generator — either ships them under a message saying the
  * commit is empty, or leaves them loose in a worktree the NEXT ticket commits from, under a ticket
  * that never wrote them.
+ *
+ * `satisfies` names the OTHER tickets this commit's work also met (anton-6vxl), recorded as
+ * {@link SATISFIES_TRAILER} trailers and read back by {@link readSatisfiedClaims}. Work often
+ * lands under one ticket while completing a sibling's acceptance in full, and the `<id>:` subject
+ * holds exactly one id — so the sibling is invisible to {@link worktreeHasCommitFor}, its run
+ * zero-diffs, and a ticket that IS delivered is blocked as undelivered. Trailers carry the rest
+ * without touching the subject, so the delivery and `WIP` prefixes keep the meanings every other
+ * reader here depends on. The hook-bypass reasoning above applies unchanged: this is the same empty
+ * marker, carrying more attribution in its body.
  */
-export async function commitMarker(worktreePath: string, message: string): Promise<void> {
+export async function commitMarker(
+  worktreePath: string,
+  message: string,
+  options: { satisfies?: string[] } = {},
+): Promise<void> {
   // `--allow-empty` PERMITS an empty commit; it does not FORCE one. Anything a caller happened to
   // leave staged would ship under a message saying this commit is empty, so the index is pinned to
   // HEAD first — the working tree is left alone, where a caller's cleanliness check can still see
   // whatever is in it.
   await git(worktreePath, ["reset", "--quiet", "--mixed", "HEAD"]);
-  await gitCommit(worktreePath, ["commit", "--allow-empty", "--no-verify", "-m", message]);
+  const body = withSatisfiesTrailers(message, options.satisfies);
+  await gitCommit(worktreePath, ["commit", "--allow-empty", "--no-verify", "-m", body]);
+}
+
+/**
+ * The trailer key a marker records EXTRA ticket attribution under — the ids a commit's work
+ * satisfied beyond the one named in its `<id>:` subject (anton-6vxl).
+ *
+ * A git trailer rather than more subject text, because the subject is already a load-bearing
+ * protocol here: `<id>:` means delivered and `WIP <id>:` means preserved-and-incomplete, and both
+ * are matched by PREFIX. A second id in the subject would either change what those prefixes mean or
+ * be unreadable to the matchers; a trailer is invisible to them by construction. Git parses the
+ * trailer block itself (`%(trailers:key=…)`), so anton is not writing a body-scraping parser of its
+ * own.
+ */
+export const SATISFIES_TRAILER = "Anton-Satisfies";
+
+/**
+ * Append one {@link SATISFIES_TRAILER} line per satisfied ticket id, as its own trailer paragraph.
+ *
+ * One line per id, not a comma list: that is the trailer convention git's own parser is built for
+ * (`Co-authored-by:` works the same way), so reading them back needs no splitting rule of anton's
+ * invention. The block is separated by a blank line because git only recognises trailers in the
+ * message's LAST paragraph — appended to the prose directly, they would be prose.
+ *
+ * Ids are validated rather than trusted: a value holding a newline would forge additional trailer
+ * lines, and one holding a colon or leading whitespace can break the block's parse — so a malformed
+ * id fails loudly here rather than silently recording attribution that reads back as something else.
+ */
+function withSatisfiesTrailers(message: string, satisfies: string[] | undefined): string {
+  const ids = [...new Set(satisfies ?? [])];
+  if (ids.length === 0) return message;
+  for (const id of ids) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
+      throw new Error(`${SATISFIES_TRAILER}: unusable ticket id ${JSON.stringify(id)}`);
+    }
+  }
+  const trailers = ids.map((id) => `${SATISFIES_TRAILER}: ${id}`).join("\n");
+  return `${message.replace(/\s+$/, "")}\n\n${trailers}\n`;
+}
+
+/**
+ * The subject an ATTRIBUTION marker carries — the empty commit that credits `ticketId` to the
+ * commit which actually did its work (PR #258 review).
+ *
+ * Deliberately not `<id>:` or `WIP <id>:`: both are matched by prefix and both mean a commit of the
+ * ticket's OWN, which a satisfied ticket never produced. The satisfying commit is named in the
+ * subject by FULL sha, so the marker is readable by a person at a glance and resolvable by
+ * {@link satisfiedMarkerTarget} without a second lookup — the marker sits at the branch tip when it
+ * is written, so the NEXT satisfied ticket's agent names IT, and following the reference is what
+ * keeps every marker pointing at the work rather than at a chain of markers.
+ */
+export function satisfiedMarkerSubject(ticketId: string, commit: string): string {
+  return `anton: ${ticketId} satisfied by ${commit}`;
+}
+
+/** Same id shape {@link withSatisfiesTrailers} accepts — anything else is not a marker anton wrote. */
+const SATISFIED_MARKER_SUBJECT = /^anton: [A-Za-z0-9][A-Za-z0-9._-]* satisfied by ([0-9a-f]{40})$/;
+
+/**
+ * The commit an attribution marker credits, or `undefined` when this subject is not one.
+ *
+ * Read by the settlement so a ticket satisfied while a marker sat at the tip is recorded against
+ * the WORK, not against the marker for a sibling. Only a full sha is followed: an abbreviation
+ * cannot be told from prose that happens to end in hex, and the writer above always emits one.
+ */
+export function satisfiedMarkerTarget(subject: string): string | undefined {
+  return SATISFIED_MARKER_SUBJECT.exec(subject.trim())?.[1];
+}
+
+/** A commit and the ticket ids its message claims to have satisfied (anton-6vxl). */
+export interface SatisfiedClaim {
+  /** Full sha of the commit making the claim — which commit said so, not merely that something did. */
+  sha: string;
+  subject: string;
+  /** Every id claimed via {@link SATISFIES_TRAILER}, in the order the commit lists them. */
+  ticketIds: string[];
+}
+
+/**
+ * Every sibling-attribution claim on the branch, newest commit first — commits claiming nothing are
+ * omitted entirely.
+ *
+ * Each claim carries its own sha, so a caller can say WHICH commit satisfied a ticket rather than
+ * only that the branch holds such a commit somewhere: that sha is what a bead note, a PR body or an
+ * operator investigating a skip is owed. Fails closed to none, exactly as {@link branchCommits}
+ * does and for the same reason — a `git log` that failed is not proof a ticket was satisfied, and
+ * the safe error here is re-running work rather than skipping it.
+ */
+export async function readSatisfiedClaims(
+  worktreePath: string,
+  options: { strict?: boolean } = {},
+): Promise<SatisfiedClaim[]> {
+  const commits = await branchCommits(worktreePath, options);
+  return commits.flatMap((c) =>
+    c.satisfies.length > 0 ? [{ sha: c.sha, subject: c.subject, ticketIds: c.satisfies }] : [],
+  );
+}
+
+/**
+ * True when some commit on the branch claims to have satisfied `ticketId` — the sibling-attribution
+ * counterpart to {@link worktreeHasCommitFor}, which reads only the dispatched ticket's `<id>:`
+ * subject.
+ *
+ * Returns the CLAIM, not a boolean: the caller that skips a ticket on this evidence has to be able
+ * to say which commit it skipped on. Match is EXACT, never by prefix — `anton-jz1.2` satisfying
+ * something says nothing about `anton-jz1`, the same collision {@link worktreeHasCommitFor} guards
+ * against in its subject scan. Fails closed to `undefined` with {@link readSatisfiedClaims}.
+ */
+export async function branchSatisfiesTicket(
+  worktreePath: string,
+  ticketId: string,
+  options: { strict?: boolean } = {},
+): Promise<SatisfiedClaim | undefined> {
+  const claims = await readSatisfiedClaims(worktreePath, options);
+  return claims.find((c) => c.ticketIds.includes(ticketId));
 }
 
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {
@@ -1021,30 +1167,64 @@ async function preservedFiles(
   return perCommit === undefined ? undefined : [...new Set(perCommit.flat())];
 }
 
-/** How far back a subject scan reads. A run's own commits are always at the branch tip. */
-const BRANCH_LOG_ARGS = ["log", "--format=%H%x00%s", "-n", "1000"];
+/**
+ * How far back a branch scan reads. A run's own commits are always at the branch tip.
+ *
+ * Three NUL-separated fields per commit — sha, subject, and the {@link SATISFIES_TRAILER} values —
+ * and `-z` to NUL-terminate each RECORD. A subject may contain anything a person can type, so every
+ * printable separator is one a commit message could forge; NUL is the one byte git refuses to store
+ * in a message at all ("a NUL byte in commit log message not allowed"), which is what makes this
+ * framing unforgeable rather than merely unlikely. The trailer VALUES are joined by US (`%x1F`)
+ * instead, since a NUL there would be indistinguishable from a field break.
+ *
+ * `%(trailers:…)` is git's own trailer parser, so a `Anton-Satisfies:`-looking line in the middle of
+ * a prose body is correctly NOT a trailer — only the message's final block is.
+ */
+const BRANCH_LOG_ARGS = [
+  "log",
+  "-z",
+  `--format=%H%x00%s%x00%(trailers:key=${SATISFIES_TRAILER},valueonly,separator=%x1F)`,
+  "-n",
+  "1000",
+];
+
+/** Splits the trailer field's US-joined values; a commit claiming nothing yields `[]`. */
+const TRAILER_VALUE_SEPARATOR = "\u001f";
 
 /**
  * The commits at the tip of the branch checked out in `worktreePath`, newest first — or, given
- * `base`, only those the branch carries beyond it (`<base>..HEAD`). Fails closed to none (git error
- * → treat as absent) rather than risk a skip — except under `strict`, where absence is the
- * permissive answer and the caller has asked to see the failure instead.
- *
- * NUL between sha and subject: a subject may contain anything a person can type, so any printable
- * separator is one a commit message can forge.
+ * `base`, only those the branch carries beyond it (`<base>..HEAD`) — each with the ticket ids its
+ * message claims to have satisfied. Fails closed to none (git error → treat as absent) rather than
+ * risk a skip — except under `strict`, where absence is the permissive answer and the caller has
+ * asked to see the failure instead.
  */
 async function branchCommits(
   worktreePath: string,
   options: { strict?: boolean; base?: string } = {},
-): Promise<{ sha: string; subject: string }[]> {
+): Promise<{ sha: string; subject: string; satisfies: string[] }[]> {
   const args = options.base ? [...BRANCH_LOG_ARGS, `${options.base}..HEAD`, "--"] : BRANCH_LOG_ARGS;
   const log = options.strict
     ? await git(worktreePath, args)
     : await git(worktreePath, args).catch(() => "");
-  return log.split("\n").flatMap((line) => {
-    const [sha, ...rest] = line.split("\0");
-    return sha && rest.length > 0 ? [{ sha, subject: rest.join("\0") }] : [];
-  });
+  // `-z` NUL-TERMINATES each record and each `%x00` separates a field within it, so the stream is a
+  // flat run of NUL-delimited fields, three per commit, with one empty segment left by the final
+  // terminator. Grouping by threes is exact rather than heuristic: git stores no NUL in a commit
+  // message, so no field can contain the delimiter and no commit can shift the grouping.
+  const fields = log.split("\0");
+  const commits: { sha: string; subject: string; satisfies: string[] }[] = [];
+  for (let i = 0; i + 2 < fields.length; i += 3) {
+    const [sha, subject, trailers] = [fields[i], fields[i + 1], fields[i + 2]];
+    if (!sha || subject === undefined || trailers === undefined) continue;
+    commits.push({
+      sha,
+      subject,
+      satisfies: trailers
+        .split(TRAILER_VALUE_SEPARATOR)
+        .map((v) => v.trim())
+        .filter(Boolean),
+    });
+  }
+  return commits;
 }
 
 /** The branch's commit subjects — {@link branchCommits} for the readers that only match on text. */
@@ -1662,8 +1842,12 @@ const MIN_DELETION_SLICE_CHARS = 500;
  * but it is REPORTED (`incomplete`), never swallowed. The reviewer has no other route to a deleted
  * file, so an empty result it isn't warned about reads as "nothing was removed", and the removals it
  * never saw are approved by its verdict. Whatever the pass collected before the failure still ships.
+ *
+ * Exported for the unit tests, which drive the budget allocation a case at a time: reaching it
+ * through {@link diffAgainstBase} costs a truncation-forcing filler commit per case and hides which
+ * allocation rule a failure belongs to.
  */
-async function deletionPatch(
+export async function deletionPatch(
   worktreePath: string,
   from: string,
   max: number,

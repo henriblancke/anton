@@ -55,6 +55,14 @@ import type { FailureBreakerConfig } from "./autopilot-failure-streak";
 import type { ScoreBreakerConfig } from "./autopilot-score-slide";
 import type { WipLimitConfig } from "./autopilot-wip";
 import type { ScoreAlarm } from "./jobs/review-alarm";
+import {
+  MODEL_ROUTABLE_JOB_TYPES,
+  isModelRoutableJobType,
+  isModelRoutableJobTypeWithLabelContext,
+  subsumes,
+  type ModelRoute,
+} from "./jobs/model-routing";
+import { MODEL_ROUTABLE_STEP_IDS, PIPELINE_JOB_TYPE, isModelRoutableStepId } from "./jobs/step-ids";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
 import type { Project } from "./types";
@@ -358,6 +366,17 @@ export interface ProjectSettings {
    * boundary; every selected variant is held to the same invariant floor as the default.
    */
   formulaVariants?: FormulaVariant[];
+  /**
+   * Which model each kind of work runs on (anton-uu7r), in PRECEDENCE ORDER — first match wins,
+   * with {@link model} as the fallback when nothing matches. Authored in the same shape as
+   * {@link formulaVariants} beside it, because it answers the same shape of question: let the work
+   * itself pick, instead of one setting having to be expensive enough for the hardest job.
+   *
+   * Absent/empty ⇒ every job runs on {@link model} (or the driver's own default), so this is
+   * invisible to a zero-config project. Validated with {@link modelRoutesSchema} at the API
+   * boundary — including the save-time rejection of a rule that could never fire.
+   */
+  modelRoutes?: ModelRoute[];
   /**
    * How long a run may sit stuck before the run-health sweep (anton-4ks0) calls it a finding.
    * Absent → {@link DEFAULT_RUN_HEALTH_THRESHOLDS}; a stored value need only carry the knobs the
@@ -1019,6 +1038,98 @@ export const formulaVariantsSchema = z
  * field optional so a patch carries only the knobs the operator touched; each is range-checked (fail
  * loud) and unknown keys rejected, matching {@link budgetPolicySchema}.
  */
+/**
+ * How many routing rules one project may declare (anton-uu7r). Bounded for the reason every other
+ * operator list is: the table is walked per unit of work, and a table nobody can read is a table
+ * nobody can debug. Generously above what a real routing policy needs.
+ */
+export const MODEL_ROUTES_MAX = 20;
+
+/**
+ * The model routing table (anton-uu7r) — an ORDERED list, matching {@link formulaVariantsSchema}'s
+ * shape and for the same reason: the order IS the documented precedence, so first match wins and
+ * `settings.model` is the fallback when nothing matches.
+ *
+ * `model` is a FREE bounded string, never an allowlist: a gateway combo name (`cc/claude-opus-5[1m]`)
+ * is not knowable to anton, so validating against a catalogue would reject the exact value an
+ * operator with a gateway has to write. Only Claude-capable job types and steps are accepted, so a
+ * saved rule always describes a context that can actually invoke the selected model.
+ */
+export const modelRoutesSchema = z
+  .array(
+    z
+      .object({
+        jobType: z
+          .string()
+          .refine(isModelRoutableJobType, {
+            message: `job type must be one of: ${MODEL_ROUTABLE_JOB_TYPES.join(", ")}`,
+          })
+          .optional(),
+        step: z
+          .string()
+          .refine(isModelRoutableStepId, {
+            message: `step must be one of: ${MODEL_ROUTABLE_STEP_IDS.join(", ")}`,
+          })
+          .optional(),
+        label: z.string().trim().min(1).max(120).optional(),
+        model: z.string().trim().min(1).max(200),
+      })
+      .strict(),
+  )
+  .max(MODEL_ROUTES_MAX)
+  .superRefine(unreachableRoutes) as z.ZodType<ModelRoute[]>;
+
+/**
+ * Rejects, at SAVE time, a rule that can never fire — the alternative is a row an operator authored,
+ * saved, and will never see take effect, with nothing anywhere to say why.
+ *
+ * Two ways a rule matches nothing:
+ *
+ * 1. **An impossible pair.** Only `execute-epic` walks a run formula, so `step:` alongside any other
+ *    job type describes work that does not exist.
+ * 2. **A label on a job without a bead.** Scheduled jobs have no bead labels to match.
+ * 3. **A row an earlier row shadows.** First match wins, so a rule already subsumed by one above it
+ *    is unreachable — the same reasoning that rejects a twice-mapped pipeline variant.
+ */
+function unreachableRoutes(routes: ModelRoute[], ctx: z.RefinementCtx): void {
+  routes.forEach((route, i) => {
+    if (route.step !== undefined && route.jobType !== undefined && route.jobType !== PIPELINE_JOB_TYPE) {
+      ctx.addIssue({
+        code: "custom",
+        path: [i, "step"],
+        message:
+          `only \`${PIPELINE_JOB_TYPE}\` walks a pipeline, so a \`${route.jobType}\` rule naming ` +
+          `step \`${route.step}\` can never match — drop the step, or route the job type instead`,
+      });
+      return;
+    }
+    if (
+      route.label !== undefined &&
+      route.jobType !== undefined &&
+      !isModelRoutableJobTypeWithLabelContext(route.jobType)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: [i, "label"],
+        message:
+          `a \`${route.jobType}\` job has no bead labels, so a label route can never match — ` +
+          "drop the label, or route a bead-backed job instead",
+      });
+      return;
+    }
+    const shadowedBy = routes.findIndex((earlier, j) => j < i && subsumes(earlier, route));
+    if (shadowedBy >= 0) {
+      ctx.addIssue({
+        code: "custom",
+        path: [i],
+        message:
+          `rule ${i + 1} can never match — rule ${shadowedBy + 1} already matches everything it ` +
+          `does, and the first match wins`,
+      });
+    }
+  });
+}
+
 export const runHealthThresholdsSchema = z
   .object({
     parkedRunMinutes: z.number().int().min(1).max(10_080), // 1 min … 7 days

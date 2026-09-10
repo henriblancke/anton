@@ -12,6 +12,7 @@ import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { claudeRouting } from "../claude/driver";
 import type { RunClaudeOptions, runClaude } from "../claude/driver";
+import { resolveModel } from "./model-routing";
 import { applyArmedProposals, movedTheBoard, reportUnsettledProposals } from "../gardener/armed";
 import type { GardenerDetection } from "../gardener/detections";
 import {
@@ -246,7 +247,7 @@ export async function judgeBoard(scope: PassScope, input: JudgeInput): Promise<P
   const result = await claude({
     cwd: scope.project.repoPath,
     prompt,
-    model: settings.model,
+    model: resolveModel(settings, { jobType: "product-master" }),
     routing: claudeRouting(settings),
     permissionMode: settings.permissionMode ?? "bypassPermissions",
     disallowedTools: PM_DENIED_TOOLS,

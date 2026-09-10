@@ -10,6 +10,7 @@ import {
   draftFromSettings,
   nominatedLabels,
   reviewerMissing,
+  stagedRoutes,
   settingsPatchBody,
   type SettingsDraft,
 } from "@/components/settings/settings-draft";
@@ -84,6 +85,26 @@ describe("dirtyFields", () => {
     expect(dirty({ activeAgents: new Set(["nextjs"]) }).agents).toBe(true);
   });
 
+  it("reads a reordered routing rule as an edit — the order IS the evaluation order", () => {
+    const baseline: EditableSettings = {
+      modelRoutes: [
+        { label: "a", model: "opus" },
+        { label: "b", model: "sonnet" },
+      ],
+    };
+    const rows = draft(baseline).modelRouteRows;
+    expect(dirty({ modelRouteRows: [rows[1], rows[0]] }, baseline).modelRoutes).toBe(true);
+    expect(dirty({}, baseline).modelRoutes).toBe(false);
+  });
+
+  it("does not read a modelless routing row as an edit — the save drops it", () => {
+    const rows = [
+      ...draft().modelRouteRows,
+      { id: "new-0", jobType: "execute-epic", step: "", label: "", model: "" },
+    ];
+    expect(dirty({ modelRouteRows: rows }).modelRoutes).toBe(false);
+  });
+
   it("reads a reordered variant as an edit — the order IS the precedence", () => {
     const baseline: EditableSettings = {
       formulaVariants: [
@@ -134,6 +155,30 @@ describe("settingsPatchBody", () => {
     >;
     expect(Object.values(policy).every((level) => level === "propose")).toBe(true);
     expect(Object.keys(policy).length).toBeGreaterThan(0);
+  });
+});
+
+describe("stagedRoutes — the model routing table a save would send (anton-uu7r)", () => {
+  it("omits a matcher left blank rather than sending it as \"\"", () => {
+    expect(
+      stagedRoutes([
+        { id: "1", jobType: "execute-epic", step: "", label: " risk:high ", model: " opus " },
+      ]),
+    ).toEqual([{ jobType: "execute-epic", label: "risk:high", model: "opus" }]);
+  });
+
+  it("drops a row naming no model — scaffolding, not a rule", () => {
+    expect(stagedRoutes([{ id: "1", jobType: "execute-epic", step: "", label: "", model: "  " }])).toEqual(
+      [],
+    );
+  });
+
+  it("keeps an unreachable row — a shadowed rule is a mistake to see and fix, not to hide", () => {
+    const rows = [
+      { id: "1", jobType: "execute-epic", step: "", label: "", model: "sonnet" },
+      { id: "2", jobType: "execute-epic", step: "review", label: "", model: "opus" },
+    ];
+    expect(stagedRoutes(rows)).toHaveLength(2);
   });
 });
 

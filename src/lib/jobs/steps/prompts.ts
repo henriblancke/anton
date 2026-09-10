@@ -356,10 +356,12 @@ function ticketPromptClosing(ticketId: string, preserved: boolean): string {
  * back, so the merge gate is the only place the founder would ever see them; putting them in the body
  * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
  *
- * `satisfied` — the tickets that settled on an EARLIER commit of this run (anton-8h4b). Their
- * acceptance is in this diff, but no commit here carries their name, so the body attributes each to
- * the commit that did the work rather than listing it among the deliveries: a reader matching
- * tickets to commits would otherwise go looking for one that does not exist.
+ * `satisfied` — the tickets that settled on ANOTHER commit rather than one of their own
+ * (anton-8h4b). No commit here carries their name, so the body attributes each to the commit that
+ * did the work rather than listing it among the deliveries: a reader matching tickets to commits
+ * would otherwise go looking for one that does not exist. A settlement flagged `inherited` is
+ * attributed to the BASE instead of to this run (PR #258 review) — same reason, one step further:
+ * its commit is not in this diff at all.
  */
 export function prBody(
   target: Bead,
@@ -398,6 +400,12 @@ export function prBody(
  * way. The header claims no close — a ticket whose close never landed (a budget that ran out on it,
  * or a bd write that failed) is still open or blocked, and its line says so, since the body is where
  * a reviewer learns it needs closing by hand.
+ *
+ * Two headings, because the two claims send a reviewer to different places (PR #258 review). A
+ * BRANCH-ADDED commit is in this diff, so "satisfied by earlier commits of this run" is an
+ * instruction the reviewer can follow. An INHERITED one reached the base by an earlier merge — the
+ * work is in the tree and nothing here re-does it, but no commit of this pull request carries it,
+ * and saying otherwise sends the reviewer hunting a diff that cannot contain it.
  */
 export function satisfiedLines(
   tickets: Bead[],
@@ -405,8 +413,31 @@ export function satisfiedLines(
 ): string[] {
   const settled = tickets.filter((t) => satisfied.has(t.id));
   if (settled.length === 0) return [];
+  const group = (inherited: boolean) =>
+    settled.filter((t) => (satisfied.get(t.id)!.inherited ?? false) === inherited);
   return [
-    `Satisfied by earlier commits of this run (no commit of their own):`,
+    ...satisfiedGroup(
+      group(false),
+      satisfied,
+      `Satisfied by earlier commits of this run (no commit of their own):`,
+    ),
+    ...satisfiedGroup(
+      group(true),
+      satisfied,
+      `Already satisfied by commits in the base, not by this run (not in this diff):`,
+    ),
+  ];
+}
+
+/** One heading and its ticket lines, or nothing when no ticket settled that way. */
+function satisfiedGroup(
+  settled: Bead[],
+  satisfied: ReadonlyMap<string, SatisfiedSettlement>,
+  heading: string,
+): string[] {
+  if (settled.length === 0) return [];
+  return [
+    heading,
     ...settled.map((t) => {
       const by = satisfied.get(t.id)!;
       const line = `- ${t.id} — ${t.title} — by ${satisfiedByLine(by)}`;

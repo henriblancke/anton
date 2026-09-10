@@ -58,6 +58,7 @@ function retiredTarget(): Bead {
     status: "closed",
     // Built with the real stamper, so the fixture can't drift from the label format the gate parses.
     labels: [repairLabel(TARGET, "already-shipped", Date.now())],
+    closed_at: "2026-09-09T00:00:00.000Z",
     dependencies: [{ type: "supersedes", issue_id: TARGET, depends_on_id: SURVIVOR }],
     notes: "retired as already shipped",
   } as unknown as Bead;
@@ -112,5 +113,12 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
       "run-1",
       expect.objectContaining({ status: "done" }),
     );
+  });
+
+  it("does not recover a retirement from a board read that could not be refreshed", async () => {
+    const target = retiredTarget();
+
+    expect(await settleCompletedRun(run([target], target), target, false)).toBe(false);
+    expect(showMock).not.toHaveBeenCalled();
   });
 });

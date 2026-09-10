@@ -1316,3 +1316,151 @@ describe("settings route — work policy (anton-c7iv)", () => {
     expect(persisted().pickerPolicy).toEqual(policy);
   });
 });
+
+describe("settings route — model routing table (anton-uu7r)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("persists no key for a zero-config project — an empty table is the default, not a setting", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.modelRoutes).toBeUndefined();
+    expect("modelRoutes" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists a valid table IN ORDER — that order is the evaluation precedence", async () => {
+    const modelRoutes = [
+      { jobType: "execute-epic", step: "review", model: "claude-opus-5" },
+      { jobType: "execute-epic", label: "risk:high", model: "claude-opus-5" },
+      { jobType: "nightly-stringer", model: "claude-haiku-4-5" },
+      { model: "claude-sonnet-5" },
+    ];
+    const res = await PATCH(patchReq({ modelRoutes }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.modelRoutes).toEqual(modelRoutes);
+    expect(persisted().modelRoutes).toEqual(modelRoutes);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.modelRoutes).toEqual(modelRoutes);
+  });
+
+  it("accepts a gateway combo name — anton cannot know a gateway's catalogue", async () => {
+    for (const model of ["cc/claude-opus-5[1m]", "bedrock/us.anthropic.claude-sonnet-5", "gpt-5"]) {
+      const res = await PATCH(patchReq({ modelRoutes: [{ model }] }), ctx("tmp"));
+      expect(res.status).toBe(200);
+      expect(persisted().modelRoutes).toEqual([{ model }]);
+    }
+  });
+
+  it("clears the table on [] / null — every job back to settings.model", async () => {
+    await PATCH(patchReq({ modelRoutes: [{ model: "claude-opus-5" }] }), ctx("tmp"));
+    await PATCH(patchReq({ modelRoutes: [] }), ctx("tmp"));
+    expect("modelRoutes" in persisted()).toBe(false);
+
+    await PATCH(patchReq({ modelRoutes: [{ model: "claude-opus-5" }] }), ctx("tmp"));
+    await PATCH(patchReq({ modelRoutes: null }), ctx("tmp"));
+    expect("modelRoutes" in persisted()).toBe(false);
+  });
+
+  it("rejects an unknown job type — anton knows its own types", async () => {
+    const res = await PATCH(
+      patchReq({ modelRoutes: [{ jobType: "execute-feature", model: "claude-opus-5" }] }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/job type must be one of/);
+  });
+
+  it("rejects an unknown step id — anton knows its own steps", async () => {
+    const res = await PATCH(
+      patchReq({ modelRoutes: [{ step: "deploy", model: "claude-opus-5" }] }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/step must be one of/);
+  });
+
+  it("rejects an empty model — a rule that names no model routes nowhere", async () => {
+    for (const model of ["", "   ", 7, null]) {
+      const res = await PATCH(patchReq({ modelRoutes: [{ model }] }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/modelRoutes/);
+    }
+  });
+
+  it("rejects more rules than the bound allows", async () => {
+    const tooMany = Array.from({ length: 21 }, (_, i) => ({
+      label: `tier:${i}`,
+      model: "claude-opus-5",
+    }));
+    const res = await PATCH(patchReq({ modelRoutes: tooMany }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/modelRoutes/);
+  });
+
+  it("rejects a step named on a job type that walks no pipeline — it can match nothing", async () => {
+    const res = await PATCH(
+      patchReq({ modelRoutes: [{ jobType: "review-fix-pr", step: "review", model: "claude-opus-5" }] }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/can never match/);
+  });
+
+  it("rejects a rule an earlier rule already shadows — first match wins, so it never fires", async () => {
+    const shadowed = [
+      // A bare catch-all above anything at all.
+      [{ model: "claude-sonnet-5" }, { jobType: "execute-epic", model: "claude-opus-5" }],
+      // A whole job type above one of its steps.
+      [
+        { jobType: "execute-epic", model: "claude-sonnet-5" },
+        { jobType: "execute-epic", step: "review", model: "claude-opus-5" },
+      ],
+      // The same rule twice.
+      [
+        { label: "risk:high", model: "claude-opus-5" },
+        { label: "risk:high", model: "claude-sonnet-5" },
+      ],
+    ];
+    for (const modelRoutes of shadowed) {
+      const res = await PATCH(patchReq({ modelRoutes }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/can never match/);
+    }
+    expect("modelRoutes" in persisted()).toBe(false);
+  });
+
+  it("accepts sibling rules that overlap in neither direction, and the narrower-first ordering", async () => {
+    const modelRoutes = [
+      { jobType: "execute-epic", step: "review", model: "claude-opus-5" },
+      { jobType: "execute-epic", model: "claude-sonnet-5" },
+      { label: "risk:high", model: "claude-opus-5" },
+      { label: "size:S", model: "claude-haiku-4-5" },
+    ];
+    const res = await PATCH(patchReq({ modelRoutes }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().modelRoutes).toEqual(modelRoutes);
+  });
+
+  it("rejects an unknown key on a rule and leaves the stored table untouched", async () => {
+    const stored = [{ jobType: "execute-epic", model: "claude-opus-5" }];
+    await PATCH(patchReq({ modelRoutes: stored }), ctx("tmp"));
+    for (const value of [
+      [{ model: "claude-opus-5", agent: "nextjs" }],
+      [{ model: "claude-opus-5", label: "" }],
+      "claude-opus-5",
+      [{ jobType: "execute-epic" }],
+    ]) {
+      const res = await PATCH(patchReq({ modelRoutes: value }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/modelRoutes/);
+    }
+    expect(persisted().modelRoutes).toEqual(stored);
+  });
+});

@@ -302,6 +302,19 @@ and reschedules. Durability = **resumability, not retry-in-place**:
   a note, and the walk continues — the feature ships what landed and leaves one thing for a human.
   A run where *every* ticket times out parks instead: an empty PR is a false success.
 
+- **What the branch says a ticket delivered** — a run's skip decision is made against **git**, not
+  the board, so a ticket closed elsewhere whose commit never reached this branch is regenerated
+  rather than skipped into a PR that would be missing it. Three things on the branch can speak for a
+  ticket: a commit subjected `<ticket-id>:` (its own delivery), an `Anton-Satisfies: <ticket-id>`
+  **commit trailer** on the commit that did the work (one change often meets a sibling ticket's
+  acceptance in full, and a subject holds exactly one id), and — for settlements written before that
+  trailer existed, or by an operator by hand — the `satisfied on <branch> by <sha>` clause on the
+  bead's own notes, which counts only once git confirms the commit it names is reachable here. anton
+  writes the trailer itself when it settles a ticket as satisfied; a human recording one by hand adds
+  the trailer line to the commit message. The branch is read **before** the `agent:human` guard: that
+  label says who does the work, not what the diff contains, so a ticket an agent attempted and
+  someone relabelled afterwards is still credited to the commit that covered it.
+
 Job types:
 1. **execute-epic** — approved epic → warm worktree → per ticket: `claude` (agent prompt) →
    tests → commit → when the epic's tickets are done, open one PR → `in-review`.
