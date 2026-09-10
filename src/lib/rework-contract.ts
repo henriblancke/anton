@@ -515,7 +515,13 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       !htmlBlockStart(dedented);
     while (!lazy && items.length > 0 && indent < items[items.length - 1]!) items.pop();
     const base = items[items.length - 1] ?? 0;
-    const rel = indent >= base ? dedent(line.text, base) : line.text;
+    // `rel` normally starts at the active item's content column, but a lazy continuation can
+    // dedent out of a wide item. In that shape it still begins at physical column zero: expand
+    // its leading tabs from there before handing it to the container peel, whose `base` is kept
+    // for prefix identity. Otherwise a tab is counted from (say) column five, reaches column
+    // eight, and looks like only three columns of indentation instead of the physical four.
+    const rel =
+      indent >= base ? dedent(line.text, base) : expandLeadingTabs(line.text);
     const peeled = peelContainers(rel, base);
     items.push(...peeled.opened);
     const { text: content, column } = peeled;
@@ -810,6 +816,28 @@ function indentColumns(line: string, from = 0): number {
     else break;
   }
   return column;
+}
+
+/** Expand only leading tabs, counting them from the physical start of a source line. */
+function expandLeadingTabs(line: string): string {
+  let column = 0;
+  let at = 0;
+  let indentation = "";
+  while (at < line.length) {
+    const char = line[at]!;
+    if (char === " ") {
+      indentation += char;
+      column += 1;
+    } else if (char === "\t") {
+      const width = TAB_STOP - (column % TAB_STOP);
+      indentation += " ".repeat(width);
+      column += width;
+    } else {
+      break;
+    }
+    at += 1;
+  }
+  return indentation + line.slice(at);
 }
 
 /**

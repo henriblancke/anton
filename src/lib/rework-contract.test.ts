@@ -561,6 +561,12 @@ describe("instructionCriteria", () => {
       "Expected output:",
       "## literal",
     ]);
+    // A tab on the physical line reaches column four, even though this item's content starts at
+    // column five. It is the same lazy continuation, not an indented code block or a heading.
+    expect(texts("123. Expected output:\n\t## literal")).toEqual([
+      "Expected output:",
+      "## literal",
+    ]);
     // Its markers still shear, as they do on any continuation line.
     expect(texts("123. Expected output:\n    - literal")).toEqual(["Expected output:", "literal"]);
     // Under a NARROW marker the same four columns are only one past the item's content, where a
