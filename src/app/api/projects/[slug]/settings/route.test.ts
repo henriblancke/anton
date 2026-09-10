@@ -1374,7 +1374,7 @@ describe("settings route — model routing table (anton-uu7r)", () => {
       ctx("tmp"),
     );
     expect(res.status).toBe(400);
-    expect((await res.json()).error).toMatch(/unknown job type/);
+    expect((await res.json()).error).toMatch(/job type must be one of/);
   });
 
   it("rejects an unknown step id — anton knows its own steps", async () => {
@@ -1406,7 +1406,7 @@ describe("settings route — model routing table (anton-uu7r)", () => {
 
   it("rejects a step named on a job type that walks no pipeline — it can match nothing", async () => {
     const res = await PATCH(
-      patchReq({ modelRoutes: [{ jobType: "review-fix-pr", step: "verify", model: "claude-opus-5" }] }),
+      patchReq({ modelRoutes: [{ jobType: "review-fix-pr", step: "review", model: "claude-opus-5" }] }),
       ctx("tmp"),
     );
     expect(res.status).toBe(400);

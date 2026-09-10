@@ -54,6 +54,8 @@ describe("dispatchClaude", () => {
         ...ctx,
         step: { id: "implementation", labels: ["step:implement"] },
         target: { ...ctx.target, labels: ["risk:high"] },
+        // A run-phase implementation has no one ticket to route from.
+        tickets: [],
         settings: {
           ...ctx.settings,
           model: "fallback",
