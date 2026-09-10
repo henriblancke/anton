@@ -136,9 +136,22 @@ describe("HealthRail", () => {
     render(<HealthRail slug="anton" health={baseHealth({ stoppedCount: 0 })} />);
     // The block still renders — this rail always does — but an anchor to an absent section, or a
     // dismissed count of zero, would each point at something that isn't there.
-    expect(screen.getByText("Nothing is stopped.")).toBeTruthy();
+    expect(screen.getByText("No open alerts.")).toBeTruthy();
     expect(screen.queryByRole("link", { name: "Jump to Needs you" })).toBeNull();
     expect(screen.queryByText(/dismissed/)).toBeNull();
     expect(screen.getByRole("link", { name: "Back to board" })).toBeTruthy();
+  });
+
+  it("does not call unwatched parked work stopped", () => {
+    render(
+      <HealthRail
+        slug="anton"
+        health={baseHealth({
+          parks: { parkedCount: 2, oldestAgeMs: 3_600_000, disarmed: ["run-health"] },
+        })}
+      />,
+    );
+    expect(screen.getByText("No open alerts.")).toBeTruthy();
+    expect(screen.queryByText("Nothing is stopped.")).toBeNull();
   });
 });

@@ -154,7 +154,7 @@ export function HealthRail({ slug, health }: { slug: string; health: ProjectHeal
         {/* This block used to redirect to the board, which is where the rows were. They are here now
             (anton-7gxs), so it counts them and points DOWN the page instead. The block still renders
             at zero — this rail is the one thing on the page that always does, and "nothing is
-            stopped" is worth saying — but the anchor is only offered when there is something to
+            open alerts" is worth saying — but the anchor is only offered when there is something to
             jump to. */}
         <p className="text-muted-foreground">
           {stoppedCount > 0 ? (
@@ -162,7 +162,7 @@ export function HealthRail({ slug, health }: { slug: string; health: ProjectHeal
               {stoppedCount} open {stoppedCount === 1 ? "alert" : "alerts"} needing a decision.
             </>
           ) : (
-            "Nothing is stopped."
+            "No open alerts."
           )}
         </p>
         {dismissedCount > 0 ? (
