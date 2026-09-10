@@ -810,6 +810,21 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).not.toContain("the real old box");
   });
 
+  it("ignores an Acceptance heading inside a fence opened on a list marker", () => {
+    const nestedFence = [
+      "## Goal",
+      "g",
+      "",
+      "- ```md",
+      "  ## Acceptance Criteria",
+      "  - [ ] stale sample",
+      "  ```",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(nestedFence, edited);
+    expect(reconciled).toContain("  ## Acceptance Criteria\n  - [ ] stale sample\n  ```");
+    expect(reconciled).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+  });
+
   it("keeps a dropped duplicate as an empty boundary — it terminated the peer section after it", () => {
     // `## Acceptance`, a nested `### Acceptance Criteria`, then a peer `### Success`: the judge reads
     // Success as its own section only because the duplicate closed the shallower Acceptance. Dropping

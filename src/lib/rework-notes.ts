@@ -16,8 +16,10 @@ import {
 } from "./beads/contract";
 import {
   type Heading,
+  closingFence,
   htmlBlockLines,
   isHeading,
+  openingFence,
   type ScannedLine,
   scanMarkdown,
   unterminatedCloser,
@@ -181,6 +183,7 @@ function replaceAcceptance(description: string, boxes: string[]): string {
   // headings before sectioning: their surrounding raw HTML stays founder-authored, but the
   // description-first contract reader cannot concatenate its stale boxes with the real section.
   const inHtml = htmlBlockLines(description);
+  const inContainerFence = containerFenceLines(description);
   const initiallyScanned = scanMarkdown(description);
   const neutralized = initiallyScanned
     .map((line, at) =>
@@ -190,7 +193,9 @@ function replaceAcceptance(description: string, boxes: string[]): string {
     )
     .join("\n");
   const lines = scanMarkdown(neutralized);
-  const sections = sectionsNamed(lines, ACCEPTANCE_KEYS).filter(({ start }) => !inHtml[start]);
+  const sections = sectionsNamed(lines, ACCEPTANCE_KEYS).filter(
+    ({ start }) => !inHtml[start] && !inContainerFence[start],
+  );
   if (sections.length === 0) {
     const kept = neutralized.trimEnd();
     const closer = unterminatedCloser(kept);
@@ -226,6 +231,41 @@ function replaceAcceptance(description: string, boxes: string[]): string {
     .filter((piece) => piece.length > 0)
     .map((piece) => piece.join("\n"))
     .join("\n\n");
+}
+
+/**
+ * Fences opened on a list item's marker line are invisible to the flat markdown scanner. Mark
+ * their lines here so an apparent contract heading in the literal sample cannot be reconciled.
+ */
+function containerFenceLines(description: string): boolean[] {
+  const lines = description.split(/\r?\n/);
+  const fenced = Array.from({ length: lines.length }, () => false);
+  let open: { prefix: string; fence: ReturnType<typeof openingFence> } | undefined;
+  for (let at = 0; at < lines.length; at += 1) {
+    const text = lines[at]!;
+    if (open) {
+      const inner = text.startsWith(open.prefix) ? text.slice(open.prefix.length) : undefined;
+      if (inner === undefined) {
+        open = undefined;
+      } else {
+        fenced[at] = true;
+        if (closingFence(inner, open.fence!)) open = undefined;
+        continue;
+      }
+    }
+    const item = /^(?: {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+)(.*)$/.exec(text);
+    const fence = item && openingFence(item[1]!);
+    if (item && fence) {
+      fenced[at] = true;
+      // Continuation lines sit at the list item's content column; repeating `- ` would start a
+      // sibling item instead of remaining inside the fence.
+      open = {
+        prefix: text.slice(0, text.length - item[1]!.length).replace(/[^\t]/g, " "),
+        fence,
+      };
+    }
+  }
+  return fenced;
 }
 
 /** Every section under one of `keys` as the judge sees it: `start` is its heading's line, `end` the line opening the next section. */
