@@ -176,11 +176,23 @@ export function reconcileFollowUpDescription(
  * see; ignoring them appends a real section after the block is closed.
  */
 function replaceAcceptance(description: string, boxes: string[]): string {
-  const lines = scanMarkdown(description);
+  // `scanMarkdown` deliberately does not model raw HTML blocks, while this writer must not let a
+  // heading hidden in one become part of the contract it later reads. Neutralize only those
+  // headings before sectioning: their surrounding raw HTML stays founder-authored, but the
+  // description-first contract reader cannot concatenate its stale boxes with the real section.
   const inHtml = htmlBlockLines(description);
+  const initiallyScanned = scanMarkdown(description);
+  const neutralized = initiallyScanned
+    .map((line, at) =>
+      inHtml[at] && line.heading && ACCEPTANCE_KEYS.includes(line.heading.key)
+        ? line.text.replace(/^([ \t]*)(.*)$/, "$1<!-- $2 -->")
+        : line.text,
+    )
+    .join("\n");
+  const lines = scanMarkdown(neutralized);
   const sections = sectionsNamed(lines, ACCEPTANCE_KEYS).filter(({ start }) => !inHtml[start]);
   if (sections.length === 0) {
-    const kept = description.trimEnd();
+    const kept = neutralized.trimEnd();
     const closer = unterminatedCloser(kept);
     return [kept, ...(closer ? [closer] : []), ``, `## ${ACCEPTANCE_HEADING}`, ...boxes].join("\n");
   }

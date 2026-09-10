@@ -634,6 +634,9 @@ describe("reconcileFollowUpDescription", () => {
     expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
       "- [ ] Cover the exhausted path.",
     );
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).not.toContain(
+      "- [ ] hidden",
+    );
   });
 
   it("closes an HTML comment the hand-made description ends inside before appending — a heading in a comment renders nothing", () => {
@@ -671,7 +674,7 @@ describe("reconcileFollowUpDescription", () => {
     // appended below it.
     const hidden = "## Goal\nharden the retry\n\n<script>\n## Acceptance Criteria\n- [ ] hidden";
     const reconciled = reconcileFollowUpDescription(hidden, edited);
-    expect(reconciled.startsWith(hidden)).toBe(true);
+    expect(reconciled).toContain("<!-- ## Acceptance Criteria -->\n- [ ] hidden");
     expect(reconciled).toContain(
       "- [ ] hidden\n</script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
     );
@@ -700,7 +703,7 @@ describe("reconcileFollowUpDescription", () => {
     // rendered Acceptance is raw script text and whose stale boxes stay effective.
     const held = "## Goal\ng\n\n- <script>\n  ## Acceptance Criteria\n  - [ ] stale";
     const appended = reconcileFollowUpDescription(held, edited);
-    expect(appended.startsWith(held)).toBe(true);
+    expect(appended).toContain("  <!-- ## Acceptance Criteria -->\n  - [ ] stale");
     expect(appended).toContain(
       "  - [ ] stale\n  </script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
     );
@@ -711,7 +714,7 @@ describe("reconcileFollowUpDescription", () => {
     // heading is raw HTML until the blank line, so the real Acceptance must be appended below it.
     const custom = "## Goal\ng\n\n<widget>\n## Acceptance Criteria\n- [ ] stale\n";
     const customAppended = reconcileFollowUpDescription(custom, edited);
-    expect(customAppended.startsWith(custom)).toBe(true);
+    expect(customAppended).toContain("<!-- ## Acceptance Criteria -->\n- [ ] stale");
     expect(customAppended).toContain("- [ ] stale\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
     // A persistent block in a list ends with that list. The dedented Acceptance is visible and
     // therefore is the section to replace, not a hidden copy that needs another section appended.
@@ -738,9 +741,29 @@ describe("reconcileFollowUpDescription", () => {
     // section is therefore not replaceable; append a real Acceptance section after the blank.
     const blankTerminated = "## Goal\ng\n\n<div>\n## Acceptance Criteria\n- [ ] hidden\n\n";
     const appendedAfterBlock = reconcileFollowUpDescription(blankTerminated, edited);
-    expect(appendedAfterBlock.startsWith(blankTerminated.trimEnd())).toBe(true);
+    expect(appendedAfterBlock).toContain("<!-- ## Acceptance Criteria -->\n- [ ] hidden");
     expect(appendedAfterBlock).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
-    expect(appendedAfterBlock.match(/^##+ Acceptance/gm)).toHaveLength(2);
+    expect(appendedAfterBlock.match(/^##+ Acceptance/gm)).toHaveLength(1);
+
+    // A heading inside a closed raw block must not survive into the description-first contract
+    // parse beside the visible replacement section.
+    const closedHidden = "## Goal\ng\n\n<script>\n## Acceptance Criteria\n- [ ] stale\n</script>";
+    const neutralized = reconcileFollowUpDescription(closedHidden, edited);
+    expect(acceptanceBody(makeBead({ id: "f", description: neutralized }))).not.toContain("stale");
+    expect(acceptanceBody(makeBead({ id: "f", description: neutralized }))).toContain(
+      "- [ ] Guard the null branch.",
+    );
+
+    // A heading inside a list item is a block boundary too, so the custom tag below it holds the
+    // apparent Acceptance section as raw HTML and reconciliation appends a visible one.
+    const nestedHeading = "## Goal\ng\n\n- # Notes\n  <widget>\n  ## Acceptance Criteria\n  - [ ] stale";
+    const nestedHeadingReconciled = reconcileFollowUpDescription(nestedHeading, edited);
+    expect(nestedHeadingReconciled).toContain(
+      "  - [ ] stale\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
+    expect(acceptanceBody(makeBead({ id: "f", description: nestedHeadingReconciled }))).not.toContain(
+      "stale",
+    );
   });
 
   it("closes a construct nested in a list item inside that item, not at the top level", () => {

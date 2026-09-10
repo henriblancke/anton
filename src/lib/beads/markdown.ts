@@ -430,14 +430,17 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
       if (text.toLowerCase().includes(html.close)) html = undefined;
       else indent = container.prefix;
     }
+    // Paragraph interruption is determined by the content *inside* a container. `- # Notes`
+    // opens a heading in its item, not a paragraph whose following custom tag is ineligible to
+    // start a type-7 HTML block.
     paragraphOpen =
       !html &&
       !looseHtml &&
       line.visible.trim() !== "" &&
-      !line.heading &&
-      !THEMATIC_BREAK.test(text) &&
-      !EMPTY_LIST_ITEM.test(text) &&
-      !/^ {4}/.test(text);
+      !isHeading(container.content) &&
+      !THEMATIC_BREAK.test(container.content) &&
+      !EMPTY_LIST_ITEM.test(container.content) &&
+      !/^ {4}/.test(container.content);
   }
   const closer = state.fence
     ? indent + state.fence.char.repeat(state.fence.len)
