@@ -107,14 +107,24 @@ function finiteNonNegative(value: unknown): number | undefined {
  * Convert 9Router's `/api/pricing` response into the rate shape used by the ledger.
  *
  * 9Router returns `{ provider: { model: { input, output, cached, cache_creation } } }`, with
- * values in dollars per million tokens. Keep both the provider-qualified and bare model spellings:
- * the former is needed for combos such as `cc/claude-opus-5[1m]`, while the latter covers a gateway
- * that reports only the provider's model id.
+ * values in dollars per million tokens. Provider-qualified spellings are always safe. A bare model
+ * spelling is added only when precisely one provider offered it: otherwise it would assign whichever
+ * provider happened to arrive first in the response.
  */
 export function parse9RouterPricing(payload: unknown): Readonly<Record<string, ModelPrice>> {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return {};
 
   const prices: Record<string, ModelPrice> = {};
+  const aliases = new Map<string, ModelPrice | undefined>();
+  const addAlias = (key: string, price: ModelPrice) => {
+    if (!key) return;
+    if (!aliases.has(key)) {
+      aliases.set(key, price);
+      return;
+    }
+    // A bare id tells us no provider. Never let object iteration choose one for it.
+    aliases.set(key, undefined);
+  };
   for (const [provider, models] of Object.entries(payload)) {
     if (!models || typeof models !== "object" || Array.isArray(models)) continue;
     for (const [model, value] of Object.entries(models)) {
@@ -131,11 +141,11 @@ export function parse9RouterPricing(payload: unknown): Readonly<Record<string, M
         cacheWrite5m: finiteNonNegative(rate.cache_creation),
       };
       prices[`${provider}/${model}`] = price;
-      prices[model] ??= price;
-      const normalized = normalizeModelId(model);
-      if (normalized) prices[normalized] ??= price;
+      addAlias(model, price);
+      addAlias(normalizeModelId(model), price);
     }
   }
+  for (const [alias, price] of aliases) if (price) prices[alias] = price;
   return prices;
 }
 
@@ -222,7 +232,9 @@ function hasAnyCount(counts: TokenCounts): boolean {
  *
  * Undefined has exactly two causes, and neither is a zero:
  *
- *  - The price table does not know the model. An unknown price is unknown, not free.
+ *  - The price table does not know the model, or the ledger does not establish API billing. An
+ *    unknown price is unknown, not free. In particular, an unrouted row (`null`) may be a Claude
+ *    subscription call, which is not token-billed at Anthropic API list rates.
  *  - The row reported no counts at all — the unknown-usage row a crashed result writes. Nothing was
  *    measured, so nothing can be derived; `0` would claim a free invocation that in fact spent
  *    tokens nobody can see.
@@ -244,14 +256,19 @@ export function costOf(
   endpointHost?: string | null,
   gatewayPricing?: GatewayPricing,
 ): number | undefined {
-  // Anthropic's list rates apply only to direct Anthropic API calls. A gateway can serve the same
-  // model id through subscription, discounted, or free capacity; use only that endpoint's own
-  // table, and never apply a currently configured gateway's rates to historical rows from another.
-  const price = endpointHost
-    ? gatewayPricing?.endpointHost === endpointHost
-      ? gatewayPricing.prices[model ?? ""] ?? gatewayPricing.prices[normalizeModelId(model)]
-      : undefined
-    : priceOf(model);
+  // `undefined` is retained for pure callers that deliberately ask for an API-rate equivalent.
+  // Persisted rows always carry `null` or a host. Null means the CLI used its default transport,
+  // whose billing mode (subscription vs API key) is unknown; do not invent a charge. A supplied
+  // gateway table is therefore an explicit, caller-owned rate snapshot, never an implicit lookup.
+  const price = endpointHost === undefined
+    ? priceOf(model)
+    : endpointHost === null
+      ? undefined
+      : endpointHost === "api.anthropic.com"
+        ? priceOf(model)
+        : gatewayPricing?.endpointHost === endpointHost
+          ? gatewayPricing.prices[model ?? ""] ?? gatewayPricing.prices[normalizeModelId(model)]
+          : undefined;
   if (!price || !hasAnyCount(counts)) return undefined;
 
   const input = count(counts.inputTokens);

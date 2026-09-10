@@ -140,6 +140,11 @@ describe("costOf", () => {
     expect(costOf("cc/claude-opus-5[1m]", { inputTokens: 1_000_000 }, "router.example.com")).toBeUndefined();
   });
 
+  it("leaves default-transport ledger rows unpriced because they may use a subscription", () => {
+    expect(costOf("claude-opus-5", { inputTokens: 1_000_000 }, null)).toBeUndefined();
+    expect(costOf("claude-opus-5", { inputTokens: 1_000_000 }, "api.anthropic.com")).toBeCloseTo(5, 10);
+  });
+
   it("uses the matching gateway's published rate for routed calls", () => {
     const gatewayPricing = {
       endpointHost: "router.example.com",
@@ -233,6 +238,21 @@ describe("9Router pricing", () => {
       "claude-opus-5[1m]",
       "opus-5",
     ]);
+  });
+
+  it("omits a bare alias when more than one provider prices it", () => {
+    const prices = parse9RouterPricing({
+      cheap: { "shared-model": { input: 1, output: 2 } },
+      premium: { "shared-model": { input: 10, output: 20 } },
+    });
+
+    expect(prices["cheap/shared-model"]).toMatchObject({ input: 1, output: 2 });
+    expect(prices["premium/shared-model"]).toMatchObject({ input: 10, output: 20 });
+    expect(prices["shared-model"]).toBeUndefined();
+    expect(costOf("shared-model", { inputTokens: 1_000_000 }, "router.example.com", {
+      endpointHost: "router.example.com",
+      prices,
+    })).toBeUndefined();
   });
 });
 

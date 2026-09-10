@@ -119,7 +119,7 @@ describe("grouping by task", () => {
     expect(breakdownBy(rows, "task").tokens.total).toBe(breakdownBy(rows, "model").tokens.total);
   });
 
-  it("uses endpoint pricing for a routed known model in both folds", () => {
+  it("uses an explicit endpoint-rate snapshot for a routed known model in both folds", () => {
     const rows = [
       row({
         modelReported: "cc/claude-opus-5[1m]",
