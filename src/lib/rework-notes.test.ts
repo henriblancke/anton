@@ -294,6 +294,28 @@ describe("followUpDescription", () => {
     expect(description).toContain("Discovered from t1 — Quote `<!--` safely.");
   });
 
+  it("ignores backslash-escaped backticks when detecting code spans — they are literal punctuation", () => {
+    // CommonMark processes backslash escapes before code spans, so \`…\` is plain text; treating
+    // those backticks as span delimiters would leave a bare <!-- in the rendered contract, where it
+    // starts an unclosed HTML comment and hides the remaining sections.
+    const description = followUpDescription({
+      ...args,
+      summary: "handle \\`<!--\\` in notes",
+      instructions: "Fix \\`<!--\\` handling.",
+      findings: [],
+      ticket: makeBead({ id: "t1", title: "Escape \\`<!--\\` correctly" }),
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain("## Goal\nhandle \\`<\\!--\\` in notes\n");
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] Fix \\`<\\!--\\` handling.",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(description).toContain("Discovered from t1 — Escape \\`<\\!--\\` correctly.");
+    expect(description).not.toContain("<!--");
+  });
+
   it("escapes a fence-shaped summary — bare, it would fence every section under the Goal", () => {
     for (const summary of ["```", "```md swallows the section", "~~~"]) {
       const description = followUpDescription({ ...args, summary, parentId: "feat" });

@@ -459,7 +459,9 @@ function splitCodeSpans(text: string): { segment: string; code: boolean }[] {
   let i = 0;
   while (i < text.length) {
     const open = /^`+/.exec(text.slice(i));
-    if (!open) {
+    // A backslash-escaped run is literal punctuation, not a delimiter — CommonMark processes
+    // backslash escapes before code spans, so ``\`<!--\``` never opens a span.
+    if (!open || text[i - 1] === "\\") {
       plain += text[i];
       i++;
       continue;
