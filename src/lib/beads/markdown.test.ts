@@ -285,6 +285,25 @@ describe("scanMarkdown", () => {
       expect(headings("```\nAcceptance\n===\n```").every((h) => h === undefined)).toBe(true);
       expect(headings("<!--\nAcceptance\n===\n-->").every((h) => h === undefined)).toBe(true);
     });
+
+    it("recovers no Setext heading inside a raw HTML block, which the render shows as raw text", () => {
+      // The AST reads the whole script block as one html node, so no heading exists to recover —
+      // synthesizing one from the source lines would pass a bead whose Acceptance never renders.
+      expect(
+        headings("<script>\nAcceptance Criteria\n===\n- [ ] stale\n</script>").every(
+          (h) => h === undefined,
+        ),
+      ).toBe(true);
+      // The block closed, so the underlined label after it is a real heading again.
+      expect(headings("<script>\nx\n</script>\n\nAcceptance\n===")).toEqual([
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { depth: 1, key: "acceptance" },
+        undefined,
+      ]);
+    });
   });
 });
 

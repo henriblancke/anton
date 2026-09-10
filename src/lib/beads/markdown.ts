@@ -70,6 +70,8 @@ interface Line {
   fenced: boolean;
   delimiter: boolean;
   commented: boolean;
+  /** Inside a raw HTML block — the render shows no Markdown structure there. */
+  html: boolean;
   masked: string;
   visible: string;
   heading?: Heading;
@@ -120,6 +122,7 @@ const lineRecords = (source: string): Line[] => {
       fenced: false,
       delimiter: false,
       commented: false,
+      html: false,
       masked: text,
       visible: text,
       headingRest: false,
@@ -144,6 +147,7 @@ const paragraphLine = (line: Line): boolean =>
   !line.commented &&
   !line.heading &&
   !line.headingRest &&
+  !line.html &&
   line.visible.trim() !== "" &&
   !THEMATIC_BREAK.test(line.text) &&
   !BLOCK_LINE.test(line.text) &&
@@ -264,6 +268,11 @@ export function scanMarkdown(source: string): ScannedLine[] {
       }
     }
   });
+  visit(root, (node, parent) => {
+    if (!isHtmlBlock(node, parent)) return;
+    const { start, end } = lineRange(lines, node.position!);
+    for (let index = start; index <= end; index++) lines[index]!.html = true;
+  });
   markSetextHeadings(lines);
 
   return lines.map(({ text, fenced, delimiter, commented, visible, masked, heading, headingRest }) => ({
@@ -285,22 +294,25 @@ export function headingEnd(lines: readonly ScannedLine[], at: number): number {
   return end;
 }
 
+/**
+ * A raw HTML block node — one the render shows as raw text, hiding any Markdown structure inside.
+ * Inline tags (parented by a paragraph or heading) and comments hide no section.
+ */
+const isHtmlBlock = (node: MarkdownNode, parent?: MarkdownNode): boolean =>
+  node.type === "html" &&
+  node.position !== undefined &&
+  !node.value?.startsWith("<!--") &&
+  !/^<![a-z]/.test(node.value ?? "") &&
+  ["root", "listItem", "blockquote"].includes(parent?.type ?? "");
+
 /** The Markdown AST identifies raw HTML blocks; inline tags and comments do not hide a section. */
 export function htmlBlockLines(source: string): boolean[] {
   const lines = lineRecords(source);
   const root = fromMarkdown(source) as unknown as MarkdownNode;
   const inHtml = lines.map(() => false);
   visit(root, (node, parent) => {
-    if (
-      node.type !== "html" ||
-      !node.position ||
-      node.value?.startsWith("<!--") ||
-      (/^<![a-z]/.test(node.value ?? "")) ||
-      !["root", "listItem", "blockquote"].includes(parent?.type ?? "")
-    ) {
-      return;
-    }
-    const { start, end } = lineRange(lines, node.position);
+    if (!isHtmlBlock(node, parent)) return;
+    const { start, end } = lineRange(lines, node.position!);
     for (let index = start; index <= end; index++) inHtml[index] = true;
   });
   return inHtml;
