@@ -29,6 +29,7 @@ import { ProposalsSection } from "@/components/settings/sections/proposals-secti
 import { ReviewFixSection } from "@/components/settings/sections/review-fix-section";
 import { ReviewSection } from "@/components/settings/sections/review-section";
 import { ValueSection } from "@/components/settings/sections/value-section";
+import { ModelRoutingSection } from "@/components/settings/sections/model-routing-section";
 import { VariantsSection } from "@/components/settings/sections/variants-section";
 import { SettingsNav } from "@/components/settings/settings-nav";
 import { SettingsSaveBar } from "@/components/settings/settings-save-bar";
@@ -163,6 +164,7 @@ export function SettingsView({
     agents: <AgentsSection form={form} bundledAgents={bundledAgents} userAgents={userAgents} />,
     prompt: <PromptSection form={form} basePrompt={basePrompt} />,
     variants: <VariantsSection form={form} />,
+    "model-routing": <ModelRoutingSection form={form} projectSlug={project.slug} />,
     execution: <ExecutionSection form={form} />,
     quota: <QuotaSection form={form} project={project} quotaProjects={quotaProjects} />,
     autopilot: <AutopilotSection form={form} />,

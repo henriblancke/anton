@@ -9,6 +9,8 @@ import { metered } from "../../claude-invocations";
 import { formatAntonResult, parseAntonResult } from "../../claude/anton-result";
 import { claudeRouting, runClaude } from "../../claude/driver";
 import { appendSessionLog, endSession, setSessionClaudeId } from "../../sessions";
+import { resolveModel } from "../model-routing";
+import { stepName } from "./resolve";
 import { stepSession, type StepContext } from "./context";
 import type { StepResult } from "./result";
 
@@ -49,7 +51,13 @@ export async function dispatchClaude(
       cwd: ctx.worktreePath,
       prompt: args.prompt,
       appendSystemPrompt: args.appendSystemPrompt,
-      model: ctx.settings.model,
+      model: resolveModel(ctx.settings, {
+        jobType: "execute-epic",
+        step: ctx.step ? (stepName(ctx.step) as "implement" | "claude") : undefined,
+        // Ticket-phase steps receive exactly one ticket. Its labels are the routing context even
+        // though this session is filed under the run target by callers that share a session.
+        labels: ctx.tickets.length === 1 ? (ctx.tickets[0]?.labels ?? []) : ctx.target.labels,
+      }),
       routing: claudeRouting(ctx.settings),
       permissionMode: ctx.settings.permissionMode ?? "bypassPermissions",
       signal: ctx.ctx.signal,

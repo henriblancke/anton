@@ -21,6 +21,7 @@ import {
 } from "../scan-severity";
 import type { Project } from "../types";
 import { readBoardContext } from "./nightly-stringer-board";
+import { resolveModel } from "./model-routing";
 
 /**
  * The /scan-triage prompt for one scan. Three things ride along resolved rather than left to the
@@ -91,7 +92,7 @@ export async function runTriage(opts: {
   const claudeResult = await (opts.claude ?? runClaude)({
     cwd: project.repoPath,
     prompt,
-    model: settings.model,
+    model: resolveModel(settings, { jobType: "nightly-stringer" }),
     routing: claudeRouting(settings),
     permissionMode: settings.permissionMode ?? "bypassPermissions",
     signal: opts.signal,

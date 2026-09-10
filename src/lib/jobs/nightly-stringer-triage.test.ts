@@ -3,8 +3,9 @@
  * skills/scan-triage executes against it (anton-ol1l, anton-bz1w). Asserted here without a scan or
  * a claude session: everything the agent must not have to re-derive is in the text, or it isn't.
  */
-import { expect, it } from "vitest";
-import { buildTriagePrompt } from "./nightly-stringer-triage";
+import { expect, it, vi } from "vitest";
+import type { RunClaudeOptions } from "../claude/driver";
+import { buildTriagePrompt, runTriage } from "./nightly-stringer-triage";
 
 const BOARD = "## Board context — as read\n- feat-1 · attach:child · epic:epic-1";
 
@@ -22,4 +23,34 @@ it("hands triage the scan, the project's severity mapping, and the board it rout
   expect(prompt).toContain(BOARD);
   // The skill itself leads, so its rules are what the session runs on.
   expect(prompt.indexOf("scan-triage")).toBeLessThan(prompt.indexOf("scan file to triage is:"));
+});
+
+it("routes its pipeline-free nightly-stringer session", async () => {
+  let seen: RunClaudeOptions | undefined;
+  const claude = vi.fn(async (options: RunClaudeOptions) => {
+    seen = options;
+    return { ok: true, text: "", modelUsage: [] };
+  });
+  await runTriage({
+    project: {
+      id: "p",
+      slug: "p",
+      name: "Project",
+      repoPath: "/tmp",
+      defaultBranch: "main",
+      hasBeads: true,
+      createdAt: Date.now(),
+    },
+    settings: {
+      model: "fallback",
+      modelRoutes: [{ jobType: "nightly-stringer", model: "triage-model" }],
+    },
+    scanFile: "/tmp/scan.json",
+    logPath: "/tmp/scan.log",
+    signal: new AbortController().signal,
+    claudeReached: async () => {},
+    onEvent: () => {},
+    claude,
+  });
+  expect(seen?.model).toBe("triage-model");
 });

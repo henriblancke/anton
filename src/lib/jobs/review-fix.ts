@@ -51,6 +51,7 @@ import { existsSync } from "node:fs";
 import { beads, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { claudeRouting, runClaude } from "../claude/driver";
+import { resolveModel } from "./model-routing";
 import {
   branchAheadOfRemote,
   commitAll,
@@ -590,7 +591,7 @@ async function runFixSession(args: {
       cwd: worktree.path,
       prompt,
       appendSystemPrompt,
-      model: settings.model,
+      model: resolveReviewFixModel(settings, epic),
       routing: claudeRouting(settings),
       permissionMode: settings.permissionMode ?? "bypassPermissions",
       signal: ctx.signal,
@@ -644,6 +645,11 @@ async function runFixSession(args: {
     await endSession(db, clock, sessionId, "failed");
     throw e; // propagate so the runner applies quota backoff / retry / park
   }
+}
+
+/** The per-PR worker has no pipeline step; its target labels are its routing context. */
+export function resolveReviewFixModel(settings: ProjectSettings, epic: Pick<Bead, "labels">) {
+  return resolveModel(settings, { jobType: "review-fix-pr", labels: epic.labels });
 }
 
 /**

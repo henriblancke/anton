@@ -69,6 +69,7 @@ const ticket: Bead = {
   issue_type: "task",
   parent: "anton-gate1",
   description: "## Goal\n\nA bounded loop.\n\n## Acceptance\n\n- [ ] bounded\n",
+  labels: ["risk:high"],
 };
 
 const diff: BranchDiff = {
@@ -287,7 +288,10 @@ async function sessionKinds(): Promise<Array<{ kind: string; status: string; bea
 
 describe("runReviewGate — convergence", () => {
   it("stops after one review when nothing blocking is reported", async () => {
-    const { result, calls, commitMessages } = gate([report(9, [ADVISORY])]);
+    const { result, calls, commitMessages } = gate([report(9, [ADVISORY])], {
+      model: "fallback",
+      modelRoutes: [{ jobType: "execute-epic", step: "review", model: "review-model" }],
+    });
     const out = await result;
 
     expect(out.outcome).toBe("clean");
@@ -301,6 +305,7 @@ describe("runReviewGate — convergence", () => {
     ]);
     expect(blockingFindings(out.unresolved)).toEqual([]);
     expect(calls).toHaveLength(1); // one review, no fix
+    expect(calls[0].model).toBe("review-model");
     expect(commitMessages).toEqual([]);
   });
 
@@ -320,6 +325,17 @@ describe("runReviewGate — convergence", () => {
     expect(blockingFindings(out.unresolved)).toEqual([]);
     expect(calls).toHaveLength(3); // review → fix → review
     expect(commitMessages).toEqual(["anton-gate1: address self-review findings (round 1)"]);
+  });
+
+  it("keeps child-ticket label routing through review fixes", async () => {
+    const { result, calls } = gate([report(4, [BLOCKING]), "fixed", report(9, [])], {
+      model: "fallback",
+      modelRoutes: [{ jobType: "execute-epic", step: "review", label: "risk:high", model: "careful" }],
+    });
+
+    await result;
+
+    expect(calls.map((call) => call.model)).toEqual(["careful", "careful", "careful"]);
   });
 
   it("pins every session report to the run's routing — so investigate hits the reviewed endpoint", async () => {

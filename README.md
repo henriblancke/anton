@@ -294,13 +294,18 @@ A project can drive a Claude-compatible **gateway** (9Router, an in-house proxy,
 
 The token itself is **never stored** — only the name of the variable it lives in. Set that variable in the shell or service that runs anton, scoped to the token. A base URL without a token env var name is rejected, and a value shaped like a token rather than a variable name (lowercase, dashes, an `sk-…` prefix) is refused so a pasted secret can't be saved by mistake.
 
-For [9Router](https://jugaldb.substack.com/p/how-to-make-claude-code-virtually), the concrete values are:
+#### Worked example — 9Router
 
-| Field | 9Router value |
-|-------|---------------|
-| Base URL | `http://localhost:20128` |
-| Auth token env var | `ANTHROPIC_AUTH_TOKEN` (export it to your 9Router API key in anton's environment) |
-| Discover models from the gateway | on (mirrors `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`, so combos and gateway models show in the picker) |
+[9Router](https://jugaldb.substack.com/p/how-to-make-claude-code-virtually) runs as a local proxy on port 20128 and serves the Anthropic messages API natively. Configured end to end:
+
+| Field | 9Router value | Why |
+|-------|---------------|-----|
+| Base URL | `http://localhost:20128` | the bare origin — **no `/v1` suffix**, since the proxy serves `POST /v1/messages` itself |
+| Auth token env var | `ANTHROPIC_AUTH_TOKEN` | export that variable to your 9Router API key in anton's own environment; the field takes the variable's **name**, and the key never reaches anton |
+| Discover models from the gateway | on | sets `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` for the run, so the driver asks 9Router which models and combos it serves instead of assuming the Claude catalogue |
+| Model | `cc/claude-opus-5[1m]` | a 9Router combo name — set it under **Settings → Model routing**, not in the environment |
+
+The **model** is the one that bites, and its field is in a different section. anton passes `--model`, which outranks the gateway's own `ANTHROPIC_MODEL` — so exporting a combo name has no effect. Put it in a rule under **Settings → Model routing**, whose model column takes any name your gateway accepts (a plain model id or a combo like `cc/claude-opus-5[1m]`); General's **Default model** offers anton's own catalogue only.
 
 ### Board modes — solo or team
 
