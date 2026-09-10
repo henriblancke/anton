@@ -18,7 +18,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { and, count, desc, eq, isNotNull } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
-import type { AntonDb, Clock } from "./jobs/queue";
+import { isUniqueViolation, type AntonDb, type Clock } from "./jobs/queue";
 import type { RunHealthFindingKind } from "./run-health";
 
 export type EscalationStatus = "open" | "resolved";
@@ -459,10 +459,15 @@ async function signatureFor(db: AntonDb, id: string): Promise<string | null> {
 /**
  * Pick a dismissed alert back up (anton-7gxs): clear the stamp and put the row back on the list.
  *
- * Refused — as a no-op reporting `false` — when an open row already covers the same finding. The
- * partial `escalations_open_unique` index would reject the write anyway; refusing here makes it a
- * quiet "already back" rather than a 500, which is the honest answer when the sweep re-raised the
- * stall after a dismissal was restored elsewhere.
+ * Refused — as a no-op reporting `false` — when an open row already covers the same finding. That is
+ * the honest answer when the sweep re-raised the stall, or another dismissal of it was restored,
+ * after this one was put down: the alert is already back, and there is nothing for this click to do.
+ *
+ * Read and write run in ONE better-sqlite3 transaction (single synchronous connection, so the pair
+ * cannot interleave), with `escalations_open_unique` caught as the backstop for anything that lands
+ * outside it — a second process on the same file. Both layers matter: without them a raise between
+ * the check and the update turned a quiet `false` into a 500 from the route (PR #261 review). The
+ * same read→write-in-a-transaction-plus-catch shape `raiseEscalation` uses, for the same index.
  *
  * The resolution is cleared with the stamp: a restored row is not "dismissed" any more, and leaving
  * the word there would leave the Dismissed list and the open list disagreeing about one row.
@@ -474,28 +479,46 @@ export async function restoreEscalation(
   id: string,
 ): Promise<boolean> {
   const nowMs = clock.now();
-  const row = await getEscalation(db, projectId, id);
-  if (!row || row.dismissedAt == null) return false;
 
-  const live = await db
-    .select({ id: schema.escalations.id })
-    .from(schema.escalations)
-    .where(
-      and(
-        eq(schema.escalations.projectId, projectId),
-        eq(schema.escalations.findingKey, row.findingKey),
-        eq(schema.escalations.status, "open"),
-      ),
-    )
-    .limit(1);
-  if (live.length > 0) return false;
+  try {
+    return db.transaction((tx) => {
+      const row = tx
+        .select()
+        .from(schema.escalations)
+        .where(and(eq(schema.escalations.projectId, projectId), eq(schema.escalations.id, id)))
+        .limit(1)
+        .all()[0];
+      if (!row || row.dismissedAt == null) return false;
 
-  const rows = await db
-    .update(schema.escalations)
-    .set({ status: "open", resolution: null, dismissedAt: null, updatedAt: secDate(nowMs) })
-    .where(and(eq(schema.escalations.id, id), isNotNull(schema.escalations.dismissedAt)))
-    .returning({ id: schema.escalations.id });
-  return rows.length > 0;
+      const live = tx
+        .select({ id: schema.escalations.id })
+        .from(schema.escalations)
+        .where(
+          and(
+            eq(schema.escalations.projectId, projectId),
+            eq(schema.escalations.findingKey, row.findingKey),
+            eq(schema.escalations.status, "open"),
+          ),
+        )
+        .limit(1)
+        .all();
+      if (live.length > 0) return false;
+
+      const rows = tx
+        .update(schema.escalations)
+        .set({ status: "open", resolution: null, dismissedAt: null, updatedAt: secDate(nowMs) })
+        .where(and(eq(schema.escalations.id, id), isNotNull(schema.escalations.dismissedAt)))
+        .returning({ id: schema.escalations.id })
+        .all();
+      return rows.length > 0;
+    });
+  } catch (e) {
+    // The partial index rejected the update: an open row for this finding landed from outside this
+    // connection. The alert is back either way, so this is the same quiet "already back" the
+    // in-transaction check reports — not a 500.
+    if (isUniqueViolation(e)) return false;
+    throw e;
+  }
 }
 
 /**

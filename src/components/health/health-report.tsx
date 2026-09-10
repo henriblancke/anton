@@ -1,6 +1,6 @@
 import type { ProjectHealth } from "@/lib/health";
 import { AppliedSection } from "./applied-section";
-import { AutopilotBreakerHeader } from "./autopilot-breaker-band";
+import { StreamedAutopilotBreakerHeader } from "./autopilot-breaker-band";
 import { CodebaseSignalsSection } from "./codebase-signals-section";
 import { DismissedSection } from "./dismissed-section";
 import { HealthRail } from "./health-rail";
@@ -57,8 +57,10 @@ export function HealthReport({ slug, health }: { slug: string; health: ProjectHe
           {/* Above everything: a stale process is the reason to distrust the sections below it. */}
           <StaleServerBanner servers={health.staleServers} />
           {/* Then the breaker, because it outranks every row under it: an escalation is one stalled
-              card, a disarm is every card that would have started. */}
-          <AutopilotBreakerHeader slug={slug} breaker={health.breaker} />
+              card, a disarm is every card that would have started. It arrives LATE — the read
+              spawns a `gh pr view` per in-review PR — so it streams in behind its own boundary, and
+              every alert below it paints without waiting (PR #261 review). */}
+          <StreamedAutopilotBreakerHeader slug={slug} breaker={health.breaker} />
           <NeedsYouSection slug={slug} escalations={health.escalations} />
           {/* Directly under the list it explains: with the watcher off, that list has no producer at
               all, so an empty one means "nothing detected", not "nothing wrong". */}

@@ -77,10 +77,20 @@ export interface ProjectHealth {
    */
   dismissedTotal: number;
   /**
-   * Why the autopilot has stopped, if it has, with the evidence a re-arm is judged on. Undefined
-   * while it is running.
+   * Why the autopilot has stopped, if it has, with the evidence a re-arm is judged on. Resolves
+   * undefined while it is running.
+   *
+   * A PROMISE, unlike every other field here, and deliberately so (PR #261 review): deciding the WIP
+   * hold spawns a `gh pr view` per in-review PR, so awaiting it with the rest held the whole page —
+   * including the Resume/Dismiss/Abandon buttons that moved here — behind an unreachable GitHub.
+   * The report unwraps it inside the breaker band's own Suspense boundary, exactly as the board does
+   * (see components/board/board-parts.tsx), so the band is the only thing that waits on it.
+   *
+   * Created ONCE per request and threaded down as a prop — never re-invoked. Calling `currentBreaker`
+   * inside a component instead would spawn the `gh pr view` fan-out again on every render, which is
+   * the cost this field exists to pay exactly once.
    */
-  breaker: AutopilotBreaker | undefined;
+  breaker: Promise<AutopilotBreaker | undefined> | undefined;
   /**
    * Parked work nothing is watching. Undefined — and so silent — when the watcher is armed or
    * nothing is parked; its presence IS the signal (see lib/unwatched-parks.ts).
@@ -145,7 +155,8 @@ export interface HealthAlerts {
   dismissed: EscalationView[];
   /** Total dismissed rows, not just the page in `dismissed`. Defaults to the page's own length. */
   dismissedTotal?: number;
-  breaker?: AutopilotBreaker;
+  /** Unresolved on purpose — see {@link ProjectHealth.breaker}. */
+  breaker?: Promise<AutopilotBreaker | undefined>;
   parks?: UnwatchedParks;
 }
 
@@ -160,27 +171,28 @@ export async function getProjectHealth(project: Project): Promise<ProjectHealth>
   // Read the running builds live rather than from a stored report: which build is running is a fact
   // about this instant, and a patrol row written by a since-restarted process would report drift
   // that no longer exists.
-  const [board, escalations, dismissed, breaker, parks, staleServers, starts, verdicts] =
-    await Promise.all([
-      getBoard(project),
-      openEscalations(project.id),
-      dismissedEscalations(project.id),
-      // Degrades to "no band" rather than failing the page, exactly as the board does: deciding the
-      // WIP hold spawns a `gh pr view` per in-review PR, so an unreachable GitHub must cost the
-      // breaker band and nothing else. The board is the page's subject; this is context beside it.
-      currentBreaker(project).catch((err) => {
-        console.error(`[health] autopilot breaker read failed for ${project.slug}`, err);
-        return undefined;
-      }),
-      unwatchedParksForProject(project.id),
-      // Degrades to "no stale servers" like every other read here: drift detection shells out to the
-      // process table, and a transient failure there must not take the page down.
-      serverBuildDrifts().catch(() => [] as ServerDrift[]),
-      latestPickerStarts(project.id),
-      // Declines only, and no more of them than the log can show: the merge below keeps the newest
-      // PICKER_LOG_LIMIT entries across both stores, so a wider read would only fetch rows it drops.
-      latestPickerDeclines(project.id, PICKER_LOG_LIMIT),
-    ]);
+  // Deliberately NOT awaited with the rest, and handed on unresolved — exactly as the board page
+  // does. Deciding the WIP hold spawns a `gh pr view` per in-review PR, so awaiting it here would
+  // hold every alert on this page, and every button on them, behind a network read for one band of
+  // context beside them. Failure degrades to "no band" for the same reason: the alerts are the page.
+  const breaker = currentBreaker(project).catch((err) => {
+    console.error(`[health] autopilot breaker read failed for ${project.slug}`, err);
+    return undefined;
+  });
+
+  const [board, escalations, dismissed, parks, staleServers, starts, verdicts] = await Promise.all([
+    getBoard(project),
+    openEscalations(project.id),
+    dismissedEscalations(project.id),
+    unwatchedParksForProject(project.id),
+    // Degrades to "no stale servers" like every other read here: drift detection shells out to the
+    // process table, and a transient failure there must not take the page down.
+    serverBuildDrifts().catch(() => [] as ServerDrift[]),
+    latestPickerStarts(project.id),
+    // Declines only, and no more of them than the log can show: the merge below keeps the newest
+    // PICKER_LOG_LIMIT entries across both stores, so a wider read would only fetch rows it drops.
+    latestPickerDeclines(project.id, PICKER_LOG_LIMIT),
+  ]);
   return projectHealthFromBoard(
     board,
     { escalations, dismissed: dismissed.rows, dismissedTotal: dismissed.total, breaker, parks },

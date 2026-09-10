@@ -134,7 +134,7 @@ const RESTRICTED_CANCELLABLE_STATUSES = [...CANCELLABLE_STATUSES, "failed"] as c
 const COVERING_STATUSES = ["queued", "running", "parked", "failed"] as const;
 
 /** Is `e` a SQLite UNIQUE-constraint violation (the partial-index backstop firing)? */
-function isUniqueViolation(e: unknown): boolean {
+export function isUniqueViolation(e: unknown): boolean {
   const code = (e as { code?: string })?.code;
   return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT";
 }

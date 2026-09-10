@@ -44,7 +44,10 @@ let t: TestDb;
 beforeEach(() => {
   t = makeTestDb();
   for (const id of ["p1", "p2"]) {
-    t.db.insert(schema.projects).values({ id, slug: id, name: id, repoPath: `/tmp/${id}` }).run();
+    t.db
+      .insert(schema.projects)
+      .values({ id, slug: id, name: id, repoPath: `/tmp/${id}` })
+      .run();
   }
 });
 afterEach(() => t.close());
@@ -62,7 +65,13 @@ function finding(o: Partial<RunHealthFinding> = {}): RunHealthFinding {
   };
 }
 
-const raise = (o: { projectId?: string; finding?: RunHealthFinding; epicBeadId?: string } = {}) =>
+const raise = (
+  o: {
+    projectId?: string;
+    finding?: RunHealthFinding;
+    epicBeadId?: string;
+  } = {},
+) =>
   raiseEscalation(t.db, clock, {
     projectId: o.projectId ?? "p1",
     finding: o.finding ?? finding(),
@@ -91,7 +100,9 @@ describe("raiseEscalation", () => {
 
   it("returns the open row and inserts nothing when the same finding is raised again", async () => {
     const first = await raise();
-    const again = await raise({ finding: finding({ reason: "parked 9h ago: agent exited 1" }) });
+    const again = await raise({
+      finding: finding({ reason: "parked 9h ago: agent exited 1" }),
+    });
 
     expect(again.created).toBe(false);
     expect(again.escalation.id).toBe(first.escalation.id);
@@ -121,7 +132,11 @@ describe("raiseEscalation", () => {
 
   it("tolerates a finding that names no bead at all", async () => {
     const { escalation } = await raise({
-      finding: finding({ key: "exhausted-job:j-1", kind: "exhausted-job", beadId: undefined }),
+      finding: finding({
+        key: "exhausted-job:j-1",
+        kind: "exhausted-job",
+        beadId: undefined,
+      }),
       epicBeadId: undefined,
     });
     expect(escalation.beadId).toBeNull();
@@ -198,7 +213,9 @@ describe("reads", () => {
       .where(eq(schema.escalations.id, older.escalation.id))
       .run();
     const newer = await raise({ finding: finding({ key: "parked-run:new" }) });
-    const settled = await raise({ finding: finding({ key: "parked-run:done" }) });
+    const settled = await raise({
+      finding: finding({ key: "parked-run:done" }),
+    });
     await settleEscalation(t.db, clock, settled.escalation.id, "abandoned");
     await raise({ projectId: "p2" });
 
@@ -256,7 +273,10 @@ describe("toEscalationView", () => {
         targetBeadId: "e-1",
       }),
     });
-    expect(toEscalationView(escalation)).toMatchObject({ kind: "needs-human", gateId: "g-1" });
+    expect(toEscalationView(escalation)).toMatchObject({
+      kind: "needs-human",
+      gateId: "g-1",
+    });
   });
 
   it("stays actionable when the evidence blob is corrupt", async () => {
@@ -270,12 +290,14 @@ describe("toEscalationView", () => {
       .run();
 
     const view = toEscalationView((await getEscalation(t.db, "p1", escalation.id))!);
-    expect(view).toMatchObject({ reason: "parked 4h ago: agent exited 1", epicBeadId: "e-1" });
+    expect(view).toMatchObject({
+      reason: "parked 4h ago: agent exited 1",
+      epicBeadId: "e-1",
+    });
     expect(view.ageMs).toBe(0);
     expect(view.prNumber).toBeUndefined();
   });
 });
-
 
 /**
  * The signature is the whole basis of "until it changes", so what it does and does NOT distinguish
@@ -298,7 +320,11 @@ describe("escalationSignature", () => {
   it("changes when the failure changes, even for the same subject", () => {
     // The case this exists for: one job id, two different failures. `findingKey` cannot tell them
     // apart, and a dismissal keyed on it alone would silence the second one.
-    const first = finding({ kind: "exhausted-job", key: "exhausted-job:j-1", reason: "API 503" });
+    const first = finding({
+      kind: "exhausted-job",
+      key: "exhausted-job:j-1",
+      reason: "API 503",
+    });
     const second = { ...first, reason: "API 401 — bad credentials" };
     expect(escalationSignature(first)).not.toBe(escalationSignature(second));
   });
@@ -355,7 +381,9 @@ describe("escalationSignature", () => {
   it("still separates two failures that differ by more than their age", () => {
     // The coarsening must not swallow the case the signature exists for.
     const first = finding({ reason: "run parked 4h: API 503" });
-    const second = finding({ reason: "run parked 5h: API 401 — bad credentials" });
+    const second = finding({
+      reason: "run parked 5h: API 401 — bad credentials",
+    });
     expect(escalationSignature(first)).not.toBe(escalationSignature(second));
   });
 });
@@ -378,9 +406,15 @@ describe("a dismissed stall stays down", () => {
   });
 
   it("raises again the moment the same subject fails a new way", async () => {
-    const first = finding({ kind: "exhausted-job", key: "exhausted-job:j-1", reason: "API 503" });
+    const first = finding({
+      kind: "exhausted-job",
+      key: "exhausted-job:j-1",
+      reason: "API 503",
+    });
     await dismiss(first);
-    const next = await raise({ finding: { ...first, reason: "API 401 — bad credentials" } });
+    const next = await raise({
+      finding: { ...first, reason: "API 401 — bad credentials" },
+    });
     expect(next.suppressed).toBeUndefined();
     expect(next.created).toBe(true);
     expect(await listOpenEscalations(t.db, "p1")).toHaveLength(1);
@@ -413,7 +447,9 @@ describe("a dismissed stall stays down", () => {
     // The sweep re-derives `reason` every pass, so an untouched stall crossing an hour boundary
     // arrives with new TEXT and identical evidence. That must not read as a new stall.
     await dismiss(finding({ reason: "run parked 4h: agent exited 1" }));
-    const later = await raise({ finding: finding({ reason: "run parked 5h: agent exited 1" }) });
+    const later = await raise({
+      finding: finding({ reason: "run parked 5h: agent exited 1" }),
+    });
     expect(later.suppressed).toBe(true);
     expect(later.created).toBe(false);
     expect(await listOpenEscalations(t.db, "p1")).toHaveLength(0);
@@ -513,7 +549,9 @@ describe("dismissing a row raised before signatures existed", () => {
     // The two paths must normalize identically: the stamp is derived from the stored `reason`
     // COLUMN, the re-raise from a freshly rendered finding. Normalization living anywhere but
     // inside escalationSignature would drift them apart and re-raise a dismissed legacy row.
-    const { escalation } = await raise({ finding: finding({ reason: "run parked 4h: agent exited 1" }) });
+    const { escalation } = await raise({
+      finding: finding({ reason: "run parked 4h: agent exited 1" }),
+    });
     t.db
       .update(schema.escalations)
       .set({ signature: null })
@@ -521,13 +559,17 @@ describe("dismissing a row raised before signatures existed", () => {
       .run();
     expect(await settleEscalation(t.db, clock, escalation.id, "dismissed", true)).toBe(true);
 
-    const later = await raise({ finding: finding({ reason: "run parked 5h: agent exited 1" }) });
+    const later = await raise({
+      finding: finding({ reason: "run parked 5h: agent exited 1" }),
+    });
     expect(later.suppressed).toBe(true);
   });
 
   it("still lets a changed stall through", async () => {
     await settleEscalation(t.db, clock, await legacyRow(), "dismissed", true);
-    const changed = await raise({ finding: { ...finding(), reason: "parked: worktree dirty" } });
+    const changed = await raise({
+      finding: { ...finding(), reason: "parked: worktree dirty" },
+    });
     expect(changed.suppressed).toBeUndefined();
     expect(changed.created).toBe(true);
   });
@@ -576,7 +618,9 @@ describe("restoreEscalation", () => {
     // back", not a 500.
     const { escalation } = await raise();
     await settleEscalation(t.db, clock, escalation.id, "dismissed", true);
-    await raise({ finding: { ...finding(), reason: "parked again, differently" } });
+    await raise({
+      finding: { ...finding(), reason: "parked again, differently" },
+    });
 
     expect(await restoreEscalation(t.db, clock, "p1", escalation.id)).toBe(false);
   });
@@ -586,5 +630,53 @@ describe("restoreEscalation", () => {
     expect(await restoreEscalation(t.db, clock, "p1", escalation.id)).toBe(false);
     await settleEscalation(t.db, clock, escalation.id, "dismissed", true);
     expect(await restoreEscalation(t.db, clock, "p2", escalation.id)).toBe(false);
+  });
+
+  it("reads and writes in one transaction, so a raise cannot land between them", async () => {
+    // The check and the update are what the partial index sits behind: run apart, a sweep raising
+    // the same finding in the gap turns the quiet "already back" into a 500 from the route
+    // (PR #261 review). One better-sqlite3 transaction closes the gap on this connection.
+    const { escalation } = await raise();
+    await settleEscalation(t.db, clock, escalation.id, "dismissed", true);
+
+    const calls: string[] = [];
+    const tracked = new Proxy(t.db, {
+      get(target, prop, receiver) {
+        if (prop === "transaction") calls.push("transaction");
+        if (prop === "select" || prop === "update") calls.push(String(prop));
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    expect(await restoreEscalation(tracked, clock, "p1", escalation.id)).toBe(true);
+    // Every read and write went through the transaction, not the connection beside it.
+    expect(calls).toEqual(["transaction"]);
+  });
+
+  it("answers 'already back' rather than throwing when the index rejects the write", async () => {
+    // The backstop for what the transaction above cannot cover: a SECOND process on the same file
+    // raising this finding. better-sqlite3 rejects the update on `escalations_open_unique`, and the
+    // route must still see the quiet false — the alert is up either way.
+    const conflicted = {
+      transaction() {
+        throw Object.assign(new Error("UNIQUE constraint failed"), {
+          code: "SQLITE_CONSTRAINT_UNIQUE",
+        });
+      },
+    } as unknown as typeof t.db;
+    expect(await restoreEscalation(conflicted, clock, "p1", "esc-1")).toBe(false);
+  });
+
+  it("still throws anything that is not a uniqueness conflict", async () => {
+    // The catch is narrow on purpose: swallowing every error would report a corrupt db, a locked
+    // file, or a bug in the update as "already back" — a lie the operator cannot see through.
+    const broken = {
+      transaction() {
+        throw Object.assign(new Error("database is locked"), {
+          code: "SQLITE_BUSY",
+        });
+      },
+    } as unknown as typeof t.db;
+    await expect(restoreEscalation(broken, clock, "p1", "esc-1")).rejects.toThrow(/locked/);
   });
 });

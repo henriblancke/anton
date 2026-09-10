@@ -31,10 +31,15 @@ export function BoardLoadError({ message, onRetry }: { message: string; onRetry:
  * The board's one alert line, drawn from whichever breaker read is freshest: the board's own poll
  * once one has landed, otherwise the page's streamed server read.
  *
- * Its own Suspense boundary with a null fallback, because deciding the WIP hold reads GitHub: the
- * strip is late context, not a placeholder the operator should watch a skeleton for. The escalation
- * and park counts are already resolved values, so the strip only ever suspends on the breaker — and
- * when it does, the cards below have already painted.
+ * Its own Suspense boundary, because deciding the WIP hold reads GitHub: the strip is late context,
+ * not a placeholder the operator should watch a skeleton for, and the cards below have already
+ * painted by the time it suspends.
+ *
+ * The fallback is the SAME strip minus the breaker, not `null` (PR #261 review). The escalation and
+ * park counts are already resolved values, and blanking them while an unrelated GitHub read is
+ * outstanding hid "8 stopped" behind a `gh pr view` that can take minutes — a regression against the
+ * three bands this strip replaced, which each rendered outside the breaker's boundary. So only the
+ * breaker's own chips arrive late; everything already known is on screen from the first paint.
  */
 export function BoardAttentionSlot({
   slug,
@@ -62,7 +67,7 @@ export function BoardAttentionSlot({
     />
   );
   return (
-    <Suspense fallback={null}>
+    <Suspense fallback={strip(undefined)}>
       {polled ? strip(polled.value) : <StreamedAttentionStrip streamed={streamed} render={strip} />}
     </Suspense>
   );
