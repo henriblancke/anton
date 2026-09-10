@@ -1104,7 +1104,7 @@ export async function repairAlreadyShipped(args: {
    */
   signal?: AbortSignal;
 }): Promise<AlreadyShippedOutcome> {
-  const { repoPath, base, bead, dispatched, runTargetId, operator, block, committed, now, autonomy, signal } = args;
+  const { repoPath, base, bead, dispatched, runTargetId, operator, block, committed, autonomy, signal } = args;
   const claim = block.reason?.trim() || "(no reason given)";
 
   if (committed) {
@@ -1392,7 +1392,10 @@ export async function repairAlreadyShipped(args: {
     }
     let label: string | undefined;
     try {
-      label = await recordRepair(repoPath, bead, KLASS, attempted, now);
+      // This stamp is provenance for the retirement that is already on the board, not for the
+      // earlier decision to attempt one. Give it a post-supersede instant so recovery can reject
+      // a historical stamp left by an older retirement cycle without rejecting this one.
+      label = await recordRepair(repoPath, bead, KLASS, attempted, Date.now());
     } catch (e) {
       // The retirement stands, for `ref-stale`'s reason ({@link unstampedNote}): the ticket is closed
       // and pointed at its survivor, and reopening it over a missing label would undo a correct

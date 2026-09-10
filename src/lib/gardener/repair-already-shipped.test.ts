@@ -1288,7 +1288,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(outcome).toMatchObject({
       action: "retired",
       replacementId: SHIPPER,
-      label: repairLabel(TARGET, "already-shipped", NOW),
+      label: expect.stringMatching(/^repair:already-shipped:[0-9a-f]{12}:\d+$/),
       proof: [commitProof()],
     });
     expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
@@ -1301,7 +1301,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(evidence.split("\n")).toHaveLength(1);
 
     // The STAMP, so a repeat escalates rather than repairing again (R5.6).
-    expect(tagMock).toHaveBeenCalledWith(repo, TARGET, [repairLabel(TARGET, "already-shipped", NOW)]);
+    expect(tagMock).toHaveBeenCalledWith(repo, TARGET, [(outcome as { label: string }).label]);
 
     // The `not-delivered` MARKER, written as part of the settlement rather than by the caller after
     // it releases the claim (PR #238 review): merge finalization's one way to tell a retired ticket
@@ -2550,10 +2550,10 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       expect((outcome as { why: string }).why).toContain("between the retirement and its repair stamp");
       // Both unordered writes come off the live ticket together — the marker so a later merge does not
       // read it as undelivered, the stamp so a valid repair of it is not suppressed forever.
-      expect(untagMock).toHaveBeenCalledWith(repo, TARGET, [
-        LABELS.notDelivered,
-        repairLabel(TARGET, "already-shipped", NOW),
-      ]);
+      const stamp = tagMock.mock.calls
+        .flatMap(([, , labels]) => labels)
+        .find((label) => label.startsWith("repair:already-shipped:"));
+      expect(untagMock).toHaveBeenCalledWith(repo, TARGET, [LABELS.notDelivered, stamp]);
       expect(evidenceOf(outcome)).toContain("reopened or reclaimed");
       expect(evidenceOf(outcome)).toContain("repair stamp");
       // The retirement is left to whoever reopened it: anton does not reopen a ticket already open.
@@ -2914,7 +2914,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
         action: "retired",
         replacementId: SHIPPER,
         marked: false,
-        label: repairLabel(TARGET, "already-shipped", NOW),
+        label: expect.stringMatching(/^repair:already-shipped:[0-9a-f]{12}:\d+$/),
       });
       expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
       // Retried before it was allowed to fail, like the skip path's marker.

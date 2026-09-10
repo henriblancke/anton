@@ -51,14 +51,17 @@ const TARGET = "anton-5bpd";
 const SURVIVOR = "anton-keep";
 
 /** The retired standalone target: closed, superseding a survivor, stamped by anton's own repair. */
-function retiredTarget(): Bead {
+function retiredTarget({
+  stampAt = Date.now(),
+  closedAt = "2026-09-09T00:00:00.000Z",
+}: { stampAt?: number; closedAt?: string } = {}): Bead {
   return {
     id: TARGET,
     issue_type: "feature",
     status: "closed",
     // Built with the real stamper, so the fixture can't drift from the label format the gate parses.
-    labels: [repairLabel(TARGET, "already-shipped", Date.now())],
-    closed_at: "2026-09-09T00:00:00.000Z",
+    labels: [repairLabel(TARGET, "already-shipped", stampAt)],
+    closed_at: closedAt,
     dependencies: [{ type: "supersedes", issue_id: TARGET, depends_on_id: SURVIVOR }],
     notes: "retired as already shipped",
   } as unknown as Bead;
@@ -120,5 +123,16 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
 
     expect(await settleCompletedRun(run([target], target), target, false)).toBe(false);
     expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stamp left by a retirement cycle before the current closure", async () => {
+    const target = retiredTarget({
+      stampAt: Date.parse("2026-09-09T00:00:00.000Z"),
+      closedAt: "2026-09-09T00:00:01.000Z",
+    });
+
+    showMock.mockResolvedValue(target);
+    expect(await settleCompletedRun(run([target], target), target)).toBe(false);
+    expect(updateRunMock).not.toHaveBeenCalled();
   });
 });
