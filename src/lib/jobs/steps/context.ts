@@ -54,6 +54,8 @@ export interface StepDeps {
    * in-session (anton-juar) instead of re-running the step from scratch.
    */
   runClaude?: (options: RunClaudeOptions) => Promise<ClaudeResult>;
+  /** True when `runClaude` meters each internal retry, so dispatch must not add an outer row. */
+  recordsEachAttempt?: boolean;
 }
 
 /**
@@ -165,4 +167,3 @@ export async function stepSession(
   });
   return { session, owned: true };
 }
-

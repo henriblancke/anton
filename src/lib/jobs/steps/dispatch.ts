@@ -32,8 +32,9 @@ export async function dispatchClaude(
 ): Promise<StepResult> {
   // Metered here rather than at each step (anton-77l9): this is the ONE dispatch every agent-running
   // step goes through, so the ledger holds every invocation without a new step having to remember.
-  // Wrapped OUTSIDE the run's resume-aware driver, so one recorded invocation is one result.
-  const claude = metered(ctx.db, ctx.clock, {
+  // A resume-aware ticket driver meters its own underlying attempts. Other drivers are metered
+  // here, at this shared dispatch boundary.
+  const dimensions = {
     projectId: ctx.projectId,
     jobType: ctx.ctx.type,
     jobId: ctx.ctx.jobId,
@@ -41,7 +42,10 @@ export async function dispatchClaude(
     runId: ctx.runId,
     beadId: args.beadId,
     modelRequested: ctx.settings.model,
-  }, ctx.deps?.runClaude ?? runClaude);
+  };
+  const claude = ctx.deps?.recordsEachAttempt
+    ? (ctx.deps.runClaude ?? runClaude)
+    : metered(ctx.db, ctx.clock, dimensions, ctx.deps?.runClaude ?? runClaude);
   const { session, owned } = await stepSession(ctx, args.beadId);
   ctx.ctx.report({ sessionId: session.sessionId, cwd: ctx.worktreePath });
 

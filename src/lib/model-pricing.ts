@@ -156,7 +156,12 @@ function hasAnyCount(counts: TokenCounts): boolean {
 export function costOf(
   model: string | null | undefined,
   counts: TokenCounts,
+  endpointHost?: string | null,
 ): number | undefined {
+  // Anthropic's list rates apply only to direct Anthropic API calls. A gateway can serve the same
+  // model id through subscription, discounted, or free capacity; without a gateway-specific table
+  // claiming an Anthropic dollar figure would be less honest than leaving it unpriced.
+  if (endpointHost) return undefined;
   const price = priceOf(model);
   if (!price || !hasAnyCount(counts)) return undefined;
 
@@ -172,6 +177,8 @@ export function costOf(
 /** A ledger row as this module reads it: the model it reported usage under, plus the counts. */
 export interface PriceableRow extends TokenCounts {
   modelReported: string | null;
+  /** A routed endpoint has its own billing contract and is unpriced until anton knows its rates. */
+  endpointHost?: string | null;
 }
 
 /** What a set of rows cost, with what could NOT be priced kept visible beside the total. */
@@ -206,7 +213,7 @@ export function totalCost(rows: readonly PriceableRow[]): SpendCost {
   let priced = 0;
 
   for (const row of rows) {
-    const cost = costOf(row.modelReported, row);
+    const cost = costOf(row.modelReported, row, row.endpointHost);
     if (cost === undefined) {
       // Only a NAMED model is worth reporting back; a row with no model reported is the
       // unknown-usage row, and it names nothing to add to the table.

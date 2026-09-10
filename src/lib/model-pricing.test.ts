@@ -135,6 +135,10 @@ describe("costOf", () => {
     expect(costOf(null, spent)).toBeUndefined();
   });
 
+  it("leaves a gateway-routed call unpriced even when its model has a direct API rate", () => {
+    expect(costOf("cc/claude-opus-5[1m]", { inputTokens: 1_000_000 }, "router.example.com")).toBeUndefined();
+  });
+
   it("yields no cost for a row that measured nothing, and zero for one that measured zero", () => {
     // The unknown-usage row a crashed result writes: nothing was measured, so nothing is derivable.
     expect(costOf("claude-opus-5", {})).toBeUndefined();
@@ -212,6 +216,14 @@ describe("totalCost", () => {
     expect(spend.priced).toBe(0);
     expect(spend.unpriced).toBe(4);
     expect(spend.unpricedModels).toEqual(["glm-4.6", "deepseek-chat"]);
+  });
+
+  it("does not apply direct API rates to a gateway-served known model", () => {
+    const spend = totalCost([row("cc/claude-opus-5[1m]", {
+      inputTokens: 1_000_000,
+      endpointHost: "router.example.com",
+    })]);
+    expect(spend).toMatchObject({ usd: 0, priced: 0, unpriced: 1, unpricedModels: ["cc/claude-opus-5[1m]"] });
   });
 
   it("reads an unrouted project as fully priced, and an empty window as zero", () => {
