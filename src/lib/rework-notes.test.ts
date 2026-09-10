@@ -557,6 +557,40 @@ describe("reconcileFollowUpDescription", () => {
     );
   });
 
+  it("keeps a dropped Setext duplicate's underline when it stays as an empty boundary", () => {
+    // `# Acceptance`, then a Setext-h2 duplicate, then a peer `## Notes`: the duplicate is kept as
+    // an empty boundary because it terminated the peer after it. Keeping only its first line
+    // deleted the `---` and turned the surviving boundary back into a plain paragraph — the peer
+    // re-parented under the surviving Acceptance, its boxes folded into the replaced section.
+    const nested = [
+      "# Acceptance",
+      "- [ ] the old box",
+      "Acceptance Criteria",
+      "---",
+      "- [ ] the setext duplicate's box",
+      "## Notes",
+      "a founder-authored peer",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(nested, edited);
+
+    expect(reconciled).not.toContain("old box");
+    expect(reconciled).not.toContain("setext duplicate");
+    // The boundary keeps its underline — it still renders as the heading that closes Acceptance.
+    expect(reconciled).toContain("Acceptance Criteria\n---\n\n## Notes\na founder-authored peer");
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toBe(
+      [
+        "- [ ] Guard the null branch.",
+        "- [ ] Cover the exhausted path.",
+        "- [ ] src/retry.ts:12 — retries on a 4xx",
+        "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+      ].join("\n"),
+    );
+  });
+
   it("takes a sub-heading grouping criteria with the acceptance — it is that section's own content", () => {
     const grouped = [
       "## Goal",

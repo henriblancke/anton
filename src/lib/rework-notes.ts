@@ -244,7 +244,10 @@ function replaceAcceptance(description: string, boxes: string[]): string {
     // adds nothing to the boxes above while still closing the section.
     const next = authoredLines[end]?.heading;
     if (next && next.depth > governing.depth && !isTicketContractHeading(next)) {
-      pieces.push([authoredLines[start]!.text]);
+      // Through the heading's LAST line here too: a kept Setext boundary without its `===` or `---`
+      // underline is the label turned back into plain text — the boundary gone, and the peer section
+      // after it re-parented under the surviving Acceptance.
+      pieces.push(texts(start, headingEnd(lines, start) + 1));
       governing = authoredLines[start]!.heading!;
     }
     cursor = end;
