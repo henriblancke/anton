@@ -694,6 +694,19 @@ describe("reconcileFollowUpDescription", () => {
     expect(inner).not.toContain("stale");
     expect(inner).not.toContain("</script>");
     expect(inner.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // A block opened on a CONTAINER's own line hides its heading just the same: CommonMark starts
+    // it inside the item, so `- <script>` buries the indented heading below it. Reading the raw
+    // line missed the opener, so the hidden section was swapped in place — leaving a bead whose
+    // rendered Acceptance is raw script text and whose stale boxes stay effective.
+    const held = "## Goal\ng\n\n- <script>\n  ## Acceptance Criteria\n  - [ ] stale";
+    const appended = reconcileFollowUpDescription(held, edited);
+    expect(appended.startsWith(held)).toBe(true);
+    expect(appended).toContain(
+      "  - [ ] stale\n  </script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
+    expect(acceptanceBody(makeBead({ id: "f", description: appended }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
   });
 
   it("closes a construct nested in a list item inside that item, not at the top level", () => {

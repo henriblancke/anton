@@ -260,6 +260,13 @@ describe("unterminatedCloser", () => {
     expect(unterminatedCloser("- example\n  ```\n  old")).toBe("  ```");
     expect(unterminatedCloser("- example\n  <!--\n  old")).toBe("  -->");
     expect(unterminatedCloser("- example\n  <script>\n  old")).toBe("  </script>");
+    // A block can open on the CONTAINER's own line, where the raw text hides the tag behind the
+    // marker: `- <script>` starts the block inside the item, and reading the line unpeeled found no
+    // opener at all — so the heading under it was reported written while the render hid it as raw
+    // HTML, and the appended section landed inside a block nobody closed.
+    expect(unterminatedCloser("- <script>\n  ## Acceptance Criteria")).toBe("  </script>");
+    expect(unterminatedCloser("> <script>\n> ## Acceptance Criteria")).toBe("> </script>");
+    expect(unterminatedCloser("1. <pre>\n   code")).toBe("   </pre>");
     // The innermost open construct is the one whose indentation is carried.
     expect(unterminatedCloser("  ```\nold\n  ```\n- item\n  ~~~\nmore")).toBe("  ~~~");
     // A construct opened at the top level still closes there.
@@ -300,6 +307,23 @@ describe("htmlBlockLines", () => {
     ]);
     // A block that opens and closes on one line holds only that line.
     expect(htmlBlockLines("<script>alert(1)</script>\n## Acceptance")).toEqual([true, false]);
+  });
+
+  it("marks a block opened behind a list or blockquote marker", () => {
+    // CommonMark opens the item's content on the marker's own line, so `- <script>` starts the
+    // block INSIDE the item. Testing the raw line missed the opener, so the indented heading read
+    // as a written section while every renderer hid it — and reconciliation replaced boxes nobody
+    // could see instead of appending a section that renders.
+    expect(htmlBlockLines("- <script>\n  ## Acceptance Criteria\n  - [ ] stale")).toEqual([
+      true,
+      true,
+      true,
+    ]);
+    expect(htmlBlockLines("> <script>\n> ## Acceptance Criteria")).toEqual([true, true]);
+    // The marker does not make a block of a tag that opens none: conditions 6 and 7 still end at
+    // the blank line, and inline HTML mid-line still starts nothing.
+    expect(htmlBlockLines("- <div>\n  x\n\n## Acceptance")).toEqual([false, false, false, false]);
+    expect(htmlBlockLines("- see <script> in the note\n## Acceptance")).toEqual([false, false]);
   });
 
   it("opens no block where the render reads the tag as content or ends it at a blank line", () => {

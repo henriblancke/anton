@@ -388,13 +388,17 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
       inHtml.push(false);
       continue;
     }
-    // Judged on the comment-blanked text: a `<script>` inside `<!-- … -->` opens no block.
-    html = HTML_BLOCKS.find((block) => block.open.test(line.masked));
-    if (!html) looseHtml = LOOSE_HTML_BLOCK.test(line.masked);
+    // Judged on the comment-blanked text: a `<script>` inside `<!-- … -->` opens no block. Judged
+    // past the container markers too ({@link peelContainers}): a block opens inside the list item or
+    // callout that holds it, and reading the raw `- <script>` found no opener — so the heading below
+    // it was reported as written while every render hid it as raw HTML.
+    const container = peelContainers(line.masked);
+    html = HTML_BLOCKS.find((block) => block.open.test(container.content));
+    if (!html) looseHtml = LOOSE_HTML_BLOCK.test(container.content);
     inHtml.push(html !== undefined);
     if (html) {
       if (text.toLowerCase().includes(html.close)) html = undefined;
-      else indent = indentOf(text);
+      else indent = container.prefix;
     }
   }
   const closer = state.fence
@@ -408,6 +412,36 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
 /** The leading whitespace of `text`, verbatim — the indentation a closer must repeat to sit in the
  * same container as its opener ({@link unterminatedCloser}). */
 const indentOf = (text: string): string => /^[ \t]*/.exec(text)![0];
+
+/**
+ * One container marker at a line's head — a blockquote `>` or a list bullet — and the whitespace
+ * that follows it, as CommonMark opens containers left to right.
+ */
+const CONTAINER_STEP = /^ {0,3}(?:(>)[ \t]?|(?:[-*+]|\d{1,9}[.)])(?:[ \t]+|$))/;
+
+/**
+ * The container markers at the head of `text`, and the content that sits inside them.
+ *
+ * A blockquote or list marker opens its content on the SAME line, so an HTML block can begin behind
+ * one: `- <script>` starts the block inside the item, and testing the raw line found no opener at
+ * all — the heading under it read as written while the render hid it inside raw HTML.
+ *
+ * `prefix` is what a CLOSER must carry to land in the same containers ({@link unterminatedCloser}).
+ * A quote's marker is repeated verbatim; a list marker becomes the COLUMNS its content sits at,
+ * since repeating the bullet would open a second item rather than continue the first. The content's
+ * own indentation is carried too, so a block opened by an ordinary indented line — inside a
+ * container or not — still closes at the column it opened at.
+ */
+function peelContainers(text: string): { prefix: string; content: string } {
+  let markers = "";
+  let rest = text;
+  for (;;) {
+    const step = CONTAINER_STEP.exec(rest);
+    if (!step) return { prefix: markers + indentOf(rest), content: rest };
+    markers += step[1] ? step[0] : " ".repeat(step[0].length);
+    rest = rest.slice(step[0].length);
+  }
+}
 
 /** One walk of the state machine: the lines, plus the state the last line left open. */
 function scan(source: string): { lines: ScannedLine[]; state: ScanState } {
