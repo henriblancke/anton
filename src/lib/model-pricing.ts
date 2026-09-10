@@ -142,7 +142,8 @@ export function parse9RouterPricing(payload: unknown): Readonly<Record<string, M
       };
       prices[`${provider}/${model}`] = price;
       addAlias(model, price);
-      addAlias(normalizeModelId(model), price);
+      const normalized = normalizeModelId(model);
+      if (normalized !== model) addAlias(normalized, price);
     }
   }
   for (const [alias, price] of aliases) if (price) prices[alias] = price;

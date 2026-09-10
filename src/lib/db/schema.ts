@@ -713,6 +713,8 @@ export const claudeInvocations = sqliteTable(
   "claude_invocations",
   {
     id: text("id").primaryKey(),
+    /** One id per driver call, shared by every model-usage row it produced. */
+    invocationId: text("invocation_id"),
     projectId: text("project_id").references(() => projects.id),
     /** The queue job type that dispatched this invocation (`execute-epic`, `review-fix-pr`, …). */
     jobType: text("job_type"),
@@ -765,5 +767,6 @@ export const claudeInvocations = sqliteTable(
     index("claude_invocations_project_idx").on(table.projectId, table.recordedAt),
     // Serves "what did this run spend", which is a run detail read and not a scan of the table.
     index("claude_invocations_run_idx").on(table.runId),
+    index("claude_invocations_invocation_idx").on(table.invocationId),
   ],
 );

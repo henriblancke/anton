@@ -161,7 +161,7 @@ describe("recordInvocation", () => {
     await recordInvocation(
       tdb.db,
       clock,
-      { ...DIMENSIONS, projectId: tdb.projectId },
+      { ...DIMENSIONS, projectId: tdb.projectId, baseUrl: "https://api.anthropic.com" },
       result({ modelUsage: USAGE }),
     );
 
@@ -387,7 +387,7 @@ describe("invocationSpend", () => {
     await recordInvocation(
       tdb.db,
       clock,
-      { ...DIMENSIONS, projectId: tdb.projectId },
+      { ...DIMENSIONS, projectId: tdb.projectId, baseUrl: "https://api.anthropic.com" },
       result({ costUsd: 1.5, modelUsage: USAGE }),
     );
 
@@ -396,6 +396,18 @@ describe("invocationSpend", () => {
     expect(spend.cost.usd).toBeCloseTo(0.731615 + (1820 + 28 * 5) / 1e6, 10);
     expect(spend.cost.usd).not.toBeCloseTo(1.5, 2);
     expect(spend.cost).toMatchObject({ priced: 2, unpriced: 0, unpricedModels: [] });
+    tdb.close();
+  });
+
+  it("limits complete invocations rather than splitting their per-model rows", async () => {
+    const tdb = makeProjectDb();
+    await recordInvocation(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId },
+      result({ modelUsage: USAGE }),
+    );
+    expect(await listInvocations(tdb.db, tdb.projectId, { limit: 1 })).toHaveLength(2);
     tdb.close();
   });
 

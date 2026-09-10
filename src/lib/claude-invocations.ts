@@ -89,6 +89,7 @@ export function invocationRows(
   >,
 ): Array<Omit<typeof schema.claudeInvocations.$inferInsert, "id" | "recordedAt">> {
   const shared = {
+    invocationId: randomUUID(),
     projectId: dimensions.projectId ?? null,
     jobType: dimensions.jobType ?? null,
     jobId: dimensions.jobId ?? null,
@@ -166,12 +167,18 @@ export async function listInvocations(
   const where = projectFilter && sinceFilter
     ? and(projectFilter, sinceFilter)
     : projectFilter ?? sinceFilter;
-  const query = db
+  const rows = await db
     .select()
     .from(schema.claudeInvocations)
     .where(where)
-    .orderBy(desc(schema.claudeInvocations.recordedAt));
-  return opts.limit === undefined ? query : query.limit(opts.limit);
+    .orderBy(desc(schema.claudeInvocations.recordedAt), desc(schema.claudeInvocations.id));
+  // The table is per (invocation, model), but a caller's limit is in complete driver calls. Slice
+  // after regrouping so a sidecar row cannot be shown without the requested model that ran beside it.
+  return opts.limit === undefined
+    ? rows
+    : groupInvocations(rows)
+        .slice(0, opts.limit)
+        .flatMap((invocation) => invocation.rows);
 }
 
 /** One project's spend over a window, read as invocations rather than as rows. */

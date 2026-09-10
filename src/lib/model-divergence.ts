@@ -48,6 +48,8 @@ export interface InvocationModelRow {
 
 /** Everything shared by the rows of ONE invocation — what regroups them without an invocation id. */
 export interface InvocationDimensionRow extends InvocationModelRow {
+  /** Durable identity for rows written by one driver call; null on ledger rows from before 0036. */
+  invocationId?: string | null;
   projectId: string | null;
   jobType: string | null;
   jobId: string | null;
@@ -178,6 +180,9 @@ export function classifyDivergence(
  * the merge costs the count and never the answer.
  */
 function invocationKey(row: InvocationDimensionRow): string {
+  if (row.invocationId) return `id:${row.invocationId}`;
+  // Legacy rows predate a durable invocation id. Keep their historical reconstruction rather than
+  // merging them with new rows or making an old ledger unreadable.
   return JSON.stringify([
     row.projectId,
     row.jobType,

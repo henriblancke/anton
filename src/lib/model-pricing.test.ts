@@ -254,6 +254,11 @@ describe("9Router pricing", () => {
       prices,
     })).toBeUndefined();
   });
+
+  it("keeps a uniquely priced model that is already normalized", () => {
+    const prices = parse9RouterPricing({ gateway: { "shared-model": { input: 1, output: 2 } } });
+    expect(prices["shared-model"]).toMatchObject({ input: 1, output: 2 });
+  });
 });
 
 describe("totalCost", () => {

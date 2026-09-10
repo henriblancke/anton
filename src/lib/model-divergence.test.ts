@@ -162,6 +162,14 @@ describe("groupInvocations", () => {
     expect(facts.every((f) => f.divergence === "served")).toBe(true);
   });
 
+  it("keeps same-second calls separate by their persisted invocation id", () => {
+    const facts = groupInvocations([
+      row({ invocationId: "call-a", claudeSessionId: null }),
+      row({ invocationId: "call-b", claudeSessionId: null }),
+    ]);
+    expect(facts).toHaveLength(2);
+  });
+
   it("carries the dimensions a reader needs to locate a diverged call", () => {
     const [fact] = groupInvocations([
       row({ modelReported: "glm-4.6", endpointHost: "gw.example.com" }),
