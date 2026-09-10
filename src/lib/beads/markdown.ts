@@ -418,6 +418,10 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
     // callout that holds it, and reading the raw `- <script>` found no opener — so the heading below
     // it was reported as written while every render hid it as raw HTML.
     const container = peelContainers(line.masked);
+    // A list item interrupts the paragraph before it, so a type-7 tag on the item's first line
+    // may open its own raw HTML block. `paragraphOpen` describes the preceding source line; carry
+    // it across this container boundary and `<widget>` is incorrectly read as inline HTML.
+    if (LIST_ITEM.test(line.masked)) paragraphOpen = false;
     html = HTML_BLOCKS.find((block) => block.open.test(container.content));
     if (!html && LOOSE_HTML_BLOCK.test(container.content)) {
       looseHtml = "named";
@@ -463,6 +467,10 @@ const indentOf = (text: string): string => /^[ \t]*/.exec(text)![0];
  * that follows it, as CommonMark opens containers left to right.
  */
 const CONTAINER_STEP = /^ {0,3}(?:(>)[ \t]?|(?:[-*+]|\d{1,9}[.)])(?:[ \t]+|$))/;
+
+/** A list item's marker at the start of a source line. Unlike {@link CONTAINER_STEP}, this is
+ * used to distinguish an interrupting list from a blockquote when resetting paragraph state. */
+const LIST_ITEM = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]+|$)/;
 
 /**
  * The container markers at the head of `text`, and the content that sits inside them.

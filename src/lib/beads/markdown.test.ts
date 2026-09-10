@@ -296,6 +296,16 @@ describe("unterminatedCloser", () => {
     expect(htmlBlockLines('intro\n<widget>\n## Acceptance Criteria')).toEqual([false, false, false]);
   });
 
+  it("lets a list item interrupt the paragraph before a type-7 tag", () => {
+    // The list marker ends `intro`'s paragraph. Its widget is therefore a blank-terminated raw
+    // HTML block, and the indented heading is hidden rather than a visible Acceptance heading.
+    expect(htmlBlockLines("intro\n- <widget>\n  ## Acceptance Criteria")).toEqual([
+      false,
+      true,
+      true,
+    ]);
+  });
+
   it("recognizes a type-7 tag after non-paragraph blocks", () => {
     expect(htmlBlockLines('---\n<widget>\n## Acceptance Criteria')).toEqual([false, true, true]);
     expect(htmlBlockLines('-\n<widget>\n## Acceptance Criteria')).toEqual([false, true, true]);
