@@ -174,8 +174,9 @@ export function toEscalationView(row: EscalationRow): EscalationView {
  * The rendered ages inside a finding's `reason`, replaced by a placeholder so they can't move the
  * signature (PR #261 review).
  *
- * Three detectors build `reason` around `humanAge(ageMs)` — `run parked 4h: …`, `PR #12 idle 3d …`,
- * `run-lease expired 90m ago …` (jobs/run-health.ts) — and that text is a CLOCK, not evidence: an
+ * Four detectors build `reason` around `humanAge(ageMs)` — `run parked 4h: …`, `PR #12 idle 3d …`,
+ * `run-lease expired 90m ago …`, `waiting on a human 2h: …` (jobs/run-health.ts) — and that text is
+ * a CLOCK, not evidence: an
  * untouched stall re-renders as `4h` then `5h` the moment it crosses an hour boundary. Hashing it
  * raw gave the next sweep a signature the dismissed row could not match, so the alert an operator
  * put down came straight back — the one thing durable dismissal exists to prevent.

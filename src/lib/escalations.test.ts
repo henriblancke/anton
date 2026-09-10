@@ -336,6 +336,18 @@ describe("escalationSignature", () => {
         reason: `run-lease expired ${age} ago with no job to resume it — the owning run died mid-flight`,
       });
     expect(escalationSignature(deadLease("59m"))).toBe(escalationSignature(deadLease("1h")));
+
+    // The fourth, and the one the first pass at this test missed (PR #261 review). `needs-human` is
+    // not dismissable today (escalation-kinds.ts), so nothing depends on it — but the detector
+    // renders an age like every other, and the day that kind becomes dismissable the omission would
+    // be the P1 bug again with no test failing.
+    const needsHuman = (age: string) =>
+      finding({
+        kind: "needs-human",
+        key: "needs-human:g-1",
+        reason: `waiting on a human ${age}: review the migration plan`,
+      });
+    expect(escalationSignature(needsHuman("2h"))).toBe(escalationSignature(needsHuman("3h")));
   });
 
   it("still separates two failures that differ by more than their age", () => {
