@@ -286,6 +286,25 @@ describe("unterminatedCloser", () => {
     // prose, so it cannot swallow a section appended below it.
     expect(unterminatedCloser("<!todo\n## Acceptance")).toBeUndefined();
   });
+
+  it("parses quoted attributes in a type-7 tag", () => {
+    expect(htmlBlockLines('<widget title="a > b">\n## Acceptance Criteria')).toEqual([true, true]);
+    expect(unterminatedCloser('<widget title="a > b">\n## Acceptance Criteria')).toBeUndefined();
+  });
+
+  it("does not let a type-7 tag interrupt a paragraph", () => {
+    expect(htmlBlockLines('intro\n<widget>\n## Acceptance Criteria')).toEqual([false, false, false]);
+  });
+
+  it("recognizes a type-7 tag after non-paragraph blocks", () => {
+    expect(htmlBlockLines('---\n<widget>\n## Acceptance Criteria')).toEqual([false, true, true]);
+    expect(htmlBlockLines('-\n<widget>\n## Acceptance Criteria')).toEqual([false, true, true]);
+    expect(htmlBlockLines('    code\n<widget>\n## Acceptance Criteria')).toEqual([
+      false,
+      true,
+      true,
+    ]);
+  });
 });
 
 describe("htmlBlockLines", () => {

@@ -307,8 +307,10 @@ const LOOSE_HTML_BLOCK = new RegExp(
   "i",
 );
 
-/** CommonMark condition 7: a complete custom HTML tag alone on its line. */
-const CUSTOM_HTML_BLOCK = /^ {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[^<>]*)?\/?>(?:[ \t]*)$/;
+/** A type-7 HTML block opener: one complete tag on the line, with quoted attributes allowed. */
+const CUSTOM_HTML_BLOCK = /^ {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+(?:[^"'<>]|"[^"]*"|'[^']*')*)?[ \t]*\/?>(?:[ \t]*)$/;
+const THEMATIC_BREAK = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+const EMPTY_LIST_ITEM = /^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]*$/;
 
 /**
  * The line that closes whatever construct `source` ends inside — the fence's own delimiter, `-->`
@@ -398,14 +400,15 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
       looseHtml = undefined;
       paragraphOpen = false;
     }
+    if (text.trim() === "") paragraphOpen = false;
     const openFence = state.fence !== undefined;
     const openComment = state.inComment;
     const line = scanLine(state, text);
     // This line opened one of them — a fence delimiter or a `<!--` that outlives the line.
     if ((!openFence && state.fence) || (!openComment && state.inComment)) indent = indentOf(text);
     if (line.fenced || state.inComment) {
-      inHtml.push(false);
       paragraphOpen = false;
+      inHtml.push(false);
       continue;
     }
     // Judged on the comment-blanked text: a `<script>` inside `<!-- … -->` opens no block. Judged
@@ -427,7 +430,14 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
       if (text.toLowerCase().includes(html.close)) html = undefined;
       else indent = container.prefix;
     }
-    paragraphOpen = !html && !looseHtml && line.visible.trim() !== "" && !line.heading;
+    paragraphOpen =
+      !html &&
+      !looseHtml &&
+      line.visible.trim() !== "" &&
+      !line.heading &&
+      !THEMATIC_BREAK.test(text) &&
+      !EMPTY_LIST_ITEM.test(text) &&
+      !/^ {4}/.test(text);
   }
   const closer = state.fence
     ? indent + state.fence.char.repeat(state.fence.len)
