@@ -370,6 +370,43 @@ describe("htmlBlockLines", () => {
       true,
     ]);
   });
+
+  it("recognizes a complete custom tag at a block boundary", () => {
+    // A condition-7 HTML block is raw through its next blank line. Its heading is not a rendered
+    // Acceptance heading and reconciliation must append a visible one instead of replacing it.
+    expect(htmlBlockLines("<widget>\n## Acceptance Criteria\n- [ ] stale\n")).toEqual([
+      true,
+      true,
+      true,
+      false,
+    ]);
+    // Condition 7 cannot interrupt a paragraph, so this remains ordinary prose.
+    expect(htmlBlockLines("An explanation\n<widget>\n## Acceptance Criteria")).toEqual([
+      false,
+      false,
+      false,
+    ]);
+  });
+
+  it("ends a persistent block when its list container ends", () => {
+    expect(htmlBlockLines("- <script>\n  raw\n## Acceptance Criteria\n- [ ] stale")).toEqual([
+      true,
+      true,
+      false,
+      false,
+    ]);
+  });
+
+  it("ends a blank-terminated block when its list container ends", () => {
+    // The dedented heading is no longer part of the list's raw HTML block. It must be scanned as
+    // normal Markdown, so a later persistent opener is not incorrectly ignored either.
+    expect(htmlBlockLines("- <div>\n  raw\n<script>\n## Acceptance Criteria")).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ]);
+  });
 });
 
 describe("unquote", () => {

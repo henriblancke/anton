@@ -271,7 +271,8 @@ export function scanMarkdown(source: string): ScannedLine[] {
  * A persistent HTML block's opener and the tag that closes it — CommonMark's start conditions 1, 3,
  * 4 and 5, the ones that end at their OWN closing text rather than at a blank line
  * ({@link unterminatedCloser}). Condition 2's `<!--` is the comment state machine's already.
- * Condition 7 is absent because a blank line ends it, so nothing appended after one lands inside it.
+ * Conditions 6 and 7 are absent because a blank line ends them, so nothing appended after one lands
+ * inside it.
  */
 const HTML_BLOCKS: { open: RegExp; close: string }[] = [
   { open: /^ {0,3}<pre(?:[ \t>]|$)/i, close: "</pre>" },
@@ -293,10 +294,10 @@ const HTML_BLOCKS: { open: RegExp; close: string }[] = [
  * Criteria` renders that final heading, while reading the `<script>` as a block of its own hid it and
  * appended a second one after a closing tag nobody wrote.
  *
- * Condition 7 — any other complete tag alone on its line — is absent for the same reason it is
- * absent from the send-back parser: it may not interrupt a paragraph, so recognising it here would
- * need paragraph state this walk does not keep, and misreading prose as a block hides more than it
- * reveals. Nothing it would cover holds a persistent opener without one of these tags above it.
+ * Condition 7 — any other complete tag alone on its line — is tracked separately. It has the same
+ * blank-line terminator, but may not interrupt a paragraph: `<widget>` begins a raw HTML block at a
+ * block boundary, while `explain <widget>` stays prose. The walk keeps the small amount of paragraph
+ * state needed to tell those cases apart.
  */
 const LOOSE_HTML_BLOCK = new RegExp(
   "^ {0,3}</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|" +
@@ -305,6 +306,9 @@ const LOOSE_HTML_BLOCK = new RegExp(
     "p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ \\t>]|/>|$)",
   "i",
 );
+
+/** CommonMark condition 7: a complete custom HTML tag alone on its line. */
+const CUSTOM_HTML_BLOCK = /^ {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[^<>]*)?\/?>(?:[ \t]*)$/;
 
 /**
  * The line that closes whatever construct `source` ends inside — the fence's own delimiter, `-->`
@@ -363,29 +367,36 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
   // A blank-terminated block (CommonMark's conditions 6 and 7) standing open. Its content is raw
   // HTML too, so nothing inside it opens anything — a `<script>` under `<div>` is text the outer
   // block holds, not a block of its own, and tracking one there hid a heading the render shows.
-  let looseHtml = false;
+  let looseHtml: "named" | "custom" | undefined;
+  // Like persistent blocks, blank-terminated blocks cannot survive the list item or quote that
+  // contains their opener. Kept separately because they have no closer to emit.
+  let looseIndent = "";
+  // Condition 7 may not interrupt a paragraph. This only needs to distinguish a block boundary
+  // from ordinary visible text; fences, comments and every HTML block reset it below.
+  let paragraphOpen = false;
   const inHtml: boolean[] = [];
   for (const text of source.split(/\r?\n/)) {
     // An HTML block is literal until its closing text: no fence opens and no comment starts inside
     // one, so nothing else is tracked while it stands.
     if (html) {
-      // A persistent HTML block is still bound to the list item or blockquote that opened it.
-      // Once a line leaves that container, CommonMark closes the container (and therefore this
-      // block) before reading the leaving line. Do not let a quoted `<script>` hide a top-level
-      // Acceptance heading merely because its closing tag was never written.
-      if (indent && !text.startsWith(indent)) {
-        html = undefined;
-      } else {
+      // Leaving a list item or blockquote ends the block it contained before this line. Process the
+      // dedented line again in the normal scanner, rather than treating its heading as raw HTML.
+      if (indent && !text.startsWith(indent)) html = undefined;
+      else {
         inHtml.push(true);
         if (text.toLowerCase().includes(html.close)) html = undefined;
         continue;
       }
     }
     if (looseHtml) {
-      // Its nonblank content is raw HTML. The blank terminator and what follows render as Markdown.
-      looseHtml = text.trim() !== "";
-      inHtml.push(looseHtml);
-      continue;
+      // A blank line or leaving the containing item ends it. On a dedent, scan the same line as
+      // fresh Markdown — it may be the visible Acceptance heading we must replace.
+      if (text.trim() !== "" && (!looseIndent || text.startsWith(looseIndent))) {
+        inHtml.push(true);
+        continue;
+      }
+      looseHtml = undefined;
+      paragraphOpen = false;
     }
     const openFence = state.fence !== undefined;
     const openComment = state.inComment;
@@ -394,6 +405,7 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
     if ((!openFence && state.fence) || (!openComment && state.inComment)) indent = indentOf(text);
     if (line.fenced || state.inComment) {
       inHtml.push(false);
+      paragraphOpen = false;
       continue;
     }
     // Judged on the comment-blanked text: a `<script>` inside `<!-- … -->` opens no block. Judged
@@ -402,12 +414,20 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
     // it was reported as written while every render hid it as raw HTML.
     const container = peelContainers(line.masked);
     html = HTML_BLOCKS.find((block) => block.open.test(container.content));
-    if (!html) looseHtml = LOOSE_HTML_BLOCK.test(container.content);
-    inHtml.push(html !== undefined || looseHtml);
+    if (!html && LOOSE_HTML_BLOCK.test(container.content)) {
+      looseHtml = "named";
+      looseIndent = container.prefix;
+    }
+    if (!html && !looseHtml && !paragraphOpen && CUSTOM_HTML_BLOCK.test(container.content)) {
+      looseHtml = "custom";
+      looseIndent = container.prefix;
+    }
+    inHtml.push(html !== undefined || looseHtml !== undefined);
     if (html) {
       if (text.toLowerCase().includes(html.close)) html = undefined;
       else indent = container.prefix;
     }
+    paragraphOpen = !html && !looseHtml && line.visible.trim() !== "" && !line.heading;
   }
   const closer = state.fence
     ? indent + state.fence.char.repeat(state.fence.len)

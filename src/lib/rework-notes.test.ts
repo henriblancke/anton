@@ -707,6 +707,19 @@ describe("reconcileFollowUpDescription", () => {
     expect(acceptanceBody(makeBead({ id: "f", description: appended }))).toContain(
       "- [ ] Cover the exhausted path.",
     );
+    // A complete custom tag is condition 7 HTML when it stands at a block boundary. Its apparent
+    // heading is raw HTML until the blank line, so the real Acceptance must be appended below it.
+    const custom = "## Goal\ng\n\n<widget>\n## Acceptance Criteria\n- [ ] stale\n";
+    const customAppended = reconcileFollowUpDescription(custom, edited);
+    expect(customAppended.startsWith(custom)).toBe(true);
+    expect(customAppended).toContain("- [ ] stale\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    // A persistent block in a list ends with that list. The dedented Acceptance is visible and
+    // therefore is the section to replace, not a hidden copy that needs another section appended.
+    const dedented = "## Goal\ng\n\n- <script>\n  raw\n## Acceptance Criteria\n- [ ] stale";
+    const dedentedReconciled = reconcileFollowUpDescription(dedented, edited);
+    expect(dedentedReconciled).not.toContain("stale");
+    expect(dedentedReconciled).not.toContain("</script>");
+    expect(dedentedReconciled.match(/^##+ Acceptance/gm)).toHaveLength(1);
     // Leaving a quoted persistent block closes it with the quote. The following Acceptance heading
     // renders normally and must be replaced in place rather than misread as hidden and duplicated.
     const leftQuote = "## Goal\ng\n\n> <script>\n> raw\n## Acceptance Criteria\n- [ ] stale";
