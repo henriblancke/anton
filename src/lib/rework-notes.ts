@@ -17,6 +17,7 @@ import {
 import {
   type Heading,
   closingFence,
+  headingEnd,
   htmlBlockLines,
   isHeading,
   openingFence,
@@ -225,7 +226,7 @@ function replaceAcceptance(description: string, boxes: string[]): string {
   }
   const texts = (from: number, to: number) => authoredLines.slice(from, to).map((l) => l.text);
   const [first, ...duplicates] = sections;
-  const pieces = [[...texts(0, first!.start + 1), ...boxes]];
+  const pieces = [[...texts(0, headingEnd(lines, first!.start) + 1), ...boxes]];
   // Text between a dropped copy and the next: verbatim, minus the blank lines that led into the copy.
   let cursor = first!.end;
   // The heading that governs what follows, as the judge scopes sections — the surviving Acceptance

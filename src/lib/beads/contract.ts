@@ -277,11 +277,21 @@ const isScaffolding = (text: string) =>
   isHeading(text) || EMPTY_LIST_ITEM.test(text) || THEMATIC_BREAK.test(text);
 
 /** The lines of a body that count as authored text — everything the render hides, the blank lines
- * and the scaffolding dropped. Fenced content is literal, so the scaffolding test skips it. */
+ * and the scaffolding dropped. Fenced content is literal, so the scaffolding test skips it.
+ *
+ * A Setext heading is scaffolding too, and only the scanner can say so: `Backend` is a paragraph
+ * until the `===` under it arrives, so the line-at-a-time {@link isScaffolding} cannot see it and a
+ * section holding nothing but an underlined label read as written — the empty rubric approved and
+ * executed against, which is the one thing this judge exists to refuse. {@link RenderedLine.heading}
+ * carries the scanner's verdict for every line of the run, the underline included. */
 function contentLines(raw: string): RenderedLine[] {
   return renderedLines(raw)
-    .map((l) => ({ text: (l.fenced ? l.text : unquote(l.text)).trim(), fenced: l.fenced }))
-    .filter((l) => l.text !== "" && (l.fenced || !isScaffolding(l.text)));
+    .map((l) => ({
+      text: (l.fenced ? l.text : unquote(l.text)).trim(),
+      fenced: l.fenced,
+      heading: l.heading,
+    }))
+    .filter((l) => l.text !== "" && (l.fenced || (!l.heading && !isScaffolding(l.text))));
 }
 
 /** One body's state. A body is a prompt only when EVERY line of it is one. */

@@ -74,21 +74,39 @@ describe("scanMarkdown", () => {
   describe("fences", () => {
     it("flags the delimiters as punctuation and the content as literal, opening no section", () => {
       expect(scanMarkdown("```js\n## Acceptance\n```\nafter")).toEqual([
-        { text: "```js", fenced: true, delimiter: true, commented: false, visible: "", masked: "```js" },
+        {
+          text: "```js",
+          fenced: true,
+          delimiter: true,
+          commented: false,
+          headingRest: false,
+          visible: "",
+          masked: "```js",
+        },
         {
           text: "## Acceptance",
           fenced: true,
           delimiter: false,
           commented: false,
+          headingRest: false,
           visible: "## Acceptance",
           masked: "## Acceptance",
         },
-        { text: "```", fenced: true, delimiter: true, commented: false, visible: "", masked: "```" },
+        {
+          text: "```",
+          fenced: true,
+          delimiter: true,
+          commented: false,
+          headingRest: false,
+          visible: "",
+          masked: "```",
+        },
         {
           text: "after",
           fenced: false,
           delimiter: false,
           commented: false,
+          headingRest: false,
           visible: "after",
           masked: "after",
           heading: undefined,
@@ -192,16 +210,84 @@ describe("scanMarkdown", () => {
       expect(masked("```\n<!-- x -->\n```")).toEqual(["```", "<!-- x -->", "```"]);
     });
   });
+
+  describe("Setext headings", () => {
+    /** The heading each line opens, paired with whether it CONTINUES the one above. */
+    const setext = (source: string) =>
+      scanMarkdown(source).map((l) => [l.heading?.depth ?? null, l.headingRest] as const);
+
+    it("reads an underlined label as the heading it renders, keyed on the label", () => {
+      expect(headings("Acceptance Criteria\n===")).toEqual([
+        { depth: 1, key: "acceptancecriteria" },
+        undefined,
+      ]);
+      // `-` underlines an h2, and any run of either mark does it — `=` and `-----` alike.
+      expect(headings("Acceptance\n-")).toEqual([{ depth: 2, key: "acceptance" }, undefined]);
+      expect(headings("Acceptance\n=====")).toEqual([{ depth: 1, key: "acceptance" }, undefined]);
+    });
+
+    it("flags every line of the run as the heading's own, the underline included", () => {
+      // A multiline paragraph underlined is ONE heading: the key is the first line's, and every
+      // line after it is heading text rather than body under it.
+      expect(setext("Acceptance\nCriteria\n===\nbody")).toEqual([
+        [1, false],
+        [null, true],
+        [null, true],
+        [null, false],
+      ]);
+    });
+
+    it("needs a paragraph above it — a bare underline is a rule or plain text", () => {
+      expect(headings("---")).toEqual([undefined]);
+      expect(headings("\n===")).toEqual([undefined, undefined]);
+      // A `---` after a blank line closes no paragraph, so the label above stays text.
+      expect(headings("Acceptance\n\n---")).toEqual([undefined, undefined, undefined]);
+    });
+
+    it("does not reach across a line that opens a block of its own", () => {
+      // Each of these ends the paragraph, so the `===` below closes nothing.
+      for (const between of ["- item", "> quote", "# ATX", "    code", "<div>"]) {
+        expect(headings(`Acceptance\n${between}\n===`)[0]).toBeUndefined();
+      }
+      // A type-7 tag may NOT interrupt a paragraph, so that run really is one heading.
+      expect(headings('Acceptance\n<widget x="y">\n===')[0]).toEqual({
+        depth: 1,
+        key: "acceptance",
+      });
+    });
+
+    it("stops at a thematic break, which ends the paragraph before any underline reaches it", () => {
+      // `***` is a rule, not paragraph text: it closes `Acceptance` and opens nothing, so the
+      // `===` under it underlines no paragraph at all.
+      expect(headings("Acceptance\n***\n===").every((h) => h === undefined)).toBe(true);
+    });
+
+    it("does not let a second underline reach back across a heading already made", () => {
+      // `A` / `---` is an h2 and `B` / `===` an h1 — two headings, not one run. Walking back over
+      // the consumed `---` would swallow the first heading into the second.
+      expect(headings("A\n---\nB\n===")).toEqual([
+        { depth: 2, key: "a" },
+        undefined,
+        { depth: 1, key: "b" },
+        undefined,
+      ]);
+    });
+
+    it("opens no heading inside a fence or an HTML comment, as the render shows none", () => {
+      expect(headings("```\nAcceptance\n===\n```").every((h) => h === undefined)).toBe(true);
+      expect(headings("<!--\nAcceptance\n===\n-->").every((h) => h === undefined)).toBe(true);
+    });
+  });
 });
 
 describe("renderedLines", () => {
   it("drops fence delimiters, strips comments, and keeps fenced content flagged as literal", () => {
     expect(renderedLines("# A\n<!-- c -->\n```\nx\n```\n\nend")).toEqual([
-      { text: "# A", fenced: false },
-      { text: "", fenced: false },
-      { text: "x", fenced: true },
-      { text: "", fenced: false },
-      { text: "end", fenced: false },
+      { text: "# A", fenced: false, heading: true },
+      { text: "", fenced: false, heading: false },
+      { text: "x", fenced: true, heading: false },
+      { text: "", fenced: false, heading: false },
+      { text: "end", fenced: false, heading: false },
     ]);
   });
 

@@ -157,6 +157,37 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
   });
 
+  it("treats a section holding only a Setext heading as unwritten", () => {
+    // `Backend` / `===` renders as a heading, scaffolding exactly like an ATX `### Backend` — and
+    // only the scanner can say so, since the label is a paragraph until the underline arrives.
+    // Counting either line as content passed the blocking gate on a section stating no rubric.
+    for (const underline of ["===", "---", "=", "-"]) {
+      const bead = ticket({
+        acceptance_criteria: undefined,
+        description: [DESCRIPTION, "", "## Acceptance", "Backend", underline].join("\n"),
+      });
+      expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
+    }
+    // A criterion BESIDE the label is the section's content, as under an ATX heading. It must sit
+    // ABOVE it: a Setext heading is only ever h1 or h2, so one under `## Acceptance` CLOSES the
+    // section rather than grouping inside it — which is exactly how the description renders.
+    const beside = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "- [ ] it works", "", "Backend", "==="].join("\n"),
+    });
+    expect(validateBeadContract(beside)).toEqual([]);
+  });
+
+  it("reads a Setext-underlined contract heading as the section it renders", () => {
+    // `Acceptance Criteria` / `===` renders the section, and a scanner blind to Setext found none
+    // — blocking a ticket whose rubric the founder can plainly read.
+    const bead = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "Acceptance Criteria", "===", "", "- [ ] it works"].join("\n"),
+    });
+    expect(validateBeadContract(bead)).toEqual([]);
+  });
+
   it("treats a section holding only a thematic break as unwritten", () => {
     // `---` renders as a rule, not text — counting it as content let approval and execution
     // proceed with no definition of done.

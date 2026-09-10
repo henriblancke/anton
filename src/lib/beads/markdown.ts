@@ -29,11 +29,15 @@ export interface ScannedLine {
   visible: string;
   masked: string;
   heading?: Heading;
+  /** A continuation of a multi-line heading, such as a Setext underline. */
+  headingRest: boolean;
 }
 
 export interface RenderedLine {
   text: string;
   fenced: boolean;
+  /** Structural heading markup rather than authored body text. */
+  heading: boolean;
 }
 
 export interface Fence {
@@ -65,6 +69,7 @@ interface Line {
   masked: string;
   visible: string;
   heading?: Heading;
+  headingRest: boolean;
 }
 
 const fenceOf = (text: string): Fence | undefined => {
@@ -113,6 +118,7 @@ const lineRecords = (source: string): Line[] => {
       commented: false,
       masked: text,
       visible: text,
+      headingRest: false,
     });
     start += text.length + (source.startsWith("\r\n", start + text.length) ? 2 : 1);
   }
@@ -203,22 +209,32 @@ export function scanMarkdown(source: string): ScannedLine[] {
   visit(root, (node) => {
     if (!node.position) return;
     if (node.type === "heading") {
-      const line = lines[node.position.start.line - 1];
+      const { start, end } = lineRange(lines, node.position);
+      const line = lines[start];
       if (line && !line.fenced && !line.commented) {
         line.heading = { depth: node.depth!, key: slug(textOf(node).replace(/<!--.*$/, "")) };
+        for (let at = start + 1; at <= end; at++) lines[at]!.headingRest = true;
       }
     }
   });
 
-  return lines.map(({ text, fenced, delimiter, commented, visible, masked, heading }) => ({
+  return lines.map(({ text, fenced, delimiter, commented, visible, masked, heading, headingRest }) => ({
     text,
     fenced,
     delimiter,
     commented,
     visible: fenced || delimiter ? (delimiter ? "" : text) : visible,
     masked,
+    headingRest,
     ...(heading ? { heading } : {}),
   }));
+}
+
+/** The final source line belonging to the heading opened at `at`. */
+export function headingEnd(lines: readonly ScannedLine[], at: number): number {
+  let end = at;
+  while (lines[end + 1]?.headingRest) end += 1;
+  return end;
 }
 
 /** The Markdown AST identifies raw HTML blocks; inline tags and comments do not hide a section. */
@@ -335,7 +351,11 @@ export function unterminatedCloser(source: string): string | undefined {
 export function renderedLines(raw: string): RenderedLine[] {
   return scanMarkdown(raw)
     .filter((line) => !line.delimiter)
-    .map((line) => ({ text: line.visible, fenced: line.fenced }));
+    .map((line) => ({
+      text: line.visible,
+      fenced: line.fenced,
+      heading: line.heading !== undefined || line.headingRest,
+    }));
 }
 
 /** Remove blockquote punctuation for the contract's TODO-placeholder policy. */

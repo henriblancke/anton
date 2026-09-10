@@ -530,6 +530,33 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled.split("\n\n## Context")[1]).toBe(authored.split("\n\n## Context")[1]);
   });
 
+  it("keeps a Setext-underlined Acceptance heading whole — the underline is the heading, not its body", () => {
+    // A half-created follow-up can carry `Acceptance Criteria` / `===`. Keeping only the label and
+    // dropping the underline turned the surviving heading into plain text, leaving the reconciled
+    // bead with no rendered Acceptance at all — and no retry reconciles a bead that reads finished.
+    const setext = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "Acceptance Criteria",
+      "===",
+      "- [ ] the old box",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(setext, edited);
+
+    expect(reconciled).toContain("Acceptance Criteria\n===\n- [ ] Guard the null branch.");
+    expect(reconciled).not.toContain("the old box");
+    expect(reconciled).toContain("\n\n## Context\nKept.");
+    // The rewrite renders the section it claims to have written.
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "Guard the null branch.",
+    );
+  });
+
   it("takes a sub-heading grouping criteria with the acceptance — it is that section's own content", () => {
     const grouped = [
       "## Goal",
