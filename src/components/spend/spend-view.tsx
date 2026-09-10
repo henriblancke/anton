@@ -116,7 +116,7 @@ function SpendSummary({
           value={formatUsd(breakdown.usd)}
           hint={
             breakdown.usd === undefined
-              ? "No call in this window used a model anton has a price for."
+              ? "No call in this window has a billable rate anton can verify."
               : hasGatewayPricing
                 ? `Derived from measured tokens · direct rates as of ${PRICES_AS_OF}; routed rates from 9Router`
                 : `Derived from measured tokens · prices as of ${PRICES_AS_OF}`
@@ -158,7 +158,7 @@ function SpendSummary({
           {breakdown.unpricedModels.length > 0 ? (
             <>
               {" "}
-              — no price for{" "}
+              — pricing could not be verified for{" "}
               <span className="font-mono">{breakdown.unpricedModels.join(", ")}</span>. Their tokens
               are counted; their dollars are not, and they are not free.
             </>

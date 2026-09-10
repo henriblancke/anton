@@ -133,7 +133,7 @@ function SpendTableRow({ group, maxTokens }: { group: SpendGroup; maxTokens: num
           </span>
           <span className="font-mono text-[10px] text-subtle">
             {group.rows} row{group.rows === 1 ? "" : "s"}
-            {group.usd === undefined && hasMeasuredTokens(group) ? " · no price for this model" : ""}
+            {group.usd === undefined && hasMeasuredTokens(group) ? " · pricing unverified" : ""}
             {group.usd === undefined && !hasMeasuredTokens(group)
               ? " · reported no usage"
               : ""}
@@ -163,7 +163,7 @@ function SpendTableRow({ group, maxTokens }: { group: SpendGroup; maxTokens: num
             className="text-subtle"
             title={
               hasMeasuredTokens(group)
-                ? "anton has no price for this model, so its tokens are counted and its cost is not. Not free — unpriced."
+                ? "Anton cannot verify billing for this model and route, so its tokens are counted and its cost is not. Not free — unpriced."
                 : "This invocation reported no usage at all, so there is nothing to price."
             }
           >
@@ -174,7 +174,7 @@ function SpendTableRow({ group, maxTokens }: { group: SpendGroup; maxTokens: num
             className={partial ? "text-muted-foreground" : "text-foreground"}
             title={
               partial
-                ? `At least this — ${group.unpriced} of ${group.rows} rows use a model anton has no price for.`
+                ? `At least this — anton cannot verify billing for ${group.unpriced} of ${group.rows} rows.`
                 : "Derived from the measured token counts and anton's own price table."
             }
           >

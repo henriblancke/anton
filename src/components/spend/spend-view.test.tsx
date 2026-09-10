@@ -137,7 +137,7 @@ describe("a model anton has no price for", () => {
     expect(within(unpriced).queryByText("$0.00")).toBeNull();
     // The tokens are still counted — unpriceable is not unmeasured.
     expect(within(unpriced).getByText("990K")).toBeTruthy();
-    expect(within(unpriced).getByText(/no price for this model/)).toBeTruthy();
+    expect(within(unpriced).getByText(/pricing unverified/)).toBeTruthy();
   });
 
   it("says the window total is a floor rather than letting it read as complete", () => {
@@ -173,7 +173,7 @@ describe("a model anton has no price for", () => {
     );
 
     const models = within(tableFor("Model"));
-    expect(models.getByText(/no price for this model/)).toBeTruthy();
+    expect(models.getByText(/pricing unverified/)).toBeTruthy();
     expect(models.getByText(/reported no usage/)).toBeTruthy();
   });
 });
