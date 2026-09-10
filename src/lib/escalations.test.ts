@@ -448,6 +448,22 @@ describe("dismissing a row raised before signatures existed", () => {
     expect((await raise()).suppressed).toBe(true);
   });
 
+  it("stays down across an age tick too, so the backfill matches a fresh raise", async () => {
+    // The two paths must normalize identically: the stamp is derived from the stored `reason`
+    // COLUMN, the re-raise from a freshly rendered finding. Normalization living anywhere but
+    // inside escalationSignature would drift them apart and re-raise a dismissed legacy row.
+    const { escalation } = await raise({ finding: finding({ reason: "run parked 4h: agent exited 1" }) });
+    t.db
+      .update(schema.escalations)
+      .set({ signature: null })
+      .where(eq(schema.escalations.id, escalation.id))
+      .run();
+    expect(await settleEscalation(t.db, clock, escalation.id, "dismissed", true)).toBe(true);
+
+    const later = await raise({ finding: finding({ reason: "run parked 5h: agent exited 1" }) });
+    expect(later.suppressed).toBe(true);
+  });
+
   it("still lets a changed stall through", async () => {
     await settleEscalation(t.db, clock, await legacyRow(), "dismissed", true);
     const changed = await raise({ finding: { ...finding(), reason: "parked: worktree dirty" } });
