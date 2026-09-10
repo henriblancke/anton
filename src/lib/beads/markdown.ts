@@ -281,7 +281,9 @@ const HTML_BLOCKS: { open: RegExp; close: string }[] = [
   { open: /^ {0,3}<textarea(?:[ \t>]|$)/i, close: "</textarea>" },
   { open: /^ {0,3}<\?/, close: "?>" },
   { open: /^ {0,3}<!\[CDATA\[/, close: "]]>" },
-  { open: /^ {0,3}<![A-Za-z]/, close: ">" },
+  // CommonMark's declaration block requires an uppercase ASCII letter. A lowercase `<!foo` is
+  // ordinary text, so treating it as raw HTML hides the Acceptance heading that follows it.
+  { open: /^ {0,3}<![A-Z]/, close: ">" },
 ];
 
 /**
@@ -369,9 +371,17 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
     // An HTML block is literal until its closing text: no fence opens and no comment starts inside
     // one, so nothing else is tracked while it stands.
     if (html) {
-      inHtml.push(true);
-      if (text.toLowerCase().includes(html.close)) html = undefined;
-      continue;
+      // A persistent HTML block is still bound to the list item or blockquote that opened it.
+      // Once a line leaves that container, CommonMark closes the container (and therefore this
+      // block) before reading the leaving line. Do not let a quoted `<script>` hide a top-level
+      // Acceptance heading merely because its closing tag was never written.
+      if (indent && !text.startsWith(indent)) {
+        html = undefined;
+      } else {
+        inHtml.push(true);
+        if (text.toLowerCase().includes(html.close)) html = undefined;
+        continue;
+      }
     }
     if (looseHtml) {
       // A blank line ends it, and what follows renders as Markdown again.

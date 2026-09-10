@@ -282,6 +282,9 @@ describe("unterminatedCloser", () => {
     expect(unterminatedCloser('<span x="y">')).toBeUndefined();
     // A tag opened MID-line is inline HTML, which starts no block at all.
     expect(unterminatedCloser("see <script> in the note")).toBeUndefined();
+    // HTML declarations require an uppercase ASCII letter. A lowercase declaration-shaped line is
+    // prose, so it cannot swallow a section appended below it.
+    expect(unterminatedCloser("<!todo\n## Acceptance")).toBeUndefined();
   });
 });
 
@@ -320,6 +323,15 @@ describe("htmlBlockLines", () => {
       true,
     ]);
     expect(htmlBlockLines("> <script>\n> ## Acceptance Criteria")).toEqual([true, true]);
+    // A persistent block ends with the container that holds it. The unquoted heading is visible;
+    // carrying the HTML state across the quote boundary hid it and caused reconciliation to append
+    // a duplicate Acceptance section.
+    expect(htmlBlockLines("> <script>\n> raw\n## Acceptance Criteria\n- [ ] stale")).toEqual([
+      true,
+      true,
+      false,
+      false,
+    ]);
     // The marker does not make a block of a tag that opens none: conditions 6 and 7 still end at
     // the blank line, and inline HTML mid-line still starts nothing.
     expect(htmlBlockLines("- <div>\n  x\n\n## Acceptance")).toEqual([false, false, false, false]);

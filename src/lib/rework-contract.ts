@@ -285,12 +285,14 @@ const HTML_BLOCK_START = new RegExp(
     "<(?:pre|script|style|textarea)(?:[ \\t>]|$)" +
     "|<!--" +
     "|<\\?" +
-    "|<![A-Za-z]" +
     "|<!\\[CDATA\\[" +
     `|</?(?:${HTML_BLOCK_TAGS})(?:[ \\t>]|/>|$)` +
     ")",
   "i",
 );
+
+/** CommonMark declarations start with an uppercase ASCII letter; `<!todo` is ordinary prose. */
+const htmlBlockStart = (text: string): boolean => HTML_BLOCK_START.test(text) || /^ {0,3}<![A-Z]/.test(text);
 
 /**
  * The containers a line's content sits in, outermost first: a column its text must reach, or a
@@ -510,7 +512,7 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
     const lazy =
       openParagraph !== undefined &&
       !BLOCK_START.test(dedented) &&
-      !HTML_BLOCK_START.test(dedented);
+      !htmlBlockStart(dedented);
     while (!lazy && items.length > 0 && indent < items[items.length - 1]!) items.pop();
     const base = items[items.length - 1] ?? 0;
     const rel = indent >= base ? dedent(line.text, base) : line.text;
@@ -946,7 +948,7 @@ function setextHeadingRun(
     // A comment that opens AND closes on one line is neither `commented` nor `literal`, so the walk
     // used to cross it — dropping an actionable paragraph as a heading and leaving doneGap to refuse
     // a request that stated a step. It opens an HTML block, which ends the paragraph like any other.
-    if (HTML_BLOCK_START.test(inner)) return 0;
+    if (htmlBlockStart(inner)) return 0;
     // A fence opened AFTER container markers is invisible to the flat scanner, so `fenced` above
     // never fires for it and the walk crossed the block: `> Fix the retry` / `> ``` ` / `> expected`
     // / `> ``` ` / `> ===` is a step, a sample and a stray `===`, and reading the run as one heading

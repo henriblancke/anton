@@ -707,6 +707,20 @@ describe("reconcileFollowUpDescription", () => {
     expect(acceptanceBody(makeBead({ id: "f", description: appended }))).toContain(
       "- [ ] Cover the exhausted path.",
     );
+    // Leaving a quoted persistent block closes it with the quote. The following Acceptance heading
+    // renders normally and must be replaced in place rather than misread as hidden and duplicated.
+    const leftQuote = "## Goal\ng\n\n> <script>\n> raw\n## Acceptance Criteria\n- [ ] stale";
+    const visibleAfterQuote = reconcileFollowUpDescription(leftQuote, edited);
+    expect(visibleAfterQuote).not.toContain("stale");
+    expect(visibleAfterQuote).not.toContain("</script>");
+    expect(visibleAfterQuote.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // A declaration block begins only with an uppercase ASCII letter. Lowercase `<!foo` is prose,
+    // so the visible Acceptance section below it is likewise replaced, not duplicated after `>`.
+    const lowercaseDeclaration = "## Goal\ng\n\n<!foo\n## Acceptance Criteria\n- [ ] stale";
+    const visibleAfterDeclaration = reconcileFollowUpDescription(lowercaseDeclaration, edited);
+    expect(visibleAfterDeclaration).not.toContain("stale");
+    expect(visibleAfterDeclaration).not.toContain("\n>\n");
+    expect(visibleAfterDeclaration.match(/^##+ Acceptance/gm)).toHaveLength(1);
   });
 
   it("closes a construct nested in a list item inside that item, not at the top level", () => {
