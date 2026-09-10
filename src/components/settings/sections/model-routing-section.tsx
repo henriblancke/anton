@@ -7,7 +7,12 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { JOB_TYPE_LABELS } from "@/lib/jobs-filters";
 import { MODEL_ROUTABLE_STEP_IDS, PIPELINE_JOB_TYPE } from "@/lib/jobs/step-ids";
-import { MODEL_ROUTABLE_JOB_TYPES, subsumes, type ModelRouteMatch } from "@/lib/jobs/model-routing";
+import {
+  MODEL_ROUTABLE_JOB_TYPES,
+  isModelRoutableJobTypeWithLabelContext,
+  subsumes,
+  type ModelRouteMatch,
+} from "@/lib/jobs/model-routing";
 import { RowControls, SectionHeading } from "@/components/settings/settings-fields";
 import type { ModelRouteRow } from "@/components/settings/settings-types";
 import type { SettingsForm } from "@/components/settings/use-settings-form";
@@ -130,6 +135,7 @@ function RouteRow({
 }) {
   const n = index + 1;
   const stepsApply = row.jobType === ANY || row.jobType === PIPELINE_JOB_TYPE;
+  const labelsApply = row.jobType === ANY || isModelRoutableJobTypeWithLabelContext(row.jobType);
   const dead = shadowedBy !== undefined;
 
   return (
@@ -151,6 +157,9 @@ function RouteRow({
               // A step is only a fact about the pipeline job, so switching away drops it rather
               // than leaving an invisible matcher the save would then be refused for.
               ...(jobType !== ANY && jobType !== PIPELINE_JOB_TYPE ? { step: ANY } : {}),
+              // Scheduled jobs have no bead to supply labels, so avoid an invisible matcher the
+              // settings boundary would reject as unreachable.
+              ...(jobType !== ANY && !isModelRoutableJobTypeWithLabelContext(jobType) ? { label: ANY } : {}),
             })
           }
           options={MODEL_ROUTABLE_JOB_TYPES.map((t) => ({ value: t, label: JOB_TYPE_LABELS[t] }))}
@@ -174,7 +183,12 @@ function RouteRow({
           placeholder="any label"
           maxLength={120}
           aria-label={`Rule ${n} bead label`}
-          className="min-w-0 flex-1 basis-32 rounded-lg border border-border bg-background px-2.5 py-1.5 font-mono text-[12px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+          disabled={!labelsApply}
+          title={labelsApply ? undefined : "this job has no bead labels"}
+          className={cn(
+            "min-w-0 flex-1 basis-32 rounded-lg border border-border bg-background px-2.5 py-1.5 font-mono text-[12px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60",
+            !labelsApply && "cursor-not-allowed opacity-50",
+          )}
         />
 
         <span aria-hidden="true" className="shrink-0 text-[11px] text-subtle">

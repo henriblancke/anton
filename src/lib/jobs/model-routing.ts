@@ -7,7 +7,7 @@
  * read one definition of what a rule is.
  */
 import type { JobType } from "./queue";
-import type { BuiltinStepId } from "./step-ids";
+import { PIPELINE_JOB_TYPE, type BuiltinStepId } from "./step-ids";
 import type { ProjectSettings } from "../projects";
 
 /** Job workers that actually dispatch Claude and can therefore be named in a model route. */
@@ -18,10 +18,19 @@ export const MODEL_ROUTABLE_JOB_TYPES = [
   "product-master",
 ] as const satisfies readonly JobType[];
 
+/** Routable workers that have a bead available for label matching. */
+export const MODEL_ROUTABLE_JOB_TYPES_WITH_LABEL_CONTEXT = ["execute-epic", "review-fix-pr"] as const;
+
 const MODEL_ROUTABLE_JOB_TYPE_SET = new Set<string>(MODEL_ROUTABLE_JOB_TYPES);
 
 export function isModelRoutableJobType(value: unknown): value is (typeof MODEL_ROUTABLE_JOB_TYPES)[number] {
   return typeof value === "string" && MODEL_ROUTABLE_JOB_TYPE_SET.has(value);
+}
+
+export function isModelRoutableJobTypeWithLabelContext(
+  value: unknown,
+): value is (typeof MODEL_ROUTABLE_JOB_TYPES_WITH_LABEL_CONTEXT)[number] {
+  return typeof value === "string" && MODEL_ROUTABLE_JOB_TYPES_WITH_LABEL_CONTEXT.includes(value as never);
 }
 
 /**
@@ -69,9 +78,15 @@ export type ModelRouteMatch = { [K in Matcher]?: string };
  * identical rules subsume each other. `{label: "a"}` and `{label: "b"}` subsume neither way.
  */
 export function subsumes(earlier: ModelRouteMatch, later: ModelRouteMatch): boolean {
-  return MODEL_ROUTE_MATCHERS.every(
-    (key: Matcher) => earlier[key] === undefined || earlier[key] === later[key],
-  );
+  // A step only exists in execute-epic. Treat that implication as an explicit matcher before
+  // comparing rules, or `{jobType: execute-epic}` would incorrectly fail to shadow `{step: review}`.
+  const effectiveJobType = (route: ModelRouteMatch) =>
+    route.step === undefined ? route.jobType : PIPELINE_JOB_TYPE;
+  return MODEL_ROUTE_MATCHERS.every((key: Matcher) => {
+    const earlierValue = key === "jobType" ? effectiveJobType(earlier) : earlier[key];
+    const laterValue = key === "jobType" ? effectiveJobType(later) : later[key];
+    return earlierValue === undefined || earlierValue === laterValue;
+  });
 }
 
 /** The facts known at one Claude invocation. Omitted step/labels mean that call has none. */

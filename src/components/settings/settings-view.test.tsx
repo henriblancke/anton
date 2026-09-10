@@ -10,8 +10,8 @@ import { toast } from "sonner";
 import { PICKER_BAR } from "@/components/settings/sections/picker-autonomy-section";
 import { SettingsView } from "@/components/settings/settings-view";
 import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
-import { JOB_TYPES } from "@/lib/jobs-filters";
-import { BUILTIN_STEP_IDS } from "@/lib/jobs/step-ids";
+import { MODEL_ROUTABLE_JOB_TYPES } from "@/lib/jobs/model-routing";
+import { MODEL_ROUTABLE_STEP_IDS } from "@/lib/jobs/step-ids";
 import { REPAIR_CLASSES } from "@/lib/gardener/repair";
 import type { Project } from "@/lib/types";
 
@@ -680,18 +680,30 @@ describe("SettingsView model routing (anton-uu7r)", () => {
     expect(step.value).toBe("");
   });
 
-  it("offers every job type the queue defines and every step anton can run", () => {
+  it("disables the label matcher for a job without bead context, and drops a set one", () => {
+    renderView({ modelRoutes: [{ jobType: "execute-epic", label: "risk:high", model: "claude-opus-5" }] });
+
+    fireEvent.change(screen.getByLabelText("Rule 1 job type"), {
+      target: { value: "nightly-stringer" },
+    });
+
+    const label = screen.getByLabelText("Rule 1 bead label") as HTMLInputElement;
+    expect(label.disabled).toBe(true);
+    expect(label.value).toBe("");
+  });
+
+  it("offers every job type and step that can invoke Claude", () => {
     renderView({ modelRoutes: [{ model: "claude-opus-5" }] });
 
     const jobOptions = within(screen.getByLabelText("Rule 1 job type"))
       .getAllByRole("option")
       .map((o) => (o as HTMLOptionElement).value);
-    expect(jobOptions).toEqual(["", ...JOB_TYPES]);
+    expect(jobOptions).toEqual(["", ...MODEL_ROUTABLE_JOB_TYPES]);
 
     const stepOptions = within(screen.getByLabelText("Rule 1 step"))
       .getAllByRole("option")
       .map((o) => (o as HTMLOptionElement).value);
-    expect(stepOptions).toEqual(["", ...BUILTIN_STEP_IDS]);
+    expect(stepOptions).toEqual(["", ...MODEL_ROUTABLE_STEP_IDS]);
   });
 });
 

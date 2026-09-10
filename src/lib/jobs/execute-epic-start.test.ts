@@ -203,3 +203,16 @@ describe("beginEpicRun — the created run records its endpoint host (anton-oom5
     expect(updateRunMock.mock.calls[0][3]).toMatchObject({ endpointHost: "router.local:20128" });
   });
 });
+
+describe("beginEpicRun — the run-row model", () => {
+  it("keeps the configured fallback instead of claiming a target-label route ran for every ticket", async () => {
+    projectSettings = {
+      model: "fallback",
+      modelRoutes: [{ jobType: "execute-epic", label: "risk:high", model: "routed" }],
+    };
+
+    await start([bead("t1", { labels: [LABELS.approved, "risk:high"] })], "t1");
+
+    expect(createRunMock.mock.calls[0][2]).toMatchObject({ model: "fallback" });
+  });
+});

@@ -18,6 +18,7 @@ describe("subsumes — whether an earlier rule makes a later one dead", () => {
       true,
     );
     expect(subsumes({ step: "review" }, { jobType: "execute-epic", step: "review" })).toBe(true);
+    expect(subsumes({ jobType: "execute-epic" }, { step: "review" })).toBe(true);
   });
 
   it("a NARROWER rule does not subsume the broader one — narrowest-first is the fix", () => {
@@ -71,5 +72,8 @@ describe("modelRoutesSchema", () => {
     expect(modelRoutesSchema.safeParse([{ step: "claude", model: "custom" }]).success).toBe(true);
     expect(modelRoutesSchema.safeParse([{ jobType: "review-fix", model: "unused" }]).success).toBe(false);
     expect(modelRoutesSchema.safeParse([{ step: "verify", model: "unused" }]).success).toBe(false);
+    expect(
+      modelRoutesSchema.safeParse([{ jobType: "nightly-stringer", label: "risk:high", model: "unused" }]).success,
+    ).toBe(false);
   });
 });

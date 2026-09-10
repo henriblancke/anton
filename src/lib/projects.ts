@@ -55,7 +55,13 @@ import type { FailureBreakerConfig } from "./autopilot-failure-streak";
 import type { ScoreBreakerConfig } from "./autopilot-score-slide";
 import type { WipLimitConfig } from "./autopilot-wip";
 import type { ScoreAlarm } from "./jobs/review-alarm";
-import { MODEL_ROUTABLE_JOB_TYPES, isModelRoutableJobType, subsumes, type ModelRoute } from "./jobs/model-routing";
+import {
+  MODEL_ROUTABLE_JOB_TYPES,
+  isModelRoutableJobType,
+  isModelRoutableJobTypeWithLabelContext,
+  subsumes,
+  type ModelRoute,
+} from "./jobs/model-routing";
 import { MODEL_ROUTABLE_STEP_IDS, PIPELINE_JOB_TYPE, isModelRoutableStepId } from "./jobs/step-ids";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
@@ -1081,7 +1087,8 @@ export const modelRoutesSchema = z
  *
  * 1. **An impossible pair.** Only `execute-epic` walks a run formula, so `step:` alongside any other
  *    job type describes work that does not exist.
- * 2. **A row an earlier row shadows.** First match wins, so a rule already subsumed by one above it
+ * 2. **A label on a job without a bead.** Scheduled jobs have no bead labels to match.
+ * 3. **A row an earlier row shadows.** First match wins, so a rule already subsumed by one above it
  *    is unreachable — the same reasoning that rejects a twice-mapped pipeline variant.
  */
 function unreachableRoutes(routes: ModelRoute[], ctx: z.RefinementCtx): void {
@@ -1093,6 +1100,20 @@ function unreachableRoutes(routes: ModelRoute[], ctx: z.RefinementCtx): void {
         message:
           `only \`${PIPELINE_JOB_TYPE}\` walks a pipeline, so a \`${route.jobType}\` rule naming ` +
           `step \`${route.step}\` can never match — drop the step, or route the job type instead`,
+      });
+      return;
+    }
+    if (
+      route.label !== undefined &&
+      route.jobType !== undefined &&
+      !isModelRoutableJobTypeWithLabelContext(route.jobType)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: [i, "label"],
+        message:
+          `a \`${route.jobType}\` job has no bead labels, so a label route can never match — ` +
+          "drop the label, or route a bead-backed job instead",
       });
       return;
     }
