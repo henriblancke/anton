@@ -286,14 +286,21 @@ describe("metered", () => {
     tdb.close();
   });
 
-  it("records nothing when the driver throws — the ledger holds spend, not failures", async () => {
+  it("records unknown error usage when the driver throws", async () => {
     const tdb = makeProjectDb();
     const driver = metered(tdb.db, clock, { ...DIMENSIONS, projectId: tdb.projectId }, async () => {
       throw new Error("mid-stream death");
     });
 
     await expect(driver({ cwd: "/tmp/wt", prompt: "work", routing })).rejects.toThrow("mid-stream death");
-    expect(await listInvocations(tdb.db, tdb.projectId)).toHaveLength(0);
+    await expect(listInvocations(tdb.db, tdb.projectId)).resolves.toMatchObject([
+      {
+        modelReported: null,
+        inputTokens: null,
+        outcome: "error",
+        modelRequested: DIMENSIONS.modelRequested,
+      },
+    ]);
     tdb.close();
   });
 });

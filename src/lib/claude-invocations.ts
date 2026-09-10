@@ -227,13 +227,10 @@ export async function invocationSpend(
  * a new dispatch site forgets. Shaped exactly like the driver, so it composes with the resume-aware
  * driver the run already wraps (`resilientClaude`) and drops into the same `deps.runClaude` seam.
  *
- * The grain is one recorded invocation per RESULT. A dispatch whose transient death is retried
- * in-session produces one result and one recorded invocation, which is honest in both directions: a
- * mid-stream death emits no result event at all, so its usage is not merely unrecorded but unknown,
- * and its tokens are already inside the resumed session's cumulative `modelUsage`.
- *
- * A throw passes straight through — the ledger records what was spent, never what failed; the run
- * row and the session log own the failure.
+ * The grain is one recorded invocation per driver call. A dispatch whose transient death is retried
+ * in-session produces an error row for the interrupted call and a result row for the retry. A
+ * mid-stream death has no result event, so its token usage is unknown — but omitting the invocation
+ * entirely would systematically understate spend.
  */
 export function metered(
   db: AntonDb,
@@ -242,8 +239,7 @@ export function metered(
   driver: (options: RunClaudeOptions) => Promise<ClaudeResult>,
 ): (options: RunClaudeOptions) => Promise<ClaudeResult> {
   return async (options) => {
-    const result = await driver(options);
-    await recordInvocation(db, clock, {
+    const invocationDimensions = {
       ...dimensions,
       // The model as SPAWNED, which is what the result's usage answers for — the caller's dimension
       // is only the default for a driver invoked with no model of its own.
@@ -253,8 +249,17 @@ export function metered(
       baseUrl:
         dimensions.baseUrl ??
         (options.routing.routed ? options.routing.baseUrl : undefined),
-    }, result);
-    return result;
+    };
+    try {
+      const result = await driver(options);
+      await recordInvocation(db, clock, invocationDimensions, result);
+      return result;
+    } catch (error) {
+      // A rejected driver may have consumed tokens before losing its result event. Preserve that
+      // fact as unknown usage; the error itself remains the driver's responsibility.
+      await recordInvocation(db, clock, invocationDimensions, { ok: false, modelUsage: [] });
+      throw error;
+    }
   };
 }
 
