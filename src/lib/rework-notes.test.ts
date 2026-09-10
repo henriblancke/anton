@@ -845,6 +845,23 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).not.toMatch(/\n  ```\n\n## Acceptance Criteria/);
   });
 
+  it("keeps a list container across a blank before its nested fence", () => {
+    const separatedFence = [
+      "## Goal",
+      "g",
+      "",
+      "- example",
+      "",
+      "  ```md",
+      "  sample",
+      "## Acceptance Criteria",
+      "- [ ] stale",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(separatedFence, edited);
+    expect(reconciled).toContain("  ```md\n  sample\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled).not.toContain("stale");
+  });
+
   it("keeps a dropped duplicate as an empty boundary — it terminated the peer section after it", () => {
     // `## Acceptance`, a nested `### Acceptance Criteria`, then a peer `### Success`: the judge reads
     // Success as its own section only because the duplicate closed the shallower Acceptance. Dropping

@@ -341,6 +341,16 @@ describe("htmlBlockLines", () => {
       true,
       true,
     ]);
+    // A blank is allowed inside the item, so it does not close the persistent block before the
+    // indented Acceptance-looking heading or its explicit closer.
+    expect(htmlBlockLines("- <script>\n  raw\n\n  ## Acceptance Criteria\n  - [ ] stale\n  </script>")).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+    ]);
     expect(htmlBlockLines("> <script>\n> ## Acceptance Criteria")).toEqual([true, true]);
     // A persistent block ends with the container that holds it. The unquoted heading is visible;
     // carrying the HTML state across the quote boundary hid it and caused reconciliation to append

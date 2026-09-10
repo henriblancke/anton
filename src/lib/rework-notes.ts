@@ -271,7 +271,9 @@ function containerFenceLines(description: string): { fenced: boolean[]; openers:
       // Continuations begin at the content column. Keep this even when the marker's own line is
       // prose: a fence can open on its following line (`- example` then `  ```md`).
       itemPrefix = text.slice(0, text.length - item[1]!.length).replace(/[^\t]/g, " ");
-    } else if (itemPrefix && !text.startsWith(itemPrefix)) {
+    // A blank alone does not leave a list item; its following continuation may still be at the
+    // item's content column. Only actual dedented content closes this remembered container.
+    } else if (itemPrefix && text.trim() !== "" && !text.startsWith(itemPrefix)) {
       itemPrefix = undefined;
     }
     const inner = itemPrefix && text.startsWith(itemPrefix) ? text.slice(itemPrefix.length) : text;

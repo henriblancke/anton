@@ -383,7 +383,9 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
     if (html) {
       // Leaving a list item or blockquote ends the block it contained before this line. Process the
       // dedented line again in the normal scanner, rather than treating its heading as raw HTML.
-      if (indent && !text.startsWith(indent)) html = undefined;
+      // A blank is valid inside an item and cannot by itself close the persistent block it holds.
+      // Only nonblank content dedented out of that container resumes ordinary Markdown scanning.
+      if (indent && text.trim() !== "" && !text.startsWith(indent)) html = undefined;
       else {
         inHtml.push(true);
         if (text.toLowerCase().includes(html.close)) html = undefined;
@@ -439,7 +441,9 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
       line.visible.trim() !== "" &&
       !isHeading(container.content) &&
       !THEMATIC_BREAK.test(container.content) &&
-      !EMPTY_LIST_ITEM.test(container.content) &&
+      // The marker is peeled from `container.content`; test the source line to keep a bare list
+      // item from pretending it opened a paragraph and blocking the following type-7 HTML block.
+      !EMPTY_LIST_ITEM.test(line.masked) &&
       !/^ {4}/.test(container.content);
   }
   const closer = state.fence
