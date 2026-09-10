@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { EscalationActions } from "@/components/board/escalation-actions";
+import { EscalationActions } from "@/components/health/escalation-actions";
 
 const refresh = vi.fn();
 const success = vi.fn();

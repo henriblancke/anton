@@ -956,16 +956,30 @@ async function resumeForFinding(
  * Raise the finding on the board with its evidence, and note it on the target bead. A row that
  * already existed converges on `escalations_open_unique` rather than counting twice — the same
  * idempotence the resume path has.
+ *
+ * A stall a human has DISMISSED raises nothing at all (anton-7gxs): `raiseEscalation` reports it
+ * `suppressed`, and this pass then treats it as HELD — nothing on the board, and no bd note either.
+ * The note matters as much as the row: it is how an escalation is visible off the anton UI, so
+ * writing one for a suppressed finding would re-nag on the board anton doesn't own, hourly, about
+ * exactly the alert the operator put down.
  */
 async function escalateFinding(
   finding: RunHealthFinding,
   actor: FindingActor,
 ): Promise<FindingOutcome> {
-  const { escalation, created } = await raiseEscalation(actor.db, actor.clock, {
+  const { escalation, created, suppressed } = await raiseEscalation(actor.db, actor.clock, {
     projectId: actor.projectId,
     finding,
     epicBeadId: epicBeadIdFor(finding, actor.ctx),
   });
+  if (suppressed) {
+    console.log(
+      `[unstick] ${finding.key} stays down: an operator dismissed this exact stall ` +
+        `(escalation ${escalation.id}); it returns if the stall changes`,
+    );
+    await actor.heartbeat();
+    return { action: "held", wroteBead: false };
+  }
   const wroteBead = await writeEscalationNote(
     actor.repoPath,
     escalation,

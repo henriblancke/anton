@@ -725,6 +725,39 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(jobRows()).toEqual([]);
   });
 
+  /**
+   * A human dismissal is durable (anton-7gxs), and this pass is where that has to hold: without it,
+   * an operator who cleared a 503 storm would find the same thirty rows back an hour later — plus
+   * thirty fresh bd notes on the beads, which is the half that nags on a board anton doesn't own.
+   */
+  it("raises nothing for a stall an operator dismissed, and writes no note for it", async () => {
+    seedParkedRun("r-2", "e-2", "agent exited 1");
+    await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: agent exited 1"));
+
+    expect(await sweep()).toMatchObject({ escalated: 1 });
+    const raised = escalationRows()[0]!;
+    await realSettleEscalation(t.db, clock, raised.id, "dismissed", true);
+    noteMock.mockClear();
+
+    // Same stall, next sweep: held, not escalated — and nothing new on the board or the bead.
+    expect(await sweep()).toMatchObject({ escalated: 0, held: 1 });
+    expect(escalationRows().filter((row) => row.status === "open")).toEqual([]);
+    expect(noteMock).not.toHaveBeenCalled();
+  });
+
+  it("raises again when the same run parks for a different reason", async () => {
+    seedParkedRun("r-2", "e-2", "agent exited 1");
+    await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: agent exited 1"));
+    await sweep();
+    await realSettleEscalation(t.db, clock, escalationRows()[0]!.id, "dismissed", true);
+
+    // The dismissal covers the stall it was made about, not the run forever: a new failure on the
+    // same run is a new decision, and burying it would be the failure mode this feature must avoid.
+    await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: worktree is dirty"));
+    expect(await sweep()).toMatchObject({ escalated: 1 });
+    expect(escalationRows().filter((row) => row.status === "open")).toHaveLength(1);
+  });
+
   it("writes the board-native bd note once and pushes it, then stops retrying it", async () => {
     seedParkedRun("r-2", "e-2", "agent exited 1");
     await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: agent exited 1"));

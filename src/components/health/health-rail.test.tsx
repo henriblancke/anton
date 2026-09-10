@@ -20,6 +20,10 @@ function baseHealth(over: Partial<ProjectHealth> = {}): ProjectHealth {
     scanHealth: undefined,
     trajectory: undefined,
     stoppedCount: 0,
+    escalations: [],
+    dismissed: [],
+    breaker: undefined,
+    parks: undefined,
     staleServers: [],
     pickerLog: [],
     ...over,
@@ -85,21 +89,35 @@ describe("HealthRail", () => {
     );
   });
 
-  it("names the count of stopped runs and links back to the board", () => {
+  it("counts the open alerts and jumps to the list, which is on this page now", () => {
     render(<HealthRail slug="anton" health={baseHealth({ stoppedCount: 2 })} />);
-    expect(screen.getByText(/2 stopped runs/)).toBeTruthy();
-    expect(screen.getByText(/answered on the board, not/)).toBeTruthy();
+    expect(screen.getByText(/2/)).toBeTruthy();
+    expect(screen.getByText(/needing a decision/)).toBeTruthy();
+    // The rows moved here from the board (anton-7gxs), so the rail's pointer moved with them: it
+    // jumps DOWN the page rather than redirecting to a board that no longer lists them.
+    expect(screen.getByRole("link", { name: "Jump to Needs you" }).getAttribute("href")).toBe(
+      "#needs-you",
+    );
     expect(screen.getByRole("link", { name: "Back to board" }).getAttribute("href")).toBe(
       "/projects/anton",
     );
   });
 
-  it("drops the redirection clause when nothing is stopped", () => {
+  it("says how many are dismissed, and that they come back if the stall changes", () => {
+    const dismissed = [
+      { id: "esc-9", findingKey: "k", kind: "exhausted-job", reason: "r", ageMs: 0, status: "resolved", noted: true, raisedAt: 0 },
+    ] as ProjectHealth["dismissed"];
+    render(<HealthRail slug="anton" health={baseHealth({ dismissed })} />);
+    expect(screen.getByText(/1 dismissed/)).toBeTruthy();
+  });
+
+  it("drops the jump when nothing is stopped, and never claims a dismissal nobody made", () => {
     render(<HealthRail slug="anton" health={baseHealth({ stoppedCount: 0 })} />);
-    // The block still renders — this rail always does — but "answered on the board, not here"
-    // would imply work is waiting there, which is the opposite of what a zero count means.
-    expect(screen.getByText("No stopped runs.")).toBeTruthy();
-    expect(screen.queryByText(/answered on the board/)).toBeNull();
+    // The block still renders — this rail always does — but an anchor to an absent section, or a
+    // dismissed count of zero, would each point at something that isn't there.
+    expect(screen.getByText("Nothing is stopped.")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Jump to Needs you" })).toBeNull();
+    expect(screen.queryByText(/dismissed/)).toBeNull();
     expect(screen.getByRole("link", { name: "Back to board" })).toBeTruthy();
   });
 });

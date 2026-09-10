@@ -20,6 +20,10 @@ function health(over: Partial<ProjectHealth> = {}): ProjectHealth {
     scanHealth: undefined,
     trajectory: undefined,
     stoppedCount: 0,
+    escalations: [],
+    dismissed: [],
+    breaker: undefined,
+    parks: undefined,
     staleServers: [],
     pickerLog: [],
     ...over,
@@ -93,7 +97,7 @@ describe("HealthReport", () => {
     render(<HealthReport slug="anton" health={health()} />);
     // Anchored on the rail's headings and its back-link, which render unconditionally — NOT on the
     // stopped-run copy, which varies with the count (see HealthRail's zero case).
-    expect(screen.getByText("On the board")).toBeTruthy();
+    expect(screen.getByText("Needs you")).toBeTruthy();
     expect(screen.getByText("Last checked")).toBeTruthy();
     expect(screen.getByRole("link", { name: "Back to board" })).toBeTruthy();
   });

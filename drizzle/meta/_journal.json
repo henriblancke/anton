@@ -260,6 +260,13 @@
       "when": 1789045442716,
       "tag": "0036_claude_invocation_id",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "6",
+      "when": 1789055614769,
+      "tag": "0037_escalation_dismissal",
+      "breakpoints": true
     }
   ]
 }

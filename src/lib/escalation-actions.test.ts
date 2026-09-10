@@ -22,6 +22,7 @@ const actOnBead = vi.fn<(...args: unknown[]) => Promise<string>>();
 const actOnJob = vi.fn<(...args: unknown[]) => Promise<string>>();
 const readTargetState = vi.fn<(...args: unknown[]) => Promise<string>>();
 const restartedLocally = vi.fn<(projectId: string, epicBeadId: string) => boolean>();
+const restoreEscalation = vi.fn<(...args: unknown[]) => Promise<boolean>>();
 
 vi.mock("./db", async () => {
   const actual = await vi.importActual<typeof import("./db")>("./db");
@@ -33,6 +34,7 @@ vi.mock("./escalations", async () => {
     ...actual,
     getEscalation: (...args: unknown[]) => getEscalation(...args),
     settleEscalation: (...args: unknown[]) => settleEscalation(...args),
+    restoreEscalation: (...args: unknown[]) => restoreEscalation(...args),
     // The row IS the view in this suite: `toEscalationView` is escalations.test.ts's to own.
     toEscalationView: (row: unknown) => row as EscalationView,
   };
@@ -301,11 +303,15 @@ describe("actOnEscalation — dismiss", () => {
       action: "dismiss",
       detail: "dismissed",
     });
+    // `true` is the human flag (anton-7gxs): it stamps `dismissedAt`, which is what stops the next
+    // sweep raising this stall again. The sweep's own retirement path settles as "dismissed" too,
+    // and must NOT pass it — so the argument is asserted, not glossed over.
     expect(settleEscalation).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
       "esc-1",
       "dismissed",
+      true,
     );
     expect(actOnBead).not.toHaveBeenCalled();
     expect(actOnJob).not.toHaveBeenCalled();
@@ -321,14 +327,58 @@ describe("actOnEscalation — dismiss", () => {
 
   // Settling a wait on a person settles nothing: the gate stays open and the very next sweep
   // bounces the same row back. The panel hides the button; a direct POST never passes the panel.
-  it("is refused on a wait for a person, which settling alone cannot end", async () => {
-    open({ kind: "needs-human", gateId: "g-1" });
+  it.each(["needs-human", "autopilot-disarm"] as const)(
+    "is refused on %s, which settling alone cannot end",
+    async (kind) => {
+      open({ kind, gateId: kind === "needs-human" ? "g-1" : undefined });
 
-    expect(await actOnEscalation(project, "esc-1", "dismiss")).toEqual({
-      ok: false,
-      reason: "not-dismissable",
+      expect(await actOnEscalation(project, "esc-1", "dismiss")).toEqual({
+        ok: false,
+        reason: "not-dismissable",
+      });
+      expect(settleEscalation).not.toHaveBeenCalled();
+    },
+  );
+
+  // Every stall class is dismissable since anton-7gxs — before it, only a stale PR was, which left
+  // the storm this feature exists for (thirty identical `exhausted-job` rows) with no way down.
+  it.each(["parked-run", "dead-lease", "exhausted-job"] as const)(
+    "is offered on %s, the classes a burst actually produces",
+    async (kind) => {
+      open({ kind });
+      expect(await actOnEscalation(project, "esc-1", "dismiss")).toMatchObject({ ok: true });
+    },
+  );
+});
+
+/**
+ * Restore is the only verb that acts on a row which is NOT open, so it must be routed before the
+ * open guard — a restore that answered "already settled" could never undo anything.
+ */
+describe("actOnEscalation — restore", () => {
+  it("lifts a dismissal on a settled row", async () => {
+    open({ status: "resolved", resolution: "dismissed" });
+    restoreEscalation.mockResolvedValue(true);
+
+    expect(await actOnEscalation(project, "esc-1", "restore")).toMatchObject({
+      ok: true,
+      action: "restore",
+      detail: "restored",
     });
+    expect(actOnBead).not.toHaveBeenCalled();
     expect(settleEscalation).not.toHaveBeenCalled();
+  });
+
+  it("reports nothing-to-restore when the store refuses", async () => {
+    // The store refuses a row nobody dismissed, and one an open row already covers — the second is
+    // the sweep having re-raised the finding, which is the outcome the click wanted anyway.
+    open({ status: "resolved" });
+    restoreEscalation.mockResolvedValue(false);
+
+    expect(await actOnEscalation(project, "esc-1", "restore")).toEqual({
+      ok: false,
+      reason: "not-dismissed",
+    });
   });
 });
 

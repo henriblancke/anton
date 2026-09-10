@@ -10,20 +10,36 @@
  * lib/review-trajectory.ts and lib/scan-health.ts. This module only decides what a page needs out of
  * what those already computed.
  *
- * `rankAttention` is deliberately fed NO escalations here: an escalation is answered inline on the
- * board (Resume/Dismiss/Abandon), never on this page, so folding one in would let an unrelated stall
- * decide whether this page calls hygiene-and-review "clean" — see {@link projectHealthFromBoard}. The
- * open count still reaches the page, but only as a number the right rail points back at the board
- * with, never as a row rendered here.
+ * Since anton-7gxs this page ALSO owns the alerts themselves — every open escalation with its
+ * Resume/Dismiss/Abandon buttons, the autopilot breaker's evidence, and the unwatched-park warning.
+ * They used to be three bands above the board; a burst of identical failures could push the columns
+ * off the screen, so the board keeps a one-line summary and the rows come here, where a page is
+ * allowed to be as long as the trouble is.
+ *
+ * `rankAttention` is still deliberately fed NO escalations: it decides whether this page calls
+ * hygiene-and-review "clean", and a stopped run is a different claim about a different thing — one
+ * upstream outage should not make the codebase look unhealthy, nor a clean codebase hide a stall.
+ * The escalations travel beside its output, never through it (see {@link projectHealthFromBoard}).
  */
 import { rankAttention, type AttentionItem } from "./attention";
+import { currentBreaker } from "./autopilot-state";
+import type { AutopilotBreaker } from "./autopilot-breaker";
 import { getBoard } from "./board";
 import { serverBuildDrifts, type ServerDrift } from "./build/drift";
-import { openEscalations } from "./escalations";
+import { dismissedEscalations, openEscalations } from "./escalations";
+import { unwatchedParksForProject } from "./unwatched-parks";
 import { PICKER_LOG_LIMIT, pickerLogEntries, type PickerLogEntry } from "./picker-log";
 import { latestPickerStarts, type PickerStartRow } from "./picker-starts";
 import { latestPickerDeclines, type PickerVerdictRow } from "./picker-veto";
-import type { Board, HygieneReport, Project, ReviewTrajectory, ScanHealth } from "./types";
+import type {
+  Board,
+  EscalationView,
+  HygieneReport,
+  Project,
+  ReviewTrajectory,
+  ScanHealth,
+  UnwatchedParks,
+} from "./types";
 
 export interface ProjectHealth {
   /** `attention`-severity items: hygiene's dep-cycle/stale-in-progress findings, and the worst
@@ -37,8 +53,32 @@ export interface ProjectHealth {
   scanHealth: ScanHealth | undefined;
   /** Recent review scores, or undefined for a project nothing has ever scored. */
   trajectory: ReviewTrajectory | undefined;
-  /** Open, stopped escalations — answered on the board, named here only as a count. */
+  /**
+   * How many alerts are open — the number the rail prints and the board's strip counts. The rows
+   * themselves are `escalations` below; this is kept as its own field because most of the page only
+   * ever asks "how much", and deriving it at each call site invites the two disagreeing.
+   */
   stoppedCount: number;
+  /**
+   * Every open escalation, in full, with the evidence each one's decision is made on (anton-7gxs).
+   * This is the list the board's strip only counts.
+   */
+  escalations: EscalationView[];
+  /**
+   * Alerts a human put down, newest first — the undo list for a durable dismissal. Bounded by
+   * {@link listDismissedEscalations}: this is a record of decisions, not a queue.
+   */
+  dismissed: EscalationView[];
+  /**
+   * Why the autopilot has stopped, if it has, with the evidence a re-arm is judged on. Undefined
+   * while it is running.
+   */
+  breaker: AutopilotBreaker | undefined;
+  /**
+   * Parked work nothing is watching. Undefined — and so silent — when the watcher is armed or
+   * nothing is parked; its presence IS the signal (see lib/unwatched-parks.ts).
+   */
+  parks: UnwatchedParks | undefined;
   /**
    * What the picker started unattended and what the operator vetoed, newest first (R3.10). Empty
    * for a project whose picker has never started anything and whose picks nobody has refused —
@@ -63,7 +103,7 @@ export interface ProjectHealth {
  */
 export function projectHealthFromBoard(
   board: Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">,
-  stoppedCount: number,
+  alerts: HealthAlerts,
   staleServers: ServerDrift[] = [],
   picker: { starts: PickerStartRow[]; verdicts: PickerVerdictRow[] } = { starts: [], verdicts: [] },
 ): ProjectHealth {
@@ -77,10 +117,26 @@ export function projectHealthFromBoard(
     hygiene: board.hygiene,
     scanHealth: board.scanHealth,
     trajectory: board.reviewTrajectory,
-    stoppedCount,
+    stoppedCount: alerts.escalations.length,
+    escalations: alerts.escalations,
+    dismissed: alerts.dismissed,
+    breaker: alerts.breaker,
+    parks: alerts.parks,
     pickerLog: pickerLogEntries(picker),
     staleServers,
   };
+}
+
+/**
+ * The four alert reads this page now owns, passed as one bag rather than four positional arguments.
+ * They arrive together, they are all about "what has stopped", and a fifth positional `undefined`
+ * in a call site is exactly how the wrong one gets passed.
+ */
+export interface HealthAlerts {
+  escalations: EscalationView[];
+  dismissed: EscalationView[];
+  breaker?: AutopilotBreaker;
+  parks?: UnwatchedParks;
 }
 
 /**
@@ -94,16 +150,31 @@ export async function getProjectHealth(project: Project): Promise<ProjectHealth>
   // Read the running builds live rather than from a stored report: which build is running is a fact
   // about this instant, and a patrol row written by a since-restarted process would report drift
   // that no longer exists.
-  const [board, escalations, staleServers, starts, verdicts] = await Promise.all([
-    getBoard(project),
-    openEscalations(project.id),
-    // Degrades to "no stale servers" like every other read here: drift detection shells out to the
-    // process table, and a transient failure there must not take the page down.
-    serverBuildDrifts().catch(() => [] as ServerDrift[]),
-    latestPickerStarts(project.id),
-    // Declines only, and no more of them than the log can show: the merge below keeps the newest
-    // PICKER_LOG_LIMIT entries across both stores, so a wider read would only fetch rows it drops.
-    latestPickerDeclines(project.id, PICKER_LOG_LIMIT),
-  ]);
-  return projectHealthFromBoard(board, escalations.length, staleServers, { starts, verdicts });
+  const [board, escalations, dismissed, breaker, parks, staleServers, starts, verdicts] =
+    await Promise.all([
+      getBoard(project),
+      openEscalations(project.id),
+      dismissedEscalations(project.id),
+      // Degrades to "no band" rather than failing the page, exactly as the board does: deciding the
+      // WIP hold spawns a `gh pr view` per in-review PR, so an unreachable GitHub must cost the
+      // breaker band and nothing else. The board is the page's subject; this is context beside it.
+      currentBreaker(project).catch((err) => {
+        console.error(`[health] autopilot breaker read failed for ${project.slug}`, err);
+        return undefined;
+      }),
+      unwatchedParksForProject(project.id),
+      // Degrades to "no stale servers" like every other read here: drift detection shells out to the
+      // process table, and a transient failure there must not take the page down.
+      serverBuildDrifts().catch(() => [] as ServerDrift[]),
+      latestPickerStarts(project.id),
+      // Declines only, and no more of them than the log can show: the merge below keeps the newest
+      // PICKER_LOG_LIMIT entries across both stores, so a wider read would only fetch rows it drops.
+      latestPickerDeclines(project.id, PICKER_LOG_LIMIT),
+    ]);
+  return projectHealthFromBoard(
+    board,
+    { escalations, dismissed, breaker, parks },
+    staleServers,
+    { starts, verdicts },
+  );
 }
