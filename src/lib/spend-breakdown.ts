@@ -25,7 +25,7 @@
  * Pure and dependency-free — no db, no node builtins — so it is importable from a client component.
  */
 import { DISPLAY_LOCALE } from "./time";
-import { costOf, type PriceableRow } from "./model-pricing";
+import { costOf, type GatewayPricing, type PriceableRow } from "./model-pricing";
 
 /** The columns a breakdown row is folded from: the counts, plus the dimensions grouped on. */
 export interface SpendRow extends PriceableRow {
@@ -189,6 +189,7 @@ function bySpend(a: SpendGroup, b: SpendGroup): number {
 export function breakdownBy(
   rows: readonly SpendRow[],
   dimension: SpendDimension,
+  gatewayPricing?: GatewayPricing,
 ): SpendBreakdown {
   const groups = new Map<string, SpendGroup>();
   const tokens: TokenTotals = { ...ZERO_TOKENS };
@@ -197,7 +198,7 @@ export function breakdownBy(
   let priced = 0;
 
   for (const row of rows) {
-    const cost = costOf(row.modelReported, row);
+    const cost = costOf(row.modelReported, row, row.endpointHost, gatewayPricing);
     const { key, label } = groupKey(row, dimension);
     const group = groups.get(key) ?? {
       key,

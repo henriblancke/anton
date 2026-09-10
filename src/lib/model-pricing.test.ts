@@ -10,6 +10,7 @@ import {
   costOf,
   isPriced,
   MODEL_PRICES,
+  parse9RouterPricing,
   PRICES_AS_OF,
   PRICES_SOURCE,
   priceOf,
@@ -139,6 +140,34 @@ describe("costOf", () => {
     expect(costOf("cc/claude-opus-5[1m]", { inputTokens: 1_000_000 }, "router.example.com")).toBeUndefined();
   });
 
+  it("uses the matching gateway's published rate for routed calls", () => {
+    const gatewayPricing = {
+      endpointHost: "router.example.com",
+      prices: parse9RouterPricing({
+        cc: {
+          "claude-opus-5[1m]": { input: 1, output: 2, cached: 0.1, cache_creation: 1.25 },
+        },
+      }),
+    };
+
+    expect(
+      costOf(
+        "cc/claude-opus-5[1m]",
+        { inputTokens: 1_000_000, outputTokens: 1_000_000 },
+        "router.example.com",
+        gatewayPricing,
+      ),
+    ).toBeCloseTo(3, 10);
+    expect(
+      costOf(
+        "cc/claude-opus-5[1m]",
+        { inputTokens: 1_000_000 },
+        "another-router.example.com",
+        gatewayPricing,
+      ),
+    ).toBeUndefined();
+  });
+
   it("yields no cost for a row that measured nothing, and zero for one that measured zero", () => {
     // The unknown-usage row a crashed result writes: nothing was measured, so nothing is derivable.
     expect(costOf("claude-opus-5", {})).toBeUndefined();
@@ -180,6 +209,30 @@ describe("costOf", () => {
     // reported, because a gateway makes that figure a claim about a model name and nothing more.
     const counts = { ...OPUS_RUN, costUsd: 999 } as never;
     expect(costOf("claude-opus-5", counts)).toBe(costOf("claude-opus-5", OPUS_RUN));
+  });
+});
+
+describe("9Router pricing", () => {
+  it("accepts provider/model rates and keeps missing models unpriced", () => {
+    const prices = parse9RouterPricing({
+      cc: {
+        "claude-opus-5[1m]": { input: 1, output: 2, cached: 0.1, cache_creation: 1.25 },
+      },
+      malformed: { model: { input: "not a number", output: 2 } },
+    });
+
+    expect(prices["cc/claude-opus-5[1m]"]).toMatchObject({
+      input: 1,
+      output: 2,
+      cacheRead: 0.1,
+      cacheWrite5m: 1.25,
+    });
+    expect(prices["opus-5"]).toMatchObject({ input: 1, output: 2 });
+    expect(Object.keys(prices)).toEqual([
+      "cc/claude-opus-5[1m]",
+      "claude-opus-5[1m]",
+      "opus-5",
+    ]);
   });
 });
 

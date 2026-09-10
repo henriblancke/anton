@@ -32,12 +32,14 @@ export function SpendView({
   model,
   task,
   divergence,
+  hasGatewayPricing,
 }: {
   slug: string;
   window: SpendWindow;
   model: SpendBreakdown;
   task: SpendBreakdown;
   divergence: DivergenceSummary;
+  hasGatewayPricing?: boolean;
 }) {
   const windowLabel =
     SPEND_WINDOWS.find((option) => option.value === window)?.label.toLowerCase() ?? "this window";
@@ -48,12 +50,17 @@ export function SpendView({
 
       {model.recorded ? (
         <>
-          <SpendSummary breakdown={model} windowLabel={windowLabel} divergence={divergence} />
+          <SpendSummary
+            breakdown={model}
+            windowLabel={windowLabel}
+            divergence={divergence}
+            hasGatewayPricing={hasGatewayPricing}
+          />
 
           <div className="flex flex-col gap-4 min-[1100px]:flex-row min-[1100px]:items-start">
             <SpendSection
               title="By model"
-              hint="What each model was actually served for, at anton's own prices."
+              hint="What each model was actually served for, at the applicable direct or gateway prices."
               className="min-w-0 flex-1"
             >
               <SpendTable
@@ -94,10 +101,12 @@ function SpendSummary({
   breakdown,
   windowLabel,
   divergence,
+  hasGatewayPricing,
 }: {
   breakdown: SpendBreakdown;
   windowLabel: string;
   divergence: DivergenceSummary;
+  hasGatewayPricing?: boolean;
 }) {
   return (
     <section className="flex flex-col gap-2.5 rounded-xl border border-border bg-card/40 px-3.5 py-3">
@@ -108,7 +117,9 @@ function SpendSummary({
           hint={
             breakdown.usd === undefined
               ? "No call in this window used a model anton has a price for."
-              : `Derived from measured tokens · prices as of ${PRICES_AS_OF}`
+              : hasGatewayPricing
+                ? `Derived from measured tokens · direct rates as of ${PRICES_AS_OF}; routed rates from 9Router`
+                : `Derived from measured tokens · prices as of ${PRICES_AS_OF}`
           }
         />
         <Stat
@@ -136,7 +147,7 @@ function SpendSummary({
           Measured, not sampled
         </span>{" "}
         — every figure here comes from the token counts each call reported, priced from anton&rsquo;s
-        own table. Unlike the quota shares in Settings, none of it is an estimate, so none of it is
+        applicable direct or gateway price table. Unlike the quota shares in Settings, none of it is an estimate, so none of it is
         marked <span className="font-mono">≈</span>.
       </p>
 

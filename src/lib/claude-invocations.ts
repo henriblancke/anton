@@ -35,7 +35,7 @@ import {
   type DivergenceSummary,
   type InvocationFact,
 } from "./model-divergence";
-import { totalCost, type SpendCost } from "./model-pricing";
+import { totalCost, type GatewayPricing, type SpendCost } from "./model-pricing";
 import { breakdownBy, type SpendBreakdown } from "./spend-breakdown";
 import type { AntonDb, Clock } from "./jobs/queue";
 
@@ -292,12 +292,12 @@ export function projectSpend(
 export async function spendBreakdowns(
   db: AntonDb,
   projectId: string | undefined,
-  opts: { since?: Date } = {},
+  opts: { since?: Date; gatewayPricing?: GatewayPricing } = {},
 ): Promise<{ model: SpendBreakdown; task: SpendBreakdown; divergence: DivergenceSummary }> {
   const rows = await listInvocations(db, projectId, opts);
   return {
-    model: breakdownBy(rows, "model"),
-    task: breakdownBy(rows, "task"),
+    model: breakdownBy(rows, "model", opts.gatewayPricing),
+    task: breakdownBy(rows, "task", opts.gatewayPricing),
     // Carried along for the same reason `invocationSpend` carries it: a per-model figure attributed
     // to a model that did not serve the call is worse than no figure, and nobody thinks to ask.
     divergence: divergenceSummary(groupInvocations(rows)),
@@ -307,7 +307,7 @@ export async function spendBreakdowns(
 /** UI/read path for the two breakdowns over the shared anton.db — see {@link spendBreakdowns}. */
 export function projectSpendBreakdowns(
   projectId: string,
-  opts?: { since?: Date },
+  opts?: { since?: Date; gatewayPricing?: GatewayPricing },
 ): Promise<{ model: SpendBreakdown; task: SpendBreakdown; divergence: DivergenceSummary }> {
   return spendBreakdowns(getDb(), projectId, opts);
 }

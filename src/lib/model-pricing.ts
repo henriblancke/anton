@@ -43,11 +43,11 @@ export interface ModelPrice {
   input: number;
   output: number;
   /** A cache hit. 0.1x base input on every model but the 5.1 pair, which is 0.025x. */
-  cacheRead: number;
+  cacheRead?: number;
   /** Writing the 5-minute cache: 1.25x base input. What Claude Code's own caching uses. */
-  cacheWrite5m: number;
+  cacheWrite5m?: number;
   /** Writing the 1-hour cache: 2x base input. Recorded for completeness; see {@link costOf}. */
-  cacheWrite1h: number;
+  cacheWrite1h?: number;
 }
 
 /** USD per MTok, keyed by {@link normalizeModelId} — verified {@link PRICES_AS_OF}. */
@@ -91,6 +91,91 @@ const PER_MILLION = 1_000_000;
 export function priceOf(model: string | null | undefined): ModelPrice | undefined {
   const id = normalizeModelId(model);
   return id ? MODEL_PRICES[id] : undefined;
+}
+
+/** Pricing fetched from a gateway's own pricing API for one endpoint host. */
+export interface GatewayPricing {
+  endpointHost: string;
+  prices: Readonly<Record<string, ModelPrice>>;
+}
+
+function finiteNonNegative(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * Convert 9Router's `/api/pricing` response into the rate shape used by the ledger.
+ *
+ * 9Router returns `{ provider: { model: { input, output, cached, cache_creation } } }`, with
+ * values in dollars per million tokens. Keep both the provider-qualified and bare model spellings:
+ * the former is needed for combos such as `cc/claude-opus-5[1m]`, while the latter covers a gateway
+ * that reports only the provider's model id.
+ */
+export function parse9RouterPricing(payload: unknown): Readonly<Record<string, ModelPrice>> {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return {};
+
+  const prices: Record<string, ModelPrice> = {};
+  for (const [provider, models] of Object.entries(payload)) {
+    if (!models || typeof models !== "object" || Array.isArray(models)) continue;
+    for (const [model, value] of Object.entries(models)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const rate = value as Record<string, unknown>;
+      const input = finiteNonNegative(rate.input);
+      const output = finiteNonNegative(rate.output);
+      if (input === undefined || output === undefined) continue;
+
+      const price: ModelPrice = {
+        input,
+        output,
+        cacheRead: finiteNonNegative(rate.cached),
+        cacheWrite5m: finiteNonNegative(rate.cache_creation),
+      };
+      prices[`${provider}/${model}`] = price;
+      prices[model] ??= price;
+      const normalized = normalizeModelId(model);
+      if (normalized) prices[normalized] ??= price;
+    }
+  }
+  return prices;
+}
+
+/** Read 9Router's current pricing without making the spend page depend on its availability. */
+export async function fetch9RouterPricing(args: {
+  baseUrl?: string;
+  authTokenEnv?: string;
+  fetchImpl?: typeof fetch;
+}): Promise<GatewayPricing | undefined> {
+  const baseUrl = args.baseUrl?.trim();
+  const token = args.authTokenEnv ? process.env[args.authTokenEnv] : undefined;
+  if (!baseUrl || !args.authTokenEnv || !token) return undefined;
+
+  let endpoint: URL;
+  try {
+    endpoint = new URL(baseUrl);
+    endpoint.pathname = "/api/pricing";
+    endpoint.search = "";
+    endpoint.hash = "";
+  } catch {
+    return undefined;
+  }
+
+  try {
+    const response = await (args.fetchImpl ?? fetch)(endpoint, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "x-api-key": token,
+      },
+      cache: "no-store",
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (!response.ok) return undefined;
+    const prices = parse9RouterPricing(await response.json());
+    return Object.keys(prices).length > 0
+      ? { endpointHost: endpoint.host, prices }
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Whether anton can price this model at all — the question a UI asks before showing a dash. */
@@ -157,19 +242,30 @@ export function costOf(
   model: string | null | undefined,
   counts: TokenCounts,
   endpointHost?: string | null,
+  gatewayPricing?: GatewayPricing,
 ): number | undefined {
   // Anthropic's list rates apply only to direct Anthropic API calls. A gateway can serve the same
-  // model id through subscription, discounted, or free capacity; without a gateway-specific table
-  // claiming an Anthropic dollar figure would be less honest than leaving it unpriced.
-  if (endpointHost) return undefined;
-  const price = priceOf(model);
+  // model id through subscription, discounted, or free capacity; use only that endpoint's own
+  // table, and never apply a currently configured gateway's rates to historical rows from another.
+  const price = endpointHost
+    ? gatewayPricing?.endpointHost === endpointHost
+      ? gatewayPricing.prices[model ?? ""] ?? gatewayPricing.prices[normalizeModelId(model)]
+      : undefined
+    : priceOf(model);
   if (!price || !hasAnyCount(counts)) return undefined;
 
+  const input = count(counts.inputTokens);
+  const output = count(counts.outputTokens);
+  const cacheRead = count(counts.cacheReadInputTokens);
+  const cacheWrite = count(counts.cacheCreationInputTokens);
+  if ((cacheRead > 0 && price.cacheRead === undefined) ||
+      (cacheWrite > 0 && price.cacheWrite5m === undefined)) return undefined;
+
   const tokens =
-    count(counts.inputTokens) * price.input +
-    count(counts.outputTokens) * price.output +
-    count(counts.cacheReadInputTokens) * price.cacheRead +
-    count(counts.cacheCreationInputTokens) * price.cacheWrite5m;
+    input * price.input +
+    output * price.output +
+    cacheRead * (price.cacheRead ?? 0) +
+    cacheWrite * (price.cacheWrite5m ?? 0);
 
   return tokens / PER_MILLION + count(counts.webSearchRequests) * WEB_SEARCH_USD_PER_REQUEST;
 }
@@ -207,13 +303,13 @@ export interface SpendCost {
  * all of it", and a project routed through a gateway is exactly the case where the difference
  * decides whether the figure means anything.
  */
-export function totalCost(rows: readonly PriceableRow[]): SpendCost {
+export function totalCost(rows: readonly PriceableRow[], gatewayPricing?: GatewayPricing): SpendCost {
   const unknown = new Map<string, number>();
   let usd = 0;
   let priced = 0;
 
   for (const row of rows) {
-    const cost = costOf(row.modelReported, row, row.endpointHost);
+    const cost = costOf(row.modelReported, row, row.endpointHost, gatewayPricing);
     if (cost === undefined) {
       // Only a NAMED model is worth reporting back; a row with no model reported is the
       // unknown-usage row, and it names nothing to add to the table.

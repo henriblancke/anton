@@ -1,7 +1,8 @@
 import { notFound } from "next/navigation";
 
-import { getProjectBySlug } from "@/lib/projects";
+import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
 import { projectSpendBreakdowns } from "@/lib/claude-invocations";
+import { fetch9RouterPricing } from "@/lib/model-pricing";
 import { normalizeWindow, windowSince } from "@/lib/spend-breakdown";
 import { PageHeader } from "@/components/atoms";
 import { SpendView } from "@/components/spend/spend-view";
@@ -26,9 +27,17 @@ export default async function ProjectSpendPage({
   const project = await getProjectBySlug(slug);
   if (!project) notFound();
 
+  const settings = await getProjectSettingsBySlug(slug);
+  const gatewayPricing = settings
+    ? await fetch9RouterPricing({
+        baseUrl: settings.claudeBaseUrl,
+        authTokenEnv: settings.claudeAuthTokenEnv,
+      })
+    : undefined;
   const window = normalizeWindow(query.window);
   const { model, task, divergence } = await projectSpendBreakdowns(project.id, {
     since: windowSince(window),
+    gatewayPricing,
   });
 
   return (
@@ -45,6 +54,7 @@ export default async function ProjectSpendPage({
           model={model}
           task={task}
           divergence={divergence}
+          hasGatewayPricing={gatewayPricing !== undefined}
         />
       </div>
     </div>

@@ -21,6 +21,7 @@ import {
   windowSince,
   type SpendRow,
 } from "./spend-breakdown";
+import { parse9RouterPricing } from "./model-pricing";
 
 const AT = new Date("2026-09-09T12:00:00Z");
 
@@ -116,6 +117,29 @@ describe("grouping by task", () => {
 
     expect(breakdownBy(rows, "task").usd).toBe(breakdownBy(rows, "model").usd);
     expect(breakdownBy(rows, "task").tokens.total).toBe(breakdownBy(rows, "model").tokens.total);
+  });
+
+  it("uses endpoint pricing for a routed known model in both folds", () => {
+    const rows = [
+      row({
+        modelReported: "cc/claude-opus-5[1m]",
+        endpointHost: "router.example.com",
+      }),
+    ];
+    const gatewayPricing = {
+      endpointHost: "router.example.com",
+      prices: parse9RouterPricing({
+        cc: {
+          "claude-opus-5[1m]": { input: 1, output: 2, cached: 0.1, cache_creation: 1.25 },
+        },
+      }),
+    };
+
+    const model = breakdownBy(rows, "model", gatewayPricing);
+    const task = breakdownBy(rows, "task", gatewayPricing);
+    expect(model.usd).toBeCloseTo(0.006625, 10);
+    expect(task.usd).toBe(model.usd);
+    expect(model.unpriced).toBe(0);
   });
 });
 
