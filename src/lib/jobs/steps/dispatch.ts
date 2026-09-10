@@ -44,7 +44,7 @@ export async function dispatchClaude(
         step: ctx.step ? (stepName(ctx.step) as "implement" | "claude") : undefined,
         // Ticket-phase steps receive exactly one ticket. Its labels are the routing context even
         // though this session is filed under the run target by callers that share a session.
-        labels: (ctx.tickets.length === 1 ? ctx.tickets[0]?.labels : undefined) ?? ctx.target.labels,
+        labels: ctx.tickets.length === 1 ? (ctx.tickets[0]?.labels ?? []) : ctx.target.labels,
       }),
       routing: claudeRouting(ctx.settings),
       permissionMode: ctx.settings.permissionMode ?? "bypassPermissions",

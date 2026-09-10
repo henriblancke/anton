@@ -91,6 +91,28 @@ describe("dispatchClaude", () => {
     expect(claude.calls[0].model).toBe("safe");
   });
 
+  it("does not let an unlabeled ticket inherit a target-only route", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+
+    await dispatchClaude(
+      {
+        ...ctx,
+        step: { id: "security-pass", labels: ["step:claude"] },
+        target: { ...ctx.target, labels: ["risk:high"] },
+        tickets: [{ ...ctx.target, id: "anton-8d0f.1", labels: undefined }],
+        settings: {
+          ...ctx.settings,
+          model: "fallback",
+          modelRoutes: [{ label: "risk:high", model: "safe" }],
+        },
+      },
+      args(ctx.target.id),
+    );
+
+    expect(claude.calls[0].model).toBe("fallback");
+  });
+
   it("tells the runner Claude was reached before the spawn, so a crashed spawn still counts (PR #248)", async () => {
     // The runner prices the attempt on this signal alone — an attempt that never says so is refunded
     // from the project's spend meter and its burn window discarded. It has to fire BEFORE the
