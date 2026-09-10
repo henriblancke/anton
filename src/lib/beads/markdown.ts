@@ -11,6 +11,10 @@ import { fromMarkdown } from "mdast-util-from-markdown";
 /** One blockquote marker — retained for the contract's prompt policy, not Markdown parsing. */
 const BLOCKQUOTE = /^ {0,3}>[ \t]?/;
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const SETEXT_UNDERLINE = /^ {0,3}(?:=+|-+)[ \t]*$/;
+const THEMATIC_BREAK = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+const BLOCK_LINE = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)|^ {0,3}>|^ {0,3}#{1,6}(?:[ \t]|$)|^ {4}/;
+const HTML_BLOCK_LINE = /^ {0,3}<(?:pre|script|style|textarea)(?:[ \t>]|$)|^ {0,3}<(?:div|address|article|aside|blockquote|body|section|table|ul|ol|li|p)(?:[ \t>]|\/>|$)|^ {0,3}(?:<!--|<\?|<!\[CDATA\[|<![A-Z])/i;
 
 /** Heading text → comparison key, case- and punctuation-insensitive. */
 const slug = (heading: string) => heading.toLowerCase().replace(/[^a-z0-9]+/g, "");
@@ -135,6 +139,36 @@ const lineRange = (lines: Line[], position: Position) => ({
   end: Math.min(lines.length - 1, position.end.line - 1),
 });
 
+const paragraphLine = (line: Line): boolean =>
+  !line.fenced &&
+  !line.commented &&
+  !line.heading &&
+  !line.headingRest &&
+  line.visible.trim() !== "" &&
+  !THEMATIC_BREAK.test(line.text) &&
+  !BLOCK_LINE.test(line.text) &&
+  !HTML_BLOCK_LINE.test(line.masked);
+
+/**
+ * Preserve the contract scanner's conservative Setext projection. Micromark correctly models
+ * containers, but a flat contract section reader must never let an underlined line reach across a
+ * block boundary; it may still recover a visible Setext heading immediately after a list item.
+ */
+function markSetextHeadings(lines: Line[]): void {
+  for (let at = 1; at < lines.length; at++) {
+    const underline = lines[at]!;
+    if (underline.heading || underline.headingRest || !SETEXT_UNDERLINE.test(underline.text)) continue;
+    let start = at;
+    while (start > 0 && paragraphLine(lines[start - 1]!)) start--;
+    if (start === at) continue;
+    lines[start]!.heading = {
+      depth: underline.text.trimStart().startsWith("=") ? 1 : 2,
+      key: slug(lines[start]!.visible),
+    };
+    for (let rest = start + 1; rest <= at; rest++) lines[rest]!.headingRest = true;
+  }
+}
+
 /**
  * Comments are inline HTML tokens, so their source-preserving projection is kept separate from the
  * AST walk. Micromark decides where HTML blocks and headings are; this only removes an already
@@ -211,12 +245,16 @@ export function scanMarkdown(source: string): ScannedLine[] {
     if (node.type === "heading") {
       const { start, end } = lineRange(lines, node.position);
       const line = lines[start];
-      if (line && !line.fenced && !line.commented) {
+      const uninterrupted = Array.from({ length: Math.max(0, end - start - 1) }, (_, offset) =>
+        paragraphLine(lines[start + offset + 1]!),
+      ).every(Boolean);
+      if (line && !line.fenced && !line.commented && (end === start || uninterrupted)) {
         line.heading = { depth: node.depth!, key: slug(textOf(node).replace(/<!--.*$/, "")) };
         for (let at = start + 1; at <= end; at++) lines[at]!.headingRest = true;
       }
     }
   });
+  markSetextHeadings(lines);
 
   return lines.map(({ text, fenced, delimiter, commented, visible, masked, heading, headingRest }) => ({
     text,
