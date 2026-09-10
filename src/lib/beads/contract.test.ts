@@ -188,6 +188,17 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(validateBeadContract(bead)).toEqual([]);
   });
 
+  it("treats an empty Setext-underlined contract section as unwritten", () => {
+    // `Acceptance Criteria` / `===` with nothing under it: the underline is part of the heading,
+    // not the section's body. Counting it as content passed the blocking gate with no criterion
+    // stated — the underline is punctuation, and no line-at-a-time judge calls it scaffolding.
+    const bead = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "Acceptance Criteria", "==="].join("\n"),
+    });
+    expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
+  });
+
   it("treats a section holding only a thematic break as unwritten", () => {
     // `---` renders as a rule, not text — counting it as content let approval and execution
     // proceed with no definition of done.

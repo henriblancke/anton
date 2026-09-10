@@ -322,7 +322,16 @@ function sectionsNamed(lines: ScannedLine[], keys: string[]): { start: number; e
     const depth = line.heading.depth;
     let end = start + 1;
     while (end < lines.length) {
-      const heading = lines[end]!.heading;
+      const next = lines[end]!;
+      // A Setext heading's later lines stay inside the section it opens — as the judge's
+      // `sectionOccurrences` bounds it — so the underline that MAKES the heading is never cut
+      // from it. Without this, replacing the section's body kept the label and dropped the
+      // `===` / `---` under it, turning the surviving heading back into plain text.
+      if (next.headingRest) {
+        end += 1;
+        continue;
+      }
+      const heading = next.heading;
       if (heading && (heading.depth <= depth || isTicketContractHeading(heading))) break;
       end += 1;
     }
