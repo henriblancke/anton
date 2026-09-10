@@ -25,7 +25,7 @@
  * db-injectable, like `runs` and `picker-starts`: the handler and its tests share one connection.
  */
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gte } from "drizzle-orm";
+import { and, desc, eq, gte, sql } from "drizzle-orm";
 import type { ClaudeResult, RunClaudeOptions } from "./claude/driver";
 import type { ModelUsageEntry } from "./claude/model-usage";
 import { getDb, schema } from "./db";
@@ -171,7 +171,9 @@ export async function listInvocations(
     .select()
     .from(schema.claudeInvocations)
     .where(where)
-    .orderBy(desc(schema.claudeInvocations.recordedAt), desc(schema.claudeInvocations.id));
+    // Timestamps are intentionally whole-second values, so ties use SQLite's append-only rowid
+    // rather than a random UUID. That keeps an invocation limit chronological even under bursts.
+    .orderBy(desc(schema.claudeInvocations.recordedAt), desc(sql`rowid`));
   // The table is per (invocation, model), but a caller's limit is in complete driver calls. Slice
   // after regrouping so a sidecar row cannot be shown without the requested model that ran beside it.
   return opts.limit === undefined

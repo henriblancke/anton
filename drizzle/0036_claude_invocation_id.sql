@@ -5,5 +5,5 @@
 --   DROP INDEX IF EXISTS claude_invocations_invocation_idx;
 --   ALTER TABLE claude_invocations DROP COLUMN invocation_id;
 
-ALTER TABLE claude_invocations ADD COLUMN invocation_id text;
+ALTER TABLE claude_invocations ADD COLUMN invocation_id text;--> statement-breakpoint
 CREATE INDEX claude_invocations_invocation_idx ON claude_invocations(invocation_id);

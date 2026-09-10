@@ -411,6 +411,26 @@ describe("invocationSpend", () => {
     tdb.close();
   });
 
+  it("limits tied timestamps by the newest recorded invocation", async () => {
+    const tdb = makeProjectDb();
+    await recordInvocation(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId, runId: "older-run" },
+      result({ modelUsage: [USAGE[0]!] }),
+    );
+    await recordInvocation(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId, runId: "newer-run" },
+      result({ modelUsage: [USAGE[0]!] }),
+    );
+    expect(await listInvocations(tdb.db, tdb.projectId, { limit: 1 })).toMatchObject([
+      { runId: "newer-run" },
+    ]);
+    tdb.close();
+  });
+
   it("leaves a gateway-served model unpriced rather than counting it as free", async () => {
     const tdb = makeProjectDb();
     await recordInvocation(
