@@ -46,7 +46,10 @@ export const POST = withProject<{ slug: string; escalationId: string }>(
       const result = await actOnEscalation(project, params.escalationId, action);
       if (!result.ok) {
         const status = result.reason === "not-found" ? 404 : 409;
-        return NextResponse.json({ error: FAILURE_MESSAGES[result.reason] }, { status });
+        return NextResponse.json(
+          { error: FAILURE_MESSAGES[result.reason], reason: result.reason },
+          { status },
+        );
       }
       return NextResponse.json({
         action: result.action,

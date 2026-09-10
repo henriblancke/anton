@@ -37,13 +37,19 @@ export function DismissedSection({
   /** How many are dismissed in all. Defaults to the page's own length for callers with one page. */
   total?: number;
 }) {
+  const router = useRouter();
   const [older, setOlder] = useState<EscalationView[]>([]);
   const [loading, setLoading] = useState(false);
+  const [restart, setRestart] = useState<{ fromTotal: number; total: number } | null>(null);
   // Deduped, because the two halves CAN overlap: restoring a row re-renders the server page, whose
   // first page then pulls one row up out of the range `older` already holds. Undeduped that is a
   // repeated React key and the same decision offered twice.
   const rows = dedupeById([...dismissed, ...older]);
-  const all = total ?? dismissed.length;
+  const sourceTotal = total ?? dismissed.length;
+  // While `router.refresh()` is fetching the restarted first page, use the changed total from the
+  // rejected page. Once the new server props arrive, `fromTotal` no longer matches and this returns
+  // to deriving directly from them — no effect or second render is needed.
+  const all = restart?.fromTotal === sourceTotal ? restart.total : sourceTotal;
 
   if (dismissed.length === 0) return null;
 
@@ -60,14 +66,27 @@ export function DismissedSection({
   async function showOlder() {
     setLoading(true);
     try {
-      const res = await fetch(`/api/projects/${slug}/escalations/dismissed?offset=${rows.length}`, {
+      // Count raw page entries, not the deduped rendered rows. A refreshed first page can overlap
+      // `older` after a restore; using `rows.length` would then ask one entry too early or late.
+      const offset = dismissed.length + older.length;
+      const res = await fetch(`/api/projects/${slug}/escalations/dismissed?offset=${offset}`, {
         cache: "no-store",
       });
       const body = (await res.json().catch(() => null)) as {
         dismissed?: EscalationView[];
+        total?: number;
         error?: string;
       } | null;
       if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
+      // Offset pagination has no stable position if another operator changes the collection while
+      // this request is in flight. Discard this potentially shifted page and restart from the new
+      // server-rendered first page instead of permanently skipping its boundary row.
+      if (typeof body?.total === "number" && body.total !== all) {
+        setOlder([]);
+        setRestart({ fromTotal: sourceTotal, total: body.total });
+        router.refresh();
+        return;
+      }
       setOlder((prev) => [...prev, ...(body?.dismissed ?? [])]);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to load older dismissals");
@@ -173,18 +192,27 @@ function RestoreButton({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "restore" }),
       });
-      const body = (await res.json().catch(() => null)) as { error?: string } | null;
-      if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
+      const body = (await res.json().catch(() => null)) as {
+        error?: string;
+        reason?: string;
+      } | null;
+      if (!res.ok) {
+        // `not-dismissed` is the precise race outcome where another actor already restored it or
+        // the sweep re-raised it. The row no longer belongs in this list; every other failure may
+        // still leave a durable suppression behind, so keep its paged-in copy visible for retry.
+        if (body?.reason === "not-dismissed") {
+          onRestored(escalationId);
+          toast.success("Already restored — it's back under Needs you");
+          router.refresh();
+          return;
+        }
+        throw new Error(body?.error ?? `Request failed (${res.status})`);
+      }
       onRestored(escalationId);
       toast.success("Restored — it's back under Needs you");
       router.refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to restore the alert");
-      // Either way the list is stale from here: a refused restore usually means the sweep raised it
-      // again, which is the outcome the click wanted — so this row is gone from the dismissed set
-      // either way, and a paged-in copy of it must go with it.
-      onRestored(escalationId);
-      router.refresh();
     } finally {
       setPending(false);
     }

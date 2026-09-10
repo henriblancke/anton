@@ -161,6 +161,44 @@ describe("DismissedSection", () => {
       expect(screen.getAllByRole("button", { name: "Restore" })).toHaveLength(1);
     });
 
+    it("keeps a paged-in row when its restore request fails", async () => {
+      const older = { ...dismissed({ id: "esc-2" }), reason: "still suppressed" };
+      const fetchMock = vi.fn(async (url: string) =>
+        url.includes("/dismissed?offset=")
+          ? new Response(JSON.stringify({ dismissed: [older], total: 2 }), { status: 200 })
+          : new Response(JSON.stringify({ error: "database unavailable" }), { status: 500 }),
+      );
+      vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+      render(<DismissedSection slug="anton" dismissed={[dismissed()]} total={2} />);
+      fireEvent.click(screen.getByRole("button", { name: /^Show$/ }));
+      fireEvent.click(screen.getByRole("button", { name: /Show older/ }));
+      await waitFor(() => expect(screen.getByText("still suppressed")).toBeTruthy());
+
+      fireEvent.click(screen.getAllByRole("button", { name: "Restore" })[1]);
+
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      expect(screen.getByText("still suppressed")).toBeTruthy();
+      expect(refresh).not.toHaveBeenCalled();
+    });
+
+    it("restarts pagination if another operator changes the total mid-walk", async () => {
+      const shifted = { ...dismissed({ id: "esc-2" }), reason: "must not be accepted" };
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify({ dismissed: [shifted], total: 1 }), { status: 200 }),
+      );
+      vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+      render(<DismissedSection slug="anton" dismissed={[dismissed()]} total={2} />);
+      fireEvent.click(screen.getByRole("button", { name: /^Show$/ }));
+      fireEvent.click(screen.getByRole("button", { name: /Show older/ }));
+
+      await waitFor(() => expect(refresh).toHaveBeenCalled());
+      // The returned offset page was based on a changed collection, so it cannot be allowed to
+      // advance the walk and hide the record at its boundary.
+      expect(screen.queryByText("must not be accepted")).toBeNull();
+    });
+
     it("keeps the list it has when an older page fails to load", async () => {
       vi.stubGlobal(
         "fetch",
@@ -179,11 +217,14 @@ describe("DismissedSection", () => {
     });
   });
 
-  it("re-reads on a refused restore too — usually the sweep raised it again, which is the point", async () => {
+  it("re-reads on an explicit already-restored response", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
-        new Response(JSON.stringify({ error: "nothing to restore" }), { status: 409 }),
+        new Response(
+          JSON.stringify({ error: "nothing to restore", reason: "not-dismissed" }),
+          { status: 409 },
+        ),
       ) as unknown as typeof fetch,
     );
 
