@@ -14,6 +14,7 @@
  * wiring is what makes it unit-testable against a fake driver.
  */
 import { type Bead } from "../beads/bd";
+import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import {
   commitAll,
@@ -369,6 +370,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       projectId,
       runId,
       target,
+      tickets,
       settings,
       worktreePath,
       findings: blocking,
@@ -570,7 +572,11 @@ async function runReviewSession(args: {
       const result = await claude({
         cwd: worktreePath,
         prompt,
-        model: settings.model,
+        model: resolveModel(settings, {
+          jobType: "execute-epic",
+          step: "review",
+          labels: [target, ...tickets].flatMap((bead) => bead.labels ?? []),
+        }),
         routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         disallowedTools: REVIEW_DENIED_TOOLS,
@@ -844,6 +850,7 @@ async function runGateFixSession(args: {
   projectId: string;
   runId?: string;
   target: Bead;
+  tickets: Bead[];
   settings: ProjectSettings;
   worktreePath: string;
   findings: ReviewFinding[];
@@ -856,7 +863,7 @@ async function runGateFixSession(args: {
   /** Hash the tree a commit would write — how the gate proves the committed tree is the tested one. */
   hashTree: (worktreePath: string) => Promise<string>;
 }): Promise<{ sessionId: string; committed: boolean; verified?: VerifyGateOutcome[] }> {
-  const { db, clock, ctx, projectId, runId, target, settings, worktreePath, findings, round, maxRounds, claude, commit } =
+  const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
 
   const { prompt, appendSystemPrompt } = await buildFindingsFixPrompt({
@@ -892,7 +899,11 @@ async function runGateFixSession(args: {
         cwd: worktreePath,
         prompt,
         appendSystemPrompt,
-        model: settings.model,
+        model: resolveModel(settings, {
+          jobType: "execute-epic",
+          step: "review",
+          labels: [target, ...tickets].flatMap((bead) => bead.labels ?? []),
+        }),
         routing: claudeRouting(settings),
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         signal: ctx.signal,

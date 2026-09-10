@@ -11,7 +11,13 @@ import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 import { driveJob } from "@/lib/testing/jobs";
 import { getJob, type Clock } from "./queue";
 import type { PrReview } from "../git/pr";
-import { claimOwnerFor, inReviewEpics, makeReviewFixHandler, parseThreadReport } from "./review-fix";
+import {
+  claimOwnerFor,
+  inReviewEpics,
+  makeReviewFixHandler,
+  parseThreadReport,
+  resolveReviewFixModel,
+} from "./review-fix";
 import { LABELS, type Bead } from "../beads/bd";
 
 /** The board read the dispatcher triages off. Everything else in beads stays real. */
@@ -98,6 +104,18 @@ describe("parseThreadReport (re-exported from ./review-fix)", () => {
     expect(parseThreadReport("```json\n{not json\n```")).toEqual([]);
     expect(parseThreadReport('```json\n{"threads":"nope"}\n```')).toEqual([]);
   });
+});
+
+it("routes the pipeline-free per-PR fix session by target label", () => {
+  expect(
+    resolveReviewFixModel(
+      {
+        model: "fallback",
+        modelRoutes: [{ jobType: "review-fix-pr", label: "risk:high", model: "safe" }],
+      },
+      { labels: ["risk:high"] },
+    ),
+  ).toBe("safe");
 });
 
 describe("inReviewEpics", () => {

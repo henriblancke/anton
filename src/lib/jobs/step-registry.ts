@@ -40,6 +40,7 @@ import { claudeStep, implementStep } from "./steps/agent";
 import { reviewStep, verifyStep } from "./steps/gates";
 import { commitStep, prStep } from "./steps/git";
 import { resolveStepIn } from "./steps/resolve";
+import type { BuiltinStepId } from "./step-ids";
 import type { CookedStep } from "./steps/context";
 import type { StepDefinition } from "./steps/result";
 
@@ -67,8 +68,12 @@ export { stepName, STEP_LABEL_PREFIX, type StepRegistry } from "./steps/resolve"
 /**
  * Every step anton knows how to execute, by label suffix. A project formula may name any of these;
  * anything else parks the run (see {@link resolveStep}).
+ *
+ * Keyed by {@link BuiltinStepId} rather than by `string`: the settings boundary validates a routing
+ * rule's step against that list, so a step added here without an id there would be a step no
+ * operator could route to, and an id there with no handler here a control naming nothing.
  */
-export const BUILTIN_STEPS: Readonly<Record<string, StepDefinition>> = Object.freeze({
+export const BUILTIN_STEPS: Readonly<Record<BuiltinStepId, StepDefinition>> = Object.freeze({
   implement: {
     name: "implement",
     class: "required",

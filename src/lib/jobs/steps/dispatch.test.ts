@@ -17,8 +17,8 @@ beforeEach(async () => {
 
 afterEach(() => closeSandbox(sandbox));
 
-const args = (prompt = "do the thing") => ({
-  beadId: target.id,
+const args = (beadId = target.id, prompt = "do the thing") => ({
+  beadId,
   prompt,
   appendSystemPrompt: "the operating contract",
   failure: (text: string | undefined) => `claude reported an error: ${text ?? "unknown"}`,
@@ -44,6 +44,75 @@ describe("dispatchClaude", () => {
     expect(rows[0].status).toBe("done");
     // The live handle names the session the agent is actually writing into.
     expect(reported).toEqual([{ sessionId: result.facts?.sessionIds?.[0], cwd: sandbox.dir }]);
+  });
+
+  it("routes an execute step by its step id and bead labels", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+    await dispatchClaude(
+      {
+        ...ctx,
+        step: { id: "implementation", labels: ["step:implement"] },
+        target: { ...ctx.target, labels: ["risk:high"] },
+        // A run-phase implementation has no one ticket to route from.
+        tickets: [],
+        settings: {
+          ...ctx.settings,
+          model: "fallback",
+          modelRoutes: [
+            { jobType: "execute-epic", step: "review", model: "reviewer" },
+            { label: "risk:high", model: "safe" },
+          ],
+        },
+      },
+      args(),
+    );
+    expect(claude.calls[0].model).toBe("safe");
+  });
+
+  it("routes a ticket-phase custom step by the ticket's labels", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+    const ticket = { ...ctx.target, id: "anton-8d0f.1", labels: ["risk:high"] };
+
+    await dispatchClaude(
+      {
+        ...ctx,
+        step: { id: "security-pass", labels: ["step:claude"] },
+        target: { ...ctx.target, labels: ["risk:low"] },
+        tickets: [ticket],
+        settings: {
+          ...ctx.settings,
+          model: "fallback",
+          modelRoutes: [{ label: "risk:high", model: "safe" }],
+        },
+      },
+      args(ctx.target.id),
+    );
+
+    expect(claude.calls[0].model).toBe("safe");
+  });
+
+  it("does not let an unlabeled ticket inherit a target-only route", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+
+    await dispatchClaude(
+      {
+        ...ctx,
+        step: { id: "security-pass", labels: ["step:claude"] },
+        target: { ...ctx.target, labels: ["risk:high"] },
+        tickets: [{ ...ctx.target, id: "anton-8d0f.1", labels: undefined }],
+        settings: {
+          ...ctx.settings,
+          model: "fallback",
+          modelRoutes: [{ label: "risk:high", model: "safe" }],
+        },
+      },
+      args(ctx.target.id),
+    );
+
+    expect(claude.calls[0].model).toBe("fallback");
   });
 
   it("tells the runner Claude was reached before the spawn, so a crashed spawn still counts (PR #248)", async () => {

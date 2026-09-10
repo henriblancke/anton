@@ -45,7 +45,9 @@ import {
   humanGateReason,
   HUMAN_GATE_ARMED_LABEL,
 } from "./execute-epic-human-gate";
-import { branchDelivery, landableTicketIds } from "./execute-epic-dispatch";
+import { landableTicketIds } from "./execute-epic-dispatch";
+import type { BuiltinStepId } from "./step-ids";
+import { branchDelivery } from "./execute-epic-dispatch";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage, stalePrBodyNote } from "./execute-epic-review";
 import { assertDelivered, displacesSelfReport, selfReportRank } from "./execute-epic-ticket";
@@ -76,7 +78,7 @@ function ticket(id: string, labels?: string[]): Bead {
 }
 
 /** A resolved pipeline addressed the way a formula does: one `step:<name>` per step. */
-function pipeline(...names: string[]): { source: string; steps: ResolvedStep[] } {
+function pipeline(...names: BuiltinStepId[]): { source: string; steps: ResolvedStep[] } {
   return {
     source: "/repo/.beads/formulas/anton-run.formula.toml",
     steps: names.map((name) => ({

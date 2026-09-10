@@ -101,6 +101,10 @@ export async function beginEpicRun(args: {
     projectId,
     epicBeadId,
     branch,
+    // A multi-ticket run may dispatch each ticket (and each pipeline step) to a different routed
+    // model. The run row has one model field, so preserve only the project's configured fallback;
+    // recording a model selected from the union of all labels would falsely claim every dispatch
+    // used it.
     model: settings.model,
     // Record where this run will actually drive its traffic (anton-oom5). Derived from the SAME
     // routing resolver the spawn honors (claudeRouting), not the raw base URL, so a base URL that

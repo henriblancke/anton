@@ -96,6 +96,20 @@ describe("judgeBoard", () => {
     expect(scope.logged.join("")).toContain("judging 1 bead(s) with the shipped contract");
   });
 
+  it("routes its pipeline-free product-master session", async () => {
+    const { claude, seen } = session(report(`{"proposals":[]}`));
+    await judgeBoard(fakeScope(REPO), {
+      settings: {
+        model: "fallback",
+        modelRoutes: [{ jobType: "product-master", model: "board-model" }],
+      },
+      boardInput: boardInput([]),
+      claude,
+      onEvent: undefined,
+    });
+    expect(seen[0].model).toBe("board-model");
+  });
+
   it("says which reasoning it judged with, so a restyled pass is never mistaken for the default", async () => {
     const { claude } = session(report(`{"proposals":[]}`));
     const scope = fakeScope(REPO);
