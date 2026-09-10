@@ -38,6 +38,11 @@ describe("isHeading", () => {
     expect(isHeading("    # Goal")).toBe(false); // four spaces is an indented code block
     expect(isHeading("Goal")).toBe(false);
   });
+
+  it("uses the CommonMark parser for non-ATX headings too", () => {
+    expect(isHeading("Release notes\n-------------")).toBe(true);
+    expect(isHeading("\\# escaped")).toBe(false);
+  });
 });
 
 describe("scanMarkdown", () => {

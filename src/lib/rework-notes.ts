@@ -187,11 +187,15 @@ function replaceAcceptance(description: string, boxes: string[]): string {
   const inContainerFence = containerFences.fenced;
   const initiallyScanned = scanMarkdown(description);
   const neutralized = initiallyScanned
-    .map((line, at) =>
-      inHtml[at] && line.heading && ACCEPTANCE_KEYS.includes(line.heading.key)
+    .map((line, at) => {
+      // HTML blocks contain literal source, so a parser correctly exposes no heading node there.
+      // This writer still needs to neutralize an Acceptance-looking line before it appends the real
+      // section; parse that one raw line solely to identify the spelling to comment out.
+      const heading = line.heading ?? scanMarkdown(line.text)[0]?.heading;
+      return inHtml[at] && heading && ACCEPTANCE_KEYS.includes(heading.key)
         ? line.text.replace(/^([ \t]*)(.*)$/, "$1<!-- $2 -->")
-        : line.text,
-    )
+        : line.text;
+    })
     .join("\n");
   // The flat scanner cannot see that dedenting out of a list closes a fence held by that item. Hide
   // just those nested openers from this *section-finding* pass: the untouched `neutralized` lines
@@ -199,7 +203,14 @@ function replaceAcceptance(description: string, boxes: string[]): string {
   const sectionScan = neutralized
     .split("\n")
     .map((line, at) =>
-      containerFences.openers[at] ? line.replace(/([`~])/, "\\\\$1") : line,
+      containerFences.openers[at]
+        ? line.replace(/([`~])/, "\\\\$1")
+        // Micromark correctly treats lowercase declarations as prose, but preserves the following
+        // line in the same raw-HTML token. Escape only this scan copy so the visible heading can
+        // still delimit the section we replace.
+        : /^ {0,3}<![a-z]/.test(line)
+          ? line.replace("<", "&lt;")
+          : line,
     )
     .join("\n");
   const lines = scanMarkdown(sectionScan);
