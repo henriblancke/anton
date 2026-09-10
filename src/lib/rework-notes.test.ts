@@ -825,6 +825,26 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
   });
 
+  it("replaces a visible Acceptance section after a list-contained fence ends by dedent", () => {
+    // The flat scanner otherwise holds the two-space fence open through the dedented heading. In
+    // CommonMark that dedent leaves the list (and hence closes its fence), so this is the actual
+    // Acceptance section to replace; adding an indented closer here would open a new top-level fence.
+    const dedentedFence = [
+      "## Goal",
+      "g",
+      "",
+      "- example",
+      "  ```md",
+      "  old",
+      "## Acceptance Criteria",
+      "- [ ] stale",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(dedentedFence, edited);
+    expect(reconciled).toContain("  ```md\n  old\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled).not.toContain("stale");
+    expect(reconciled).not.toMatch(/\n  ```\n\n## Acceptance Criteria/);
+  });
+
   it("keeps a dropped duplicate as an empty boundary — it terminated the peer section after it", () => {
     // `## Acceptance`, a nested `### Acceptance Criteria`, then a peer `### Success`: the judge reads
     // Success as its own section only because the duplicate closed the shallower Acceptance. Dropping

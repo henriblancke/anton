@@ -183,7 +183,8 @@ function replaceAcceptance(description: string, boxes: string[]): string {
   // headings before sectioning: their surrounding raw HTML stays founder-authored, but the
   // description-first contract reader cannot concatenate its stale boxes with the real section.
   const inHtml = htmlBlockLines(description);
-  const inContainerFence = containerFenceLines(description);
+  const containerFences = containerFenceLines(description);
+  const inContainerFence = containerFences.fenced;
   const initiallyScanned = scanMarkdown(description);
   const neutralized = initiallyScanned
     .map((line, at) =>
@@ -192,7 +193,17 @@ function replaceAcceptance(description: string, boxes: string[]): string {
         : line.text,
     )
     .join("\n");
-  const lines = scanMarkdown(neutralized);
+  // The flat scanner cannot see that dedenting out of a list closes a fence held by that item. Hide
+  // just those nested openers from this *section-finding* pass: the untouched `neutralized` lines
+  // below are still what we return, and the real renderer already closes the fence at the dedent.
+  const sectionScan = neutralized
+    .split("\n")
+    .map((line, at) =>
+      containerFences.openers[at] ? line.replace(/([`~])/, "\\\\$1") : line,
+    )
+    .join("\n");
+  const lines = scanMarkdown(sectionScan);
+  const authoredLines = scanMarkdown(neutralized);
   const sections = sectionsNamed(lines, ACCEPTANCE_KEYS).filter(
     ({ start }) => !inHtml[start] && !inContainerFence[start],
   );
@@ -201,17 +212,17 @@ function replaceAcceptance(description: string, boxes: string[]): string {
     const closer = unterminatedCloser(kept);
     return [kept, ...(closer ? [closer] : []), ``, `## ${ACCEPTANCE_HEADING}`, ...boxes].join("\n");
   }
-  const texts = (from: number, to: number) => lines.slice(from, to).map((l) => l.text);
+  const texts = (from: number, to: number) => authoredLines.slice(from, to).map((l) => l.text);
   const [first, ...duplicates] = sections;
   const pieces = [[...texts(0, first!.start + 1), ...boxes]];
   // Text between a dropped copy and the next: verbatim, minus the blank lines that led into the copy.
   let cursor = first!.end;
   // The heading that governs what follows, as the judge scopes sections — the surviving Acceptance
   // until a kept heading supersedes it.
-  let governing = lines[first!.start]!.heading!;
+  let governing = authoredLines[first!.start]!.heading!;
   for (const { start, end } of duplicates) {
     pieces.push(withoutTrailingBlank(texts(cursor, start)));
-    governing = lastHeadingIn(lines, cursor, start) ?? governing;
+    governing = lastHeadingIn(authoredLines, cursor, start) ?? governing;
     // A dropped copy can be load-bearing: it TERMINATED the section after it. `## Acceptance`, a
     // nested `### Acceptance Criteria`, then a peer `### Success` — the judge reads Success as its
     // own section only because the duplicate closed the shallower Acceptance. Dropping the heading
@@ -219,14 +230,14 @@ function replaceAcceptance(description: string, boxes: string[]): string {
     // into the very acceptance this reconcile exists to replace. So the heading stays as an empty
     // boundary, its stale body gone: the judge concatenates repeated headings, and an empty body
     // adds nothing to the boxes above while still closing the section.
-    const next = lines[end]?.heading;
+    const next = authoredLines[end]?.heading;
     if (next && next.depth > governing.depth && !isTicketContractHeading(next)) {
-      pieces.push([lines[start]!.text]);
-      governing = lines[start]!.heading!;
+      pieces.push([authoredLines[start]!.text]);
+      governing = authoredLines[start]!.heading!;
     }
     cursor = end;
   }
-  pieces.push(texts(cursor, lines.length));
+  pieces.push(texts(cursor, authoredLines.length));
   return pieces
     .filter((piece) => piece.length > 0)
     .map((piece) => piece.join("\n"))
@@ -237,10 +248,12 @@ function replaceAcceptance(description: string, boxes: string[]): string {
  * Fences opened on a list item's marker line are invisible to the flat markdown scanner. Mark
  * their lines here so an apparent contract heading in the literal sample cannot be reconciled.
  */
-function containerFenceLines(description: string): boolean[] {
+function containerFenceLines(description: string): { fenced: boolean[]; openers: boolean[] } {
   const lines = description.split(/\r?\n/);
   const fenced = Array.from({ length: lines.length }, () => false);
+  const openers = Array.from({ length: lines.length }, () => false);
   let open: { prefix: string; fence: ReturnType<typeof openingFence> } | undefined;
+  let itemPrefix: string | undefined;
   for (let at = 0; at < lines.length; at += 1) {
     const text = lines[at]!;
     if (open) {
@@ -254,9 +267,25 @@ function containerFenceLines(description: string): boolean[] {
       }
     }
     const item = /^(?: {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+)(.*)$/.exec(text);
+    if (item) {
+      // Continuations begin at the content column. Keep this even when the marker's own line is
+      // prose: a fence can open on its following line (`- example` then `  ```md`).
+      itemPrefix = text.slice(0, text.length - item[1]!.length).replace(/[^\t]/g, " ");
+    } else if (itemPrefix && !text.startsWith(itemPrefix)) {
+      itemPrefix = undefined;
+    }
+    const inner = itemPrefix && text.startsWith(itemPrefix) ? text.slice(itemPrefix.length) : text;
+    const nestedFence = openingFence(inner);
+    if (nestedFence && itemPrefix) {
+      fenced[at] = true;
+      openers[at] = true;
+      open = { prefix: itemPrefix, fence: nestedFence };
+      continue;
+    }
     const fence = item && openingFence(item[1]!);
     if (item && fence) {
       fenced[at] = true;
+      openers[at] = true;
       // Continuation lines sit at the list item's content column; repeating `- ` would start a
       // sibling item instead of remaining inside the fence.
       open = {
@@ -265,7 +294,7 @@ function containerFenceLines(description: string): boolean[] {
       };
     }
   }
-  return fenced;
+  return { fenced, openers };
 }
 
 /** Every section under one of `keys` as the judge sees it: `start` is its heading's line, `end` the line opening the next section. */
