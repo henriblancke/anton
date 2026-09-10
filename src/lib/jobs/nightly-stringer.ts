@@ -13,6 +13,8 @@
  * window rather than skipping it. The worst case either way is claude re-reading a scan and deduping
  * against the board it already wrote.
  */
+import { metered } from "../claude-invocations";
+import { runClaude } from "../claude/driver";
 import { syncBoard } from "./nightly-stringer-board";
 import { openPass, type NightlyPass } from "./nightly-stringer-pass";
 import { restoreScanWindow, scanShippedTree, type ScanPass } from "./nightly-stringer-scan";
@@ -37,6 +39,8 @@ export interface NightlyStringerDeps {
  * trend is made of, so it is recorded like any other, and nothing is dispatched over it.
  */
 async function triageScan(
+  db: AntonDb,
+  clock: Clock,
   pass: NightlyPass,
   scanned: ScanPass,
   ctx: JobContext,
@@ -56,6 +60,15 @@ async function triageScan(
     signal: ctx.signal,
     claudeReached: ctx.claudeReached,
     onEvent: pass.onEvent,
+    // Metered like every other invocation (anton-77l9). The pass writes no run row, so the ledger's
+    // run and step columns are what separate this spend from a ticket's.
+    claude: metered(db, clock, {
+      projectId: pass.project.id,
+      jobType: ctx.type,
+      jobId: ctx.jobId,
+      step: "scan-triage",
+      modelRequested: pass.settings.model,
+    }, runClaude),
   });
   // Triage read the signals; from here the consumed --delta window is legitimately spent.
   pass.markTriaged();
@@ -87,7 +100,7 @@ async function runNightlyPass(db: AntonDb, clock: Clock, ctx: JobContext): Promi
     // the catch below with `scanned` set rather than stranding a consumed --delta window.
     await scanned.reportDiagnostics();
     await ctx.heartbeat();
-    const effect = await triageScan(pass, scanned, ctx);
+    const effect = await triageScan(db, clock, pass, scanned, ctx);
     await pass.end("done");
     return effect;
   } catch (e) {

@@ -106,7 +106,8 @@ function fakeClaude(replies: ScriptedReply[]) {
     const next = replies[calls.length - 1];
     if (next === undefined) throw new Error(`unscripted claude dispatch #${calls.length}`);
     if (next instanceof Error) throw next;
-    return typeof next === "string" ? { ok: true, text: next } : next;
+    // `modelUsage: []` is what a result with no readable usage carries (anton-77l9).
+    return typeof next === "string" ? { ok: true, text: next, modelUsage: [] } : next;
   };
   return { run, calls };
 }
@@ -123,6 +124,8 @@ const ctx: ReviewGateContext = {
   heartbeat: async () => {},
   report: (info) => reportedInfos.push(info),
   claudeReached: async () => {},
+  jobId: "job-test",
+  type: "execute-epic",
 };
 
 beforeEach(async () => {
@@ -738,7 +741,7 @@ describe("runReviewGate — quota", () => {
   });
 
   it("marks the review session failed when claude reports an error result", async () => {
-    const failing = async (): Promise<ClaudeResult> => ({ ok: false, text: "boom" });
+    const failing = async (): Promise<ClaudeResult> => ({ ok: false, text: "boom", modelUsage: [] });
     const worktree = fakeWorktree();
     await expect(
       runReviewGate({
@@ -837,7 +840,7 @@ describe("runReviewGate — the review is read-only", () => {
     // clean tree, so `settleBaseline` would adopt it as the baseline and a later clean review would
     // hand it to the PR unreviewed.
     const worktree = fakeWorktree([], "", [1]);
-    const { result, restores } = gate([{ ok: false, text: "boom" }], {}, [], worktree);
+    const { result, restores } = gate([{ ok: false, text: "boom", modelUsage: [] }], {}, [], worktree);
 
     await expect(result).rejects.toThrow(/claude reported an error reviewing anton-gate1/);
     expect(restores).toHaveLength(1);

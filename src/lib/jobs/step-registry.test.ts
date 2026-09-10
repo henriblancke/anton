@@ -61,7 +61,9 @@ function fakeClaude(...replies: Array<string | ClaudeResult | Error>) {
     const next = replies[calls.length - 1];
     if (next === undefined) throw new Error(`unscripted claude dispatch #${calls.length}`);
     if (next instanceof Error) throw next;
-    return typeof next === "string" ? { ok: true, text: next } : next;
+    // `modelUsage: []` is what a result with no readable usage carries — the spend ledger records
+    // such an invocation with unknown usage rather than dropping it (anton-77l9).
+    return typeof next === "string" ? { ok: true, text: next, modelUsage: [] } : next;
   };
   return { run, calls };
 }
@@ -101,7 +103,7 @@ function context(overrides: Partial<StepContext> = {}): StepContext {
   return {
     db: tdb.db,
     clock,
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {}, jobId: "job-test", type: "execute-epic" },
     projectId,
     runId,
     repoPath: dir,

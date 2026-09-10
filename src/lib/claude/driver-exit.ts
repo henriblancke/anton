@@ -8,6 +8,7 @@
 import { RecoverableClaudeError, UsageLimitError } from "../jobs/errors";
 import type { StreamState } from "./driver-events";
 import { usageLimitError, type ClaudeChannels } from "./driver-limits";
+import { parseModelUsage, type ModelUsageEntry } from "./model-usage";
 
 export interface ClaudeResult {
   ok: boolean;
@@ -15,6 +16,17 @@ export interface ClaudeResult {
   sessionId?: string;
   numTurns?: number;
   costUsd?: number;
+  /**
+   * The per-model token counts the result event reported (anton-77l9), one entry per model it named.
+   * CUMULATIVE for the session, so it is the latest result's map — never a sum across results (see
+   * {@link parseModelUsage}). Empty when the field was absent, `{}`, or unreadable: that is an
+   * invocation with unknown usage, which is still recorded rather than dropped.
+   */
+  modelUsage: ModelUsageEntry[];
+  /** Wall-clock ms the result event reported for the invocation, when it reported one. */
+  durationMs?: number;
+  /** Ms of that spent in API calls, when reported — the rest is tool and hook time. */
+  durationApiMs?: number;
   /** Final assistant/result text — the `result` field when present, else the last assistant text block. */
   text?: string;
   /** True if claude reported an error result subtype. */
@@ -195,6 +207,9 @@ export function toClaudeResult(stream: StreamState): ClaudeResult {
     sessionId: typeof raw.session_id === "string" ? raw.session_id : undefined,
     numTurns: typeof raw.num_turns === "number" ? raw.num_turns : undefined,
     costUsd: typeof raw.total_cost_usd === "number" ? raw.total_cost_usd : undefined,
+    modelUsage: parseModelUsage(raw.modelUsage),
+    durationMs: typeof raw.duration_ms === "number" ? raw.duration_ms : undefined,
+    durationApiMs: typeof raw.duration_api_ms === "number" ? raw.duration_api_ms : undefined,
     // Fall back to the last assistant message when the result field is absent (a result-less
     // success, observed on `claude --resume`) so the agent's final text — and its ANTON-RESULT
     // self-report — isn't lost, which would let partial work close as a false success (anton-juar).

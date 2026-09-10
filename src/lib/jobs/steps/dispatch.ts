@@ -5,6 +5,7 @@
  * `ANTON-RESULT` parsing are the SAME wherever an agent runs — a step that grew its own dispatch
  * would quietly drop one of the three.
  */
+import { metered } from "../../claude-invocations";
 import { formatAntonResult, parseAntonResult } from "../../claude/anton-result";
 import { claudeRouting, runClaude } from "../../claude/driver";
 import { appendSessionLog, endSession, setSessionClaudeId } from "../../sessions";
@@ -29,7 +30,22 @@ export async function dispatchClaude(
     failure: (text: string | undefined) => string;
   },
 ): Promise<StepResult> {
-  const claude = ctx.deps?.runClaude ?? runClaude;
+  // Metered here rather than at each step (anton-77l9): this is the ONE dispatch every agent-running
+  // step goes through, so the ledger holds every invocation without a new step having to remember.
+  // A resume-aware ticket driver meters its own underlying attempts. Other drivers are metered
+  // here, at this shared dispatch boundary.
+  const dimensions = {
+    projectId: ctx.projectId,
+    jobType: ctx.ctx.type,
+    jobId: ctx.ctx.jobId,
+    step: ctx.step?.id ?? "claude",
+    runId: ctx.runId,
+    beadId: args.beadId,
+    modelRequested: ctx.settings.model,
+  };
+  const claude = ctx.deps?.recordsEachAttempt
+    ? (ctx.deps.runClaude ?? runClaude)
+    : metered(ctx.db, ctx.clock, dimensions, ctx.deps?.runClaude ?? runClaude);
   const { session, owned } = await stepSession(ctx, args.beadId);
   ctx.ctx.report({ sessionId: session.sessionId, cwd: ctx.worktreePath });
 

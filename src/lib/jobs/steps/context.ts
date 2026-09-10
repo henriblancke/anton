@@ -54,6 +54,8 @@ export interface StepDeps {
    * in-session (anton-juar) instead of re-running the step from scratch.
    */
   runClaude?: (options: RunClaudeOptions) => Promise<ClaudeResult>;
+  /** True when `runClaude` meters each internal retry, so dispatch must not add an outer row. */
+  recordsEachAttempt?: boolean;
 }
 
 /**
@@ -63,8 +65,12 @@ export interface StepDeps {
 export interface StepContext {
   db: AntonDb;
   clock: Clock;
-  /** The runner's job context: cancellation, heartbeats, and the live-session handle. */
-  ctx: Pick<JobContext, "signal" | "heartbeat" | "report" | "claudeReached">;
+  /**
+   * The runner's job context: cancellation, heartbeats, the live-session handle — and the job's own
+   * identity, which the spend ledger records as the dimension separating what a run cost from what a
+   * nightly pass cost (anton-77l9).
+   */
+  ctx: Pick<JobContext, "signal" | "heartbeat" | "report" | "claudeReached" | "jobId" | "type">;
   projectId: string;
   runId: string;
   /** The project repo — where bd and gh run. Never the worktree. */
@@ -161,4 +167,3 @@ export async function stepSession(
   });
   return { session, owned: true };
 }
-

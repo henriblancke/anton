@@ -58,8 +58,10 @@ export function resilientClaude(args: {
    * the step rather than implying the resumed session was implementing the ticket.
    */
   stepId?: string;
+  /** The per-attempt driver; normally bare Claude, but metered for a ticket walk. */
+  driver?: (options: RunClaudeOptions) => Promise<ClaudeResult>;
 }): (options: RunClaudeOptions) => Promise<ClaudeResult> {
-  const { db, ctx, sessionId, logPath, ticket, stepId } = args;
+  const { db, ctx, sessionId, logPath, ticket, stepId, driver = runClaude } = args;
   return async function dispatch(options: RunClaudeOptions): Promise<ClaudeResult> {
     let resumeId: string | undefined;
     let priorError: string | undefined;
@@ -67,7 +69,7 @@ export function resilientClaude(args: {
 
     for (let attempt = 0; ; attempt++) {
       try {
-        const result = await runClaude(
+        const result = await driver(
           resumeId
             ? {
                 ...options,
