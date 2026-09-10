@@ -784,6 +784,14 @@ describe("reconcileFollowUpDescription", () => {
     expect(dedentedReconciled).not.toContain("stale");
     expect(dedentedReconciled).not.toContain("</script>");
     expect(dedentedReconciled.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // A hidden heading inside a QUOTED block keeps its `>` marker outside the comment: swallowing
+    // it ended the blockquote, so the rest of the hidden block reparsed as visible markdown and
+    // the stale boxes leaked into the rendered description.
+    const quoted = "## Goal\ng\n\n> <script>\n> ## Acceptance Criteria\n> - [ ] stale\n> </script>";
+    const quotedReconciled = reconcileFollowUpDescription(quoted, edited);
+    expect(quotedReconciled).toContain("> <!-- ## Acceptance Criteria -->");
+    expect(quotedReconciled).toContain("> - [ ] stale\n> </script>");
+    expect(quotedReconciled.match(/^##+ Acceptance/gm)).toHaveLength(1);
     // Leaving a quoted persistent block closes it with the quote. The following Acceptance heading
     // renders normally and must be replaced in place rather than misread as hidden and duplicated.
     const leftQuote = "## Goal\ng\n\n> <script>\n> raw\n## Acceptance Criteria\n- [ ] stale";

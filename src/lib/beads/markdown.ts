@@ -301,11 +301,29 @@ function closerPrefix(source: string, offset: number): string {
   const lineStart = source.lastIndexOf("\n", Math.max(0, offset - 1)) + 1;
   let rest = source.slice(lineStart, offset);
   let prefix = "";
+  // Visual columns, not source length: CommonMark expands a tab to the next multiple of four, so
+  // `-\t` opens an item whose content sits at column 4 — two source characters, four columns.
+  // Measuring by source length put the closer outside the item, where it opened a new fence.
+  let column = 0;
+  let kept = 0;
+  const expand = (text: string): string => {
+    for (const char of text) {
+      column = char === "\t" ? column + (4 - (column % 4)) : column + 1;
+    }
+    return " ".repeat(column - kept);
+  };
   for (;;) {
-    if (!rest) return prefix + (/^[ \t]*/.exec(source.slice(lineStart))?.[0] ?? "");
+    if (!rest) return prefix + expand(/^[ \t]*/.exec(source.slice(lineStart))![0]!);
     const match = /^ {0,3}(?:(>)[ \t]?|(?:[-*+]|\d{1,9}[.)])(?:[ \t]+|$))/.exec(rest);
-    if (!match) return prefix + (/^[ \t]*/.exec(rest)?.[0] ?? "");
-    prefix += match[1] ? match[0] : " ".repeat(match[0].length);
+    if (!match) return prefix + expand(/^[ \t]*/.exec(rest)![0]!);
+    if (match[1]) {
+      // A blockquote marker is kept as typed — tabs included, so its width is preserved verbatim.
+      prefix += match[0];
+      expand(match[0]);
+      kept = column;
+    } else {
+      expand(match[0]);
+    }
     rest = rest.slice(match[0].length);
   }
 }

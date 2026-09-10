@@ -194,7 +194,10 @@ function replaceAcceptance(description: string, boxes: string[]): string {
       // section; parse that one raw line solely to identify the spelling to comment out.
       const heading = line.heading ?? scanMarkdown(line.text)[0]?.heading;
       return inHtml[at] && heading && ACCEPTANCE_KEYS.includes(heading.key)
-        ? line.text.replace(/^([ \t]*)(.*)$/, "$1<!-- $2 -->")
+        ? // Container markers stay OUTSIDE the comment: a `>` swallowed into it ends the
+          // blockquote, and the rest of the hidden block reparses as visible markdown — stale
+          // boxes and all — while the reconcile claims to keep everything but Acceptance.
+          line.text.replace(/^([ \t]*(?:>[ \t]?)*)(.*)$/, "$1<!-- $2 -->")
         : line.text;
     })
     .join("\n");

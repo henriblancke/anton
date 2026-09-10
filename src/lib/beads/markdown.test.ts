@@ -362,6 +362,13 @@ describe("unterminatedCloser", () => {
     expect(unterminatedCloser("  ```\nold\n  ```\n- item\n  ~~~\nmore")).toBe("  ~~~");
     // A construct opened at the top level still closes there.
     expect(unterminatedCloser("intro\n```ts\ncode")).toBe("```");
+    // A tab after the marker is VISUAL indentation: CommonMark expands it to the next
+    // four-column stop, so `-\t` puts the item's content at column 4. Two source characters
+    // measured as two spaces placed the closer outside the item — leaving the item had already
+    // ended the fence, so the delimiter opened a new top-level one and swallowed the append.
+    expect(unterminatedCloser("-\t```md\n    some content")).toBe("    ```");
+    expect(unterminatedCloser("-\t```md\n\tcontent")).toBe("    ```");
+    expect(unterminatedCloser("1.\t```\n    code")).toBe("    ```");
   });
 
   it("opens no HTML block from a tag the render never shows or reads as text", () => {
