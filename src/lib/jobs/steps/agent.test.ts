@@ -45,7 +45,7 @@ describe("step:implement", () => {
 
   // A failed ticket must not silently pull the rest of the run along behind it.
   it("stops at the first ticket the agent could not deliver, and still reports its sessions", async () => {
-    const claude = fakeClaude({ ok: false, text: "the model gave up" });
+    const claude = fakeClaude({ ok: false, text: "the model gave up", modelUsage: [] });
 
     const result = await implementStep(
       sandbox.context({

@@ -32,6 +32,7 @@
  */
 import { loadAllIssues } from "../beads/issues";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
+import { metered } from "../claude-invocations";
 import { runClaude } from "../claude/driver";
 import { claudeRouting } from "../claude/driver-routing";
 import { getProjectSettings, resolveAutonomyPolicy } from "../projects";
@@ -170,7 +171,15 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
       const claims = await judgeBoard(scope, {
         settings,
         boardInput,
-        claude,
+        // Metered like every other invocation (anton-77l9). The pass writes no run row; `step` and
+        // `job_type` are what separate a board judgment's spend from a ticket's.
+        claude: metered(db, clock, {
+          projectId: project.id,
+          jobType: ctx.type,
+          jobId: ctx.jobId,
+          step: "product-master",
+          modelRequested: settings.model,
+        }, claude),
         onEvent: session.onEvent,
       });
 

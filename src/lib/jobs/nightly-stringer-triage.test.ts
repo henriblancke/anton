@@ -29,7 +29,7 @@ it("routes its pipeline-free nightly-stringer session", async () => {
   let seen: RunClaudeOptions | undefined;
   const claude = vi.fn(async (options: RunClaudeOptions) => {
     seen = options;
-    return { ok: true, text: "" };
+    return { ok: true, text: "", modelUsage: [] };
   });
   await runTriage({
     project: {

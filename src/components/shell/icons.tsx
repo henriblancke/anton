@@ -128,3 +128,25 @@ export function JobsIcon({ className }: { className?: string }) {
     </svg>
   );
 }
+
+export function SpendIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.3}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M2.5 13.5V9.5" />
+      <path d="M6.5 13.5V4.5" />
+      <path d="M10.5 13.5V7" />
+      <path d="M14 13.5V2.5" />
+    </svg>
+  );
+}

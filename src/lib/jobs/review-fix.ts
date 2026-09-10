@@ -49,6 +49,7 @@
  */
 import { existsSync } from "node:fs";
 import { beads, type Bead } from "../beads/bd";
+import { metered } from "../claude-invocations";
 import { claudeRouting, runClaude } from "../claude/driver";
 import { resolveModel } from "./model-routing";
 import {
@@ -578,7 +579,15 @@ async function runFixSession(args: {
     });
 
     await ctx.claudeReached();
-    const result = await runClaude({
+    const result = await metered(db, clock, {
+      projectId,
+      jobType: ctx.type,
+      jobId: ctx.jobId,
+      step: "review-fix",
+      runId: run?.id,
+      beadId: epic.id,
+      modelRequested: settings.model,
+    }, runClaude)({
       cwd: worktree.path,
       prompt,
       appendSystemPrompt,

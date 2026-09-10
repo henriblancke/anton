@@ -142,12 +142,59 @@ describe("toClaudeResult", () => {
           },
         }),
       ),
-    ).toEqual({ ok: true, sessionId: "sess-5", numTurns: 3, costUsd: 0.25, text: "done", isError: false });
+    ).toEqual({
+      ok: true,
+      sessionId: "sess-5",
+      numTurns: 3,
+      costUsd: 0.25,
+      modelUsage: [],
+      durationMs: undefined,
+      durationApiMs: undefined,
+      text: "done",
+      isError: false,
+    });
 
     expect(toClaudeResult(stream({ resultRaw: { type: "result", num_turns: "3" } }))).toMatchObject({
       numTurns: undefined,
       costUsd: undefined,
     });
+  });
+
+  it("carries the per-model usage and the durations the result reported (anton-77l9)", () => {
+    const result = toClaudeResult(
+      stream({
+        resultRaw: {
+          type: "result",
+          is_error: false,
+          num_turns: 37,
+          duration_ms: 4_368_913,
+          duration_api_ms: 444_789,
+          modelUsage: {
+            "claude-haiku-4-5-20251001": { inputTokens: 1820, outputTokens: 28 },
+            "claude-opus-5[1m]": { inputTokens: 438, outputTokens: 29177, thinkingTokens: 10732 },
+          },
+        },
+      }),
+    );
+
+    expect(result.modelUsage).toEqual([
+      { model: "claude-haiku-4-5-20251001", inputTokens: 1820, outputTokens: 28 },
+      { model: "claude-opus-5[1m]", inputTokens: 438, outputTokens: 29177, thinkingTokens: 10732 },
+    ]);
+    expect(result.durationMs).toBe(4_368_913);
+    expect(result.durationApiMs).toBe(444_789);
+  });
+
+  it("reports unknown usage rather than throwing on a result that omits or garbles modelUsage", () => {
+    // Claude Code omits the field entirely on a crash/startup-error result, and a gateway can
+    // return something else in its place. Neither may cost the caller its result.
+    expect(toClaudeResult(stream({ resultRaw: { type: "result" } })).modelUsage).toEqual([]);
+    expect(
+      toClaudeResult(stream({ resultRaw: { type: "result", modelUsage: "lots" } })).modelUsage,
+    ).toEqual([]);
+    expect(
+      toClaudeResult(stream({ resultRaw: { type: "result", duration_ms: "9s" } })).durationMs,
+    ).toBeUndefined();
   });
 
   it("falls back to the last assistant text only when the result field is absent", () => {

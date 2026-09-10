@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "2c9aeb44-2488-415a-806f-3d4827ccc220",
-  "prevId": "2c02f647-7503-423a-9e2f-61cbf077ea3d",
+  "id": "6f262676-6758-4b05-8e39-a666ce707427",
+  "prevId": "2c9aeb44-2488-415a-806f-3d4827ccc220",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -305,6 +305,13 @@
           "notNull": true,
           "autoincrement": false
         },
+        "invocation_id": {
+          "name": "invocation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "project_id": {
           "name": "project_id",
           "type": "text",
@@ -474,6 +481,13 @@
           "name": "claude_invocations_run_idx",
           "columns": [
             "run_id"
+          ],
+          "isUnique": false
+        },
+        "claude_invocations_invocation_idx": {
+          "name": "claude_invocations_invocation_idx",
+          "columns": [
+            "invocation_id"
           ],
           "isUnique": false
         }

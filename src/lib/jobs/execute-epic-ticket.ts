@@ -11,7 +11,9 @@
  * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
 import type { Bead } from "../beads/bd";
+import { metered } from "../claude-invocations";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
+import { runClaude } from "../claude/driver";
 import { branchAddedCommit } from "../git/ops";
 import { BlockedByAgentError, NeedsHumanError, NoDeliveryError } from "./execute-epic-errors";
 import {
@@ -160,7 +162,19 @@ async function walkTicketSteps(args: {
           logPath,
           ticket,
           stepId: cooked.id,
+          // Meter the bare driver inside the resilience loop: every interrupted call and its
+          // resumed successor are distinct paid attempts, even when the wrapper returns one result.
+          driver: metered(db, ticketCtx.clock, {
+            projectId: ticketCtx.projectId,
+            jobType: ticketCtx.ctx.type,
+            jobId: ticketCtx.ctx.jobId,
+            step: cooked.id,
+            runId: ticketCtx.runId,
+            beadId: ticket.id,
+            modelRequested: ticketCtx.settings?.model,
+          }, runClaude),
         }),
+        recordsEachAttempt: true,
       },
     });
     recordStepReport(progress, result.facts);

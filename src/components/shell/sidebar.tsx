@@ -19,6 +19,7 @@ import {
   RoadmapIcon,
   RunsIcon,
   SettingsIcon,
+  SpendIcon,
   TicketsIcon,
 } from "@/components/shell/icons";
 
@@ -32,6 +33,7 @@ function projectNav(slug: string): NavEntry[] {
     { label: "Roadmap", href: `/projects/${slug}/roadmap`, icon: RoadmapIcon },
     { label: "Tickets", href: `/projects/${slug}/tickets`, icon: TicketsIcon },
     { label: "Dependencies", href: `/projects/${slug}/dependencies`, icon: DependenciesIcon },
+    { label: "Spend", href: `/projects/${slug}/spend`, icon: SpendIcon },
   ];
 }
 
