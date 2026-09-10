@@ -22,6 +22,8 @@ import { makeTestDb, type TestDb } from "./db/testing";
 import {
   escalationSignature,
   getEscalation,
+  countDismissedEscalations,
+  DISMISSED_PAGE,
   listDismissedEscalations,
   listOpenEscalations,
   markEscalationNoted,
@@ -430,6 +432,53 @@ describe("a dismissed stall stays down", () => {
     const rows = await listDismissedEscalations(t.db, "p1");
     expect(rows).toHaveLength(2);
     expect(rows.every((row) => row.dismissedAt != null)).toBe(true);
+  });
+
+  /**
+   * Every dismissed row is a LIVE suppression, so a row the list cannot reach is a stall anton will
+   * never mention again with no way to undo it — and one bulk call dismisses up to 200 (PR #261
+   * review). The page must therefore be a window, not the end of the list.
+   */
+  describe("paging past the first page", () => {
+    /** More dismissals than one page holds, all in the same second — the bulk-dismissal shape. */
+    async function dismissMany(n: number): Promise<void> {
+      for (let i = 0; i < n; i++) {
+        await dismiss(finding({ key: `parked-run:r-${i}`, runId: `r-${i}` }));
+      }
+    }
+
+    it("reaches every dismissal, with no row repeated or skipped across pages", async () => {
+      const total = DISMISSED_PAGE + 12;
+      await dismissMany(total);
+
+      const first = await listDismissedEscalations(t.db, "p1");
+      const second = await listDismissedEscalations(t.db, "p1", {
+        offset: DISMISSED_PAGE,
+      });
+      expect(first).toHaveLength(DISMISSED_PAGE);
+      expect(second).toHaveLength(12);
+
+      // The property that matters is coverage, not order: walked end to end, the pages are exactly
+      // the dismissed set, once each. Same-second stamps make this fail without the id tiebreak.
+      const walked = [...first, ...second].map((row) => row.id);
+      expect(new Set(walked).size).toBe(total);
+      expect(await countDismissedEscalations(t.db, "p1")).toBe(total);
+    });
+
+    it("counts every suppression, not just the page the operator can see", async () => {
+      await dismissMany(DISMISSED_PAGE + 3);
+      const page = await listDismissedEscalations(t.db, "p1");
+      // The misreport the cap used to make: 53 standing suppressions rendering as "50".
+      expect(page).toHaveLength(DISMISSED_PAGE);
+      expect(await countDismissedEscalations(t.db, "p1")).toBe(DISMISSED_PAGE + 3);
+    });
+
+    it("counts only this project's dismissals", async () => {
+      await dismiss();
+      await raise({ projectId: "p2" });
+      expect(await countDismissedEscalations(t.db, "p2")).toBe(0);
+      expect(await countDismissedEscalations(t.db, "p1")).toBe(1);
+    });
   });
 });
 

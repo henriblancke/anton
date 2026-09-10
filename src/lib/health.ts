@@ -65,10 +65,17 @@ export interface ProjectHealth {
    */
   escalations: EscalationView[];
   /**
-   * Alerts a human put down, newest first — the undo list for a durable dismissal. Bounded by
-   * {@link listDismissedEscalations}: this is a record of decisions, not a queue.
+   * Alerts a human put down, newest first — the undo list for a durable dismissal. One page of them
+   * (see {@link listDismissedEscalations}); `dismissedTotal` says how many there are in all, and the
+   * section pages to the rest. This is a record of decisions, not a queue.
    */
   dismissed: EscalationView[];
+  /**
+   * How many alerts are dismissed in total — every one an active suppression, and so every one
+   * something the operator must be able to reach and restore. Larger than `dismissed.length`
+   * whenever there is an older page.
+   */
+  dismissedTotal: number;
   /**
    * Why the autopilot has stopped, if it has, with the evidence a re-arm is judged on. Undefined
    * while it is running.
@@ -120,6 +127,7 @@ export function projectHealthFromBoard(
     stoppedCount: alerts.escalations.length,
     escalations: alerts.escalations,
     dismissed: alerts.dismissed,
+    dismissedTotal: alerts.dismissedTotal ?? alerts.dismissed.length,
     breaker: alerts.breaker,
     parks: alerts.parks,
     pickerLog: pickerLogEntries(picker),
@@ -135,6 +143,8 @@ export function projectHealthFromBoard(
 export interface HealthAlerts {
   escalations: EscalationView[];
   dismissed: EscalationView[];
+  /** Total dismissed rows, not just the page in `dismissed`. Defaults to the page's own length. */
+  dismissedTotal?: number;
   breaker?: AutopilotBreaker;
   parks?: UnwatchedParks;
 }
@@ -173,7 +183,7 @@ export async function getProjectHealth(project: Project): Promise<ProjectHealth>
     ]);
   return projectHealthFromBoard(
     board,
-    { escalations, dismissed, breaker, parks },
+    { escalations, dismissed: dismissed.rows, dismissedTotal: dismissed.total, breaker, parks },
     staleServers,
     { starts, verdicts },
   );

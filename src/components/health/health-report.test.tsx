@@ -22,6 +22,7 @@ function health(over: Partial<ProjectHealth> = {}): ProjectHealth {
     stoppedCount: 0,
     escalations: [],
     dismissed: [],
+  dismissedTotal: 0,
     breaker: undefined,
     parks: undefined,
     staleServers: [],

@@ -22,6 +22,7 @@ function baseHealth(over: Partial<ProjectHealth> = {}): ProjectHealth {
     stoppedCount: 0,
     escalations: [],
     dismissed: [],
+  dismissedTotal: 0,
     breaker: undefined,
     parks: undefined,
     staleServers: [],
@@ -107,8 +108,28 @@ describe("HealthRail", () => {
     const dismissed = [
       { id: "esc-9", findingKey: "k", kind: "exhausted-job", reason: "r", ageMs: 0, status: "resolved", noted: true, raisedAt: 0 },
     ] as ProjectHealth["dismissed"];
-    render(<HealthRail slug="anton" health={baseHealth({ dismissed })} />);
+    render(<HealthRail slug="anton" health={baseHealth({ dismissed, dismissedTotal: 1 })} />);
     expect(screen.getByText(/1 dismissed/)).toBeTruthy();
+  });
+
+  it("counts every standing suppression, not just the page the section renders (PR #261 review)", () => {
+    // A dismissal suppresses its stall while its row exists, so this line is a count of live
+    // suppressions. Reading it off the first page would under-report a project that dismissed a
+    // storm — exactly the case where the operator most needs to know how many are still down.
+    const dismissed = [
+      {
+        id: "esc-9",
+        findingKey: "k",
+        kind: "exhausted-job",
+        reason: "r",
+        ageMs: 0,
+        status: "resolved",
+        noted: true,
+        raisedAt: 0,
+      },
+    ] as ProjectHealth["dismissed"];
+    render(<HealthRail slug="anton" health={baseHealth({ dismissed, dismissedTotal: 53 })} />);
+    expect(screen.getByText(/53 dismissed/)).toBeTruthy();
   });
 
   it("drops the jump when nothing is stopped, and never claims a dismissal nobody made", () => {

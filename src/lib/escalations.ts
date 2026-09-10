@@ -15,7 +15,7 @@
  * path goes through the shared anton.db.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { and, desc, eq, isNotNull } from "drizzle-orm";
+import { and, count, desc, eq, isNotNull } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -501,37 +501,71 @@ export async function restoreEscalation(
 /**
  * The alerts a human put down, newest dismissal first. db-injectable; read-only.
  *
- * Bounded, unlike {@link listOpenEscalations}: this list is a record of decisions rather than a
- * queue, and a project that has dismissed a thousand storms should not render a thousand rows to
- * say so. The newest are the ones a founder might want back.
+ * Paged rather than capped (PR #261 review). The first page is all this list is USUALLY about — a
+ * record of decisions rather than a queue, and a project that dismissed a thousand storms should
+ * not render a thousand rows to say so. But a dismissal is durable: while its row exists, the
+ * matching stall is never raised again. A hard cap therefore did not just hide old rows, it stranded
+ * live suppressions — the operator had no id and no `Restore` for any of them, and one bulk call
+ * dismisses up to 200 (the collection route's `MAX_IDS`). So the page is a window with a way to ask
+ * for the next one, not the end of the list.
  */
 export async function listDismissedEscalations(
   db: AntonDb,
   projectId: string,
-  limit = DISMISSED_LIMIT,
+  opts: { limit?: number; offset?: number } = {},
 ): Promise<EscalationRow[]> {
-  return db
-    .select()
-    .from(schema.escalations)
-    .where(
-      and(
-        eq(schema.escalations.projectId, projectId),
-        isNotNull(schema.escalations.dismissedAt),
-      ),
-    )
-    .orderBy(desc(schema.escalations.dismissedAt))
-    .limit(limit);
+  const { limit = DISMISSED_PAGE, offset = 0 } = opts;
+  return (
+    db
+      .select()
+      .from(schema.escalations)
+      .where(
+        and(eq(schema.escalations.projectId, projectId), isNotNull(schema.escalations.dismissedAt)),
+      )
+      // Tie-broken by id so the ordering is TOTAL: `dismissedAt` is stored to the second, and one bulk
+      // dismissal stamps every row it touches with the same one. Ordering by it alone leaves the
+      // within-second order up to SQLite, and two pages read under two different orders can repeat a
+      // row on page 2 and drop another entirely — the exact rows this pagination exists to reach.
+      .orderBy(desc(schema.escalations.dismissedAt), desc(schema.escalations.id))
+      .limit(limit)
+      .offset(offset)
+  );
 }
 
-/** How many dismissed alerts the Health page's disclosure will show. */
-export const DISMISSED_LIMIT = 50;
+/** How many dismissed alerts are still down — every one of them an active suppression. */
+export async function countDismissedEscalations(db: AntonDb, projectId: string): Promise<number> {
+  const rows = await db
+    .select({ n: count() })
+    .from(schema.escalations)
+    .where(
+      and(eq(schema.escalations.projectId, projectId), isNotNull(schema.escalations.dismissedAt)),
+    );
+  return rows[0]?.n ?? 0;
+}
+
+/** How many dismissed alerts one page of the Health page's disclosure holds. */
+export const DISMISSED_PAGE = 50;
 
 /** UI read path over the shared anton.db — the board panel's source. */
 export async function openEscalations(projectId: string): Promise<EscalationView[]> {
   return (await listOpenEscalations(getDb(), projectId)).map(toEscalationView);
 }
 
-/** UI read path for the Health page's Dismissed disclosure. */
-export async function dismissedEscalations(projectId: string): Promise<EscalationView[]> {
-  return (await listDismissedEscalations(getDb(), projectId)).map(toEscalationView);
+/**
+ * UI read path for the Health page's Dismissed disclosure — one page, plus the true total.
+ *
+ * The total is read rather than derived from `rows.length`: the count is what tells the operator
+ * there ARE older suppressions to page to, and a length that stops at the page size would report a
+ * project with 200 dismissals as having exactly 50 — the misreport that made the cap a trap.
+ */
+export async function dismissedEscalations(
+  projectId: string,
+  opts: { limit?: number; offset?: number } = {},
+): Promise<{ rows: EscalationView[]; total: number }> {
+  const db = getDb();
+  const [rows, total] = await Promise.all([
+    listDismissedEscalations(db, projectId, opts),
+    countDismissedEscalations(db, projectId),
+  ]);
+  return { rows: rows.map(toEscalationView), total };
 }

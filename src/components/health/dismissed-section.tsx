@@ -30,11 +30,51 @@ import type { EscalationView } from "@/lib/types";
 export function DismissedSection({
   slug,
   dismissed,
+  total,
 }: {
   slug: string;
   dismissed: EscalationView[];
+  /** How many are dismissed in all. Defaults to the page's own length for callers with one page. */
+  total?: number;
 }) {
+  const [older, setOlder] = useState<EscalationView[]>([]);
+  const [loading, setLoading] = useState(false);
+  // Deduped, because the two halves CAN overlap: restoring a row re-renders the server page, whose
+  // first page then pulls one row up out of the range `older` already holds. Undeduped that is a
+  // repeated React key and the same decision offered twice.
+  const rows = dedupeById([...dismissed, ...older]);
+  const all = total ?? dismissed.length;
+
   if (dismissed.length === 0) return null;
+
+  /**
+   * Forget a paged-in row once it has been restored. `router.refresh()` re-renders the server's
+   * FIRST page, and nothing else — a row this component paged in lives in client state the refresh
+   * never touches, so without this a restored row keeps rendering with a `Restore` that can only
+   * 409. The server page needs no such help: the refresh drops the row from it.
+   */
+  function dropOlder(id: string) {
+    setOlder((prev) => prev.filter((row) => row.id !== id));
+  }
+
+  async function showOlder() {
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/projects/${slug}/escalations/dismissed?offset=${rows.length}`, {
+        cache: "no-store",
+      });
+      const body = (await res.json().catch(() => null)) as {
+        dismissed?: EscalationView[];
+        error?: string;
+      } | null;
+      if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
+      setOlder((prev) => [...prev, ...(body?.dismissed ?? [])]);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to load older dismissals");
+    } finally {
+      setLoading(false);
+    }
+  }
 
   return (
     <section
@@ -45,14 +85,14 @@ export function DismissedSection({
         <h2 id="dismissed-heading" className="text-xs font-medium text-foreground">
           Dismissed
         </h2>
-        <MetaChip>{dismissed.length}</MetaChip>
+        <MetaChip>{all}</MetaChip>
       </div>
       <div className="px-3 py-2">
         <Disclosure
           summary="Put down by hand. Each stays down until its stall changes — restore one to bring it back now."
         >
           <ul className="divide-y divide-border/50">
-            {dismissed.map((escalation) => (
+            {rows.map((escalation) => (
               <li
                 key={escalation.id}
                 className="flex flex-wrap items-start gap-x-2.5 gap-y-1 py-2"
@@ -70,14 +110,42 @@ export function DismissedSection({
                       deciding on exactly this sentence. */}
                   <p className="text-muted-foreground">{escalation.reason}</p>
                 </div>
-                <RestoreButton slug={slug} escalationId={escalation.id} />
+                <RestoreButton
+                  slug={slug}
+                  escalationId={escalation.id}
+                  onRestored={dropOlder}
+                />
               </li>
             ))}
           </ul>
+          {/* Every row still here is an active suppression, so "the rest" is not an archive — it is
+              the only place those decisions can be undone. The button stays until the list is whole. */}
+          {rows.length < all ? (
+            <div className="flex items-center gap-2 pt-2">
+              <Button
+                type="button"
+                size="xs"
+                variant="outline"
+                disabled={loading}
+                onClick={() => void showOlder()}
+              >
+                {loading ? "Loading…" : "Show older"}
+              </Button>
+              <span className="text-[11px] text-subtle">
+                {rows.length} of {all} — the rest are still suppressed
+              </span>
+            </div>
+          ) : null}
         </Disclosure>
       </div>
     </section>
   );
+}
+
+/** First occurrence wins — the server-rendered page is fresher than anything paged in earlier. */
+function dedupeById(rows: EscalationView[]): EscalationView[] {
+  const seen = new Set<string>();
+  return rows.filter((row) => (seen.has(row.id) ? false : (seen.add(row.id), true)));
 }
 
 function isoSeconds(unixSeconds: number): string {
@@ -85,7 +153,15 @@ function isoSeconds(unixSeconds: number): string {
 }
 
 /** Bring one dismissed alert back to the list above. One click — restoring changes no work. */
-function RestoreButton({ slug, escalationId }: { slug: string; escalationId: string }) {
+function RestoreButton({
+  slug,
+  escalationId,
+  onRestored,
+}: {
+  slug: string;
+  escalationId: string;
+  onRestored: (id: string) => void;
+}) {
   const router = useRouter();
   const [pending, setPending] = useState(false);
 
@@ -99,12 +175,15 @@ function RestoreButton({ slug, escalationId }: { slug: string; escalationId: str
       });
       const body = (await res.json().catch(() => null)) as { error?: string } | null;
       if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
+      onRestored(escalationId);
       toast.success("Restored — it's back under Needs you");
       router.refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to restore the alert");
       // Either way the list is stale from here: a refused restore usually means the sweep raised it
-      // again, which is the outcome the click wanted.
+      // again, which is the outcome the click wanted — so this row is gone from the dismissed set
+      // either way, and a paged-in copy of it must go with it.
+      onRestored(escalationId);
       router.refresh();
     } finally {
       setPending(false);

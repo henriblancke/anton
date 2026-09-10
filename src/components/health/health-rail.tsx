@@ -66,7 +66,9 @@ function DeltaNote({ scanHealth }: { scanHealth: NonNullable<ProjectHealth["scan
  */
 export function HealthRail({ slug, health }: { slug: string; health: ProjectHealth }) {
   const { hygiene, scanHealth, trajectory, stoppedCount } = health;
-  const dismissedCount = health.dismissed.length;
+  // The TOTAL, not the page: this line is a count of standing suppressions, and `dismissed` holds
+  // only the first page of them (PR #261 review).
+  const dismissedCount = health.dismissedTotal;
 
   return (
     <aside className="flex w-full flex-col divide-y divide-border/50 rounded-xl border border-border bg-card/60 text-xs min-[900px]:sticky min-[900px]:top-[18px] min-[900px]:w-52 min-[900px]:shrink-0">

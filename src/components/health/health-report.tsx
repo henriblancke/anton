@@ -63,7 +63,11 @@ export function HealthReport({ slug, health }: { slug: string; health: ProjectHe
           {/* Directly under the list it explains: with the watcher off, that list has no producer at
               all, so an empty one means "nothing detected", not "nothing wrong". */}
           <UnwatchedParksBand slug={slug} parks={health.parks} />
-          <DismissedSection slug={slug} dismissed={health.dismissed} />
+          <DismissedSection
+            slug={slug}
+            dismissed={health.dismissed}
+            total={health.dismissedTotal}
+          />
           {neverChecked ? <NeverCheckedBanner /> : null}
           <WorthALookSection slug={slug} items={health.worthALook} />
           <CodebaseSignalsSection scanHealth={health.scanHealth} />

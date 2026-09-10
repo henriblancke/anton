@@ -235,6 +235,7 @@ process.stdin.on('end',()=>{
             stoppedCount: 0,
             escalations: [],
             dismissed: [],
+    dismissedTotal: 0,
             breaker: undefined,
             parks: undefined,
             staleServers: [],

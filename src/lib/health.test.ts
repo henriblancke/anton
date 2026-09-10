@@ -201,7 +201,7 @@ describe("getProjectHealth", () => {
     }));
     vi.doMock("./escalations", () => ({
       openEscalations: vi.fn().mockResolvedValue([]),
-      dismissedEscalations: vi.fn().mockResolvedValue([]),
+      dismissedEscalations: vi.fn().mockResolvedValue({ rows: [], total: 0 }),
     }));
     vi.doMock("./build/drift", () => ({
       serverBuildDrifts: vi.fn().mockRejectedValue(new Error("spawnSync lsof EAGAIN")),
