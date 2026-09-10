@@ -36,6 +36,8 @@ const EXPRESSIONS: Record<string, string> = {
   "env.REVIEW_FILE": ".github/CODE_REVIEW.md",
   "env.REVIEW_LABEL": "claude-approved",
   "env.REVIEW_LABEL_THRESHOLD": "7",
+  // Set by the workflow's CLI-pin step; configures the action, never a command's identity.
+  "env.CLAUDE_BIN": "/usr/local/bin/claude",
 };
 
 /**
