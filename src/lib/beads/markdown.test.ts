@@ -332,9 +332,8 @@ describe("htmlBlockLines", () => {
       false,
       false,
     ]);
-    // The marker does not make a block of a tag that opens none: conditions 6 and 7 still end at
-    // the blank line, and inline HTML mid-line still starts nothing.
-    expect(htmlBlockLines("- <div>\n  x\n\n## Acceptance")).toEqual([false, false, false, false]);
+    // A type-6 block's content is raw HTML until its blank terminator, even inside a list.
+    expect(htmlBlockLines("- <div>\n  x\n\n## Acceptance")).toEqual([true, true, false, false]);
     expect(htmlBlockLines("- see <script> in the note\n## Acceptance")).toEqual([false, false]);
   });
 
@@ -346,8 +345,8 @@ describe("htmlBlockLines", () => {
       false,
     ]);
     expect(htmlBlockLines("<!-- <script> -->\n## Acceptance")).toEqual([false, false]);
-    // Conditions 6 and 7 end at the blank line, so the heading below is written text.
-    expect(htmlBlockLines("<div>\nx\n\n## Acceptance")).toEqual([false, false, false, false]);
+    // Condition 6 hides its nonblank content, then the blank ends it and the heading below is text.
+    expect(htmlBlockLines("<div>\nx\n\n## Acceptance")).toEqual([true, true, false, false]);
     expect(htmlBlockLines("see <script> in the note\n## Acceptance")).toEqual([false, false]);
   });
 
@@ -355,8 +354,8 @@ describe("htmlBlockLines", () => {
     // `<script>` is raw content of the `<div>` block, which the blank line ends — so the heading
     // below renders, and nothing after it is hidden by a `</script>` nobody wrote.
     expect(htmlBlockLines("<div>\n<script>\n\n## Acceptance Criteria\n- [ ] stale")).toEqual([
-      false,
-      false,
+      true,
+      true,
       false,
       false,
       false,
@@ -364,8 +363,8 @@ describe("htmlBlockLines", () => {
     expect(unterminatedCloser("<div>\n<script>\n\n## Acceptance Criteria")).toBeUndefined();
     // Past the blank line the block is over, so a persistent opener there is its own block again.
     expect(htmlBlockLines("<div>\nx\n\n<script>\n## Acceptance")).toEqual([
-      false,
-      false,
+      true,
+      true,
       false,
       true,
       true,

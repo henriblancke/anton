@@ -271,8 +271,7 @@ export function scanMarkdown(source: string): ScannedLine[] {
  * A persistent HTML block's opener and the tag that closes it — CommonMark's start conditions 1, 3,
  * 4 and 5, the ones that end at their OWN closing text rather than at a blank line
  * ({@link unterminatedCloser}). Condition 2's `<!--` is the comment state machine's already.
- * Conditions 6 and 7 are absent because a blank line ends them, so nothing appended after one lands
- * inside it.
+ * Condition 7 is absent because a blank line ends it, so nothing appended after one lands inside it.
  */
 const HTML_BLOCKS: { open: RegExp; close: string }[] = [
   { open: /^ {0,3}<pre(?:[ \t>]|$)/i, close: "</pre>" },
@@ -288,12 +287,11 @@ const HTML_BLOCKS: { open: RegExp; close: string }[] = [
 
 /**
  * A block that ends at the next BLANK line rather than at a closing tag — CommonMark's start
- * condition 6, the named block-level tags. Tracked only to stop a persistent opener
- * ({@link HTML_BLOCKS}) from starting inside one: its content is raw HTML like any other block's, so
- * `<div>` / `<script>` / blank / `## Acceptance Criteria` renders that heading, while reading the
- * `<script>` as a block of its own hid the real section and appended a second one after a closing
- * tag nobody wrote. Its OWN lines are not hidden — the block ends at the blank line, so a heading
- * below it is written text, which is what the `inHtml` reader answers.
+ * condition 6, the named block-level tags. Its content is raw HTML until the blank terminator, so an
+ * Acceptance-looking heading inside it is not a visible section. It also stops a persistent opener
+ * ({@link HTML_BLOCKS}) from starting inside it: `<div>` / `<script>` / blank / `## Acceptance
+ * Criteria` renders that final heading, while reading the `<script>` as a block of its own hid it and
+ * appended a second one after a closing tag nobody wrote.
  *
  * Condition 7 — any other complete tag alone on its line — is absent for the same reason it is
  * absent from the send-back parser: it may not interrupt a paragraph, so recognising it here would
@@ -384,9 +382,9 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
       }
     }
     if (looseHtml) {
-      // A blank line ends it, and what follows renders as Markdown again.
+      // Its nonblank content is raw HTML. The blank terminator and what follows render as Markdown.
       looseHtml = text.trim() !== "";
-      inHtml.push(false);
+      inHtml.push(looseHtml);
       continue;
     }
     const openFence = state.fence !== undefined;
@@ -405,7 +403,7 @@ function walkHtmlBlocks(source: string): { inHtml: boolean[]; closer: string | u
     const container = peelContainers(line.masked);
     html = HTML_BLOCKS.find((block) => block.open.test(container.content));
     if (!html) looseHtml = LOOSE_HTML_BLOCK.test(container.content);
-    inHtml.push(html !== undefined);
+    inHtml.push(html !== undefined || looseHtml);
     if (html) {
       if (text.toLowerCase().includes(html.close)) html = undefined;
       else indent = container.prefix;

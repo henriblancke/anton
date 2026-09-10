@@ -721,6 +721,13 @@ describe("reconcileFollowUpDescription", () => {
     expect(visibleAfterDeclaration).not.toContain("stale");
     expect(visibleAfterDeclaration).not.toContain("\n>\n");
     expect(visibleAfterDeclaration.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // A type-6 HTML block hides its nonblank content until its blank terminator. The apparent
+    // section is therefore not replaceable; append a real Acceptance section after the blank.
+    const blankTerminated = "## Goal\ng\n\n<div>\n## Acceptance Criteria\n- [ ] hidden\n\n";
+    const appendedAfterBlock = reconcileFollowUpDescription(blankTerminated, edited);
+    expect(appendedAfterBlock.startsWith(blankTerminated.trimEnd())).toBe(true);
+    expect(appendedAfterBlock).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(appendedAfterBlock.match(/^##+ Acceptance/gm)).toHaveLength(2);
   });
 
   it("closes a construct nested in a list item inside that item, not at the top level", () => {
