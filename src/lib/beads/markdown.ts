@@ -172,9 +172,12 @@ function markSetextHeadings(lines: Line[]): void {
 /**
  * Comments are inline HTML tokens, so their source-preserving projection is kept separate from the
  * AST walk. Micromark decides where HTML blocks and headings are; this only removes an already
- * recognised `<!-- … -->` span without losing offsets needed by citation repairs.
+ * recognised `<!-- … -->` span without losing offsets needed by citation repairs. An opener inside
+ * an inline code span is literal text — CommonMark parses no HTML there — so it never opens a
+ * comment here either.
  */
-function stripComments(lines: Line[]) {
+function stripComments(lines: Line[], codeSpans: { start: number; end: number }[]) {
+  const inCode = (offset: number) => codeSpans.some((span) => offset >= span.start && offset < span.end);
   let open = false;
   for (const line of lines) {
     if (line.fenced) continue;
@@ -195,7 +198,8 @@ function stripComments(lines: Line[]) {
         open = false;
         continue;
       }
-      const start = line.text.indexOf("<!--", at);
+      let start = line.text.indexOf("<!--", at);
+      while (start !== -1 && inCode(line.start + start)) start = line.text.indexOf("<!--", start + 4);
       if (start === -1) {
         const rest = line.text.slice(at);
         visible += rest;
@@ -239,7 +243,13 @@ export function scanMarkdown(source: string): ScannedLine[] {
       return;
     }
   });
-  stripComments(lines);
+  const codeSpans: { start: number; end: number }[] = [];
+  visit(root, (node) => {
+    if (node.type === "inlineCode" && node.position) {
+      codeSpans.push({ start: node.position.start.offset!, end: node.position.end.offset! });
+    }
+  });
+  stripComments(lines, codeSpans);
   visit(root, (node) => {
     if (!node.position) return;
     if (node.type === "heading") {
@@ -369,6 +379,13 @@ export function unterminatedCloser(source: string): string | undefined {
   });
   if (!closer) {
     const lines = scanMarkdown(source);
+    const codeSpans: { start: number; end: number }[] = [];
+    visit(root, (node) => {
+      if (node.type === "inlineCode" && node.position) {
+        codeSpans.push({ start: node.position.start.offset!, end: node.position.end.offset! });
+      }
+    });
+    const inCode = (at: number) => codeSpans.some((span) => at >= span.start && at < span.end);
     let commentOffset: number | undefined;
     let commentOpen = false;
     let fence: { offset: number; opener: string } | undefined;
@@ -385,7 +402,8 @@ export function unterminatedCloser(source: string): string | undefined {
           commentOffset = undefined;
           continue;
         }
-        const start = line.text.indexOf("<!--", at);
+        let start = line.text.indexOf("<!--", at);
+        while (start !== -1 && inCode(offset + start)) start = line.text.indexOf("<!--", start + 4);
         if (start === -1) break;
         commentOpen = true;
         commentOffset = offset + start;

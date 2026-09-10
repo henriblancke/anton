@@ -182,6 +182,14 @@ describe("scanMarkdown", () => {
       expect(headings("text <!-- x\n## Hidden")).toEqual([undefined, undefined]);
     });
 
+    it("reads a comment opener inside an inline code span as literal text, not a comment", () => {
+      // CommonMark parses no HTML inside a code span, so `<!--` there opens nothing — the heading
+      // after it stays visible, and a real comment later on the line is still stripped.
+      expect(visible("a `<!--` b <!-- x --> c")).toEqual(["a `<!--` b  c"]);
+      expect(visible("see `<!--`\n## Real")).toEqual(["see `<!--`", "## Real"]);
+      expect(headings("see `<!--`\n## Real")).toEqual([undefined, { depth: 2, key: "real" }]);
+    });
+
     it("flags the lines that BEGIN inside a comment — the opener's own line is not one of them", () => {
       const commented = (source: string) => scanMarkdown(source).map((l) => l.commented);
       expect(commented("a <!-- x\n## hidden\n--> tail\nafter")).toEqual([false, true, true, false]);

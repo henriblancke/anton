@@ -441,7 +441,46 @@ function oneLine(text: string): string {
  * otherwise open a section of its own. The note keeps the raw text; it is prose, not a contract.
  */
 function markdownSafe(text: string): string {
-  return text.replace(/<!--/g, "<\\!--");
+  // Escape outside inline code spans only: CommonMark reads no backslash inside one, so an
+  // escaped opener there would render with a visible backslash and no longer match the note.
+  return splitCodeSpans(text)
+    .map(({ segment, code }) => (code ? segment : segment.replace(/<!--/g, "<\\!--")))
+    .join("");
+}
+
+/**
+ * `text` broken into alternating plain and inline-code-span segments. A span opens on a run of
+ * backticks and closes on a run of exactly the same length; an opener with no closer is literal
+ * text, and scanning resumes after it — later backticks can still open a span.
+ */
+function splitCodeSpans(text: string): { segment: string; code: boolean }[] {
+  const parts: { segment: string; code: boolean }[] = [];
+  let plain = "";
+  let i = 0;
+  while (i < text.length) {
+    const open = /^`+/.exec(text.slice(i));
+    if (!open) {
+      plain += text[i];
+      i++;
+      continue;
+    }
+    const ticks = open[0];
+    // The closer is a backtick run of the same length, not part of a longer run.
+    const rest = text.slice(i + ticks.length);
+    const close = new RegExp(`(?<!\`)${ticks}(?!\`)`).exec(rest);
+    if (!close) {
+      plain += ticks;
+      i += ticks.length;
+      continue;
+    }
+    parts.push({ segment: plain, code: false });
+    const end = i + ticks.length + close.index + ticks.length;
+    parts.push({ segment: text.slice(i, end), code: true });
+    plain = "";
+    i = end;
+  }
+  if (plain) parts.push({ segment: plain, code: false });
+  return parts;
 }
 
 /** A fence delimiter at a line's head — the only place one opens a block ({@link goalBody}). */

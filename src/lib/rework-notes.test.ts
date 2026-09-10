@@ -272,6 +272,28 @@ describe("followUpDescription", () => {
     expect(description).not.toContain("<!--");
   });
 
+  it("keeps a comment opener inside an inline code span literal — escaping there adds a visible backslash", () => {
+    // CommonMark reads no backslash escapes inside a code span, so neutralising `<!--` there would
+    // render `<\!--` and the note would no longer match the founder's words. The span is already
+    // literal text; only openers outside spans need the escape.
+    const description = followUpDescription({
+      ...args,
+      summary: "handle `<!--` tokens",
+      instructions: "Handle `<!--` in a span.\nEscape a bare <!-- outside one.",
+      findings: [],
+      ticket: makeBead({ id: "t1", title: "Quote `<!--` safely" }),
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain("## Goal\nhandle `<!--` tokens\n");
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] Handle `<!--` in a span.",
+      "- [ ] Escape a bare <\\!-- outside one.",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(description).toContain("Discovered from t1 — Quote `<!--` safely.");
+  });
+
   it("escapes a fence-shaped summary — bare, it would fence every section under the Goal", () => {
     for (const summary of ["```", "```md swallows the section", "~~~"]) {
       const description = followUpDescription({ ...args, summary, parentId: "feat" });
