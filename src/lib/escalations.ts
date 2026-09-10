@@ -171,6 +171,32 @@ export function toEscalationView(row: EscalationRow): EscalationView {
 }
 
 /**
+ * The rendered ages inside a finding's `reason`, replaced by a placeholder so they can't move the
+ * signature (PR #261 review).
+ *
+ * Three detectors build `reason` around `humanAge(ageMs)` — `run parked 4h: …`, `PR #12 idle 3d …`,
+ * `run-lease expired 90m ago …` (jobs/run-health.ts) — and that text is a CLOCK, not evidence: an
+ * untouched stall re-renders as `4h` then `5h` the moment it crosses an hour boundary. Hashing it
+ * raw gave the next sweep a signature the dismissed row could not match, so the alert an operator
+ * put down came straight back — the one thing durable dismissal exists to prevent.
+ *
+ * A normalization rather than a separate stable-evidence field on the finding, because the same
+ * function must also run over the `reason` COLUMN when a legacy row's signature is backfilled at
+ * dismissal time ({@link signatureFor}), where all that survives of the finding is the rendered
+ * text. One rule applied to both keeps a backfilled row hashing identically to the same stall
+ * raised fresh.
+ *
+ * Matches `humanAge`'s whole output shape (`<n>m` / `<n>h` / `<n>d`) wherever it appears, so an
+ * error blob quoting its own duration (`timed out after 30m`) is normalized too. That is the safe
+ * direction to be wrong in: it makes the signature slightly coarser — one failure whose only
+ * difference is a duration reads as the same failure — where the opposite error re-raises a
+ * dismissed alert on a tick of the clock.
+ */
+function withoutRenderedAges(reason: string): string {
+  return reason.replace(/\b\d+[mhd]\b/g, "\u0001age");
+}
+
+/**
  * The stall's identity, for deciding whether a dismissed alert should stay down (anton-7gxs).
  *
  * `findingKey` is what makes two sweeps over one stall converge on one row; it is NOT enough to
@@ -178,6 +204,10 @@ export function toEscalationView(row: EscalationRow): EscalationView {
  * both survive the failure changing underneath them, so a dismissal keyed on them alone would
  * silence the next, different failure of the same job. The signature folds in the two fields that
  * DO move when the stall changes: why it stopped, and when.
+ *
+ * Why it stopped is taken age-free ({@link withoutRenderedAges}): the reason string carries a
+ * rendered age that ticks on its own, and how long a stall has been stuck is not a way the stall
+ * CHANGED. When it started (`since`) is already in the hash and is the honest test for a restart.
  *
  * Hashed rather than stored raw because `reason` is unbounded free text (a park message can carry a
  * whole API error blob), and this column is only ever compared for equality.
@@ -190,8 +220,9 @@ export function escalationSignature(
   finding: Pick<EscalationFinding, "kind" | "key" | "reason" | "since">,
 ): string {
   const since = Math.floor(finding.since / 1000);
+  const reason = withoutRenderedAges(finding.reason);
   return createHash("sha256")
-    .update(`${finding.kind}\u0000${finding.key}\u0000${finding.reason}\u0000${since}`)
+    .update(`${finding.kind}\u0000${finding.key}\u0000${reason}\u0000${since}`)
     .digest("hex")
     .slice(0, 32);
 }

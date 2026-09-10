@@ -159,7 +159,7 @@ describe("EscalationActions — dismiss", () => {
       expect.objectContaining({ body: JSON.stringify({ action: "dismiss" }) }),
     );
     expect(success).toHaveBeenCalledWith(
-      "Dismissed — anton raises it again if it's still stuck at the next sweep",
+      "Dismissed — it stays down until this stall changes; restore it from Dismissed",
     );
   });
 

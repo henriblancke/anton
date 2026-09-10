@@ -307,6 +307,43 @@ describe("escalationSignature", () => {
       escalationSignature({ ...first, since: NOW - 30 * 60_000 }),
     );
   });
+
+  /**
+   * The regression from PR #261's review. Three detectors render `humanAge(ageMs)` into `reason`,
+   * so an UNTOUCHED stall re-reads with different text the moment it crosses a minute/hour/day
+   * boundary. Hashing that text made the next sweep miss the dismissed row and re-raise the exact
+   * alert the operator had put down.
+   */
+  it("ignores the rendered age ticking over inside an otherwise unchanged reason", () => {
+    const at4h = finding({ reason: "run parked 4h: agent exited 1" });
+    const at5h = finding({ reason: "run parked 5h: agent exited 1" });
+    expect(escalationSignature(at4h)).toBe(escalationSignature(at5h));
+  });
+
+  it("ignores the age on every detector that renders one", () => {
+    const stalePr = (age: string) =>
+      finding({
+        kind: "stale-pr",
+        key: "stale-pr:t-9:12",
+        reason: `PR #12 idle ${age} with the target still in review`,
+      });
+    expect(escalationSignature(stalePr("3d"))).toBe(escalationSignature(stalePr("4d")));
+
+    const deadLease = (age: string) =>
+      finding({
+        kind: "dead-lease",
+        key: "dead-lease:t-9",
+        reason: `run-lease expired ${age} ago with no job to resume it — the owning run died mid-flight`,
+      });
+    expect(escalationSignature(deadLease("59m"))).toBe(escalationSignature(deadLease("1h")));
+  });
+
+  it("still separates two failures that differ by more than their age", () => {
+    // The coarsening must not swallow the case the signature exists for.
+    const first = finding({ reason: "run parked 4h: API 503" });
+    const second = finding({ reason: "run parked 5h: API 401 — bad credentials" });
+    expect(escalationSignature(first)).not.toBe(escalationSignature(second));
+  });
 });
 
 describe("a dismissed stall stays down", () => {
@@ -356,6 +393,16 @@ describe("a dismissed stall stays down", () => {
     const again = await raise({ finding: changed });
     expect(again.suppressed).toBeUndefined();
     expect(again.escalation.id).toBe(live.escalation.id);
+  });
+
+  it("stays down when only the rendered age moved on (PR #261 review)", async () => {
+    // The sweep re-derives `reason` every pass, so an untouched stall crossing an hour boundary
+    // arrives with new TEXT and identical evidence. That must not read as a new stall.
+    await dismiss(finding({ reason: "run parked 4h: agent exited 1" }));
+    const later = await raise({ finding: finding({ reason: "run parked 5h: agent exited 1" }) });
+    expect(later.suppressed).toBe(true);
+    expect(later.created).toBe(false);
+    expect(await listOpenEscalations(t.db, "p1")).toHaveLength(0);
   });
 
   it("is scoped to its project — one board's dismissal never silences another's", async () => {

@@ -18,7 +18,7 @@ const ACTION_DETAIL: Record<string, string> = {
   "cancelled-job": "Stopped — the job is cancelled and won't retry",
   "job-already-settled": "Already settled — the job had already stopped",
   "job-restarted": "Not stopped — the job is running again, so it was left alone",
-  dismissed: "Dismissed — anton raises it again if it's still stuck at the next sweep",
+  dismissed: "Dismissed — it stays down until this stall changes; restore it from Dismissed",
   "gate-resolved": "Gate closed — the wait is over; there was no run left to restart",
   // Names no blocker and promises no restart, deliberately. This ONE detail covers every reason the
   // board refused the dispatch — unapproved, abandoned, claimed by another operator, already in
@@ -144,7 +144,7 @@ export function EscalationActions({
           size="xs"
           variant="outline"
           disabled={pending !== null}
-          title="Settle this alert without changing the work — anton raises it again if it's still stuck at the next sweep"
+          title="Settle this alert without changing the work — it stays down until this stall changes, and you can restore it from Dismissed"
           onClick={() => void act("dismiss")}
         >
           <CheckIcon aria-hidden="true" />
