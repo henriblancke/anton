@@ -1,21 +1,20 @@
 // @vitest-environment jsdom
 /**
- * Escalations only (anton-ue90.1 / the health-page split). This used to be `attention-strip.test.tsx`
- * covering a band that also carried hygiene findings, the worst review score, and the patrol's own
- * housekeeping — that coverage moved with the behaviour to the Health page's own tests. What stays
- * is everything an escalation offered: every decision affordance, the two-clock-safe stuck timer,
- * and the "nothing stopped, render nothing" honesty rule (now a much simpler claim than the old
- * "checked, clean" vs "never checked" distinction, because this component no longer has hygiene or
- * review data to be clean ABOUT).
+ * The Health page's alert list (anton-7gxs), which was the board's escalation strip until a storm of
+ * identical failures proved a list cannot live above the columns. What is covered here is what an
+ * escalation always offered: every decision affordance, the two-clock-safe stuck timer, and the
+ * "nothing stopped, render nothing" honesty rule.
  *
  * Plus the request-vs-failure split (anton-mivh.2): a wait on a person is work paused on purpose,
- * and the strip has to say so — in its own colour, its own verb, and its own place in the order —
- * without softening how the four accidental stalls read.
+ * and the list has to say so — in its own colour, its own verb, and its own place in the order —
+ * without softening how the four accidental stalls read. And the grouping this move added: a burst
+ * is one event wearing many faces, so failures of one kind collapse under one header with one
+ * "Dismiss all".
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
-import { EscalationStrip } from "@/components/board/escalation-strip";
+import { NeedsYouSection } from "@/components/health/needs-you-section";
 import type { EscalationView } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
@@ -50,10 +49,10 @@ function escalation(o: Partial<EscalationView> = {}): EscalationView {
 }
 
 function renderStrip(escalations: EscalationView[] = []) {
-  return render(<EscalationStrip slug="anton" escalations={escalations} />);
+  return render(<NeedsYouSection slug="anton" escalations={escalations} />);
 }
 
-describe("EscalationStrip", () => {
+describe("NeedsYouSection", () => {
   it("renders nothing when nothing has stopped", () => {
     // The old merged strip's "board clean" empty state does not move here: hygiene and review data
     // are gone from this component, so it has no basis for that claim any more — the Health pill
@@ -84,7 +83,7 @@ describe("EscalationStrip", () => {
     // live clock in the effect that runs after hydration.
     const sweptAt = Date.now() - 9 * HOUR;
     const { rerender } = render(
-      <EscalationStrip
+      <NeedsYouSection
         slug="anton"
         escalations={[escalation({ since: Math.floor(sweptAt / 1000), ageMs: 2 * HOUR })]}
       />,
@@ -94,7 +93,7 @@ describe("EscalationStrip", () => {
     // escalation-age.test.ts, which is where the two-clock rule actually lives.
     expect(screen.getByText("stuck 9h")).toBeTruthy();
     rerender(
-      <EscalationStrip
+      <NeedsYouSection
         slug="anton"
         escalations={[escalation({ since: Math.floor(sweptAt / 1000), ageMs: 2 * HOUR })]}
       />,
@@ -160,13 +159,16 @@ describe("EscalationStrip", () => {
     expect(container.querySelector("section")?.className).not.toContain("destructive");
   });
 
-  it("keeps the failure classes reading as failures when a request shares the strip", () => {
+  it("keeps the failure classes reading as failures when a request shares the list", () => {
     const { container } = renderStrip([
       escalation(),
       escalation({ id: "esc-2", kind: "needs-human", gateId: "g-1" }),
     ]);
 
-    expect(screen.getByText("Parked run").className).toContain("risk-high");
+    // The class is named ONCE, by the group header, and the rows under it stop repeating it — but
+    // the count beside that header still carries the failure register, so a group of stalls reads
+    // as stalls at a glance without thirty red chips saying the same word.
+    expect(screen.getByRole("heading", { name: "Parked run" })).toBeTruthy();
     expect(screen.getByText("stuck 4h")).toBeTruthy();
     expect(screen.getByText("1 stopped")).toBeTruthy();
     expect(screen.getByText("1 to answer")).toBeTruthy();

@@ -556,6 +556,8 @@ describe("partitionOpenEscalations", () => {
       status: "open",
       resolution: null,
       notedAt: null,
+      dismissedAt: null,
+      signature: null,
       raisedAt: secDate(NOW),
       updatedAt: secDate(NOW),
     };

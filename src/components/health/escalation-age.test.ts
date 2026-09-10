@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { escalationAge, stuckFor } from "@/components/board/escalation-age";
+import { escalationAge, stuckFor } from "@/components/health/escalation-age";
 import type { EscalationView } from "@/lib/types";
 
 const HOUR = 3_600_000;

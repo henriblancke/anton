@@ -8,7 +8,10 @@ import { parseJsonBody, withProject } from "../../resolve-project";
 export const dynamic = "force-dynamic";
 
 /**
- * Settle one escalation (anton-wvcy): `{ action: "resume" | "abandon" | "dismiss" }`.
+ * Settle one escalation (anton-wvcy): `{ action: "resume" | "abandon" | "dismiss" | "restore" }`.
+ *
+ * `restore` (anton-7gxs) is the one verb that acts on a row that is not open: it lifts a dismissal,
+ * which is what makes dismissing safe to be durable in the first place.
  *
  * A POST on the escalation itself rather than sub-resources — every verb is the SAME decision
  * ("how does this stall end?"), and modelling them as one action field keeps the panel's buttons
@@ -34,7 +37,7 @@ export const POST = withProject<{ slug: string; escalationId: string }>(
     const action = (body as { action?: unknown })?.action;
     if (!isEscalationAction(action)) {
       return NextResponse.json(
-        { error: 'action must be "resume", "abandon", or "dismiss"' },
+        { error: 'action must be "resume", "abandon", "dismiss", or "restore"' },
         { status: 400 },
       );
     }
@@ -43,7 +46,10 @@ export const POST = withProject<{ slug: string; escalationId: string }>(
       const result = await actOnEscalation(project, params.escalationId, action);
       if (!result.ok) {
         const status = result.reason === "not-found" ? 404 : 409;
-        return NextResponse.json({ error: FAILURE_MESSAGES[result.reason] }, { status });
+        return NextResponse.json(
+          { error: FAILURE_MESSAGES[result.reason], reason: result.reason },
+          { status },
+        );
       }
       return NextResponse.json({
         action: result.action,
@@ -68,7 +74,11 @@ const FAILURE_MESSAGES = {
   "not-open": "This escalation has already been settled",
   "no-target": "This escalation names no ticket or job to act on",
   "not-dismissable":
-    "A wait on a person can't be dismissed — the gate would stay open and the next sweep would raise it again. Resolve it (you did the thing) or abandon the work",
+    "This alert can't be dismissed — a wait on a person leaves its gate open, and a disarm keeps every card stopped. Answer it, or re-arm anton",
+  "not-dismissed":
+    "There is nothing to restore — this alert was never dismissed, or it was already restored",
+  "restore-conflicted":
+    "This alert is already open elsewhere; its dismissal remains available to restore after that alert is settled",
   contested: "Another machine has picked this work back up — it is running again, so nothing was changed",
   unverified:
     "anton could not read the shared board, so it can't rule out another machine running this work — nothing was changed. Try again once bd can reach the remote",
