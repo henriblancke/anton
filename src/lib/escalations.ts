@@ -14,11 +14,11 @@
  * db-injectable (like runs/run-health) so the sweep and its tests share one connection; the UI read
  * path goes through the shared anton.db.
  */
-import { randomUUID } from "node:crypto";
-import { and, desc, eq } from "drizzle-orm";
+import { createHash, randomUUID } from "node:crypto";
+import { and, count, desc, eq, isNotNull, lt, or } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
-import type { AntonDb, Clock } from "./jobs/queue";
+import { isUniqueViolation, type AntonDb, type Clock } from "./jobs/queue";
 import type { RunHealthFindingKind } from "./run-health";
 
 export type EscalationStatus = "open" | "resolved";
@@ -69,8 +69,11 @@ export type EscalationResolution = "resumed" | "abandoned" | "dismissed";
  * The verb side of {@link EscalationResolution} — what the founder clicked, before it is recorded as
  * how the row was settled. It lives here rather than with the code that applies it so that every
  * handler taking a verb can name one without importing back through escalation-actions.ts.
+ *
+ * `restore` is the odd one out: it is the only verb that acts on a row that is already SETTLED, and
+ * it records no resolution at all — it takes one away (see {@link restoreEscalation}).
  */
-export type EscalationAction = "resume" | "abandon" | "dismiss";
+export type EscalationAction = "resume" | "abandon" | "dismiss" | "restore";
 
 export type EscalationRow = typeof schema.escalations.$inferSelect;
 
@@ -111,6 +114,14 @@ export interface EscalationView {
   noted: boolean;
   /** Unix seconds this escalation was first raised. */
   raisedAt: number;
+  /**
+   * Unix seconds a HUMAN put this alert down, absent on every other row — including one the sweep
+   * itself retired, which records `resolution: "dismissed"` and no stamp (see the column's note).
+   * Its presence is what the Dismissed list and the suppression on the raise path both key off.
+   */
+  dismissedAt?: number;
+  /** The stall's identity as it was when dismissed — what a later raise is compared against. */
+  signature?: string;
 }
 
 function secDate(ms: number): Date {
@@ -154,7 +165,67 @@ export function toEscalationView(row: EscalationRow): EscalationView {
     resolution: (row.resolution ?? undefined) as EscalationResolution | undefined,
     noted: row.notedAt != null,
     raisedAt: toEpoch(row.raisedAt) ?? 0,
+    dismissedAt: toEpoch(row.dismissedAt) ?? undefined,
+    signature: row.signature ?? undefined,
   };
+}
+
+/**
+ * The rendered ages inside a finding's `reason`, replaced by a placeholder so they can't move the
+ * signature (PR #261 review).
+ *
+ * Four detectors build `reason` around `humanAge(ageMs)` — `run parked 4h: …`, `PR #12 idle 3d …`,
+ * `run-lease expired 90m ago …`, `waiting on a human 2h: …` (jobs/run-health.ts) — and that text is
+ * a CLOCK, not evidence: an
+ * untouched stall re-renders as `4h` then `5h` the moment it crosses an hour boundary. Hashing it
+ * raw gave the next sweep a signature the dismissed row could not match, so the alert an operator
+ * put down came straight back — the one thing durable dismissal exists to prevent.
+ *
+ * A normalization rather than a separate stable-evidence field on the finding, because the same
+ * function must also run over the `reason` COLUMN when a legacy row's signature is backfilled at
+ * dismissal time ({@link signatureFor}), where all that survives of the finding is the rendered
+ * text. One rule applied to both keeps a backfilled row hashing identically to the same stall
+ * raised fresh.
+ *
+ * Matches `humanAge`'s whole output shape (`<n>m` / `<n>h` / `<n>d`) wherever it appears, so an
+ * error blob quoting its own duration (`timed out after 30m`) is normalized too. That is the safe
+ * direction to be wrong in: it makes the signature slightly coarser — one failure whose only
+ * difference is a duration reads as the same failure — where the opposite error re-raises a
+ * dismissed alert on a tick of the clock.
+ */
+function withoutRenderedAges(reason: string): string {
+  return reason.replace(/\b\d+[mhd]\b/g, "\u0001age");
+}
+
+/**
+ * The stall's identity, for deciding whether a dismissed alert should stay down (anton-7gxs).
+ *
+ * `findingKey` is what makes two sweeps over one stall converge on one row; it is NOT enough to
+ * hang a dismissal on. An `exhausted-job` key is the job id, and a `parked-run` key is the run id —
+ * both survive the failure changing underneath them, so a dismissal keyed on them alone would
+ * silence the next, different failure of the same job. The signature folds in the two fields that
+ * DO move when the stall changes: why it stopped, and when.
+ *
+ * Why it stopped is taken age-free ({@link withoutRenderedAges}): the reason string carries a
+ * rendered age that ticks on its own, and how long a stall has been stuck is not a way the stall
+ * CHANGED. When it started (`since`) is already in the hash and is the honest test for a restart.
+ *
+ * Hashed rather than stored raw because `reason` is unbounded free text (a park message can carry a
+ * whole API error blob), and this column is only ever compared for equality.
+ *
+ * `since` is rounded to the second, matching how the row itself stores it: a finding re-derived from
+ * the same event must hash identically across sweeps, and sub-second drift in a re-read timestamp
+ * would otherwise make every raise look like a new stall.
+ */
+export function escalationSignature(
+  finding: Pick<EscalationFinding, "kind" | "key" | "reason" | "since">,
+): string {
+  const since = Math.floor(finding.since / 1000);
+  const reason = withoutRenderedAges(finding.reason);
+  return createHash("sha256")
+    .update(`${finding.kind}\u0000${finding.key}\u0000${reason}\u0000${since}`)
+    .digest("hex")
+    .slice(0, 32);
 }
 
 export interface RaiseEscalationInput {
@@ -169,6 +240,13 @@ export interface RaiseEscalationResult {
   escalation: EscalationRow;
   /** False when an open escalation already covered this finding — the idempotent path. */
   created: boolean;
+  /**
+   * True when nothing was raised because a human had already dismissed this exact stall
+   * (anton-7gxs). Distinct from `created: false` on its own, which means the row is already up and
+   * on the board: a suppressed finding has NO row on the board, so the caller must not write a bd
+   * note for it or count it as an escalation the operator can see.
+   */
+  suppressed?: boolean;
 }
 
 /**
@@ -186,6 +264,7 @@ export async function raiseEscalation(
 ): Promise<RaiseEscalationResult> {
   const { projectId, finding } = input;
   const nowMs = clock.now();
+  const signature = escalationSignature(finding);
 
   const openRow = (tx: Pick<AntonDb, "select">) =>
     tx
@@ -201,10 +280,35 @@ export async function raiseEscalation(
       .limit(1)
       .all()[0];
 
+  /**
+   * A human's standing "not this one" for this exact stall. Matched on the SIGNATURE, not the key:
+   * the same job failing a new way is a new stall and comes back, which is the whole reason the
+   * signature exists. Read inside the same transaction as the open-row check so a dismissal landing
+   * mid-sweep can't be straddled.
+   */
+  const dismissedRow = (tx: Pick<AntonDb, "select">) =>
+    tx
+      .select()
+      .from(schema.escalations)
+      .where(
+        and(
+          eq(schema.escalations.projectId, projectId),
+          eq(schema.escalations.findingKey, finding.key),
+          eq(schema.escalations.signature, signature),
+          isNotNull(schema.escalations.dismissedAt),
+        ),
+      )
+      .limit(1)
+      .all()[0];
+
   try {
     return db.transaction((tx) => {
       const existing = openRow(tx);
       if (existing) return { escalation: existing, created: false };
+      // Ordered after the open check on purpose: a row that is UP outranks a row that was put down,
+      // so a stall re-raised and then dismissed and then re-raised again reports the live row.
+      const dismissed = dismissedRow(tx);
+      if (dismissed) return { escalation: dismissed, created: false, suppressed: true };
 
       const inserted = tx
         .insert(schema.escalations)
@@ -221,6 +325,7 @@ export async function raiseEscalation(
           since: secDate(finding.since),
           evidenceJson: JSON.stringify(finding),
           status: "open",
+          signature,
           raisedAt: secDate(nowMs),
           updatedAt: secDate(nowMs),
         })
@@ -281,23 +386,225 @@ export async function getEscalation(
  * Settle an escalation. The status guard lives in the UPDATE's WHERE so two clicks on the same
  * item can't both "win": the second updates zero rows and reports false, which is what stops a
  * double-click from resuming a run twice.
+ *
+ * `byHuman` stamps `dismissedAt`, and ONLY a person's click ever passes it: that stamp is what
+ * suppresses the next raise of this stall, and the sweep's own retirement path settles as
+ * `dismissed` too (see `settleEndedStalls`) while meaning the exact opposite — "this is over", not
+ * "stop telling me". Defaulting it off keeps every existing caller honest by construction.
  */
 export async function settleEscalation(
   db: AntonDb,
   clock: Clock,
   id: string,
   resolution: EscalationResolution,
+  byHuman = false,
 ): Promise<boolean> {
   const nowMs = clock.now();
   const rows = await db
     .update(schema.escalations)
-    .set({ status: "resolved", resolution, updatedAt: secDate(nowMs) })
+    .set({
+      status: "resolved",
+      resolution,
+      updatedAt: secDate(nowMs),
+      ...(byHuman ? { dismissedAt: secDate(nowMs), signature: await signatureFor(db, id) } : {}),
+    })
     .where(and(eq(schema.escalations.id, id), eq(schema.escalations.status, "open")))
     .returning({ id: schema.escalations.id });
   return rows.length > 0;
 }
 
+/**
+ * The signature to stamp on a row being dismissed — its own, or one derived now if it has none.
+ *
+ * A row raised before this column existed carries NULL, and a NULL never matches, so dismissing one
+ * would settle it and change nothing about the next sweep. That is not an edge case: the storm that
+ * motivated durable dismissal is sitting on the board of every install that upgrades into it, and a
+ * feature that works for every future alert but none of the current ones is a feature that appears
+ * broken on the day it ships.
+ *
+ * So it is backfilled at DISMISSAL time rather than by a migration. The migration has no hash
+ * function to compute one with (sqlite ships no sha256), and there is nothing to gain from stamping
+ * rows nobody has put down — the signature only ever matters to a row a person dismissed.
+ *
+ * Derived from the row's own columns, which are exactly what the finding was raised from: the
+ * seconds-resolution `since` matches the flooring {@link escalationSignature} applies, so a
+ * backfilled row hashes identically to the same stall raised fresh. A row with no `since` at all
+ * keeps its NULL and simply doesn't suppress — the honest outcome when there is nothing to compare.
+ */
+async function signatureFor(db: AntonDb, id: string): Promise<string | null> {
+  const rows = await db
+    .select({
+      kind: schema.escalations.kind,
+      findingKey: schema.escalations.findingKey,
+      reason: schema.escalations.reason,
+      since: schema.escalations.since,
+      signature: schema.escalations.signature,
+    })
+    .from(schema.escalations)
+    .where(eq(schema.escalations.id, id))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return null;
+  if (row.signature) return row.signature;
+  const since = toEpoch(row.since);
+  if (since === undefined) return null;
+  return escalationSignature({
+    kind: row.kind as EscalationKind,
+    key: row.findingKey,
+    reason: row.reason,
+    since: since * 1000,
+  });
+}
+
+/**
+ * Pick a dismissed alert back up (anton-7gxs): clear the stamp and put the row back on the list.
+ *
+ * Refused — as a no-op reporting `false` — when an open row already covers the same finding. That is
+ * the honest answer when the sweep re-raised the stall, or another dismissal of it was restored,
+ * after this one was put down: the alert is already back, and there is nothing for this click to do.
+ *
+ * Read and write run in ONE better-sqlite3 transaction (single synchronous connection, so the pair
+ * cannot interleave), with `escalations_open_unique` caught as the backstop for anything that lands
+ * outside it — a second process on the same file. Both layers matter: without them a raise between
+ * the check and the update turned a quiet `false` into a 500 from the route (PR #261 review). The
+ * same read→write-in-a-transaction-plus-catch shape `raiseEscalation` uses, for the same index.
+ *
+ * The resolution is cleared with the stamp: a restored row is not "dismissed" any more, and leaving
+ * the word there would leave the Dismissed list and the open list disagreeing about one row.
+ */
+export type RestoreEscalationResult = "restored" | "already-restored" | "conflicted" | "not-dismissed";
+
+export async function restoreEscalation(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+  id: string,
+): Promise<RestoreEscalationResult> {
+  const nowMs = clock.now();
+
+  try {
+    return db.transaction((tx) => {
+      const row = tx
+        .select()
+        .from(schema.escalations)
+        .where(and(eq(schema.escalations.projectId, projectId), eq(schema.escalations.id, id)))
+        .limit(1)
+        .all()[0];
+      if (!row) return "not-dismissed";
+      if (row.dismissedAt == null) return "already-restored";
+
+      const live = tx
+        .select({ id: schema.escalations.id })
+        .from(schema.escalations)
+        .where(
+          and(
+            eq(schema.escalations.projectId, projectId),
+            eq(schema.escalations.findingKey, row.findingKey),
+            eq(schema.escalations.status, "open"),
+          ),
+        )
+        .limit(1)
+        .all();
+      if (live.length > 0) return "conflicted";
+
+      const rows = tx
+        .update(schema.escalations)
+        .set({ status: "open", resolution: null, dismissedAt: null, updatedAt: secDate(nowMs) })
+        .where(and(eq(schema.escalations.id, id), isNotNull(schema.escalations.dismissedAt)))
+        .returning({ id: schema.escalations.id })
+        .all();
+      return rows.length > 0 ? "restored" : "already-restored";
+    });
+  } catch (e) {
+    // The partial index rejected the update: an open row for this finding landed from outside this
+    // connection. The alert is back either way, so this is the same quiet "already back" the
+    // in-transaction check reports — not a 500.
+    if (isUniqueViolation(e)) return "conflicted";
+    throw e;
+  }
+}
+
+/**
+ * The alerts a human put down, newest dismissal first. db-injectable; read-only.
+ *
+ * Paged rather than capped (PR #261 review). The first page is all this list is USUALLY about — a
+ * record of decisions rather than a queue, and a project that dismissed a thousand storms should
+ * not render a thousand rows to say so. But a dismissal is durable: while its row exists, the
+ * matching stall is never raised again. A hard cap therefore did not just hide old rows, it stranded
+ * live suppressions — the operator had no id and no `Restore` for any of them, and one bulk call
+ * dismisses up to 200 (the collection route's `MAX_IDS`). So the page is a window with a way to ask
+ * for the next one, not the end of the list.
+ */
+export async function listDismissedEscalations(
+  db: AntonDb,
+  projectId: string,
+  opts: { limit?: number; offset?: number; before?: { dismissedAt: number; id: string } } = {},
+): Promise<EscalationRow[]> {
+  const { limit = DISMISSED_PAGE, offset = 0, before } = opts;
+  const beforeCondition = before
+    ? or(
+        lt(schema.escalations.dismissedAt, secDate(before.dismissedAt * 1000)),
+        and(
+          eq(schema.escalations.dismissedAt, secDate(before.dismissedAt * 1000)),
+          lt(schema.escalations.id, before.id),
+        ),
+      )
+    : undefined;
+  return (
+    db
+      .select()
+      .from(schema.escalations)
+      .where(
+        and(
+          eq(schema.escalations.projectId, projectId),
+          isNotNull(schema.escalations.dismissedAt),
+          beforeCondition,
+        ),
+      )
+      // Tie-broken by id so the ordering is TOTAL: `dismissedAt` is stored to the second, and one bulk
+      // dismissal stamps every row it touches with the same one. Ordering by it alone leaves the
+      // within-second order up to SQLite, and two pages read under two different orders can repeat a
+      // row on page 2 and drop another entirely — the exact rows this pagination exists to reach.
+      .orderBy(desc(schema.escalations.dismissedAt), desc(schema.escalations.id))
+      .limit(limit)
+      .offset(offset)
+  );
+}
+
+/** How many dismissed alerts are still down — every one of them an active suppression. */
+export async function countDismissedEscalations(db: AntonDb, projectId: string): Promise<number> {
+  const rows = await db
+    .select({ n: count() })
+    .from(schema.escalations)
+    .where(
+      and(eq(schema.escalations.projectId, projectId), isNotNull(schema.escalations.dismissedAt)),
+    );
+  return rows[0]?.n ?? 0;
+}
+
+/** How many dismissed alerts one page of the Health page's disclosure holds. */
+export const DISMISSED_PAGE = 50;
+
 /** UI read path over the shared anton.db — the board panel's source. */
 export async function openEscalations(projectId: string): Promise<EscalationView[]> {
   return (await listOpenEscalations(getDb(), projectId)).map(toEscalationView);
+}
+
+/**
+ * UI read path for the Health page's Dismissed disclosure — one page, plus the true total.
+ *
+ * The total is read rather than derived from `rows.length`: the count is what tells the operator
+ * there ARE older suppressions to page to, and a length that stops at the page size would report a
+ * project with 200 dismissals as having exactly 50 — the misreport that made the cap a trap.
+ */
+export async function dismissedEscalations(
+  projectId: string,
+  opts: { limit?: number; offset?: number; before?: { dismissedAt: number; id: string } } = {},
+): Promise<{ rows: EscalationView[]; total: number }> {
+  const db = getDb();
+  const [rows, total] = await Promise.all([
+    listDismissedEscalations(db, projectId, opts),
+    countDismissedEscalations(db, projectId),
+  ]);
+  return { rows: rows.map(toEscalationView), total };
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { use } from "react";
+import { Suspense, use } from "react";
 import { PauseIcon, TriangleAlertIcon } from "lucide-react";
 import Link from "next/link";
 
@@ -49,25 +49,6 @@ import { cn } from "@/lib/utils";
  * itself the moment anton is updated and restarted, so its remedy lives in the evidence (the exact
  * `git pull` / `bun install`) and the clearing sentence, not in an action on this board.
  */
-/**
- * The band as the board mounts it: the breaker read, resolved HERE rather than in the page.
- *
- * Deciding the WIP hold spawns a `gh pr view` per in-review PR, and that read is network-bound —
- * awaiting it in the page's own render would put every card on the board behind GitHub's latency.
- * The page hands over the unresolved promise instead and this component suspends on it alone, so a
- * slow GitHub costs a late band and nothing else.
- */
-export function AutopilotBreakerBand({
-  slug,
-  breaker,
-}: {
-  slug: string;
-  /** Resolves to undefined when the autopilot is running. Absent when there is no project at all. */
-  breaker?: Promise<AutopilotBreaker | undefined>;
-}) {
-  return <AutopilotBreakerHeader slug={slug} breaker={breaker ? use(breaker) : undefined} />;
-}
-
 export function AutopilotBreakerHeader({
   slug,
   breaker,
@@ -143,4 +124,42 @@ export function AutopilotBreakerHeader({
       </div>
     </section>
   );
+}
+
+/**
+ * The band on the Health page, where the breaker read arrives late (PR #261 review).
+ *
+ * Deciding the WIP hold spawns a `gh pr view` per in-review PR, so the page hands the read over
+ * unresolved and this wrapper suspends on it alone — behind its OWN boundary, with a null fallback.
+ * The pairing is the same one the board's `BoardAttentionSlot` makes, for the same reason: the
+ * alerts under this band, and every Resume/Dismiss/Abandon on them, must not wait on GitHub, and a
+ * band that is late is better shown as absent than as a skeleton the operator watches.
+ */
+export function StreamedAutopilotBreakerHeader({
+  slug,
+  breaker,
+}: {
+  slug: string;
+  /** The page's server read — a promise, because deciding the hold reads GitHub. */
+  breaker?: Promise<AutopilotBreaker | undefined>;
+}) {
+  return (
+    <Suspense fallback={null}>
+      <UnwrappedBreakerHeader slug={slug} breaker={breaker} />
+    </Suspense>
+  );
+}
+
+/**
+ * The unwrap itself, in a component rather than an inline `use()` in the wrapper: a hook called
+ * beside the boundary would suspend the parent, which is the one thing the boundary exists to stop.
+ */
+function UnwrappedBreakerHeader({
+  slug,
+  breaker,
+}: {
+  slug: string;
+  breaker?: Promise<AutopilotBreaker | undefined>;
+}) {
+  return <AutopilotBreakerHeader slug={slug} breaker={breaker ? use(breaker) : undefined} />;
 }

@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { EscalationActions } from "@/components/board/escalation-actions";
+import { EscalationActions } from "@/components/health/escalation-actions";
 
 const refresh = vi.fn();
 const success = vi.fn();
@@ -159,7 +159,7 @@ describe("EscalationActions — dismiss", () => {
       expect.objectContaining({ body: JSON.stringify({ action: "dismiss" }) }),
     );
     expect(success).toHaveBeenCalledWith(
-      "Dismissed — anton raises it again if it's still stuck at the next sweep",
+      "Dismissed — it stays down until this stall changes; restore it from Dismissed",
     );
   });
 

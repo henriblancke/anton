@@ -1,10 +1,14 @@
 import type { ProjectHealth } from "@/lib/health";
 import { AppliedSection } from "./applied-section";
+import { StreamedAutopilotBreakerHeader } from "./autopilot-breaker-band";
 import { CodebaseSignalsSection } from "./codebase-signals-section";
+import { DismissedSection } from "./dismissed-section";
 import { HealthRail } from "./health-rail";
 import { HousekeepingSection } from "./housekeeping-section";
+import { NeedsYouSection } from "./needs-you-section";
 import { StaleServerBanner } from "./stale-server-banner";
 import { TicketDialogHost } from "./ticket-dialog-host";
+import { UnwatchedParksBand } from "./unwatched-parks-band";
 import { WorthALookSection } from "./worth-a-look-section";
 
 /**
@@ -33,9 +37,15 @@ function NeverCheckedBanner() {
  * each omit themselves when they have nothing to say, and the rail beside them always renders,
  * carrying the clean-vs-never-checked distinction for the page as a whole.
  *
- * `TicketDialogHost` is the page's one client boundary (mirrors `epic-board.tsx`'s `TicketDialog` +
- * `onOpenBead` pair): everything else here is a Server Component, and only the leaf bead-link buttons
- * nested inside it reach across that boundary.
+ * "Read-only" stopped being true at anton-7gxs, and the ordering below is what that change costs.
+ * The alerts that used to live above the board — the breaker, the stopped runs, the unwatched-park
+ * warning — now lead this page, because they are the only things here that need a DECISION rather
+ * than a look, and a decision buried under three trend charts is one nobody makes. Everything after
+ * them is the report this page has always been.
+ *
+ * `TicketDialogHost` is the page's one client boundary for the report half (mirrors `epic-board.tsx`'s
+ * `TicketDialog` + `onOpenBead` pair); the alert sections are client components of their own, because
+ * every one of them carries a button.
  */
 export function HealthReport({ slug, health }: { slug: string; health: ProjectHealth }) {
   const neverChecked = !health.hygiene && !health.scanHealth && !health.trajectory;
@@ -46,6 +56,20 @@ export function HealthReport({ slug, health }: { slug: string; health: ProjectHe
         <div className="flex min-w-0 flex-1 flex-col gap-3">
           {/* Above everything: a stale process is the reason to distrust the sections below it. */}
           <StaleServerBanner servers={health.staleServers} />
+          {/* Then the breaker, because it outranks every row under it: an escalation is one stalled
+              card, a disarm is every card that would have started. It arrives LATE — the read
+              spawns a `gh pr view` per in-review PR — so it streams in behind its own boundary, and
+              every alert below it paints without waiting (PR #261 review). */}
+          <StreamedAutopilotBreakerHeader slug={slug} breaker={health.breaker} />
+          <NeedsYouSection slug={slug} escalations={health.escalations} />
+          {/* Directly under the list it explains: with the watcher off, that list has no producer at
+              all, so an empty one means "nothing detected", not "nothing wrong". */}
+          <UnwatchedParksBand slug={slug} parks={health.parks} />
+          <DismissedSection
+            slug={slug}
+            dismissed={health.dismissed}
+            total={health.dismissedTotal}
+          />
           {neverChecked ? <NeverCheckedBanner /> : null}
           <WorthALookSection slug={slug} items={health.worthALook} />
           <CodebaseSignalsSection scanHealth={health.scanHealth} />

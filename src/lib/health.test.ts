@@ -1,14 +1,25 @@
 /**
  * `projectHealthFromBoard` composes `rankAttention` for the Health page. What matters: escalations
- * never taint what this page calls "worth a look" or "clean" (they're answered on the board, not
- * here), the attention/housekeeping split still comes straight from `rankAttention`, and the stopped
- * count is carried through untouched for the right rail's "answered on the board" line.
+ * never taint what this page calls "worth a look" or "clean", the attention/housekeeping split still
+ * comes straight from `rankAttention`, and the alerts are carried through untouched beside it.
+ *
+ * The separation outlived the move that brought the alerts onto this page (anton-7gxs). It was never
+ * about WHERE they are answered — it is that "the codebase is healthy" and "work is stopped" are two
+ * different claims, and folding one into the other would let a single upstream outage make a clean
+ * codebase look sick, or a clean patrol hide a board that has not moved in a day.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { projectHealthFromBoard } from "./health";
+import { projectHealthFromBoard, type HealthAlerts } from "./health";
 import type { ServerDrift } from "./build/drift";
-import type { Board, HygieneFinding, HygieneReport, Project, ReviewTrajectory } from "./types";
+import type {
+  Board,
+  EscalationView,
+  HygieneFinding,
+  HygieneReport,
+  Project,
+  ReviewTrajectory,
+} from "./types";
 
 type BoardSlice = Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">;
 
@@ -60,10 +71,32 @@ function trajectory(score: number): ReviewTrajectory {
   return { recent: [worst], average: score, worst, scored: 1 };
 }
 
+/**
+ * The alert bag the composition takes, defaulted to "nothing is stopped". Named per case rather than
+ * passed positionally: the four reads arrive together and only the count matters to most of these.
+ */
+function alerts(over: Partial<HealthAlerts> = {}): HealthAlerts {
+  return { escalations: [], dismissed: [], ...over };
+}
+
+/** `n` open escalations, distinguishable only by id — these cases count them, never read them. */
+function stopped(n: number): EscalationView[] {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `esc-${i}`,
+    findingKey: `exhausted-job:job-${i}`,
+    kind: "exhausted-job" as const,
+    reason: "claude exited 1",
+    ageMs: 0,
+    status: "open" as const,
+    noted: true,
+    raisedAt: 0,
+  }));
+}
+
 describe("projectHealthFromBoard", () => {
   it("reports nothing checked for a project with no patrol, no scan, no scores", () => {
     const board: BoardSlice = { hygiene: undefined, scanHealth: undefined, reviewTrajectory: undefined };
-    const health = projectHealthFromBoard(board, 0);
+    const health = projectHealthFromBoard(board, alerts());
     expect(health.worthALook).toEqual([]);
     expect(health.housekeeping).toEqual([]);
     expect(health.hygiene).toBeUndefined();
@@ -73,7 +106,7 @@ describe("projectHealthFromBoard", () => {
 
   it("distinguishes 'checked, clean' from 'never checked' by keeping the patrol report itself", () => {
     const board: BoardSlice = { hygiene: hygiene([]), scanHealth: undefined, reviewTrajectory: undefined };
-    const health = projectHealthFromBoard(board, 0);
+    const health = projectHealthFromBoard(board, alerts());
     expect(health.worthALook).toEqual([]);
     // The report ran and found nothing — that's a different claim from never having run, and the
     // page tells them apart by whether `hygiene` itself is present, not by the item lists alone.
@@ -86,7 +119,7 @@ describe("projectHealthFromBoard", () => {
       scanHealth: undefined,
       reviewTrajectory: undefined,
     };
-    const health = projectHealthFromBoard(board, 0);
+    const health = projectHealthFromBoard(board, alerts());
     expect(health.worthALook).toHaveLength(1);
     expect(health.worthALook[0]).toMatchObject({ source: "hygiene", severity: "attention" });
     expect(health.housekeeping).toEqual([]);
@@ -98,7 +131,7 @@ describe("projectHealthFromBoard", () => {
       scanHealth: undefined,
       reviewTrajectory: undefined,
     };
-    const health = projectHealthFromBoard(board, 0);
+    const health = projectHealthFromBoard(board, alerts());
     expect(health.worthALook).toEqual([]);
     expect(health.housekeeping).toHaveLength(1);
     expect(health.housekeeping[0]).toMatchObject({ source: "hygiene", severity: "housekeeping" });
@@ -106,23 +139,23 @@ describe("projectHealthFromBoard", () => {
 
   it("promotes a rework-band worst score into worthALook", () => {
     const board: BoardSlice = { hygiene: undefined, scanHealth: undefined, reviewTrajectory: trajectory(3) };
-    const health = projectHealthFromBoard(board, 0);
+    const health = projectHealthFromBoard(board, alerts());
     expect(health.worthALook).toHaveLength(1);
     expect(health.worthALook[0]).toMatchObject({ source: "review" });
   });
 
   it("leaves a healthy trend out of worthALook", () => {
     const board: BoardSlice = { hygiene: undefined, scanHealth: undefined, reviewTrajectory: trajectory(8) };
-    const health = projectHealthFromBoard(board, 0);
+    const health = projectHealthFromBoard(board, alerts());
     expect(health.worthALook).toEqual([]);
   });
 
   it("carries the stopped count through untouched, independent of hygiene/review findings", () => {
     const board: BoardSlice = { hygiene: undefined, scanHealth: undefined, reviewTrajectory: undefined };
-    const health = projectHealthFromBoard(board, 3);
+    const health = projectHealthFromBoard(board, alerts({ escalations: stopped(3) }));
     expect(health.stoppedCount).toBe(3);
-    // An open escalation must not turn a project with no findings into a "not clean" one — it's a
-    // different question, answered on the board, and this page never mixes the two.
+    // An open escalation must not turn a project with no findings into a "not clean" one — it is a
+    // different question, and this page keeps the two apart even though it now renders both.
     expect(health.worthALook).toEqual([]);
   });
 });
@@ -150,11 +183,11 @@ describe("build drift on the health page", () => {
         },
       },
     ];
-    expect(projectHealthFromBoard(board, 0, servers).staleServers).toBe(servers);
+    expect(projectHealthFromBoard(board, alerts(), servers).staleServers).toBe(servers);
   });
 
   it("reports none when every running server started from the current checkout", () => {
-    expect(projectHealthFromBoard(board, 0).staleServers).toEqual([]);
+    expect(projectHealthFromBoard(board, alerts()).staleServers).toEqual([]);
   });
 });
 
@@ -166,9 +199,19 @@ describe("getProjectHealth", () => {
     vi.doMock("./board", () => ({
       getBoard: vi.fn().mockResolvedValue({ hygiene: hygiene([]), scanHealth: undefined, reviewTrajectory: undefined }),
     }));
-    vi.doMock("./escalations", () => ({ openEscalations: vi.fn().mockResolvedValue([]) }));
+    vi.doMock("./escalations", () => ({
+      openEscalations: vi.fn().mockResolvedValue([]),
+      dismissedEscalations: vi.fn().mockResolvedValue({ rows: [], total: 0 }),
+    }));
     vi.doMock("./build/drift", () => ({
       serverBuildDrifts: vi.fn().mockRejectedValue(new Error("spawnSync lsof EAGAIN")),
+    }));
+    // The breaker read reaches GitHub and the process table, and the park read reaches the db —
+    // neither is what this case is about, and both are stubbed so the drift failure is the only
+    // thing under test.
+    vi.doMock("./autopilot-state", () => ({ currentBreaker: vi.fn().mockResolvedValue(undefined) }));
+    vi.doMock("./unwatched-parks", () => ({
+      unwatchedParksForProject: vi.fn().mockResolvedValue(undefined),
     }));
     vi.doMock("./picker-starts", () => ({ latestPickerStarts: vi.fn().mockResolvedValue([]) }));
     vi.doMock("./picker-veto", () => ({ latestPickerDeclines: vi.fn().mockResolvedValue([]) }));

@@ -651,6 +651,29 @@ export const escalations = sqliteTable(
     /** When the board-native `bd note` landed. Null with a `beadId` set means the write failed and
      *  the next pass retries it — the note is what makes the escalation visible off the anton UI. */
     notedAt: ts("noted_at"),
+    /**
+     * When a HUMAN put this alert down (anton-7gxs), and the reason it stays down: a dismissed row
+     * suppresses the next raise of the same stall (see {@link escalationSignature}).
+     *
+     * Deliberately NOT `resolution = 'dismissed'`, which the sweep itself writes whenever it retires
+     * an ended stall (`settleEndedStalls` in jobs/unstick.ts). Keying suppression off the resolution
+     * would make every auto-retirement silence its own finding forever — the exact opposite of what
+     * that path means, which is "this stall is over, so stop showing it". Only a click sets this.
+     */
+    dismissedAt: ts("dismissed_at"),
+    /**
+     * The stall's identity BEYOND its finding key — what "until it changes" is measured against.
+     *
+     * `findingKey` alone is too coarse to gate a dismissal on: an `exhausted-job` key is the job id,
+     * and that job's error text is exactly what changes when the failure changes. The signature
+     * folds in the reason and the stall's start, so a dismissed 503 storm stays down while the same
+     * job failing a NEW way comes straight back.
+     *
+     * Null on rows written before this column existed, and null rows never suppress: an old
+     * dismissal has nothing to compare against, and silencing a live stall on a guess is the one
+     * mistake this table must not make.
+     */
+    signature: text("signature"),
     raisedAt: ts("raised_at").notNull().default(now),
     updatedAt: ts("updated_at").notNull().default(now),
   },
@@ -664,6 +687,12 @@ export const escalations = sqliteTable(
       .where(sql`${table.status} = 'open'`),
     // Serves the board panel's "this project's open escalations" read without a full scan.
     index("escalations_project_status_idx").on(table.projectId, table.status),
+    // Serves the suppression read on the raise path — one lookup per finding per sweep, so it must
+    // not scan the table's whole history. Partial on dismissed rows for the same reason the open
+    // index above is partial: only they can ever match.
+    index("escalations_dismissed_idx")
+      .on(table.projectId, table.findingKey)
+      .where(sql`${table.dismissedAt} is not null`),
   ],
 );
 

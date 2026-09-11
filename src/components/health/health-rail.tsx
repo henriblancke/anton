@@ -66,6 +66,9 @@ function DeltaNote({ scanHealth }: { scanHealth: NonNullable<ProjectHealth["scan
  */
 export function HealthRail({ slug, health }: { slug: string; health: ProjectHealth }) {
   const { hygiene, scanHealth, trajectory, stoppedCount } = health;
+  // The TOTAL, not the page: this line is a count of standing suppressions, and `dismissed` holds
+  // only the first page of them (PR #261 review).
+  const dismissedCount = health.dismissedTotal;
 
   return (
     <aside className="flex w-full flex-col divide-y divide-border/50 rounded-xl border border-border bg-card/60 text-xs min-[900px]:sticky min-[900px]:top-[18px] min-[900px]:w-52 min-[900px]:shrink-0">
@@ -147,21 +150,34 @@ export function HealthRail({ slug, health }: { slug: string; health: ProjectHeal
         </p>
       </RailBlock>
 
-      <RailBlock title="On the board">
-        {/* "answered on the board, not here" is a redirection, so it is only said when there is
-            something to redirect: at zero it would imply work is waiting somewhere else, which is
-            the opposite of what the count means. The block itself still renders — this rail is the
-            one thing on the page that always does, and "nothing is stopped" is worth saying. */}
+      <RailBlock title="Needs you">
+        {/* This block used to redirect to the board, which is where the rows were. They are here now
+            (anton-7gxs), so it counts them and points DOWN the page instead. The block still renders
+            at zero — this rail is the one thing on the page that always does, and "nothing is
+            open alerts" is worth saying — but the anchor is only offered when there is something to
+            jump to. */}
         <p className="text-muted-foreground">
           {stoppedCount > 0 ? (
             <>
-              {stoppedCount} stopped {stoppedCount === 1 ? "run" : "runs"} — answered on the board,
-              not here.
+              {stoppedCount} open {stoppedCount === 1 ? "alert" : "alerts"} needing a decision.
             </>
           ) : (
-            "No stopped runs."
+            "No open alerts."
           )}
         </p>
+        {dismissedCount > 0 ? (
+          <p className="text-subtle">
+            {dismissedCount} dismissed — down until the stall changes.
+          </p>
+        ) : null}
+        {stoppedCount > 0 ? (
+          <a
+            href="#needs-you"
+            className="text-subtle underline-offset-2 hover:text-foreground hover:underline"
+          >
+            Jump to Needs you
+          </a>
+        ) : null}
         <Link
           href={`/projects/${slug}`}
           className="text-subtle underline-offset-2 hover:text-foreground hover:underline"

@@ -8,14 +8,12 @@ import type { Board, EscalationView, UnwatchedParks } from "@/lib/types";
 import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
 import { BoardCanvas } from "@/components/board/board-canvas";
 import {
-  BoardBreakerSlot,
+  BoardAttentionSlot,
   BoardDragOverlay,
   BoardLoadError,
 } from "@/components/board/board-parts";
 import { BoardSkeleton } from "@/components/board/board-skeleton";
 import { BoardToolbar } from "@/components/board/board-toolbar";
-import { EscalationStrip } from "@/components/board/escalation-strip";
-import { UnwatchedParksBand } from "@/components/board/unwatched-parks-band";
 import { OperatorQueue } from "@/components/board/operator-queue";
 import { useBoardBreaker } from "@/components/board/use-board-breaker";
 import { useBoardDrag } from "@/components/board/use-board-drag";
@@ -52,15 +50,19 @@ export function EpicBoard({
    */
   initialGrouping?: BoardGrouping;
   /**
-   * Open escalations, server-rendered by the page (anton-ue90.1). They are the only signal that
-   * still gets a band above the board — hygiene, review trend, and housekeeping moved to the Health
-   * page (anton-ue90.3) — and they're answered by an action that reloads the page, so they don't
-   * need the board's poll.
+   * Open escalations, server-rendered by the page. COUNTED here, never listed (anton-7gxs): the
+   * strip reports how many have stopped and how many are asks, and the rows with their Resume /
+   * Dismiss / Abandon buttons live on the Health page — choosing between those verbs means reading
+   * the park message, which is exactly what a one-line strip cannot show.
+   *
+   * Still no poll behind it: an answer is given on the Health page, which re-renders from its own
+   * server read, and the count here refreshes with the page.
    */
   escalations?: EscalationView[];
   /**
    * Parked work with nothing watching it (anton-kh98), server-rendered by the page. Absent — and so
    * silent — whenever the stall watcher is armed or nothing is parked; its presence IS the signal.
+   * The strip carries it as a count plus the arm button, and the full band is on the Health page.
    *
    * The FIRST paint only: the board re-reads it on its own slower cadence, because both edges — a
    * job parking, and the watcher being armed elsewhere — happen off this board entirely.
@@ -116,16 +118,20 @@ export function EpicBoard({
         sort={sort}
         onSortChange={setSort}
       />
-      {/* Above the escalations, because it outranks them: an escalation is one stalled card, a
-          breaker is every card that would have started. */}
-      <BoardBreakerSlot slug={slug} polled={polledBreaker} streamed={breaker} />
-      {/* Directly above the strip it explains: with the watcher off, the strip has no producer at
-          all, so an empty strip means "nothing detected", not "nothing wrong". */}
-      <UnwatchedParksBand slug={slug} parks={unwatched.parks} onArmed={unwatched.refresh} />
-      {/* The one band that still needs a DECISION about a card below it, not just a look. Escalations
-          come from the page's server render — they are answered by an action that reloads, not by a
-          poll — so they don't ride the board payload the way hygiene/trend/scan health used to. */}
-      <EscalationStrip slug={slug} escalations={escalations} />
+      {/* Every alert this board raises, on ONE fixed-height line (anton-7gxs): what stopped the
+          autopilot, how much work is stopped or waiting on an answer, and whether anything is
+          watching the queue. Three separate bands used to stack here, each as tall as its worst
+          night, and a storm of identical failures pushed the columns off the screen entirely. The
+          rows themselves — and every per-row verb — now live on the Health page the strip links to;
+          only the two whole-decision buttons (re-arm, arm the watcher) stay inline. */}
+      <BoardAttentionSlot
+        slug={slug}
+        escalations={escalations}
+        parks={unwatched.parks}
+        onArmed={unwatched.refresh}
+        polled={polledBreaker}
+        streamed={breaker}
+      />
       {/* Below the escalations, never instead of them: a stopped run needs a decision now, while
           this band is standing work that was always the founder's. It reads the UNFILTERED board on
           purpose — a queue narrowed by the column filters would quietly under-report what is owed. */}

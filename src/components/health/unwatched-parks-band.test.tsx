@@ -11,10 +11,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { UnwatchedParksBand } from "@/components/board/unwatched-parks-band";
+import { UnwatchedParksBand } from "@/components/health/unwatched-parks-band";
 import type { UnwatchedParks } from "@/lib/types";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+// The arm button falls back to `router.refresh()` when its caller passes no `onArmed` — the Health
+// page's shape (anton-7gxs), where the band is server-rendered rather than polled.
+vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
 
 /** The band's re-read of its own signal — what the arm button asks for once its writes settle. */
 const onArmed = vi.fn();
