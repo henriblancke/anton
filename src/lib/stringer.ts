@@ -791,7 +791,10 @@ export async function scan(opts: {
     // measures from the advanced state, finds nothing, and closes green over findings nobody
     // triaged. The original error passes through unchanged when the unwind works, so the runner
     // still classifies a timeout as a timeout and an abort as cancellation.
-    throw await rejectWithBaselineRestored(toScanError(err, { timeoutMs }), unwind);
+    // Report the budget stringer actually ran under (remainingMs, after the token lookup's own
+    // share was deducted), not the outer timeoutMs -- otherwise a slow `gh auth token` makes the
+    // error claim a much longer deadline than what killed the process.
+    throw await rejectWithBaselineRestored(toScanError(err, { timeoutMs: remainingMs }), unwind);
   }
 
   let read: Awaited<ReturnType<typeof readAnnotatedSignals>>;
