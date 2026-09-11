@@ -164,6 +164,12 @@ export function useAutomationSchedules({
   async function runNow(id: string) {
     try {
       await postRunNow(slug, id);
+      // Optimistic: the button's own `pending` state clears the instant this resolves, but the
+      // server truth for `pendingRun` otherwise waits on the next poll tick (up to 30s) — a stale
+      // "not firing" would re-enable the button in that window and let a second click send a
+      // redundant request the route only rejects with a 409. The next poll (or a settle) overwrites
+      // this with server truth regardless (see `withTimes` — pendingRun is assigned, never merged).
+      update((p) => ({ ...p, [id]: { ...p[id], pendingRun: "queued" } }));
       toast.success(`${id} started`, {
         description: "Watch its row here — the next poll picks up the fire within 30s.",
       });

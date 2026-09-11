@@ -1257,6 +1257,76 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect(body(fetchMock)).toEqual({ type: "gardener", enabled: true });
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith("gardener enabled"));
   });
+
+  describe("Run now", () => {
+    /** POST /run resolving 200 with a fresh job id — the shape the real route answers with. */
+    function stubRunNow(status = 200, body: Record<string, unknown> = { jobId: "job-1" }) {
+      const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+        () => Promise.resolve(new Response(JSON.stringify(body), { status })),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      return fetchMock;
+    }
+
+    const runNowButton = (label = "nightly-stringer") =>
+      screen.getByRole("button", { name: `${label} run now` }) as HTMLButtonElement;
+
+    it("POSTs the run route and toasts success", async () => {
+      const fetchMock = stubRunNow();
+      renderView({}, [], stringer());
+
+      fireEvent.click(runNowButton());
+
+      await waitFor(() =>
+        expect(fetchMock).toHaveBeenCalledWith(
+          "/api/projects/tmp/schedules/nightly-stringer/run",
+          { method: "POST" },
+        ),
+      );
+      await waitFor(() =>
+        expect(toast.success).toHaveBeenCalledWith(
+          "nightly-stringer started",
+          expect.objectContaining({ description: expect.any(String) }),
+        ),
+      );
+    });
+
+    /**
+     * The button's own `pending` state clears the instant the POST resolves, but the panel's next
+     * poll (which is what would otherwise flip `pendingRun`) can be up to 30s away — Codex flagged
+     * that gap as a route where a second click lands before the row shows anything is running and
+     * draws an avoidable 409. The fix writes `pendingRun` optimistically on success, so the button
+     * disables itself without waiting on the poll.
+     */
+    it("disables itself on success without waiting for the next poll", async () => {
+      stubRunNow();
+      renderView({}, [], stringer());
+
+      const button = runNowButton();
+      expect(button.disabled).toBe(false);
+
+      fireEvent.click(button);
+      await waitFor(() => expect(button.disabled).toBe(true));
+    });
+
+    it("toasts the server's refusal and leaves the button clickable", async () => {
+      stubRunNow(409, { error: "nightly-stringer is already running", reason: "already-running" });
+      renderView({}, [], stringer());
+
+      fireEvent.click(runNowButton());
+
+      await waitFor(() =>
+        expect(toast.error).toHaveBeenCalledWith("nightly-stringer is already running"),
+      );
+      expect(runNowButton().disabled).toBe(false);
+    });
+
+    it("is disabled while the automation is off", () => {
+      stubRunNow();
+      renderView({}, [], stringer({ enabled: false, nextRunAt: undefined }));
+      expect(runNowButton().disabled).toBe(true);
+    });
+  });
 });
 
 describe("SettingsView proposal autonomy (anton-3mqq)", () => {
