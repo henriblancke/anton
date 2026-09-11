@@ -86,7 +86,7 @@ jobs:
           # get neither the secrets nor a writable token. Pinning the helper to the base revision
           # would buy no privilege back — and would break the PR that adds or edits it.
           claude_args: >-
-            --model "${{ vars.CLAUDE_MODEL_AUTO || 'claude-sonnet-4-6' }}"
+            --model "${{ vars.CLAUDE_MODEL_AUTO || 'claude-sonnet-5' }}"
             --allowedTools
             "Read,Glob,Grep,LS,Bash(jq:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh label create:*),Bash(gh api graphql:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files:*),Bash(.github/scripts/pr-comment.sh:*),Bash(./.github/scripts/pr-comment.sh:*),Bash(bash .github/scripts/pr-comment.sh:*),mcp__github_inline_comment__create_inline_comment"
           prompt: |
