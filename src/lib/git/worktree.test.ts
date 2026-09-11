@@ -246,11 +246,13 @@ suite("worktree manager (real git)", () => {
     }
   });
 
-  // PR #263 review, round 2: a linked worktree's `.git` is a FILE (gitrepository-layout(5)), so
-  // `core.hooksPath=.git/hooks` can never be bridged there — `mkdir(dirname(link))` hits `.git`
-  // itself and throws EEXIST every time, not just on a race. Must not abort worktree creation.
-  it("warm: false does not throw when core.hooksPath is rooted at .git (a file in a linked worktree)", async () => {
+  // PR #263 review, round 2 + 3: a linked worktree's `.git` is a FILE (gitrepository-layout(5)), so
+  // `core.hooksPath=.git/hooks` can never be bridged there. The first fix (EEXIST-swallow) stopped
+  // the crash but turned it into a silent bypass — verified against real git that no hooks fire —
+  // so this must warn, not just avoid throwing.
+  it("warm: false warns (not throws) when core.hooksPath is rooted at .git — hooks there cannot be bridged", async () => {
     const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-dotgit-"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       execFileSync("git", ["init", "-q"], { cwd: hookRepo });
       execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
@@ -263,7 +265,10 @@ suite("worktree manager (real git)", () => {
       await expect(
         createWorktree({ repoPath: hookRepo, branch: "anton/hooks-dotgit" }),
       ).resolves.toMatchObject({ branch: "anton/hooks-dotgit" });
+
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("cannot run"));
     } finally {
+      warn.mockRestore();
       rmSync(hookRepo, { recursive: true, force: true });
     }
   });
@@ -300,6 +305,41 @@ suite("worktree manager (real git)", () => {
         .split("\n")
         .filter(Boolean);
       expect(staged).not.toContain(".husky/_");
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  // PR #263 review, round 3: git config stores `core.hooksPath` verbatim — `./.husky/_` and
+  // `.husky/_` name the same directory to git, but `join()` and a literal info/exclude line treat
+  // them as different strings. Reproduced: without normalizing first, the earlier exclude fix wrote
+  // the unnormalized value and `git status`/`git add -A` still saw the symlink as untracked.
+  it("warm: false links and excludes a core.hooksPath spelled with a leading ./", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-dotslash-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const hooksDir = join(hookRepo, ".husky", "_");
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", "./.husky/_"], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-dotslash" });
+      expect(existsSync(join(wt.path, ".husky", "_", "pre-push"))).toBe(true);
+
+      const status = execFileSync("git", ["status", "--porcelain"], { cwd: wt.path }).toString();
+      expect(status).toBe(""); // excluded, not merely un-added — a dirty status would still surface it
+
+      execFileSync("git", ["add", "-A"], { cwd: wt.path });
+      const staged = execFileSync("git", ["diff", "--cached", "--name-only"], { cwd: wt.path })
+        .toString()
+        .trim();
+      expect(staged).toBe("");
     } finally {
       rmSync(hookRepo, { recursive: true, force: true });
     }

@@ -10,7 +10,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { hostname } from "node:os";
-import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
 
@@ -490,18 +490,16 @@ export async function createWorktree(opts: {
  * config for that reason. An absolute `core.hooksPath` already resolves identically from every
  * worktree and needs no help.
  *
- * Entirely best-effort: every step below can fail (a linked worktree's `.git` is a FILE, so a
- * hooksPath rooted there — `.git/hooks` — can never be materialized under it; a symlink can race
- * a concurrent call) and none of it should ever abort worktree creation over a hooks convenience
- * (PR #263 review, round 2).
+ * Entirely best-effort: every step below can fail (a symlink can race a concurrent call) and none
+ * of it should ever abort worktree creation over a hooks convenience (PR #263 review, round 2).
  */
 async function linkRelativeHooksPath(
   repoPath: string,
   worktreePath: string,
 ): Promise<void> {
-  let hooksPath: string;
+  let rawHooksPath: string;
   try {
-    hooksPath = await git(repoPath, ["config", "--get", "core.hooksPath"]);
+    rawHooksPath = await git(repoPath, ["config", "--get", "core.hooksPath"]);
   } catch (e: unknown) {
     // Exit code 1 with no stderr is `git config --get` for an unset key — the common case, nothing
     // to preserve. Anything else (a wedged process, the git() helper's 120s timeout under load) is
@@ -515,7 +513,32 @@ async function linkRelativeHooksPath(
     }
     return;
   }
-  if (!hooksPath || isAbsolute(hooksPath)) return;
+  if (!rawHooksPath || isAbsolute(rawHooksPath)) return;
+
+  // Normalize once and use this form everywhere below (materializing, resolving, excluding): git
+  // itself treats `./.husky/_` and `.husky/_` as the same config value (config stores it verbatim,
+  // uninterpreted), but `join`/an `info/exclude` gitignore-pattern line do not — a literal `./`
+  // prefix silently defeats both the `existsSync(link)` reuse check and the exclude-pattern match
+  // (PR #263 review, round 3).
+  const hooksPath = normalize(rawHooksPath).replace(/[/\\]+$/, "");
+
+  // A linked worktree's `.git` is a FILE, not a directory (gitrepository-layout(5)) — so a
+  // hooksPath rooted under it (`.git/hooks`, or `.git` itself) can never be materialized as a
+  // subdirectory there, and — verified against real git — resolves to neither this worktree's
+  // private per-worktree gitdir nor the repo's common one; the hook is simply never found. There is
+  // no fix this function can apply (making it work would mean overriding core.hooksPath on every
+  // git invocation made from this worktree, which is well outside worktree creation); the honest
+  // move is a loud, specific warning instead of silently doing nothing, so the actual failure mode
+  // — hooks configured but never firing — is at least visible in logs (PR #263 review, round 3:
+  // the previous EEXIST-swallow turned a crash into exactly that silent bypass).
+  if (hooksPath === ".git" || hooksPath.startsWith(`.git${sep}`)) {
+    console.warn(
+      `[worktree] core.hooksPath (${hooksPath}) for ${repoPath} is rooted under .git, which is a ` +
+        `file (not a directory) in a linked worktree — these hooks cannot run from ${worktreePath}; ` +
+        `move them outside .git if this worktree needs to run them`,
+    );
+    return;
+  }
 
   const target = resolve(repoPath, hooksPath);
   if (!existsSync(target)) return; // never materialized in the base repo either (e.g. no install yet)
@@ -526,11 +549,6 @@ async function linkRelativeHooksPath(
   // No lock of its own: createWorktree's idempotent-reuse path can run this concurrently with a
   // second in-flight call for the same branch (both racing past withBranchLock, which has already
   // released by the time this runs). A concurrent winner's EEXIST anywhere below is silently fine.
-  //
-  // `dirname(link)` can be `.git` itself (hooksPath = `.git/hooks`) — and in a linked worktree
-  // `.git` is a FILE (gitrepository-layout(5)), not a directory, so `mkdir` throws EEXIST there
-  // every time, not just on a race. That specific hooksPath can never be bridged into a linked
-  // worktree (git itself has nowhere to put it), so skip quietly rather than warn on the norm.
   try {
     await mkdir(dirname(link), { recursive: true });
   } catch (e: unknown) {
