@@ -44,8 +44,13 @@ const noopLog: RunnerLogger = { info: () => {}, error: () => {} };
 export interface BoardPickerNudgeDeps {
   db: AntonDb;
   /**
-   * How a pass reaches the queue. Wired to the runner in `service.ts` so a project mid-teardown is
-   * refused by the same quiesce barrier every other enqueue path crosses; a test passes its own.
+   * How a pass reaches the queue. Wired to the runner's transactional
+   * `enqueueScheduledTypeIfAbsent` in `service-runner.ts` (PR #264 review) — not the bare
+   * `enqueue()` — so a scheduler tick or a manual "Run now" fire landing between this module's own
+   * `queuedJobId` pre-check (below) and the insert can't double-fire the pass; that check and the
+   * insert this calls are still two separate operations, but the insert re-checks freshly inside its
+   * own transaction regardless of what this pre-check saw. Refused (project mid-teardown) by the
+   * same quiesce barrier every other enqueue path crosses; a test passes its own.
    */
   enqueue: (projectId: string) => Promise<unknown>;
   windowMs?: number;

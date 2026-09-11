@@ -109,9 +109,14 @@ export function getScheduler(): Scheduler {
  * moves, so the recorded plan trails the board by seconds rather than by the ten-minute cadence
  * that stays behind it as the backstop.
  *
- * Enqueued through the RUNNER, not the queue directly, so a project mid-teardown is refused by the
- * same quiesce barrier every other enqueue path crosses — a nudge racing `deleteProject` must not
- * insert a job row the abort sweep has already been past.
+ * Enqueued through the RUNNER's `enqueueScheduledTypeIfAbsent`, not the bare `enqueue()` — a project
+ * mid-teardown is refused by the same quiesce barrier every other enqueue path crosses (a nudge
+ * racing `deleteProject` must not insert a job row the abort sweep has already been past), and a
+ * scheduler tick or a manual "Run now" fire landing between the nudge's own `queuedJobId` check and
+ * this insert can't double-fire the pass (PR #264 review) — the check and insert here are ONE
+ * transaction. `coveredBy: ["queued"]` preserves the nudge's own semantics: a `running` pass may
+ * have read the board before this change landed, so it must not count as covering it (see
+ * `BoardPickerNudge.pass`'s doc comment).
  */
 export function getPickerNudge(): BoardPickerNudge {
   const s = state();
@@ -119,7 +124,14 @@ export function getPickerNudge(): BoardPickerNudge {
   s.pickerNudge = new BoardPickerNudge({
     db: getDb(),
     enqueue: (projectId) =>
-      getRunner().enqueue({ type: "board-picker", projectId, payload: { projectId } }),
+      Promise.resolve(
+        getRunner().enqueueScheduledTypeIfAbsent(
+          "board-picker",
+          projectId,
+          { projectId },
+          { coveredBy: ["queued"] },
+        ),
+      ),
     log,
   });
   return s.pickerNudge;

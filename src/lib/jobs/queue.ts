@@ -514,6 +514,63 @@ export function enqueueReviewFixPrIfAbsent(
 }
 
 /**
+ * Enqueue one of the SCHEDULED job types (board-picker, nightly-stringer, …) for a project unless a
+ * job of that type is already COVERING it under `coveredBy` — the same one-active-per-(type,
+ * project) coalescing `Scheduler.tickOnce` and `runScheduleNow` (schedules.ts) already apply,
+ * available to every OTHER producer of these types (PR #264 review).
+ *
+ * The board-change nudge (picker-nudge.ts) is the motivating caller: it checks `queuedJobId` before
+ * calling its injected `enqueue`, but that check and the insert it guards are two separate
+ * operations with an `await` between them — a scheduler tick or a manual "Run now" fire landing in
+ * that window is invisible to it and could double-fire the pass. Wrapping the check and insert in
+ * ONE synchronous transaction closes that window the same way `enqueueReviewFixPrIfAbsent` closes
+ * its own: better-sqlite3 runs one connection, so nothing can interleave between the read and the
+ * write here.
+ *
+ * `coveredBy` defaults to `ACTIVE_STATUSES` (queued+running), matching the scheduler's own
+ * coalescing — but the nudge deliberately dedupes on `queued` ONLY (a `running` pass may have read
+ * the board before the change that triggered this nudge, so it does not cover it); pass
+ * `["queued"]` to preserve that semantic exactly rather than silently widening it.
+ *
+ * `refuseProject` is the runner's project-teardown veto, asked inside the transaction for the same
+ * reason `enqueueReviewFixPrIfAbsent` asks it — a check made before this call would still race
+ * `quiesceProject`. Returns the existing job's id when one already covers this project (inserting no
+ * new row), otherwise a freshly-created `queued` job's id.
+ */
+export function enqueueScheduledTypeIfAbsent(
+  db: AntonDb,
+  clock: Clock,
+  type: JobType,
+  projectId: string,
+  payload: unknown,
+  opts?: {
+    refuseProject?: (projectId: string) => boolean;
+    coveredBy?: readonly string[];
+  },
+): string {
+  const nowMs = clock.now();
+  return db.transaction((tx) => {
+    if (opts?.refuseProject?.(projectId)) {
+      throw new Error(`Project is being deleted: ${projectId}`);
+    }
+
+    const existing = firstJobId(
+      tx,
+      and(
+        eq(schema.jobs.type, type),
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, opts?.coveredBy ? [...opts.coveredBy] : [...ACTIVE_STATUSES]),
+      ),
+    );
+    if (existing) return existing;
+
+    const row = newJobRow({ type, projectId, payload }, nowMs);
+    tx.insert(schema.jobs).values(row).run();
+    return row.id;
+  });
+}
+
+/**
  * Enqueue an execute-epic run, deduped against any already-active job for the same project + epic.
  * Returns the existing job's id (inserting no new row) when a `queued`/`running` execute-epic job
  * exists for that epic; otherwise inserts a fresh `queued` job and returns its id. Prior

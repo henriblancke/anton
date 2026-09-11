@@ -35,6 +35,7 @@ import {
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
   enqueueReviewFixPrIfAbsent,
+  enqueueScheduledTypeIfAbsent,
   getJob,
   leaseDue,
   park,
@@ -695,6 +696,24 @@ export class JobRunner {
   enqueueReviewFixPrIfAbsent(projectId: string, epicBeadId: string): string | undefined {
     return enqueueReviewFixPrIfAbsent(this.db, this.clock, projectId, epicBeadId, {
       refuseProject: (pid) => this.quiescedProjects.has(pid),
+    });
+  }
+
+  /**
+   * Enqueue one of the SCHEDULED job types (board-picker, nightly-stringer, …) for a project unless
+   * one is already covering it (PR #264 review) — see `enqueueScheduledTypeIfAbsent` (queue.ts) for
+   * why this needs its own transactional dedupe rather than the bare `enqueue()` above, and for what
+   * `coveredBy` changes. The board-change nudge (picker-nudge.ts) is the current caller.
+   */
+  enqueueScheduledTypeIfAbsent(
+    type: JobType,
+    projectId: string,
+    payload: unknown,
+    opts?: { coveredBy?: readonly string[] },
+  ): string {
+    return enqueueScheduledTypeIfAbsent(this.db, this.clock, type, projectId, payload, {
+      refuseProject: (pid) => this.quiescedProjects.has(pid),
+      coveredBy: opts?.coveredBy,
     });
   }
 

@@ -15,6 +15,7 @@ import {
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
   enqueueReviewFixPrIfAbsent,
+  enqueueScheduledTypeIfAbsent,
   getJob,
   resumeBudgetDeferredJobs,
   resumeJob,
@@ -515,5 +516,55 @@ describe("enqueueReviewFixPrIfAbsent", () => {
     const b = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-2");
     const c = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p2", "epic-1");
     expect(new Set([a, b, c]).size).toBe(3);
+  });
+});
+
+/**
+ * PR #264 review: the board-change nudge (picker-nudge.ts) checked `queuedJobId` before calling its
+ * injected `enqueue`, but that check and the insert were two separate operations with an await
+ * between them — a scheduler tick or a manual "Run now" fire landing in that window was invisible to
+ * it and could double-fire the pass. `enqueueScheduledTypeIfAbsent` closes that window with one
+ * synchronous transaction, the same pattern `enqueueReviewFixPrIfAbsent` already uses.
+ */
+describe("enqueueScheduledTypeIfAbsent", () => {
+  it("returns the existing job id and inserts no new row when one is already active", () => {
+    const a = enqueueScheduledTypeIfAbsent(t.db, systemClock, "nightly-stringer", "p1", {});
+    const b = enqueueScheduledTypeIfAbsent(t.db, systemClock, "nightly-stringer", "p1", {});
+    expect(b).toBe(a);
+    expect(t.db.select().from(schema.jobs).all()).toHaveLength(1);
+  });
+
+  it("dedupes against a running job, not just a queued one, under the default coveredBy", () => {
+    const a = enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", {});
+    t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
+    const b = enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", {});
+    expect(b).toBe(a);
+    expect(t.db.select().from(schema.jobs).all()).toHaveLength(1);
+  });
+
+  it("coveredBy: ['queued'] does NOT treat a running job as covering — the nudge's own semantics", () => {
+    const a = enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", {});
+    t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
+    const b = enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", {}, {
+      coveredBy: ["queued"],
+    });
+    expect(b).not.toBe(a);
+    expect(t.db.select().from(schema.jobs).all()).toHaveLength(2);
+  });
+
+  it("keeps types and projects independent", () => {
+    const a = enqueueScheduledTypeIfAbsent(t.db, systemClock, "nightly-stringer", "p1", {});
+    const b = enqueueScheduledTypeIfAbsent(t.db, systemClock, "orphan-grooming", "p1", {});
+    const c = enqueueScheduledTypeIfAbsent(t.db, systemClock, "nightly-stringer", "p2", {});
+    expect(new Set([a, b, c]).size).toBe(3);
+  });
+
+  it("refuses a project mid-teardown", () => {
+    expect(() =>
+      enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", {}, {
+        refuseProject: (projectId) => projectId === "p1",
+      }),
+    ).toThrow(/being deleted/);
+    expect(t.db.select().from(schema.jobs).all()).toHaveLength(0);
   });
 });
