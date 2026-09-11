@@ -413,6 +413,61 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  // Flagged by a parallel review pass: info/exclude is SHARED across every worktree of a repo (no
+  // per-worktree exclude file exists — gitrepository-layout(5)), so two createWorktree calls for
+  // different branches — which do NOT serialize against each other (withBranchLock is per-branch)
+  // — can both pass the read in excludeHooksPath before either writes. A read-then-`writeFile` of
+  // the whole content would silently drop whichever pattern lost the race: a lost update for a
+  // DIFFERENT worktree's hooks bridge, not a benign duplicate. appendFile fixes this; each branch
+  // gets its own hooksPath here via an `includeIf onbranch:` conditional, so the two patterns are
+  // genuinely distinct and a dropped one is unambiguous.
+  it("warm: false does not lose a concurrent worktree's exclude pattern (info/exclude is shared)", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-concurrent-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      writeFileSync(join(hookRepo, "hooksA.gitconfig"), "[core]\n\thooksPath = .hooksA\n");
+      writeFileSync(join(hookRepo, "hooksB.gitconfig"), "[core]\n\thooksPath = .hooksB\n");
+      execFileSync(
+        "git",
+        ["config", "includeIf.onbranch:anton/hooks-race-a.path", join(hookRepo, "hooksA.gitconfig")],
+        { cwd: hookRepo },
+      );
+      execFileSync(
+        "git",
+        ["config", "includeIf.onbranch:anton/hooks-race-b.path", join(hookRepo, "hooksB.gitconfig")],
+        { cwd: hookRepo },
+      );
+      mkdirSync(join(hookRepo, ".hooksA"), { recursive: true });
+      mkdirSync(join(hookRepo, ".hooksB"), { recursive: true });
+      writeFileSync(join(hookRepo, ".hooksA", "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      writeFileSync(join(hookRepo, ".hooksB", "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["branch", "anton/hooks-race-a"], { cwd: hookRepo });
+      execFileSync("git", ["branch", "anton/hooks-race-b"], { cwd: hookRepo });
+
+      const [wtA, wtB] = await Promise.all([
+        createWorktree({ repoPath: hookRepo, branch: "anton/hooks-race-a" }),
+        createWorktree({ repoPath: hookRepo, branch: "anton/hooks-race-b" }),
+      ]);
+
+      expect(existsSync(join(wtA.path, ".hooksA", "pre-push"))).toBe(true);
+      expect(existsSync(join(wtB.path, ".hooksB", "pre-push"))).toBe(true);
+
+      // Both must have been excluded — neither branch's writer overwrote the other's pattern.
+      const statusA = execFileSync("git", ["status", "--porcelain"], { cwd: wtA.path }).toString();
+      const statusB = execFileSync("git", ["status", "--porcelain"], { cwd: wtB.path }).toString();
+      expect(statusA).not.toContain(".hooksA");
+      expect(statusB).not.toContain(".hooksB");
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
   // The guard the unit suite below asserts on, exercised end-to-end: `warm: true` under vitest must
   // never shell out to a real package manager, however installable the checkout looks.
   it("warm: true is a no-op under vitest even with a lockfile present", async () => {

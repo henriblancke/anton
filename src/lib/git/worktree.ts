@@ -11,7 +11,7 @@ import { promisify } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { hostname } from "node:os";
 import { delimiter, dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
-import { mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
 
 const execFileAsync = promisify(execFile);
@@ -614,11 +614,19 @@ async function excludeHooksPath(worktreePath: string, hooksPath: string): Promis
   const existing = await readFile(excludePath, "utf8").catch(() => "");
   if (existing.split("\n").includes(pattern)) return; // already excluded (a prior run)
 
+  // `appendFile`, never a read-then-`writeFile` of the whole content: this file is SHARED across
+  // every worktree of the repo (there is no per-worktree exclude — gitrepository-layout(5)), so two
+  // concurrent createWorktree calls for different branches can both pass the read above before
+  // either writes. A full-content overwrite from a stale read would silently drop whichever pattern
+  // lost the race — not a benign duplicate, a lost update for a DIFFERENT worktree's hooks bridge.
+  // Appending only risks a harmless duplicate line on the rare same-pattern race, which gitignore
+  // tolerates fine and is self-correcting: the next createWorktree that runs this function again
+  // will see it already present. Existing() above is best-effort dedup only, not a correctness lock.
+  // A leading newline guards against a rare pre-existing file with no trailing newline of its own
+  // (e.g. hand-edited) — gitignore treats blank lines as no-ops, so this never fabricates or
+  // corrupts a prior pattern regardless of what the last byte in the file was.
   await mkdir(dirname(excludePath), { recursive: true }).catch(() => {});
-  await writeFile(
-    excludePath,
-    `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${pattern}\n`,
-  ).catch((e: unknown) => {
+  await appendFile(excludePath, `\n${pattern}\n`).catch((e: unknown) => {
     console.warn(
       `[worktree] could not exclude ${hooksPath} in ${worktreePath}: ${gitError(e)} — ` +
         `a fix commit's \`git add -A\` may stage the hooks symlink`,
