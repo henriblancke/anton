@@ -477,6 +477,12 @@ export async function createWorktree(opts: {
   return wt;
 }
 
+// Matches only the platform path separator (never a hardcoded `/` or `\`) so a trailing repeated
+// separator collapses (`.husky/_/` → `.husky/_`) without touching a POSIX path's literal trailing
+// backslash, which is a valid filename character there, just not a separator (PR #263 review,
+// round 6).
+const TRAILING_SEP_RE = new RegExp(`[${sep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}]+$`);
+
 /**
  * A relative `core.hooksPath` (Husky 9's `.husky/_`) is documented to resolve against the
  * directory the hook RUNS in — i.e. per-worktree, not the base repo (git-config(1)). A worktree
@@ -504,11 +510,23 @@ async function linkRelativeHooksPath(
     // actually checked out where the query runs — the worktree's branch, not the base repo's
     // (PR #263 review, round 4). The worktree already exists by this point (createWorktree's
     // `git worktree add` ran above), so this reads its real, effective config.
-    rawHooksPath = await git(worktreePath, ["config", "--get", "core.hooksPath"]);
+    //
+    // NOT the shared `git()` helper — it does a blanket `stdout.trim()`, which would silently
+    // strip legitimate leading/trailing whitespace from a quoted config value (git-config(1):
+    // whitespace inside a quoted value is preserved verbatim). Verified: a real `core.hooksPath =
+    // ".hooks "` names a directory whose name has a trailing space, and the base checkout does
+    // invoke a hook from it — trimming it here would make the bridge look for the wrong directory
+    // (PR #263 review, round 6). Only the trailing newline `execFile` appends needs stripping.
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "config", "--get", "core.hooksPath"],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    rawHooksPath = stdout.replace(/\n$/, "");
   } catch (e: unknown) {
     // Exit code 1 with no stderr is `git config --get` for an unset key — the common case, nothing
-    // to preserve. Anything else (a wedged process, the git() helper's 120s timeout under load) is
-    // silent hook loss reproducing the exact PR #263 bug this exists to fix, so it must be visible.
+    // to preserve. Anything else (a wedged process, a 120s timeout under load) is silent hook loss
+    // reproducing the exact PR #263 bug this exists to fix, so it must be visible.
     const code = (e as { code?: unknown }).code;
     if (code !== 1) {
       console.warn(
@@ -524,8 +542,12 @@ async function linkRelativeHooksPath(
   // itself treats `./.husky/_` and `.husky/_` as the same config value (config stores it verbatim,
   // uninterpreted), but `join`/an `info/exclude` gitignore-pattern line do not — a literal `./`
   // prefix silently defeats both the `existsSync(link)` reuse check and the exclude-pattern match
-  // (PR #263 review, round 3).
-  const hooksPath = normalize(rawHooksPath).replace(/[/\\]+$/, "");
+  // (PR #263 review, round 3). `normalize` preserves trailing whitespace (not a separator on any
+  // platform) but not a repeated trailing separator, which IS worth collapsing — done here with
+  // `sep` alone, never a hardcoded `/` or `\`, so a POSIX path whose real, literal last character
+  // happens to be `\` (a valid filename character there, just not a separator) survives untouched
+  // (PR #263 review, round 6).
+  const hooksPath = normalize(rawHooksPath).replace(TRAILING_SEP_RE, "");
 
   // `normalize` already collapses a SAFE internal `..` (`a/../b` → `b`); a hooksPath that still
   // starts with `..` after that genuinely escapes repoPath/worktreePath — e.g. `../shared-hooks`,
@@ -581,14 +603,24 @@ async function linkRelativeHooksPath(
     );
     return;
   }
-  await symlink(target, link, "dir").catch((e: unknown) => {
-    if ((e as { code?: string }).code === "EEXIST") return;
-    console.warn(
-      `[worktree] could not link relative core.hooksPath (${hooksPath}) into ${worktreePath}: ` +
-        `${gitError(e)} — hooks in this worktree may silently not run`,
-    );
-    return;
-  });
+  // Track success explicitly rather than swallowing every symlink() failure the same way: a
+  // non-EEXIST error (e.g. EPERM — no symlink privilege) means no bridge exists at `link`, so
+  // running excludeHooksPath anyway would permanently add `hooksPath` to info/exclude for a
+  // directory that was never created here — hiding the real, still-broken hooks gap from `git
+  // status`, and (if the same-named path happens to exist untracked in the base checkout for an
+  // unrelated reason) hiding that too (PR #263 review, round 6).
+  const linked = await symlink(target, link, "dir").then(
+    () => true,
+    (e: unknown) => {
+      if ((e as { code?: string }).code === "EEXIST") return true; // already bridged — fine
+      console.warn(
+        `[worktree] could not link relative core.hooksPath (${hooksPath}) into ${worktreePath}: ` +
+          `${gitError(e)} — hooks in this worktree may silently not run`,
+      );
+      return false;
+    },
+  );
+  if (!linked) return;
 
   // The symlink's target is this machine's absolute path — a `commitAll`/`git add -A` in the
   // worktree (review-fix's fix commit) would otherwise stage it as a real, unignored, untracked

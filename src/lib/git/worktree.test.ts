@@ -520,7 +520,7 @@ suite("worktree manager (real git)", () => {
       writeFileSync(join(sharedHooks, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
       execFileSync("git", ["config", "core.hooksPath", "../shared-hooks"], { cwd: hookRepo });
 
-      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-traversal" });
+      await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-traversal" });
 
       // join(worktreePath, "../shared-hooks") collapses to worktreesRootFor(repoPath)/shared-hooks
       // — the shared directory holding every OTHER branch's worktree for this repo too. Confirm no
@@ -530,6 +530,66 @@ suite("worktree manager (real git)", () => {
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("points outside the repo"));
     } finally {
       warn.mockRestore();
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  // Caught by a real GitHub review pass on this diff (round 6): git-config(1) preserves
+  // leading/trailing whitespace inside a quoted config value verbatim, but the shared `git()`
+  // helper does a blanket `stdout.trim()` — using it here would silently rewrite a real
+  // `core.hooksPath = ".hooks "` (trailing space, a valid directory-name character) down to
+  // `.hooks`, a directory that doesn't exist, so the bridge would never find the real one.
+  it("warm: false preserves leading/trailing whitespace in core.hooksPath", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-ws-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const literalName = ".hooks ";
+      const hooksDir = join(hookRepo, literalName);
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", literalName], { cwd: hookRepo });
+      // Confirm git itself preserved the trailing space (quoted the value) before trusting the
+      // rest of the assertion.
+      expect(
+        execFileSync("git", ["config", "--get", "core.hooksPath"], { cwd: hookRepo }).toString(),
+      ).toBe(`${literalName}\n`);
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-ws" });
+      expect(existsSync(join(wt.path, literalName, "pre-push"))).toBe(true);
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  // Caught by the same review pass (round 6): on POSIX, `\` is a valid filename character, not a
+  // separator — only `/` (and, cross-platform, `path.sep`) should be stripped as a trailing
+  // separator. Regex-stripping a hardcoded `/\\/` would truncate a literal trailing backslash in
+  // the directory's real name.
+  it("warm: false preserves a literal trailing backslash in a POSIX core.hooksPath", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-bslash-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const literalName = ".hooks\\"; // trailing backslash IS the filename on POSIX
+      const hooksDir = join(hookRepo, literalName);
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", literalName], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-bslash" });
+      expect(existsSync(join(wt.path, literalName, "pre-push"))).toBe(true);
+    } finally {
       rmSync(hookRepo, { recursive: true, force: true });
     }
   });
