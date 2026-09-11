@@ -209,6 +209,65 @@ describe("Scheduler.tickOnce", () => {
   });
 
   /**
+   * PR #264 review: the still-in-flight branch's `nextRunAt` write is computed from the `s.cron`
+   * the batch `due`-query snapshot read at the top of the tick. If an operator's settings PATCH
+   * changes the cron and lands AFTER that snapshot but BEFORE this write, an unconditional write
+   * would clobber `updateSchedule`'s own freshly-recomputed `nextRunAt` with one computed from the
+   * now-stale cron — firing the automation once more on its OLD cadence despite the successful edit.
+   * Guarding the write on cron+enabled still matching what `nextRunAt` was computed from means the
+   * PATCH's own write is left standing instead.
+   */
+  it("does not clobber a concurrent cron PATCH's nextRunAt on the in-flight-skip branch", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "review-fix",
+      cron: "*/5 * * * *",
+    });
+    await tdb.db.insert(schema.jobs).values({
+      id: "inflight-2",
+      type: "review-fix",
+      projectId: "p1",
+      status: "running",
+      payloadJson: "{}",
+    });
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    const select = tdb.db.select.bind(tdb.db);
+    let patched = false;
+    const selects = vi.spyOn(tdb.db, "select").mockImplementation(((
+      columns?: Record<string, unknown>,
+    ) => {
+      // The tick's due-query snapshot selects a bare `.select()` over schedules (no column map) —
+      // land the race right after it, before this tick reaches its own nextRunAt write.
+      if (!patched && !columns) {
+        patched = true;
+        void updateSchedule(tdb.db, clock, id, { cron: "0 0 * * *" });
+      }
+      return select(columns as never);
+    }) as typeof tdb.db.select);
+
+    clock.set(base + 5 * 60_000);
+    try {
+      expect(await sched.tickOnce()).toBe(0);
+    } finally {
+      selects.mockRestore();
+    }
+
+    expect(patched).toBe(true);
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    // The PATCH's own cron and nextRunAt stand — the tick's stale-cron write did not land.
+    expect(row.cron).toBe("0 0 * * *");
+    const expectedNextRunAt = tdb.db
+      .select({ nextRunAt: schema.schedules.nextRunAt })
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, id))
+      .get()!.nextRunAt as Date;
+    // Midnight cadence, not the every-5-minutes one the tick would have written.
+    expect(expectedNextRunAt.getMinutes()).toBe(0);
+    expect(expectedNextRunAt.getHours()).toBe(0);
+  });
+
+  /**
    * anton-y771. The coalescing key is the job TYPE, so work the poll DISPATCHES must not suppress
    * the poll: measured on anton's own history, 505 of 10062 review-fix jobs outlived their 15-minute
    * slot, and with a shared type a 45-minute fix on one PR swallowed the next three polls — the ones
