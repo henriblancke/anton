@@ -339,8 +339,10 @@ describe("scan", () => {
     // Skip the token lookup so the whole 250ms budget goes to stringer, not to spawning the fake gh.
     process.env.GITHUB_TOKEN = "test-token";
 
+    // remainingMs is real elapsed time (the 250ms budget minus whatever the lookup/setup already
+    // spent), so the reported timeout is at most 250ms, not necessarily exactly 250ms.
     await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.toThrow(
-      /stringer timed out after 250ms \(killed with SIG/,
+      /stringer timed out after \d+ms \(killed with SIG/,
     );
     await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.not.toThrow(
       /gitlog/,
@@ -579,8 +581,9 @@ describe("scan", () => {
       // Skip the token lookup so the whole 250ms budget goes to stringer, not to spawning the fake gh.
       process.env.GITHUB_TOKEN = "test-token";
 
+      // remainingMs is real elapsed time, so the reported timeout is at most 250ms.
       await expect(scan({ repoPath: dir, scanFile: join(dir, "s2.json") })).rejects.toThrow(
-        /stringer timed out after 250ms/,
+        /stringer timed out after \d+ms/,
       );
       expect(readFileSync(state, "utf8")).toBe(consumed);
     });
@@ -8035,6 +8038,32 @@ describe("scan", () => {
     await expect(
       scan({ repoPath: "/repo", scanFile: join(dir, "s.json"), signal: ac.signal }),
     ).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("rejects without launching stringer when gh auth token exhausts the scan deadline", async () => {
+    const argvDump = join(dir, "argv.json");
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+    // Hangs well past the tiny deadline below, so the lookup itself consumes the whole budget.
+    process.env[GH_BIN_ENV] = writeScript("hanging-gh", ["setTimeout(() => {}, 60000);"]);
+    process.env.ANTON_STRINGER_TIMEOUT_MS = "50";
+
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.toThrow(
+      /gh auth token lookup consumed the scan's 50ms deadline before stringer could start/,
+    );
+    expect(existsSync(argvDump)).toBe(false);
+  });
+
+  it("propagates a caller abort raised during the gh auth token lookup, without launching stringer", async () => {
+    const argvDump = join(dir, "argv.json");
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+    process.env[GH_BIN_ENV] = writeScript("hanging-gh", ["setTimeout(() => {}, 60000);"]);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 50);
+
+    await expect(
+      scan({ repoPath: "/repo", scanFile: join(dir, "s.json"), signal: ac.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(existsSync(argvDump)).toBe(false);
   });
 });
 
