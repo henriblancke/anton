@@ -484,25 +484,15 @@ export async function createWorktree(opts: {
 const TRAILING_SEP_RE = new RegExp(`[${sep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}]+$`);
 
 /**
- * A relative `core.hooksPath` (Husky 9's `.husky/_`) is documented to resolve against the
- * directory the hook RUNS in — i.e. per-worktree, not the base repo (git-config(1)). A worktree
- * whose install never ran (`warm: false`, such as review-fix's fix checkout) — or whose install ran
- * but skipped/failed (no recognized lockfile, or a caught error in warmWorktree) — never regenerates
- * that directory, so git silently finds nothing there and every hook — including a project's
- * pre-push gate — is skipped with no warning (PR #263 review). Symlinking the worktree's copy at
- * the base repo's real directory keeps the same hooks active everywhere without touching git
- * config: `git config --worktree core.hooksPath` requires `extensions.worktreeConfig`, which breaks
- * this repo's own stringer `gitlog` collector (anton-uspu) — anton does not touch a repo's git
- * config for that reason. An absolute `core.hooksPath` already resolves identically from every
- * worktree and needs no help.
- *
- * Entirely best-effort: every step below can fail (a symlink can race a concurrent call) and none
- * of it should ever abort worktree creation over a hooks convenience (PR #263 review, round 2).
+ * Read `core.hooksPath` from `worktreePath`'s own effective config, normalized the same way for
+ * every caller that needs to know what hooksPath a worktree is (or was) bridging — creating the
+ * link (linkRelativeHooksPath) and deciding whether an info/exclude entry is still needed after a
+ * worktree is removed (unexcludeHooksPathIfUnused) must agree on this value, or a mismatch would
+ * either leave a stale exclude line in place forever or remove one a surviving worktree still needs.
+ * Returns `null` for "nothing to bridge" (unset, absolute, or unreadable — see body) — never for
+ * "found but empty", which core.hooksPath cannot meaningfully be.
  */
-async function linkRelativeHooksPath(
-  repoPath: string,
-  worktreePath: string,
-): Promise<void> {
+async function readNormalizedHooksPath(worktreePath: string): Promise<string | null> {
   let rawHooksPath: string;
   try {
     // From worktreePath, not repoPath: `core.hooksPath` can come from an `includeIf
@@ -530,24 +520,48 @@ async function linkRelativeHooksPath(
     const code = (e as { code?: unknown }).code;
     if (code !== 1) {
       console.warn(
-        `[worktree] could not read core.hooksPath for ${worktreePath}: ` +
-          `${gitError(e)} — a relative hooksPath, if set, may not be linked into this worktree`,
+        `[worktree] could not read core.hooksPath for ${worktreePath}: ${gitError(e)} — ` +
+          `a relative hooksPath, if set, may not be linked into this worktree`,
       );
     }
-    return;
+    return null;
   }
-  if (!rawHooksPath || isAbsolute(rawHooksPath)) return;
+  if (!rawHooksPath || isAbsolute(rawHooksPath)) return null;
 
-  // Normalize once and use this form everywhere below (materializing, resolving, excluding): git
-  // itself treats `./.husky/_` and `.husky/_` as the same config value (config stores it verbatim,
-  // uninterpreted), but `join`/an `info/exclude` gitignore-pattern line do not — a literal `./`
-  // prefix silently defeats both the `existsSync(link)` reuse check and the exclude-pattern match
-  // (PR #263 review, round 3). `normalize` preserves trailing whitespace (not a separator on any
-  // platform) but not a repeated trailing separator, which IS worth collapsing — done here with
-  // `sep` alone, never a hardcoded `/` or `\`, so a POSIX path whose real, literal last character
-  // happens to be `\` (a valid filename character there, just not a separator) survives untouched
-  // (PR #263 review, round 6).
-  const hooksPath = normalize(rawHooksPath).replace(TRAILING_SEP_RE, "");
+  // Normalize once and use this form everywhere it's needed (materializing, resolving, excluding):
+  // git itself treats `./.husky/_` and `.husky/_` as the same config value (config stores it
+  // verbatim, uninterpreted), but `join`/an `info/exclude` gitignore-pattern line do not — a
+  // literal `./` prefix silently defeats both the `existsSync(link)` reuse check and the
+  // exclude-pattern match (PR #263 review, round 3). `normalize` preserves trailing whitespace (not
+  // a separator on any platform) but not a repeated trailing separator, which IS worth collapsing —
+  // done here with `sep` alone, never a hardcoded `/` or `\`, so a POSIX path whose real, literal
+  // last character happens to be `\` (a valid filename character there, just not a separator)
+  // survives untouched (PR #263 review, round 6).
+  return normalize(rawHooksPath).replace(TRAILING_SEP_RE, "");
+}
+
+/**
+ * A relative `core.hooksPath` (Husky 9's `.husky/_`) is documented to resolve against the
+ * directory the hook RUNS in — i.e. per-worktree, not the base repo (git-config(1)). A worktree
+ * whose install never ran (`warm: false`, such as review-fix's fix checkout) — or whose install ran
+ * but skipped/failed (no recognized lockfile, or a caught error in warmWorktree) — never regenerates
+ * that directory, so git silently finds nothing there and every hook — including a project's
+ * pre-push gate — is skipped with no warning (PR #263 review). Symlinking the worktree's copy at
+ * the base repo's real directory keeps the same hooks active everywhere without touching git
+ * config: `git config --worktree core.hooksPath` requires `extensions.worktreeConfig`, which breaks
+ * this repo's own stringer `gitlog` collector (anton-uspu) — anton does not touch a repo's git
+ * config for that reason. An absolute `core.hooksPath` already resolves identically from every
+ * worktree and needs no help.
+ *
+ * Entirely best-effort: every step below can fail (a symlink can race a concurrent call) and none
+ * of it should ever abort worktree creation over a hooks convenience (PR #263 review, round 2).
+ */
+async function linkRelativeHooksPath(
+  repoPath: string,
+  worktreePath: string,
+): Promise<void> {
+  const hooksPath = await readNormalizedHooksPath(worktreePath);
+  if (hooksPath === null) return;
 
   // `normalize` already collapses a SAFE internal `..` (`a/../b` → `b`); a hooksPath that still
   // starts with `..` after that genuinely escapes repoPath/worktreePath — e.g. `../shared-hooks`,
@@ -693,6 +707,68 @@ async function excludeHooksPath(worktreePath: string, hooksPath: string): Promis
       `[worktree] could not exclude ${hooksPath} in ${worktreePath}: ${gitError(e)} — ` +
         `a fix commit's \`git add -A\` may stage the hooks symlink`,
     );
+  });
+}
+
+/**
+ * Undo `excludeHooksPath` for `removedWorktree`'s own hooksPath once it's gone, but ONLY if no
+ * other live worktree of the same repo still bridges the same pattern. `info/exclude` is shared
+ * across every worktree (gitrepository-layout(5) — there is no per-worktree exclude file), so a
+ * pattern added for one worktree's hooks bridge is otherwise permanent: it silently hides a
+ * same-named directory in the base checkout (and any sibling worktree) forever, even long after
+ * the worktree that needed it is gone (PR #263 review, round 7 — reproduced: appending the pattern
+ * to a fresh repo's info/exclude made its own untracked `.githooks/` vanish from `git status`).
+ * Called from `removeWorktree` AFTER the worktree is actually gone, so `listWorktrees` below no
+ * longer reports it as a survivor still needing the pattern. Entirely best-effort — a failure here
+ * leaves a stray exclude line, the same “hooks convenience, never a gate” tradeoff as everywhere
+ * else in this bridge.
+ */
+async function unexcludeHooksPathIfUnused(
+  repoPath: string,
+  removedWorktreePath: string,
+  hooksPath: string,
+): Promise<void> {
+  const survivors = await listWorktrees(repoPath).catch(() => null);
+  if (!survivors) return; // can't enumerate — leave the pattern rather than risk removing a used one
+
+  for (const record of survivors) {
+    // The base checkout is never a run worktree holding a symlink bridge — it's the SOURCE the
+    // bridge points at, and its own core.hooksPath trivially always "matches" (config is repo-wide
+    // by default). Counting it as a survivor would make cleanup a permanent no-op: verified this
+    // was exactly the bug on the first pass at this fix — every hooksPath "survived" forever
+    // because the main worktree always looked like a user.
+    if (record.isMain) continue;
+    if (record.path === removedWorktreePath) continue; // this is the one just removed
+    if (!existsSync(record.path)) continue; // administrative record for an already-gone checkout
+    const stillUsed = await readNormalizedHooksPath(record.path).catch(() => null);
+    if (stillUsed === hooksPath) return; // a live worktree still bridges this exact pattern — keep it
+  }
+
+  // repoPath (the base checkout), not removedWorktreePath — that directory no longer exists, and
+  // info/exclude is shared repo-wide regardless of which checkout resolves it (git-path resolves
+  // to the same file from any worktree of this repo).
+  const excludePath = await git(repoPath, [
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-path",
+    "info/exclude",
+  ]).catch(() => null);
+  if (!excludePath) return;
+
+  const pattern = `/${escapeGitignorePattern(hooksPath)}`;
+  const existing = await readFile(excludePath, "utf8").catch(() => null);
+  if (existing === null || !existing.split("\n").includes(pattern)) return; // nothing to remove
+
+  // A plain rewrite, not `appendFile`, is safe here: nothing else in this bridge removes lines from
+  // this file, so there is no concurrent remover to race against — only concurrent ADDERS
+  // (excludeHooksPath, always append-only), and this read-then-write can only ever drop a line that
+  // is already present in `existing`, never invent content a concurrent appender hasn't written yet.
+  // A pattern appended by a genuinely concurrent createWorktree between this read and this write
+  // would be for a DIFFERENT worktree's hooksPath (this one's own worktree is already gone), so it
+  // is preserved by the filter — only THIS exact pattern's lines are dropped.
+  const kept = existing.split("\n").filter((line) => line !== pattern);
+  await writeFile(excludePath, kept.join("\n")).catch((e: unknown) => {
+    console.warn(`[worktree] could not clean up info/exclude entry for ${hooksPath}: ${gitError(e)}`);
   });
 }
 
@@ -1060,6 +1136,13 @@ export async function removeWorktree(
   if (guard.blocker) return { removed: false, skipped: guard.blocker, branchDeleted: false };
 
   const existed = existsSync(wt.path);
+  // Read BEFORE removal — the worktree's own config (including any includeIf onbranch:
+  // conditional, which is why this isn't just `git -C repoPath`) is only queryable while the
+  // checkout still exists. `null` genuinely means "nothing to clean up", not "read failed", so a
+  // read error here just skips the cleanup below rather than risking a wrong removal.
+  const hooksPathBeforeRemoval = existed
+    ? await readNormalizedHooksPath(wt.path).catch(() => null)
+    : null;
   if (existed) {
     // A crashed anton's claim lock still sits on the checkout, and `git worktree remove --force`
     // refuses a locked worktree — break the dead claim rather than leaking the checkout forever.
@@ -1121,5 +1204,9 @@ export async function removeWorktree(
       if (await branchExists(wt.repoPath, wt.branch)) branchSkipped = gitError(err);
     }
   }
-  return { removed: existed && !existsSync(wt.path), branchDeleted, branchSkipped };
+  const removed = existed && !existsSync(wt.path);
+  if (removed && hooksPathBeforeRemoval !== null) {
+    await unexcludeHooksPathIfUnused(wt.repoPath, wt.path, hooksPathBeforeRemoval);
+  }
+  return { removed, branchDeleted, branchSkipped };
 }

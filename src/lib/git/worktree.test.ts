@@ -594,6 +594,85 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  // Caught by a real codex review pass on this diff (round 7): info/exclude is shared across
+  // every worktree of the repo, with no per-worktree exclude file to scope it to — so once a
+  // pattern is added there, it silently hides a same-named directory in the BASE checkout (and any
+  // sibling worktree) forever, even long after the worktree that needed it is gone. removeWorktree
+  // must clean it up once nothing else needs it.
+  it("removeWorktree removes the info/exclude entry once no worktree needs it anymore", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-cleanup-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const hooksDir = join(hookRepo, ".githooks");
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", ".githooks"], { cwd: hookRepo });
+
+      // The base checkout's OWN untracked .githooks/ is untouched before the exclude is added —
+      // baseline this is really the same directory the fix must stop hiding.
+      expect(execFileSync("git", ["status", "--porcelain"], { cwd: hookRepo }).toString()).toContain(
+        ".githooks",
+      );
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-cleanup" });
+      expect(existsSync(join(wt.path, ".githooks", "pre-push"))).toBe(true);
+      // Confirmed side effect of linking: the base checkout's own .githooks/ is now hidden too.
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd: hookRepo }).toString(),
+      ).not.toContain(".githooks");
+
+      await removeWorktree(wt, { deleteBranch: true });
+
+      // Nothing else in the repo needs the pattern anymore — it must be gone, and the base
+      // checkout's real, still-untracked .githooks/ must be visible again.
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd: hookRepo }).toString(),
+      ).toContain(".githooks");
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("removeWorktree keeps the info/exclude entry while a sibling worktree still needs it", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-keepshared-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const hooksDir = join(hookRepo, ".githooks");
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", ".githooks"], { cwd: hookRepo });
+
+      const wtA = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-keep-a" });
+      const wtB = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-keep-b" });
+      expect(existsSync(join(wtA.path, ".githooks", "pre-push"))).toBe(true);
+      expect(existsSync(join(wtB.path, ".githooks", "pre-push"))).toBe(true);
+
+      await removeWorktree(wtA, { deleteBranch: true });
+
+      // wtB still bridges the SAME hooksPath — the pattern must stay, both for wtB's own
+      // git status and for the base checkout's.
+      const statusWtB = execFileSync("git", ["status", "--porcelain"], { cwd: wtB.path }).toString();
+      expect(statusWtB).not.toContain(".githooks");
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd: hookRepo }).toString(),
+      ).not.toContain(".githooks");
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
   // The guard the unit suite below asserts on, exercised end-to-end: `warm: true` under vitest must
   // never shell out to a real package manager, however installable the checkout looks.
   it("warm: true is a no-op under vitest even with a lockfile present", async () => {
