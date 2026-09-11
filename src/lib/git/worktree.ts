@@ -10,8 +10,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { hostname } from "node:os";
-import { delimiter, dirname, join, resolve, sep } from "node:path";
-import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
 
 const execFileAsync = promisify(execFile);
@@ -467,8 +467,69 @@ export async function createWorktree(opts: {
     return { path: await realpath(path), branch, baseBranch, repoPath };
   });
 
-  if (warm) await warmWorktree(wt, signal);
+  if (warm) {
+    await warmWorktree(wt, signal);
+  } else {
+    // A cold worktree never runs the install that would otherwise regenerate a relative
+    // `core.hooksPath` (Husky 9's `.husky/_`) — see linkRelativeHooksPath's doc comment.
+    await linkRelativeHooksPath(repoPath, wt.path);
+  }
   return wt;
+}
+
+/**
+ * A relative `core.hooksPath` (Husky 9's `.husky/_`) is documented to resolve against the
+ * directory the hook RUNS in — i.e. per-worktree, not the base repo (git-config(1)). A cold
+ * (`warm: false`) worktree, such as review-fix's fix checkout, never runs the install that
+ * regenerates that directory, so git silently finds nothing there and every hook — including a
+ * project's pre-push gate — is skipped with no warning (PR #263 review). Symlinking the
+ * worktree's copy at the base repo's real directory keeps the same hooks active everywhere without
+ * touching git config: `git config --worktree core.hooksPath` requires
+ * `extensions.worktreeConfig`, which breaks this repo's own stringer `gitlog` collector
+ * (anton-uspu) — anton does not touch a repo's git config for that reason. An absolute
+ * `core.hooksPath` already resolves identically from every worktree and needs no help.
+ */
+async function linkRelativeHooksPath(
+  repoPath: string,
+  worktreePath: string,
+): Promise<void> {
+  let hooksPath: string;
+  try {
+    hooksPath = await git(repoPath, ["config", "--get", "core.hooksPath"]);
+  } catch (e: unknown) {
+    // Exit code 1 with no stderr is `git config --get` for an unset key — the common case, nothing
+    // to preserve. Anything else (a wedged process, the git() helper's 120s timeout under load) is
+    // silent hook loss reproducing the exact PR #263 bug this exists to fix, so it must be visible.
+    const code = (e as { code?: unknown }).code;
+    if (code !== 1) {
+      console.warn(
+        `[worktree] could not read core.hooksPath for ${repoPath} while preparing ${worktreePath}: ` +
+          `${gitError(e)} — a relative hooksPath, if set, may not be linked into this worktree`,
+      );
+    }
+    return;
+  }
+  if (!hooksPath || isAbsolute(hooksPath)) return;
+
+  const target = resolve(repoPath, hooksPath);
+  if (!existsSync(target)) return; // never materialized in the base repo either (e.g. no install yet)
+
+  const link = join(worktreePath, hooksPath);
+  if (existsSync(link)) return; // already a real dir (tracked hooks) or a prior link
+
+  // No lock of its own: createWorktree's idempotent-reuse path can run this concurrently with a
+  // second in-flight call for the same branch (both racing past withBranchLock, which has already
+  // released by the time this runs). `mkdir(recursive: true)` is already a no-op on an existing
+  // dir, so only the symlink itself can race — a concurrent winner's EEXIST there is silently
+  // fine; only a genuine failure is worth a warning.
+  await mkdir(dirname(link), { recursive: true });
+  await symlink(target, link, "dir").catch((e: unknown) => {
+    if ((e as { code?: string }).code === "EEXIST") return;
+    console.warn(
+      `[worktree] could not link relative core.hooksPath (${hooksPath}) into ${worktreePath}: ` +
+        `${gitError(e)} — hooks in this worktree may silently not run`,
+    );
+  });
 }
 
 /**

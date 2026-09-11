@@ -160,6 +160,63 @@ suite("worktree manager (real git)", () => {
     expect(existsSync(second.path)).toBe(true);
   });
 
+  // PR #263 review: a relative `core.hooksPath` (Husky 9's `.husky/_`) resolves against the
+  // directory the hook runs in, per-worktree — so a cold (`warm: false`) checkout that never runs
+  // the install regenerating that directory silently loses every hook, including a pre-push gate.
+  it("warm: false symlinks a relative core.hooksPath into the fresh worktree so hooks still fire", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const hookLog = join(hookRepo, "hook.log");
+      const hooksDir = join(hookRepo, ".husky", "_");
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(
+        join(hooksDir, "pre-push"),
+        `#!/bin/sh\npwd >> "${hookLog}"\n`,
+        { mode: 0o755 },
+      );
+      execFileSync("git", ["config", "core.hooksPath", ".husky/_"], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-relative" });
+
+      // Same file git resolves core.hooksPath/pre-push against when it runs a hook from this
+      // worktree's cwd (git-config(1): relative hooksPath resolves per-worktree, not per-repo).
+      const link = join(wt.path, ".husky", "_");
+      expect(existsSync(join(link, "pre-push"))).toBe(true);
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  // An absolute core.hooksPath already resolves identically from every worktree (git-config(1)) —
+  // linking it would be pointless and risks colliding with a tracked directory of the same name.
+  it("warm: false leaves an absolute core.hooksPath untouched", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-abs-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const absHooks = mkdtempSync(join(tmpdir(), "anton-wt-hooks-target-"));
+      execFileSync("git", ["config", "core.hooksPath", absHooks], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-absolute" });
+
+      expect(existsSync(join(wt.path, absHooks.replace(/^\//, "")))).toBe(false);
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
   // The guard the unit suite below asserts on, exercised end-to-end: `warm: true` under vitest must
   // never shell out to a real package manager, however installable the checkout looks.
   it("warm: true is a no-op under vitest even with a lockfile present", async () => {
