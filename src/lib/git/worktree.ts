@@ -95,6 +95,49 @@ function branchKey(repoPath: string, branch: string): string {
   return `${resolve(repoPath)}\u0000${branch}`;
 }
 
+/**
+ * Same pattern as {@link branchLocks} below, in-process only, keyed per repo (`info/exclude` is
+ * shared repo-wide, not per-branch): serializes `excludeHooksPath`'s appends against
+ * `unexcludeHooksPathIfUnused`'s read-modify-write. Without it, a concurrent append landing between
+ * the cleanup's read and its write is invisible to the cleanup's `existing` snapshot and gets
+ * silently discarded by the rewrite — verified: an append landing in that window vanished entirely
+ * (PR #263 review, round 8). Anton's own multiple concurrent `createWorktree`/`removeWorktree`
+ * calls are the only writers this needs to serialize against each other; a human or another tool
+ * editing `info/exclude` by hand at the same instant is a race no in-process lock can close anyway.
+ */
+const excludeFileLocks = new Map<string, Promise<void>>();
+
+async function withExcludeFileLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+  const key = resolve(repoPath);
+  const prior = excludeFileLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const held = new Promise<void>((resolveHeld) => (release = resolveHeld));
+  const chain = prior.then(() => held);
+  excludeFileLocks.set(key, chain);
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (excludeFileLocks.get(key) === chain) excludeFileLocks.delete(key);
+  }
+}
+
+/**
+ * Prefixes an anton-added `info/exclude` pattern line so cleanup can tell it apart from a line the
+ * user or another tool put there for their own reasons. Without this, `unexcludeHooksPathIfUnused`
+ * deleting every line that textually matches the pattern would also delete a user's own pre-existing
+ * identical entry — verified: a `/.mystuff` line the user added before anton ever touched the repo
+ * was silently gone after the LAST anton worktree bridging `.mystuff` was removed, even though
+ * anton's own `excludeHooksPath` never wrote a NEW line for it (its dedup check saw the user's line
+ * already there and no-opped) (PR #263 review, round 8). The marker is itself a harmless gitignore
+ * comment line (verified: doesn't affect matching), so a person reading `info/exclude` by hand also
+ * sees which lines are anton's.
+ */
+function ownershipMarker(hooksPath: string): string {
+  return `# anton:hooks-bridge:${hooksPath}`;
+}
+
 export async function withBranchLock<T>(
   repoPath: string,
   branch: string,
@@ -643,11 +686,10 @@ async function linkRelativeHooksPath(
   // is already tracked). `info/exclude` is git-native and — unlike `core.hooksPath` combined with
   // `extensions.worktreeConfig` — never read by anything outside git itself, so it can't repeat the
   // stringer breakage (anton-uspu) that ruled out a config-based fix. It IS shared across every
-  // worktree of this repo (there is no per-worktree exclude file — gitrepository-layout(5)) and
-  // isn't cleaned up when this worktree is removed; that's an acceptable, permanent, no-op-once-set
-  // trade — hiding `hooksPath` from `git status` is correct in every checkout of this repo, not
-  // just this one, since it names a hooks bridge no checkout should ever track.
-  await excludeHooksPath(worktreePath, hooksPath);
+  // worktree of this repo (there is no per-worktree exclude file — gitrepository-layout(5)); the
+  // entry is cleaned up by `unexcludeHooksPathIfUnused` once `removeWorktree` confirms no OTHER
+  // worktree still bridges this hooksPath (PR #263 review, round 7).
+  await excludeHooksPath(repoPath, worktreePath, hooksPath);
 }
 
 /**
@@ -665,11 +707,20 @@ function escapeGitignorePattern(path: string): string {
 
 /**
  * Append the exact `hooksPath` (never a broader prefix — a sibling untracked file under the same
- * parent must still surface in `git status`) to this repo's `info/exclude` once. Best-effort: a
- * failure here still leaves the hooks working, just with a stray untracked entry `git status` would
- * show until a fix commit's `git add -A` sweeps it up.
+ * parent must still surface in `git status`), MARKED as anton's own, to this repo's `info/exclude`
+ * once. Best-effort: a failure here still leaves the hooks working, just with a stray untracked
+ * entry `git status` would show until a fix commit's `git add -A` sweeps it up.
+ *
+ * Locked (`withExcludeFileLock`) and marked (`ownershipMarker`) for the same reason: this file is
+ * shared repo-wide, and `unexcludeHooksPathIfUnused` removes lines from it later — without the lock
+ * that removal can race a concurrent append into oblivion, and without the marker it can't tell an
+ * anton-added line from a same-text line the user added themselves (PR #263 review, round 8).
  */
-async function excludeHooksPath(worktreePath: string, hooksPath: string): Promise<void> {
+async function excludeHooksPath(
+  repoPath: string,
+  worktreePath: string,
+  hooksPath: string,
+): Promise<void> {
   const excludePath = await git(worktreePath, [
     "rev-parse",
     "--path-format=absolute",
@@ -687,26 +738,25 @@ async function excludeHooksPath(worktreePath: string, hooksPath: string): Promis
   // (PR #263 review, round 4). A leading `/` anchors to the repo root regardless of how many
   // segments hooksPath has, which is what's wanted: only THIS hooks bridge, nowhere else.
   const pattern = `/${escapeGitignorePattern(hooksPath)}`;
-  const existing = await readFile(excludePath, "utf8").catch(() => "");
-  if (existing.split("\n").includes(pattern)) return; // already excluded (a prior run)
+  const marker = ownershipMarker(hooksPath);
 
-  // `appendFile`, never a read-then-`writeFile` of the whole content: this file is SHARED across
-  // every worktree of the repo (there is no per-worktree exclude — gitrepository-layout(5)), so two
-  // concurrent createWorktree calls for different branches can both pass the read above before
-  // either writes. A full-content overwrite from a stale read would silently drop whichever pattern
-  // lost the race — not a benign duplicate, a lost update for a DIFFERENT worktree's hooks bridge.
-  // Appending only risks a harmless duplicate line on the rare same-pattern race, which gitignore
-  // tolerates fine and is self-correcting: the next createWorktree that runs this function again
-  // will see it already present. Existing() above is best-effort dedup only, not a correctness lock.
-  // A leading newline guards against a rare pre-existing file with no trailing newline of its own
-  // (e.g. hand-edited) — gitignore treats blank lines as no-ops, so this never fabricates or
-  // corrupts a prior pattern regardless of what the last byte in the file was.
-  await mkdir(dirname(excludePath), { recursive: true }).catch(() => {});
-  await appendFile(excludePath, `\n${pattern}\n`).catch((e: unknown) => {
-    console.warn(
-      `[worktree] could not exclude ${hooksPath} in ${worktreePath}: ${gitError(e)} — ` +
-        `a fix commit's \`git add -A\` may stage the hooks symlink`,
-    );
+  await withExcludeFileLock(repoPath, async () => {
+    const existing = await readFile(excludePath, "utf8").catch(() => "");
+    const lines = existing.split("\n");
+    // Already excluded — by anton (has its marker line immediately before it) or, just as good,
+    // by the user's own unrelated pattern. Either way there's nothing to add.
+    if (lines.includes(pattern)) return;
+
+    // A leading newline guards against a rare pre-existing file with no trailing newline of its
+    // own (e.g. hand-edited) — gitignore treats blank lines as no-ops, so this never fabricates or
+    // corrupts a prior pattern regardless of what the last byte in the file was.
+    await mkdir(dirname(excludePath), { recursive: true }).catch(() => {});
+    await appendFile(excludePath, `\n${marker}\n${pattern}\n`).catch((e: unknown) => {
+      console.warn(
+        `[worktree] could not exclude ${hooksPath} in ${worktreePath}: ${gitError(e)} — ` +
+          `a fix commit's \`git add -A\` may stage the hooks symlink`,
+      );
+    });
   });
 }
 
@@ -756,19 +806,37 @@ async function unexcludeHooksPathIfUnused(
   if (!excludePath) return;
 
   const pattern = `/${escapeGitignorePattern(hooksPath)}`;
-  const existing = await readFile(excludePath, "utf8").catch(() => null);
-  if (existing === null || !existing.split("\n").includes(pattern)) return; // nothing to remove
+  const marker = ownershipMarker(hooksPath);
 
-  // A plain rewrite, not `appendFile`, is safe here: nothing else in this bridge removes lines from
-  // this file, so there is no concurrent remover to race against — only concurrent ADDERS
-  // (excludeHooksPath, always append-only), and this read-then-write can only ever drop a line that
-  // is already present in `existing`, never invent content a concurrent appender hasn't written yet.
-  // A pattern appended by a genuinely concurrent createWorktree between this read and this write
-  // would be for a DIFFERENT worktree's hooksPath (this one's own worktree is already gone), so it
-  // is preserved by the filter — only THIS exact pattern's lines are dropped.
-  const kept = existing.split("\n").filter((line) => line !== pattern);
-  await writeFile(excludePath, kept.join("\n")).catch((e: unknown) => {
-    console.warn(`[worktree] could not clean up info/exclude entry for ${hooksPath}: ${gitError(e)}`);
+  // Locked against `excludeHooksPath`'s appends (PR #263 review, round 8: an append landing
+  // between an unlocked read and write here was silently discarded by the rewrite below) and
+  // marker-gated against a user's own pre-existing identical pattern (same review round: filtering
+  // every textually-matching line deleted a `/.mystuff` the user added themselves, since nothing
+  // distinguished it from anton's — the marker line immediately above a pattern is that evidence).
+  await withExcludeFileLock(repoPath, async () => {
+    const existing = await readFile(excludePath, "utf8").catch(() => null);
+    if (existing === null) return;
+    const lines = existing.split("\n");
+
+    // Only a pattern line whose immediately preceding line is anton's own marker for THIS exact
+    // hooksPath is anton's to remove. A bare pattern line with no marker (or a different marker)
+    // is either the user's own entry or a stale line from a build predating the marker convention
+    // — leave it untouched either way.
+    const kept: string[] = [];
+    let removedAny = false;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i] === pattern && lines[i - 1] === marker) {
+        kept.pop(); // drop the marker line just pushed
+        removedAny = true;
+        continue; // and drop this pattern line
+      }
+      kept.push(lines[i]);
+    }
+    if (!removedAny) return; // nothing that was ours to remove
+
+    await writeFile(excludePath, kept.join("\n")).catch((e: unknown) => {
+      console.warn(`[worktree] could not clean up info/exclude entry for ${hooksPath}: ${gitError(e)}`);
+    });
   });
 }
 

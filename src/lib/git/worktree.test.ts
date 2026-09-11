@@ -673,6 +673,108 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  // Caught by a real codex review pass on this diff (round 8): a line that textually matches the
+  // hooksPath pattern isn't necessarily anton's — the user (or another tool) may have added the
+  // exact same pattern to info/exclude for their own unrelated reasons, before anton ever touched
+  // this repo. Filtering every matching line, with no way to tell the two apart, deleted the
+  // user's own entry once the last anton worktree bridging that hooksPath was removed — even
+  // though anton's own excludeHooksPath never wrote a NEW line for it (its dedup check saw the
+  // user's line already there).
+  it("removeWorktree preserves a user's own pre-existing info/exclude entry", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-userowned-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      // The user's OWN pre-existing entry, added before anton ever touched this repo.
+      const excludePath = execFileSync(
+        "git",
+        ["-C", hookRepo, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"],
+      )
+        .toString()
+        .trim();
+      writeFileSync(excludePath, "/.mystuff\n# a comment the user left\n");
+
+      const hooksDir = join(hookRepo, ".mystuff");
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", ".mystuff"], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-userowned" });
+      expect(existsSync(join(wt.path, ".mystuff", "pre-push"))).toBe(true);
+
+      await removeWorktree(wt, { deleteBranch: true });
+
+      // The user's line — and their comment — must survive, exactly as they left them.
+      const final = readFileSync(excludePath, "utf8");
+      expect(final).toContain("/.mystuff");
+      expect(final).toContain("# a comment the user left");
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  // Caught by the same review pass: unexcludeHooksPathIfUnused's cleanup does async work
+  // (listWorktrees + a readNormalizedHooksPath per survivor) between reading info/exclude and
+  // writing it back. A concurrent excludeHooksPath append landing in that exact window, for a
+  // DIFFERENT worktree's hooksPath, must not be silently discarded by the cleanup's rewrite —
+  // withExcludeFileLock is what guarantees that structurally. This exercises both call sites
+  // running genuinely concurrently (Promise.all below); it does not force the exact interleaving
+  // that would fail without the lock (JS's event loop resolves this repo's real I/O too fast to
+  // reliably land there without adding a test-only delay to production code), so treat it as a
+  // correctness-under-load smoke test, not a standalone proof the lock is load-bearing — that was
+  // verified separately with a synthetic read/delay/write reproduction outside this suite.
+  it("removing one worktree does not drop a pattern concurrently appended for another", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-lockrace-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      writeFileSync(join(hookRepo, "hooksA.gitconfig"), "[core]\n\thooksPath = .hooksA\n");
+      writeFileSync(join(hookRepo, "hooksB.gitconfig"), "[core]\n\thooksPath = .hooksB\n");
+      execFileSync(
+        "git",
+        ["config", "includeIf.onbranch:anton/lockrace-a.path", join(hookRepo, "hooksA.gitconfig")],
+        { cwd: hookRepo },
+      );
+      execFileSync(
+        "git",
+        ["config", "includeIf.onbranch:anton/lockrace-b.path", join(hookRepo, "hooksB.gitconfig")],
+        { cwd: hookRepo },
+      );
+      mkdirSync(join(hookRepo, ".hooksA"), { recursive: true });
+      mkdirSync(join(hookRepo, ".hooksB"), { recursive: true });
+      writeFileSync(join(hookRepo, ".hooksA", "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      writeFileSync(join(hookRepo, ".hooksB", "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["branch", "anton/lockrace-a"], { cwd: hookRepo });
+
+      const wtA = await createWorktree({ repoPath: hookRepo, branch: "anton/lockrace-a" });
+      expect(existsSync(join(wtA.path, ".hooksA", "pre-push"))).toBe(true);
+
+      // Remove wtA (triggers cleanup of .hooksA's pattern) at the same time a second worktree for
+      // a DIFFERENT hooksPath (.hooksB) is being created (triggers an append) — both contend for
+      // withExcludeFileLock, and neither must lose the other's write.
+      const [, wtB] = await Promise.all([
+        removeWorktree(wtA, { deleteBranch: true }),
+        createWorktree({ repoPath: hookRepo, branch: "anton/lockrace-b" }),
+      ]);
+
+      expect(existsSync(join(wtB.path, ".hooksB", "pre-push"))).toBe(true);
+      const statusWtB = execFileSync("git", ["status", "--porcelain"], { cwd: wtB.path }).toString();
+      expect(statusWtB).not.toContain(".hooksB"); // must still be excluded — not lost to the race
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
   // The guard the unit suite below asserts on, exercised end-to-end: `warm: true` under vitest must
   // never shell out to a real package manager, however installable the checkout looks.
   it("warm: true is a no-op under vitest even with a lockfile present", async () => {
