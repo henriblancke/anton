@@ -527,6 +527,23 @@ async function linkRelativeHooksPath(
   // (PR #263 review, round 3).
   const hooksPath = normalize(rawHooksPath).replace(/[/\\]+$/, "");
 
+  // `normalize` already collapses a SAFE internal `..` (`a/../b` → `b`); a hooksPath that still
+  // starts with `..` after that genuinely escapes repoPath/worktreePath — e.g. `../shared-hooks`,
+  // a real pattern for sharing hooks across sibling checkouts. `join(worktreePath, hooksPath)`
+  // silently collapses that back OUTSIDE the worktree (verified: it lands in
+  // `worktreesRootFor(repoPath)`, the directory holding every OTHER branch's worktree too), so
+  // this would symlink into a shared directory outside the intended sandbox rather than into the
+  // worktree being created (caught by an independent review pass on this same diff). Bridging a
+  // hooksPath that points elsewhere entirely is out of scope for "make this worktree's own copy
+  // work" — warn and skip, matching the `.git`-rooted case just below.
+  if (hooksPath === ".." || hooksPath.startsWith(`..${sep}`)) {
+    console.warn(
+      `[worktree] core.hooksPath (${hooksPath}) for ${repoPath} points outside the repo — refusing ` +
+        `to link it into ${worktreePath}`,
+    );
+    return;
+  }
+
   // A linked worktree's `.git` is a FILE, not a directory (gitrepository-layout(5)) — so a
   // hooksPath rooted under it (`.git/hooks`, or `.git` itself) can never be materialized as a
   // subdirectory there, and — verified against real git — resolves to neither this worktree's

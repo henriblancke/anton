@@ -30,6 +30,7 @@ import {
   withWorktreeClaim,
   worktreeClaimHolder,
   worktreePathFor,
+  worktreesRootFor,
   WORKTREES_ROOT_ENV,
   type Worktree,
 } from "./worktree";
@@ -494,6 +495,41 @@ suite("worktree manager (real git)", () => {
       const status = execFileSync("git", ["status", "--porcelain"], { cwd: wt.path }).toString();
       expect(status).toBe(""); // an unescaped `[1]` would leave the symlink itself untracked
     } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  // Caught by an independent review pass on this same diff: `join(worktreePath, hooksPath)`
+  // silently collapses a `..`-escaping hooksPath (e.g. `../shared-hooks`, a real pattern for
+  // sharing hooks across sibling checkouts) back OUTSIDE the worktree — into
+  // worktreesRootFor(repoPath), the directory holding every OTHER branch's worktree for this repo
+  // too. Must warn and skip, not symlink into a shared directory outside the sandbox.
+  it("warm: false refuses a core.hooksPath that escapes the repo via ..", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-traversal-"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const sharedHooks = join(hookRepo, "..", "shared-hooks");
+      mkdirSync(sharedHooks, { recursive: true });
+      writeFileSync(join(sharedHooks, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", "../shared-hooks"], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-traversal" });
+
+      // join(worktreePath, "../shared-hooks") collapses to worktreesRootFor(repoPath)/shared-hooks
+      // — the shared directory holding every OTHER branch's worktree for this repo too. Confirm no
+      // symlink was created there.
+      const dangerousCollapseTarget = join(worktreesRootFor(hookRepo), "shared-hooks");
+      expect(existsSync(dangerousCollapseTarget)).toBe(false);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("points outside the repo"));
+    } finally {
+      warn.mockRestore();
       rmSync(hookRepo, { recursive: true, force: true });
     }
   });
