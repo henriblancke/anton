@@ -96,18 +96,85 @@ function branchKey(repoPath: string, branch: string): string {
 }
 
 /**
- * Same pattern as {@link branchLocks} below, in-process only, keyed per repo (`info/exclude` is
- * shared repo-wide, not per-branch): serializes `excludeHooksPath`'s appends against
- * `unexcludeHooksPathIfUnused`'s read-modify-write. Without it, a concurrent append landing between
- * the cleanup's read and its write is invisible to the cleanup's `existing` snapshot and gets
- * silently discarded by the rewrite — verified: an append landing in that window vanished entirely
- * (PR #263 review, round 8). Anton's own multiple concurrent `createWorktree`/`removeWorktree`
- * calls are the only writers this needs to serialize against each other; a human or another tool
- * editing `info/exclude` by hand at the same instant is a race no in-process lock can close anyway.
+ * In-process half of the exclude-file lock, keyed per repo (`info/exclude` is shared repo-wide, not
+ * per-branch). Fast path for anton's own concurrent `createWorktree`/`removeWorktree` calls within
+ * ONE process — the cross-process half below is what actually makes the critical section exclusive
+ * when a second anton process shares the repo (PR #263 review, round 9: this map alone is invisible
+ * to another process, so two anton processes on the same machine could still interleave their
+ * read-modify-write of `info/exclude` and silently discard each other's append).
  */
 const excludeFileLocks = new Map<string, Promise<void>>();
 
-async function withExcludeFileLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+/** Directory-as-mutex under the repo's common git dir — `mkdir` is atomic across processes. */
+const EXCLUDE_LOCK_DIR_NAME = "anton-hooks-bridge.lock";
+/** A lock dir older than this is presumed abandoned by a crashed process, not held. */
+const EXCLUDE_LOCK_STALE_MS = 30_000;
+const EXCLUDE_LOCK_RETRY_MS = 50;
+const EXCLUDE_LOCK_TIMEOUT_MS = 15_000;
+
+/**
+ * Take the cross-process lock over `commonDir`'s hooks-bridge state (`info/exclude` plus the
+ * registry below). `mkdir` without `recursive` is an atomic create-if-absent on every platform anton
+ * runs on, which is what a Promise-chain map (see {@link excludeFileLocks}) can never be across a
+ * process boundary. Returns a releaser; the caller must call it exactly once.
+ *
+ * Fails open, not closed: a repo whose common dir can't be resolved, or a lock that can't be created
+ * at all (read-only filesystem, permissions), degrades to the in-process-only guarantee every caller
+ * had before this fix rather than losing the hooks-bridge convenience entirely over an unrelated
+ * filesystem error — the exclude entry is best-effort by design (see {@link excludeHooksPath}).
+ */
+async function acquireCrossProcessExcludeLock(commonDir: string): Promise<() => Promise<void>> {
+  const lockPath = join(commonDir, EXCLUDE_LOCK_DIR_NAME);
+  const deadline = Date.now() + EXCLUDE_LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      await mkdir(lockPath);
+      await writeFile(
+        join(lockPath, "owner"),
+        `pid=${process.pid} host=${hostname()} time=${new Date().toISOString()}\n`,
+      ).catch(() => {});
+      return () => rm(lockPath, { recursive: true, force: true }).catch(() => {});
+    } catch (e: unknown) {
+      if ((e as { code?: string }).code !== "EEXIST") {
+        console.warn(
+          `[worktree] could not take the hooks-bridge lock at ${lockPath}: ${gitError(e)} — ` +
+            `proceeding without cross-process protection for this update`,
+        );
+        return async () => {};
+      }
+      let ageMs: number;
+      try {
+        ageMs = Date.now() - statSync(lockPath).mtimeMs;
+      } catch {
+        continue; // lock vanished between our failed mkdir and this stat — just retry
+      }
+      if (ageMs > EXCLUDE_LOCK_STALE_MS) {
+        // A process that died mid-update leaves this behind forever otherwise — nothing else ever
+        // clears it, and every future hooks bridge on the repo would wait out the full timeout.
+        await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+        continue;
+      }
+      if (Date.now() > deadline) {
+        console.warn(
+          `[worktree] timed out after ${EXCLUDE_LOCK_TIMEOUT_MS}ms waiting for the hooks-bridge lock ` +
+            `at ${lockPath} — proceeding without it; a concurrent process's info/exclude edit may be lost`,
+        );
+        return async () => {};
+      }
+      await new Promise((r) => setTimeout(r, EXCLUDE_LOCK_RETRY_MS));
+    }
+  }
+}
+
+/**
+ * Run `fn` with both halves of the exclude-file lock held, and the repo's git common dir (where
+ * `info/exclude` and the hooks-bridge registry both live) resolved for it — `null` when the repo's
+ * common dir can't be read, in which case `fn` itself must treat "nothing to do" as the safe default.
+ */
+async function withExcludeFileLock<T>(
+  repoPath: string,
+  fn: (commonDir: string | null) => Promise<T>,
+): Promise<T> {
   const key = resolve(repoPath);
   const prior = excludeFileLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
@@ -116,11 +183,71 @@ async function withExcludeFileLock<T>(repoPath: string, fn: () => Promise<T>): P
   excludeFileLocks.set(key, chain);
   await prior;
   try {
-    return await fn();
+    const commonDir = await git(repoPath, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]).catch(() => null);
+    const unlockCrossProcess = commonDir
+      ? await acquireCrossProcessExcludeLock(commonDir)
+      : async () => {};
+    try {
+      return await fn(commonDir);
+    } finally {
+      await unlockCrossProcess();
+    }
   } finally {
     release();
     if (excludeFileLocks.get(key) === chain) excludeFileLocks.delete(key);
   }
+}
+
+/**
+ * Durable record of which worktree paths anton has actually symlinked a bridge into, and for which
+ * `hooksPath` — the ground truth `unexcludeHooksPathIfUnused` needs for two things a live git-config
+ * read cannot give it (PR #263 review, round 9):
+ *
+ * 1. Which `hooksPath` a REMOVED worktree bridged. Its checkout may already be gone by the time
+ *    cleanup runs (config unreadable), or `core.hooksPath` may have changed while it existed — either
+ *    way, a live re-read at teardown answers the wrong question. This file answers "what was
+ *    actually bridged when the symlink was created", which is what must be undone.
+ * 2. Whether a SURVIVING worktree is a genuine reason to keep the pattern. A worktree whose effective
+ *    `core.hooksPath` merely happens to equal the removed one — a user-created linked worktree anton
+ *    never touched, for instance — is not a reason: it never had a symlink bridge or an exclude entry
+ *    depending on it. Only an entry actually recorded here proves anton put a real bridge there.
+ *
+ * Lives under the repo's common git dir (shared by every worktree, same as `info/exclude` itself),
+ * and is read/written only under {@link withExcludeFileLock} — same requirement as the exclude file,
+ * for the same reason: a read-modify-write outside the lock can lose a concurrent writer's entry.
+ */
+const HOOKS_BRIDGE_REGISTRY_FILE = "anton-hooks-bridges.json";
+
+type HooksBridgeRegistry = Record<string, string>;
+
+function hooksBridgeRegistryPath(commonDir: string): string {
+  return join(commonDir, HOOKS_BRIDGE_REGISTRY_FILE);
+}
+
+async function readHooksBridgeRegistry(commonDir: string): Promise<HooksBridgeRegistry> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(hooksBridgeRegistryPath(commonDir), "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as HooksBridgeRegistry)
+      : {};
+  } catch {
+    return {}; // missing (nothing bridged yet), or unreadable/corrupt — start clean rather than throw
+  }
+}
+
+async function writeHooksBridgeRegistry(commonDir: string, registry: HooksBridgeRegistry): Promise<void> {
+  await writeFile(hooksBridgeRegistryPath(commonDir), `${JSON.stringify(registry, null, 2)}\n`).catch(
+    (e: unknown) => {
+      console.warn(
+        `[worktree] could not persist the hooks-bridge registry at ${hooksBridgeRegistryPath(commonDir)}: ` +
+          `${gitError(e)} — a later cleanup may misjudge whether this bridge is still in use`,
+      );
+    },
+  );
 }
 
 /**
@@ -708,30 +835,24 @@ function escapeGitignorePattern(path: string): string {
 /**
  * Append the exact `hooksPath` (never a broader prefix — a sibling untracked file under the same
  * parent must still surface in `git status`), MARKED as anton's own, to this repo's `info/exclude`
- * once. Best-effort: a failure here still leaves the hooks working, just with a stray untracked
- * entry `git status` would show until a fix commit's `git add -A` sweeps it up.
+ * once, and record in the persisted registry that `worktreePath` is what's actually bridging it.
+ * Best-effort: a failure here still leaves the hooks working, just with a stray untracked entry
+ * `git status` would show until a fix commit's `git add -A` sweeps it up.
  *
- * Locked (`withExcludeFileLock`) and marked (`ownershipMarker`) for the same reason: this file is
- * shared repo-wide, and `unexcludeHooksPathIfUnused` removes lines from it later — without the lock
- * that removal can race a concurrent append into oblivion, and without the marker it can't tell an
- * anton-added line from a same-text line the user added themselves (PR #263 review, round 8).
+ * Locked (`withExcludeFileLock`, both its in-process and cross-process halves — PR #263 review,
+ * round 9: a second anton PROCESS sharing this repo is invisible to an in-process-only lock) and
+ * marked (`ownershipMarker`) for the same reason: `info/exclude` is shared repo-wide, and
+ * `unexcludeHooksPathIfUnused` removes lines from it later — without the lock that removal can race
+ * a concurrent append into oblivion, and without the marker it can't tell an anton-added line from a
+ * same-text line the user added themselves (PR #263 review, round 8). The registry write happens in
+ * the SAME locked section as the exclude-file write, so a concurrent reader never observes one
+ * without the other.
  */
 async function excludeHooksPath(
   repoPath: string,
   worktreePath: string,
   hooksPath: string,
 ): Promise<void> {
-  const excludePath = await git(worktreePath, [
-    "rev-parse",
-    "--path-format=absolute",
-    "--git-path",
-    "info/exclude",
-  ]).catch((e: unknown) => {
-    console.warn(`[worktree] could not resolve info/exclude for ${worktreePath}: ${gitError(e)}`);
-    return null;
-  });
-  if (!excludePath) return;
-
   // Git's exclude-file syntax is line-oriented gitignore patterns, where a pattern with NO slash
   // matches at any depth (gitignore(5)) — so a single-segment hooksPath like `.githooks` written
   // bare would also hide an unrelated `packages/foo/.githooks/` from `git status`/`git add -A`
@@ -739,81 +860,88 @@ async function excludeHooksPath(
   // segments hooksPath has, which is what's wanted: only THIS hooks bridge, nowhere else.
   const pattern = `/${escapeGitignorePattern(hooksPath)}`;
   const marker = ownershipMarker(hooksPath);
+  const worktreeKey = resolve(worktreePath);
 
-  await withExcludeFileLock(repoPath, async () => {
+  await withExcludeFileLock(repoPath, async (commonDir) => {
+    if (!commonDir) return; // can't resolve the repo's shared state — nothing safe to do
+    const excludePath = join(commonDir, "info", "exclude");
+
     const existing = await readFile(excludePath, "utf8").catch(() => "");
     const lines = existing.split("\n");
     // Already excluded — by anton (has its marker line immediately before it) or, just as good,
-    // by the user's own unrelated pattern. Either way there's nothing to add.
-    if (lines.includes(pattern)) return;
+    // by the user's own unrelated pattern. Either way there's nothing to add to the exclude file,
+    // but this worktree's own registry entry below must still be recorded.
+    if (!lines.includes(pattern)) {
+      // A leading newline guards against a rare pre-existing file with no trailing newline of its
+      // own (e.g. hand-edited) — gitignore treats blank lines as no-ops, so this never fabricates
+      // or corrupts a prior pattern regardless of what the last byte in the file was.
+      await mkdir(dirname(excludePath), { recursive: true }).catch(() => {});
+      await appendFile(excludePath, `\n${marker}\n${pattern}\n`).catch((e: unknown) => {
+        console.warn(
+          `[worktree] could not exclude ${hooksPath} in ${worktreePath}: ${gitError(e)} — ` +
+            `a fix commit's \`git add -A\` may stage the hooks symlink`,
+        );
+      });
+    }
 
-    // A leading newline guards against a rare pre-existing file with no trailing newline of its
-    // own (e.g. hand-edited) — gitignore treats blank lines as no-ops, so this never fabricates or
-    // corrupts a prior pattern regardless of what the last byte in the file was.
-    await mkdir(dirname(excludePath), { recursive: true }).catch(() => {});
-    await appendFile(excludePath, `\n${marker}\n${pattern}\n`).catch((e: unknown) => {
-      console.warn(
-        `[worktree] could not exclude ${hooksPath} in ${worktreePath}: ${gitError(e)} — ` +
-          `a fix commit's \`git add -A\` may stage the hooks symlink`,
-      );
-    });
+    // Ground truth for `unexcludeHooksPathIfUnused`: THIS worktree bridges THIS hooksPath, as of
+    // right now — recorded even if the exclude line already existed (e.g. from a previous bridge of
+    // the same hooksPath), since this is the fact that must be undone when this worktree goes away.
+    const registry = await readHooksBridgeRegistry(commonDir);
+    registry[worktreeKey] = hooksPath;
+    await writeHooksBridgeRegistry(commonDir, registry);
   });
 }
 
 /**
- * Undo `excludeHooksPath` for `removedWorktree`'s own hooksPath once it's gone, but ONLY if no
- * other live worktree of the same repo still bridges the same pattern. `info/exclude` is shared
- * across every worktree (gitrepository-layout(5) — there is no per-worktree exclude file), so a
- * pattern added for one worktree's hooks bridge is otherwise permanent: it silently hides a
- * same-named directory in the base checkout (and any sibling worktree) forever, even long after
- * the worktree that needed it is gone (PR #263 review, round 7 — reproduced: appending the pattern
- * to a fresh repo's info/exclude made its own untracked `.githooks/` vanish from `git status`).
- * Called from `removeWorktree` AFTER the worktree is actually gone, so `listWorktrees` below no
- * longer reports it as a survivor still needing the pattern. Entirely best-effort — a failure here
- * leaves a stray exclude line, the same “hooks convenience, never a gate” tradeoff as everywhere
- * else in this bridge.
+ * Undo `excludeHooksPath` for whatever hooksPath the persisted registry says `removedWorktreePath`
+ * actually bridged, but ONLY if no other registry entry still bridges the same pattern. Looked up
+ * from the registry — never a live re-read of `core.hooksPath` — for two reasons (PR #263 review,
+ * round 9):
+ *
+ * 1. `core.hooksPath` can change (or the checkout can already be gone) between when the bridge was
+ *    created and when this runs; a live read then answers "what is core.hooksPath NOW", not "what
+ *    did this worktree's now-defunct symlink actually bridge", which is the only question that
+ *    determines what needs undoing.
+ * 2. A live re-read of every OTHER worktree's config to check for survivors counts a worktree anton
+ *    never touched (e.g. a user-created linked worktree whose effective config happens to equal the
+ *    removed one) as a reason to keep the pattern — it never held a symlink bridge or depended on
+ *    this exclude entry. Only a registry entry is proof anton actually put a bridge there.
+ *
+ * `info/exclude` is shared across every worktree (gitrepository-layout(5) — there is no per-worktree
+ * exclude file), so a pattern added for one worktree's hooks bridge is otherwise permanent: it
+ * silently hides a same-named directory in the base checkout (and any sibling worktree) forever,
+ * even long after the worktree that needed it is gone (PR #263 review, round 7). Called from
+ * `removeWorktree` after the worktree is gone (or even if it never existed by the time cleanup
+ * runs — the registry lookup needs no live checkout). Entirely best-effort — a failure here leaves a
+ * stray exclude line, the same “hooks convenience, never a gate” tradeoff as everywhere else in this
+ * bridge.
  */
 async function unexcludeHooksPathIfUnused(
   repoPath: string,
   removedWorktreePath: string,
-  hooksPath: string,
 ): Promise<void> {
-  const survivors = await listWorktrees(repoPath).catch(() => null);
-  if (!survivors) return; // can't enumerate — leave the pattern rather than risk removing a used one
+  const worktreeKey = resolve(removedWorktreePath);
 
-  for (const record of survivors) {
-    // The base checkout is never a run worktree holding a symlink bridge — it's the SOURCE the
-    // bridge points at, and its own core.hooksPath trivially always "matches" (config is repo-wide
-    // by default). Counting it as a survivor would make cleanup a permanent no-op: verified this
-    // was exactly the bug on the first pass at this fix — every hooksPath "survived" forever
-    // because the main worktree always looked like a user.
-    if (record.isMain) continue;
-    if (record.path === removedWorktreePath) continue; // this is the one just removed
-    if (!existsSync(record.path)) continue; // administrative record for an already-gone checkout
-    const stillUsed = await readNormalizedHooksPath(record.path).catch(() => null);
-    if (stillUsed === hooksPath) return; // a live worktree still bridges this exact pattern — keep it
-  }
+  // Registry read, survivor check, and (conditionally) the exclude-file rewrite all happen inside
+  // ONE locked section — moving survivor discovery outside the lock is exactly what let a
+  // concurrent create/remove interleave and misjudge usage (PR #263 review, round 9: the previous
+  // version's `listWorktrees` survivor scan ran entirely unlocked).
+  await withExcludeFileLock(repoPath, async (commonDir) => {
+    if (!commonDir) return;
+    const registry = await readHooksBridgeRegistry(commonDir);
+    const hooksPath = registry[worktreeKey];
+    if (hooksPath === undefined) return; // this worktree never had a registered bridge of ours
 
-  // repoPath (the base checkout), not removedWorktreePath — that directory no longer exists, and
-  // info/exclude is shared repo-wide regardless of which checkout resolves it (git-path resolves
-  // to the same file from any worktree of this repo).
-  const excludePath = await git(repoPath, [
-    "rev-parse",
-    "--path-format=absolute",
-    "--git-path",
-    "info/exclude",
-  ]).catch(() => null);
-  if (!excludePath) return;
+    delete registry[worktreeKey];
+    const stillUsed = Object.values(registry).includes(hooksPath);
+    await writeHooksBridgeRegistry(commonDir, registry);
+    if (stillUsed) return; // another registered worktree still bridges this exact pattern — keep it
 
-  const pattern = `/${escapeGitignorePattern(hooksPath)}`;
-  const marker = ownershipMarker(hooksPath);
+    const excludePath = join(commonDir, "info", "exclude");
+    const pattern = `/${escapeGitignorePattern(hooksPath)}`;
+    const marker = ownershipMarker(hooksPath);
 
-  // Locked against `excludeHooksPath`'s appends (PR #263 review, round 8: an append landing
-  // between an unlocked read and write here was silently discarded by the rewrite below) and
-  // marker-gated against a user's own pre-existing identical pattern (same review round: filtering
-  // every textually-matching line deleted a `/.mystuff` the user added themselves, since nothing
-  // distinguished it from anton's — the marker line immediately above a pattern is that evidence).
-  await withExcludeFileLock(repoPath, async () => {
     const existing = await readFile(excludePath, "utf8").catch(() => null);
     if (existing === null) return;
     const lines = existing.split("\n");
@@ -821,7 +949,7 @@ async function unexcludeHooksPathIfUnused(
     // Only a pattern line whose immediately preceding line is anton's own marker for THIS exact
     // hooksPath is anton's to remove. A bare pattern line with no marker (or a different marker)
     // is either the user's own entry or a stale line from a build predating the marker convention
-    // — leave it untouched either way.
+    // — leave it untouched either way (PR #263 review, round 8).
     const kept: string[] = [];
     let removedAny = false;
     for (let i = 0; i < lines.length; i++) {
@@ -1204,13 +1332,6 @@ export async function removeWorktree(
   if (guard.blocker) return { removed: false, skipped: guard.blocker, branchDeleted: false };
 
   const existed = existsSync(wt.path);
-  // Read BEFORE removal — the worktree's own config (including any includeIf onbranch:
-  // conditional, which is why this isn't just `git -C repoPath`) is only queryable while the
-  // checkout still exists. `null` genuinely means "nothing to clean up", not "read failed", so a
-  // read error here just skips the cleanup below rather than risking a wrong removal.
-  const hooksPathBeforeRemoval = existed
-    ? await readNormalizedHooksPath(wt.path).catch(() => null)
-    : null;
   if (existed) {
     // A crashed anton's claim lock still sits on the checkout, and `git worktree remove --force`
     // refuses a locked worktree — break the dead claim rather than leaking the checkout forever.
@@ -1273,8 +1394,12 @@ export async function removeWorktree(
     }
   }
   const removed = existed && !existsSync(wt.path);
-  if (removed && hooksPathBeforeRemoval !== null) {
-    await unexcludeHooksPathIfUnused(wt.repoPath, wt.path, hooksPathBeforeRemoval);
+  // Looked up from the persisted registry (see unexcludeHooksPathIfUnused), not a live re-read of
+  // this worktree's config — the checkout is gone by now, and config could have changed while it
+  // existed anyway. Runs whenever the path is confirmed absent, not only when THIS call removed it,
+  // so a registry entry left behind by a checkout deleted outside anton still gets swept up.
+  if (!existsSync(wt.path)) {
+    await unexcludeHooksPathIfUnused(wt.repoPath, wt.path);
   }
   return { removed, branchDeleted, branchSkipped };
 }

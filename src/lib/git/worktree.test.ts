@@ -719,10 +719,10 @@ suite("worktree manager (real git)", () => {
   });
 
   // Caught by the same review pass: unexcludeHooksPathIfUnused's cleanup does async work
-  // (listWorktrees + a readNormalizedHooksPath per survivor) between reading info/exclude and
-  // writing it back. A concurrent excludeHooksPath append landing in that exact window, for a
-  // DIFFERENT worktree's hooksPath, must not be silently discarded by the cleanup's rewrite —
-  // withExcludeFileLock is what guarantees that structurally. This exercises both call sites
+  // (a registry read/write) between reading info/exclude and writing it back. A concurrent
+  // excludeHooksPath append landing in that exact window, for a DIFFERENT worktree's hooksPath,
+  // must not be silently discarded by the cleanup's rewrite — withExcludeFileLock is what
+  // guarantees that structurally. This exercises both call sites
   // running genuinely concurrently (Promise.all below); it does not force the exact interleaving
   // that would fail without the lock (JS's event loop resolves this repo's real I/O too fast to
   // reliably land there without adding a test-only delay to production code), so treat it as a
@@ -770,6 +770,102 @@ suite("worktree manager (real git)", () => {
       expect(existsSync(join(wtB.path, ".hooksB", "pre-push"))).toBe(true);
       const statusWtB = execFileSync("git", ["status", "--porcelain"], { cwd: wtB.path }).toString();
       expect(statusWtB).not.toContain(".hooksB"); // must still be excluded — not lost to the race
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  // PR #263 review, round 9: a user-created linked worktree that just happens to share the removed
+  // worktree's effective core.hooksPath (repo-wide config, so this is the common case, not an edge
+  // case) must not be mistaken for a reason to keep the exclude entry — it never got an anton
+  // symlink bridge and never depended on info/exclude hiding anything for it. Only a worktree anton
+  // itself bridged (recorded in the persisted registry) should count as a survivor.
+  it("removeWorktree cleans up the exclude entry even when a user's own linked worktree shares the same hooksPath", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-userwt-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+      execFileSync("git", ["config", "core.hooksPath", ".githooks"], { cwd: hookRepo });
+      mkdirSync(join(hookRepo, ".githooks"), { recursive: true });
+      writeFileSync(join(hookRepo, ".githooks", "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["branch", "anton/userwt-owned"], { cwd: hookRepo });
+      execFileSync("git", ["branch", "user/other-branch"], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/userwt-owned" });
+      expect(existsSync(join(wt.path, ".githooks", "pre-push"))).toBe(true);
+
+      // A worktree anton never created or bridged — same repo, same (repo-wide) core.hooksPath,
+      // but no anton symlink and no registry entry for it.
+      const userWorktreePath = mkdtempSync(join(tmpdir(), "anton-wt-hooks-userwt-linked-"));
+      rmSync(userWorktreePath, { recursive: true, force: true });
+      execFileSync("git", ["worktree", "add", userWorktreePath, "user/other-branch"], {
+        cwd: hookRepo,
+      });
+
+      try {
+        await removeWorktree(wt, { deleteBranch: true });
+
+        const excludePath = execFileSync(
+          "git",
+          ["-C", hookRepo, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"],
+          { cwd: hookRepo },
+        )
+          .toString()
+          .trim();
+        const final = readFileSync(excludePath, "utf8");
+        // Cleaned up despite the user's linked worktree still resolving the same hooksPath — it
+        // was never a real survivor of anton's bridge.
+        expect(final).not.toContain(".githooks");
+
+        const statusUserWt = execFileSync("git", ["status", "--porcelain"], {
+          cwd: userWorktreePath,
+        }).toString();
+        expect(statusUserWt).not.toContain(".githooks"); // the user's own directory, unaffected
+      } finally {
+        execFileSync("git", ["worktree", "remove", "--force", userWorktreePath], { cwd: hookRepo }).toString();
+      }
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  // PR #263 review, round 9: unexcludeHooksPathIfUnused must undo the hooksPath the worktree
+  // actually bridged when its symlink was created, not whatever core.hooksPath happens to read as
+  // right now. Changing the repo's config after the worktree exists (and before it's removed) is
+  // exactly the case a live re-read at teardown gets wrong.
+  it("removeWorktree unexcludes the ORIGINALLY bridged hooksPath, even if core.hooksPath changed since", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-changed-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+      execFileSync("git", ["config", "core.hooksPath", ".hooksOld"], { cwd: hookRepo });
+      mkdirSync(join(hookRepo, ".hooksOld"), { recursive: true });
+      writeFileSync(join(hookRepo, ".hooksOld", "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["branch", "anton/hooks-changed"], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-changed" });
+      expect(existsSync(join(wt.path, ".hooksOld", "pre-push"))).toBe(true);
+
+      const excludePathArgs = ["-C", hookRepo, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"];
+      const excludePath = execFileSync("git", excludePathArgs, { cwd: hookRepo }).toString().trim();
+      expect(readFileSync(excludePath, "utf8")).toContain(".hooksOld");
+
+      // Repo-wide config changes while the worktree still exists — the worktree's own bridged
+      // hooksPath (.hooksOld) never changes, only what a fresh config read would now report.
+      execFileSync("git", ["config", "core.hooksPath", ".hooksNew"], { cwd: hookRepo });
+
+      await removeWorktree(wt, { deleteBranch: true });
+
+      const final = readFileSync(excludePath, "utf8");
+      expect(final).not.toContain(".hooksOld"); // the ORIGINALLY bridged path was cleaned up
     } finally {
       rmSync(hookRepo, { recursive: true, force: true });
     }
