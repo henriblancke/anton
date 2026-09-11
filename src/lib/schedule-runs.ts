@@ -96,19 +96,29 @@ export function toScheduleLastRun(row: {
 const SCHEDULE_ID = sql<string>`json_extract(${schema.jobs.payloadJson}, '$.scheduleId')`;
 
 /**
+ * SQLite's insert-order rowid (see `JOB_INSERT_ORDER` in jobs/queue.ts for the fuller rationale):
+ * `created_at` is truncated to whole seconds on the way in, so two fires of one schedule enqueued
+ * within the same second — a fast pass settling, then an operator's "Run now" landing before the
+ * next tick — tie on it exactly. A bare-column `max(created_at)` aggregate only guarantees its
+ * status/outcome columns come from A row that achieves the max, not a deterministic one when several
+ * do (PR #264 review), so ties need their own tie-break the same way every other "latest job" read
+ * in this codebase already gets one.
+ */
+const RUN_INSERT_ORDER = sql`${schema.jobs}.rowid`;
+
+/**
  * The latest settled fire per schedule, for one project, keyed by schedule id.
  *
- * One grouped query rather than a per-schedule read: SQLite guarantees that when a query aggregates
- * `max()`, the bare columns beside it come from the row that produced that maximum — so this picks
- * the newest settled job per schedule and its status/outcome in a single pass, instead of scanning
- * every job row into memory to sort in JS.
+ * Reduced in JS rather than left to a grouped `max()` aggregate: SQLite only guarantees the bare
+ * columns beside `max()` come from A row that produced it, which is fine while `created_at` is
+ * unique per schedule but silently picks an arbitrary same-second tie otherwise (see
+ * `RUN_INSERT_ORDER`). Reading every settled row costs the same table scan the aggregate already
+ * paid for — this changes how the newest row per schedule is CHOSEN, not how much is read.
  *
  * "Newest" is measured on `created_at`, the immutable ENQUEUE time, not on `updated_at`: an operator
  * resuming a long-parked fire re-stamps its `updated_at`, so ordering by settlement would let a
- * fire from last week displace the one that ran an hour ago. The settlement time is still what the
- * column dates, so it rides along as a bare column of the row `max()` chose — and the enqueue time
- * rides along too, because that is what the UI matches against the schedule's `lastRunAt` to tell
- * this fire's outcome from a still-running one's.
+ * fire from last week displace the one that ran an hour ago. Ties on `created_at` break on insert
+ * order, which is total.
  */
 export async function lastRunsBySchedule(
   projectId: string,
@@ -120,8 +130,9 @@ export async function lastRunsBySchedule(
       outcome: schema.jobs.outcome,
       outcomeNote: schema.jobs.outcomeNote,
       lastError: schema.jobs.lastError,
-      enqueuedAt: sql<number>`max(${schema.jobs.createdAt})`,
+      enqueuedAt: sql<number>`${schema.jobs.createdAt}`,
       at: sql<number>`${schema.jobs.updatedAt}`,
+      insertOrder: RUN_INSERT_ORDER,
     })
     .from(schema.jobs)
     .where(
@@ -130,13 +141,24 @@ export async function lastRunsBySchedule(
         inArray(schema.jobs.status, [...SETTLED]),
         sql`${SCHEDULE_ID} is not null`,
       ),
-    )
-    .groupBy(SCHEDULE_ID);
+    );
 
   const byId: Record<string, ScheduleLastRun> = {};
+  const winnerOrder = new Map<string, number>();
   for (const row of rows) {
     if (!row.scheduleId) continue;
-    byId[row.scheduleId] = toScheduleLastRun(row);
+    const order = Number(row.insertOrder);
+    const enqueuedAt = Number(row.enqueuedAt);
+    const prevOrder = winnerOrder.get(row.scheduleId);
+    const prev = byId[row.scheduleId];
+    if (
+      prevOrder === undefined ||
+      enqueuedAt > prev!.enqueuedAt ||
+      (enqueuedAt === prev!.enqueuedAt && order > prevOrder)
+    ) {
+      winnerOrder.set(row.scheduleId, order);
+      byId[row.scheduleId] = toScheduleLastRun({ ...row, at: Number(row.at), enqueuedAt });
+    }
   }
   return byId;
 }
