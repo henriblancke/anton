@@ -770,7 +770,11 @@ export async function scan(opts: {
   // need unwinding -- routing it through rejectWithBaselineRestored would risk turning a harmless
   // credential-lookup timeout into a poison error if that (unneeded) restore itself failed.
   if (remainingMs <= 0) {
-    throw toScanError(Object.assign(new Error("token lookup exhausted the scan deadline"), { killed: true, signal: "SIGTERM" }), { timeoutMs });
+    // Not toScanError -- that formatter's message says stringer was killed, but stringer was
+    // never spawned here; blaming it would send an operator chasing the wrong executable.
+    throw new Error(
+      `gh auth token lookup consumed the scan's ${formatTimeout(timeoutMs)} deadline before stringer could start (no output written).`,
+    );
   }
   let stderr = "";
   try {

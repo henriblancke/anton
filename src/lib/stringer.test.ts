@@ -336,6 +336,8 @@ describe("scan", () => {
       "setTimeout(() => {}, 60000);", // outlive the deadline → SIGTERMed with no output written
     ]);
     process.env.ANTON_STRINGER_TIMEOUT_MS = "250";
+    // Skip the token lookup so the whole 250ms budget goes to stringer, not to spawning the fake gh.
+    process.env.GITHUB_TOKEN = "test-token";
 
     await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.toThrow(
       /stringer timed out after 250ms \(killed with SIG/,
@@ -574,6 +576,8 @@ describe("scan", () => {
         "setTimeout(() => {}, 60000);",
       ]);
       process.env.ANTON_STRINGER_TIMEOUT_MS = "250";
+      // Skip the token lookup so the whole 250ms budget goes to stringer, not to spawning the fake gh.
+      process.env.GITHUB_TOKEN = "test-token";
 
       await expect(scan({ repoPath: dir, scanFile: join(dir, "s2.json") })).rejects.toThrow(
         /stringer timed out after 250ms/,
