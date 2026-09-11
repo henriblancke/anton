@@ -55,7 +55,7 @@ import type { StepResultWith } from "./result";
  *    ticket's commits that anton has already closed the bead for. Poison.
  */
 export async function commitStep(ctx: StepContext): Promise<StepResultWith<"committed">> {
-  const hooksPath = await resolveHooksPathOverride(ctx.repoPath);
+  const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
   const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx), { hooksPath });
   if (committed) return { ok: true, detail: "committed", facts: { committed: true } };
 

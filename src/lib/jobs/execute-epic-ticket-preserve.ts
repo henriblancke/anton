@@ -503,7 +503,7 @@ async function commitPreservedTree(args: {
   // Hashed BEFORE the attempt, because after it a hook's edits are indistinguishable from the
   // agent's own work.
   const verified = await stageAllAndHashTree(worktreePath).catch(() => null);
-  const hooksPath = await resolveHooksPathOverride(repoPath);
+  const hooksPath = await resolveHooksPathOverride(repoPath, worktreePath);
   const first = await commitAll(worktreePath, message, { hooksPath }).catch(rejected);
   // Accepted by this project's hooks — the same proof an ordinary commit ships on, so `verified` is
   // not re-compared here; it exists for the bypass below, where no hook is left to say yes.

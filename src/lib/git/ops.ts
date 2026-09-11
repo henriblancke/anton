@@ -6,6 +6,7 @@
 import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -16,29 +17,48 @@ const execFileAsync = promisify(execFile);
 export const GH_BIN_ENV = "ANTON_GH_BIN";
 
 /**
- * Resolve `repoPath`'s effective `core.hooksPath`, absolutized against `repoPath` — or `undefined`
- * when unset. Every git command anton runs against a WORKTREE of this repo passes the result back
- * in as `-c core.hooksPath=<this>` (see {@link git}/{@link gitCommit}), so the worktree's hooks are
- * exactly the base repo's, resolved once from the one place git itself would resolve them from. An
- * absolute `core.hooksPath` already means the same thing from anywhere and is returned unchanged; a
- * relative one is resolved against `repoPath` because that is where the user configured it to mean
- * something (git-config(1): a relative `core.hooksPath` is documented as relative to the directory
- * holding it, i.e. the checkout it was configured in — the base repo here, never the worktree, which
- * has no config of its own to configure it relative to).
+ * Resolve the effective `core.hooksPath` to override with when running git against `worktreePath`
+ * (a worktree of `repoPath`, or `repoPath` itself when no worktree is involved) — or `undefined`
+ * when unset. Every hook-firing git command anton runs against a worktree passes the result back in
+ * as `-c core.hooksPath=<this>` (see {@link git}/{@link gitCommit}), so hooks fire from the right
+ * source with no bridge, symlink, or `info/exclude` entry needed at all (PR #263 replaced that
+ * subsystem with this).
  *
- * This replaces the earlier symlink-into-the-worktree + `info/exclude` bridge entirely (PR #263):
- * git resolves an absolute `core.hooksPath` identically from any working tree, so there is nothing
- * left to bridge — no materialized directory, no exclude-file entry, no cross-process lock.
+ * Three things this must get right, each caught by review on the first version (PR #263 round 16):
+ *
+ * 1. **Read from the worktree, not the base repo.** `core.hooksPath` can come from a shared config
+ *    file selected by an `includeIf "onbranch:…"` condition that matches the WORKTREE's checked-out
+ *    branch, not the base repo's (which may sit on `main` for the run's whole duration). Querying
+ *    `repoPath` here would silently miss it — git-config(1): an `onbranch` condition is evaluated
+ *    against the branch checked out in the repository the query runs against.
+ * 2. **Expand `~`.** Git accepts `~/shared-hooks` in `core.hooksPath`; a plain `--get` returns it
+ *    unexpanded, so absolutizing it naively would produce `<repo>/~/shared-hooks`. `--path` expands
+ *    `~` to `$HOME` and leaves an already-relative or -absolute value untouched otherwise.
+ * 3. **Prefer a worktree-local copy for a TRACKED relative directory.** A relative `core.hooksPath`
+ *    pointing at a directory anton's own worktree carries its own copy of — content checked into
+ *    git, so each worktree's checkout can genuinely differ (a PR that itself edits the hooks) — must
+ *    resolve to that worktree's copy, not the base repo's. Only a GENERATED, gitignored directory
+ *    (Husky's `.husky/_`, materialized by a local install anton's cold worktrees never ran) falls
+ *    back to the base repo, because the worktree simply has no copy of its own to prefer.
  */
-export async function resolveHooksPathOverride(repoPath: string): Promise<string | undefined> {
+export async function resolveHooksPathOverride(
+  repoPath: string,
+  worktreePath?: string,
+): Promise<string | undefined> {
+  const queryFrom = worktreePath ?? repoPath;
   let raw: string;
   try {
-    raw = await git(repoPath, ["config", "--get", "core.hooksPath"]);
+    raw = await git(queryFrom, ["config", "--path", "--get", "core.hooksPath"]);
   } catch {
     return undefined; // unset, or unreadable — nothing to override with
   }
   if (!raw) return undefined;
-  return isAbsolute(raw) ? raw : resolve(repoPath, raw);
+  if (isAbsolute(raw)) return raw;
+
+  const inWorktree = worktreePath ? resolve(worktreePath, raw) : undefined;
+  if (inWorktree && existsSync(inWorktree)) return inWorktree;
+
+  return resolve(repoPath, raw);
 }
 
 async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
@@ -1971,7 +1991,7 @@ export async function openPullRequest(opts: {
       `no "origin" remote in ${opts.repoPath}; cannot open a PR. Add a remote or open it manually.`,
     );
   }
-  const hooksPath = await resolveHooksPathOverride(opts.repoPath);
+  const hooksPath = await resolveHooksPathOverride(opts.repoPath, opts.worktreePath);
   await pushBranch(opts.worktreePath ?? opts.repoPath, opts.branch, hooksPath);
 
   const existing = await findOpenPullRequest(opts.repoPath, opts.branch);

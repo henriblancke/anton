@@ -17,7 +17,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   COMMIT_TIMEOUT_ENV,
@@ -426,6 +426,79 @@ suite("resolveHooksPathOverride (real git)", () => {
     const abs = join(sandbox, "shared-hooks");
     execFileSync("git", ["-C", repo, "config", "core.hooksPath", abs], { stdio: "ignore" });
     expect(await resolveHooksPathOverride(repo)).toBe(abs);
+  });
+
+  // PR #263 review, round 16: `core.hooksPath` accepts `~/…`; a plain `--get` returns it literally,
+  // and naively resolving that against repoPath produces a nonexistent `<repo>/~/…` path.
+  it("expands a ~-prefixed core.hooksPath to $HOME, not a literal ~ under the repo", async () => {
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "~/anton-hookspath-test-home"], {
+      stdio: "ignore",
+    });
+    const resolved = await resolveHooksPathOverride(repo);
+    expect(resolved).not.toContain("~");
+    expect(resolved).toBe(join(homedir(), "anton-hookspath-test-home"));
+  });
+
+  // PR #263 review, round 16: an `includeIf "onbranch:…"` selecting a DIFFERENT hooksPath for the
+  // worktree's branch must be read from the WORKTREE, not the base repo — which may sit on an
+  // unrelated branch (main) for the run's whole duration and would silently miss the conditional.
+  it("reads core.hooksPath from the worktree's own branch-conditional includeIf, not the base repo's", async () => {
+    const includeFile = join(sandbox, "onbranch-hooks.gitconfig");
+    writeFileSync(includeFile, "[core]\n\thooksPath = .hooks-for-feature\n");
+    execFileSync(
+      "git",
+      ["-C", repo, "config", `includeIf.onbranch:anton/**.path`, includeFile],
+      { stdio: "ignore" },
+    );
+
+    // Base repo stays on `main` — the includeIf does not match here, so core.hooksPath is unset.
+    expect(await resolveHooksPathOverride(repo)).toBeUndefined();
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    mkdirSync(join(worktree, ".hooks-for-feature"));
+    // Queried with the worktree given: the includeIf matches ITS checked-out branch.
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(
+      join(worktree, ".hooks-for-feature"),
+    );
+  });
+
+  // PR #263 review, round 16: a relative core.hooksPath pointing at a directory TRACKED in git has
+  // its own copy per worktree/branch (unlike Husky's generated, gitignored `.husky/_`). The override
+  // must prefer the worktree's own copy when one exists on disk, not hardwire the base repo's.
+  it("prefers the worktree's own copy of a tracked relative hooksPath over the base repo's", async () => {
+    mkdirSync(join(repo, ".githooks"));
+    writeFileSync(join(repo, ".githooks", "pre-commit"), "base version\n");
+    execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".githooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    // The worktree's own tracked copy diverges — this PR's own change to the hooks, say.
+    writeFileSync(join(worktree, ".githooks", "pre-commit"), "feature version\n");
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, ".githooks"));
+  });
+
+  // The Husky case stays correct: a GENERATED, gitignored directory has no copy in a cold worktree
+  // at all, so there is nothing to prefer — the base repo is still the right (only) source.
+  it("falls back to the base repo's copy when the worktree has none (generated, gitignored hooks)", async () => {
+    mkdirSync(join(repo, ".husky", "_"), { recursive: true });
+    writeFileSync(join(repo, ".husky", "_", "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".husky/_"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    // Cold worktree: .husky/_ is gitignored, so nothing was checked out — and no install ran here.
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".husky", "_"));
   });
 });
 

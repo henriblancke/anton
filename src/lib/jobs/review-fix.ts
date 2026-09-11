@@ -485,7 +485,7 @@ async function prepareFixWorktree(args: {
   }
   await ctx.heartbeat();
 
-  const hooksPath = await resolveHooksPathOverride(repo);
+  const hooksPath = await resolveHooksPathOverride(repo, worktree.path);
   await safe(() =>
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
   );
@@ -689,7 +689,7 @@ async function commitAndPushFix(
   branch: string,
   number: number,
 ): Promise<boolean> {
-  const hooksPath = await resolveHooksPathOverride(repo);
+  const hooksPath = await resolveHooksPathOverride(repo, worktreePath);
   const { committed } = await commitAll(
     worktreePath,
     `${epicId}: address review feedback (PR #${number})`,
