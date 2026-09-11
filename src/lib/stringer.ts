@@ -742,6 +742,7 @@ export async function scan(opts: {
   args.push("--no-color");
 
   const timeoutMs = scanTimeoutMs();
+  const deadline = Date.now() + timeoutMs;
   // A caller's own GITHUB_TOKEN (CI, an operator's shell) wins — `gh auth token` is only a
   // fallback for when nothing already set it, and only set when it actually resolves. Bounded by
   // and cancellable via the same deadline/signal as the scan itself, so a slow credential store
@@ -751,11 +752,15 @@ export async function scan(opts: {
     const token = await githubToken(timeoutMs, opts.signal);
     if (token) env.GITHUB_TOKEN = token;
   }
+  // The lookup above can itself consume part of the outer deadline -- charge that against what's
+  // left rather than handing stringer the full timeoutMs again, or a slow `gh auth token` lets the
+  // whole scan overrun ANTON_STRINGER_TIMEOUT_MS by however long the lookup took.
+  const remainingMs = Math.max(0, deadline - Date.now());
   let stderr = "";
   try {
     ({ stderr } = await execFileAsync(bin, args, {
       env,
-      timeout: timeoutMs,
+      timeout: remainingMs,
       maxBuffer: 64 * 1024 * 1024,
       signal: opts.signal,
     }));
