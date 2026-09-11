@@ -755,9 +755,17 @@ export async function scan(opts: {
   // The lookup above can itself consume part of the outer deadline -- charge that against what's
   // left rather than handing stringer the full timeoutMs again, or a slow `gh auth token` lets the
   // whole scan overrun ANTON_STRINGER_TIMEOUT_MS by however long the lookup took.
-  const remainingMs = Math.max(0, deadline - Date.now());
+  const remainingMs = deadline - Date.now();
   let stderr = "";
   try {
+    // execFile treats `timeout: 0` as "no timeout" (Node and Bun both), so a budget already
+    // exhausted by the token lookup must reject here instead of spawning stringer uncapped.
+    if (remainingMs <= 0) {
+      throw Object.assign(new Error("token lookup exhausted the scan deadline"), {
+        killed: true,
+        signal: "SIGTERM",
+      });
+    }
     ({ stderr } = await execFileAsync(bin, args, {
       env,
       timeout: remainingMs,
