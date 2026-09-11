@@ -245,58 +245,68 @@ interface ReviewThreadsPage {
  * reviewer commenting every round) used to have everything past the first page silently dropped,
  * including whichever thread was actually unresolved — `threadsNeedingAttention` never saw it, so
  * `classifyReview` reported the PR clean and the dispatcher skipped it with nothing to show for why.
+ *
+ * A later-page failure breaks the loop and returns the pages already fetched rather than throwing
+ * to the outer catch and discarding every completed page — losing page 1's unresolved threads would
+ * misclassify a >100-thread PR as clean the same way truncation did.
  */
 async function getReviewThreads(
   repoPath: string,
   number: number,
   signal?: AbortSignal,
 ): Promise<ReviewThread[]> {
+  const allNodes: RawReviewThreadNode[] = [];
   try {
     const nwo = await nameWithOwner(repoPath, signal);
     if (!nwo) return [];
     const [owner, repo] = nwo.split("/");
 
-    const allNodes: RawReviewThreadNode[] = [];
     let cursor: string | undefined;
     for (;;) {
-      const raw = await gh(
-        repoPath,
-        [
-          "api", "graphql",
-          "-f", `query=${REVIEW_THREADS_QUERY}`,
-          "-f", `owner=${owner}`,
-          "-f", `repo=${repo}`,
-          "-F", `number=${number}`,
-          ...(cursor ? ["-f", `cursor=${cursor}`] : []),
-        ],
-        signal,
-      );
-      const parsed = JSON.parse(raw) as ReviewThreadsPage;
+      let parsed: ReviewThreadsPage;
+      try {
+        const raw = await gh(
+          repoPath,
+          [
+            "api", "graphql",
+            "-f", `query=${REVIEW_THREADS_QUERY}`,
+            "-f", `owner=${owner}`,
+            "-f", `repo=${repo}`,
+            "-F", `number=${number}`,
+            ...(cursor ? ["-f", `cursor=${cursor}`] : []),
+          ],
+          signal,
+        );
+        parsed = JSON.parse(raw) as ReviewThreadsPage;
+      } catch {
+        // Keep the pages already fetched; a failed first page still degrades to [].
+        break;
+      }
       const page = parsed.data?.repository?.pullRequest?.reviewThreads;
       allNodes.push(...(page?.nodes ?? []));
       if (!page?.pageInfo?.hasNextPage || !page.pageInfo.endCursor) break;
       cursor = page.pageInfo.endCursor;
     }
-
-    return allNodes
-      .filter((n) => typeof n?.id === "string")
-      .map((n) => ({
-        id: n.id!,
-        isResolved: n.isResolved ?? false,
-        isOutdated: n.isOutdated ?? false,
-        path: n.path ?? undefined,
-        line: n.line ?? undefined,
-        comments: (n.comments?.nodes ?? [])
-          .filter((c) => typeof c?.databaseId === "number")
-          .map((c) => ({
-            id: c.databaseId!,
-            author: c.author?.login ?? "unknown",
-            body: c.body ?? "",
-          })),
-      }));
   } catch {
     return [];
   }
+
+  return allNodes
+    .filter((n) => typeof n?.id === "string")
+    .map((n) => ({
+      id: n.id!,
+      isResolved: n.isResolved ?? false,
+      isOutdated: n.isOutdated ?? false,
+      path: n.path ?? undefined,
+      line: n.line ?? undefined,
+      comments: (n.comments?.nodes ?? [])
+        .filter((c) => typeof c?.databaseId === "number")
+        .map((c) => ({
+          id: c.databaseId!,
+          author: c.author?.login ?? "unknown",
+          body: c.body ?? "",
+        })),
+    }));
 }
 
 /**

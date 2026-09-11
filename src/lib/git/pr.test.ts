@@ -216,4 +216,43 @@ process.exit(0);
     // whole point: a truncated fetch would report this PR clean.
     expect(classifyReview(review).actionable).toBe(true);
   });
+
+  it("preserves already-fetched pages when a later page fails", async () => {
+    // Overwrite the fake gh so page 2 errors (page 1 still reports hasNextPage) — the first page's
+    // unresolved thread must survive rather than the whole fetch collapsing to [].
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const hasCursor = a.some((x) => x.startsWith('cursor='));
+  if (!hasCursor) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+      pageInfo: { hasNextPage: true, endCursor: 'PAGE2' },
+      nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
+    } } } } }));
+    process.exit(0);
+  }
+  process.stderr.write('boom');
+  process.exit(1);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
+    expect(classifyReview(review).actionable).toBe(true);
+  });
 });
