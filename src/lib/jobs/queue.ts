@@ -536,6 +536,14 @@ export function enqueueReviewFixPrIfAbsent(
  * reason `enqueueReviewFixPrIfAbsent` asks it — a check made before this call would still race
  * `quiesceProject`. Returns the existing job's id when one already covers this project (inserting no
  * new row), otherwise a freshly-created `queued` job's id.
+ *
+ * `scheduleId`, when passed, stamps `schedules.lastRunAt` in the SAME transaction as the insert —
+ * mirroring `runScheduleNow` and `Scheduler.tickOnce` (PR #264 review). Without it, a caller whose
+ * payload names a `scheduleId` (the board-picker nudge) would make its jobs visible to
+ * `pendingRunsBySchedule`/`lastRunsBySchedule` — both keyed on that payload field — while leaving
+ * `lastRunAt` unmoved: a first-ever fire would still read "never" (`LastRunCell` returns early with
+ * no `lastRunAt` to compare against), and a later one would date itself against a stale stamp,
+ * showing its outcome beside the PREVIOUS fire's timestamp.
  */
 export function enqueueScheduledTypeIfAbsent(
   db: AntonDb,
@@ -546,6 +554,7 @@ export function enqueueScheduledTypeIfAbsent(
   opts?: {
     refuseProject?: (projectId: string) => boolean;
     coveredBy?: readonly string[];
+    scheduleId?: string;
   },
 ): string {
   const nowMs = clock.now();
@@ -566,6 +575,12 @@ export function enqueueScheduledTypeIfAbsent(
 
     const row = newJobRow({ type, projectId, payload }, nowMs);
     tx.insert(schema.jobs).values(row).run();
+    if (opts?.scheduleId) {
+      tx.update(schema.schedules)
+        .set({ lastRunAt: row.createdAt })
+        .where(eq(schema.schedules.id, opts.scheduleId))
+        .run();
+    }
     return row.id;
   });
 }

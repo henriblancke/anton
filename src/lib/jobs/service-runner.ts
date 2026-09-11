@@ -120,7 +120,12 @@ export function getScheduler(): Scheduler {
  * one (PR #264 review), matching the shape `runScheduleNow`/the scheduler both stamp — without it
  * the job was invisible to `pendingRunsBySchedule`/`lastRunsBySchedule` (both keyed on that field)
  * while still counting against `runScheduleNow`'s own "already-running" check, leaving the Automation
- * table's Run now button enabled through a 409 the nudge itself was causing.
+ * table's Run now button enabled through a 409 the nudge itself was causing. `scheduleId` is ALSO
+ * passed as its own option (PR #264 review), not just folded into the payload: it makes
+ * `enqueueScheduledTypeIfAbsent` stamp `schedules.lastRunAt` in the same transaction as the insert,
+ * the way `runScheduleNow`/the scheduler both do — without that stamp a first-ever nudge fire would
+ * still read "never" in the Automation table, and a later one would date itself against a stale
+ * `lastRunAt` from whatever fire last used the scheduler/Run now paths.
  */
 export function getPickerNudge(): BoardPickerNudge {
   const s = state();
@@ -133,7 +138,7 @@ export function getPickerNudge(): BoardPickerNudge {
           "board-picker",
           projectId,
           scheduleId ? { projectId, scheduleId } : { projectId },
-          { coveredBy: ["queued"] },
+          { coveredBy: ["queued"], scheduleId },
         ),
       ),
     log,

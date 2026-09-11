@@ -709,11 +709,12 @@ export class JobRunner {
     type: JobType,
     projectId: string,
     payload: unknown,
-    opts?: { coveredBy?: readonly string[] },
+    opts?: { coveredBy?: readonly string[]; scheduleId?: string },
   ): string {
     return enqueueScheduledTypeIfAbsent(this.db, this.clock, type, projectId, payload, {
       refuseProject: (pid) => this.quiescedProjects.has(pid),
       coveredBy: opts?.coveredBy,
+      scheduleId: opts?.scheduleId,
     });
   }
 

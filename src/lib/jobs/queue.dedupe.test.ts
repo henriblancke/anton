@@ -23,6 +23,7 @@ import {
   toMs,
 } from "./queue";
 import { insertProject } from "@/lib/testing/project";
+import { createSchedule } from "../schedules";
 
 let t: TestDb;
 beforeEach(() => {
@@ -566,5 +567,56 @@ describe("enqueueScheduledTypeIfAbsent", () => {
       }),
     ).toThrow(/being deleted/);
     expect(t.db.select().from(schema.jobs).all()).toHaveLength(0);
+  });
+
+  // PR #264 review: without this stamp, a caller whose payload names a scheduleId (the board-picker
+  // nudge) inserts a job that's visible to schedule-keyed reads but leaves schedules.lastRunAt
+  // untouched — a first-ever fire would still show "never", and a later one would date itself
+  // against a stale stamp from whatever fire last used the scheduler/Run now paths.
+  it("stamps schedules.lastRunAt in the same transaction when scheduleId is passed", async () => {
+    const scheduleId = await createSchedule(t.db, systemClock, {
+      projectId: "p1",
+      type: "board-picker",
+      cron: "*/10 * * * *",
+    });
+    const before = t.db
+      .select({ lastRunAt: schema.schedules.lastRunAt })
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, scheduleId))
+      .get();
+    expect(before?.lastRunAt).toBeNull();
+
+    const jobId = enqueueScheduledTypeIfAbsent(
+      t.db,
+      systemClock,
+      "board-picker",
+      "p1",
+      { projectId: "p1", scheduleId },
+      { scheduleId },
+    );
+
+    const job = await getJob(t.db, jobId);
+    const after = t.db
+      .select({ lastRunAt: schema.schedules.lastRunAt })
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, scheduleId))
+      .get();
+    expect(after?.lastRunAt?.getTime()).toBe(job!.createdAt.getTime());
+  });
+
+  it("does not touch schedules.lastRunAt when scheduleId is omitted", async () => {
+    const scheduleId = await createSchedule(t.db, systemClock, {
+      projectId: "p1",
+      type: "board-picker",
+      cron: "*/10 * * * *",
+    });
+    enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", { projectId: "p1" });
+
+    const after = t.db
+      .select({ lastRunAt: schema.schedules.lastRunAt })
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, scheduleId))
+      .get();
+    expect(after?.lastRunAt).toBeNull();
   });
 });
