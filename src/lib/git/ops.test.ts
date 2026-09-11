@@ -32,6 +32,7 @@ import {
   markPullRequestDraft,
   openPullRequest,
   pullRequestState,
+  pushBranch,
   readFileAtRev,
   readPathHistory,
   distanceBehindUpstream,
@@ -263,6 +264,144 @@ process.exit(0);
     }
   });
 });
+
+/**
+ * Regression coverage for the worktree push path (review finding): `pushBranch`/`openPullRequest`
+ * must run `git push` from the WORKTREE, never from the base repo checkout — a project's own
+ * `pre-push` hook can inspect the working tree it runs in (a "did you forget to commit a fix"
+ * staleness check, as seen in a real downstream project), and that hook sees whatever happens to be
+ * checked out at the cwd `git push` was invoked from. Proven with a REAL pre-push hook recording its
+ * own cwd's checked-out branch, exercised against a base repo deliberately left on an unrelated
+ * branch — the exact shape of anton's real usage, where the base repo checkout persists across runs
+ * on whatever branch the last run left it on.
+ */
+suite("push runs from the worktree, not the base repo (real git · real pre-push hook)", () => {
+  let sandbox: string;
+  let repo: string;
+  let bare: string;
+  let hookLog: string;
+
+  const g = (args: string[], cwd = repo) => execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-push-cwd-"));
+    repo = join(sandbox, "repo");
+    bare = join(sandbox, "remote.git");
+    hookLog = join(sandbox, "hook.log");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "--bare", "-q", bare], { stdio: "ignore" });
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["remote", "add", "origin", bare]);
+    g(["push", "-q", "-u", "origin", "main"]);
+
+    // A real pre-push hook — client-side, in the pushing repo's own .git/hooks — that records the
+    // branch checked out at ITS OWN cwd (git sets it before invoking hooks), exactly what a
+    // project's stale-working-tree gate reads.
+    const hooksDir = join(repo, ".git", "hooks");
+    const hookPath = join(hooksDir, "pre-push");
+    writeFileSync(hookPath, `#!/usr/bin/env sh\ngit rev-parse --abbrev-ref HEAD >> "${hookLog}"\n`);
+    chmodSync(hookPath, 0o755);
+
+    // The feature branch, checked out only in a SEPARATE worktree — mirroring anton, where the run's
+    // branch lives in `.anton-worktrees/...` and the base repo checkout is never moved onto it.
+    g(["worktree", "add", "-q", "-b", "anton/epic-1", join(sandbox, "worktree")]);
+    writeFileSync(join(sandbox, "worktree", "work.md"), "work\n");
+    g(["add", "-A"], join(sandbox, "worktree"));
+    g(["commit", "-q", "-m", "t1"], join(sandbox, "worktree"));
+
+    // The base repo checkout is left on `main` — whatever an unrelated prior run left it on, same as
+    // execute-epic's `repoPath` in production. This is the exact mismatch the review flagged: pushing
+    // `-C repo` would run the hook with `main` checked out while pushing `anton/epic-1`.
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("pushBranch runs the pre-push hook against the worktree's checkout, not the base repo's", async () => {
+    await pushBranch(join(sandbox, "worktree"), "anton/epic-1");
+
+    expect(readFileSync(hookLog, "utf8").trim()).toBe("anton/epic-1");
+    // The base repo's own checkout never moved off main — proof the push didn't need it to.
+    expect(
+      execFileSync("git", ["-C", repo, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" }).trim(),
+    ).toBe("main");
+  });
+
+  it("pushBranch against the base repo would have failed the hook — pinning what the bug looked like", async () => {
+    // The regression this guards: pushing `-C repo` (the base checkout, still on main) runs the hook
+    // with the WRONG branch checked out. Exercised directly against the old call shape so a revert of
+    // the worktreePath plumbing is caught even if a caller stops passing it.
+    await pushBranch(repo, "anton/epic-1");
+
+    expect(readFileSync(hookLog, "utf8").trim()).toBe("main");
+    expect(readFileSync(hookLog, "utf8").trim()).not.toBe("anton/epic-1");
+  });
+
+  it("openPullRequest pushes from worktreePath when given one, leaving the base repo checkout untouched", async () => {
+    process.env[GH_BIN_ENV] = writeBin(
+      join(sandbox, "bin"),
+      "gh",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){process.stdout.write('https://github.com/acme/repo/pull/1\\n');process.exit(0);}
+process.exit(0);`,
+    );
+
+    await openPullRequest({
+      repoPath: repo,
+      worktreePath: join(sandbox, "worktree"),
+      branch: "anton/epic-1",
+      base: "main",
+      title: "Epic 1",
+      body: "body",
+    });
+
+    expect(readFileSync(hookLog, "utf8").trim()).toBe("anton/epic-1");
+    expect(
+      execFileSync("git", ["-C", repo, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" }).trim(),
+    ).toBe("main");
+  });
+
+  it("openPullRequest falls back to pushing from repoPath when no worktreePath is given", async () => {
+    process.env[GH_BIN_ENV] = writeBin(
+      join(sandbox, "bin"),
+      "gh",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){process.stdout.write('https://github.com/acme/repo/pull/1\\n');process.exit(0);}
+process.exit(0);`,
+    );
+    // No separate worktree here — the branch is checked out directly in `repo` itself (a distinct
+    // branch, since `anton/epic-1` is already checked out in the sibling worktree from `beforeEach`
+    // and git refuses to check out a branch twice) — the shape every caller with no worktree of its
+    // own is in.
+    g(["checkout", "-q", "-b", "anton/no-worktree"]);
+
+    await openPullRequest({
+      repoPath: repo,
+      branch: "anton/no-worktree",
+      base: "main",
+      title: "No worktree",
+      body: "body",
+    });
+
+    expect(readFileSync(hookLog, "utf8").trim()).toBe("anton/no-worktree");
+  });
+});
+
+function writeBin(dir: string, name: string, body: string): string {
+  const p = join(dir, name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(p, `#!/usr/bin/env node\n${body}`);
+  chmodSync(p, 0o755);
+  return p;
+}
 
 describe("pullRequestState (fake gh)", () => {
   let sandbox: string;

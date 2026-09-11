@@ -78,6 +78,20 @@ describe("step:pr", () => {
     );
   });
 
+  // Review finding: the fixture points repoPath and worktreePath at the same dir, which would let
+  // a regression back to pushing from repoPath alone pass here undetected — assert the field is
+  // forwarded explicitly, distinct from repoPath, so a caller that stops wiring it is caught.
+  it("passes worktreePath through to openPullRequest, distinct from repoPath", async () => {
+    await prStep(sandbox.context({ worktreePath: "/some/other/worktree" }));
+
+    expect(ops.openPullRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repoPath: sandbox.dir,
+        worktreePath: "/some/other/worktree",
+      }),
+    );
+  });
+
   // Advisories never hold the PR back, so its body is the only place the founder would ever see them.
   it("carries the unresolved review findings into the PR body", async () => {
     await prStep(
