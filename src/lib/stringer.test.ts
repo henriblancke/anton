@@ -31,10 +31,13 @@ import {
   scan,
 } from "./stringer";
 import { isPoisonError } from "./jobs/errors";
+import { GH_BIN_ENV } from "./git/ops";
 
 let dir: string;
 let prevBin: string | undefined;
 let prevTimeout: string | undefined;
+let prevGhBin: string | undefined;
+let prevGithubToken: string | undefined;
 
 /** Fake stringer with a scripted body (executable node script), for the failure-path tests. */
 function writeScript(name: string, body: string[]): string {
@@ -65,6 +68,35 @@ function writeFakeStringer(argvDump: string, signals: unknown, stderr = ""): str
   return path;
 }
 
+/** Fake stringer that additionally dumps its GITHUB_TOKEN env var to envDump (empty string if unset). */
+function writeEnvDumpingStringer(envDump: string): string {
+  const path = join(dir, "env-dump-stringer");
+  const body = [
+    "#!/usr/bin/env node",
+    "const fs = require('fs');",
+    `fs.writeFileSync(${JSON.stringify(envDump)}, process.env.GITHUB_TOKEN || '');`,
+    "const i = process.argv.indexOf('-o');",
+    "if (i !== -1) fs.writeFileSync(process.argv[i + 1], JSON.stringify([]));",
+    "process.exit(0);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
+/** Fake `gh auth token` that echoes a canned token (or exits nonzero when unauthenticated). */
+function writeFakeGh(token: string | undefined): string {
+  const path = join(dir, "fake-gh");
+  const body =
+    token === undefined
+      ? ["#!/usr/bin/env node", "process.exit(1);", ""].join("\n")
+      : ["#!/usr/bin/env node", `process.stdout.write(${JSON.stringify(token)});`, ""].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
 /** Real stringer 1.8.3 stderr for a repo with extensions.worktreeConfig set (scan still exits 0). */
 const WORKTREECONFIG_STDERR = [
   `time=2026-07-26T19:26:45.418-04:00 level=INFO msg=scanning collectors=15`,
@@ -78,6 +110,14 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "anton-stringer-"));
   prevBin = process.env[STRINGER_BIN_ENV];
   prevTimeout = process.env.ANTON_STRINGER_TIMEOUT_MS;
+  prevGhBin = process.env[GH_BIN_ENV];
+  prevGithubToken = process.env.GITHUB_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  // Every scan() call now shells out to `gh auth token` when GITHUB_TOKEN is unset. Point it at a
+  // fast failing fake by default so the ~310 pre-existing calls in this file stay hermetic instead
+  // of hitting the machine's real (possibly slow/unauthenticated) `gh`; the token-specific tests
+  // below override this with their own fake.
+  process.env[GH_BIN_ENV] = writeFakeGh(undefined);
 });
 
 afterEach(() => {
@@ -85,6 +125,10 @@ afterEach(() => {
   else process.env[STRINGER_BIN_ENV] = prevBin;
   if (prevTimeout === undefined) delete process.env.ANTON_STRINGER_TIMEOUT_MS;
   else process.env.ANTON_STRINGER_TIMEOUT_MS = prevTimeout;
+  if (prevGhBin === undefined) delete process.env[GH_BIN_ENV];
+  else process.env[GH_BIN_ENV] = prevGhBin;
+  if (prevGithubToken === undefined) delete process.env.GITHUB_TOKEN;
+  else process.env.GITHUB_TOKEN = prevGithubToken;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -127,6 +171,38 @@ describe("scan", () => {
     expect(DEFAULT_SCAN_EXCLUDES).toContain(".claude/**");
     const globs = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1].split(",");
     expect(globs).toContain(".claude/**");
+  });
+
+  it("passes GITHUB_TOKEN from `gh auth token`, so stringer's github collector isn't silently skipped", async () => {
+    const envDump = join(dir, "env.txt");
+    process.env[STRINGER_BIN_ENV] = writeEnvDumpingStringer(envDump);
+    process.env[GH_BIN_ENV] = writeFakeGh("gho_faketoken123");
+
+    await scan({ repoPath: "/repo", scanFile: join(dir, "s.json") });
+
+    expect(readFileSync(envDump, "utf8")).toBe("gho_faketoken123");
+  });
+
+  it("leaves an already-set GITHUB_TOKEN alone rather than overriding it with `gh auth token`", async () => {
+    const envDump = join(dir, "env.txt");
+    process.env[STRINGER_BIN_ENV] = writeEnvDumpingStringer(envDump);
+    process.env[GH_BIN_ENV] = writeFakeGh("gho_fromgh");
+    process.env.GITHUB_TOKEN = "operator-provided-token";
+
+    await scan({ repoPath: "/repo", scanFile: join(dir, "s.json") });
+
+    expect(readFileSync(envDump, "utf8")).toBe("operator-provided-token");
+  });
+
+  it("scans without a GITHUB_TOKEN when gh is unauthenticated, rather than failing the scan", async () => {
+    const envDump = join(dir, "env.txt");
+    process.env[STRINGER_BIN_ENV] = writeEnvDumpingStringer(envDump);
+    process.env[GH_BIN_ENV] = writeFakeGh(undefined);
+
+    const result = await scan({ repoPath: "/repo", scanFile: join(dir, "s.json") });
+
+    expect(readFileSync(envDump, "utf8")).toBe("");
+    expect(result.signals).toEqual([]);
   });
 
   it("excludes anton's own database, a githygiene finding that recurs on every scan of this repo", async () => {
@@ -260,9 +336,13 @@ describe("scan", () => {
       "setTimeout(() => {}, 60000);", // outlive the deadline → SIGTERMed with no output written
     ]);
     process.env.ANTON_STRINGER_TIMEOUT_MS = "250";
+    // Skip the token lookup so the whole 250ms budget goes to stringer, not to spawning the fake gh.
+    process.env.GITHUB_TOKEN = "test-token";
 
+    // remainingMs is real elapsed time (the 250ms budget minus whatever the lookup/setup already
+    // spent), so the reported timeout is at most 250ms, not necessarily exactly 250ms.
     await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.toThrow(
-      /stringer timed out after 250ms \(killed with SIG/,
+      /stringer timed out after \d+ms \(killed with SIG/,
     );
     await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.not.toThrow(
       /gitlog/,
@@ -498,9 +578,12 @@ describe("scan", () => {
         "setTimeout(() => {}, 60000);",
       ]);
       process.env.ANTON_STRINGER_TIMEOUT_MS = "250";
+      // Skip the token lookup so the whole 250ms budget goes to stringer, not to spawning the fake gh.
+      process.env.GITHUB_TOKEN = "test-token";
 
+      // remainingMs is real elapsed time, so the reported timeout is at most 250ms.
       await expect(scan({ repoPath: dir, scanFile: join(dir, "s2.json") })).rejects.toThrow(
-        /stringer timed out after 250ms/,
+        /stringer timed out after \d+ms/,
       );
       expect(readFileSync(state, "utf8")).toBe(consumed);
     });
@@ -7955,6 +8038,32 @@ describe("scan", () => {
     await expect(
       scan({ repoPath: "/repo", scanFile: join(dir, "s.json"), signal: ac.signal }),
     ).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("rejects without launching stringer when gh auth token exhausts the scan deadline", async () => {
+    const argvDump = join(dir, "argv.json");
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+    // Hangs well past the tiny deadline below, so the lookup itself consumes the whole budget.
+    process.env[GH_BIN_ENV] = writeScript("hanging-gh", ["setTimeout(() => {}, 60000);"]);
+    process.env.ANTON_STRINGER_TIMEOUT_MS = "50";
+
+    await expect(scan({ repoPath: "/repo", scanFile: join(dir, "s.json") })).rejects.toThrow(
+      /gh auth token lookup consumed the scan's 50ms deadline before stringer could start/,
+    );
+    expect(existsSync(argvDump)).toBe(false);
+  });
+
+  it("propagates a caller abort raised during the gh auth token lookup, without launching stringer", async () => {
+    const argvDump = join(dir, "argv.json");
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+    process.env[GH_BIN_ENV] = writeScript("hanging-gh", ["setTimeout(() => {}, 60000);"]);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 50);
+
+    await expect(
+      scan({ repoPath: "/repo", scanFile: join(dir, "s.json"), signal: ac.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(existsSync(argvDump)).toBe(false);
   });
 });
 
