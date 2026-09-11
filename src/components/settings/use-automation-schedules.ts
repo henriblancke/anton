@@ -170,7 +170,13 @@ export function useAutomationSchedules({
     // up. `raced()` sees this write via `inFlight`/`completed` and drops that stale answer instead.
     writes.current.inFlight += 1;
     try {
-      await postRunNow(slug, id);
+      // Queued behind this row's own writes (PR #264 review), not sent straight through: the button
+      // reads OPTIMISTIC state, so an operator can click Run now the instant a toggle-on lands on
+      // screen while that PATCH is still in flight. Firing straight through would race it — the POST
+      // could reach `runScheduleNow` first and observe the still-disabled row server-side, returning
+      // a 409 for a click the UI showed as valid. Riding the same queue `patchSchedule` uses makes the
+      // fire wait for every write already open on this row to land first.
+      await queueRowWrite(rowWrites, id, () => postRunNow(slug, id));
       // Optimistic: the button's own `pending` state clears the instant this resolves, but the
       // server truth for `pendingRun` otherwise waits on the next poll tick (up to 30s) — a stale
       // "not firing" would re-enable the button in that window and let a second click send a
