@@ -428,8 +428,8 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo)).toBe(abs);
   });
 
-  // PR #263 review, round 16: `core.hooksPath` accepts `~/…`; a plain `--get` returns it literally,
-  // and naively resolving that against repoPath produces a nonexistent `<repo>/~/…` path.
+  // `core.hooksPath` accepts `~/…`; a plain `--get` returns it literally, and naively resolving
+  // that against repoPath produces a nonexistent `<repo>/~/…` path.
   it("expands a ~-prefixed core.hooksPath to $HOME, not a literal ~ under the repo", async () => {
     execFileSync("git", ["-C", repo, "config", "core.hooksPath", "~/anton-hookspath-test-home"], {
       stdio: "ignore",
@@ -439,9 +439,9 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(resolved).toBe(join(homedir(), "anton-hookspath-test-home"));
   });
 
-  // PR #263 review, round 16: an `includeIf "onbranch:…"` selecting a DIFFERENT hooksPath for the
-  // worktree's branch must be read from the WORKTREE, not the base repo — which may sit on an
-  // unrelated branch (main) for the run's whole duration and would silently miss the conditional.
+  // An `includeIf "onbranch:…"` selecting a DIFFERENT hooksPath for the worktree's branch must be
+  // read from the WORKTREE, not the base repo — which may sit on an unrelated branch (main) for the
+  // run's whole duration and would silently miss the conditional.
   it("reads core.hooksPath from the worktree's own branch-conditional includeIf, not the base repo's", async () => {
     const includeFile = join(sandbox, "onbranch-hooks.gitconfig");
     writeFileSync(includeFile, "[core]\n\thooksPath = .hooks-for-feature\n");
@@ -465,8 +465,8 @@ suite("resolveHooksPathOverride (real git)", () => {
     );
   });
 
-  // PR #263 review, round 16: a relative core.hooksPath pointing at a directory TRACKED in git has
-  // its own copy per worktree/branch (unlike Husky's generated, gitignored `.husky/_`). The override
+  // A relative core.hooksPath pointing at a directory TRACKED in git has its own copy per
+  // worktree/branch (unlike Husky's generated, gitignored `.husky/_`). The override
   // must prefer the worktree's own copy when one exists on disk, not hardwire the base repo's.
   it("prefers the worktree's own copy of a tracked relative hooksPath over the base repo's", async () => {
     mkdirSync(join(repo, ".githooks"));
@@ -499,6 +499,24 @@ suite("resolveHooksPathOverride (real git)", () => {
     // Cold worktree: .husky/_ is gitignored, so nothing was checked out — and no install ran here.
 
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".husky", "_"));
+  });
+
+  // A quoted core.hooksPath keeps leading/trailing whitespace verbatim (git-config(1)) — the shared
+  // `git()` helper's blanket stdout.trim() would silently rewrite
+  // ".hooks " to a directory (".hooks") that doesn't exist.
+  it("preserves leading/trailing whitespace in a literal core.hooksPath", async () => {
+    const literalName = ".hooks ";
+    mkdirSync(join(repo, literalName));
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", literalName], { stdio: "ignore" });
+    // Confirm git itself really did store and echo it with the trailing space, so this test would
+    // fail loudly if a future git version's quoting behavior ever changed.
+    expect(
+      execFileSync("git", ["-C", repo, "config", "--get", "core.hooksPath"], {
+        encoding: "utf8",
+      }),
+    ).toBe(`${literalName}\n`);
+
+    expect(await resolveHooksPathOverride(repo)).toBe(join(repo, literalName));
   });
 });
 

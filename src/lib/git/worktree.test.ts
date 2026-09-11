@@ -160,7 +160,7 @@ suite("worktree manager (real git)", () => {
     expect(existsSync(second.path)).toBe(true);
   });
 
-  // PR #263 replaced the symlink-into-the-worktree + info/exclude bridge with a `-c
+  // The symlink-into-the-worktree + info/exclude bridge was replaced with a `-c
   // core.hooksPath=<absolute>` override passed on every git invocation against a worktree (see
   // resolveHooksPathOverride in ops.ts) — so createWorktree itself now has nothing to materialize
   // for a relative core.hooksPath at all.

@@ -471,7 +471,7 @@ export async function createWorktree(opts: {
   // No hooks bridge to materialize here: every git command anton runs against this worktree passes
   // `-c core.hooksPath=<resolved from repoPath>` itself (see resolveHooksPathOverride in ops.ts) —
   // hooks fire from the base repo's own directory with no symlink, no info/exclude entry, and no
-  // dependence on whether warming happened to regenerate anything (PR #263).
+  // dependence on whether warming happened to regenerate anything.
   return wt;
 }
 

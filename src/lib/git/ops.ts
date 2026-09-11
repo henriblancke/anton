@@ -21,10 +21,10 @@ export const GH_BIN_ENV = "ANTON_GH_BIN";
  * (a worktree of `repoPath`, or `repoPath` itself when no worktree is involved) — or `undefined`
  * when unset. Every hook-firing git command anton runs against a worktree passes the result back in
  * as `-c core.hooksPath=<this>` (see {@link git}/{@link gitCommit}), so hooks fire from the right
- * source with no bridge, symlink, or `info/exclude` entry needed at all (PR #263 replaced that
- * subsystem with this).
+ * source with no bridge, symlink, or `info/exclude` entry needed at all — replacing the earlier
+ * symlink-into-the-worktree bridge entirely.
  *
- * Three things this must get right, each caught by review on the first version (PR #263 round 16):
+ * Four things this must get right:
  *
  * 1. **Read from the worktree, not the base repo.** `core.hooksPath` can come from a shared config
  *    file selected by an `includeIf "onbranch:…"` condition that matches the WORKTREE's checked-out
@@ -40,6 +40,10 @@ export const GH_BIN_ENV = "ANTON_GH_BIN";
  *    resolve to that worktree's copy, not the base repo's. Only a GENERATED, gitignored directory
  *    (Husky's `.husky/_`, materialized by a local install anton's cold worktrees never ran) falls
  *    back to the base repo, because the worktree simply has no copy of its own to prefer.
+ * 4. **Preserve whitespace.** A quoted `core.hooksPath` like `".hooks "` keeps its trailing space —
+ *    git-config(1): whitespace inside a quoted value is preserved verbatim — so this reads git's
+ *    output directly rather than through the shared {@link git} helper, whose blanket `.trim()`
+ *    would silently rewrite `.hooks ` to `.hooks`, a directory that doesn't exist.
  */
 export async function resolveHooksPathOverride(
   repoPath: string,
@@ -48,7 +52,12 @@ export async function resolveHooksPathOverride(
   const queryFrom = worktreePath ?? repoPath;
   let raw: string;
   try {
-    raw = await git(queryFrom, ["config", "--path", "--get", "core.hooksPath"]);
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", queryFrom, "config", "--path", "--get", "core.hooksPath"],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    raw = stdout.replace(/\n$/, ""); // only git's own record terminator, never surrounding whitespace
   } catch {
     return undefined; // unset, or unreadable — nothing to override with
   }
