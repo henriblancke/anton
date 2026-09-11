@@ -113,6 +113,11 @@ beforeEach(() => {
   prevGhBin = process.env[GH_BIN_ENV];
   prevGithubToken = process.env.GITHUB_TOKEN;
   delete process.env.GITHUB_TOKEN;
+  // Every scan() call now shells out to `gh auth token` when GITHUB_TOKEN is unset. Point it at a
+  // fast failing fake by default so the ~310 pre-existing calls in this file stay hermetic instead
+  // of hitting the machine's real (possibly slow/unauthenticated) `gh`; the token-specific tests
+  // below override this with their own fake.
+  process.env[GH_BIN_ENV] = writeFakeGh(undefined);
 });
 
 afterEach(() => {

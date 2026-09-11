@@ -698,7 +698,10 @@ async function readAnnotatedSignals(
 async function githubToken(timeoutMs: number, signal?: AbortSignal): Promise<string | undefined> {
   const gh = process.env[GH_BIN_ENV] ?? "gh";
   try {
-    const { stdout } = await execFileAsync(gh, ["auth", "token"], {
+    // stringer's github collector always calls api.github.com, never an enterprise host -- so
+    // without --hostname, a machine whose `gh` default host is a GHE instance would hand stringer
+    // that host's token, which api.github.com rejects (or worse, silently mismatches an account).
+    const { stdout } = await execFileAsync(gh, ["auth", "token", "--hostname", "github.com"], {
       timeout: Math.min(10_000, timeoutMs),
       maxBuffer: 1024 * 1024,
       signal,
