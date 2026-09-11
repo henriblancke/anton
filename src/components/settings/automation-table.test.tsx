@@ -64,6 +64,7 @@ const DEFAULT_CRONS: Record<string, string> = {
 function renderTable(
   overrides: Record<string, Partial<AutomationScheduleState>> = {},
   cadenceOffer: CadenceOffer | null = null,
+  opts: { onRunNow?: (id: string) => Promise<void> } = {},
 ) {
   const state: Record<string, AutomationScheduleState> = {};
   for (const automation of AUTOMATIONS) {
@@ -85,6 +86,7 @@ function renderTable(
       cadenceOffer={cadenceOffer}
       onCronChange={onCronChange}
       onToggle={onToggle}
+      onRunNow={opts.onRunNow}
       onAcceptCadenceOffer={onAcceptCadenceOffer}
       onDeclineCadenceOffer={onDeclineCadenceOffer}
     />,
@@ -479,6 +481,45 @@ describe("the automation rows", () => {
     const { onToggle } = renderTable({ "run-health": { enabled: false } });
     fireEvent.click(screen.getByRole("switch", { name: "run-health" }));
     expect(onToggle).toHaveBeenCalledWith("run-health", true);
+  });
+});
+
+/**
+ * The "Run now" button (Settings → Automation). The claim under test is that it can only ever fire
+ * an automation the operator has already armed — off is off, whether or not a run request is
+ * layered on top — and that it never doubles a fire already in flight.
+ */
+describe("the Run now button", () => {
+  function runNowButton(label: string) {
+    return screen.getByRole("button", { name: `${label} run now` });
+  }
+
+  it("is absent when the table is rendered without onRunNow", () => {
+    renderTable({ "run-health": { enabled: true } });
+    expect(screen.queryByRole("button", { name: "run-health run now" })).toBeNull();
+  });
+
+  it("is disabled while the automation is off", () => {
+    const onRunNow = vi.fn().mockResolvedValue(undefined);
+    renderTable({ "run-health": { enabled: false } }, null, { onRunNow });
+    const button = runNowButton("run-health") as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+  });
+
+  it("fires the automation's id when clicked while on", async () => {
+    const onRunNow = vi.fn().mockResolvedValue(undefined);
+    renderTable({ "run-health": { enabled: true } }, null, { onRunNow });
+    const button = runNowButton("run-health") as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+
+    fireEvent.click(button);
+    expect(onRunNow).toHaveBeenCalledWith("run-health");
+  });
+
+  it("is disabled while a fire is already queued or running", () => {
+    const onRunNow = vi.fn().mockResolvedValue(undefined);
+    renderTable({ "run-health": { enabled: true, pendingRun: "queued" } }, null, { onRunNow });
+    expect((runNowButton("run-health") as HTMLButtonElement).disabled).toBe(true);
   });
 });
 

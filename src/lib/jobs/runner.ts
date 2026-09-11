@@ -55,6 +55,7 @@ import {
   type JobType,
 } from "./queue";
 import { reconcileInterruptedRuns } from "../runs";
+import { runScheduleNow, type RunNowResult } from "../schedules";
 import {
   isPoisonError,
   isRunAlreadyLiveError,
@@ -694,6 +695,19 @@ export class JobRunner {
   enqueueReviewFixPrIfAbsent(projectId: string, epicBeadId: string): string | undefined {
     return enqueueReviewFixPrIfAbsent(this.db, this.clock, projectId, epicBeadId, {
       refuseProject: (pid) => this.quiescedProjects.has(pid),
+    });
+  }
+
+  /**
+   * Fire one schedule's job right now, outside its cron (Settings → Automation's "Run now").
+   * Delegates to `runScheduleNow` (schedules.ts), which mirrors the scheduler's own tick — same
+   * payload shape, same `lastRunAt` stamp — passing the project-teardown veto through exactly as
+   * `resume`/`enqueueReviewFixPrIfAbsent` do: asked inside the write's own transaction, not read
+   * here first, so a fire racing `quiesceProject` can't land behind its sweep.
+   */
+  runScheduleNow(scheduleId: string): Promise<RunNowResult> {
+    return runScheduleNow(this.db, this.clock, scheduleId, {
+      refuseProject: (projectId) => this.quiescedProjects.has(projectId),
     });
   }
 

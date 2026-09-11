@@ -41,6 +41,12 @@ export interface AutomationSchedules {
   cadenceOffer: CadenceOffer | null;
   acceptCadenceOffer: () => Promise<void>;
   declineCadenceOffer: () => Promise<void>;
+  /**
+   * Fire one automation's job right now, outside its cron. Toasts success/failure; the row's own
+   * `pendingRun` follows on the panel's next poll tick rather than being forced here — the toast
+   * already confirms the enqueue, and there is no local job id to reconcile against.
+   */
+  runNow: (id: string) => Promise<void>;
 }
 
 /**
@@ -155,6 +161,17 @@ export function useAutomationSchedules({
     setCron,
   });
 
+  async function runNow(id: string) {
+    try {
+      await postRunNow(slug, id);
+      toast.success(`${id} started`, {
+        description: "Watch its row here — the next poll picks up the fire within 30s.",
+      });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : `Failed to run ${id}`);
+    }
+  }
+
   return {
     state,
     toggle: (id, next) =>
@@ -165,6 +182,7 @@ export function useAutomationSchedules({
     cadenceOffer: cadence.offer,
     acceptCadenceOffer: cadence.accept,
     declineCadenceOffer: cadence.decline,
+    runNow,
   };
 }
 
@@ -323,6 +341,15 @@ async function putSchedule(
   }
   const { schedule } = await res.json().catch(() => ({ schedule: undefined }));
   return schedule;
+}
+
+/** Fire one automation's job right now. Throws the server's own message so the caller can toast it. */
+async function postRunNow(slug: string, id: string): Promise<void> {
+  const res = await fetch(`/api/projects/${slug}/schedules/${id}/run`, { method: "POST" });
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({ error: "Run failed" }));
+    throw new Error(error ?? "Run failed");
+  }
 }
 
 /**
