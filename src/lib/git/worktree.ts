@@ -489,6 +489,11 @@ export async function createWorktree(opts: {
  * this repo's own stringer `gitlog` collector (anton-uspu) — anton does not touch a repo's git
  * config for that reason. An absolute `core.hooksPath` already resolves identically from every
  * worktree and needs no help.
+ *
+ * Entirely best-effort: every step below can fail (a linked worktree's `.git` is a FILE, so a
+ * hooksPath rooted there — `.git/hooks` — can never be materialized under it; a symlink can race
+ * a concurrent call) and none of it should ever abort worktree creation over a hooks convenience
+ * (PR #263 review, round 2).
  */
 async function linkRelativeHooksPath(
   repoPath: string,
@@ -520,15 +525,76 @@ async function linkRelativeHooksPath(
 
   // No lock of its own: createWorktree's idempotent-reuse path can run this concurrently with a
   // second in-flight call for the same branch (both racing past withBranchLock, which has already
-  // released by the time this runs). `mkdir(recursive: true)` is already a no-op on an existing
-  // dir, so only the symlink itself can race — a concurrent winner's EEXIST there is silently
-  // fine; only a genuine failure is worth a warning.
-  await mkdir(dirname(link), { recursive: true });
+  // released by the time this runs). A concurrent winner's EEXIST anywhere below is silently fine.
+  //
+  // `dirname(link)` can be `.git` itself (hooksPath = `.git/hooks`) — and in a linked worktree
+  // `.git` is a FILE (gitrepository-layout(5)), not a directory, so `mkdir` throws EEXIST there
+  // every time, not just on a race. That specific hooksPath can never be bridged into a linked
+  // worktree (git itself has nowhere to put it), so skip quietly rather than warn on the norm.
+  try {
+    await mkdir(dirname(link), { recursive: true });
+  } catch (e: unknown) {
+    if ((e as { code?: string }).code === "EEXIST") return;
+    console.warn(
+      `[worktree] could not prepare a home for core.hooksPath (${hooksPath}) in ${worktreePath}: ` +
+        `${gitError(e)} — hooks in this worktree may silently not run`,
+    );
+    return;
+  }
   await symlink(target, link, "dir").catch((e: unknown) => {
     if ((e as { code?: string }).code === "EEXIST") return;
     console.warn(
       `[worktree] could not link relative core.hooksPath (${hooksPath}) into ${worktreePath}: ` +
         `${gitError(e)} — hooks in this worktree may silently not run`,
+    );
+    return;
+  });
+
+  // The symlink's target is this machine's absolute path — a `commitAll`/`git add -A` in the
+  // worktree (review-fix's fix commit) would otherwise stage it as a real, unignored, untracked
+  // entry (PR #263 review, round 2 — reproduced even for Husky's own layout: `.husky/_`'s nested
+  // `.gitignore` only covers files INSIDE it, not the `.husky/_` symlink entry itself when `.husky/`
+  // is already tracked). `info/exclude` is git-native and — unlike `core.hooksPath` combined with
+  // `extensions.worktreeConfig` — never read by anything outside git itself, so it can't repeat the
+  // stringer breakage (anton-uspu) that ruled out a config-based fix. It IS shared across every
+  // worktree of this repo (there is no per-worktree exclude file — gitrepository-layout(5)) and
+  // isn't cleaned up when this worktree is removed; that's an acceptable, permanent, no-op-once-set
+  // trade — hiding `hooksPath` from `git status` is correct in every checkout of this repo, not
+  // just this one, since it names a hooks bridge no checkout should ever track.
+  await excludeHooksPath(worktreePath, hooksPath);
+}
+
+/**
+ * Append the exact `hooksPath` (never a broader prefix — a sibling untracked file under the same
+ * parent must still surface in `git status`) to this repo's `info/exclude` once. Best-effort: a
+ * failure here still leaves the hooks working, just with a stray untracked entry `git status` would
+ * show until a fix commit's `git add -A` sweeps it up.
+ */
+async function excludeHooksPath(worktreePath: string, hooksPath: string): Promise<void> {
+  const excludePath = await git(worktreePath, [
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-path",
+    "info/exclude",
+  ]).catch((e: unknown) => {
+    console.warn(`[worktree] could not resolve info/exclude for ${worktreePath}: ${gitError(e)}`);
+    return null;
+  });
+  if (!excludePath) return;
+
+  // Git's exclude-file syntax is line-oriented gitignore patterns — a bare relative path like
+  // `.husky/_` matches exactly that path from the repo root, which is exactly what's wanted here.
+  const existing = await readFile(excludePath, "utf8").catch(() => "");
+  if (existing.split("\n").includes(hooksPath)) return; // already excluded (a prior run)
+
+  await mkdir(dirname(excludePath), { recursive: true }).catch(() => {});
+  await writeFile(
+    excludePath,
+    `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${hooksPath}\n`,
+  ).catch((e: unknown) => {
+    console.warn(
+      `[worktree] could not exclude ${hooksPath} in ${worktreePath}: ${gitError(e)} — ` +
+        `a fix commit's \`git add -A\` may stage the hooks symlink`,
     );
   });
 }

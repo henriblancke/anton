@@ -246,6 +246,65 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  // PR #263 review, round 2: a linked worktree's `.git` is a FILE (gitrepository-layout(5)), so
+  // `core.hooksPath=.git/hooks` can never be bridged there — `mkdir(dirname(link))` hits `.git`
+  // itself and throws EEXIST every time, not just on a race. Must not abort worktree creation.
+  it("warm: false does not throw when core.hooksPath is rooted at .git (a file in a linked worktree)", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-dotgit-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+      execFileSync("git", ["config", "core.hooksPath", ".git/hooks"], { cwd: hookRepo });
+
+      await expect(
+        createWorktree({ repoPath: hookRepo, branch: "anton/hooks-dotgit" }),
+      ).resolves.toMatchObject({ branch: "anton/hooks-dotgit" });
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  // PR #263 review, round 2: the symlink's target is this machine's absolute path — an unguarded
+  // `git add -A` (review-fix's commitAll) would stage it into the fix commit. Reproduced even for
+  // Husky's own layout, where `.husky/` is already tracked (Husky ships a committed pre-commit under
+  // it) so `.husky/_`'s own nested `.gitignore` (`*`) never gets consulted for the `_` entry itself.
+  it("warm: false keeps the hooks symlink out of `git add -A` (info/exclude, not core.hooksPath)", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-addall-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      mkdirSync(join(hookRepo, ".husky"), { recursive: true });
+      writeFileSync(join(hookRepo, ".husky", "pre-commit"), "echo tracked\n");
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const hooksDir = join(hookRepo, ".husky", "_");
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, ".gitignore"), "*\n");
+      writeFileSync(join(hooksDir, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", ".husky/_"], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-addall" });
+      expect(existsSync(join(wt.path, ".husky", "_", "pre-push"))).toBe(true);
+
+      execFileSync("git", ["add", "-A"], { cwd: wt.path });
+      const staged = execFileSync("git", ["diff", "--cached", "--name-only"], { cwd: wt.path })
+        .toString()
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+      expect(staged).not.toContain(".husky/_");
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
   // The guard the unit suite below asserts on, exercised end-to-end: `warm: true` under vitest must
   // never shell out to a real package manager, however installable the checkout looks.
   it("warm: true is a no-op under vitest even with a lockfile present", async () => {
