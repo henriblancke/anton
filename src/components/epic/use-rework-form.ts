@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import type { ReviewFinding, ReviewReport, ReworkResult, Ticket } from "@/lib/types";
 import {
+  draftRefusal,
   initialDraft,
   isDraftComplete,
   reworkCandidates,
@@ -41,6 +42,11 @@ export interface ReworkFormModel {
   isSelected: (key: string) => boolean;
   toggleFinding: (key: string) => void;
   submitting: boolean;
+  /**
+   * Why a filled-in draft is refused — the founder wrote something, and it states no done. Null when
+   * nothing stands in the way, or when the gap is a blank field the form already shows.
+   */
+  refusal: string | null;
   canSubmit: boolean;
   submit: () => void;
 }
@@ -68,7 +74,8 @@ export function useReworkForm({
   });
 
   const findings = report?.findings ?? [];
-  const canSubmit = isDraftComplete(draft) && !submitting;
+  const refusal = draftRefusal(draft, findings, selected);
+  const canSubmit = isDraftComplete(draft) && refusal === null && !submitting;
 
   return {
     candidates,
@@ -81,6 +88,7 @@ export function useReworkForm({
     isSelected: (key) => selected.has(key),
     toggleFinding: (key) => setSelected((prev) => toggleKey(prev, key)),
     submitting,
+    refusal,
     canSubmit,
     submit: () => {
       if (canSubmit) void send(reworkPayload(draft, findings, selected));

@@ -8,14 +8,17 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "./beads/bd";
-import { validateBeadContract } from "./beads/contract";
+import { acceptanceBody, validateBeadContract } from "./beads/contract";
 import { formatHumanNote } from "./beads/notes";
 import type { ReviewFinding } from "./jobs/review-context";
 import {
+  detachmentNoteBody,
   followUpDescription,
   hasAnyHumanNote,
+  hasDetachmentNote,
   hasHumanNote,
   originNoteBody,
+  reconcileFollowUpDescription,
   reworkNoteBody,
   settledPhrase,
 } from "./rework-notes";
@@ -78,6 +81,14 @@ describe("reworkNoteBody", () => {
     expect(body).toContain("- [advisory] (general) — naming drifts");
   });
 
+  it("keeps a multiline finding on one bullet, so the list a founder reads is one item per finding", () => {
+    const body = reworkNoteBody({
+      ...noteArgs,
+      findings: [{ severity: "blocking", location: "src/a.ts:1", note: "first line\nsecond line" }],
+    });
+    expect(body).toContain("- [blocking] src/a.ts:1 — first line second line");
+  });
+
   it("writes no findings section at all when none were selected", () => {
     const body = reworkNoteBody(noteArgs);
     expect(body).not.toContain("Findings to fix");
@@ -86,7 +97,20 @@ describe("reworkNoteBody", () => {
 });
 
 describe("followUpDescription", () => {
-  const args = { summary: "harden the retry", ticket: ticket(), targetId: "feat" };
+  const args = {
+    summary: "harden the retry",
+    instructions: INSTRUCTIONS,
+    findings: [] as ReviewFinding[],
+    ticket: ticket(),
+    targetId: "feat",
+  };
+  const findings: ReviewFinding[] = [
+    { severity: "blocking", location: "src/retry.ts:12", note: "retries on a 4xx, which never recovers" },
+    { severity: "advisory", location: "(general)", note: "no test covers the exhausted path" },
+  ];
+  const acceptanceOf = (description: string) =>
+    description.split("## Acceptance Criteria\n")[1].split("\n\n## Context")[0].split("\n");
+  const goalOf = (description: string) => description.split("## Goal\n")[1]!.split("\n")[0];
 
   it("writes a bead the contract judges as complete — an unshaped one poison-parks the runner", () => {
     const description = followUpDescription({ ...args, parentId: "feat" });
@@ -106,8 +130,352 @@ describe("followUpDescription", () => {
     }
   });
 
-  it("never repeats the instructions — they are the human note, and two copies would drift", () => {
-    expect(followUpDescription({ ...args, parentId: "feat" })).not.toContain(INSTRUCTIONS);
+  it("builds the acceptance from the instructions and the selected findings, not the summary", () => {
+    const acceptance = acceptanceOf(
+      followUpDescription({
+        ...args,
+        instructions: "Guard the null branch before retrying.\nAdd a test that fails without the guard.",
+        findings,
+      }),
+    );
+    expect(acceptance).toEqual([
+      "- [ ] Guard the null branch before retrying.",
+      "- [ ] Add a test that fails without the guard.",
+      "- [ ] src/retry.ts:12 — retries on a 4xx, which never recovers",
+      "- [ ] (general) — no test covers the exhausted path",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(acceptance).not.toContain("- [ ] harden the retry");
+  });
+
+  it("keeps the summary as the Goal and the title, never as a box to tick", () => {
+    const description = followUpDescription(args);
+    expect(description).toContain("## Goal\nharden the retry\n");
+    expect(acceptanceOf(description)).not.toContain("- [ ] harden the retry");
+  });
+
+  it("keeps the generic findings-addressed box even when the founder selected none", () => {
+    expect(acceptanceOf(followUpDescription(args))).toEqual([
+      `- [ ] ${INSTRUCTIONS}`,
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+  });
+
+  it("makes one box per instruction line, whatever list marker the founder typed", () => {
+    const acceptance = acceptanceOf(
+      followUpDescription({
+        ...args,
+        instructions: [
+          "Some prose first.",
+          "",
+          "- a dashed bullet",
+          "* a starred bullet",
+          "1. a numbered step",
+          "2) another numbering",
+          "- [ ] a box already",
+          "[x] a ticked box",
+          "[x].disabled must stay matched",
+          "-",
+          "- [ ]",
+          "   ",
+        ].join("\n"),
+      }),
+    );
+    // A bare `-` or `- [ ]` is a list the founder started and abandoned — a box over nothing. A
+    // `[x]` with no separator after it is a selector the founder wrote, and stays in the box.
+    expect(acceptance.slice(0, -1)).toEqual([
+      "- [ ] Some prose first.",
+      "- [ ] a dashed bullet",
+      "- [ ] a starred bullet",
+      "- [ ] a numbered step",
+      "- [ ] another numbering",
+      "- [ ] a box already",
+      "- [ ] a ticked box",
+      "- [ ] [x].disabled must stay matched",
+    ]);
+  });
+
+  it("files a fenced example verbatim and unboxed, in its place among the boxes", () => {
+    const example = ["```md", "## Expected", "- item", "<!-- literal -->", "```"];
+    const description = followUpDescription({
+      ...args,
+      parentId: "feat",
+      instructions: ["The rendered note reads:", ...example, "- and the test proves it"].join("\n"),
+    });
+    // Boxing each line would file `- [ ] ## Expected`, and the comment escape would alter literal
+    // text; the judge reads fenced content as authored, so the block stands as the founder typed it.
+    expect(acceptanceOf(description).slice(0, -1)).toEqual([
+      "- [ ] The rendered note reads:",
+      ...example,
+      "- [ ] and the test proves it",
+    ]);
+    // The heading inside the fence opens no section: Context, Out of scope and Verify still stand.
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(acceptanceBody(makeBead({ id: "anton-new", description }))).toContain("## Expected");
+  });
+
+  it("closes an unclosed fence in the instructions — open, it would swallow the rest of the contract", () => {
+    const description = followUpDescription({
+      ...args,
+      parentId: "feat",
+      instructions: "Expect:\n```sh\nnpm test",
+    });
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] Expect:",
+      "```sh",
+      "npm test",
+      "```",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+  });
+
+  it("collapses a multiline finding into one box — a line break inside it would close the section", () => {
+    const description = followUpDescription({
+      ...args,
+      parentId: "feat",
+      findings: [
+        {
+          severity: "blocking",
+          location: "src/retry.ts:12\nsrc/retry.ts:40",
+          note: "retries on a 4xx\n\n## Context\nwhich never recovers",
+        },
+      ],
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(acceptanceOf(description)).toEqual([
+      `- [ ] ${INSTRUCTIONS}`,
+      "- [ ] src/retry.ts:12 src/retry.ts:40 — retries on a 4xx ## Context which never recovers",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(description.match(/^## Context$/gm)).toHaveLength(1);
+  });
+
+  it("escapes an HTML comment opener in the founder's text — unmatched, it would hide the rest of the bead", () => {
+    const description = followUpDescription({
+      ...args,
+      summary: "handle <!-- in titles",
+      instructions: "Handle an unmatched <!-- in the parser.\nKeep a matched <!-- x --> as text.",
+      findings: [{ severity: "blocking", location: "src/md.ts:3", note: "chokes on <!--" }],
+      ticket: makeBead({ id: "t1", title: "Parse <!-- safely" }),
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain("## Goal\nhandle <\\!-- in titles\n");
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] Handle an unmatched <\\!-- in the parser.",
+      "- [ ] Keep a matched <\\!-- x --> as text.",
+      "- [ ] src/md.ts:3 — chokes on <\\!--",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(description).toContain("Discovered from t1 — Parse <\\!-- safely.");
+    expect(description).not.toContain("<!--");
+  });
+
+  it("keeps a comment opener inside an inline code span literal — escaping there adds a visible backslash", () => {
+    // CommonMark reads no backslash escapes inside a code span, so neutralising `<!--` there would
+    // render `<\!--` and the note would no longer match the founder's words. The span is already
+    // literal text; only openers outside spans need the escape.
+    const description = followUpDescription({
+      ...args,
+      summary: "handle `<!--` tokens",
+      instructions: "Handle `<!--` in a span.\nEscape a bare <!-- outside one.",
+      findings: [],
+      ticket: makeBead({ id: "t1", title: "Quote `<!--` safely" }),
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain("## Goal\nhandle `<!--` tokens\n");
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] Handle `<!--` in a span.",
+      "- [ ] Escape a bare <\\!-- outside one.",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(description).toContain("Discovered from t1 — Quote `<!--` safely.");
+  });
+
+  it("ignores backslash-escaped backticks when detecting code spans — they are literal punctuation", () => {
+    // CommonMark processes backslash escapes before code spans, so \`…\` is plain text; treating
+    // those backticks as span delimiters would leave a bare <!-- in the rendered contract, where it
+    // starts an unclosed HTML comment and hides the remaining sections.
+    const description = followUpDescription({
+      ...args,
+      summary: "handle \\`<!--\\` in notes",
+      instructions: "Fix \\`<!--\\` handling.",
+      findings: [],
+      ticket: makeBead({ id: "t1", title: "Escape \\`<!--\\` correctly" }),
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain("## Goal\nhandle \\`<\\!--\\` in notes\n");
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] Fix \\`<\\!--\\` handling.",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(description).toContain("Discovered from t1 — Escape \\`<\\!--\\` correctly.");
+    expect(description).not.toContain("<!--");
+  });
+
+  it("escapes a fence-shaped summary — bare, it would fence every section under the Goal", () => {
+    for (const summary of ["```", "```md swallows the section", "~~~"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      // Unescaped, the delimiter opens a block that runs to the end of the description: the scanner
+      // reads Acceptance, Context, Out of scope and Verify as literal content, and the approve route
+      // refuses the follow-up the rework just created.
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(description).toContain(`## Goal\n\\${summary}\n`);
+      expect(acceptanceOf(description)).toEqual([
+        `- [ ] ${INSTRUCTIONS}`,
+        "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+      ]);
+    }
+  });
+
+  it("escapes a heading- or rule-shaped summary — bare, the Goal states nothing", () => {
+    // A fence is not the only block a summary can be. `## Backend` opens a section of its own and
+    // leaves the Goal empty; `---` renders as a rule, which is not text either — the judge reports
+    // no Goal for both, and the founder's own words are what the section is supposed to hold.
+    for (const summary of ["## Backend", "# Backend", "###### Backend", "---", "***", "___"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(description).toContain(`## Goal\n\\${summary}\n`);
+      expect(goalOf(description)).toBe(`\\${summary}`);
+    }
+  });
+
+  it("escapes an HTML-block-shaped summary — bare, it swallows every section under the Goal", () => {
+    // These five openers run to their own closing tag, not to the blank line the Goal ends with, so
+    // Acceptance, Context, Out of scope and Verify render inside the block: a founder opening the
+    // follow-up sees a Goal and nothing else. The scanner models no HTML block, so it would report a
+    // complete contract over a description that shows none — the false green the escape prevents.
+    for (const summary of ["<script>", "<pre>", "<style>", "<textarea>", "<?php", "<!DOCTYPE html>"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(goalOf(description)).toBe(`\\${summary}`);
+    }
+  });
+
+  it("leaves an HTML block that ends at the blank line as typed — the sections below it survive", () => {
+    // Conditions 6 and 7 close at a blank line, which is what follows the Goal, so `<div>` needs no
+    // escape; a `<!--` is already neutralised as text before the block check runs.
+    for (const summary of ["<div>", '<span data-x="y">', "<!-- note -->"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(goalOf(description)).toBe(summary.replace("<!--", "<\\!--"));
+    }
+  });
+
+  it("leaves an HTML tag mid-summary alone — only the line's head opens a block", () => {
+    for (const summary of ["the <script> tag is dropped", "keep <pre> in the output"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(goalOf(description)).toBe(summary);
+    }
+  });
+
+  it("leaves a heading- or rule-shaped summary alone mid-line — only the head opens a block", () => {
+    for (const summary of ["drop the ## Backend label", "the --- rule renders wrong"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+      expect(description).toContain(`## Goal\n${summary}\n`);
+    }
+  });
+
+  it("leaves a bare marker or TODO summary as typed — escaping it would fake a written Goal", () => {
+    // These say nothing, and the judge is right to say so. Backslashing them would turn the
+    // placeholder into prose the gate reads as authored — the false green the gate exists to catch.
+    for (const summary of ["- ", "1. ", "TODO — fill this in"]) {
+      const description = followUpDescription({ ...args, summary, parentId: "feat" });
+      expect(description).toContain(`## Goal\n${summary.trim()}\n`);
+      expect(
+        validateBeadContract(makeBead({ id: "anton-new", description })).map((v) => v.section),
+      ).toEqual(["Goal"]);
+    }
+  });
+
+  it("leaves a fence delimiter mid-summary alone — only the line's head opens a block", () => {
+    const description = followUpDescription({
+      ...args,
+      summary: "the ``` closer is dropped",
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain("## Goal\nthe ``` closer is dropped\n");
+  });
+
+  it("files a closed HTML comment's sample as a verbatim block — boxing each line would flatten an indented example", () => {
+    const description = followUpDescription({
+      ...args,
+      instructions: "Render this:\n<!--\nif ok:\n    retry()\n-->",
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    // The sample stands as one fenced block, so `    retry()` keeps its indentation; boxing it as
+    // `- [ ]     retry()` would render a separate list item with the leading spaces collapsed. The
+    // delimiter lines begin outside the comment and are boxed, escaped, like any other line.
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] Render this:",
+      "- [ ] <\\!--",
+      "```",
+      "if ok:",
+      "    retry()",
+      "```",
+      "- [ ] -->",
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+    expect(description.match(/^## Context$/gm)).toHaveLength(1);
+  });
+
+  it("collapses a multi-line summary and title to one line — a pasted heading must not open its own section", () => {
+    const description = followUpDescription({
+      ...args,
+      summary: "harden the retry\n## Acceptance Criteria\n- [ ] always passes",
+      ticket: makeBead({ id: "t1", title: "Ticket one\n## Context\nforged" }),
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain(
+      "## Goal\nharden the retry ## Acceptance Criteria - [ ] always passes\n",
+    );
+    expect(description).toContain("Discovered from t1 — Ticket one ## Context forged.");
+    expect(description.match(/^## Acceptance Criteria$/gm)).toHaveLength(1);
+    expect(description.match(/^## Context$/gm)).toHaveLength(1);
+    expect(acceptanceOf(description)).toEqual([
+      `- [ ] ${INSTRUCTIONS}`,
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+  });
+
+  it("still writes a contract-complete bead when the instructions are blank — the generic box carries it", () => {
+    const description = followUpDescription({ ...args, instructions: "  \n", parentId: "feat" });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(acceptanceOf(description)).toEqual([
+      "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+    ]);
+  });
+
+  it("keeps Goal, Acceptance, Context, Out of scope and Verify in that order, with their content", () => {
+    expect(
+      followUpDescription({ ...args, findings: findings.slice(0, 1), parentId: "feat" }),
+    ).toMatchInlineSnapshot(`
+      "## Goal
+      harden the retry
+
+      ## Acceptance Criteria
+      - [ ] Add a test that fails without the null guard.
+      - [ ] src/retry.ts:12 — retries on a 4xx, which never recovers
+      - [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply
+
+      ## Context
+      Discovered from t1 — Ticket one. That ticket's acceptance was met and it keeps its review score; this bead carries the next iteration feat's self-review prompted. The founder's instructions and the findings they selected are the human note on this bead.
+      It runs as a ticket of feat, in that target's next run.
+
+      ## Out of scope
+      Anything beyond the instructions in the note. t1 already shipped its own acceptance; re-litigating it belongs on that ticket, not here.
+
+      ## Verify
+      The project's own checks stay green, and the run's self-review scores this bead against the acceptance above."
+    `);
   });
 
   it("tells a parented bead it runs as a ticket, and a parentless one that it is its own target", () => {
@@ -140,6 +508,546 @@ describe("followUpDescription", () => {
         pipeline: { outcome: "retired", pr: "gh-42", redirected: false },
       }),
     ).toContain("That ticket's acceptance was met");
+  });
+});
+
+describe("reconcileFollowUpDescription", () => {
+  const args = {
+    summary: "harden the retry",
+    instructions: INSTRUCTIONS,
+    findings: [] as ReviewFinding[],
+    ticket: ticket(),
+    targetId: "feat",
+    parentId: "feat",
+  };
+  const edited = {
+    ...args,
+    instructions: "Guard the null branch.\nCover the exhausted path.",
+    findings: [
+      { severity: "blocking", location: "src/retry.ts:12", note: "retries on a 4xx" },
+    ] as ReviewFinding[],
+  };
+
+  it("round-trips a generated contract — a frozen first attempt reconciles to exactly the regenerated one", () => {
+    expect(reconcileFollowUpDescription(followUpDescription(args), edited)).toBe(
+      followUpDescription(edited),
+    );
+  });
+
+  it("swaps only the acceptance, keeping a founder's Context, Out of scope and Verify as written", () => {
+    const authored = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Acceptance Criteria",
+      "- [ ] the old box",
+      "",
+      "## Context",
+      "Discovered from t1. The founder's own account of why this matters.",
+      "It runs as a ticket of feat, in that target's next run.",
+      "",
+      "## Out of scope",
+      "The founder narrowed this by hand: leave the timeout alone.",
+      "",
+      "## Verify",
+      "Run the retry suite twice; the second run must not flake.",
+      "",
+      "## Notes",
+      "A section the formula never writes.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(authored, edited);
+
+    expect(reconciled).not.toContain("the old box");
+    expect(reconciled).toContain("- [ ] Guard the null branch.");
+    expect(reconciled).toContain("- [ ] Cover the exhausted path.");
+    expect(reconciled).toContain("- [ ] src/retry.ts:12 — retries on a 4xx");
+    for (const kept of [
+      "The founder's own account of why this matters.",
+      "The founder narrowed this by hand: leave the timeout alone.",
+      "Run the retry suite twice; the second run must not flake.",
+      "## Notes\nA section the formula never writes.",
+    ]) {
+      expect(reconciled).toContain(kept);
+    }
+    // The section boundary is the contract judge's: the rest of the description is byte-for-byte.
+    expect(reconciled.split("\n\n## Context")[1]).toBe(authored.split("\n\n## Context")[1]);
+  });
+
+  it("keeps a Setext-underlined Acceptance heading whole — the underline is the heading, not its body", () => {
+    // A half-created follow-up can carry `Acceptance Criteria` / `===`. Keeping only the label and
+    // dropping the underline turned the surviving heading into plain text, leaving the reconciled
+    // bead with no rendered Acceptance at all — and no retry reconciles a bead that reads finished.
+    const setext = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "Acceptance Criteria",
+      "===",
+      "- [ ] the old box",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(setext, edited);
+
+    expect(reconciled).toContain("Acceptance Criteria\n===\n- [ ] Guard the null branch.");
+    expect(reconciled).not.toContain("the old box");
+    expect(reconciled).toContain("\n\n## Context\nKept.");
+    // The rewrite renders the section it claims to have written.
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "Guard the null branch.",
+    );
+  });
+
+  it("keeps a dropped Setext duplicate's underline when it stays as an empty boundary", () => {
+    // `# Acceptance`, then a Setext-h2 duplicate, then a peer `## Notes`: the duplicate is kept as
+    // an empty boundary because it terminated the peer after it. Keeping only its first line
+    // deleted the `---` and turned the surviving boundary back into a plain paragraph — the peer
+    // re-parented under the surviving Acceptance, its boxes folded into the replaced section.
+    const nested = [
+      "# Acceptance",
+      "- [ ] the old box",
+      "Acceptance Criteria",
+      "---",
+      "- [ ] the setext duplicate's box",
+      "## Notes",
+      "a founder-authored peer",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(nested, edited);
+
+    expect(reconciled).not.toContain("old box");
+    expect(reconciled).not.toContain("setext duplicate");
+    // The boundary keeps its underline — it still renders as the heading that closes Acceptance.
+    expect(reconciled).toContain("Acceptance Criteria\n---\n\n## Notes\na founder-authored peer");
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toBe(
+      [
+        "- [ ] Guard the null branch.",
+        "- [ ] Cover the exhausted path.",
+        "- [ ] src/retry.ts:12 — retries on a 4xx",
+        "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+      ].join("\n"),
+    );
+  });
+
+  it("takes a sub-heading grouping criteria with the acceptance — it is that section's own content", () => {
+    const grouped = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Acceptance Criteria",
+      "### API",
+      "- [ ] the api box",
+      "### UI",
+      "- [ ] the ui box",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(grouped, edited);
+
+    expect(reconciled).not.toContain("### API");
+    expect(reconciled).not.toContain("the ui box");
+    expect(reconciled).toContain("## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled).toContain("\n\n## Context\nKept.");
+  });
+
+  it("takes an epic-only heading grouping criteria with the acceptance — on a ticket it is content, not a boundary", () => {
+    const grouped = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Acceptance Criteria",
+      "### Success",
+      "- [ ] the grouped old box",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(grouped, edited);
+
+    expect(reconciled).not.toContain("### Success");
+    expect(reconciled).not.toContain("old box");
+    expect(reconciled).toContain("## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled).toContain("\n\n## Context\nKept.");
+    // The judge sections a ticket by its own tier's headings, so its effective acceptance is exactly
+    // the request's boxes — no stale grouped criteria beside them.
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toBe(
+      [
+        "- [ ] Guard the null branch.",
+        "- [ ] Cover the exhausted path.",
+        "- [ ] src/retry.ts:12 — retries on a 4xx",
+        "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+      ].join("\n"),
+    );
+  });
+
+  it("re-says a generated run-location line for the parentage the bead holds now, and nothing else in Context", () => {
+    const reconciled = reconcileFollowUpDescription(followUpDescription(args), {
+      ...args,
+      parentId: undefined,
+    });
+    expect(reconciled).toBe(followUpDescription({ ...args, parentId: undefined }));
+  });
+
+  it("re-says the run-location line only in Context — the same sentence in Goal or a box is authored text", () => {
+    const sentence = "It runs as a ticket of feat, in that target's next run.";
+    const elsewhere = followUpDescription(args)
+      .replace("## Goal\n", `## Goal\n${sentence}\n`)
+      .replace("## Acceptance Criteria\n", `## Acceptance Criteria\n- [ ] ${sentence}\n`);
+    const reconciled = reconcileFollowUpDescription(elsewhere, {
+      ...args,
+      instructions: `${sentence}\n${INSTRUCTIONS}`,
+      parentId: undefined,
+    });
+    expect(reconciled.split("\n\n## Acceptance")[0]).toBe(elsewhere.split("\n\n## Acceptance")[0]);
+    expect(reconciled).toContain(`- [ ] ${sentence}`);
+    expect(reconciled.split("\n\n## Context")[1]).not.toContain(sentence);
+    expect(reconciled.split("\n\n## Context")[1]).toContain("It is its own run target");
+  });
+
+  it("leaves a run-location line the founder rewrote alone — they own the Context then", () => {
+    const rewritten = followUpDescription(args).replace(
+      "It runs as a ticket of feat, in that target's next run.",
+      "Runs wherever the gardener puts it.",
+    );
+    const reconciled = reconcileFollowUpDescription(rewritten, { ...args, parentId: undefined });
+    expect(reconciled).toContain("Runs wherever the gardener puts it.");
+    expect(reconciled).not.toContain("It is its own run target");
+  });
+
+  it("appends an Acceptance section to a hand-made bead that has none, keeping what it says", () => {
+    const handMade = "## Goal\nharden the retry\n\n## Context\nMade by hand.\n";
+    const reconciled = reconcileFollowUpDescription(handMade, edited);
+    expect(reconciled.startsWith("## Goal\nharden the retry\n\n## Context\nMade by hand.")).toBe(true);
+    expect(reconciled).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled.trimEnd().endsWith("or answered with why they don't apply")).toBe(true);
+  });
+
+  it("closes a fence the hand-made description ends inside before appending — a heading in a fence is literal code to the judge", () => {
+    const unclosed = "## Goal\nharden the retry\n\n## Context\nMade by hand:\n```ts\nretry();";
+    const reconciled = reconcileFollowUpDescription(unclosed, edited);
+    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled).toContain("\nretry();\n```\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).not.toContain(
+      "- [ ] hidden",
+    );
+  });
+
+  it("closes an HTML comment the hand-made description ends inside before appending — a heading in a comment renders nothing", () => {
+    const unclosed = "## Goal\nharden the retry\n\n## Context\nMade by hand. <!-- todo: finish";
+    const reconciled = reconcileFollowUpDescription(unclosed, edited);
+    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled).toContain("finish\n-->\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+  });
+
+  it("closes a persistent HTML block the hand-made description ends inside — one runs past the blank line", () => {
+    // `<script>` and its kind end at their own closing tag, not at a blank line, so an appended
+    // `## Acceptance` was swallowed in every renderer while the judge — blind to HTML blocks — read
+    // the section as written. The bead then counted as finished with no acceptance a founder could
+    // see, and no retry reconciles a finished bead, so it could never be approved.
+    const unclosed = "## Goal\nharden the retry\n\n## Context\nMade by hand:\n<script>\nretry();";
+    const reconciled = reconcileFollowUpDescription(unclosed, edited);
+    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled).toContain(
+      "\nretry();\n</script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+  });
+
+  it("ignores an Acceptance heading buried in a persistent HTML block — it renders no section", () => {
+    // `<script>` runs past the blank line to its own closing tag, so the description RENDERS no
+    // Acceptance while the scanner — which models no HTML block — reports the hidden heading as one.
+    // Swapping those boxes skipped the closer and filed a bead whose acceptance nobody can see:
+    // the judge then reported no gap, the pass noted the bead finished, and no retry reconciles a
+    // finished bead. The hidden heading is not a section, so the block is closed and a real one
+    // appended below it.
+    const hidden = "## Goal\nharden the retry\n\n<script>\n## Acceptance Criteria\n- [ ] hidden";
+    const reconciled = reconcileFollowUpDescription(hidden, edited);
+    expect(reconciled).toContain("<!-- ## Acceptance Criteria -->\n- [ ] hidden");
+    expect(reconciled).toContain(
+      "- [ ] hidden\n</script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
+    // What the judge reads as this bead's acceptance is the request's boxes — the hidden ones are
+    // inside the block, above the closer, so no renderer and no reader shows them as criteria.
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+    // A block that CLOSES leaves the heading below it visible, so that section is swapped as ever.
+    const closed = "## Goal\ng\n\n<script>\nx\n</script>\n\n## Acceptance Criteria\n- [ ] stale";
+    const swapped = reconcileFollowUpDescription(closed, edited);
+    expect(swapped).not.toContain("stale");
+    expect(swapped.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // A persistent opener inside a block that ends at a BLANK line opens nothing: `<script>` is raw
+    // content of the `<div>`, so the heading past the blank renders and IS the section to swap.
+    // Tracking a `<script>` block there hid the real section, appended a second one after a closing
+    // tag nobody wrote, and left the stale boxes in the bead's effective acceptance.
+    const nested = "## Goal\ng\n\n<div>\n<script>\n\n## Acceptance Criteria\n- [ ] stale";
+    const inner = reconcileFollowUpDescription(nested, edited);
+    expect(inner).not.toContain("stale");
+    expect(inner).not.toContain("</script>");
+    expect(inner.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // A block opened on a CONTAINER's own line hides its heading just the same: CommonMark starts
+    // it inside the item, so `- <script>` buries the indented heading below it. Reading the raw
+    // line missed the opener, so the hidden section was swapped in place — leaving a bead whose
+    // rendered Acceptance is raw script text and whose stale boxes stay effective.
+    const held = "## Goal\ng\n\n- <script>\n  ## Acceptance Criteria\n  - [ ] stale";
+    const appended = reconcileFollowUpDescription(held, edited);
+    expect(appended).toContain("  <!-- ## Acceptance Criteria -->\n  - [ ] stale");
+    expect(appended).toContain(
+      "  - [ ] stale\n  </script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
+    expect(acceptanceBody(makeBead({ id: "f", description: appended }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+    // A complete custom tag is condition 7 HTML when it stands at a block boundary. Its apparent
+    // heading is raw HTML until the blank line, so the real Acceptance must be appended below it.
+    const custom = "## Goal\ng\n\n<widget>\n## Acceptance Criteria\n- [ ] stale\n";
+    const customAppended = reconcileFollowUpDescription(custom, edited);
+    expect(customAppended).toContain("<!-- ## Acceptance Criteria -->\n- [ ] stale");
+    expect(customAppended).toContain("- [ ] stale\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    // A persistent block in a list ends with that list. The dedented Acceptance is visible and
+    // therefore is the section to replace, not a hidden copy that needs another section appended.
+    const dedented = "## Goal\ng\n\n- <script>\n  raw\n## Acceptance Criteria\n- [ ] stale";
+    const dedentedReconciled = reconcileFollowUpDescription(dedented, edited);
+    expect(dedentedReconciled).not.toContain("stale");
+    expect(dedentedReconciled).not.toContain("</script>");
+    expect(dedentedReconciled.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // A hidden heading inside a QUOTED block keeps its `>` marker outside the comment: swallowing
+    // it ended the blockquote, so the rest of the hidden block reparsed as visible markdown and
+    // the stale boxes leaked into the rendered description.
+    const quoted = "## Goal\ng\n\n> <script>\n> ## Acceptance Criteria\n> - [ ] stale\n> </script>";
+    const quotedReconciled = reconcileFollowUpDescription(quoted, edited);
+    expect(quotedReconciled).toContain("> <!-- ## Acceptance Criteria -->");
+    expect(quotedReconciled).toContain("> - [ ] stale\n> </script>");
+    expect(quotedReconciled.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // Leaving a quoted persistent block closes it with the quote. The following Acceptance heading
+    // renders normally and must be replaced in place rather than misread as hidden and duplicated.
+    const leftQuote = "## Goal\ng\n\n> <script>\n> raw\n## Acceptance Criteria\n- [ ] stale";
+    const visibleAfterQuote = reconcileFollowUpDescription(leftQuote, edited);
+    expect(visibleAfterQuote).not.toContain("stale");
+    expect(visibleAfterQuote).not.toContain("</script>");
+    expect(visibleAfterQuote.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // A declaration block begins only with an uppercase ASCII letter. Lowercase `<!foo` is prose,
+    // so the visible Acceptance section below it is likewise replaced, not duplicated after `>`.
+    const lowercaseDeclaration = "## Goal\ng\n\n<!foo\n## Acceptance Criteria\n- [ ] stale";
+    const visibleAfterDeclaration = reconcileFollowUpDescription(lowercaseDeclaration, edited);
+    expect(visibleAfterDeclaration).not.toContain("stale");
+    expect(visibleAfterDeclaration).not.toContain("\n>\n");
+    expect(visibleAfterDeclaration.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    // A type-6 HTML block hides its nonblank content until its blank terminator. The apparent
+    // section is therefore not replaceable; append a real Acceptance section after the blank.
+    const blankTerminated = "## Goal\ng\n\n<div>\n## Acceptance Criteria\n- [ ] hidden\n\n";
+    const appendedAfterBlock = reconcileFollowUpDescription(blankTerminated, edited);
+    expect(appendedAfterBlock).toContain("<!-- ## Acceptance Criteria -->\n- [ ] hidden");
+    expect(appendedAfterBlock).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(appendedAfterBlock.match(/^##+ Acceptance/gm)).toHaveLength(1);
+
+    // A heading inside a closed raw block must not survive into the description-first contract
+    // parse beside the visible replacement section.
+    const closedHidden = "## Goal\ng\n\n<script>\n## Acceptance Criteria\n- [ ] stale\n</script>";
+    const neutralized = reconcileFollowUpDescription(closedHidden, edited);
+    expect(acceptanceBody(makeBead({ id: "f", description: neutralized }))).not.toContain("stale");
+    expect(acceptanceBody(makeBead({ id: "f", description: neutralized }))).toContain(
+      "- [ ] Guard the null branch.",
+    );
+
+    // A heading inside a list item is a block boundary too, so the custom tag below it holds the
+    // apparent Acceptance section as raw HTML and reconciliation appends a visible one.
+    const nestedHeading = "## Goal\ng\n\n- # Notes\n  <widget>\n  ## Acceptance Criteria\n  - [ ] stale";
+    const nestedHeadingReconciled = reconcileFollowUpDescription(nestedHeading, edited);
+    expect(nestedHeadingReconciled).toContain(
+      "  - [ ] stale\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
+    expect(acceptanceBody(makeBead({ id: "f", description: nestedHeadingReconciled }))).not.toContain(
+      "stale",
+    );
+  });
+
+  it("closes a construct nested in a list item inside that item, not at the top level", () => {
+    // The scanner reads fences flat, so a fence indented into a list item is recorded as an
+    // ordinary one and used to be closed with an unindented delimiter. CommonMark reads that dedent
+    // as leaving the ITEM — which already ends the fence — and then opens a NEW top-level fence,
+    // swallowing the appended `## Acceptance Criteria` in every renderer while the judge still
+    // reported it. The bead read as finished with an acceptance nobody could see, and no retry
+    // reconciles a finished bead, so it could never be approved.
+    const unclosed = "## Goal\nharden the retry\n\n## Context\n- Made by hand:\n  ```ts\n  retry();";
+    const reconciled = reconcileFollowUpDescription(unclosed, edited);
+    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled).toContain(
+      "\n  retry();\n  ```\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+      "- [ ] Cover the exhausted path.",
+    );
+  });
+
+  it("writes the whole contract over a blank description — there is nothing to keep", () => {
+    expect(reconcileFollowUpDescription(undefined, edited)).toBe(followUpDescription(edited));
+    expect(reconcileFollowUpDescription("  \n", edited)).toBe(followUpDescription(edited));
+  });
+
+  it("ignores an Acceptance heading quoted inside a fence — the judge does too", () => {
+    const fenced = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "```md",
+      "## Acceptance Criteria",
+      "- [ ] a sample box",
+      "```",
+      "",
+      "## Acceptance Criteria",
+      "- [ ] the real old box",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(fenced, edited);
+    expect(reconciled).toContain("- [ ] a sample box");
+    expect(reconciled).not.toContain("the real old box");
+  });
+
+  it("ignores an Acceptance heading inside a fence opened on a list marker", () => {
+    const nestedFence = [
+      "## Goal",
+      "g",
+      "",
+      "- ```md",
+      "  ## Acceptance Criteria",
+      "  - [ ] stale sample",
+      "  ```",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(nestedFence, edited);
+    expect(reconciled).toContain("  ## Acceptance Criteria\n  - [ ] stale sample\n  ```");
+    expect(reconciled).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+  });
+
+  it("replaces a visible Acceptance section after a list-contained fence ends by dedent", () => {
+    // The flat scanner otherwise holds the two-space fence open through the dedented heading. In
+    // CommonMark that dedent leaves the list (and hence closes its fence), so this is the actual
+    // Acceptance section to replace; adding an indented closer here would open a new top-level fence.
+    const dedentedFence = [
+      "## Goal",
+      "g",
+      "",
+      "- example",
+      "  ```md",
+      "  old",
+      "## Acceptance Criteria",
+      "- [ ] stale",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(dedentedFence, edited);
+    expect(reconciled).toContain("  ```md\n  old\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled).not.toContain("stale");
+    expect(reconciled).not.toMatch(/\n  ```\n\n## Acceptance Criteria/);
+  });
+
+  it("keeps a list container across a blank before its nested fence", () => {
+    const separatedFence = [
+      "## Goal",
+      "g",
+      "",
+      "- example",
+      "",
+      "  ```md",
+      "  sample",
+      "## Acceptance Criteria",
+      "- [ ] stale",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(separatedFence, edited);
+    expect(reconciled).toContain("  ```md\n  sample\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled).not.toContain("stale");
+  });
+
+  it("keeps a dropped duplicate as an empty boundary — it terminated the peer section after it", () => {
+    // `## Acceptance`, a nested `### Acceptance Criteria`, then a peer `### Success`: the judge reads
+    // Success as its own section only because the duplicate closed the shallower Acceptance. Dropping
+    // that heading outright re-parented Success under the survivor, folding founder-authored boxes
+    // back into the very acceptance this reconcile replaces.
+    const nested = [
+      "## Acceptance",
+      "- [ ] the old box",
+      "### Acceptance Criteria",
+      "- [ ] the nested duplicate's box",
+      "### Success",
+      "- [ ] a founder-authored peer",
+      "",
+      "## Context",
+      "Kept.",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(nested, edited);
+
+    expect(reconciled).not.toContain("old box");
+    expect(reconciled).not.toContain("nested duplicate");
+    // The peer keeps its text and stays OUTSIDE Acceptance.
+    expect(reconciled).toContain("### Success\n- [ ] a founder-authored peer");
+    expect(reconciled).toContain("## Context\nKept.");
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toBe(
+      [
+        "- [ ] Guard the null branch.",
+        "- [ ] Cover the exhausted path.",
+        "- [ ] src/retry.ts:12 — retries on a 4xx",
+        "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+      ].join("\n"),
+    );
+  });
+
+  it("reconciles every Acceptance section — the judge concatenates repeated headings, so a stale later copy would still govern", () => {
+    const repeated = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Acceptance Criteria",
+      "- [ ] the first old box",
+      "",
+      "## Context",
+      "Kept.",
+      "",
+      "## Acceptance",
+      "### Grouped",
+      "- [ ] the second old box",
+      "",
+      "## Verify",
+      "Kept too.",
+      "",
+      "## Acceptance Criteria",
+      "- [ ] the trailing old box",
+    ].join("\n");
+
+    const reconciled = reconcileFollowUpDescription(repeated, edited);
+
+    expect(reconciled.match(/^##+ Acceptance/gm)).toHaveLength(1);
+    expect(reconciled).not.toContain("old box");
+    expect(reconciled).not.toContain("### Grouped");
+    expect(reconciled).toContain("## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(reconciled).toContain("\n\n## Context\nKept.\n\n## Verify\nKept too.");
+    expect(reconciled.endsWith("Kept too.")).toBe(true);
+    // What the contract judge reads as this bead's acceptance is exactly the request's boxes.
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toBe(
+      [
+        "- [ ] Guard the null branch.",
+        "- [ ] Cover the exhausted path.",
+        "- [ ] src/retry.ts:12 — retries on a 4xx",
+        "- [ ] The findings listed in this bead's note are addressed, or answered with why they don't apply",
+      ].join("\n"),
+    );
   });
 });
 
@@ -233,5 +1141,44 @@ describe("hasAnyHumanNote", () => {
     expect(
       hasAnyHumanNote(makeBead({ id: "t1", notes: formatHumanNote("hi", "founder", new Date()) })),
     ).toBe(true);
+  });
+});
+
+describe("detachmentNoteBody / hasDetachmentNote", () => {
+  const kept = detachmentNoteBody({ targetId: "feat", pr: "gh-42", contextKept: true });
+  const rewritten = detachmentNoteBody({ targetId: "feat", pr: "gh-42", contextKept: false });
+
+  it("names the target and the PR that merged, and says the detachment is being carried out", () => {
+    // Written before the reparent, so it must hold whether or not that write lands: a decision in
+    // progress, never a move already made.
+    for (const body of [kept, rewritten]) {
+      expect(body).toContain("feat's pull request (gh-42) merged after this follow-up was created under it");
+      expect(body).toContain("anton is detaching it to stand as its own run target — approve it to run.");
+      expect(body).not.toContain("was detached");
+    }
+  });
+
+  it("warns about a stale Context only where the pass leaves the Context alone", () => {
+    expect(kept).toContain("Its Context section still names the parent it was created under.");
+    expect(rewritten).not.toContain("Context section");
+  });
+
+  it("is one line — a system note is parsed per line", () => {
+    expect(kept).not.toContain("\n");
+  });
+
+  it("is found back whichever variant a pass wrote, and only for that target and PR", () => {
+    for (const body of [kept, rewritten]) {
+      const bead = makeBead({ id: "f", notes: ["anton: run failed after 2 tickets", body].join("\n") });
+      expect(hasDetachmentNote(bead, "feat", "gh-42")).toBe(true);
+      expect(hasDetachmentNote(bead, "feat", "gh-43")).toBe(false);
+      expect(hasDetachmentNote(bead, "other", "gh-42")).toBe(false);
+    }
+  });
+
+  it("ignores the same words in a HUMAN note — only anton records a detachment", () => {
+    const bead = makeBead({ id: "f", notes: formatHumanNote(kept, "founder", new Date()) });
+    expect(hasDetachmentNote(bead, "feat", "gh-42")).toBe(false);
+    expect(hasDetachmentNote(makeBead({ id: "f" }), "feat", "gh-42")).toBe(false);
   });
 });

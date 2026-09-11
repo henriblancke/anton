@@ -34,6 +34,7 @@ import {
 import {
   applyFollowUp,
   applyReopen,
+  followUpCandidateIds,
   type AppliedRework,
 } from "./rework-modes";
 import {
@@ -64,8 +65,8 @@ export { reworkNoteBody } from "./rework-notes";
  * Idempotent by construction rather than by token: a repeat of the same request finds its own note
  * already on a bead already in the state it wanted (reopen) or its own follow-up already linked
  * (follow-up) and writes nothing, so a double-click leaves one note and one bead. Every check and
- * its write are serialized on the ticket's AND the target's write locks, which is what makes that
- * hold for two requests in flight at once.
+ * its write are serialized on the ticket's AND the target's write locks — and, for a follow-up, on
+ * every bead it could resume — which is what makes that hold for two requests in flight at once.
  */
 export async function reworkTicket(
   project: Project,
@@ -80,9 +81,16 @@ export async function reworkTicket(
   // Both beads' write locks, taken together in sorted order (withBeadWriteLocks): the mode's writes
   // land on the ticket while the pipeline reset lands on the TARGET, and the reset is only correct
   // against a target nothing else is moving. Deduped for a standalone target, where the ticket IS
-  // the target.
-  const applied = await withBeadWriteLocks(project.repoPath, [ticket.id, target.id], () =>
-    applyUnderLocks(project, target, ticket, request, plan),
+  // the target. A follow-up adds the beads it could RESUME (followUpCandidateIds): resuming rewrites
+  // a half-created bead's contract off a read of it, and that bead has writers of its own — a
+  // founder editing it in ticket-detail — which only its lock orders against this one. Taken here,
+  // in the one sorted set, rather than nested inside: see followUpCandidateIds for why.
+  const resumable =
+    plan.mode === "follow-up" ? followUpCandidateIds(all, ticket.id, request.summary) : [];
+  const applied = await withBeadWriteLocks(
+    project.repoPath,
+    [ticket.id, target.id, ...resumable],
+    () => applyUnderLocks(project, target, ticket, request, plan, new Set(resumable)),
   );
 
   // Fire-and-forget, like every other board write behind a route: the writes already landed locally
@@ -112,12 +120,13 @@ async function applyUnderLocks(
   ticket: Bead,
   request: ReworkRequest,
   plan: ReworkPlan,
+  lockedFollowUps: ReadonlySet<string>,
 ): Promise<AppliedUnderLocks> {
   const before =
     plan.pipeline?.outcome === "retired"
       ? await snapshotBeforeWrites(project.repoPath, target, ticket, plan.rollsBackTicket)
       : undefined;
-  const applied = await applyMode(project, target, ticket, request, plan);
+  const applied = await applyMode(project, target, ticket, request, plan, lockedFollowUps);
   // Only retire when the instructions landed on a bead THIS target's run will dispatch: a parentless
   // follow-up is its own run target, so clearing the target's ref and `stage:in-review` would strip
   // the merge gate off a PR that is still open — and hand the claimer a target whose work is already
@@ -140,10 +149,11 @@ function applyMode(
   ticket: Bead,
   request: ReworkRequest,
   plan: ReworkPlan,
+  lockedFollowUps: ReadonlySet<string>,
 ): Promise<AppliedRework> {
   return plan.mode === "reopen"
     ? applyReopen(project, target, ticket, request)
-    : applyFollowUp(project, target, ticket, request, plan.pipeline);
+    : applyFollowUp(project, target, ticket, request, plan.pipeline, lockedFollowUps);
 }
 
 /**

@@ -45,6 +45,18 @@ jobs:
         with:
           fetch-depth: 1
 
+      # claude-code-action hardcodes CLI 2.1.267 (src/entrypoints/run.ts), and that build crashes
+      # ~500ms after init in every run here — result is_error:true, $0 cost, empty modelUsage, no
+      # error text (anthropics/claude-code-action#1759, open). Every 2.1.263 run in this repo
+      # succeeded and tests/ci/claude-review-permissions.test.ts validated the allowlist semantics
+      # against it, so pin 2.1.263 via `path_to_claude_code_executable`, which skips the action's
+      # installer entirely. Unpin once the upstream fix lands.
+      - name: Install Claude Code 2.1.263
+        run: |
+          npm install --global @anthropic-ai/claude-code@2.1.263
+          echo "CLAUDE_BIN=$(command -v claude)" >> "$GITHUB_ENV"
+          claude --version
+
       - name: Run Claude Code Review
         id: claude-review
         env:
@@ -57,6 +69,8 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Pinned CLI from the step above; skips the action's 2.1.267 auto-install.
+          path_to_claude_code_executable: ${{ env.CLAUDE_BIN }}
           # Do NOT re-add `track_progress` / `use_sticky_comment`. They force the action into
           # tag mode, which pre-builds a prompt holding the entire PR context — including every
           # review comment AND its full `diffHunk`, with no cap (claude-code-action,
