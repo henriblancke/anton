@@ -11,6 +11,7 @@ import {
   isAncestor,
   openPullRequest,
   readWorktreeState,
+  resolveHooksPathOverride,
   worktreeHasCommitFor,
   worktreeHasPreservedCommitFor,
   type WorktreeState,
@@ -54,7 +55,8 @@ import type { StepResultWith } from "./result";
  *    ticket's commits that anton has already closed the bead for. Poison.
  */
 export async function commitStep(ctx: StepContext): Promise<StepResultWith<"committed">> {
-  const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx));
+  const hooksPath = await resolveHooksPathOverride(ctx.repoPath);
+  const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx), { hooksPath });
   if (committed) return { ok: true, detail: "committed", facts: { committed: true } };
 
   // No anchor to compare against: fall back to the index alone. The pre-anton-8t1f behaviour, kept

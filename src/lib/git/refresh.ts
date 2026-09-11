@@ -130,6 +130,8 @@ export async function refreshCheckout(
 
   try {
     // --ff-only: a merge commit here would be anton writing history into the project's branch.
+    // No hooksPath override needed: this runs against repoPath itself (the base checkout), never a
+    // worktree, so git already resolves its own core.hooksPath natively.
     const merged = await mergeIntoCurrent(repoPath, trackingRef, { ffOnly: true });
     if (!merged.ok) {
       return { ...at, drift: `fast-forwarding to origin/${branch} conflicted (${merged.conflicts.join(", ")})` };

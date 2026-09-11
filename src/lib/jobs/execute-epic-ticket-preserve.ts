@@ -13,6 +13,7 @@ import {
   isAncestor,
   preservedCommitPrefix,
   readWorktreeState,
+  resolveHooksPathOverride,
   stageAllAndHashTree,
   sameWorktreeState,
   worktreeHasPreservedCommitFor,
@@ -259,6 +260,7 @@ export async function preserveTimedOutWork(args: {
   // locked index, a rejecting pre-commit hook or a full disk is what they need to see, and the
   // rollback below is safe either way.
   const kept = await commitPreservedTree({
+    repoPath: run.repoPath,
     worktreePath,
     logPath,
     message: preservedCommitMessage(ticket, timeoutMs),
@@ -490,17 +492,19 @@ function preservedCommitMessage(
  * landed — the one act this whole path exists to refuse.
  */
 async function commitPreservedTree(args: {
+  repoPath: string;
   worktreePath: string;
   logPath: string;
   message: string;
   before: WorktreeState;
 }): Promise<{ committed: boolean } | { committed: false; error: unknown }> {
-  const { worktreePath, logPath, message, before } = args;
+  const { repoPath, worktreePath, logPath, message, before } = args;
   const rejected = (error: unknown) => ({ committed: false as const, error });
   // Hashed BEFORE the attempt, because after it a hook's edits are indistinguishable from the
   // agent's own work.
   const verified = await stageAllAndHashTree(worktreePath).catch(() => null);
-  const first = await commitAll(worktreePath, message).catch(rejected);
+  const hooksPath = await resolveHooksPathOverride(repoPath);
+  const first = await commitAll(worktreePath, message, { hooksPath }).catch(rejected);
   // Accepted by this project's hooks — the same proof an ordinary commit ships on, so `verified` is
   // not re-compared here; it exists for the bypass below, where no hook is left to say yes.
   if (!("error" in first)) return first;

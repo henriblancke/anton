@@ -16,6 +16,7 @@ const ops = vi.hoisted(() => ({
   isAncestor: vi.fn(),
   openPullRequest: vi.fn(),
   readWorktreeState: vi.fn(),
+  resolveHooksPathOverride: vi.fn(),
   worktreeHasCommitFor: vi.fn(),
   worktreeHasPreservedCommitFor: vi.fn(),
 }));
@@ -31,6 +32,7 @@ beforeEach(async () => {
   ops.commitAll.mockResolvedValue({ committed: true });
   ops.worktreeHasPreservedCommitFor.mockResolvedValue(false);
   ops.openPullRequest.mockResolvedValue({ url: "https://example.test/pr/7", ref: "gh-7" });
+  ops.resolveHooksPathOverride.mockResolvedValue(undefined);
 });
 
 afterEach(() => closeSandbox(sandbox));
@@ -42,10 +44,14 @@ describe("step:commit", () => {
   // commit must not be filed under whichever ticket happened to be first.
   it("names the ticket it covers in the commit subject, else the run target", async () => {
     await commitStep(sandbox.context({ tickets: [ticket("anton-a")] }));
-    expect(ops.commitAll).toHaveBeenLastCalledWith(sandbox.dir, "anton-a: ticket anton-a");
+    expect(ops.commitAll).toHaveBeenLastCalledWith(sandbox.dir, "anton-a: ticket anton-a", {
+      hooksPath: undefined,
+    });
 
     await commitStep(sandbox.context({ tickets: [ticket("anton-a"), ticket("anton-b")] }));
-    expect(ops.commitAll).toHaveBeenLastCalledWith(sandbox.dir, `${target.id}: ${target.title}`);
+    expect(ops.commitAll).toHaveBeenLastCalledWith(sandbox.dir, `${target.id}: ${target.title}`, {
+      hooksPath: undefined,
+    });
   });
 
   // git is the run's evidence of record: a clean agent exit that left no diff delivered nothing.

@@ -58,6 +58,7 @@ import {
   fetchOrigin,
   mergeIntoCurrent,
   pushBranch,
+  resolveHooksPathOverride,
 } from "../git/ops";
 import {
   ANTON_MARK,
@@ -484,14 +485,15 @@ async function prepareFixWorktree(args: {
   }
   await ctx.heartbeat();
 
+  const hooksPath = await resolveHooksPathOverride(repo);
   await safe(() =>
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
   );
   await safe(() =>
-    mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true }),
+    mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true, hooksPath }),
   );
 
-  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number);
+  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number, hooksPath);
   await ctx.heartbeat();
   return { worktree, conflicts };
 }
@@ -502,10 +504,11 @@ async function premergeBase(
   pr: PrReview,
   baseBranch: string | undefined,
   number: number,
+  hooksPath: string | undefined,
 ): Promise<string[]> {
   if (pr.mergeable !== "CONFLICTING" || !baseBranch) return [];
   try {
-    const merge = await mergeIntoCurrent(worktreePath, `origin/${baseBranch}`);
+    const merge = await mergeIntoCurrent(worktreePath, `origin/${baseBranch}`, { hooksPath });
     return merge.conflicts; // clean auto-merge → a merge commit is pushed below
   } catch (e) {
     consoleLog.error(`PR #${number}: merging origin/${baseBranch} failed`, e);
@@ -686,14 +689,18 @@ async function commitAndPushFix(
   branch: string,
   number: number,
 ): Promise<boolean> {
+  const hooksPath = await resolveHooksPathOverride(repo);
   const { committed } = await commitAll(
     worktreePath,
     `${epicId}: address review feedback (PR #${number})`,
+    { hooksPath },
   );
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
   // From the worktree, not `repo` (the base checkout) — see pushBranch's doc comment: a project's
-  // pre-push hook that inspects the working tree must see the branch actually being pushed.
-  if (pushed) await pushBranch(worktreePath, branch);
+  // pre-push hook that inspects the working tree must see the branch actually being pushed. The
+  // resolved hooksPath still comes from `repo` (the base checkout's config) — that's the one place
+  // `core.hooksPath` was actually configured; git resolves an absolute path the same from either.
+  if (pushed) await pushBranch(worktreePath, branch, hooksPath);
   return pushed;
 }
 

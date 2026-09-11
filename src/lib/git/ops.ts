@@ -6,6 +6,7 @@
 import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { isAbsolute, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
@@ -14,8 +15,35 @@ const execFileAsync = promisify(execFile);
 /** Override the GitHub CLI (tests point this at a fake that echoes a PR url). */
 export const GH_BIN_ENV = "ANTON_GH_BIN";
 
-async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], {
+/**
+ * Resolve `repoPath`'s effective `core.hooksPath`, absolutized against `repoPath` — or `undefined`
+ * when unset. Every git command anton runs against a WORKTREE of this repo passes the result back
+ * in as `-c core.hooksPath=<this>` (see {@link git}/{@link gitCommit}), so the worktree's hooks are
+ * exactly the base repo's, resolved once from the one place git itself would resolve them from. An
+ * absolute `core.hooksPath` already means the same thing from anywhere and is returned unchanged; a
+ * relative one is resolved against `repoPath` because that is where the user configured it to mean
+ * something (git-config(1): a relative `core.hooksPath` is documented as relative to the directory
+ * holding it, i.e. the checkout it was configured in — the base repo here, never the worktree, which
+ * has no config of its own to configure it relative to).
+ *
+ * This replaces the earlier symlink-into-the-worktree + `info/exclude` bridge entirely (PR #263):
+ * git resolves an absolute `core.hooksPath` identically from any working tree, so there is nothing
+ * left to bridge — no materialized directory, no exclude-file entry, no cross-process lock.
+ */
+export async function resolveHooksPathOverride(repoPath: string): Promise<string | undefined> {
+  let raw: string;
+  try {
+    raw = await git(repoPath, ["config", "--get", "core.hooksPath"]);
+  } catch {
+    return undefined; // unset, or unreadable — nothing to override with
+  }
+  if (!raw) return undefined;
+  return isAbsolute(raw) ? raw : resolve(repoPath, raw);
+}
+
+async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
+  const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
+  const { stdout } = await execFileAsync("git", [...configArgs, "-C", cwd, ...args], {
     timeout: 120_000,
     maxBuffer: 16 * 1024 * 1024,
   });
@@ -252,11 +280,12 @@ function commitFailed(args: string[], code: number | null, stderr: string): Erro
  * Only the KILL path reaps. A commit that ends on its own already waited for its hooks — git runs
  * them synchronously — so there is nothing left to wait for.
  */
-function gitCommit(cwd: string, args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
+function gitCommit(cwd: string, args: string[], hooksPath?: string): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
     // stdout is dropped rather than piped: nothing here reads it, and a chatty hook filling an
     // unread pipe would block the commit outright.
-    const child = spawn("git", ["-C", cwd, ...args], {
+    const child = spawn("git", [...configArgs, "-C", cwd, ...args], {
       stdio: ["ignore", "ignore", "pipe"],
       detached: process.platform !== "win32",
     });
@@ -282,7 +311,7 @@ function gitCommit(cwd: string, args: string[]): Promise<void> {
     child.on("close", (code) => {
       // A kill in flight owns the verdict: its group may still hold live writers.
       if (killing) return;
-      settle(() => (code === 0 ? resolve() : reject(commitFailed(args, code, stderr()))));
+      settle(() => (code === 0 ? resolvePromise() : reject(commitFailed(args, code, stderr()))));
     });
   });
 }
@@ -525,16 +554,16 @@ function exitedWith(error: unknown, code: number): boolean {
 export async function commitAll(
   worktreePath: string,
   message: string,
-  options: { bypassHooks?: boolean } = {},
+  options: { bypassHooks?: boolean; hooksPath?: string } = {},
 ): Promise<{ committed: boolean }> {
-  await git(worktreePath, ["add", "-A"]);
+  await git(worktreePath, ["add", "-A"], options.hooksPath);
   const bypass = options.bypassHooks ? ["--no-verify"] : [];
   try {
     // Exits non-zero when there ARE staged changes → there is something to commit.
     await git(worktreePath, ["diff", "--cached", "--quiet"]);
     return { committed: false };
   } catch {
-    await gitCommit(worktreePath, ["commit", ...bypass, "-m", message]);
+    await gitCommit(worktreePath, ["commit", ...bypass, "-m", message], options.hooksPath);
     return { committed: true };
   }
 }
@@ -754,8 +783,8 @@ export async function hasRemote(repoPath: string, name = "origin"): Promise<bool
  * and fails almost every push. Run from the worktree, `cwd`'s checkout IS the branch being pushed, so
  * the hook sees what it expects.
  */
-export async function pushBranch(cwd: string, branch: string): Promise<void> {
-  await git(cwd, ["push", "-u", "origin", branch]);
+export async function pushBranch(cwd: string, branch: string, hooksPath?: string): Promise<void> {
+  await git(cwd, ["push", "-u", "origin", branch], hooksPath);
 }
 
 /**
@@ -843,10 +872,14 @@ export async function resolveFreshBase(repoPath: string, base: string): Promise<
 export async function mergeIntoCurrent(
   worktreePath: string,
   ref: string,
-  opts?: { ffOnly?: boolean },
+  opts?: { ffOnly?: boolean; hooksPath?: string },
 ): Promise<{ ok: boolean; conflicts: string[] }> {
   try {
-    await git(worktreePath, ["merge", "--no-edit", ...(opts?.ffOnly ? ["--ff-only"] : []), ref]);
+    await git(
+      worktreePath,
+      ["merge", "--no-edit", ...(opts?.ffOnly ? ["--ff-only"] : []), ref],
+      opts?.hooksPath,
+    );
     return { ok: true, conflicts: [] };
   } catch (e) {
     const conflicts = await diffPaths(worktreePath, ["--name-only", "--diff-filter=U"]).catch(() => []);
@@ -1938,7 +1971,8 @@ export async function openPullRequest(opts: {
       `no "origin" remote in ${opts.repoPath}; cannot open a PR. Add a remote or open it manually.`,
     );
   }
-  await pushBranch(opts.worktreePath ?? opts.repoPath, opts.branch);
+  const hooksPath = await resolveHooksPathOverride(opts.repoPath);
+  await pushBranch(opts.worktreePath ?? opts.repoPath, opts.branch, hooksPath);
 
   const existing = await findOpenPullRequest(opts.repoPath, opts.branch);
   if (existing) {

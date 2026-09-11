@@ -39,6 +39,7 @@ import {
   readPreservedCommitFor,
   readWorktreeState,
   resolveFreshBase,
+  resolveHooksPathOverride,
   resolveMergeBase,
   restoreWorktreeState,
   sameWorktreeState,
@@ -392,6 +393,98 @@ process.exit(0);`,
     });
 
     expect(readFileSync(hookLog, "utf8").trim()).toBe("anton/no-worktree");
+  });
+});
+
+suite("resolveHooksPathOverride (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-hookspath-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "user.name", "anton-test"], { stdio: "ignore" });
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("returns undefined when core.hooksPath is unset", async () => {
+    expect(await resolveHooksPathOverride(repo)).toBeUndefined();
+  });
+
+  it("absolutizes a relative core.hooksPath against the repo", async () => {
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".husky/_"], { stdio: "ignore" });
+    expect(await resolveHooksPathOverride(repo)).toBe(join(repo, ".husky/_"));
+  });
+
+  it("passes an absolute core.hooksPath through unchanged", async () => {
+    const abs = join(sandbox, "shared-hooks");
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", abs], { stdio: "ignore" });
+    expect(await resolveHooksPathOverride(repo)).toBe(abs);
+  });
+});
+
+/**
+ * Proves the replacement for the deleted symlink-into-the-worktree + `info/exclude` bridge (PR
+ * #263): a relative `core.hooksPath` configured in the base repo still fires from a worktree push,
+ * with nothing materialized in the worktree's own working tree at all.
+ */
+suite("pushBranch fires a relative core.hooksPath configured in the base repo (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+  let worktree: string;
+  let bare: string;
+  let hookLog: string;
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-hookspath-push-"));
+    repo = join(sandbox, "repo");
+    bare = join(sandbox, "remote.git");
+    worktree = join(sandbox, "worktree");
+    hookLog = join(sandbox, "hook.log");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "--bare", "-q", bare], { stdio: "ignore" });
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    const g = (args: string[], cwd = repo) => execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    g(["remote", "add", "origin", bare]);
+
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["push", "-q", "-u", "origin", "main"]);
+
+    // Relative hooksPath, resolved in the BASE repo — never materialized in the worktree. Set only
+    // AFTER the initial `main` push above, so the hook log captures only the test's own push.
+    mkdirSync(join(repo, ".githooks"));
+    const hookPath = join(repo, ".githooks", "pre-push");
+    writeFileSync(hookPath, `#!/usr/bin/env sh\ngit rev-parse --abbrev-ref HEAD >> "${hookLog}"\n`);
+    chmodSync(hookPath, 0o755);
+    g(["config", "core.hooksPath", ".githooks"]);
+
+    g(["worktree", "add", "-q", "-b", "anton/epic-1", worktree]);
+    writeFileSync(join(worktree, "work.md"), "work\n");
+    g(["add", "-A"], worktree);
+    g(["commit", "-q", "-m", "t1"], worktree);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("fires the base repo's relative-hooksPath pre-push hook when pushing from the worktree", async () => {
+    const hooksPath = await resolveHooksPathOverride(repo);
+    await pushBranch(worktree, "anton/epic-1", hooksPath);
+
+    expect(readFileSync(hookLog, "utf8").trim()).toBe("anton/epic-1");
+    // Nothing materialized inside the worktree — no symlink, no bridged directory.
+    expect(existsSync(join(worktree, ".githooks"))).toBe(false);
   });
 });
 
