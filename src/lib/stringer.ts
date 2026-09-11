@@ -691,13 +691,17 @@ async function readAnnotatedSignals(
  * "GITHUB_TOKEN not set, skipping GitHub collector" and that whole signal source is dark — every
  * other collector still runs. Best-effort: `gh` missing or unauthenticated just means no GitHub
  * signals this scan, not a failed scan.
+ *
+ * Bounded by (and cancellable via) the caller's own scan deadline/signal — this lookup must not
+ * outlive a scan a caller already gave up on, so it never adds its own independent wait past that.
  */
-async function githubToken(): Promise<string | undefined> {
+async function githubToken(timeoutMs: number, signal?: AbortSignal): Promise<string | undefined> {
   const gh = process.env[GH_BIN_ENV] ?? "gh";
   try {
     const { stdout } = await execFileAsync(gh, ["auth", "token"], {
-      timeout: 10_000,
+      timeout: Math.min(10_000, timeoutMs),
       maxBuffer: 1024 * 1024,
+      signal,
     });
     const token = stdout.trim();
     return token || undefined;
@@ -739,10 +743,12 @@ export async function scan(opts: {
 
   const timeoutMs = scanTimeoutMs();
   // A caller's own GITHUB_TOKEN (CI, an operator's shell) wins — `gh auth token` is only a
-  // fallback for when nothing already set it, and only set when it actually resolves.
+  // fallback for when nothing already set it, and only set when it actually resolves. Bounded by
+  // and cancellable via the same deadline/signal as the scan itself, so a slow credential store
+  // can't add its own wait on top of (or outlive) an already-cancelled/short-deadline scan.
   const env = { ...process.env };
   if (!env.GITHUB_TOKEN) {
-    const token = await githubToken();
+    const token = await githubToken(timeoutMs, opts.signal);
     if (token) env.GITHUB_TOKEN = token;
   }
   let stderr = "";
