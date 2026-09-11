@@ -759,16 +759,16 @@ export async function scan(opts: {
   // left rather than handing stringer the full timeoutMs again, or a slow `gh auth token` lets the
   // whole scan overrun ANTON_STRINGER_TIMEOUT_MS by however long the lookup took.
   const remainingMs = deadline - Date.now();
+  // execFile treats `timeout: 0` as "no timeout" (Node and Bun both), so a budget already
+  // exhausted by the token lookup must reject here instead of spawning stringer uncapped. This is
+  // BEFORE the try below on purpose: stringer never ran, so the baseline is untouched and doesn't
+  // need unwinding -- routing it through rejectWithBaselineRestored would risk turning a harmless
+  // credential-lookup timeout into a poison error if that (unneeded) restore itself failed.
+  if (remainingMs <= 0) {
+    throw toScanError(Object.assign(new Error("token lookup exhausted the scan deadline"), { killed: true, signal: "SIGTERM" }), { timeoutMs });
+  }
   let stderr = "";
   try {
-    // execFile treats `timeout: 0` as "no timeout" (Node and Bun both), so a budget already
-    // exhausted by the token lookup must reject here instead of spawning stringer uncapped.
-    if (remainingMs <= 0) {
-      throw Object.assign(new Error("token lookup exhausted the scan deadline"), {
-        killed: true,
-        signal: "SIGTERM",
-      });
-    }
     ({ stderr } = await execFileAsync(bin, args, {
       env,
       timeout: remainingMs,
