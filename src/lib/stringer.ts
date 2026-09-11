@@ -708,7 +708,12 @@ async function githubToken(timeoutMs: number, signal?: AbortSignal): Promise<str
     });
     const token = stdout.trim();
     return token || undefined;
-  } catch {
+  } catch (err) {
+    // A caller abort must propagate, not collapse into "no token": swallowing it here would let
+    // scan() spawn stringer with an already-aborted signal and then run the baseline-unwind path
+    // for what should have short-circuited as cancellation (see toScanError's own AbortError check).
+    const e = err as { name?: string; code?: unknown } | null;
+    if (e?.name === "AbortError" || e?.code === "ABORT_ERR") throw err;
     return undefined;
   }
 }
