@@ -18,6 +18,7 @@ import { filterDeadcodeSignals, type DeadcodeFilter } from "./scan-deadcode";
 import { filterDuplicationSignals, type DuplicationFilter } from "./scan-duplication";
 import { filterSecretSignals, type SecretFilter } from "./scan-secrets";
 import { PoisonError } from "./jobs/errors";
+import { GH_BIN_ENV } from "./git/ops";
 
 const execFileAsync = promisify(execFile);
 
@@ -683,6 +684,28 @@ async function readAnnotatedSignals(
  * poison so the runner parks the job instead of retrying past the lost window (see
  * `rejectWithBaselineRestored`).
  */
+/**
+ * `gh auth token` — the same credential anton already uses for `gh pr`/`gh issue` calls (see
+ * git/ops.ts, git/pr.ts). stringer's `github` collector (open issues/PRs/review-todos) reads its
+ * own `GITHUB_TOKEN` env var rather than shelling out to `gh`, so without this it silently logs
+ * "GITHUB_TOKEN not set, skipping GitHub collector" and that whole signal source is dark — every
+ * other collector still runs. Best-effort: `gh` missing or unauthenticated just means no GitHub
+ * signals this scan, not a failed scan.
+ */
+async function githubToken(): Promise<string | undefined> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  try {
+    const { stdout } = await execFileAsync(gh, ["auth", "token"], {
+      timeout: 10_000,
+      maxBuffer: 1024 * 1024,
+    });
+    const token = stdout.trim();
+    return token || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function scan(opts: {
   repoPath: string;
   scanFile: string;
@@ -715,9 +738,17 @@ export async function scan(opts: {
   args.push("--no-color");
 
   const timeoutMs = scanTimeoutMs();
+  // A caller's own GITHUB_TOKEN (CI, an operator's shell) wins — `gh auth token` is only a
+  // fallback for when nothing already set it, and only set when it actually resolves.
+  const env = { ...process.env };
+  if (!env.GITHUB_TOKEN) {
+    const token = await githubToken();
+    if (token) env.GITHUB_TOKEN = token;
+  }
   let stderr = "";
   try {
     ({ stderr } = await execFileAsync(bin, args, {
+      env,
       timeout: timeoutMs,
       maxBuffer: 64 * 1024 * 1024,
       signal: opts.signal,
