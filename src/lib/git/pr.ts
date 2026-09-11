@@ -202,10 +202,49 @@ async function nameWithOwner(repoPath: string, signal?: AbortSignal): Promise<st
   return nwo || undefined;
 }
 
+const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$number){
+    reviewThreads(first:100 after:$cursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{
+        id isResolved isOutdated path line
+        comments(first:50){nodes{databaseId author{login} body}}
+      }
+    }
+  }}
+}`;
+
+interface RawReviewThreadNode {
+  id?: string;
+  isResolved?: boolean;
+  isOutdated?: boolean;
+  path?: string | null;
+  line?: number | null;
+  comments?: { nodes?: Array<{ databaseId?: number; author?: { login?: string } | null; body?: string }> };
+}
+
+interface ReviewThreadsPage {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        reviewThreads?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: RawReviewThreadNode[];
+        };
+      };
+    };
+  };
+}
+
 /**
  * Inline review threads via GraphQL — the only API that exposes thread resolution state and the
  * node ids `resolveReviewThread` needs. Best-effort — returns [] on any failure (same contract as
  * the old REST comment fetch), so a missing token degrades to "no inline feedback", not a crash.
+ *
+ * Paginated: a PR that has collected over 100 threads (routine on a long-running epic with a bot
+ * reviewer commenting every round) used to have everything past the first page silently dropped,
+ * including whichever thread was actually unresolved — `threadsNeedingAttention` never saw it, so
+ * `classifyReview` reported the PR clean and the dispatcher skipped it with nothing to show for why.
  */
 async function getReviewThreads(
   repoPath: string,
@@ -216,45 +255,30 @@ async function getReviewThreads(
     const nwo = await nameWithOwner(repoPath, signal);
     if (!nwo) return [];
     const [owner, repo] = nwo.split("/");
-    const query = `query($owner:String!,$repo:String!,$number:Int!){
-      repository(owner:$owner,name:$repo){pullRequest(number:$number){
-        reviewThreads(first:100){nodes{
-          id isResolved isOutdated path line
-          comments(first:50){nodes{databaseId author{login} body}}
-        }}
-      }}
-    }`;
-    const raw = await gh(
-      repoPath,
-      [
-        "api", "graphql",
-        "-f", `query=${query}`,
-        "-f", `owner=${owner}`,
-        "-f", `repo=${repo}`,
-        "-F", `number=${number}`,
-      ],
-      signal,
-    );
-    const parsed = JSON.parse(raw) as {
-      data?: {
-        repository?: {
-          pullRequest?: {
-            reviewThreads?: {
-              nodes?: Array<{
-                id?: string;
-                isResolved?: boolean;
-                isOutdated?: boolean;
-                path?: string | null;
-                line?: number | null;
-                comments?: { nodes?: Array<{ databaseId?: number; author?: { login?: string } | null; body?: string }> };
-              }>;
-            };
-          };
-        };
-      };
-    };
-    const nodes = parsed.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
-    return nodes
+
+    const allNodes: RawReviewThreadNode[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const raw = await gh(
+        repoPath,
+        [
+          "api", "graphql",
+          "-f", `query=${REVIEW_THREADS_QUERY}`,
+          "-f", `owner=${owner}`,
+          "-f", `repo=${repo}`,
+          "-F", `number=${number}`,
+          ...(cursor ? ["-f", `cursor=${cursor}`] : []),
+        ],
+        signal,
+      );
+      const parsed = JSON.parse(raw) as ReviewThreadsPage;
+      const page = parsed.data?.repository?.pullRequest?.reviewThreads;
+      allNodes.push(...(page?.nodes ?? []));
+      if (!page?.pageInfo?.hasNextPage || !page.pageInfo.endCursor) break;
+      cursor = page.pageInfo.endCursor;
+    }
+
+    return allNodes
       .filter((n) => typeof n?.id === "string")
       .map((n) => ({
         id: n.id!,
