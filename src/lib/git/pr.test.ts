@@ -1,11 +1,20 @@
 /**
  * Unit tests for the pure PR helpers (anton-3t2.2): ref parsing, the actionable classifier, and
  * the re-request reviewer set. No `gh` — these are the decision functions the job relies on.
+ *
+ * A second suite below drives `getPrReview` against a fake `gh` to prove its GraphQL review-thread
+ * fetch paginates rather than silently truncating at 100 nodes (the bug behind "examined N PRs,
+ * dispatched 0" on a PR whose unresolved thread landed on page 2).
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { GH_BIN_ENV } from "./ops";
 import {
   ANTON_MARK,
   classifyReview,
+  getPrReview,
   prNumberFromRef,
   reviewersRequestingChanges,
   threadsNeedingAttention,
@@ -135,5 +144,115 @@ describe("reviewersRequestingChanges", () => {
       ],
     });
     expect(reviewersRequestingChanges(p)).toEqual([]);
+  });
+});
+
+describe("getPrReview (fake gh)", () => {
+  let sandbox: string;
+  let binDir: string;
+  let prevGh: string | undefined;
+
+  // Fake gh: `pr view` answers a minimal OPEN PR; `api graphql` serves review threads two pages
+  // deep — page 1 has no cursor and reports hasNextPage, page 2 is reached via `-f cursor=...` and
+  // carries the one unresolved thread. A real >100-node PR looks exactly like this, just wider.
+  function installFakeGh(): void {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'repo' && a[1] === 'view') {
+  process.stdout.write('o/r\\n');
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const hasCursor = a.some((x) => x.startsWith('cursor='));
+  if (!hasCursor) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+      pageInfo: { hasNextPage: true, endCursor: 'PAGE2' },
+      nodes: [{ id: 'RT_1', isResolved: true, isOutdated: false, path: 'a.ts', line: 1, comments: { nodes: [{ databaseId: 1, author: { login: 'bot' }, body: 'old, resolved' }] } }],
+    } } } } }));
+  } else {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{ id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { nodes: [{ databaseId: 2, author: { login: 'alice' }, body: 'please fix' }] } }],
+    } } } } }));
+  }
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+  }
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-prreview-"));
+    binDir = join(sandbox, "bin");
+    mkdirSync(binDir);
+    installFakeGh();
+    prevGh = process.env[GH_BIN_ENV];
+    process.env[GH_BIN_ENV] = join(binDir, "gh");
+  });
+
+  afterEach(() => {
+    if (prevGh === undefined) delete process.env[GH_BIN_ENV];
+    else process.env[GH_BIN_ENV] = prevGh;
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("follows pageInfo.hasNextPage across review-thread pages instead of truncating at 100", async () => {
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_1", "RT_2"]);
+    // The unresolved thread lived on page 2 — proving it actually reached the classifier is the
+    // whole point: a truncated fetch would report this PR clean.
+    expect(classifyReview(review).actionable).toBe(true);
+  });
+
+  it("preserves already-fetched pages when a later page fails", async () => {
+    // Overwrite the fake gh so page 2 errors (page 1 still reports hasNextPage) — the first page's
+    // unresolved thread must survive rather than the whole fetch collapsing to [].
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const hasCursor = a.some((x) => x.startsWith('cursor='));
+  if (!hasCursor) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+      pageInfo: { hasNextPage: true, endCursor: 'PAGE2' },
+      nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
+    } } } } }));
+    process.exit(0);
+  }
+  process.stderr.write('boom');
+  process.exit(1);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
+    expect(classifyReview(review).actionable).toBe(true);
   });
 });

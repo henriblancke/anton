@@ -202,77 +202,111 @@ async function nameWithOwner(repoPath: string, signal?: AbortSignal): Promise<st
   return nwo || undefined;
 }
 
+const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$number){
+    reviewThreads(first:100 after:$cursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{
+        id isResolved isOutdated path line
+        comments(first:50){nodes{databaseId author{login} body}}
+      }
+    }
+  }}
+}`;
+
+interface RawReviewThreadNode {
+  id?: string;
+  isResolved?: boolean;
+  isOutdated?: boolean;
+  path?: string | null;
+  line?: number | null;
+  comments?: { nodes?: Array<{ databaseId?: number; author?: { login?: string } | null; body?: string }> };
+}
+
+interface ReviewThreadsPage {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        reviewThreads?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: RawReviewThreadNode[];
+        };
+      };
+    };
+  };
+}
+
 /**
  * Inline review threads via GraphQL — the only API that exposes thread resolution state and the
  * node ids `resolveReviewThread` needs. Best-effort — returns [] on any failure (same contract as
  * the old REST comment fetch), so a missing token degrades to "no inline feedback", not a crash.
+ *
+ * Paginated: a PR that has collected over 100 threads (routine on a long-running epic with a bot
+ * reviewer commenting every round) used to have everything past the first page silently dropped,
+ * including whichever thread was actually unresolved — `threadsNeedingAttention` never saw it, so
+ * `classifyReview` reported the PR clean and the dispatcher skipped it with nothing to show for why.
+ *
+ * A later-page failure breaks the loop and returns the pages already fetched rather than throwing
+ * to the outer catch and discarding every completed page — losing page 1's unresolved threads would
+ * misclassify a >100-thread PR as clean the same way truncation did.
  */
 async function getReviewThreads(
   repoPath: string,
   number: number,
   signal?: AbortSignal,
 ): Promise<ReviewThread[]> {
+  const allNodes: RawReviewThreadNode[] = [];
   try {
     const nwo = await nameWithOwner(repoPath, signal);
     if (!nwo) return [];
     const [owner, repo] = nwo.split("/");
-    const query = `query($owner:String!,$repo:String!,$number:Int!){
-      repository(owner:$owner,name:$repo){pullRequest(number:$number){
-        reviewThreads(first:100){nodes{
-          id isResolved isOutdated path line
-          comments(first:50){nodes{databaseId author{login} body}}
-        }}
-      }}
-    }`;
-    const raw = await gh(
-      repoPath,
-      [
-        "api", "graphql",
-        "-f", `query=${query}`,
-        "-f", `owner=${owner}`,
-        "-f", `repo=${repo}`,
-        "-F", `number=${number}`,
-      ],
-      signal,
-    );
-    const parsed = JSON.parse(raw) as {
-      data?: {
-        repository?: {
-          pullRequest?: {
-            reviewThreads?: {
-              nodes?: Array<{
-                id?: string;
-                isResolved?: boolean;
-                isOutdated?: boolean;
-                path?: string | null;
-                line?: number | null;
-                comments?: { nodes?: Array<{ databaseId?: number; author?: { login?: string } | null; body?: string }> };
-              }>;
-            };
-          };
-        };
-      };
-    };
-    const nodes = parsed.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
-    return nodes
-      .filter((n) => typeof n?.id === "string")
-      .map((n) => ({
-        id: n.id!,
-        isResolved: n.isResolved ?? false,
-        isOutdated: n.isOutdated ?? false,
-        path: n.path ?? undefined,
-        line: n.line ?? undefined,
-        comments: (n.comments?.nodes ?? [])
-          .filter((c) => typeof c?.databaseId === "number")
-          .map((c) => ({
-            id: c.databaseId!,
-            author: c.author?.login ?? "unknown",
-            body: c.body ?? "",
-          })),
-      }));
+
+    let cursor: string | undefined;
+    for (;;) {
+      let parsed: ReviewThreadsPage;
+      try {
+        const raw = await gh(
+          repoPath,
+          [
+            "api", "graphql",
+            "-f", `query=${REVIEW_THREADS_QUERY}`,
+            "-f", `owner=${owner}`,
+            "-f", `repo=${repo}`,
+            "-F", `number=${number}`,
+            ...(cursor ? ["-f", `cursor=${cursor}`] : []),
+          ],
+          signal,
+        );
+        parsed = JSON.parse(raw) as ReviewThreadsPage;
+      } catch {
+        // Keep the pages already fetched; a failed first page still degrades to [].
+        break;
+      }
+      const page = parsed.data?.repository?.pullRequest?.reviewThreads;
+      allNodes.push(...(page?.nodes ?? []));
+      if (!page?.pageInfo?.hasNextPage || !page.pageInfo.endCursor) break;
+      cursor = page.pageInfo.endCursor;
+    }
   } catch {
     return [];
   }
+
+  return allNodes
+    .filter((n) => typeof n?.id === "string")
+    .map((n) => ({
+      id: n.id!,
+      isResolved: n.isResolved ?? false,
+      isOutdated: n.isOutdated ?? false,
+      path: n.path ?? undefined,
+      line: n.line ?? undefined,
+      comments: (n.comments?.nodes ?? [])
+        .filter((c) => typeof c?.databaseId === "number")
+        .map((c) => ({
+          id: c.databaseId!,
+          author: c.author?.login ?? "unknown",
+          body: c.body ?? "",
+        })),
+    }));
 }
 
 /**
