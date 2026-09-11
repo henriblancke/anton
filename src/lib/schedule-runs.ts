@@ -109,56 +109,68 @@ const RUN_INSERT_ORDER = sql`${schema.jobs}.rowid`;
 /**
  * The latest settled fire per schedule, for one project, keyed by schedule id.
  *
- * Reduced in JS rather than left to a grouped `max()` aggregate: SQLite only guarantees the bare
- * columns beside `max()` come from A row that produced it, which is fine while `created_at` is
- * unique per schedule but silently picks an arbitrary same-second tie otherwise (see
- * `RUN_INSERT_ORDER`). Reading every settled row costs the same table scan the aggregate already
- * paid for — this changes how the newest row per schedule is CHOSEN, not how much is read.
+ * A `ROW_NUMBER()` window, partitioned by schedule and ordered by `(created_at, rowid)` DESC, keeps
+ * the "one winner per schedule" reduction inside SQLite (PR #264 review) rather than materializing
+ * every settled job for the project into JS — `review-fix` alone can run every 15 minutes for a
+ * project's whole lifetime, so that set only grows. SQLite computes the window over the same rows
+ * the old bare-column `max()` aggregate scanned; only the WINNER-PICKING step moved, from a
+ * SQL construct too weak to break a tie deterministically (bare columns beside `max()` are only
+ * guaranteed to come from A row achieving it, not a chosen one) to one built to.
  *
  * "Newest" is measured on `created_at`, the immutable ENQUEUE time, not on `updated_at`: an operator
  * resuming a long-parked fire re-stamps its `updated_at`, so ordering by settlement would let a
- * fire from last week displace the one that ran an hour ago. Ties on `created_at` break on insert
- * order, which is total.
+ * fire from last week displace the one that ran an hour ago. Ties on `created_at` break on
+ * `RUN_INSERT_ORDER` (the rowid), which is total.
  */
 export async function lastRunsBySchedule(
   projectId: string,
 ): Promise<Record<string, ScheduleLastRun>> {
-  const rows = await getDb()
-    .select({
-      scheduleId: SCHEDULE_ID,
-      status: schema.jobs.status,
-      outcome: schema.jobs.outcome,
-      outcomeNote: schema.jobs.outcomeNote,
-      lastError: schema.jobs.lastError,
-      enqueuedAt: sql<number>`${schema.jobs.createdAt}`,
-      at: sql<number>`${schema.jobs.updatedAt}`,
-      insertOrder: RUN_INSERT_ORDER,
-    })
-    .from(schema.jobs)
-    .where(
-      and(
-        eq(schema.jobs.projectId, projectId),
-        inArray(schema.jobs.status, [...SETTLED]),
-        sql`${SCHEDULE_ID} is not null`,
-      ),
-    );
+  const rows = await getDb().all<{
+    scheduleId: string;
+    status: string;
+    outcome: string | null;
+    outcomeNote: string | null;
+    lastError: string | null;
+    enqueuedAt: number;
+    at: number;
+  }>(sql`
+    with ranked as (
+      select
+        ${SCHEDULE_ID} as schedule_id,
+        ${schema.jobs.status} as status,
+        ${schema.jobs.outcome} as outcome,
+        ${schema.jobs.outcomeNote} as outcome_note,
+        ${schema.jobs.lastError} as last_error,
+        ${schema.jobs.createdAt} as enqueued_at,
+        ${schema.jobs.updatedAt} as at,
+        row_number() over (
+          partition by ${SCHEDULE_ID}
+          order by ${schema.jobs.createdAt} desc, ${RUN_INSERT_ORDER} desc
+        ) as rn
+      from ${schema.jobs}
+      where
+        ${schema.jobs.projectId} = ${projectId}
+        and ${schema.jobs.status} in (${sql.join(
+          SETTLED.map((status) => sql`${status}`),
+          sql`, `,
+        )})
+        and ${SCHEDULE_ID} is not null
+    )
+    select
+      schedule_id as scheduleId,
+      status,
+      outcome,
+      outcome_note as outcomeNote,
+      last_error as lastError,
+      enqueued_at as enqueuedAt,
+      at
+    from ranked
+    where rn = 1
+  `);
 
   const byId: Record<string, ScheduleLastRun> = {};
-  const winnerOrder = new Map<string, number>();
   for (const row of rows) {
-    if (!row.scheduleId) continue;
-    const order = Number(row.insertOrder);
-    const enqueuedAt = Number(row.enqueuedAt);
-    const prevOrder = winnerOrder.get(row.scheduleId);
-    const prev = byId[row.scheduleId];
-    if (
-      prevOrder === undefined ||
-      enqueuedAt > prev!.enqueuedAt ||
-      (enqueuedAt === prev!.enqueuedAt && order > prevOrder)
-    ) {
-      winnerOrder.set(row.scheduleId, order);
-      byId[row.scheduleId] = toScheduleLastRun({ ...row, at: Number(row.at), enqueuedAt });
-    }
+    byId[row.scheduleId] = toScheduleLastRun(row);
   }
   return byId;
 }
