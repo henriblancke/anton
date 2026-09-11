@@ -5,10 +5,12 @@
  * the handler table and the policy sources — lives in ./service-runner and its siblings. Kept thin
  * on purpose (anton-6fo2): a new job type or a new boot preflight must not widen this module.
  */
-import { getDb } from "../db";
+import { and, eq } from "drizzle-orm";
+import { getDb, schema } from "../db";
 import { activeExecuteEpicId, getJob, systemClock } from "./queue";
 import { resumeEpic, type ResumeOutcome } from "./unstick";
 import type { RunningJobInfo } from "./runner";
+import type { RunNowResult, ScheduledJobType } from "../schedules";
 import { getPickerNudge, getRunner, getScheduler, startRunner } from "./service-runner";
 
 export { getPickerNudge, getRunner, getScheduler, startRunner };
@@ -53,6 +55,26 @@ export async function resumeJob(projectId: string, jobId: string): Promise<boole
   const job = await getJob(getDb(), jobId);
   if (!job || job.projectId !== projectId) return false;
   return getRunner().resume(jobId);
+}
+
+/**
+ * Fire one automation's job right now, from Settings → Automation's "Run now". Scoped to the
+ * project so a route can't fire another project's schedule by id, and to `type` (not a raw schedule
+ * id) so the route needs no separate lookup to validate the caller's request — it already resolves
+ * type → schedule via `listSchedules`/`DEFAULT_SCHEDULES` the way every other schedules route does.
+ * Delegates to the runner so a project mid-teardown is refused rather than handed a fresh job row.
+ */
+export async function runScheduleNow(
+  projectId: string,
+  type: ScheduledJobType,
+): Promise<RunNowResult> {
+  const row = await getDb()
+    .select({ id: schema.schedules.id })
+    .from(schema.schedules)
+    .where(and(eq(schema.schedules.projectId, projectId), eq(schema.schedules.type, type)))
+    .limit(1);
+  if (!row[0]) return { ok: false, reason: "not-found" };
+  return getRunner().runScheduleNow(row[0].id);
 }
 
 /**

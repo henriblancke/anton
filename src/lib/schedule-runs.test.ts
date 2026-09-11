@@ -241,6 +241,38 @@ describe("lastRunsBySchedule", () => {
       .values({ id: "p-quiet", slug: "quiet", name: "quiet", repoPath: "/tmp/quiet" });
     expect(await runs.lastRunsBySchedule("p-quiet")).toEqual({});
   });
+
+  // PR #264 review: two fires of one schedule enqueued and settled within the same whole second —
+  // a fast pass, then an operator's "Run now" landing before the clock ticks over — tie exactly on
+  // `created_at`. A bare-column `max()` aggregate is free to pick either row's status/outcome on a
+  // tie; this pins that the SECOND (later-inserted) fire always wins, deterministically, however
+  // many times the read runs.
+  it("breaks a same-second enqueue tie by insert order, not arbitrarily", async () => {
+    await job({
+      scheduleId: "s-tied",
+      status: "failed",
+      lastError: "bd exited 1",
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
+    await job({
+      scheduleId: "s-tied",
+      status: "done",
+      outcome: "ok",
+      outcomeNote: "closed 1 gate(s)",
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
+
+    for (let i = 0; i < 5; i += 1) {
+      expect((await runs.lastRunsBySchedule(PROJECT_ID))["s-tied"]).toEqual({
+        outcome: "ok",
+        at: NOW,
+        enqueuedAt: NOW,
+        note: "closed 1 gate(s)",
+      });
+    }
+  });
 });
 
 describe("listSchedules carries the last fire's outcome", () => {

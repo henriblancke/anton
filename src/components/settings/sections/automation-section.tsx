@@ -30,6 +30,7 @@ export function AutomationSection({
         cadenceOffer={schedules.cadenceOffer}
         onCronChange={schedules.setCron}
         onToggle={schedules.toggle}
+        onRunNow={schedules.runNow}
         onAcceptCadenceOffer={schedules.acceptCadenceOffer}
         onDeclineCadenceOffer={schedules.declineCadenceOffer}
       />

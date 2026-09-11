@@ -1257,6 +1257,117 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect(body(fetchMock)).toEqual({ type: "gardener", enabled: true });
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith("gardener enabled"));
   });
+
+  describe("Run now", () => {
+    /** POST /run resolving 200 with a fresh job id — the shape the real route answers with. */
+    function stubRunNow(status = 200, body: Record<string, unknown> = { jobId: "job-1" }) {
+      const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+        () => Promise.resolve(new Response(JSON.stringify(body), { status })),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      return fetchMock;
+    }
+
+    const runNowButton = (label = "nightly-stringer") =>
+      screen.getByRole("button", { name: `${label} run now` }) as HTMLButtonElement;
+
+    it("POSTs the run route and toasts success", async () => {
+      const fetchMock = stubRunNow();
+      renderView({}, [], stringer());
+
+      fireEvent.click(runNowButton());
+
+      await waitFor(() =>
+        expect(fetchMock).toHaveBeenCalledWith(
+          "/api/projects/tmp/schedules/nightly-stringer/run",
+          { method: "POST" },
+        ),
+      );
+      await waitFor(() =>
+        expect(toast.success).toHaveBeenCalledWith(
+          "nightly-stringer started",
+          expect.objectContaining({ description: expect.any(String) }),
+        ),
+      );
+    });
+
+    /**
+     * The button's own `pending` state clears the instant the POST resolves, but the panel's next
+     * poll (which is what would otherwise flip `pendingRun`) can be up to 30s away — Codex flagged
+     * that gap as a route where a second click lands before the row shows anything is running and
+     * draws an avoidable 409. The fix writes `pendingRun` optimistically on success, so the button
+     * disables itself without waiting on the poll.
+     */
+    it("disables itself on success without waiting for the next poll", async () => {
+      stubRunNow();
+      renderView({}, [], stringer());
+
+      const button = runNowButton();
+      expect(button.disabled).toBe(false);
+
+      fireEvent.click(button);
+      await waitFor(() => expect(button.disabled).toBe(true));
+    });
+
+    it("toasts the server's refusal and leaves the button clickable", async () => {
+      stubRunNow(409, { error: "nightly-stringer is already running", reason: "already-running" });
+      renderView({}, [], stringer());
+
+      fireEvent.click(runNowButton());
+
+      await waitFor(() =>
+        expect(toast.error).toHaveBeenCalledWith("nightly-stringer is already running"),
+      );
+      expect(runNowButton().disabled).toBe(false);
+    });
+
+    it("is disabled while the automation is off", () => {
+      stubRunNow();
+      renderView({}, [], stringer({ enabled: false, nextRunAt: undefined }));
+      expect(runNowButton().disabled).toBe(true);
+    });
+
+    /**
+     * Codex review (second pass): the optimistic `pendingRun` write only survives if `runNow`
+     * participates in the same in-flight write guard `patchSchedule` uses — otherwise a poll GET
+     * that was ALREADY in flight when the POST landed carries pre-fire data (no `pendingRun`), and
+     * `raced()` would accept it as newer, clearing the optimistic write and re-enabling the button
+     * before the next real poll (up to 30s later) catches up. This pins the fix: a stale poll
+     * response that resolves AFTER a successful runNow must not undo it.
+     */
+    it("ignores a schedules poll that was already in flight when runNow landed", async () => {
+      let resolvePoll!: (body: unknown) => void;
+      const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+        (input, init) => {
+          if (init?.method === "POST") {
+            return Promise.resolve(new Response(JSON.stringify({ jobId: "job-1" }), { status: 200 }));
+          }
+          // The panel's leading poll GET — held open until the test resolves it below, simulating
+          // a request that was already in flight before the POST landed.
+          return new Promise<Response>((resolve) => {
+            resolvePoll = (body: unknown) => resolve(new Response(JSON.stringify(body)));
+          });
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      renderView({}, [], stringer());
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+      fireEvent.click(runNowButton());
+      await waitFor(() => expect(runNowButton().disabled).toBe(true));
+
+      // The stale poll answers AFTER the fire, with no pendingRun (it read the board before the
+      // fire existed) — without the write guard this would win and re-enable the button. Flush the
+      // microtasks the resolved fetch → json() → update() chain runs on, then assert nothing moved.
+      resolvePoll({ schedules: stringer() });
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(runNowButton().disabled).toBe(true);
+    });
+  });
 });
 
 describe("SettingsView proposal autonomy (anton-3mqq)", () => {

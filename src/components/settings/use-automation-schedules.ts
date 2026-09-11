@@ -41,6 +41,13 @@ export interface AutomationSchedules {
   cadenceOffer: CadenceOffer | null;
   acceptCadenceOffer: () => Promise<void>;
   declineCadenceOffer: () => Promise<void>;
+  /**
+   * Fire one automation's job right now, outside its cron. Toasts success/failure and optimistically
+   * marks the row `pendingRun: "queued"` so the button disables itself without waiting on the next
+   * poll tick (up to 30s) — the next genuine poll (or a settle) overwrites this with server truth
+   * regardless, since `withTimes` assigns `pendingRun` rather than merging it.
+   */
+  runNow: (id: string) => Promise<void>;
 }
 
 /**
@@ -155,6 +162,41 @@ export function useAutomationSchedules({
     setCron,
   });
 
+  async function runNow(id: string) {
+    // Counted at the CALL, like `patchSchedule`'s guard (PR #264 review): a poll's `readSchedules`
+    // can already be in flight when this POST lands, and without this guard that poll's answer —
+    // read before the fire existed — would win the race and overwrite the optimistic `pendingRun`
+    // below with `undefined`, re-enabling the button before the NEXT poll (up to 30s later) catches
+    // up. `raced()` sees this write via `inFlight`/`completed` and drops that stale answer instead.
+    writes.current.inFlight += 1;
+    try {
+      // Queued behind this row's own writes (PR #264 review), not sent straight through: the button
+      // reads OPTIMISTIC state, so an operator can click Run now the instant a toggle-on lands on
+      // screen while that PATCH is still in flight. Firing straight through would race it — the POST
+      // could reach `runScheduleNow` first and observe the still-disabled row server-side, returning
+      // a 409 for a click the UI showed as valid. Riding the same queue `patchSchedule` uses makes the
+      // fire wait for every write already open on this row to land first.
+      await queueRowWrite(rowWrites, id, () => postRunNow(slug, id));
+      // Optimistic: the button's own `pending` state clears the instant this resolves, but the
+      // server truth for `pendingRun` otherwise waits on the next poll tick (up to 30s) — a stale
+      // "not firing" would re-enable the button in that window and let a second click send a
+      // redundant request the route only rejects with a 409. The next GENUINELY later poll (or a
+      // settle) overwrites this with server truth regardless (see `withTimes` — pendingRun is
+      // assigned, never merged).
+      update((p) => ({ ...p, [id]: { ...p[id], pendingRun: "queued" } }));
+      toast.success(`${id} started`, {
+        description: "Watch its row here — the next poll picks up the fire within 30s.",
+      });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : `Failed to run ${id}`);
+    } finally {
+      // In `finally` so a rejected POST also clears the in-flight count — otherwise a failed fire
+      // would leave the counter above zero and silently stop the poll for the rest of the session.
+      writes.current.inFlight -= 1;
+      writes.current.completed += 1;
+    }
+  }
+
   return {
     state,
     toggle: (id, next) =>
@@ -165,6 +207,7 @@ export function useAutomationSchedules({
     cadenceOffer: cadence.offer,
     acceptCadenceOffer: cadence.accept,
     declineCadenceOffer: cadence.decline,
+    runNow,
   };
 }
 
@@ -323,6 +366,15 @@ async function putSchedule(
   }
   const { schedule } = await res.json().catch(() => ({ schedule: undefined }));
   return schedule;
+}
+
+/** Fire one automation's job right now. Throws the server's own message so the caller can toast it. */
+async function postRunNow(slug: string, id: string): Promise<void> {
+  const res = await fetch(`/api/projects/${slug}/schedules/${id}/run`, { method: "POST" });
+  if (!res.ok) {
+    const { error } = await res.json().catch(() => ({ error: "Run failed" }));
+    throw new Error(error ?? "Run failed");
+  }
 }
 
 /**

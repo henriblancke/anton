@@ -39,7 +39,7 @@ import {
   resetIssueSnapshots,
 } from "../beads/snapshot";
 import { PoisonError } from "./errors";
-import { enqueue, queuedJobId, type Clock } from "./queue";
+import { enqueue, enqueueScheduledTypeIfAbsent, queuedJobId, type Clock } from "./queue";
 import type { JobContext } from "./runner";
 import { makeBoardPickerHandler } from "./board-picker";
 import { BoardPickerNudge, PICKER_NUDGE_WINDOW_MS } from "./picker-nudge";
@@ -1177,5 +1177,113 @@ describe("BoardPickerNudge", () => {
     await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
 
     expect(enqueued).toEqual([]);
+  });
+
+  /**
+   * PR #264 review: this suite's own `nudge` above is wired with the BARE `enqueue()`, which is
+   * fine for pinning the debounce/gating logic but does not exercise the real production wiring
+   * (service-runner.ts) — `queuedJobId` and the insert it guards are two separate operations, and a
+   * scheduler tick or a manual "Run now" fire landing between them is invisible to the check. This
+   * pins the real wiring: `enqueue` calls `enqueueScheduledTypeIfAbsent` (matching
+   * `getPickerNudge()`), and a competing insert is injected into the exact gap between the nudge's
+   * own pre-check and its call — the transactional re-check inside `enqueueScheduledTypeIfAbsent`
+   * must still coalesce onto one job.
+   */
+  it("does not double-fire when a job lands between its own pre-check and its enqueue call", async () => {
+    let raced = false;
+    const select = t.db.select.bind(t.db);
+    vi.spyOn(t.db, "select").mockImplementation(((columns?: Record<string, unknown>) => {
+      // `queuedJobId`'s query (the pass's pre-check, called before its enqueue) is the only
+      // single-column `{ id }` select made before the race is injected — land the competing insert
+      // right there, in the gap between that check and this nudge's own transactional enqueue.
+      if (!raced && columns && Object.keys(columns).length === 1 && "id" in columns) {
+        raced = true;
+        enqueueScheduledTypeIfAbsent(t.db, clock, "board-picker", "p1", { projectId: "p1" });
+      }
+      return select(columns as never);
+    }) as typeof t.db.select);
+
+    const raceNudge = new BoardPickerNudge({
+      db: t.db,
+      enqueue: (projectId) =>
+        Promise.resolve(
+          enqueueScheduledTypeIfAbsent(
+            t.db,
+            clock,
+            "board-picker",
+            projectId,
+            { projectId },
+            { coveredBy: ["queued"] },
+          ),
+        ),
+    });
+    raceNudge.start();
+    try {
+      await read("/tmp/p1", []);
+      await read("/tmp/p1", [bead("t1")]);
+      await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    } finally {
+      raceNudge.stop();
+      vi.mocked(t.db.select).mockRestore();
+    }
+
+    expect(raced).toBe(true);
+    expect(
+      t.db.select().from(schema.jobs).all().filter((j) => j.type === "board-picker"),
+    ).toHaveLength(1);
+  });
+
+  /**
+   * PR #264 review: the production wiring in service-runner.ts passes `enqueue` a `scheduleId` so
+   * the job it enqueues carries `{ projectId, scheduleId }` — the same payload shape the scheduler
+   * and `runScheduleNow` both stamp. Without it, `pendingRunsBySchedule`/`lastRunsBySchedule` (both
+   * keyed on that payload field, not on type+project) can't see the nudge's job at all, even though
+   * `runScheduleNow`'s own type+project "already-running" check still refuses a Run now click
+   * against it — leaving the Automation table's button enabled through a 409 the nudge itself was
+   * causing. Pins that this suite's own `enqueue` stub, called the way `getPickerNudge()` calls it,
+   * receives a resolvable schedule id and the job it inserts carries it in the payload.
+   */
+  it("passes its schedule id through to the job it enqueues", async () => {
+    // The outer `beforeEach`'s `nudge` is already started and subscribed to the same board-changed
+    // broadcast — left running, it would race this test's own nudge to `enqueueJob` and, having
+    // inserted first, make `queuedJobId` short-circuit this one before its `enqueue` stub ever runs.
+    nudge.stop();
+    await createSchedule(t.db, clock, { projectId: "p1", type: "board-picker", cron: "*/10 * * * *" });
+    let seenScheduleId: string | undefined;
+    const scheduledNudge = new BoardPickerNudge({
+      db: t.db,
+      enqueue: (projectId, scheduleId) => {
+        seenScheduleId = scheduleId;
+        return Promise.resolve(
+          enqueueScheduledTypeIfAbsent(
+            t.db,
+            clock,
+            "board-picker",
+            projectId,
+            scheduleId ? { projectId, scheduleId } : { projectId },
+            { coveredBy: ["queued"] },
+          ),
+        );
+      },
+    });
+    scheduledNudge.start();
+    try {
+      await read("/tmp/p1", []);
+      await read("/tmp/p1", [bead("t1")]);
+      await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    } finally {
+      scheduledNudge.stop();
+    }
+
+    expect(seenScheduleId).toBeDefined();
+    const job = t.db
+      .select()
+      .from(schema.jobs)
+      .all()
+      .find((j) => j.type === "board-picker");
+    expect(JSON.parse(job!.payloadJson as string)).toEqual({
+      projectId: "p1",
+      scheduleId: seenScheduleId,
+    });
   });
 });
