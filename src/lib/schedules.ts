@@ -453,6 +453,28 @@ export async function scheduleEnabled(
   return rows[0]?.enabled ?? true;
 }
 
+/**
+ * This project's schedule id for `type`, if the row exists (PR #264 review). A caller that enqueues
+ * OUTSIDE the scheduler's own tick — the board-picker nudge is the one caller today — needs this to
+ * stamp the same `{ scheduleId }` payload shape `runScheduleNow` and the scheduler both use, so its
+ * jobs are visible to `pendingRunsBySchedule`/`lastRunsBySchedule` (both keyed on that payload field,
+ * not on type+project) instead of being invisible to every schedule-keyed read while still counting
+ * against `runScheduleNow`'s own type+project "already-running" check — the split that let the Run
+ * now button stay enabled through a 409 a nudge job was already causing.
+ */
+export async function scheduleIdFor(
+  db: AntonDb,
+  projectId: string,
+  type: ScheduledJobType,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({ id: schema.schedules.id })
+    .from(schema.schedules)
+    .where(and(eq(schema.schedules.projectId, projectId), eq(schema.schedules.type, type)))
+    .limit(1);
+  return rows[0]?.id;
+}
+
 /** {@link scheduleEnabled} over the shared anton.db — the UI read path. */
 export async function isScheduleEnabled(
   projectId: string,

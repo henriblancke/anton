@@ -116,19 +116,23 @@ export function getScheduler(): Scheduler {
  * this insert can't double-fire the pass (PR #264 review) — the check and insert here are ONE
  * transaction. `coveredBy: ["queued"]` preserves the nudge's own semantics: a `running` pass may
  * have read the board before this change landed, so it must not count as covering it (see
- * `BoardPickerNudge.pass`'s doc comment).
+ * `BoardPickerNudge.pass`'s doc comment). The payload carries `scheduleId` when the nudge resolved
+ * one (PR #264 review), matching the shape `runScheduleNow`/the scheduler both stamp — without it
+ * the job was invisible to `pendingRunsBySchedule`/`lastRunsBySchedule` (both keyed on that field)
+ * while still counting against `runScheduleNow`'s own "already-running" check, leaving the Automation
+ * table's Run now button enabled through a 409 the nudge itself was causing.
  */
 export function getPickerNudge(): BoardPickerNudge {
   const s = state();
   if (s.pickerNudge) return s.pickerNudge;
   s.pickerNudge = new BoardPickerNudge({
     db: getDb(),
-    enqueue: (projectId) =>
+    enqueue: (projectId, scheduleId) =>
       Promise.resolve(
         getRunner().enqueueScheduledTypeIfAbsent(
           "board-picker",
           projectId,
-          { projectId },
+          scheduleId ? { projectId, scheduleId } : { projectId },
           { coveredBy: ["queued"] },
         ),
       ),

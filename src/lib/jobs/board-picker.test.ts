@@ -1232,4 +1232,58 @@ describe("BoardPickerNudge", () => {
       t.db.select().from(schema.jobs).all().filter((j) => j.type === "board-picker"),
     ).toHaveLength(1);
   });
+
+  /**
+   * PR #264 review: the production wiring in service-runner.ts passes `enqueue` a `scheduleId` so
+   * the job it enqueues carries `{ projectId, scheduleId }` — the same payload shape the scheduler
+   * and `runScheduleNow` both stamp. Without it, `pendingRunsBySchedule`/`lastRunsBySchedule` (both
+   * keyed on that payload field, not on type+project) can't see the nudge's job at all, even though
+   * `runScheduleNow`'s own type+project "already-running" check still refuses a Run now click
+   * against it — leaving the Automation table's button enabled through a 409 the nudge itself was
+   * causing. Pins that this suite's own `enqueue` stub, called the way `getPickerNudge()` calls it,
+   * receives a resolvable schedule id and the job it inserts carries it in the payload.
+   */
+  it("passes its schedule id through to the job it enqueues", async () => {
+    // The outer `beforeEach`'s `nudge` is already started and subscribed to the same board-changed
+    // broadcast — left running, it would race this test's own nudge to `enqueueJob` and, having
+    // inserted first, make `queuedJobId` short-circuit this one before its `enqueue` stub ever runs.
+    nudge.stop();
+    await createSchedule(t.db, clock, { projectId: "p1", type: "board-picker", cron: "*/10 * * * *" });
+    let seenScheduleId: string | undefined;
+    const scheduledNudge = new BoardPickerNudge({
+      db: t.db,
+      enqueue: (projectId, scheduleId) => {
+        seenScheduleId = scheduleId;
+        return Promise.resolve(
+          enqueueScheduledTypeIfAbsent(
+            t.db,
+            clock,
+            "board-picker",
+            projectId,
+            scheduleId ? { projectId, scheduleId } : { projectId },
+            { coveredBy: ["queued"] },
+          ),
+        );
+      },
+    });
+    scheduledNudge.start();
+    try {
+      await read("/tmp/p1", []);
+      await read("/tmp/p1", [bead("t1")]);
+      await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    } finally {
+      scheduledNudge.stop();
+    }
+
+    expect(seenScheduleId).toBeDefined();
+    const job = t.db
+      .select()
+      .from(schema.jobs)
+      .all()
+      .find((j) => j.type === "board-picker");
+    expect(JSON.parse(job!.payloadJson as string)).toEqual({
+      projectId: "p1",
+      scheduleId: seenScheduleId,
+    });
+  });
 });
