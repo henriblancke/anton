@@ -3,7 +3,7 @@
  * their job when due and advance lastRun/nextRun; disabled ones never fire; a bad cron doesn't
  * wedge the loop. Uses a fake clock so "due" is deterministic.
  */
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { eq } from "drizzle-orm";
@@ -14,6 +14,7 @@ import {
   createSchedule,
   DEFAULT_SCHEDULES,
   ensureSchedule,
+  runScheduleNow,
   seedDefaultSchedules,
   updateSchedule,
 } from "../schedules";
@@ -155,6 +156,56 @@ describe("Scheduler.tickOnce", () => {
     await tdb.db.update(schema.jobs).set({ status: "done" }).where(eq(schema.jobs.id, "inflight-1"));
     clock.set(base + 60 * 60_000);
     expect(await sched.tickOnce()).toBe(1);
+  });
+
+  /**
+   * PR #264 review: the `inflightKeys` snapshot above is ONE `await`ed read for the whole tick,
+   * taken before any per-schedule transaction. A manual "Run now" fire (schedules.ts's
+   * runScheduleNow) that lands after that snapshot but before this schedule's own insert would be
+   * invisible to it — without a fresh re-check made INSIDE the insert's own transaction, this tick
+   * would insert a second active job for the same (type, project) instead of coalescing onto the
+   * manual one. Proves the tick absorbs that race cleanly: no throw, no duplicate row, nextRunAt
+   * still advances so the slot is not retried forever.
+   */
+  it("absorbs a manual fire that lands in the snapshot-to-insert gap (PR #264 review)", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "nightly-stringer",
+      cron: "0 3 * * *",
+    });
+    clock.set(new Date(2026, 6, 11, 3, 0, 0, 0).getTime());
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    // Simulate the race: the tick's inflight snapshot reads an EMPTY set (nothing in flight yet),
+    // but a concurrent manual fire lands and commits its own job before this tick reaches its insert.
+    const select = tdb.db.select.bind(tdb.db);
+    let injected = false;
+    const selects = vi.spyOn(tdb.db, "select").mockImplementation(((
+      columns?: Record<string, unknown>,
+    ) => {
+      if (!injected && columns && "type" in columns && "projectId" in columns) {
+        injected = true;
+        // Runs synchronously, landing between the tick's batch snapshot and its later per-schedule
+        // insert — exactly the gap the fresh re-check inside that insert's transaction now closes.
+        void runScheduleNow(tdb.db, clock, id);
+      }
+      return select(columns as never);
+    }) as typeof tdb.db.select);
+
+    let count: number;
+    try {
+      count = await sched.tickOnce();
+    } finally {
+      selects.mockRestore();
+    }
+
+    expect(injected).toBe(true);
+    // The tick's own insert lost the race and was absorbed — only the manual fire's job exists.
+    expect(count).toBe(0);
+    expect(jobsFor(tdb, "p1").filter((j) => j.type === "nightly-stringer")).toHaveLength(1);
+    // nextRunAt still advanced, so this slot is not retried forever.
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect((row.nextRunAt as Date).getTime()).toBeGreaterThan(clock.now());
   });
 
   /**

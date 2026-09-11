@@ -1326,6 +1326,47 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
       renderView({}, [], stringer({ enabled: false, nextRunAt: undefined }));
       expect(runNowButton().disabled).toBe(true);
     });
+
+    /**
+     * Codex review (second pass): the optimistic `pendingRun` write only survives if `runNow`
+     * participates in the same in-flight write guard `patchSchedule` uses — otherwise a poll GET
+     * that was ALREADY in flight when the POST landed carries pre-fire data (no `pendingRun`), and
+     * `raced()` would accept it as newer, clearing the optimistic write and re-enabling the button
+     * before the next real poll (up to 30s later) catches up. This pins the fix: a stale poll
+     * response that resolves AFTER a successful runNow must not undo it.
+     */
+    it("ignores a schedules poll that was already in flight when runNow landed", async () => {
+      let resolvePoll!: (body: unknown) => void;
+      const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+        (input, init) => {
+          if (init?.method === "POST") {
+            return Promise.resolve(new Response(JSON.stringify({ jobId: "job-1" }), { status: 200 }));
+          }
+          // The panel's leading poll GET — held open until the test resolves it below, simulating
+          // a request that was already in flight before the POST landed.
+          return new Promise<Response>((resolve) => {
+            resolvePoll = (body: unknown) => resolve(new Response(JSON.stringify(body)));
+          });
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      renderView({}, [], stringer());
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+      fireEvent.click(runNowButton());
+      await waitFor(() => expect(runNowButton().disabled).toBe(true));
+
+      // The stale poll answers AFTER the fire, with no pendingRun (it read the board before the
+      // fire existed) — without the write guard this would win and re-enable the button. Flush the
+      // microtasks the resolved fetch → json() → update() chain runs on, then assert nothing moved.
+      resolvePoll({ schedules: stringer() });
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(runNowButton().disabled).toBe(true);
+    });
   });
 });
 

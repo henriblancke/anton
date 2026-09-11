@@ -42,9 +42,10 @@ export interface AutomationSchedules {
   acceptCadenceOffer: () => Promise<void>;
   declineCadenceOffer: () => Promise<void>;
   /**
-   * Fire one automation's job right now, outside its cron. Toasts success/failure; the row's own
-   * `pendingRun` follows on the panel's next poll tick rather than being forced here — the toast
-   * already confirms the enqueue, and there is no local job id to reconcile against.
+   * Fire one automation's job right now, outside its cron. Toasts success/failure and optimistically
+   * marks the row `pendingRun: "queued"` so the button disables itself without waiting on the next
+   * poll tick (up to 30s) — the next genuine poll (or a settle) overwrites this with server truth
+   * regardless, since `withTimes` assigns `pendingRun` rather than merging it.
    */
   runNow: (id: string) => Promise<void>;
 }
@@ -162,19 +163,31 @@ export function useAutomationSchedules({
   });
 
   async function runNow(id: string) {
+    // Counted at the CALL, like `patchSchedule`'s guard (PR #264 review): a poll's `readSchedules`
+    // can already be in flight when this POST lands, and without this guard that poll's answer —
+    // read before the fire existed — would win the race and overwrite the optimistic `pendingRun`
+    // below with `undefined`, re-enabling the button before the NEXT poll (up to 30s later) catches
+    // up. `raced()` sees this write via `inFlight`/`completed` and drops that stale answer instead.
+    writes.current.inFlight += 1;
     try {
       await postRunNow(slug, id);
       // Optimistic: the button's own `pending` state clears the instant this resolves, but the
       // server truth for `pendingRun` otherwise waits on the next poll tick (up to 30s) — a stale
       // "not firing" would re-enable the button in that window and let a second click send a
-      // redundant request the route only rejects with a 409. The next poll (or a settle) overwrites
-      // this with server truth regardless (see `withTimes` — pendingRun is assigned, never merged).
+      // redundant request the route only rejects with a 409. The next GENUINELY later poll (or a
+      // settle) overwrites this with server truth regardless (see `withTimes` — pendingRun is
+      // assigned, never merged).
       update((p) => ({ ...p, [id]: { ...p[id], pendingRun: "queued" } }));
       toast.success(`${id} started`, {
         description: "Watch its row here — the next poll picks up the fire within 30s.",
       });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : `Failed to run ${id}`);
+    } finally {
+      // In `finally` so a rejected POST also clears the in-flight count — otherwise a failed fire
+      // would leave the counter above zero and silently stop the poll for the rest of the session.
+      writes.current.inFlight -= 1;
+      writes.current.completed += 1;
     }
   }
 
