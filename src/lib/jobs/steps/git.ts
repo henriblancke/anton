@@ -195,6 +195,7 @@ export async function prStep(ctx: StepContext): Promise<StepResultWith<"pr">> {
   ctx.assertLeaseHeld?.();
   const pr = await openPullRequest({
     repoPath: ctx.repoPath,
+    worktreePath: ctx.worktreePath,
     branch: ctx.branch,
     base: ctx.baseBranch,
     title: buildPrTitle(ctx.target, ctx.target.id, ctx.settings.conventionalCommits),

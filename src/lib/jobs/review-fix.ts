@@ -691,7 +691,9 @@ async function commitAndPushFix(
     `${epicId}: address review feedback (PR #${number})`,
   );
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
-  if (pushed) await pushBranch(repo, branch);
+  // From the worktree, not `repo` (the base checkout) — see pushBranch's doc comment: a project's
+  // pre-push hook that inspects the working tree must see the branch actually being pushed.
+  if (pushed) await pushBranch(worktreePath, branch);
   return pushed;
 }
 

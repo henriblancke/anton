@@ -743,8 +743,19 @@ export async function hasRemote(repoPath: string, name = "origin"): Promise<bool
   }
 }
 
-export async function pushBranch(repoPath: string, branch: string): Promise<void> {
-  await git(repoPath, ["push", "-u", "origin", branch]);
+/**
+ * Push `branch` to `origin`, run from `cwd` — the run's WORKTREE when the caller has one, never the
+ * base repo checkout. `git push` itself only needs the shared object database (a worktree and its
+ * base checkout are the same repository), so pushing from either succeeds identically — but a
+ * project's own `pre-push` hook can't tell the difference: a hook that diffs the working tree against
+ * the commits being pushed (a "did you forget to commit a fix" check) reads whatever branch happens
+ * to be checked out at `cwd`. Run from the base repo, that is whatever the last execute-epic run left
+ * it on — unrelated to the branch actually being pushed — so the hook compares two unrelated trees
+ * and fails almost every push. Run from the worktree, `cwd`'s checkout IS the branch being pushed, so
+ * the hook sees what it expects.
+ */
+export async function pushBranch(cwd: string, branch: string): Promise<void> {
+  await git(cwd, ["push", "-u", "origin", branch]);
 }
 
 /**
@@ -1911,6 +1922,12 @@ export async function pullRequestState(
  */
 export async function openPullRequest(opts: {
   repoPath: string;
+  /**
+   * Where `branch` is actually checked out — the run's worktree. Pushed FROM here rather than
+   * `repoPath` (see {@link pushBranch}); `gh` itself still runs against `repoPath`, since it talks to
+   * GitHub, not the working tree. Defaults to `repoPath` for callers with no separate worktree.
+   */
+  worktreePath?: string;
   branch: string;
   base: string;
   title: string;
@@ -1921,7 +1938,7 @@ export async function openPullRequest(opts: {
       `no "origin" remote in ${opts.repoPath}; cannot open a PR. Add a remote or open it manually.`,
     );
   }
-  await pushBranch(opts.repoPath, opts.branch);
+  await pushBranch(opts.worktreePath ?? opts.repoPath, opts.branch);
 
   const existing = await findOpenPullRequest(opts.repoPath, opts.branch);
   if (existing) {
