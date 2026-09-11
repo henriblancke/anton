@@ -345,6 +345,74 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  // PR #263 review, round 4: `core.hooksPath` can come from an `includeIf "onbranch:…"`
+  // conditional (git-config(1)), which resolves against whichever branch is actually checked out
+  // where the query runs. Reading it from repoPath (the base checkout, left on a different branch)
+  // instead of worktreePath silently missed a hooksPath that only applies to the worktree's branch.
+  it("warm: false reads core.hooksPath from an includeIf that only applies to the worktree's branch", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-includeif-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      // The base checkout stays on its default branch throughout — never anton/**, so this
+      // include never applies there, only inside a worktree checked out onto that branch pattern.
+      const includeFile = join(hookRepo, "hooks.gitconfig");
+      writeFileSync(includeFile, "[core]\n\thooksPath = .hooks\n");
+      execFileSync(
+        "git",
+        ["config", `includeIf.onbranch:anton/**.path`, includeFile],
+        { cwd: hookRepo },
+      );
+      mkdirSync(join(hookRepo, ".hooks"), { recursive: true });
+      writeFileSync(join(hookRepo, ".hooks", "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-includeif" });
+      expect(existsSync(join(wt.path, ".hooks", "pre-push"))).toBe(true);
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
+  // PR #263 review, round 4: a slashless hooksPath (no `/` in it at all) is an UNANCHORED gitignore
+  // pattern — it matches at any directory depth, not just the repo root — so writing it bare to
+  // info/exclude would also hide an unrelated nested directory of the same name from `git status`.
+  it("warm: false anchors a slashless core.hooksPath to the repo root, not any depth", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-slashless-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      mkdirSync(join(hookRepo, "packages", "foo", ".githooks"), { recursive: true });
+      writeFileSync(join(hookRepo, "packages", "foo", ".githooks", "wanted"), "keep\n");
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const hooksDir = join(hookRepo, ".githooks");
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", ".githooks"], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-slashless" });
+      expect(existsSync(join(wt.path, ".githooks", "pre-push"))).toBe(true);
+
+      // A real, untracked, nested directory sharing the same bare name — must still surface.
+      mkdirSync(join(wt.path, "packages", "bar", ".githooks"), { recursive: true });
+      writeFileSync(join(wt.path, "packages", "bar", ".githooks", "unrelated"), "x\n");
+
+      const status = execFileSync("git", ["status", "--porcelain"], { cwd: wt.path }).toString();
+      expect(status).toContain("packages/bar/");
+      expect(status).not.toMatch(/^\?\?\s+\.githooks\/?$/m); // the root bridge itself stays hidden
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
   // The guard the unit suite below asserts on, exercised end-to-end: `warm: true` under vitest must
   // never shell out to a real package manager, however installable the checkout looks.
   it("warm: true is a no-op under vitest even with a lockfile present", async () => {

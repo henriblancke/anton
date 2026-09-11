@@ -499,7 +499,12 @@ async function linkRelativeHooksPath(
 ): Promise<void> {
   let rawHooksPath: string;
   try {
-    rawHooksPath = await git(repoPath, ["config", "--get", "core.hooksPath"]);
+    // From worktreePath, not repoPath: `core.hooksPath` can come from an `includeIf
+    // "onbranch:…"` conditional (git-config(1)), which resolves against whichever branch is
+    // actually checked out where the query runs — the worktree's branch, not the base repo's
+    // (PR #263 review, round 4). The worktree already exists by this point (createWorktree's
+    // `git worktree add` ran above), so this reads its real, effective config.
+    rawHooksPath = await git(worktreePath, ["config", "--get", "core.hooksPath"]);
   } catch (e: unknown) {
     // Exit code 1 with no stderr is `git config --get` for an unset key — the common case, nothing
     // to preserve. Anything else (a wedged process, the git() helper's 120s timeout under load) is
@@ -507,7 +512,7 @@ async function linkRelativeHooksPath(
     const code = (e as { code?: unknown }).code;
     if (code !== 1) {
       console.warn(
-        `[worktree] could not read core.hooksPath for ${repoPath} while preparing ${worktreePath}: ` +
+        `[worktree] could not read core.hooksPath for ${worktreePath}: ` +
           `${gitError(e)} — a relative hooksPath, if set, may not be linked into this worktree`,
       );
     }
@@ -600,15 +605,19 @@ async function excludeHooksPath(worktreePath: string, hooksPath: string): Promis
   });
   if (!excludePath) return;
 
-  // Git's exclude-file syntax is line-oriented gitignore patterns — a bare relative path like
-  // `.husky/_` matches exactly that path from the repo root, which is exactly what's wanted here.
+  // Git's exclude-file syntax is line-oriented gitignore patterns, where a pattern with NO slash
+  // matches at any depth (gitignore(5)) — so a single-segment hooksPath like `.githooks` written
+  // bare would also hide an unrelated `packages/foo/.githooks/` from `git status`/`git add -A`
+  // (PR #263 review, round 4). A leading `/` anchors to the repo root regardless of how many
+  // segments hooksPath has, which is what's wanted: only THIS hooks bridge, nowhere else.
+  const pattern = `/${hooksPath}`;
   const existing = await readFile(excludePath, "utf8").catch(() => "");
-  if (existing.split("\n").includes(hooksPath)) return; // already excluded (a prior run)
+  if (existing.split("\n").includes(pattern)) return; // already excluded (a prior run)
 
   await mkdir(dirname(excludePath), { recursive: true }).catch(() => {});
   await writeFile(
     excludePath,
-    `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${hooksPath}\n`,
+    `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${pattern}\n`,
   ).catch((e: unknown) => {
     console.warn(
       `[worktree] could not exclude ${hooksPath} in ${worktreePath}: ${gitError(e)} — ` +
