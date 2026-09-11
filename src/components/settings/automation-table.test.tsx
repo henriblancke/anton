@@ -350,6 +350,33 @@ describe("the automation rows", () => {
     expect(screen.getByText(/^in progress · failed 1d ago$/)).toBeTruthy();
   });
 
+  // Codex review, PR #264: `lastRunAt`/`enqueuedAt` are whole SECONDS (newJobRow's secDate floors
+  // both), so a manual "Run now" fire landing in the same wall-clock second as an EARLIER fire's
+  // settlement stamps an enqueue time numerically equal to that earlier fire's. The `>=` match alone
+  // cannot tell the two apart, and without `pendingRun` overriding it, the new in-flight fire would
+  // wrongly show the OLD, already-settled outcome as its own.
+  it("does not alias a same-second manual rerun onto the previous fire's settled outcome", () => {
+    const sameSec = NOW_SEC() - 5;
+    renderTable({
+      "run-health": {
+        enabled: true,
+        lastRunAt: sameSec,
+        pendingRun: "queued",
+        lastRun: {
+          outcome: "ok",
+          at: sameSec,
+          enqueuedAt: sameSec, // ties lastRunAt to the second — the aliasing case
+          note: "no stalls found",
+        },
+      },
+    });
+
+    // Must read as in-flight (queued, with the older result dated below it), never as the settled
+    // "ok" outcome standing in for the new fire.
+    expect(screen.getByText(/^queued · ok/)).toBeTruthy();
+    expect(screen.queryByText("no stalls found")).toBeNull();
+  });
+
   // Disabling a schedule leaves an already enqueued job queued and unleased (jobs/runner.ts) while
   // preserving `lastRunAt`, so the unsettled reading would otherwise claim a handler is running for
   // as long as the automation stays off.

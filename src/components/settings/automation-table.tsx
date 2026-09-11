@@ -515,6 +515,15 @@ function RunNowButton({
  * for a worker. With no
  * pending job to read (a poll that hasn't landed yet) the switch is all there is, and decides as
  * before.
+ *
+ * `pendingRun` also OVERRIDES the enqueue-time match above, not merely supplements it (PR #264
+ * review): `lastRunAt`/`enqueuedAt` are whole SECONDS (`newJobRow`'s `secDate` floors both), so a
+ * manual "Run now" fire landing in the same wall-clock second as an earlier fire's settlement stamps
+ * an enqueue time equal to that earlier fire's — the `>=` match then can't tell the two apart and
+ * would show the old, already-settled outcome as if it belonged to the new, still-active fire.
+ * `pendingRun` has no such ambiguity: it comes from a direct read of job STATUS
+ * (`pendingRunsBySchedule`), not a timestamp comparison, so whenever it says a fire is queued or
+ * running, that overrides whatever the seconds-precision match concluded.
  */
 function LastRunCell({
   state,
@@ -528,7 +537,12 @@ function LastRunCell({
   if (!state.lastRunAt) return <span className="text-subtle">never</span>;
 
   const previous = state.lastRun;
-  const settled = previous !== undefined && previous.enqueuedAt >= state.lastRunAt;
+  // `pendingRun` overrides the enqueue-time match, not merely supplements it (PR #264 review): both
+  // timestamps are whole SECONDS, so a manual fire landing in the same second as an earlier settle
+  // stamps an enqueue time equal to that earlier fire's, and the `>=` match alone can't tell them
+  // apart. `pendingRun` reads job STATUS directly and has no such ambiguity.
+  const settled =
+    !state.pendingRun && previous !== undefined && previous.enqueuedAt >= state.lastRunAt;
   const style = settled ? OUTCOME_STYLES[previous.outcome] : undefined;
   const held = state.pendingRun !== "running" && !on;
   const pending = held
