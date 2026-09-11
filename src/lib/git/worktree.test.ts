@@ -468,6 +468,36 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  // PR #263 review, round 5: hooksPath is a filesystem path, valid with characters that are
+  // gitignore(5) wildcards (`*`, `?`, `[...]`) or that change how the exclude LINE parses (`!`
+  // negates, `#` comments out). Unescaped, `.hooks[1]` written into info/exclude fails to match its
+  // own literal directory (bracket expression), so the symlink itself would surface in `git status`.
+  it("warm: false escapes gitignore metacharacters in a literal core.hooksPath", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-glob-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const literalName = ".hooks[1]";
+      const hooksDir = join(hookRepo, literalName);
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", literalName], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-glob" });
+      expect(existsSync(join(wt.path, literalName, "pre-push"))).toBe(true);
+
+      const status = execFileSync("git", ["status", "--porcelain"], { cwd: wt.path }).toString();
+      expect(status).toBe(""); // an unescaped `[1]` would leave the symlink itself untracked
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
   // The guard the unit suite below asserts on, exercised end-to-end: `warm: true` under vitest must
   // never shell out to a real package manager, however installable the checkout looks.
   it("warm: true is a no-op under vitest even with a lockfile present", async () => {

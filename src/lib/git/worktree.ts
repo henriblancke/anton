@@ -588,6 +588,19 @@ async function linkRelativeHooksPath(
 }
 
 /**
+ * Escape gitignore(5) pattern metacharacters in a literal path segment so it matches only itself.
+ * `hooksPath` is a filesystem path, valid with characters that are wildcards in exclude-pattern
+ * syntax (`*`, `?`, `[...]`) or that change how the LINE is parsed (`!` negates, `#` comments out,
+ * a trailing space is stripped unless itself escaped) — verified with Git 2.43 that an unescaped
+ * `.hooks[1]` fails to match its own literal directory, and an unescaped `.hooks*` also hides an
+ * unrelated `.hooks-legitimate` (PR #263 review, round 5). Backslash-escaping every such character
+ * makes the pattern match exactly the literal path, nothing more and nothing less.
+ */
+function escapeGitignorePattern(path: string): string {
+  return path.replace(/[\\*?[\]!#]/g, "\\$&").replace(/ +$/, (m) => "\\ ".repeat(m.length));
+}
+
+/**
  * Append the exact `hooksPath` (never a broader prefix — a sibling untracked file under the same
  * parent must still surface in `git status`) to this repo's `info/exclude` once. Best-effort: a
  * failure here still leaves the hooks working, just with a stray untracked entry `git status` would
@@ -610,7 +623,7 @@ async function excludeHooksPath(worktreePath: string, hooksPath: string): Promis
   // bare would also hide an unrelated `packages/foo/.githooks/` from `git status`/`git add -A`
   // (PR #263 review, round 4). A leading `/` anchors to the repo root regardless of how many
   // segments hooksPath has, which is what's wanted: only THIS hooks bridge, nowhere else.
-  const pattern = `/${hooksPath}`;
+  const pattern = `/${escapeGitignorePattern(hooksPath)}`;
   const existing = await readFile(excludePath, "utf8").catch(() => "");
   if (existing.split("\n").includes(pattern)) return; // already excluded (a prior run)
 
