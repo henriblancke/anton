@@ -467,27 +467,28 @@ export async function createWorktree(opts: {
     return { path: await realpath(path), branch, baseBranch, repoPath };
   });
 
-  if (warm) {
-    await warmWorktree(wt, signal);
-  } else {
-    // A cold worktree never runs the install that would otherwise regenerate a relative
-    // `core.hooksPath` (Husky 9's `.husky/_`) — see linkRelativeHooksPath's doc comment.
-    await linkRelativeHooksPath(repoPath, wt.path);
-  }
+  if (warm) await warmWorktree(wt, signal);
+  // Unconditional, not just the `warm: false` branch (PR #263 review): `warmWorktree` itself is
+  // best-effort — no recognized lockfile, or an install that throws — and catches its own failures,
+  // so `warm: true` is no guarantee the install (and the `prepare` script that regenerates a
+  // relative hooksPath) actually ran. linkRelativeHooksPath is a cheap, idempotent no-op once the
+  // link already exists, so re-running it after a real warm costs one `git config --get`.
+  await linkRelativeHooksPath(repoPath, wt.path);
   return wt;
 }
 
 /**
  * A relative `core.hooksPath` (Husky 9's `.husky/_`) is documented to resolve against the
- * directory the hook RUNS in — i.e. per-worktree, not the base repo (git-config(1)). A cold
- * (`warm: false`) worktree, such as review-fix's fix checkout, never runs the install that
- * regenerates that directory, so git silently finds nothing there and every hook — including a
- * project's pre-push gate — is skipped with no warning (PR #263 review). Symlinking the
- * worktree's copy at the base repo's real directory keeps the same hooks active everywhere without
- * touching git config: `git config --worktree core.hooksPath` requires
- * `extensions.worktreeConfig`, which breaks this repo's own stringer `gitlog` collector
- * (anton-uspu) — anton does not touch a repo's git config for that reason. An absolute
- * `core.hooksPath` already resolves identically from every worktree and needs no help.
+ * directory the hook RUNS in — i.e. per-worktree, not the base repo (git-config(1)). A worktree
+ * whose install never ran (`warm: false`, such as review-fix's fix checkout) — or whose install ran
+ * but skipped/failed (no recognized lockfile, or a caught error in warmWorktree) — never regenerates
+ * that directory, so git silently finds nothing there and every hook — including a project's
+ * pre-push gate — is skipped with no warning (PR #263 review). Symlinking the worktree's copy at
+ * the base repo's real directory keeps the same hooks active everywhere without touching git
+ * config: `git config --worktree core.hooksPath` requires `extensions.worktreeConfig`, which breaks
+ * this repo's own stringer `gitlog` collector (anton-uspu) — anton does not touch a repo's git
+ * config for that reason. An absolute `core.hooksPath` already resolves identically from every
+ * worktree and needs no help.
  */
 async function linkRelativeHooksPath(
   repoPath: string,

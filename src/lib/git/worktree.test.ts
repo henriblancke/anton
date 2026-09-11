@@ -194,6 +194,35 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  // PR #263 review (second pass): `warm: true` is no guarantee the install ran — no recognized
+  // lockfile, or (as forced here) the vitest guard in resolveWarmCommand — so the link must not be
+  // gated on `warm: false` alone.
+  it("warm: true also links a relative core.hooksPath when the install itself is a no-op", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-warm-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      const hooksDir = join(hookRepo, ".husky", "_");
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, "pre-push"), `#!/bin/sh\ntrue\n`, { mode: 0o755 });
+      execFileSync("git", ["config", "core.hooksPath", ".husky/_"], { cwd: hookRepo });
+
+      // No lockfile in this repo → resolveWarmCommand returns null even outside vitest's guard —
+      // exactly the "install skipped" case the review flagged, exercised end-to-end via warm: true.
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-warm", warm: true });
+
+      const link = join(wt.path, ".husky", "_");
+      expect(existsSync(join(link, "pre-push"))).toBe(true);
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
   // An absolute core.hooksPath already resolves identically from every worktree (git-config(1)) —
   // linking it would be pointless and risks colliding with a tracked directory of the same name.
   it("warm: false leaves an absolute core.hooksPath untouched", async () => {
