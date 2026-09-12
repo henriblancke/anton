@@ -888,6 +888,92 @@ suite("resolveHooksPathOverride (real git)", () => {
     expectDisablesHooks(await resolveHooksPathOverride(repo, worktree));
   });
 
+  // Finding A (PR #263 review, round 29): `core.hooksPath=deps/hooks` names a path NESTED inside the
+  // submodule gitlink `deps`, not the gitlink itself. `git submodule status` only ever reports a line
+  // for the gitlink PATH (`deps`), never for a path nested inside one (`deps/hooks`) — so
+  // `checkedOutSubmoduleSha(worktreePath, "deps/hooks")` always comes back `checkedOut: false`, making
+  // round 28's staleness check a silent no-op for this shape. The containing gitlink `deps` must be
+  // validated instead, via `ancestorSubmoduleSha`, the same helper the nested-uninitialized case
+  // already uses.
+  it("does not trust a nested hooksPath's initialized-but-stale containing submodule", async () => {
+    const submoduleUpstream = join(sandbox, "nested-hooks-submodule-upstream-initialized-stale");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    mkdirSync(join(submoduleUpstream, "hooks"));
+    writeFileSync(join(submoduleUpstream, "hooks", "pre-push"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+    const v1Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(submoduleUpstream, "hooks", "pre-push"), "v2\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v2"], { stdio: "ignore" });
+    const v2Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "deps",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "-C", "deps", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "deps"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add deps submodule at v1"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "deps/hooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-nested-initialized-stale-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-10", worktree, "main"],
+      { stdio: "ignore" },
+    );
+    // Initialize `deps` in the worktree — a real, populated v1 checkout.
+    execFileSync(
+      "git",
+      ["-C", worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "deps"],
+      { stdio: "ignore" },
+    );
+    expect(readFileSync(join(worktree, "deps", "hooks", "pre-push"), "utf8")).toBe("v1\n");
+
+    // Advance the WORKTREE's own branch to bump the gitlink to v2 without re-running `submodule
+    // update` — leaving the checkout at v1 while the worktree's own current HEAD now records v2.
+    execFileSync("git", ["-C", worktree, "-C", "deps", "checkout", "-q", v2Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "add", "deps"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "bump deps submodule to v2"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", worktree, "-C", "deps", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    expect(
+      execFileSync("git", ["-C", worktree, "rev-parse", "HEAD:deps"], { encoding: "utf8" }).trim(),
+    ).toBe(v2Sha);
+    expect(readFileSync(join(worktree, "deps", "hooks", "pre-push"), "utf8")).toBe("v1\n");
+
+    // A real, populated `deps/hooks` exists on disk at v1 — must not be silently trusted just because
+    // `checkedOutSubmoduleSha(worktreePath, "deps/hooks")` finds no exact-path match for the nested
+    // value.
+    expectDisablesHooks(await resolveHooksPathOverride(repo, worktree));
+  });
+
   // A hooksPath NESTED inside a submodule (`core.hooksPath=deps/hooks`, `deps` the gitlink) has no
   // tree entry of its own in the superproject at all — only `deps` itself is recorded — so it can't
   // be probed directly the way a hooksPath that IS a gitlink can. Without walking up to find the
@@ -1313,6 +1399,93 @@ suite("resolveHooksPathOverride (real git)", () => {
     writeFileSync(join(repo, ".hooks", "post-commit"), "#!/bin/sh\nexit 0\n");
 
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, ".hooks"));
+  });
+
+  // Finding B (PR #263 review, round 29): the worktree-scoped early return above must preserve "never
+  // falls back to the base repo" without also meaning "never validated". A worktree-scoped hooksPath
+  // naming an initialized-but-now-stale submodule must still come back disabled, not silently reused
+  // as if it were current, and must never resolve to the base repo's copy either.
+  it("does not silently reuse a stale worktree-scoped submodule hooksPath", async () => {
+    const submoduleUpstream = join(sandbox, "worktree-scoped-stale-submodule-upstream");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-push"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+    const v1Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(submoduleUpstream, "pre-push"), "v2\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v2"], { stdio: "ignore" });
+    const v2Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "hooks",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "-C", "hooks", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule at v1"], {
+      stdio: "ignore",
+    });
+    // A directory of the same name in the BASE repo, at v2 — must never be reachable for a
+    // worktree-scoped value, staleness aside.
+    execFileSync("git", ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "hooks"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "-C", "hooks", "checkout", "-q", v2Sha], { stdio: "ignore" });
+
+    execFileSync("git", ["-C", repo, "config", "extensions.worktreeConfig", "true"], {
+      stdio: "ignore",
+    });
+    const worktree = join(sandbox, "worktree-scoped-stale-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-11", worktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", worktree, "config", "--worktree", "core.hooksPath", "hooks"], {
+      stdio: "ignore",
+    });
+    // Initialize `hooks` in the worktree at v1, then bump the worktree's own HEAD to v2 without
+    // re-running `submodule update` — a real, populated but now-stale checkout.
+    execFileSync(
+      "git",
+      ["-C", worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "hooks"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", worktree, "-C", "hooks", "checkout", "-q", v2Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "add", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "bump hooks submodule to v2"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", worktree, "-C", "hooks", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    expect(readFileSync(join(worktree, "hooks", "pre-push"), "utf8")).toBe("v1\n");
+
+    const resolved = await resolveHooksPathOverride(repo, worktree);
+    expectDisablesHooks(resolved);
+    expect(resolved).not.toBe(join(repo, "hooks"));
+    expect(resolved).not.toBe(join(worktree, "hooks"));
   });
 
   // A quoted core.hooksPath keeps leading/trailing whitespace verbatim (git-config(1)) — the shared

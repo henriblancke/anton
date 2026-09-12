@@ -98,6 +98,23 @@ async function readHooksPathConfig(
  * leave it in effect and run its stale hook; the sentinel forces hooks off for real instead
  * (PR #263 review, round 28).
  *
+ * Round 28's staleness check had two gaps of its own, both closed in round 29 (PR #263 review):
+ *
+ * - It queried `checkedOutSubmoduleSha(worktreePath, raw)` only for `raw` itself being the gitlink.
+ *   A hooksPath NESTED inside an initialized submodule (`core.hooksPath=deps/hooks`, `deps` the
+ *   gitlink) always came back `checkedOut: false` from that call — `git submodule status` reports a
+ *   line per gitlink PATH, never for a path nested inside one — so the check silently no-op'd for
+ *   every nested hooksPath instead of validating the CONTAINING gitlink's checkout. It now falls
+ *   through to {@link ancestorSubmoduleSha} for that shape, the same helper already used below for
+ *   the uninitialized-nested case.
+ * - `scope === "worktree"` returned `inWorktree` unconditionally before any staleness check ever ran,
+ *   reusing a stale worktree-scoped submodule checkout as if it were fine. "Never falls back to the
+ *   base repo" (the real invariant a worktree-scoped value carries) and "never gets validated" are
+ *   different properties that an earlier round conflated into one early return; `isWorktreeScoped` is
+ *   now threaded through every branch instead, so a worktree-scoped hooksPath runs the same staleness
+ *   checks as a repo-scoped one and only ever substitutes `inWorktree` where this function would
+ *   otherwise resolve to the base repo's copy.
+ *
  * Four things this must get right:
  *
  * 1. **Read from the worktree, not the base repo.** `core.hooksPath` can come from a shared config
@@ -169,12 +186,20 @@ export async function resolveHooksPathOverride(
   // A `worktree`-scoped value (`git config --worktree core.hooksPath …`, requires
   // `extensions.worktreeConfig`) is deliberately PRIVATE to this checkout — git-config(1) documents
   // `--worktree` as exactly that, distinct from `local`'s repo-wide config file that every linked
-  // worktree already inherits. Falling back to the base repo's copy for a missing worktree-scoped
-  // path would run a hook this worktree specifically opted out of by choosing its own value, possibly
-  // a same-named directory that exists in the base repo for an unrelated reason (PR #263 review,
-  // round 11) — so a worktree-scoped value NEVER falls back; a missing worktree-scoped hooksPath
-  // means git itself would fire no hook here either, and this returns that same nonexistent path.
-  if (scope === "worktree") return inWorktree;
+  // worktree already inherits. That privacy means this function must NEVER resolve a worktree-scoped
+  // value to the base repo's copy — possibly a same-named directory that exists there for an
+  // unrelated reason (PR #263 review, round 11); a missing worktree-scoped hooksPath means git itself
+  // would fire no hook here either, and `inWorktree` (however nonexistent) is that same answer.
+  //
+  // It does NOT mean skipping the staleness checks below, though: a worktree-scoped hooksPath naming
+  // an initialized-but-now-stale submodule is exactly as capable of pointing at stale content as a
+  // repo-scoped one. An earlier round's unconditional `return inWorktree` here answered the "where"
+  // question correctly but skipped the "is it safe" question entirely, reusing a stale worktree-scoped
+  // checkout as if it were fine (PR #263 review, round 29). `isWorktreeScoped` is threaded through
+  // every branch below instead — mirroring {@link resolveHooksPathOverrideForMerge}'s own
+  // `isWorktreeScoped`/`verifiedSource` pattern — substituting `inWorktree` only where this function
+  // would otherwise resolve to the base repo's copy, never as a way to skip validation.
+  const isWorktreeScoped = scope === "worktree";
 
   // A DIRECTORY, never merely "exists": `.git` is git's one built-in relative core.hooksPath value
   // that is a real directory in the base repo but a plain FILE in every linked worktree (a "gitfile"
@@ -191,14 +216,16 @@ export async function resolveHooksPathOverride(
   // no-match exit 1 those helpers otherwise rely on), which would otherwise make them throw and abort
   // every commit/push using such a path (PR #263 review). Detected up front, before either probe ever
   // runs: it is never "tracked" or "a submodule" by definition, so this falls straight to the base
-  // repo's copy, the only sensible source for a shared directory that lives outside either checkout.
+  // repo's copy for a repo-scoped value — the only sensible source for a shared directory that lives
+  // outside either checkout — or to `inWorktree` for a worktree-scoped one, per the never-falls-back
+  // guard above (PR #263 review, round 29).
   const rel = relative(repoPath, resolve(repoPath, raw));
   // `rel === ".."` or a `..` SEGMENT (`..${sep}`) means real traversal; a bare `startsWith("..")`
   // would also match a same-level name that merely begins with two dots, like `..hooks` — a valid
   // directory name path.relative can legitimately return unchanged (PR #263 review, round 4).
   const escapesRepo = rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
   if (escapesRepo && existsSync(inWorktree) && statSync(inWorktree).isDirectory()) return inWorktree;
-  if (escapesRepo) return resolve(repoPath, raw);
+  if (escapesRepo) return isWorktreeScoped ? inWorktree : resolve(repoPath, raw);
 
   // A DIRECTORY THAT IS ACTUALLY AN UNINITIALIZED SUBMODULE is the other case `isDirectory()` alone
   // can't tell apart: `git worktree add` materializes a submodule's gitlink entry as a real, empty
@@ -212,42 +239,68 @@ export async function resolveHooksPathOverride(
   // that rather than misreading it as "not a submodule" and silently accepting the broken worktree
   // copy — PR #263 review, round 14).
   //
-  // The base repo's copy is trusted as a substitute only when `baseSubmoduleMatches` confirms it is
-  // BOTH initialized AND checked out at the EXACT commit this worktree's tree records for the
-  // gitlink — never merely "initialized somewhere". A feature branch may have bumped the gitlink to
-  // a newer commit than whatever the base repo's own checkout happens to sit at (nothing keeps them
-  // in lockstep), and running that STALE commit's hooks — silently missing a gate it added, or
-  // applying behavior it deliberately changed — is worse than running none. A mismatch or an
-  // uninitialized base copy falls through to the worktree's own (still empty) path instead, so no
-  // hook fires at all rather than an outdated one (PR #263 review, round 18).
+  // The base repo's copy is trusted as a substitute only when it is REPO-scoped AND
+  // `baseSubmoduleMatches` confirms the base is BOTH initialized AND checked out at the EXACT commit
+  // this worktree's tree records for the gitlink — never merely "initialized somewhere". A
+  // worktree-scoped value never resolves to the base repo regardless of whether it matches (the
+  // never-falls-back guard above), so it gets `inWorktree`'s empty placeholder instead, the same "no
+  // hook fires" answer as an unmatched repo-scoped one (PR #263 review, round 29). A feature branch
+  // may have bumped the gitlink to a newer commit than whatever the base repo's own checkout happens
+  // to sit at (nothing keeps them in lockstep), and running that STALE commit's hooks — silently
+  // missing a gate it added, or applying behavior it deliberately changed — is worse than running none
+  // (PR #263 review, round 18).
   if (existsSync(inWorktree) && statSync(inWorktree).isDirectory()) {
     const submoduleSha = await uninitializedSubmoduleSha(worktreePath, raw);
-    if (submoduleSha && (await baseSubmoduleMatches(repoPath, raw, submoduleSha))) {
-      return resolve(repoPath, raw);
+    if (submoduleSha) {
+      if (!isWorktreeScoped && (await baseSubmoduleMatches(repoPath, raw, submoduleSha))) {
+        return resolve(repoPath, raw);
+      }
+      return inWorktree;
     }
-    if (!submoduleSha) {
-      // Not the uninitialized ("-") case above — either an ordinary tracked directory (real content
-      // of its own, safe to trust as `inWorktree` unconditionally, same as always) or an INITIALIZED
-      // submodule whose checkout has gone STALE: a fast-forward that just advanced this worktree's
-      // own branch (bringing the gitlink along) never re-runs `submodule update` on its own, so an
-      // already-initialized checkout can silently disagree with what the CURRENT tree (this
-      // worktree's own HEAD, right now — not an incoming ref; that's resolveHooksPathOverrideForMerge's
-      // job) actually records for the gitlink (PR #263 review, round 28). `checkedOutSubmoduleSha`
-      // tells the two apart (`checkedOut: false, sha: undefined` only for a path naming no submodule
-      // at all); `ancestorSubmoduleSha`'s default `rev = "HEAD"` gets the gitlink's CURRENT expected
-      // commit to compare the checkout against.
-      const checkedOut = await checkedOutSubmoduleSha(worktreePath, raw);
-      if (checkedOut.checkedOut) {
-        const current = await ancestorSubmoduleSha(worktreePath, raw);
-        if (current && checkedOut.sha !== current.sha) {
-          // Stale, not merely absent: unlike the uninitialized case above, `inWorktree` here is a
-          // real, populated checkout — just of the WRONG commit — so returning it as this function's
-          // usual "empty placeholder, no hook fires" signal would actually run that stale content's
-          // hook. Worse than running none, the same reasoning round 18 already applied to a stale
-          // BASE-repo copy; a stale WORKTREE copy is no safer. `disabledHooksPath` forces hooks off
-          // for real instead of handing back a path that still resolves to something.
-          return disabledHooksPath();
-        }
+
+    // Not the uninitialized ("-") case above — either an ordinary tracked directory (real content
+    // of its own, safe to trust as `inWorktree` unconditionally, same as always) or an INITIALIZED
+    // submodule whose checkout has gone STALE against the current tree (this worktree's own HEAD,
+    // right now — not an incoming ref; that's resolveHooksPathOverrideForMerge's job). A
+    // fast-forward that just advanced this worktree's own branch (bringing the gitlink along) never
+    // re-runs `submodule update` on its own, so an already-initialized checkout can silently disagree
+    // with what the CURRENT tree actually records for the gitlink (PR #263 review, round 28).
+    //
+    // Two shapes need separate handling here, because `git submodule status` only ever reports a
+    // line for the gitlink PATH itself, never for a path nested inside one (PR #263 review, round
+    // 29):
+    //
+    // - `raw` IS the gitlink: `checkedOutSubmoduleSha(worktreePath, raw)` finds it directly, and
+    //   `ancestorSubmoduleSha(worktreePath, raw)` (default `rev = "HEAD"`, matching `raw` itself
+    //   first in its ancestor walk) gets the gitlink's CURRENT expected commit to compare the
+    //   checkout against.
+    // - `raw` is NESTED inside the gitlink (`core.hooksPath=deps/hooks`, `deps` the gitlink): the
+    //   direct query above always comes back `checkedOut: false` — not because nothing is checked
+    //   out, but because `raw` itself names no submodule at all, the same "no match" answer
+    //   `checkedOutSubmoduleSha` gives an ordinary directory — so validating `raw` directly is a
+    //   silent no-op for this shape. Falling through to `ancestorSubmoduleSha(worktreePath, raw)`
+    //   instead finds the CONTAINING gitlink (the same helper the nested-uninitialized case below
+    //   already uses), and it is THAT gitlink's actual checkout — queried via
+    //   `checkedOutSubmoduleSha(worktreePath, containing.submodulePath)` — that must be compared
+    //   against what the current tree now records for it, not `raw`'s own (nonexistent) submodule
+    //   status.
+    const checkedOut = await checkedOutSubmoduleSha(worktreePath, raw);
+    if (checkedOut.checkedOut) {
+      const current = await ancestorSubmoduleSha(worktreePath, raw);
+      if (current && checkedOut.sha !== current.sha) {
+        // Stale, not merely absent: unlike the uninitialized case above, `inWorktree` here is a
+        // real, populated checkout — just of the WRONG commit — so returning it as this function's
+        // usual "empty placeholder, no hook fires" signal would actually run that stale content's
+        // hook. Worse than running none, the same reasoning round 18 already applied to a stale
+        // BASE-repo copy; a stale WORKTREE copy is no safer. `disabledHooksPath` forces hooks off
+        // for real instead of handing back a path that still resolves to something.
+        return disabledHooksPath();
+      }
+    } else {
+      const containing = await ancestorSubmoduleSha(worktreePath, raw);
+      if (containing) {
+        const actual = await checkedOutSubmoduleSha(worktreePath, containing.submodulePath);
+        if (!actual.checkedOut || actual.sha !== containing.sha) return disabledHooksPath();
       }
     }
     return inWorktree;
@@ -263,25 +316,31 @@ export async function resolveHooksPathOverride(
   // completely unconditionally: none of round 18's staleness verification ever runs, because that
   // logic only ever triggers for a hooksPath that IS itself a gitlink. `ancestorSubmoduleSha` finds
   // the nearest containing gitlink so the exact same base-must-match-worktree check applies to a
-  // nested path too (PR #263 review, round 20).
+  // nested path too (PR #263 review, round 20) — and, per the never-falls-back guard above, a
+  // worktree-scoped value gets `inWorktree` here regardless of whether the base matches, without even
+  // spending the `baseSubmoduleMatches` call to find out (PR #263 review, round 29).
   const containing = await ancestorSubmoduleSha(worktreePath, raw);
   if (containing) {
-    const matches = await baseSubmoduleMatches(repoPath, containing.submodulePath, containing.sha);
+    const matches =
+      !isWorktreeScoped &&
+      (await baseSubmoduleMatches(repoPath, containing.submodulePath, containing.sha));
     return matches ? resolve(repoPath, raw) : inWorktree;
   }
 
   // Missing in the worktree — fall back to the base repo's copy only when NEITHER checkout has ever
-  // tracked it (a generated directory like Husky's `.husky/_`, never committed at all). Either
-  // checkout tracking it — now or at any point in its own history — means the worktree's branch
-  // deleted or moved a REAL hooks directory on purpose, and `inWorktree` is still the right answer:
-  // git runs no hook for a configured `core.hooksPath` that doesn't exist. `isTrackedInBaseRepo`
-  // alone is not enough: the base checkout's index has no record of a directory this FEATURE branch
-  // introduced and later deleted entirely — never present on base at all — which would otherwise be
-  // indistinguishable from one that was always generated (PR #263 review, round 15); `everTrackedOnBranch`
-  // catches that case by walking the worktree's own history instead of only its current index.
+  // tracked it (a generated directory like Husky's `.husky/_`, never committed at all) AND the value
+  // isn't worktree-scoped, which never falls back to the base repo regardless (the never-falls-back
+  // guard above; PR #263 review, round 29). Either checkout tracking it — now or at any point in its
+  // own history — means the worktree's branch deleted or moved a REAL hooks directory on purpose, and
+  // `inWorktree` is still the right answer: git runs no hook for a configured `core.hooksPath` that
+  // doesn't exist. `isTrackedInBaseRepo` alone is not enough: the base checkout's index has no record
+  // of a directory this FEATURE branch introduced and later deleted entirely — never present on base
+  // at all — which would otherwise be indistinguishable from one that was always generated (PR #263
+  // review, round 15); `everTrackedOnBranch` catches that case by walking the worktree's own history
+  // instead of only its current index.
   const trackedSomewhere =
     (await isTrackedInBaseRepo(repoPath, raw)) || (await everTrackedOnBranch(worktreePath, raw));
-  return trackedSomewhere ? inWorktree : resolve(repoPath, raw);
+  return trackedSomewhere || isWorktreeScoped ? inWorktree : resolve(repoPath, raw);
 }
 
 /**
@@ -350,12 +409,27 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
  * under a real tree, and a gitlink is a dead end to `ls-tree -r` by design (it does not recurse into
  * submodules) — checking each ancestor path individually is what correctly finds a gitlink at any
  * depth, not just an immediate parent.
+ *
+ * `rev` is verified with `rev-parse --verify --quiet` before `ls-tree` ever runs: an UNBORN branch
+ * (a brand-new worktree/repo with no commits yet — `HEAD` exists as a ref but resolves to nothing)
+ * makes `ls-tree HEAD` fail with exit 128 ("Not a valid object name HEAD"), not the exit-1 no-match
+ * this function otherwise relies on to mean "not a submodule". Round 29's staleness check reaches
+ * this helper for an ORDINARY tracked directory too now (not only a confirmed submodule shape), so an
+ * unborn `rev` must read as "no containing gitlink exists yet" rather than propagate and abort the
+ * caller (PR #263 review, round 29).
  */
 async function ancestorSubmoduleSha(
   worktreePath: string,
   relPath: string,
   rev = "HEAD",
 ): Promise<{ submodulePath: string; sha: string } | undefined> {
+  try {
+    await execFileAsync("git", ["-C", worktreePath, "rev-parse", "--verify", "--quiet", rev], {
+      timeout: 120_000,
+    });
+  } catch {
+    return undefined;
+  }
   let candidate = posixNormalize(relPath);
   while (candidate !== "." && candidate !== "/") {
     const { stdout } = await execFileAsync(
