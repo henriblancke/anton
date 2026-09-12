@@ -1637,6 +1637,123 @@ suite("needsHooksPathOverrideForMerge (real git)", () => {
     ).resolves.toBe(join(repo, "hooks"));
   });
 
+  // `ref` may not exist at all — the caller's own fetch of it can be best-effort — and this must not
+  // throw when it doesn't: needsHooksPathOverrideForMerge already answers `true` for exactly this
+  // case, so resolveHooksPathOverrideForMerge is called next, and its own `ls-tree ref` would
+  // otherwise fail OUTSIDE the safe() boundary the only caller wraps the merge in, aborting the whole
+  // review-fix run rather than merely skipping the now-moot override (PR #263 review, round 22).
+  it("resolveHooksPathOverrideForMerge returns undefined rather than throwing when ref does not exist", async () => {
+    execFileSync("git", ["-C", worktree, "config", "core.hooksPath", ".githooks"], {
+      stdio: "ignore",
+    });
+    // A ref that has genuinely never existed anywhere reachable from this worktree — unlike
+    // `origin/feature`, which the outer `beforeEach` already pushed and which every worktree here
+    // shares via the common `.git`.
+    await expect(
+      resolveHooksPathOverrideForMerge(repo, worktree, "origin/never-pushed-branch"),
+    ).resolves.toBeUndefined();
+  });
+
+  // The nested-hooksPath counterpart to the "returns undefined rather than a stale value" test
+  // above: when `core.hooksPath` points INSIDE a submodule (`deps/hooks`) and the incoming ref
+  // advances the containing gitlink, ls-tree has no direct entry for `deps/hooks` at all (the
+  // superproject's tree never records anything below a gitlink) — this must run the SAME
+  // ancestor-submodule staleness check the direct-submodule case gets, not delegate straight to
+  // resolveHooksPathOverride (the current-tree resolver, wrong question for a merge) just because
+  // the no-entry shape looks identical to a generated directory's (PR #263 review, round 22).
+  it("resolveHooksPathOverrideForMerge validates a nested hooksPath against the incoming ref rather than delegating to the current-tree resolver", async () => {
+    const submoduleUpstream = join(sandbox, "nested-hooks-submodule-upstream-merge-value");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    mkdirSync(join(submoduleUpstream, "hooks"));
+    writeFileSync(join(submoduleUpstream, "hooks", "post-merge"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+    const v1Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(submoduleUpstream, "hooks", "post-merge"), "v2\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v2"], { stdio: "ignore" });
+    const v2Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "deps",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "-C", "deps", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "deps"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add deps at v1"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "main"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "deps/hooks"], { stdio: "ignore" });
+
+    // `feature` bumps deps to v2 and is pushed.
+    execFileSync("git", ["-C", repo, "checkout", "-q", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "-C", "deps", "checkout", "-q", v2Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "deps"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "bump deps to v2"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "checkout", "-q", "main"], { stdio: "ignore" });
+    // Checking out branches never touches a submodule's own working directory — restore the base
+    // repo's own checkout back to v1, matching what main's tree actually records.
+    execFileSync("git", ["-C", repo, "-C", "deps", "checkout", "-q", v1Sha], { stdio: "ignore" });
+
+    // The review worktree is cut from main (still at v1) and initializes deps there —
+    // self-consistent right now (its own gitlink and checkout both agree on v1).
+    const nestedMergeWorktree = join(sandbox, "worktree-nested-merge-value");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-12", nestedMergeWorktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      [
+        "-C",
+        nestedMergeWorktree,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "deps",
+      ],
+      { stdio: "ignore" },
+    );
+    expect(readFileSync(join(nestedMergeWorktree, "deps", "hooks", "post-merge"), "utf8")).toBe(
+      "v1\n",
+    );
+    execFileSync("git", ["-C", nestedMergeWorktree, "fetch", "-q", "origin", "feature"], {
+      stdio: "ignore",
+    });
+
+    await expect(
+      needsHooksPathOverrideForMerge(repo, nestedMergeWorktree, "origin/feature"),
+    ).resolves.toBe(true);
+    await expect(
+      resolveHooksPathOverrideForMerge(repo, nestedMergeWorktree, "origin/feature"),
+    ).resolves.toBeUndefined();
+  });
+
   // A plain tracked directory (never a submodule) must keep returning `false` when `ref` carries it:
   // git's native per-worktree hooksPath resolution already gets this right once the merge lands, and
   // the submodule-specific staleness check above must not misfire for an ordinary path just because

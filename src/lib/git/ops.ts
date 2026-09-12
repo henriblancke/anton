@@ -625,6 +625,20 @@ export async function resolveHooksPathOverrideForMerge(
   const rel = relative(repoPath, resolve(repoPath, raw));
   if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return resolve(repoPath, raw);
 
+  // `ref` itself may not exist: the caller's own fetch of it can be best-effort, so a missing
+  // remote-tracking ref reaching this function is expected input, not exceptional — the same reason
+  // {@link needsHooksPathOverrideForMerge} guards its own `ls-tree` call the identical way. Without
+  // this, a failed sync fetch would make `ls-tree` below throw OUTSIDE the `safe()` boundary this
+  // function's only caller wraps its merge in, aborting the whole review-fix run instead of merely
+  // skipping the override the failed sync already made moot (PR #263 review, round 22).
+  try {
+    await execFileAsync("git", ["-C", worktreePath, "rev-parse", "--verify", "--quiet", ref], {
+      timeout: 120_000,
+    });
+  } catch {
+    return undefined; // ref doesn't exist (or is unreadable) — no override to resolve either way
+  }
+
   const { stdout } = await execFileAsync(
     "git",
     ["-C", worktreePath, "ls-tree", ref, "--", `:(literal)${raw}`],
@@ -632,15 +646,9 @@ export async function resolveHooksPathOverrideForMerge(
   );
   const entry = stdout.split("\n")[0] ?? "";
   const tab = entry.indexOf("\t");
-  if (tab === -1) {
-    // `ref` doesn't carry `raw` at all — a GENERATED directory (Husky's `.husky/_`), never tracked by
-    // any ref, exactly the case `resolveHooksPathOverride`'s tracked-somewhere fallback already
-    // handles correctly and without any ref-specific reasoning (a generated path's status doesn't
-    // depend on which ref is about to land) — reuse it rather than duplicate that logic.
-    return resolveHooksPathOverride(repoPath, worktreePath);
-  }
-  const [mode, , incomingSha] = entry.slice(0, tab).split(" ");
-  if (mode !== "160000") {
+  const [mode, , incomingSha] = tab === -1 ? [] : entry.slice(0, tab).split(" ");
+
+  if (tab !== -1 && mode !== "160000") {
     // A plain tracked directory or file: git's native per-worktree resolution (≥ 2.43) gets this
     // right once the merge lands. No override needed at all — but `needsHooksPathOverrideForMerge`
     // already said one was, so this is reached only when its OWN answer disagreed for a different
@@ -648,13 +656,19 @@ export async function resolveHooksPathOverrideForMerge(
     return undefined;
   }
 
-  const baseMatchesDirect = incomingSha ? await baseSubmoduleMatches(repoPath, raw, incomingSha) : false;
+  const baseMatchesDirect =
+    tab !== -1 && incomingSha ? await baseSubmoduleMatches(repoPath, raw, incomingSha) : false;
   if (baseMatchesDirect) return resolve(repoPath, raw);
 
-  // The direct submodule check failed (or the hooksPath is nested — findable only by walking up from
-  // `ref`'s own tree). Either way, a nested hooksPath needs `ancestorSubmoduleSha` run against `ref`
-  // specifically — the incoming tree's structure, not the worktree's current one — to find what
-  // gitlink contains it.
+  // Either the direct submodule check failed, OR `raw` had no tree entry of its own at all — the
+  // NESTED case (`deps/hooks`, where `ref`'s tree records only `deps`), which must run this same
+  // ancestor check rather than falling straight through to `resolveHooksPathOverride` (the
+  // current-tree resolver, wrong question for a merge — see this function's own docstring): a nested
+  // hooksPath whose containing submodule the incoming ref bumped is exactly as capable of pointing at
+  // stale content as a hooksPath that IS itself the gitlink, and skipping this check here would read
+  // "no direct tree entry" as proof of "generated, safe to ask the current-tree resolver" when it
+  // might just as easily mean "nested inside a submodule ref is about to move"
+  // (PR #263 review, round 22).
   const containing = await ancestorSubmoduleSha(worktreePath, raw, ref);
   if (containing) {
     const baseMatchesContaining = await baseSubmoduleMatches(
@@ -662,13 +676,23 @@ export async function resolveHooksPathOverrideForMerge(
       containing.submodulePath,
       containing.sha,
     );
-    if (baseMatchesContaining) return resolve(repoPath, raw);
+    return baseMatchesContaining ? resolve(repoPath, raw) : undefined;
   }
 
-  // No source is verified to match what `ref` will actually check out: neither the base repo's
-  // copy nor (implicitly, since this function was only reached because an override was needed)
-  // the worktree's own. Omitting the override is the safe choice — no hook fires, rather than one
-  // built from stale content.
+  if (tab === -1) {
+    // No containing gitlink anywhere in `ref`'s tree either — a GENERATED directory (Husky's
+    // `.husky/_`), never tracked by any ref at all, exactly the case `resolveHooksPathOverride`'s
+    // tracked-somewhere fallback already handles correctly and without any ref-specific reasoning (a
+    // generated path's status doesn't depend on which ref is about to land) — reuse it rather than
+    // duplicate that logic.
+    return resolveHooksPathOverride(repoPath, worktreePath);
+  }
+
+  // `raw` itself is a submodule gitlink (mode 160000, tab !== -1) whose direct AND ancestor checks
+  // both failed to find a verified match. No source is confirmed to match what `ref` will actually
+  // check out: neither the base repo's copy nor (implicitly, since this function was only reached
+  // because an override was needed) the worktree's own. Omitting the override is the safe choice —
+  // no hook fires, rather than one built from stale content.
   return undefined;
 }
 
