@@ -773,6 +773,21 @@ suite("needsHooksPathOverrideForMerge (real git)", () => {
       needsHooksPathOverrideForMerge(repo, worktree, "origin/feature"),
     ).resolves.toBe(true);
   });
+
+  // The caller's own fetch of `ref` can be best-effort (swallowed and continued past on failure), so
+  // a missing remote-tracking ref reaching this function is an expected input, not a bug to surface —
+  // `ls-tree` rejects a missing tree-ish outright (exit 128), which would otherwise throw here for an
+  // ordinary, correctly-configured relative hooksPath and abort the caller's whole run (PR #263
+  // review, round 12).
+  it("returns true without throwing when ref does not exist (e.g. a failed fetch)", async () => {
+    execFileSync("git", ["-C", worktree, "config", "core.hooksPath", ".githooks"], {
+      stdio: "ignore",
+    });
+    // Deliberately no fetch: origin/feature was never created in this worktree.
+    await expect(
+      needsHooksPathOverrideForMerge(repo, worktree, "origin/feature"),
+    ).resolves.toBe(true);
+  });
 });
 
 /**

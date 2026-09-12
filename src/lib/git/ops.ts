@@ -200,6 +200,15 @@ async function isTrackedInBaseRepo(repoPath: string, relPath: string): Promise<b
  * so it is detected up front, the same way and for the same reason as
  * {@link resolveHooksPathOverride}'s own escape check (PR #263 review, round 9: the check added
  * there does not cover this separate `ls-tree` probe).
+ *
+ * `ref` itself may not exist: a caller's own fetch of it can be best-effort (wrapped in a
+ * swallow-and-continue helper upstream), so a missing remote-tracking ref reaching this function is
+ * an expected, not exceptional, input — `ls-tree` rejects a missing `<tree-ish>` outright (exit 128,
+ * same failure shape as the `..`-escape above), which would otherwise throw here even for an
+ * ordinary, correctly-configured relative hooksPath, breaking every review-fix run whose sync fetch
+ * happened to fail (PR #263 review, round 12). Checked with `rev-parse --verify` before ever running
+ * `ls-tree`; a missing ref answers `true` (override needed) — harmless, since the merge this decision
+ * feeds is about to fail on the same missing ref anyway, through its own best-effort handling.
  */
 export async function needsHooksPathOverrideForMerge(
   repoPath: string,
@@ -221,6 +230,14 @@ export async function needsHooksPathOverrideForMerge(
 
   const rel = relative(repoPath, resolve(repoPath, raw));
   if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return true; // never ref-trackable
+
+  try {
+    await execFileAsync("git", ["-C", worktreePath, "rev-parse", "--verify", "--quiet", ref], {
+      timeout: 120_000,
+    });
+  } catch {
+    return true; // ref doesn't exist (or is unreadable) — nothing for it to track either way
+  }
 
   const { stdout } = await execFileAsync(
     "git",
