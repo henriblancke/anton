@@ -1848,6 +1848,134 @@ suite("needsHooksPathOverrideForMerge (real git)", () => {
 
     rmSync(nestSandbox, { recursive: true, force: true });
   });
+
+  // The worktree-scope guard must not BYPASS submodule staleness validation, only redirect where the
+  // resolved path lives: a worktree-scoped hooksPath naming a submodule the incoming ref is about to
+  // bump is exactly as capable of pointing at stale content as a repo-scoped one — a fast-forward
+  // updates the gitlink but never re-runs `submodule update`, so an already-initialized,
+  // currently-self-consistent worktree-scoped submodule goes stale the instant the merge lands the
+  // same way a repo-scoped one does. Returning the worktree's own copy unconditionally (round 23's
+  // fix, correct about WHERE, silent about WHETHER) would run that stale content
+  // (PR #263 review, round 24).
+  it("resolveHooksPathOverrideForMerge validates a worktree-scoped submodule against the incoming ref rather than returning it unconditionally", async () => {
+    const scopedSandbox = mkdtempSync(join(tmpdir(), "anton-mergehooks-scoped-submodule-"));
+    const scopedRepo = join(scopedSandbox, "repo");
+    const scopedRemote = join(scopedSandbox, "remote.git");
+    const submoduleUpstream = join(scopedSandbox, "hooks-submodule-upstream");
+
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "post-merge"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+    const v1Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(submoduleUpstream, "post-merge"), "v2\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v2"], { stdio: "ignore" });
+    const v2Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync("git", ["init", "-q", "-b", "main", scopedRepo], { stdio: "ignore" });
+    execFileSync("git", ["-C", scopedRepo, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", scopedRepo, "config", "user.name", "anton-test"], { stdio: "ignore" });
+    execFileSync("git", ["-C", scopedRepo, "config", "extensions.worktreeConfig", "true"], {
+      stdio: "ignore",
+    });
+    execFileSync(
+      "git",
+      [
+        "-C",
+        scopedRepo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "hooks",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", scopedRepo, "-C", "hooks", "checkout", "-q", v1Sha], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", scopedRepo, "add", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", scopedRepo, "commit", "-q", "-m", "add hooks submodule at v1"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["init", "-q", "--bare", scopedRemote], { stdio: "ignore" });
+    execFileSync("git", ["-C", scopedRepo, "remote", "add", "origin", scopedRemote], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", scopedRepo, "push", "-q", "origin", "main"], { stdio: "ignore" });
+
+    // `feature` bumps the gitlink to v2 and is pushed — the base checkout is never touched.
+    execFileSync("git", ["-C", scopedRepo, "checkout", "-q", "-b", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", scopedRepo, "-C", "hooks", "checkout", "-q", v2Sha], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", scopedRepo, "add", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", scopedRepo, "commit", "-q", "-m", "bump hooks submodule to v2"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", scopedRepo, "push", "-q", "origin", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", scopedRepo, "checkout", "-q", "main"], { stdio: "ignore" });
+    execFileSync("git", ["-C", scopedRepo, "-C", "hooks", "checkout", "-q", v1Sha], {
+      stdio: "ignore",
+    });
+
+    // The review worktree sets a WORKTREE-SCOPED core.hooksPath naming the submodule, initialized at
+    // v1 — self-consistent right now (its own gitlink and checkout both agree on v1).
+    const scopedWorktree = join(scopedSandbox, "worktree");
+    execFileSync(
+      "git",
+      ["-C", scopedRepo, "worktree", "add", "-q", "-b", "review-copy", scopedWorktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      ["-C", scopedWorktree, "config", "--worktree", "core.hooksPath", "hooks"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      [
+        "-C",
+        scopedWorktree,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "hooks",
+      ],
+      { stdio: "ignore" },
+    );
+    expect(readFileSync(join(scopedWorktree, "hooks", "post-merge"), "utf8")).toBe("v1\n");
+    execFileSync("git", ["-C", scopedWorktree, "fetch", "-q", "origin", "feature"], {
+      stdio: "ignore",
+    });
+
+    await expect(
+      needsHooksPathOverrideForMerge(scopedRepo, scopedWorktree, "origin/feature"),
+    ).resolves.toBe(true);
+    await expect(
+      resolveHooksPathOverrideForMerge(scopedRepo, scopedWorktree, "origin/feature"),
+    ).resolves.toBeUndefined();
+
+    rmSync(scopedSandbox, { recursive: true, force: true });
+  });
 });
 
 /**

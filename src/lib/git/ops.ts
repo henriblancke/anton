@@ -623,20 +623,27 @@ export async function resolveHooksPathOverrideForMerge(
   if (isAbsolute(raw)) return raw;
 
   // A `worktree`-scoped value (`git config --worktree core.hooksPath …`, requires
-  // `extensions.worktreeConfig`) is deliberately PRIVATE to this checkout — resolved against
-  // `worktreePath`, never `repoPath`, same as {@link resolveHooksPathOverride}'s identical scope
-  // guard. Skipping this here would resolve a worktree-private relative path against the wrong base
-  // entirely whenever the two checkouts don't share a parent directory a `../`-escape would
-  // coincidentally land back inside — silently pointing the merge's hook at an unrelated directory,
-  // or one that doesn't exist (PR #263 review, round 23).
+  // `extensions.worktreeConfig`) is deliberately PRIVATE to this checkout, so any RESOLVED path this
+  // function returns for it must be `worktreePath`-relative, never `repoPath`-relative — the same
+  // scope guard {@link resolveHooksPathOverride} has. It does NOT mean skipping the submodule
+  // staleness validation below, though: a worktree-scoped hooksPath naming a submodule the incoming
+  // `ref` is about to bump is exactly as capable of pointing at stale content as a repo-scoped one —
+  // git updates the gitlink on a fast-forward but never re-runs `submodule update`, so an
+  // already-initialized, currently-self-consistent worktree-scoped submodule goes stale the instant
+  // the merge lands the same way a repo-scoped one does (PR #263 review, round 24 — round 23 fixed
+  // WHERE a worktree-scoped path resolves to, but returning it unconditionally, before any of the
+  // checks below ever run, left the WHETHER unanswered).
+  const isWorktreeScoped = scope === "worktree";
   const inWorktree = resolve(worktreePath, raw);
-  if (scope === "worktree") return inWorktree;
 
   // A `..`-escaping path can never be tracked by ANY ref (see needsHooksPathOverrideForMerge) — the
-  // base repo's resolved copy is the only sensible source, same as resolveHooksPathOverride's
-  // identical case, since such a path lives outside either checkout entirely.
+  // base repo's resolved copy is the only sensible source for a repo-scoped path (a worktree-scoped
+  // one stays worktree-relative even here, per the note above), since such a path lives outside
+  // either checkout entirely.
   const rel = relative(repoPath, resolve(repoPath, raw));
-  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return resolve(repoPath, raw);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    return isWorktreeScoped ? inWorktree : resolve(repoPath, raw);
+  }
 
   // `ref` itself may not exist: the caller's own fetch of it can be best-effort, so a missing
   // remote-tracking ref reaching this function is expected input, not exceptional — the same reason
@@ -669,9 +676,18 @@ export async function resolveHooksPathOverrideForMerge(
     return undefined;
   }
 
-  const baseMatchesDirect =
-    tab !== -1 && incomingSha ? await baseSubmoduleMatches(repoPath, raw, incomingSha) : false;
-  if (baseMatchesDirect) return resolve(repoPath, raw);
+  // A verified source's resolved path: the worktree's own copy for a worktree-scoped hooksPath
+  // (private — never the base repo, even when it happens to match), the base repo's copy otherwise.
+  const verifiedSource = () => (isWorktreeScoped ? inWorktree : resolve(repoPath, raw));
+  const sourceMatches = (relPath: string, wantSha: string) =>
+    isWorktreeScoped
+      ? checkedOutSubmoduleSha(worktreePath, relPath).then(
+          (c) => c.checkedOut && c.sha === wantSha,
+        )
+      : baseSubmoduleMatches(repoPath, relPath, wantSha);
+
+  const directMatches = tab !== -1 && incomingSha ? await sourceMatches(raw, incomingSha) : false;
+  if (directMatches) return verifiedSource();
 
   // Either the direct submodule check failed, OR `raw` had no tree entry of its own at all — the
   // NESTED case (`deps/hooks`, where `ref`'s tree records only `deps`), which must run this same
@@ -684,28 +700,29 @@ export async function resolveHooksPathOverrideForMerge(
   // (PR #263 review, round 22).
   const containing = await ancestorSubmoduleSha(worktreePath, raw, ref);
   if (containing) {
-    const baseMatchesContaining = await baseSubmoduleMatches(
-      repoPath,
-      containing.submodulePath,
-      containing.sha,
-    );
-    return baseMatchesContaining ? resolve(repoPath, raw) : undefined;
+    const containingMatches = await sourceMatches(containing.submodulePath, containing.sha);
+    return containingMatches ? verifiedSource() : undefined;
   }
 
   if (tab === -1) {
     // No containing gitlink anywhere in `ref`'s tree either — a GENERATED directory (Husky's
-    // `.husky/_`), never tracked by any ref at all, exactly the case `resolveHooksPathOverride`'s
-    // tracked-somewhere fallback already handles correctly and without any ref-specific reasoning (a
-    // generated path's status doesn't depend on which ref is about to land) — reuse it rather than
-    // duplicate that logic.
-    return resolveHooksPathOverride(repoPath, worktreePath);
+    // `.husky/_`), never tracked by any ref at all. A repo-scoped value delegates to
+    // `resolveHooksPathOverride`'s tracked-somewhere fallback, which already handles this correctly
+    // without any ref-specific reasoning (a generated path's status doesn't depend on which ref is
+    // about to land). A worktree-scoped value skips that delegation: `resolveHooksPathOverride` reads
+    // scope only to detect a MISSING worktree-scoped value (git-config-format(5): `--worktree`
+    // requires `extensions.worktreeConfig`, so scope itself already implies the current checkout
+    // sets it) — a present one it treats exactly like a repo-scoped one, tracked-check and all,
+    // which for a private value answers the wrong question entirely. The worktree's own copy is the
+    // only source a private scope could ever mean, generated or not, so it resolves there directly.
+    return isWorktreeScoped ? inWorktree : resolveHooksPathOverride(repoPath, worktreePath);
   }
 
   // `raw` itself is a submodule gitlink (mode 160000, tab !== -1) whose direct AND ancestor checks
   // both failed to find a verified match. No source is confirmed to match what `ref` will actually
-  // check out: neither the base repo's copy nor (implicitly, since this function was only reached
-  // because an override was needed) the worktree's own. Omitting the override is the safe choice —
-  // no hook fires, rather than one built from stale content.
+  // check out: neither the verified source above nor (implicitly, since this function was only
+  // reached because an override was needed) the worktree's own pre-check state. Omitting the
+  // override is the safe choice — no hook fires, rather than one built from stale content.
   return undefined;
 }
 
