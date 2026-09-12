@@ -606,18 +606,31 @@ export async function resolveHooksPathOverrideForMerge(
   ref: string,
 ): Promise<string | undefined> {
   let raw: string;
+  let scope: string;
   try {
     const { stdout } = await execFileAsync(
       "git",
-      ["-C", worktreePath, "config", "--path", "--get", "core.hooksPath"],
+      ["-C", worktreePath, "config", "--show-scope", "--path", "--get", "core.hooksPath"],
       { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
     );
-    raw = stdout.replace(/\n$/, "");
+    const tab = stdout.indexOf("\t");
+    scope = stdout.slice(0, tab);
+    raw = stdout.slice(tab + 1).replace(/\n$/, "");
   } catch {
     return undefined; // unset — nothing to override with
   }
   if (!raw) return undefined;
   if (isAbsolute(raw)) return raw;
+
+  // A `worktree`-scoped value (`git config --worktree core.hooksPath …`, requires
+  // `extensions.worktreeConfig`) is deliberately PRIVATE to this checkout — resolved against
+  // `worktreePath`, never `repoPath`, same as {@link resolveHooksPathOverride}'s identical scope
+  // guard. Skipping this here would resolve a worktree-private relative path against the wrong base
+  // entirely whenever the two checkouts don't share a parent directory a `../`-escape would
+  // coincidentally land back inside — silently pointing the merge's hook at an unrelated directory,
+  // or one that doesn't exist (PR #263 review, round 23).
+  const inWorktree = resolve(worktreePath, raw);
+  if (scope === "worktree") return inWorktree;
 
   // A `..`-escaping path can never be tracked by ANY ref (see needsHooksPathOverrideForMerge) — the
   // base repo's resolved copy is the only sensible source, same as resolveHooksPathOverride's

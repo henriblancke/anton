@@ -1779,6 +1779,75 @@ suite("needsHooksPathOverrideForMerge (real git)", () => {
     execFileSync("git", ["-C", worktree, "fetch", "-q", "origin", "feature"], { stdio: "ignore" });
     expect(await needsHooksPathOverrideForMerge(repo, worktree, "origin/feature")).toBe(false);
   });
+
+  // A `worktree`-scoped core.hooksPath is deliberately PRIVATE to that checkout and must resolve
+  // against `worktreePath`, never `repoPath` — the same scope guard `resolveHooksPathOverride` has,
+  // which this merge-specific resolver must not skip just because it also needs to reason about
+  // `ref`. `repo` and `worktree` are placed at DIFFERENT nesting depths here specifically so a
+  // `../`-relative value resolves to two genuinely different directories depending on which base is
+  // used — the sandbox's default sibling layout would make the bug invisible, since both bases would
+  // coincidentally land on the same parent (PR #263 review, round 23).
+  it("resolveHooksPathOverrideForMerge resolves a worktree-scoped hooksPath against the worktree, not the base repo", async () => {
+    const nestSandbox = mkdtempSync(join(tmpdir(), "anton-mergehooks-scope-"));
+    const nestedRepoDir = join(nestSandbox, "nest", "repo");
+    mkdirSync(join(nestSandbox, "nest"), { recursive: true });
+    execFileSync("git", ["init", "-q", "-b", "main", nestedRepoDir], { stdio: "ignore" });
+    execFileSync("git", ["-C", nestedRepoDir, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", nestedRepoDir, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", nestedRepoDir, "config", "extensions.worktreeConfig", "true"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", nestedRepoDir, "commit", "-q", "-m", "init", "--allow-empty"], {
+      stdio: "ignore",
+    });
+    const nestRemote = join(nestSandbox, "remote.git");
+    execFileSync("git", ["init", "-q", "--bare", nestRemote], { stdio: "ignore" });
+    execFileSync("git", ["-C", nestedRepoDir, "remote", "add", "origin", nestRemote], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", nestedRepoDir, "branch", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", nestedRepoDir, "push", "-q", "origin", "main", "feature"], {
+      stdio: "ignore",
+    });
+
+    const nestedWorktreeDir = join(nestSandbox, "worktree");
+    execFileSync(
+      "git",
+      ["-C", nestedRepoDir, "worktree", "add", "-q", "-b", "review-copy", nestedWorktreeDir, "feature"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      ["-C", nestedWorktreeDir, "config", "--worktree", "core.hooksPath", "../private-hooks"],
+      { stdio: "ignore" },
+    );
+    // The worktree-relative resolution: nestSandbox/private-hooks.
+    const worktreeRelative = join(nestSandbox, "private-hooks");
+    mkdirSync(worktreeRelative);
+    writeFileSync(join(worktreeRelative, "post-merge"), "#!/usr/bin/env sh\nexit 0\n");
+    // The (wrong) base-relative resolution: nestSandbox/nest/private-hooks — a different directory
+    // entirely, since nestedRepoDir is one level deeper than nestedWorktreeDir.
+    const baseRelative = join(nestSandbox, "nest", "private-hooks");
+    mkdirSync(baseRelative);
+    writeFileSync(join(baseRelative, "post-merge"), "#!/usr/bin/env sh\nexit 1\n");
+
+    execFileSync("git", ["-C", nestedWorktreeDir, "fetch", "-q", "origin", "feature"], {
+      stdio: "ignore",
+    });
+
+    await expect(
+      needsHooksPathOverrideForMerge(nestedRepoDir, nestedWorktreeDir, "origin/feature"),
+    ).resolves.toBe(true);
+    await expect(
+      resolveHooksPathOverrideForMerge(nestedRepoDir, nestedWorktreeDir, "origin/feature"),
+    ).resolves.toBe(worktreeRelative);
+
+    rmSync(nestSandbox, { recursive: true, force: true });
+  });
 });
 
 /**
