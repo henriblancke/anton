@@ -8,6 +8,7 @@ import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { normalize as posixNormalizeRaw } from "node:path/posix";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
@@ -244,6 +245,13 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
  * `relPath` itself being the uninitialized submodule. Every reported line's OWN path column is
  * checked against `relPath` instead — only a line naming this exact path, not a filtered-in
  * descendant's, answers the question this helper exists to ask (PR #263 review, round 15).
+ *
+ * That comparison must be against `relPath`'s CANONICAL form, not its literal spelling: git always
+ * reports a submodule's path canonically (`hooks`, never `./hooks` or `hooks/`), while `core.
+ * hooksPath` — read via `git config --path`, which expands `~` but does no other normalization — can
+ * be any of those valid, noncanonical spellings. Comparing against the raw string would then never
+ * match a canonically-different-but-equal path, silently falling through to `false` and accepting
+ * the worktree's empty placeholder (PR #263 review, round 16).
  */
 async function isUninitializedSubmodule(worktreePath: string, relPath: string): Promise<boolean> {
   try {
@@ -252,7 +260,7 @@ async function isUninitializedSubmodule(worktreePath: string, relPath: string): 
       ["-C", worktreePath, "submodule", "status", "--", `:(literal)${relPath}`],
       { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
     );
-    const wanted = relPath.replace(/\/+$/, "");
+    const wanted = posixNormalize(relPath);
     return stdout
       .split("\n")
       .some((line) => line[0] === "-" && submoduleStatusPath(line) === wanted);
@@ -281,6 +289,19 @@ function submoduleStatusPath(line: string): string {
   const withoutPrefix = line.slice(42); // 1 status char + 40-char sha + 1 space
   const describeStart = withoutPrefix.lastIndexOf(" (");
   return describeStart === -1 ? withoutPrefix : withoutPrefix.slice(0, describeStart);
+}
+
+/**
+ * `relPath` in the canonical form git itself reports a path in — no `./` prefix, no interior `./`
+ * segment, no trailing slash (`node:path/posix`'s `normalize` collapses the first two; the last is
+ * stripped separately, since `normalize` only drops a trailing slash for the bare `.` case). Used to
+ * compare a `core.hooksPath` value (read via `git config --path`, which expands `~` but performs no
+ * other normalization, so `./hooks` and `hooks/` both pass through it unchanged) against
+ * {@link submoduleStatusPath}'s output, which `git submodule status` always canonicalizes regardless
+ * of how its own pathspec argument was spelled (PR #263 review, round 16).
+ */
+function posixNormalize(relPath: string): string {
+  return posixNormalizeRaw(relPath).replace(/\/+$/, "");
 }
 
 /**

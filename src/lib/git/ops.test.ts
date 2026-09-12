@@ -540,6 +540,57 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".githooks"));
   });
 
+  // `git config --path` expands `~` but performs no other normalization: a noncanonical but valid
+  // core.hooksPath spelling like `./hooks` (or a trailing-slash `hooks/`) passes through unchanged,
+  // while `git submodule status` always reports a submodule's path CANONICALLY regardless of how its
+  // own pathspec argument was spelled. Comparing the raw, noncanonical hooksPath value against that
+  // canonical report must not silently fail to match (PR #263 review, round 16).
+  it("falls back to the base repo's copy when the worktree's hooksPath uses a noncanonical spelling of an uninitialized submodule", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-noncanonical");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "hooks",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule"], {
+      stdio: "ignore",
+    });
+    // "./hooks" is a valid, noncanonical spelling of the same path git's own submodule status always
+    // reports canonically as "hooks".
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "./hooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-noncanonical-hookspath");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-3", worktree], {
+      stdio: "ignore",
+    });
+    expect(statSync(join(worktree, "hooks")).isDirectory()).toBe(true);
+    expect(existsSync(join(worktree, "hooks", "pre-push"))).toBe(false);
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, "hooks"));
+  });
+
   // `git submodule status -- <path>` takes `<path>` as a PATHSPEC FILTER, not an assertion that the
   // operand itself is a gitlink (git-submodule(1)): an ORDINARY directory that merely CONTAINS an
   // uninitialized submodule still reports that descendant's own line with a leading `-`. A hooksPath
