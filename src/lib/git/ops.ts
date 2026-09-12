@@ -6,7 +6,7 @@
 import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -100,7 +100,14 @@ export async function resolveHooksPathOverride(
   if (!worktreePath) return resolve(repoPath, raw);
 
   const inWorktree = resolve(worktreePath, raw);
-  if (existsSync(inWorktree)) return inWorktree;
+  // A DIRECTORY, never merely "exists": `.git` is git's one built-in relative core.hooksPath value
+  // that is a real directory in the base repo but a plain FILE in every linked worktree (a "gitfile"
+  // pointer to the shared gitdir — gitrepository-layout(5)). `existsSync` alone would accept that
+  // file as the hooks directory and silently stop running any hook at all from a worktree, while the
+  // base repo's own `.git` keeps working (PR #263 review) — `isDirectory()` falls through to the
+  // tracked-check below instead, which correctly resolves `.git` to the base repo's real directory
+  // (never tracked in git's index, so treated the same as any other generated path).
+  if (existsSync(inWorktree) && statSync(inWorktree).isDirectory()) return inWorktree;
 
   // A `core.hooksPath` that climbs out of the repo via `..` (valid — git-config(1) places no
   // restriction on it) can never be in ANY checkout's index, so `isTrackedInBaseRepo`'s `ls-files`

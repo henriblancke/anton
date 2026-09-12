@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -602,6 +603,27 @@ suite("resolveHooksPathOverride (real git)", () => {
     execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "remove hooks"], { stdio: "ignore" });
 
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "..hooks"));
+  });
+
+  // `.git` is git's one built-in case where a relative core.hooksPath resolves to a REAL directory
+  // in the base repo but a plain FILE in every linked worktree (a "gitfile" pointer to the shared
+  // gitdir, per gitrepository-layout(5)) — `existsSync` alone accepts that file as the hooks
+  // directory and silently runs no hook at all from a worktree push, while the base repo's own
+  // `.git` keeps working fine (PR #263 review, round 5).
+  it("resolves core.hooksPath=.git to the base repo's real directory, not the worktree's gitfile", async () => {
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init", "--allow-empty"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".git"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    // Confirm the setup actually reproduces the collision: the worktree's .git is a file, not a dir.
+    expect(statSync(join(worktree, ".git")).isDirectory()).toBe(false);
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".git"));
   });
 
   // A quoted core.hooksPath keeps leading/trailing whitespace verbatim (git-config(1)) — the shared
