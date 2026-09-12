@@ -54,11 +54,23 @@ jobs:
   # instead of self-skipping in `check`. Report-only for now — flip `continue-on-error` off once the
   # suite is reliably green here; the job exists to make failures *visible* rather than hidden behind
   # a green `check`.
+  #
+  # Sharded 4 ways (anton-m4b5.3): the suite's cost is per-file subprocess overhead (each test shells
+  # out to real bd/git many times), not CPU, so 4 GitHub-hosted runners in parallel cut wall time
+  # roughly 4x over one job running all ~76 files sequentially through `maxWorkers: 4`. Measured
+  # single-job baseline before sharding: 22-35 minutes (runs 34654794714, 34630896615, 34630019901,
+  # 34627803658, 34627448106). Each shard keeps its OWN `maxWorkers: 4` — sharding adds more isolated
+  # runners, it does not raise per-job fork concurrency, so it does not reopen the Dolt port/lock race
+  # anton-vgoh tracks (a fresh runner per shard means no two shards share a port-selection window).
   integration:
     runs-on: ubuntu-latest
     continue-on-error: true
     # Real bd/Dolt work shells out per issue and is slow; cap it so a hang can't run for hours.
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       # PINNED deliberately (beads' install.sh always takes the LATEST release, which once made this
       # job non-deterministic). Moved to 1.1.0 with anton-qhoz: bd 1.1.0 nests `export.*`/`dolt.*` in
@@ -88,10 +100,12 @@ jobs:
             echo "::error::bd version mismatch — expected ${BD_VERSION}, got: $(bd version)"; exit 1; }
       - name: Install
         run: bun install --frozen-lockfile
-      - name: Test (integration suites)
+      - name: "Test (integration suites, shard ${{ matrix.shard }}/4)"
         # Dedicated config: `*.integration.test.ts` only, with a capped fork pool so the per-repo
         # Dolt sql-servers don't race and deadlock `bd dolt pull` under full parallelism (anton-0oi).
-        run: bun run test:integration
+        # `--shard` splits the file list across the 4 matrix runners (anton-m4b5.3); each runner still
+        # enforces its own `maxWorkers: 4` from vitest.integration.config.ts.
+        run: bun run test:integration -- --shard=${{ matrix.shard }}/4
 
   # Coverage (anton-7jy). Report-only — a separate, non-blocking job. V8 instrumentation adds ~5x
   # runtime, so it's kept OFF the blocking `check` gate to avoid slowing/flaking it; the html+lcov
