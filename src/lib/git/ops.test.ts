@@ -485,23 +485,28 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, ".githooks"));
   });
 
-  // The Husky case stays correct: a GENERATED, gitignored directory has no copy in a cold worktree
-  // at all, so there is nothing to prefer — the base repo is still the right (only) source.
-  it("falls back to the base repo's copy when the worktree has none (generated, gitignored hooks)", async () => {
-    // Husky's own installer commits a `.gitignore` line for `_` — that's what marks the directory as
-    // generated rather than tracked, and is what the override must check for.
-    mkdirSync(join(repo, ".husky", "_"), { recursive: true });
-    writeFileSync(join(repo, ".husky", ".gitignore"), "_\n");
-    writeFileSync(join(repo, ".husky", "_", "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
-    execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" });
-    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+  // The Husky case stays correct: a GENERATED directory has no copy in a cold worktree at all, so
+  // there is nothing to prefer — the base repo is still the right (only) source. Husky 9's installer
+  // writes `.husky/_/.gitignore` (`*`) itself on `prepare` — that file is never committed either, so
+  // the base repo tracks NOTHING under `.husky/_` at all (checking gitignore state instead would miss
+  // this: the rule ignores the directory's contents without ever naming the directory itself, and a
+  // cold clone that never ran `prepare` has no `.gitignore` there to consult in the first place — PR
+  // #263 review).
+  it("falls back to the base repo's copy when the worktree has none (generated hooks, never committed)", async () => {
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init", "--allow-empty"], {
+      stdio: "ignore",
+    });
     execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".husky/_"], { stdio: "ignore" });
+    // Simulates a local `prepare` install: materialized on disk, but never `git add`ed.
+    mkdirSync(join(repo, ".husky", "_"), { recursive: true });
+    writeFileSync(join(repo, ".husky", "_", ".gitignore"), "*\n");
+    writeFileSync(join(repo, ".husky", "_", "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
 
     const worktree = join(sandbox, "worktree");
     execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
       stdio: "ignore",
     });
-    // Cold worktree: .husky/_ is gitignored, so nothing was checked out — and no install ran here.
+    // Cold worktree: nothing under .husky/_ was ever committed, so nothing was checked out here.
 
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".husky", "_"));
   });

@@ -37,21 +37,26 @@ export const GH_BIN_ENV = "ANTON_GH_BIN";
  * 3. **Prefer a worktree-local copy for a TRACKED relative directory.** A relative `core.hooksPath`
  *    pointing at a directory anton's own worktree carries its own copy of — content checked into
  *    git, so each worktree's checkout can genuinely differ (a PR that itself edits the hooks) — must
- *    resolve to that worktree's copy, not the base repo's. Only a GENERATED, gitignored directory
- *    (Husky's `.husky/_`, materialized by a local install anton's cold worktrees never ran) falls
- *    back to the base repo, because the worktree simply has no copy of its own to prefer.
+ *    resolve to that worktree's copy, not the base repo's. Only a GENERATED directory never committed
+ *    to git at all (Husky's `.husky/_`, materialized by a local install anton's cold worktrees never
+ *    ran) falls back to the base repo, because the worktree simply has no copy of its own to prefer.
  * 4. **Preserve whitespace.** A quoted `core.hooksPath` like `".hooks "` keeps its trailing space —
  *    git-config(1): whitespace inside a quoted value is preserved verbatim — so this reads git's
  *    output directly rather than through the shared {@link git} helper, whose blanket `.trim()`
  *    would silently rewrite `.hooks ` to `.hooks`, a directory that doesn't exist.
  * 5. **Don't revive a hooks directory the checked-out branch deleted.** A missing worktree copy has
- *    two different causes that must not be treated alike: a GENERATED, gitignored directory (Husky's
- *    `.husky/_`) never existed there and the base repo's copy is genuinely the only source (point 3
- *    above); but a TRACKED directory absent from the worktree means the feature branch itself removed
- *    or migrated it, and git would correctly run no hook at all for that — falling back to the base
- *    repo's stale copy would run a hook the branch intentionally deleted, and could block landing the
- *    very PR that deletes it. `git check-ignore` is what tells the two apart: only an ignored path
- *    falls back.
+ *    two different causes that must not be treated alike: a GENERATED directory (Husky's `.husky/_`)
+ *    never existed there and the base repo's copy is genuinely the only source (point 3 above); but a
+ *    TRACKED directory absent from the worktree means the feature branch itself removed or migrated
+ *    it, and git would correctly run no hook at all for that — falling back to the base repo's stale
+ *    copy would run a hook the branch intentionally deleted, and could block landing the very PR that
+ *    deletes it. `git ls-files`, run against `repoPath`'s OWN checkout (which stays on its own branch
+ *    throughout — the worktree's deletion never touches it), is what tells the two apart: a
+ *    Husky-style directory is never committed at all (its own installer writes `.husky/_/.gitignore`
+ *    on `prepare`, itself untracked — checking gitignore state instead would miss it, since the rule
+ *    ignores the directory's contents without ever naming the directory itself), so `ls-files` finds
+ *    nothing for it there either; a directory the worktree's branch deleted is still tracked in the
+ *    base repo's checkout, since that deletion never happened there.
  */
 export async function resolveHooksPathOverride(
   repoPath: string,
@@ -76,22 +81,33 @@ export async function resolveHooksPathOverride(
 
   const inWorktree = resolve(worktreePath, raw);
   if (existsSync(inWorktree)) return inWorktree;
-  // Missing in the worktree — fall back to the base repo's copy only when git itself would never
-  // have tracked one there (a generated directory like Husky's `.husky/_`). Otherwise the checked-out
-  // branch deleted or moved a tracked hooks directory on purpose, and `inWorktree` is still the right
-  // answer: git runs no hook for a configured `core.hooksPath` that doesn't exist.
-  return (await isGitIgnored(worktreePath, raw)) ? resolve(repoPath, raw) : inWorktree;
+  // Missing in the worktree — fall back to the base repo's copy only when the base checkout doesn't
+  // track it either (a generated directory like Husky's `.husky/_`, never committed at all — see
+  // isTrackedInBaseRepo). Otherwise the base repo DOES still track it, so the worktree's branch must
+  // have deleted or moved it on purpose, and `inWorktree` is still the right answer: git runs no hook
+  // for a configured `core.hooksPath` that doesn't exist.
+  return (await isTrackedInBaseRepo(repoPath, raw)) ? inWorktree : resolve(repoPath, raw);
 }
 
-/** Whether `relPath` (as configured, relative to `cwd`) is excluded by `cwd`'s own gitignore rules. */
-async function isGitIgnored(cwd: string, relPath: string): Promise<boolean> {
+/**
+ * Whether `relPath` is a path `repoPath`'s OWN checkout currently tracks in git — queried there
+ * rather than the worktree, because the worktree's branch is exactly what may have deleted it, and
+ * asking it would just confirm the deletion instead of revealing whether it was ever a real, tracked
+ * hooks directory. `git ls-files` is what distinguishes "nobody ever committed this" (Husky's
+ * `.husky/_`, generated by `prepare` and never checked in — even its own `.gitignore` is written
+ * fresh on every install, so gitignore state can't be used as the signal either) from "a real hooks
+ * directory the worktree's branch removed" (PR #263 review): the base repo still has the latter.
+ */
+async function isTrackedInBaseRepo(repoPath: string, relPath: string): Promise<boolean> {
   try {
-    await execFileAsync("git", ["-C", cwd, "check-ignore", "-q", "--", relPath], {
-      timeout: 120_000,
-    });
-    return true;
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", repoPath, "ls-files", "--error-unmatch", "--", relPath],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    return stdout.trim().length > 0;
   } catch {
-    return false; // exit 1 (not ignored) or a fatal error either way — nothing to revive from
+    return false; // untracked, or unreadable — nothing to revive from
   }
 }
 
