@@ -627,6 +627,34 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".git"));
   });
 
+  // A `worktree`-scoped core.hooksPath (`git config --worktree ...`, requires
+  // extensions.worktreeConfig) is deliberately PRIVATE to that checkout — never the base repo's to
+  // fall back to, even when a same-named directory happens to exist there for an unrelated reason.
+  // Native git itself fires no hook when a worktree-scoped path is missing; this must match that,
+  // not revive whatever the base repo happens to have (PR #263 review, round 11).
+  it("never falls back to the base repo for a worktree-scoped hooksPath", async () => {
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init", "--allow-empty"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "extensions.worktreeConfig", "true"], {
+      stdio: "ignore",
+    });
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", worktree, "config", "--worktree", "core.hooksPath", ".hooks"], {
+      stdio: "ignore",
+    });
+    // A directory of the same name exists in the BASE repo for an unrelated reason — the
+    // worktree-scoped value must never be treated as "generated, fall back to this".
+    mkdirSync(join(repo, ".hooks"));
+    writeFileSync(join(repo, ".hooks", "post-commit"), "#!/bin/sh\nexit 0\n");
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, ".hooks"));
+  });
+
   // A quoted core.hooksPath keeps leading/trailing whitespace verbatim (git-config(1)) — the shared
   // `git()` helper's blanket stdout.trim() would silently rewrite
   // ".hooks " to a directory (".hooks") that doesn't exist.

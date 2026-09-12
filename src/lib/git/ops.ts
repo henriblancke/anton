@@ -84,13 +84,20 @@ export async function resolveHooksPathOverride(
 ): Promise<string | undefined> {
   const queryFrom = worktreePath ?? repoPath;
   let raw: string;
+  let scope: string;
   try {
     const { stdout } = await execFileAsync(
       "git",
-      ["-C", queryFrom, "config", "--path", "--get", "core.hooksPath"],
+      ["-C", queryFrom, "config", "--show-scope", "--path", "--get", "core.hooksPath"],
       { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
     );
-    raw = stdout.replace(/\n$/, ""); // only git's own record terminator, never surrounding whitespace
+    // `--show-scope` prefixes exactly one tab-delimited field before the value; the value itself may
+    // contain no leading/trailing whitespace of its own to confuse with the separator (git-config(1)
+    // documents the scope column as tab-separated), so split once and keep the remainder verbatim,
+    // including the record terminator strip below.
+    const tab = stdout.indexOf("\t");
+    scope = stdout.slice(0, tab);
+    raw = stdout.slice(tab + 1).replace(/\n$/, ""); // only git's record terminator, never whitespace
   } catch {
     return undefined; // unset, or unreadable — nothing to override with
   }
@@ -100,6 +107,16 @@ export async function resolveHooksPathOverride(
   if (!worktreePath) return resolve(repoPath, raw);
 
   const inWorktree = resolve(worktreePath, raw);
+  // A `worktree`-scoped value (`git config --worktree core.hooksPath …`, requires
+  // `extensions.worktreeConfig`) is deliberately PRIVATE to this checkout — git-config(1) documents
+  // `--worktree` as exactly that, distinct from `local`'s repo-wide config file that every linked
+  // worktree already inherits. Falling back to the base repo's copy for a missing worktree-scoped
+  // path would run a hook this worktree specifically opted out of by choosing its own value, possibly
+  // a same-named directory that exists in the base repo for an unrelated reason (PR #263 review,
+  // round 11) — so a worktree-scoped value NEVER falls back; a missing worktree-scoped hooksPath
+  // means git itself would fire no hook here either, and this returns that same nonexistent path.
+  if (scope === "worktree") return inWorktree;
+
   // A DIRECTORY, never merely "exists": `.git` is git's one built-in relative core.hooksPath value
   // that is a real directory in the base repo but a plain FILE in every linked worktree (a "gitfile"
   // pointer to the shared gitdir — gitrepository-layout(5)). `existsSync` alone would accept that
