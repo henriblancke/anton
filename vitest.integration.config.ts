@@ -29,6 +29,12 @@ export default defineConfig({
     // above reappears. `maxWorkers` caps how many test FILES run at once (vitest 4 replaced
     // `poolOptions.forks.maxForks` with this top-level option). Tune up only alongside evidence the
     // suite still completes without hanging.
+    //
+    // CI additionally shards ACROSS jobs (ci.yml `integration`, 4-way `--shard`, anton-m4b5.3):
+    // each shard is a separate GitHub-hosted runner with its OWN `maxWorkers: 4`, so sharding adds
+    // parallel runners rather than raising per-job fork concurrency — it does not reopen the
+    // port/lock race anton-vgoh tracks. `--shard` is a CLI flag, not a config option, so it is
+    // passed on the command line (`bun run test:integration -- --shard=N/4`) rather than here.
     maxWorkers: 4,
   },
 });
