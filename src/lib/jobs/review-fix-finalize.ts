@@ -494,6 +494,22 @@ async function closeFinalized(
       .filter((b) => b.status !== "closed" && !skip.has(b.id))
       .map((b) => [b.id, b]),
   );
+  // A fresh read of the children the SNAPSHOT had closed, immediately before the close (PR #238
+  // review). `children` is the sweep's snapshot, and another process can reopen a marked retirement
+  // between it and here: that child is `closed` in the snapshot, so preservedAtMerge never rehomed it
+  // and the `stillOpen` set above never closes it — yet this close drops `stage:in-review` and makes
+  // the target undiscoverable (inReviewEpics excludes a closed target), stranding the reopened ticket
+  // open beneath it where no later sweep will revisit it. So each is confirmed still closed now; one
+  // the board shows reopened — or one bd cannot read, which proves nothing and this seam never acts on
+  // — holds the finalization open, leaving `stage:in-review` for the next sweep to re-finalize from a
+  // fresh snapshot that preserves and rehomes it. What can still slip past is a reopen after this read
+  // but before the batch; the in-process lock orders same-process writers and the cross-process rest
+  // is anton-od4, the residual every write on this seam carries.
+  for (const child of children) {
+    if (child.id === epic.id || child.status !== "closed") continue;
+    const fresh = await tryShow(repo, child.id);
+    if (!fresh || fresh.status !== "closed") return;
+  }
   const closed =
     followUp.unfinished === undefined &&
     (await safe(() =>

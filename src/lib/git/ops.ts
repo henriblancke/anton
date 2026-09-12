@@ -496,6 +496,32 @@ export async function resolveMergeBase(worktreePath: string, base: string): Prom
 }
 
 /**
+ * The commit `HEAD` forked from `base`, and NOTHING else — the strict form of
+ * {@link resolveMergeBase} for a caller that is about to treat "in the base" as "in this checkout".
+ *
+ * The lenient helper's no-merge-base fallback pins the base TIP, which is the right baseline for a
+ * review to diff against but the wrong one for a landing check: after `origin/<base>` is
+ * force-rewritten to an unrelated history, that tip reaches commits this branch never forked from,
+ * so a ticket's work could be found "landed" in a history `HEAD` does not contain, retired on that
+ * evidence, and the tickets behind it dispatched against a mechanism the checkout lacks. So an
+ * unrelated history (`merge-base` exit 1) THROWS here like a base that names nothing or a read that
+ * broke: with no fork point there is no checkout-bound answer, and the caller must fail closed.
+ */
+export async function resolveForkPoint(worktreePath: string, base: string): Promise<string> {
+  try {
+    return await git(worktreePath, ["merge-base", base, "HEAD"]);
+  } catch (error) {
+    if (exitedWith(error, 1)) {
+      throw new Error(
+        `${base} and HEAD share no commit in ${worktreePath} — the base was rewritten to an ` +
+          `unrelated history, so this checkout has no fork point to check against`,
+      );
+    }
+    throw error;
+  }
+}
+
+/**
  * Whether a rejected git call is the command exiting with `code` — its own answer — rather than a
  * run that never got one. A process killed by a timeout carries `code: null` and a signal, and a
  * spawn failure carries a string errno, so neither is mistaken for an exit status.
@@ -948,13 +974,25 @@ export async function distanceBehindUpstream(repoPath: string): Promise<Upstream
  * machine closed then crashed on (before opening the PR) has its commit solely in that machine's
  * local, never-pushed worktree. Skipping such a ticket on board state alone would open the epic's PR
  * missing that work. A run's own ticket commits are always at the branch tip, so bounding the scan
- * is safe. Fails closed to `false` (git error → treat as absent → re-run) rather than risk a skip.
+ * is safe. Fails closed to `false` (git error → treat as absent → re-run) rather than risk a skip —
+ * except under `strict`, for the caller whose safe answer is the other one (PR #238 review): the
+ * retirement ledger drops a superseded ticket on "no commit here", and a `git log` that failed is
+ * not that answer. Read as absent, the ticket leaves the delivered set and the pull request's body
+ * while its commit ships in the diff, or an all-retired run parks without opening the PR at all.
+ *
+ * `base` narrows the read to the commits the branch carries BEYOND it — `<base>..HEAD` — for the
+ * caller whose question is "did THIS run commit it", not "has it ever been committed" (PR #238
+ * review). The tip scan walks into the base's own history, so a ticket that shipped under its id
+ * in an earlier merge — then reopened and settled otherwise — reads as committed by a run that never
+ * touched it: kept out of the retirement ledger, skipped as done, and advertised as delivered by a
+ * pull request that carries nothing of it. The delta is what the run's PR will contain.
  */
 export async function worktreeHasCommitFor(
   worktreePath: string,
   ticketId: string,
+  options: { base?: string; strict?: boolean } = {},
 ): Promise<boolean> {
-  return (await branchSubjects(worktreePath)).some((s) => s.startsWith(`${ticketId}:`));
+  return (await branchSubjects(worktreePath, options)).some((s) => s.startsWith(`${ticketId}:`));
 }
 
 /**
@@ -1154,18 +1192,20 @@ const BRANCH_LOG_ARGS = [
 const TRAILER_VALUE_SEPARATOR = "\u001f";
 
 /**
- * The commits at the tip of the branch checked out in `worktreePath`, newest first, each with the
- * ticket ids its message claims to have satisfied. Fails closed to none (git error → treat as
- * absent) rather than risk a skip — except under `strict`, where absence is the permissive answer
- * and the caller has asked to see the failure instead.
+ * The commits at the tip of the branch checked out in `worktreePath`, newest first — or, given
+ * `base`, only those the branch carries beyond it (`<base>..HEAD`) — each with the ticket ids its
+ * message claims to have satisfied. Fails closed to none (git error → treat as absent) rather than
+ * risk a skip — except under `strict`, where absence is the permissive answer and the caller has
+ * asked to see the failure instead.
  */
 async function branchCommits(
   worktreePath: string,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; base?: string } = {},
 ): Promise<{ sha: string; subject: string; satisfies: string[] }[]> {
+  const args = options.base ? [...BRANCH_LOG_ARGS, `${options.base}..HEAD`, "--"] : BRANCH_LOG_ARGS;
   const log = options.strict
-    ? await git(worktreePath, BRANCH_LOG_ARGS)
-    : await git(worktreePath, BRANCH_LOG_ARGS).catch(() => "");
+    ? await git(worktreePath, args)
+    : await git(worktreePath, args).catch(() => "");
   // `-z` NUL-TERMINATES each record and each `%x00` separates a field within it, so the stream is a
   // flat run of NUL-delimited fields, three per commit, with one empty segment left by the final
   // terminator. Grouping by threes is exact rather than heuristic: git stores no NUL in a commit
@@ -1190,7 +1230,7 @@ async function branchCommits(
 /** The branch's commit subjects — {@link branchCommits} for the readers that only match on text. */
 async function branchSubjects(
   worktreePath: string,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; base?: string } = {},
 ): Promise<string[]> {
   return (await branchCommits(worktreePath, options)).map((c) => c.subject);
 }
@@ -1219,6 +1259,280 @@ export async function branchContainsCommit(
     () => true,
     () => false,
   );
+}
+
+/** What git can say about a commit NAMED IN PROSE — see {@link readCommitReach}. */
+export type CommitReach =
+  /** The commit resolves here and `base`'s history contains it: the work it carries has landed. */
+  | { state: "reaches"; sha: string }
+  /** It resolves, and `base` does not contain it — it sits on some other line of history. */
+  | { state: "outside"; sha: string }
+  /** No single commit in this repository answers to that name (unknown, or an ambiguous prefix). */
+  | { state: "absent" }
+  /** The question itself failed — an unresolvable base, a broken object store, a killed process. */
+  | { state: "unreadable"; detail: string };
+
+/**
+ * Does `base`'s history contain `commit`? The raw read behind the `already-shipped` claim check
+ * (anton-9a4m). It reports; whether the answer proves a claim is `gardener/repair-already-shipped.ts`'s
+ * call.
+ *
+ * FOUR ANSWERS, not a boolean, because a checker that must fail closed needs to tell "the base does
+ * not contain it" (the claim is contradicted) from "git could not say" (the claim is unchecked) —
+ * {@link branchContainsCommit} deliberately folds both into `false`, which is right for a caller
+ * whose next move is the same either way and wrong for one that has to STATE what failed.
+ *
+ * The direction is "the base contains the commit", i.e. the commit is an ANCESTOR of the base. The
+ * opposite reading — a commit built on top of the base — proves nothing about work having landed: it
+ * holds for every commit on every unmerged branch cut from that base, including the one the run is
+ * standing on.
+ *
+ * `commit` must be a bare hex sha, which is what a prose citation ever is; anything else is
+ * `unreadable` rather than handed to git, so no revision expression, ref name or option-shaped
+ * string is resolved on a claim's say-so. Nothing here fetches: a commit this repository has not
+ * seen is `absent`, never a reason to go to the network mid-check.
+ */
+export async function readCommitReach(
+  repoPath: string,
+  commit: string,
+  base: string,
+): Promise<CommitReach> {
+  if (!/^[0-9a-f]{4,40}$/i.test(commit)) {
+    return { state: "unreadable", detail: `"${commit}" is not a commit sha` };
+  }
+  let sha: string;
+  try {
+    // `--verify --quiet` exits 1 with no output when the name resolves to nothing or is ambiguous,
+    // rather than echoing it back; `^{commit}` refuses a sha that is a tree or a blob.
+    sha = await git(repoPath, ["rev-parse", "--verify", "--quiet", `${commit}^{commit}`]);
+  } catch (error) {
+    if (exitedWith(error, 1)) return { state: "absent" };
+    return { state: "unreadable", detail: describeGitFailure(error) };
+  }
+  if (!sha) return { state: "absent" };
+  try {
+    await git(repoPath, ["merge-base", "--is-ancestor", sha, base]);
+    return { state: "reaches", sha };
+  } catch (error) {
+    if (exitedWith(error, 1)) return { state: "outside", sha };
+    return { state: "unreadable", detail: `${base}: ${describeGitFailure(error)}` };
+  }
+}
+
+/**
+ * One commit GitHub records for a pull request, as much of it as the checks read — see
+ * {@link readPullRequestCommits}.
+ */
+export interface PullRequestCommit {
+  sha: string;
+  /** Headline and body joined — what a bead id is looked for in. */
+  message: string;
+  /**
+   * When the WORK in it was done — the OLDER of its author and committer dates, ISO 8601. The two
+   * agree on a fresh commit; a rebase re-dates the committer side and keeps the author's, so the
+   * older is the one a rebase after a bead's reopen cannot move past that reopen (PR #238 review).
+   */
+  workedAt: string;
+}
+
+/** What GitHub records as a pull request's commits — see {@link readPullRequestCommits}. */
+export type PullRequestCommits =
+  | { state: "read"; commits: PullRequestCommit[] }
+  | { state: "unreadable"; detail: string };
+
+/** The shape a bead id takes — the gate both naming reads hold their input to before it reaches a regex. */
+const BEAD_ID = /^[A-Za-z0-9][\w.-]*$/;
+
+/** What `base`'s history says about a BEAD — see {@link readCommitNaming}. */
+export type CommitNaming =
+  /**
+   * A commit `base` contains names the bead in its message: the work filed under it has landed.
+   * `committedAt` is its committer date (ISO 8601) — when it took the shape the base holds, which
+   * for a squash or a rebase is the merge itself — so a caller can place the landing in time.
+   */
+  | { state: "found"; sha: string; committedAt: string }
+  /** No commit in `base`'s history names it. */
+  | { state: "none" }
+  /** The question itself failed — an unresolvable base, a broken object store, a killed process. */
+  | { state: "unreadable"; detail: string };
+
+/**
+ * Does any commit in `base`'s history name `beadId` in its message? The read behind the
+ * `already-shipped` check's answer for a bead the board has CLOSED (PR #238 review): closed alone
+ * is not "landed" — an epic's children close the moment their run commits, before the feature's
+ * pull request is merged — so what proves the close is a commit the base actually contains.
+ *
+ * The whole MESSAGE, not the subject, because anton squash-merges: the tickets' own `<id>: …`
+ * subjects survive only as lines in the squash commit's body. Matched as a standalone token
+ * ({@link beadNamedIn}), so `anton-fade` does not answer for `anton-fade1`, nor for its dotted child
+ * `anton-fade.1`. Read as an ancestor walk from `base` and nothing else — no fetch, for the reason
+ * {@link readCommitReach} gives.
+ */
+export async function readCommitNaming(
+  repoPath: string,
+  beadId: string,
+  base: string,
+): Promise<CommitNaming> {
+  if (!BEAD_ID.test(beadId)) return { state: "unreadable", detail: `"${beadId}" is not a bead id` };
+  let log: string;
+  try {
+    // `-F` keeps the id a literal. Commits are separated by NUL, since `%B` spans lines and a
+    // message may carry any other byte (PR #238 review): git object content can never hold `\0`,
+    // so no body can split an entry the way one holding `\x1e` would.
+    log = await git(repoPath, [
+      "log",
+      "-F",
+      `--grep=${beadId}`,
+      "-n",
+      "50",
+      "--format=%H%x1f%cI%x1f%B%x00",
+      base,
+      "--",
+    ]);
+  } catch (error) {
+    return { state: "unreadable", detail: `${base}: ${describeGitFailure(error)}` };
+  }
+  const named = beadNamedIn(beadId);
+  for (const entry of log.split("\0")) {
+    // Split on the first TWO separators only — a body that itself carries `\x1f` must stay whole.
+    const shaEnd = entry.indexOf("\x1f");
+    if (shaEnd < 0) continue;
+    const dateEnd = entry.indexOf("\x1f", shaEnd + 1);
+    if (dateEnd < 0) continue;
+    const sha = entry.slice(0, shaEnd).trim();
+    const committedAt = entry.slice(shaEnd + 1, dateEnd).trim();
+    const message = entry.slice(dateEnd + 1);
+    if (sha && named.test(message)) return { state: "found", sha, committedAt };
+  }
+  return { state: "none" };
+}
+
+/**
+ * `beadId` as a standalone token in prose. The boundaries reject a longer id it is the head of
+ * (`anton-fade1`) and — because bd mints child ids by appending `.<n>` — a dotted child of it
+ * (`anton-fade.1`) (PR #238 review): a commit naming the child has not said the parent landed. A
+ * dot followed by nothing id-like is sentence punctuation, and the id still matches ahead of it.
+ */
+function beadNamedIn(beadId: string): RegExp {
+  return new RegExp(`(?<![\\w-])${beadId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-]|\\.\\w)`);
+}
+
+/**
+ * The commits GitHub records for a pull request — each with its message and when its work was done.
+ *
+ * The record behind two of the `already-shipped` check's answers (PR #238 review). Whether a merged
+ * PR CARRIED a closed bead ({@link pullRequestCommitNaming}): the board's parentage is read NOW, and
+ * a bead re-homed under a run target after that target's PR merged would pass on it, while GitHub
+ * keeps the `<id>: …` subjects anton committed for each ticket whatever the squash's body was
+ * rewritten to. And whether the PR holds work from the bead's CURRENT cycle
+ * ({@link newestPullRequestCommit}): a merge is dated when the PR merged, so a PR still open when
+ * its bead was reopened and merged unchanged afterwards is dated after a reopen it carries nothing
+ * from — only its own commits say when the work in it was done.
+ *
+ * `unreadable` for anything short of an answer — no gh, an unreachable GitHub, a PR the ref does
+ * not name, a commit gh dates with nothing — so a caller fails closed rather than reading a network
+ * failure as "not carried" or an undated commit as an old one.
+ *
+ * `gh pr view --json commits` reads GitHub's GraphQL API, which returns at most 250 commits per PR
+ * without explicit pagination (PR #238 review). A PR past that cap has its list silently truncated,
+ * and a bead-naming commit in position 251+ goes unseen — {@link pullRequestCommitNaming} and
+ * {@link pullRequestCommitUnder} then answer `undefined` and the caller fails CLOSED (escalates to a
+ * human rather than accepting an unverifiable retirement), so no wrong retirement results, but a
+ * valid claim on such a PR fails spuriously. This is acceptable because anton opens ONE PR per epic
+ * and commits one per ticket, so a PR's commit count tracks its epic's ticket count — orders of
+ * magnitude below 250. Should that ever change, swap this for the paginated REST endpoint
+ * (`gh api repos/{owner}/{repo}/pulls/{number}/commits --paginate`, 100 per page, guaranteed
+ * complete) — its per-commit shape (`sha`, `commit.message`, `commit.author.date`,
+ * `commit.committer.date`) differs from the fields read below and would need remapping.
+ */
+export async function readPullRequestCommits(repoPath: string, ref: string): Promise<PullRequestCommits> {
+  const selector = ref.startsWith("gh-") ? ref.slice(3) : ref;
+  if (!selector) return { state: "unreadable", detail: `"${ref}" names no pull request` };
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  let commits: unknown;
+  try {
+    const { stdout } = await execFileAsync(gh, ["pr", "view", selector, "--json", "commits"], {
+      cwd: repoPath,
+      timeout: 120_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    commits = (JSON.parse(stdout) as { commits?: unknown }).commits;
+  } catch (error) {
+    return { state: "unreadable", detail: `${ref}: ${describeGitFailure(error)}` };
+  }
+  if (!Array.isArray(commits)) {
+    return { state: "unreadable", detail: `${ref}: gh reported no commit list for the pull request` };
+  }
+  const text = (v: unknown): string => (typeof v === "string" ? v : "");
+  const read: PullRequestCommit[] = [];
+  for (const entry of commits as Record<string, unknown>[]) {
+    const sha = text(entry.oid);
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) continue;
+    const dates = [entry.authoredDate, entry.committedDate].map(text).filter((d) => !Number.isNaN(Date.parse(d)));
+    if (dates.length === 0) {
+      return { state: "unreadable", detail: `${ref}: gh dates commit \`${sha.slice(0, 10)}\` with nothing` };
+    }
+    const workedAt = dates.reduce((older, d) => (Date.parse(d) < Date.parse(older) ? d : older));
+    read.push({ sha, message: `${text(entry.messageHeadline)}\n${text(entry.messageBody)}`, workedAt });
+  }
+  return { state: "read", commits: read };
+}
+
+/** The commit whose work is newest — undefined for an empty list. */
+export function newestPullRequestCommit(
+  commits: readonly PullRequestCommit[],
+): PullRequestCommit | undefined {
+  let newest: PullRequestCommit | undefined;
+  for (const commit of commits) {
+    if (!newest || Date.parse(commit.workedAt) > Date.parse(newest.workedAt)) newest = commit;
+  }
+  return newest;
+}
+
+/**
+ * The newest commit in a PR's list naming `beadId` as a standalone token ({@link beadNamedIn}) —
+ * undefined when none does, or when `beadId` is not the shape of an id. The NEWEST, because what
+ * the caller measures against the bead's reopen is when the bead's work in that PR was last done.
+ */
+export function pullRequestCommitNaming(
+  commits: readonly PullRequestCommit[],
+  beadId: string,
+): PullRequestCommit | undefined {
+  if (!BEAD_ID.test(beadId)) return undefined;
+  const named = beadNamedIn(beadId);
+  return newestPullRequestCommit(commits.filter((commit) => named.test(commit.message)));
+}
+
+/**
+ * The newest commit in a PR's list COMMITTED UNDER one of `beadIds` — a `<id>: …` subject, the
+ * delivery attribution anton writes ({@link worktreeHasCommitFor}) — undefined when none is.
+ *
+ * Stricter than {@link pullRequestCommitNaming} on purpose (PR #238 review): a commit that merely
+ * mentions the id is not the bead's work. GitHub's "Update branch" merges the base into the PR's
+ * branch under `Merge branch 'main' into anton/<id>`, which names the id as a token and carries no
+ * work of the bead's — dated after a reopen, it would pass for the rework. A subject the id heads
+ * is a commit a run made for that bead, and nothing else anton or GitHub writes takes that shape.
+ * Exact on the id: `anton-fade:` is not `anton-fade.1:`.
+ */
+export function pullRequestCommitUnder(
+  commits: readonly PullRequestCommit[],
+  beadIds: readonly string[],
+): PullRequestCommit | undefined {
+  const prefixes = beadIds.filter((id) => BEAD_ID.test(id)).map((id) => `${id}:`);
+  if (prefixes.length === 0) return undefined;
+  return newestPullRequestCommit(
+    commits.filter((commit) => {
+      const subject = commit.message.split("\n", 1)[0] ?? "";
+      return prefixes.some((prefix) => subject.startsWith(prefix));
+    }),
+  );
+}
+
+/** A failed git call in one line — its own stderr where it wrote any, else the thrown message. */
+function describeGitFailure(error: unknown): string {
+  const stderr = (error as { stderr?: unknown } | null)?.stderr;
+  const written = typeof stderr === "string" ? stderr.trim() : "";
+  return written || (error instanceof Error ? error.message : String(error));
 }
 
 /**
@@ -1860,10 +2174,63 @@ export async function markPullRequestDraft(repoPath: string, selector: string): 
 export type PullRequestState = "open" | "merged" | "closed" | "unknown";
 
 /**
- * Report the lifecycle state of the PR named by a beads external ref (`gh-<n>`, a bare number, or
- * a PR url). Returns `"unknown"` when the state can't be determined — no `gh`, a network/CLI error,
- * or an unparseable ref — so callers can fail closed rather than mistake a transient failure for a
- * definitive state.
+ * What GitHub reports of a PR beyond its state — enough to place a merge in a branch's HISTORY
+ * rather than take `merged` as "landed". A repository that merges into more than one branch
+ * (`develop`, a release line) has merged PRs whose work `main` does not contain (PR #238 review).
+ */
+export interface PullRequestMerge {
+  state: PullRequestState;
+  /** The commit the merge produced — the merge, squash or rebased head — when gh reported one. */
+  mergeCommit?: string;
+  /** The branch the PR targets, as gh names it (`main`, not `origin/main`). */
+  baseRefName?: string;
+}
+
+/**
+ * Read the PR named by a beads external ref (`gh-<n>`, a bare number, or a PR url): its lifecycle
+ * state and, when it merged, the commit that merged it and the branch it merged into.
+ *
+ * `state` is `"unknown"` when it can't be determined — no `gh`, a network/CLI error, or an
+ * unparseable ref — so callers can fail closed rather than mistake a transient failure for a
+ * definitive state. The merge fields are absent whenever gh did not report them; a caller that
+ * needs the merge placed in a history treats their absence as unplaced, never as merged.
+ */
+export async function readPullRequestMerge(repoPath: string, ref: string): Promise<PullRequestMerge> {
+  // `gh pr view` accepts a number or url; `gh-<n>` is the beads form, so strip the prefix.
+  const selector = ref.startsWith("gh-") ? ref.slice(3) : ref;
+  if (!selector) return { state: "unknown" };
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  try {
+    const { stdout } = await execFileAsync(
+      gh,
+      ["pr", "view", selector, "--json", "state,mergeCommit,baseRefName"],
+      { cwd: repoPath, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    const parsed = JSON.parse(stdout) as {
+      state?: string;
+      mergeCommit?: { oid?: string } | null;
+      baseRefName?: string;
+    };
+    // gh reports state as OPEN | CLOSED | MERGED (a closed-then-merged PR reports MERGED).
+    const state = parsed.state?.toUpperCase();
+    const mapped: PullRequestState =
+      state === "OPEN" ? "open" : state === "MERGED" ? "merged" : state === "CLOSED" ? "closed" : "unknown";
+    const oid = parsed.mergeCommit?.oid;
+    return {
+      state: mapped,
+      ...(typeof oid === "string" && /^[0-9a-f]{7,40}$/i.test(oid) ? { mergeCommit: oid } : {}),
+      ...(typeof parsed.baseRefName === "string" && parsed.baseRefName
+        ? { baseRefName: parsed.baseRefName }
+        : {}),
+    };
+  } catch {
+    return { state: "unknown" };
+  }
+}
+
+/**
+ * Report the lifecycle state of the PR named by a beads external ref — {@link readPullRequestMerge}
+ * reduced to its state, for the callers that only ask whether a PR is open, merged or closed.
  *
  * Used by execute-epic to tell a STALE ref (a PR that was closed WITHOUT merging — which review-fix
  * deliberately leaves on the bead so a Run/Force run can recover the epic) apart from a ref that
@@ -1873,25 +2240,7 @@ export async function pullRequestState(
   repoPath: string,
   ref: string,
 ): Promise<PullRequestState> {
-  // `gh pr view` accepts a number or url; `gh-<n>` is the beads form, so strip the prefix.
-  const selector = ref.startsWith("gh-") ? ref.slice(3) : ref;
-  if (!selector) return "unknown";
-  const gh = process.env[GH_BIN_ENV] ?? "gh";
-  try {
-    const { stdout } = await execFileAsync(gh, ["pr", "view", selector, "--json", "state"], {
-      cwd: repoPath,
-      timeout: 120_000,
-      maxBuffer: 4 * 1024 * 1024,
-    });
-    // gh reports state as OPEN | CLOSED | MERGED (a closed-then-merged PR reports MERGED).
-    const state = (JSON.parse(stdout) as { state?: string }).state?.toUpperCase();
-    if (state === "OPEN") return "open";
-    if (state === "MERGED") return "merged";
-    if (state === "CLOSED") return "closed";
-    return "unknown";
-  } catch {
-    return "unknown";
-  }
+  return (await readPullRequestMerge(repoPath, ref)).state;
 }
 
 /**

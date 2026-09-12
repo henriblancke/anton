@@ -4,6 +4,7 @@
  * Separate from the context because these are the types a caller reads on the way OUT — the facts,
  * the verdict, and the floor class the formula validator (anton-6b99) enforces.
  */
+import type { Bead } from "../../beads/bd";
 import type { AntonResult } from "../../claude/anton-result";
 import type { PullRequest } from "../../git/ops";
 import type { ReviewGateResult } from "../review-gate";
@@ -27,6 +28,19 @@ export type StepClass = "required" | "default-on" | "additive";
 export interface StepFacts {
   /** `implement` / `claude` — the agent's `ANTON-RESULT` self-report, when it emitted one. */
   selfReport?: AntonResult | null;
+  /**
+   * `implement` — the ticket as the agent was PROMPTED with it: the run's snapshot plus the notes
+   * and, when the listing dropped it, the description read at dispatch (`readForDispatch`).
+   * Retained because a claim about "this ticket" is a claim
+   * about that read, and the `already-shipped` repair fences the retirement on it (PR #238 review):
+   * a human note appended after the prompt was built is an instruction the agent never saw.
+   *
+   * It belongs to THIS step's {@link selfReport} and to no other, so a step that reports one must
+   * report both — the phase records them as a pair (execute-epic-ticket.ts `recordStepReport`), and a
+   * dispatching step supplying a report without a snapshot leaves the phase with none rather than
+   * inheriting another step's read.
+   */
+  dispatched?: Bead;
   /** `commit` — whether the worktree actually had a diff to commit (false ⇒ nothing delivered). */
   committed?: boolean;
   /**

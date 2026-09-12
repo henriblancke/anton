@@ -1,15 +1,21 @@
 /**
- * The FACTUAL repair pass on a blocked ticket (anton-fzas, anton-qg4h / R5.4 — extracted from
- * execute-epic-ticket.ts) — the two repairs that invent nothing: a pointer rewritten to what it
- * already meant, and an ordering that already exists in reality written down.
+ * The FACTUAL repair pass on a blocked ticket (anton-fzas, anton-qg4h, anton-5bpd / R5.4 — extracted
+ * from execute-epic-ticket.ts) — the repairs that invent nothing: a pointer rewritten to what it
+ * already meant, an ordering that already exists in reality written down, and a ticket whose work
+ * has demonstrably already landed retired against what landed it.
  *
  * WHICH FAILURES may reach it at all is the settlement's judgement (`repairableBlock`, in
- * execute-epic-ticket-settle.ts); this module owns which of the two repairs then runs, how far it
- * may go, and what it leaves behind.
+ * execute-epic-ticket-settle.ts); this module owns which of the repairs then runs, how far it may
+ * go, and what it leaves behind.
  */
 import { beads, type Bead } from "../beads/bd";
 import type { AntonResult } from "../claude/anton-result";
 import { shadowNote } from "../gardener/repair";
+import {
+  refusalNote as shippedRefusalNote,
+  repairAlreadyShipped,
+  type AlreadyShippedOutcome,
+} from "../gardener/repair-already-shipped";
 import {
   refusalNote as depRefusalNote,
   repairDepMissing,
@@ -22,18 +28,20 @@ import { safe } from "./execute-epic-persist";
 import type { StepContext } from "./step-registry";
 
 /** What the repair pass answers, whichever class it ran for. */
-export type TicketRepair = RefStaleOutcome | DepMissingOutcome;
+export type TicketRepair = RefStaleOutcome | DepMissingOutcome | AlreadyShippedOutcome;
 
 /** The repair MODULE that ran — the name its stamp, its note and its log line are written under. */
-type RepairKind = "dep-missing" | "ref-stale";
+type RepairKind = "dep-missing" | "ref-stale" | "already-shipped";
 
 /**
  * Work out and (where armed) apply the repair this block earns.
  *
- * WHICH REPAIR RUNS is decided by the agent's classified report (anton-ie05 / R5.1), and only
- * `dep-missing` needs it: no fact about the bead can tell anton that other work has to land first,
- * so that class is the whole trigger — and being unable to check it is exactly why the repair writes
- * nothing it cannot resolve against the board.
+ * WHICH REPAIR RUNS is decided by the agent's classified report (anton-ie05 / R5.1), and two classes
+ * need it. `dep-missing`: no fact about the bead can tell anton that other work has to land first, so
+ * that class is the whole trigger — and being unable to check it is exactly why the repair writes
+ * nothing it cannot resolve against the board. `already-shipped` (anton-5bpd): nothing about a bead
+ * says its work is already in the tree either, and the report is the only place the commit, bead or
+ * PR that shipped it is NAMED — which is the whole of what anton then goes and checks.
  *
  * `ref-stale` keeps running on EVERY other block, class or none. Its trigger is evidence rather than
  * the agent's word — the bead's cited paths are checked against the worktree, so it fires only where
@@ -68,14 +76,31 @@ export async function repairBlockedTicket(args: {
   logPath: string;
   /** The agent's parsed `ANTON-RESULT` line, when it emitted one: the class AND the reason. */
   selfReport: AntonResult | null;
+  /**
+   * The ticket as the agent was PROMPTED with it, when the dispatching step reported it — the
+   * snapshot plus the notes read at dispatch. Falls back to the snapshot alone, which carries the
+   * contract fields and can attest to nothing about the notes.
+   */
+  dispatched?: Bead;
+  /**
+   * The operator this run holds the ticket's claim for (`run.operator`). Only `already-shipped`
+   * reads it, to tell an operator's reassignment mid-run from anton's own claim.
+   */
+  operator?: string;
   /** The error that halted the ticket — the reason's fallback when the agent stated none. */
   e: unknown;
+  /**
+   * Whether this ticket's work reached a commit on the run's branch. Only `already-shipped` reads
+   * it, and it is fatal to that claim: a diff on the branch contradicts "nothing needed to change".
+   */
+  committed: boolean;
 }): Promise<TicketRepair | undefined> {
   const { run, ticket, logPath, selfReport, e } = args;
   const { clock, worktreePath } = run;
   const repo = run.repoPath;
   const klass = selfReport?.outcome === "blocked" ? selfReport.klass : undefined;
-  const kind: RepairKind = klass === "dep-missing" ? "dep-missing" : "ref-stale";
+  const kind: RepairKind =
+    klass === "dep-missing" ? "dep-missing" : klass === "already-shipped" ? "already-shipped" : "ref-stale";
   const autonomy = resolveRepairAutonomy(run.settings);
   try {
     // One instant for whichever repair runs — the arms are mutually exclusive, and the stamp is
@@ -84,8 +109,9 @@ export async function repairBlockedTicket(args: {
     // Read the bead fresh: the snapshot this run dispatched from predates the session, and the
     // repair rewrites the description — or the edges — it is holding.
     const fresh = await beads.show(repo, ticket.id);
-    // The self-report's reason FIRST for both repairs, and it is load-bearing for `dep-missing`:
-    // the prerequisite is named in the agent's own prose, and the run's error message names none.
+    // The self-report's reason FIRST for every repair, and it is load-bearing for the two the class
+    // triggers: the prerequisite `dep-missing` parks behind and the work `already-shipped` retires
+    // against are named in the agent's own prose, and the run's error message names neither.
     const block = {
       reason: selfReport?.reason ?? (e instanceof Error ? e.message : undefined),
     };
@@ -99,6 +125,42 @@ export async function repairBlockedTicket(args: {
             autonomy: autonomy["dep-missing"],
             runTicketIds: args.runTicketIds,
           })
+        : kind === "already-shipped"
+        ? await repairAlreadyShipped({
+            repoPath: repo,
+            // The COMMIT this checkout forked from, pinned at worktree CREATION (PR #238 review):
+            // `run.baseForkSha`, not a fork point recomputed here from the movable `run.baseRef`.
+            // `origin/<base>` can be force-reset BACKWARD along the same history after the worktree
+            // was cut, and re-running `merge-base` then resolves the rewound tip rather than the
+            // checkout's original fork — a survivor commit between the two is present in the base the
+            // checkout was created from but absent from the recomputed older history, so
+            // verifyShippedClaim would search only that history and reject a valid already-shipped
+            // claim. The persisted SHA is the immutable commit the branch actually forked from — the
+            // fork point AT THE WRITE the retirement has to hold against — so it is what the check
+            // verifies against, unchanged across resumes and any base rewind.
+            base: run.baseForkSha,
+            bead: fresh,
+            // The contract the agent was PROMPTED with (PR #238 review): `fresh` is read after the
+            // report, so an edit landing mid-session is already in it, and a fence starting there
+            // would hold the retirement to the rewritten ticket and never see the drift. The
+            // dispatch-time read carries the human notes the prompt did; the snapshot does not.
+            dispatched: args.dispatched ?? ticket,
+            // And the run the claim was made FOR: a re-parent of the ticket or an ancestor while
+            // the agent ran hands it to another run, and `fresh` already reads as that run's.
+            runTargetId: run.target.id,
+            // The operator anton holds the claim for (PR #238 review): a reassignment landing while
+            // the agent ran leaves `fresh` in_progress under another name, and no lifecycle field
+            // on the bead tells that from anton's own claim.
+            operator: args.operator,
+            block,
+            committed: args.committed,
+            now,
+            autonomy: autonomy["already-shipped"],
+            // The LIVE signal, not the settlement's one-time read of it: this repair is the one that
+            // settles a bead for good, and an operator's kill landing while it reads GitHub must
+            // stop it before its first write (PR #238 review).
+            signal: run.ctx.signal,
+          })
         : await repairRefStale({
             repoPath: repo,
             worktreePath,
@@ -107,12 +169,12 @@ export async function repairBlockedTicket(args: {
             now,
             autonomy: autonomy["ref-stale"],
           });
-    await recordRepairOutcome({ repo, ticketId: ticket.id, logPath, kind, outcome });
+    await recordRepairOutcome({ repo, ticketId: ticket.id, logPath, kind, outcome, signal: run.ctx.signal });
     return outcome;
   } catch (failure) {
     // The MODULE that ran and the block CLASS it ran on are two different facts (PR #223 review).
-    // Every non-`dep-missing` block falls through to `ref-stale`, so naming the class alone reads as
-    // if an `env` repair existed and threw, rather than that `ref-stale` refused an `env` block.
+    // Every unclassified block falls through to `ref-stale`, so naming the class alone reads as if an
+    // `env` repair existed and threw, rather than that `ref-stale` refused an `env` block.
     console.error(
       `[execute-epic] ${kind} repair failed for ${ticket.id} (block class: ${klass ?? "unclassified"})`,
       failure,
@@ -124,6 +186,13 @@ export async function repairBlockedTicket(args: {
 /**
  * What a repair leaves behind whichever way it went: the refusal or shadow note on the bead, then
  * its own line in the session log. Both best-effort — the block stands either way.
+ *
+ * A job the abort has reached leaves only the log line, whatever the repair answered (PR #238
+ * review). The repair reads the live signal before ITS first write, but a shadowed or escalated
+ * outcome reaches here without one — a kill landing during a long GitHub read, or after the
+ * under-lock reread found the board moved, would otherwise turn into a note on a bead the
+ * settlement promised to leave untouched. The cancellation's author is deciding the ticket, and a
+ * note is a board write like any other.
  */
 async function recordRepairOutcome(args: {
   repo: string;
@@ -131,19 +200,36 @@ async function recordRepairOutcome(args: {
   logPath: string;
   kind: RepairKind;
   outcome: TicketRepair;
+  /** The job's LIVE abort signal — re-read here, at the moment of the write, not the settlement's read. */
+  signal: AbortSignal;
 }): Promise<void> {
-  const { repo, ticketId, logPath, kind, outcome } = args;
+  const { repo, ticketId, logPath, kind, outcome, signal } = args;
+  if (signal.aborted) {
+    await appendSessionLog(
+      logPath,
+      `[repair:${kind}] not recorded on the bead — the job was cancelled; ${repairLogLine(outcome)}\n`,
+    ).catch(() => {});
+    return;
+  }
   if (outcome.action === "escalate") {
     await safe(() =>
       beads.note(
         repo,
         ticketId,
-        kind === "dep-missing" ? depRefusalNote(outcome) : refusalNote(outcome),
+        kind === "dep-missing"
+          ? depRefusalNote(outcome)
+          : kind === "already-shipped"
+            ? shippedRefusalNote(outcome)
+            : refusalNote(outcome),
       ),
     );
   } else if (outcome.action === "shadow") {
     await safe(() => beads.note(repo, ticketId, shadowNote(kind, outcome.attempted)));
   }
+  // `overtaken` writes NO bead note on purpose (PR #238 review): the repair already cleared the
+  // marker and took back what was still its own, and the ticket is now either another run's live
+  // work or a settled close carrying its own evidence — a refusal note from here would land on
+  // whichever the other hand left. The account travels in the session log line below.
   await appendSessionLog(logPath, `[repair:${kind}] ${repairLogLine(outcome)}\n`).catch(() => {});
 }
 
@@ -154,12 +240,18 @@ function repairLogLine(outcome: TicketRepair): string {
       return `repaired — ${outcome.attempted}`;
     case "parked":
       return `parked — ${outcome.attempted}`;
+    case "retired":
+      return `retired — ${outcome.attempted}`;
     case "shadow":
       // The one line an operator reads a week of shadow off, so it says what the write WOULD have
       // been, not merely that one was withheld.
       return `shadow (not armed to write) — would have: ${outcome.attempted}`;
     case "escalate":
       return `escalated — ${[outcome.why, ...outcome.evidence].join(" ")}`;
+    case "overtaken":
+      return `overtaken after the marker — ${[outcome.why, ...outcome.evidence].join(" ")}`;
+    case "cancelled":
+      return `cancelled before writing — ${outcome.why}`;
     // Named rather than left to `default`, so a future outcome shape without a `why` is a type error
     // HERE instead of an `undefined` in the log line (PR #223 review).
     case "none":

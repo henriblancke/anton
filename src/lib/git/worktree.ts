@@ -516,7 +516,16 @@ export async function listBranches(repoPath: string, prefix: string): Promise<st
   return out.split("\n").filter(Boolean);
 }
 
-async function branchExists(repoPath: string, branch: string): Promise<boolean> {
+/**
+ * Whether `branch` already exists locally. Also what tells a run whether its checkout is REUSED
+ * (PR #238 review): {@link createWorktree} checks out an existing branch as it stands and only cuts
+ * a new one off the base when none exists, so the answer here — asked BEFORE the create — is
+ * whether this run inherits a prior attempt's history or starts its own.
+ *
+ * Fails closed to `false` (a broken ref store, an unreadable repo): "no branch" only ever leads a
+ * caller to derive the answer from the checkout itself rather than trust an inherited one.
+ */
+export async function branchExists(repoPath: string, branch: string): Promise<boolean> {
   try {
     await git(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
     return true;

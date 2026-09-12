@@ -20,7 +20,7 @@ import {
   type BeadPatch,
   type PruneAge,
 } from "./bd-args";
-import { asArray } from "./bd-json";
+import { asArray, str } from "./bd-json";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
 import {
@@ -71,7 +71,7 @@ import { doltSync } from "./sync-coalescer";
 // bd.ts back (breaking the bd ↔ snapshot cycle, anton-mur). Re-exported here so every existing
 // `from ".../beads/bd"` import keeps working.
 export type { Bead, BeadComment, BeadDep } from "./types";
-import type { Bead } from "./types";
+import type { Bead, BeadDep } from "./types";
 
 // The dependency types anton may write, validated at the link seam because bd validates nothing
 // there (anton-igkb). Re-exported so callers reach the set through the same module as `link`.
@@ -99,11 +99,12 @@ export const LABELS = {
   abandoned: "abandoned",
   /**
    * Work a run reserved but did NOT deliver (anton-67xj): a ticket skipped behind a timed-out one
-   * whose partial work was rolled back, or the timed-out ticket itself. Nothing from it is on the
-   * run's branch, so it is in no PR — which is exactly what merge finalization cannot see for
-   * itself: `bd` has no "this bead is not in that diff" fact, and a still-open child otherwise
-   * reads as one the run merely forgot to close. Cleared the moment a run dispatches the ticket
-   * again. See beads.isNotDelivered.
+   * whose partial work was rolled back, or the timed-out ticket itself — or one the run RETIRED as
+   * already shipped (anton-5bpd), whose work is in the run's base rather than its diff. Nothing
+   * from it is on the run's branch, so it is in no PR — which is exactly what merge finalization
+   * cannot see for itself: `bd` has no "this bead is not in that diff" fact, and a still-open child
+   * otherwise reads as one the run merely forgot to close. Cleared the moment a run dispatches the
+   * ticket again. See beads.isNotDelivered.
    */
   notDelivered: "not-delivered",
   /**
@@ -209,6 +210,39 @@ async function bdWrite(cwd: string, args: string[], opts?: BdOpts): Promise<stri
   // next board read never blocks on a cold `bd list` queued behind the Dolt lock.
   invalidateIssueSnapshot(cwd, true);
   return stdout;
+}
+
+/**
+ * One version of a bead, as `bd history` records it — see {@link parseBeadHistory}.
+ */
+export interface BeadVersion {
+  /** When this version was written (ISO 8601, the Dolt commit's date). */
+  at: string;
+  /** The bead's status in this version. */
+  status: string;
+}
+
+/**
+ * Read `bd history <id> --json` — every version of one bead, NEWEST FIRST, each as
+ * `{ CommitHash, Committer, CommitDate, Issue }` — down to the two fields a reader replays: when the
+ * version was written and what status it held. The bead's row itself holds no record of a REOPEN
+ * (`closed_at` is cleared by one and overwritten by the next close, `started_at` never moves), so
+ * this is the only place the board says a bead's current closure is not its first (PR #238 review).
+ *
+ * Throws on anything but an array of versions: a reader that measures evidence against the reopen
+ * this history holds must fail closed on a history it could not read, not on one that read empty.
+ */
+export function parseBeadHistory(raw: string): BeadVersion[] {
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) throw new Error("bd history: expected a JSON array of versions");
+  return parsed.map((entry, i): BeadVersion => {
+    const e = entry as Record<string, unknown> | null;
+    const issue = e?.Issue as Record<string, unknown> | null | undefined;
+    const at = str(e?.CommitDate);
+    const status = str(issue?.status);
+    if (!at || !status) throw new Error(`bd history: version ${i} carries no CommitDate or Issue.status`);
+    return { at, status };
+  });
 }
 
 // ── the claimable set + the verified claim (anton-9anc) ──
@@ -1038,6 +1072,14 @@ export const beads = {
     bdWrite(cwd, ["reopen", id, ...(reason ? ["--reason", reason] : [])]),
 
   /**
+   * Every version of a bead, newest first — the record a reopen leaves that the bead's own row does
+   * not ({@link parseBeadHistory}). Whole, not `--limit`ed: the reader wants the LAST transition out
+   * of `closed`, and a window that misses it would read a reopened bead as never reopened.
+   */
+  history: (cwd: string, id: string): Promise<BeadVersion[]> =>
+    bd(cwd, ["history", id, "--json"]).then(parseBeadHistory),
+
+  /**
    * Snooze a bead (`bd defer`) / restore it (`bd undefer`) — the "not now, but not dead" state
    * (anton-ywi8). A deferred bead keeps its contract, notes, and edges but drops out of `bd ready`,
    * so the runtime never picks it up; undefer returns it to `open`. Deliberately distinct from
@@ -1100,6 +1142,50 @@ export const beads = {
 
   /** A bead a human abandoned (closed + `abandoned`) — closed, but explicitly NOT delivered. */
   isAbandoned: (b: Bead) => b.labels?.includes(LABELS.abandoned) ?? false,
+
+  /**
+   * The bead that SUPERSEDED this one — the survivor `bd supersede <id> --with <survivor>` points
+   * its `supersedes` edge at — or undefined when the board records no such retirement. Read off the
+   * bead's own inline `dependencies` ({@link beads.supersedesTarget}), so it costs nothing beyond the
+   * board read every caller already has.
+   *
+   * Closed is part of the question, not a separate check: the edge is written alongside the close,
+   * and a bead someone REOPENED is live work again whatever pointer it still carries — so this gates
+   * `supersedesTarget` to `closed`, and a run re-executing a reopened retirement clears the now-stale
+   * edge through the ungated reader instead.
+   *
+   * The distinction this exists for (anton-5bpd): a superseded bead has the same shape as an
+   * abandoned one — closed, with no commit under its own id on any branch — and anything that reads
+   * "closed with nothing on this branch" as a cross-machine resume must tell all three apart.
+   */
+  supersededBy: (b: Bead): string | undefined =>
+    b.status === "closed" ? beads.supersedesTarget(b) : undefined,
+
+  /**
+   * The survivor a `supersedes` edge on this bead names, whatever the bead's STATUS — the
+   * status-agnostic half of {@link beads.supersededBy}, which is that answer gated to `closed`.
+   *
+   * The edge outlives the close it was written beside: `bd reopen` returns the bead to `open` but
+   * leaves its `supersedes` pointer in place, so a retirement an operator reopened to re-run still
+   * carries it (PR #238 review). To every reader that gates on `closed`, that reopened edge is inert
+   * — but the run about to re-execute the ticket must CLEAR it, or the ticket's honest close reads as
+   * superseded all over again (execute-epic-ticket-bookends `claimTicket`). That reader needs the id
+   * on an OPEN bead, which {@link beads.supersededBy} withholds by design; this is what it reads.
+   *
+   * TWO SHAPES of `dependencies`, because bd's two reads disagree (measured on 1.1.2). `bd list
+   * --json` carries EDGE rows — `{ issue_id, depends_on_id, type }`, the {@link BeadDep} shape.
+   * `bd show --json` carries the depended-on ISSUES themselves, each stamped with `dependency_type`
+   * and no edge fields at all. A reader that knew only the list shape read every `show` of a
+   * superseded bead as "not superseded" (PR #238 review — the post-write fence in
+   * gardener/repair-already-shipped.ts is a `show` reader), so both are accepted here.
+   */
+  supersedesTarget: (b: Bead): string | undefined => {
+    for (const d of (b.dependencies ?? []) as Array<Partial<BeadDep> & { id?: string; dependency_type?: string }>) {
+      if (d.type === "supersedes" && d.issue_id === b.id && d.depends_on_id) return d.depends_on_id;
+      if (d.dependency_type === "supersedes" && d.id) return d.id;
+    }
+    return undefined;
+  },
 
   /** A bead a run reserved but never delivered (see LABELS.notDelivered) — open, and in no PR. */
   isNotDelivered: (b: Bead) => b.labels?.includes(LABELS.notDelivered) ?? false,

@@ -33,11 +33,17 @@ import {
   openPullRequest,
   pullRequestState,
   readFileAtRev,
+  readPullRequestMerge,
+  readPullRequestCommits,
+  newestPullRequestCommit,
+  pullRequestCommitNaming,
+  pullRequestCommitUnder,
   readPathHistory,
   distanceBehindUpstream,
   readPreservedCommitFor,
   readWorktreeState,
   resolveFreshBase,
+  resolveForkPoint,
   resolveMergeBase,
   restoreWorktreeState,
   sameWorktreeState,
@@ -47,6 +53,8 @@ import {
   branchAddedCommit,
   describeCommit,
   branchContainsCommit,
+  readCommitNaming,
+  readCommitReach,
   branchSatisfiesTicket,
   readSatisfiedClaims,
   satisfiedMarkerSubject,
@@ -269,8 +277,9 @@ describe("pullRequestState (fake gh)", () => {
   let binDir: string;
   let prevGh: string | undefined;
 
-  // Fake gh whose `pr view <selector> --json state` echoes the state passed in via ANTON_TEST_PR_STATE,
-  // or exits non-zero (as the real gh does for an unknown PR) when it's set to "__error__".
+  // Fake gh whose `pr view <selector> --json …` echoes the state passed in via ANTON_TEST_PR_STATE
+  // — plus the merge commit and base branch from ANTON_TEST_PR_MERGE_OID / ANTON_TEST_PR_BASE when
+  // set — or exits non-zero (as the real gh does for an unknown PR) when it's set to "__error__".
   function installFakeGh(): void {
     const fakeGh = join(binDir, "gh");
     writeFileSync(
@@ -280,7 +289,11 @@ const a=process.argv.slice(2);
 if(a[0]==='pr'&&a[1]==='view'){
   const st=process.env.ANTON_TEST_PR_STATE;
   if(!st||st==='__error__'){process.stderr.write('no pull requests found\\n');process.exit(1);}
-  process.stdout.write(JSON.stringify({state:st})+'\\n');process.exit(0);
+  const oid=process.env.ANTON_TEST_PR_MERGE_OID;
+  const out={state:st,mergeCommit:oid?{oid}:null};
+  if(process.env.ANTON_TEST_PR_BASE)out.baseRefName=process.env.ANTON_TEST_PR_BASE;
+  if(process.env.ANTON_TEST_PR_COMMITS)out.commits=JSON.parse(process.env.ANTON_TEST_PR_COMMITS);
+  process.stdout.write(JSON.stringify(out)+'\\n');process.exit(0);
 }
 process.exit(0);
 `,
@@ -301,7 +314,109 @@ process.exit(0);
     if (prevGh === undefined) delete process.env[GH_BIN_ENV];
     else process.env[GH_BIN_ENV] = prevGh;
     delete process.env.ANTON_TEST_PR_STATE;
+    delete process.env.ANTON_TEST_PR_MERGE_OID;
+    delete process.env.ANTON_TEST_PR_BASE;
+    delete process.env.ANTON_TEST_PR_COMMITS;
     rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("reads the merge commit and base branch beside the state, and omits what gh does not name", async () => {
+    process.env.ANTON_TEST_PR_STATE = "MERGED";
+    process.env.ANTON_TEST_PR_MERGE_OID = "a".repeat(40);
+    process.env.ANTON_TEST_PR_BASE = "develop";
+    expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({
+      state: "merged",
+      mergeCommit: "a".repeat(40),
+      baseRefName: "develop",
+    });
+    // No merge commit named — the field is absent rather than a bogus value a caller could resolve.
+    delete process.env.ANTON_TEST_PR_MERGE_OID;
+    delete process.env.ANTON_TEST_PR_BASE;
+    expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({ state: "merged" });
+    // A merge commit that is not a sha is dropped too: only a bare hex sha is ever handed to git.
+    process.env.ANTON_TEST_PR_MERGE_OID = "HEAD~1";
+    expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({ state: "merged" });
+    process.env.ANTON_TEST_PR_STATE = "__error__";
+    expect(await readPullRequestMerge(sandbox, "gh-42")).toEqual({ state: "unknown" });
+  });
+
+  // The PR's own commit list is GitHub's record of what it carried and WHEN — read for a closed
+  // bead the base names nowhere, so that the board's parentage today is not what vouches for it,
+  // and for every merged PR, so that its merge's date is not what places its work in time.
+  it("reads each commit with its message and the OLDER of its two dates — the one a rebase keeps", async () => {
+    process.env.ANTON_TEST_PR_STATE = "MERGED";
+    process.env.ANTON_TEST_PR_COMMITS = JSON.stringify([
+      {
+        oid: "b".repeat(40),
+        messageHeadline: "anton-fade: the work",
+        messageBody: "as first written",
+        authoredDate: "2020-01-01T00:00:00Z",
+        committedDate: "2020-03-01T00:00:00Z",
+      },
+      // Not a sha — skipped, as the naming read always did.
+      { oid: "HEAD~1", messageHeadline: "anton-fade: not a commit", committedDate: "2021-01-01T00:00:00Z" },
+      { oid: "c".repeat(40), messageHeadline: "chore: authored date only", authoredDate: "2020-02-01T00:00:00Z" },
+    ]);
+    expect(await readPullRequestCommits(sandbox, "gh-42")).toEqual({
+      state: "read",
+      commits: [
+        { sha: "b".repeat(40), message: "anton-fade: the work\nas first written", workedAt: "2020-01-01T00:00:00Z" },
+        { sha: "c".repeat(40), message: "chore: authored date only\n", workedAt: "2020-02-01T00:00:00Z" },
+      ],
+    });
+  });
+
+  it("finds the NEWEST commit naming a bead, as a whole token, and the newest commit overall", async () => {
+    const commits = [
+      { sha: "b".repeat(40), message: "anton-fade1: a longer id\n", workedAt: "2020-05-01T00:00:00Z" },
+      { sha: "c".repeat(40), message: "anton-fade.1: the dotted child\n", workedAt: "2020-04-01T00:00:00Z" },
+      { sha: "d".repeat(40), message: "feat: the subject\ncloses anton-fade.", workedAt: "2020-01-01T00:00:00Z" },
+      { sha: "e".repeat(40), message: "anton-fade: the rework\n", workedAt: "2020-03-01T00:00:00Z" },
+    ];
+    expect(pullRequestCommitNaming(commits, "anton-fade")).toMatchObject({ sha: "e".repeat(40) });
+    expect(pullRequestCommitNaming(commits, "anton-fade.1")).toMatchObject({ sha: "c".repeat(40) });
+    expect(pullRequestCommitNaming(commits, "anton-x1e5")).toBeUndefined();
+    expect(pullRequestCommitNaming(commits, "not an id")).toBeUndefined();
+    expect(newestPullRequestCommit(commits)).toMatchObject({ sha: "b".repeat(40) });
+    expect(newestPullRequestCommit([])).toBeUndefined();
+  });
+
+  // A commit COMMITTED UNDER a bead heads its subject with `<id>:` — a merge from the base names
+  // the id through the branch and is not one, nor is a commit whose body merely mentions it.
+  it("finds the NEWEST commit committed under one of the given ids, by its `<id>:` subject alone", async () => {
+    const commits = [
+      { sha: "a".repeat(40), message: "Merge branch 'main' into anton/anton-fade\n", workedAt: "2020-06-01T00:00:00Z" },
+      { sha: "b".repeat(40), message: "anton-fade1: a longer id\n", workedAt: "2020-05-01T00:00:00Z" },
+      { sha: "c".repeat(40), message: "anton-fade.1: the dotted child\n", workedAt: "2020-04-01T00:00:00Z" },
+      { sha: "d".repeat(40), message: "feat: the subject\nanton-fade: named in the body", workedAt: "2020-03-15T00:00:00Z" },
+      { sha: "e".repeat(40), message: "anton-fade: the rework\n", workedAt: "2020-03-01T00:00:00Z" },
+      { sha: "f".repeat(40), message: "anton-kid1: a ticket's commit\n", workedAt: "2020-02-01T00:00:00Z" },
+    ];
+    expect(pullRequestCommitUnder(commits, ["anton-fade"])).toMatchObject({ sha: "e".repeat(40) });
+    expect(pullRequestCommitUnder(commits, ["anton-fade", "anton-kid1"])).toMatchObject({ sha: "e".repeat(40) });
+    expect(pullRequestCommitUnder(commits, ["anton-kid1"])).toMatchObject({ sha: "f".repeat(40) });
+    expect(pullRequestCommitUnder(commits, ["anton-fade.1"])).toMatchObject({ sha: "c".repeat(40) });
+    expect(pullRequestCommitUnder(commits, ["anton-x1e5"])).toBeUndefined();
+    expect(pullRequestCommitUnder(commits, ["not an id"])).toBeUndefined();
+    expect(pullRequestCommitUnder(commits, [])).toBeUndefined();
+  });
+
+  it("fails closed when gh cannot read the PR, names no commit list, dates a commit with nothing, or the ref names nothing", async () => {
+    process.env.ANTON_TEST_PR_STATE = "__error__";
+    expect(await readPullRequestCommits(sandbox, "gh-42")).toMatchObject({ state: "unreadable" });
+    process.env.ANTON_TEST_PR_STATE = "MERGED";
+    expect(await readPullRequestCommits(sandbox, "gh-42")).toMatchObject({
+      state: "unreadable",
+      detail: expect.stringContaining("no commit list"),
+    });
+    process.env.ANTON_TEST_PR_COMMITS = JSON.stringify([
+      { oid: "b".repeat(40), messageHeadline: "anton-fade: undated", committedDate: "last tuesday" },
+    ]);
+    expect(await readPullRequestCommits(sandbox, "gh-42")).toMatchObject({
+      state: "unreadable",
+      detail: expect.stringContaining("with nothing"),
+    });
+    expect(await readPullRequestCommits(sandbox, "")).toMatchObject({ state: "unreadable" });
   });
 
   it("maps gh states to open / merged / closed, strips the gh- ref prefix", async () => {
@@ -361,6 +476,26 @@ suite("worktreeHasCommitFor (real git)", () => {
 
   it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
     expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
+  });
+
+  // PR #238 review: asked with a base, the scan covers only what the branch carries beyond it — a
+  // ticket an earlier merge landed under its id in the base is not one THIS run committed.
+  it("with a base, sees only the commits the branch carries beyond it", async () => {
+    writeFileSync(join(repo, "old.md"), "landed earlier\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-old1: shipped in an earlier merge"]);
+    g(["checkout", "-q", "-b", "anton/run"]);
+    writeFileSync(join(repo, "new.md"), "this run\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-new1: committed by this run"]);
+
+    expect(await worktreeHasCommitFor(repo, "anton-old1")).toBe(true);
+    expect(await worktreeHasCommitFor(repo, "anton-old1", { base: "main" })).toBe(false);
+    expect(await worktreeHasCommitFor(repo, "anton-new1", { base: "main" })).toBe(true);
+    // A base that resolves to nothing fails closed to absent, as the unscoped read does — unless the
+    // caller asked to see the failure, because absence is the answer that drops a ticket for it.
+    expect(await worktreeHasCommitFor(repo, "anton-new1", { base: "origin/nope" })).toBe(false);
+    await expect(worktreeHasCommitFor(repo, "anton-new1", { base: "origin/nope", strict: true })).rejects.toThrow();
   });
 
   /**
@@ -551,6 +686,142 @@ suite("branchContainsCommit (real git)", () => {
 });
 
 /**
+ * anton-9a4m: the `already-shipped` check has to tell a contradicted claim ("the base does not
+ * contain that commit") from an unchecked one ("git could not say"), which is the whole reason this
+ * read answers with four states where branchContainsCommit answers with a boolean.
+ */
+suite("readCommitReach (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+  let landed: string;
+  let unmerged: string;
+
+  const g = (args: string[]) =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-reach-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    landed = g(["rev-parse", "HEAD"]);
+    g(["checkout", "-q", "-b", "side"]);
+    writeFileSync(join(repo, "side.md"), "side\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "side"]);
+    unmerged = g(["rev-parse", "HEAD"]);
+    g(["checkout", "-q", "main"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("reads a commit the base contains, and one it does not", async () => {
+    expect(await readCommitReach(repo, landed.slice(0, 7), "main")).toEqual({
+      state: "reaches",
+      sha: landed,
+    });
+    expect(await readCommitReach(repo, unmerged.slice(0, 7), "main")).toEqual({
+      state: "outside",
+      sha: unmerged,
+    });
+  });
+
+  it("reads a sha this repository does not hold as absent, never as unreachable", async () => {
+    expect(await readCommitReach(repo, "0123456789abcdef0123456789abcdef01234567", "main")).toEqual({
+      state: "absent",
+    });
+  });
+
+  it("fails closed on a base git cannot resolve, and on a name that is not a sha", async () => {
+    const badBase = await readCommitReach(repo, landed, "origin/nope");
+    expect(badBase.state).toBe("unreadable");
+    expect(badBase).toMatchObject({ detail: expect.stringContaining("origin/nope") });
+
+    // Never handed to git: a revision expression, a ref name, or an option-shaped string.
+    for (const notASha of ["HEAD", "main~1", "--upload-pack=touch /tmp/x"]) {
+      expect(await readCommitReach(repo, notASha, "main")).toMatchObject({ state: "unreadable" });
+    }
+  });
+});
+
+/**
+ * The commit-naming read behind the closed-bead half of the `already-shipped` check. Entries are
+ * NUL-separated (PR #238 review): a message can carry any other byte, and one holding the record
+ * separator the read used to split on would cut the id it names off into a discarded fragment.
+ */
+suite("readCommitNaming (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-naming-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("finds a bead named in a squash body, even after a record- or unit-separator byte", async () => {
+    const msg = join(sandbox, "msg.txt");
+    writeFileSync(
+      msg,
+      "feat: the squash\n\nprose with a \x1e byte, and a \x1f byte, then\n\nanton-x1e5: the ticket line\n",
+    );
+    g(["commit", "-q", "--allow-empty", "-F", msg]);
+    const sha = g(["rev-parse", "HEAD"]);
+
+    expect(await readCommitNaming(repo, "anton-x1e5", "main")).toEqual({
+      state: "found",
+      sha,
+      committedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+    });
+  });
+
+  it("matches the id as a whole token, and answers none for a bead no commit names", async () => {
+    g(["commit", "-q", "--allow-empty", "-m", "anton-fade1: a longer id"]);
+
+    expect(await readCommitNaming(repo, "anton-fade", "main")).toEqual({ state: "none" });
+    expect(await readCommitNaming(repo, "anton-fade1", "main")).toMatchObject({ state: "found" });
+  });
+
+  // bd mints child ids as `<parent>.<n>`, so a commit naming the child has not said the parent
+  // landed (PR #238 review) — while a parent named ahead of a full stop has been.
+  it("does not let a dotted child's commit answer for its parent, but reads a sentence-final id", async () => {
+    g(["commit", "-q", "--allow-empty", "-m", "anton-fade.1: the child"]);
+
+    expect(await readCommitNaming(repo, "anton-fade", "main")).toEqual({ state: "none" });
+    expect(await readCommitNaming(repo, "anton-fade.1", "main")).toMatchObject({ state: "found" });
+
+    g(["commit", "-q", "--allow-empty", "-m", "feat: subject\n\nthis closes anton-fade."]);
+    const sha = g(["rev-parse", "HEAD"]);
+    expect(await readCommitNaming(repo, "anton-fade", "main")).toMatchObject({ state: "found", sha });
+  });
+
+  it("fails closed on a base git cannot resolve", async () => {
+    const verdict = await readCommitNaming(repo, "anton-x1e5", "origin/nope");
+    expect(verdict).toMatchObject({ state: "unreadable", detail: expect.stringContaining("origin/nope") });
+  });
+});
+
+/**
  * anton-nuft: a `satisfied` self-report names a commit as the evidence its step is already done, and
  * the gate settles on the branch rather than the claim. The commit has to be one the run's branch
  * ADDED — a commit of the base is on the branch too, and naming it is a zero-diff false success
@@ -580,8 +851,12 @@ suite("branchAddedCommit (real git)", () => {
     commitFile("README.md", "init");
   });
 
+  // Retried, like the bd suites' teardown: the rejection paths here resolve the moment `git
+  // merge-base --is-ancestor` exits non-zero, while the child is still tearing down its own hold on
+  // .git/objects — a bare rmSync then walks the dir underneath it and dies ENOTEMPTY with every
+  // assertion already green (PR #238 CI).
   afterEach(() => {
-    rmSync(sandbox, { recursive: true, force: true });
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   it("accepts a commit the run's branch added over its base, by short sha", async () => {
@@ -868,7 +1143,7 @@ suite("distanceBehindUpstream concurrency (real git)", () => {
   });
 
   afterEach(() => {
-    rmSync(sandbox, { recursive: true, force: true });
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
   // The breaker poll and the execute-epic preflight fetch the SAME upstream tracking ref from one
@@ -1378,6 +1653,58 @@ suite("resolveMergeBase (real git)", () => {
     rmSync(join(repo, ".git", "objects", head.slice(0, 2), head.slice(2)));
 
     await expect(resolveMergeBase(repo, "main")).rejects.toThrow();
+  });
+});
+
+suite("resolveForkPoint (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const out = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-forkpoint-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", "anton/epic-1"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("pins the fork point as a SHA, like the lenient resolver", async () => {
+    const fork = out(["rev-parse", "HEAD"]);
+    g(["checkout", "-q", "main"]);
+    writeFileSync(join(repo, "other.ts"), "export const other = 0;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "someone else"]);
+    g(["checkout", "-q", "anton/epic-1"]);
+
+    expect(await resolveForkPoint(repo, "main")).toBe(fork);
+  });
+
+  it("throws on a base rewritten to an unrelated history, rather than pinning its tip", async () => {
+    // The lenient resolver answers the base TIP here — a commit this checkout never forked from.
+    // A landing check given that tip would find work "in the base" that HEAD does not contain.
+    g(["checkout", "-q", "--orphan", "rewritten"]);
+    writeFileSync(join(repo, "b.ts"), "export const b = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "unrelated history"]);
+    expect(await resolveMergeBase(repo, "main")).toBe(out(["rev-parse", "main"]));
+
+    await expect(resolveForkPoint(repo, "main")).rejects.toThrow(/share no commit/);
+  });
+
+  it("throws on a base that does not resolve, rather than handing the name back", async () => {
+    await expect(resolveForkPoint(repo, "origin/nope")).rejects.toThrow();
   });
 });
 

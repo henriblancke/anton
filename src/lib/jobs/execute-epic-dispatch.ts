@@ -5,10 +5,13 @@
  * Three sets come out of it and every one of them is load-bearing downstream: what was DELIVERED
  * (the PR body and the review contract speak for exactly that), what was HELD (a blocker outside
  * this run — the tail parks), and what was SKIPPED behind a rolled-back timeout (merge finalization
- * reads its marker, not this module's memory).
+ * reads its marker, not this module's memory). A fourth — what anton RETIRED as already shipped
+ * (anton-5bpd) — is recorded on the run rather than here: the ticket is settled on the board, so
+ * nothing downstream has to decide anything about it beyond saying it is not in the PR.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { claimGuard } from "../beads/claim";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { latestSatisfiedRecord } from "../beads/satisfied-note";
 import { appendSessionLog } from "../sessions";
@@ -30,9 +33,11 @@ import {
   orderTickets,
   reorderForPrereq,
   reorderNote,
+  runReadiness,
   skipNote,
   skippedDependents,
   type PrereqEdge,
+  type RetiredTicketOutcome,
   type SkipCause,
   type TicketTimeoutOutcome,
 } from "./execute-epic-board";
@@ -40,9 +45,11 @@ import {
   BlockedTailError,
   PrereqCycleError,
   ReorderedOnPrereqError,
+  TicketRetiredError,
   TicketTimeoutError,
 } from "./execute-epic-errors";
-import { mustPersist, mustRead, safe } from "./execute-epic-persist";
+import { mustPersist, mustRead, mustReadBoard, safe } from "./execute-epic-persist";
+import { runTargetAbove } from "./gate-targets";
 import type { RunPreparation } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
 import { runTicket } from "./execute-epic-ticket";
@@ -66,6 +73,14 @@ export interface DispatchOutcome {
   satisfied: Map<string, SatisfiedSettlement>;
   /** Tickets this run never dispatched, and the timeout each is waiting behind. */
   skipped: Map<string, SkipCause>;
+  /**
+   * The run's ONLY ticket was its standalone target, and THIS attempt verified and retired it as
+   * already shipped (PR #238 review). There is nothing to review, no pull request to open, and
+   * nothing left for a person to decide — the target is already closed as superseded with anton's
+   * evidence on the bead — so the run phase finishes the run as a delivered-nothing SUCCESS rather
+   * than parking a job on work the board has settled.
+   */
+  targetRetired: boolean;
 }
 
 /** What the loop learns as it goes, and what the tail and the delivery verdict then read. */
@@ -83,6 +98,10 @@ interface DispatchLedger {
    * tickets written against IT still have their mechanism and must still run, whatever rolled back
    * further up the chain. Same rule merge finalization applies; recorded as the loop goes, since
    * only the loop knows what actually landed here.
+   *
+   * A ticket anton RETIRED as already shipped (anton-5bpd) counts too, for that same reason read one
+   * step out: its work is in the run's BASE rather than in a commit on this branch, so the tickets
+   * written against it have their mechanism just as surely.
    */
   onBranch: Set<string>;
   /** Tickets that settled on an earlier commit of the run — see {@link DispatchOutcome.satisfied}. */
@@ -94,11 +113,48 @@ export async function dispatchRunTickets(
   run: EpicRun,
   prep: Extract<RunPreparation, { done: false }>,
 ): Promise<DispatchOutcome> {
-  const { live, held, dispatchable } = partitionTickets(run, prep.gated);
+  // Read against the run's DELTA, not the branch's whole history (PR #238 review): the question is
+  // whether THIS run committed the ticket — what its pull request will carry — and a scan that walks
+  // into the base finds a commit an earlier merge landed under the same id, keeping a ticket the
+  // board has since settled out of the retirement ledger and in the delivered set of a PR that
+  // carries nothing of it.
+  //
+  // And read STRICTLY (PR #238 review): "no commit here" is what drops a superseded ticket from the
+  // run, so a scan that failed — the base ref gone, git itself broken — must stop the run rather
+  // than read as absence. Taken for absence, a ticket whose commit IS in this delta leaves the
+  // delivered set and the PR body while its diff ships, or an all-retired run parks without opening
+  // the pull request that carries it.
+  // Partition against the fork COMMIT pinned at worktree creation, never the mutable ref the run
+  // recorded (PR #238 review). The read below is `<fork>..HEAD`: measured against `baseRef`
+  // (`origin/<base>`, a ref a sibling run's fetch can advance or rewind mid-run), a base rewound
+  // behind the fork point would widen the window into pre-fork history, where an old `<ticketId>:`
+  // commit reads as this run's delivery and keeps a superseded ticket live for a PR that carries
+  // nothing of it. {@link warmRunWorktree} resolves the fork once — when origin/<base> is fresh and
+  // HEAD still sits at it — and persists it, so every ticket is partitioned against the same commit
+  // the checkout was actually cut from, and a resume reads the stored value rather than recomputing
+  // over a worktree whose HEAD has since moved on.
+  const forkPoint = prep.runStep.baseForkSha;
+  const { live, held, dispatchable } = await partitionTickets(run, prep.gated, async (id) => {
+    try {
+      return await worktreeHasCommitFor(prep.worktree.path, id, { base: forkPoint, strict: true });
+    } catch (e) {
+      throw new PoisonEpic(
+        `${id} is superseded on the board, and anton could not read the commits ` +
+          `\`${prep.worktree.branch}\` carries beyond ${prep.runStep.baseRef} in ${prep.worktree.path} ` +
+          `to tell whether this branch holds its work (${e instanceof Error ? e.message : String(e)}). ` +
+          `Refusing to retire it on an unreadable branch — if its commit IS here, the pull request ` +
+          `would ship it unlisted. Repair the worktree, then resume the run`,
+      );
+    }
+  });
   const ledger: DispatchLedger = {
     skipCause: new Map(),
     skipped: new Map(),
-    onBranch: new Set(),
+    // Seeded with the retirements the board already held when the run read it (PR #238 review):
+    // their work is in the run's base, so a timeout cascade stops at one exactly as it stops at a
+    // ticket this attempt retires. Left out, a rolled-back timeout would walk THROUGH a settled
+    // ticket and skip valid work behind it.
+    onBranch: new Set(run.retired.map((r) => r.id)),
     satisfied: new Map(),
   };
   const recordSkipped = makeSkipRecorder(run, ledger);
@@ -127,8 +183,10 @@ export async function dispatchRunTickets(
   // verdict below.
   const stoppedShort = stoppedShortIds(run.timedOut);
   await settleHeldTail(run, prep, { held, dispatchable, ledger, stoppedShort, recordSkipped });
+  const verdict = await deliveredOrPark(run, prep, live, ledger, stoppedShort);
   return {
-    delivered: await deliveredOrPark(run, prep, live, ledger, stoppedShort),
+    delivered: verdict.delivered,
+    targetRetired: verdict.targetRetired,
     satisfied: ledger.satisfied,
     skipped: ledger.skipped,
   };
@@ -168,11 +226,48 @@ async function reorderAroundPrereq(
   return reorder.order;
 }
 
+/** How retired tickets read in an operator-facing park: each id, and the bead the board points it at. */
+const retirements = (rs: readonly RetiredTicketOutcome[]) =>
+  rs.map((r) => `${r.id} → superseded by ${r.replacedBy}`).join(", ");
+
+/**
+ * A run's retirements split the only way an operator-facing sentence may speak of them
+ * (PR #238 review): `this-run` is a claim anton checked against git and the board itself,
+ * `pre-existing` is one it merely FOUND on the board — a human's rescope, a gardener dedup, an
+ * earlier attempt's retirement. Both read as "closed as superseded" on the bead, so only the
+ * recorded source tells them apart, and wording a found supersede as shipped would ask the operator
+ * to settle work on a verification nobody performed.
+ */
+const byProvenance = (rs: readonly RetiredTicketOutcome[]) => ({
+  verified: rs.filter((r) => r.source === "this-run"),
+  found: rs.filter((r) => r.source === "pre-existing"),
+});
+
+/**
+ * The retirement ledger as a park may say it: one clause per provenance, each naming its tickets,
+ * and only the `this-run` clause claiming a verification. Every park that mentions retirements
+ * speaks through this so none of them can word a found supersede as one anton checked.
+ */
+function retirementClauses(rs: readonly RetiredTicketOutcome[]): string[] {
+  const { verified, found } = byProvenance(rs);
+  return [
+    verified.length
+      ? `already shipped, verified and closed as superseded (${retirements(verified)})`
+      : null,
+    found.length
+      ? `already settled as superseded on the board, which this run did not verify ` +
+        `(${retirements(found)})`
+      : null,
+  ].filter((clause): clause is string => clause !== null);
+}
+
 /** The run's tickets, split into what it may dispatch now and what a blocker outside it holds. */
-function partitionTickets(
+async function partitionTickets(
   run: EpicRun,
   gated: Set<string>,
-): { live: Bead[]; held: Bead[]; dispatchable: Bead[] } {
+  /** Whether THIS branch carries a commit under the ticket's id — the branch's own evidence. */
+  hasCommitFor: (ticketId: string) => Promise<boolean>,
+): Promise<{ live: Bead[]; held: Bead[]; dispatchable: Bead[] }> {
   const { targetId: epicBeadId, tickets, all } = run;
   // 4. Per ticket: the formula's ticket phase (its steps up to and including the commit) →
   //    (close | in-review). Skip work that already
@@ -186,14 +281,75 @@ function partitionTickets(
   // of the done-on-board logic below: an abandoned bead IS closed, but its work was never
   // committed, so that logic would read "closed with no commit on this branch" as a
   // cross-machine resume, reopen it, and re-run the agent on work a human explicitly killed.
-  const live = orderTickets(tickets, all).filter((t) => !beads.isAbandoned(t));
+  // A ticket the board records as SUPERSEDED is dropped in the same breath and for the same reason
+  // (anton-5bpd): it too is closed with no commit under its own id on this branch, because the work
+  // shipped under the survivor's. Every resume of a run that retired one — a usage-limit park, a
+  // review-gate refusal, a held tail, a crash retry — would otherwise read it as a cross-machine
+  // resume, reopen it, and dispatch an agent that can only report `already-shipped` again, into the
+  // repair's own loop guard: the bead ends up open-then-blocked and the feature parks, the exact
+  // false stall the retirement exists to end. The `supersedes` edge is the durable signal (the one
+  // `bd supersede` writes beside the close), so a retirement an EARLIER attempt made reads the same
+  // as one this attempt is about to. Recorded on the run's retired ledger rather than dropped
+  // silently, so the pull request this attempt opens still says what it does not contain.
+  //
+  // UNLESS this branch carries a commit under the ticket's own id (PR #238 review). A child that
+  // committed and closed on an earlier attempt, and was superseded by hand between that attempt's
+  // failure and this resume, is closed with its work IN THIS DIFF: the branch is the evidence, and
+  // "no commit under its own id" — the premise of dropping it — is false. Dropped here, it never
+  // reaches the loop, so the delivered set and the pull request's body omit a commit the reviewer
+  // will read, and the retirement notice claims the PR does not carry it. Kept live instead: the
+  // loop's done-on-board check finds the commit, skips the ticket exactly as any closed child whose
+  // work is already here, and counts it delivered.
+  //
+  // And only on a read taken NOW, under the ticket's write lock ({@link retireFound}): `tickets` is
+  // the run's snapshot, and a supersede an operator has since reopened is live work again.
+  const live: Bead[] = [];
+  // Tickets a reopen brought back after the readiness verdict was computed. `gated` cannot speak for
+  // them — see {@link regateReopened}.
+  const reopened: Bead[] = [];
+  let abandoned = 0;
+  for (const ticket of orderTickets(tickets, all)) {
+    if (beads.isAbandoned(ticket)) {
+      abandoned += 1;
+      continue;
+    }
+    if (!beads.supersededBy(ticket) || (await hasCommitFor(ticket.id))) {
+      live.push(ticket);
+      continue;
+    }
+    const found = await retireFound(run, ticket);
+    if ("retired" in found) {
+      run.retired.push(found.retired);
+      continue;
+    }
+    // The bead the locked read PROVED live, never the snapshot it replaces (PR #238 review): a
+    // reopen typically edits the contract, and dispatching the stale one would run the agent — and
+    // close the ticket — against the requirements the reopen retired.
+    //
+    // Which is exactly why it is re-gated here. Steps 0b/0c read this ticket as `closed` and
+    // excluded it as work that would not re-run; it is going to run, under a contract the reopen
+    // may have rewritten, so the same gates the cross-machine resume re-applies are owed here —
+    // and BEFORE the loop, so a spec with no definition of done parks the run rather than
+    // dispatching an agent self-review can't score.
+    assertRerunGates(run, found.live);
+    reopened.push(found.live);
+    live.push(found.live);
+  }
   if (live.length === 0) {
-    // Every ticket abandoned but the epic left open — a contradiction only a human can settle
-    // (abandon the epic too, or add work to it). Park rather than open an empty PR or mark the
+    // Every ticket settled but the epic left open — a contradiction only a human can settle
+    // (settle the epic too, or add work to it). Park rather than open an empty PR or mark the
     // run done, either of which would read as a delivery that never happened.
+    // Said by PROVENANCE, never as one thing (PR #238 review): every retirement here is one the run
+    // FOUND on the board — the dispatch loop has not run yet — so this run verified no delivery, and
+    // "already shipped" would hand the operator a premise anton never checked when settling the epic.
+    // And "abandoned" only when a ticket WAS (PR #238 review): an abandon is a recorded won't-do, a
+    // different decision from a supersede, and naming one that never happened misreads the board.
+    const outcomes = [...(abandoned > 0 ? ["been abandoned"] : []), ...retirementClauses(run.retired)];
     throw new PoisonEpic(
-      `every ticket under ${epicBeadId} has been abandoned — nothing left to run; abandon the ` +
-        `epic itself or give it work, then resume the run`,
+      (outcomes.length > 0
+        ? `every ticket under ${epicBeadId} has ${outcomes.join(", or ")}`
+        : `${epicBeadId} has no tickets`) +
+        ` — nothing left to run; settle the epic itself or give it work, then resume the run`,
     );
   }
   // A ticket a bead OUTSIDE this run still blocks is HELD, not run (anton-1two): its work depends
@@ -201,9 +357,319 @@ function partitionTickets(
   // exist yet — the false-success shape issue #46 is about. Its runnable siblings are independent
   // work, so they run now (the readiness verdict above already refused a run with none of them),
   // and the held tail parks the run after the loop rather than riding into the PR unrun.
-  const held = live.filter((t) => gated.has(t.id));
-  const dispatchable = live.filter((t) => !gated.has(t.id));
+  const holds = reopened.length > 0 ? await regateReopened(run, gated, live, reopened) : gated;
+  const held = live.filter((t) => holds.has(t.id));
+  const dispatchable = live.filter((t) => !holds.has(t.id));
   return { live, held, dispatchable };
+}
+
+/**
+ * The gate set, recomputed from a FRESH board once a reopen has put a snapshot-superseded ticket
+ * back into the run (PR #238 review).
+ *
+ * `gated` came from the readiness verdict, and that verdict was computed over a board where these
+ * tickets read as CLOSED — a closed child is not work, so the graph dropped it and its blockers with
+ * it. Reinstated on `gated` alone, a reopened ticket can therefore never be held: the set that would
+ * have to name it was computed before it existed as work. Its external prerequisite is still open,
+ * and the run claims it and dispatches an agent onto a premise that has not shipped — the false
+ * success the hold exists to prevent.
+ *
+ * So readiness is asked again, of the board as it reads NOW: only that read carries the reopened
+ * ticket as work, and only it can see the edges that hold it. The two verdicts are UNIONED rather
+ * than swapped — the earlier one is what the whole run was planned against (a closed prerequisite
+ * that reopened between the two reads must not silently un-hold a sibling), so the fresh read may
+ * only ADD holds.
+ *
+ * And it adds them for EVERY live ticket, not only the reopened ones (PR #238 review). The fresh
+ * read is a second opinion on the whole run, and a prerequisite of an ordinary sibling can have
+ * reopened in the same window that reopened the retirement — a person rescoping one bead usually
+ * touches its neighbours. Kept to the reopened ids, that hold would be read off the fresh board and
+ * then discarded, and the sibling would be dispatched onto a prerequisite the board currently holds
+ * open: the same false success this re-gate exists to prevent, one ticket over. Narrowed to `live`
+ * only so a hold on work outside this run never lands in the run's own set.
+ *
+ * An unreadable board holds every reopened ticket rather than dispatching it: this is the read that
+ * decides whether an agent runs without its prerequisite, and "could not check" is not "not
+ * blocked". Held rather than thrown, because a hold is already this function's own answer — the tail
+ * parks with the blocker named, which is the same operator-facing stop a throw would produce.
+ */
+async function regateReopened(
+  run: EpicRun,
+  gated: Set<string>,
+  live: Bead[],
+  reopened: Bead[],
+): Promise<Set<string>> {
+  const board = await mustReadBoard(run.repo);
+  if (!board) {
+    console.warn(
+      `[execute-epic] ${run.targetId}: could not re-read the board to re-gate ` +
+        `${reopened.map((t) => t.id).join(", ")} after their retirements were reopened — holding ` +
+        `them rather than dispatching work whose prerequisites anton could not check`,
+    );
+    // Only the REOPENED ids are added here, not every live ticket: the run's own verdict already
+    // speaks for its ordinary siblings — it was computed over a board that carried them as work —
+    // and holding those too would park a whole run over one unreadable read.
+    return new Set([...gated, ...reopened.map((t) => t.id)]);
+  }
+  const fresh = runReadiness(board, run.targetId, run.targetIsUnit);
+  return new Set([...gated, ...fresh.gated.filter((id) => live.some((t) => t.id === id))]);
+}
+
+/**
+ * What a snapshot-superseded ticket turned out to be under a fresh read: RETIRED, or live work after
+ * all — and when live, the bead as that read found it, never the snapshot the run walked in with
+ * (PR #238 review).
+ *
+ * The distinction is the whole point. A reopen is a person saying the work is not done, and an
+ * operator who reopens a superseded ticket usually EDITS its contract in the same gesture — that is
+ * what the rerun is for. Handing the loop the snapshot instead would dispatch the agent against the
+ * pre-reopen requirements (`readForDispatch` fills the description only when the snapshot carries
+ * none, so a stale one wins) and close the ticket against them. So the bead the read proved live is
+ * what travels on, exactly as a refreshed board's target is adopted wholesale
+ * (execute-epic-human-gate `adoptRefreshedTarget`) rather than merged field by field: a merge would
+ * keep a description the reopen deliberately cleared.
+ */
+type FoundRetirement = { retired: RetiredTicketOutcome } | { live: Bead };
+
+/**
+ * Retire a ticket the run's SNAPSHOT holds as superseded — or answer that it is live work after all
+ * — on a read taken under the ticket's write lock (PR #238 review).
+ *
+ * The snapshot was taken at the board refresh, and an operator can reopen a superseded ticket
+ * between that read and this partition: the reopen is a person saying the work is NOT done, and a
+ * run that trusts the snapshot drops the ticket from dispatch anyway, on a supersede the board no
+ * longer holds. So the retirement is decided on the bead as it reads now, and a bead no longer
+ * closed as superseded stays live — as {@link FoundRetirement} carries it, the FRESH bead: it is
+ * dispatched like any other, or — closed with its commit elsewhere — regenerated by the loop's
+ * cross-machine path. A board that cannot answer stops the run rather than settle the ticket either
+ * way: retired on an unreadable bead, a reopen is silently reversed; kept live, a retirement an
+ * earlier attempt verified is re-run.
+ *
+ * What it retires it MARKS ({@link markRetired}), under the same lock, so the merge that lands the
+ * rest of the run can still tell the ticket apart if it is reopened after this read.
+ *
+ * The lock orders only THIS process's writers (beads/claim-lock), so the marker is fenced a second
+ * time after it lands (PR #238 review), the way the repair fences its own supersede
+ * (repair-already-shipped.ts `retirementHeld`): on a shared-server board another process can reopen
+ * the ticket, re-home it and claim it between the read above and the tag, and a run that snapshotted
+ * the reopened bead BEFORE the tag landed never sees the marker at its claim gate, so the marker
+ * outlives that run's delivery and its merge reads the work as undelivered. Re-read once the tag is
+ * on the board — the only read that can have seen such a writer — the bead is either still closed
+ * as superseded AND still carrying the marker, and the retirement stands, or it has moved, and the
+ * marker is WITHDRAWN before the ticket is handed back as live. A bead superseded on the reread but
+ * with the marker stripped out from under it is the same race the other way, and stops the run: the
+ * retirement is accepted only against a marker the reread proves is still on the board. What the
+ * fence cannot close is a reopen that lands after this
+ * second read: that one is seen by every snapshot taken after it, and the claim gate clears the
+ * marker (execute-epic-ticket-bookends `claimTicket`); the cross-process rest is anton-od4.
+ */
+async function retireFound(run: EpicRun, ticket: Bead): Promise<FoundRetirement> {
+  const { repo } = run;
+  return withBeadWriteLock(repo, ticket.id, async () => {
+    const live = await mustRead(repo, ticket.id);
+    if (!live) {
+      throw new PoisonEpic(
+        `${ticket.id} is superseded on the board this run read, but bd would not read the ticket ` +
+          `back, so anton cannot tell whether it still is — the run stopped rather than retire a ` +
+          `ticket an operator may have reopened, or re-run one the board has settled. Check the ` +
+          `beads DB, then resume the run`,
+      );
+    }
+    if (!beads.supersededBy(live)) {
+      // No longer superseded — reopened since the snapshot, so it is live work again. Normally that
+      // hands it back to the loop to dispatch or regenerate against THIS run's target. But a reopen
+      // on a shared-server board can also REHOME it onto another run's target between the snapshot
+      // and this read, and returning undefined feeds the loop the stale snapshot `ticket`:
+      // reopenForRegeneration sees an already-open bead and no-ops, and runTicket claims it by id and
+      // runs work that now belongs to that other target. So the retirement stands down only when the
+      // ticket's RUN TARGET is still this run's; a bead rehomed since stops the run rather than
+      // execute another target's ticket.
+      //
+      await assertRunTargetStillOwns(run, live);
+      // The FRESH bead, not the snapshot (PR #238 review). A reopen usually rewrites the contract
+      // the rerun exists to satisfy, and the snapshot still holds the pre-reopen one — dispatched
+      // on it, the agent works to superseded requirements and the ticket closes against them.
+      return { live };
+    }
+    await markRetired(run, ticket.id);
+    const marked = await mustRead(repo, ticket.id);
+    if (!marked) {
+      throw new PoisonEpic(
+        `${ticket.id} is retired as already shipped and now carries \`${LABELS.notDelivered}\`, but ` +
+          `bd would not read the ticket back, so anton cannot tell whether the marker landed on a ` +
+          `ticket that is still superseded or on one another process has since reopened and claimed ` +
+          `— the run stopped rather than open a pull request on either guess. Check the beads DB, ` +
+          `then resume the run`,
+      );
+    }
+    const replacedBy = beads.supersededBy(marked);
+    if (replacedBy) {
+      // The reread proves the bead is still superseded, but the retirement is only safe if THIS
+      // run's marker is still on it: another process can strip `not-delivered` between markRetired
+      // and this read, and a bead superseded-but-unmarked reads to merge finalization as work no
+      // run reserved — reopened during review, the merge that carries none of it closes it as
+      // shipped. So the marker is asserted, not just the supersede, and its absence stops the run
+      // rather than open a PR whose merge would silently reverse that reopen.
+      if (!beads.isNotDelivered(marked)) {
+        throw new PoisonEpic(
+          `${ticket.id} is superseded on the reread that fenced its retirement, but the ` +
+            `\`${LABELS.notDelivered}\` marker anton just wrote is gone — another process cleared it ` +
+            `between the tag and this read, so the merge that lands the rest of the run would read ` +
+            `the ticket as work no run reserved and close it as shipped if it were reopened ` +
+            `meanwhile. The run stopped rather than open a pull request on that race. Check the ` +
+            `beads DB, then resume the run`,
+        );
+      }
+      return { retired: { id: ticket.id, replacedBy, source: "pre-existing" } };
+    }
+    await withdrawRetiredMarker(run, ticket.id);
+    // Live again, so it owes the SAME ownership fence the pre-marker live path pays (PR #238
+    // review): this exit hands the loop a ticket to dispatch just as that one does, and a reopen on
+    // a shared-server board can rehome the bead onto another run's target in this window as easily
+    // as in the earlier one. Unfenced, `regateReopened` would only recompute readiness and
+    // `runTicket` would claim by id and execute work that now belongs elsewhere. Asked AFTER the
+    // withdraw so a bead that did move is handed back unmarked either way — a `not-delivered` label
+    // left on another target's live ticket is read by whichever run delivers it as work that run did
+    // not do.
+    await assertRunTargetStillOwns(run, marked);
+    // Live again on the post-marker read, so the same rule applies: `marked` IS that read, so it is
+    // the bead the loop dispatches — the snapshot's contract predates the reopen. Minus the marker
+    // the withdraw above just took OFF the board: `marked` was read before it, and a bead handed on
+    // still carrying a label the board no longer has would send the claim bookend clearing a marker
+    // that is already gone — a `mustPersist` untag whose refusal parks the run on a race that has
+    // already been settled.
+    return { live: { ...marked, labels: (marked.labels ?? []).filter((l) => l !== LABELS.notDelivered) } };
+  });
+}
+
+/**
+ * Refuse to hand a reopened retirement back to the loop unless THIS run's target still owns it
+ * (PR #238 review) — the fence both of {@link retireFound}'s live exits pay, so neither can dispatch
+ * a ticket a rehome moved onto another run.
+ *
+ * The run target is the ticket's first run-target ANCESTOR, not its direct parent: under
+ * feature → task → subtask, a reparent of the intermediate task moves the subtask's owner while
+ * leaving `parentOf(subtask)` untouched, so a direct-parent compare would wave the ticket through
+ * onto a target that no longer owns it. Recompute the owner from a FRESH full board — the only read
+ * that carries the ancestry above the bead — and an unreadable board stops the run rather than
+ * guess, exactly as the superseded reread does.
+ */
+async function assertRunTargetStillOwns(run: EpicRun, live: Bead): Promise<void> {
+  const board = await mustReadBoard(run.repo);
+  if (!board) {
+    throw new PoisonEpic(
+      `${live.id} was superseded on the board this run read and has since been reopened, but ` +
+        `bd would not read the board back, so anton cannot recompute which run target now owns ` +
+        `it — the run stopped rather than dispatch a ticket that may belong to a different ` +
+        `target. Check the beads DB, then resume the run`,
+    );
+  }
+  const owner = runTargetAbove(board, live.id);
+  if (owner?.id !== run.targetId) {
+    throw new PoisonEpic(
+      `${live.id} was superseded on the board this run read but has since been reopened and ` +
+        `now runs under ${owner?.id ?? "no run target"} rather than this run's ${run.targetId} ` +
+        `— the run stopped rather than dispatch a ticket that now belongs to a different run ` +
+        `target. Check the beads DB, then resume the run`,
+    );
+  }
+}
+
+/**
+ * Take back a {@link markRetired} marker whose ticket moved between the read it was decided on and
+ * the read after it landed: the bead is live work again, and a marker left on it would be read by
+ * the merge of whichever run delivers it as work that run did not do. Guarded like the write it
+ * undoes, and like the claim gate's own clear of the same marker: a run that cannot take it back
+ * must not go on to open a pull request over it.
+ */
+async function withdrawRetiredMarker(run: EpicRun, ticketId: string): Promise<void> {
+  if (!(await mustPersist(() => beads.untag(run.repo, ticketId, [LABELS.notDelivered])))) {
+    throw new PoisonEpic(
+      `${ticketId} was reopened while anton was retiring it as already shipped, and bd would not ` +
+        `clear the \`${LABELS.notDelivered}\` marker that retirement left on it — the run stopped ` +
+        `rather than leave live work marked as undelivered for the merge that will carry it. ` +
+        `Check the beads DB, then resume the run`,
+    );
+  }
+}
+
+/**
+ * Mark a retirement the run FOUND on the board as work this run does NOT deliver — the same
+ * `not-delivered` marker a skipped ticket carries, for the same reader (PR #238 review). A
+ * retirement this run makes itself is marked by the settlement that writes it, under the ticket's
+ * lock and before its claim is released (repair-already-shipped.ts); this covers the ones an
+ * earlier attempt, a person or the gardener settled. A retirement is a closed bead whose
+ * work is in the run's BASE, not in its diff; reopened by an operator while the run's pull request
+ * sits in review, it is an open child with nothing of its own in that PR, and merge finalization
+ * only preserves what is `blocked` or marked — an unmarked reopen is closed as shipped by the very
+ * merge that carries none of it, silently reversing the operator's decision. Marked, it is
+ * preserved and rehomed for a rerun instead, and the marker is cleared the moment a run dispatches
+ * it (see the ticket's claim bookend). While the bead stays closed the marker is inert: the merge
+ * closes nothing that is already closed.
+ *
+ * Not best-effort, for the reason the skip path's marker is not: finalization has no other way to
+ * see this, so a run that cannot record it must not go on to open the PR.
+ */
+async function markRetired(run: EpicRun, ticketId: string): Promise<void> {
+  if (!(await mustPersist(() => beads.tag(run.repo, ticketId, [LABELS.notDelivered])))) {
+    throw new PoisonEpic(
+      `${ticketId} is retired as already shipped, but bd would not record \`${LABELS.notDelivered}\` ` +
+        `on it — the run stopped rather than open a pull request whose merge would close this ` +
+        `ticket as shipped if it were reopened meanwhile. Check the beads DB, then resume the run`,
+    );
+  }
+}
+
+/**
+ * Reopen a closed child whose commit this branch lacks, decided on a read taken under the bead's
+ * write lock (PR #238 review). The already-shipped repair retires a ticket against a SURVIVOR it
+ * re-reads as closed under that survivor's lock, then supersedes; a resumed run whose old branch
+ * lacks the survivor's now-landed commit reaches this reopen for that very bead. Unlocked, the
+ * reopen could land between the repair's reread and its supersede, and the target would be retired
+ * against a survivor that is live work again. Queued on the survivor's lock, the two can only order:
+ * the reopen lands first and the repair's reread refuses it, or the supersede lands first and this
+ * reopen follows a retirement that was checked against a closed bead.
+ *
+ * `ticket.status` came from the run's snapshot, so a bead somebody has reopened since is left
+ * alone: a reopen on a bead that already reads open is a write for nothing. A read that comes back
+ * abandoned or superseded STOPS the run instead (PR #238 review): those are still `closed`, so a
+ * status-only check would treat the retirement as the old close and regenerate it, undoing an
+ * abandon or a supersede that landed since. A bead bd will not read back stops it too, for the
+ * same reason under uncertainty — the snapshot's `closed` says nothing about what the board holds
+ * now, and anton cannot tell a plain close from a retirement it can no longer see. The reopen
+ * itself stays best-effort, as before — runTicket's claim is what fails loudly on a bead still
+ * closed.
+ */
+async function reopenForRegeneration(repo: string, ticket: Bead): Promise<void> {
+  await withBeadWriteLock(repo, ticket.id, async () => {
+    const live = await mustRead(repo, ticket.id);
+    if (!live) {
+      throw new PoisonEpic(
+        `${ticket.id} is closed on the board this run read but its commit is on no branch here, ` +
+          `and bd would not read the ticket back, so anton cannot tell whether it is still closed ` +
+          `— the run stopped rather than reopen a ticket the board may since have abandoned or ` +
+          `superseded. Check the beads DB, then resume the run`,
+      );
+    }
+    if (live.status !== "closed") return;
+    // A read that comes back abandoned or superseded is the !live branch's danger made visible
+    // (PR #238 review): the snapshot's plain `closed` reached here as work to regenerate, but the
+    // board has retired it SINCE. It is still `closed`, so the status check above lets it fall
+    // through — and reopening it would undo the newer settlement and re-run work a person killed
+    // or that shipped elsewhere. Stop; the resume re-snapshots and routes it through retirement
+    // or the nothing-live park instead.
+    const supersededBy = beads.supersededBy(live);
+    if (beads.isAbandoned(live) || supersededBy) {
+      throw new PoisonEpic(
+        `${ticket.id} is closed on the board this run read and its commit is on no branch here, ` +
+          `but a fresh read under its lock shows it was ${
+            beads.isAbandoned(live) ? "abandoned" : `superseded by ${supersededBy}`
+          } since — the run stopped rather than reopen it and regenerate work the board has ` +
+          `retired. Check the beads DB, then resume the run`,
+      );
+    }
+    await safe(() => beads.reopen(repo, ticket.id));
+  });
 }
 
 /**
@@ -361,6 +827,44 @@ function stoppedShortIds(timedOut: readonly TicketTimeoutOutcome[]): Set<string>
 }
 
 /**
+ * The gates step 0b/0c SKIPPED for a ticket they read as resume-skipped, re-applied now that it is
+ * going to run after all (anton-jz1, anton-j9zs).
+ *
+ * Two callers, one rule, because they are the same case seen from two sides: a ticket closed on
+ * another machine whose commit never reached this branch, and a ticket the run's snapshot held as
+ * superseded that a fresh read found reopened ({@link retireFound}). Both were excluded from those
+ * gates as work that would not re-run, and both do. Left ungated, a ticket whose `agent:` label was
+ * disabled meanwhile regenerates silently under the default agent, and one whose spec lost its
+ * definition of done is regenerated against a rubric self-review cannot score.
+ *
+ * The grouped TARGET is re-checked alongside the ticket: its criteria are that rubric, and a run
+ * whose children all arrived closed was gated on nothing at 0c — this is the first time its spec is
+ * read.
+ */
+function assertRerunGates(run: EpicRun, ticket: Bead): void {
+  const { targetId: epicBeadId, settings, userAgentIds, target } = run;
+  const disabled = inactiveAgentTickets([ticket], settings.agents, userAgentIds);
+  if (disabled.length > 0) {
+    throw new PoisonEpic(
+      `epic ${epicBeadId} needs agents enabled in this project's settings: ` +
+        disabled.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
+        ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
+    );
+  }
+  const regressed = contractGaps(
+    ticket.id === target.id ? [ticket] : [target, ticket],
+    "blocking",
+  );
+  if (regressed.length > 0) {
+    throw new PoisonEpic(
+      `epic ${epicBeadId} has beads that don't meet the bead contract: ` +
+        formatContractGaps(regressed) +
+        ` — write the missing section(s), then resume the run`,
+    );
+  }
+}
+
+/**
  * How a ticket's work reaches THIS branch — under its own name, or under a sibling's (anton-ag76).
  *
  * Both are delivery and the skip treats them alike; what differs is what the pull request may say.
@@ -488,8 +992,8 @@ async function dispatchTicket(
   ledger: DispatchLedger,
   recordSkipped: (t: Bead, c: SkipCause, doneOnBoard: boolean) => Promise<void>,
 ): Promise<void> {
-  const { repo, targetId: epicBeadId, ctx, standaloneRun, lease, settings, target } = run;
-  const { tickets, all, timedOut, userAgentIds, operator, ticketTimeoutMs } = run;
+  const { repo, targetId: epicBeadId, ctx, standaloneRun, lease } = run;
+  const { tickets, all, timedOut, operator, ticketTimeoutMs } = run;
   const { isResumeSkipped, worktree, runStep, ticketSteps } = prep;
   const { onBranch } = ledger;
   lease.assertHeld(); // yield before starting a ticket if the shared lease has lapsed
@@ -589,38 +1093,12 @@ async function dispatchTicket(
   // (anton-jz1): a ticket whose `agent:` label was disabled since it first closed must
   // poison-park, exactly as step 0b does, rather than silently regenerate under the default
   // agent. Checked before the reopen/runTicket so the re-run never starts.
-  if (doneOnBoard) {
-    const disabled = inactiveAgentTickets([ticket], settings.agents, userAgentIds);
-    if (disabled.length > 0) {
-      throw new PoisonEpic(
-        `epic ${epicBeadId} needs agents enabled in this project's settings: ` +
-          disabled.map((x) => `${x.id} → agent:${x.agent}`).join(", ") +
-          ` — enable them in Settings → Agents (or relabel the tickets), then resume the run`,
-      );
-    }
-    // Same re-gate for the bead contract (anton-j9zs): step 0c skipped this ticket as
-    // resume-skipped, which only holds while it isn't re-run. Regenerating its work under a
-    // spec with no definition of done is the state that gate exists to refuse. The grouped
-    // TARGET is re-checked alongside the ticket: its criteria are the rubric self-review
-    // scores the regenerated work against, and a run whose children all arrived closed was
-    // gated on nothing at 0c — this is the first time that target's spec is read.
-    const regressed = contractGaps(
-      ticket.id === target.id ? [ticket] : [target, ticket],
-      "blocking",
-    );
-    if (regressed.length > 0) {
-      throw new PoisonEpic(
-        `epic ${epicBeadId} has beads that don't meet the bead contract: ` +
-          formatContractGaps(regressed) +
-          ` — write the missing section(s), then resume the run`,
-      );
-    }
-  }
+  if (doneOnBoard) assertRerunGates(run, ticket);
   // Done on the board but the commit is missing from this branch (cross-machine resume): the
   // work must be regenerated here. Reopen a closed child first so runTicket's claim + close
   // operate on a live bead (a standalone target is never closed, so it needs no reopen).
   if (doneOnBoard && ticket.status === "closed") {
-    await safe(() => beads.reopen(repo, ticket.id));
+    await reopenForRegeneration(repo, ticket);
   }
   try {
     const settlement = await runTicket({
@@ -642,6 +1120,33 @@ async function dispatchTicket(
       ledger.satisfied.set(ticket.id, { ...settlement.by, closed: settlement.closed });
     }
   } catch (e) {
+    // A ticket anton RETIRED as already shipped is absorbed too (anton-5bpd). The repair verified
+    // against git and the board that its work is already in the tree and closed the bead as
+    // superseded by whatever landed it, so there is nothing left for this run — or any retry — to
+    // do. Halting here would park the whole feature on a ticket that is finished, which is exactly
+    // the false stall the class exists to end. Nothing cascades: the work it was waiting for is in
+    // the run's BASE, so every ticket written against it still has its mechanism.
+    //
+    // Recorded, then the cancellation is asked (PR #238 review). The settlement lets a retirement
+    // that landed before the job's kill stand — the abort cannot take a supersede back — and so it
+    // does not rethrow on the kill the way every other stop does, which leaves THIS catch as the
+    // one place the kill can be heard. `ctx.heartbeat()` does not read the signal (runner.ts only
+    // renews the lease), so returning normally here would have the queue claim and tag the next
+    // ticket under a job that is already cancelled. The retirement stays on the ledger — it is
+    // done, and a resume finds it on the board either way — and the loop stops here.
+    //
+    // Nothing is written to the board here: the `not-delivered` marker a retirement owes merge
+    // finalization is part of the settlement itself, written beside the supersede under the
+    // ticket's lock and before its claim is released (PR #238 review) — a marker written from this
+    // catch would land after the release, on a ticket another run may already have snapshotted.
+    if (e instanceof TicketRetiredError) {
+      run.retired.push({ id: e.ticketId, replacedBy: e.replacementId, source: "this-run" });
+      onBranch.add(e.ticketId);
+      console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
+      ctx.signal.throwIfAborted();
+      await ctx.heartbeat();
+      return;
+    }
     // A ticket that ran out of time is the ONE failure this loop absorbs (anton-t1mo). It has
     // already blocked its own bead and settled its partial work — preserved in a commit of its
     // own or rolled back (anton-d967) — so the feature can carry on: the tickets behind it are
@@ -741,7 +1246,7 @@ async function deliveredOrPark(
   live: Bead[],
   ledger: DispatchLedger,
   stoppedShort: Set<string>,
-): Promise<Bead[]> {
+): Promise<{ delivered: Bead[]; targetRetired: boolean }> {
   const { targetId: epicBeadId, timedOut } = run;
   const { skipped } = ledger;
   const { worktree } = prep;
@@ -768,10 +1273,17 @@ async function deliveredOrPark(
   //     and someone relabelled `agent:human` afterwards is still in this diff, and dropping it
   //     would hide work the reviewer must read — and, when it is the only ticket, make the
   //     no-delivery park below claim an empty branch that has commits on it.
+  //     A ticket RETIRED as already shipped (anton-5bpd) is out on the same rule: its work is in
+  //     this run's BASE, under the survivor's id, so no commit here carries it. One retired on an
+  //     EARLIER attempt never reached `live` at all (partitionTickets drops it — unless this branch
+  //     carries its commit, in which case it is delivered like any other closed child whose work
+  //     is here); this covers the one this attempt retired mid-loop, whose board snapshot still
+  //     predates the supersede.
+  const retired = new Set(run.retired.map((r) => r.id));
   //     A human ticket a SIBLING's commit satisfied stays too (PR #258 review): the ledger proved
   //     the work is on this branch under another name, so the branch question above cannot see it.
   const delivered = await deliveredTickets(
-    live.filter((t) => !skipped.has(t.id)),
+    live.filter((t) => !skipped.has(t.id) && !retired.has(t.id)),
     stoppedShort,
     (id) => worktreeHasCommitFor(worktree.path, id),
     new Set(ledger.satisfied.keys()),
@@ -786,20 +1298,83 @@ async function deliveredOrPark(
     throw new PoisonEpic(outOfTimeParkMessage(run, [...skipped.keys()]));
   }
 
-  // Nothing timed out and still nothing is left to show: every live ticket is human work a
-  // person did outside this branch (anton-mv70) — the resume that closed the last answered gate
-  // lands here with an empty set. The run phase speaks for a diff, so carrying on would review
-  // nothing and hand `gh pr create` a branch with no commits between it and the base. Park
-  // instead, naming the one thing left to do: this target ships no code, so a person settles it.
-  if (delivered.length === 0) {
+  // Nothing timed out, and what is left to show was RETIRED rather than run (anton-5bpd): every
+  // ticket anton could dispatch turned out to have already shipped, so each is closed as superseded
+  // and no commit is on this branch. Carrying on would review nothing and hand `gh pr create` a
+  // branch with no diff. Park instead, naming the retirements — the epic itself is the thing left to
+  // settle, and only a person decides whether it is now empty or still wants work.
+  //
+  // EVERY live one, not merely one of them (PR #238 review): `run.retired.length > 0` is also true
+  // of a run that retired one ticket and had a person finish another outside the branch, and this
+  // message would then claim the whole feature had shipped while never naming the human ticket at
+  // all. That mix belongs to the `agent:human` park below, which names both halves.
+  //
+  // And by PROVENANCE, like every other park that names the ledger (PR #238 review): the ledger
+  // holds what partitionTickets FOUND already superseded on the board beside what this attempt
+  // verified and retired itself, and "anton verified that" is only true of the second half.
+  const notRetired = live.filter((t) => !retired.has(t.id));
+  if (delivered.length === 0 && run.retired.length > 0 && notRetired.length === 0) {
+    const { found } = byProvenance(run.retired);
+    // A STANDALONE target this attempt verified and retired itself is FINISHED, not parked
+    // (PR #238 review). The park below asks a person to close the target by hand or give it work —
+    // both already answered here: the target IS the retired ticket, closed as superseded with
+    // anton's evidence on it, so there is no PR to open, no ticket left to run and no decision
+    // left to make. Parked, `settleRunRow` writes the run FAILED and the runner parks the job
+    // permanently, which represents a successfully retired target as a stuck execution and counts
+    // against the consecutive-failure breaker. The run phase finishes it as done instead.
+    // Only when every retirement on the ledger is THIS run's: a supersede anton merely FOUND is
+    // somebody else's decision, and settling the run on it would claim a verification anton never
+    // performed.
+    //
+    // This verdict is reached from `run.retired`, which every attempt rebuilds in memory, so it
+    // speaks only for the attempt that wrote it — an interruption between the supersede and the run
+    // row settling leaves the retirement on the board with nothing here to recover it from, and the
+    // retry cannot reach this line at all (the target is closed and unassigned by then, so the claim
+    // gate refuses it first). The DURABLE half is asked before any of this, off the bead's own
+    // `already-shipped` repair stamp (execute-epic-recover `settleRetiredStandalone`), which makes
+    // the outcome idempotent across a restart rather than dependent on this ledger surviving.
+    if (run.standaloneRun && found.length === 0) return { delivered, targetRetired: true };
     throw new PoisonEpic(
-      `every ticket under ${epicBeadId} is work a person does, not an agent ` +
-        `(${live.map((t) => t.id).join(", ")}) — they are done and nothing was committed on ` +
-        `this branch, so there is no pull request to open. Close ${epicBeadId} by hand to ` +
-        `settle it, or give it a ticket an agent can deliver and resume the run`,
+      `every ticket under ${epicBeadId} that this run could dispatch was retired rather than ` +
+        `run: ${retirementClauses(run.retired).join("; ")} — each is closed on the board, ` +
+        `pointing at what it is superseded by, and nothing was committed here, so there is no ` +
+        `pull request to open. Close ${epicBeadId} by hand to settle it, or give it work that ` +
+        `has not landed yet and resume the run`,
     );
   }
-  return delivered;
+
+  // Nothing timed out and still nothing is left to show: every live ticket anton could dispatch is
+  // human work a person did outside this branch (anton-mv70) — the resume that closed the last
+  // answered gate lands here with an empty set. The run phase speaks for a diff, so carrying on
+  // would review nothing and hand `gh pr create` a branch with no commits between it and the base.
+  // Park instead, naming the one thing left to do: this target ships no code, so a person settles
+  // it. Any retirements are named alongside rather than folded in, so the operator sees which
+  // tickets a person finished and which were already in the tree — and split by PROVENANCE for the
+  // reason the retirement notice is (PR #238 review): a supersede this run only FOUND on the board
+  // is somebody else's decision, so saying it "had already shipped" would put anton's verification
+  // behind a delivery it never checked.
+  if (delivered.length === 0) {
+    const { verified, found } = byProvenance(run.retired);
+    const alsoRetired = [
+      verified.length
+        ? `, and ${verified.length} more had already shipped, closed as superseded ` +
+          `(${retirements(verified)})`
+        : null,
+      found.length
+        ? `, and ${found.length} more were already settled as superseded on the board ` +
+          `(${retirements(found)})`
+        : null,
+    ]
+      .filter(Boolean)
+      .join("");
+    throw new PoisonEpic(
+      `every ticket under ${epicBeadId} that is left to run is work a person does, not an agent ` +
+        `(${notRetired.map((t) => t.id).join(", ")})${alsoRetired} — they are done and nothing ` +
+        `was committed on this branch, so there is no pull request to open. Close ${epicBeadId} ` +
+        `by hand to settle it, or give it a ticket an agent can deliver and resume the run`,
+    );
+  }
+  return { delivered, targetRetired: false };
 }
 
 /**
@@ -817,9 +1392,14 @@ async function deliveredOrPark(
  * When the preserve could not READ the branch it rolled back onto, that answer is unknown (PR #228
  * review) — and an unknown fate is spoken as one here rather than folded into the rollback, which
  * would tell the operator to expect a fresh start on a branch that may still carry the work.
+ *
+ * A ticket the run RETIRED as already shipped (anton-5bpd) is named too, by provenance (PR #238
+ * review): with one ticket timing out and another retired, nothing is delivered and this is the
+ * park that fires — and "every ticket ran out of time … re-scope them" would tell the operator to
+ * re-scope work the board has already settled, while never saying it was.
  */
 export function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string {
-  const { targetId, timedOut, branch, standaloneRun, ticketTimeoutMs } = run;
+  const { targetId, timedOut, branch, standaloneRun, ticketTimeoutMs, retired } = run;
   const budget = Number.isFinite(ticketTimeoutMs)
     ? `${Math.round(ticketTimeoutMs / 60_000)}m`
     : "unbounded";
@@ -872,11 +1452,16 @@ export function outOfTimeParkMessage(run: EpicRun, skippedIds: string[]): string
       `${fate} Raise this project's ticketTimeoutMinutes${split}, then resume the run`
     );
   }
+  const retiredClause =
+    retired.length > 0
+      ? ` — the rest were retired rather than run: ${retirementClauses(retired).join("; ")}`
+      : "";
   return (
-    `every ticket under ${targetId} ran out of time ` +
+    `every ticket under ${targetId}${retired.length > 0 ? " left to run" : ""} ran out of time ` +
     `(${timedOut.map((t) => t.id).join(", ")})` +
     (skippedIds.length > 0 ? ` or was skipped behind one that did (${skippedIds.join(", ")})` : "") +
-    ` — nothing was delivered. ${fate} Re-scope them into smaller tickets, or raise this ` +
-    `project's ticketTimeoutMinutes, then resume the run`
+    `${retiredClause} — nothing was delivered. ${fate} Re-scope ` +
+    `${retired.length > 0 ? "the ones that ran out of time" : "them"} into smaller tickets, or ` +
+    `raise this project's ticketTimeoutMinutes, then resume the run`
   );
 }

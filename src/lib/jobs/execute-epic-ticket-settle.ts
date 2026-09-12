@@ -13,8 +13,10 @@
  * finished work, so it lives next door in execute-epic-ticket-preserve.ts (anton-d967); this owns
  * only what the board is told about the answer.
  */
-import { beads, LABELS, type Bead } from "../beads/bd";
+import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
 import { blockNoteEvidence } from "../beads/block-note";
+import { swapUnderLock } from "../beads/claim";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { shortSha, type SatisfiedBy } from "../beads/satisfied-note";
 import { formatAntonResult, type AntonResult } from "../claude/anton-result";
 import {
@@ -36,10 +38,11 @@ import {
   ParkedOnPrereqError,
   ReorderedOnPrereqError,
   RepairedBlockError,
+  TicketRetiredError,
   TicketTimeoutError,
   WorktreeDirtyError,
 } from "./execute-epic-errors";
-import { mustPersist, safe } from "./execute-epic-persist";
+import { mustPersist, mustRead, safe } from "./execute-epic-persist";
 import { preserveTimedOutWork } from "./execute-epic-ticket-preserve";
 import { repairBlockedTicket, type TicketRepair } from "./execute-epic-ticket-repair";
 import type { StepContext } from "./step-registry";
@@ -69,6 +72,14 @@ export interface TicketProgress {
    * delivery-evidence gate, never replaces it; a missing/unparseable line (null) falls through to it.
    */
   selfReport: AntonResult | null;
+  /**
+   * The ticket as the agent behind {@link selfReport} was PROMPTED with it — the snapshot plus the
+   * notes read at dispatch (steps/agent.ts `readForDispatch`). The `already-shipped` repair fences
+   * its retirement on this read (PR #238 review), so it moves with the report it belongs to and
+   * never independently ({@link recordStepReport}): absent when the step that spoke for the phase
+   * reported no snapshot of its own.
+   */
+  dispatched?: Bead;
 }
 
 /**
@@ -158,6 +169,8 @@ export async function settleFailedTicket(args: {
   timeoutMs: number;
   /** Whether this ticket IS the whole run target — the timeout's licence to KEEP its work. */
   standalone: boolean;
+  /** The operator this run holds the ticket's claim for — the `already-shipped` repair reads it. */
+  operator?: string;
   e: unknown;
 }): Promise<never> {
   const { run, ticket, session, ranOutOfTime, baseline, progress, timeoutMs, standalone, e } = args;
@@ -199,10 +212,48 @@ export async function settleFailedTicket(args: {
         runTicketIds: args.runTicketIds,
         logPath,
         selfReport: progress.selfReport,
+        dispatched: progress.dispatched,
+        operator: args.operator,
         e,
+        committed: progress.committed,
       })
     : undefined;
-  await releaseFailedTicket({ run, ticket, session, progress, e, kinds, repair });
+  // The repair reads git, asks GitHub and waits on write locks — long enough for the job's abort to
+  // land AFTER the check above (PR #238 review). The repair re-reads the live signal before its own
+  // first write, so a kill in that window retired nothing; the same kill keeps the release from
+  // writing too, for settleAbortedTicket's reason — cancellation wins, and the ticket stays claimed
+  // for the resume. A retirement that DID land before the kill is settled for good and is released
+  // as one: the abort cannot take it back, and leaving a closed bead claimed would only be residue.
+  if (repair?.action !== "retired" && run.ctx.signal.aborted) {
+    await cancelledTicket({ ticket, session, e, why: "aborted" });
+  }
+  // A retirement that landed UNMARKED is not released (PR #238 review). The `not-delivered` marker
+  // is written beside the supersede, under the ticket's lock, because the release below is what
+  // makes the ticket claimable again: marked after it, another run can snapshot the bead in between
+  // and deliver it with a marker its claim bookend never saw, and merge finalization then rehomes
+  // work that shipped. bd refused the marker every time, so the run stops here — the retirement
+  // stands, the claim stays on the closed bead (which keeps it out of every claimable set until a
+  // resume marks it), and no pull request opens whose merge would close a reopen of it as shipped.
+  if (repair?.action === "retired" && !repair.marked) {
+    throw new PoisonEpic(
+      `${ticket.id} is retired as already shipped, but bd would not record \`${LABELS.notDelivered}\` ` +
+        `on it — the run stopped rather than release the ticket and open a pull request whose merge ` +
+        `would close this ticket as shipped if it were reopened meanwhile. Check the beads DB, then ` +
+        `resume the run`,
+    );
+  }
+  // A retirement OVERTAKEN in its marker window (PR #238 review) is settled by nobody here. Between
+  // the fence's reread and the marker another process either reopened and reclaimed the ticket — so
+  // the repair cleared its marker and took back what was still anton's, leaving the newer decision
+  // standing — or stripped the marker while anton's close stood. Releasing now would block the ticket
+  // and unassign whoever holds it, or reset a settled bead open; opening a PR on the unmarked close
+  // could later close a reopen of it as shipped. So the run stops on the block, writing nothing: the
+  // ticket stays exactly as the other hand left it.
+  if (repair?.action === "overtaken") {
+    await appendSessionLog(logPath, `[overtaken] ${ticket.id}: ${repair.why}\n`).catch(() => {});
+    throw e;
+  }
+  await releaseFailedTicket({ run, ticket, session, progress, e, kinds, repair, operator: args.operator });
   // The repaired bead goes back through the ordinary queue (R5.10): a non-poison error spends one of
   // the runner's own attempts, behind its own backoff and the picker's brakes. The block it replaces
   // would have parked the run outright.
@@ -218,11 +269,19 @@ export async function settleFailedTicket(args: {
       ? new ReorderedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, logPath, e)
       : new ParkedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, e);
   }
+  // A RETIRED ticket earns neither a retry nor a wait (anton-5bpd): its work has already landed, so
+  // there is nothing left for any attempt to do. The bead is closed against its survivor with the
+  // evidence on it, and the ticket LOOP absorbs this one error and carries on with the rest of the
+  // feature — halting the epic would park a whole run on a ticket that is finished.
+  if (repair?.action === "retired") {
+    throw new TicketRetiredError(ticket.id, repair.replacementId, repair.attempted);
+  }
   throw e;
 }
 
 /**
- * Whether this failure is one a FACTUAL repair may run on at all (anton-fzas, anton-qg4h / R5.4).
+ * Whether this failure is one a FACTUAL repair may run on at all (anton-fzas, anton-qg4h,
+ * anton-5bpd / R5.4).
  *
  * Only the two block kinds that mean "the agent could not do the work": a zero-diff run
  * ({@link NoDeliveryError}), and one the agent itself declared incomplete
@@ -609,7 +668,6 @@ async function settleAbortedTicket(args: {
   const { run, ticket, session, e } = args;
   const { ctx } = run;
   const repo = run.repoPath;
-  const { logPath } = session;
   // An ABORTED ticket writes nothing to the board (anton-6xj0). The abort's author decides this
   // ticket's fate, not this unwinding handler: an abandon settles it (closed + `abandoned`, the
   // stage label cleared — beads.abandon does all three), a force-kill or a lost lease leaves it
@@ -628,16 +686,29 @@ async function settleAbortedTicket(args: {
       .then((b) => beads.isAbandoned(b))
       .catch(() => false));
   if (ctx.signal.aborted || settledElsewhere) {
-    const why = ctx.signal.aborted ? "aborted" : "abandoned";
-    await appendSessionLog(logPath, `[${why}] ${ticket.id} was ${why} mid-run\n`).catch(() => {});
-    // "Writes nothing to the board" covers the RUN's writes too, and the ask is one of them: the
-    // run-level catch turns a NeedsHumanError into a `human` gate blocking the target. That gate
-    // outlives the cancellation — a person must clear it by hand, and on an abandoned target
-    // gate-check never resumes anything that would. Cancellation wins; the ask travels as a plain
-    // stop instead, carrying what was asked so it still reaches the operator through the run row.
-    if (e instanceof NeedsHumanError) throw new CancelledAskError(ticket.id, why, e.ask);
-    throw e;
+    await cancelledTicket({ ticket, session, e, why: ctx.signal.aborted ? "aborted" : "abandoned" });
   }
+}
+
+/**
+ * Stop the settlement of a ticket whose fate somebody else decided — logged in the session, never
+ * on the board — by rethrowing the error the ticket halted on.
+ */
+async function cancelledTicket(args: {
+  ticket: Bead;
+  session: JobSession;
+  e: unknown;
+  why: "aborted" | "abandoned";
+}): Promise<never> {
+  const { ticket, session, e, why } = args;
+  await appendSessionLog(session.logPath, `[${why}] ${ticket.id} was ${why} mid-run\n`).catch(() => {});
+  // "Writes nothing to the board" covers the RUN's writes too, and the ask is one of them: the
+  // run-level catch turns a NeedsHumanError into a `human` gate blocking the target. That gate
+  // outlives the cancellation — a person must clear it by hand, and on an abandoned target
+  // gate-check never resumes anything that would. Cancellation wins; the ask travels as a plain
+  // stop instead, carrying what was asked so it still reaches the operator through the run row.
+  if (e instanceof NeedsHumanError) throw new CancelledAskError(ticket.id, why, e.ask);
+  throw e;
 }
 
 /**
@@ -647,8 +718,10 @@ async function settleAbortedTicket(args: {
  * (commits exist), OR the agent delivered nothing at all (zero diff). Both are human-review
  * states — block with an operator-facing note. Resetting a no-delivery ticket to open would
  * silently re-queue it into the ready pool and hide the false-success. A `needs-human` ask is
- * the exception to that rule, excused by `settleAbortedTicket` before this runs. All
- * best-effort: never mask the run's error; the epic-level finally sync pushes the release.
+ * the exception to that rule, excused by `settleAbortedTicket` before this runs, and so is a ticket
+ * anton RETIRED (anton-5bpd), whose outcome is already recorded and must not be rewritten — its claim
+ * comes off under a CAS (see {@link releaseRetiredClaim}), never unconditionally. All best-effort:
+ * never mask the run's error; the epic-level finally sync pushes the release.
  */
 async function releaseFailedTicket(args: {
   run: Omit<StepContext, "tickets">;
@@ -659,12 +732,23 @@ async function releaseFailedTicket(args: {
   kinds: TicketFailureKinds;
   /** What the factual repair pass answered, when it ran — see {@link repairBlockedTicket}. */
   repair?: TicketRepair;
+  /** The operator this run holds the claim for — the retired release's CAS reads it (see below). */
+  operator?: string;
 }): Promise<void> {
   const { run, ticket, session, e } = args;
   const repo = run.repoPath;
   const { committed, selfReport } = args.progress;
   const { noDelivery, agentBlocked, needsHuman } = args.kinds;
   if (isUsageLimitError(e)) return;
+  // A RETIRED bead (anton-5bpd) is SETTLED, not released: the repair closed it as superseded by the
+  // work that actually shipped it. Both branches below would undo that — `blocked` rewrites a
+  // recorded outcome, and `open` re-queues a ticket whose work is already in the tree — so neither
+  // runs. Only the claim comes off, and only while the board still shows anton's OWN retirement on
+  // it, so the board never shows a dead session's ticket as in-flight without stomping a newer hand.
+  if (args.repair?.action === "retired") {
+    await releaseRetiredClaim(repo, ticket.id, args.repair.replacementId, args.operator);
+    return;
+  }
   // A REPAIRED bead is not a human-review state, it is work with one retry coming (R5.10) — and
   // `blocked` is a status bd refuses to claim, so blocking it here would kill that retry on its own
   // first step. Left `open` like every other re-queued ticket; the repair's own note and stamp are
@@ -689,8 +773,134 @@ async function releaseFailedTicket(args: {
   } else {
     await safe(() => beads.setStatus(repo, ticket.id, "open"));
   }
-  await safe(() => beads.unassign(repo, ticket.id));
-  await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+  await releaseTicketClaim(repo, ticket.id);
+}
+
+/** Hand the claim back: the assignee and the stage label a live run puts on a ticket. */
+async function releaseTicketClaim(repo: string, ticketId: string): Promise<void> {
+  await safe(() => beads.unassign(repo, ticketId));
+  await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
+}
+
+/**
+ * Hand a RETIRED ticket's claim back, but only while the board still shows anton's OWN retirement on
+ * it (PR #238 review). The supersede and its marker landed under the ticket's lock; this release runs
+ * once that lock is dropped, so between the repair's final reread (`retirementOvertaken`) and here another
+ * run or operator can reopen and reclaim the ticket — reachable even with the SAME operator, whose
+ * `bd update --claim` is idempotent, so no assignee change need betray it. An unconditional unassign
+ * would then strip that newer holder and leave the ticket `in_progress` but unowned.
+ *
+ * So the release is the project's claim protocol, not a read followed by a bare write (PR #238
+ * review). Three things make it one:
+ *
+ *  1. The ticket's WRITE LOCK wraps the whole read-decide-write sequence, so it is ordered against
+ *     every other claim write in this process — a worker's `claimVerified`, a human's Claim CAS, the
+ *     skip path's own guarded writes (beads/claim-lock.ts). Read-then-write outside it is exactly the
+ *     lost update this releases into.
+ *  2. The retirement is re-read INSIDE that lock and the release refused unless the ticket is still
+ *     closed as superseded by the survivor anton retired it against. A reopen flips the status off
+ *     `closed`, which is what `supersededBy` gates on — so this is the one fence that catches a
+ *     same-operator reclaim no assignee comparison can see.
+ *  3. The assignee comes off through the CONDITIONAL swap ({@link swapUnderLock}), taking its OWN
+ *     pre-write read rather than the gate's (PR #238 review). Handing `fresh` in as `current` would
+ *     suppress that read — the one thing that makes the helper a compare-and-swap — and leave the
+ *     window from the gate's read to the write covered by nothing but the post-write verify, which
+ *     sees the desired unassigned state and so cannot tell an overwritten claim from a clean
+ *     release. Re-read adjacent to the write, a holder that landed from another machine is found
+ *     before the write and reported as the loser's owner. The stage label follows only once that
+ *     swap says the claim was ours to take off — a board that reads otherwise keeps both.
+ *  4. And the retirement is asked ONE more time with the release on the board ({@link
+ *     retirementReopenedDuringRelease}), because the swap's own read can only compare an ASSIGNEE:
+ *     a same-operator reclaim after a reopen writes the identical name, so the compare passes and
+ *     the release strips a claim the reopen made valid. Only a read taken after the write can have
+ *     seen that writer. Reopened, the claim is put back the way it was found and the stage label is
+ *     left alone.
+ *
+ * The expected owner is the fresh read's own, not `operator`: when the run resolved no operator, bd's
+ * assignee is not a name anton can compare against (gardener/repair-already-shipped.ts
+ * `claimReclaimedSinceDispatch` declines the same comparison for the same reason), so the swap is
+ * held to what the in-lock read saw rather than to an identity anton does not have. With an operator,
+ * a mismatch is refused before the swap so the release never even attempts a claim that is not this
+ * run's.
+ *
+ * Best-effort throughout, like every write on this stopping path: a refused bd call costs the
+ * release, never the run's own error.
+ */
+async function releaseRetiredClaim(
+  repo: string,
+  ticketId: string,
+  replacementId: string,
+  operator: string | undefined,
+): Promise<void> {
+  await withBeadWriteLock(repo, ticketId, async () => {
+    // mustRead, not a swallowed `show`: an unreadable board must not turn this compare-and-swap into
+    // an unconditional release (see execute-epic-persist).
+    const fresh = await mustRead(repo, ticketId);
+    if (!fresh || beads.supersededBy(fresh) !== replacementId) return;
+    const holder = ownerOf(fresh);
+    if (operator && holder !== operator) return;
+    // No `current`: the swap takes its own read immediately before the write (see the header). A
+    // swap that LOST names the holder that beat us, and neither write lands.
+    const swap = await swapUnderLock(repo, ticketId)(holder, undefined).catch((e) => {
+      console.error(`[execute-epic] could not release ${ticketId}'s retired claim`, e);
+      return { ok: false, owner: holder } as const;
+    });
+    if (!swap.ok) {
+      console.warn(
+        `[execute-epic] left ${ticketId}'s claim as it stands${swap.owner ? ` (held by ${swap.owner})` : ""} — ` +
+          `its assignee moved while anton was releasing the retirement, so the claim is not anton's ` +
+          `to take off`,
+      );
+      return;
+    }
+    if (await retirementReopenedDuringRelease(repo, ticketId, replacementId, holder)) return;
+    await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
+  });
+}
+
+/**
+ * The fence after the release: whether the retirement it released was reopened and reclaimed while
+ * it was releasing it — and if so, put the claim back (PR #238 review).
+ *
+ * The swap's compare covers a DIFFERENT owner landing in the window. What it cannot see is the same
+ * one: another process reopening the ticket and re-claiming it under the operator anton's own claim
+ * already named writes the identical assignee, so the compare passes and the release strips a claim
+ * that reopen made valid — leaving an `in_progress` ticket with no owner, which `bd update --claim`
+ * refuses outright, so the rerun the reopen was for can never claim it.
+ *
+ * Status is what tells them apart, and only a read taken with the release ON the board can have seen
+ * the writer — the same after-the-write fence the retirement paths use (execute-epic-dispatch
+ * `retireFound`). Still closed as superseded by the survivor anton retired it against, nothing moved
+ * and the release stands. Anything else is a reopen, and the assignee goes back to the holder the
+ * release found — conditionally, so a third hand that has claimed it since keeps it.
+ *
+ * An unreadable bead leaves the release as it stands and says so: this runs on a stopping path where
+ * every write is best-effort, and a restore attempted on an unverified read could just as easily
+ * re-claim a ticket nothing reopened.
+ */
+async function retirementReopenedDuringRelease(
+  repo: string,
+  ticketId: string,
+  replacementId: string,
+  holder: string | undefined,
+): Promise<boolean> {
+  const after = await mustRead(repo, ticketId);
+  if (!after) {
+    console.warn(
+      `[execute-epic] released ${ticketId}'s retired claim but could not read the ticket back — ` +
+        `if another hand reopened it in that window, its claim is off and a human has to hand it back`,
+    );
+    return false;
+  }
+  if (beads.supersededBy(after) === replacementId) return false;
+  console.warn(
+    `[execute-epic] ${ticketId} was reopened while anton was releasing the claim its retirement ` +
+      `held — putting the claim back${holder ? ` for ${holder}` : ""} so the rerun that reopen is ` +
+      `for can take it`,
+  );
+  if (!holder) return true;
+  await safe(() => swapUnderLock(repo, ticketId)(undefined, holder));
+  return true;
 }
 
 /** Block the bead for a human, with the note that says which failure this was and where its evidence is. */

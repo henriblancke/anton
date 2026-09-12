@@ -59,7 +59,7 @@ export {
   type StepResult,
   type StepResultWith,
 } from "./steps/result";
-export { claudeStep, implementStep, withDispatchNotes } from "./steps/agent";
+export { claudeStep, implementStep, readForDispatch } from "./steps/agent";
 export { reviewStep, verifyStep } from "./steps/gates";
 export { commitStep, prStep } from "./steps/git";
 export { prBody, ticketPrompt, truncateField } from "./steps/prompts";

@@ -46,6 +46,7 @@ function run(o: Partial<RunRow> = {}): RunRow {
     endpointHost: null,
     formula: null,
     formulaVariant: null,
+    baseForkSha: null,
     status: "parked",
     reviewScore: null,
     attempts: 1,

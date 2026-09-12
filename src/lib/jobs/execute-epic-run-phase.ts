@@ -8,9 +8,10 @@
  * overlap is still not a licence to fan out.
  */
 import { beads, LABELS } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { updateRun } from "../runs";
 import { releaseRunResources } from "./worktree-reaper";
-import type { SkipCause } from "./execute-epic-board";
+import type { RetiredTicketOutcome, SkipCause } from "./execute-epic-board";
 import type { DispatchOutcome } from "./execute-epic-dispatch";
 import { armMergeGate } from "./execute-epic-merge-gate";
 import { runReviewStep } from "./execute-epic-review-step";
@@ -28,7 +29,12 @@ export async function walkRunPhase(
   dispatched: DispatchOutcome,
 ): Promise<void> {
   const carry: RunPhaseCarry = { advisories: [], staleBodyFallback: null };
-  for (const { step: cooked, definition } of prep.runSteps) {
+  // A standalone target THIS attempt verified and retired as already shipped has nothing for these
+  // steps to speak for (PR #238 review): the bead is closed as superseded with anton's evidence on
+  // it, and no commit is on the branch — so there is no diff to review and no pull request to open
+  // (`gh pr create` would fail on an empty diff). Skip to the finish, which settles the row as done
+  // rather than parking a run on a target the board has already settled.
+  for (const { step: cooked, definition } of dispatched.targetRetired ? [] : prep.runSteps) {
     // A step boundary is a lease checkpoint: never dispatch run-level work — and never open a
     // PR — under a lease this run can no longer prove it holds.
     run.lease.assertHeld();
@@ -53,7 +59,7 @@ export async function walkRunPhase(
     }
     await runOtherStep(run, dispatch);
   }
-  await finishRun(run, prep, dispatched.skipped, carry);
+  await finishRun(run, prep, dispatched.skipped, carry, dispatched.targetRetired);
 }
 
 /** Open the run's ONE pull request, stamp the ref, and move the target into review. */
@@ -90,7 +96,9 @@ async function runPrStep(
       carry.staleBodyFallback = stalePrBodyRunError(epicBeadId, note);
     }
   }
-  await safe(() => beads.setPrRef(repo, epicBeadId, pr.ref));
+  // Under the bead's write lock, like every other live PR-ref write (pr-link.ts gives the reason):
+  // an `already-shipped` retirement elsewhere may be re-reading this pointer as its evidence.
+  await safe(() => withBeadWriteLock(repo, epicBeadId, () => beads.setPrRef(repo, epicBeadId, pr.ref)));
   // The merge wait becomes board state, not a polling job (anton-k0kj): past this step the
   // only thing left to learn is whether this PR merges, which `bd gate check` answers for the
   // whole project in one call per slot. Best-effort like the writes around it — the
@@ -130,8 +138,10 @@ async function finishRun(
   prep: Extract<RunPreparation, { done: false }>,
   skipped: Map<string, SkipCause>,
   carry: RunPhaseCarry,
+  /** The run opened no pull request: its standalone target was retired as already shipped. */
+  targetRetired: boolean,
 ): Promise<void> {
-  const { db, clock, ctx, projectId, repo, runId, targetId: epicBeadId, timedOut } = run;
+  const { db, clock, ctx, projectId, repo, runId, targetId: epicBeadId, timedOut, retired } = run;
   const { worktree } = prep;
   const staleBodyFallback = carry.staleBodyFallback;
   // A feature that delivered most of itself still owes the founder the part it didn't
@@ -145,6 +155,44 @@ async function finishRun(
       `whether its work is in this PR; re-scope them or raise ticketTimeoutMinutes, then run them.`
     : null;
   if (timeoutNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${timeoutNotice}`));
+
+  // The tickets RETIRED as already shipped (anton-5bpd) — this attempt's and any an earlier one
+  // left on the board. The founder reads the TARGET at the merge gate, and a ticket that is closed
+  // but in no diff would otherwise look like work this PR carries. Each bead carries its own record
+  // of where the work went; this says, in one place, that the feature shipped minus these because
+  // they were already in the tree.
+  //
+  // Split by PROVENANCE, because only one half is anton's word (PR #238 review): the `this-run` ones
+  // anton checked against git and the board itself, the `pre-existing` ones it merely FOUND already
+  // superseded — by a human's scope call, a gardener dedup, an earlier attempt. Collapsing them
+  // would put anton's verification behind a decision it never made.
+  const names = (rs: RetiredTicketOutcome[]) =>
+    rs.map((r) => `${r.id} (superseded by ${r.replacedBy})`).join(", ");
+  const verified = retired.filter((r) => r.source === "this-run");
+  const preExisting = retired.filter((r) => r.source === "pre-existing");
+  const retiredNotice = retired.length
+    ? [
+        verified.length
+          ? `${verified.length} ticket(s) had already shipped — anton verified that against the ` +
+            `repository and the board and retired them as superseded: ${names(verified)}.`
+          : null,
+        preExisting.length
+          ? `${preExisting.length} ticket(s) were already settled as superseded on the board when ` +
+            `this run read it: ${names(preExisting)}. anton did not verify those; each bead ` +
+            `carries the record of whoever did.`
+          : null,
+        // Worded for the run that actually happened (PR #238 review): a retired STANDALONE target
+        // left nothing on the branch, so no pull request was opened at all, and "None of them is in
+        // this PR" would point the founder at one that does not exist.
+        targetRetired
+          ? `Nothing was committed here, so this run opened no pull request and nothing is left ` +
+            `to run.`
+          : `None of them is in this PR.`,
+      ]
+        .filter(Boolean)
+        .join(" ")
+    : null;
+  if (retiredNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${retiredNotice}`));
 
   // The tickets the timeout took down with it (anton-67xj) — the founder reads the TARGET at the
   // merge gate, so the PR's missing half is named there too, not only on each skipped bead.
@@ -162,7 +210,9 @@ async function finishRun(
   await updateRun(db, clock, runId, {
     status: "done",
     endedAt: clock.now(),
-    error: [timeoutNotice, skippedNotice, staleBodyFallback].filter(Boolean).join(" — ") || null,
+    error:
+      [timeoutNotice, retiredNotice, skippedNotice, staleBodyFallback].filter(Boolean).join(" — ") ||
+      null,
   });
   // The branch and its PR carry the work now, so the checkout is residue; the branch survives
   // because the target is still open in review (anton-hrun.1). The claim comes off first: the

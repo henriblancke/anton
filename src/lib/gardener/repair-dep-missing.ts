@@ -32,7 +32,7 @@
 import { beads, type Bead } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
-import { indexBoard, isOpenWork, type BoardIndex } from "./board-index";
+import { beadIdsNamedIn, indexBoard, isOpenWork, namedBeadIds, type BoardIndex } from "./board-index";
 import { isProposalBead } from "./detections";
 import type { ProposalAutonomy } from "./autonomy";
 import {
@@ -47,49 +47,13 @@ import {
 const KLASS = "dep-missing" as const;
 
 /**
- * bd ids as they appear in prose (`anton-qg4h`, `anton-287p.1`). Deliberately loose — the board's own
- * id prefixes and then membership decide what is real (see {@link resolvePrereq}), so the pattern
- * only has to be wide enough not to miss one. The dotted suffix is part of the id: bd mints child ids that carry it, and
- * a pattern that stopped at the dot would resolve `anton-287p.1` to its parent.
- */
-const ID_PATTERN = /\b[a-z][a-z0-9]*-[a-z0-9]{2,12}(?:\.[a-z0-9]+)*\b/gi;
-
-/**
  * Every bead id the agent's reason mentions, lower-cased and de-duplicated in the order written.
  *
  * Order matters only for how a refusal reports them; which one is the prerequisite is never decided
  * by position — a reason naming two ids is ambiguous, not "the first one".
  */
 export function namedPrereqs(reason: string | undefined): string[] {
-  if (!reason) return [];
-  const seen = new Set<string>();
-  for (const match of reason.matchAll(ID_PATTERN)) seen.add(match[0].toLowerCase());
-  return [...seen];
-}
-
-/** The bit before the dash — `anton` in `anton-qg4h`; empty for an id shaped like neither. */
-function idPrefix(id: string): string {
-  const dash = id.indexOf("-");
-  return dash > 0 ? id.slice(0, dash) : "";
-}
-
-/**
- * The id prefixes this board actually mints, read off the snapshot rather than configured.
- *
- * Needed because {@link ID_PATTERN} is loose enough that ordinary hyphenated prose ("pre-existing",
- * "one-line") reads as an id to it. Membership in the board used to be the whole filter, which was
- * fine while it ran before any cardinality question — but cardinality is now decided FIRST (see
- * {@link resolvePrereq}), and counting English words as named prerequisites would refuse every
- * reason written in sentences. The prefix is the cheapest line between the two readings: a mistyped
- * `anton-zzzz` is a bead id that missed, `pre-existing` was never one.
- */
-function mintedPrefixes(index: BoardIndex): Set<string> {
-  const prefixes = new Set<string>();
-  for (const id of index.byId.keys()) {
-    const prefix = idPrefix(id);
-    if (prefix) prefixes.add(prefix);
-  }
-  return prefixes;
+  return namedBeadIds(reason);
 }
 
 /**
@@ -166,15 +130,14 @@ export function resolvePrereq(
   targetId: string,
   reason: string | undefined,
 ): PrereqVerdict {
-  const named = namedPrereqs(reason).filter((id) => id !== targetId);
   // CARDINALITY BEFORE MEMBERSHIP (PR #223 review). Narrowing to what the board holds first would
   // read "needs anton-qg4h and anton-zzzz" as one unambiguous prerequisite by discarding the id that
   // resolved to nothing — but a reason naming two ids is ambiguous whether or not both are real: the
   // one that missed may be the mistyped form of the bead actually meant, and the ordering recorded
   // would then be the wrong half of what the agent stated. The system prompt asks for exactly one id
-  // and sends anything else to a human; this is that rule, enforced.
-  const prefixes = mintedPrefixes(index);
-  const candidates = named.filter((id) => prefixes.has(idPrefix(id)));
+  // and sends anything else to a human; this is that rule, enforced. `beadIdsNamedIn` is the prefix
+  // narrowing that keeps ordinary hyphenated prose from counting as a named bead.
+  const candidates = beadIdsNamedIn(index, reason).filter((id) => id !== targetId);
   if (candidates.length === 0) {
     return {
       state: "unresolved",

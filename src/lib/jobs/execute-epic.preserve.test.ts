@@ -96,6 +96,7 @@ suite("preserveTimedOutWork (real git)", () => {
       branch: BRANCH,
       baseBranch: "main",
       baseRef: "origin/main",
+      baseForkSha: "f0f0f0forkcommit",
       target: ticket,
       settings,
     };
@@ -725,6 +726,7 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -829,6 +831,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -958,6 +961,7 @@ suite("settleTicketTimeout — a satisfied step the deadline caught during its b
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -1082,6 +1086,7 @@ suite("settleTicketTimeout — unmarkable self-committed work stops the run", ()
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target: ticket,
     settings: { testCommand: "true" } satisfies ProjectSettings,
   });
@@ -1252,6 +1257,7 @@ describe("outOfTimeParkMessage — what the operator may safely do next (anton-d
           ...(preservedUnknown ? { preservedUnknown: true } : {}),
         },
       ],
+      retired: [],
     }) as unknown as EpicRun;
 
   it("warns that splitting means taking the preserved commit off the branch first", () => {
@@ -1282,5 +1288,46 @@ describe("outOfTimeParkMessage — what the operator may safely do next (anton-d
     expect(message).toMatch(/UNKNOWN/);
     expect(message).toContain(`could not read \`${BRANCH}\`'s history`);
     expect(message).toContain(`checking \`${BRANCH}\` for a preserved commit first`);
+  });
+
+  // One ticket timed out and another was RETIRED as already shipped (anton-5bpd): nothing is
+  // delivered, so this is the park that fires — and "every ticket ran out of time, re-scope them"
+  // would tell the operator to re-scope work the board has already settled (PR #238 review). The
+  // ledger is named, by provenance, so only the half this run verified is called verified.
+  it("names the tickets the run retired beside the ones that ran out of time, by provenance", () => {
+    const run = {
+      ...parkRun(false),
+      targetId: "anton-feat",
+      standaloneRun: false,
+      timedOut: [{ id: "anton-t1", delivered: false }],
+      retired: [
+        { id: "anton-r1", replacedBy: "anton-s1", source: "this-run" },
+        { id: "anton-r2", replacedBy: "anton-s2", source: "pre-existing" },
+      ],
+    } as unknown as EpicRun;
+
+    const message = outOfTimeParkMessage(run, []);
+
+    expect(message).toContain("every ticket under anton-feat left to run ran out of time (anton-t1)");
+    expect(message).toContain(
+      "already shipped, verified and closed as superseded (anton-r1 → superseded by anton-s1)",
+    );
+    expect(message).toContain(
+      "which this run did not verify (anton-r2 → superseded by anton-s2)",
+    );
+    expect(message).toContain("Re-scope the ones that ran out of time into smaller tickets");
+    expect(message).toMatch(/rolled back, so resuming starts it over/);
+  });
+
+  it("keeps the plain all-timeouts wording when nothing was retired", () => {
+    const message = outOfTimeParkMessage(
+      { ...parkRun(false), standaloneRun: false } as unknown as EpicRun,
+      ["anton-skip"],
+    );
+
+    expect(message).toContain(`every ticket under ${ticket.id} ran out of time (${ticket.id})`);
+    expect(message).toContain("or was skipped behind one that did (anton-skip)");
+    expect(message).not.toMatch(/retired/);
+    expect(message).toContain("Re-scope them into smaller tickets");
   });
 });

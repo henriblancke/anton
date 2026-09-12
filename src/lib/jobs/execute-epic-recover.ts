@@ -9,6 +9,7 @@
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { runTickets } from "../ticket-view";
+import { priorRepair } from "../gardener/repair";
 import { pullRequestState } from "../git/ops";
 import { findWorktree, worktreePathFor, type Worktree } from "../git/worktree";
 import { updateRun } from "../runs";
@@ -25,7 +26,7 @@ import type { EpicRun } from "./execute-epic-run";
  */
 export async function refreshRunBoard(
   run: EpicRun,
-): Promise<{ preCheckTrusted: boolean; leaseTarget: Bead }> {
+): Promise<{ preCheckTrusted: boolean; currentBoardTrusted: boolean; leaseTarget: Bead }> {
   const { repo, targetId: epicBeadId } = run;
   // 0. Cross-machine double-run guard (anton-jz1). A queued job that reschedules (quota/backoff)
   //    re-enters this handler WITHOUT the enqueue-time liveRunCheck. If a Force run started on
@@ -49,6 +50,7 @@ export async function refreshRunBoard(
   //    the post-publish race arbitration (step 1b) must NOT steal the lease from it by owner order
   //    when our pre-check couldn't rule it out (anton-jz1).
   let preCheckTrusted = true;
+  let currentBoardTrusted = false;
   try {
     await beads.pull(repo);
   } catch {
@@ -86,11 +88,12 @@ export async function refreshRunBoard(
       // read `leaseTarget`. Leaving it stale would let a run whose completion/lease is visible in
       // this fresh list fall through into worktree/PR handling instead of finishing idempotently.
       leaseTarget = freshTarget;
+      currentBoardTrusted = true;
     }
   } catch {
     // keep the pre-pull snapshot
   }
-  return { preCheckTrusted, leaseTarget };
+  return { preCheckTrusted, currentBoardTrusted, leaseTarget };
 }
 
 /**
@@ -98,9 +101,49 @@ export async function refreshRunBoard(
  * crashed attempt, or by the run that held the lease this one parked on. Answers `true` once the
  * attempt is settled `done`; the caller returns without executing anything.
  */
-export async function settleCompletedRun(run: EpicRun, leaseTarget: Bead): Promise<boolean> {
+export async function settleCompletedRun(
+  run: EpicRun,
+  leaseTarget: Bead,
+  currentBoardTrusted = true,
+): Promise<boolean> {
   const { db, clock, ctx, projectId, repo, runId, branch, targetId: epicBeadId, lease } = run;
   const { all, standaloneRun } = run;
+  // 0a-pre. The target is its own single ticket and THIS anton already retired it as already
+  //     shipped — the terminal success execute-epic-dispatch answers with `targetRetired`, recovered
+  //     from the BOARD rather than from the ledger that attempt held in memory (PR #238 review).
+  //     Its success path reads `run.retired`, which every attempt rebuilds from scratch, so an
+  //     interruption between the supersede and the run row settling makes it unreachable: the retry
+  //     reconstructs an empty ledger and never gets that far anyway, because the target is now
+  //     closed and unassigned and `claimRunTarget` refuses it — parking a successfully retired
+  //     target as a stuck execution, against the breaker, telling the operator to reopen a
+  //     retirement anton made correctly. Asked here it is idempotent instead: the run settles done
+  //     exactly as the uninterrupted attempt would.
+  //
+  //     Only when the target carries NO pull request pointer, so this never preempts the live-PR
+  //     short-circuit below: a target already carried to an open or merged PR has a different right
+  //     answer (adopt the in-review state, arm the merge gate), and settling it here would tell the
+  //     operator no pull request was opened while one sits in review. A retirement opens none by
+  //     construction — the run phase skips every step including `pr` — so the two states do not
+  //     overlap on any board anton itself wrote, and one that holds both is odd enough to be worth a
+  //     person's eyes rather than either module's guess.
+  //     Asked of the REFRESHED board, not of the snapshot verdict (PR #238 review).
+  //     `refreshRunBoard` adopts a fresh `run.all` but deliberately leaves `run.standaloneRun`
+  //     alone — the shape is recomputed in 0a-ter, AFTER this short-circuit. So on a retry whose
+  //     fresh board has since gained a child under the target, the stale `true` still reads it as
+  //     its own single ticket: a stamped, superseded target would settle the whole run `done` here
+  //     and strand that newly-added work beneath a closed target, with no run path left to reach
+  //     it. Re-derived in `execute-epic-prepare`'s own words (`groupsChildren` over `runTickets`)
+  //     so the two cannot disagree, and kept local — 0a-ter still owns the assignment to `run`.
+  const standaloneNow =
+    standaloneRun && !beads.groupsChildren(run.target, runTickets(all, epicBeadId));
+  if (
+    currentBoardTrusted &&
+    !beads.getPrRef(leaseTarget) &&
+    standaloneNow &&
+    (await settleRetiredStandalone(run, leaseTarget))
+  ) {
+    return true;
+  }
   // 0a. Revalidate the target still needs execution (anton-jz1). A job that parked on a foreign
   //     live lease (foreignRunLeaseLive below) or lost the publish race (step 1b) reschedules and
   //     re-enters this handler once that lease clears — but the run that HELD the lease may have
@@ -263,4 +306,89 @@ export async function settleCompletedRun(run: EpicRun, leaseTarget: Bead): Promi
     }
   }
   return false;
+}
+
+/**
+ * Whether this standalone target is one anton itself retired as already shipped — the durable half
+ * of the terminal outcome `dispatchRunTickets` answers with `targetRetired` (PR #238 review).
+ *
+ * That verdict is reached from `run.retired`, an in-memory ledger every attempt rebuilds. So it
+ * survives only inside the attempt that wrote it: a crash, a kill or a `finishRun` that could not
+ * write the row leaves the supersede on the board with no record of it anywhere the retry reads.
+ * And the retry never reaches that path regardless — the target is closed and unassigned by then, so
+ * the claim gate refuses it first and the run parks on a message asking a human to reopen a
+ * retirement anton made correctly, counting a success against the consecutive-failure breaker.
+ * Recovering it from the board makes the outcome idempotent: this attempt settles `done` exactly as
+ * the uninterrupted one would.
+ *
+ * The provenance test is anton's OWN repair STAMP, not the supersede (PR #238 review). Every
+ * retirement reads the same on the bead — closed, with a `supersedes` edge — so the edge alone
+ * cannot tell anton's verified one from a human's rescope, a gardener dedup or an operator's
+ * `bd supersede` of a target they decided against. Only `repair:already-shipped:<hash>:<ms>` says
+ * anton checked the claim against git and the board and settled it itself, and only that licenses
+ * finishing the run as a success rather than reporting a settlement nobody here performed. A
+ * supersede anton merely FOUND falls through to the ordinary walk, where the claim gate parks it for
+ * the person whose decision it was — the same split `byProvenance` draws in the dispatch phase.
+ *
+ * Read from a `bd show` rather than the board list: the stamp lives in `labels` and the repair's
+ * account in `notes`, and only `show` carries the notes blob. An unreadable bead falls through: this
+ * decides whether a run finishes as a success, and "could not check" is not "anton retired it".
+ */
+async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise<boolean> {
+  const { db, clock, ctx, projectId, repo, runId, branch, targetId, lease } = run;
+  const survivor = beads.supersededBy(leaseTarget);
+  if (!survivor) return false;
+  // The stamp and the note both live on the full bead; the lease read may be a list row.
+  const stamped = await beads.show(repo, targetId).catch(() => undefined);
+  if (!stamped || beads.supersededBy(stamped) !== survivor) return false;
+  const repair = priorRepair(stamped, "already-shipped");
+  if (!repair) return false;
+  // A stamp survives reopen/re-supersede cycles. It proves only the closure it followed, not a
+  // later human retirement: a current close after the stamp must take the ordinary parked path.
+  const closedAt = stamped.closed_at ? Date.parse(stamped.closed_at) : Number.NaN;
+  if (!Number.isFinite(closedAt) || repair.at < closedAt) return false;
+
+  // This attempt's own leftover lease, exactly as the live-PR short-circuit adopts it: a crash after
+  // the supersede but before the cleanup leaves an unexpired `run-lease:…:<runId>` this run
+  // published, and the general adoption runs after this return. Only OUR OWN — a foreign machine's
+  // lease is left for its owner and its TTL.
+  lease.adoptOwn(leaseTarget);
+  // Nothing was committed, so the checkout is pure residue and the branch goes with it: the target
+  // is settled, and no pull request was ever opened from it. Routed through the same teardown as
+  // every other terminal exit (anton-hrun.1) so it owes the same branch policy and session account,
+  // and best-effort for the same reason — a settled target must not fail over a cleanup.
+  await safe(async () => {
+    const staleWorktree: Worktree = (await findWorktree(repo, branch)) ?? {
+      path: worktreePathFor(repo, branch),
+      branch,
+      baseBranch: branch,
+      repoPath: repo,
+    };
+    await releaseRunResources({
+      db,
+      clock,
+      ctx,
+      projectId,
+      runId,
+      repoPath: repo,
+      worktree: staleWorktree,
+      beadId: targetId,
+      status: "done",
+    });
+  });
+  // The row says what happened, in the words `finishRun` would have used for the same run: a
+  // verified retirement, and no pull request because nothing was committed. Nothing is written to
+  // the BEAD here — the retirement already put its own evidence and repair notes there, under the
+  // ticket's lock and before the window this recovers from, so the account a person reads at the
+  // target is intact and a second note would only repeat it.
+  await updateRun(db, clock, runId, {
+    status: "done",
+    endedAt: clock.now(),
+    error:
+      `${targetId} had already shipped — anton verified that against the repository and the board ` +
+      `and retired it as superseded by ${survivor}` +
+      `${repair.attempted ? ` (${repair.attempted})` : ""}. Nothing was committed here, so this ` +
+      `run opened no pull request and nothing is left to run.`,
+  });
+  return true;
 }

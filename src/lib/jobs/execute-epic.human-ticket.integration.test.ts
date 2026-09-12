@@ -391,6 +391,69 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
     }
   });
 
+  it("names the human ticket AND the retirement when the run has both (PR #238 review)", async () => {
+    // Two ways to deliver nothing can meet in one feature: a ticket already superseded on the board,
+    // and a ticket a person did outside the branch. The retirement park must not swallow that — it
+    // speaks for a feature that was ENTIRELY already shipped, and firing here would tell the
+    // operator every dispatchable ticket had landed while never naming the ticket a person actually
+    // did. So the human park takes it, and names both halves.
+    //
+    // The retirement here is PRE-EXISTING — `bd supersede` run by a person, not this run's repair —
+    // which is also why nothing anton writes about it may claim anton verified it.
+    const feature = await beads.create(repo, {
+      title: "Provision the vendor tenancy",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nVendor tenancy",
+    });
+    await beads.approve(repo, feature);
+    const survivor = createTicket(repo, { title: "Tenancy provisioning (shipped earlier)" });
+    const alreadyShipped = createTicket(repo, {
+      title: "Provision the tenancy",
+      parent: feature,
+    });
+    await beads.supersede(repo, alreadyShipped, survivor);
+    const sign = createTicket(repo, {
+      title: "Sign the tenancy agreement",
+      parent: feature,
+      labels: [LABELS.agentHuman],
+    });
+
+    const log = join(sandbox, "human-plus-retired-inv.jsonl");
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = loggingClaude("claude-human-plus-retired", log);
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: feature });
+
+      // The superseded ticket is never dispatched and never reopened; the human one gets its gate.
+      expect(dispatched(log)).toEqual([]);
+      expect((await beads.show(repo, alreadyShipped)).status).toBe("closed");
+      expect(await gatesBlocking(sign)).toHaveLength(1);
+
+      // Answering the person's part leaves the run with nothing delivered — the mixed case.
+      const gate = (await gatesBlocking(sign))[0];
+      await beads.gateResolve(repo, gate.id, "signed — countersigned copy filed");
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await tickToIdle(runner);
+
+      const settled = await getJob(tdb.db, jobId);
+      expect(settled?.status).toBe("parked");
+      expect(settled?.lastError).toContain("no pull request to open");
+      // BOTH halves are named, and the human one is not described as already shipped.
+      expect(settled?.lastError).toContain(sign);
+      expect(settled?.lastError).toContain(alreadyShipped);
+      expect(settled?.lastError).toContain(survivor);
+      expect(settled?.lastError).toMatch(/work a person does/);
+      expect(settled?.lastError).not.toMatch(/every ticket under .* had ALREADY SHIPPED/);
+
+      expect(beads.getPrRef(await beads.show(repo, feature)) ?? null).toBeNull();
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
   it("arms nothing when the run parks before it holds the run-lease (PR #213 review)", async () => {
     // Arming is a WRITE, and a run that never wins the run-lease has no right to leave one. Held
     // where it was — ahead of every pre-lease gate — two machines starting the same target race
