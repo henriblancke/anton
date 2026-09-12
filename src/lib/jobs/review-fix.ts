@@ -485,21 +485,26 @@ async function prepareFixWorktree(args: {
   }
   await ctx.heartbeat();
 
-  const hooksPath = await resolveHooksPathOverride(repo, worktree.path);
   await safe(() =>
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
   );
-  await safe(() =>
-    mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true, hooksPath }),
-  );
+  // No `hooksPath` override on this fast-forward: it is exactly the merge that can FIRST introduce a
+  // tracked hooks directory into this worktree (a reviewer's push that adds or edits `.githooks`,
+  // say), so any value resolved beforehand is stale or points nowhere by the time the merge runs and
+  // fires `post-merge` — resolveHooksPathOverride exists to correct git's resolution for a directory
+  // that predates the command it's passed to, not one the command itself is about to create. Native,
+  // per-worktree resolution (git ≥ 2.43, verified against every case this file's history added the
+  // override for) already gets a plain fast-forward right on its own, tracked-hooks-dir included
+  // (PR #263 review, round 7 — round 6's re-resolve-after-the-fact fix only reached the LATER
+  // premerge below, not this merge itself).
+  await safe(() => mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true }));
 
-  // Re-resolved, not the `hooksPath` captured above: the fast-forward just now may be exactly what
-  // FIRST introduced a tracked hooksPath (or changed it) into this worktree — a reviewer's push that
-  // adds/edits `.githooks`, say. Using the pre-sync value here would premerge with an override that
-  // is stale or points nowhere, silently skipping the `post-merge` hook a base-branch merge should
-  // fire (PR #263 review, round 6).
-  const premergeHooksPath = await resolveHooksPathOverride(repo, worktree.path);
-  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number, premergeHooksPath);
+  // Resolved AFTER the sync above, unlike the fast-forward: this premerge is a plain command against
+  // whatever the worktree already has checked out (the sync's own hooks-directory changes, if any,
+  // already landed), so the override here is answering the ordinary "was this generated, like Husky's
+  // .husky/_?" question resolveHooksPathOverride is for — not racing a merge that hasn't run yet.
+  const hooksPath = await resolveHooksPathOverride(repo, worktree.path);
+  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number, hooksPath);
   await ctx.heartbeat();
   return { worktree, conflicts };
 }
