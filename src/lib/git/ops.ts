@@ -124,7 +124,22 @@ export async function resolveHooksPathOverride(
   // base repo's own `.git` keeps working (PR #263 review) — `isDirectory()` falls through to the
   // tracked-check below instead, which correctly resolves `.git` to the base repo's real directory
   // (never tracked in git's index, so treated the same as any other generated path).
-  if (existsSync(inWorktree) && statSync(inWorktree).isDirectory()) return inWorktree;
+  //
+  // A DIRECTORY THAT IS ACTUALLY AN UNINITIALIZED SUBMODULE is the other case `isDirectory()` alone
+  // can't tell apart: `git worktree add` materializes a submodule's gitlink entry as a real, empty
+  // directory in the new worktree regardless of whether that submodule has ever been initialized
+  // there (`git submodule update --init` never runs for a worktree add) — so a `core.hooksPath`
+  // naming a submodule root looks like a present, empty hooks directory instead of the tracked
+  // directory it actually is. `isUninitializedSubmodule` is what tells the two apart, and the base
+  // repo's own copy is returned DIRECTLY rather than falling through to the tracked-check further
+  // below: that check exists to tell a generated directory apart from one the worktree's branch
+  // deliberately deleted, neither of which describes an uninitialized submodule — it's unconditionally
+  // tracked (submodules are gitlinks in the index) and the base repo's copy is guaranteed initialized,
+  // since anton's runs never delete it (PR #263 review, round 13).
+  if (existsSync(inWorktree) && statSync(inWorktree).isDirectory()) {
+    if (await isUninitializedSubmodule(worktreePath, raw)) return resolve(repoPath, raw);
+    return inWorktree;
+  }
 
   // A `core.hooksPath` that climbs out of the repo via `..` (valid — git-config(1) places no
   // restriction on it) can never be in ANY checkout's index, so `isTrackedInBaseRepo`'s `ls-files`
@@ -172,6 +187,38 @@ async function isTrackedInBaseRepo(repoPath: string, relPath: string): Promise<b
     // on purpose, so {@link exitedWith} is what tells a real "not tracked" apart from that and lets
     // everything else propagate.
     if (exitedWith(e, 1)) return false;
+    throw e;
+  }
+}
+
+/**
+ * Whether `relPath` is a submodule gitlink in `worktreePath`'s index that has never been
+ * initialized there — the one case `existsSync`+`isDirectory()` can't tell apart from a real,
+ * populated hooks directory. `git worktree add` materializes every tracked path, submodule gitlinks
+ * included, but never runs `submodule update --init` for the new worktree (that is a separate,
+ * opt-in step) — so an uninitialized submodule shows up as a real, merely empty directory, exactly
+ * as present on disk as a hooks directory with content (PR #263 review, round 13).
+ *
+ * `git submodule status` is what distinguishes the two: it prefixes exactly one status character per
+ * line, and a leading `-` is documented as specifically "not initialized" (git-submodule(1)) — the
+ * only prefix meaning this worktree's copy is the empty placeholder, not real hook content.
+ */
+async function isUninitializedSubmodule(worktreePath: string, relPath: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "submodule", "status", "--", `:(literal)${relPath}`],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    return stdout.startsWith("-");
+  } catch (e) {
+    // Exit 1: `relPath` matches no submodule at all — the ordinary case for every hooksPath naming an
+    // regular tracked directory, not a submodule. Exit 128: `relPath` resolves outside the repository
+    // entirely (a `..`-escaping hooksPath, still possible here since that check runs after this one) —
+    // also never a submodule question this repo can answer. Both mean "not a submodule", the answer
+    // this helper exists to give either way; anything else (a corrupt index, a timeout, git missing)
+    // is an operational failure that must propagate rather than silently accept the directory.
+    if (exitedWith(e, 1) || exitedWith(e, 128)) return false;
     throw e;
   }
 }

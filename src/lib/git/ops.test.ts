@@ -487,6 +487,59 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, ".githooks"));
   });
 
+  // A core.hooksPath naming a SUBMODULE ROOT is the case `existsSync`+`isDirectory()` alone can't
+  // tell apart from a real, populated hooks directory: `git worktree add` materializes every tracked
+  // path, submodule gitlinks included, as a real directory — but never runs `submodule update --init`
+  // for the new worktree, so an uninitialized submodule there is an empty directory that is just as
+  // "present" on disk as one with real hook content. Falling for it would silently run no hook at all
+  // from every worktree push, while the base repo's own initialized copy keeps working (PR #263
+  // review, round 13).
+  it("falls back to the base repo's copy when the worktree's hooksPath is an uninitialized submodule", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        ".githooks",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".githooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    // Confirm the setup actually reproduces the collision: the worktree's .githooks exists as a real,
+    // empty directory (the gitlink materialized, but the submodule content was never checked out).
+    expect(statSync(join(worktree, ".githooks")).isDirectory()).toBe(true);
+    expect(existsSync(join(worktree, ".githooks", "pre-push"))).toBe(false);
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".githooks"));
+  });
+
   // The Husky case stays correct: a GENERATED directory has no copy in a cold worktree at all, so
   // there is nothing to prefer — the base repo is still the right (only) source. Husky 9's installer
   // writes `.husky/_/.gitignore` (`*`) itself on `prepare` — that file is never committed either, so
