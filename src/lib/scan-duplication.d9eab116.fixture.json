@@ -3,9 +3,9 @@
     "Source": "duplication",
     "Kind": "code-clone",
     "FilePath": "src/lib/git/ops.test.ts",
-    "Line": 318,
+    "Line": 319,
     "Title": "Duplicated block (6 lines, 4 locations)",
-    "Description": "Duplicated code found in:\n  - src/lib/git/ops.test.ts:318\n  - src/lib/git/ops.test.ts:436\n  - src/lib/git/ops.test.ts:732\n  - src/lib/git/ops.test.ts:319\n",
+    "Description": "Duplicated code found in:\n  - src/lib/git/ops.test.ts:319\n  - src/lib/git/ops.test.ts:529\n  - src/lib/git/ops.test.ts:825\n  - src/lib/git/ops.test.ts:320\n",
     "Confidence": 0.44999999999999996
   },
   {

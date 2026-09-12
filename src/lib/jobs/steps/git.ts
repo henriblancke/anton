@@ -11,6 +11,7 @@ import {
   isAncestor,
   openPullRequest,
   readWorktreeState,
+  resolveHooksPathOverride,
   worktreeHasCommitFor,
   worktreeHasPreservedCommitFor,
   type WorktreeState,
@@ -54,7 +55,8 @@ import type { StepResultWith } from "./result";
  *    ticket's commits that anton has already closed the bead for. Poison.
  */
 export async function commitStep(ctx: StepContext): Promise<StepResultWith<"committed">> {
-  const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx));
+  const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
+  const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx), { hooksPath });
   if (committed) return { ok: true, detail: "committed", facts: { committed: true } };
 
   // No anchor to compare against: fall back to the index alone. The pre-anton-8t1f behaviour, kept
@@ -183,7 +185,12 @@ async function adoptPreservedWork(ctx: StepContext): Promise<StepResultWith<"com
 async function recordAttribution(ctx: StepContext, why: string): Promise<boolean> {
   const subject = stepSubject(ctx);
   if (await worktreeHasCommitFor(ctx.worktreePath, subject.id)) return false;
-  await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`);
+  // `hooksPath` is resolved and passed through for the same reason `commitStep` above does it:
+  // `commitMarker`'s `--no-verify` bypasses only `pre-commit`/`commit-msg`, so a generated,
+  // base-only hook still needs the base repo's copy resolved rather than this cold worktree's own,
+  // nonexistent one (PR #263 review, round 15).
+  const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
+  await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`, { hooksPath });
   return true;
 }
 
@@ -195,6 +202,7 @@ export async function prStep(ctx: StepContext): Promise<StepResultWith<"pr">> {
   ctx.assertLeaseHeld?.();
   const pr = await openPullRequest({
     repoPath: ctx.repoPath,
+    worktreePath: ctx.worktreePath,
     branch: ctx.branch,
     base: ctx.baseBranch,
     title: buildPrTitle(ctx.target, ctx.target.id, ctx.settings.conventionalCommits),

@@ -8025,7 +8025,7 @@ describe("scan", () => {
       }
       // ...and the test arrange-block clones the bead names as REAL duplication still come through.
       expect(kept).toContainEqual(
-        expect.objectContaining({ FilePath: "src/lib/git/ops.test.ts", Line: 318 }),
+        expect.objectContaining({ FilePath: "src/lib/git/ops.test.ts", Line: 319 }),
       );
     });
   });

@@ -45,6 +45,7 @@ describeBd("review-fix e2e (real handler · real bd/git · fake claude/gh)", () 
   let epicId: string;
   let branch: string;
   let restoreEnv: () => void;
+  let hookLog: string;
 
   /** One dispatcher pass, driven to settlement. `epicBeadId` narrows it to a single target. */
   const runDispatch = (epicBeadId?: string) =>
@@ -186,6 +187,16 @@ process.exit(0);`,
     tdb = makeProjectDb({ repoPath: repo });
     clock = new FakeClock(1_700_000_000_000);
     projectId = tdb.projectId;
+
+    // Review finding: a real pre-push hook, recording the branch checked out at ITS OWN cwd (git
+    // sets this before invoking hooks) — the same thing a project's stale-working-tree gate reads.
+    // Hooks live in the shared .git dir, so this fires identically whether `git push` runs from
+    // `repo` (left on `main` the whole suite) or from a worktree checked out on the feature branch —
+    // which is exactly what distinguishes a push run from the right place from one that isn't.
+    hookLog = join(sandbox, "pre-push-hook.log");
+    const hookPath = join(repo, ".git", "hooks", "pre-push");
+    writeFileSync(hookPath, `#!/usr/bin/env sh\ngit rev-parse --abbrev-ref HEAD >> "${hookLog}"\n`);
+    chmodSync(hookPath, 0o755);
   });
 
   afterAll(() => {
@@ -216,6 +227,15 @@ process.exit(0);`,
       encoding: "utf8",
     });
     expect(remoteLog).toContain("address review feedback");
+
+    // Review finding: the push ran from the run's WORKTREE, not from `repo` — the base checkout,
+    // which sat on `main` the whole test. A regression back to pushing `-C repo` would run this
+    // real pre-push hook with `main` checked out instead of the feature branch: distinguishing
+    // proof, not just "a commit reached origin" (which passed under the old, buggy call shape too).
+    expect(readFileSync(hookLog, "utf8").trim()).toBe(branch);
+    expect(
+      execFileSync("git", ["-C", repo, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" }).trim(),
+    ).toBe("main");
 
     // Notify calls fired: the fixed thread got a reply + was resolved, plus the PR-level comment
     // and the reviewer re-request.
@@ -286,6 +306,11 @@ process.exit(0);`,
         encoding: "utf8",
       });
       expect(remoteLog).toContain("[prior]");
+
+      // Review finding: this path pushes via the `branchAheadOfRemote` fallback (no new commit this
+      // run) rather than the `committed` branch the first test covers — same requirement, from the
+      // worktree, not `repo`.
+      expect(readFileSync(hookLog, "utf8").trim().split("\n").pop()).toBe(branch);
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
     }

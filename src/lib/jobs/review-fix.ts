@@ -57,7 +57,10 @@ import {
   commitAll,
   fetchOrigin,
   mergeIntoCurrent,
+  needsHooksPathOverrideForMerge,
   pushBranch,
+  resolveHooksPathOverride,
+  resolveHooksPathOverrideForMerge,
 } from "../git/ops";
 import {
   ANTON_MARK,
@@ -487,11 +490,31 @@ async function prepareFixWorktree(args: {
   await safe(() =>
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
   );
+
+  // Override `core.hooksPath` for the fast-forward below ONLY when the incoming ref itself doesn't
+  // carry it (see needsHooksPathOverrideForMerge) — a value resolved before this merge is either
+  // exactly right (a generated directory like Husky's `.husky/_`, never tracked by any ref) or
+  // guaranteed stale (a tracked directory the merge is about to introduce or change), and using it in
+  // the wrong case silently skips or misfires this merge's own `post-merge` (PR #263 review, rounds
+  // 6-8). The VALUE, once an override is needed, comes from resolveHooksPathOverrideForMerge rather
+  // than resolveHooksPathOverride: the latter answers "what does the CURRENT checkout need", which
+  // can pass for a submodule-backed hooksPath that is self-consistent right now but about to go stale
+  // the instant this merge changes the gitlink — resolveHooksPathOverrideForMerge validates any
+  // submodule substitute against the INCOMING ref specifically (PR #263 review, round 21).
+  const syncRef = `origin/${branch}`;
+  const syncHooksPath = (await needsHooksPathOverrideForMerge(repo, worktree.path, syncRef))
+    ? await resolveHooksPathOverrideForMerge(repo, worktree.path, syncRef)
+    : undefined;
   await safe(() =>
-    mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true }),
+    mergeIntoCurrent(worktree.path, syncRef, { ffOnly: true, hooksPath: syncHooksPath }),
   );
 
-  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number);
+  // Resolved AFTER the sync above, unlike the fast-forward: this premerge is a plain command against
+  // whatever the worktree already has checked out (the sync's own hooks-directory changes, if any,
+  // already landed), so the override here is answering the ordinary "was this generated, like Husky's
+  // .husky/_?" question resolveHooksPathOverride is for — not racing a merge that hasn't run yet.
+  const hooksPath = await resolveHooksPathOverride(repo, worktree.path);
+  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number, hooksPath);
   await ctx.heartbeat();
   return { worktree, conflicts };
 }
@@ -502,10 +525,11 @@ async function premergeBase(
   pr: PrReview,
   baseBranch: string | undefined,
   number: number,
+  hooksPath: string | undefined,
 ): Promise<string[]> {
   if (pr.mergeable !== "CONFLICTING" || !baseBranch) return [];
   try {
-    const merge = await mergeIntoCurrent(worktreePath, `origin/${baseBranch}`);
+    const merge = await mergeIntoCurrent(worktreePath, `origin/${baseBranch}`, { hooksPath });
     return merge.conflicts; // clean auto-merge → a merge commit is pushed below
   } catch (e) {
     consoleLog.error(`PR #${number}: merging origin/${baseBranch} failed`, e);
@@ -686,12 +710,18 @@ async function commitAndPushFix(
   branch: string,
   number: number,
 ): Promise<boolean> {
+  const hooksPath = await resolveHooksPathOverride(repo, worktreePath);
   const { committed } = await commitAll(
     worktreePath,
     `${epicId}: address review feedback (PR #${number})`,
+    { hooksPath },
   );
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
-  if (pushed) await pushBranch(repo, branch);
+  // From the worktree, not `repo` (the base checkout) — see pushBranch's doc comment: a project's
+  // pre-push hook that inspects the working tree must see the branch actually being pushed. The
+  // resolved hooksPath still comes from `repo` (the base checkout's config) — that's the one place
+  // `core.hooksPath` was actually configured; git resolves an absolute path the same from either.
+  if (pushed) await pushBranch(worktreePath, branch, hooksPath);
   return pushed;
 }
 
