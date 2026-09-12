@@ -523,5 +523,9 @@ async function commitPreservedTree(args: {
     await logPreserve(logPath, `${why} — anton did not retry with the hooks bypassed`);
     return first;
   }
-  return commitAll(worktreePath, message, { bypassHooks: true }).catch(rejected);
+  // `hooksPath`, not just `bypassHooks`: `--no-verify` bypasses only `pre-commit`/`commit-msg`
+  // (git-commit(1)) — `post-commit` still runs, and without the same override this retry resolves it
+  // against a cold worktree where a generated hooks directory (Husky's `.husky/_`) was never
+  // installed, silently skipping it (PR #263 review).
+  return commitAll(worktreePath, message, { bypassHooks: true, hooksPath }).catch(rejected);
 }
