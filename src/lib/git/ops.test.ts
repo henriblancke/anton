@@ -540,6 +540,62 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".githooks"));
   });
 
+  // A submodule gitlink whose `.gitmodules` mapping is missing or corrupt — e.g. a feature branch
+  // that dropped `.gitmodules` while leaving the gitlink itself in the tree — makes `git submodule
+  // status` fail with exit 128 ("fatal: no submodule mapping found"), the SAME exit code a `..`-escaping
+  // hooksPath produces. Only the escape case may be read as "not a submodule, fall back silently";
+  // this one is a genuine defect in the checkout and must propagate rather than be misread as "not a
+  // submodule" and silently accept the worktree's empty placeholder directory (PR #263 review, round 14).
+  it("propagates a submodule status failure instead of accepting a broken worktree copy", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-2");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        ".githooks",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule"], {
+      stdio: "ignore",
+    });
+    // Corrupt the mapping while keeping the gitlink itself tracked — the scenario a feature branch
+    // that mishandles .gitmodules produces.
+    execFileSync("git", ["-C", repo, "rm", "-q", "--cached", ".gitmodules"], { stdio: "ignore" });
+    rmSync(join(repo, ".gitmodules"));
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "drop gitmodules mapping"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".githooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    expect(statSync(join(worktree, ".githooks")).isDirectory()).toBe(true);
+
+    await expect(resolveHooksPathOverride(repo, worktree)).rejects.toThrow();
+  });
+
   // The Husky case stays correct: a GENERATED directory has no copy in a cold worktree at all, so
   // there is nothing to prefer — the base repo is still the right (only) source. Husky 9's installer
   // writes `.husky/_/.gitignore` (`*`) itself on `prepare` — that file is never committed either, so

@@ -125,6 +125,22 @@ export async function resolveHooksPathOverride(
   // tracked-check below instead, which correctly resolves `.git` to the base repo's real directory
   // (never tracked in git's index, so treated the same as any other generated path).
   //
+  // A `core.hooksPath` that climbs out of the repo via `..` (valid — git-config(1) places no
+  // restriction on it) can never be in ANY checkout's index, so neither `isTrackedInBaseRepo`'s
+  // `ls-files` nor `isUninitializedSubmodule`'s `submodule status` below has anything meaningful to
+  // answer for it — worse, git rejects a pathspec outside the repository outright (exit 128, not the
+  // no-match exit 1 those helpers otherwise rely on), which would otherwise make them throw and abort
+  // every commit/push using such a path (PR #263 review). Detected up front, before either probe ever
+  // runs: it is never "tracked" or "a submodule" by definition, so this falls straight to the base
+  // repo's copy, the only sensible source for a shared directory that lives outside either checkout.
+  const rel = relative(repoPath, resolve(repoPath, raw));
+  // `rel === ".."` or a `..` SEGMENT (`..${sep}`) means real traversal; a bare `startsWith("..")`
+  // would also match a same-level name that merely begins with two dots, like `..hooks` — a valid
+  // directory name path.relative can legitimately return unchanged (PR #263 review, round 4).
+  const escapesRepo = rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+  if (escapesRepo && existsSync(inWorktree) && statSync(inWorktree).isDirectory()) return inWorktree;
+  if (escapesRepo) return resolve(repoPath, raw);
+
   // A DIRECTORY THAT IS ACTUALLY AN UNINITIALIZED SUBMODULE is the other case `isDirectory()` alone
   // can't tell apart: `git worktree add` materializes a submodule's gitlink entry as a real, empty
   // directory in the new worktree regardless of whether that submodule has ever been initialized
@@ -135,24 +151,16 @@ export async function resolveHooksPathOverride(
   // below: that check exists to tell a generated directory apart from one the worktree's branch
   // deliberately deleted, neither of which describes an uninitialized submodule — it's unconditionally
   // tracked (submodules are gitlinks in the index) and the base repo's copy is guaranteed initialized,
-  // since anton's runs never delete it (PR #263 review, round 13).
+  // since anton's runs never delete it (PR #263 review, round 13). `raw` is confirmed to resolve
+  // INSIDE the repo by this point (the `escapesRepo` check above already returned otherwise), so an
+  // exit-128 failure here can only be a genuine operational failure — e.g. a feature branch that
+  // dropped `.gitmodules` while keeping the gitlink, which git reports as "no submodule mapping found"
+  // — and `isUninitializedSubmodule` propagates it rather than misreading it as "not a submodule" and
+  // silently accepting the broken worktree copy (PR #263 review, round 14).
   if (existsSync(inWorktree) && statSync(inWorktree).isDirectory()) {
     if (await isUninitializedSubmodule(worktreePath, raw)) return resolve(repoPath, raw);
     return inWorktree;
   }
-
-  // A `core.hooksPath` that climbs out of the repo via `..` (valid — git-config(1) places no
-  // restriction on it) can never be in ANY checkout's index, so `isTrackedInBaseRepo`'s `ls-files`
-  // has nothing meaningful to answer — worse, git rejects a pathspec outside the repository outright
-  // (exit 128, not the no-match exit 1), which would otherwise make this throw and abort every
-  // commit/push using such a path (PR #263 review). Skip the probe: it is never "tracked" by
-  // definition, so this falls straight to the base repo's copy, the only sensible source for a
-  // shared directory that lives outside either checkout.
-  const rel = relative(repoPath, resolve(repoPath, raw));
-  // `rel === ".."` or a `..` SEGMENT (`..${sep}`) means real traversal; a bare `startsWith("..")`
-  // would also match a same-level name that merely begins with two dots, like `..hooks` — a valid
-  // directory name path.relative can legitimately return unchanged (PR #263 review, round 4).
-  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return resolve(repoPath, raw);
 
   // Missing in the worktree — fall back to the base repo's copy only when the base checkout doesn't
   // track it either (a generated directory like Husky's `.husky/_`, never committed at all — see
@@ -212,13 +220,15 @@ async function isUninitializedSubmodule(worktreePath: string, relPath: string): 
     );
     return stdout.startsWith("-");
   } catch (e) {
-    // Exit 1: `relPath` matches no submodule at all — the ordinary case for every hooksPath naming an
-    // regular tracked directory, not a submodule. Exit 128: `relPath` resolves outside the repository
-    // entirely (a `..`-escaping hooksPath, still possible here since that check runs after this one) —
-    // also never a submodule question this repo can answer. Both mean "not a submodule", the answer
-    // this helper exists to give either way; anything else (a corrupt index, a timeout, git missing)
-    // is an operational failure that must propagate rather than silently accept the directory.
-    if (exitedWith(e, 1) || exitedWith(e, 128)) return false;
+    // Exit 1 is `submodule status`'s documented no-match signal — `relPath` is a regular tracked
+    // directory, not a submodule at all, the ordinary case this helper must say "false" for. Every
+    // other exit code is an operational failure with the worktree itself still usable: notably exit
+    // 128 covers BOTH a path that legitimately escapes the repo (already handled by the caller before
+    // this ever runs, so ruled out here) AND a submodule gitlink whose `.gitmodules` mapping is
+    // missing or corrupt — git reports the latter as "fatal: no submodule mapping found", a real
+    // defect that must surface rather than be misread as "not a submodule" and silently accept the
+    // worktree's placeholder directory in its place (PR #263 review, round 14).
+    if (exitedWith(e, 1)) return false;
     throw e;
   }
 }
