@@ -705,16 +705,23 @@ export async function resolveHooksPathOverrideForMerge(
   }
 
   if (tab === -1) {
-    // No containing gitlink anywhere in `ref`'s tree either — a GENERATED directory (Husky's
-    // `.husky/_`), never tracked by any ref at all. A repo-scoped value delegates to
-    // `resolveHooksPathOverride`'s tracked-somewhere fallback, which already handles this correctly
-    // without any ref-specific reasoning (a generated path's status doesn't depend on which ref is
-    // about to land). A worktree-scoped value skips that delegation: `resolveHooksPathOverride` reads
-    // scope only to detect a MISSING worktree-scoped value (git-config-format(5): `--worktree`
-    // requires `extensions.worktreeConfig`, so scope itself already implies the current checkout
-    // sets it) — a present one it treats exactly like a repo-scoped one, tracked-check and all,
-    // which for a private value answers the wrong question entirely. The worktree's own copy is the
-    // only source a private scope could ever mean, generated or not, so it resolves there directly.
+    // No containing gitlink anywhere in `ref`'s tree either — but that "no entry in `ref`" shape is
+    // ambiguous between two very different histories, and only one of them is safe to delegate on:
+    //
+    // - GENERATED, never tracked by any ref at all (Husky's `.husky/_`) — the case
+    //   `resolveHooksPathOverride`'s tracked-somewhere fallback already handles correctly.
+    // - DELETED: the CURRENT tree (this worktree's own HEAD, pre-merge) has `raw` — or an ancestor of
+    //   it — as a submodule gitlink that `ref` is about to REMOVE entirely. Delegating to
+    //   `resolveHooksPathOverride` here would answer "what does the current checkout need" for a
+    //   submodule about to stop existing post-merge — reading its still-present gitlink as proof of a
+    //   real hooks directory and returning a path (the worktree's own copy, or the base repo's) whose
+    //   `post-merge` fires for content the merge is simultaneously deleting (PR #263 review, round 25).
+    //
+    // `ancestorSubmoduleSha` against the CURRENT tree (default `rev = "HEAD"`) is what tells them
+    // apart: a submodule the incoming ref deletes still has ITS gitlink in the current tree, while a
+    // path that was always generated never does, on either side.
+    const currentlyASubmodule = await ancestorSubmoduleSha(worktreePath, raw);
+    if (currentlyASubmodule) return undefined;
     return isWorktreeScoped ? inWorktree : resolveHooksPathOverride(repoPath, worktreePath);
   }
 

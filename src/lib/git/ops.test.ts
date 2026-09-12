@@ -1617,7 +1617,12 @@ suite("needsHooksPathOverrideForMerge (real git)", () => {
     });
     execFileSync("git", ["-C", repo, "push", "-q", "origin", "main"], { stdio: "ignore" });
     execFileSync("git", ["-C", repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
-    execFileSync("git", ["-C", repo, "push", "-q", "origin", "feature"], { stdio: "ignore" });
+    // `feature` (created at the outer beforeEach's initial commit, before the submodule existed)
+    // must actually carry the submodule too, or origin/feature after this push still has no `hooks`
+    // entry at all — indistinguishable from a deletion, which a correct resolver must (and does,
+    // per round 25) refuse to treat as "safe, use the base copy".
+    execFileSync("git", ["-C", repo, "branch", "-f", "feature", "main"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "push", "-q", "-f", "origin", "feature"], { stdio: "ignore" });
 
     // The review worktree never initializes its submodule — the base repo's own copy is at the same
     // (only) commit that ever existed, so it is a safe substitute.
@@ -1975,6 +1980,82 @@ suite("needsHooksPathOverrideForMerge (real git)", () => {
     ).resolves.toBeUndefined();
 
     rmSync(scopedSandbox, { recursive: true, force: true });
+  });
+
+  // When the incoming ref DELETES the submodule a hooksPath names, "ref has no entry there" must not
+  // be misread as "generated, safe to delegate to the current-tree resolver" — the current tree
+  // (this worktree's own HEAD) still has the submodule's gitlink, which is exactly what makes this
+  // deletion, not always-generated: a generated path (Husky's `.husky/_`) has no gitlink on EITHER
+  // side, ever. Delegating anyway would answer "what does the current checkout need" for a submodule
+  // about to stop existing entirely, returning a path whose `post-merge` fires for content the merge
+  // is simultaneously deleting (PR #263 review, round 25).
+  it("resolveHooksPathOverrideForMerge returns undefined when the incoming ref deletes the hooks submodule", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-deleted");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "post-merge"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "hooks",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "main"], { stdio: "ignore" });
+
+    // `feature` deletes the submodule entirely and is pushed.
+    execFileSync("git", ["-C", repo, "checkout", "-q", "-b", "feature-deletes-hooks"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "rm", "-q", "hooks"], { stdio: "ignore" });
+    rmSync(join(repo, ".git", "modules", "hooks"), { recursive: true, force: true });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "remove hooks submodule"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "push", "-q", "-f", "origin", "feature-deletes-hooks:feature"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "checkout", "-q", "main"], { stdio: "ignore" });
+
+    // The review worktree is cut from main — the submodule still exists there, uninitialized.
+    const deletionWorktree = join(sandbox, "worktree-submodule-deleted");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-13", deletionWorktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", deletionWorktree, "fetch", "-q", "origin", "feature"], {
+      stdio: "ignore",
+    });
+    expect(existsSync(join(deletionWorktree, "hooks", "post-merge"))).toBe(false);
+
+    await expect(
+      needsHooksPathOverrideForMerge(repo, deletionWorktree, "origin/feature"),
+    ).resolves.toBe(true);
+    await expect(
+      resolveHooksPathOverrideForMerge(repo, deletionWorktree, "origin/feature"),
+    ).resolves.toBeUndefined();
   });
 });
 
