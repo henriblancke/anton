@@ -533,6 +533,29 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, ".githooks"));
   });
 
+  // A core.hooksPath containing a pathspec metacharacter must be matched LITERALLY, not as a glob —
+  // otherwise a coincidentally-matching tracked file elsewhere in the repo makes an untracked,
+  // generated directory look tracked, and the override wrongly refuses to fall back to it (PR #263
+  // review, round 2).
+  it("treats a hooksPath containing a pathspec metacharacter as a literal name, not a glob", async () => {
+    // `.hooks*` never exists anywhere — but `.hooks-config` is tracked, and would match the glob
+    // `.hooks*` under a naive (non-literal) `ls-files` query.
+    mkdirSync(join(repo, ".hooks-config"));
+    writeFileSync(join(repo, ".hooks-config", "settings"), "\n");
+    execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".hooks*"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    // `.hooks*` was never tracked itself — only the unrelated `.hooks-config` was — so this is the
+    // Husky-style "generated, never committed" case and must fall back to a base-repo path, never the
+    // nonexistent worktree path a glob match on `.hooks-config` would wrongly justify skipping.
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".hooks*"));
+  });
+
   // A quoted core.hooksPath keeps leading/trailing whitespace verbatim (git-config(1)) — the shared
   // `git()` helper's blanket stdout.trim() would silently rewrite
   // ".hooks " to a directory (".hooks") that doesn't exist.

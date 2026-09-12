@@ -56,7 +56,20 @@ export const GH_BIN_ENV = "ANTON_GH_BIN";
  *    on `prepare`, itself untracked — checking gitignore state instead would miss it, since the rule
  *    ignores the directory's contents without ever naming the directory itself), so `ls-files` finds
  *    nothing for it there either; a directory the worktree's branch deleted is still tracked in the
- *    base repo's checkout, since that deletion never happened there.
+ *    base repo's checkout, since that deletion never happened there. Two things that probe must get
+ *    right in turn (PR #263 review, round 2):
+ *    - **A literal pathspec.** `relPath` reaches `ls-files` unescaped; a hooksPath containing a
+ *      pathspec metacharacter (`.hooks*`) would otherwise match by GLOB rather than by name, and a
+ *      coincidentally-matching tracked file elsewhere in the repo would report "tracked" for a
+ *      directory nothing ever put there. Prefixed with `:(literal)`, the same guard this file already
+ *      applies wherever a git-derived path reaches a pathspec position (see {@link blobModeAtRev}),
+ *      so it can only ever match that exact path.
+ *    - **Distinguish "not tracked" from "couldn't tell".** `--error-unmatch` turns a genuine no-match
+ *      into exit code 1 with git's own "did not match any file(s)" message — recognizable, and the
+ *      only case that legitimately means "generated, fall back". Anything else (a corrupt index, a
+ *      timeout) is an operational failure with the WORKTREE still usable; swallowing it as "not
+ *      tracked" would revive a base-repo hook the branch may have deleted on purpose. It must throw
+ *      instead, same as the unguarded `execFileAsync` calls elsewhere in this file.
  */
 export async function resolveHooksPathOverride(
   repoPath: string,
@@ -100,14 +113,21 @@ export async function resolveHooksPathOverride(
  */
 async function isTrackedInBaseRepo(repoPath: string, relPath: string): Promise<boolean> {
   try {
-    const { stdout } = await execFileAsync(
+    await execFileAsync(
       "git",
-      ["-C", repoPath, "ls-files", "--error-unmatch", "--", relPath],
+      ["-C", repoPath, "ls-files", "--error-unmatch", "--", `:(literal)${relPath}`],
       { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
     );
-    return stdout.trim().length > 0;
-  } catch {
-    return false; // untracked, or unreadable — nothing to revive from
+    return true;
+  } catch (e) {
+    // Exit 1 is `--error-unmatch`'s documented signal for a genuine no-match — the only case that
+    // legitimately means "generated, fall back to the base repo's copy". Anything else (a corrupt
+    // index, a timeout, git missing) is an operational failure with the worktree itself still
+    // perfectly usable; swallowing it here would revive a hook the worktree's branch may have deleted
+    // on purpose, so {@link exitedWith} is what tells a real "not tracked" apart from that and lets
+    // everything else propagate.
+    if (exitedWith(e, 1)) return false;
+    throw e;
   }
 }
 
