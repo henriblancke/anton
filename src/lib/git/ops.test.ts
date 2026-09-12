@@ -42,6 +42,7 @@ import {
   readWorktreeState,
   resolveFreshBase,
   resolveHooksPathOverride,
+  resolveHooksPathOverrideForMerge,
   resolveMergeBase,
   restoreWorktreeState,
   sameWorktreeState,
@@ -1473,6 +1474,167 @@ suite("needsHooksPathOverrideForMerge (real git)", () => {
     await expect(
       needsHooksPathOverrideForMerge(repo, behindWorktree, "origin/feature"),
     ).resolves.toBe(true);
+  });
+
+  // `resolveHooksPathOverride` answers "what does the CURRENT checkout need" — a different question
+  // than what this fast-forward needs. A review worktree whose submodule-backed hooksPath is
+  // currently self-consistent (its own gitlink matches its own checkout) passes that check even
+  // though `ref` is about to move the gitlink to a commit NEITHER side has ever checked out — the
+  // exact case round 19 taught `needsHooksPathOverrideForMerge` to flag as "override needed", but
+  // whose VALUE `resolveHooksPathOverride` would still get wrong if a caller used it anyway
+  // (PR #263 review, round 21). `resolveHooksPathOverrideForMerge` must return `undefined` here: no
+  // source verified to match the incoming commit exists, so no hook should fire rather than a stale
+  // one.
+  it("resolveHooksPathOverrideForMerge returns undefined rather than a stale value when neither side has the incoming commit", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-merge-value");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "post-merge"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+    const v1Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(submoduleUpstream, "post-merge"), "v2\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v2"], { stdio: "ignore" });
+    const v2Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "hooks",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "-C", "hooks", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule at v1"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "main"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
+
+    // `feature` bumps the gitlink to v2 and is pushed.
+    execFileSync("git", ["-C", repo, "checkout", "-q", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "-C", "hooks", "checkout", "-q", v2Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "bump hooks submodule to v2"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "checkout", "-q", "main"], { stdio: "ignore" });
+    // Checking out branches in the superproject never touches a submodule's own working directory
+    // (git-checkout(1) leaves an initialized submodule's HEAD alone) — restore the base repo's own
+    // submodule checkout back to v1, matching what main's tree actually records, so this test's base
+    // repo is a genuinely self-consistent v1 checkout rather than an artifact of the v2 checkout above.
+    execFileSync("git", ["-C", repo, "-C", "hooks", "checkout", "-q", v1Sha], { stdio: "ignore" });
+
+    // The review worktree is cut from main (still at v1) and initializes its submodule there —
+    // self-consistent right now (its own gitlink and checkout both agree on v1).
+    const mergeValueWorktree = join(sandbox, "worktree-merge-value");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-10", mergeValueWorktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      [
+        "-C",
+        mergeValueWorktree,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "hooks",
+      ],
+      { stdio: "ignore" },
+    );
+    expect(readFileSync(join(mergeValueWorktree, "hooks", "post-merge"), "utf8")).toBe("v1\n");
+    execFileSync("git", ["-C", mergeValueWorktree, "fetch", "-q", "origin", "feature"], {
+      stdio: "ignore",
+    });
+
+    await expect(
+      needsHooksPathOverrideForMerge(repo, mergeValueWorktree, "origin/feature"),
+    ).resolves.toBe(true);
+    await expect(
+      resolveHooksPathOverrideForMerge(repo, mergeValueWorktree, "origin/feature"),
+    ).resolves.toBeUndefined();
+  });
+
+  // The safe counterpart: when the base repo's submodule copy IS actually checked out at the
+  // INCOMING commit, resolveHooksPathOverrideForMerge correctly returns it (PR #263 review, round 21).
+  it("resolveHooksPathOverrideForMerge returns the base repo's copy when it matches the incoming commit", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-merge-value-safe");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "post-merge"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "hooks",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "main"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "feature"], { stdio: "ignore" });
+
+    // The review worktree never initializes its submodule — the base repo's own copy is at the same
+    // (only) commit that ever existed, so it is a safe substitute.
+    const safeWorktree = join(sandbox, "worktree-merge-value-safe");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-11", safeWorktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", safeWorktree, "fetch", "-q", "origin", "feature"], {
+      stdio: "ignore",
+    });
+    expect(existsSync(join(safeWorktree, "hooks", "post-merge"))).toBe(false);
+
+    await expect(
+      resolveHooksPathOverrideForMerge(repo, safeWorktree, "origin/feature"),
+    ).resolves.toBe(join(repo, "hooks"));
   });
 
   // A plain tracked directory (never a submodule) must keep returning `false` when `ref` carries it:

@@ -60,6 +60,7 @@ import {
   needsHooksPathOverrideForMerge,
   pushBranch,
   resolveHooksPathOverride,
+  resolveHooksPathOverrideForMerge,
 } from "../git/ops";
 import {
   ANTON_MARK,
@@ -495,10 +496,14 @@ async function prepareFixWorktree(args: {
   // exactly right (a generated directory like Husky's `.husky/_`, never tracked by any ref) or
   // guaranteed stale (a tracked directory the merge is about to introduce or change), and using it in
   // the wrong case silently skips or misfires this merge's own `post-merge` (PR #263 review, rounds
-  // 6-8).
+  // 6-8). The VALUE, once an override is needed, comes from resolveHooksPathOverrideForMerge rather
+  // than resolveHooksPathOverride: the latter answers "what does the CURRENT checkout need", which
+  // can pass for a submodule-backed hooksPath that is self-consistent right now but about to go stale
+  // the instant this merge changes the gitlink — resolveHooksPathOverrideForMerge validates any
+  // submodule substitute against the INCOMING ref specifically (PR #263 review, round 21).
   const syncRef = `origin/${branch}`;
   const syncHooksPath = (await needsHooksPathOverrideForMerge(repo, worktree.path, syncRef))
-    ? await resolveHooksPathOverride(repo, worktree.path)
+    ? await resolveHooksPathOverrideForMerge(repo, worktree.path, syncRef)
     : undefined;
   await safe(() =>
     mergeIntoCurrent(worktree.path, syncRef, { ffOnly: true, hooksPath: syncHooksPath }),

@@ -251,12 +251,16 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
 }
 
 /**
- * The nearest ancestor of `relPath` (`relPath` itself included) that `worktreePath`'s HEAD tree
+ * The nearest ancestor of `relPath` (`relPath` itself included) that `rev`'s tree in `worktreePath`
  * records as a submodule gitlink (mode `160000`) — along with the commit that gitlink targets — or
  * `undefined` when no ancestor is one. A hooksPath NESTED inside a submodule (`core.hooksPath=
  * deps/hooks`, `deps` the gitlink) needs this because the superproject's tree never records anything
  * below the gitlink itself (gitsubmodules(7)): `deps/hooks` has no tree entry of its own to inspect
  * directly, uninitialized or not, so the only way to reason about it is to find what CONTAINS it.
+ *
+ * `rev` is a parameter, not always `HEAD`, because {@link resolveHooksPathOverrideForMerge} needs the
+ * answer for an INCOMING ref rather than the worktree's current checkout — the same distinction
+ * {@link checkedOutSubmoduleSha} draws for the direct-submodule case (PR #263 review, round 21).
  *
  * Walked with `git ls-tree` one path segment at a time from `relPath` up to the repo root, rather
  * than a single `-r` (recursive) call: a recursive listing only shows entries actually reachable
@@ -267,12 +271,13 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
 async function ancestorSubmoduleSha(
   worktreePath: string,
   relPath: string,
+  rev = "HEAD",
 ): Promise<{ submodulePath: string; sha: string } | undefined> {
   let candidate = posixNormalize(relPath);
   while (candidate !== "." && candidate !== "/") {
     const { stdout } = await execFileAsync(
       "git",
-      ["-C", worktreePath, "ls-tree", "HEAD", "--", `:(literal)${candidate}`],
+      ["-C", worktreePath, "ls-tree", rev, "--", `:(literal)${candidate}`],
       { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
     );
     const entry = stdout.split("\n")[0] ?? "";
@@ -573,6 +578,98 @@ export async function needsHooksPathOverrideForMerge(
   // override is needed (PR #263 review, round 19).
   const current = await checkedOutSubmoduleSha(worktreePath, raw);
   return !current.checkedOut || current.sha !== incomingSha;
+}
+
+/**
+ * The `core.hooksPath` value to actually pass into the fast-forward merge bringing `ref` into
+ * `worktreePath` — called only once {@link needsHooksPathOverrideForMerge} has said `true`, i.e. an
+ * override is needed. `undefined` means no safe value exists: the merge should run with NO override
+ * (no hook fires) rather than a WRONG one.
+ *
+ * The mistake this exists to prevent: calling {@link resolveHooksPathOverride} for this purpose,
+ * which answers "what does the CURRENT checkout need" — a different question. A review worktree
+ * whose submodule-backed hooksPath is currently initialized and self-consistent (worktree's own
+ * gitlink matches its own checkout) passes that check happily even though `ref` is about to move the
+ * gitlink to a commit NEITHER the worktree's nor the base repo's checkout has ever seen — a
+ * fast-forward changes the recorded gitlink but never re-runs `submodule update`, so `post-merge`
+ * would fire against content from the OLD commit right after the merge changes what the gitlink
+ * says. Every submodule check here is against the INCOMING (`ref`) gitlink specifically, never the
+ * worktree's own pre-merge one, so the answer is right for the tree the merge is about to produce,
+ * not the one that's about to be replaced (PR #263 review, round 21 — round 19 closed this same gap
+ * for {@link needsHooksPathOverrideForMerge}'s own boolean, but the VALUE this function returns had
+ * an identical hole: {@link resolveHooksPathOverride} was still being asked, and it answers for the
+ * wrong tree).
+ */
+export async function resolveHooksPathOverrideForMerge(
+  repoPath: string,
+  worktreePath: string,
+  ref: string,
+): Promise<string | undefined> {
+  let raw: string;
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "config", "--path", "--get", "core.hooksPath"],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    raw = stdout.replace(/\n$/, "");
+  } catch {
+    return undefined; // unset — nothing to override with
+  }
+  if (!raw) return undefined;
+  if (isAbsolute(raw)) return raw;
+
+  // A `..`-escaping path can never be tracked by ANY ref (see needsHooksPathOverrideForMerge) — the
+  // base repo's resolved copy is the only sensible source, same as resolveHooksPathOverride's
+  // identical case, since such a path lives outside either checkout entirely.
+  const rel = relative(repoPath, resolve(repoPath, raw));
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return resolve(repoPath, raw);
+
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", worktreePath, "ls-tree", ref, "--", `:(literal)${raw}`],
+    { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+  );
+  const entry = stdout.split("\n")[0] ?? "";
+  const tab = entry.indexOf("\t");
+  if (tab === -1) {
+    // `ref` doesn't carry `raw` at all — a GENERATED directory (Husky's `.husky/_`), never tracked by
+    // any ref, exactly the case `resolveHooksPathOverride`'s tracked-somewhere fallback already
+    // handles correctly and without any ref-specific reasoning (a generated path's status doesn't
+    // depend on which ref is about to land) — reuse it rather than duplicate that logic.
+    return resolveHooksPathOverride(repoPath, worktreePath);
+  }
+  const [mode, , incomingSha] = entry.slice(0, tab).split(" ");
+  if (mode !== "160000") {
+    // A plain tracked directory or file: git's native per-worktree resolution (≥ 2.43) gets this
+    // right once the merge lands. No override needed at all — but `needsHooksPathOverrideForMerge`
+    // already said one was, so this is reached only when its OWN answer disagreed for a different
+    // path than this call is racing; return undefined defensively rather than a value nothing needs.
+    return undefined;
+  }
+
+  const baseMatchesDirect = incomingSha ? await baseSubmoduleMatches(repoPath, raw, incomingSha) : false;
+  if (baseMatchesDirect) return resolve(repoPath, raw);
+
+  // The direct submodule check failed (or the hooksPath is nested — findable only by walking up from
+  // `ref`'s own tree). Either way, a nested hooksPath needs `ancestorSubmoduleSha` run against `ref`
+  // specifically — the incoming tree's structure, not the worktree's current one — to find what
+  // gitlink contains it.
+  const containing = await ancestorSubmoduleSha(worktreePath, raw, ref);
+  if (containing) {
+    const baseMatchesContaining = await baseSubmoduleMatches(
+      repoPath,
+      containing.submodulePath,
+      containing.sha,
+    );
+    if (baseMatchesContaining) return resolve(repoPath, raw);
+  }
+
+  // No source is verified to match what `ref` will actually check out: neither the base repo's
+  // copy nor (implicitly, since this function was only reached because an override was needed)
+  // the worktree's own. Omitting the override is the safe choice — no hook fires, rather than one
+  // built from stale content.
+  return undefined;
 }
 
 async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
