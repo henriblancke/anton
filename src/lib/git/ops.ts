@@ -344,6 +344,44 @@ async function baseSubmoduleMatches(
 }
 
 /**
+ * Whether `relPath`'s submodule in `worktreePath` currently has ANY real, checked-out content that
+ * could serve a hook — and if so, the exact commit it's at. `git submodule status`'s status
+ * character is what distinguishes an actual checkout from a hollow placeholder: `-` (uninitialized)
+ * reports the gitlink target with no checkout backing it at all, so it is deliberately excluded here
+ * (`checkedOut: false`, `sha: undefined`) rather than reported as "checked out at the gitlink's own
+ * commit" — a caller comparing shas alone would otherwise see an uninitialized submodule whose
+ * gitlink happens to already equal the incoming one as a false "match" (PR #263 review, round 19,
+ * building on round 15's same distinction). A normal match (` `) or a MISMATCH (`+`, git-submodule(1):
+ * "the currently checked out submodule commit does not match the SHA-1 found in the index") both mean
+ * real content exists, whatever commit it's at — reported as `checkedOut: true` with that `sha`.
+ * `checkedOut: false, sha: undefined` also covers `relPath` naming no submodule at all.
+ */
+async function checkedOutSubmoduleSha(
+  worktreePath: string,
+  relPath: string,
+): Promise<{ checkedOut: boolean; sha: string | undefined }> {
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "submodule", "status", "--", `:(literal)${relPath}`],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    ));
+  } catch (e) {
+    if (exitedWith(e, 1)) return { checkedOut: false, sha: undefined };
+    throw e;
+  }
+  const wanted = posixNormalize(relPath);
+  for (const line of stdout.split("\n")) {
+    const parsed = parseSubmoduleStatusLine(line);
+    if (parsed.path === wanted || parsed.path.startsWith(`${wanted} (`)) {
+      return { checkedOut: parsed.status !== "-", sha: parsed.sha };
+    }
+  }
+  return { checkedOut: false, sha: undefined };
+}
+
+/**
  * One `git submodule status` output line, split into its three parts — format `<status-char><sha>
  * <path>[ (<describe>)]` (git-submodule(1)): exactly one status character, then the object id, a
  * space, then the path.
@@ -447,10 +485,19 @@ export async function needsHooksPathOverrideForMerge(
 
   const { stdout } = await execFileAsync(
     "git",
-    ["-C", worktreePath, "ls-tree", "--name-only", ref, "--", `:(literal)${raw}`],
+    ["-C", worktreePath, "ls-tree", ref, "--", `:(literal)${raw}`],
     { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
   );
-  if (stdout.trim().length === 0) return true; // ref doesn't carry it — override needed
+  const entry = stdout.split("\n")[0] ?? "";
+  const tab = entry.indexOf("\t");
+  if (tab === -1) return true; // ref doesn't carry it — override needed
+  const [mode, , incomingSha] = entry.slice(0, tab).split(" ");
+  // A plain tracked directory or file (`040000`/`100644`/`100755`, never `160000`) is exactly the
+  // case the original logic already got right: `ref` carries it, so git's native per-worktree
+  // resolution (≥ 2.43) picks it up correctly once the merge lands — no override needed. Only a
+  // submodule gitlink needs the extra check below, since only a submodule's ACTUAL content can go on
+  // being stale after the merge changes what the gitlink points to.
+  if (mode !== "160000") return false;
 
   // `ref` carrying the gitlink is not the same as the merge actually populating it: a fast-forward
   // never runs `submodule update --init` on its own, so a hooksPath naming a submodule that is
@@ -460,7 +507,17 @@ export async function needsHooksPathOverrideForMerge(
   // would read the ref's tracked gitlink as proof the merge's own `post-merge` will fire correctly,
   // when the worktree it actually runs against still has nothing checked out at that path
   // (PR #263 review, round 15).
-  return (await uninitializedSubmoduleSha(worktreePath, raw)) !== undefined;
+  //
+  // Nor is the CURRENT checkout matching its OWN gitlink proof enough on its own: `ref` may have
+  // moved the gitlink to a newer commit than what this worktree currently has checked out — a
+  // fast-forward changes the recorded gitlink but never touches the submodule's actual checkout on
+  // disk, so a hooksPath that reads as "fine, currently initialized and matching" before the merge is
+  // exactly the stale copy `post-merge` would fire against once the merge lands and the gitlink no
+  // longer agrees with it. Comparing the CURRENT checkout against the INCOMING gitlink — not just the
+  // current one — is what catches this: any mismatch, uninitialized or merely stale, means an
+  // override is needed (PR #263 review, round 19).
+  const current = await checkedOutSubmoduleSha(worktreePath, raw);
+  return !current.checkedOut || current.sha !== incomingSha;
 }
 
 async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
