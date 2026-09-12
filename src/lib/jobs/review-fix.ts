@@ -493,7 +493,13 @@ async function prepareFixWorktree(args: {
     mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true, hooksPath }),
   );
 
-  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number, hooksPath);
+  // Re-resolved, not the `hooksPath` captured above: the fast-forward just now may be exactly what
+  // FIRST introduced a tracked hooksPath (or changed it) into this worktree — a reviewer's push that
+  // adds/edits `.githooks`, say. Using the pre-sync value here would premerge with an override that
+  // is stale or points nowhere, silently skipping the `post-merge` hook a base-branch merge should
+  // fire (PR #263 review, round 6).
+  const premergeHooksPath = await resolveHooksPathOverride(repo, worktree.path);
+  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number, premergeHooksPath);
   await ctx.heartbeat();
   return { worktree, conflicts };
 }
