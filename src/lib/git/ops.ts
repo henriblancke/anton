@@ -7,7 +7,7 @@ import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
@@ -70,6 +70,13 @@ export const GH_BIN_ENV = "ANTON_GH_BIN";
  *      timeout) is an operational failure with the WORKTREE still usable; swallowing it as "not
  *      tracked" would revive a base-repo hook the branch may have deleted on purpose. It must throw
  *      instead, same as the unguarded `execFileAsync` calls elsewhere in this file.
+ *    - **Skip the probe for a path outside the repo entirely.** `core.hooksPath` may validly climb
+ *      out via `..` — git-config(1) places no restriction on it — but such a path can never appear in
+ *      ANY checkout's index, and `ls-files` rejects a pathspec outside the repository with exit 128,
+ *      not the no-match exit 1 the code above depends on. Detected up front (before ever calling
+ *      `ls-files`) via {@link relative}: it is never "tracked" by definition, so this falls straight
+ *      to the base repo's copy — the only sensible source for a directory that lives outside either
+ *      checkout to begin with.
  */
 export async function resolveHooksPathOverride(
   repoPath: string,
@@ -94,6 +101,17 @@ export async function resolveHooksPathOverride(
 
   const inWorktree = resolve(worktreePath, raw);
   if (existsSync(inWorktree)) return inWorktree;
+
+  // A `core.hooksPath` that climbs out of the repo via `..` (valid — git-config(1) places no
+  // restriction on it) can never be in ANY checkout's index, so `isTrackedInBaseRepo`'s `ls-files`
+  // has nothing meaningful to answer — worse, git rejects a pathspec outside the repository outright
+  // (exit 128, not the no-match exit 1), which would otherwise make this throw and abort every
+  // commit/push using such a path (PR #263 review). Skip the probe: it is never "tracked" by
+  // definition, so this falls straight to the base repo's copy, the only sensible source for a
+  // shared directory that lives outside either checkout.
+  const rel = relative(repoPath, resolve(repoPath, raw));
+  if (rel.startsWith("..") || isAbsolute(rel)) return resolve(repoPath, raw);
+
   // Missing in the worktree — fall back to the base repo's copy only when the base checkout doesn't
   // track it either (a generated directory like Husky's `.husky/_`, never committed at all — see
   // isTrackedInBaseRepo). Otherwise the base repo DOES still track it, so the worktree's branch must

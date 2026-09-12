@@ -556,6 +556,31 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".hooks*"));
   });
 
+  // A relative core.hooksPath validly climbs out of the repo via `..` (git-config(1) places no
+  // restriction on it) — a shared hooks directory living beside several checkouts, say. Such a path
+  // can never be in ANY checkout's index, and `git ls-files` REJECTS a pathspec outside the
+  // repository outright (exit 128), rather than answering "not tracked" (exit 1) — so the tracked-hook
+  // probe must never even run for it, or it throws and aborts the commit/push (PR #263 review,
+  // round 3).
+  it("falls back to the base repo's copy of a hooksPath that climbs outside the repo via ..", async () => {
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init", "--allow-empty"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "../shared-hooks"], {
+      stdio: "ignore",
+    });
+    mkdirSync(join(sandbox, "shared-hooks"));
+    writeFileSync(join(sandbox, "shared-hooks", "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    // The worktree has no sibling `shared-hooks` of its own — only the one beside the base repo.
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(sandbox, "shared-hooks"));
+  });
+
   // A quoted core.hooksPath keeps leading/trailing whitespace verbatim (git-config(1)) — the shared
   // `git()` helper's blanket stdout.trim() would silently rewrite
   // ".hooks " to a directory (".hooks") that doesn't exist.
