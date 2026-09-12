@@ -699,6 +699,132 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, hooksDirName));
   });
 
+  // The base repo's own copy of an uninitialized submodule is trusted as a substitute only when it
+  // is checked out at the EXACT commit the worktree's tree records for the gitlink — never merely
+  // "initialized somewhere". A feature branch may bump the submodule to a newer commit than whatever
+  // the base repo's own checkout happens to sit at; running that STALE commit's hooks (silently
+  // missing a gate it added, or applying behavior it changed) is worse than running none at all
+  // (PR #263 review, round 18).
+  it("does not fall back to the base repo's stale copy of a submodule the feature branch bumped to a newer commit", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-stale");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-push"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+    const v1Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(submoduleUpstream, "pre-push"), "v2\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v2"], { stdio: "ignore" });
+    const v2Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleUpstream, "hooks"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "-C", "hooks", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule at v1"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
+
+    // Feature branch bumps the gitlink to v2 — the base checkout is never touched and stays at v1.
+    execFileSync("git", ["-C", repo, "checkout", "-q", "-b", "anton/epic-5"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "-C", "hooks", "checkout", "-q", v2Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "bump hooks submodule to v2"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "checkout", "-q", "main"], { stdio: "ignore" });
+    // Restore the base checkout's own submodule copy back to v1, matching what main's tree records.
+    execFileSync("git", ["-C", repo, "-C", "hooks", "checkout", "-q", v1Sha], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-stale-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", worktree, "anton/epic-5"],
+      { stdio: "ignore" },
+    );
+    // The worktree's own copy is the empty, uninitialized placeholder — its tree records v2.
+    expect(existsSync(join(worktree, "hooks", "pre-push"))).toBe(false);
+    expect(execFileSync("git", ["-C", worktree, "rev-parse", "HEAD:hooks"], { encoding: "utf8" }).trim()).toBe(
+      v2Sha,
+    );
+    // The base repo's own checkout is a real, populated copy — but at the WRONG (v1) commit.
+    expect(readFileSync(join(repo, "hooks", "pre-push"), "utf8")).toBe("v1\n");
+
+    // Neither copy is safe to use: the worktree's is empty, and the base repo's is stale. This must
+    // fall back to the worktree's own path so NO hook fires, rather than run v1's stale pre-push.
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "hooks"));
+  });
+
+  // A repository created with `git init --object-format=sha256` (git-init(1)) reports a 64-character
+  // object id in `submodule status`, not sha1's 40 — hard-coding the sha1 width would misparse every
+  // line in such a repository, leaving part of the hash attached to the path instead of splitting
+  // cleanly (PR #263 review, round 18).
+  it("detects an uninitialized submodule in a sha256 repository", async () => {
+    const sha256Sandbox = mkdtempSync(join(tmpdir(), "anton-hookspath-sha256-"));
+    const sha256Repo = join(sha256Sandbox, "repo");
+    const submoduleUpstream = join(sha256Sandbox, "upstream");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", "--object-format=sha256", submoduleUpstream], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    mkdirSync(sha256Repo);
+    execFileSync("git", ["init", "-q", "-b", "main", "--object-format=sha256", sha256Repo], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", sha256Repo, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", sha256Repo, "config", "user.name", "anton-test"], { stdio: "ignore" });
+    execFileSync(
+      "git",
+      ["-C", sha256Repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleUpstream, "hooks"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", sha256Repo, "commit", "-q", "-m", "add hooks submodule"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", sha256Repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
+
+    const sha256Worktree = join(sha256Sandbox, "worktree");
+    execFileSync(
+      "git",
+      ["-C", sha256Repo, "worktree", "add", "-q", "-b", "anton/epic-6", sha256Worktree],
+      { stdio: "ignore" },
+    );
+    expect(existsSync(join(sha256Worktree, "hooks", "pre-push"))).toBe(false);
+
+    expect(await resolveHooksPathOverride(sha256Repo, sha256Worktree)).toBe(
+      join(sha256Repo, "hooks"),
+    );
+
+    rmSync(sha256Sandbox, { recursive: true, force: true });
+  });
+
   // A submodule gitlink whose `.gitmodules` mapping is missing or corrupt — e.g. a feature branch
   // that dropped `.gitmodules` while leaving the gitlink itself in the tree — makes `git submodule
   // status` fail with exit 128 ("fatal: no submodule mapping found"), the SAME exit code a `..`-escaping

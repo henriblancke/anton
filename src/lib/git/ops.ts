@@ -128,7 +128,7 @@ export async function resolveHooksPathOverride(
   //
   // A `core.hooksPath` that climbs out of the repo via `..` (valid — git-config(1) places no
   // restriction on it) can never be in ANY checkout's index, so neither `isTrackedInBaseRepo`'s
-  // `ls-files` nor `isUninitializedSubmodule`'s `submodule status` below has anything meaningful to
+  // `ls-files` nor `uninitializedSubmoduleSha`'s `submodule status` below has anything meaningful to
   // answer for it — worse, git rejects a pathspec outside the repository outright (exit 128, not the
   // no-match exit 1 those helpers otherwise rely on), which would otherwise make them throw and abort
   // every commit/push using such a path (PR #263 review). Detected up front, before either probe ever
@@ -147,19 +147,26 @@ export async function resolveHooksPathOverride(
   // directory in the new worktree regardless of whether that submodule has ever been initialized
   // there (`git submodule update --init` never runs for a worktree add) — so a `core.hooksPath`
   // naming a submodule root looks like a present, empty hooks directory instead of the tracked
-  // directory it actually is. `isUninitializedSubmodule` is what tells the two apart, and the base
-  // repo's own copy is returned DIRECTLY rather than falling through to the tracked-check further
-  // below: that check exists to tell a generated directory apart from one the worktree's branch
-  // deliberately deleted, neither of which describes an uninitialized submodule — it's unconditionally
-  // tracked (submodules are gitlinks in the index) and the base repo's copy is guaranteed initialized,
-  // since anton's runs never delete it (PR #263 review, round 13). `raw` is confirmed to resolve
-  // INSIDE the repo by this point (the `escapesRepo` check above already returned otherwise), so an
-  // exit-128 failure here can only be a genuine operational failure — e.g. a feature branch that
-  // dropped `.gitmodules` while keeping the gitlink, which git reports as "no submodule mapping found"
-  // — and `isUninitializedSubmodule` propagates it rather than misreading it as "not a submodule" and
-  // silently accepting the broken worktree copy (PR #263 review, round 14).
+  // directory it actually is. `uninitializedSubmoduleSha` is what tells the two apart (`raw` is
+  // confirmed to resolve INSIDE the repo by this point — the `escapesRepo` check above already
+  // returned otherwise — so an exit-128 failure it hits can only be a genuine operational failure,
+  // e.g. a feature branch that dropped `.gitmodules` while keeping the gitlink, and it propagates
+  // that rather than misreading it as "not a submodule" and silently accepting the broken worktree
+  // copy — PR #263 review, round 14).
+  //
+  // The base repo's copy is trusted as a substitute only when `baseSubmoduleMatches` confirms it is
+  // BOTH initialized AND checked out at the EXACT commit this worktree's tree records for the
+  // gitlink — never merely "initialized somewhere". A feature branch may have bumped the gitlink to
+  // a newer commit than whatever the base repo's own checkout happens to sit at (nothing keeps them
+  // in lockstep), and running that STALE commit's hooks — silently missing a gate it added, or
+  // applying behavior it deliberately changed — is worse than running none. A mismatch or an
+  // uninitialized base copy falls through to the worktree's own (still empty) path instead, so no
+  // hook fires at all rather than an outdated one (PR #263 review, round 18).
   if (existsSync(inWorktree) && statSync(inWorktree).isDirectory()) {
-    if (await isUninitializedSubmodule(worktreePath, raw)) return resolve(repoPath, raw);
+    const submoduleSha = await uninitializedSubmoduleSha(worktreePath, raw);
+    if (submoduleSha && (await baseSubmoduleMatches(repoPath, raw, submoduleSha))) {
+      return resolve(repoPath, raw);
+    }
     return inWorktree;
   }
 
@@ -252,8 +259,17 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
  * be any of those valid, noncanonical spellings. Comparing against the raw string would then never
  * match a canonically-different-but-equal path, silently falling through to `false` and accepting
  * the worktree's empty placeholder (PR #263 review, round 16).
+ *
+ * Returns the gitlink's target commit — the sha this worktree's tree RECORDS for the submodule,
+ * present in `submodule status`'s output even when uninitialized — rather than a bare boolean:
+ * {@link resolveHooksPathOverride} needs it to confirm the base repo's own copy is actually checked
+ * out at that same commit before trusting it as a substitute (a feature branch may have bumped the
+ * gitlink to a commit the base repo's copy predates — PR #263 review, round 18).
  */
-async function isUninitializedSubmodule(worktreePath: string, relPath: string): Promise<boolean> {
+async function uninitializedSubmoduleSha(
+  worktreePath: string,
+  relPath: string,
+): Promise<string | undefined> {
   try {
     const { stdout } = await execFileAsync(
       "git",
@@ -261,9 +277,11 @@ async function isUninitializedSubmodule(worktreePath: string, relPath: string): 
       { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
     );
     const wanted = posixNormalize(relPath);
-    return stdout
-      .split("\n")
-      .some((line) => line[0] === "-" && lineNamesPath(line, wanted));
+    for (const line of stdout.split("\n")) {
+      const parsed = parseSubmoduleStatusLine(line);
+      if (parsed.status === "-" && parsed.path === wanted) return parsed.sha;
+    }
+    return undefined;
   } catch (e) {
     // Exit 1 is `submodule status`'s documented no-match signal — `relPath` is a regular tracked
     // directory, not a submodule at all, the ordinary case this helper must say "false" for. Every
@@ -273,27 +291,82 @@ async function isUninitializedSubmodule(worktreePath: string, relPath: string): 
     // missing or corrupt — git reports the latter as "fatal: no submodule mapping found", a real
     // defect that must surface rather than be misread as "not a submodule" and silently accept the
     // worktree's placeholder directory in its place (PR #263 review, round 14).
-    if (exitedWith(e, 1)) return false;
+    if (exitedWith(e, 1)) return undefined;
     throw e;
   }
 }
 
 /**
- * Whether one `git submodule status` output line names exactly `wanted` — format
- * `<status-char><40-char-sha> <path>[ (<describe>)]` (git-submodule(1)): exactly one status
- * character, a fixed 40-hex-char sha, a space, then the path.
- *
- * The path is compared WHOLE against `wanted` rather than extracted by trimming an assumed
- * `(<describe>)` suffix off the end: a describe suffix comes from running `git describe` INSIDE the
- * submodule's own checkout, which an uninitialized submodule — the only status this helper ever
- * matches a line against, since every call site filters on the leading `-` first — has none of, its
- * git directory never having been cloned there at all. A path that itself legitimately contains
- * literal `" ("` text (`core.hooksPath="hooks (x)"`) would otherwise be misparsed as a shorter path
- * plus a fake describe suffix, and the caller's exact-path check would then never match it
- * (PR #263 review, round 17).
+ * Whether the base repo's OWN checkout of the submodule at `relPath` is initialized and checked out
+ * at exactly `wantSha` — the gate {@link resolveHooksPathOverride} applies before trusting the base
+ * repo's copy as a substitute for the worktree's uninitialized one. Reusing `git submodule status`
+ * here (rather than `git -C <submodule-dir> rev-parse HEAD`) is deliberate: run against an
+ * UNINITIALIZED submodule directory — no `.git` of its own — a bare `git -C` command silently falls
+ * through to the enclosing superproject's repository instead of failing, so a base repo whose own
+ * copy is ALSO uninitialized would misreport the superproject's HEAD as if it were the submodule's,
+ * a false match this function must not produce (PR #263 review, round 18). `git submodule status`
+ * has no such ambiguity: its leading status character is always accurate to that path specifically.
  */
-function lineNamesPath(line: string, wanted: string): boolean {
-  return line.slice(42) === wanted; // 1 status char + 40-char sha + 1 space
+async function baseSubmoduleMatches(
+  repoPath: string,
+  relPath: string,
+  wantSha: string,
+): Promise<boolean> {
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(
+      "git",
+      ["-C", repoPath, "submodule", "status", "--", `:(literal)${relPath}`],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    ));
+  } catch (e) {
+    // Exit 1 is `submodule status`'s documented no-match signal — the base repo does not track
+    // `relPath` as a submodule at all, never a match. Anything else (a corrupt index, a timeout, git
+    // missing) is an operational failure that must propagate rather than be misread as "no match",
+    // same reasoning as {@link uninitializedSubmoduleSha}'s identical guard.
+    if (exitedWith(e, 1)) return false;
+    throw e;
+  }
+  const wanted = posixNormalize(relPath);
+  for (const line of stdout.split("\n")) {
+    const parsed = parseSubmoduleStatusLine(line);
+    // An INITIALIZED submodule's line (the only kind that can match here — see below) carries a
+    // ` (<describe>)` suffix `parseSubmoduleStatusLine` deliberately leaves attached, so the path
+    // must be matched as either the whole string or that whole string plus the suffix — never by
+    // trimming a suspected suffix off blindly, which would misparse a path whose own name legitimately
+    // contains literal `" ("` text (the same ambiguity `uninitializedSubmoduleSha`'s `-`-only lines
+    // never hit, since a submodule with no checkout has nothing to run `git describe` in at all).
+    if (parsed.path === wanted || parsed.path.startsWith(`${wanted} (`)) {
+      return parsed.status !== "-" && parsed.sha === wantSha;
+    }
+  }
+  return false;
+}
+
+/**
+ * One `git submodule status` output line, split into its three parts — format `<status-char><sha>
+ * <path>[ (<describe>)]` (git-submodule(1)): exactly one status character, then the object id, a
+ * space, then the path.
+ *
+ * The sha is NOT assumed to be 40 hex characters: `git init --object-format=sha256` (git-init(1))
+ * produces 64-character object ids, and hard-coding the sha1 width would misparse every line in such
+ * a repository, leaving part of the hash attached to `path` instead — silently breaking every
+ * comparison against it (PR #263 review, round 18). Split on the FIRST space after the status
+ * character instead: a hex object id, of either length, can never itself contain one.
+ *
+ * `path` is left WHOLE rather than trimmed of an assumed trailing `(<describe>)` — every caller here
+ * only ever matches a `-`-prefixed (uninitialized) line, and an uninitialized submodule's line never
+ * carries a describe suffix in the first place (that comes from running `git describe` INSIDE the
+ * submodule's own checkout, which doesn't exist yet). Trimming one anyway would misparse a path that
+ * itself legitimately contains literal `" ("` text (`core.hooksPath="hooks (x)"`) as a shorter path
+ * plus a fake suffix, breaking every exact-path comparison against it (PR #263 review, round 17).
+ */
+function parseSubmoduleStatusLine(line: string): { status: string; sha: string; path: string } {
+  const status = line[0] ?? "";
+  const spaceIndex = line.indexOf(" ", 1);
+  return spaceIndex === -1
+    ? { status, sha: line.slice(1), path: "" }
+    : { status, sha: line.slice(1, spaceIndex), path: line.slice(spaceIndex + 1) };
 }
 
 /**
@@ -387,7 +460,7 @@ export async function needsHooksPathOverrideForMerge(
   // would read the ref's tracked gitlink as proof the merge's own `post-merge` will fire correctly,
   // when the worktree it actually runs against still has nothing checked out at that path
   // (PR #263 review, round 15).
-  return isUninitializedSubmodule(worktreePath, raw);
+  return (await uninitializedSubmoduleSha(worktreePath, raw)) !== undefined;
 }
 
 async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
