@@ -18,6 +18,69 @@ const execFileAsync = promisify(execFile);
 export const GH_BIN_ENV = "ANTON_GH_BIN";
 
 /**
+ * Whether `error` is git's usage-error exit for an unrecognized CLI flag (129 — parse-options'
+ * `usage_with_options` exit, unchanged since long before `--show-scope` existed), confirmed by
+ * scanning stderr for git's own "unknown option" wording so an unrelated 129 is never misread as it.
+ */
+function isUnknownOptionError(error: unknown): boolean {
+  if (!exitedWith(error, 129)) return false;
+  const stderr = (error as { stderr?: unknown } | null)?.stderr;
+  return typeof stderr === "string" && /unknown option/i.test(stderr);
+}
+
+/**
+ * Raw `core.hooksPath` plus git's SCOPE label for it ("worktree", "local", "global", "system",
+ * "command" — git-config(1) `--show-scope`), or `undefined` when the key is genuinely unset. Shared
+ * by {@link resolveHooksPathOverride} and {@link resolveHooksPathOverrideForMerge}: both key their
+ * worktree-scope-never-falls-back guard on this label.
+ *
+ * `--show-scope` is Git 2.26+ only (PR #263 review): an older git's parse-options rejects the flag
+ * itself with exit 129, which a blanket catch cannot tell apart from `--get`'s own "key not set" exit
+ * (1, no output) — misreading "can't tell the scope" as "no override at all" and letting a generated
+ * hooksPath (Husky's `.husky/_`) resolve inside a cold worktree with no override, so its hook never
+ * fires. A plain `--path --get` (no `--show-scope`) works on every git this project supports, so an
+ * unrecognized-flag failure retries with that instead of jumping straight to "unset": if IT succeeds,
+ * the key is confirmed SET but the scope is unknowable here — reported as `"unknown"`, deliberately
+ * never `"worktree"` (the one scope both callers treat as never-falls-back; misreporting an ordinary
+ * local/global hooksPath as worktree-scoped would suppress its hook instead of running it — the
+ * opposite failure from the one this fixes). Only the fallback's OWN "key not set" exit means
+ * genuinely unset; anything else (a corrupt config file, git's ret=3) propagates rather than being
+ * swallowed as absence, same principle as {@link isTrackedInBaseRepo}'s "not tracked" vs. "couldn't
+ * tell".
+ */
+async function readHooksPathConfig(
+  queryFrom: string,
+): Promise<{ raw: string; scope: string } | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", queryFrom, "config", "--show-scope", "--path", "--get", "core.hooksPath"],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    // `--show-scope` prefixes exactly one tab-delimited field before the value; the value itself may
+    // contain no leading/trailing whitespace of its own to confuse with the separator (git-config(1)
+    // documents the scope column as tab-separated), so split once and keep the remainder verbatim,
+    // including the record terminator strip below.
+    const tab = stdout.indexOf("\t");
+    return { scope: stdout.slice(0, tab), raw: stdout.slice(tab + 1).replace(/\n$/, "") };
+  } catch (e) {
+    if (exitedWith(e, 1)) return undefined; // unset — git's own "key not set" signal
+    if (!isUnknownOptionError(e)) throw e; // a real failure (corrupt config, …) — never swallow it
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", queryFrom, "config", "--path", "--get", "core.hooksPath"],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    return { scope: "unknown", raw: stdout.replace(/\n$/, "") };
+  } catch (e) {
+    if (exitedWith(e, 1)) return undefined; // unset, confirmed without --show-scope's help
+    throw e; // same key, same config files — a real failure, not absence
+  }
+}
+
+/**
  * Resolve the effective `core.hooksPath` to override with when running git against `worktreePath`
  * (a worktree of `repoPath`, or `repoPath` itself when no worktree is involved) — or `undefined`
  * when unset. Every hook-firing git command anton runs against a worktree passes the result back in
@@ -84,24 +147,9 @@ export async function resolveHooksPathOverride(
   worktreePath?: string,
 ): Promise<string | undefined> {
   const queryFrom = worktreePath ?? repoPath;
-  let raw: string;
-  let scope: string;
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["-C", queryFrom, "config", "--show-scope", "--path", "--get", "core.hooksPath"],
-      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
-    );
-    // `--show-scope` prefixes exactly one tab-delimited field before the value; the value itself may
-    // contain no leading/trailing whitespace of its own to confuse with the separator (git-config(1)
-    // documents the scope column as tab-separated), so split once and keep the remainder verbatim,
-    // including the record terminator strip below.
-    const tab = stdout.indexOf("\t");
-    scope = stdout.slice(0, tab);
-    raw = stdout.slice(tab + 1).replace(/\n$/, ""); // only git's record terminator, never whitespace
-  } catch {
-    return undefined; // unset, or unreadable — nothing to override with
-  }
+  const config = await readHooksPathConfig(queryFrom);
+  if (!config) return undefined;
+  const { raw, scope } = config;
   if (!raw) return undefined;
   if (isAbsolute(raw)) return raw;
 
@@ -605,20 +653,9 @@ export async function resolveHooksPathOverrideForMerge(
   worktreePath: string,
   ref: string,
 ): Promise<string | undefined> {
-  let raw: string;
-  let scope: string;
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["-C", worktreePath, "config", "--show-scope", "--path", "--get", "core.hooksPath"],
-      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
-    );
-    const tab = stdout.indexOf("\t");
-    scope = stdout.slice(0, tab);
-    raw = stdout.slice(tab + 1).replace(/\n$/, "");
-  } catch {
-    return undefined; // unset — nothing to override with
-  }
+  const config = await readHooksPathConfig(worktreePath);
+  if (!config) return undefined;
+  const { raw, scope } = config;
   if (!raw) return undefined;
   if (isAbsolute(raw)) return raw;
 

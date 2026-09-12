@@ -24,7 +24,15 @@ const commitMarkerMock = vi.fn();
 
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
-  return { ...actual, commitMarker: (...args: unknown[]) => commitMarkerMock(...args) };
+  return {
+    ...actual,
+    commitMarker: (...args: unknown[]) => commitMarkerMock(...args),
+    // `REPO`/`WORKTREE` below are fake paths, not real checkouts — the real `resolveHooksPathOverride`
+    // now correctly THROWS on a nonexistent directory rather than misreading it as "hooksPath unset"
+    // (PR #263 review), so it needs mocking here like `commitMarker`: this suite exercises the
+    // close/note/marker sequencing, not hooksPath resolution.
+    resolveHooksPathOverride: () => Promise.resolve(undefined),
+  };
 });
 
 vi.mock("../beads/bd", async () => {

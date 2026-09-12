@@ -71,6 +71,36 @@ function has(cmd: string): boolean {
 
 const suite = has("git") ? describe : describe.skip;
 
+// On a pre-2.26 git, `--show-scope` itself is an unrecognized flag (exit 129, parse-options' usage
+// error) — a blanket catch cannot tell that apart from `--get`'s own "key not set" exit (1), and
+// misreading it as unset would suppress every hook this repo configures on such a git (PR #263
+// review, unresolved thread). Shimmed here rather than relying on an actually-old git being
+// installed: the shim rejects `--show-scope` the same way a real pre-2.26 git would; every other
+// invocation (including the fallback `--path --get`, no `--show-scope`) delegates to the real git so
+// everything except the flag rejection itself is exercised for real. Shared by both
+// `resolveHooksPathOverride` and `resolveHooksPathOverrideForMerge` test suites — same underlying
+// `readHooksPathConfig` helper, same shim needed either way.
+function shimGitRejectingShowScope(sandboxDir: string): string {
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const binDir = join(sandboxDir, "bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const a=process.argv.slice(2);
+if(a.includes('core.hooksPath')&&a.includes('--get')&&a.includes('--show-scope')){
+  process.stderr.write("error: unknown option \`show-scope'\\n");
+  process.exit(129);
+}
+const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+process.exit(r.status ?? 1);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
 suite("openPullRequest idempotency (real git · fake gh)", () => {
   let sandbox: string;
   let repo: string;
@@ -1215,6 +1245,41 @@ suite("resolveHooksPathOverride (real git)", () => {
 
     expect(await resolveHooksPathOverride(repo)).toBe(join(repo, literalName));
   });
+
+  it("falls back to a plain --get and still returns the path when --show-scope is unsupported", async () => {
+    const abs = join(sandbox, "shared-hooks");
+    mkdirSync(abs);
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", abs], { stdio: "ignore" });
+
+    const binDir = shimGitRejectingShowScope(sandbox);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    try {
+      expect(await resolveHooksPathOverride(repo)).toBe(abs);
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+
+  it("still returns undefined when hooksPath is genuinely unset and --show-scope is unsupported", async () => {
+    // core.hooksPath left unset in `repo`.
+    const binDir = shimGitRejectingShowScope(sandbox);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    try {
+      expect(await resolveHooksPathOverride(repo)).toBeUndefined();
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+
+  it("propagates a config error that is neither 'unset' nor 'unrecognized flag' rather than swallowing it as absence", async () => {
+    // A corrupted config file fails EVERY `git config` invocation the same way, including the
+    // `--show-scope` probe itself — so this hits the first `catch` in `readHooksPathConfig`, not the
+    // fallback's, but the same "propagate, don't swallow" requirement applies to both.
+    writeFileSync(join(repo, ".git", "config"), "[core\n", { flag: "a" });
+    await expect(resolveHooksPathOverride(repo)).rejects.toThrow();
+  });
 });
 
 // A caller merging a fetched ref into its own worktree needs a NARROWER answer than
@@ -1657,6 +1722,50 @@ suite("needsHooksPathOverrideForMerge (real git)", () => {
     await expect(
       resolveHooksPathOverrideForMerge(repo, worktree, "origin/never-pushed-branch"),
     ).resolves.toBeUndefined();
+  });
+
+  // Same "--show-scope unsupported" failure mode as `resolveHooksPathOverride`'s own suite (PR #263
+  // review, unresolved thread), against this function's separate call site instead — a generated,
+  // never-tracked hooksPath (Husky's shape) must still resolve, not read as unset.
+  it("resolveHooksPathOverrideForMerge falls back to a plain --get and still returns the path when --show-scope is unsupported", async () => {
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".husky/_"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "fetch", "-q", "origin", "feature"], { stdio: "ignore" });
+
+    const binDir = shimGitRejectingShowScope(sandbox);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    try {
+      await expect(
+        resolveHooksPathOverrideForMerge(repo, worktree, "origin/feature"),
+      ).resolves.toBe(join(repo, ".husky/_"));
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+
+  it("resolveHooksPathOverrideForMerge still returns undefined when hooksPath is genuinely unset and --show-scope is unsupported", async () => {
+    // core.hooksPath left unset.
+    execFileSync("git", ["-C", worktree, "fetch", "-q", "origin", "feature"], { stdio: "ignore" });
+
+    const binDir = shimGitRejectingShowScope(sandbox);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    try {
+      await expect(
+        resolveHooksPathOverrideForMerge(repo, worktree, "origin/feature"),
+      ).resolves.toBeUndefined();
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+
+  it("resolveHooksPathOverrideForMerge propagates a config error that is neither 'unset' nor 'unrecognized flag' rather than swallowing it as absence", async () => {
+    // `worktree`'s own `.git` is a gitlink FILE pointing at the base repo's shared gitdir (not its own
+    // directory), so the local-scope config a linked worktree reads is `repo/.git/config`.
+    writeFileSync(join(repo, ".git", "config"), "[core\n", { flag: "a" });
+    await expect(
+      resolveHooksPathOverrideForMerge(repo, worktree, "origin/feature"),
+    ).rejects.toThrow();
   });
 
   // The nested-hooksPath counterpart to the "returns undefined rather than a stale value" test
