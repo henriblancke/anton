@@ -7,7 +7,7 @@ import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
@@ -110,7 +110,10 @@ export async function resolveHooksPathOverride(
   // definition, so this falls straight to the base repo's copy, the only sensible source for a
   // shared directory that lives outside either checkout.
   const rel = relative(repoPath, resolve(repoPath, raw));
-  if (rel.startsWith("..") || isAbsolute(rel)) return resolve(repoPath, raw);
+  // `rel === ".."` or a `..` SEGMENT (`..${sep}`) means real traversal; a bare `startsWith("..")`
+  // would also match a same-level name that merely begins with two dots, like `..hooks` — a valid
+  // directory name path.relative can legitimately return unchanged (PR #263 review, round 4).
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return resolve(repoPath, raw);
 
   // Missing in the worktree — fall back to the base repo's copy only when the base checkout doesn't
   // track it either (a generated directory like Husky's `.husky/_`, never committed at all — see

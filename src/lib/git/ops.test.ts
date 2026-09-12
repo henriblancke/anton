@@ -581,6 +581,29 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(sandbox, "shared-hooks"));
   });
 
+  // A directory name that merely BEGINS with two dots, like `..hooks`, is not a `..` traversal —
+  // `path.relative` can legitimately return it unchanged for a same-level name, and a naive
+  // `startsWith("..")` would misclassify it as escaping the repo, skip the tracked-hooks probe, and
+  // wrongly revive the base repo's stale copy of a directory the worktree's branch actually deleted
+  // on purpose (PR #263 review, round 4) — the same real-tracked-deletion case as the `.githooks`
+  // test above, just with a name shaped like a traversal.
+  it("does not mistake a same-level directory name starting with '..' for a parent traversal", async () => {
+    mkdirSync(join(repo, "..hooks"));
+    writeFileSync(join(repo, "..hooks", "pre-commit"), "base version\n");
+    execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "..hooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", worktree, "rm", "-rq", "..hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "remove hooks"], { stdio: "ignore" });
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "..hooks"));
+  });
+
   // A quoted core.hooksPath keeps leading/trailing whitespace verbatim (git-config(1)) — the shared
   // `git()` helper's blanket stdout.trim() would silently rewrite
   // ".hooks " to a directory (".hooks") that doesn't exist.
