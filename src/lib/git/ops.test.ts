@@ -540,6 +540,65 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".githooks"));
   });
 
+  // `git submodule status -- <path>` takes `<path>` as a PATHSPEC FILTER, not an assertion that the
+  // operand itself is a gitlink (git-submodule(1)): an ORDINARY directory that merely CONTAINS an
+  // uninitialized submodule still reports that descendant's own line with a leading `-`. A hooksPath
+  // naming the ordinary directory itself (not the submodule) must not be misread as "this directory
+  // is the uninitialized submodule" just because something inside it is (PR #263 review, round 15).
+  it("does not mistake a hooksPath directory for an uninitialized submodule merely nested inside it", async () => {
+    const nestedUpstream = join(sandbox, "nested-submodule-upstream");
+    mkdirSync(nestedUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", nestedUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", nestedUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", nestedUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(nestedUpstream, "marker"), "x");
+    execFileSync("git", ["-C", nestedUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", nestedUpstream, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    // The hooksPath directory itself is ORDINARY and tracked — it holds real hook content of its
+    // own, plus an unrelated nested submodule dependency the hooks happen to need.
+    mkdirSync(join(repo, "myhooks"));
+    writeFileSync(join(repo, "myhooks", "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks dir"], { stdio: "ignore" });
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        nestedUpstream,
+        "myhooks/dep",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add nested submodule dependency"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "myhooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-nested-submodule");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-2", worktree], {
+      stdio: "ignore",
+    });
+    // The worktree's myhooks/pre-push is real (a normal tracked file); myhooks/dep is the
+    // uninitialized nested submodule — present as an empty directory, same as any other worktree add.
+    expect(existsSync(join(worktree, "myhooks", "pre-push"))).toBe(true);
+    expect(existsSync(join(worktree, "myhooks", "dep", "marker"))).toBe(false);
+
+    // myhooks itself is a real, tracked, non-submodule directory — the worktree's own copy is the
+    // right answer, not the base repo's.
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "myhooks"));
+  });
+
   // A submodule gitlink whose `.gitmodules` mapping is missing or corrupt — e.g. a feature branch
   // that dropped `.gitmodules` while leaving the gitlink itself in the tree — makes `git submodule
   // status` fail with exit 128 ("fatal: no submodule mapping found"), the SAME exit code a `..`-escaping
@@ -642,6 +701,38 @@ suite("resolveHooksPathOverride (real git)", () => {
     execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "remove hooks"], { stdio: "ignore" });
 
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, ".githooks"));
+  });
+
+  // The base checkout's index alone cannot distinguish a REAL hooks directory the feature branch
+  // introduced and later deleted entirely from one that was always generated: the base branch never
+  // tracked either, since the deletion (like the introduction) happened only on the feature branch.
+  // `isTrackedInBaseRepo` would misread this as "generated, fall back" and revive a hook the feature
+  // branch never intended to run again — the worktree's OWN history is what tells them apart
+  // (PR #263 review, round 15).
+  it("does not fall back to the base repo's copy of a hooks dir the feature branch itself introduced and deleted", async () => {
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init", "--allow-empty"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "myhooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    // The feature branch introduces AND deletes myhooks — the base branch never had it at any point.
+    mkdirSync(join(worktree, "myhooks"));
+    writeFileSync(join(worktree, "myhooks", "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", worktree, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "add hooks dir"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "rm", "-rq", "myhooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "remove hooks"], { stdio: "ignore" });
+
+    // A stale local copy happens to sit in the base repo, same shape as a real generated directory —
+    // this must not be mistaken for one, since it was in fact a real, now-deleted tracked directory.
+    mkdirSync(join(repo, "myhooks"));
+    writeFileSync(join(repo, "myhooks", "pre-push"), "stale local install\n");
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "myhooks"));
   });
 
   // A core.hooksPath containing a pathspec metacharacter must be matched LITERALLY, not as a glob —
@@ -893,6 +984,68 @@ suite("needsHooksPathOverrideForMerge (real git)", () => {
       stdio: "ignore",
     });
     // Deliberately no fetch: origin/feature was never created in this worktree.
+    await expect(
+      needsHooksPathOverrideForMerge(repo, worktree, "origin/feature"),
+    ).resolves.toBe(true);
+  });
+
+  // `ref` tracking the gitlink is not the same as the merge actually populating it: a fast-forward
+  // never runs `submodule update --init` on its own, so a hooksPath naming a submodule the review
+  // worktree has never initialized stays exactly that empty placeholder after the merge lands, and
+  // its `post-merge` would silently never fire — the same condition `resolveHooksPathOverride`
+  // already detects for the CURRENT checkout, which this narrower probe must not miss just because
+  // `ref` happens to carry the tracked gitlink too (PR #263 review, round 15).
+  it("returns true when the current hooksPath is an uninitialized submodule, even though ref tracks the gitlink", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "post-merge"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    // `feature` (and thus origin/feature) tracks the submodule gitlink — the case this probe
+    // previously read as "no override needed".
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        ".githooks",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "checkout", "-q", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "checkout", "-q", "main"], { stdio: "ignore" });
+
+    // The review worktree also tracks the gitlink (fetched via the push above being on the same
+    // branch it's already on) but never ran `submodule update --init`, so its copy is the empty
+    // placeholder `git worktree add` always materializes.
+    execFileSync("git", ["-C", worktree, "config", "core.hooksPath", ".githooks"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", worktree, "fetch", "-q", "origin", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "reset", "-q", "--hard", "origin/feature"], {
+      stdio: "ignore",
+    });
+    expect(statSync(join(worktree, ".githooks")).isDirectory()).toBe(true);
+    expect(existsSync(join(worktree, ".githooks", "post-merge"))).toBe(false);
+
     await expect(
       needsHooksPathOverrideForMerge(repo, worktree, "origin/feature"),
     ).resolves.toBe(true);

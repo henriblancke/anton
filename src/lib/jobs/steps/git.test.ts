@@ -65,6 +65,29 @@ describe("step:commit", () => {
     // Without a per-ticket anchor there is nothing to read HEAD against, so it never reaches git.
     expect(ops.readWorktreeState).not.toHaveBeenCalled();
   });
+
+  // The marker commit adopting the agent's own self-committed work must resolve and pass hooksPath
+  // the same way commitAll above does: commitMarker's --no-verify bypasses only pre-commit/commit-msg,
+  // so a generated, base-only post-commit hook still needs the resolved path rather than silently
+  // resolving against a cold worktree that never installed it (PR #263 review, round 15).
+  it("passes the resolved hooksPath to the marker commit recording the agent's self-committed work", async () => {
+    ops.commitAll.mockResolvedValue({ committed: false });
+    ops.readWorktreeState.mockResolvedValue({
+      ref: `refs/heads/${sandbox.context().branch}`,
+      head: "agent-head",
+    });
+    ops.isAncestor.mockResolvedValue(true);
+    ops.worktreeHasCommitFor.mockResolvedValue(false);
+    ops.resolveHooksPathOverride.mockResolvedValue("/base/repo/.githooks");
+
+    await commitStep(sandbox.context({ ticketStartHead: "start-head" }));
+
+    expect(ops.commitMarker).toHaveBeenCalledWith(
+      sandbox.dir,
+      expect.any(String),
+      expect.objectContaining({ hooksPath: "/base/repo/.githooks" }),
+    );
+  });
 });
 
 describe("step:pr", () => {

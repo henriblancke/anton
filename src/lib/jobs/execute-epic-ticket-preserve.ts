@@ -296,6 +296,7 @@ export async function preserveTimedOutWork(args: {
     const after = "error" in kept ? await readWorktreeState(worktreePath).catch(() => null) : now;
     if (after && (await movedForwardOnBranch(worktreePath, baseline, after, branch))) {
       return adoptSelfCommittedWork({
+        repoPath: run.repoPath,
         worktreePath,
         branch,
         ticket,
@@ -356,6 +357,7 @@ export async function preserveTimedOutWork(args: {
  * outrank their bookkeeping, but handed to a person instead of reported as preserved.
  */
 async function adoptSelfCommittedWork(args: {
+  repoPath: string;
   worktreePath: string;
   branch: string;
   ticket: Bead;
@@ -370,7 +372,7 @@ async function adoptSelfCommittedWork(args: {
    */
   alreadyMarked: boolean;
 }): Promise<PreservedWork> {
-  const { worktreePath, branch, ticket, timeoutMs, logPath, why, alreadyMarked } = args;
+  const { repoPath, worktreePath, branch, ticket, timeoutMs, logPath, why, alreadyMarked } = args;
   const message = preservedCommitMessage(ticket, timeoutMs, { marker: true });
   // A REJECTED marker call is not proof the marker is absent (PR #228 review). `--no-verify` bypasses
   // only `pre-commit` and `commit-msg` (git-commit(1)); `post-commit` runs AFTER the commit is made,
@@ -380,9 +382,15 @@ async function adoptSelfCommittedWork(args: {
   // older marker beneath these self-commits does not cover them, so it must not pass for the fresh
   // tip marker this call meant to make. A read that fails stays "unmarked": that answer stops for a
   // person, where a wrong "marked" reports work no resume can see as preserved.
+  //
+  // `hooksPath` is resolved and passed through for the same reason `commitPreservedTree` below
+  // already does it: `--no-verify` bypasses only `pre-commit`/`commit-msg`, so a generated,
+  // base-only hook still needs the base repo's copy resolved rather than the cold worktree's own,
+  // nonexistent one (PR #263 review, round 15).
+  const hooksPath = await resolveHooksPathOverride(repoPath, worktreePath);
   const marked =
     alreadyMarked ||
-    (await safe(() => commitMarker(worktreePath, message))) ||
+    (await safe(() => commitMarker(worktreePath, message, { hooksPath }))) ||
     (await worktreeTipIsPreservedCommitFor(worktreePath, ticket.id));
   if (!marked) {
     await logPreserve(

@@ -162,12 +162,18 @@ export async function resolveHooksPathOverride(
     return inWorktree;
   }
 
-  // Missing in the worktree — fall back to the base repo's copy only when the base checkout doesn't
-  // track it either (a generated directory like Husky's `.husky/_`, never committed at all — see
-  // isTrackedInBaseRepo). Otherwise the base repo DOES still track it, so the worktree's branch must
-  // have deleted or moved it on purpose, and `inWorktree` is still the right answer: git runs no hook
-  // for a configured `core.hooksPath` that doesn't exist.
-  return (await isTrackedInBaseRepo(repoPath, raw)) ? inWorktree : resolve(repoPath, raw);
+  // Missing in the worktree — fall back to the base repo's copy only when NEITHER checkout has ever
+  // tracked it (a generated directory like Husky's `.husky/_`, never committed at all). Either
+  // checkout tracking it — now or at any point in its own history — means the worktree's branch
+  // deleted or moved a REAL hooks directory on purpose, and `inWorktree` is still the right answer:
+  // git runs no hook for a configured `core.hooksPath` that doesn't exist. `isTrackedInBaseRepo`
+  // alone is not enough: the base checkout's index has no record of a directory this FEATURE branch
+  // introduced and later deleted entirely — never present on base at all — which would otherwise be
+  // indistinguishable from one that was always generated (PR #263 review, round 15); `everTrackedOnBranch`
+  // catches that case by walking the worktree's own history instead of only its current index.
+  const trackedSomewhere =
+    (await isTrackedInBaseRepo(repoPath, raw)) || (await everTrackedOnBranch(worktreePath, raw));
+  return trackedSomewhere ? inWorktree : resolve(repoPath, raw);
 }
 
 /**
@@ -200,6 +206,26 @@ async function isTrackedInBaseRepo(repoPath: string, relPath: string): Promise<b
 }
 
 /**
+ * Whether `relPath` has EVER been a real, committed path anywhere in `worktreePath`'s own branch
+ * history — not just its current index (which {@link isTrackedInBaseRepo} checks for the base
+ * checkout, and which `existsSync`/`ls-tree` above already ruled out for the worktree's PRESENT
+ * tree). A path a feature branch introduced and later deleted entirely never appears in the base
+ * checkout's index at all — the base branch never tracked it either — so `isTrackedInBaseRepo` alone
+ * cannot tell that deletion apart from a directory that was always generated and never committed on
+ * EITHER branch (PR #263 review, round 15): `git log`, walking the WORKTREE's own history, is what
+ * distinguishes the two — a real, later-deleted directory has a commit touching it somewhere in that
+ * history; a purely generated one (Husky's `.husky/_`) has none, on any branch, ever.
+ */
+async function everTrackedOnBranch(worktreePath: string, relPath: string): Promise<boolean> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", worktreePath, "log", "-1", "--format=%H", "--", `:(literal)${relPath}`],
+    { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+  );
+  return stdout.trim().length > 0;
+}
+
+/**
  * Whether `relPath` is a submodule gitlink in `worktreePath`'s index that has never been
  * initialized there — the one case `existsSync`+`isDirectory()` can't tell apart from a real,
  * populated hooks directory. `git worktree add` materializes every tracked path, submodule gitlinks
@@ -210,6 +236,14 @@ async function isTrackedInBaseRepo(repoPath: string, relPath: string): Promise<b
  * `git submodule status` is what distinguishes the two: it prefixes exactly one status character per
  * line, and a leading `-` is documented as specifically "not initialized" (git-submodule(1)) — the
  * only prefix meaning this worktree's copy is the empty placeholder, not real hook content.
+ *
+ * Its `-- <path>` accepts a PATHSPEC FILTER, not an assertion that the operand itself is a gitlink
+ * (git-submodule(1)): `relPath` naming an ordinary directory that merely CONTAINS an uninitialized
+ * submodule (`core.hooksPath=.`, or any directory holding one nested inside) still returns that
+ * descendant's own line with a leading `-`, which a bare `stdout.startsWith("-")` would misread as
+ * `relPath` itself being the uninitialized submodule. Every reported line's OWN path column is
+ * checked against `relPath` instead — only a line naming this exact path, not a filtered-in
+ * descendant's, answers the question this helper exists to ask (PR #263 review, round 15).
  */
 async function isUninitializedSubmodule(worktreePath: string, relPath: string): Promise<boolean> {
   try {
@@ -218,7 +252,10 @@ async function isUninitializedSubmodule(worktreePath: string, relPath: string): 
       ["-C", worktreePath, "submodule", "status", "--", `:(literal)${relPath}`],
       { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
     );
-    return stdout.startsWith("-");
+    const wanted = relPath.replace(/\/+$/, "");
+    return stdout
+      .split("\n")
+      .some((line) => line[0] === "-" && submoduleStatusPath(line) === wanted);
   } catch (e) {
     // Exit 1 is `submodule status`'s documented no-match signal — `relPath` is a regular tracked
     // directory, not a submodule at all, the ordinary case this helper must say "false" for. Every
@@ -231,6 +268,19 @@ async function isUninitializedSubmodule(worktreePath: string, relPath: string): 
     if (exitedWith(e, 1)) return false;
     throw e;
   }
+}
+
+/**
+ * The path column of one `git submodule status` output line — format `<status-char><40-char-sha>
+ * <path>[ (<describe>)]` (git-submodule(1)): exactly one status character, a fixed 40-hex-char sha,
+ * a space, the path, then an OPTIONAL ` (<describe>)` suffix (an attached branch/tag name — absent
+ * entirely for a detached or uninitialized submodule, present for one on a branch). Sliced by fixed
+ * offset rather than split on space, since the path itself may legitimately contain one.
+ */
+function submoduleStatusPath(line: string): string {
+  const withoutPrefix = line.slice(42); // 1 status char + 40-char sha + 1 space
+  const describeStart = withoutPrefix.lastIndexOf(" (");
+  return describeStart === -1 ? withoutPrefix : withoutPrefix.slice(0, describeStart);
 }
 
 /**
@@ -301,7 +351,17 @@ export async function needsHooksPathOverrideForMerge(
     ["-C", worktreePath, "ls-tree", "--name-only", ref, "--", `:(literal)${raw}`],
     { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
   );
-  return stdout.trim().length === 0;
+  if (stdout.trim().length === 0) return true; // ref doesn't carry it — override needed
+
+  // `ref` carrying the gitlink is not the same as the merge actually populating it: a fast-forward
+  // never runs `submodule update --init` on its own, so a hooksPath naming a submodule that is
+  // initialized in the base checkout but UNINITIALIZED in this review worktree stays exactly that
+  // empty placeholder after the merge lands — the same condition {@link resolveHooksPathOverride}
+  // already detects for the CURRENT checkout via `git submodule status`. Skipping this check here
+  // would read the ref's tracked gitlink as proof the merge's own `post-merge` will fire correctly,
+  // when the worktree it actually runs against still has nothing checked out at that path
+  // (PR #263 review, round 15).
+  return isUninitializedSubmodule(worktreePath, raw);
 }
 
 async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
@@ -901,7 +961,7 @@ export async function isAncestor(
 export async function commitMarker(
   worktreePath: string,
   message: string,
-  options: { satisfies?: string[] } = {},
+  options: { satisfies?: string[]; hooksPath?: string } = {},
 ): Promise<void> {
   // `--allow-empty` PERMITS an empty commit; it does not FORCE one. Anything a caller happened to
   // leave staged would ship under a message saying this commit is empty, so the index is pinned to
@@ -909,7 +969,16 @@ export async function commitMarker(
   // whatever is in it.
   await git(worktreePath, ["reset", "--quiet", "--mixed", "HEAD"]);
   const body = withSatisfiesTrailers(message, options.satisfies);
-  await gitCommit(worktreePath, ["commit", "--allow-empty", "--no-verify", "-m", body]);
+  // `--no-verify` bypasses only `pre-commit` and `commit-msg` (git-commit(1)) — a generated,
+  // base-only `post-commit` hook (Husky's `.husky/_`) still runs, and without `hooksPath` resolves
+  // against this cold worktree, where it was never installed, silently skipping it (PR #263 review,
+  // round 15) — the same gap {@link commitPreservedTree}'s bypass retry closed by passing its own
+  // resolved path through instead of relying on `--no-verify` alone.
+  await gitCommit(
+    worktreePath,
+    ["commit", "--allow-empty", "--no-verify", "-m", body],
+    options.hooksPath,
+  );
 }
 
 /**
