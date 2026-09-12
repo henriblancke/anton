@@ -263,7 +263,7 @@ async function isUninitializedSubmodule(worktreePath: string, relPath: string): 
     const wanted = posixNormalize(relPath);
     return stdout
       .split("\n")
-      .some((line) => line[0] === "-" && submoduleStatusPath(line) === wanted);
+      .some((line) => line[0] === "-" && lineNamesPath(line, wanted));
   } catch (e) {
     // Exit 1 is `submodule status`'s documented no-match signal — `relPath` is a regular tracked
     // directory, not a submodule at all, the ordinary case this helper must say "false" for. Every
@@ -279,16 +279,21 @@ async function isUninitializedSubmodule(worktreePath: string, relPath: string): 
 }
 
 /**
- * The path column of one `git submodule status` output line — format `<status-char><40-char-sha>
- * <path>[ (<describe>)]` (git-submodule(1)): exactly one status character, a fixed 40-hex-char sha,
- * a space, the path, then an OPTIONAL ` (<describe>)` suffix (an attached branch/tag name — absent
- * entirely for a detached or uninitialized submodule, present for one on a branch). Sliced by fixed
- * offset rather than split on space, since the path itself may legitimately contain one.
+ * Whether one `git submodule status` output line names exactly `wanted` — format
+ * `<status-char><40-char-sha> <path>[ (<describe>)]` (git-submodule(1)): exactly one status
+ * character, a fixed 40-hex-char sha, a space, then the path.
+ *
+ * The path is compared WHOLE against `wanted` rather than extracted by trimming an assumed
+ * `(<describe>)` suffix off the end: a describe suffix comes from running `git describe` INSIDE the
+ * submodule's own checkout, which an uninitialized submodule — the only status this helper ever
+ * matches a line against, since every call site filters on the leading `-` first — has none of, its
+ * git directory never having been cloned there at all. A path that itself legitimately contains
+ * literal `" ("` text (`core.hooksPath="hooks (x)"`) would otherwise be misparsed as a shorter path
+ * plus a fake describe suffix, and the caller's exact-path check would then never match it
+ * (PR #263 review, round 17).
  */
-function submoduleStatusPath(line: string): string {
-  const withoutPrefix = line.slice(42); // 1 status char + 40-char sha + 1 space
-  const describeStart = withoutPrefix.lastIndexOf(" (");
-  return describeStart === -1 ? withoutPrefix : withoutPrefix.slice(0, describeStart);
+function lineNamesPath(line: string, wanted: string): boolean {
+  return line.slice(42) === wanted; // 1 status char + 40-char sha + 1 space
 }
 
 /**

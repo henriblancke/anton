@@ -650,6 +650,55 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "myhooks"));
   });
 
+  // A submodule path that itself contains literal `" ("` text must not be misparsed as a shorter
+  // path plus a fake `git describe` suffix: an uninitialized submodule's status line never actually
+  // carries a describe suffix (there is no checkout to describe), so the FULL remainder after the
+  // sha is the path, verbatim (PR #263 review, round 17).
+  it("falls back to the base repo's copy when the uninitialized submodule's own path contains a literal '('", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-parens");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    const hooksDirName = "hooks (x)";
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        hooksDirName,
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", hooksDirName], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-parens-submodule");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-4", worktree], {
+      stdio: "ignore",
+    });
+    expect(statSync(join(worktree, hooksDirName)).isDirectory()).toBe(true);
+    expect(existsSync(join(worktree, hooksDirName, "pre-push"))).toBe(false);
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, hooksDirName));
+  });
+
   // A submodule gitlink whose `.gitmodules` mapping is missing or corrupt — e.g. a feature branch
   // that dropped `.gitmodules` while leaving the gitlink itself in the tree — makes `git submodule
   // status` fail with exit 128 ("fatal: no submodule mapping found"), the SAME exit code a `..`-escaping
