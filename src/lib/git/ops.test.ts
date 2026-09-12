@@ -770,6 +770,122 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "hooks"));
   });
 
+  // A hooksPath NESTED inside a submodule (`core.hooksPath=deps/hooks`, `deps` the gitlink) has no
+  // tree entry of its own in the superproject at all — only `deps` itself is recorded — so it can't
+  // be probed directly the way a hooksPath that IS a gitlink can. Without walking up to find the
+  // containing gitlink, this silently falls to the generic "never tracked, must be generated" path
+  // and hands back the base repo's copy completely unconditionally, without ever checking whether
+  // that base copy is even at the same commit the worktree's tree records for `deps`
+  // (PR #263 review, round 20).
+  it("does not fall back to a stale base copy when the hooksPath is nested inside a submodule the feature branch bumped", async () => {
+    const submoduleUpstream = join(sandbox, "nested-hooks-submodule-upstream");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    mkdirSync(join(submoduleUpstream, "hooks"));
+    writeFileSync(join(submoduleUpstream, "hooks", "pre-push"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+    const v1Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(submoduleUpstream, "hooks", "pre-push"), "v2\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v2"], { stdio: "ignore" });
+    const v2Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleUpstream, "deps"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "-C", "deps", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "deps"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add deps submodule at v1"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "deps/hooks"], { stdio: "ignore" });
+
+    // Feature branch bumps deps to v2 — the base checkout is never touched and stays at v1.
+    execFileSync("git", ["-C", repo, "checkout", "-q", "-b", "anton/epic-8"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "-C", "deps", "checkout", "-q", v2Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "deps"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "bump deps submodule to v2"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "checkout", "-q", "main"], { stdio: "ignore" });
+    // Restore the base checkout's own submodule copy back to v1, matching what main's tree records.
+    execFileSync("git", ["-C", repo, "-C", "deps", "checkout", "-q", v1Sha], { stdio: "ignore" });
+
+    const nestedWorktree = join(sandbox, "worktree-nested-stale-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", nestedWorktree, "anton/epic-8"],
+      { stdio: "ignore" },
+    );
+    // The worktree's deps is uninitialized — deps/hooks doesn't even exist on disk — while its tree
+    // records deps at v2.
+    expect(existsSync(join(nestedWorktree, "deps", "hooks"))).toBe(false);
+    expect(
+      execFileSync("git", ["-C", nestedWorktree, "rev-parse", "HEAD:deps"], { encoding: "utf8" }).trim(),
+    ).toBe(v2Sha);
+    // The base repo's own checkout is a real, populated copy — but at the WRONG (v1) commit.
+    expect(readFileSync(join(repo, "deps", "hooks", "pre-push"), "utf8")).toBe("v1\n");
+
+    // Neither copy is safe: the worktree's doesn't exist, and the base repo's is stale. This must
+    // fall back to the worktree's own (nonexistent) path so NO hook fires, rather than run v1's
+    // stale pre-push.
+    expect(await resolveHooksPathOverride(repo, nestedWorktree)).toBe(
+      join(nestedWorktree, "deps", "hooks"),
+    );
+  });
+
+  // The matching counterpart to the test above: when the base repo's submodule copy DOES match what
+  // the worktree's tree records for the containing gitlink, the nested hooksPath correctly resolves
+  // to the base repo's copy (PR #263 review, round 20).
+  it("falls back to the base repo's copy when a nested hooksPath's containing submodule matches", async () => {
+    const submoduleUpstream = join(sandbox, "nested-hooks-submodule-upstream-matching");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    mkdirSync(join(submoduleUpstream, "hooks"));
+    writeFileSync(join(submoduleUpstream, "hooks", "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleUpstream, "deps"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add deps submodule"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "deps/hooks"], { stdio: "ignore" });
+
+    const nestedWorktree = join(sandbox, "worktree-nested-matching-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-9", nestedWorktree],
+      { stdio: "ignore" },
+    );
+    expect(existsSync(join(nestedWorktree, "deps", "hooks"))).toBe(false);
+
+    expect(await resolveHooksPathOverride(repo, nestedWorktree)).toBe(
+      join(repo, "deps", "hooks"),
+    );
+  });
+
   // A repository created with `git init --object-format=sha256` (git-init(1)) reports a 64-character
   // object id in `submodule status`, not sha1's 40 — hard-coding the sha1 width would misparse every
   // line in such a repository, leaving part of the hash attached to the path instead of splitting

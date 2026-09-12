@@ -8,7 +8,7 @@ import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { normalize as posixNormalizeRaw } from "node:path/posix";
+import { dirname as posixDirname, normalize as posixNormalizeRaw } from "node:path/posix";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
@@ -170,6 +170,23 @@ export async function resolveHooksPathOverride(
     return inWorktree;
   }
 
+  // A hooksPath NESTED INSIDE an uninitialized submodule (`core.hooksPath=deps/hooks`, where `deps`
+  // is the gitlink) is the other shape `existsSync` alone can't see: the superproject's tree records
+  // only `deps` as a gitlink — never a `deps/hooks` entry of its own (gitsubmodules(7): a submodule's
+  // CONTENTS are never part of the superproject's tree) — so `deps/hooks` is simply absent from both
+  // `git ls-files` and `git log`, indistinguishable from a directory that was always generated on
+  // EITHER branch. Left unhandled, this would fall straight to the tracked-somewhere check below,
+  // find nothing tracking it (correctly — nothing ever could), and hand back the base repo's copy
+  // completely unconditionally: none of round 18's staleness verification ever runs, because that
+  // logic only ever triggers for a hooksPath that IS itself a gitlink. `ancestorSubmoduleSha` finds
+  // the nearest containing gitlink so the exact same base-must-match-worktree check applies to a
+  // nested path too (PR #263 review, round 20).
+  const containing = await ancestorSubmoduleSha(worktreePath, raw);
+  if (containing) {
+    const matches = await baseSubmoduleMatches(repoPath, containing.submodulePath, containing.sha);
+    return matches ? resolve(repoPath, raw) : inWorktree;
+  }
+
   // Missing in the worktree — fall back to the base repo's copy only when NEITHER checkout has ever
   // tracked it (a generated directory like Husky's `.husky/_`, never committed at all). Either
   // checkout tracking it — now or at any point in its own history — means the worktree's branch
@@ -231,6 +248,44 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
     { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
   );
   return stdout.trim().length > 0;
+}
+
+/**
+ * The nearest ancestor of `relPath` (`relPath` itself included) that `worktreePath`'s HEAD tree
+ * records as a submodule gitlink (mode `160000`) — along with the commit that gitlink targets — or
+ * `undefined` when no ancestor is one. A hooksPath NESTED inside a submodule (`core.hooksPath=
+ * deps/hooks`, `deps` the gitlink) needs this because the superproject's tree never records anything
+ * below the gitlink itself (gitsubmodules(7)): `deps/hooks` has no tree entry of its own to inspect
+ * directly, uninitialized or not, so the only way to reason about it is to find what CONTAINS it.
+ *
+ * Walked with `git ls-tree` one path segment at a time from `relPath` up to the repo root, rather
+ * than a single `-r` (recursive) call: a recursive listing only shows entries actually reachable
+ * under a real tree, and a gitlink is a dead end to `ls-tree -r` by design (it does not recurse into
+ * submodules) — checking each ancestor path individually is what correctly finds a gitlink at any
+ * depth, not just an immediate parent.
+ */
+async function ancestorSubmoduleSha(
+  worktreePath: string,
+  relPath: string,
+): Promise<{ submodulePath: string; sha: string } | undefined> {
+  let candidate = posixNormalize(relPath);
+  while (candidate !== "." && candidate !== "/") {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "ls-tree", "HEAD", "--", `:(literal)${candidate}`],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    const entry = stdout.split("\n")[0] ?? "";
+    const tab = entry.indexOf("\t");
+    if (tab !== -1) {
+      const [mode, , sha] = entry.slice(0, tab).split(" ");
+      if (mode === "160000" && sha) return { submodulePath: candidate, sha };
+    }
+    const parent = posixDirname(candidate);
+    if (parent === candidate) break;
+    candidate = parent;
+  }
+  return undefined;
 }
 
 /**
