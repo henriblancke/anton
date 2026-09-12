@@ -730,6 +730,21 @@ suite("needsHooksPathOverrideForMerge (real git)", () => {
     // `prepare`), so this must say "override needed" even though nothing was fetched to introduce it.
     expect(await needsHooksPathOverrideForMerge(repo, worktree, "origin/feature")).toBe(true);
   });
+
+  // A `..`-escaping hooksPath can never be tracked by ANY ref, and git rejects a pathspec outside the
+  // repository outright (exit 128) rather than answering "not found" — so this must be detected
+  // before ever calling `ls-tree`, or it throws and aborts the caller's merge outside its own error
+  // handling (PR #263 review, round 9: the escape guard added to resolveHooksPathOverride did not
+  // cover this separate probe).
+  it("returns true for a hooksPath that climbs outside the repo via .., without invoking ls-tree", async () => {
+    execFileSync("git", ["-C", worktree, "config", "core.hooksPath", "../shared-hooks"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", worktree, "fetch", "-q", "origin", "feature"], { stdio: "ignore" });
+    await expect(
+      needsHooksPathOverrideForMerge(repo, worktree, "origin/feature"),
+    ).resolves.toBe(true);
+  });
 });
 
 /**

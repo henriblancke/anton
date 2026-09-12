@@ -171,12 +171,18 @@ async function isTrackedInBaseRepo(repoPath: string, relPath: string): Promise<b
  *   already gets this right once the merge lands; passing a value resolved BEFORE the merge would
  *   necessarily be stale or point nowhere, since the tracked copy doesn't exist yet, and silently
  *   skip `post-merge` (round 6/7's bug).
- * - `true` (override needed): the hooksPath is unset, absolute, or a relative path `ref` does NOT
- *   carry — a GENERATED directory like Husky's `.husky/_`, which no ref ever tracks. No fetch
- *   introduces it, so there is nothing for native resolution to pick up post-merge either; the base
- *   repo's locally-installed copy (from {@link resolveHooksPathOverride}) is the only source, and
- *   omitting the override here means `post-merge` never fires at all (round 8's regression from
- *   unconditionally dropping it).
+ * - `true` (override needed): the hooksPath is unset, absolute, a relative path that climbs outside
+ *   the repo via `..`, or a relative path `ref` does NOT carry — a GENERATED directory like Husky's
+ *   `.husky/_`, which no ref ever tracks. No fetch introduces it, so there is nothing for native
+ *   resolution to pick up post-merge either; the base repo's locally-installed copy (from
+ *   {@link resolveHooksPathOverride}) is the only source, and omitting the override here means
+ *   `post-merge` never fires at all (round 8's regression from unconditionally dropping it).
+ *
+ * A `..`-escaping path can never be tracked by ANY ref — git rejects a pathspec outside the
+ * repository outright (exit 128), not the empty-output "not found" this function otherwise reads —
+ * so it is detected up front, the same way and for the same reason as
+ * {@link resolveHooksPathOverride}'s own escape check (PR #263 review, round 9: the check added
+ * there does not cover this separate `ls-tree` probe).
  */
 export async function needsHooksPathOverrideForMerge(
   repoPath: string,
@@ -195,6 +201,9 @@ export async function needsHooksPathOverrideForMerge(
     return false; // unset — nothing to override with either way
   }
   if (!raw || isAbsolute(raw)) return false; // absolute is resolved already; never ref-trackable
+
+  const rel = relative(repoPath, resolve(repoPath, raw));
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return true; // never ref-trackable
 
   const { stdout } = await execFileAsync(
     "git",
