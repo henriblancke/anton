@@ -488,8 +488,13 @@ suite("resolveHooksPathOverride (real git)", () => {
   // The Husky case stays correct: a GENERATED, gitignored directory has no copy in a cold worktree
   // at all, so there is nothing to prefer — the base repo is still the right (only) source.
   it("falls back to the base repo's copy when the worktree has none (generated, gitignored hooks)", async () => {
+    // Husky's own installer commits a `.gitignore` line for `_` — that's what marks the directory as
+    // generated rather than tracked, and is what the override must check for.
     mkdirSync(join(repo, ".husky", "_"), { recursive: true });
+    writeFileSync(join(repo, ".husky", ".gitignore"), "_\n");
     writeFileSync(join(repo, ".husky", "_", "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+    execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init"], { stdio: "ignore" });
     execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".husky/_"], { stdio: "ignore" });
 
     const worktree = join(sandbox, "worktree");
@@ -499,6 +504,28 @@ suite("resolveHooksPathOverride (real git)", () => {
     // Cold worktree: .husky/_ is gitignored, so nothing was checked out — and no install ran here.
 
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(repo, ".husky", "_"));
+  });
+
+  // A TRACKED hooks directory absent from the worktree is a different situation from Husky's
+  // generated one above: the feature branch itself deleted or migrated it, so git would run no hook
+  // at all — falling back to the base repo's stale copy would revive a hook the branch intentionally
+  // removed, and could block landing the very PR that deletes it (PR #263 review).
+  it("does not fall back to the base repo's copy of a tracked hooks dir the worktree's branch deleted", async () => {
+    mkdirSync(join(repo, ".githooks"));
+    writeFileSync(join(repo, ".githooks", "pre-commit"), "base version\n");
+    execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", ".githooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    // The feature branch deletes the tracked hooks directory entirely.
+    execFileSync("git", ["-C", worktree, "rm", "-rq", ".githooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "remove hooks"], { stdio: "ignore" });
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, ".githooks"));
   });
 
   // A quoted core.hooksPath keeps leading/trailing whitespace verbatim (git-config(1)) — the shared

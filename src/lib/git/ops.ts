@@ -44,6 +44,14 @@ export const GH_BIN_ENV = "ANTON_GH_BIN";
  *    git-config(1): whitespace inside a quoted value is preserved verbatim — so this reads git's
  *    output directly rather than through the shared {@link git} helper, whose blanket `.trim()`
  *    would silently rewrite `.hooks ` to `.hooks`, a directory that doesn't exist.
+ * 5. **Don't revive a hooks directory the checked-out branch deleted.** A missing worktree copy has
+ *    two different causes that must not be treated alike: a GENERATED, gitignored directory (Husky's
+ *    `.husky/_`) never existed there and the base repo's copy is genuinely the only source (point 3
+ *    above); but a TRACKED directory absent from the worktree means the feature branch itself removed
+ *    or migrated it, and git would correctly run no hook at all for that — falling back to the base
+ *    repo's stale copy would run a hook the branch intentionally deleted, and could block landing the
+ *    very PR that deletes it. `git check-ignore` is what tells the two apart: only an ignored path
+ *    falls back.
  */
 export async function resolveHooksPathOverride(
   repoPath: string,
@@ -64,10 +72,27 @@ export async function resolveHooksPathOverride(
   if (!raw) return undefined;
   if (isAbsolute(raw)) return raw;
 
-  const inWorktree = worktreePath ? resolve(worktreePath, raw) : undefined;
-  if (inWorktree && existsSync(inWorktree)) return inWorktree;
+  if (!worktreePath) return resolve(repoPath, raw);
 
-  return resolve(repoPath, raw);
+  const inWorktree = resolve(worktreePath, raw);
+  if (existsSync(inWorktree)) return inWorktree;
+  // Missing in the worktree — fall back to the base repo's copy only when git itself would never
+  // have tracked one there (a generated directory like Husky's `.husky/_`). Otherwise the checked-out
+  // branch deleted or moved a tracked hooks directory on purpose, and `inWorktree` is still the right
+  // answer: git runs no hook for a configured `core.hooksPath` that doesn't exist.
+  return (await isGitIgnored(worktreePath, raw)) ? resolve(repoPath, raw) : inWorktree;
+}
+
+/** Whether `relPath` (as configured, relative to `cwd`) is excluded by `cwd`'s own gitignore rules. */
+async function isGitIgnored(cwd: string, relPath: string): Promise<boolean> {
+  try {
+    await execFileAsync("git", ["-C", cwd, "check-ignore", "-q", "--", relPath], {
+      timeout: 120_000,
+    });
+    return true;
+  } catch {
+    return false; // exit 1 (not ignored) or a fatal error either way — nothing to revive from
+  }
 }
 
 async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
