@@ -7,6 +7,7 @@ import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalizeRaw } from "node:path/posix";
 import { StringDecoder } from "node:string_decoder";
@@ -87,6 +88,15 @@ async function readHooksPathConfig(
  * as `-c core.hooksPath=<this>` (see {@link git}/{@link gitCommit}), so hooks fire from the right
  * source with no bridge, symlink, or `info/exclude` entry needed at all — replacing the earlier
  * symlink-into-the-worktree bridge entirely.
+ *
+ * Beyond a real path or `undefined` (unset), this can also return {@link disabledHooksPath}'s
+ * sentinel: an already-INITIALIZED submodule-backed hooksPath whose checked-out commit has gone
+ * stale against what this worktree's own CURRENT tree (its own HEAD, just advanced by whatever
+ * fast-forward or checkout preceded this call) now records for the gitlink. That worktree copy is
+ * real, populated content — not absent, like the uninitialized-submodule case this function already
+ * falls back on `inWorktree`'s empty placeholder for — so `undefined`/omitting the `-c` flag would
+ * leave it in effect and run its stale hook; the sentinel forces hooks off for real instead
+ * (PR #263 review, round 28).
  *
  * Four things this must get right:
  *
@@ -214,6 +224,31 @@ export async function resolveHooksPathOverride(
     const submoduleSha = await uninitializedSubmoduleSha(worktreePath, raw);
     if (submoduleSha && (await baseSubmoduleMatches(repoPath, raw, submoduleSha))) {
       return resolve(repoPath, raw);
+    }
+    if (!submoduleSha) {
+      // Not the uninitialized ("-") case above — either an ordinary tracked directory (real content
+      // of its own, safe to trust as `inWorktree` unconditionally, same as always) or an INITIALIZED
+      // submodule whose checkout has gone STALE: a fast-forward that just advanced this worktree's
+      // own branch (bringing the gitlink along) never re-runs `submodule update` on its own, so an
+      // already-initialized checkout can silently disagree with what the CURRENT tree (this
+      // worktree's own HEAD, right now — not an incoming ref; that's resolveHooksPathOverrideForMerge's
+      // job) actually records for the gitlink (PR #263 review, round 28). `checkedOutSubmoduleSha`
+      // tells the two apart (`checkedOut: false, sha: undefined` only for a path naming no submodule
+      // at all); `ancestorSubmoduleSha`'s default `rev = "HEAD"` gets the gitlink's CURRENT expected
+      // commit to compare the checkout against.
+      const checkedOut = await checkedOutSubmoduleSha(worktreePath, raw);
+      if (checkedOut.checkedOut) {
+        const current = await ancestorSubmoduleSha(worktreePath, raw);
+        if (current && checkedOut.sha !== current.sha) {
+          // Stale, not merely absent: unlike the uninitialized case above, `inWorktree` here is a
+          // real, populated checkout — just of the WRONG commit — so returning it as this function's
+          // usual "empty placeholder, no hook fires" signal would actually run that stale content's
+          // hook. Worse than running none, the same reasoning round 18 already applied to a stale
+          // BASE-repo copy; a stale WORKTREE copy is no safer. `disabledHooksPath` forces hooks off
+          // for real instead of handing back a path that still resolves to something.
+          return disabledHooksPath();
+        }
+      }
     }
     return inWorktree;
   }
@@ -629,10 +664,43 @@ export async function needsHooksPathOverrideForMerge(
 }
 
 /**
+ * An absolute path guaranteed not to exist on disk, freshly minted per call — the value this file
+ * passes as `-c core.hooksPath=<this>` whenever {@link resolveHooksPathOverrideForMerge} determines
+ * `core.hooksPath` IS configured to something but that something is unsafe to trust for the merge
+ * about to run. Git's own hook lookup (git-config(1)) treats a `core.hooksPath` that resolves to a
+ * nonexistent directory as "look there, find nothing, run no hook" — the standard way to disable
+ * hooks for a single invocation without touching repo config permanently. `undefined` cannot stand
+ * in for this: omitting the `-c` flag entirely leaves whatever `core.hooksPath` already resolves to
+ * on disk in effect for that git invocation, which is exactly the stale/wrong directory this
+ * function is refusing to trust (PR #263 review, round 26). Per-call via `randomUUID`, rather than a
+ * single fixed sentinel string, so no two concurrent merges (or a merge and an unrelated git
+ * invocation elsewhere) could ever collide on the same nonexistent path in a way that matters — collision
+ * here is harmless either way (both merely resolve to "absent"), but there's no reason to share one.
+ */
+function disabledHooksPath(): string {
+  return resolve(tmpdir(), `anton-disabled-hooks-${randomUUID()}`);
+}
+
+/**
  * The `core.hooksPath` value to actually pass into the fast-forward merge bringing `ref` into
  * `worktreePath` — called only once {@link needsHooksPathOverrideForMerge} has said `true`, i.e. an
- * override is needed. `undefined` means no safe value exists: the merge should run with NO override
- * (no hook fires) rather than a WRONG one.
+ * override is needed. Three-way contract, not two:
+ *
+ * - `undefined`: `core.hooksPath` is genuinely UNSET (or the ordinary "not a submodule, delegate"
+ *   path below determined nothing needs overriding) — there was never anything to disable, so
+ *   omitting the `-c` flag is exactly correct; git fires no hook either way.
+ * - a real path: a source was POSITIVELY VERIFIED to match what `ref` will actually check out —
+ *   safe to pass through as-is.
+ * - {@link disabledHooksPath}'s sentinel: `core.hooksPath` IS configured to something, but no source
+ *   verified to match the incoming commit exists (a submodule the merge is about to advance, that
+ *   neither this worktree's nor the base repo's checkout currently matches). Returning `undefined`
+ *   here would be silently wrong: the caller's `git()` helper only adds a `-c core.hooksPath=…`
+ *   argument when given a value, so omitting one leaves the worktree's OWN, already-configured (and
+ *   stale) `core.hooksPath` in effect for that git invocation — reproduced with git 2.43, where
+ *   merging a v2 gitlink while the worktree's submodule checkout stays at v1 still runs v1's
+ *   `post-merge`. The sentinel forces hooks off for real, rather than merely declining to say
+ *   anything (PR #263 review, round 26 — the exact misconception the previous two-way contract
+ *   `undefined` = "no override, no hook fires" encoded).
  *
  * The mistake this exists to prevent: calling {@link resolveHooksPathOverride} for this purpose,
  * which answers "what does the CURRENT checkout need" — a different question. A review worktree
@@ -654,9 +722,14 @@ export async function resolveHooksPathOverrideForMerge(
   ref: string,
 ): Promise<string | undefined> {
   const config = await readHooksPathConfig(worktreePath);
+  // Genuinely unset — nothing was ever configured, so nothing was going to fire anyway. The only
+  // two `undefined` cases in this function that do NOT mean "disable an active-but-unsafe
+  // hooksPath": every OTHER `return undefined` below is reached only once `raw` is confirmed
+  // non-empty, i.e. something IS configured, and must use {@link disabledHooksPath} instead (PR
+  // #263 review, round 26).
   if (!config) return undefined;
   const { raw, scope } = config;
-  if (!raw) return undefined;
+  if (!raw) return undefined; // empty value reads the same as unset — nothing configured either way
   if (isAbsolute(raw)) return raw;
 
   // A `worktree`-scoped value (`git config --worktree core.hooksPath …`, requires
@@ -673,12 +746,19 @@ export async function resolveHooksPathOverrideForMerge(
   const isWorktreeScoped = scope === "worktree";
   const inWorktree = resolve(worktreePath, raw);
 
-  // A `..`-escaping path can never be tracked by ANY ref (see needsHooksPathOverrideForMerge) — the
-  // base repo's resolved copy is the only sensible source for a repo-scoped path (a worktree-scoped
-  // one stays worktree-relative even here, per the note above), since such a path lives outside
-  // either checkout entirely.
+  // A `..`-escaping path can never be tracked by ANY ref (see needsHooksPathOverrideForMerge), so
+  // there's no incoming-commit staleness question to answer for it — unlike every submodule check
+  // below, "exists as a real directory" is itself sufficient proof here. Mirrors
+  // {@link resolveHooksPathOverride}'s own escapesRepo branch: native git resolves a relative
+  // `core.hooksPath` against wherever it's actually invoked (git-config(1)), so a worktree-relative
+  // copy that exists on disk beside the review worktree is what git itself would use there,
+  // regardless of scope — prefer it over the base repo's copy whenever it exists, not only for a
+  // worktree-scoped value (PR #263 review, round 27; round 24 covered the worktree-scoped ↔
+  // repo-scoped WHERE, but the missing `existsSync` check here still defaulted every repo-scoped
+  // escaping path to the base repo even when the worktree had its own).
   const rel = relative(repoPath, resolve(repoPath, raw));
   if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    if (existsSync(inWorktree) && statSync(inWorktree).isDirectory()) return inWorktree;
     return isWorktreeScoped ? inWorktree : resolve(repoPath, raw);
   }
 
@@ -693,7 +773,12 @@ export async function resolveHooksPathOverrideForMerge(
       timeout: 120_000,
     });
   } catch {
-    return undefined; // ref doesn't exist (or is unreadable) — no override to resolve either way
+    // `ref` doesn't exist (or is unreadable) — safe to still return `undefined` here, unlike the
+    // "unsafe source" cases below: the merge this override would apply to can never itself succeed
+    // against an unreadable `ref` (mergeIntoCurrent's own `git merge` fails on the same bad ref
+    // first), so no hook fires from this call regardless of what's passed for hooksPath. Nothing to
+    // disable when the operation it would guard never runs.
+    return undefined;
   }
 
   const { stdout } = await execFileAsync(
@@ -707,9 +792,11 @@ export async function resolveHooksPathOverrideForMerge(
 
   if (tab !== -1 && mode !== "160000") {
     // A plain tracked directory or file: git's native per-worktree resolution (≥ 2.43) gets this
-    // right once the merge lands. No override needed at all — but `needsHooksPathOverrideForMerge`
-    // already said one was, so this is reached only when its OWN answer disagreed for a different
-    // path than this call is racing; return undefined defensively rather than a value nothing needs.
+    // right once the merge lands — genuinely no override needed, unlike the submodule cases below,
+    // because there's no separate "checkout" step to go stale; the merge itself writes this path's
+    // final post-merge content directly. `needsHooksPathOverrideForMerge` already said one was
+    // needed, so this is reached only when its OWN answer disagreed for a different path than this
+    // call is racing; return undefined defensively rather than a value nothing needs.
     return undefined;
   }
 
@@ -738,7 +825,14 @@ export async function resolveHooksPathOverrideForMerge(
   const containing = await ancestorSubmoduleSha(worktreePath, raw, ref);
   if (containing) {
     const containingMatches = await sourceMatches(containing.submodulePath, containing.sha);
-    return containingMatches ? verifiedSource() : undefined;
+    // Unverified: `core.hooksPath` IS configured (nested inside `containing.submodulePath`), and the
+    // containing submodule's post-merge checkout is neither confirmed at the incoming commit nor
+    // absent — the same "stale, existing content" shape as the direct-submodule case below, just one
+    // level down. Omitting the override would leave THIS worktree's own already-configured
+    // hooksPath in effect for the merge, which for an initialized-but-stale nested submodule is a
+    // real (wrong) directory on disk, not an absent one — `disabledHooksPath` forces it off instead
+    // (PR #263 review, round 26).
+    return containingMatches ? verifiedSource() : disabledHooksPath();
   }
 
   if (tab === -1) {
@@ -758,16 +852,27 @@ export async function resolveHooksPathOverrideForMerge(
     // apart: a submodule the incoming ref deletes still has ITS gitlink in the current tree, while a
     // path that was always generated never does, on either side.
     const currentlyASubmodule = await ancestorSubmoduleSha(worktreePath, raw);
-    if (currentlyASubmodule) return undefined;
+    // Unverified, not "nothing configured": `core.hooksPath` IS set, and the current tree's gitlink
+    // proves this is a submodule the merge is about to delete, not a generated directory. Git never
+    // removes a deleted submodule's on-disk checkout automatically (git-submodule(1) — deleting the
+    // gitlink from the tree leaves an untracked directory behind), so the worktree's own
+    // already-configured hooksPath still resolves to that now-stale, soon-orphaned content. Omitting
+    // the override would leave it in effect for the merge; `disabledHooksPath` forces it off instead
+    // (PR #263 review, round 26).
+    if (currentlyASubmodule) return disabledHooksPath();
     return isWorktreeScoped ? inWorktree : resolveHooksPathOverride(repoPath, worktreePath);
   }
 
   // `raw` itself is a submodule gitlink (mode 160000, tab !== -1) whose direct AND ancestor checks
   // both failed to find a verified match. No source is confirmed to match what `ref` will actually
   // check out: neither the verified source above nor (implicitly, since this function was only
-  // reached because an override was needed) the worktree's own pre-check state. Omitting the
-  // override is the safe choice — no hook fires, rather than one built from stale content.
-  return undefined;
+  // reached because an override was needed) the worktree's own pre-check state. `core.hooksPath` IS
+  // configured here (this is the `raw`-is-a-gitlink branch, not the unset case), so omitting the
+  // override would leave the worktree's own stale submodule checkout active for the merge —
+  // `disabledHooksPath` forces hooks off for real instead of merely declining to say anything (PR
+  // #263 review, round 26 — this is finding 1's headline case: the fast-forward that advances a
+  // hooks-path submodule gitlink to a commit neither side has ever checked out).
+  return disabledHooksPath();
 }
 
 async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
