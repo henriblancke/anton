@@ -31,6 +31,7 @@ import {
   listDirBlobsAtRev,
   lookupOpenPullRequest,
   markPullRequestDraft,
+  needsHooksPathOverrideForMerge,
   openPullRequest,
   pullRequestState,
   pushBranch,
@@ -642,6 +643,92 @@ suite("resolveHooksPathOverride (real git)", () => {
     ).toBe(`${literalName}\n`);
 
     expect(await resolveHooksPathOverride(repo)).toBe(join(repo, literalName));
+  });
+});
+
+// A caller merging a fetched ref into its own worktree needs a NARROWER answer than
+// resolveHooksPathOverride's "what does the current checkout need": whether THIS merge's own
+// post-merge fires correctly with no override, or needs one supplied. Getting this wrong in either
+// direction breaks a real case (PR #263 review, rounds 6-8):
+// - a tracked hooksPath the incoming ref is about to introduce/change needs NO override (native
+//   per-worktree resolution already gets it right once the merge lands; a pre-merge value is stale)
+// - a generated hooksPath (Husky's `.husky/_`) no ref ever tracks DOES need the base repo's override
+//   (no fetch ever introduces it, so there's nothing for native resolution to pick up either)
+suite("needsHooksPathOverrideForMerge (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+  let remote: string;
+  let worktree: string;
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-mergehooks-"));
+    repo = join(sandbox, "repo");
+    remote = join(sandbox, "remote.git");
+    worktree = join(sandbox, "worktree");
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "user.name", "anton-test"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init", "--allow-empty"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["init", "-q", "--bare", remote], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "remote", "add", "origin", remote], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "branch", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "main", "feature"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "review-copy", worktree, "feature"], {
+      stdio: "ignore",
+    });
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("returns false when core.hooksPath is unset", async () => {
+    execFileSync("git", ["-C", worktree, "fetch", "-q", "origin", "feature"], { stdio: "ignore" });
+    expect(await needsHooksPathOverrideForMerge(repo, worktree, "origin/feature")).toBe(false);
+  });
+
+  it("returns false when core.hooksPath is absolute (already fully resolved)", async () => {
+    execFileSync("git", ["-C", worktree, "config", "core.hooksPath", join(sandbox, "abs-hooks")], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", worktree, "fetch", "-q", "origin", "feature"], { stdio: "ignore" });
+    expect(await needsHooksPathOverrideForMerge(repo, worktree, "origin/feature")).toBe(false);
+  });
+
+  it("returns false when the incoming ref itself tracks the relative hooksPath", async () => {
+    execFileSync("git", ["-C", worktree, "config", "core.hooksPath", ".githooks"], {
+      stdio: "ignore",
+    });
+    // A reviewer's push to `feature` adds a tracked hooks directory this worktree doesn't have yet.
+    const clone = join(sandbox, "reviewer-push");
+    execFileSync("git", ["clone", "-q", remote, clone], { stdio: "ignore" });
+    execFileSync("git", ["-C", clone, "checkout", "-q", "feature"], { stdio: "ignore" });
+    execFileSync("git", ["-C", clone, "config", "user.email", "t@example.com"], { stdio: "ignore" });
+    execFileSync("git", ["-C", clone, "config", "user.name", "anton-test"], { stdio: "ignore" });
+    mkdirSync(join(clone, ".githooks"));
+    writeFileSync(join(clone, ".githooks", "post-merge"), "#!/bin/sh\nexit 0\n");
+    execFileSync("git", ["-C", clone, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", clone, "commit", "-q", "-m", "reviewer adds hooks"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", clone, "push", "-q", "origin", "feature"], { stdio: "ignore" });
+
+    execFileSync("git", ["-C", worktree, "fetch", "-q", "origin", "feature"], { stdio: "ignore" });
+    expect(await needsHooksPathOverrideForMerge(repo, worktree, "origin/feature")).toBe(false);
+  });
+
+  it("returns true when the relative hooksPath is generated and no ref tracks it", async () => {
+    execFileSync("git", ["-C", worktree, "config", "core.hooksPath", ".husky/_"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", worktree, "fetch", "-q", "origin", "feature"], { stdio: "ignore" });
+    // `.husky/_` is never committed to any ref (Husky's own installer writes it locally on
+    // `prepare`), so this must say "override needed" even though nothing was fetched to introduce it.
+    expect(await needsHooksPathOverrideForMerge(repo, worktree, "origin/feature")).toBe(true);
   });
 });
 

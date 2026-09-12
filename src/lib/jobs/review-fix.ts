@@ -57,6 +57,7 @@ import {
   commitAll,
   fetchOrigin,
   mergeIntoCurrent,
+  needsHooksPathOverrideForMerge,
   pushBranch,
   resolveHooksPathOverride,
 } from "../git/ops";
@@ -488,16 +489,20 @@ async function prepareFixWorktree(args: {
   await safe(() =>
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
   );
-  // No `hooksPath` override on this fast-forward: it is exactly the merge that can FIRST introduce a
-  // tracked hooks directory into this worktree (a reviewer's push that adds or edits `.githooks`,
-  // say), so any value resolved beforehand is stale or points nowhere by the time the merge runs and
-  // fires `post-merge` — resolveHooksPathOverride exists to correct git's resolution for a directory
-  // that predates the command it's passed to, not one the command itself is about to create. Native,
-  // per-worktree resolution (git ≥ 2.43, verified against every case this file's history added the
-  // override for) already gets a plain fast-forward right on its own, tracked-hooks-dir included
-  // (PR #263 review, round 7 — round 6's re-resolve-after-the-fact fix only reached the LATER
-  // premerge below, not this merge itself).
-  await safe(() => mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true }));
+
+  // Override `core.hooksPath` for the fast-forward below ONLY when the incoming ref itself doesn't
+  // carry it (see needsHooksPathOverrideForMerge) — a value resolved before this merge is either
+  // exactly right (a generated directory like Husky's `.husky/_`, never tracked by any ref) or
+  // guaranteed stale (a tracked directory the merge is about to introduce or change), and using it in
+  // the wrong case silently skips or misfires this merge's own `post-merge` (PR #263 review, rounds
+  // 6-8).
+  const syncRef = `origin/${branch}`;
+  const syncHooksPath = (await needsHooksPathOverrideForMerge(repo, worktree.path, syncRef))
+    ? await resolveHooksPathOverride(repo, worktree.path)
+    : undefined;
+  await safe(() =>
+    mergeIntoCurrent(worktree.path, syncRef, { ffOnly: true, hooksPath: syncHooksPath }),
+  );
 
   // Resolved AFTER the sync above, unlike the fast-forward: this premerge is a plain command against
   // whatever the worktree already has checked out (the sync's own hooks-directory changes, if any,

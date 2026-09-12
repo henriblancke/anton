@@ -159,6 +159,51 @@ async function isTrackedInBaseRepo(repoPath: string, relPath: string): Promise<b
   }
 }
 
+/**
+ * Whether a merge bringing `ref` (a fetched remote-tracking ref, typically) into `worktreePath` needs
+ * an explicit `core.hooksPath` override to fire that merge's own `post-merge` correctly — the
+ * question a caller doing exactly that merge needs answered BEFORE running it, which is narrower
+ * than {@link resolveHooksPathOverride}'s "what does the CURRENT checkout need" (PR #263 review,
+ * rounds 6-8). Two outcomes, and a caller must never guess wrong between them:
+ *
+ * - `false` (no override needed): `ref` itself carries the configured hooksPath — a reviewer's push
+ *   that adds or edits a tracked `.githooks`, say. Git's native per-worktree resolution (≥ 2.43)
+ *   already gets this right once the merge lands; passing a value resolved BEFORE the merge would
+ *   necessarily be stale or point nowhere, since the tracked copy doesn't exist yet, and silently
+ *   skip `post-merge` (round 6/7's bug).
+ * - `true` (override needed): the hooksPath is unset, absolute, or a relative path `ref` does NOT
+ *   carry — a GENERATED directory like Husky's `.husky/_`, which no ref ever tracks. No fetch
+ *   introduces it, so there is nothing for native resolution to pick up post-merge either; the base
+ *   repo's locally-installed copy (from {@link resolveHooksPathOverride}) is the only source, and
+ *   omitting the override here means `post-merge` never fires at all (round 8's regression from
+ *   unconditionally dropping it).
+ */
+export async function needsHooksPathOverrideForMerge(
+  repoPath: string,
+  worktreePath: string,
+  ref: string,
+): Promise<boolean> {
+  let raw: string;
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "config", "--path", "--get", "core.hooksPath"],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    raw = stdout.replace(/\n$/, "");
+  } catch {
+    return false; // unset — nothing to override with either way
+  }
+  if (!raw || isAbsolute(raw)) return false; // absolute is resolved already; never ref-trackable
+
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", worktreePath, "ls-tree", "--name-only", ref, "--", `:(literal)${raw}`],
+    { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+  );
+  return stdout.trim().length === 0;
+}
+
 async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
   const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
   const { stdout } = await execFileAsync("git", [...configArgs, "-C", cwd, ...args], {
