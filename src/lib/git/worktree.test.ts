@@ -3,6 +3,21 @@
  * temp repo. Skipped when `git` isn't installed.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+const warmResolutionFailure = vi.hoisted(() => ({ enabled: false }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    existsSync(path: Parameters<typeof actual.existsSync>[0]) {
+      if (warmResolutionFailure.enabled && String(path).endsWith("bun.lock")) {
+        throw new Error("temporary filesystem failure");
+      }
+      return actual.existsSync(path);
+    },
+  };
+});
+
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -229,6 +244,23 @@ suite("worktree manager (real git)", () => {
     } finally {
       warn.mockRestore();
       delete process.env[WARM_COMMAND_ENV];
+    }
+  });
+
+  it("returns the creation fork when warm-command resolution throws", async () => {
+    const priorVitest = process.env.VITEST;
+    delete process.env.VITEST;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    warmResolutionFailure.enabled = true;
+    try {
+      const wt = await createWorktree({ repoPath: repo, branch: "anton/run-warm-resolution-fails", warm: true });
+      expect(wt.forkSha).toMatch(/^[0-9a-f]{40}$/);
+      expect(warn.mock.calls.flat().join(" ")).toContain("failed unexpectedly");
+    } finally {
+      warmResolutionFailure.enabled = false;
+      warn.mockRestore();
+      if (priorVitest === undefined) delete process.env.VITEST;
+      else process.env.VITEST = priorVitest;
     }
   });
 

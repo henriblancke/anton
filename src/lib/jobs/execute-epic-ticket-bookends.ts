@@ -7,6 +7,7 @@
  * ticket stops short is the settlement's (execute-epic-ticket-settle.ts).
  */
 import { beads, labelValueOf, LABELS, ownerOf, unclaimableStatus, type Bead } from "../beads/bd";
+import { isServerMode } from "../beads/board-mode";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { claudeRouting } from "../claude/driver-routing";
 import { formatSatisfiedNote, shortSha } from "../beads/satisfied-note";
@@ -268,6 +269,19 @@ async function restoreRetirementEdge(
   survivor: string,
   closedAt: string | undefined,
 ): Promise<void> {
+  // `bd supersede` has no compare-and-swap form. An embedded board's local write lock lets this
+  // process make the re-read/write sequence coherent; a shared server can accept another writer
+  // between those operations, so restoring there could overwrite live work before the read-back
+  // detects it. Leave the overtaking state untouched and park instead.
+  if (isServerMode(repo)) {
+    throw new PoisonEpic(
+      `${ticketId} was retired as superseded by ${survivor} while anton was removing the stale ` +
+        `\`supersedes\` edge a previous retirement left on it, but the shared board exposes no ` +
+        `conditional restore — anton stopped before writing so it could not overwrite the newer ` +
+        `decision. Re-read the ticket and restore its survivor manually if it is still the intended ` +
+        `retirement, then resume the run`,
+    );
+  }
   const failure = await withBeadWriteLock(repo, ticketId, () =>
     persistRetirementEdge(repo, ticketId, survivor, closedAt),
   );

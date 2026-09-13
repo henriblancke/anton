@@ -14,6 +14,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "../beads/bd";
+import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
 
 const closeMock = vi.fn();
 const noteMock = vi.fn();
@@ -234,6 +235,7 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
 
   beforeEach(() => {
     vi.resetAllMocks();
+    resetBoardModeCache();
     claimMock.mockResolvedValue(undefined);
     tagMock.mockResolvedValue(undefined);
     untagMock.mockResolvedValue(undefined);
@@ -404,6 +406,20 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     );
     expect((err as Error).message).toMatch(/while anton was removing the stale `supersedes` edge/);
     expect(err).not.toBeInstanceOf(PoisonEpic);
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
+  it("parks before restoring on a shared board without a conditional write", async () => {
+    pinBoardMode(REPO, { mode: "server" });
+    showMock.mockResolvedValueOnce(claimed).mockResolvedValue(settledElsewhere);
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(PoisonEpic);
+    expect((err as Error).message).toMatch(/no conditional restore/);
     expect(supersedeMock).not.toHaveBeenCalled();
   });
 

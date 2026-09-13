@@ -493,7 +493,18 @@ export async function createWorktree(opts: {
     return { path: resolved, branch, baseBranch, ...(forkSha ? { forkSha } : {}), repoPath };
   });
 
-  if (warm) await warmWorktree(wt, signal);
+  if (warm) {
+    try {
+      await warmWorktree(wt, signal);
+    } catch (err) {
+      // The fork was captured before warming; an unexpected setup failure must not discard it before
+      // the run row can persist it for a later resume.
+      console.warn(
+        `[worktree] warming ${wt.path} failed unexpectedly — continuing without it: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
   // No hooks bridge to materialize here: every git command anton runs against this worktree passes
   // `-c core.hooksPath=<resolved from repoPath>` itself (see resolveHooksPathOverride in ops.ts) —
   // hooks fire from the base repo's own directory with no symlink, no info/exclude entry, and no
