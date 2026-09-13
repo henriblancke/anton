@@ -160,6 +160,39 @@ suite("worktree manager (real git)", () => {
     expect(existsSync(second.path)).toBe(true);
   });
 
+  // The symlink-into-the-worktree + info/exclude bridge was replaced with a `-c
+  // core.hooksPath=<absolute>` override passed on every git invocation against a worktree (see
+  // resolveHooksPathOverride in ops.ts) — so createWorktree itself now has nothing to materialize
+  // for a relative core.hooksPath at all.
+  it("does not touch info/exclude or create any hooks symlink for a relative core.hooksPath", async () => {
+    const hookRepo = mkdtempSync(join(tmpdir(), "anton-wt-hooks-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: hookRepo });
+      execFileSync("git", ["config", "user.name", "anton-test"], { cwd: hookRepo });
+      writeFileSync(join(hookRepo, "README.md"), "# tmp\n");
+      execFileSync("git", ["add", "."], { cwd: hookRepo });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: hookRepo });
+
+      mkdirSync(join(hookRepo, ".githooks"));
+      writeFileSync(join(hookRepo, ".githooks", "pre-push"), "#!/usr/bin/env sh\nexit 0\n");
+      execFileSync("git", ["config", "core.hooksPath", ".githooks"], { cwd: hookRepo });
+
+      const wt = await createWorktree({ repoPath: hookRepo, branch: "anton/hooks-check" });
+
+      expect(existsSync(join(wt.path, ".githooks"))).toBe(false);
+      const excludePath = execFileSync(
+        "git",
+        ["-C", hookRepo, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"],
+        { encoding: "utf8" },
+      ).trim();
+      const excludeContent = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+      expect(excludeContent).not.toContain(".githooks");
+    } finally {
+      rmSync(hookRepo, { recursive: true, force: true });
+    }
+  });
+
   // The guard the unit suite below asserts on, exercised end-to-end: `warm: true` under vitest must
   // never shell out to a real package manager, however installable the checkout looks.
   it("warm: true is a no-op under vitest even with a lockfile present", async () => {

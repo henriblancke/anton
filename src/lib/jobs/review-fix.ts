@@ -57,7 +57,11 @@ import {
   commitAll,
   fetchOrigin,
   mergeIntoCurrent,
+  needsHooksPathOverrideForMerge,
   pushBranch,
+  resolveHooksPathOverride,
+  resolveHooksPathOverrideForMerge,
+  stageAll,
 } from "../git/ops";
 import {
   ANTON_MARK,
@@ -487,28 +491,62 @@ async function prepareFixWorktree(args: {
   await safe(() =>
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
   );
+
+  // Override `core.hooksPath` for the fast-forward below ONLY when the incoming ref itself doesn't
+  // carry it (see needsHooksPathOverrideForMerge) — a value resolved before this merge is either
+  // exactly right (a generated directory like Husky's `.husky/_`, never tracked by any ref) or
+  // guaranteed stale (a tracked directory the merge is about to introduce or change), and using it in
+  // the wrong case silently skips or misfires this merge's own `post-merge` (PR #263 review, rounds
+  // 6-8). The VALUE, once an override is needed, comes from resolveHooksPathOverrideForMerge rather
+  // than resolveHooksPathOverride: the latter answers "what does the CURRENT checkout need", which
+  // can pass for a submodule-backed hooksPath that is self-consistent right now but about to go stale
+  // the instant this merge changes the gitlink — resolveHooksPathOverrideForMerge validates any
+  // submodule substitute against the INCOMING ref specifically (PR #263 review, round 21).
+  const syncRef = `origin/${branch}`;
+  const syncHooksPath = (await needsHooksPathOverrideForMerge(repo, worktree.path, syncRef))
+    ? await resolveHooksPathOverrideForMerge(repo, worktree.path, syncRef)
+    : undefined;
   await safe(() =>
-    mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true }),
+    mergeIntoCurrent(worktree.path, syncRef, { ffOnly: true, hooksPath: syncHooksPath }),
   );
 
-  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number);
+  // This premerge brings in a DIFFERENT ref than the sync above (`origin/${baseBranch}`, the PR's
+  // base, not `origin/${branch}`), so it needs the identical incoming-ref-aware resolution — the
+  // sync's own comment explains why resolveHooksPathOverride (answering "what does the CURRENT
+  // checkout need") is wrong for a merge that hasn't run yet. An earlier round resolved this
+  // premerge's override against the current checkout instead of `origin/${baseBranch}`, which is the
+  // same bug in a new spot: a conflicting PR's base can introduce or advance a tracked hooks
+  // directory/submodule the feature worktree doesn't have, and the stale current-checkout answer
+  // would skip a newly-introduced `post-merge` or run an old submodule checkout `git merge` never
+  // updates on its own (PR #263 review, round 30). `needsHooksPathOverrideForMerge` asks only whether
+  // the incoming ref changes something about the hooksPath directory/submodule relative to the
+  // current checkout — nothing in it assumes the resulting merge is fast-forward-only, so it applies
+  // equally to this non-`ffOnly` premerge. Resolution is done inside `premergeBase` itself, after its
+  // own `baseBranch` guard, rather than unconditionally here — there is no `origin/${baseBranch}` ref
+  // to resolve against (nor any point doing the work) when there is no conflict to premerge at all.
+  const conflicts = await premergeBase(repo, worktree.path, pr, baseBranch, number);
   await ctx.heartbeat();
   return { worktree, conflicts };
 }
 
 /** The base merge GitHub says this PR needs — its conflicts are what claude is asked to resolve. */
 async function premergeBase(
+  repo: string,
   worktreePath: string,
   pr: PrReview,
   baseBranch: string | undefined,
   number: number,
 ): Promise<string[]> {
   if (pr.mergeable !== "CONFLICTING" || !baseBranch) return [];
+  const baseRef = `origin/${baseBranch}`;
+  const hooksPath = (await needsHooksPathOverrideForMerge(repo, worktreePath, baseRef))
+    ? await resolveHooksPathOverrideForMerge(repo, worktreePath, baseRef)
+    : undefined;
   try {
-    const merge = await mergeIntoCurrent(worktreePath, `origin/${baseBranch}`);
+    const merge = await mergeIntoCurrent(worktreePath, baseRef, { hooksPath });
     return merge.conflicts; // clean auto-merge → a merge commit is pushed below
   } catch (e) {
-    consoleLog.error(`PR #${number}: merging origin/${baseBranch} failed`, e);
+    consoleLog.error(`PR #${number}: merging ${baseRef} failed`, e);
     return [];
   }
 }
@@ -686,12 +724,29 @@ async function commitAndPushFix(
   branch: string,
   number: number,
 ): Promise<boolean> {
+  // Staged BEFORE `resolveHooksPathOverride` is asked anything (PR #263 review, round 37) — the
+  // same fix `commitStep` applies for the same reason: its submodule-staleness check reads the
+  // INDEX, and claude's fix session may have checked a hooks-path submodule out at a new commit
+  // without staging it itself, relying on `commitAll`'s own `git add -A` below to pick it up. Asked
+  // before that staging happens, the check would see the old, unstaged gitlink and disable hooks for
+  // a commit that, by the time it actually runs, legitimately carries the new one. See `commitAll`'s
+  // doc comment for the full ordering bug. `commitAll`'s own `git add -A` is a no-op now that this
+  // has already staged everything.
+  await stageAll(worktreePath);
+  const hooksPath = await resolveHooksPathOverride(repo, worktreePath);
   const { committed } = await commitAll(
     worktreePath,
     `${epicId}: address review feedback (PR #${number})`,
+    { hooksPath },
   );
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
-  if (pushed) await pushBranch(repo, branch);
+  // From the worktree, not `repo` (the base checkout) — see pushBranch's doc comment: a project's
+  // pre-push hook that inspects the working tree must see the branch actually being pushed. The
+  // resolved hooksPath above is ALSO read from the worktree (resolveHooksPathOverride(repo,
+  // worktreePath) queries worktreePath when given, per its own contract) — the same "read from the
+  // worktree, not the base repo" behavior this file's onbranch-includeIf reasoning depends on
+  // elsewhere, not the base checkout's config.
+  if (pushed) await pushBranch(worktreePath, branch, hooksPath);
   return pushed;
 }
 

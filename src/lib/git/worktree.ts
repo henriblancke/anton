@@ -468,6 +468,10 @@ export async function createWorktree(opts: {
   });
 
   if (warm) await warmWorktree(wt, signal);
+  // No hooks bridge to materialize here: every git command anton runs against this worktree passes
+  // `-c core.hooksPath=<resolved from repoPath>` itself (see resolveHooksPathOverride in ops.ts) —
+  // hooks fire from the base repo's own directory with no symlink, no info/exclude entry, and no
+  // dependence on whether warming happened to regenerate anything.
   return wt;
 }
 
@@ -896,5 +900,6 @@ export async function removeWorktree(
       if (await branchExists(wt.repoPath, wt.branch)) branchSkipped = gitError(err);
     }
   }
-  return { removed: existed && !existsSync(wt.path), branchDeleted, branchSkipped };
+  const removed = existed && !existsSync(wt.path);
+  return { removed, branchDeleted, branchSkipped };
 }

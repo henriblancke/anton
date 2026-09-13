@@ -13,6 +13,7 @@ import type { SatisfiedBy } from "../beads/satisfied-note";
 import {
   commitMarker,
   readWorktreeState,
+  resolveHooksPathOverride,
   satisfiedMarkerSubject,
   type WorktreeState,
 } from "../git/ops";
@@ -384,6 +385,11 @@ async function recordSatisfiedOnBranch(
 ): Promise<void> {
   const cited = by.subject ? `${shortSha(by.commit)} "${by.subject}"` : shortSha(by.commit);
   try {
+    // `hooksPath` is resolved and passed through for the same reason the preserve retry does it:
+    // `commitMarker`'s `--no-verify` bypasses only `pre-commit`/`commit-msg`, so a generated,
+    // base-only hook still needs the base repo's copy resolved rather than this cold worktree's own,
+    // nonexistent one (PR #263 review, round 15).
+    const hooksPath = await resolveHooksPathOverride(run.repoPath, run.worktreePath);
     await commitMarker(
       run.worktreePath,
       // The satisfying commit is named in the SUBJECT by full sha, so a reviewer meeting this marker
@@ -395,7 +401,7 @@ async function recordSatisfiedOnBranch(
         `own. This empty commit records the attribution no subject on this branch carries — it is ` +
         `what a later attempt reads to see the ticket as delivered instead of dispatching it into ` +
         `a zero diff.`,
-      { satisfies: [ticket.id] },
+      { satisfies: [ticket.id], hooksPath },
     );
   } catch (e) {
     throw new PoisonEpic(
