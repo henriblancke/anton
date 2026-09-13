@@ -101,17 +101,20 @@ export function parseRouterUsage(body: unknown, plan: string | null = null): Rou
   };
 }
 
-/** Build the per-connection usage endpoint from the router's base URL. Exported for testing. */
+/**
+ * Build the per-connection management endpoint from the router's origin. Claude-compatible gateway
+ * URLs may include an API version (for example `/v1`), but 9Router's management API never does.
+ */
 export function routerUsageUrl(baseUrl: string, connectionId: string): string {
   const url = new URL(baseUrl);
-  const path = url.pathname.replace(/\/+$/, "");
-  url.pathname = `${path}/api/usage/${encodeURIComponent(connectionId)}`;
+  url.pathname = `/api/usage/${encodeURIComponent(connectionId)}`;
   url.search = "";
   url.hash = "";
   return url.toString();
 }
 
-const key = (baseUrl: string, connectionId: string): string => `${baseUrl}::${connectionId}`;
+/** The canonical management endpoint makes equivalent configured gateway URLs share one read. */
+const key = (url: string, connectionId: string): string => `${url}::${connectionId}`;
 
 /** Cool-off armed on a 429, shared by every reader of one (baseUrl, connectionId) pair. */
 const backoffUntil = new Map<string, number>();
@@ -150,7 +153,7 @@ export async function fetchRouterUsage(
     });
     if (res.status === 429) {
       const waitMs = backoffMsFor(res.headers.get("retry-after"));
-      backoffUntil.set(key(baseUrl, connectionId), Date.now() + waitMs);
+      backoffUntil.set(key(url, connectionId), Date.now() + waitMs);
       console.warn(`[router-usage] ${baseUrl} 429 — backing off ${Math.round(waitMs / 1000)}s`);
       return null;
     }
@@ -188,7 +191,14 @@ export async function getRouterUsageCached(
   const connectionId = settings.routerConnectionId?.trim();
   if (!baseUrl || !connectionId) return null;
 
-  const k = key(baseUrl, connectionId);
+  let url: string;
+  try {
+    url = routerUsageUrl(baseUrl, connectionId);
+  } catch {
+    return null;
+  }
+
+  const k = key(url, connectionId);
   const ts = now();
 
   const until = backoffUntil.get(k) ?? 0;
@@ -220,7 +230,7 @@ export function resetRouterUsageCache(): void {
   backoffUntil.clear();
 }
 
-/** Arm the 429 backoff for one (baseUrl, connectionId) pair. Test-only. */
+/** Arm the 429 backoff for one canonical management endpoint and connection pair. Test-only. */
 export function armRouterBackoffForTest(baseUrl: string, connectionId: string, until: number): void {
-  backoffUntil.set(key(baseUrl, connectionId), until);
+  backoffUntil.set(key(routerUsageUrl(baseUrl, connectionId), connectionId), until);
 }

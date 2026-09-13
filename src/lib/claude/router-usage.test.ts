@@ -68,6 +68,12 @@ describe("routerUsageUrl", () => {
       "https://gateway.example/api/usage/conn%20ab%2Fcd",
     );
   });
+
+  it("uses the router origin when the Claude-compatible base URL includes /v1", () => {
+    expect(routerUsageUrl("https://api.9router.dev/v1", "conn_ab12cd34")).toBe(
+      "https://api.9router.dev/api/usage/conn_ab12cd34",
+    );
+  });
 });
 
 describe("parseRouterUsage", () => {
@@ -331,7 +337,7 @@ describe("getRouterUsageCached (mirrors usage.ts's TTL, single-flight, and 429 b
     expect(calls).toBe(1); // no new fetch — served from cache during backoff
   });
 
-  it("keys the cache per (baseUrl, connectionId) so distinct routed projects don't collide", async () => {
+  it("keys the cache per management endpoint and connection so distinct routed projects don't collide", async () => {
     let calls = 0;
     process.env.ROUTER_TOKEN_TEST = "secret";
     const now = () => 1_000;
@@ -347,6 +353,60 @@ describe("getRouterUsageCached (mirrors usage.ts's TTL, single-flight, and 429 b
       now,
     );
     expect(calls).toBe(2); // two distinct connections, each fetched once
+  });
+
+  it("dedupes equivalent base-URL spellings across projects", async () => {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    process.env.ROUTER_TOKEN_TEST = "secret";
+    const fetcher = async () => {
+      calls += 1;
+      await gate;
+      return withResponse(200, true, ROUTER_FIXTURE);
+    };
+    const now = () => 1_000;
+
+    const first = getRouterUsageCached(
+      { ...SETTINGS, claudeBaseUrl: "http://router:20128" },
+      fetcher,
+      now,
+    );
+    const second = getRouterUsageCached(
+      { ...SETTINGS, claudeBaseUrl: "http://router:20128/" },
+      fetcher,
+      now,
+    );
+    release();
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      expect.objectContaining({ sessionPct: 64, weeklyPct: 37 }),
+      expect.objectContaining({ sessionPct: 64, weeklyPct: 37 }),
+    ]);
+    expect(calls).toBe(1);
+  });
+
+  it("shares 429 backoff between equivalent base-URL spellings", async () => {
+    process.env.ROUTER_TOKEN_TEST = "secret";
+    await fetchRouterUsage(
+      { ...SETTINGS, claudeBaseUrl: "http://router:20128" },
+      async () => withResponse(429, false, { error: "rate limited" }, { "retry-after": "30" }),
+    );
+
+    let calls = 0;
+    const result = await getRouterUsageCached(
+      { ...SETTINGS, claudeBaseUrl: "http://router:20128/" },
+      async () => {
+        calls += 1;
+        return withResponse(200, true, ROUTER_FIXTURE);
+      },
+      Date.now,
+    );
+
+    expect(result).toBeNull();
+    expect(calls).toBe(0);
   });
 
   it("returns null without a fetch when the project isn't routed at all", async () => {
