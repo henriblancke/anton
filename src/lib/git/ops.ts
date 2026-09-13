@@ -334,22 +334,30 @@ export async function resolveHooksPathOverride(
       if (containing) {
         const actual = await checkedOutSubmoduleSha(worktreePath, containing.submodulePath);
         if (!actual.checkedOut || actual.sha !== containing.sha) return disabledHooksPath();
-      } else if (existsSync(join(inWorktree, ".git"))) {
+      } else if (await orphanedSubmoduleAncestor(worktreePath, raw)) {
         // ORPHANED SUBMODULE CHECKOUT, left behind by a merge that already landed (PR #263 review,
-        // round 31). `checkedOut.checkedOut` is false and `containing` is undefined, so neither the
-        // uninitialized case above nor the nested-containing-gitlink case just above found ANY
-        // gitlink — current or ancestor — anywhere in `raw`'s ancestry: `git submodule status`
-        // reports no match because the CURRENT tree's `.gitmodules`/index no longer registers `raw`
-        // as a submodule at all. That is exactly what happens right after a merge deletes a
-        // hooks-path submodule's gitlink — Git does not clean up the submodule's own working
-        // directory when the gitlink disappears from the tree; it leaves the nonempty checkout,
-        // including its own `.git` FILE (a gitfile pointing at `$GIT_DIR/modules/<name>`, the same
-        // shape a submodule's `.git` always has per gitrepository-layout(5)), sitting on disk. An
-        // ordinary tracked-and-deleted directory or a Husky-style generated one never has its own
-        // `.git` entry — only a former (or current) submodule checkout does — so its presence here,
-        // with no gitlink left to vouch for it, means `inWorktree` is that orphan corpse, not a
-        // trustworthy directory. Returning it as an ordinary hooks directory would run hooks the
-        // incoming branch just deleted; `disabledHooksPath` forces hooks off instead.
+        // round 31; extended to the NESTED shape in round 32). `checkedOut.checkedOut` is false and
+        // `containing` is undefined, so neither the uninitialized case above nor the
+        // nested-containing-gitlink case just above found ANY gitlink — current or ancestor —
+        // anywhere in `raw`'s ancestry: `git submodule status` reports no match because the CURRENT
+        // tree's `.gitmodules`/index no longer registers `raw` (or anything containing it) as a
+        // submodule at all. That is exactly what happens right after a merge deletes a hooks-path
+        // submodule's gitlink — Git does not clean up the submodule's own working directory when the
+        // gitlink disappears from the tree; it leaves the nonempty checkout, including its own `.git`
+        // FILE (a gitfile pointing at `$GIT_DIR/modules/<name>`, the same shape a submodule's `.git`
+        // always has per gitrepository-layout(5)), sitting on disk. Round 31's check looked only at
+        // `inWorktree` itself, which catches `raw` BEING the deleted gitlink (`core.hooksPath=deps`)
+        // but misses `raw` being NESTED inside one (`core.hooksPath=deps/hooks`, `deps` the deleted
+        // gitlink): the orphan's own `.git` gitfile then sits at `deps/.git`, one level above
+        // `inWorktree` (`deps/hooks`), which — being an ordinary subdirectory of a submodule checkout,
+        // not the checkout's own root — has no `.git` of its own to find. `orphanedSubmoduleAncestor`
+        // walks every ancestor segment of `raw` (round 31's single-level check surviving as its first
+        // iteration) so an orphan is caught at any depth. An ordinary tracked-and-deleted directory or
+        // a Husky-style generated one never has its own `.git` entry anywhere in its ancestry — only a
+        // former (or current) submodule checkout does — so finding one here, with no gitlink left to
+        // vouch for it, means `inWorktree` descends from that orphan corpse, not a trustworthy
+        // directory. Returning it as an ordinary hooks directory would run hooks the incoming branch
+        // just deleted; `disabledHooksPath` forces hooks off instead.
         return disabledHooksPath();
       }
     }
@@ -440,6 +448,47 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
     { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
   );
   return stdout.trim().length > 0;
+}
+
+/**
+ * The nearest ancestor of `relPath` (`relPath` itself included, `worktreePath`'s own root excluded)
+ * that still has a leftover `.git` gitfile ON DISK in `worktreePath` — the filesystem-side
+ * counterpart to {@link ancestorSubmoduleSha}'s tree-side walk, used once that walk has already
+ * confirmed no CURRENT gitlink covers `relPath` at any depth. Round 31 (PR #263 review) added a
+ * single-level check here (`existsSync(join(inWorktree, ".git")))`) for the case where `raw` ITSELF
+ * was the deleted gitlink's path — the orphan's leftover `.git` gitfile then sits directly at
+ * `inWorktree`. That check misses the equally real NESTED shape (`core.hooksPath=deps/hooks`, where
+ * `deps` — not `deps/hooks` — was the gitlink): once `deps`'s gitlink is deleted from the tree, the
+ * orphaned checkout's own `.git` gitfile lives at `deps/.git`, one level up from `inWorktree`
+ * (`deps/hooks`), which itself has no `.git` of its own — only a submodule's ROOT ever does
+ * (gitrepository-layout(5)). A bare single-level check at `inWorktree` therefore returns `false` for
+ * this shape and falls through to treating the orphan corpse as an ordinary hooks directory, the
+ * exact bug round 31 fixed, one directory level deeper (PR #263 review, round 32). Walking every
+ * ancestor segment — the same `posixNormalize`/`posixDirname` loop {@link ancestorSubmoduleSha} uses
+ * against the git tree, adapted here to check the filesystem instead — catches an orphan at any
+ * depth, with round 31's single-level case surviving unchanged as this walk's first iteration.
+ *
+ * The walk stops before `worktreePath`'s own root (`candidate !== "." && candidate !== "/"`, the same
+ * boundary {@link ancestorSubmoduleSha} uses): `worktreePath`'s own `.git` always exists — it is the
+ * worktree's own gitdir pointer, not an orphan signal — and checking it here would misreport every
+ * hooksPath whatsoever as an orphaned submodule.
+ *
+ * Returns the ancestor path that carries the leftover `.git`, or `undefined` when no segment does —
+ * callers only need the boolean "is `relPath` inside an orphaned submodule checkout", but the path is
+ * kept for parity with {@link ancestorSubmoduleSha}'s return shape and easier debugging.
+ */
+async function orphanedSubmoduleAncestor(
+  worktreePath: string,
+  relPath: string,
+): Promise<string | undefined> {
+  let candidate = posixNormalize(relPath);
+  while (candidate !== "." && candidate !== "/") {
+    if (existsSync(join(resolve(worktreePath, candidate), ".git"))) return candidate;
+    const parent = posixDirname(candidate);
+    if (parent === candidate) break;
+    candidate = parent;
+  }
+  return undefined;
 }
 
 /**
@@ -984,15 +1033,19 @@ export async function resolveHooksPathOverrideForMerge(
     // the override would leave it in effect for the merge; `disabledHooksPath` forces it off instead
     // (PR #263 review, round 26).
     if (currentlyASubmodule) return disabledHooksPath();
-    // Repo-scoped delegates to {@link resolveHooksPathOverride}, which now carries its own round-31
-    // orphaned-submodule check (a directory with no current gitlink anywhere in its ancestry, yet
-    // still holding its own `.git` gitfile — the leftover a PRIOR merge's submodule deletion left on
-    // disk). A worktree-scoped value never delegates there — the never-falls-back guard earlier in
-    // this function means `resolveHooksPathOverride` is never even called for it — so without a
-    // check here it would return this same orphan corpse via `inWorktree` unconditionally, missing
-    // the exact scenario round 31 fixed for the repo-scoped path (PR #263 review, round 31).
+    // Repo-scoped delegates to {@link resolveHooksPathOverride}, which now carries its own round-31/32
+    // orphaned-submodule check (an ancestor of `raw`, `raw` itself included, with no current gitlink
+    // anywhere in ITS ancestry, yet still holding its own `.git` gitfile — the leftover a PRIOR
+    // merge's submodule deletion left on disk, whether `raw` itself was the deleted gitlink or `raw`
+    // sits nested inside one). A worktree-scoped value never delegates there — the never-falls-back
+    // guard earlier in this function means `resolveHooksPathOverride` is never even called for it —
+    // so without the same check here it would return this same orphan corpse via `inWorktree`
+    // unconditionally, missing the exact scenario round 31 fixed (and round 32 extended to the
+    // nested-path shape) for the repo-scoped path (PR #263 review, round 31 and round 32).
+    // `orphanedSubmoduleAncestor` is a standalone helper, not a closure over
+    // `resolveHooksPathOverride`'s locals, precisely so this call site can reuse it too.
     if (isWorktreeScoped) {
-      return existsSync(join(inWorktree, ".git")) ? disabledHooksPath() : inWorktree;
+      return (await orphanedSubmoduleAncestor(worktreePath, raw)) ? disabledHooksPath() : inWorktree;
     }
     return resolveHooksPathOverride(repoPath, worktreePath);
   }

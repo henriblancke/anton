@@ -960,6 +960,82 @@ suite("resolveHooksPathOverride (real git)", () => {
     expectDisablesHooks(await resolveHooksPathOverride(repo, worktree));
   });
 
+  // Round 31's orphan check only inspected `inWorktree` itself for its own `.git` gitfile — correct
+  // when the hooksPath IS the deleted gitlink, but blind to the NESTED shape: `core.hooksPath=
+  // deps/hooks`, where `deps` (not `deps/hooks`) is the submodule gitlink. Once `deps`'s gitlink is
+  // deleted from the tree, the orphaned checkout's own `.git` gitfile lives at `deps/.git`, one level
+  // above `inWorktree` (`deps/hooks`) — which, being an ordinary subdirectory of a submodule checkout
+  // rather than the checkout's own root, has no `.git` of its own. `resolveHooksPathOverride` must
+  // walk every ancestor of the hooksPath, not just check the hooksPath itself (PR #263 review, round
+  // 32).
+  it("disables hooks for a nested hooksPath left orphaned by a deleted containing submodule", async () => {
+    const submoduleUpstream = join(sandbox, "nested-hooks-submodule-upstream-orphaned");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    mkdirSync(join(submoduleUpstream, "hooks"));
+    writeFileSync(join(submoduleUpstream, "hooks", "pre-push"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleUpstream, "deps"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add deps submodule"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "deps/hooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-nested-orphaned-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-nested-orphan", worktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      ["-C", worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "deps"],
+      { stdio: "ignore" },
+    );
+    expect(readFileSync(join(worktree, "deps", "hooks", "pre-push"), "utf8")).toBe("v1\n");
+    // The submodule ROOT (`deps`) has its own `.git` gitfile; the nested `deps/hooks` subdirectory
+    // does not — only a submodule's own root ever does (gitrepository-layout(5)).
+    expect(existsSync(join(worktree, "deps", ".git"))).toBe(true);
+    expect(existsSync(join(worktree, "deps", "hooks", ".git"))).toBe(false);
+    const gitFileContents = readFileSync(join(worktree, "deps", ".git"), "utf8");
+
+    // Simulate the sync merge landing a ref that deletes the `deps` gitlink: remove it from the tree,
+    // then manually leave the orphaned, `.git`-containing directory behind on disk — mirroring what
+    // real git does (it does NOT clean up a deleted submodule's working directory).
+    execFileSync("git", ["-C", worktree, "rm", "-q", "--cached", "deps"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "delete deps submodule"], {
+      stdio: "ignore",
+    });
+    expect(
+      execFileSync("git", ["-C", worktree, "ls-tree", "HEAD", "--", "deps"], {
+        encoding: "utf8",
+      }).trim(),
+    ).toBe("");
+    // `git rm --cached` leaves the working directory in place; if it didn't, recreate it explicitly so
+    // the orphan shape (nonempty `deps/` directory + its own `.git` gitfile, `deps/hooks/` beneath it,
+    // no gitlink left anywhere) is reproduced regardless of git version behavior.
+    if (!existsSync(join(worktree, "deps", ".git"))) {
+      mkdirSync(join(worktree, "deps", "hooks"), { recursive: true });
+      writeFileSync(join(worktree, "deps", "hooks", "pre-push"), "v1\n");
+      writeFileSync(join(worktree, "deps", ".git"), gitFileContents);
+    }
+    expect(existsSync(join(worktree, "deps", "hooks", "pre-push"))).toBe(true);
+    expect(existsSync(join(worktree, "deps", ".git"))).toBe(true);
+    expect(existsSync(join(worktree, "deps", "hooks", ".git"))).toBe(false);
+
+    expectDisablesHooks(await resolveHooksPathOverride(repo, worktree));
+  });
+
   // Finding A (PR #263 review, round 29): `core.hooksPath=deps/hooks` names a path NESTED inside the
   // submodule gitlink `deps`, not the gitlink itself. `git submodule status` only ever reports a line
   // for the gitlink PATH (`deps`), never for a path nested inside one (`deps/hooks`) — so
