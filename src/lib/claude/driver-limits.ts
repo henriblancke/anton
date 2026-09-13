@@ -93,6 +93,33 @@ const SPEND_LIMIT_RESULT_RE =
  */
 const GATEWAY_BILLING_RE = /\[402\][\s\S]{0,200}?requires more credits/i;
 
+/**
+ * The session-limit banner — observed verbatim as `You've hit your session limit · resets 9pm
+ * (America/New_York)` (anton-2gsj, from three consecutive parked runs in anton.db). Like the
+ * monthly spend-limit sentence above, this is ordinary English a model could reproduce while
+ * describing its own failure, so it gets the same authorship-scoped treatment rather than the
+ * terse banners' free rein: loosely on stderr (Claude Code's own channel), and on the result field
+ * only end-anchored via `SESSION_LIMIT_RESULT_RE` so the banner must be the WHOLE result. Never
+ * scanned in the model-authored transcript.
+ */
+const SESSION_LIMIT_RE = /^\s*you['’]ve hit your session limit\b[\s\S]{0,40}?resets?\s+[^\n]*?\([^)]+\)/im;
+
+/** Result-field variant of `SESSION_LIMIT_RE`, end-anchored so the banner must be the whole result. */
+const SESSION_LIMIT_RESULT_RE =
+  /^\s*you['’]ve hit your session limit\b[\s\S]{0,40}?resets?\s+[^\n]*?\([^)]+\)[^\n]*\s*$/i;
+
+/**
+ * The out-of-usage-credits banner — observed verbatim as `You're out of usage credits. Switch to
+ * another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to
+ * continue.` (anton-2gsj, from parked review-fix jobs in anton.db). Same reasoning and same
+ * authorship-scoped guard as `SESSION_LIMIT_RE`.
+ */
+const USAGE_CREDITS_RE = /^\s*you['’]re out of usage credits\b[\s\S]{0,120}?claude\.ai\/settings\/usage/im;
+
+/** Result-field variant of `USAGE_CREDITS_RE`, end-anchored so the banner must be the whole result. */
+const USAGE_CREDITS_RESULT_RE =
+  /^\s*you['’]re out of usage credits\b[\s\S]{0,120}?claude\.ai\/settings\/usage[^\n]*\s*$/i;
+
 /** Claude's machine-readable reset stamp, trailing a banner: `…usage limit reached|1700000000`. */
 const RESET_EPOCH_RE = /\|\s*(\d{10,13})\s*$/m;
 /** Prose form: "resets at <when>" — anything up to the next line break or clause separator. */
@@ -221,17 +248,22 @@ function combinedText(channels: ClaudeChannels): string {
 
 /**
  * Terse machine banners are trusted across the full transcript (assistant + result + stderr) — the
- * result field alone isn't a reliable place to find them. The monthly spend-limit sentence is
- * model-reproducible prose, so it is never scanned in the assistant transcript, and its two
- * remaining channels are matched with strictness suited to their authorship: stderr (Claude Code's
- * own) loosely, the model-authored result field only when the banner is the WHOLE result.
+ * result field alone isn't a reliable place to find them. The monthly spend-limit, session-limit,
+ * and usage-credits sentences are all model-reproducible prose, so none of them are ever scanned in
+ * the assistant transcript, and their remaining two channels are matched with strictness suited to
+ * their authorship: stderr (Claude Code's own) loosely, the model-authored result field only when
+ * the banner is the WHOLE result.
  */
 function isUsageLimited(channels: ClaudeChannels): boolean {
   return (
     USAGE_LIMIT_RE.test(combinedText(channels)) ||
     SPEND_LIMIT_RE.test(channels.stderr) ||
     SPEND_LIMIT_RESULT_RE.test(channels.resultText) ||
-    GATEWAY_BILLING_RE.test(combinedText(channels))
+    GATEWAY_BILLING_RE.test(combinedText(channels)) ||
+    SESSION_LIMIT_RE.test(channels.stderr) ||
+    SESSION_LIMIT_RESULT_RE.test(channels.resultText) ||
+    USAGE_CREDITS_RE.test(channels.stderr) ||
+    USAGE_CREDITS_RESULT_RE.test(channels.resultText)
   );
 }
 

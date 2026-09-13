@@ -11,6 +11,15 @@ const channels = (overrides: Partial<ClaudeChannels>): ClaudeChannels => ({ ...E
 
 const SPEND_BANNER = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage";
 
+// Observed verbatim in anton.db escalations.evidence_json (anton-2gsj): three consecutive
+// autopilot-disarm and exhausted-job entries, all parked on this exact banner.
+const SESSION_LIMIT_BANNER = "You've hit your session limit · resets 9pm (America/New_York)";
+
+// Observed verbatim in anton.db escalations.evidence_json (anton-2gsj): repeated exhausted-job
+// entries for parked review-fix jobs.
+const USAGE_CREDITS_BANNER =
+  "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
+
 // Observed verbatim in .anton/sessions/*.log for PR #238 and #252 (anton-x96g): OpenRouter's
 // billing stop, delivered inside a 503 envelope that otherwise matches driver-exit.ts's bare `503`
 // transient regex.
@@ -119,5 +128,37 @@ describe("usageLimitError", () => {
 
   it("leaves a genuine gateway 503 with no [402] inside untouched — it must still resolve as transient (anton-x96g)", () => {
     expect(usageLimitError(channels({ stderr: "API Error: 503 [openrouter/anthropic/claude-sonnet-5] Service Unavailable" }))).toBeNull();
+  });
+
+  it("classifies the session-limit banner as a quota hit (anton-2gsj)", () => {
+    expect(usageLimitError(channels({ stderr: SESSION_LIMIT_BANNER }))).not.toBeNull();
+    expect(usageLimitError(channels({ resultText: SESSION_LIMIT_BANNER }))).not.toBeNull();
+  });
+
+  it("ignores the session-limit banner when a model merely quotes it in its own prose (anton-2gsj)", () => {
+    expect(
+      usageLimitError(channels({ transcript: `${SESSION_LIMIT_BANNER}\n` })),
+    ).toBeNull();
+    expect(
+      usageLimitError(
+        channels({ resultText: `${SESSION_LIMIT_BANNER}\n\nBut three tests still fail.` }),
+      ),
+    ).toBeNull();
+  });
+
+  it("classifies the out-of-usage-credits banner as a quota hit (anton-2gsj)", () => {
+    expect(usageLimitError(channels({ stderr: USAGE_CREDITS_BANNER }))).not.toBeNull();
+    expect(usageLimitError(channels({ resultText: USAGE_CREDITS_BANNER }))).not.toBeNull();
+  });
+
+  it("ignores the out-of-usage-credits banner when a model merely quotes it in its own prose (anton-2gsj)", () => {
+    expect(
+      usageLimitError(channels({ transcript: `${USAGE_CREDITS_BANNER}\n` })),
+    ).toBeNull();
+    expect(
+      usageLimitError(
+        channels({ resultText: `${USAGE_CREDITS_BANNER}\n\nBut three tests still fail.` }),
+      ),
+    ).toBeNull();
   });
 });
