@@ -501,6 +501,29 @@ describe("a ticket the board already holds as superseded", () => {
     expect(run.retired).toEqual([]);
   });
 
+  // A commit in the diff is evidence of the snapshot's work, not a waiver for a later board decision
+  // (PR #238 review). The operator reopened and rewrote this ticket; dispatching the stale closed bead
+  // would accept the commit as delivery and let merge finalization close the new requirements unseen.
+  it("re-runs the fresh contract when a committed superseded ticket was reopened after the snapshot", async () => {
+    const REOPENED = "## Goal\nShip the rewrite.\n\n## Acceptance\nThe rewrite works.";
+    hasCommitMock.mockImplementation(async (worktree, id) => worktree === WORKTREE && id === "anton-a");
+    const run = makeRun(
+      [superseded("anton-a", SHIPPER, { description: CONTRACT }), bead("anton-b")],
+      new AbortController().signal,
+    );
+    (run.target as Bead).description = CONTRACT;
+    board = board.map((b) =>
+      b.id === "anton-a" ? ({ ...b, status: "open", description: REOPENED, dependencies: [] } as Bead) : b,
+    );
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(dispatchedIds()).toEqual(["anton-a", "anton-b"]);
+    expect(dispatchedBead("anton-a")?.description).toBe(REOPENED);
+    expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-a", "anton-b"]);
+    expect(run.retired).toEqual([]);
+  });
+
   // The commit that keeps a superseded ticket live has to be in THIS run's delta (PR #238 review):
   // a `<id>:` commit an earlier merge landed in the base is on the branch's ancestry too, and read
   // there it would keep a settled ticket out of the ledger and in the delivered set of a PR that

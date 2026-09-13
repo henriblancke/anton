@@ -313,8 +313,22 @@ async function partitionTickets(
       abandoned += 1;
       continue;
     }
-    if (!beads.supersededBy(ticket) || (await hasCommitFor(ticket.id))) {
+    if (!beads.supersededBy(ticket)) {
       live.push(ticket);
+      continue;
+    }
+    if (await hasCommitFor(ticket.id)) {
+      // A commit proves this branch carries the snapshot's work, not that an operator has not since
+      // reopened or rewritten the ticket (PR #238 review). Read its lifecycle under the same lock as
+      // a no-commit retirement before accepting that commit as delivery: a fresh open bead must run
+      // its current contract, while one still superseded remains a closed delivery in this diff.
+      const fresh = await rereadSupersededTicket(run, ticket);
+      if (!beads.supersededBy(fresh)) {
+        await assertRunTargetStillOwns(run, fresh);
+        assertRerunGates(run, fresh);
+        reopened.push(fresh);
+      }
+      live.push(fresh);
       continue;
     }
     const found = await retireFound(run, ticket);
@@ -430,6 +444,29 @@ async function regateReopened(
  * keep a description the reopen deliberately cleared.
  */
 type FoundRetirement = { retired: RetiredTicketOutcome } | { live: Bead };
+
+/**
+ * Re-read a snapshot-superseded ticket before a branch commit accepts it as delivery (PR #238 review).
+ *
+ * A commit establishes only what this branch contains. It cannot establish that the board still calls
+ * the ticket superseded: an operator can reopen and rewrite it between the snapshot and this check.
+ * The locked read therefore supplies the ticket the loop may skip or dispatch, never the stale
+ * snapshot whose closed status would otherwise hide the reopened contract from merge finalization.
+ */
+async function rereadSupersededTicket(run: EpicRun, ticket: Bead): Promise<Bead> {
+  return withBeadWriteLock(run.repo, ticket.id, async () => {
+    const fresh = await mustRead(run.repo, ticket.id);
+    if (!fresh) {
+      throw new PoisonEpic(
+        `${ticket.id} is superseded on the board this run read and has a commit on this branch, but ` +
+          `bd would not read the ticket back, so anton cannot tell whether an operator reopened it ` +
+          `since — the run stopped rather than accept stale work as delivery. Check the beads DB, ` +
+          `then resume the run`,
+      );
+    }
+    return fresh;
+  });
+}
 
 /**
  * Retire a ticket the run's SNAPSHOT holds as superseded — or answer that it is live work after all
