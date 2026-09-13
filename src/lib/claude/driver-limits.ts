@@ -86,6 +86,17 @@ const SPEND_LIMIT_RESULT_RE =
 const RESET_EPOCH_RE = /\|\s*(\d{10,13})\s*$/m;
 /** Prose form: "resets at <when>" — anything up to the next line break or clause separator. */
 const RESET_AT_RE = /reset(?:s)?\s+at\s+([^\n,;]+)/i;
+/**
+ * Clock-time prose with an explicit zone: "resets 9pm (America/New_York)" — no "at", the hour is
+ * 12-hour with am/pm, and the IANA zone trails in parens (anton-fjw3). Distinct from `RESET_AT_RE`,
+ * which requires the literal "at" and an already-absolute (ISO) value.
+ */
+const RESET_TZ_RE = /reset(?:s)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)/i;
+/**
+ * Relative-duration prose: "(reset after 2m 41s)" — any subset of h/m/s components, all optional
+ * individually but at least one must be present (anton-fjw3).
+ */
+const RESET_RELATIVE_RE = /reset(?:s)?\s+after\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i;
 /** Last resort: any ISO-8601 timestamp anywhere in the notice. */
 const RESET_ISO_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/;
 
@@ -104,12 +115,90 @@ function dateSeconds(value: string | undefined): number | undefined {
   return Number.isNaN(ms) ? undefined : Math.floor(ms / 1000);
 }
 
-/** Best-effort extraction of a reset time (unix seconds) from claude's usage-limit text. */
-export function parseResetAt(text: string | undefined): number | undefined {
+/** now + "Xh Ym Zs" (any subset), or undefined when none of the three units matched. */
+function relativeResetSeconds(text: string, nowMs: number): number | undefined {
+  const match = text.match(RESET_RELATIVE_RE);
+  if (!match) return undefined;
+  const [, h, m, s] = match;
+  if (!h && !m && !s) return undefined;
+  const totalSeconds = Number(h ?? 0) * 3600 + Number(m ?? 0) * 60 + Number(s ?? 0);
+  if (totalSeconds <= 0) return undefined;
+  return Math.floor(nowMs / 1000) + totalSeconds;
+}
+
+/**
+ * A wall-clock time in `timeZone` as a UTC epoch (ms) — the standard offset round-trip: format the
+ * naive-UTC guess back through the target zone, and the drift between what we asked for and what
+ * came back IS the zone's offset at that moment (handles DST without a tz database dependency).
+ */
+function zonedWallTimeToUtcMs(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  timeZone: string,
+): number {
+  const guessUtc = Date.UTC(year, month - 1, day, hour, minute, 0);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(new Date(guessUtc));
+  const get = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? 0);
+  const readBackUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"), get("second"));
+  return guessUtc - (readBackUtc - guessUtc);
+}
+
+/**
+ * The next occurrence (from `nowMs`) of a bare clock time in an explicit zone — "resets 9pm
+ * (America/New_York)" — rolled to tomorrow when that time has already passed today in that zone.
+ * Undefined on no match or an invalid IANA zone (`Intl` throws `RangeError`).
+ */
+function tzResetSeconds(text: string, nowMs: number): number | undefined {
+  const match = text.match(RESET_TZ_RE);
+  if (!match) return undefined;
+  const [, hourStr, minuteStr, ampm, timeZone] = match;
+  let hour = Number(hourStr) % 12;
+  if (ampm.toLowerCase() === "pm") hour += 12;
+  const minute = minuteStr ? Number(minuteStr) : 0;
+  try {
+    const todayParts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date(nowMs));
+    const get = (type: string) => Number(todayParts.find((p) => p.type === type)?.value ?? 0);
+    const year = get("year");
+    const month = get("month");
+    const day = get("day");
+    let candidateMs = zonedWallTimeToUtcMs(year, month, day, hour, minute, timeZone);
+    if (candidateMs <= nowMs) candidateMs = zonedWallTimeToUtcMs(year, month, day + 1, hour, minute, timeZone);
+    return Math.floor(candidateMs / 1000);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Best-effort extraction of a reset time (unix seconds) from claude's usage-limit text. `nowMs`
+ * anchors the relative ("reset after …") and zoned-clock-time ("resets 9pm (…)") forms — callers
+ * pass a fixed clock in tests so assertions never race wall time (anton-fjw3); production callers
+ * rely on the `Date.now()` default.
+ */
+export function parseResetAt(text: string | undefined, nowMs: number = Date.now()): number | undefined {
   if (!text) return undefined;
   return (
     epochSeconds(text) ??
     dateSeconds(text.match(RESET_AT_RE)?.[1]) ??
+    relativeResetSeconds(text, nowMs) ??
+    tzResetSeconds(text, nowMs) ??
     dateSeconds(text.match(RESET_ISO_RE)?.[0])
   );
 }

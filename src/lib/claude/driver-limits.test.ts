@@ -30,6 +30,39 @@ describe("parseResetAt", () => {
     expect(parseResetAt(undefined)).toBeUndefined();
     expect(parseResetAt("usage limit reached; resets at some point soon")).toBeUndefined();
   });
+
+  // 2026-01-15T10:00:00Z = 2026-01-15 05:00 America/New_York (EST, UTC-5) — well before 9pm today,
+  // so the zoned form below resolves to *today's* 9pm and stays comfortably in the future.
+  const NOW_MS = Date.parse("2026-01-15T10:00:00Z");
+
+  it.each([
+    {
+      name: "clock-time prose with an explicit IANA zone",
+      text: "resets 9pm (America/New_York)",
+      expected: Math.floor(Date.parse("2026-01-16T02:00:00Z") / 1000), // 21:00 EST = 02:00Z next day
+    },
+    {
+      name: "relative duration prose",
+      text: "(reset after 2m 41s)",
+      expected: Math.floor(NOW_MS / 1000) + 161,
+    },
+  ])("parses $name against an injected clock", ({ text, expected }) => {
+    const resetAt = parseResetAt(text, NOW_MS);
+    expect(resetAt).toBe(expected);
+    expect(resetAt).toBeGreaterThan(Math.floor(NOW_MS / 1000));
+  });
+
+  it("rolls the zoned clock-time form to tomorrow once today's time has already passed", () => {
+    // 2026-01-16T03:00:00Z = 2026-01-15 22:00 EST — an hour past today's 9pm in that zone.
+    const afterNineMs = Date.parse("2026-01-16T03:00:00Z");
+    expect(parseResetAt("resets 9pm (America/New_York)", afterNineMs)).toBe(
+      Math.floor(Date.parse("2026-01-17T02:00:00Z") / 1000), // tomorrow's 21:00 EST
+    );
+  });
+
+  it("yields undefined for an unparseable reset, leaving the runner's own cooloff to apply", () => {
+    expect(parseResetAt("(reset shortly)", NOW_MS)).toBeUndefined();
+  });
 });
 
 describe("usageLimitError", () => {
