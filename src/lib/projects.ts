@@ -163,6 +163,15 @@ export interface ProjectSettings {
    * alongside {@link claudeBaseUrl}.
    */
   claudeGatewayModelDiscovery?: boolean;
+  /**
+   * Which router connection this project meters on (anton-m5oc) — the router's own connection id,
+   * not a name anton invents. A router fronts N provider connections; this names the ONE anton reads
+   * quota from, because the router's usage endpoint is per-connection, not per-router. Only
+   * meaningful alongside {@link claudeBaseUrl} — a project not routed through a gateway has no router
+   * to meter on. Absent → no routed meter; the governor and the project view fall back to today's
+   * behavior (sibling tickets anton-gnvw, anton-ds7e).
+   */
+  routerConnectionId?: string;
   testCommand?: string;
   /**
    * Optional operator-pinned verify gates (anton-3oh8), run in the worktree after the agent and

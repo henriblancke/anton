@@ -43,6 +43,7 @@ import {
   applyFieldRules,
   booleanValue,
   boundedString,
+  connectionId,
   envVarName,
   fieldRule,
   httpUrl,
@@ -73,6 +74,8 @@ const MAX_COMMAND = 1000;
 const MAX_URL = 2000;
 /** Upper bound on an env-var name (anton-n16m) — no shell allows one near this long. */
 const MAX_ENV_NAME = 256;
+/** Upper bound on a router connection id (anton-m5oc) — well past any real router's id length. */
+const MAX_CONNECTION_ID = 256;
 
 const settingsField = <K extends keyof ProjectSettings & string>(
   key: K,
@@ -163,6 +166,9 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     settingsField("claudeBaseUrl", httpUrl(MAX_URL)),
     settingsField("claudeAuthTokenEnv", envVarName(MAX_ENV_NAME)),
     settingsField("claudeGatewayModelDiscovery", booleanValue),
+    // Which of the router's connections this project meters on (anton-m5oc). Only meaningful
+    // alongside claudeBaseUrl; the cross-check mirrors the token-env-name requirement below.
+    settingsField("routerConnectionId", connectionId(MAX_CONNECTION_ID)),
 
     // Operator prompt overrides — cleared, each falls back to the shipped contract.
     settingsField("seedPrompt", boundedString(MAX_PROMPT)),

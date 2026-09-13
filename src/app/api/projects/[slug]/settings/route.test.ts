@@ -504,6 +504,45 @@ describe("settings route — Claude gateway routing (anton-n16m)", () => {
     expect((await orphaned.json()).error).toMatch(/claudeAuthTokenEnv/);
     expect(persisted().claudeAuthTokenEnv).toBe("ANTHROPIC_AUTH_TOKEN");
   });
+
+  /**
+   * Which router connection this project meters on (anton-m5oc) — validated like the other routing
+   * fields: bounded, cleared by "" / null, and refused if it looks like a pasted credential rather
+   * than the router's own connection id.
+   */
+  it("PATCH persists a router connection id, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ routerConnectionId: "conn_ab12cd34" }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings).toMatchObject({ routerConnectionId: "conn_ab12cd34" });
+    expect(persisted()).toMatchObject({ routerConnectionId: "conn_ab12cd34" });
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings).toMatchObject({ routerConnectionId: "conn_ab12cd34" });
+  });
+
+  it('PATCH "" / null clears the router connection id back to the default (key removed)', async () => {
+    await PATCH(patchReq({ routerConnectionId: "conn_ab12cd34" }), ctx("tmp"));
+    await PATCH(patchReq({ routerConnectionId: "" }), ctx("tmp"));
+    expect("routerConnectionId" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a blank or over-length router connection id", async () => {
+    for (const bad of ["   ", "x".repeat(257), 42, {}]) {
+      const res = await PATCH(patchReq({ routerConnectionId: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/routerConnectionId/);
+    }
+    expect("routerConnectionId" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a router connection id shaped like a pasted credential", async () => {
+    for (const bad of ["sk-ant-abc123", "AKIAIOSFODNN7EXAMPLE", "ghp_0123456789abcdef"]) {
+      const res = await PATCH(patchReq({ routerConnectionId: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/routerConnectionId/);
+    }
+    expect("routerConnectionId" in persisted()).toBe(false);
+  });
 });
 
 /**
