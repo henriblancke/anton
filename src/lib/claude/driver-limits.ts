@@ -82,6 +82,17 @@ const SPEND_LIMIT_RE =
 const SPEND_LIMIT_RESULT_RE =
   /^\s*(?:you['’]ve\s+)?(?:hit|reached) your monthly spend limit\b[\s\S]{0,80}?(?:claude\.ai\/settings\/usage|\/usage-credits\b)[^\n]*\s*$/i;
 
+/**
+ * OpenRouter's billing stop, wrapped inside a 503 envelope — observed verbatim as `API Error: 503
+ * [openrouter/…] [402]: {"error":{"message":"This request requires more credits…` (anton-x96g, PR
+ * #238/#252). The bare `503` in that string otherwise matches `TRANSIENT_STDERR_RE`
+ * (driver-exit.ts) and gets resumed as a transient network blip against a wall that never moves —
+ * quota classification must catch the buried `[402]` first. Scanned across the combined transcript
+ * like the terse usage-limit banners above: a bracketed `[402]` paired with "requires more credits"
+ * is a machine error-code format, not phrasing a model would casually reproduce in its own prose.
+ */
+const GATEWAY_BILLING_RE = /\[402\][\s\S]{0,200}?requires more credits/i;
+
 /** Claude's machine-readable reset stamp, trailing a banner: `…usage limit reached|1700000000`. */
 const RESET_EPOCH_RE = /\|\s*(\d{10,13})\s*$/m;
 /** Prose form: "resets at <when>" — anything up to the next line break or clause separator. */
@@ -219,7 +230,8 @@ function isUsageLimited(channels: ClaudeChannels): boolean {
   return (
     USAGE_LIMIT_RE.test(combinedText(channels)) ||
     SPEND_LIMIT_RE.test(channels.stderr) ||
-    SPEND_LIMIT_RESULT_RE.test(channels.resultText)
+    SPEND_LIMIT_RESULT_RE.test(channels.resultText) ||
+    GATEWAY_BILLING_RE.test(combinedText(channels))
   );
 }
 

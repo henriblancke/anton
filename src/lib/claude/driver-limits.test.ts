@@ -11,6 +11,12 @@ const channels = (overrides: Partial<ClaudeChannels>): ClaudeChannels => ({ ...E
 
 const SPEND_BANNER = "You've hit your monthly spend limit · raise it at claude.ai/settings/usage";
 
+// Observed verbatim in .anton/sessions/*.log for PR #238 and #252 (anton-x96g): OpenRouter's
+// billing stop, delivered inside a 503 envelope that otherwise matches driver-exit.ts's bare `503`
+// transient regex.
+const GATEWAY_402_ENVELOPE =
+  'API Error: 503 [openrouter/anthropic/claude-sonnet-5] [402]: {"error":{"message":"This request requires more credits, or fewer max_tokens.","code":402}}';
+
 describe("parseResetAt", () => {
   it("reads the trailing epoch stamp, normalizing milliseconds to seconds", () => {
     expect(parseResetAt("Claude AI usage limit reached|1700000000")).toBe(1700000000);
@@ -103,5 +109,15 @@ describe("usageLimitError", () => {
     expect(usageLimitError(channels({ transcript: "usage limit reached\n" }))?.message).toBe(
       "usage limit reached",
     );
+  });
+
+  it("classifies OpenRouter's [402] billing stop as a quota hit even though it arrives inside a 503 envelope (anton-x96g)", () => {
+    expect(usageLimitError(channels({ stderr: GATEWAY_402_ENVELOPE }))).not.toBeNull();
+    expect(usageLimitError(channels({ transcript: `${GATEWAY_402_ENVELOPE}\n` }))).not.toBeNull();
+    expect(usageLimitError(channels({ resultText: GATEWAY_402_ENVELOPE }))).not.toBeNull();
+  });
+
+  it("leaves a genuine gateway 503 with no [402] inside untouched — it must still resolve as transient (anton-x96g)", () => {
+    expect(usageLimitError(channels({ stderr: "API Error: 503 [openrouter/anthropic/claude-sonnet-5] Service Unavailable" }))).toBeNull();
   });
 });
