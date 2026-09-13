@@ -94,6 +94,24 @@ describe("parseRouterUsage", () => {
     ["a not-yet-authorized message body", { message: "Usage not available for this connection" }],
     ["a non-object body", "nope"],
     ["a null body", null],
+    [
+      "a negative session percentage",
+      {
+        quotas: {
+          "session (5h)": { ...ROUTER_FIXTURE.quotas["session (5h)"], used: -1 },
+          "weekly (7d)": ROUTER_FIXTURE.quotas["weekly (7d)"],
+        },
+      },
+    ],
+    [
+      "a weekly percentage above the router's 0–100 contract",
+      {
+        quotas: {
+          "session (5h)": ROUTER_FIXTURE.quotas["session (5h)"],
+          "weekly (7d)": { ...ROUTER_FIXTURE.quotas["weekly (7d)"], used: 999 },
+        },
+      },
+    ],
   ])("returns null for %s — never a fabricated percentage", (_label, body) => {
     expect(parseRouterUsage(body)).toBeNull();
   });

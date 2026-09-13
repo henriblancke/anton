@@ -1164,6 +1164,39 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     expect(deferred?.lastError).toMatch(/budget: session-headroom/);
   });
 
+  it("paces a routed project when the Anthropic meter is unavailable but its router is exhausted", async () => {
+    // The machine-wide Anthropic subscription meter is absent (for example, OAuth is unreadable),
+    // but the routed project's router still reports a real exhausted session. The account outage
+    // must not short-circuit the project's independent gate.
+    h.seedProjects("routed");
+    let ran = 0;
+    const resolveProjectUsage: ProjectUsageResolver = async (pid, accountUsage) => {
+      expect(pid).toBe("routed");
+      expect(accountUsage).toBeNull();
+      return usage({ sessionPct: 99, weeklyPct: 0 });
+    };
+    const r = budgetRunner(
+      h,
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => null,
+        resolveProjectUsage,
+      },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "routed" });
+
+    expect(await r.tickOnce()).toBe(0);
+    await r.whenIdle();
+
+    expect(ran).toBe(0);
+    const deferred = await getJob(h.db, id);
+    expect(deferred?.status).toBe("queued");
+    expect(toMs(deferred?.runAt)).toBeGreaterThan(h.clock.now());
+    expect(deferred?.lastError).toMatch(/budget: session-headroom/);
+  });
+
   it("a routed project whose router cannot be read still admits — a broken meter never holds work", async () => {
     // The account meter reads exhausted, and the resolver reports the router unreadable (null) —
     // budgetGate's own fail-open handles a null usage, so the project must admit rather than pace

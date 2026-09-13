@@ -46,7 +46,9 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 function toPct(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100
+    ? value
+    : null;
 }
 
 function toIso(value: unknown): string | null {

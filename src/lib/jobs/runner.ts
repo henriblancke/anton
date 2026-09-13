@@ -1037,9 +1037,9 @@ export class JobRunner {
    * its queued + reclaimable governed jobs and collects the ones not worth the remaining budget
    * into `valueHeldJobIds` (queued → exclude) / `valueHeldReclaimIds` (lease-expired running →
    * capOf 0) — see {@link applyValueGate}.
-   * Only runs when a budget-policy resolver is injected. Fails OPEN: a null usage read defers
-   * nothing AND resumes any deferrals a prior governed tick wrote (a missing meter must never
-   * starve the queue — not even via a stale pace boundary), mirroring `budgetGate`'s own contract.
+   * Only runs when a budget-policy resolver is injected. Fails OPEN per project: an unreadable
+   * project's meter defers nothing and resumes only that project's prior deferrals. Other projects
+   * still evaluate their own router meters, so a missing Anthropic account read cannot unpace them.
    */
   private async applyBudgetGovernor(
     heldBucketKeys: Set<string>,
@@ -1092,30 +1092,24 @@ export class JobRunner {
     if (governed.length === 0) return; // no project is budget-aware → never read usage
 
     const usage = await this.readUsageSafe();
-    if (!usage) {
-      // Fail open — a broken/absent meter never holds work. That must include work a PRIOR
-      // governed tick already pushed to a future runAt: leaseDue only scans due rows, so without
-      // pulling those deferrals back a 429 backoff / credentials hiccup / meter outage would
-      // strand governed jobs until the stale pace boundary — possibly hours or the weekly reset.
-      // Same marker-scoped resume as the pacing-off path above.
-      for (const { pid } of governed) {
+    const now = this.clock.now();
+    for (const { pid, policy } of governed) {
+      // The meter this project actually paces against (anton-gnvw): its own router when routed,
+      // the account-wide read above otherwise. Resolve it even when the account meter is absent:
+      // an unreadable Anthropic endpoint says nothing about a healthy routed meter. A resolver
+      // failure uses its account argument, preserving the fail-open behavior for that project.
+      const projectUsage = this.resolveProjectUsage
+        ? await this.resolveProjectUsage(pid, usage).catch(() => usage)
+        : usage;
+      if (!projectUsage) {
+        // Fail open only for the project whose meter is unavailable. Resume its own stale governor
+        // deferrals, but keep evaluating other governed projects with their independent meters.
         await resumeBudgetDeferredJobs(this.db, this.clock, {
           types: GOVERNED_JOB_TYPES,
           projectId: pid,
         });
+        continue;
       }
-      return;
-    }
-
-    const now = this.clock.now();
-    for (const { pid, policy } of governed) {
-      // The meter this project actually paces against (anton-gnvw): its own router when routed,
-      // the account-wide read above otherwise. Resolved per project — never assume `usage` (the
-      // account meter) describes a routed project's traffic. A resolver failure falls back to the
-      // account read, same fail-open posture as every other governor read.
-      const projectUsage = this.resolveProjectUsage
-        ? await this.resolveProjectUsage(pid, usage).catch(() => usage)
-        : usage;
       // The quota share (R6.1) is enforced against THIS project's attributed spend, not the account
       // meter above — that one is moved by every repo here. Unresolvable spend leaves the share
       // unbound, the same fail-open posture as a null usage read.
