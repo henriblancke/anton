@@ -177,6 +177,17 @@ describe("usageLimitError", () => {
     ).toBeNull();
   });
 
+  it("rejects result prose with an API-error-shaped [429] prefix but no structured payload", () => {
+    expect(
+      usageLimitError(
+        channels({
+          resultText:
+            "API Error: 503 [claude/claude-opus-5] [429]: rate_limit_error quoted while three tests still fail",
+        }),
+      ),
+    ).toBeNull();
+  });
+
   it("classifies a bare [429] from the API or a gateway as a quota hit (anton-h8z4)", () => {
     expect(usageLimitError(channels({ stderr: "API Error: 500 [openrouter] [429]: rate limited" }))).not.toBeNull();
   });

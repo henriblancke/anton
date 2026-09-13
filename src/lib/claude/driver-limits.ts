@@ -104,15 +104,14 @@ const GATEWAY_BILLING_RESULT_RE =
  * matches `TRANSIENT_STDERR_RE` (driver-exit.ts) and gets treated as a passing network blip instead
  * of a quota that needs a real cooloff — quota classification must catch it first.
  *
- * Two machine-only shapes, neither one a model would casually reproduce in prose: the JSON
- * `"type":"rate_limit_error"` field a provider's error body carries, and a bracketed `[429]` status
- * code the way Claude Code's own API-error wrapper and gateways render it — as opposed to a bare
- * "429" typed inline, which stays ambiguous enough to leave alone. They still use the same result
- * whole-envelope guard as the billing error because model prose can quote either shape verbatim.
+ * Stderr accepts either machine-only signal: the JSON `"type":"rate_limit_error"` field a provider's
+ * error body carries or a bracketed `[429]` status code the way Claude Code's own API-error wrapper
+ * and gateways render it. A result must carry the complete canonical JSON error envelope, including
+ * the structured `rate_limit_error` payload; an API-error-shaped prefix alone remains model prose.
  */
 const RATE_LIMIT_RE = /"type"\s*:\s*"rate_limit_error"|\[429\]/i;
 const RATE_LIMIT_RESULT_RE =
-  /^[ \t]*API Error:\s*\d{3}\s+\[[^\]]+\]\s+\[429\]:\s*[^\n]*\S[ \t]*\n?$/i;
+  /^[ \t]*API Error:\s*\d{3}\s+\[[^\]\r\n]+\]\s+\[429\]:\s*\{\s*"type"\s*:\s*"error"\s*,\s*"error"\s*:\s*\{\s*"type"\s*:\s*"rate_limit_error"\s*,\s*"message"\s*:\s*"(?:\\.|[^"\\\r\n])*"\s*\}\s*\}[ \t]*\r?\n?$/i;
 
 /**
  * The session-limit banner — observed verbatim as `You've hit your session limit · resets 9pm
