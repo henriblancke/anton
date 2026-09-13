@@ -145,3 +145,23 @@ it("resolves its OWN fork point when it just created the branch, ignoring anothe
   expect(runStep.baseForkSha).toBe("f0f0f0forkcommit");
   expect(await getRunBaseForkSha(t.db, FRESH)).toBe("f0f0f0forkcommit");
 });
+
+it("prefers the creation-captured fork over re-resolving the mutable base (PR #238 review)", async () => {
+  // The checkout's own HEAD, captured by `createWorktree` before warming, is the fork as the branch
+  // was cut — a ref a sibling fetch could rewind only AFTER the checkout materialized. Resolving the
+  // base again (or reading it later) would answer the rewound tip, so the captured value must win.
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    repoPath: "/repo",
+    forkSha: "creation-fork",
+  });
+  resolveForkPointMock.mockRejectedValue(new Error("resolver must not run when the checkout returned its own fork"));
+
+  const { runStep } = await warmRunWorktree(makeRun());
+
+  expect(resolveForkPointMock).not.toHaveBeenCalled();
+  expect(runStep.baseForkSha).toBe("creation-fork");
+  expect(await getRunBaseForkSha(t.db, RUN_ID)).toBe("creation-fork");
+});

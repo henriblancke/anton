@@ -32,6 +32,8 @@ export interface Worktree {
   branch: string;
   /** Branch the worktree was created from. */
   baseBranch: string;
+  /** The commit the checkout forked from, captured at creation — see {@link readForkAtCreation}. */
+  forkSha?: string;
   /** The main repo the worktree belongs to. */
   repoPath: string;
 }
@@ -403,6 +405,24 @@ function conflictingClaim(
  * edits. The claim holder itself says so with `claimedBy` — it materializes its own checkout under
  * its claim, and refusing that would deadlock the very job the claim is for.
  */
+/**
+ * The commit a freshly-created checkout forked from, resolved before any slow step can rewind the
+ * base ref (PR #238 review). {@link createWorktree} branches off `baseBranch` — a mutable
+ * remote-tracking ref such as `origin/main` — inside a lock that holds minutes, and the warm that
+ * follows runs minutes more. Reading the fork point from inside that window (or after it) against
+ * the still-mutable ref lets a sibling run's fetch rewind it behind the commit this branch was
+ * actually cut from. So `createWorktree` records the fork by reading the new checkout's own HEAD —
+ * the commit the branch was literally created at — and returns it; the caller pins HEAD here instead
+ * of re-deriving later.
+ */
+async function readForkAtCreation(worktreePath: string): Promise<string | undefined> {
+  try {
+    return await git(worktreePath, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+  } catch {
+    return undefined; // best-effort: the caller falls back to its own resolution
+  }
+}
+
 export async function createWorktree(opts: {
   repoPath: string;
   branch: string;
@@ -462,12 +482,22 @@ export async function createWorktree(opts: {
       await git(repoPath, ["worktree", "add", ...lockArgs, path, "-b", branch, baseBranch]);
     }
 
+    // Read the new checkout's HEAD *before* warming: the branch was just cut from `baseBranch`, and
+    // warming (or any later fetch) can rewind that ref behind the commit the checkout records. HEAD
+    // is fixed to the creation commit regardless — only read here, not after the warm below.
+    const forkSha = await readForkAtCreation(path);
+
     // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
     // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
-    return { path: await realpath(path), branch, baseBranch, repoPath };
+    const resolved = await realpath(path);
+    return { path: resolved, branch, baseBranch, ...(forkSha ? { forkSha } : {}), repoPath };
   });
 
   if (warm) await warmWorktree(wt, signal);
+  // No hooks bridge to materialize here: every git command anton runs against this worktree passes
+  // `-c core.hooksPath=<resolved from repoPath>` itself (see resolveHooksPathOverride in ops.ts) —
+  // hooks fire from the base repo's own directory with no symlink, no info/exclude entry, and no
+  // dependence on whether warming happened to regenerate anything.
   return wt;
 }
 
@@ -905,5 +935,6 @@ export async function removeWorktree(
       if (await branchExists(wt.repoPath, wt.branch)) branchSkipped = gitError(err);
     }
   }
-  return { removed: existed && !existsSync(wt.path), branchDeleted, branchSkipped };
+  const removed = existed && !existsSync(wt.path);
+  return { removed, branchDeleted, branchSkipped };
 }

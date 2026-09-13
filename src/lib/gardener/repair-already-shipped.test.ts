@@ -2888,14 +2888,25 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
   });
 
   it("keeps the retirement when only the STAMP failed, and says the guard is not armed for it", async () => {
-    // The marker is the first tag write and lands; the stamp, second, is what bd refuses.
-    tagMock.mockImplementationOnce(async () => "").mockRejectedValueOnce(new Error("beads db is locked"));
+    // The marker is the first tag write and lands; the stamp, second, is what bd refuses — but it is
+    // retried through `mustPersist` before the caller accepts the retirement (PR #238 review), so a
+    // single refusal gives it another chance. The "guards not armed" note only fires when the stamp
+    // fails EVERY try, which is the case that leaves recovery unable to recognise the retirement.
+    tagMock
+      .mockImplementationOnce(async () => "")
+      .mockRejectedValue(new Error("beads db is locked"))
+      .mockRejectedValue(new Error("beads db is locked"))
+      .mockRejectedValue(new Error("beads db is locked"));
 
     const outcome = await retire();
 
     expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER, marked: true });
     expect((outcome as { label?: string }).label).toBeUndefined();
     expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
+    // The stamp was retried to exhaustion, not swallowed on its first refusal (PR #238 review).
+    expect(
+      tagMock.mock.calls.filter(([, , labels]) => labels.some((l) => l.startsWith("repair:"))).length,
+    ).toBe(3);
     const notes = noteMock.mock.calls.map((c) => c[2]);
     expect(notes.some((t) => t.includes("could not stamp it"))).toBe(true);
   });

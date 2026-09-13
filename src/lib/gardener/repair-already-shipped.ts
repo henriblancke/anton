@@ -1391,17 +1391,24 @@ export async function repairAlreadyShipped(args: {
       }
     }
     let label: string | undefined;
-    try {
-      // This stamp is provenance for the retirement that is already on the board, not for the
-      // earlier decision to attempt one. Give it a post-supersede instant so recovery can reject
-      // a historical stamp left by an older retirement cycle without rejecting this one.
+    // The stamp is the retirement's provenance on the board, not a soft nicety: the next attempt's
+    // `settleRetiredStandalone` recognises this closure only through `priorRepair`, so a stamp that
+    // silently failed would leave a verified retirement that nothing can recover (PR #238 review).
+    // Retried like the marker for that reason — only a durable label may answer `retired` — and, on
+    // exhaustion, the unstamped fallback is logged as a note so the process does not die quiet.
+    // (`recordRepair`'s tag is the idempotent, throwing half; its note is already best-effort.)
+    const stamped = await mustPersist(async () => {
+      // A post-supersede instant so recovery can reject a historical stamp left by an older
+      // retirement cycle without rejecting this one.
       label = await recordRepair(repoPath, bead, KLASS, attempted, Date.now());
-    } catch (e) {
+    });
+    if (!stamped || label === undefined) {
       // The retirement stands, for `ref-stale`'s reason ({@link unstampedNote}): the ticket is closed
       // and pointed at its survivor, and reopening it over a missing label would undo a correct
       // settlement to protect a guard the closed bead no longer needs.
-      console.error(`[repair] ${bead.id} was retired as superseded but could not be stamped`, e);
+      console.error(`[repair] ${bead.id} was retired as superseded but could not be stamped`);
       await beads.note(repoPath, bead.id, unstampedNote(KLASS, attempted)).catch(() => {});
+      label = undefined;
     }
     // The stamp opens the SAME window the marker did, and it is the last one (PR #238 review). The
     // locks order this process only, so between the marker fence's reread and `recordRepair` another

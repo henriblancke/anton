@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useId, useRef, useState } from "react";
+import { PlayIcon } from "lucide-react";
 
 import { describeCron, isFastCadence } from "@/lib/jobs/cadence";
 import { formatExactTime, formatRelativeTime } from "@/lib/time";
@@ -186,6 +187,7 @@ export function AutomationTable({
   cadenceOffer,
   onCronChange,
   onToggle,
+  onRunNow,
   onAcceptCadenceOffer,
   onDeclineCadenceOffer,
 }: {
@@ -197,6 +199,8 @@ export function AutomationTable({
   cadenceOffer?: CadenceOffer | null;
   onCronChange: (id: string, cron: string) => void;
   onToggle: (id: string, next: boolean) => void;
+  /** Fire the automation's job right now, outside its cron. Absent = the row shows no button. */
+  onRunNow?: (id: string) => Promise<void>;
   onAcceptCadenceOffer?: () => void;
   onDeclineCadenceOffer?: () => void;
 }) {
@@ -266,6 +270,7 @@ export function AutomationTable({
                     defaultCron={defaultCrons[automation.id] ?? state[automation.id].cron}
                     onCronChange={(cron) => onCronChange(automation.id, cron)}
                     onToggle={(next) => onToggle(automation.id, next)}
+                    onRunNow={onRunNow ? () => onRunNow(automation.id) : undefined}
                   />,
                   cadenceOffer?.automationId === automation.id ? (
                     <CadenceOfferRow
@@ -339,6 +344,7 @@ function AutomationTableRow({
   defaultCron,
   onCronChange,
   onToggle,
+  onRunNow,
 }: {
   automation: AutomationSpec;
   state: AutomationScheduleState;
@@ -349,6 +355,8 @@ function AutomationTableRow({
   defaultCron: string;
   onCronChange: (cron: string) => void;
   onToggle: (next: boolean) => void;
+  /** Absent = the row shows no Run now button (see {@link AutomationTable}). */
+  onRunNow?: () => Promise<void>;
 }) {
   const on = state.enabled === true;
   // A cadence faster than the threshold is flagged on the row as well as in the editor: the editor
@@ -406,10 +414,70 @@ function AutomationTableRow({
         <LastRunCell state={state} now={now} on={on} />
       </td>
 
-      <td className="px-2.5 py-2 text-right align-middle">
-        <Toggle checked={on} onChange={onToggle} label={automation.label} />
+      <td className="px-2.5 py-2 align-middle">
+        <div className="flex items-center justify-end gap-2">
+          {onRunNow ? (
+            <RunNowButton
+              label={automation.label}
+              disabled={!on}
+              alreadyFiring={state.pendingRun === "queued" || state.pendingRun === "running"}
+              onRunNow={onRunNow}
+            />
+          ) : null}
+          <Toggle checked={on} onChange={onToggle} label={automation.label} />
+        </div>
       </td>
     </tr>
+  );
+}
+
+/**
+ * Fires the automation's job outside its cron. Disabled while the automation is off — arming it is
+ * the one place an operator decides a type may run at all, and this must not become a second way to
+ * reach that decision (see the route's own refusal) — and while a fire is already queued/running, so
+ * a click can't pile a second job behind one already in flight. The click's own pending state covers
+ * the gap between the POST landing and the next schedule poll picking up the fresh `pendingRun`.
+ */
+function RunNowButton({
+  label,
+  disabled,
+  alreadyFiring,
+  onRunNow,
+}: {
+  label: string;
+  disabled: boolean;
+  alreadyFiring: boolean;
+  onRunNow: () => Promise<void>;
+}) {
+  const [pending, setPending] = useState(false);
+
+  async function run() {
+    setPending(true);
+    try {
+      await onRunNow();
+    } finally {
+      setPending(false);
+    }
+  }
+
+  const title = disabled
+    ? "Turn this automation on to run it manually"
+    : alreadyFiring
+      ? "Already running"
+      : `Run ${label} now`;
+
+  return (
+    <Button
+      type="button"
+      size="icon-xs"
+      variant="ghost"
+      disabled={disabled || alreadyFiring || pending}
+      title={title}
+      aria-label={`${label} run now`}
+      onClick={() => void run()}
+    >
+      <PlayIcon aria-hidden="true" />
+    </Button>
   );
 }
 
@@ -447,6 +515,15 @@ function AutomationTableRow({
  * for a worker. With no
  * pending job to read (a poll that hasn't landed yet) the switch is all there is, and decides as
  * before.
+ *
+ * `pendingRun` also OVERRIDES the enqueue-time match above, not merely supplements it (PR #264
+ * review): `lastRunAt`/`enqueuedAt` are whole SECONDS (`newJobRow`'s `secDate` floors both), so a
+ * manual "Run now" fire landing in the same wall-clock second as an earlier fire's settlement stamps
+ * an enqueue time equal to that earlier fire's — the `>=` match then can't tell the two apart and
+ * would show the old, already-settled outcome as if it belonged to the new, still-active fire.
+ * `pendingRun` has no such ambiguity: it comes from a direct read of job STATUS
+ * (`pendingRunsBySchedule`), not a timestamp comparison, so whenever it says a fire is queued or
+ * running, that overrides whatever the seconds-precision match concluded.
  */
 function LastRunCell({
   state,
@@ -460,7 +537,12 @@ function LastRunCell({
   if (!state.lastRunAt) return <span className="text-subtle">never</span>;
 
   const previous = state.lastRun;
-  const settled = previous !== undefined && previous.enqueuedAt >= state.lastRunAt;
+  // `pendingRun` overrides the enqueue-time match, not merely supplements it (PR #264 review): both
+  // timestamps are whole SECONDS, so a manual fire landing in the same second as an earlier settle
+  // stamps an enqueue time equal to that earlier fire's, and the `>=` match alone can't tell them
+  // apart. `pendingRun` reads job STATUS directly and has no such ambiguity.
+  const settled =
+    !state.pendingRun && previous !== undefined && previous.enqueuedAt >= state.lastRunAt;
   const style = settled ? OUTCOME_STYLES[previous.outcome] : undefined;
   const held = state.pendingRun !== "running" && !on;
   const pending = held

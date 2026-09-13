@@ -31,7 +31,15 @@ const commitMarkerMock = vi.fn();
 
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
-  return { ...actual, commitMarker: (...args: unknown[]) => commitMarkerMock(...args) };
+  return {
+    ...actual,
+    commitMarker: (...args: unknown[]) => commitMarkerMock(...args),
+    // `REPO`/`WORKTREE` below are fake paths, not real checkouts — the real `resolveHooksPathOverride`
+    // now correctly THROWS on a nonexistent directory rather than misreading it as "hooksPath unset"
+    // (PR #263 review), so it needs mocking here like `commitMarker`: this suite exercises the
+    // close/note/marker sequencing, not hooksPath resolution.
+    resolveHooksPathOverride: () => Promise.resolve(undefined),
+  };
 });
 
 vi.mock("../beads/bd", async () => {
@@ -319,9 +327,18 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
   // retirement's edge rather than the reopened one's — and because the survivor matches, nothing
   // downstream can tell. Only a read taken with the unlink on the board can have seen that writer.
   it("retries instead of running when a retirement landed while the edge was being removed", async () => {
+    // Until the restore re-draws the edge, every read after the unlink shows the settled retirement
+    // with its edge stripped; once `bd supersede` restores it, the post-write fence must see it back.
     showMock
-      .mockResolvedValueOnce(claimed) // pre-unlink: still ours, so the edge reads as stale
-      .mockResolvedValue(settledElsewhere); // post-unlink: another hand settled it
+      .mockImplementationOnce(() => Promise.resolve(claimed))
+      .mockImplementation(async () =>
+        supersedeMock.mock.calls.some(([, , survivor]) => survivor === SURVIVOR)
+          ? {
+              ...settledElsewhere,
+              dependencies: [{ issue_id: "anton-t2", depends_on_id: SURVIVOR, type: "supersedes" }],
+            }
+          : settledElsewhere,
+      );
 
     const err = await claimTicket(run(), reopened, "op").then(
       () => undefined,
@@ -446,6 +463,34 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     );
     expect(err).not.toBeInstanceOf(PoisonEpic);
     expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
+  // The write's own success does not prove the checked closure was restored (PR #238 review): on a
+  // shared board another hand can reopen/abandon/re-supersede the ticket between the conditional
+  // read and the write, and `bd supersede` then closes the newer live state or overwrites its
+  // survivor. The restore must re-read with the write ON the board and stop — not retry, which would
+  // overwrite the overtaking decision a second time — when the close no longer reads as the one it
+  // checked.
+  it("parks when the restored edge lands on a board that moved during the write", async () => {
+    // attempt 1 read: settled with edge stripped → restore writes → the post-write read sees the
+    // ticket REOPENED live (another hand won the window after the write's own precondition read).
+    showMock
+      .mockResolvedValueOnce(claimed) // pre-unlink
+      .mockResolvedValueOnce(settledElsewhere) // the fence: settled, edge stripped
+      .mockResolvedValueOnce(settledElsewhere) // restore's own read: still the retirement
+      .mockResolvedValue({ ...unlinked, status: "open", assignee: "other-op" }); // post-write: reopened
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PoisonEpic);
+    expect((err as Error).message).toMatch(/no longer reads as the retirement it restores/);
+    // It wrote once and stopped — a retry would stomp the reopen that overtook it.
+    expect(supersedeMock).toHaveBeenCalledTimes(1);
+    // The claim is NOT handed back: the ticket belongs to whoever decided it.
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(unassignMock).not.toHaveBeenCalled();
   });
 
   // A retry re-reads too, so a board that moved between attempts stops the write rather than

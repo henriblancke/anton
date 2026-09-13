@@ -72,10 +72,13 @@ export async function warmRunWorktree(
   });
   run.worktree = worktree;
   // Pin the fork COMMIT now, while origin/<base> is freshly fetched and — on a FIRST creation — HEAD
-  // still sits at it (PR #238 review). Persisted so dispatch partitions against the commit the branch
-  // was cut from, never re-derived against `baseRef` a sibling run's fetch can rewind mid-run. A
-  // resume READS the stored value rather than recomputing: its worktree already carries this run's
-  // commits, so `merge-base <base> HEAD` then would answer far behind the true fork.
+  // still sits at it (PR #238 review). A fresh creation's fork is already fixed at the instant
+  // `createWorktree` cut the branch (before warming could rewind the base); only a legacy row or a
+  // reused checkout without a recorded fork re-derives it, and the derived value is persisted so
+  // dispatch partitions against the commit the branch was cut from — never re-derived against
+  // `baseRef` a sibling run's fetch can rewind mid-run. A resume READS the stored value rather than
+  // recomputing: its worktree already carries this run's commits, so `merge-base <base> HEAD` then
+  // would answer far behind the true fork.
   //
   // The pin follows the CHECKOUT, not this run row alone (PR #238 review). Attempts do not all share
   // a row: an ordinary handler failure settles it `failed`, so the runner's retry opens a FRESH row
@@ -85,14 +88,19 @@ export async function warmRunWorktree(
   // run that INHERITED its branch recovers what the attempt that cut it recorded, and only one
   // standing on a branch it just created resolves a fork point of its own. A pre-column branch has
   // neither, and recomputes once — no worse than the old behaviour — storing the answer on its row.
-  const persistedFork =
-    (await getRunBaseForkSha(db, runId)) ??
+  const storedFork = await getRunBaseForkSha(db, runId);
+  const reusedFork =
+    storedFork ??
     (reusedCheckout
       ? await findRunBaseForkShaForBranch(db, projectId, run.targetId, branch)
       : undefined);
   let baseForkSha: string;
   try {
-    baseForkSha = persistedFork ?? (await resolveForkPoint(worktree.path, freshBase));
+    // The creation-captured fork wins: it was read from the new checkout's HEAD before warming, so
+    // it cannot have been rewound by a sibling fetch. A reused checkout falls back to the row (this
+    // run or the attempt that cut the branch); only a legacy row recomputes, against the fresh base.
+    baseForkSha =
+      worktree.forkSha ?? reusedFork ?? (await resolveForkPoint(worktree.path, freshBase));
   } catch (e) {
     // Only reachable when a legacy row (no pinned fork) resumes over a worktree whose base was
     // rewritten to an unrelated history — a fresh creation forks off `freshBase` and always shares
@@ -108,7 +116,9 @@ export async function warmRunWorktree(
     worktreePath: worktree.path,
     branch: worktree.branch,
     attempts: ctx.attempt,
-    ...(persistedFork ? {} : { baseForkSha }),
+    // Persist the creation-captured fork (and a recovered sibling's pin) onto this row; only a
+    // value already stored on this row is left as-is so a resume does not rewrite what it read.
+    ...(storedFork ? {} : { baseForkSha }),
   });
   await ctx.heartbeat();
 

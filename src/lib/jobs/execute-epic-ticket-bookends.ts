@@ -14,6 +14,7 @@ import type { SatisfiedBy } from "../beads/satisfied-note";
 import {
   commitMarker,
   readWorktreeState,
+  resolveHooksPathOverride,
   satisfiedMarkerSubject,
   type WorktreeState,
 } from "../git/ops";
@@ -309,11 +310,30 @@ async function persistRetirementEdge(
     if (!restorableRetirement(fresh, closedAt)) return undefined;
     try {
       await beads.supersede(repo, ticketId, survivor);
-      return undefined;
     } catch (e) {
       console.error(`[execute-epic] bd write failed (attempt ${attempt}/${RESTORE_ATTEMPTS}):`, e);
       why = `bd refused the write: ${errorText(e)}`;
+      continue;
     }
+    // The write's success is not proof the checked closure was restored (PR #238 review). On a
+    // shared-server board `withBeadWriteLock` orders only THIS process: a reopen, abandon, or
+    // re-supersede by another machine can land between the conditional read and the write, and
+    // `bd supersede` would then have closed the newer live state or overwritten its survivor. Re-read
+    // with the write ON the board and accept only the exact retirement this pass set out to re-draw.
+    const after = await beads.show(repo, ticketId).catch((e: unknown) => {
+      console.error(`[execute-epic] bd read-back failed (attempt ${attempt}/${RESTORE_ATTEMPTS}):`, e);
+      why = `bd would not read the ticket back to confirm the restore: ${errorText(e)}`;
+      return undefined;
+    });
+    if (!after) continue;
+    if (restoreHeld(after, closedAt, survivor)) return undefined;
+    // The write landed on a board that had moved since the read. Retrying would overwrite whatever
+    // decision overtook the restore a second time, so stop writing and park: the overtaking decision
+    // is preserved by surfacing it, never by treating this close as the one the fence checked.
+    return (
+      `the edge was written back, but ${ticketId} no longer reads as the retirement it restores — ` +
+      `another hand decided it between the check and the write, and anton does not rewrite that`
+    );
   }
   return why;
 }
@@ -335,7 +355,25 @@ function restorableRetirement(fresh: Bead, closedAt: string | undefined): boolea
   // A close is not a durable identity: an intervening reopen followed by an ordinary close has the
   // same status and no edge, but belongs to another decision. Only redraw the edge on the precise
   // closure the post-unlink fence observed; otherwise leave the newer close untouched.
-  return Boolean(closedAt) && fresh.closed_at === closedAt && beads.supersedesTarget(fresh) === undefined;
+  if (!Boolean(closedAt) || fresh.closed_at !== closedAt) return false;
+  return beads.supersedesTarget(fresh) === undefined;
+}
+
+/**
+ * Whether a read taken AFTER the restore wrote still reads as the retirement this pass set out to
+ * re-draw — the post-write fence {@link persistRetirementEdge} lands. Anything else means another
+ * hand decided the ticket in the window: a reopen/re-claim, an abandon, a close in another cycle
+ * (`closed_at` moved), or a re-supersede against a different survivor. The write's own success
+ * proved nothing, because `bd supersede` shuts the board-dangerous race (a live ticket it re-closes,
+ * or a survivor it overwrites) before any later reader can see it — only a fresh read can.
+ */
+function restoreHeld(after: Bead, closedAt: string | undefined, survivor: string): boolean {
+  if (after.status !== "closed" || beads.isAbandoned(after)) return false;
+  if (!Boolean(closedAt) || after.closed_at !== closedAt) return false;
+  // The edge is asserted (not just the status): a survivor STRIPPED in the same window leaves a
+  // valid close with no survivor recorded, the state the next attempt misreads as a cross-machine
+  // resume, so a close without this survivor on the board is still "not restored".
+  return beads.supersedesTarget(after) === survivor;
 }
 
 /**
@@ -659,6 +697,11 @@ async function recordSatisfiedOnBranch(
 ): Promise<void> {
   const cited = by.subject ? `${shortSha(by.commit)} "${by.subject}"` : shortSha(by.commit);
   try {
+    // `hooksPath` is resolved and passed through for the same reason the preserve retry does it:
+    // `commitMarker`'s `--no-verify` bypasses only `pre-commit`/`commit-msg`, so a generated,
+    // base-only hook still needs the base repo's copy resolved rather than this cold worktree's own,
+    // nonexistent one (PR #263 review, round 15).
+    const hooksPath = await resolveHooksPathOverride(run.repoPath, run.worktreePath);
     await commitMarker(
       run.worktreePath,
       // The satisfying commit is named in the SUBJECT by full sha, so a reviewer meeting this marker
@@ -670,7 +713,7 @@ async function recordSatisfiedOnBranch(
         `own. This empty commit records the attribution no subject on this branch carries — it is ` +
         `what a later attempt reads to see the ticket as delivered instead of dispatching it into ` +
         `a zero diff.`,
-      { satisfies: [ticket.id] },
+      { satisfies: [ticket.id], hooksPath },
     );
   } catch (e) {
     throw new PoisonEpic(

@@ -15,6 +15,7 @@ import {
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
   enqueueReviewFixPrIfAbsent,
+  enqueueScheduledTypeIfAbsent,
   getJob,
   resumeBudgetDeferredJobs,
   resumeJob,
@@ -22,6 +23,7 @@ import {
   toMs,
 } from "./queue";
 import { insertProject } from "@/lib/testing/project";
+import { createSchedule } from "../schedules";
 
 let t: TestDb;
 beforeEach(() => {
@@ -515,5 +517,106 @@ describe("enqueueReviewFixPrIfAbsent", () => {
     const b = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-2");
     const c = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p2", "epic-1");
     expect(new Set([a, b, c]).size).toBe(3);
+  });
+});
+
+/**
+ * PR #264 review: the board-change nudge (picker-nudge.ts) checked `queuedJobId` before calling its
+ * injected `enqueue`, but that check and the insert were two separate operations with an await
+ * between them — a scheduler tick or a manual "Run now" fire landing in that window was invisible to
+ * it and could double-fire the pass. `enqueueScheduledTypeIfAbsent` closes that window with one
+ * synchronous transaction, the same pattern `enqueueReviewFixPrIfAbsent` already uses.
+ */
+describe("enqueueScheduledTypeIfAbsent", () => {
+  it("returns the existing job id and inserts no new row when one is already active", () => {
+    const a = enqueueScheduledTypeIfAbsent(t.db, systemClock, "nightly-stringer", "p1", {});
+    const b = enqueueScheduledTypeIfAbsent(t.db, systemClock, "nightly-stringer", "p1", {});
+    expect(b).toBe(a);
+    expect(t.db.select().from(schema.jobs).all()).toHaveLength(1);
+  });
+
+  it("dedupes against a running job, not just a queued one, under the default coveredBy", () => {
+    const a = enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", {});
+    t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
+    const b = enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", {});
+    expect(b).toBe(a);
+    expect(t.db.select().from(schema.jobs).all()).toHaveLength(1);
+  });
+
+  it("coveredBy: ['queued'] does NOT treat a running job as covering — the nudge's own semantics", () => {
+    const a = enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", {});
+    t.db.update(schema.jobs).set({ status: "running" }).where(eq(schema.jobs.id, a)).run();
+    const b = enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", {}, {
+      coveredBy: ["queued"],
+    });
+    expect(b).not.toBe(a);
+    expect(t.db.select().from(schema.jobs).all()).toHaveLength(2);
+  });
+
+  it("keeps types and projects independent", () => {
+    const a = enqueueScheduledTypeIfAbsent(t.db, systemClock, "nightly-stringer", "p1", {});
+    const b = enqueueScheduledTypeIfAbsent(t.db, systemClock, "orphan-grooming", "p1", {});
+    const c = enqueueScheduledTypeIfAbsent(t.db, systemClock, "nightly-stringer", "p2", {});
+    expect(new Set([a, b, c]).size).toBe(3);
+  });
+
+  it("refuses a project mid-teardown", () => {
+    expect(() =>
+      enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", {}, {
+        refuseProject: (projectId) => projectId === "p1",
+      }),
+    ).toThrow(/being deleted/);
+    expect(t.db.select().from(schema.jobs).all()).toHaveLength(0);
+  });
+
+  // PR #264 review: without this stamp, a caller whose payload names a scheduleId (the board-picker
+  // nudge) inserts a job that's visible to schedule-keyed reads but leaves schedules.lastRunAt
+  // untouched — a first-ever fire would still show "never", and a later one would date itself
+  // against a stale stamp from whatever fire last used the scheduler/Run now paths.
+  it("stamps schedules.lastRunAt in the same transaction when scheduleId is passed", async () => {
+    const scheduleId = await createSchedule(t.db, systemClock, {
+      projectId: "p1",
+      type: "board-picker",
+      cron: "*/10 * * * *",
+    });
+    const before = t.db
+      .select({ lastRunAt: schema.schedules.lastRunAt })
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, scheduleId))
+      .get();
+    expect(before?.lastRunAt).toBeNull();
+
+    const jobId = enqueueScheduledTypeIfAbsent(
+      t.db,
+      systemClock,
+      "board-picker",
+      "p1",
+      { projectId: "p1", scheduleId },
+      { scheduleId },
+    );
+
+    const job = await getJob(t.db, jobId);
+    const after = t.db
+      .select({ lastRunAt: schema.schedules.lastRunAt })
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, scheduleId))
+      .get();
+    expect(after?.lastRunAt?.getTime()).toBe(job!.createdAt.getTime());
+  });
+
+  it("does not touch schedules.lastRunAt when scheduleId is omitted", async () => {
+    const scheduleId = await createSchedule(t.db, systemClock, {
+      projectId: "p1",
+      type: "board-picker",
+      cron: "*/10 * * * *",
+    });
+    enqueueScheduledTypeIfAbsent(t.db, systemClock, "board-picker", "p1", { projectId: "p1" });
+
+    const after = t.db
+      .select({ lastRunAt: schema.schedules.lastRunAt })
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, scheduleId))
+      .get();
+    expect(after?.lastRunAt).toBeNull();
   });
 });

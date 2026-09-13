@@ -51,8 +51,13 @@ export async function refreshRunBoard(
   //    when our pre-check couldn't rule it out (anton-jz1).
   let preCheckTrusted = true;
   let currentBoardTrusted = false;
+  // Pull success is the whole of what "fresh board" means off a shared-server board: `beads.pull`
+  // resolves without throwing on a no-remote or server-mode board too, but only a real pull makes
+  // the local clone reflect what other machines have written since the top-of-handler snapshot.
+  let pulled = false;
   try {
     await beads.pull(repo);
+    pulled = true;
   } catch {
     preCheckTrusted = false; // stale local snapshot — an incumbent lease may be invisible below
   }
@@ -88,7 +93,13 @@ export async function refreshRunBoard(
       // read `leaseTarget`. Leaving it stale would let a run whose completion/lease is visible in
       // this fresh list fall through into worktree/PR handling instead of finishing idempotently.
       leaseTarget = freshTarget;
-      currentBoardTrusted = true;
+      // The board is trusted only if the pull that was supposed to refresh it succeeded. On a
+      // non-server shared board a failed pull leaves the local clone stale, so `fresh` here reflects
+      // the same snapshot the pre-pull read carried — and adopting its shape as "current" would let
+      // `settleCompletedRun` accept a stale standalone retirement while another machine has since
+      // filed a child beneath it. Server mode never throws, so `pulled` stays true there; a no-remote
+      // board has no other machine to be stale against, and its pull resolves without throwing too.
+      currentBoardTrusted = pulled;
     }
   } catch {
     // keep the pre-pull snapshot
