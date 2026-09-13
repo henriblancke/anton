@@ -16,7 +16,7 @@ import { updateRun } from "../runs";
 import { releaseRunResources } from "./worktree-reaper";
 import { PoisonEpic } from "./errors";
 import { armMergeGate } from "./execute-epic-merge-gate";
-import { safe } from "./execute-epic-persist";
+import { mustReadBoard, safe } from "./execute-epic-persist";
 import type { EpicRun } from "./execute-epic-run";
 
 /**
@@ -359,11 +359,53 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
   const closedAt = stamped.closed_at ? Date.parse(stamped.closed_at) : Number.NaN;
   if (!Number.isFinite(closedAt) || repair.at < closedAt) return false;
 
+  // The refresh that admitted this settlement and its terminal row write are unordered with other
+  // board writers. Re-list immediately before the row write: a child attached before this boundary
+  // makes the target grouped, so recovering it as a completed standalone run would strand that work.
+  const childlessNow = async (): Promise<boolean> => {
+    const current = await mustReadBoard(repo);
+    const currentTarget = current?.find((bead) => bead.id === targetId);
+    return Boolean(currentTarget) && !beads.groupsChildren(currentTarget!, runTickets(current!, targetId));
+  };
+  if (!(await childlessNow())) {
+    throw new PoisonEpic(
+      `${targetId} gained child tickets before anton could settle its already-shipped retirement — ` +
+        `the target is closed and cannot safely switch from a standalone run to a grouped run. ` +
+        `Resolve the board topology before resuming.`,
+    );
+  }
+
   // This attempt's own leftover lease, exactly as the live-PR short-circuit adopts it: a crash after
   // the supersede but before the cleanup leaves an unexpired `run-lease:…:<runId>` this run
   // published, and the general adoption runs after this return. Only OUR OWN — a foreign machine's
   // lease is left for its owner and its TTL.
   lease.adoptOwn(leaseTarget);
+  // The row says what happened, in the words `finishRun` would have used for the same run: a
+  // verified retirement, and no pull request because nothing was committed. Nothing is written to
+  // the BEAD here — the retirement already put its own evidence and repair notes there, under the
+  // ticket's lock and before the window this recovers from, so the account a person reads at the
+  // target is intact and a second note would only repeat it.
+  await updateRun(db, clock, runId, {
+    status: "done",
+    endedAt: clock.now(),
+    error:
+      `${targetId} had already shipped — anton verified that against the repository and the board ` +
+      `and retired it as superseded by ${survivor}` +
+      `${repair.attempted ? ` (${repair.attempted})` : ""}. Nothing was committed here, so this ` +
+      `run opened no pull request and nothing is left to run.`,
+  });
+  // `updateRun` is local, but it is still the boundary that makes this attempt terminal. A re-parent
+  // from another writer can land while it is being recorded, so fence it too. The closed target cannot
+  // safely enter grouped preparation — its claim gate accepts only open targets — and returning false
+  // would both continue through that invalid path and leave a terminal row behind. Poison so the
+  // attempt's normal settlement records the topology conflict as failed instead of as a false success.
+  if (!(await childlessNow())) {
+    throw new PoisonEpic(
+      `${targetId} gained child tickets while anton recorded its already-shipped retirement — the ` +
+        `target is closed and cannot safely switch from a standalone run to a grouped run. Resolve ` +
+        `the board topology before resuming; anton will not report the retirement as settled.`,
+    );
+  }
   // Nothing was committed, so the checkout is pure residue and the branch goes with it: the target
   // is settled, and no pull request was ever opened from it. Routed through the same teardown as
   // every other terminal exit (anton-hrun.1) so it owes the same branch policy and session account,
@@ -386,20 +428,6 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
       beadId: targetId,
       status: "done",
     });
-  });
-  // The row says what happened, in the words `finishRun` would have used for the same run: a
-  // verified retirement, and no pull request because nothing was committed. Nothing is written to
-  // the BEAD here — the retirement already put its own evidence and repair notes there, under the
-  // ticket's lock and before the window this recovers from, so the account a person reads at the
-  // target is intact and a second note would only repeat it.
-  await updateRun(db, clock, runId, {
-    status: "done",
-    endedAt: clock.now(),
-    error:
-      `${targetId} had already shipped — anton verified that against the repository and the board ` +
-      `and retired it as superseded by ${survivor}` +
-      `${repair.attempted ? ` (${repair.attempted})` : ""}. Nothing was committed here, so this ` +
-      `run opened no pull request and nothing is left to run.`,
   });
   return true;
 }

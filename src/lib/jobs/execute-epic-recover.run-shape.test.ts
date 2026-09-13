@@ -16,6 +16,7 @@ import type { Bead } from "../beads/bd";
 import { repairLabel } from "../gardener/repair";
 
 const showMock = vi.fn();
+const loadAllIssuesMock = vi.fn();
 const updateRunMock = vi.fn();
 const releaseRunResourcesMock = vi.fn();
 const findWorktreeMock = vi.fn();
@@ -32,6 +33,11 @@ vi.mock("../beads/bd", async () => {
 vi.mock("../runs", async () => {
   const actual = await vi.importActual<typeof import("../runs")>("../runs");
   return { ...actual, updateRun: (...a: unknown[]) => updateRunMock(...a) };
+});
+
+vi.mock("../beads/issues", async () => {
+  const actual = await vi.importActual<typeof import("../beads/issues")>("../beads/issues");
+  return { ...actual, loadAllIssues: (...a: unknown[]) => loadAllIssuesMock(...a) };
 });
 
 vi.mock("./worktree-reaper", () => ({
@@ -94,6 +100,7 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     showMock.mockImplementation(async () => retiredTarget());
+    loadAllIssuesMock.mockImplementation(async () => [retiredTarget()]);
     findWorktreeMock.mockResolvedValue(undefined);
   });
 
@@ -109,6 +116,8 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
     const target = retiredTarget();
 
     expect(await settleCompletedRun(run([target], target), target)).toBe(true);
+    // The adjacent board recheck found the same standalone shape before recording the terminal row.
+    expect(loadAllIssuesMock).toHaveBeenCalledWith(REPO, { strictGates: true });
     // Settled as a finished run, with no PR, exactly as the uninterrupted attempt would.
     expect(updateRunMock).toHaveBeenCalledWith(
       expect.anything(),
@@ -116,6 +125,35 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
       "run-1",
       expect.objectContaining({ status: "done" }),
     );
+  });
+
+  it("poisons the run when the adjacent board recheck finds a new child", async () => {
+    const target = retiredTarget();
+    loadAllIssuesMock.mockResolvedValue([target, child()]);
+
+    await expect(settleCompletedRun(run([target], target), target)).rejects.toThrow(
+      "gained child tickets before anton could settle",
+    );
+    expect(updateRunMock).not.toHaveBeenCalled();
+  });
+
+  it("poisons the run when a child lands while the terminal row is written", async () => {
+    const target = retiredTarget();
+    loadAllIssuesMock
+      .mockResolvedValueOnce([target])
+      .mockResolvedValueOnce([target, child()]);
+
+    await expect(settleCompletedRun(run([target], target), target)).rejects.toThrow(
+      "gained child tickets while anton recorded",
+    );
+    expect(updateRunMock).toHaveBeenCalledTimes(1);
+    expect(updateRunMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      "run-1",
+      expect.objectContaining({ status: "done" }),
+    );
+    expect(releaseRunResourcesMock).not.toHaveBeenCalled();
   });
 
   it("does not recover a retirement from a board read that could not be refreshed", async () => {

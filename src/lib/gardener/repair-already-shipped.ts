@@ -1712,21 +1712,22 @@ async function retirementOvertaken(args: {
   const { repoPath, targetId, replacementId, stamp } = args;
   const target = await readBead(repoPath, targetId, "after");
   const stillOurClose = typeof target !== "string" && beads.supersededBy(target) === replacementId;
-  // Still anton's own close AND the marker still on it: the retirement stands whole, nothing to do.
-  // The marker is asserted, not just the supersede (PR #238 review): a writer that STRIPPED
-  // `not-delivered` while leaving the ticket superseded would pass a supersede-only check, and the
-  // caller would take `marked: true` for a marker the board no longer carries — a retirement merge
-  // finalization can no longer preserve if the ticket is reopened in review.
-  if (stillOurClose && beads.isNotDelivered(target)) return undefined;
-  // Still the close anton wrote, but the marker was stripped in the window (PR #238 review). The
-  // retirement is valid, so nothing is reopened and there is no live work to clear it off — but
-  // unmarked it is invisible to merge finalization, which could then close a reopen of it as shipped
-  // by this run's PR. Reported so the caller stops rather than open one.
+  const stampPresent = !stamp || (typeof target !== "string" && target.labels?.includes(stamp));
+  // The marker and, on the last fence, the stamp are both part of the retirement's durable account.
+  // A writer can remove either one while leaving the supersede in place, so accepting the close alone
+  // would make a later recovery believe this repair still owns the ticket when its guard is gone.
+  if (stillOurClose && beads.isNotDelivered(target) && stampPresent) return undefined;
+  // Still the close anton wrote, but a retirement marker or its final repair stamp was stripped in the
+  // window. The retirement remains valid, so nothing is reopened, but it is not a whole retirement
+  // anton may report as settled.
   if (stillOurClose) {
+    const missing = !beads.isNotDelivered(target)
+      ? `\`${LABELS.notDelivered}\` marker`
+      : `repair stamp \`${stamp}\``;
     return (
-      `${targetId} is retired as superseded by ${replacementId}, but its \`${LABELS.notDelivered}\` ` +
-      `marker was stripped between the retirement and this reread — unmarked, a reopen of it in ` +
-      `review could be closed as shipped by this run's PR, so the run stops rather than open one`
+      `${targetId} is retired as superseded by ${replacementId}, but its ${missing} was stripped ` +
+      `between the retirement and this reread — a repair without its durable guard cannot be accepted, ` +
+      `so the run stops rather than report it as settled`
     );
   }
   // Not anton's close reads TWO ways, and only one of them puts the marker on work a run could pick
