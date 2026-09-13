@@ -509,30 +509,43 @@ async function prepareFixWorktree(args: {
     mergeIntoCurrent(worktree.path, syncRef, { ffOnly: true, hooksPath: syncHooksPath }),
   );
 
-  // Resolved AFTER the sync above, unlike the fast-forward: this premerge is a plain command against
-  // whatever the worktree already has checked out (the sync's own hooks-directory changes, if any,
-  // already landed), so the override here is answering the ordinary "was this generated, like Husky's
-  // .husky/_?" question resolveHooksPathOverride is for — not racing a merge that hasn't run yet.
-  const hooksPath = await resolveHooksPathOverride(repo, worktree.path);
-  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number, hooksPath);
+  // This premerge brings in a DIFFERENT ref than the sync above (`origin/${baseBranch}`, the PR's
+  // base, not `origin/${branch}`), so it needs the identical incoming-ref-aware resolution — the
+  // sync's own comment explains why resolveHooksPathOverride (answering "what does the CURRENT
+  // checkout need") is wrong for a merge that hasn't run yet. An earlier round resolved this
+  // premerge's override against the current checkout instead of `origin/${baseBranch}`, which is the
+  // same bug in a new spot: a conflicting PR's base can introduce or advance a tracked hooks
+  // directory/submodule the feature worktree doesn't have, and the stale current-checkout answer
+  // would skip a newly-introduced `post-merge` or run an old submodule checkout `git merge` never
+  // updates on its own (PR #263 review, round 30). `needsHooksPathOverrideForMerge` asks only whether
+  // the incoming ref changes something about the hooksPath directory/submodule relative to the
+  // current checkout — nothing in it assumes the resulting merge is fast-forward-only, so it applies
+  // equally to this non-`ffOnly` premerge. Resolution is done inside `premergeBase` itself, after its
+  // own `baseBranch` guard, rather than unconditionally here — there is no `origin/${baseBranch}` ref
+  // to resolve against (nor any point doing the work) when there is no conflict to premerge at all.
+  const conflicts = await premergeBase(repo, worktree.path, pr, baseBranch, number);
   await ctx.heartbeat();
   return { worktree, conflicts };
 }
 
 /** The base merge GitHub says this PR needs — its conflicts are what claude is asked to resolve. */
 async function premergeBase(
+  repo: string,
   worktreePath: string,
   pr: PrReview,
   baseBranch: string | undefined,
   number: number,
-  hooksPath: string | undefined,
 ): Promise<string[]> {
   if (pr.mergeable !== "CONFLICTING" || !baseBranch) return [];
+  const baseRef = `origin/${baseBranch}`;
+  const hooksPath = (await needsHooksPathOverrideForMerge(repo, worktreePath, baseRef))
+    ? await resolveHooksPathOverrideForMerge(repo, worktreePath, baseRef)
+    : undefined;
   try {
-    const merge = await mergeIntoCurrent(worktreePath, `origin/${baseBranch}`, { hooksPath });
+    const merge = await mergeIntoCurrent(worktreePath, baseRef, { hooksPath });
     return merge.conflicts; // clean auto-merge → a merge commit is pushed below
   } catch (e) {
-    consoleLog.error(`PR #${number}: merging origin/${baseBranch} failed`, e);
+    consoleLog.error(`PR #${number}: merging ${baseRef} failed`, e);
     return [];
   }
 }

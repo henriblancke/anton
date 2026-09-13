@@ -39,15 +39,32 @@ function isUnknownOptionError(error: unknown): boolean {
  * itself with exit 129, which a blanket catch cannot tell apart from `--get`'s own "key not set" exit
  * (1, no output) — misreading "can't tell the scope" as "no override at all" and letting a generated
  * hooksPath (Husky's `.husky/_`) resolve inside a cold worktree with no override, so its hook never
- * fires. A plain `--path --get` (no `--show-scope`) works on every git this project supports, so an
- * unrecognized-flag failure retries with that instead of jumping straight to "unset": if IT succeeds,
- * the key is confirmed SET but the scope is unknowable here — reported as `"unknown"`, deliberately
- * never `"worktree"` (the one scope both callers treat as never-falls-back; misreporting an ordinary
- * local/global hooksPath as worktree-scoped would suppress its hook instead of running it — the
- * opposite failure from the one this fixes). Only the fallback's OWN "key not set" exit means
- * genuinely unset; anything else (a corrupt config file, git's ret=3) propagates rather than being
- * swallowed as absence, same principle as {@link isTrackedInBaseRepo}'s "not tracked" vs. "couldn't
- * tell".
+ * fires. An unrecognized-flag failure retries with `--show-origin --path --get` instead of jumping
+ * straight to "unset": `--show-origin` is Git 1.8.5+ — old enough to be safe on every git this project
+ * supports — and, unlike a plain `--path --get`, still carries enough information to recover exactly
+ * the one scope distinction every caller actually branches on.
+ *
+ * That distinction is `"worktree"` vs. everything else, never a full scope taxonomy: both
+ * {@link resolveHooksPathOverride} and {@link resolveHooksPathOverrideForMerge} key their
+ * never-falls-back-to-the-base-repo guard on `scope === "worktree"` specifically. Reporting every
+ * legacy-path config value as `"unknown"` (an earlier round's fix) satisfied that guard for a
+ * REPO-scoped value — `"unknown" !== "worktree"` still let it fall back where it should — but a
+ * genuinely worktree-scoped value on the SAME legacy git also read as `"unknown"`, which the guard
+ * treats as fair game to fall back too, exactly the leak the whole `scope` mechanism exists to
+ * prevent (PR #263 review, round 30). `--show-origin`'s output — one line, `<type>:<path>\t<value>`
+ * (git-config(1)) — is what tells the two apart without `--show-scope`: git's own per-worktree config
+ * file is `$GIT_DIR/worktrees/<id>/config.worktree` for a linked worktree (gitrepository-layout(5)),
+ * so a `file:` origin whose path matches that shape means this value was set via
+ * `git config --worktree …` and belongs to `"worktree"` scope; every other origin (the ordinary repo
+ * `config`, a user's global `.gitconfig`, `system`, `command line`, …) reports `"unknown"`, preserving
+ * this function's existing behavior for every case that isn't the one bug being fixed. This
+ * deliberately does not attempt to distinguish local/global/system on the legacy path — no caller
+ * branches on any scope value other than `"worktree"`, so reproducing `--show-scope`'s full label set
+ * here would be pure overengineering.
+ *
+ * Only the fallback's OWN "key not set" exit means genuinely unset; anything else (a corrupt config
+ * file, git's ret=3) propagates rather than being swallowed as absence, same principle as
+ * {@link isTrackedInBaseRepo}'s "not tracked" vs. "couldn't tell".
  */
 async function readHooksPathConfig(
   queryFrom: string,
@@ -71,10 +88,26 @@ async function readHooksPathConfig(
   try {
     const { stdout } = await execFileAsync(
       "git",
-      ["-C", queryFrom, "config", "--path", "--get", "core.hooksPath"],
+      ["-C", queryFrom, "config", "--show-origin", "--path", "--get", "core.hooksPath"],
       { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
     );
-    return { scope: "unknown", raw: stdout.replace(/\n$/, "") };
+    // `--show-origin` prefixes one tab-delimited `<type>:<path>` field before the value, same
+    // split-once shape as `--show-scope` above (git-config(1)).
+    const tab = stdout.indexOf("\t");
+    const origin = stdout.slice(0, tab);
+    const raw = stdout.slice(tab + 1).replace(/\n$/, "");
+    const colon = origin.indexOf(":");
+    const originType = colon === -1 ? origin : origin.slice(0, colon);
+    const originPath = colon === -1 ? "" : origin.slice(colon + 1);
+    // A linked worktree's own per-worktree config file, per gitrepository-layout(5) — the only
+    // origin shape that means `git config --worktree …` set this value. Everything else (the
+    // repo's ordinary `config`, `~/.gitconfig`, `/etc/gitconfig`, `command line`, …) is reported as
+    // `"unknown"`, matching this function's pre-existing behavior for every non-worktree case.
+    const scope =
+      originType === "file" && /\/worktrees\/[^/]+\/config\.worktree$/.test(originPath)
+        ? "worktree"
+        : "unknown";
+    return { scope, raw };
   } catch (e) {
     if (exitedWith(e, 1)) return undefined; // unset, confirmed without --show-scope's help
     throw e; // same key, same config files — a real failure, not absence

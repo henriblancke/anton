@@ -1540,6 +1540,40 @@ suite("resolveHooksPathOverride (real git)", () => {
     writeFileSync(join(repo, ".git", "config"), "[core\n", { flag: "a" });
     await expect(resolveHooksPathOverride(repo)).rejects.toThrow();
   });
+
+  // PR #263 review, round 30: on a `--show-scope`-unsupported git, a worktree-scoped hooksPath must
+  // still be recovered as `"worktree"` (via the `--show-origin` fallback), not `"unknown"` — reporting
+  // it as `"unknown"` would let the never-falls-back-to-the-base-repo guard treat it as fair game to
+  // fall back, exactly the leak the whole `scope` mechanism exists to prevent.
+  it("recovers worktree scope from --show-origin when --show-scope is unsupported", async () => {
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init", "--allow-empty"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "extensions.worktreeConfig", "true"], {
+      stdio: "ignore",
+    });
+
+    const worktree = join(sandbox, "legacy-worktree-scope");
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-1", worktree], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", worktree, "config", "--worktree", "core.hooksPath", ".hooks"], {
+      stdio: "ignore",
+    });
+    // A same-named directory in the BASE repo — if scope were misread as anything but "worktree",
+    // the never-falls-back guard would let this stand in for the missing worktree-local ".hooks".
+    mkdirSync(join(repo, ".hooks"));
+    writeFileSync(join(repo, ".hooks", "post-commit"), "#!/bin/sh\nexit 0\n");
+
+    const binDir = shimGitRejectingShowScope(sandbox);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    try {
+      expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, ".hooks"));
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
 });
 
 // A caller merging a fetched ref into its own worktree needs a NARROWER answer than
