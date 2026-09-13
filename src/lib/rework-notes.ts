@@ -270,12 +270,12 @@ function containerFenceLines(description: string): { fenced: boolean[]; openers:
   const lines = description.split(/\r?\n/);
   const fenced = Array.from({ length: lines.length }, () => false);
   const openers = Array.from({ length: lines.length }, () => false);
-  let open: { prefix: string; fence: ReturnType<typeof openingFence> } | undefined;
-  let itemPrefix: string | undefined;
+  let open: { indent: number; fence: ReturnType<typeof openingFence> } | undefined;
+  let itemIndent: number | undefined;
   for (let at = 0; at < lines.length; at += 1) {
     const text = lines[at]!;
     if (open) {
-      const inner = text.startsWith(open.prefix) ? text.slice(open.prefix.length) : undefined;
+      const inner = text.trim() === "" ? "" : removeIndentColumns(text, open.indent);
       if (inner === undefined) {
         open = undefined;
       } else {
@@ -288,18 +288,18 @@ function containerFenceLines(description: string): { fenced: boolean[]; openers:
     if (item) {
       // Continuations begin at the content column. Keep this even when the marker's own line is
       // prose: a fence can open on its following line (`- example` then `  ```md`).
-      itemPrefix = text.slice(0, text.length - item[1]!.length).replace(/[^\t]/g, " ");
+      itemIndent = indentationColumns(text.slice(0, text.length - item[1]!.length));
     // A blank alone does not leave a list item; its following continuation may still be at the
     // item's content column. Only actual dedented content closes this remembered container.
-    } else if (itemPrefix && text.trim() !== "" && !text.startsWith(itemPrefix)) {
-      itemPrefix = undefined;
+    } else if (itemIndent && text.trim() !== "" && indentationColumns(text) < itemIndent) {
+      itemIndent = undefined;
     }
-    const inner = itemPrefix && text.startsWith(itemPrefix) ? text.slice(itemPrefix.length) : text;
-    const nestedFence = openingFence(inner);
-    if (nestedFence && itemPrefix) {
+    const inner = itemIndent ? removeIndentColumns(text, itemIndent) : text;
+    const nestedFence = inner && openingFence(inner);
+    if (nestedFence && itemIndent) {
       fenced[at] = true;
       openers[at] = true;
-      open = { prefix: itemPrefix, fence: nestedFence };
+      open = { indent: itemIndent, fence: nestedFence };
       continue;
     }
     const fence = item && openingFence(item[1]!);
@@ -308,13 +308,42 @@ function containerFenceLines(description: string): { fenced: boolean[]; openers:
       openers[at] = true;
       // Continuation lines sit at the list item's content column; repeating `- ` would start a
       // sibling item instead of remaining inside the fence.
-      open = {
-        prefix: text.slice(0, text.length - item[1]!.length).replace(/[^\t]/g, " "),
-        fence,
-      };
+      open = { indent: indentationColumns(text.slice(0, text.length - item[1]!.length)), fence };
     }
   }
   return { fenced, openers };
+}
+
+/** Remove a list container's indentation by rendered column, not its source spelling. */
+function removeIndentColumns(text: string, required: number): string | undefined {
+  let at = 0;
+  let column = 0;
+  while (at < text.length && column < required) {
+    const char = text[at]!;
+    if (char === " ") {
+      column += 1;
+    } else if (char === "\t") {
+      column += 4 - (column % 4);
+    } else {
+      return undefined;
+    }
+    at += 1;
+  }
+  return column >= required ? text.slice(at) : undefined;
+}
+
+function indentationColumns(text: string): number {
+  let at = 0;
+  while (at < text.length && (text[at] === " " || text[at] === "\t")) at += 1;
+  return visualColumns(text.slice(0, at));
+}
+
+function visualColumns(text: string): number {
+  let column = 0;
+  for (const char of text) {
+    column += char === "\t" ? 4 - (column % 4) : 1;
+  }
+  return column;
 }
 
 /** Every section under one of `keys` as the judge sees it: `start` is its heading's line, `end` the line opening the next section. */

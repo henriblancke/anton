@@ -998,6 +998,28 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
   });
 
+  it("keeps a list-contained fence when its continuation uses equivalent column indentation", () => {
+    // `-\t` and four spaces both reach column four. Comparing their source-shaped prefixes treated
+    // the sample's Acceptance-looking heading as real and swapped it, even though CommonMark keeps
+    // it inside the list container's fence.
+    const tabIndentedFence = [
+      "## Goal",
+      "g",
+      "",
+      "-\t```md",
+      "    ## Acceptance Criteria",
+      "    - [ ] stale sample",
+      "    ```",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(tabIndentedFence, edited);
+
+    expect(reconciled).toContain("    ## Acceptance Criteria\n    - [ ] stale sample\n    ```");
+    expect(reconciled).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).not.toContain(
+      "stale sample",
+    );
+  });
+
   it("replaces a visible Acceptance section after a list-contained fence ends by dedent", () => {
     // The flat scanner otherwise holds the two-space fence open through the dedented heading. In
     // CommonMark that dedent leaves the list (and hence closes its fence), so this is the actual
