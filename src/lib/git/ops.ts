@@ -392,6 +392,28 @@ export async function resolveHooksPathOverride(
     return matches ? resolve(repoPath, raw) : inWorktree;
   }
 
+  // No CURRENT containing gitlink anywhere in `raw`'s ancestry — but for a NESTED hooksPath
+  // (`core.hooksPath=deps/hooks`, `deps` the gitlink), that is exactly what a cold, brand-new
+  // worktree checking out a branch that already deleted `deps` looks like too: nothing left an
+  // orphaned checkout on disk here for `orphanedSubmoduleAncestor` to find (that helper needs a
+  // leftover `.git` gitfile, which only exists in a worktree that once had the submodule
+  // initialized), so this worktree has never even glimpsed `deps` at all. Neither
+  // `isTrackedInBaseRepo` nor `everTrackedOnBranch` below can see this shape either: both query
+  // `raw`'s own EXACT literal path (`deps/hooks`), and a submodule's tree entry only ever exists at
+  // the gitlink's OWN path (`deps`) — the superproject's index/tree never records anything nested
+  // inside a submodule, initialized or not (gitsubmodules(7)) — so both probes structurally answer
+  // "not tracked" for the nested path regardless of whether the CONTAINING gitlink was ever real.
+  // Left unchecked, this fell through to `trackedSomewhere` reading `false` for the wrong reason (not
+  // because `deps/hooks` was actually generated, but because neither probe can see the nested shape
+  // at all) and handed back the base repo's still-initialized `deps/hooks` — resurrecting hooks from
+  // a submodule the feature branch deleted, the same class of bug the orphan-marker checks above
+  // exist to prevent. `historicalAncestorGitlink` answers the question those probes structurally
+  // cannot: was any ancestor of `raw` EVER a gitlink in this branch's own history, current or not.
+  // Finding one means `raw` is nested inside (or is) a submodule this branch deleted, not a generated
+  // directory — `inWorktree` (git's own "nothing exists, no hook fires" answer) is correct
+  // regardless of scope, never the base repo's stale copy (PR #263 review, round 34).
+  if (await historicalAncestorGitlink(worktreePath, raw)) return inWorktree;
+
   // Missing in the worktree — fall back to the base repo's copy only when NEITHER checkout has ever
   // tracked it (a generated directory like Husky's `.husky/_`, never committed at all) AND the value
   // isn't worktree-scoped, which never falls back to the base repo regardless (the never-falls-back
@@ -455,6 +477,71 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
     { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
   );
   return stdout.trim().length > 0;
+}
+
+/**
+ * Whether `relPath` or any of its ancestor path segments was EVER (at any point in
+ * `worktreePath`'s OWN branch history, current tree already ruled out by {@link
+ * ancestorSubmoduleSha} before this runs) a submodule gitlink (mode `160000`) that this branch
+ * later deleted. Closes a gap neither {@link isTrackedInBaseRepo} nor {@link everTrackedOnBranch}
+ * can see for a NESTED hooksPath (`core.hooksPath=deps/hooks`, `deps` the gitlink): both query
+ * `relPath`'s own EXACT literal path, and a submodule's tree entry only ever exists at the
+ * gitlink's OWN path — the superproject's index/tree never records anything nested inside a
+ * submodule, initialized or not (gitsubmodules(7)) — so neither probe can answer "was the
+ * CONTAINING gitlink ever real" for a nested path (PR #263 review, round 34).
+ *
+ * Walked the same ancestor-segment way {@link ancestorSubmoduleSha} walks the current tree, but
+ * historically: for each segment, the most recent commit (reachable from this branch's `HEAD`,
+ * not `--all` — a sibling branch's history says nothing about what THIS branch did) that deleted
+ * it is found via `--diff-filter=D`, and that commit's PARENT tree is checked for a `160000` mode
+ * at the same path — confirming the deleted entry was actually a gitlink, not an ordinary
+ * directory or Husky-style generated path that happened to exist and later got removed too.
+ */
+async function historicalAncestorGitlink(worktreePath: string, relPath: string): Promise<boolean> {
+  let candidate = posixNormalize(relPath);
+  while (candidate !== "." && candidate !== "/") {
+    if (await wasGitlinkDeletedOnBranch(worktreePath, candidate)) return true;
+    const parent = posixDirname(candidate);
+    if (parent === candidate) break;
+    candidate = parent;
+  }
+  return false;
+}
+
+/**
+ * Whether `worktreePath`'s own branch history contains a commit that deleted `relPath` while it
+ * was a submodule gitlink (mode `160000`) at that time — the per-segment check {@link
+ * historicalAncestorGitlink} runs at each ancestor level.
+ */
+async function wasGitlinkDeletedOnBranch(worktreePath: string, relPath: string): Promise<boolean> {
+  let deletionSha: string;
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "log", "-1", "--diff-filter=D", "--format=%H", "--", `:(literal)${relPath}`],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    deletionSha = stdout.trim();
+  } catch {
+    return false;
+  }
+  if (!deletionSha) return false;
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "ls-tree", `${deletionSha}^`, "--", `:(literal)${relPath}`],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    const entry = stdout.split("\n")[0] ?? "";
+    const tab = entry.indexOf("\t");
+    if (tab === -1) return false;
+    const [mode] = entry.slice(0, tab).split(" ");
+    return mode === "160000";
+  } catch {
+    // A deletion commit with no parent (the branch's very first commit) makes `<sha>^` invalid —
+    // exit 128, not a `160000` match either way; genuinely nothing to corroborate against.
+    return false;
+  }
 }
 
 /**
@@ -540,13 +627,21 @@ async function orphanedSubmoduleAncestor(
  *   submodule checkout has this shape for its own root. But the gitfile's mere existence still isn't
  *   proof by itself — nothing stops its content from pointing somewhere that has nothing to do with
  *   the superproject's own submodule storage. Reading the gitfile's target and checking that it
- *   resolves under `$GIT_COMMON_DIR` (`git rev-parse --path-format=absolute --git-common-dir`, Git
- *   2.31+ — no older than the `--show-scope` floor this file already assumes elsewhere) — either the
- *   base repo's shared `modules/<name>`, or, for a submodule initialized separately inside a linked
- *   worktree, that worktree's own `worktrees/<id>/modules/<name>` (`git submodule update --init` run
- *   inside a worktree creates the submodule's administrative storage there, not under the base repo's
- *   shared `modules/`) — is the authoritative corroboration: a standalone repo never has this shape at
- *   all, and a properly deinitialized former submodule wouldn't have a gitfile left to check.
+ *   resolves under `$GIT_COMMON_DIR` — either the base repo's shared `modules/<name>`, or, for a
+ *   submodule initialized separately inside a linked worktree, that worktree's own
+ *   `worktrees/<id>/modules/<name>` (`git submodule update --init` run inside a worktree creates the
+ *   submodule's administrative storage there, not under the base repo's shared `modules/`) — is the
+ *   authoritative corroboration: a standalone repo never has this shape at all, and a properly
+ *   deinitialized former submodule wouldn't have a gitfile left to check.
+ *
+ * `$GIT_COMMON_DIR` itself is read via a plain `git rev-parse --git-common-dir` (Git 2.5+, no older
+ * than every other floor this file already assumes) rather than `--path-format=absolute`
+ * (git-rev-parse(1), Git 2.31+): on a pre-2.31 git, that flag is rejected outright, and the blanket
+ * `catch` below used to read the rejection as "not orphaned" and let the resolver reuse the leftover
+ * checkout's stale hooks (PR #263 review, round 34). `--git-common-dir` alone may answer with a path
+ * RELATIVE to the `-C worktreePath` it ran against rather than an absolute one (git-rev-parse(1)); it
+ * is resolved against `worktreePath` below before canonicalization, the same way the gitfile's own
+ * target a few lines above is resolved against the gitfile's own directory.
  *
  * Read directly off disk — no extra git subprocess beyond the one needed to locate `$GIT_COMMON_DIR`
  * — since this only needs to know WHERE the gitfile points, not query git about its content.
@@ -580,10 +675,14 @@ async function corroboratesOrphanedSubmodule(
   try {
     const { stdout } = await execFileAsync(
       "git",
-      ["-C", worktreePath, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      ["-C", worktreePath, "rev-parse", "--git-common-dir"],
       { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
     );
-    const rawCommonDir = resolve(stdout.trim());
+    // `--git-common-dir` (unlike `--path-format=absolute --git-common-dir`, Git 2.31+) may answer
+    // with a path relative to the `-C worktreePath` it ran against — resolving it against
+    // `worktreePath` gives the same absolute answer without requiring 2.31+ (PR #263 review, round
+    // 34).
+    const rawCommonDir = resolve(worktreePath, stdout.trim());
     gitCommonDir = existsSync(rawCommonDir) ? realpathSync(rawCommonDir) : rawCommonDir;
   } catch {
     return false;

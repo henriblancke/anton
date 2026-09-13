@@ -101,6 +101,31 @@ process.exit(r.status ?? 1);
   return binDir;
 }
 
+// PR #263 review, round 34: simulates a pre-2.31 git, which rejects `rev-parse --path-format=…`
+// outright (`--path-format` itself is Git 2.31+, git-rev-parse(1)) — the failure mode
+// `corroboratesOrphanedSubmodule` used to hit and misread, via its blanket `catch`, as "not
+// orphaned".
+function shimGitRejectingPathFormat(sandboxDir: string): string {
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const binDir = join(sandboxDir, "bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const a=process.argv.slice(2);
+if(a.some((arg)=>arg.startsWith('--path-format'))){
+  process.stderr.write("error: unknown option \`path-format'\\n");
+  process.exit(129);
+}
+const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+process.exit(r.status ?? 1);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
 // The disabling sentinel `resolveHooksPathOverrideForMerge` returns instead of `undefined` whenever
 // `core.hooksPath` IS configured but no source verified to match the incoming commit exists (PR #263
 // review, round 26): an absolute path guaranteed to not exist on disk, which git's own hook lookup
@@ -960,6 +985,67 @@ suite("resolveHooksPathOverride (real git)", () => {
     expectDisablesHooks(await resolveHooksPathOverride(repo, worktree));
   });
 
+  // PR #263 review, round 34: the same true-positive orphan scenario as above, but with
+  // `rev-parse --path-format=…` rejected the way a pre-2.31 git would reject it —
+  // `corroboratesOrphanedSubmodule` must still correctly detect and disable the orphan without that
+  // flag, confirming the fix didn't just move the incompatibility rather than removing it.
+  it("still disables hooks for an orphaned submodule when git rejects --path-format (pre-2.31 compatibility)", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-orphaned-legacy-git");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-push"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleUpstream, "hooks"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-orphaned-submodule-legacy-git");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-orphan-legacy-git", worktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      ["-C", worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "hooks"],
+      { stdio: "ignore" },
+    );
+    const gitFileContents = readFileSync(join(worktree, "hooks", ".git"), "utf8");
+
+    execFileSync("git", ["-C", worktree, "rm", "-q", "--cached", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "delete hooks submodule"], {
+      stdio: "ignore",
+    });
+    if (!existsSync(join(worktree, "hooks", ".git"))) {
+      mkdirSync(join(worktree, "hooks"), { recursive: true });
+      writeFileSync(join(worktree, "hooks", "pre-push"), "v1\n");
+      writeFileSync(join(worktree, "hooks", ".git"), gitFileContents);
+    }
+    expect(existsSync(join(worktree, "hooks", "pre-push"))).toBe(true);
+    expect(existsSync(join(worktree, "hooks", ".git"))).toBe(true);
+
+    const binDir = shimGitRejectingPathFormat(sandbox);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    try {
+      expectDisablesHooks(await resolveHooksPathOverride(repo, worktree));
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+
   // Round 31's orphan check only inspected `inWorktree` itself for its own `.git` gitfile — correct
   // when the hooksPath IS the deleted gitlink, but blind to the NESTED shape: `core.hooksPath=
   // deps/hooks`, where `deps` (not `deps/hooks`) is the submodule gitlink. Once `deps`'s gitlink is
@@ -1068,6 +1154,90 @@ suite("resolveHooksPathOverride (real git)", () => {
     // Must resolve to the real, on-disk hooks directory — not `disabledHooksPath()` — since a
     // standalone nested repo is exactly as trustworthy as any other ordinary directory content.
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "vendor", "hooks"));
+  });
+
+  // Round 34's gap: a BRAND NEW worktree that never had `deps` initialized locally at all — so no
+  // orphaned `.git` leftover exists anywhere on disk for `orphanedSubmoduleAncestor` to find — checks
+  // out a branch whose own history already deleted the `deps` gitlink. `raw` (`deps/hooks`) does not
+  // exist on disk (never checked out here), and neither `isTrackedInBaseRepo` nor `everTrackedOnBranch`
+  // can see the nested shape (a submodule's tree entry only ever exists at the gitlink's own path,
+  // never anything nested inside it) — so without `historicalAncestorGitlink`, this used to fall
+  // through to the base repo's still-initialized `deps/hooks`, resurrecting hooks from a submodule the
+  // feature branch deleted (PR #263 review, round 34).
+  it("does not fall back to the base repo's copy of a nested hooksPath whose containing submodule was deleted from branch history, in a cold worktree with no orphan leftover", async () => {
+    const submoduleUpstream = join(sandbox, "nested-hooks-submodule-upstream-history-deleted");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    mkdirSync(join(submoduleUpstream, "hooks"));
+    writeFileSync(join(submoduleUpstream, "hooks", "pre-push"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "deps",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add deps submodule"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "deps/hooks"], { stdio: "ignore" });
+    // The base repo still has `deps` initialized and checked out from before the deletion — this is
+    // the stale copy the fallback must NOT return.
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "deps"],
+      { stdio: "ignore" },
+    );
+    expect(existsSync(join(repo, "deps", "hooks", "pre-push"))).toBe(true);
+
+    // A separate worktree, branched from BEFORE the deletion, is where the deletion commit actually
+    // happens — mirroring a real feature branch's own history.
+    const authoringWorktree = join(sandbox, "worktree-history-author");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-history-deleted", authoringWorktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", authoringWorktree, "rm", "-q", "--cached", "deps"], { stdio: "ignore" });
+    execFileSync("git", ["-C", authoringWorktree, "commit", "-q", "-m", "delete deps submodule"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "worktree", "remove", "--force", authoringWorktree], {
+      stdio: "ignore",
+    });
+
+    // A BRAND NEW worktree checking out that same branch fresh: `deps` was never initialized here at
+    // all, so there is no orphaned `.git` leftover on disk — the cold-worktree shape the finding
+    // describes, distinct from round 31/32's "orphan left behind after deletion" tests above.
+    const coldWorktree = join(sandbox, "worktree-history-cold");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", coldWorktree, "anton/epic-history-deleted"],
+      { stdio: "ignore" },
+    );
+    expect(
+      execFileSync("git", ["-C", coldWorktree, "ls-tree", "HEAD", "--", "deps"], {
+        encoding: "utf8",
+      }).trim(),
+    ).toBe("");
+    expect(existsSync(join(coldWorktree, "deps"))).toBe(false);
+
+    expect(await resolveHooksPathOverride(repo, coldWorktree)).toBe(join(coldWorktree, "deps", "hooks"));
   });
 
   // Finding A (PR #263 review, round 29): `core.hooksPath=deps/hooks` names a path NESTED inside the
