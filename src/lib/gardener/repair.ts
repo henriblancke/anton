@@ -96,13 +96,18 @@ export function repairFingerprint(beadId: string, klass: RepairClass): string {
  * triggered the repair would count double too, and a threshold of 3 would trip on one honest park
  * plus one failed repair. Multi-segment by the same precedent `run-lease:<expiry>[:<owner>]` sets.
  */
-export function repairLabel(beadId: string, klass: RepairClass, atMs: number): string {
-  return `${repairFingerprint(beadId, klass)}:${Math.floor(atMs)}`;
+export function repairLabel(
+  beadId: string,
+  klass: RepairClass,
+  atMs: number,
+  closure?: string,
+): string {
+  return `${repairFingerprint(beadId, klass)}:${Math.floor(atMs)}${closure ? `:${closure}` : ""}`;
 }
 
 /** A repair stamp's exact shape, so no unrelated `repair`-ish label is ever read as one. */
 const REPAIR_LABEL = new RegExp(
-  `^${REPAIR_NAMESPACE}:([a-z-]+):([0-9a-f]{${FINGERPRINT_HASH_LENGTH}}):(\\d+)$`,
+  `^${REPAIR_NAMESPACE}:([a-z-]+):([0-9a-f]{${FINGERPRINT_HASH_LENGTH}}):(\\d+)(?::([A-Za-z0-9_-]+))?$`,
 );
 
 /** One repair anton already made on a bead, as the board remembers it. */
@@ -112,6 +117,8 @@ export interface RepairAttempt {
   fingerprint: string;
   /** Unix MILLISECONDS the repair was stamped. */
   at: number;
+  /** The durable board version that began the closure this repair retired. */
+  closure?: string;
   /**
    * What the repair actually did, recovered from the bead's note. Undefined when the note was
    * edited away or predates the note format — the stamp still counts, because the LABEL is the
@@ -238,6 +245,7 @@ export function repairAttemptsOf(bead: RepairedBead): RepairAttempt[] {
       klass,
       fingerprint,
       at: Number(m[3]!),
+      ...(m[4] ? { closure: m[4] } : {}),
       ...(prose ? { attempted: prose } : {}),
     });
   }
@@ -365,8 +373,9 @@ export async function recordRepair(
   klass: RepairClass,
   attempted: string,
   atMs: number,
+  closure?: string,
 ): Promise<string> {
-  const label = repairLabel(bead.id, klass, atMs);
+  const label = repairLabel(bead.id, klass, atMs, closure);
   await beads.tag(repoPath, bead.id, [label]);
   try {
     await beads.note(repoPath, bead.id, repairNote(repairFingerprint(bead.id, klass), attempted));

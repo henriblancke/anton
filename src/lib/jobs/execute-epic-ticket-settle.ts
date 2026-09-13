@@ -14,6 +14,7 @@
  * only what the board is told about the answer.
  */
 import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
+import { isOpenWork } from "../gardener/board-index";
 import { blockNoteEvidence } from "../beads/block-note";
 import { swapUnderLock } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
@@ -893,6 +894,13 @@ async function retirementReopenedDuringRelease(
     return false;
   }
   if (beads.supersededBy(after) === replacementId) return false;
+  if (!isOpenWork(after)) {
+    console.warn(
+      `[execute-epic] ${ticketId}'s retirement was replaced by a newer ${after.status} outcome while ` +
+        `anton released its claim — leaving that release standing rather than restoring a stale holder`,
+    );
+    return true;
+  }
   console.warn(
     `[execute-epic] ${ticketId} was reopened while anton was releasing the claim its retirement ` +
       `held — putting the claim back${holder ? ` for ${holder}` : ""} so the rerun that reopen is ` +

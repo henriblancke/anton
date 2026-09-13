@@ -7,6 +7,7 @@
  * either answer wrong opens a duplicate pull request or re-dispatches shipped work.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { readCurrentClosureVersion } from "../beads/closure-cycle";
 import { isServerMode } from "../beads/board-mode";
 import { loadAllIssues } from "../beads/issues";
 import { runTickets } from "../ticket-view";
@@ -353,11 +354,11 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
   const stamped = await beads.show(repo, targetId).catch(() => undefined);
   if (!stamped || beads.supersededBy(stamped) !== survivor) return false;
   const repair = priorRepair(stamped, "already-shipped");
-  if (!repair) return false;
-  // A stamp survives reopen/re-supersede cycles. It proves only the closure it followed, not a
-  // later human retirement: a current close after the stamp must take the ordinary parked path.
-  const closedAt = stamped.closed_at ? Date.parse(stamped.closed_at) : Number.NaN;
-  if (!Number.isFinite(closedAt) || repair.at < closedAt) return false;
+  if (!repair?.closure) return false;
+  // A stamp survives reopen/re-supersede cycles. Its closure version must still be the one the
+  // ticket is closed in; timestamps cannot distinguish two cycles that close in the same second.
+  const closure = await readCurrentClosureVersion(repo, targetId).catch(() => undefined);
+  if (closure !== repair.closure) return false;
 
   // The refresh that admitted this settlement and its terminal row write are unordered with other
   // board writers. Pull before each fence on embedded boards: another machine can publish a child

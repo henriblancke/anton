@@ -306,6 +306,41 @@ describe("settling a ticket the repair RETIRED", () => {
     expect(untagMock).not.toHaveBeenCalled();
   });
 
+  it("does not restore the former holder after a later re-supersede", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    let live = retiredRead("anton-op");
+    showMock.mockImplementation(async () => live);
+    unassignMock.mockImplementation(async () => {
+      live = {
+        ...retiredRead(),
+        dependencies: [{ dependency_type: "supersedes", id: "anton-new-ship" }],
+      } as unknown as Bead;
+      return "";
+    });
+
+    await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
+
+    expect(unassignMock).toHaveBeenCalledWith("/tmp/anton", "anton-a");
+    expect(assignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("does not restore the former holder after a later plain closure", async () => {
+    repairMock.mockResolvedValue(retired(true));
+    let live = retiredRead("anton-op");
+    showMock.mockImplementation(async () => live);
+    unassignMock.mockImplementation(async () => {
+      live = { id: ticket.id, status: "closed", assignee: "" } as unknown as Bead;
+      return "";
+    });
+
+    await expect(settle("anton-op")).rejects.toBeInstanceOf(TicketRetiredError);
+
+    expect(unassignMock).toHaveBeenCalledWith("/tmp/anton", "anton-a");
+    expect(assignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
   // Best-effort like every write on this stopping path: an unreadable fence leaves the release as it
   // stands rather than re-claiming a ticket nothing reopened.
   it("leaves the release standing when the fence's read fails", async () => {

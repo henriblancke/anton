@@ -35,6 +35,7 @@
  * any part of it.
  */
 import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
+import { readCurrentClosureVersion } from "../beads/closure-cycle";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { humanNotesPromptBlock } from "../beads/notes";
@@ -1409,9 +1410,9 @@ export async function repairAlreadyShipped(args: {
     // exhaustion, the unstamped fallback is logged as a note so the process does not die quiet.
     // (`recordRepair`'s tag is the idempotent, throwing half; its note is already best-effort.)
     const stamped = await mustPersist(async () => {
-      // A post-supersede instant so recovery can reject a historical stamp left by an older
-      // retirement cycle without rejecting this one.
-      label = await recordRepair(repoPath, bead, KLASS, attempted, Date.now());
+      const closure = await readCurrentClosureVersion(repoPath, bead.id);
+      if (!closure) throw new Error(`bd history carries no closed version for ${bead.id}`);
+      label = await recordRepair(repoPath, bead, KLASS, attempted, Date.now(), closure);
     });
     if (!stamped || label === undefined) {
       // The stamp is the whole of what lets a resume recognise this closure (`settleRetiredStandalone`

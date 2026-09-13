@@ -18,6 +18,9 @@ import type { Bead } from "../beads/bd";
 
 const createWorktreeMock = vi.fn();
 const acquireClaimMock = vi.fn<(...a: unknown[]) => Promise<void>>();
+const releaseClaimMock = vi.fn<(...a: unknown[]) => Promise<void>>();
+const removeWorktreeMock = vi.fn();
+const updateRunMock = vi.fn();
 /** Whether the branch already existed — what tells a REUSED checkout from a first creation. */
 const branchExistsMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
 vi.mock("../git/worktree", async () => {
@@ -25,6 +28,8 @@ vi.mock("../git/worktree", async () => {
   return {
     ...actual,
     acquireWorktreeClaim: (...a: unknown[]) => acquireClaimMock(...a),
+    releaseWorktreeClaim: (...a: unknown[]) => releaseClaimMock(...a),
+    removeWorktree: (...a: unknown[]) => removeWorktreeMock(...a),
     branchExists: (...a: unknown[]) => branchExistsMock(...a),
     createWorktree: (...a: unknown[]) => createWorktreeMock(...a),
   };
@@ -41,8 +46,14 @@ vi.mock("../git/ops", async () => {
   };
 });
 
+vi.mock("../runs", async () => {
+  const actual = await vi.importActual<typeof import("../runs")>("../runs");
+  return { ...actual, updateRun: (...a: unknown[]) => updateRunMock(...a) };
+});
+
 const { warmRunWorktree } = await import("./execute-epic-claim");
-const { createRun, updateRun, getRunBaseForkSha } = await import("../runs");
+const actualRuns = await vi.importActual<typeof import("../runs")>("../runs");
+const { createRun, getRunBaseForkSha } = actualRuns;
 import type { EpicRun } from "./execute-epic-run";
 import type { Clock } from "./queue";
 
@@ -83,6 +94,9 @@ beforeEach(async () => {
     repoPath: "/repo",
   });
   acquireClaimMock.mockReset().mockResolvedValue(undefined);
+  releaseClaimMock.mockReset().mockResolvedValue(undefined);
+  removeWorktreeMock.mockReset().mockResolvedValue({ removed: true, branchDeleted: true });
+  updateRunMock.mockReset().mockImplementation(actualRuns.updateRun);
   branchExistsMock.mockReset().mockResolvedValue(false);
   resolveFreshBaseMock.mockReset().mockResolvedValue(FRESH_BASE);
   resolveForkPointMock.mockReset().mockResolvedValue("f0f0f0forkcommit");
@@ -108,7 +122,7 @@ it("stops before checkout creation when reuse detection cannot inspect refs", as
 it("reuses the pinned fork on resume instead of recomputing over a moved HEAD", async () => {
   // A prior attempt already pinned the true fork; the base has since rewound, so recomputing now
   // would answer behind it. The resume must read the stored value and never call the resolver.
-  await updateRun(t.db, clock, RUN_ID, { baseForkSha: "trueforkcommit" });
+  await actualRuns.updateRun(t.db, clock, RUN_ID, { baseForkSha: "trueforkcommit" });
   resolveForkPointMock.mockRejectedValue(new Error("resolver must not run on resume"));
 
   const { runStep } = await warmRunWorktree(makeRun());
@@ -122,7 +136,7 @@ it("recovers the BRANCH's pin when an ordinary failure retried onto a fresh run 
   // the retry opens a FRESH row over the SAME branch and worktree. Keyed by run id alone it would
   // find no pin and recompute against a base a sibling fetch may have rewound since — the exact
   // widening the pin exists to prevent.
-  await updateRun(t.db, clock, RUN_ID, {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
     baseForkSha: "trueforkcommit",
     branch: BRANCH,
     status: "failed",
@@ -141,7 +155,11 @@ it("recovers the BRANCH's pin when an ordinary failure retried onto a fresh run 
 it("resolves its OWN fork point when it just created the branch, ignoring another branch's pin", async () => {
   // A run standing on a branch it cut itself forks HERE, at the freshly-fetched base. A pin from an
   // earlier run of the same epic on a DIFFERENT branch describes a checkout this one does not share.
-  await updateRun(t.db, clock, RUN_ID, { baseForkSha: "oldbranchfork", branch: "anton/old", status: "failed" });
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "oldbranchfork",
+    branch: "anton/old",
+    status: "failed",
+  });
   const FRESH = "run-3";
   await createRun(t.db, clock, { id: FRESH, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
   branchExistsMock.mockResolvedValue(false);
@@ -178,7 +196,7 @@ it("ignores a reused checkout's forkSha — it reads the branch's current HEAD, 
   // checkout returned by `createWorktree` reports the branch's current HEAD as its `forkSha`.
   // Preferring it would partition this run against `<HEAD>..HEAD>` (dropping every already-committed
   // ticket); the recovered pin — another attempt's row on the same branch — has to win instead.
-  await updateRun(t.db, clock, RUN_ID, {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
     baseForkSha: "trueforkcommit",
     branch: BRANCH,
     status: "failed",
@@ -200,4 +218,42 @@ it("ignores a reused checkout's forkSha — it reads the branch's current HEAD, 
 
   expect(resolveForkPointMock).not.toHaveBeenCalled();
   expect(runStep.baseForkSha).toBe("trueforkcommit");
+});
+
+it("removes a newly created checkout and branch when fork-pin persistence fails", async () => {
+  updateRunMock.mockRejectedValueOnce(new Error("database unavailable"));
+
+  await expect(warmRunWorktree(makeRun())).rejects.toThrow("database unavailable");
+
+  expect(releaseClaimMock).toHaveBeenCalledWith("/repo", BRANCH, "execute-epic#run-1");
+  expect(removeWorktreeMock).toHaveBeenCalledWith(
+    expect.objectContaining({ path: WORKTREE, branch: BRANCH }),
+    { deleteBranch: true },
+  );
+});
+
+it("preserves a reused checkout and branch when fork-pin persistence fails", async () => {
+  branchExistsMock.mockResolvedValue(true);
+  updateRunMock.mockRejectedValueOnce(new Error("database unavailable"));
+
+  await expect(warmRunWorktree(makeRun())).rejects.toThrow("database unavailable");
+
+  expect(releaseClaimMock).not.toHaveBeenCalled();
+  expect(removeWorktreeMock).not.toHaveBeenCalled();
+});
+
+it("poisons the run when failed fork-pin cleanup cannot prove complete removal", async () => {
+  updateRunMock.mockRejectedValueOnce(new Error("database unavailable"));
+  removeWorktreeMock.mockResolvedValue({
+    removed: false,
+    skipped: "locked by another owner",
+    branchDeleted: false,
+    branchSkipped: "branch is checked out",
+  });
+
+  await expect(warmRunWorktree(makeRun())).rejects.toThrow(
+    "newly-created checkout could not be fully removed",
+  );
+  expect(releaseClaimMock).toHaveBeenCalledWith("/repo", BRANCH, "execute-epic#run-1");
+  expect(removeWorktreeMock).toHaveBeenCalledOnce();
 });

@@ -7,6 +7,7 @@
  * ticket stops short is the settlement's (execute-epic-ticket-settle.ts).
  */
 import { beads, labelValueOf, LABELS, ownerOf, unclaimableStatus, type Bead } from "../beads/bd";
+import { readCurrentClosureVersion } from "../beads/closure-cycle";
 import { isServerMode } from "../beads/board-mode";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { claudeRouting } from "../claude/driver-routing";
@@ -232,7 +233,8 @@ async function assertUnlinkedOurStaleEdge(
   }
   const settled = retirementSettledSinceClaim(after, operator);
   if (settled) {
-    await restoreRetirementEdge(repo, ticketId, survivor, after.closed_at);
+    const closure = await readCurrentClosureVersion(repo, ticketId).catch(() => undefined);
+    await restoreRetirementEdge(repo, ticketId, survivor, closure);
     throw new Error(
       `refusing to execute ${ticketId}: it was retired as superseded by ${survivor} while anton ` +
         `was removing the stale \`supersedes\` edge a previous retirement left on it (${settled}) — ` +
@@ -267,7 +269,7 @@ async function restoreRetirementEdge(
   repo: string,
   ticketId: string,
   survivor: string,
-  closedAt: string | undefined,
+  closure: string | undefined,
 ): Promise<void> {
   // `bd supersede` has no compare-and-swap form. An embedded board's local write lock lets this
   // process make the re-read/write sequence coherent; a shared server can accept another writer
@@ -282,8 +284,15 @@ async function restoreRetirementEdge(
         `retirement, then resume the run`,
     );
   }
+  if (!closure) {
+    throw new PoisonEpic(
+      `${ticketId} was retired as superseded by ${survivor} while anton was removing the stale ` +
+        `\`supersedes\` edge, but bd history could not identify that closure — anton stopped before ` +
+        `writing so it could not restore an edge over a newer same-second decision`,
+    );
+  }
   const failure = await withBeadWriteLock(repo, ticketId, () =>
-    persistRetirementEdge(repo, ticketId, survivor, closedAt),
+    persistRetirementEdge(repo, ticketId, survivor, closure),
   );
   if (!failure) return;
   throw new PoisonEpic(
@@ -310,7 +319,7 @@ async function persistRetirementEdge(
   repo: string,
   ticketId: string,
   survivor: string,
-  closedAt: string | undefined,
+  closure: string,
 ): Promise<string | undefined> {
   let why = "bd would not read the ticket back";
   for (let attempt = 1; attempt <= RESTORE_ATTEMPTS; attempt += 1) {
@@ -321,7 +330,7 @@ async function persistRetirementEdge(
       return undefined;
     });
     if (!fresh) continue;
-    if (!restorableRetirement(fresh, closedAt)) return undefined;
+    if (!(await restorableRetirement(repo, fresh, closure))) return undefined;
     try {
       await beads.supersede(repo, ticketId, survivor);
     } catch (e) {
@@ -340,7 +349,7 @@ async function persistRetirementEdge(
       return undefined;
     });
     if (!after) continue;
-    if (restoreHeld(after, closedAt, survivor)) return undefined;
+    if (await restoreHeld(repo, after, closure, survivor)) return undefined;
     // The write landed on a board that had moved since the read. Retrying would overwrite whatever
     // decision overtook the restore a second time, so stop writing and park: the overtaking decision
     // is preserved by surfacing it, never by treating this close as the one the fence checked.
@@ -364,12 +373,10 @@ async function persistRetirementEdge(
  * re-superseding would overwrite. Either way the run still retries — the ticket is settled, which is
  * all the caller's error claims.
  */
-function restorableRetirement(fresh: Bead, closedAt: string | undefined): boolean {
+async function restorableRetirement(repo: string, fresh: Bead, closure: string): Promise<boolean> {
   if (fresh.status !== "closed" || beads.isAbandoned(fresh)) return false;
-  // A close is not a durable identity: an intervening reopen followed by an ordinary close has the
-  // same status and no edge, but belongs to another decision. Only redraw the edge on the precise
-  // closure the post-unlink fence observed; otherwise leave the newer close untouched.
-  if (!Boolean(closedAt) || fresh.closed_at !== closedAt) return false;
+  // Beads timestamps are second-granular: only the immutable history version distinguishes a same-second reclose.
+  if ((await readCurrentClosureVersion(repo, fresh.id).catch(() => undefined)) !== closure) return false;
   return beads.supersedesTarget(fresh) === undefined;
 }
 
@@ -377,13 +384,13 @@ function restorableRetirement(fresh: Bead, closedAt: string | undefined): boolea
  * Whether a read taken AFTER the restore wrote still reads as the retirement this pass set out to
  * re-draw — the post-write fence {@link persistRetirementEdge} lands. Anything else means another
  * hand decided the ticket in the window: a reopen/re-claim, an abandon, a close in another cycle
- * (`closed_at` moved), or a re-supersede against a different survivor. The write's own success
+ * (with a different history identity), or a re-supersede against a different survivor. The write's own success
  * proved nothing, because `bd supersede` shuts the board-dangerous race (a live ticket it re-closes,
  * or a survivor it overwrites) before any later reader can see it — only a fresh read can.
  */
-function restoreHeld(after: Bead, closedAt: string | undefined, survivor: string): boolean {
+async function restoreHeld(repo: string, after: Bead, closure: string, survivor: string): Promise<boolean> {
   if (after.status !== "closed" || beads.isAbandoned(after)) return false;
-  if (!Boolean(closedAt) || after.closed_at !== closedAt) return false;
+  if ((await readCurrentClosureVersion(repo, after.id).catch(() => undefined)) !== closure) return false;
   // The edge is asserted (not just the status): a survivor STRIPPED in the same window leaves a
   // valid close with no survivor recorded, the state the next attempt misreads as a cross-machine
   // resume, so a close without this survivor on the board is still "not restored".

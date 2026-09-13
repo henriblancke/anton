@@ -13,7 +13,7 @@
  * real repository can't be asked for on demand.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bead } from "../beads/bd";
+import type { Bead, BeadVersion } from "../beads/bd";
 import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
 
 const closeMock = vi.fn();
@@ -27,6 +27,7 @@ const supersedeMock = vi.fn();
 const setStatusMock = vi.fn();
 const unassignMock = vi.fn();
 const syncMock = vi.fn();
+const historyMock = vi.fn<(...args: unknown[]) => Promise<BeadVersion[]>>();
 const endSessionMock = vi.fn();
 const commitMarkerMock = vi.fn();
 
@@ -60,6 +61,7 @@ vi.mock("../beads/bd", async () => {
       setStatus: (...args: unknown[]) => setStatusMock(...args),
       unassign: (...args: unknown[]) => unassignMock(...args),
       sync: (...args: unknown[]) => syncMock(...args),
+      history: (...args: unknown[]) => historyMock(...args),
     },
   };
 });
@@ -228,10 +230,10 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
   const settledElsewhere = {
     ...unlinked,
     status: "closed",
-    // `closed_at` identifies this closure cycle. A later reopen/ordinary-close must not be
-    // converted back into this old retirement by the edge-restoration retry.
-    closed_at: "2026-09-09T00:00:00.000Z",
   } as Bead;
+  const settledClosure: BeadVersion[] = [
+    { hash: "settled-close", at: "2026-09-09T00:00:00.000Z", status: "closed" },
+  ];
 
   beforeEach(() => {
     vi.resetAllMocks();
@@ -242,6 +244,7 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     setStatusMock.mockResolvedValue(undefined);
     unassignMock.mockResolvedValue(undefined);
     syncMock.mockResolvedValue(undefined);
+    historyMock.mockResolvedValue(settledClosure);
     unlinkMock.mockResolvedValue(undefined);
     supersedeMock.mockResolvedValue(undefined);
     showMock.mockResolvedValue(claimed);
@@ -464,20 +467,38 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     expect(supersedeMock).not.toHaveBeenCalled();
   });
 
-  it("does not convert a newer plain closure into the old retirement", async () => {
+  it("does not convert a same-second reopen and plain reclose into the old retirement", async () => {
+    historyMock
+      .mockResolvedValueOnce(settledClosure)
+      .mockResolvedValue([
+        { hash: "new-close", at: "2026-09-09T00:00:00.000Z", status: "closed" },
+        { hash: "reopened", at: "2026-09-09T00:00:00.000Z", status: "open" },
+        { hash: "settled-close", at: "2026-09-09T00:00:00.000Z", status: "closed" },
+      ]);
     showMock
       .mockResolvedValueOnce(claimed)
       .mockResolvedValueOnce(settledElsewhere)
-      .mockResolvedValue({
-        ...settledElsewhere,
-        closed_at: "2026-09-09T00:01:00.000Z",
-      });
+      .mockResolvedValue({ ...settledElsewhere });
 
     const err = await claimTicket(run(), reopened, "op").then(
       () => undefined,
       (e: unknown) => e,
     );
     expect(err).not.toBeInstanceOf(PoisonEpic);
+    expect(supersedeMock).not.toHaveBeenCalled();
+  });
+
+  it("parks rather than restore when it cannot identify the retired closure", async () => {
+    historyMock.mockRejectedValue(new Error("dolt offline"));
+    showMock.mockResolvedValueOnce(claimed).mockResolvedValue(settledElsewhere);
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(PoisonEpic);
+    expect((err as Error).message).toMatch(/bd history could not identify that closure/);
     expect(supersedeMock).not.toHaveBeenCalled();
   });
 

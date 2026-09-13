@@ -216,6 +216,8 @@ async function bdWrite(cwd: string, args: string[], opts?: BdOpts): Promise<stri
  * One version of a bead, as `bd history` records it — see {@link parseBeadHistory}.
  */
 export interface BeadVersion {
+  /** The immutable Dolt commit that wrote this version. */
+  hash: string;
   /** When this version was written (ISO 8601, the Dolt commit's date). */
   at: string;
   /** The bead's status in this version. */
@@ -238,10 +240,13 @@ export function parseBeadHistory(raw: string): BeadVersion[] {
   return parsed.map((entry, i): BeadVersion => {
     const e = entry as Record<string, unknown> | null;
     const issue = e?.Issue as Record<string, unknown> | null | undefined;
+    const hash = str(e?.CommitHash);
     const at = str(e?.CommitDate);
     const status = str(issue?.status);
-    if (!at || !status) throw new Error(`bd history: version ${i} carries no CommitDate or Issue.status`);
-    return { at, status };
+    if (!hash || !at || !status) {
+      throw new Error(`bd history: version ${i} carries no CommitHash, CommitDate, or Issue.status`);
+    }
+    return { hash, at, status };
   });
 }
 

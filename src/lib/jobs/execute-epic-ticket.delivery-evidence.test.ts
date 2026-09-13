@@ -18,7 +18,7 @@
  * about how those four compose and nothing smaller can make it.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bead } from "../beads/bd";
+import type { Bead, BeadVersion } from "../beads/bd";
 import type { AntonResult } from "../claude/anton-result";
 import type { CommitNaming, CommitReach } from "../git/ops";
 import type { ResolvedStep } from "./run-formula";
@@ -55,6 +55,7 @@ const syncMock = vi.fn(async () => {});
  * real bd would answer after the write.
  */
 const showMock = vi.fn(async (_repo: string, id: string) => shown(id));
+const historyMock = vi.fn<(...args: unknown[]) => Promise<BeadVersion[]>>();
 const loadAllIssuesMock = vi.fn(async () => board());
 const startJobSessionMock = vi.fn(async () => ({ sessionId: "sess-1", logPath: "/tmp/sess-1.log" }));
 const endSessionMock = vi.fn(async () => {});
@@ -88,7 +89,7 @@ vi.mock("../beads/bd", async () => {
       supersede: (...args: unknown[]) => supersedeMock(...(args as [string, string, string])),
       sync: (...args: unknown[]) => syncMock(...(args as [])),
       show: (repo: string, id: string) => showMock(repo, id),
-      history: async () => [],
+      history: (...args: unknown[]) => historyMock(...args),
     },
   };
 });
@@ -291,6 +292,9 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
   beforeEach(() => {
     vi.clearAllMocks();
     showMock.mockImplementation(async (_repo: string, id: string) => shown(id));
+    historyMock.mockReset().mockResolvedValue([
+      { hash: "ticket-close", at: "2026-09-09T00:00:00.000Z", status: "closed" },
+    ]);
     loadAllIssuesMock.mockImplementation(async () => board());
     startJobSessionMock.mockImplementation(async () => ({
       sessionId: "sess-1",

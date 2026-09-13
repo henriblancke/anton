@@ -14,6 +14,8 @@ import {
   acquireWorktreeClaim,
   branchExists,
   createWorktree,
+  releaseWorktreeClaim,
+  removeWorktree,
   type Worktree,
 } from "../git/worktree";
 import { resolveOperator } from "../operator";
@@ -118,14 +120,38 @@ export async function warmRunWorktree(
         `the run's tickets against a moving base. Repair the worktree, then resume the run`,
     );
   }
-  await updateRun(db, clock, runId, {
-    worktreePath: worktree.path,
-    branch: worktree.branch,
-    attempts: ctx.attempt,
-    // Persist the creation-captured fork (and a recovered sibling's pin) onto this row; only a
-    // value already stored on this row is left as-is so a resume does not rewrite what it read.
-    ...(storedFork ? {} : { baseForkSha }),
-  });
+  try {
+    await updateRun(db, clock, runId, {
+      worktreePath: worktree.path,
+      branch: worktree.branch,
+      attempts: ctx.attempt,
+      // Persist the creation-captured fork (and a recovered sibling's pin) onto this row; only a
+      // value already stored on this row is left as-is so a resume does not rewrite what it read.
+      ...(storedFork ? {} : { baseForkSha }),
+    });
+  } catch (error) {
+    // A newly-created checkout without its fork pin is unsafe to reuse: a retry would find the
+    // branch and derive a different base against a ref another run may have moved. A reused checkout
+    // belongs to its prior attempt and is already pinned, so this attempt must leave it intact.
+    if (!reusedCheckout) {
+      await releaseWorktreeClaim(repo, branch, worktreeClaim).catch((cleanupError) => {
+        console.error(`[execute-epic] could not release the failed worktree claim for ${branch}`, cleanupError);
+      });
+      const removal = await removeWorktree(worktree, { deleteBranch: true }).catch((cleanupError) => {
+        console.error(`[execute-epic] could not remove the unpinned worktree for ${branch}`, cleanupError);
+        return undefined;
+      });
+      if (!removal?.removed || !removal.branchDeleted) {
+        throw new PoisonEpic(
+          `anton could not persist ${branch}'s fork pin, and its newly-created checkout could not be ` +
+            `fully removed${removal?.skipped ? ` (${removal.skipped})` : ""}${removal?.branchSkipped ? ` (${removal.branchSkipped})` : ""} — ` +
+            `leaving it reusable would let a retry recompute against a moved base. Remove the checkout ` +
+            `and branch, then resume (${error instanceof Error ? error.message : String(error)})`,
+        );
+      }
+    }
+    throw error;
+  }
   await ctx.heartbeat();
 
   // Every step of the walk runs through the step registry (anton-4npr) — one entry point per step,

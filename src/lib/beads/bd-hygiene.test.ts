@@ -460,16 +460,16 @@ describe("parseBeadHistory", () => {
       version("2026-09-08T04:42:29.477-04:00", "closed"),
     ]);
     expect(parseBeadHistory(raw)).toEqual([
-      { at: "2026-09-08T04:42:35.571-04:00", status: "closed" },
-      { at: "2026-09-08T04:42:32.125-04:00", status: "open" },
-      { at: "2026-09-08T04:42:29.477-04:00", status: "closed" },
+      { hash: "r4cqkscueunao76kiv4i143j0rq34e35", at: "2026-09-08T04:42:35.571-04:00", status: "closed" },
+      { hash: "r4cqkscueunao76kiv4i143j0rq34e35", at: "2026-09-08T04:42:32.125-04:00", status: "open" },
+      { hash: "r4cqkscueunao76kiv4i143j0rq34e35", at: "2026-09-08T04:42:29.477-04:00", status: "closed" },
     ]);
   });
 
   it("throws on anything but versions — a reader measuring against a reopen must not read an empty answer", () => {
     expect(() => parseBeadHistory('{"error": "no such issue"}')).toThrow(/expected a JSON array/);
     expect(() => parseBeadHistory(JSON.stringify([{ CommitDate: "2026-01-01T00:00:00Z" }]))).toThrow(
-      /version 0 carries no CommitDate or Issue.status/,
+      /version 0 carries no CommitHash, CommitDate, or Issue.status/,
     );
     expect(parseBeadHistory("[]")).toEqual([]);
   });

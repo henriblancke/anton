@@ -20,7 +20,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Bead } from "../beads/bd";
+import type { Bead, BeadVersion } from "../beads/bd";
 import { formatHumanNote } from "../beads/notes";
 
 const noteMock = vi.fn<(cwd: string, id: string, text: string) => Promise<string>>(async () => "");
@@ -40,7 +40,7 @@ const bdWrites = [noteMock, tagMock, linkMock, closeMock, updateMock, setPrRefMo
 /** The under-lock re-reads the RETIREMENT makes — before its write and after it; the check never calls it. */
 const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
 /** `bd history` as the check sees it — never reopened unless a case says so. */
-const historyMock = vi.fn<(cwd: string, id: string) => Promise<{ at: string; status: string }[]>>(async () => []);
+const historyMock = vi.fn<(cwd: string, id: string) => Promise<BeadVersion[]>>(async () => []);
 /**
  * What the board holds for a bead apart from THIS repair's own write. Cases script this one; the
  * retirement suite's `showMock` layers the supersede over it, so a post-write read of the ticket
@@ -278,8 +278,9 @@ suite("verifyShippedClaim (real git · seeded board · fake gh)", () => {
   const verify = (reason: string | undefined, board: Bead[], base = "main") =>
     verifyShippedClaim({ repoPath: repo, base, targetId: TARGET, reason, board });
 
-  /** A bead's versions as `bd history` lists them, newest first, from (date, status) pairs. */
-  const versions = (...pairs: [string, string][]) => pairs.map(([at, status]) => ({ at, status }));
+  /** A bead's versions as `bd history` lists them, newest first, with immutable history identities. */
+  const versions = (...pairs: [string, string][]): BeadVersion[] =>
+    pairs.map(([at, status], index) => ({ hash: `history-${index}`, at, status }));
   /** A reopen an hour from now — after every commit the sandbox makes. */
   const REOPENED_AT = new Date(Date.now() + 3_600_000).toISOString();
   const RECLOSED_AT = new Date(Date.now() + 7_200_000).toISOString();
@@ -1262,7 +1263,9 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     });
     loadAllIssuesMock.mockClear();
     loadAllIssuesMock.mockResolvedValue(board());
-    historyMock.mockReset().mockResolvedValue([]);
+    historyMock.mockReset().mockImplementation(async (_cwd, id) =>
+      id === TARGET ? [{ hash: "target-close", at: "2026-09-08T00:00:00Z", status: "closed" }] : [],
+    );
   });
 
   afterEach(() => sb.cleanup());
@@ -1271,10 +1274,10 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
   const REOPENED_AT = new Date(Date.now() + 3_600_000).toISOString();
   const RECLOSED_AT = new Date(Date.now() + 7_200_000).toISOString();
   /** `bd history` of a survivor shipped once, reopened for rework, and closed again. */
-  const REWORKED = [
-    { at: RECLOSED_AT, status: "closed" },
-    { at: REOPENED_AT, status: "in_progress" },
-    { at: "2020-01-01T00:00:00Z", status: "closed" },
+  const REWORKED: BeadVersion[] = [
+    { hash: "reclosed", at: RECLOSED_AT, status: "closed" },
+    { hash: "reopened", at: REOPENED_AT, status: "in_progress" },
+    { hash: "first-close", at: "2020-01-01T00:00:00Z", status: "closed" },
   ];
 
   const commitProof = () =>
@@ -1304,7 +1307,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(outcome).toMatchObject({
       action: "retired",
       replacementId: SHIPPER,
-      label: expect.stringMatching(/^repair:already-shipped:[0-9a-f]{12}:\d+$/),
+      label: expect.stringMatching(/^repair:already-shipped:[0-9a-f]{12}:\d+:target-close$/),
       proof: [commitProof()],
     });
     expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
@@ -2215,8 +2218,8 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       historyMock.mockImplementation(async () =>
         boardShow.mock.calls.length > 0
           ? [
-              { at: REOPENED_AT, status: "in_progress" },
-              { at: "2020-01-01T00:00:00Z", status: "closed" },
+              { hash: "reopened", at: REOPENED_AT, status: "in_progress" },
+              { hash: "first-close", at: "2020-01-01T00:00:00Z", status: "closed" },
             ]
           : [],
       );
@@ -2745,8 +2748,8 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
         historyMock.mockImplementation(async () =>
           written()
             ? [
-                { at: REOPENED_AT, status: "in_progress" },
-                { at: "2020-01-01T00:00:00Z", status: "closed" },
+                { hash: "reopened", at: REOPENED_AT, status: "in_progress" },
+                { hash: "first-close", at: "2020-01-01T00:00:00Z", status: "closed" },
               ]
             : [],
         );
@@ -2974,7 +2977,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
         action: "retired",
         replacementId: SHIPPER,
         marked: false,
-        label: expect.stringMatching(/^repair:already-shipped:[0-9a-f]{12}:\d+$/),
+        label: expect.stringMatching(/^repair:already-shipped:[0-9a-f]{12}:\d+:target-close$/),
       });
       expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
       // Retried before it was allowed to fail, like the skip path's marker.

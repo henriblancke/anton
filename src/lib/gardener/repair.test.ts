@@ -176,6 +176,24 @@ describe("the stamp on the bead", () => {
     expect(tagMock.mock.invocationCallOrder[0]!).toBeLessThan(noteMock.mock.invocationCallOrder[0]!);
   });
 
+  it("binds a retirement stamp to its closure while preserving the guard fingerprint", async () => {
+    const closure = "closure-version";
+    const label = await recordRepair(REPO, bead(), "already-shipped", "retired as superseded", T0, closure);
+
+    expect(label).toBe(repairLabel(BEAD, "already-shipped", T0, closure));
+    expect(priorRepair(bead([label]), "already-shipped")).toMatchObject({
+      fingerprint: repairFingerprint(BEAD, "already-shipped"),
+      closure,
+    });
+  });
+
+  it("keeps legacy repair stamps readable without closure provenance", () => {
+    const repair = priorRepair(bead([repairLabel(BEAD, "already-shipped", T0)]), "already-shipped");
+
+    expect(repair).toMatchObject({ fingerprint: repairFingerprint(BEAD, "already-shipped") });
+    expect(repair?.closure).toBeUndefined();
+  });
+
   it("keeps a stamped repair when only its note fails to write", async () => {
     // The label is already durable at that point, so rejecting would hand the caller a failed
     // outcome it rolls back — leaving the bead suppressed for a repair that no longer exists.

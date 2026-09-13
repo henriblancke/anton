@@ -12,10 +12,11 @@
  * which a real board cannot be asked for on demand.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bead } from "../beads/bd";
+import type { Bead, BeadVersion } from "../beads/bd";
 import { repairLabel } from "../gardener/repair";
 
 const showMock = vi.fn();
+const historyMock = vi.fn<(...args: unknown[]) => Promise<BeadVersion[]>>();
 const pullMock = vi.fn();
 const isServerModeMock = vi.fn();
 const loadAllIssuesMock = vi.fn();
@@ -33,6 +34,7 @@ vi.mock("../beads/bd", async () => {
       ...actual.beads,
       pull: (...a: unknown[]) => pullMock(...a),
       show: (...a: unknown[]) => showMock(...a),
+      history: (...a: unknown[]) => historyMock(...a),
     },
   };
 });
@@ -72,15 +74,15 @@ const SURVIVOR = "anton-keep";
 /** The retired standalone target: closed, superseding a survivor, stamped by anton's own repair. */
 function retiredTarget({
   stampAt = Date.now(),
-  closedAt = "2026-09-09T00:00:00.000Z",
-}: { stampAt?: number; closedAt?: string } = {}): Bead {
+  closure = "target-close",
+  legacy = false,
+}: { stampAt?: number; closure?: string; legacy?: boolean } = {}): Bead {
   return {
     id: TARGET,
     issue_type: "feature",
     status: "closed",
     // Built with the real stamper, so the fixture can't drift from the label format the gate parses.
-    labels: [repairLabel(TARGET, "already-shipped", stampAt)],
-    closed_at: closedAt,
+    labels: [repairLabel(TARGET, "already-shipped", stampAt, legacy ? undefined : closure)],
     dependencies: [{ type: "supersedes", issue_id: TARGET, depends_on_id: SURVIVOR }],
     notes: "retired as already shipped",
   } as unknown as Bead;
@@ -115,6 +117,7 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
     pullMock.mockResolvedValue(undefined);
     isServerModeMock.mockReturnValue(false);
     showMock.mockImplementation(async () => retiredTarget());
+    historyMock.mockResolvedValue([{ hash: "target-close", at: "2026-09-09T00:00:00.000Z", status: "closed" }]);
     loadAllIssuesMock.mockImplementation(async () => [retiredTarget()]);
     findWorktreeMock.mockResolvedValue(undefined);
   });
@@ -211,13 +214,34 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
     expect(loadAllIssuesMock).toHaveBeenCalledWith(REPO, { strictGates: true });
   });
 
-  it("rejects a stamp left by a retirement cycle before the current closure", async () => {
-    const target = retiredTarget({
-      stampAt: Date.parse("2026-09-09T00:00:00.000Z"),
-      closedAt: "2026-09-09T00:00:01.000Z",
-    });
+  it("rejects a stamp left by a same-second retirement cycle before the current closure", async () => {
+    const target = retiredTarget({ closure: "old-close" });
 
     showMock.mockResolvedValue(target);
+    historyMock.mockResolvedValue([
+      { hash: "new-close", at: "2026-09-09T00:00:00.000Z", status: "closed" },
+      { hash: "reopened", at: "2026-09-09T00:00:00.000Z", status: "open" },
+      { hash: "old-close", at: "2026-09-09T00:00:00.000Z", status: "closed" },
+    ]);
+
+    expect(await settleCompletedRun(run([target], target), target)).toBe(false);
+    expect(updateRunMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a legacy stamp without closure provenance", async () => {
+    const target = retiredTarget({ legacy: true });
+
+    showMock.mockResolvedValue(target);
+    expect(await settleCompletedRun(run([target], target), target)).toBe(false);
+    expect(historyMock).not.toHaveBeenCalled();
+    expect(updateRunMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when it cannot read the closure history", async () => {
+    const target = retiredTarget();
+
+    showMock.mockResolvedValue(target);
+    historyMock.mockRejectedValue(new Error("dolt offline"));
     expect(await settleCompletedRun(run([target], target), target)).toBe(false);
     expect(updateRunMock).not.toHaveBeenCalled();
   });
