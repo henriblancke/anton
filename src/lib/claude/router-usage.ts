@@ -52,7 +52,7 @@ function toPct(value: unknown): number | null {
 }
 
 function toIso(value: unknown): string | null {
-  return typeof value === "string" && value ? value : null;
+  return typeof value === "string" && value && Number.isFinite(Date.parse(value)) ? value : null;
 }
 
 /** One quota window (`session (5h)` / `weekly (7d)`) as 9Router's `createQuotaObject` shapes it. */
@@ -69,8 +69,9 @@ interface RouterWindow {
 function readWindow(win: unknown): RouterWindow | null {
   if (!isObject(win) || win.unlimited === true) return null;
   const pct = toPct(win.used);
-  if (pct === null) return null;
-  return { pct, resetAt: toIso(win.resetAt) };
+  const resetAt = toIso(win.resetAt);
+  if (pct === null || (win.resetAt !== null && win.resetAt !== undefined && resetAt === null)) return null;
+  return { pct, resetAt };
 }
 
 /**

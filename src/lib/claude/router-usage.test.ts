@@ -118,6 +118,15 @@ describe("parseRouterUsage", () => {
         },
       },
     ],
+    [
+      "an invalid reset timestamp",
+      {
+        quotas: {
+          "session (5h)": { ...ROUTER_FIXTURE.quotas["session (5h)"], resetAt: "not-a-date" },
+          "weekly (7d)": ROUTER_FIXTURE.quotas["weekly (7d)"],
+        },
+      },
+    ],
   ])("returns null for %s — never a fabricated percentage", (_label, body) => {
     expect(parseRouterUsage(body)).toBeNull();
   });
