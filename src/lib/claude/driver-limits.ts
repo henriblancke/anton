@@ -94,6 +94,21 @@ const SPEND_LIMIT_RESULT_RE =
 const GATEWAY_BILLING_RE = /\[402\][\s\S]{0,200}?requires more credits/i;
 
 /**
+ * A rate-limit stop trusted anywhere the same way `GATEWAY_BILLING_RE` is: observed verbatim as
+ * `API Error: 503 [claude/claude-opus-5] [429]: {"type":"error","error":{"type":"rate_limit_error",
+ * "message":"This request would exceed your (reset after 2m 41s)…` (anton-fmlb — three consecutive
+ * RESUMEs in ~60s against a wall that never moved). The bare `429` in that envelope otherwise
+ * matches `TRANSIENT_STDERR_RE` (driver-exit.ts) and gets treated as a passing network blip instead
+ * of a quota that needs a real cooloff — quota classification must catch it first.
+ *
+ * Two machine-only shapes, neither one a model would casually reproduce in prose: the JSON
+ * `"type":"rate_limit_error"` field a provider's error body carries, and a bracketed `[429]` status
+ * code the way Claude Code's own API-error wrapper and gateways render it — as opposed to a bare
+ * "429" typed inline, which stays ambiguous enough to leave alone.
+ */
+const RATE_LIMIT_RE = /"type"\s*:\s*"rate_limit_error"|\[429\]/i;
+
+/**
  * The session-limit banner — observed verbatim as `You've hit your session limit · resets 9pm
  * (America/New_York)` (anton-2gsj, from three consecutive parked runs in anton.db). Like the
  * monthly spend-limit sentence above, this is ordinary English a model could reproduce while
@@ -260,6 +275,7 @@ function isUsageLimited(channels: ClaudeChannels): boolean {
     SPEND_LIMIT_RE.test(channels.stderr) ||
     SPEND_LIMIT_RESULT_RE.test(channels.resultText) ||
     GATEWAY_BILLING_RE.test(combinedText(channels)) ||
+    RATE_LIMIT_RE.test(combinedText(channels)) ||
     SESSION_LIMIT_RE.test(channels.stderr) ||
     SESSION_LIMIT_RESULT_RE.test(channels.resultText) ||
     USAGE_CREDITS_RE.test(channels.stderr) ||

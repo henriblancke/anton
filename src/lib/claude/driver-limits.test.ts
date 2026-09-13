@@ -26,6 +26,12 @@ const USAGE_CREDITS_BANNER =
 const GATEWAY_402_ENVELOPE =
   'API Error: 503 [openrouter/anthropic/claude-sonnet-5] [402]: {"error":{"message":"This request requires more credits, or fewer max_tokens.","code":402}}';
 
+// Observed verbatim in anton.db escalations.evidence_json (anton-fmlb, 2026-09-09 21:49/21:51/21:52):
+// three consecutive RESUMEs against a wall that never moved because the bare `429` inside this
+// envelope also matches driver-exit.ts's TRANSIENT_STDERR_RE.
+const RATE_LIMIT_429_ENVELOPE =
+  'API Error: 503 [claude/claude-opus-5] [429]: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your (reset after 2m 41s)."}}';
+
 describe("parseResetAt", () => {
   it("reads the trailing epoch stamp, normalizing milliseconds to seconds", () => {
     expect(parseResetAt("Claude AI usage limit reached|1700000000")).toBe(1700000000);
@@ -128,6 +134,16 @@ describe("usageLimitError", () => {
 
   it("leaves a genuine gateway 503 with no [402] inside untouched — it must still resolve as transient (anton-x96g)", () => {
     expect(usageLimitError(channels({ stderr: "API Error: 503 [openrouter/anthropic/claude-sonnet-5] Service Unavailable" }))).toBeNull();
+  });
+
+  it("classifies a rate_limit_error payload as a quota hit even wrapped in a 503 envelope (anton-h8z4)", () => {
+    expect(usageLimitError(channels({ stderr: RATE_LIMIT_429_ENVELOPE }))).not.toBeNull();
+    expect(usageLimitError(channels({ transcript: `${RATE_LIMIT_429_ENVELOPE}\n` }))).not.toBeNull();
+    expect(usageLimitError(channels({ resultText: RATE_LIMIT_429_ENVELOPE }))).not.toBeNull();
+  });
+
+  it("classifies a bare [429] from the API or a gateway as a quota hit (anton-h8z4)", () => {
+    expect(usageLimitError(channels({ stderr: "API Error: 500 [openrouter] [429]: rate limited" }))).not.toBeNull();
   });
 
   it("classifies the session-limit banner as a quota hit (anton-2gsj)", () => {
