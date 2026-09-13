@@ -7,6 +7,7 @@
  * either answer wrong opens a duplicate pull request or re-dispatches shipped work.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { isServerMode } from "../beads/board-mode";
 import { loadAllIssues } from "../beads/issues";
 import { runTickets } from "../ticket-view";
 import { priorRepair } from "../gardener/repair";
@@ -360,9 +361,16 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
   if (!Number.isFinite(closedAt) || repair.at < closedAt) return false;
 
   // The refresh that admitted this settlement and its terminal row write are unordered with other
-  // board writers. Re-list immediately before the row write: a child attached before this boundary
-  // makes the target grouped, so recovering it as a completed standalone run would strand that work.
+  // board writers. Pull before each fence on embedded boards: another machine can publish a child
+  // after the startup refresh, and a local list alone would preserve that stale childless snapshot.
   const childlessNow = async (): Promise<boolean> => {
+    if (!isServerMode(repo)) {
+      try {
+        await beads.pull(repo);
+      } catch {
+        return false;
+      }
+    }
     const current = await mustReadBoard(repo);
     const currentTarget = current?.find((bead) => bead.id === targetId);
     return Boolean(currentTarget) && !beads.groupsChildren(currentTarget!, runTickets(current!, targetId));

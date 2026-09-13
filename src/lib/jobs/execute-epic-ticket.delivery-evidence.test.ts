@@ -219,7 +219,7 @@ function shown(id: string): Bead {
  * One dispatching step carrying the agent's self-report — and, when a case says so, the bead it
  * was prompted with — then the commit that reports the diff.
  */
-function steps(selfReport: AntonResult | null, committed: boolean, dispatched?: Bead): ResolvedStep[] {
+function steps(selfReport: AntonResult | null, committed: boolean, dispatched: Bead = ticket()): ResolvedStep[] {
   const define = (name: string, handler: () => Promise<unknown>): ResolvedStep =>
     ({
       step: { id: name },

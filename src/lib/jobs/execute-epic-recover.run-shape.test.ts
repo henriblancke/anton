@@ -16,6 +16,8 @@ import type { Bead } from "../beads/bd";
 import { repairLabel } from "../gardener/repair";
 
 const showMock = vi.fn();
+const pullMock = vi.fn();
+const isServerModeMock = vi.fn();
 const loadAllIssuesMock = vi.fn();
 const updateRunMock = vi.fn();
 const releaseRunResourcesMock = vi.fn();
@@ -25,8 +27,19 @@ const findWorktreeMock = vi.fn();
 // groupsChildren, getPrRef) stays real, so the test exercises the real shape verdict.
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
-  return { ...actual, beads: { ...actual.beads, show: (...a: unknown[]) => showMock(...a) } };
+  return {
+    ...actual,
+    beads: {
+      ...actual.beads,
+      pull: (...a: unknown[]) => pullMock(...a),
+      show: (...a: unknown[]) => showMock(...a),
+    },
+  };
 });
+
+vi.mock("../beads/board-mode", () => ({
+  isServerMode: (...a: unknown[]) => isServerModeMock(...a),
+}));
 
 // The settle path's terminal writes: stubbed so the assertion is the SHAPE VERDICT, not a real
 // run row or worktree teardown.
@@ -99,6 +112,8 @@ function run(all: Bead[], target: Bead): EpicRun {
 describe("settleCompletedRun retirement short-circuit (run shape)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    pullMock.mockResolvedValue(undefined);
+    isServerModeMock.mockReturnValue(false);
     showMock.mockImplementation(async () => retiredTarget());
     loadAllIssuesMock.mockImplementation(async () => [retiredTarget()]);
     findWorktreeMock.mockResolvedValue(undefined);
@@ -116,7 +131,8 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
     const target = retiredTarget();
 
     expect(await settleCompletedRun(run([target], target), target)).toBe(true);
-    // The adjacent board recheck found the same standalone shape before recording the terminal row.
+    // The adjacent board recheck pulled the shared embedded board, then found the same shape.
+    expect(pullMock).toHaveBeenCalledWith(REPO);
     expect(loadAllIssuesMock).toHaveBeenCalledWith(REPO, { strictGates: true });
     // Settled as a finished run, with no PR, exactly as the uninterrupted attempt would.
     expect(updateRunMock).toHaveBeenCalledWith(
@@ -161,6 +177,26 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
 
     expect(await settleCompletedRun(run([target], target), target, false)).toBe(false);
     expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses settlement when an embedded-board fence cannot pull fresh topology", async () => {
+    const target = retiredTarget();
+    pullMock.mockRejectedValue(new Error("dolt pull: remote unavailable"));
+
+    await expect(settleCompletedRun(run([target], target), target)).rejects.toThrow(
+      "gained child tickets before anton could settle",
+    );
+    expect(loadAllIssuesMock).not.toHaveBeenCalled();
+    expect(updateRunMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the server board directly at settlement fences", async () => {
+    const target = retiredTarget();
+    isServerModeMock.mockReturnValue(true);
+
+    expect(await settleCompletedRun(run([target], target), target)).toBe(true);
+    expect(pullMock).not.toHaveBeenCalled();
+    expect(loadAllIssuesMock).toHaveBeenCalledWith(REPO, { strictGates: true });
   });
 
   it("rejects a stamp left by a retirement cycle before the current closure", async () => {
