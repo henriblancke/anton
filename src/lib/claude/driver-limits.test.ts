@@ -81,6 +81,21 @@ describe("parseResetAt", () => {
     );
   });
 
+  it("uses the target instant's offset when the reset follows a DST transition", () => {
+    // 2026-03-08T05:00:00Z = midnight EST; 03:00 occurs after New York moves to EDT at 02:00.
+    const beforeSpringForwardMs = Date.parse("2026-03-08T05:00:00Z");
+    expect(parseResetAt("resets 3am (America/New_York)", beforeSpringForwardMs)).toBe(
+      Math.floor(Date.parse("2026-03-08T07:00:00Z") / 1000), // 03:00 EDT
+    );
+  });
+
+  it.each(["resets 0am (America/New_York)", "resets 13pm (America/New_York)", "resets 25pm (America/New_York)", "resets 9:99pm (America/New_York)"])(
+    "rejects invalid zoned clock values: %s",
+    (text) => {
+      expect(parseResetAt(text, NOW_MS)).toBeUndefined();
+    },
+  );
+
   it("yields undefined for an unparseable reset, leaving the runner's own cooloff to apply", () => {
     expect(parseResetAt("(reset shortly)", NOW_MS)).toBeUndefined();
   });

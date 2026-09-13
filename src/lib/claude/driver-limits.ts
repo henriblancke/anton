@@ -186,9 +186,9 @@ function relativeResetSeconds(text: string, nowMs: number): number | undefined {
 }
 
 /**
- * A wall-clock time in `timeZone` as a UTC epoch (ms) — the standard offset round-trip: format the
- * naive-UTC guess back through the target zone, and the drift between what we asked for and what
- * came back IS the zone's offset at that moment (handles DST without a tz database dependency).
+ * A wall-clock time in `timeZone` as a UTC epoch (ms). Recalculate the offset from the candidate
+ * instant until formatting it produces the requested wall time: a naive UTC guess can land before
+ * a DST transition even when the requested wall time is after it.
  */
 function zonedWallTimeToUtcMs(
   year: number,
@@ -198,8 +198,8 @@ function zonedWallTimeToUtcMs(
   minute: number,
   timeZone: string,
 ): number {
-  const guessUtc = Date.UTC(year, month - 1, day, hour, minute, 0);
-  const parts = new Intl.DateTimeFormat("en-US", {
+  const wallTimeUtc = Date.UTC(year, month - 1, day, hour, minute, 0);
+  const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone,
     hourCycle: "h23",
     year: "numeric",
@@ -208,10 +208,24 @@ function zonedWallTimeToUtcMs(
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-  }).formatToParts(new Date(guessUtc));
-  const get = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? 0);
-  const readBackUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"), get("second"));
-  return guessUtc - (readBackUtc - guessUtc);
+  });
+  let candidateUtc = wallTimeUtc;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = formatter.formatToParts(new Date(candidateUtc));
+    const get = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
+    const formattedWallTimeUtc = Date.UTC(
+      get("year"),
+      get("month") - 1,
+      get("day"),
+      get("hour"),
+      get("minute"),
+      get("second"),
+    );
+    const adjustedUtc = wallTimeUtc - (formattedWallTimeUtc - candidateUtc);
+    if (adjustedUtc === candidateUtc) return adjustedUtc;
+    candidateUtc = adjustedUtc;
+  }
+  return candidateUtc;
 }
 
 /**
@@ -223,9 +237,11 @@ function tzResetSeconds(text: string, nowMs: number): number | undefined {
   const match = text.match(RESET_TZ_RE);
   if (!match) return undefined;
   const [, hourStr, minuteStr, ampm, timeZone] = match;
-  let hour = Number(hourStr) % 12;
-  if (ampm.toLowerCase() === "pm") hour += 12;
+  const clockHour = Number(hourStr);
   const minute = minuteStr ? Number(minuteStr) : 0;
+  if (clockHour < 1 || clockHour > 12 || minute < 0 || minute > 59) return undefined;
+  let hour = clockHour % 12;
+  if (ampm.toLowerCase() === "pm") hour += 12;
   try {
     const todayParts = new Intl.DateTimeFormat("en-US", {
       timeZone,
