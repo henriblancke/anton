@@ -7,6 +7,12 @@
  * submodule the feature worktree's own checkout knows nothing about, and `git merge` never updates
  * a submodule's on-disk content on its own.
  *
+ * Round 40 simplified the submodule handling in both functions to a single conservative rule: any
+ * submodule involvement disables hooks rather than resolving the exact commit to trust. This test's
+ * hooksPath IS a submodule gitlink in `origin/main`'s tree, so it now proves the premerge disables
+ * hooks (no marker file) and still completes successfully — rather than proving a hook fires, which
+ * was this test's pre-round-40 assertion.
+ *
  * Drives the REAL handler + REAL runner + REAL bd/git against a temp repo with a bare origin, using
  * a fake `claude`/`gh` so the flow is deterministic. Skipped without bd + git.
  */
@@ -93,9 +99,12 @@ describeBd(
       mkdirSync(binDir);
 
       // A hooks submodule, introduced on `main` (the PR's base) AFTER the feature branch forked —
-      // the feature branch's own tree has never heard of it. Its `post-merge` writes a marker file
-      // this test asserts on, so "did the premerge's hooksPath override actually fire against
-      // `origin/main`'s copy" has a distinguishing, not merely negative, signal.
+      // the feature branch's own tree has never heard of it. Its `post-merge` writes a marker file;
+      // round 40's simplified submodule rule disables hooks for any submodule involvement, so this
+      // test asserts the marker is ABSENT — proving the override was resolved against
+      // `origin/main`'s tree (which sees the gitlink and disables hooks) rather than the current
+      // checkout's tree (which sees no gitlink at all and would resolve some other, hook-firing
+      // value instead).
       const submoduleUpstream = join(sandbox, "hooks-submodule-upstream");
       mkdirSync(submoduleUpstream);
       g(submoduleUpstream, ["init", "-q", "-b", "main"]);
@@ -217,18 +226,19 @@ process.exit(0);`,
       bdRepo.cleanup();
     });
 
-    it("resolves the premerge's hooksPath against origin/<baseBranch>, firing the base's newly-introduced post-merge", async () => {
+    it("resolves the premerge's hooksPath against origin/<baseBranch>, disabling hooks for the base's newly-introduced submodule gitlink", async () => {
       const fixes = await runSweep();
       expect(fixes).toHaveLength(1);
       expect((await getJob(tdb.db, fixes[0]))?.status).toBe("done");
 
-      // The base's hooks submodule — absent from the feature branch's own tree — fired its
-      // `post-merge` when `premergeBase` merged `origin/main` in. That only happens when the
-      // override actually resolved against `origin/main` (the incoming ref): resolving it against
-      // the current checkout instead (the bug this test guards) sees no `core.hooksPath`-tracking
-      // gitlink in the feature branch's pre-merge tree at all, so it would either skip the override
-      // entirely or hand back a value that never fires this hook.
-      expect(existsSync(hooksMarker)).toBe(true);
+      // The base's hooks submodule — absent from the feature branch's own tree — is a `160000`
+      // gitlink in `origin/main`'s tree, so round 40's simplified rule disables hooks for the
+      // premerge rather than firing its `post-merge`. Resolving the override against the CURRENT
+      // checkout instead (the bug this test originally guarded) would see no `core.hooksPath`-
+      // tracking gitlink in the feature branch's pre-merge tree at all, and hand back a value that
+      // fires the hook — the marker's absence here proves the override was resolved against
+      // `origin/main` (the incoming ref), not the current checkout.
+      expect(existsSync(hooksMarker)).toBe(false);
 
       // The conflict was resolved and pushed — proof the premerge itself succeeded, not just that
       // some override was computed.
