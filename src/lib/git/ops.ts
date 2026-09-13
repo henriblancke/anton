@@ -6,9 +6,9 @@
 import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalizeRaw } from "node:path/posix";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -354,10 +354,17 @@ export async function resolveHooksPathOverride(
         // walks every ancestor segment of `raw` (round 31's single-level check surviving as its first
         // iteration) so an orphan is caught at any depth. An ordinary tracked-and-deleted directory or
         // a Husky-style generated one never has its own `.git` entry anywhere in its ancestry — only a
-        // former (or current) submodule checkout does — so finding one here, with no gitlink left to
-        // vouch for it, means `inWorktree` descends from that orphan corpse, not a trustworthy
-        // directory. Returning it as an ordinary hooks directory would run hooks the incoming branch
-        // just deleted; `disabledHooksPath` forces hooks off instead.
+        // former (or current) submodule checkout does. But a `.git` entry alone still isn't proof: a
+        // directory nobody ever tracked as a submodule (a standalone `git init`/`git clone` sitting in
+        // the tree) has an ordinary `.git` DIRECTORY of its own too, and native git's hook lookup does
+        // not care whether the hooksPath directory happens to contain one — so `orphanedSubmoduleAncestor`
+        // additionally corroborates the entry is a submodule's own gitfile pointing under the
+        // superproject's `modules/` administrative storage (`corroboratesOrphanedSubmodule`) before
+        // reporting an orphan, closing the false-positive this block used to produce for a genuine
+        // standalone nested repo (PR #263 review, round 33). Finding a corroborated orphan here, with
+        // no gitlink left to vouch for it, means `inWorktree` descends from that orphan corpse, not a
+        // trustworthy directory. Returning it as an ordinary hooks directory would run hooks the
+        // incoming branch just deleted; `disabledHooksPath` forces hooks off instead.
         return disabledHooksPath();
       }
     }
@@ -452,30 +459,46 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
 
 /**
  * The nearest ancestor of `relPath` (`relPath` itself included, `worktreePath`'s own root excluded)
- * that still has a leftover `.git` gitfile ON DISK in `worktreePath` — the filesystem-side
- * counterpart to {@link ancestorSubmoduleSha}'s tree-side walk, used once that walk has already
- * confirmed no CURRENT gitlink covers `relPath` at any depth. Round 31 (PR #263 review) added a
- * single-level check here (`existsSync(join(inWorktree, ".git")))`) for the case where `raw` ITSELF
- * was the deleted gitlink's path — the orphan's leftover `.git` gitfile then sits directly at
- * `inWorktree`. That check misses the equally real NESTED shape (`core.hooksPath=deps/hooks`, where
+ * that has a leftover `.git` entry ON DISK in `worktreePath` **and corroborates as a submodule's own
+ * administrative gitfile**, not merely any directory that happens to contain a `.git` — the
+ * filesystem-side counterpart to {@link ancestorSubmoduleSha}'s tree-side walk, used once that walk
+ * has already confirmed no CURRENT gitlink covers `relPath` at any depth. Round 31 (PR #263 review)
+ * added a single-level check here (`existsSync(join(inWorktree, ".git")))`) for the case where `raw`
+ * ITSELF was the deleted gitlink's path — the orphan's leftover `.git` gitfile then sits directly at
+ * `inWorktree`. That check missed the equally real NESTED shape (`core.hooksPath=deps/hooks`, where
  * `deps` — not `deps/hooks` — was the gitlink): once `deps`'s gitlink is deleted from the tree, the
  * orphaned checkout's own `.git` gitfile lives at `deps/.git`, one level up from `inWorktree`
  * (`deps/hooks`), which itself has no `.git` of its own — only a submodule's ROOT ever does
- * (gitrepository-layout(5)). A bare single-level check at `inWorktree` therefore returns `false` for
- * this shape and falls through to treating the orphan corpse as an ordinary hooks directory, the
- * exact bug round 31 fixed, one directory level deeper (PR #263 review, round 32). Walking every
- * ancestor segment — the same `posixNormalize`/`posixDirname` loop {@link ancestorSubmoduleSha} uses
- * against the git tree, adapted here to check the filesystem instead — catches an orphan at any
- * depth, with round 31's single-level case surviving unchanged as this walk's first iteration.
+ * (gitrepository-layout(5)). Round 32 closed that gap by walking every ancestor segment — the same
+ * `posixNormalize`/`posixDirname` loop {@link ancestorSubmoduleSha} uses against the git tree, adapted
+ * here to check the filesystem instead — so an orphan is caught at any depth, with round 31's
+ * single-level case surviving unchanged as this walk's first iteration.
+ *
+ * Round 32's walk treated ANY `.git` entry as proof of "this is a deleted submodule's abandoned
+ * corpse" — but a `.git` at `candidate` proves no such thing by itself: it is exactly as consistent
+ * with a directory NOBODY ever tracked as a submodule at all (a standalone `git init`/`git clone` run
+ * directly inside the tree at that path — its own root has a real `.git` DIRECTORY, same as the
+ * superproject's own) as with an actual orphaned submodule checkout (whose leftover `.git` is a FILE —
+ * a "gitfile" pointing at the superproject's `$GIT_DIR/modules/<name>`, gitrepository-layout(5)).
+ * Treating the former as orphan evidence silently disabled hooks native git would run for it — a false
+ * positive round 31/32 introduced (PR #263 review, round 33). {@link corroboratesOrphanedSubmodule}
+ * closes that gap: it is consulted the moment a `.git` entry is found, and this walk stops there either
+ * way — the first `.git` entry found IS the checkout's own root (real, standalone, or a leftover
+ * submodule corpse), so there is nothing meaningful to find by walking past it. Only a corroborated
+ * gitfile makes this function report an orphan; a directory `.git`, or a gitfile whose target doesn't
+ * resolve under the superproject's own submodule storage, makes it report `undefined` instead — the
+ * same answer as finding no `.git` at all, letting the caller fall through to trusting `inWorktree`
+ * normally.
  *
  * The walk stops before `worktreePath`'s own root (`candidate !== "." && candidate !== "/"`, the same
  * boundary {@link ancestorSubmoduleSha} uses): `worktreePath`'s own `.git` always exists — it is the
  * worktree's own gitdir pointer, not an orphan signal — and checking it here would misreport every
  * hooksPath whatsoever as an orphaned submodule.
  *
- * Returns the ancestor path that carries the leftover `.git`, or `undefined` when no segment does —
- * callers only need the boolean "is `relPath` inside an orphaned submodule checkout", but the path is
- * kept for parity with {@link ancestorSubmoduleSha}'s return shape and easier debugging.
+ * Returns the ancestor path that carries the corroborated leftover gitfile, or `undefined` when no
+ * segment has one — callers only need the boolean "is `relPath` inside an orphaned submodule
+ * checkout", but the path is kept for parity with {@link ancestorSubmoduleSha}'s return shape and
+ * easier debugging.
  */
 async function orphanedSubmoduleAncestor(
   worktreePath: string,
@@ -483,12 +506,102 @@ async function orphanedSubmoduleAncestor(
 ): Promise<string | undefined> {
   let candidate = posixNormalize(relPath);
   while (candidate !== "." && candidate !== "/") {
-    if (existsSync(join(resolve(worktreePath, candidate), ".git"))) return candidate;
+    const gitEntryPath = join(resolve(worktreePath, candidate), ".git");
+    if (existsSync(gitEntryPath)) {
+      return (await corroboratesOrphanedSubmodule(gitEntryPath, worktreePath))
+        ? candidate
+        : undefined;
+    }
     const parent = posixDirname(candidate);
     if (parent === candidate) break;
     candidate = parent;
   }
   return undefined;
+}
+
+/**
+ * Whether the `.git` entry at `gitEntryPath` — found by {@link orphanedSubmoduleAncestor}'s walk — is
+ * actually a submodule's own gitfile pointing at ITS git data under the superproject's administrative
+ * submodule storage, rather than a real, standalone Git repository that merely happens to sit at that
+ * path (PR #263 review, round 33). Corroborates the "Distinguish standalone Git directories from
+ * orphaned submodules" finding: a leftover `.git` is NOT sufficient proof of a deleted submodule's
+ * abandoned corpse on its own — it needs corroboration that the superproject's OWN administrative
+ * storage actually backs it.
+ *
+ * Two shapes reach here, and only one of them is a leftover submodule corpse:
+ *
+ * - A DIRECTORY `.git` is what a standalone checkout — one nobody ever tracked as a submodule
+ *   gitlink, e.g. `git init`/`git clone` run directly inside the tree at that path, or a former
+ *   submodule properly `deinit`ed and re-added as an ordinary tracked directory — always has for its
+ *   own root, exactly the same shape the superproject's own `.git` has. It proves nothing about a
+ *   deleted gitlink; native git's hook lookup does not care whether the hooksPath directory happens
+ *   to contain its own `.git`, so this must not be treated as orphan evidence.
+ * - A FILE `.git` is a "gitfile" (`gitdir: <path>`, git-config(1)/gitrepository-layout(5)): only a
+ *   submodule checkout has this shape for its own root. But the gitfile's mere existence still isn't
+ *   proof by itself — nothing stops its content from pointing somewhere that has nothing to do with
+ *   the superproject's own submodule storage. Reading the gitfile's target and checking that it
+ *   resolves under `$GIT_COMMON_DIR` (`git rev-parse --path-format=absolute --git-common-dir`, Git
+ *   2.31+ — no older than the `--show-scope` floor this file already assumes elsewhere) — either the
+ *   base repo's shared `modules/<name>`, or, for a submodule initialized separately inside a linked
+ *   worktree, that worktree's own `worktrees/<id>/modules/<name>` (`git submodule update --init` run
+ *   inside a worktree creates the submodule's administrative storage there, not under the base repo's
+ *   shared `modules/`) — is the authoritative corroboration: a standalone repo never has this shape at
+ *   all, and a properly deinitialized former submodule wouldn't have a gitfile left to check.
+ *
+ * Read directly off disk — no extra git subprocess beyond the one needed to locate `$GIT_COMMON_DIR`
+ * — since this only needs to know WHERE the gitfile points, not query git about its content.
+ */
+async function corroboratesOrphanedSubmodule(
+  gitEntryPath: string,
+  worktreePath: string,
+): Promise<boolean> {
+  const stat = statSync(gitEntryPath, { throwIfNoEntry: false });
+  if (!stat) return false;
+  // A real, standalone repo's own root always has a `.git` DIRECTORY — never proof of a deleted
+  // gitlink left behind (see the doc comment above; PR #263 review, round 33).
+  if (stat.isDirectory()) return false;
+
+  let content: string;
+  try {
+    content = readFileSync(gitEntryPath, "utf8");
+  } catch {
+    return false;
+  }
+  const match = /^gitdir:\s*(.+?)\s*$/.exec(content);
+  if (!match) return false;
+  const target = resolve(dirname(gitEntryPath), match[1]);
+  // The target need not exist yet (a corrupted/incomplete checkout still corroborates the SHAPE),
+  // but canonicalize it when it does — `realpathSync` resolves any symlinked ancestor (macOS's
+  // `/tmp` -> `/private/tmp` being the common case) so the comparison below isn't fooled by two
+  // paths that name the same directory through different symlinks.
+  const canonicalTarget = existsSync(target) ? realpathSync(target) : target;
+
+  let gitCommonDir: string;
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    );
+    const rawCommonDir = resolve(stdout.trim());
+    gitCommonDir = existsSync(rawCommonDir) ? realpathSync(rawCommonDir) : rawCommonDir;
+  } catch {
+    return false;
+  }
+
+  // The administrative storage for a submodule always lives under a `modules` path segment of
+  // `$GIT_COMMON_DIR` — either directly (`modules/<name>`, a submodule initialized in the base repo,
+  // or shared) or nested under a specific worktree's own gitdir (`worktrees/<id>/modules/<name>`, a
+  // submodule initialized separately inside a linked worktree). A target outside `$GIT_COMMON_DIR`
+  // entirely, or one that never passes through a `modules` segment, is not that shape.
+  const relToCommonDir = relative(gitCommonDir, canonicalTarget);
+  return (
+    relToCommonDir !== "" &&
+    relToCommonDir !== ".." &&
+    !relToCommonDir.startsWith(`..${sep}`) &&
+    !isAbsolute(relToCommonDir) &&
+    relToCommonDir.split(sep).includes("modules")
+  );
 }
 
 /**
@@ -1043,7 +1156,10 @@ export async function resolveHooksPathOverrideForMerge(
     // unconditionally, missing the exact scenario round 31 fixed (and round 32 extended to the
     // nested-path shape) for the repo-scoped path (PR #263 review, round 31 and round 32).
     // `orphanedSubmoduleAncestor` is a standalone helper, not a closure over
-    // `resolveHooksPathOverride`'s locals, precisely so this call site can reuse it too.
+    // `resolveHooksPathOverride`'s locals, precisely so this call site can reuse it too — including its
+    // round-33 corroboration (`corroboratesOrphanedSubmodule`), which keeps a genuine standalone nested
+    // repo's own `.git` from being misread as a deleted submodule's corpse here too (PR #263 review,
+    // round 33).
     if (isWorktreeScoped) {
       return (await orphanedSubmoduleAncestor(worktreePath, raw)) ? disabledHooksPath() : inWorktree;
     }

@@ -1036,6 +1036,40 @@ suite("resolveHooksPathOverride (real git)", () => {
     expectDisablesHooks(await resolveHooksPathOverride(repo, worktree));
   });
 
+  // A standalone, genuinely nested Git checkout — nobody ever tracked it as a submodule gitlink, e.g.
+  // `git init` run directly inside the tree — has its own ordinary `.git` DIRECTORY at its root,
+  // exactly the shape round 31/32's `orphanedSubmoduleAncestor` walk used to treat as proof of a
+  // deleted submodule's abandoned corpse. That was a false positive (PR #263 review, round 33): native
+  // git's hook lookup does not care whether the hooksPath directory happens to contain its own `.git`,
+  // so `resolveHooksPathOverride` must trust `inWorktree` normally here, not disable hooks.
+  it("does not treat a standalone nested Git checkout's own .git directory as an orphaned submodule", async () => {
+    writeFileSync(join(repo, "README.md"), "init\n");
+    execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "init"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-standalone-nested-git");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-standalone-nested", worktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", worktree, "config", "core.hooksPath", "vendor/hooks"], {
+      stdio: "ignore",
+    });
+    // `vendor` was NEVER a submodule gitlink — just a plain directory someone happened to `git init`
+    // inside, with its own real `.git` DIRECTORY (not a gitfile) at its root and a `hooks` subdirectory
+    // nested beneath it, mirroring the NESTED hooksPath shape round 32's walk already has to handle.
+    mkdirSync(join(worktree, "vendor", "hooks"), { recursive: true });
+    execFileSync("git", ["init", "-q", "-b", "main", join(worktree, "vendor")], { stdio: "ignore" });
+    writeFileSync(join(worktree, "vendor", "hooks", "pre-push"), "v1\n");
+    expect(statSync(join(worktree, "vendor", ".git")).isDirectory()).toBe(true);
+    expect(existsSync(join(worktree, "vendor", "hooks", ".git"))).toBe(false);
+
+    // Must resolve to the real, on-disk hooks directory — not `disabledHooksPath()` — since a
+    // standalone nested repo is exactly as trustworthy as any other ordinary directory content.
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "vendor", "hooks"));
+  });
+
   // Finding A (PR #263 review, round 29): `core.hooksPath=deps/hooks` names a path NESTED inside the
   // submodule gitlink `deps`, not the gitlink itself. `git submodule status` only ever reports a line
   // for the gitlink PATH (`deps`), never for a path nested inside one (`deps/hooks`) — so
