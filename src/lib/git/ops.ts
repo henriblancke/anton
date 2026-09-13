@@ -442,10 +442,30 @@ export async function resolveHooksPathOverride(
   // nested path too (PR #263 review, round 20) — and, per the never-falls-back guard above, a
   // worktree-scoped value gets `inWorktree` here regardless of whether the base matches, without even
   // spending the `baseSubmoduleMatches` call to find out (PR #263 review, round 29).
+  //
+  // This is also the branch a fully-staged DELETION of the gitlink reaches — `raw` itself the
+  // deleted gitlink, or nested inside it — not merely the nested-uninitialized shape the comment
+  // above describes (PR #263 review, round 38). An ordinary `git rm <hooks-path-submodule>` (as
+  // opposed to `git rm --cached`, which only touches the index per `git rm -h` and leaves the
+  // worktree copy the `existsSync(inWorktree)` branch above already handles) removes BOTH the index
+  // entry and the on-disk checkout in one step. Round 37 made `commitStep`/`commitAndPushFix` call
+  // {@link stageAll} before ever calling this function, so that staged deletion is already fully
+  // reflected in the index by the time execution reaches here — `existsSync(inWorktree)` is false,
+  // `ancestorSubmoduleSha` (an `HEAD`-tree, i.e. last-COMMIT, lookup) still finds the OLD gitlink
+  // because nothing has been committed yet, and `baseSubmoduleMatches` can find the base repo's own
+  // checkout still sitting at that same old commit — reporting a "match" and returning the base
+  // repo's copy of the submodule this exact commit is about to delete. The commit that removes it
+  // would then unexpectedly run the outgoing `pre-commit` hook, possibly rejecting the very deletion
+  // it's meant to land. `stagedlyDeletedGitlink` closes it by checking the INDEX — what `git commit`
+  // would actually record — the same "index over HEAD" fix round 36 applied for a staged BUMP;
+  // finding no index entry at all where `HEAD` still has a gitlink means the removal is staged, and
+  // this must answer `inWorktree` (git's own "nothing exists, no hook fires" answer) exactly as it
+  // would for a directory the worktree's branch ordinarily deleted, never the base repo's stale copy.
   const containing = await ancestorSubmoduleSha(worktreePath, raw);
   if (containing) {
     const matches =
       !isWorktreeScoped &&
+      !(await stagedlyDeletedGitlink(worktreePath, containing.submodulePath)) &&
       (await baseSubmoduleMatches(repoPath, containing.submodulePath, containing.sha));
     return matches ? resolve(repoPath, raw) : inWorktree;
   }
@@ -1053,6 +1073,50 @@ async function stagedSubmoduleSha(worktreePath: string, relPath: string): Promis
     if (mode === "160000" && sha) return sha;
   }
   return undefined;
+}
+
+/**
+ * True when `relPath` is a gitlink (`160000`) in `HEAD`'s tree but has been staged for REMOVAL —
+ * ordinary `git rm <path>` on an initialized submodule, as opposed to `git rm --cached <path>`,
+ * which per `git rm -h` ("only remove from the index") leaves the working-tree copy behind for the
+ * `existsSync(inWorktree)` branch above to handle on its own. Ordinary removal deletes BOTH the
+ * index entry and the on-disk checkout, producing the "missing from the worktree" shape this file's
+ * `containing`/nested-gitlink branch also reaches — and closes the false positive that shape
+ * otherwise produces (PR #263 review, round 38).
+ *
+ * {@link stagedSubmoduleSha} alone cannot distinguish this from round 36's ordinary case: both "the
+ * index simply agrees with `HEAD`, nothing ever staged here" (round 36's normal, common case) and
+ * "the index explicitly has NO entry because the removal is staged" (this case) make `git ls-files
+ * -s` produce no output, so `stagedSubmoduleSha` returns `undefined` for both. Telling them apart
+ * needs a positive signal that `HEAD` disagrees with the CURRENT index — not just an absence of a
+ * staged gitlink sha — so this checks `HEAD`'s tree directly (`git ls-tree HEAD`) and compares it
+ * against the same `git ls-files -s` the index-side check above already runs. Only "HEAD has a
+ * `160000` entry AND the index has none at all" counts as a staged deletion; "HEAD has no entry
+ * either" (never a submodule, or already committed as removed) is not this function's concern and
+ * correctly reports `false` — nothing here is being staged for deletion, there's simply nothing
+ * there.
+ *
+ * `:(literal)` prefixes `relPath` for both invocations, matching this file's convention for every
+ * other pathspec (PR #263 review, round 16), so a path with glob metacharacters is matched literally.
+ */
+async function stagedlyDeletedGitlink(worktreePath: string, relPath: string): Promise<boolean> {
+  const pathspec = `:(literal)${relPath}`;
+  const [headEntry, indexEntry] = await Promise.all([
+    execFileAsync("git", ["-C", worktreePath, "ls-tree", "HEAD", "--", pathspec], {
+      timeout: 120_000,
+      maxBuffer: 16 * 1024 * 1024,
+    }).then(
+      (r) => r.stdout,
+      () => "",
+    ),
+    execFileAsync("git", ["-C", worktreePath, "ls-files", "-s", "--", pathspec], {
+      timeout: 120_000,
+      maxBuffer: 16 * 1024 * 1024,
+    }).then((r) => r.stdout),
+  ]);
+  const headIsGitlink = headEntry.split("\n").some((line) => line.startsWith("160000 "));
+  const indexHasEntry = indexEntry.trim().length > 0;
+  return headIsGitlink && !indexHasEntry;
 }
 
 /**

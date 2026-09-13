@@ -1078,6 +1078,85 @@ suite("resolveHooksPathOverride (real git)", () => {
     ).toBe(v2Sha);
   });
 
+  // The DELETION-direction mirror of round 36's BUMP-direction fix (PR #263 review, round 38): round
+  // 37 made `commitStep`/`commitAndPushFix` call `stageAll` BEFORE `resolveHooksPathOverride`, so the
+  // index the resolver reads already reflects an ordinary `git rm <hooks-path-submodule>` — which,
+  // unlike `git rm --cached`, removes BOTH the index entry and the on-disk checkout. With the checkout
+  // gone, execution reaches the nested/ancestor-gitlink branch, whose `ancestorSubmoduleSha` reads
+  // `HEAD` — the last COMMIT, still showing the OLD (undeleted) gitlink — and can find the base repo's
+  // own checkout still sitting at that same old commit, reporting a false "match" and handing back the
+  // base repo's copy of the submodule this very commit is about to remove.
+  it("honors a staged deletion of a hooks-path submodule instead of falling back to the base repo's stale copy", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-staged-deletion");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-commit"), "#!/bin/sh\ntouch hook-ran\nexit 0\n");
+    chmodSync(join(submoduleUpstream, "pre-commit"), 0o755);
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleUpstream, "hooks"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-staged-deletion-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-staged-deletion", worktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      ["-C", worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "hooks"],
+      { stdio: "ignore" },
+    );
+    expect(existsSync(join(worktree, "hooks", "pre-commit"))).toBe(true);
+
+    // Base repo's own checkout stays initialized at the same commit `HEAD` still records for the
+    // gitlink — the scenario that would otherwise pass `baseSubmoduleMatches` unmodified.
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "hooks"],
+      { stdio: "ignore" },
+    );
+    expect(existsSync(join(repo, "hooks", "pre-commit"))).toBe(true);
+
+    // Ordinary `git rm` — not `git rm --cached` — removes BOTH the index entry and the on-disk
+    // checkout in one step.
+    execFileSync("git", ["-C", worktree, "rm", "-q", "hooks"], { stdio: "ignore" });
+    expect(existsSync(join(worktree, "hooks"))).toBe(false);
+    expect(
+      execFileSync("git", ["-C", worktree, "ls-files", "-s", "--", "hooks"], { encoding: "utf8" }),
+    ).toBe("");
+    expect(
+      execFileSync("git", ["-C", worktree, "ls-tree", "HEAD", "--", "hooks"], {
+        encoding: "utf8",
+      }),
+    ).toContain("160000");
+
+    // Must honor the staged deletion — return `inWorktree` (git's own "nothing exists, no hook
+    // fires" answer) — never the base repo's stale, soon-to-be-removed copy.
+    const hooksPath = await resolveHooksPathOverride(repo, worktree);
+    expect(hooksPath).toBe(join(worktree, "hooks"));
+    expect(existsSync(hooksPath!)).toBe(false);
+
+    // Proof the fix reaches the actual commit, not just the resolver's return value in isolation: the
+    // commit that lands this deletion must NOT run the outgoing `pre-commit` hook.
+    const { committed } = await commitAll(worktree, "t1: remove the hooks submodule", { hooksPath });
+    expect(committed).toBe(true);
+    expect(existsSync(join(worktree, "hook-ran"))).toBe(false);
+  });
+
   // Orphaned submodule checkout, left behind by a merge that already landed (PR #263 review, round
   // 31): when a commit removes a hooks-path submodule's gitlink entirely, Git leaves its nonempty
   // working directory — including its own `.git` gitfile — sitting on disk untouched. `git submodule
