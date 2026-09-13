@@ -1307,7 +1307,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     expect(outcome).toMatchObject({
       action: "retired",
       replacementId: SHIPPER,
-      label: expect.stringMatching(/^repair:already-shipped:[0-9a-f]{12}:\d+:target-close$/),
+      label: expect.stringMatching(/^repair:already-shipped:[0-9a-f]{12}:\d+:target-close:anton-9pkk$/),
       proof: [commitProof()],
     });
     expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
@@ -2977,7 +2977,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
         action: "retired",
         replacementId: SHIPPER,
         marked: false,
-        label: expect.stringMatching(/^repair:already-shipped:[0-9a-f]{12}:\d+:target-close$/),
+        label: expect.stringMatching(/^repair:already-shipped:[0-9a-f]{12}:\d+:target-close:anton-9pkk$/),
       });
       expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
       // Retried before it was allowed to fail, like the skip path's marker.

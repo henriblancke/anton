@@ -1412,7 +1412,7 @@ export async function repairAlreadyShipped(args: {
     const stamped = await mustPersist(async () => {
       const closure = await readCurrentClosureVersion(repoPath, bead.id);
       if (!closure) throw new Error(`bd history carries no closed version for ${bead.id}`);
-      label = await recordRepair(repoPath, bead, KLASS, attempted, Date.now(), closure);
+      label = await recordRepair(repoPath, bead, KLASS, attempted, Date.now(), closure, replacementId);
     });
     if (!stamped || label === undefined) {
       // The stamp is the whole of what lets a resume recognise this closure (`settleRetiredStandalone`

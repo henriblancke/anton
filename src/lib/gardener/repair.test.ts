@@ -176,14 +176,24 @@ describe("the stamp on the bead", () => {
     expect(tagMock.mock.invocationCallOrder[0]!).toBeLessThan(noteMock.mock.invocationCallOrder[0]!);
   });
 
-  it("binds a retirement stamp to its closure while preserving the guard fingerprint", async () => {
+  it("binds a retirement stamp to its closure and verified survivor while preserving the guard fingerprint", async () => {
     const closure = "closure-version";
-    const label = await recordRepair(REPO, bead(), "already-shipped", "retired as superseded", T0, closure);
+    const survivor = "anton-survivor";
+    const label = await recordRepair(
+      REPO,
+      bead(),
+      "already-shipped",
+      "retired as superseded",
+      T0,
+      closure,
+      survivor,
+    );
 
-    expect(label).toBe(repairLabel(BEAD, "already-shipped", T0, closure));
+    expect(label).toBe(repairLabel(BEAD, "already-shipped", T0, closure, survivor));
     expect(priorRepair(bead([label]), "already-shipped")).toMatchObject({
       fingerprint: repairFingerprint(BEAD, "already-shipped"),
       closure,
+      survivor,
     });
   });
 

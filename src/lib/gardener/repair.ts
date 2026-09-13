@@ -89,7 +89,9 @@ export function repairFingerprint(beadId: string, klass: RepairClass): string {
 }
 
 /**
- * The label as it is written: the fingerprint plus WHEN the repair was made.
+ * The label as it is written: the fingerprint plus WHEN the repair was made. A verified retirement
+ * also carries its closure version and survivor, so recovery can prove it is settling the exact close
+ * anton verified rather than a later decision on the same bead.
  *
  * The timestamp is not decoration. The breaker weighs a failed run double only when the repair
  * PRECEDED it ({@link repairedFailureWeight}) — without an instant to order against, the block that
@@ -101,13 +103,14 @@ export function repairLabel(
   klass: RepairClass,
   atMs: number,
   closure?: string,
+  survivor?: string,
 ): string {
-  return `${repairFingerprint(beadId, klass)}:${Math.floor(atMs)}${closure ? `:${closure}` : ""}`;
+  return `${repairFingerprint(beadId, klass)}:${Math.floor(atMs)}${closure ? `:${closure}` : ""}${survivor ? `:${survivor}` : ""}`;
 }
 
 /** A repair stamp's exact shape, so no unrelated `repair`-ish label is ever read as one. */
 const REPAIR_LABEL = new RegExp(
-  `^${REPAIR_NAMESPACE}:([a-z-]+):([0-9a-f]{${FINGERPRINT_HASH_LENGTH}}):(\\d+)(?::([A-Za-z0-9_-]+))?$`,
+  `^${REPAIR_NAMESPACE}:([a-z-]+):([0-9a-f]{${FINGERPRINT_HASH_LENGTH}}):(\\d+)(?::([A-Za-z0-9_-]+)(?::([A-Za-z0-9_-]+))?)?$`,
 );
 
 /** One repair anton already made on a bead, as the board remembers it. */
@@ -119,6 +122,8 @@ export interface RepairAttempt {
   at: number;
   /** The durable board version that began the closure this repair retired. */
   closure?: string;
+  /** The survivor the verified retirement superseded this bead in favour of. */
+  survivor?: string;
   /**
    * What the repair actually did, recovered from the bead's note. Undefined when the note was
    * edited away or predates the note format — the stamp still counts, because the LABEL is the
@@ -246,6 +251,7 @@ export function repairAttemptsOf(bead: RepairedBead): RepairAttempt[] {
       fingerprint,
       at: Number(m[3]!),
       ...(m[4] ? { closure: m[4] } : {}),
+      ...(m[5] ? { survivor: m[5] } : {}),
       ...(prose ? { attempted: prose } : {}),
     });
   }
@@ -374,8 +380,9 @@ export async function recordRepair(
   attempted: string,
   atMs: number,
   closure?: string,
+  survivor?: string,
 ): Promise<string> {
-  const label = repairLabel(bead.id, klass, atMs, closure);
+  const label = repairLabel(bead.id, klass, atMs, closure, survivor);
   await beads.tag(repoPath, bead.id, [label]);
   try {
     await beads.note(repoPath, bead.id, repairNote(repairFingerprint(bead.id, klass), attempted));

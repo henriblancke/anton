@@ -354,9 +354,9 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
   const stamped = await beads.show(repo, targetId).catch(() => undefined);
   if (!stamped || beads.supersededBy(stamped) !== survivor) return false;
   const repair = priorRepair(stamped, "already-shipped");
-  if (!repair?.closure) return false;
-  // A stamp survives reopen/re-supersede cycles. Its closure version must still be the one the
-  // ticket is closed in; timestamps cannot distinguish two cycles that close in the same second.
+  if (!repair?.closure || repair.survivor !== survivor) return false;
+  // A stamp survives reopen/re-supersede cycles. Its closure version and survivor must still be the
+  // verified retirement; timestamps cannot distinguish two cycles that close in the same second.
   const closure = await readCurrentClosureVersion(repo, targetId).catch(() => undefined);
   if (closure !== repair.closure) return false;
 

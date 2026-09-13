@@ -894,6 +894,8 @@ async function retirementReopenedDuringRelease(
     return false;
   }
   if (beads.supersededBy(after) === replacementId) return false;
+  // A different closed result is not a reopen. Restoring the old holder there would turn a newer
+  // decision into an assigned one, even though no live work exists to reclaim.
   if (!isOpenWork(after)) {
     console.warn(
       `[execute-epic] ${ticketId}'s retirement was replaced by a newer ${after.status} outcome while ` +

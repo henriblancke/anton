@@ -75,14 +75,15 @@ const SURVIVOR = "anton-keep";
 function retiredTarget({
   stampAt = Date.now(),
   closure = "target-close",
+  survivor = SURVIVOR,
   legacy = false,
-}: { stampAt?: number; closure?: string; legacy?: boolean } = {}): Bead {
+}: { stampAt?: number; closure?: string; survivor?: string; legacy?: boolean } = {}): Bead {
   return {
     id: TARGET,
     issue_type: "feature",
     status: "closed",
     // Built with the real stamper, so the fixture can't drift from the label format the gate parses.
-    labels: [repairLabel(TARGET, "already-shipped", stampAt, legacy ? undefined : closure)],
+    labels: [repairLabel(TARGET, "already-shipped", stampAt, legacy ? undefined : closure, legacy ? undefined : survivor)],
     dependencies: [{ type: "supersedes", issue_id: TARGET, depends_on_id: SURVIVOR }],
     notes: "retired as already shipped",
   } as unknown as Bead;
@@ -225,6 +226,15 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
     ]);
 
     expect(await settleCompletedRun(run([target], target), target)).toBe(false);
+    expect(updateRunMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stamp that names a different verified survivor", async () => {
+    const target = retiredTarget({ survivor: "anton-old-survivor" });
+
+    showMock.mockResolvedValue(target);
+    expect(await settleCompletedRun(run([target], target), target)).toBe(false);
+    expect(historyMock).not.toHaveBeenCalled();
     expect(updateRunMock).not.toHaveBeenCalled();
   });
 
