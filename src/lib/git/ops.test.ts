@@ -913,6 +913,78 @@ suite("resolveHooksPathOverride (real git)", () => {
     expectDisablesHooks(await resolveHooksPathOverride(repo, worktree));
   });
 
+  // The false positive round 28's check itself introduced (PR #263 review, round 36): a checkout
+  // disagreeing with `HEAD`'s gitlink is not ALWAYS stale — a task can deliberately bump the
+  // submodule to a new commit and STAGE that change (`git add <submodule-path>`) in preparation for a
+  // commit that hasn't happened yet. `resolveHooksPathOverride` runs BEFORE that commit
+  // (`commitAndPushFix` needs the hooksPath for the commit's own `pre-commit` hook), so `HEAD` still
+  // shows the OLD gitlink while the checkout — and the INDEX — already agree on the new one. This must
+  // resolve to the real (new) checkout, not disable hooks.
+  it("trusts an initialized worktree submodule that disagrees with HEAD but matches a staged, not-yet-committed gitlink bump", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-worktree-staged-bump");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-push"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+    const v1Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(submoduleUpstream, "pre-push"), "v2\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v2"], { stdio: "ignore" });
+    const v2Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleUpstream, "hooks"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "-C", "hooks", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule at v1"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-staged-bump-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-staged-bump", worktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      ["-C", worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "hooks"],
+      { stdio: "ignore" },
+    );
+    expect(readFileSync(join(worktree, "hooks", "pre-push"), "utf8")).toBe("v1\n");
+
+    // Deliberately bump the submodule to v2 and STAGE it — but do not commit. `HEAD:hooks` still
+    // records v1; the index and the checkout already agree on v2.
+    execFileSync("git", ["-C", worktree, "-C", "hooks", "checkout", "-q", v2Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "add", "hooks"], { stdio: "ignore" });
+    expect(
+      execFileSync("git", ["-C", worktree, "rev-parse", "HEAD:hooks"], { encoding: "utf8" }).trim(),
+    ).toBe(v1Sha);
+    expect(
+      execFileSync("git", ["-C", worktree, "ls-files", "-s", "--", "hooks"], { encoding: "utf8" }),
+    ).toContain(v2Sha);
+    expect(readFileSync(join(worktree, "hooks", "pre-push"), "utf8")).toBe("v2\n");
+
+    // The checkout disagrees with `HEAD` but matches the staged index — an intentional pending
+    // update, not staleness. Must resolve to the real worktree checkout, not disable hooks.
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "hooks"));
+  });
+
   // Orphaned submodule checkout, left behind by a merge that already landed (PR #263 review, round
   // 31): when a commit removes a hooks-path submodule's gitlink entirely, Git leaves its nonempty
   // working directory — including its own `.git` gitfile — sitting on disk untouched. `git submodule
@@ -1401,6 +1473,86 @@ suite("resolveHooksPathOverride (real git)", () => {
     // `checkedOutSubmoduleSha(worktreePath, "deps/hooks")` finds no exact-path match for the nested
     // value.
     expectDisablesHooks(await resolveHooksPathOverride(repo, worktree));
+  });
+
+  // The nested-containing-gitlink counterpart to the staged-bump test above (PR #263 review, round
+  // 36): `core.hooksPath=deps/hooks` names a path nested inside the `deps` gitlink, which a task is
+  // deliberately bumping and staging (not committing) in the SAME worktree. `containing` — the
+  // `HEAD`-tree answer for `deps` — still shows v1; the checkout and the index already agree on v2.
+  it("trusts a nested hooksPath's containing submodule when it disagrees with HEAD but matches a staged, not-yet-committed bump", async () => {
+    const submoduleUpstream = join(sandbox, "nested-hooks-submodule-upstream-staged-bump");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    mkdirSync(join(submoduleUpstream, "hooks"));
+    writeFileSync(join(submoduleUpstream, "hooks", "pre-push"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+    const v1Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(submoduleUpstream, "hooks", "pre-push"), "v2\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v2"], { stdio: "ignore" });
+    const v2Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "deps",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "-C", "deps", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "deps"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add deps submodule at v1"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "deps/hooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-nested-staged-bump-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-nested-staged-bump", worktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      ["-C", worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "deps"],
+      { stdio: "ignore" },
+    );
+    expect(readFileSync(join(worktree, "deps", "hooks", "pre-push"), "utf8")).toBe("v1\n");
+
+    // Deliberately bump `deps` to v2 and STAGE it — but do not commit. `HEAD:deps` still records v1;
+    // the index and the checkout already agree on v2.
+    execFileSync("git", ["-C", worktree, "-C", "deps", "checkout", "-q", v2Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "add", "deps"], { stdio: "ignore" });
+    expect(
+      execFileSync("git", ["-C", worktree, "rev-parse", "HEAD:deps"], { encoding: "utf8" }).trim(),
+    ).toBe(v1Sha);
+    expect(
+      execFileSync("git", ["-C", worktree, "ls-files", "-s", "--", "deps"], { encoding: "utf8" }),
+    ).toContain(v2Sha);
+    expect(readFileSync(join(worktree, "deps", "hooks", "pre-push"), "utf8")).toBe("v2\n");
+
+    // The checkout disagrees with `HEAD` but matches the staged index — an intentional pending
+    // update, not staleness. Must resolve to the real worktree checkout, not disable hooks.
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "deps", "hooks"));
   });
 
   // A hooksPath NESTED inside a submodule (`core.hooksPath=deps/hooks`, `deps` the gitlink) has no

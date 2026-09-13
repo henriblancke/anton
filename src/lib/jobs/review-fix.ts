@@ -732,8 +732,10 @@ async function commitAndPushFix(
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
   // From the worktree, not `repo` (the base checkout) — see pushBranch's doc comment: a project's
   // pre-push hook that inspects the working tree must see the branch actually being pushed. The
-  // resolved hooksPath still comes from `repo` (the base checkout's config) — that's the one place
-  // `core.hooksPath` was actually configured; git resolves an absolute path the same from either.
+  // resolved hooksPath above is ALSO read from the worktree (resolveHooksPathOverride(repo,
+  // worktreePath) queries worktreePath when given, per its own contract) — the same "read from the
+  // worktree, not the base repo" behavior this file's onbranch-includeIf reasoning depends on
+  // elsewhere, not the base checkout's config.
   if (pushed) await pushBranch(worktreePath, branch, hooksPath);
   return pushed;
 }

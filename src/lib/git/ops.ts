@@ -321,19 +321,50 @@ export async function resolveHooksPathOverride(
     if (checkedOut.checkedOut) {
       const current = await ancestorSubmoduleSha(worktreePath, raw);
       if (current && checkedOut.sha !== current.sha) {
-        // Stale, not merely absent: unlike the uninitialized case above, `inWorktree` here is a
-        // real, populated checkout — just of the WRONG commit — so returning it as this function's
-        // usual "empty placeholder, no hook fires" signal would actually run that stale content's
-        // hook. Worse than running none, the same reasoning round 18 already applied to a stale
-        // BASE-repo copy; a stale WORKTREE copy is no safer. `disabledHooksPath` forces hooks off
-        // for real instead of handing back a path that still resolves to something.
-        return disabledHooksPath();
+        // A mismatch here has TWO possible causes, not one, and only one of them is genuine
+        // staleness (PR #263 review, round 36). `current` is `HEAD`'s already-committed answer — the
+        // last commit's gitlink — while `checkedOut` is the actual checkout on disk right now:
+        //
+        // - GENUINE STALENESS (round 28's original case): a fast-forward already landed, advancing
+        //   `HEAD`'s gitlink, but nothing re-ran `submodule update` — the checkout is behind what
+        //   the CURRENT commit records.
+        // - AN INTENTIONAL, ALREADY-STAGED, NOT-YET-COMMITTED UPDATE: a task deliberately checked the
+        //   submodule out at a new commit and staged that exact gitlink (`git add
+        //   <submodule-path>`), in preparation for a commit that has not happened yet — reproduced
+        //   with `resolveHooksPathOverride` called by `commitAndPushFix` before its own commit runs.
+        //   `HEAD` still shows the OLD gitlink (nothing has been committed), but the checkout is
+        //   exactly what the INDEX already agrees to stage — not stale at all, but the future
+        //   commit's own content, arriving early.
+        //
+        // `stagedSubmoduleSha` distinguishes them by asking the index — what `git commit` would
+        // actually record right now — rather than only `HEAD`'s last-committed answer. The checkout
+        // matching the staged sha means the pending commit already accounts for it; only a checkout
+        // matching NEITHER `HEAD`'s gitlink NOR a staged one is truly stale — unlike the uninitialized
+        // case above, `inWorktree` here is a real, populated checkout, just of a commit nothing
+        // vouches for, so returning it as this function's usual "empty placeholder, no hook fires"
+        // signal would actually run that unverified content's hook. Worse than running none, the same
+        // reasoning round 18 already applied to a stale BASE-repo copy. `disabledHooksPath` forces
+        // hooks off for real instead of handing back a path that still resolves to something.
+        const staged = await stagedSubmoduleSha(worktreePath, raw);
+        if (!staged || checkedOut.sha !== staged) return disabledHooksPath();
       }
     } else {
       const containing = await ancestorSubmoduleSha(worktreePath, raw);
       if (containing) {
         const actual = await checkedOutSubmoduleSha(worktreePath, containing.submodulePath);
-        if (!actual.checkedOut || actual.sha !== containing.sha) return disabledHooksPath();
+        if (!actual.checkedOut) return disabledHooksPath();
+        if (actual.sha !== containing.sha) {
+          // The identical "intentional pending update" false positive applies one level down too
+          // (PR #263 review, round 36): a hooksPath NESTED inside a submodule whose CONTAINING
+          // gitlink a task is deliberately bumping and staging (not yet committed) produces the same
+          // "checkout ahead of HEAD's tree" mismatch as the direct-gitlink case just above, for the
+          // exact same reason — `containing` is `ancestorSubmoduleSha`'s `HEAD`-tree answer, `actual`
+          // is the real checkout. `stagedSubmoduleSha` against `containing.submodulePath` (the
+          // gitlink's own path, not `raw` itself, which names no submodule at all here) closes it the
+          // same way.
+          const staged = await stagedSubmoduleSha(worktreePath, containing.submodulePath);
+          if (!staged || actual.sha !== staged) return disabledHooksPath();
+        }
       } else if (
         !(await currentTreeHasOrdinaryEntry(worktreePath, raw)) &&
         (await orphanedSubmoduleAncestor(worktreePath, raw))
@@ -981,6 +1012,47 @@ async function checkedOutSubmoduleSha(
     }
   }
   return { checkedOut: false, sha: undefined };
+}
+
+/**
+ * The gitlink sha the INDEX currently has staged for `relPath` — what `git commit` would actually
+ * record if it ran right now — distinct from both `ancestorSubmoduleSha`'s `HEAD`-tree answer (the
+ * last COMMIT's gitlink) and `checkedOutSubmoduleSha`'s answer (the actual checkout on disk). Closes
+ * the "intentional pending update" false positive `resolveHooksPathOverride`'s staleness check hit
+ * when a task deliberately bumps a submodule to a new commit and stages that change (`git add
+ * <submodule-path>`) before committing: the checkout then legitimately disagrees with `HEAD` while
+ * agreeing with the index (PR #263 review, round 36).
+ *
+ * `git ls-files -s -- <path>` is what answers this — `git-ls-files(1)`'s `-s` ("show staged
+ * contents") reports the INDEX's mode/sha/stage for a path, unlike `git ls-tree HEAD` (the last
+ * COMMIT's tree, oblivious to anything staged since). Its output format is `<mode> <sha>
+ * <stage>\t<path>`; a path with no staged change at all — the ordinary case, where the index simply
+ * agrees with `HEAD` — produces no line and an exit 0, which this function reports as `undefined`
+ * rather than an error: "nothing staged here" is not a failure, it just means `ancestorSubmoduleSha`'s
+ * `HEAD`-tree check alone was already sufficient and this helper has nothing extra to add.
+ *
+ * `:(literal)` prefixes `relPath` the same way every other pathspec in this file does, so a path
+ * containing glob metacharacters is matched literally rather than misinterpreted (PR #263 review,
+ * round 16's same reasoning, applied here).
+ *
+ * Only mode `160000` (a gitlink) counts as a match: `relPath` staged as an ORDINARY file or directory
+ * entry (a "convert submodule to regular content" change, mid-flight) answers this question with "no
+ * staged submodule sha", correctly leaving `ancestorSubmoduleSha`'s tree-side check as the only signal
+ * — there is no staged GITLINK sha to corroborate a checkout against.
+ */
+async function stagedSubmoduleSha(worktreePath: string, relPath: string): Promise<string | undefined> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", worktreePath, "ls-files", "-s", "--", `:(literal)${relPath}`],
+    { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+  );
+  for (const line of stdout.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab === -1) continue;
+    const [mode, sha] = line.slice(0, tab).split(" ");
+    if (mode === "160000" && sha) return sha;
+  }
+  return undefined;
 }
 
 /**
