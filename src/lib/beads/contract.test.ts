@@ -304,11 +304,18 @@ describe("validateBeadContract — headings inside fenced code", () => {
   it("treats a section holding only an empty fenced block as unwritten", () => {
     // The delimiters are punctuation, not content — counting them as text let a ticket whose
     // Acceptance was an empty ``` block approve and run with no definition of done.
-    const empty = ticket({
-      acceptance_criteria: undefined,
-      description: [DESCRIPTION, "", "## Acceptance", "```", "```"].join("\n"),
-    });
-    expect(summarize(empty)).toEqual([["Acceptance", "blocking"]]);
+    for (const fence of [
+      ["```", "```"],
+      ["> ```", "> ```"],
+      ["> > ```", "> > ```"],
+      ["123. ```", "     ```"],
+    ]) {
+      const empty = ticket({
+        acceptance_criteria: undefined,
+        description: [DESCRIPTION, "", "## Acceptance", ...fence].join("\n"),
+      });
+      expect(summarize(empty)).toEqual([["Acceptance", "blocking"]]);
+    }
   });
 
   it("still counts fenced CONTENT as authored — only the delimiters are skipped", () => {

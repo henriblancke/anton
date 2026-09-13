@@ -270,10 +270,11 @@ export function scanMarkdown(source: string): ScannedLine[] {
       if (!opening) return; // Indented code is not a fenced literal for the contract.
       for (let index = start; index <= end; index++) lines[index]!.fenced = true;
       lines[start]!.delimiter = true;
-      // A closer still carries each container marker (`> > ````); a list item's carries only its
-      // indentation. Strip the full container prefix — as the opener's peeling did — so the
-      // delimiter is read as one regardless of how many blockquotes and items wrap it.
-      const closing = stripContainerMarkers(lines[end]?.text ?? "");
+      // A closing delimiter ends at the code node's source column. Count back the opening length:
+      // that lands after all quote/list prefixes and a wide item's continuation indentation, while
+      // a longer closer still leaves a valid opening-length suffix (`123. ```\n     ````).
+      const closingStart = Math.max(0, node.position.end.column - opening.len - 1);
+      const closing = lines[end]?.text.slice(closingStart) ?? "";
       if (end !== start && closingFence(closing, opening)) lines[end]!.delimiter = true;
       return;
     }

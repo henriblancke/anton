@@ -328,6 +328,10 @@ it("drops the delimiters of a fence nested in several containers, empty ones inc
   expect(rendered("> > ```\n> > ```")).toEqual([]);
   expect(rendered("> > > ```\n> > > ```")).toEqual([]);
   expect(rendered("> - - ```\n> - - ```")).toEqual([]);
+  // The ordered marker has five columns of continuation indentation. The AST's code column points
+  // at the delimiter past it, so both delimiter lines must use that column rather than only peeling
+  // markers from the closer.
+  expect(rendered("123. ```\n     ```")).toEqual([]);
   expect(rendered("## Acceptance\n> > ```\n> > ```")).toEqual(["## Acceptance"]);
   // A non-empty nested fence still files its content as literal, and both delimiters drop.
   expect(rendered("> > ```\n> > x\n> > ```")).toEqual(["> > x"]);
