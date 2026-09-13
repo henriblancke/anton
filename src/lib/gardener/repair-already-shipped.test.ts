@@ -1226,6 +1226,7 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       bead: bead(TARGET, { status: "in_progress" }),
       block: { reason: CLAIM },
       committed: false,
+      dispatched: bead(TARGET, { status: "in_progress", description: "" }),
       now: NOW,
       autonomy: "apply",
       board: board(),
@@ -1281,6 +1282,17 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     tagMock.mock.invocationCallOrder[tagMock.mock.calls.findIndex(([, , labels]) => labels.some(matches))]!;
   const markerOrder = () => tagOrder((l) => l === LABELS.notDelivered);
   const stampOrder = () => tagOrder((l) => l.startsWith("repair:"));
+
+  it("refuses a claim from an agent that received no ticket contract", async () => {
+    const outcome = await retire({ dispatched: undefined });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("was not dispatched with this ticket's contract");
+    expect((outcome as { evidence: string[] }).evidence).toEqual([`the agent reported: ${CLAIM}`]);
+    expect(showMock).not.toHaveBeenCalled();
+    expect(loadAllIssuesMock).not.toHaveBeenCalled();
+    for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
+  });
 
   it("retires the ticket as superseded, with the evidence on the bead and the stamp beside it", async () => {
     const outcome = await retire();
@@ -1514,7 +1526,10 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
       id === TARGET ? bead(TARGET, { status: "in_progress", description: contract }) : bead(SHIPPER, { status: "closed" }),
     );
 
-    const outcome = await retire({ bead: bead(TARGET, { status: "in_progress", description: contract }) });
+    const outcome = await retire({
+      dispatched: bead(TARGET, { status: "in_progress", description: contract }),
+      bead: bead(TARGET, { status: "in_progress", description: contract }),
+    });
 
     expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
     expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);

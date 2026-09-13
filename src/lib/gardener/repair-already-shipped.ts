@@ -1059,8 +1059,8 @@ export async function repairAlreadyShipped(args: {
    * The ticket as the AGENT was prompted with it — the run's dispatch snapshot, whose contract the
    * claim is a claim about (PR #238 review). `bead` is read after the report, so an edit landing
    * while the agent ran is already in it, and a fence that starts from `bead` would hold the write
-   * to the rewritten ticket and never see the drift. Absent, the caller has no earlier read than
-   * `bead` and the gate has nothing to compare — see {@link contractDriftedSinceDispatch}.
+   * to the rewritten ticket and never see the drift. Absent, retirement is refused: no provenance
+   * establishes that the reporting agent received this ticket's contract.
    *
    * Its parentage is the dispatch-time HOME, held the same way ({@link homeMovedSinceDispatch}):
    * `bead` and the board are both read after the report, so a re-parent landing while the agent ran
@@ -1121,10 +1121,21 @@ export async function repairAlreadyShipped(args: {
     };
   }
 
+  if (!dispatched) {
+    return {
+      action: "escalate",
+      why:
+        `${bead.id} blocked as \`${KLASS}\`, but the reporting agent was not dispatched with this ` +
+        `ticket's contract — anton cannot retire a ticket on a claim made without its acceptance ` +
+        `criteria, so a human must decide it.`,
+      evidence: [`the agent reported: ${claim}`],
+    };
+  }
+
   // The claim was made about the ticket the agent READ, and a rewrite in the meantime makes it a
   // claim about a ticket that no longer exists. Decided before any read, like gate 1: both beads are
   // already in hand, and no autonomy level makes it acceptable.
-  const drifted = dispatched ? contractDriftedSinceDispatch(dispatched, bead) : undefined;
+  const drifted = contractDriftedSinceDispatch(dispatched, bead);
   if (drifted) {
     return {
       action: "escalate",
@@ -1139,7 +1150,7 @@ export async function repairAlreadyShipped(args: {
   // the run that dispatched the agent, and a re-parent landing while it ran leaves the ticket open
   // with its contract intact — inside a run this one does not own. The fences under the lock
   // start from the post-report board, which already holds the move (PR #238 review).
-  const rehomed = dispatched ? homeMovedSinceDispatch(dispatched, bead) : undefined;
+  const rehomed = homeMovedSinceDispatch(dispatched, bead);
   if (rehomed) return rehomedWhileRunning(bead.id, rehomed, claim);
   // The ticket's LIFECYCLE and CLAIM at dispatch, held against the same post-report read. anton
   // claimed it `in_progress` for the run's operator, and an operator reopening, blocking, deferring

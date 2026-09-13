@@ -230,8 +230,8 @@ async function walkTicketSteps(args: {
  * supplies no snapshot of its own, so the `already-shipped` repair would fence the generic step's
  * claim against the IMPLEMENTER's read — and a human note that landed between the two would look
  * like a note the reporting agent had seen. So a displacing report carries its own snapshot, or
- * none: with none, the repair falls back to the run's board snapshot, whose contract fence sees any
- * drift since and escalates rather than retiring on a read nobody attests to.
+ * none: `already-shipped` rejects a missing snapshot rather than retire a ticket on a contract the
+ * reporting agent never received.
  */
 export function recordStepReport(progress: TicketProgress, facts: StepFacts | undefined): void {
   const reported = facts?.selfReport;
