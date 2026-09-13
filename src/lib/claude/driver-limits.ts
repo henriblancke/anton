@@ -87,14 +87,17 @@ const SPEND_LIMIT_RESULT_RE =
  * [openrouter/…] [402]: {"error":{"message":"This request requires more credits…` (anton-x96g, PR
  * #238/#252). The bare `503` in that string otherwise matches `TRANSIENT_STDERR_RE`
  * (driver-exit.ts) and gets resumed as a transient network blip against a wall that never moves —
- * quota classification must catch the buried `[402]` first. Scanned across the combined transcript
- * like the terse usage-limit banners above: a bracketed `[402]` paired with "requires more credits"
- * is a machine error-code format, not phrasing a model would casually reproduce in its own prose.
+ * quota classification must catch the buried `[402]` first. It is trusted in stderr, Claude Code's
+ * own diagnostic channel; a result field must be the complete API-error envelope because the model
+ * can quote the same machine error while reporting an unrelated failure.
  */
 const GATEWAY_BILLING_RE = /\[402\][\s\S]{0,200}?requires more credits/i;
+const GATEWAY_BILLING_RESULT_RE =
+  /^[ \t]*API Error:\s*\d{3}\s+\[[^\]]+\]\s+\[402\]:\s*\{[^\n]{0,200}?requires more credits[^\n]*\}[ \t]*\n?$/i;
 
 /**
- * A rate-limit stop trusted anywhere the same way `GATEWAY_BILLING_RE` is: observed verbatim as
+ * A rate-limit stop trusted in stderr, and in a result only when the result is a complete API-error
+ * envelope, the same way `GATEWAY_BILLING_RE` is: observed verbatim as
  * `API Error: 503 [claude/claude-opus-5] [429]: {"type":"error","error":{"type":"rate_limit_error",
  * "message":"This request would exceed your (reset after 2m 41s)…` (anton-fmlb — three consecutive
  * RESUMEs in ~60s against a wall that never moved). The bare `429` in that envelope otherwise
@@ -104,9 +107,12 @@ const GATEWAY_BILLING_RE = /\[402\][\s\S]{0,200}?requires more credits/i;
  * Two machine-only shapes, neither one a model would casually reproduce in prose: the JSON
  * `"type":"rate_limit_error"` field a provider's error body carries, and a bracketed `[429]` status
  * code the way Claude Code's own API-error wrapper and gateways render it — as opposed to a bare
- * "429" typed inline, which stays ambiguous enough to leave alone.
+ * "429" typed inline, which stays ambiguous enough to leave alone. They still use the same result
+ * whole-envelope guard as the billing error because model prose can quote either shape verbatim.
  */
 const RATE_LIMIT_RE = /"type"\s*:\s*"rate_limit_error"|\[429\]/i;
+const RATE_LIMIT_RESULT_RE =
+  /^[ \t]*API Error:\s*\d{3}\s+\[[^\]]+\]\s+\[429\]:\s*[^\n]*\S[ \t]*\n?$/i;
 
 /**
  * The session-limit banner — observed verbatim as `You've hit your session limit · resets 9pm
@@ -264,18 +270,20 @@ function combinedText(channels: ClaudeChannels): string {
 /**
  * Terse machine banners are trusted across the full transcript (assistant + result + stderr) — the
  * result field alone isn't a reliable place to find them. The monthly spend-limit, session-limit,
- * and usage-credits sentences are all model-reproducible prose, so none of them are ever scanned in
- * the assistant transcript, and their remaining two channels are matched with strictness suited to
- * their authorship: stderr (Claude Code's own) loosely, the model-authored result field only when
- * the banner is the WHOLE result.
+ * usage-credits, and API-error sentences are model-reproducible, so none are scanned in the
+ * assistant transcript. Their remaining channels are matched with strictness suited to authorship:
+ * stderr (Claude Code's own) loosely, and the model-authored result field only when the notice is
+ * the WHOLE result.
  */
 function isUsageLimited(channels: ClaudeChannels): boolean {
   return (
     USAGE_LIMIT_RE.test(combinedText(channels)) ||
     SPEND_LIMIT_RE.test(channels.stderr) ||
     SPEND_LIMIT_RESULT_RE.test(channels.resultText) ||
-    GATEWAY_BILLING_RE.test(combinedText(channels)) ||
-    RATE_LIMIT_RE.test(combinedText(channels)) ||
+    GATEWAY_BILLING_RE.test(channels.stderr) ||
+    GATEWAY_BILLING_RESULT_RE.test(channels.resultText) ||
+    RATE_LIMIT_RE.test(channels.stderr) ||
+    RATE_LIMIT_RESULT_RE.test(channels.resultText) ||
     SESSION_LIMIT_RE.test(channels.stderr) ||
     SESSION_LIMIT_RESULT_RE.test(channels.resultText) ||
     USAGE_CREDITS_RE.test(channels.stderr) ||

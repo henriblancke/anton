@@ -128,8 +128,14 @@ describe("usageLimitError", () => {
 
   it("classifies OpenRouter's [402] billing stop as a quota hit even though it arrives inside a 503 envelope (anton-x96g)", () => {
     expect(usageLimitError(channels({ stderr: GATEWAY_402_ENVELOPE }))).not.toBeNull();
-    expect(usageLimitError(channels({ transcript: `${GATEWAY_402_ENVELOPE}\n` }))).not.toBeNull();
     expect(usageLimitError(channels({ resultText: GATEWAY_402_ENVELOPE }))).not.toBeNull();
+  });
+
+  it("ignores a [402] billing envelope quoted in model-authored prose", () => {
+    expect(usageLimitError(channels({ transcript: `I encountered ${GATEWAY_402_ENVELOPE}` }))).toBeNull();
+    expect(
+      usageLimitError(channels({ resultText: `${GATEWAY_402_ENVELOPE}\n\nBut three tests still fail.` })),
+    ).toBeNull();
   });
 
   it("leaves a genuine gateway 503 with no [402] inside untouched — it must still resolve as transient (anton-x96g)", () => {
@@ -138,8 +144,14 @@ describe("usageLimitError", () => {
 
   it("classifies a rate_limit_error payload as a quota hit even wrapped in a 503 envelope (anton-h8z4)", () => {
     expect(usageLimitError(channels({ stderr: RATE_LIMIT_429_ENVELOPE }))).not.toBeNull();
-    expect(usageLimitError(channels({ transcript: `${RATE_LIMIT_429_ENVELOPE}\n` }))).not.toBeNull();
     expect(usageLimitError(channels({ resultText: RATE_LIMIT_429_ENVELOPE }))).not.toBeNull();
+  });
+
+  it("ignores a [429] rate-limit envelope quoted in model-authored prose", () => {
+    expect(usageLimitError(channels({ transcript: `I encountered ${RATE_LIMIT_429_ENVELOPE}` }))).toBeNull();
+    expect(
+      usageLimitError(channels({ resultText: `${RATE_LIMIT_429_ENVELOPE}\n\nBut three tests still fail.` })),
+    ).toBeNull();
   });
 
   it("classifies a bare [429] from the API or a gateway as a quota hit (anton-h8z4)", () => {
