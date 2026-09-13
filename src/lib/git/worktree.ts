@@ -415,12 +415,8 @@ function conflictingClaim(
  * the commit the branch was literally created at — and returns it; the caller pins HEAD here instead
  * of re-deriving later.
  */
-async function readForkAtCreation(worktreePath: string): Promise<string | undefined> {
-  try {
-    return await git(worktreePath, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
-  } catch {
-    return undefined; // best-effort: the caller falls back to its own resolution
-  }
+async function readForkAtCreation(worktreePath: string): Promise<string> {
+  return git(worktreePath, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
 }
 
 export async function createWorktree(opts: {
@@ -490,7 +486,7 @@ export async function createWorktree(opts: {
     // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
     // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
     const resolved = await realpath(path);
-    return { path: resolved, branch, baseBranch, ...(forkSha ? { forkSha } : {}), repoPath };
+    return { path: resolved, branch, baseBranch, forkSha, repoPath };
   });
 
   if (warm) {

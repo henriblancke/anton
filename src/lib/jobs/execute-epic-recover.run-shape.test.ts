@@ -91,7 +91,7 @@ function child(): Bead {
   return { id: "anton-kid", issue_type: "task", status: "open", parent_id: TARGET } as unknown as Bead;
 }
 
-function run(all: Bead[], target: Bead): EpicRun {
+function run(all: Bead[], target: Bead, standaloneRun = true): EpicRun {
   return {
     db: {},
     clock: { now: () => new Date("2026-09-09T00:00:00Z") },
@@ -103,8 +103,8 @@ function run(all: Bead[], target: Bead): EpicRun {
     targetId: TARGET,
     all,
     target,
-    // The stale snapshot verdict: read before the child existed.
-    standaloneRun: true,
+    // The snapshot verdict can be stale until 0a-ter recomputes it.
+    standaloneRun,
     lease: { adoptOwn: vi.fn(), refuseForeign: vi.fn() },
   } as unknown as EpicRun;
 }
@@ -135,6 +135,18 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
     expect(pullMock).toHaveBeenCalledWith(REPO);
     expect(loadAllIssuesMock).toHaveBeenCalledWith(REPO, { strictGates: true });
     // Settled as a finished run, with no PR, exactly as the uninterrupted attempt would.
+    expect(updateRunMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      "run-1",
+      expect.objectContaining({ status: "done" }),
+    );
+  });
+
+  it("settles when the refreshed board has no children despite a stale non-standalone snapshot", async () => {
+    const target = retiredTarget();
+
+    expect(await settleCompletedRun(run([target], target, false), target)).toBe(true);
     expect(updateRunMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),

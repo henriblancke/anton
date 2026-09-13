@@ -267,6 +267,33 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  it("fails creation before warming when it cannot read the new checkout's fork", async () => {
+    const branch = "anton/run-fork-read-fails";
+    const shim = gitShim([
+      'if [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then',
+      '  echo "fatal: object database unavailable" >&2',
+      "  exit 128",
+      "fi",
+    ]);
+    process.env[WARM_COMMAND_ENV] = "mkdir -p node_modules && echo warmed > node_modules/.warm";
+
+    try {
+      await expect(createWorktree({ repoPath: repo, branch, warm: true })).rejects.toThrow(
+        "object database unavailable",
+      );
+      expect(existsSync(join(worktreePathFor(repo, branch), "node_modules"))).toBe(false);
+    } finally {
+      shim.restore();
+      delete process.env[WARM_COMMAND_ENV];
+      await removeWorktree({
+        path: worktreePathFor(repo, branch),
+        branch,
+        baseBranch: "master",
+        repoPath: repo,
+      }, { deleteBranch: true });
+    }
+  });
+
   it("returns the creation fork when warm-command resolution throws", async () => {
     const priorVitest = process.env.VITEST;
     delete process.env.VITEST;
