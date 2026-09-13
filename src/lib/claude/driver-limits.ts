@@ -125,9 +125,9 @@ const RATE_LIMIT_RESULT_RE =
  */
 const SESSION_LIMIT_RE = /^\s*you['’]ve hit your session limit\b[\s\S]{0,40}?resets?\s+[^\n]*?\([^)]+\)/im;
 
-/** Result-field variant of `SESSION_LIMIT_RE`, end-anchored so the banner must be the whole result. */
+/** Result-field variant limited to Claude Code's standalone session-limit banner. */
 const SESSION_LIMIT_RESULT_RE =
-  /^\s*you['’]ve hit your session limit\b[\s\S]{0,40}?resets?\s+[^\n]*?\([^)]+\)[^\n]*\s*$/i;
+  /^\s*you['’]ve hit your session limit\s*·\s*resets?\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*\([^)]+\)\s*$/i;
 
 /**
  * The out-of-usage-credits banner — observed verbatim as `You're out of usage credits. Switch to
@@ -137,9 +137,9 @@ const SESSION_LIMIT_RESULT_RE =
  */
 const USAGE_CREDITS_RE = /^\s*you['’]re out of usage credits\b[\s\S]{0,120}?claude\.ai\/settings\/usage/im;
 
-/** Result-field variant of `USAGE_CREDITS_RE`, end-anchored so the banner must be the whole result. */
+/** Result-field variant limited to Claude Code's standalone usage-credits banner. */
 const USAGE_CREDITS_RESULT_RE =
-  /^\s*you['’]re out of usage credits\b[\s\S]{0,120}?claude\.ai\/settings\/usage[^\n]*\s*$/i;
+  /^\s*you['’]re out of usage credits\.\s*Switch to another model, or manage usage credits at claude\.ai\/settings\/usage\?from=cc_cli_limit_message, to continue\.\s*$/i;
 
 /** Claude's machine-readable reset stamp, trailing a banner: `…usage limit reached|1700000000`. */
 const RESET_EPOCH_RE = /\|\s*(\d{10,13})\s*$/m;

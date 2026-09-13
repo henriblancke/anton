@@ -172,6 +172,11 @@ describe("usageLimitError", () => {
         channels({ resultText: `${SESSION_LIMIT_BANNER}\n\nBut three tests still fail.` }),
       ),
     ).toBeNull();
+    expect(
+      usageLimitError(
+        channels({ resultText: `${SESSION_LIMIT_BANNER} — I only quoted this fixture; tests failed.` }),
+      ),
+    ).toBeNull();
   });
 
   it("classifies the out-of-usage-credits banner as a quota hit (anton-2gsj)", () => {
@@ -186,6 +191,11 @@ describe("usageLimitError", () => {
     expect(
       usageLimitError(
         channels({ resultText: `${USAGE_CREDITS_BANNER}\n\nBut three tests still fail.` }),
+      ),
+    ).toBeNull();
+    expect(
+      usageLimitError(
+        channels({ resultText: `${USAGE_CREDITS_BANNER} I only quoted this fixture; tests failed.` }),
       ),
     ).toBeNull();
   });
