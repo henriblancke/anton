@@ -490,7 +490,40 @@ export async function resolveHooksPathOverride(
   // Finding one means `raw` is nested inside (or is) a submodule this branch deleted, not a generated
   // directory — `inWorktree` (git's own "nothing exists, no hook fires" answer) is correct
   // regardless of scope, never the base repo's stale copy (PR #263 review, round 34).
-  if (await historicalAncestorGitlink(worktreePath, raw)) return inWorktree;
+  //
+  // But "was ever a deleted gitlink" is not, by itself, proof the ancestor is dead: converting a
+  // submodule to an ordinary tracked directory in a single commit registers, in git's own diff
+  // machinery, as a `160000` → tree-mode DELETE of the old gitlink entry at that path (verified
+  // against real git — the mode change is recorded as a delete of the old entry plus adds for the
+  // new tree's contents, not a modify), so `wasGitlinkDeletedOnBranch`'s `--diff-filter=D` walk
+  // matches a REPURPOSED ancestor exactly the same way it matches a genuinely, permanently removed
+  // one. `deps` having been "historically a deleted gitlink" says nothing about whether a LATER
+  // commit on this same branch turned it into a real, currently-tracked ordinary directory — round
+  // 35's scenario, but for the ANCESTOR `deps` rather than `raw` itself, and for a generated child
+  // (`deps/hooks`, e.g. a Husky-style path never tracked on its own) rather than a tracked leaf. A
+  // cold worktree that never initialized `deps` as a submodule has no on-disk content at `raw` yet —
+  // not because the branch's tree lacks any, but because THIS worktree hasn't materialized it — so
+  // trusting the historical match unconditionally would wrongly return `inWorktree`'s "nothing here,
+  // no hook fires" for a path the current tree perfectly well tracks as ordinary content.
+  // `currentTreeHasOrdinaryEntry`, already built by round 35 to answer exactly "does the CURRENT tree
+  // show ordinary (non-gitlink) content at this path," is reused here against the SAME ancestor
+  // `historicalAncestorGitlink` found the historical deletion for — not `raw` — closing the gap
+  // between the two checks without disturbing round 34's genuine-deletion case, where the current
+  // tree has no entry at all for that ancestor and this check simply reports `false`. A match here
+  // means the ancestor's current, real content is what the eventual checkout will materialize `raw`
+  // under — the same "worktree hasn't caught up to what the tree says yet" trust the
+  // uninitialized-submodule branch above already extends (`uninitializedSubmoduleSha` +
+  // `baseSubmoduleMatches`) — so this falls through to the ordinary `trackedSomewhere` handling below
+  // exactly as if no historical deletion had ever been found, letting `everTrackedOnBranch` see
+  // `raw`'s own real commit history on this branch instead of being short-circuited here (PR #263
+  // review, round 39).
+  const historicalAncestor = await historicalAncestorGitlink(worktreePath, raw);
+  if (
+    historicalAncestor !== undefined &&
+    !(await currentTreeHasOrdinaryEntry(worktreePath, historicalAncestor))
+  ) {
+    return inWorktree;
+  }
 
   // Missing in the worktree — fall back to the base repo's copy only when NEITHER checkout has ever
   // tracked it (a generated directory like Husky's `.husky/_`, never committed at all) AND the value
@@ -558,15 +591,16 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
 }
 
 /**
- * Whether `relPath` or any of its ancestor path segments was EVER (at any point in
- * `worktreePath`'s OWN branch history, current tree already ruled out by {@link
+ * The ancestor path segment of `relPath` (`relPath` itself included) that was EVER (at any point
+ * in `worktreePath`'s OWN branch history, current tree already ruled out by {@link
  * ancestorSubmoduleSha} before this runs) a submodule gitlink (mode `160000`) that this branch
- * later deleted. Closes a gap neither {@link isTrackedInBaseRepo} nor {@link everTrackedOnBranch}
- * can see for a NESTED hooksPath (`core.hooksPath=deps/hooks`, `deps` the gitlink): both query
- * `relPath`'s own EXACT literal path, and a submodule's tree entry only ever exists at the
- * gitlink's OWN path — the superproject's index/tree never records anything nested inside a
- * submodule, initialized or not (gitsubmodules(7)) — so neither probe can answer "was the
- * CONTAINING gitlink ever real" for a nested path (PR #263 review, round 34).
+ * later deleted — or `undefined` if no segment ever was. Closes a gap neither
+ * {@link isTrackedInBaseRepo} nor {@link everTrackedOnBranch} can see for a NESTED hooksPath
+ * (`core.hooksPath=deps/hooks`, `deps` the gitlink): both query `relPath`'s own EXACT literal
+ * path, and a submodule's tree entry only ever exists at the gitlink's OWN path — the
+ * superproject's index/tree never records anything nested inside a submodule, initialized or not
+ * (gitsubmodules(7)) — so neither probe can answer "was the CONTAINING gitlink ever real" for a
+ * nested path (PR #263 review, round 34).
  *
  * Walked the same ancestor-segment way {@link ancestorSubmoduleSha} walks the current tree, but
  * historically: for each segment, the most recent commit (reachable from this branch's `HEAD`,
@@ -574,22 +608,42 @@ async function everTrackedOnBranch(worktreePath: string, relPath: string): Promi
  * it is found via `--diff-filter=D`, and that commit's PARENT tree is checked for a `160000` mode
  * at the same path — confirming the deleted entry was actually a gitlink, not an ordinary
  * directory or Husky-style generated path that happened to exist and later got removed too.
+ *
+ * Returns the matching ancestor path — rather than a bare boolean — because that answer alone is
+ * not proof the path is dead: `--diff-filter=D` also matches a commit that converts a submodule
+ * to an ordinary tracked directory in one step (git's diff machinery records the `160000` → tree
+ * mode change at the same path as a delete of the OLD gitlink entry, not a modify), so a segment
+ * that was "deleted" this way may have been immediately repurposed as real, current, ordinary
+ * content rather than actually removed. The caller uses the returned path to ask
+ * {@link currentTreeHasOrdinaryEntry} exactly that question before trusting this answer as proof
+ * of a dead path (PR #263 review, round 39; see the call site's own comment).
  */
-async function historicalAncestorGitlink(worktreePath: string, relPath: string): Promise<boolean> {
+async function historicalAncestorGitlink(
+  worktreePath: string,
+  relPath: string,
+): Promise<string | undefined> {
   let candidate = posixNormalize(relPath);
   while (candidate !== "." && candidate !== "/") {
-    if (await wasGitlinkDeletedOnBranch(worktreePath, candidate)) return true;
+    if (await wasGitlinkDeletedOnBranch(worktreePath, candidate)) return candidate;
     const parent = posixDirname(candidate);
     if (parent === candidate) break;
     candidate = parent;
   }
-  return false;
+  return undefined;
 }
 
 /**
  * Whether `worktreePath`'s own branch history contains a commit that deleted `relPath` while it
  * was a submodule gitlink (mode `160000`) at that time — the per-segment check {@link
  * historicalAncestorGitlink} runs at each ancestor level.
+ *
+ * `--diff-filter=D` matches this even when the same commit immediately replaces `relPath` with an
+ * ordinary tracked directory — a `160000` → tree mode change at one path is recorded as a delete of
+ * the old gitlink entry, not a modify — so a `true` result here means "was a gitlink at some point
+ * and that gitlink entry is gone," not "nothing lives at this path anymore." Whether something else
+ * has since repurposed the path is deliberately NOT this function's concern; {@link
+ * historicalAncestorGitlink}'s caller checks the current tree separately before trusting this as
+ * proof of a dead path (PR #263 review, round 39).
  */
 async function wasGitlinkDeletedOnBranch(worktreePath: string, relPath: string): Promise<boolean> {
   let deletionSha: string;

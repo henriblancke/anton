@@ -1561,6 +1561,121 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, coldWorktree)).toBe(join(coldWorktree, "deps", "hooks"));
   });
 
+  // Round 34's `historicalAncestorGitlink` closed the cold-worktree gap above for a CONTAINING
+  // gitlink that stayed deleted for good — but "was ever a deleted gitlink" and "is currently dead"
+  // are not the same fact. Here `deps` was once a real submodule gitlink, then a LATER commit on the
+  // SAME branch converted it to an ordinary tracked directory (never touching `deps/hooks`, a
+  // Husky-style generated child that is never tracked on its own — only ever produced by an install
+  // step). A cold worktree that never ran that install step has no `deps/hooks` on disk at all; the
+  // BASE repo, which already ran it once, has its own installed copy sitting there instead —
+  // precisely the shape every OTHER "generated, fall back to the base repo's copy" case in this
+  // function already handles correctly, except that `deps` being historically a deleted gitlink
+  // short-circuits it here. `wasGitlinkDeletedOnBranch`'s `--diff-filter=D` walk matches the
+  // gitlink-to-ordinary-directory conversion commit itself (a `160000` → tree mode change at the same
+  // path is recorded as a delete of the old entry), so without consulting the CURRENT tree,
+  // `historicalAncestorGitlink` wrongly reports `deps` as a dead ancestor and `resolveHooksPathOverride`
+  // returns `inWorktree`'s nonexistent path — silently skipping every hook — instead of falling
+  // through to the base repo's installed copy the way it would for any other generated directory
+  // (PR #263 review, round 39).
+  it("falls back to the base repo's installed copy for a generated child of an ancestor that was historically a gitlink but the current tree has since repurposed as an ordinary directory", async () => {
+    const submoduleUpstream = join(sandbox, "nested-hooks-submodule-upstream-repurposed-ancestor");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "marker.txt"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        submoduleUpstream,
+        "deps",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add deps submodule"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "deps/hooks"], { stdio: "ignore" });
+
+    // The base repo's OWN checkout already ran the (fictitious) install step that produces
+    // `deps/hooks` — a real, non-empty directory on disk that is never tracked in git at all,
+    // exactly like Husky's `.husky/_`.
+    mkdirSync(join(repo, "deps", "hooks"), { recursive: true });
+    writeFileSync(join(repo, "deps", "hooks", "pre-push"), "installed\n");
+
+    // A separate worktree, branched from before the conversion, is where the deletion of the gitlink
+    // and its replacement with an ordinary tracked directory actually happen — mirroring a real
+    // feature branch's own history. Crucially, `deps/hooks` itself is never committed here: it stays
+    // a generated path, just like on the base repo.
+    const authoringWorktree = join(sandbox, "worktree-repurposed-ancestor-author");
+    execFileSync(
+      "git",
+      [
+        "-C",
+        repo,
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "anton/epic-repurposed-ancestor",
+        authoringWorktree,
+        "main",
+      ],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", authoringWorktree, "rm", "-q", "--cached", "deps"], { stdio: "ignore" });
+    rmSync(join(authoringWorktree, "deps"), { recursive: true, force: true });
+    mkdirSync(join(authoringWorktree, "deps"), { recursive: true });
+    writeFileSync(join(authoringWorktree, "deps", "marker.txt"), "ordinary\n");
+    execFileSync("git", ["-C", authoringWorktree, "add", "-A", "deps"], { stdio: "ignore" });
+    execFileSync(
+      "git",
+      ["-C", authoringWorktree, "commit", "-q", "-m", "convert deps to ordinary directory"],
+      { stdio: "ignore" },
+    );
+    // The CURRENT tree now tracks `deps` as an ordinary directory, not a gitlink; `deps/hooks` is not
+    // in the tree at all (never committed on either branch).
+    const treeEntry = execFileSync("git", ["-C", authoringWorktree, "ls-tree", "HEAD", "--", "deps"], {
+      encoding: "utf8",
+    }).trim();
+    expect(treeEntry.startsWith("040000 tree")).toBe(true);
+    execFileSync("git", ["-C", repo, "worktree", "remove", "--force", authoringWorktree], {
+      stdio: "ignore",
+    });
+
+    // A BRAND NEW worktree checking out that same branch fresh: `deps` was never initialized as a
+    // submodule here, `deps/hooks` was never tracked, and no install step has run — the directory
+    // genuinely does not exist on disk.
+    const coldWorktree = join(sandbox, "worktree-repurposed-ancestor-cold");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", coldWorktree, "anton/epic-repurposed-ancestor"],
+      { stdio: "ignore" },
+    );
+    expect(existsSync(join(coldWorktree, "deps", "hooks"))).toBe(false);
+    expect(existsSync(join(coldWorktree, "deps", ".git"))).toBe(false);
+
+    // Native git, given `core.hooksPath=deps/hooks` and no such directory in this worktree, would run
+    // no hook at all here — but this function's OWN contract for a generated directory that the base
+    // repo has already materialized (the Husky `.husky/_` case elsewhere in this suite) is to hand
+    // back the base repo's installed copy instead, so a task running in this cold worktree still gets
+    // real hooks rather than silently running none. Repurposing `deps` as ordinary content must not
+    // defeat that fallback.
+    expect(await resolveHooksPathOverride(repo, coldWorktree)).toBe(join(repo, "deps", "hooks"));
+  });
+
   // Finding A (PR #263 review, round 29): `core.hooksPath=deps/hooks` names a path NESTED inside the
   // submodule gitlink `deps`, not the gitlink itself. `git submodule status` only ever reports a line
   // for the gitlink PATH (`deps`), never for a path nested inside one (`deps/hooks`) — so
