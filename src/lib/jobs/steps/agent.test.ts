@@ -134,4 +134,25 @@ describe("step:claude", () => {
     // The reasoning contract comes first; the run context reads as what it applies TO.
     expect(prompt.indexOf("Audit the design system.")).toBeLessThan(prompt.indexOf("`audit` step"));
   });
+
+  it("inlines the dispatched ticket contract and records it with a single-ticket report", async () => {
+    mkdirSync(join(sandbox.dir, ".claude", "agents"), { recursive: true });
+    writeFileSync(join(sandbox.dir, ".claude", "agents", "audit.md"), "Audit the design system.");
+    const claude = fakeClaude("ANTON-RESULT: blocked — already-shipped — anton-survivor already shipped it");
+    const dispatched = ticket("anton-a");
+    dispatched.description = "## Goal\n\nShip it.\n\n## Acceptance\n\n- [ ] it ships";
+    dispatched.acceptance_criteria = "- [ ] it ships";
+
+    const result = await claudeStep(
+      sandbox.context({
+        tickets: [dispatched],
+        step: { id: "audit", labels: ["step:claude", "prompt:audit"] },
+        deps: { runClaude: claude.run },
+      }),
+    );
+
+    expect(claude.calls[0].prompt).toContain(`## Ticket contract — ${dispatched.id}`);
+    expect(claude.calls[0].prompt).toContain("- [ ] it ships");
+    expect(result.facts?.dispatched).toEqual(dispatched);
+  });
 });

@@ -74,13 +74,30 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
   // A formula can run this generic step before `step:implement`, so a resume is dispatched here
   // first onto a timed-out attempt's preserved commits (PR #255 review). Read them per ticket — as
   // implementStep does — so the step is told the work exists rather than reverting or re-doing it.
-  const preserved = await readTicketsPreserved(ctx);
-  return dispatchClaude(ctx, {
+  const [preserved, dispatchedTickets] = await Promise.all([
+    readTicketsPreserved(ctx),
+    Promise.all(ctx.tickets.map((ticket) => readForDispatch(ctx.repoPath, ticket))),
+  ]);
+  const result = await dispatchClaude(ctx, {
     beadId: ctx.target.id,
-    prompt: [reasoning, "", "---", "", stepTaskBlock(ctx, stepId, preserved)].join("\n"),
+    prompt: [
+      reasoning,
+      "",
+      "---",
+      "",
+      stepTaskBlock({ ...ctx, tickets: dispatchedTickets }, stepId, preserved),
+    ].join("\n"),
     appendSystemPrompt: await buildExecutionSystemPrompt({ seedPrompt: ctx.settings.seedPrompt }),
     failure: (text) => `claude reported an error for step ${stepId}: ${text ?? "unknown"}`,
   });
+  // A generic step can report `already-shipped`, so its report carries the contract it received.
+  return {
+    ...result,
+    facts: {
+      ...result.facts,
+      ...(dispatchedTickets.length === 1 ? { dispatched: dispatchedTickets[0] } : {}),
+    },
+  };
 }
 
 /** Preserved work on the branch for each ticket in scope, in ticket order; empty when none has any. */
