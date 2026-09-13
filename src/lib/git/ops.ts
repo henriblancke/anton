@@ -1917,6 +1917,17 @@ function exitedWith(error: unknown, code: number): boolean {
 }
 
 /**
+ * Stage everything in the worktree — `git add -A`, extracted so a caller can stage BEFORE asking
+ * {@link resolveHooksPathOverride} anything (PR #263 review, round 37; see {@link commitAll}'s own
+ * doc comment for why that order matters). Idempotent: calling it again right after — as
+ * {@link commitAll} always does — finds nothing new and costs one cheap `git add -A` over an
+ * already-clean index.
+ */
+export async function stageAll(worktreePath: string, hooksPath?: string): Promise<void> {
+  await git(worktreePath, ["add", "-A"], hooksPath);
+}
+
+/**
  * Stage everything in the worktree and commit. Returns `{ committed: false }` when there is
  * nothing to commit (claude made no changes) — the caller decides whether that's acceptable.
  *
@@ -1932,13 +1943,29 @@ function exitedWith(error: unknown, code: number): boolean {
  * proves the tree is still the verified one first, via {@link stageAllAndHashTree}: a hook that
  * EDITS before it rejects leaves a different tree, and `--no-verify` would commit those post-gate
  * edits under a proof that never covered them.
+ *
+ * `hooksPath`, when the caller passes one, MUST have been resolved AFTER whatever staging already
+ * happened in the worktree — never before (PR #263 review, round 37). `resolveHooksPathOverride`'s
+ * submodule-staleness check (round 36) reads the INDEX to tell a genuinely stale checkout from an
+ * intentional, already-staged gitlink bump that just hasn't been committed yet; a caller that
+ * resolves hooksPath BEFORE staging asks that question from a snapshot of the index that predates
+ * the very staging this function's own `git add -A` below is about to do. An agent that checks a
+ * hooks-path submodule out at a new commit but never runs `git add` on it itself — relying on this
+ * `git add -A` to pick it up — used to get exactly that: `resolveHooksPathOverride` saw nothing
+ * staged yet, correctly (for that instant) reported the checkout unverified, and the disabled-hooks
+ * sentinel it returned rode into this call's `-c core.hooksPath=…`, skipping `pre-commit` for a
+ * commit that, by the time it actually ran, legitimately carried that gitlink. `commitStep` and
+ * `commitAndPushFix` — this function's two hooksPath-resolving callers — now call {@link stageAll}
+ * themselves before resolving, so the index `resolveHooksPathOverride` reads already reflects
+ * everything this commit is about to include. The `git add -A` here stays regardless, both for
+ * every OTHER caller (which never pre-stage) and as a harmless no-op for the two that now do.
  */
 export async function commitAll(
   worktreePath: string,
   message: string,
   options: { bypassHooks?: boolean; hooksPath?: string } = {},
 ): Promise<{ committed: boolean }> {
-  await git(worktreePath, ["add", "-A"], options.hooksPath);
+  await stageAll(worktreePath, options.hooksPath);
   const bypass = options.bypassHooks ? ["--no-verify"] : [];
   try {
     // Exits non-zero when there ARE staged changes → there is something to commit.
@@ -1960,7 +1987,7 @@ export async function commitAll(
  * untracked files count.
  */
 export async function stageAllAndHashTree(worktreePath: string): Promise<string> {
-  await git(worktreePath, ["add", "-A"]);
+  await stageAll(worktreePath);
   return git(worktreePath, ["write-tree"]);
 }
 

@@ -387,6 +387,12 @@ async function adoptSelfCommittedWork(args: {
   // already does it: `--no-verify` bypasses only `pre-commit`/`commit-msg`, so a generated,
   // base-only hook still needs the base repo's copy resolved rather than the cold worktree's own,
   // nonexistent one (PR #263 review, round 15).
+  //
+  // No round-37 stage-before-resolve fix needed here, for the same reason `commitStep`'s own marker
+  // call needs none (see `steps/git.ts`'s `recordAttribution`): `commitMarker` stages nothing of its
+  // own, and this call is reached only after the self-commits it marks already landed on HEAD — so
+  // any submodule gitlink `resolveHooksPathOverride` reads here is already committed, not merely
+  // staged.
   const hooksPath = await resolveHooksPathOverride(repoPath, worktreePath);
   const marked =
     alreadyMarked ||
@@ -509,7 +515,11 @@ async function commitPreservedTree(args: {
   const { repoPath, worktreePath, logPath, message, before } = args;
   const rejected = (error: unknown) => ({ committed: false as const, error });
   // Hashed BEFORE the attempt, because after it a hook's edits are indistinguishable from the
-  // agent's own work.
+  // agent's own work. This also happens to be the right order for `resolveHooksPathOverride` below
+  // (PR #263 review, round 37): `stageAllAndHashTree` stages everything first, so a hooks-path
+  // submodule bump the preserved tree carries but never had `git add` run on it is already reflected
+  // in the index by the time the resolver reads it — no separate `stageAll` needed here, unlike
+  // `commitStep`/`commitAndPushFix`, which had no staging step of their own before this fix.
   const verified = await stageAllAndHashTree(worktreePath).catch(() => null);
   const hooksPath = await resolveHooksPathOverride(repoPath, worktreePath);
   const first = await commitAll(worktreePath, message, { hooksPath }).catch(rejected);

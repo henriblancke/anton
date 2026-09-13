@@ -12,6 +12,7 @@ import {
   openPullRequest,
   readWorktreeState,
   resolveHooksPathOverride,
+  stageAll,
   worktreeHasCommitFor,
   worktreeHasPreservedCommitFor,
   type WorktreeState,
@@ -55,6 +56,13 @@ import type { StepResultWith } from "./result";
  *    ticket's commits that anton has already closed the bead for. Poison.
  */
 export async function commitStep(ctx: StepContext): Promise<StepResultWith<"committed">> {
+  // Staged BEFORE `resolveHooksPathOverride` is asked anything (PR #263 review, round 37): its
+  // submodule-staleness check reads the INDEX, and an agent that bumped a hooks-path submodule
+  // without staging it itself — relying on `commitAll`'s own `git add -A` to pick it up — must not
+  // have that gitlink judged unstaged just because this call happened first. See `commitAll`'s doc
+  // comment for the full ordering bug this closes. `commitAll` below re-runs `git add -A`, which is
+  // a no-op now that this has already staged everything.
+  await stageAll(ctx.worktreePath);
   const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
   const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx), { hooksPath });
   if (committed) return { ok: true, detail: "committed", facts: { committed: true } };
@@ -189,6 +197,13 @@ async function recordAttribution(ctx: StepContext, why: string): Promise<boolean
   // `commitMarker`'s `--no-verify` bypasses only `pre-commit`/`commit-msg`, so a generated,
   // base-only hook still needs the base repo's copy resolved rather than this cold worktree's own,
   // nonexistent one (PR #263 review, round 15).
+  //
+  // This call needs no round-37 stage-before-resolve fix: `commitMarker` stages nothing of its own
+  // (it `reset --mixed HEAD`s the index, then commits EMPTY) — both callers reach this only after
+  // the content itself already landed on HEAD, either the agent's own commits
+  // (`adoptAgentCommits`) or an earlier attempt's preserved commit (`adoptPreservedWork`). So
+  // `resolveHooksPathOverride` here reads a submodule gitlink that is already committed, not merely
+  // staged — the round-36/37 index-vs-HEAD gap this file's other call site closes does not apply.
   const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
   await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`, { hooksPath });
   return true;

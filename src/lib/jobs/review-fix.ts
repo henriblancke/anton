@@ -61,6 +61,7 @@ import {
   pushBranch,
   resolveHooksPathOverride,
   resolveHooksPathOverrideForMerge,
+  stageAll,
 } from "../git/ops";
 import {
   ANTON_MARK,
@@ -723,6 +724,15 @@ async function commitAndPushFix(
   branch: string,
   number: number,
 ): Promise<boolean> {
+  // Staged BEFORE `resolveHooksPathOverride` is asked anything (PR #263 review, round 37) — the
+  // same fix `commitStep` applies for the same reason: its submodule-staleness check reads the
+  // INDEX, and claude's fix session may have checked a hooks-path submodule out at a new commit
+  // without staging it itself, relying on `commitAll`'s own `git add -A` below to pick it up. Asked
+  // before that staging happens, the check would see the old, unstaged gitlink and disable hooks for
+  // a commit that, by the time it actually runs, legitimately carries the new one. See `commitAll`'s
+  // doc comment for the full ordering bug. `commitAll`'s own `git add -A` is a no-op now that this
+  // has already staged everything.
+  await stageAll(worktreePath);
   const hooksPath = await resolveHooksPathOverride(repo, worktreePath);
   const { committed } = await commitAll(
     worktreePath,

@@ -57,6 +57,7 @@ import {
   satisfiedMarkerSubject,
   satisfiedMarkerTarget,
   SATISFIES_TRAILER,
+  stageAll,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
 
@@ -983,6 +984,98 @@ suite("resolveHooksPathOverride (real git)", () => {
     // The checkout disagrees with `HEAD` but matches the staged index — an intentional pending
     // update, not staleness. Must resolve to the real worktree checkout, not disable hooks.
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "hooks"));
+  });
+
+  // The ordering bug round 36's fix alone did not close (PR #263 review, round 37): round 36 handles
+  // a submodule bump the caller staged itself BEFORE `resolveHooksPathOverride` ran. This covers the
+  // other shape — an agent that checks the submodule out at a new commit and does NOT run `git add`
+  // on it, relying on `commitAll`'s own `git add -A` to pick it up. `commitStep`/`commitAndPushFix`
+  // now stage the worktree via `stageAll` before resolving hooksPath, so the index the resolver reads
+  // already reflects the bump even though the caller never staged it explicitly.
+  it("keeps hooks enabled for a hooks-path submodule bumped but left unstaged, once the caller stages before resolving (commitStep/commitAndPushFix's fix)", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-unstaged-bump");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-commit"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(submoduleUpstream, "pre-commit"), 0o755);
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+    const v1Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(submoduleUpstream, "pre-commit"), "#!/bin/sh\ntouch hook-ran\nexit 0\n");
+    chmodSync(join(submoduleUpstream, "pre-commit"), 0o755);
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v2"], { stdio: "ignore" });
+    const v2Sha = execFileSync("git", ["-C", submoduleUpstream, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleUpstream, "hooks"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "-C", "hooks", "checkout", "-q", v1Sha], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "add", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule at v1"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-unstaged-bump-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-unstaged-bump", worktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      ["-C", worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "hooks"],
+      { stdio: "ignore" },
+    );
+    expect(readFileSync(join(worktree, "hooks", "pre-commit"), "utf8")).toBe("#!/bin/sh\nexit 0\n");
+
+    // Deliberately bump the submodule to v2 and leave it UNSTAGED — the shape an agent leaves when it
+    // relies on `commitAll`'s own `git add -A` to pick the bump up. `HEAD:hooks` and the INDEX both
+    // still record v1; only the checkout itself has moved.
+    execFileSync("git", ["-C", worktree, "-C", "hooks", "checkout", "-q", v2Sha], { stdio: "ignore" });
+    expect(
+      execFileSync("git", ["-C", worktree, "rev-parse", "HEAD:hooks"], { encoding: "utf8" }).trim(),
+    ).toBe(v1Sha);
+    expect(
+      execFileSync("git", ["-C", worktree, "ls-files", "-s", "--", "hooks"], { encoding: "utf8" }),
+    ).toContain(v1Sha);
+
+    // Asked BEFORE the worktree is staged, the resolver correctly (for that instant) cannot verify
+    // the checkout and disables hooks — proving the false positive still exists at the resolver
+    // layer, exactly as round 36 left it. The ordering fix has to live in the CALLER, not here.
+    expectDisablesHooks(await resolveHooksPathOverride(repo, worktree));
+
+    // `commitStep`/`commitAndPushFix`'s fix: stage first, THEN resolve. Once staged, the index
+    // agrees with the checkout and the resolver reports the real, live hooks directory.
+    await stageAll(worktree);
+    const hooksPath = await resolveHooksPathOverride(repo, worktree);
+    expect(hooksPath).toBe(join(worktree, "hooks"));
+
+    // `commitAll`'s own `git add -A` is a no-op here (everything is already staged), and the commit
+    // it produces runs the v2 `pre-commit` hook — proof the fix reaches the actual commit, not just
+    // the resolver's return value in isolation. The hook runs with the SUPERPROJECT's worktree as its
+    // cwd (it fires for the superproject's own commit, `core.hooksPath` naming its submodule), so it
+    // marks the top of `worktree`, not inside `hooks` itself.
+    writeFileSync(join(worktree, "work.md"), "work\n");
+    const { committed } = await commitAll(worktree, "t1: bump the hooks submodule", { hooksPath });
+    expect(committed).toBe(true);
+    expect(existsSync(join(worktree, "hook-ran"))).toBe(true);
+    expect(
+      execFileSync("git", ["-C", worktree, "rev-parse", "HEAD:hooks"], { encoding: "utf8" }).trim(),
+    ).toBe(v2Sha);
   });
 
   // Orphaned submodule checkout, left behind by a merge that already landed (PR #263 review, round

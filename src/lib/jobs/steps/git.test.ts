@@ -17,6 +17,7 @@ const ops = vi.hoisted(() => ({
   openPullRequest: vi.fn(),
   readWorktreeState: vi.fn(),
   resolveHooksPathOverride: vi.fn(),
+  stageAll: vi.fn(),
   worktreeHasCommitFor: vi.fn(),
   worktreeHasPreservedCommitFor: vi.fn(),
 }));
@@ -52,6 +53,24 @@ describe("step:commit", () => {
     expect(ops.commitAll).toHaveBeenLastCalledWith(sandbox.dir, `${target.id}: ${target.title}`, {
       hooksPath: undefined,
     });
+  });
+
+  // PR #263 review, round 37: the caller must stage the worktree BEFORE asking
+  // `resolveHooksPathOverride` anything, so its submodule-staleness check reads an index that
+  // already reflects everything this commit is about to include — not a pre-staging snapshot.
+  it("stages the worktree before resolving hooksPath, not after", async () => {
+    const order: string[] = [];
+    ops.stageAll.mockImplementation(async () => {
+      order.push("stageAll");
+    });
+    ops.resolveHooksPathOverride.mockImplementation(async () => {
+      order.push("resolveHooksPathOverride");
+      return undefined;
+    });
+
+    await commitStep(sandbox.context());
+
+    expect(order).toEqual(["stageAll", "resolveHooksPathOverride"]);
   });
 
   // git is the run's evidence of record: a clean agent exit that left no diff delivered nothing.
