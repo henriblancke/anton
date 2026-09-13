@@ -1,9 +1,9 @@
 /**
  * The per-job policy sources the runner reads at lease time (anton-6fo2): a project's
- * concurrency/timeout/retry policy, the budget governor's policy, the cross-machine run-liveness
- * gate, and the bead labels the value gate ranks on. Split out of service.ts so anton's public job
- * API doesn't carry the settings + beads fan-out these four resolvers need. Wired into the runner
- * by ./service-runner.
+ * concurrency/timeout/retry policy, the budget governor's policy, the meter it paces against, the
+ * cross-machine run-liveness gate, and the bead labels the value gate ranks on. Split out of
+ * service.ts so anton's public job API doesn't carry the settings + beads fan-out these resolvers
+ * need. Wired into the runner by ./service-runner.
  */
 import { getDb } from "../db";
 import {
@@ -24,6 +24,7 @@ import {
 import { projectWeeklySpendPct } from "../quota-spend";
 import { withQuotaShare } from "./budget";
 import type { ClaudeUsage } from "../claude/usage";
+import { getRouterUsageCached } from "../claude/router-usage";
 import { beads } from "../beads/bd";
 import { allIssues } from "../beads/issues";
 
@@ -112,6 +113,26 @@ export async function resolveProjectSpend(
   } catch {
     return null;
   }
+}
+
+/**
+ * The meter a governed project actually paces against (anton-gnvw): its router's own usage when
+ * routed through a gateway, the tick's account-wide read otherwise. `getRouterUsageCached` already
+ * carries the short-TTL cache + single-flight + 429 backoff, keyed per (baseUrl, connectionId) — so
+ * two routed projects sharing one router connection in the same tick still take one request, and a
+ * router that cannot be read (no creds, a timeout, a non-200, a malformed body) collapses to `null`,
+ * the same fail-open value `accountUsage` already carries when the Anthropic endpoint is down.
+ */
+export async function resolveProjectUsage(
+  projectId: string | null,
+  accountUsage: ClaudeUsage | null,
+): Promise<ClaudeUsage | null> {
+  if (!projectId) return accountUsage;
+  const settings = await getProjectSettings(getDb(), projectId).catch(() => null);
+  const baseUrl = settings?.claudeBaseUrl?.trim();
+  const connectionId = settings?.routerConnectionId?.trim();
+  if (!settings || !baseUrl || !connectionId) return accountUsage; // unrouted → today's meter
+  return getRouterUsageCached(settings).catch(() => null);
 }
 
 /** The last imbalance announced, so a per-tick resolve reports a change rather than a stream. */

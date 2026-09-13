@@ -188,6 +188,26 @@ export type ProjectSpendResolver = (
 ) => Promise<number | null>;
 
 /**
+ * The meter a governed project actually paces against (anton-gnvw). A project routed through a
+ * gateway (`claudeBaseUrl` + `routerConnectionId`) no longer sends the router traffic the account
+ * meter counts, so `budgetGate`/`admitJob` must see ITS router's own usage, not the shared Anthropic
+ * read — a routed project reading the account meter either paces on a number that isn't its
+ * traffic, or (with `resolveBudgetPolicy` gating on the account meter alone) fails open on a read
+ * that was never wrong for it in the first place, silently un-pacing the one project that opted in.
+ *
+ * `accountUsage` is the tick's own Anthropic read (possibly `null`), passed through so an UNROUTED
+ * project's resolution needs no second read: this resolver returns it unchanged, byte-identical to
+ * the pre-anton-gnvw behavior. A routed project's read is expected to be cached/deduplicated by
+ * endpoint internally (mirroring {@link getRouterUsageCached}) — the same router config shared by
+ * two projects in one tick must not double the request. Fails open like every other governor
+ * read: an unreadable router returns `null`, which `budgetGate`/`admitJob` already treat as admit.
+ */
+export type ProjectUsageResolver = (
+  projectId: string | null,
+  accountUsage: ClaudeUsage | null,
+) => Promise<ClaudeUsage | null>;
+
+/**
  * Job types the budget governor may proactively defer (anton-szld). An allowlist by design: only
  * anton's *autonomous* background work is held when the governor says the budget is scarce, and the
  * governor only delays when the runner *leases* a job — a human-approved epic still *enqueues* the
@@ -507,6 +527,7 @@ export class JobRunner {
   private readonly resolvePolicy: JobPolicyResolver | null;
   private readonly resolveBudgetPolicy: BudgetPolicyResolver | null;
   private readonly resolveProjectSpend: ProjectSpendResolver | null;
+  private readonly resolveProjectUsage: ProjectUsageResolver | null;
   private readonly liveRunCheck: LiveRunCheck | null;
   private readonly readBeadLabels: BeadLabelsReader | null;
   private readonly readUsage: () => Promise<ClaudeUsage | null>;
@@ -549,6 +570,13 @@ export class JobRunner {
      */
     resolveProjectSpend?: ProjectSpendResolver;
     /**
+     * Per-project usage source for the governor (anton-gnvw). When set, replaces the tick's account
+     * meter read with THIS project's own — a routed project reads its router, an unrouted one gets
+     * back the account read unchanged. Omit and every governed project reads the account meter, the
+     * pre-anton-gnvw behavior (also what an unrouted project always sees, resolver present or not).
+     */
+    resolveProjectUsage?: ProjectUsageResolver;
+    /**
      * Cross-machine run-liveness source (anton-jz1). When set, a fresh execute-epic enqueue that
      * has no active job in THIS machine's store is gated on it: if a run is already live for the
      * epic on another machine (read from the shared beads board), no second run is started. Omit
@@ -583,6 +611,7 @@ export class JobRunner {
     this.resolvePolicy = deps.resolvePolicy ?? null;
     this.resolveBudgetPolicy = deps.resolveBudgetPolicy ?? null;
     this.resolveProjectSpend = deps.resolveProjectSpend ?? null;
+    this.resolveProjectUsage = deps.resolveProjectUsage ?? null;
     this.liveRunCheck = deps.liveRunCheck ?? null;
     this.readBeadLabels = deps.readBeadLabels ?? null;
     this.readUsage = deps.readUsage ?? getClaudeUsageCached;
@@ -1080,13 +1109,20 @@ export class JobRunner {
 
     const now = this.clock.now();
     for (const { pid, policy } of governed) {
+      // The meter this project actually paces against (anton-gnvw): its own router when routed,
+      // the account-wide read above otherwise. Resolved per project — never assume `usage` (the
+      // account meter) describes a routed project's traffic. A resolver failure falls back to the
+      // account read, same fail-open posture as every other governor read.
+      const projectUsage = this.resolveProjectUsage
+        ? await this.resolveProjectUsage(pid, usage).catch(() => usage)
+        : usage;
       // The quota share (R6.1) is enforced against THIS project's attributed spend, not the account
       // meter above — that one is moved by every repo here. Unresolvable spend leaves the share
       // unbound, the same fail-open posture as a null usage read.
       const projectWeeklyPct = this.resolveProjectSpend
-        ? await this.resolveProjectSpend(pid, usage).catch(() => null)
+        ? await this.resolveProjectSpend(pid, projectUsage).catch(() => null)
         : null;
-      const decision = budgetGate(usage, policy, now, { projectWeeklyPct });
+      const decision = budgetGate(projectUsage, policy, now, { projectWeeklyPct });
       if (decision.admit) {
         // Budget healthy → nothing paced this tick. First pull back any rows a PRIOR governed tick
         // pushed to a future runAt: the gate can start admitting before that stale boundary (the
@@ -1099,18 +1135,21 @@ export class JobRunner {
         });
         // But "work may run" is not "any work may run": the fine-grained gate (anton-k05r) still
         // decides which queued jobs are worth the budget that's left — e.g. scarce session headroom
-        // at night admits high-value work only.
-        await this.applyValueGate(
-          usage,
-          policy,
-          pid,
-          now,
-          heldBucketKeys,
-          valueHeldJobIds,
-          valueHeldReclaimIds,
-          projectWeeklyPct,
-          bucketCapOf,
-        );
+        // at night admits high-value work only. A null projectUsage (routed + unreadable) skips the
+        // value gate the same way a null account read always has — admits without ranking.
+        if (projectUsage) {
+          await this.applyValueGate(
+            projectUsage,
+            policy,
+            pid,
+            now,
+            heldBucketKeys,
+            valueHeldJobIds,
+            valueHeldReclaimIds,
+            projectWeeklyPct,
+            bucketCapOf,
+          );
+        }
         continue;
       }
       const retryAtMs = decision.retryAt.getTime();
@@ -1141,7 +1180,9 @@ export class JobRunner {
 
       //  • immediate ("Approve" / run-directly) rows skip weekly/daytime pacing but still honor the
       //    session-headroom floor: defer them ONLY when the session itself is nearly exhausted.
-      const immediate = budgetGate(usage, policy, now, { skipPacing: true });
+      //    Same per-project meter as the coarse gate above (anton-gnvw) — the session floor a
+      //    routed project's run-directly bypass must still respect is ITS session, not the account's.
+      const immediate = budgetGate(projectUsage, policy, now, { skipPacing: true });
       if (!immediate.admit) {
         const immRetryMs = immediate.retryAt.getTime();
         await deferQueuedJobs(this.db, this.clock, {

@@ -11,7 +11,11 @@ import { describe, expect, it, vi } from "vitest";
 import * as schema from "../db/schema";
 import { recordBurnSample } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
-import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./budget";
+import {
+  DEFAULT_BUDGET_POLICY,
+  withQuotaShare,
+  type BudgetPolicy,
+} from "./budget";
 import { PoisonEpic, RunAlreadyLiveError, UsageLimitError } from "./errors";
 import { getJob, toMs } from "./queue";
 import type {
@@ -20,8 +24,14 @@ import type {
   JobHandler,
   JobPolicyResolver,
   ProjectSpendResolver,
+  ProjectUsageResolver,
 } from "./runner";
-import { usage, useRunnerHarness, waitUntil } from "./runner.fixture";
+import {
+  usage,
+  useRunnerHarness,
+  waitUntil,
+  type RunnerHarness,
+} from "./runner.fixture";
 
 /** Swap in a failing bucket load for one case; null routes to the real query. */
 let bucketLiveLoadOverride: (() => Promise<number>) | null = null;
@@ -30,7 +40,9 @@ vi.mock("./queue", async () => {
   return {
     ...actual,
     bucketLiveLoad: (...args: Parameters<typeof actual.bucketLiveLoad>) =>
-      bucketLiveLoadOverride ? bucketLiveLoadOverride() : actual.bucketLiveLoad(...args),
+      bucketLiveLoadOverride
+        ? bucketLiveLoadOverride()
+        : actual.bucketLiveLoad(...args),
   };
 });
 
@@ -43,34 +55,38 @@ const GOVERNED_TYPES = [
   "orphan-grooming",
 ] as const;
 
+/** A runner wired with the budget governor: a fixed usage read + a fixed policy for every project. */
+function budgetRunner(
+  h: RunnerHarness,
+  handler: JobHandler,
+  opts: {
+    readUsage: () => Promise<ClaudeUsage | null>;
+    policy?: BudgetPolicy;
+    resolveBudgetPolicy?: BudgetPolicyResolver;
+    resolveProjectSpend?: ProjectSpendResolver;
+    resolveProjectUsage?: ProjectUsageResolver;
+    readBeadLabels?: BeadLabelsReader;
+    /** The concurrency/autonomy policy — only the hard-hold cases need one. */
+    resolvePolicy?: JobPolicyResolver;
+  },
+) {
+  return h.makeRunner({
+    handlers: Object.fromEntries(GOVERNED_TYPES.map((type) => [type, handler])),
+    config: { maxConcurrent: 5 },
+    readUsage: opts.readUsage,
+    // Keep the burn sampler off the real endpoint — these tests exercise the governor only.
+    readUsageFresh: async () => null,
+    resolveBudgetPolicy:
+      opts.resolveBudgetPolicy ?? (() => opts.policy ?? DEFAULT_BUDGET_POLICY),
+    resolveProjectSpend: opts.resolveProjectSpend,
+    resolveProjectUsage: opts.resolveProjectUsage,
+    readBeadLabels: opts.readBeadLabels,
+    resolvePolicy: opts.resolvePolicy,
+  });
+}
+
 describe("JobRunner budget governor admission gate (anton-szld)", () => {
   const h = useRunnerHarness();
-
-  /** A runner wired with the budget governor: a fixed usage read + a fixed policy for every project. */
-  function budgetRunner(
-    handler: JobHandler,
-    opts: {
-      readUsage: () => Promise<ClaudeUsage | null>;
-      policy?: BudgetPolicy;
-      resolveBudgetPolicy?: BudgetPolicyResolver;
-      resolveProjectSpend?: ProjectSpendResolver;
-      readBeadLabels?: BeadLabelsReader;
-      /** The concurrency/autonomy policy — only the hard-hold cases need one. */
-      resolvePolicy?: JobPolicyResolver;
-    },
-  ) {
-    return h.makeRunner({
-      handlers: Object.fromEntries(GOVERNED_TYPES.map((type) => [type, handler])),
-      config: { maxConcurrent: 5 },
-      readUsage: opts.readUsage,
-      // Keep the burn sampler off the real endpoint — these tests exercise the governor only.
-      readUsageFresh: async () => null,
-      resolveBudgetPolicy: opts.resolveBudgetPolicy ?? (() => opts.policy ?? DEFAULT_BUDGET_POLICY),
-      resolveProjectSpend: opts.resolveProjectSpend,
-      readBeadLabels: opts.readBeadLabels,
-      resolvePolicy: opts.resolvePolicy,
-    });
-  }
 
   it("defers a tick past the reset boundary: leases nothing and reschedules queued work to retryAt", async () => {
     // Session nearly exhausted (99% ≥ 100 − minSessionHeadroom 5) → session-headroom defer. No known
@@ -78,6 +94,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     h.seedProjects("A");
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
@@ -91,7 +108,10 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     const job = await getJob(h.db, id);
     expect(job?.status).toBe("queued");
     expect(job?.attempts).toBe(0); // a proactive hold never burns an attempt
-    const expectedRetry = Math.floor((h.clock.now() + DEFAULT_BUDGET_POLICY.sessionWindowMs) / 1000) * 1000;
+    const expectedRetry =
+      Math.floor(
+        (h.clock.now() + DEFAULT_BUDGET_POLICY.sessionWindowMs) / 1000,
+      ) * 1000;
     expect(toMs(job?.runAt)).toBe(expectedRetry);
     expect(job?.lastError).toMatch(/budget: session-headroom/);
   });
@@ -105,12 +125,14 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     let budgetAwareOn = true;
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
       {
         readUsage: async () => usage({ sessionPct: 99 }),
-        resolveBudgetPolicy: () => (budgetAwareOn ? DEFAULT_BUDGET_POLICY : null),
+        resolveBudgetPolicy: () =>
+          budgetAwareOn ? DEFAULT_BUDGET_POLICY : null,
       },
     );
     const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
@@ -131,7 +153,9 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
 
   it("governs the orphan-grooming cleanup sweep, not just execute-epic", async () => {
     h.seedProjects("A");
-    const r = budgetRunner(async () => {}, { readUsage: async () => usage({ sessionPct: 99 }) });
+    const r = budgetRunner(h, async () => {}, {
+      readUsage: async () => usage({ sessionPct: 99 }),
+    });
     const id = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
 
     expect(await r.tickOnce()).toBe(0);
@@ -146,6 +170,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     h.seedProjects("A");
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
@@ -165,13 +190,19 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // Ahead of the weekly pace-line (weekly-on-track), session fresh: a paced job defers, but an
     // immediate-approved one skips pacing and runs now.
     h.seedProjects("A");
-    const weeklyResetAt = new Date(h.clock.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString(); // half-week left
+    const weeklyResetAt = new Date(
+      h.clock.now() + 3.5 * 24 * 60 * 60 * 1000,
+    ).toISOString(); // half-week left
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
-      { readUsage: async () => usage({ sessionPct: 10, weeklyPct: 80, weeklyResetAt }) },
+      {
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 80, weeklyResetAt }),
+      },
     );
     const paced = await r.enqueue({
       type: "execute-epic",
@@ -214,15 +245,25 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       });
     };
     await seedCrashed("crashed-paced", { projectId: "A", epicBeadId: "A-1" });
-    await seedCrashed("crashed-bypass", { projectId: "A", epicBeadId: "A-2", bypassBudget: true });
+    await seedCrashed("crashed-bypass", {
+      projectId: "A",
+      epicBeadId: "A-2",
+      bypassBudget: true,
+    });
 
-    const weeklyResetAt = new Date(h.clock.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString();
+    const weeklyResetAt = new Date(
+      h.clock.now() + 3.5 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
-      { readUsage: async () => usage({ sessionPct: 10, weeklyPct: 80, weeklyResetAt }) },
+      {
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 80, weeklyResetAt }),
+      },
     );
 
     expect(await r.tickOnce()).toBe(1); // only the bypass row reclaims
@@ -241,6 +282,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     h.seedProjects("A");
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
@@ -257,7 +299,10 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     expect(ran).toBe(0);
     const job = await getJob(h.db, id);
     expect(job?.status).toBe("queued");
-    const expectedRetry = Math.floor((h.clock.now() + DEFAULT_BUDGET_POLICY.sessionWindowMs) / 1000) * 1000;
+    const expectedRetry =
+      Math.floor(
+        (h.clock.now() + DEFAULT_BUDGET_POLICY.sessionWindowMs) / 1000,
+      ) * 1000;
     expect(toMs(job?.runAt)).toBe(expectedRetry);
     expect(job?.lastError).toMatch(/budget: session-headroom/);
   });
@@ -266,6 +311,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     h.seedProjects("A");
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
@@ -283,6 +329,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     h.seedProjects("A");
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
@@ -308,6 +355,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     let meterUp = true;
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
@@ -336,6 +384,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     let sessionPct = 99; // session exhausted → defer
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
@@ -361,16 +410,20 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // NOT: the meter it shares with A says nothing about whose quota was spent, and stopping both
     // at 30 would leave most of the operator's weekly target unspendable every week.
     h.seedProjects("A", "B");
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     const shares: Record<string, number> = { A: 30, B: 70 };
     const spent: Record<string, number> = { A: 30, B: 30 };
     const ran: string[] = [];
     const r = budgetRunner(
+      h,
       async (ctx) => {
         ran.push(ctx.projectId ?? "?");
       },
       {
-        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
         resolveBudgetPolicy: (pid) =>
           pid ? withQuotaShare(DEFAULT_BUDGET_POLICY, shares[pid]) : null,
         resolveProjectSpend: async (pid) => (pid ? spent[pid]! : null),
@@ -394,14 +447,18 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // The same meter reading, but every point of it is B's. A has spent nothing, so its 30-point
     // share is entirely intact and the governor has no business deferring it.
     h.seedProjects("A", "B");
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     const ran: string[] = [];
     const r = budgetRunner(
+      h,
       async (ctx) => {
         ran.push(ctx.projectId ?? "?");
       },
       {
-        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
         resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 30),
         resolveProjectSpend: async (pid) => (pid === "B" ? 60 : 0),
       },
@@ -419,19 +476,24 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // cut with room for three seeded execute-epic runs (3 weekly-points each) would otherwise start
     // all five queued runs at once and spend 15 against it before anything could observe them.
     h.seedProjects("A");
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
       {
-        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
         resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 10),
         resolveProjectSpend: async () => 0,
       },
     );
-    for (let i = 0; i < 5; i++) await r.enqueue({ type: "execute-epic", projectId: "A" });
+    for (let i = 0; i < 5; i++)
+      await r.enqueue({ type: "execute-epic", projectId: "A" });
 
     expect(await r.tickOnce()).toBe(3);
     await r.whenIdle();
@@ -443,13 +505,17 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // the operator's ceiling allows. Reserving against the first job too would leave any share with
     // less left than a single job's burn unspendable until the weekly reset (idle-fill, anton-ld7j).
     h.seedProjects("A");
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
-    const r = budgetRunner(async () => {}, {
-      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const r = budgetRunner(h, async () => {}, {
+      readUsage: async () =>
+        usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
       resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 10),
       resolveProjectSpend: async () => 9, // 1 point left; a seeded execute-epic costs 3
     });
-    for (let i = 0; i < 3; i++) await r.enqueue({ type: "execute-epic", projectId: "A" });
+    for (let i = 0; i < 3; i++)
+      await r.enqueue({ type: "execute-epic", projectId: "A" });
 
     expect(await r.tickOnce()).toBe(1);
     await r.whenIdle();
@@ -462,14 +528,18 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // a second, ungated crossing lease beside it (PR #248 review). Share 10, spent 9, a seeded
     // execute-epic costs 3: the bypass run crosses the cap, and nothing autonomous fits behind it.
     h.seedProjects("A");
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     const ran: string[] = [];
     const r = budgetRunner(
+      h,
       async (ctx) => {
         ran.push(ctx.jobId);
       },
       {
-        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
         resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 10),
         resolveProjectSpend: async () => 9,
       },
@@ -479,7 +549,8 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       projectId: "A",
       payload: { projectId: "A", epicBeadId: "A-1", bypassBudget: true },
     });
-    for (let i = 0; i < 2; i++) await r.enqueue({ type: "execute-epic", projectId: "A" });
+    for (let i = 0; i < 2; i++)
+      await r.enqueue({ type: "execute-epic", projectId: "A" });
 
     expect(await r.tickOnce()).toBe(1);
     await r.whenIdle();
@@ -494,14 +565,18 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // Share 10, spent 8, a seeded fix costs 1.2 and a seeded execute-epic 3: the fix crosses the
     // cap, and the epic behind it must wait — leasing alone, it would have been admitted.
     h.seedProjects("A");
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     const ran: string[] = [];
     const r = budgetRunner(
+      h,
       async (ctx) => {
         ran.push(ctx.type);
       },
       {
-        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
         resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 10),
         resolveProjectSpend: async () => 8,
       },
@@ -521,13 +596,17 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // No share, no ceiling to reserve against: an ungoverned-by-share project keeps leasing to its
     // concurrency, exactly as before the reservation existed.
     h.seedProjects("A");
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
-    const r = budgetRunner(async () => {}, {
-      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const r = budgetRunner(h, async () => {}, {
+      readUsage: async () =>
+        usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
       resolveBudgetPolicy: () => DEFAULT_BUDGET_POLICY, // projectWeeklyCapPct: null
       resolveProjectSpend: async () => 0,
     });
-    for (let i = 0; i < 5; i++) await r.enqueue({ type: "execute-epic", projectId: "A" });
+    for (let i = 0; i < 5; i++)
+      await r.enqueue({ type: "execute-epic", projectId: "A" });
 
     expect(await r.tickOnce()).toBe(5);
     await r.whenIdle();
@@ -540,21 +619,31 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // with leaseDue then excluding the held bucket AND the held job, nothing would launch, tick
     // after tick. The same starvation applies to a disabled schedule's bucket.
     h.seedProjects("A");
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     const ran: string[] = [];
     const r = budgetRunner(
+      h,
       async (ctx) => {
         ran.push(ctx.type);
       },
       {
-        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
         resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 9),
         resolveProjectSpend: async () => 0,
-        resolvePolicy: () => ({ concurrency: 5, timeoutMs: Infinity, maxAttempts: 3, autonomy: false }),
+        resolvePolicy: () => ({
+          concurrency: 5,
+          timeoutMs: Infinity,
+          maxAttempts: 3,
+          autonomy: false,
+        }),
       },
     );
     // Three seeded execute-epic runs (3 weekly-points each) would exactly fill the 9-point share.
-    for (let i = 0; i < 3; i++) await r.enqueue({ type: "execute-epic", projectId: "A" });
+    for (let i = 0; i < 3; i++)
+      await r.enqueue({ type: "execute-epic", projectId: "A" });
     const sweep = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
 
     expect(await r.tickOnce()).toBe(1);
@@ -569,26 +658,37 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // share for it anyway would hold the ungated grooming sweep behind a job that never starts —
     // nothing dispatched, with global capacity to spare.
     h.seedProjects("A");
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     const ran: string[] = [];
     const r = budgetRunner(
+      h,
       async (ctx) => {
         ran.push(ctx.type);
         if (ctx.type === "execute-epic") await gate;
       },
       {
-        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
         resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 6),
         // The running epic's own attempt is already on the meter; one more seeded run (3) fills it.
         resolveProjectSpend: async () => 3,
-        resolvePolicy: () => ({ concurrency: 1, timeoutMs: Infinity, maxAttempts: 3 }),
+        resolvePolicy: () => ({
+          concurrency: 1,
+          timeoutMs: Infinity,
+          maxAttempts: 3,
+        }),
       },
     );
     await r.enqueue({ type: "execute-epic", projectId: "A" });
     expect(await r.tickOnce()).toBe(1); // the long-running epic takes A's only slot
-    const queuedEpic = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    const queuedEpic = await r.enqueue({
+      type: "execute-epic",
+      projectId: "A",
+    });
     const sweep = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
 
     expect(await r.tickOnce()).toBe(1);
@@ -605,17 +705,25 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // throws must do the same: the candidate is left to leaseDue's own cap rather than the whole
     // tick failing on one query (PR #248 review).
     h.seedProjects("A");
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
       {
-        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
         resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 9),
         resolveProjectSpend: async () => 0,
-        resolvePolicy: () => ({ concurrency: 1, timeoutMs: Infinity, maxAttempts: 3 }),
+        resolvePolicy: () => ({
+          concurrency: 1,
+          timeoutMs: Infinity,
+          maxAttempts: 3,
+        }),
       },
     );
     const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
@@ -638,13 +746,17 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // the only weekly limit, rather than a share the runner cannot actually measure.
     h.seedProjects("A");
     let ran = 0;
-    const weeklyResetAt = new Date(h.clock.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+    const weeklyResetAt = new Date(
+      h.clock.now() + 6 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
       {
-        readUsage: async () => usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
+        readUsage: async () =>
+          usage({ sessionPct: 10, weeklyPct: 60, weeklyResetAt }),
         resolveBudgetPolicy: () => withQuotaShare(DEFAULT_BUDGET_POLICY, 30),
       },
     );
@@ -661,6 +773,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     h.seedProjects("A");
     const resetAt = Math.floor(h.clock.now() / 1000) + 3600; // seconds
     const r = budgetRunner(
+      h,
       async (ctx) => {
         await ctx.claudeReached();
         throw new UsageLimitError("hit the wall", resetAt);
@@ -685,7 +798,11 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // complete (abandoned target), park (target vanished) or reschedule (lease held elsewhere)
     // without ever spawning Claude, and each of those must leave the meter where it was.
     h.seedProjects("A");
-    const attempts: Array<{ handler: JobHandler; status: string; spent: number }> = [
+    const attempts: Array<{
+      handler: JobHandler;
+      status: string;
+      spent: number;
+    }> = [
       { handler: async () => {}, status: "done", spent: 0 },
       {
         handler: async () => {
@@ -696,7 +813,10 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       },
       {
         handler: async () => {
-          throw new RunAlreadyLiveError("run live on another machine", "foreign");
+          throw new RunAlreadyLiveError(
+            "run live on another machine",
+            "foreign",
+          );
         },
         status: "queued",
         spent: 0,
@@ -718,7 +838,9 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       },
     ];
     for (const { handler, status, spent } of attempts) {
-      const r = budgetRunner(handler, { readUsage: async () => usage({ sessionPct: 10 }) });
+      const r = budgetRunner(h, handler, {
+        readUsage: async () => usage({ sessionPct: 10 }),
+      });
       const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
       expect(await r.tickOnce()).toBe(1);
       await r.whenIdle();
@@ -739,6 +861,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       [true, 1],
     ] as const) {
       const r = budgetRunner(
+        h,
         async (ctx) => {
           if (reached) await ctx.claudeReached();
           await new Promise<void>((resolveWait) => {
@@ -767,6 +890,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // it is reclaimed, and one when an attempt finally spawns.
     h.seedProjects("A");
     const r = budgetRunner(
+      h,
       async () => {
         throw new Error("preflight crash");
       },
@@ -798,7 +922,10 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
    * no vocabulary, so a gate test about high-value work has to say which label this board calls
    * high-value — exactly as the project's settings do at runtime.
    */
-  const VALUE_POLICY: BudgetPolicy = { ...DEFAULT_BUDGET_POLICY, valueLabels: ["risk:high"] };
+  const VALUE_POLICY: BudgetPolicy = {
+    ...DEFAULT_BUDGET_POLICY,
+    valueLabels: ["risk:high"],
+  };
 
   /** Labels by bead id for the gate's reader; anything not listed reads as label-less cleanup. */
   const labelsReader =
@@ -821,6 +948,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     await seedBurn(2); // measured cost 2% — fits the 15% headroom
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
@@ -856,7 +984,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   it("value gate: a job whose cost cannot fit the remaining session is held even at high value", async () => {
     h.seedProjects("A");
     // No burn samples → execute-epic costs the L-tier seed (20%), over the 15% headroom.
-    const r = budgetRunner(async () => {}, {
+    const r = budgetRunner(h, async () => {}, {
       readUsage: async () => usage({ sessionPct: 85 }),
       policy: VALUE_POLICY,
       readBeadLabels: labelsReader({ "A-1": ["risk:high"] }),
@@ -872,7 +1000,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
 
   it("value gate: abundant budget admits low-value cleanup", async () => {
     h.seedProjects("A");
-    const r = budgetRunner(async () => {}, {
+    const r = budgetRunner(h, async () => {}, {
       readUsage: async () => usage({ sessionPct: 10 }), // 90% headroom ≥ abundant 60 → threshold 0
       readBeadLabels: labelsReader({}),
     });
@@ -891,7 +1019,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // Grooming carries no bead — it IS the low-value cleanup band — so scarce budget holds it
     // without any label read, and it drains later when budget is abundant/behind pace.
     h.seedProjects("A");
-    const r = budgetRunner(async () => {}, {
+    const r = budgetRunner(h, async () => {}, {
       readUsage: async () => usage({ sessionPct: 85 }),
     });
     const id = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
@@ -903,7 +1031,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   it("value gate: fails open when the bead's labels cannot be read", async () => {
     h.seedProjects("A");
     await seedBurn(2);
-    const r = budgetRunner(async () => {}, {
+    const r = budgetRunner(h, async () => {}, {
       readUsage: async () => usage({ sessionPct: 85 }),
       readBeadLabels: async () => null, // bead unresolved → must admit, never starve on a guess
     });
@@ -922,7 +1050,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // The operator asked for "now" — only the session floor may hold it, not the value threshold.
     h.seedProjects("A");
     await seedBurn(2);
-    const r = budgetRunner(async () => {}, {
+    const r = budgetRunner(h, async () => {}, {
       readUsage: async () => usage({ sessionPct: 85 }),
       readBeadLabels: labelsReader({}), // would score as cleanup and be held if gated
     });
@@ -947,6 +1075,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     let sessionPct = 85; // scarce → high-value only
     let ran = 0;
     const r = budgetRunner(
+      h,
       async () => {
         ran += 1;
       },
@@ -987,5 +1116,98 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     await r.whenIdle();
     expect(ran).toBe(2);
     expect((await getJob(h.db, "stuck-low"))?.status).toBe("done");
+  });
+});
+
+describe("JobRunner budget governor paces a routed project on its own meter (anton-gnvw)", () => {
+  const h = useRunnerHarness();
+
+  it("resolves usage per governed project in one tick: routed reads its router, unrouted reads the account meter", async () => {
+    // "routed" has plenty of room on ITS router (10% session) but the account meter reads
+    // exhausted (99%) — if the gate ever fell back to the account read for it, it would defer.
+    // "unrouted" has no router entry at all, so it must fall through to the account read (99% →
+    // session-headroom defer), exactly as before anton-gnvw.
+    h.seedProjects("routed", "unrouted");
+    const ran: string[] = [];
+    const resolveProjectUsage: ProjectUsageResolver = async (
+      pid,
+      accountUsage,
+    ) =>
+      pid === "routed" ? usage({ sessionPct: 10, weeklyPct: 0 }) : accountUsage;
+    const r = budgetRunner(
+      h,
+      async (ctx) => {
+        ran.push(ctx.projectId ?? "?");
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 99 }), // the account meter — exhausted
+        resolveProjectUsage,
+      },
+    );
+    const routedId = await r.enqueue({
+      type: "execute-epic",
+      projectId: "routed",
+    });
+    const unroutedId = await r.enqueue({
+      type: "execute-epic",
+      projectId: "unrouted",
+    });
+
+    expect(await r.tickOnce()).toBe(1); // only the routed project's job is due this tick
+    await r.whenIdle();
+
+    expect(ran).toEqual(["routed"]);
+    expect((await getJob(h.db, routedId))?.status).toBe("done");
+    const deferred = await getJob(h.db, unroutedId);
+    expect(deferred?.status).toBe("queued");
+    expect(toMs(deferred?.runAt)).toBeGreaterThan(h.clock.now());
+    expect(deferred?.lastError).toMatch(/budget: session-headroom/);
+  });
+
+  it("a routed project whose router cannot be read still admits — a broken meter never holds work", async () => {
+    // The account meter reads exhausted, and the resolver reports the router unreadable (null) —
+    // budgetGate's own fail-open handles a null usage, so the project must admit rather than pace
+    // on (or defer to) a meter reading that was never its own.
+    h.seedProjects("routed");
+    let ran = 0;
+    const resolveProjectUsage: ProjectUsageResolver = async () => null;
+    const r = budgetRunner(
+      h,
+      async () => {
+        ran += 1;
+      },
+      {
+        readUsage: async () => usage({ sessionPct: 99 }),
+        resolveProjectUsage,
+      },
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "routed" });
+    const runAtBefore = toMs((await getJob(h.db, id))?.runAt);
+
+    expect(await r.tickOnce()).toBe(1); // unreadable router → fails open, leases normally
+    await r.whenIdle();
+
+    expect(ran).toBe(1);
+    const job = await getJob(h.db, id);
+    expect(job?.status).toBe("done");
+    expect(runAtBefore).toBeLessThanOrEqual(h.clock.now()); // never pushed out by a stale pace
+  });
+
+  it("without a resolveProjectUsage resolver, behavior is byte-identical to the account meter for every project", async () => {
+    h.seedProjects("A");
+    let ran = 0;
+    const r = budgetRunner(
+      h,
+      async () => {
+        ran += 1;
+      },
+      { readUsage: async () => usage({ sessionPct: 10 }) }, // no resolveProjectUsage passed
+    );
+    const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+    expect(ran).toBe(1);
+    expect((await getJob(h.db, id))?.status).toBe("done");
   });
 });

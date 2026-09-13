@@ -19,7 +19,25 @@ import { DEFAULT_PROJECT_BUDGET_POLICY, type ProjectSettings } from "@/lib/proje
 let tdb: TestDb;
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
 
-const { resolveBudgetPolicy, resolveProjectSpend } = await import("./service-policy");
+/** Swap in a router read for the resolveProjectUsage cases; null routes to the real (network) fn. */
+type GetRouterUsageCached = typeof import("../claude/router-usage").getRouterUsageCached;
+let routerUsageOverride: GetRouterUsageCached | null = null;
+vi.mock("../claude/router-usage", async () => {
+  const actual = await vi.importActual<typeof import("../claude/router-usage")>(
+    "../claude/router-usage",
+  );
+  return {
+    ...actual,
+    getRouterUsageCached: ((...args: Parameters<GetRouterUsageCached>) =>
+      routerUsageOverride
+        ? routerUsageOverride(...args)
+        : actual.getRouterUsageCached(...args)) satisfies GetRouterUsageCached,
+  };
+});
+
+const { resolveBudgetPolicy, resolveProjectSpend, resolveProjectUsage } = await import(
+  "./service-policy"
+);
 
 /** The shipped weekly ceiling a share is a cut OF. */
 const TARGET = DEFAULT_PROJECT_BUDGET_POLICY.weeklyTargetPct;
@@ -322,5 +340,57 @@ describe("resolveProjectSpend", () => {
 
     expect(await resolveProjectSpend("quiet", null)).toBeNull();
     expect(await resolveProjectSpend(null, null)).toBeNull();
+  });
+});
+
+describe("resolveProjectUsage (anton-gnvw)", () => {
+  const ACCOUNT_USAGE = { sessionPct: 40, weeklyPct: 20, sessionResetAt: null, weeklyResetAt: null, plan: "max" };
+  const ROUTER_USAGE = { sessionPct: 5, weeklyPct: 1, sessionResetAt: null, weeklyResetAt: null, plan: "Claude Code" };
+
+  beforeEach(() => {
+    tdb = makeTestDb();
+    routerUsageOverride = null;
+  });
+  afterEach(() => {
+    tdb.close();
+    vi.restoreAllMocks();
+  });
+
+  it("reads the router for a routed project, never touching the account read", async () => {
+    project("routed", {
+      claudeBaseUrl: "https://gw.example.com",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+    routerUsageOverride = async () => ROUTER_USAGE;
+
+    expect(await resolveProjectUsage("routed", ACCOUNT_USAGE)).toEqual(ROUTER_USAGE);
+  });
+
+  it("returns the account usage unchanged for an unrouted project — byte-identical to today", async () => {
+    project("plain", {});
+
+    expect(await resolveProjectUsage("plain", ACCOUNT_USAGE)).toBe(ACCOUNT_USAGE);
+  });
+
+  it("fails open to null when a routed project's router cannot be read", async () => {
+    project("routed", {
+      claudeBaseUrl: "https://gw.example.com",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+    routerUsageOverride = async () => null; // unreadable: no creds, timeout, non-200, malformed body
+
+    expect(await resolveProjectUsage("routed", ACCOUNT_USAGE)).toBeNull();
+  });
+
+  it("falls back to the account usage when settings cannot be read at all", async () => {
+    // No project row for this id — getProjectSettings fails soft to {} in practice, but this
+    // resolver's own catch is what protects the governor from a hard settings-read failure.
+    expect(await resolveProjectUsage("missing", ACCOUNT_USAGE)).toBe(ACCOUNT_USAGE);
+  });
+
+  it("returns the account usage unchanged for the null-project bucket", async () => {
+    expect(await resolveProjectUsage(null, ACCOUNT_USAGE)).toBe(ACCOUNT_USAGE);
   });
 });
