@@ -192,9 +192,8 @@ function relativeResetSeconds(text: string, nowMs: number): number | undefined {
 }
 
 /**
- * A wall-clock time in `timeZone` as a UTC epoch (ms). Recalculate the offset from the candidate
- * instant until formatting it produces the requested wall time: a naive UTC guess can land before
- * a DST transition even when the requested wall time is after it.
+ * Every UTC epoch (ms) that formats to a requested wall-clock time in `timeZone`. A fall-back hour
+ * has two valid instants, so callers must keep both candidates before choosing the next reset.
  */
 function zonedWallTimeToUtcMs(
   year: number,
@@ -203,7 +202,7 @@ function zonedWallTimeToUtcMs(
   hour: number,
   minute: number,
   timeZone: string,
-): number {
+): number[] {
   const wallTimeUtc = Date.UTC(year, month - 1, day, hour, minute, 0);
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone,
@@ -215,23 +214,37 @@ function zonedWallTimeToUtcMs(
     minute: "2-digit",
     second: "2-digit",
   });
-  let candidateUtc = wallTimeUtc;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const parts = formatter.formatToParts(new Date(candidateUtc));
+  const formattedTime = (instantMs: number) => {
+    const parts = formatter.formatToParts(new Date(instantMs));
     const get = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
-    const formattedWallTimeUtc = Date.UTC(
-      get("year"),
-      get("month") - 1,
-      get("day"),
-      get("hour"),
-      get("minute"),
-      get("second"),
-    );
-    const adjustedUtc = wallTimeUtc - (formattedWallTimeUtc - candidateUtc);
-    if (adjustedUtc === candidateUtc) return adjustedUtc;
-    candidateUtc = adjustedUtc;
-  }
-  return candidateUtc;
+    return {
+      year: get("year"),
+      month: get("month"),
+      day: get("day"),
+      hour: get("hour"),
+      minute: get("minute"),
+      second: get("second"),
+    };
+  };
+  const offsets = new Set(
+    [wallTimeUtc - 86_400_000, wallTimeUtc, wallTimeUtc + 86_400_000].map((instantMs) => {
+      const local = formattedTime(instantMs);
+      return Date.UTC(local.year, local.month - 1, local.day, local.hour, local.minute, local.second) - instantMs;
+    }),
+  );
+  return [...offsets]
+    .map((offset) => wallTimeUtc - offset)
+    .filter((instantMs) => {
+      const local = formattedTime(instantMs);
+      return (
+        local.year === year &&
+        local.month === month &&
+        local.day === day &&
+        local.hour === hour &&
+        local.minute === minute
+      );
+    })
+    .sort((a, b) => a - b);
 }
 
 /**
@@ -259,9 +272,21 @@ function tzResetSeconds(text: string, nowMs: number): number | undefined {
     const year = get("year");
     const month = get("month");
     const day = get("day");
-    let candidateMs = zonedWallTimeToUtcMs(year, month, day, hour, minute, timeZone);
-    if (candidateMs <= nowMs) candidateMs = zonedWallTimeToUtcMs(year, month, day + 1, hour, minute, timeZone);
-    return Math.floor(candidateMs / 1000);
+    const todayCandidates = zonedWallTimeToUtcMs(year, month, day, hour, minute, timeZone);
+    const candidateMs = todayCandidates.find((candidate) => candidate > nowMs);
+    if (candidateMs !== undefined) return Math.floor(candidateMs / 1000);
+
+    const tomorrow = new Date(Date.UTC(year, month - 1, day + 1));
+    const tomorrowCandidates = zonedWallTimeToUtcMs(
+      tomorrow.getUTCFullYear(),
+      tomorrow.getUTCMonth() + 1,
+      tomorrow.getUTCDate(),
+      hour,
+      minute,
+      timeZone,
+    );
+    const tomorrowMs = tomorrowCandidates[0];
+    return tomorrowMs === undefined ? undefined : Math.floor(tomorrowMs / 1000);
   } catch {
     return undefined;
   }
@@ -284,33 +309,33 @@ export function parseResetAt(text: string | undefined, nowMs: number = Date.now(
   );
 }
 
-/** The text the terse banners are scanned across — and the text `resetAt` is parsed out of. */
-function combinedText(channels: ClaudeChannels): string {
-  return `${channels.transcript}\n${channels.resultText}\n${channels.stderr}`;
-}
-
 /**
- * Terse machine banners are trusted across the full transcript (assistant + result + stderr) — the
- * result field alone isn't a reliable place to find them. The monthly spend-limit, session-limit,
- * usage-credits, and API-error sentences are model-reproducible, so none are scanned in the
- * assistant transcript. Their remaining channels are matched with strictness suited to authorship:
- * stderr (Claude Code's own) loosely, and the model-authored result field only when the notice is
- * the WHOLE result.
+ * The trusted channel that established a quota wall. Keep reset parsing on this channel: model prose
+ * in the other channels may quote a reset fixture without describing the wall that actually stopped
+ * the process.
  */
-function isUsageLimited(channels: ClaudeChannels): boolean {
-  return (
-    USAGE_LIMIT_RE.test(combinedText(channels)) ||
+function usageLimitSource(channels: ClaudeChannels): string | null {
+  if (
+    USAGE_LIMIT_RE.test(channels.stderr) ||
     SPEND_LIMIT_RE.test(channels.stderr) ||
-    SPEND_LIMIT_RESULT_RE.test(channels.resultText) ||
     GATEWAY_BILLING_RE.test(channels.stderr) ||
-    GATEWAY_BILLING_RESULT_RE.test(channels.resultText) ||
     RATE_LIMIT_RE.test(channels.stderr) ||
-    RATE_LIMIT_RESULT_RE.test(channels.resultText) ||
     SESSION_LIMIT_RE.test(channels.stderr) ||
+    USAGE_CREDITS_RE.test(channels.stderr)
+  ) {
+    return channels.stderr;
+  }
+  if (
+    USAGE_LIMIT_RE.test(channels.resultText) ||
+    SPEND_LIMIT_RESULT_RE.test(channels.resultText) ||
+    GATEWAY_BILLING_RESULT_RE.test(channels.resultText) ||
+    RATE_LIMIT_RESULT_RE.test(channels.resultText) ||
     SESSION_LIMIT_RESULT_RE.test(channels.resultText) ||
-    USAGE_CREDITS_RE.test(channels.stderr) ||
     USAGE_CREDITS_RESULT_RE.test(channels.resultText)
-  );
+  ) {
+    return channels.resultText;
+  }
+  return USAGE_LIMIT_RE.test(channels.transcript) ? channels.transcript : null;
 }
 
 /**
@@ -320,11 +345,12 @@ function isUsageLimited(channels: ClaudeChannels): boolean {
  * rescheduled forever (anton-ner.2).
  */
 export function usageLimitError(channels: ClaudeChannels): UsageLimitError | null {
-  if (!isUsageLimited(channels)) return null;
+  const source = usageLimitSource(channels);
+  if (!source) return null;
   const message =
     channels.resultText ||
     channels.stderr.trim() ||
     channels.transcript.trim() ||
     "Claude AI usage limit reached";
-  return new UsageLimitError(message, parseResetAt(combinedText(channels)));
+  return new UsageLimitError(message, parseResetAt(source));
 }

@@ -3,7 +3,7 @@
  * reset time is read back. The asymmetry is the point — a terse machine banner is trusted anywhere,
  * the model-reproducible spend-limit sentence only where a model could not have authored it.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseResetAt, usageLimitError, type ClaudeChannels } from "./driver-limits";
 
 const EMPTY: ClaudeChannels = { transcript: "", resultText: "", stderr: "" };
@@ -89,6 +89,14 @@ describe("parseResetAt", () => {
     );
   });
 
+  it("uses the second occurrence of a repeated wall time during DST fall back", () => {
+    // 2026-11-01T05:45:00Z = 01:45 EDT; the first 01:30 has passed but the second is at 06:30Z.
+    const duringFallBackMs = Date.parse("2026-11-01T05:45:00Z");
+    expect(parseResetAt("resets 1:30am (America/New_York)", duringFallBackMs)).toBe(
+      Math.floor(Date.parse("2026-11-01T06:30:00Z") / 1000),
+    );
+  });
+
   it.each(["resets 0am (America/New_York)", "resets 13pm (America/New_York)", "resets 25pm (America/New_York)", "resets 9:99pm (America/New_York)"])(
     "rejects invalid zoned clock values: %s",
     (text) => {
@@ -110,6 +118,8 @@ describe("parseResetAt", () => {
 });
 
 describe("usageLimitError", () => {
+  afterEach(() => vi.useRealTimers());
+
   it("trusts the terse banner in any channel, and carries the parsed resetAt", () => {
     const fromResult = usageLimitError(channels({ resultText: "Claude AI usage limit reached|1700000000" }));
     expect(fromResult?.resetAt).toBe(1700000000);
@@ -192,9 +202,25 @@ describe("usageLimitError", () => {
     expect(usageLimitError(channels({ stderr: "API Error: 500 [openrouter] [429]: rate limited" }))).not.toBeNull();
   });
 
-  it("classifies the session-limit banner as a quota hit (anton-2gsj)", () => {
-    expect(usageLimitError(channels({ stderr: SESSION_LIMIT_BANNER }))).not.toBeNull();
+  it("classifies the session-limit banner as a quota hit and parses its reset from stderr (anton-2gsj)", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime("2026-01-15T10:00:00Z");
+    const fromStderr = usageLimitError(channels({ stderr: SESSION_LIMIT_BANNER }));
+    expect(fromStderr).not.toBeNull();
+    expect(fromStderr?.resetAt).toBe(Math.floor(Date.parse("2026-01-16T02:00:00Z") / 1000));
     expect(usageLimitError(channels({ resultText: SESSION_LIMIT_BANNER }))).not.toBeNull();
+  });
+
+  it("parses resetAt from the trusted quota channel rather than a quoted transcript fixture", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime("2026-01-15T10:00:00Z");
+    const limitError = usageLimitError(
+      channels({
+        transcript: "The regression fixture says (reset after 2m 41s).",
+        stderr: SESSION_LIMIT_BANNER,
+      }),
+    );
+    expect(limitError?.resetAt).toBe(Math.floor(Date.parse("2026-01-16T02:00:00Z") / 1000));
   });
 
   it("ignores the session-limit banner when a model merely quotes it in its own prose (anton-2gsj)", () => {
