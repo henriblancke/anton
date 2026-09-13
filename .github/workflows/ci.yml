@@ -66,7 +66,15 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     # Real bd/Dolt work shells out per issue and is slow; cap it so a hang can't run for hours.
-    timeout-minutes: 45
+    # 45 min left zero headroom for runner variance: every bd/Dolt suite (including ones that
+    # touch none of the diff) slows 2.5-3x UNIFORMLY on a busy GitHub runner, so a normal ~20-min
+    # shard became a ~50-60-min one and got cancelled at the cap with zero test failures (PR #190
+    # run 33760581986; reproduced on main with none of that PR's code, run 33580380717, commit
+    # b5278ee — the `check`/`coverage` jobs on those same runs stayed fast, the tell that it's
+    # runner variance, not the diff). 75 min buys ~15 min of headroom above that worst observed
+    # 3x slowdown, so a slow-runner run reports its real result instead of being killed at the cap,
+    # while the normal ~20-min baseline is untouched (report-only job, so this never slows a merge).
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
