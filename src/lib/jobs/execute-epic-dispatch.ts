@@ -125,18 +125,20 @@ export async function dispatchRunTickets(
   // delivered set and the PR body while its diff ships, or an all-retired run parks without opening
   // the pull request that carries it.
   // Partition against the fork COMMIT pinned at worktree creation, never the mutable ref the run
-  // recorded (PR #238 review). The read below is `<fork>..HEAD`: measured against `baseRef`
-  // (`origin/<base>`, a ref a sibling run's fetch can advance or rewind mid-run), a base rewound
-  // behind the fork point would widen the window into pre-fork history, where an old `<ticketId>:`
-  // commit reads as this run's delivery and keeps a superseded ticket live for a PR that carries
-  // nothing of it. {@link warmRunWorktree} resolves the fork once — when origin/<base> is fresh and
-  // HEAD still sits at it — and persists it, so every ticket is partitioned against the same commit
-  // the checkout was actually cut from, and a resume reads the stored value rather than recomputing
-  // over a worktree whose HEAD has since moved on.
+  // recorded (PR #238 review). That immutable lower bound prevents a base rewound behind the fork
+  // from widening the scan into pre-fork history. Also exclude commits reachable from the base AS IT
+  // READS NOW: review-fix can merge a newer base into this branch, placing its commits beyond the
+  // pinned fork even though the PR does not contain them. Both bounds are required to answer what
+  // THIS branch delivers, not what a later base merge introduced.
   const forkPoint = prep.runStep.baseForkSha;
+  const baseRef = prep.runStep.baseRef;
   const { live, held, dispatchable } = await partitionTickets(run, prep.gated, async (id) => {
     try {
-      return await worktreeHasCommitFor(prep.worktree.path, id, { base: forkPoint, strict: true });
+      return await worktreeHasCommitFor(prep.worktree.path, id, {
+        base: forkPoint,
+        excludeBase: baseRef,
+        strict: true,
+      });
     } catch (e) {
       throw new PoisonEpic(
         `${id} is superseded on the board, and anton could not read the commits ` +
@@ -323,6 +325,14 @@ async function partitionTickets(
       // a no-commit retirement before accepting that commit as delivery: a fresh open bead must run
       // its current contract, while one still superseded remains a closed delivery in this diff.
       const fresh = await rereadSupersededTicket(run, ticket);
+      // `bd abandon` closes and labels a ticket but does not remove its old `supersedes` edge. A
+      // fresh read can therefore still look superseded while recording an operator's later won't-do;
+      // abandonment wins over the snapshot's delivery evidence, so it is neither delivered nor
+      // reopened into another dispatch.
+      if (beads.isAbandoned(fresh)) {
+        abandoned += 1;
+        continue;
+      }
       if (!beads.supersededBy(fresh)) {
         await assertRunTargetStillOwns(run, fresh);
         assertRerunGates(run, fresh);

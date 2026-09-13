@@ -32,7 +32,7 @@ vi.mock("./execute-epic-ticket", () => ({
   runTicket: (args: { ticket: Bead }) => runTicketMock(args),
 }));
 
-type HasCommitOptions = { base?: string; strict?: boolean };
+type HasCommitOptions = { base?: string; excludeBase?: string; strict?: boolean };
 const hasCommitMock = vi.fn<(worktree: string, id: string, options?: HasCommitOptions) => Promise<boolean>>();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
@@ -501,6 +501,24 @@ describe("a ticket the board already holds as superseded", () => {
     expect(run.retired).toEqual([]);
   });
 
+  // `bd abandon` does not remove the supersedes edge left by an earlier retirement. A fresh read can
+  // therefore still say superseded while the label records the operator's later decision not to do
+  // the work. That decision wins even when the snapshot's commit is in this branch's diff.
+  it("drops a committed superseded ticket abandoned after the snapshot", async () => {
+    hasCommitMock.mockImplementation(async (worktree, id) => worktree === WORKTREE && id === "anton-a");
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+    board = board.map((b) =>
+      b.id === "anton-a" ? ({ ...b, labels: [LABELS.abandoned] } as Bead) : b,
+    );
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(dispatchedIds()).toEqual(["anton-b"]);
+    expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-b"]);
+    expect(run.retired).toEqual([]);
+    expect(reopenMock).not.toHaveBeenCalled();
+  });
+
   // A commit in the diff is evidence of the snapshot's work, not a waiver for a later board decision
   // (PR #238 review). The operator reopened and rewrote this ticket; dispatching the stale closed bead
   // would accept the commit as delivery and let merge finalization close the new requirements unseen.
@@ -537,7 +555,11 @@ describe("a ticket the board already holds as superseded", () => {
 
     const outcome = await dispatchRunTickets(run, prep());
 
-    expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", { base: FORK_POINT, strict: true });
+    expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", {
+      base: FORK_POINT,
+      excludeBase: BASE_REF,
+      strict: true,
+    });
     expect(dispatchedIds()).toEqual(["anton-b"]);
     expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-b"]);
     expect(run.retired).toEqual([{ id: "anton-a", replacedBy: SHIPPER, source: "pre-existing" }]);

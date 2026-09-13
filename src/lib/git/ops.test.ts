@@ -1837,6 +1837,32 @@ suite("worktreeHasCommitFor (real git)", () => {
     await expect(worktreeHasCommitFor(repo, "anton-new1", { base: "origin/nope", strict: true })).rejects.toThrow();
   });
 
+  it("excludes a base commit brought in by a post-fork merge while retaining this branch's work", async () => {
+    g(["checkout", "-q", "-b", "anton/run"]);
+    writeFileSync(join(repo, "run.md"), "this run\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-run1: committed by this run"]);
+
+    g(["checkout", "-q", "main"]);
+    writeFileSync(join(repo, "base.md"), "base after fork\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-base1: committed on base after the fork"]);
+
+    g(["checkout", "-q", "anton/run"]);
+    g(["merge", "-q", "--no-ff", "main", "-m", "merge main for review fixes"]);
+
+    const forkPoint = execFileSync("git", ["-C", repo, "merge-base", "anton/run", "main~1"], {
+      encoding: "utf8",
+    }).trim();
+    expect(await worktreeHasCommitFor(repo, "anton-base1", { base: forkPoint })).toBe(true);
+    expect(
+      await worktreeHasCommitFor(repo, "anton-base1", { base: forkPoint, excludeBase: "main", strict: true }),
+    ).toBe(false);
+    expect(
+      await worktreeHasCommitFor(repo, "anton-run1", { base: forkPoint, excludeBase: "main", strict: true }),
+    ).toBe(true);
+  });
+
   /**
    * What the resumed ticket's CONTINUATION block is written from (anton-16pq). Nothing preserved
    * means no block at all, so "absent" has to be the answer for a branch that carries only other

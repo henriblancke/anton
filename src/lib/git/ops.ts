@@ -1622,11 +1622,17 @@ export async function distanceBehindUpstream(repoPath: string): Promise<Upstream
  * in an earlier merge — then reopened and settled otherwise — reads as committed by a run that never
  * touched it: kept out of the retirement ledger, skipped as done, and advertised as delivered by a
  * pull request that carries nothing of it. The delta is what the run's PR will contain.
+ *
+ * `excludeBase` additionally drops commits reachable from the base AS IT READS NOW. A review-fix
+ * premerge can merge that base into this branch after the run forked: those commits are newer than
+ * the pinned fork and therefore appear in `<base>..HEAD`, but are not in the pull request's diff.
+ * Keeping both bounds means a base ref rewind cannot widen the scan into pre-fork history, while a
+ * base advance or merge cannot make base-only work look delivered by this run.
  */
 export async function worktreeHasCommitFor(
   worktreePath: string,
   ticketId: string,
-  options: { base?: string; strict?: boolean } = {},
+  options: { base?: string; excludeBase?: string; strict?: boolean } = {},
 ): Promise<boolean> {
   return (await branchSubjects(worktreePath, options)).some((s) => s.startsWith(`${ticketId}:`));
 }
@@ -1829,16 +1835,23 @@ const TRAILER_VALUE_SEPARATOR = "\u001f";
 
 /**
  * The commits at the tip of the branch checked out in `worktreePath`, newest first — or, given
- * `base`, only those the branch carries beyond it (`<base>..HEAD`) — each with the ticket ids its
- * message claims to have satisfied. Fails closed to none (git error → treat as absent) rather than
- * risk a skip — except under `strict`, where absence is the permissive answer and the caller has
- * asked to see the failure instead.
+ * `base`, only those the branch carries beyond it (`<base>..HEAD`). `excludeBase` then removes
+ * commits already reachable from that base, retaining a pinned lower bound while excluding a newer
+ * base merge from a branch's delivery scan. Each record carries the ticket ids its message claims to
+ * have satisfied. Fails closed to none (git error → treat as absent) rather than risk a skip —
+ * except under `strict`, where absence is the permissive answer and the caller has asked to see the
+ * failure instead.
  */
 async function branchCommits(
   worktreePath: string,
-  options: { strict?: boolean; base?: string } = {},
+  options: { strict?: boolean; base?: string; excludeBase?: string } = {},
 ): Promise<{ sha: string; subject: string; satisfies: string[] }[]> {
-  const args = options.base ? [...BRANCH_LOG_ARGS, `${options.base}..HEAD`, "--"] : BRANCH_LOG_ARGS;
+  const range = options.base ? `${options.base}..HEAD` : "HEAD";
+  const args = options.excludeBase
+    ? [...BRANCH_LOG_ARGS, range, `^${options.excludeBase}`, "--"]
+    : options.base
+      ? [...BRANCH_LOG_ARGS, range, "--"]
+      : BRANCH_LOG_ARGS;
   const log = options.strict
     ? await git(worktreePath, args)
     : await git(worktreePath, args).catch(() => "");
@@ -1866,7 +1879,7 @@ async function branchCommits(
 /** The branch's commit subjects — {@link branchCommits} for the readers that only match on text. */
 async function branchSubjects(
   worktreePath: string,
-  options: { strict?: boolean; base?: string } = {},
+  options: { strict?: boolean; base?: string; excludeBase?: string } = {},
 ): Promise<string[]> {
   return (await branchCommits(worktreePath, options)).map((c) => c.subject);
 }
