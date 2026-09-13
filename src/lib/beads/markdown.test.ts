@@ -321,6 +321,18 @@ it("flags a fence opened beside a container marker — the marker is the item's 
   expect(rendered(">   ```\n> x\n> ```")).toEqual(["> x"]);
 });
 
+it("drops the delimiters of a fence nested in several containers, empty ones included", () => {
+  // The closer carries every container marker (`> > ````), and stripping only the first `>` left
+  // the rest to render as authored text — an Acceptance section holding a bare nested fence then
+  // passed `validateBeadContract` with no criterion in it.
+  expect(rendered("> > ```\n> > ```")).toEqual([]);
+  expect(rendered("> > > ```\n> > > ```")).toEqual([]);
+  expect(rendered("> - - ```\n> - - ```")).toEqual([]);
+  expect(rendered("## Acceptance\n> > ```\n> > ```")).toEqual(["## Acceptance"]);
+  // A non-empty nested fence still files its content as literal, and both delimiters drop.
+  expect(rendered("> > ```\n> > x\n> > ```")).toEqual(["> > x"]);
+});
+
 describe("renderedLines", () => {
   it("drops fence delimiters, strips comments, and keeps fenced content flagged as literal", () => {
     expect(renderedLines("# A\n<!-- c -->\n```\nx\n```\n\nend")).toEqual([

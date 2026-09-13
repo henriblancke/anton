@@ -104,6 +104,29 @@ export function closingFence(text: string, open: Fence): boolean {
   return fence !== undefined && closesFence(fence, open);
 }
 
+/**
+ * Peel the container markers a fenced delimiter's line may carry — each leading blockquote marker
+ * (`>`) and the list marker of the innermost item, in the indentation they impose. A fence nested in
+ * two blockquotes still reads `> > ```` on both its delimiter lines, so the closing line must be
+ * stripped the same full way the opener's column peel does before either side is judged a fence.
+ */
+function stripContainerMarkers(text: string): string {
+  let rest = text;
+  for (;;) {
+    if (/^ {0,3}>[ \t]?/.test(rest)) {
+      rest = rest.replace(/^ {0,3}>[ \t]?/, "");
+      continue;
+    }
+    const item = /^ {0,3}((?:[-*+]|\d{1,9}[.)])[ \t]+)/.exec(rest);
+    if (item) {
+      rest = rest.slice(item[0].length);
+      continue;
+    }
+    break;
+  }
+  return rest;
+}
+
 /** `text` is a heading precisely when the CommonMark parser produces one complete heading node. */
 export function isHeading(text: string): boolean {
   const root = fromMarkdown(text) as unknown as MarkdownNode;
@@ -236,23 +259,21 @@ export function scanMarkdown(source: string): ScannedLine[] {
     if (!node.position) return;
     if (node.type === "code") {
       const { start, end } = lineRange(lines, node.position);
-      // A fence's content begins past its container markers — `> ```` and `- ```` carry the marker
-      // on the opener's own line, so reading the raw source line found no fence there and let its
-      // delimiters render as authored text (`validateBeadContract` then passed a section holding no
-      // criterion). Peel the columns the parser reports preceding the content so a container-owned
-      // fence is still read as a fence; indented code carries none, so it stays unfenced.
-      const peel = node.position.start.column - 1;
-      const opening = openingFence(lines[start]?.text.slice(peel) ?? "");
+      // A fence's content begins past its container markers clean — `> ````, `- ```` and `> > ````
+      // each carry their prefixes on the delimiter's own line, so reading the raw source line found
+      // no fence there and let the delimiters render as authored text (`validateBeadContract` then
+      // passed a section holding no criterion). Peel every container marker the parser reports
+      // preceding the content so a container-owned fence is still read as a fence; indented code
+      // carries none, so it stays unfenced.
+      const openingText = lines[start]?.text.slice(node.position.start.column - 1) ?? "";
+      const opening = openingFence(stripContainerMarkers(openingText));
       if (!opening) return; // Indented code is not a fenced literal for the contract.
       for (let index = start; index <= end; index++) lines[index]!.fenced = true;
       lines[start]!.delimiter = true;
-      // A blockquote closer still carries its marker (`> ````); a list item's carries only its
-      // indentation, which `closingFence` already tolerates. Strip the one leading container marker
-      // — the same single-marker bound `fenceCloser` uses — so the delimiter is read as one.
-      const closing = (lines[end]?.text ?? "").replace(
-        /^ {0,3}(?:>[ \t]?|(?:[-*+]|\d{1,9}[.)])(?:[ \t]+|$))/,
-        "",
-      );
+      // A closer still carries each container marker (`> > ````); a list item's carries only its
+      // indentation. Strip the full container prefix — as the opener's peeling did — so the
+      // delimiter is read as one regardless of how many blockquotes and items wrap it.
+      const closing = stripContainerMarkers(lines[end]?.text ?? "");
       if (end !== start && closingFence(closing, opening)) lines[end]!.delimiter = true;
       return;
     }
