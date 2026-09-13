@@ -158,6 +158,12 @@ describe("scanMarkdown", () => {
         true,
       ]);
     });
+
+    it("drops a closing delimiter with trailing whitespace", () => {
+      // Closing fences permit trailing spaces. The AST position includes them, so the scanner must
+      // locate the delimiter independently rather than slice back from the final source column.
+      expect(rendered("```\n```   ")).toEqual([]);
+    });
   });
 
   describe("HTML comments", () => {

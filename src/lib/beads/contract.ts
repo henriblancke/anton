@@ -158,18 +158,31 @@ interface SectionOccurrence {
 function sectionOccurrences(description: string, keys: ReadonlySet<string>): SectionOccurrence[] {
   const out: SectionOccurrence[] = [];
   let open: OpenSection | undefined;
+  let sectionHeading = false;
   const close = () => {
     if (open) out.push({ key: open.key, body: open.body.join("\n").trim() });
   };
   for (const { text, heading, headingRest } of scanMarkdown(description)) {
-    if (heading && opensSection(open, heading, keys)) {
-      close();
-      open = { key: heading.key, depth: heading.depth, body: [] };
-    } else if (!headingRest) open?.body.push(text);
+    if (heading) {
+      sectionHeading = opensSection(open, heading, keys);
+      if (sectionHeading) {
+        close();
+        open = { key: heading.key, depth: heading.depth, body: [] };
+      } else {
+        open?.body.push(text);
+      }
+    } else if (headingRest) {
+      if (!sectionHeading) open?.body.push(text);
+    } else {
+      sectionHeading = false;
+      open?.body.push(text);
+    }
     // A Setext heading's later lines — the `===` / `---` underline included — are the heading
     // itself, not the body under it: they open no section and say nothing in one. Leaving them in
     // the body read `Acceptance Criteria` / `===` as a WRITTEN rubric (the underline is not
-    // scaffolding to the line-at-a-time judges), passing the gate with no criterion stated.
+    // scaffolding to the line-at-a-time judges), passing the gate with no criterion stated. A
+    // nested Setext heading remains in its parent section with its underline, so bodyState can
+    // still recognise the full heading as scaffolding.
   }
   close();
   return out;

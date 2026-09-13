@@ -199,6 +199,16 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
   });
 
+  it("treats a nested Setext heading inside Acceptance as scaffolding", () => {
+    // `Backend` is deeper than the h1 Acceptance heading, so it remains part of that section.
+    // Keep its underline in the body so the scanner can identify the complete heading.
+    const bead = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "# Acceptance Criteria", "Backend", "---"].join("\n"),
+    });
+    expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
+  });
+
   it("treats a section holding only a thematic break as unwritten", () => {
     // `---` renders as a rule, not text — counting it as content let approval and execution
     // proceed with no definition of done.
