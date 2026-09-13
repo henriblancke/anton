@@ -334,7 +334,10 @@ export async function resolveHooksPathOverride(
       if (containing) {
         const actual = await checkedOutSubmoduleSha(worktreePath, containing.submodulePath);
         if (!actual.checkedOut || actual.sha !== containing.sha) return disabledHooksPath();
-      } else if (await orphanedSubmoduleAncestor(worktreePath, raw)) {
+      } else if (
+        !(await currentTreeHasOrdinaryEntry(worktreePath, raw)) &&
+        (await orphanedSubmoduleAncestor(worktreePath, raw))
+      ) {
         // ORPHANED SUBMODULE CHECKOUT, left behind by a merge that already landed (PR #263 review,
         // round 31; extended to the NESTED shape in round 32). `checkedOut.checkedOut` is false and
         // `containing` is undefined, so neither the uninitialized case above nor the
@@ -365,6 +368,30 @@ export async function resolveHooksPathOverride(
         // no gitlink left to vouch for it, means `inWorktree` descends from that orphan corpse, not a
         // trustworthy directory. Returning it as an ordinary hooks directory would run hooks the
         // incoming branch just deleted; `disabledHooksPath` forces hooks off instead.
+        //
+        // But `orphanedSubmoduleAncestor`'s filesystem-side verdict is trusted only when the CURRENT
+        // tree does NOT already answer the question itself: a fast-forward can land, in the SAME
+        // merge, a commit that replaces a hooks-path submodule's gitlink with an ORDINARY tracked
+        // directory at that exact path — a plain "convert a submodule to a regular directory" commit
+        // — and git does not necessarily clean up the old submodule's leftover `.git` gitfile (and
+        // its administrative storage under `modules/`) just because the tree entry's mode changed
+        // from `160000` to a tree/blob mode (reproduced with Git 2.43.0). That leftover corpse still
+        // corroborates under `corroboratesOrphanedSubmodule` — the administrative storage genuinely
+        // exists, it is just stale debris now — so without this guard the block above would disable
+        // hooks for a directory the CURRENT tree just checked out as real, valid, ordinary content
+        // (PR #263 review, round 35; the mirror image of round 33's "standalone repo never tracked as
+        // a submodule at all" false positive — this one is "WAS a submodule, now isn't, at the same
+        // path, in the same tree"). `currentTreeHasOrdinaryEntry` is authoritative here because the
+        // tree is ground truth for "what IS this path right now" — independent of whatever filesystem
+        // debris a fast-forward happened to leave behind — and it is checked BEFORE
+        // `orphanedSubmoduleAncestor` ever runs: once the tree itself proves `raw` is ordinary tracked
+        // content, there's nothing left to corroborate on disk. This does not overlap with round 34's
+        // `historicalAncestorGitlink` below: that check answers "was `raw` ever a gitlink this branch
+        // deleted with nothing replacing it at that path" (reached only via the earlier `containing`
+        // fallthrough, for a NESTED path whose containing gitlink no longer exists at all), a
+        // different question from this one ("was `raw` ITSELF a gitlink that the current tree now
+        // replaces with ordinary content") — and short-circuiting here, before `historicalAncestorGitlink`
+        // is ever reached for `raw` itself, is exactly what keeps the two from conflicting.
         return disabledHooksPath();
       }
     }
@@ -542,6 +569,53 @@ async function wasGitlinkDeletedOnBranch(worktreePath: string, relPath: string):
     // exit 128, not a `160000` match either way; genuinely nothing to corroborate against.
     return false;
   }
+}
+
+/**
+ * Whether `worktreePath`'s CURRENT tree at `rev` (default `HEAD`) tracks `relPath` as an ORDINARY
+ * (non-gitlink) entry — a tree/blob mode, never `160000` — used to short-circuit
+ * {@link orphanedSubmoduleAncestor}'s filesystem-side orphan check before it ever runs (PR #263
+ * review, round 35).
+ *
+ * A fast-forward can land, in the SAME merge, a commit that replaces a hooks-path submodule's gitlink
+ * with an ordinary tracked directory at that exact path (a plain "convert a submodule to a regular
+ * directory" commit) without git necessarily cleaning up the old submodule's leftover `.git` gitfile
+ * (and its administrative storage under `modules/`) on disk — the tree entry's mode changes from
+ * `160000` to a tree/blob mode, but the filesystem debris from the old checkout can survive
+ * (reproduced with Git 2.43.0). `orphanedSubmoduleAncestor` alone cannot tell that apart from a
+ * genuine orphan: the leftover gitfile still corroborates against `$GIT_COMMON_DIR/modules/` either
+ * way, since the administrative storage genuinely exists — it's just stale debris now, not evidence
+ * the whole directory is stale. The CURRENT tree is the one thing that already knows the difference:
+ * if `relPath` is tracked there as ordinary content right now, that IS what the fast-forward's own
+ * checkout used to populate `relPath`, and it needs no corroboration from `orphanedSubmoduleAncestor`
+ * at all.
+ *
+ * Distinguished from "no entry at all" (returns `false` here, same as an ordinary entry that IS a
+ * gitlink) — a path absent from the tree entirely is a different question the later `trackedSomewhere`
+ * fallback already handles; this function specifically answers "an entry exists here AND it is not a
+ * gitlink."
+ */
+async function currentTreeHasOrdinaryEntry(
+  worktreePath: string,
+  relPath: string,
+  rev = "HEAD",
+): Promise<boolean> {
+  const candidate = posixNormalize(relPath);
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "ls-tree", rev, "--", `:(literal)${candidate}`],
+      { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
+    ));
+  } catch {
+    return false;
+  }
+  const entry = stdout.split("\n")[0] ?? "";
+  const tab = entry.indexOf("\t");
+  if (tab === -1) return false;
+  const [mode] = entry.slice(0, tab).split(" ");
+  return mode !== undefined && mode !== "160000";
 }
 
 /**

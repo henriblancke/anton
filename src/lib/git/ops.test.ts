@@ -1156,6 +1156,83 @@ suite("resolveHooksPathOverride (real git)", () => {
     expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "vendor", "hooks"));
   });
 
+  // A fast-forward can land, in the SAME merge, a commit that REPLACES a hooks-path submodule's
+  // gitlink with an ordinary tracked directory at that exact path — converting it, not deleting it —
+  // while git leaves the old submodule's `.git` gitfile (and its administrative storage) sitting on
+  // disk untouched, the same leftover-debris shape round 31-34's orphan detection was built to catch
+  // for a genuine deletion. Without checking whether the CURRENT tree now tracks `hooks` as ordinary
+  // content, `orphanedSubmoduleAncestor` corroborates that stale gitfile against
+  // `$GIT_COMMON_DIR/modules/` (which still exists) and wrongly reports an orphan — even though the
+  // fast-forward's own checkout just populated `hooks` with real, valid, freshly tracked hook content.
+  // `resolveHooksPathOverride` must trust `inWorktree` here, not disable hooks (PR #263 review, round
+  // 35).
+  it("keeps hooks enabled when a synchronized branch replaces a submodule with an ordinary tracked directory at the same path", async () => {
+    const submoduleUpstream = join(sandbox, "hooks-submodule-upstream-converted");
+    mkdirSync(submoduleUpstream);
+    execFileSync("git", ["init", "-q", "-b", "main", submoduleUpstream], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.email", "t@example.com"], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["-C", submoduleUpstream, "config", "user.name", "anton-test"], {
+      stdio: "ignore",
+    });
+    writeFileSync(join(submoduleUpstream, "pre-push"), "v1\n");
+    execFileSync("git", ["-C", submoduleUpstream, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", submoduleUpstream, "commit", "-q", "-m", "v1"], { stdio: "ignore" });
+
+    execFileSync(
+      "git",
+      ["-C", repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submoduleUpstream, "hooks"],
+      { stdio: "ignore" },
+    );
+    execFileSync("git", ["-C", repo, "commit", "-q", "-m", "add hooks submodule"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "core.hooksPath", "hooks"], { stdio: "ignore" });
+
+    const worktree = join(sandbox, "worktree-converted-submodule");
+    execFileSync(
+      "git",
+      ["-C", repo, "worktree", "add", "-q", "-b", "anton/epic-convert-submodule", worktree, "main"],
+      { stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      ["-C", worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "hooks"],
+      { stdio: "ignore" },
+    );
+    expect(existsSync(join(worktree, "hooks", ".git"))).toBe(true);
+    const gitFileContents = readFileSync(join(worktree, "hooks", ".git"), "utf8");
+
+    // Simulate the branch converting the submodule to an ordinary tracked directory, in one commit:
+    // drop the gitlink, replace it with real tracked content at the same path. The leftover `.git`
+    // gitfile has to come off the disk for `git add` to walk into the directory as ordinary content
+    // instead of treating it as a nested repo — real git's fast-forward does not run through `git
+    // add`/`git rm` at all, so it never needs the gitfile out of the way first; it is put back
+    // immediately after the commit lands, reproducing the leftover-debris shape the finding
+    // describes.
+    execFileSync("git", ["-C", worktree, "rm", "-q", "--cached", "hooks"], { stdio: "ignore" });
+    rmSync(join(worktree, "hooks", ".git"));
+    writeFileSync(join(worktree, "hooks", "pre-push"), "v2\n");
+    execFileSync("git", ["-C", worktree, "add", "-A", "hooks"], { stdio: "ignore" });
+    execFileSync("git", ["-C", worktree, "commit", "-q", "-m", "convert hooks submodule to directory"], {
+      stdio: "ignore",
+    });
+
+    // The CURRENT tree now tracks `hooks` as an ordinary directory, not a gitlink.
+    const treeEntry = execFileSync("git", ["-C", worktree, "ls-tree", "HEAD", "--", "hooks"], {
+      encoding: "utf8",
+    }).trim();
+    expect(treeEntry.startsWith("040000 tree")).toBe(true);
+    expect(readFileSync(join(worktree, "hooks", "pre-push"), "utf8")).toBe("v2\n");
+
+    // Recreate the old submodule's leftover `.git` gitfile — git's own fast-forward does not
+    // necessarily clean it up just because the tree entry's mode changed away from `160000`,
+    // reproducing the leftover-debris shape the finding describes.
+    writeFileSync(join(worktree, "hooks", ".git"), gitFileContents);
+    expect(existsSync(join(worktree, "hooks", ".git"))).toBe(true);
+
+    expect(await resolveHooksPathOverride(repo, worktree)).toBe(join(worktree, "hooks"));
+  });
+
   // Round 34's gap: a BRAND NEW worktree that never had `deps` initialized locally at all — so no
   // orphaned `.git` leftover exists anywhere on disk for `orphanedSubmoduleAncestor` to find — checks
   // out a branch whose own history already deleted the `deps` gitlink. `raw` (`deps/hooks`) does not
