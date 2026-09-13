@@ -378,7 +378,9 @@ function replaceRunsUnder(description: string, targetId: string, parentId?: stri
     for (let at = start + 1; at < end; at += 1) inContext.add(at);
   }
   return lines
-    .map((line, at) => (inContext.has(at) && generated.has(line.text) ? wanted : line.text))
+    .map((line, at) =>
+      inContext.has(at) && !line.fenced && generated.has(line.text) ? wanted : line.text,
+    )
     .join("\n");
 }
 
@@ -448,6 +450,13 @@ function markdownSafe(text: string): string {
     .join("");
 }
 
+/** The uninterrupted run of backslashes ending just before `at` — a delimiter is escaped only by an ODD one. */
+const precedingBackslashes = (text: string, at: number): number => {
+  let count = 0;
+  while (text[at - 1 - count] === "\\") count++;
+  return count;
+};
+
 /**
  * `text` broken into alternating plain and inline-code-span segments. A span opens on a run of
  * backticks and closes on a run of exactly the same length; an opener with no closer is literal
@@ -460,8 +469,9 @@ function splitCodeSpans(text: string): { segment: string; code: boolean }[] {
   while (i < text.length) {
     const open = /^`+/.exec(text.slice(i));
     // A backslash-escaped run is literal punctuation, not a delimiter — CommonMark processes
-    // backslash escapes before code spans, so ``\`<!--\``` never opens a span.
-    if (!open || text[i - 1] === "\\") {
+    // backslash escapes before code spans, so ``\`<!--\``` never opens a span. Backslash escapes
+    // pair up, so an EVEN run of preceding backslashes leaves the backtick free to open a span.
+    if (!open || precedingBackslashes(text, i) % 2 === 1) {
       plain += text[i];
       i++;
       continue;

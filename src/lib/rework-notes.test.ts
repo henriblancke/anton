@@ -316,6 +316,25 @@ describe("followUpDescription", () => {
     expect(description).not.toContain("<!--");
   });
 
+  it("counts backslash parity before a backtick — an even run leaves it free to open a code span", () => {
+    // `\\` is an escaped backslash (renders `\`), so the backtick after it is NOT escaped and opens
+    // a real span; `<!--` inside must stay literal. Only an ODD run of backslashes escapes the tick.
+    const description = followUpDescription({
+      ...args,
+      summary: "handle \\\\`<!--` tokens",
+      instructions: "Fix \\\\`<!--` handling.",
+      findings: [],
+      ticket: makeBead({ id: "t1", title: "Escape \\\\`<!--` correctly" }),
+      parentId: "feat",
+    });
+    expect(validateBeadContract(makeBead({ id: "anton-new", description }))).toEqual([]);
+    expect(description).toContain("## Goal\nhandle \\\\`<!--` tokens\n");
+    // `<!--` inside the span stays literal — its only `<!--` is the one the founder typed, not an
+    // escaped copy that renders with a spurious backslash and diverges from the human note.
+    expect(description).toContain("`<!--`");
+    expect(description).not.toContain("`<\\!--`");
+  });
+
   it("escapes a fence-shaped summary — bare, it would fence every section under the Goal", () => {
     for (const summary of ["```", "```md swallows the section", "~~~"]) {
       const description = followUpDescription({ ...args, summary, parentId: "feat" });
@@ -720,6 +739,26 @@ describe("reconcileFollowUpDescription", () => {
     );
     const reconciled = reconcileFollowUpDescription(rewritten, { ...args, parentId: undefined });
     expect(reconciled).toContain("Runs wherever the gardener puts it.");
+    expect(reconciled).not.toContain("It is its own run target");
+  });
+
+  it("keeps a run-location line moved into a fenced example under Context as literal sample text", () => {
+    // The founder moved the generated sentence into a fenced block to show it; the flat scanner
+    // flags those lines fenced, so the exact-text match must not rewrite the authored sample.
+    const sentence = "It runs as a ticket of feat, in that target's next run.";
+    const moved = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Context",
+      "Here is the original line:",
+      "",
+      "```text",
+      sentence,
+      "```",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(moved, { ...edited, parentId: undefined });
+    expect(reconciled).toContain(`\`\`\`text\n${sentence}\n\`\`\``);
     expect(reconciled).not.toContain("It is its own run target");
   });
 
