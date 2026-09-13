@@ -451,9 +451,10 @@ export function instructionCriteria(instructions: string): InstructionCriterion[
       // line that dedents out of the item was filed as the fence's content rather than as the step
       // it is. CommonMark ends the block where its container ends, so hand such a fence to the
       // nested machinery, which already closes one at its container's edge.
-      const heldFence = !fence ? itemFence(line.text, items) : undefined;
-      if (heldFence) {
-        nested = heldFence;
+      const nestedFence = !fence ? heldFence(line.text, items) : undefined;
+      if (nestedFence) {
+        nested = nestedFence;
+        items.push(...nestedFence.opened);
         openParagraph = undefined;
         continue;
       }
@@ -1019,17 +1020,30 @@ function setextHeadingRun(
  * one block swallowing the step. Items the opener has already dedented out of are popped off
  * `items` first, so the column it is judged against is the item it actually sits in.
  */
-function itemFence(
+/**
+ * A fence opened on a container marker's own line — `- ````, `> ````, `> - ```` — as the flat
+ * contract scanner reports it. Everything before the fence delimiter is marker, and the content
+ * that follows sits inside those containers, so the `line.fenced` branch hands such an opener to
+ * the nested machinery rather than filing it whole: peel the markers exactly as the main loop
+ * does ({@link peelContainers}) and reopen the fence bound to the container, so its closer closes
+ * at the container's edge instead of swallowing the line that left it.
+ */
+function heldFence(
   text: string,
   items: number[],
-): { opener: string; fence: Fence; prefix: Prefix; content: string[] } | undefined {
+): { opener: string; fence: Fence; prefix: Prefix; opened: number[]; content: string[] } | undefined {
   const indent = indentColumns(text);
   while (items.length > 0 && indent < items[items.length - 1]!) items.pop();
   const base = items[items.length - 1] ?? 0;
-  if (base === 0 || indent < base) return undefined;
-  const opener = dedent(text, base);
+  const peeled = peelContainers(dedent(text, indent), indent);
+  // A fence at the top level is the ordinary `fence` path, not a nested one.
+  if (peeled.text === text && peeled.prefix.length === 1) return undefined;
+  const opener = peeled.text;
   const fence = openingFence(opener);
-  return fence && { opener, fence, prefix: [base], content: [] };
+  if (!fence) return undefined;
+  // Reattach the base so following lines are judged against the item the opener sits in.
+  if (base > 0 && (peeled.prefix[0] as number | undefined) !== base) peeled.prefix[0] = base;
+  return { opener, fence, prefix: peeled.prefix, opened: peeled.opened, content: [] };
 }
 
 /**

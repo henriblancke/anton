@@ -236,13 +236,23 @@ export function scanMarkdown(source: string): ScannedLine[] {
     if (!node.position) return;
     if (node.type === "code") {
       const { start, end } = lineRange(lines, node.position);
-      // The legacy line projection deliberately leaves container-owned fences to rework-contract,
-      // which peels the list/quote syntax before copying that example.
-      const opening = openingFence(lines[start]?.text ?? "");
+      // A fence's content begins past its container markers — `> ```` and `- ```` carry the marker
+      // on the opener's own line, so reading the raw source line found no fence there and let its
+      // delimiters render as authored text (`validateBeadContract` then passed a section holding no
+      // criterion). Peel the columns the parser reports preceding the content so a container-owned
+      // fence is still read as a fence; indented code carries none, so it stays unfenced.
+      const peel = node.position.start.column - 1;
+      const opening = openingFence(lines[start]?.text.slice(peel) ?? "");
       if (!opening) return; // Indented code is not a fenced literal for the contract.
       for (let index = start; index <= end; index++) lines[index]!.fenced = true;
       lines[start]!.delimiter = true;
-      const closing = lines[end]?.text.slice(end === start ? node.position.start.column - 1 : 0) ?? "";
+      // A blockquote closer still carries its marker (`> ````); a list item's carries only its
+      // indentation, which `closingFence` already tolerates. Strip the one leading container marker
+      // — the same single-marker bound `fenceCloser` uses — so the delimiter is read as one.
+      const closing = (lines[end]?.text ?? "").replace(
+        /^ {0,3}(?:>[ \t]?|(?:[-*+]|\d{1,9}[.)])(?:[ \t]+|$))/,
+        "",
+      );
       if (end !== start && closingFence(closing, opening)) lines[end]!.delimiter = true;
       return;
     }

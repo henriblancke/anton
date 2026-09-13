@@ -762,6 +762,27 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).not.toContain("It is its own run target");
   });
 
+  it("keeps a run-location line moved into a raw HTML sample under Context as typed content", () => {
+    // An HTML block renders its content as literal source, as a fence does its own. A generated
+    // run-location sentence the founder moved into a `<pre>` sample is founder-authored text, not
+    // the active generated line, so reconciliation must not rewrite it to the new parentage.
+    const sentence = "It runs as a ticket of feat, in that target's next run.";
+    const moved = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Context",
+      "Here is the original line:",
+      "",
+      "<pre>",
+      sentence,
+      "</pre>",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(moved, { ...edited, parentId: undefined });
+    expect(reconciled).toContain(`<pre>\n${sentence}\n</pre>`);
+    expect(reconciled).not.toContain("It is its own run target");
+  });
+
   it("appends an Acceptance section to a hand-made bead that has none, keeping what it says", () => {
     const handMade = "## Goal\nharden the retry\n\n## Context\nMade by hand.\n";
     const reconciled = reconcileFollowUpDescription(handMade, edited);

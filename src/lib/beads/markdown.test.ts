@@ -307,6 +307,20 @@ describe("scanMarkdown", () => {
   });
 });
 
+it("flags a fence opened beside a container marker — the marker is the item's or callout's, not the fence's", () => {
+  // `> ```` and `- ```` carry the container prefix on the opener's own line, so the delimiters
+  // used to read as authored text and `renderedLines` exposed them — an empty fenced block inside
+  // a list item or callout then counted as a written rubric with no criterion in it.
+  expect(rendered("> ```\n> ```")).toEqual([]);
+  expect(rendered("- ```\n- ```")).toEqual([]);
+  expect(rendered("> - ```\n> - ```")).toEqual([]);
+  // A non-empty container fence still files its content as literal, and its delimiters drop.
+  expect(rendered("> ```\n> x\n> ```")).toEqual(["> x"]);
+  expect(rendered("- ```\n  x\n  ```")).toEqual(["  x"]);
+  // A fence indented one to three columns under a marker still reads as that fence.
+  expect(rendered(">   ```\n> x\n> ```")).toEqual(["> x"]);
+});
+
 describe("renderedLines", () => {
   it("drops fence delimiters, strips comments, and keeps fenced content flagged as literal", () => {
     expect(renderedLines("# A\n<!-- c -->\n```\nx\n```\n\nend")).toEqual([

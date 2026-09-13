@@ -377,9 +377,19 @@ function replaceRunsUnder(description: string, targetId: string, parentId?: stri
   for (const { start, end } of sectionsNamed(lines, CONTEXT_KEYS)) {
     for (let at = start + 1; at < end; at += 1) inContext.add(at);
   }
+  // A raw HTML block renders its content as literal source, as a fence does its own: a run-location
+  // sentence moved into a `<pre>`/`<script>` sample is founder-authored text, not the active
+  // generated line, and rewriting it there would change what the founder wrote under Context.
+  const inHtml = new Set<number>();
+  htmlBlockLines(description).forEach((html, at) => html && inHtml.add(at));
   return lines
     .map((line, at) =>
-      inContext.has(at) && !line.fenced && generated.has(line.text) ? wanted : line.text,
+      inContext.has(at) &&
+      !line.fenced &&
+      !inHtml.has(at) &&
+      generated.has(line.text)
+        ? wanted
+        : line.text,
     )
     .join("\n");
 }
