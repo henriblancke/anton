@@ -153,9 +153,16 @@ const RESET_AT_RE = /reset(?:s)?\s+at\s+([^\n,;]+)/i;
 const RESET_TZ_RE = /reset(?:s)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)/i;
 /**
  * Relative-duration prose: "(reset after 2m 41s)" — any subset of h/m/s components, all optional
- * individually but at least one must be present (anton-fjw3).
+ * individually but at least one must be present (anton-fjw3). The trailing `(?!\s*[a-zA-Z0-9])`
+ * end-bounds the duration: without it the pattern matches its own valid prefix inside malformed
+ * text — "2minutes" (digit run followed by more letters), "2m junk" (a trailing word), "2m 41sx"
+ * (a stray suffix on the last unit) — and hands back a resetAt for text that never was one. The
+ * lookahead forces whatever follows the matched units (after any whitespace) to be a non-word
+ * character or the end of string, so those malformed cases fail to match at all and
+ * `relativeResetSeconds` falls through to `undefined` for the runner's own cooloff.
  */
-const RESET_RELATIVE_RE = /reset(?:s)?\s+after\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i;
+const RESET_RELATIVE_RE =
+  /reset(?:s)?\s+after\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?(?!\s*[a-zA-Z0-9])/i;
 /** Last resort: any ISO-8601 timestamp anywhere in the notice. */
 const RESET_ISO_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/;
 

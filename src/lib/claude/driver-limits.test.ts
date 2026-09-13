@@ -99,6 +99,14 @@ describe("parseResetAt", () => {
   it("yields undefined for an unparseable reset, leaving the runner's own cooloff to apply", () => {
     expect(parseResetAt("(reset shortly)", NOW_MS)).toBeUndefined();
   });
+
+  it.each([
+    "(reset after 2minutes)", // digit run bleeds into a non-unit word, no bounded "m"/"h"/"s" letter
+    "(reset after 2m junk)", // valid unit followed by a trailing word
+    "(reset after 2m 41sx)", // stray suffix glued onto the last unit
+  ])("rejects a relative duration with an unbounded suffix: %s", (text) => {
+    expect(parseResetAt(text, NOW_MS)).toBeUndefined();
+  });
 });
 
 describe("usageLimitError", () => {
