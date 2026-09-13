@@ -1403,12 +1403,28 @@ export async function repairAlreadyShipped(args: {
       label = await recordRepair(repoPath, bead, KLASS, attempted, Date.now());
     });
     if (!stamped || label === undefined) {
-      // The retirement stands, for `ref-stale`'s reason ({@link unstampedNote}): the ticket is closed
-      // and pointed at its survivor, and reopening it over a missing label would undo a correct
-      // settlement to protect a guard the closed bead no longer needs.
+      // The stamp is the whole of what lets a resume recognise this closure (`settleRetiredStandalone`
+      // reads `priorRepair`) and what suppresses a later valid repair from re-running. bd refused it
+      // every time, so the retirement stands but is UNPROVEN on the board: answering `retired` would
+      // have this caller settle the run as a clean, delivered-nothing success that a later crash or a
+      // failed run-row write cannot recover — the retry then parks at this closed target with no stamp
+      // to tell it the retirement was its own (PR #238 review). So the run STOPS here, exactly as the
+      // marker fence does: the caller must not release the closed bead or open a PR on a retirement
+      // nothing can later prove anton performed, and the failure is retried once bd is back. The
+      // `not-delivered` marker and the supersede already landed and stand; only the stamp is missing,
+      // so the unstamped account stays on the bead while the close itself is not taken back.
       console.error(`[repair] ${bead.id} was retired as superseded but could not be stamped`);
       await beads.note(repoPath, bead.id, unstampedNote(KLASS, attempted)).catch(() => {});
-      label = undefined;
+      return {
+        action: "overtaken",
+        why:
+          `${bead.id} blocked as \`${KLASS}\` — its retirement landed but the repair stamp could not ` +
+          `be written after every retry. The close is valid, but nothing on the board records it as ` +
+          `anton's, so a resume could not tell this retirement from a foreign close and would park the ` +
+          `run; bd refused the stamp each time, so the run stops rather than report a retirement nobody ` +
+          `can recover.`,
+        evidence: [`the retirement anton wrote: ${attempted}`],
+      };
     }
     // The stamp opens the SAME window the marker did, and it is the last one (PR #238 review). The
     // locks order this process only, so between the marker fence's reread and `recordRepair` another

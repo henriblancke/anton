@@ -2887,11 +2887,12 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
     });
   });
 
-  it("keeps the retirement when only the STAMP failed, and says the guard is not armed for it", async () => {
+  it("stops rather than settling the retirement when only the STAMP failed", async () => {
     // The marker is the first tag write and lands; the stamp, second, is what bd refuses — but it is
-    // retried through `mustPersist` before the caller accepts the retirement (PR #238 review), so a
-    // single refusal gives it another chance. The "guards not armed" note only fires when the stamp
-    // fails EVERY try, which is the case that leaves recovery unable to recognise the retirement.
+    // retried through `mustPersist` before the caller is told anything (PR #238 review). Exhausted, the
+    // repair answers `overtaken` rather than `retired`: the retirement stands but nothing on the board
+    // proves anton wrote it, so a later crash or failed run-row write leaves `settleRetiredStandalone`
+    // unable to recognise the close and the retry parks at a closed target.
     tagMock
       .mockImplementationOnce(async () => "")
       .mockRejectedValue(new Error("beads db is locked"))
@@ -2900,13 +2901,16 @@ suite("repairAlreadyShipped — the retirement (real git · seeded board · fake
 
     const outcome = await retire();
 
-    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER, marked: true });
-    expect((outcome as { label?: string }).label).toBeUndefined();
+    expect(outcome).toMatchObject({ action: "overtaken" });
+    expect((outcome as { why: string }).why).toContain("could not be written");
     expect(supersedeMock).toHaveBeenCalledWith(repo, TARGET, SHIPPER);
     // The stamp was retried to exhaustion, not swallowed on its first refusal (PR #238 review).
     expect(
       tagMock.mock.calls.filter(([, , labels]) => labels.some((l) => l.startsWith("repair:"))).length,
     ).toBe(3);
+    // The retirement and its `not-delivered` marker both landed and stand; only the stamp is missing,
+    // and the unstamped account is what remains on the bead.
+    expect(reopenMock).not.toHaveBeenCalled();
     const notes = noteMock.mock.calls.map((c) => c[2]);
     expect(notes.some((t) => t.includes("could not stamp it"))).toBe(true);
   });

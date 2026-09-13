@@ -96,11 +96,17 @@ export async function warmRunWorktree(
       : undefined);
   let baseForkSha: string;
   try {
-    // The creation-captured fork wins: it was read from the new checkout's HEAD before warming, so
-    // it cannot have been rewound by a sibling fetch. A reused checkout falls back to the row (this
-    // run or the attempt that cut the branch); only a legacy row recomputes, against the fresh base.
-    baseForkSha =
-      worktree.forkSha ?? reusedFork ?? (await resolveForkPoint(worktree.path, freshBase));
+    // The creation-captured fork is FROZEN only on a first creation (PR #238 review): there
+    // `readForkAtCreation` reads the checkout's HEAD in the instant `worktree add -b` cut it, so the
+    // base cannot since have rewound it. A reused checkout's `forkSha` is read off the SAME call
+    // checking the existing branch out, so it returns the branch's current HEAD — already carrying
+    // this run's prior-attempt commits — not the fork point. Preferring it would partition against
+    // `<HEAD>..HEAD>` and read a ticket already closed on a prior attempt as a pre-existing
+    // retirement. Only a checkout this call just created takes `worktree.forkSha`; a reused one asks
+    // `reusedFork` first, the row and the attempt that cut the branch.
+    baseForkSha = reusedCheckout
+      ? reusedFork ?? (await resolveForkPoint(worktree.path, freshBase))
+      : worktree.forkSha ?? reusedFork ?? (await resolveForkPoint(worktree.path, freshBase));
   } catch (e) {
     // Only reachable when a legacy row (no pinned fork) resumes over a worktree whose base was
     // rewritten to an unrelated history — a fresh creation forks off `freshBase` and always shares

@@ -165,3 +165,32 @@ it("prefers the creation-captured fork over re-resolving the mutable base (PR #2
   expect(runStep.baseForkSha).toBe("creation-fork");
   expect(await getRunBaseForkSha(t.db, RUN_ID)).toBe("creation-fork");
 });
+
+it("ignores a reused checkout's forkSha — it reads the branch's current HEAD, not the fork (PR #238 review)", async () => {
+  // `branchExists` answered true (reused), and the branch carries a prior attempt's commits, so the
+  // checkout returned by `createWorktree` reports the branch's current HEAD as its `forkSha`.
+  // Preferring it would partition this run against `<HEAD>..HEAD>` (dropping every already-committed
+  // ticket); the recovered pin — another attempt's row on the same branch — has to win instead.
+  await updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "trueforkcommit",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  branchExistsMock.mockResolvedValue(true);
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    repoPath: "/repo",
+    // The reused checkout's own HEAD — the branch tip with prior-attempt commits on it.
+    forkSha: "head-of-reused-branch",
+  });
+  resolveForkPointMock.mockRejectedValue(new Error("resolver must not run when a recovered fork exists"));
+
+  const { runStep } = await warmRunWorktree(makeRun(RETRY));
+
+  expect(resolveForkPointMock).not.toHaveBeenCalled();
+  expect(runStep.baseForkSha).toBe("trueforkcommit");
+});
