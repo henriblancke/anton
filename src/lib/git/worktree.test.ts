@@ -33,6 +33,7 @@ import { hostname, tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
   acquireWorktreeClaim,
+  branchExists,
   createWorktree,
   findWorktree,
   listWorktrees,
@@ -143,6 +144,25 @@ suite("worktree manager (real git)", () => {
 
     expect(second.path).toBe(first.path);
     expect(existsSync(second.path)).toBe(true);
+  });
+
+  it("returns false only when the local branch is missing", async () => {
+    expect(await branchExists(repo, "anton/does-not-exist")).toBe(false);
+  });
+
+  it("propagates operational show-ref failures instead of claiming the branch is new", async () => {
+    const shim = gitShim([
+      'if [ "$3" = "show-ref" ]; then',
+      '  echo "fatal: ref database unavailable" >&2',
+      "  exit 128",
+      "fi",
+    ]);
+
+    try {
+      await expect(branchExists(repo, "anton/anything")).rejects.toThrow("ref database unavailable");
+    } finally {
+      shim.restore();
+    }
   });
 
   // anton-2wvb: `git worktree list` reports an administrative record, which outlives a checkout

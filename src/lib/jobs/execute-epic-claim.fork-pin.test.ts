@@ -98,6 +98,13 @@ it("pins the fork commit against the freshly-fetched base on a first creation", 
   expect(await getRunBaseForkSha(t.db, RUN_ID)).toBe("f0f0f0forkcommit");
 });
 
+it("stops before checkout creation when reuse detection cannot inspect refs", async () => {
+  branchExistsMock.mockRejectedValue(new Error("ref database unavailable"));
+
+  await expect(warmRunWorktree(makeRun())).rejects.toThrow("ref database unavailable");
+  expect(createWorktreeMock).not.toHaveBeenCalled();
+});
+
 it("reuses the pinned fork on resume instead of recomputing over a moved HEAD", async () => {
   // A prior attempt already pinned the true fork; the base has since rewound, so recomputing now
   // would answer behind it. The resume must read the stored value and never call the resolver.

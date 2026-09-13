@@ -563,15 +563,19 @@ export async function listBranches(repoPath: string, prefix: string): Promise<st
  * a new one off the base when none exists, so the answer here — asked BEFORE the create — is
  * whether this run inherits a prior attempt's history or starts its own.
  *
- * Fails closed to `false` (a broken ref store, an unreadable repo): "no branch" only ever leads a
- * caller to derive the answer from the checkout itself rather than trust an inherited one.
+ * A missing ref is the one expected false result. Operational failures must propagate: treating an
+ * unreadable ref store as a new branch lets the caller misclassify a reused checkout as fresh and
+ * lose its inherited fork pin.
  */
 export async function branchExists(repoPath: string, branch: string): Promise<boolean> {
   try {
     await git(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    // `show-ref --verify` reserves exit 1 for a ref that does not exist; every other failure means
+    // git could not establish whether this checkout is reused.
+    if ((err as { code?: number }).code === 1) return false;
+    throw err;
   }
 }
 
