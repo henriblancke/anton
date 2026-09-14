@@ -176,7 +176,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // issuing a second `bd list`. Crucially, `refreshAllIssues` goes through `loadAllIssues`, which
   // falls back to separate open/closed reads where `--status all` fails; calling `beads.list` directly
   // here would skip that fallback and 500 the whole approval in exactly the scenario the board handles.
-  const allBeads = await refreshAllIssues(project.repoPath);
+  const allBeads = await refreshAllIssues(project.repoPath, { withCycles: true });
   // Validate the target is actually runnable *before* touching labels or enqueuing. Approval is the
   // run trigger, so labeling-and-enqueuing a bead that execute-epic will only poison-park is a false
   // green: the operator sees "approved" but no run ever reaches a PR. Reuse the same isRunTarget gate

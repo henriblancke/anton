@@ -152,8 +152,14 @@ export async function readAllIssues(
   return snapshot;
 }
 
-export function refreshAllIssues(cwd: string): Promise<Bead[]> {
-  return refreshIssueSnapshot(cwd, () => loadAllIssues(cwd));
+export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}): Promise<Bead[]> {
+  const board = await refreshIssueSnapshot(cwd, () => loadAllIssues(cwd, opts));
+  // A concurrent non-authoritative refresh may have won the snapshot loader. Enrich the exact board
+  // returned here so callers that must make approval decisions never lose the requested evidence.
+  if (opts.withCycles && cycleEvidenceFor(board) === undefined) {
+    attachCycleEvidence(board, await beads.depCycles(cwd));
+  }
+  return board;
 }
 
 export function probeAllIssues(cwd: string): void {

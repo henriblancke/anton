@@ -26,7 +26,7 @@ vi.mock("./bd", async () => {
   };
 });
 
-const { allIssues, loadAllIssues, readAllIssues } = await import("./issues");
+const { allIssues, loadAllIssues, readAllIssues, refreshAllIssues } = await import("./issues");
 const { cycleEvidenceFor } = await import("./cycle-evidence");
 const { resetIssueSnapshots } = await import("./snapshot");
 
@@ -127,6 +127,16 @@ describe("loadAllIssues", () => {
     cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
 
     const board = await allIssues(REPO, { withCycles: true });
+
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cyclesMock).toHaveBeenCalledWith(REPO);
+  });
+
+  it("keeps cycle evidence on a forced refresh for release re-derivation", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const board = await refreshAllIssues(REPO, { withCycles: true });
 
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
     expect(cyclesMock).toHaveBeenCalledWith(REPO);
