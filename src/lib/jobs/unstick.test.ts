@@ -1031,7 +1031,9 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
 
     expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
     expect(escalationRows()[0]).toMatchObject({ status: "open" });
-    expect(gateListMock).toHaveBeenCalledTimes(0); // no gate wait open, so no gate read either
+    // Called once per sweep as the board-outage recheck (buildPassState), not for a gate wait —
+    // there is none here, so `reconcileGateWaits`'s own read never fires.
+    expect(gateListMock).toHaveBeenCalledTimes(2);
   });
 
   it("escalates on the report's word when the gate list can't be read", async () => {
@@ -1217,7 +1219,9 @@ describe("a legacy exhausted-job escalation that is really a gate's wait", () =>
 
     expect(await sweep()).toMatchObject({ settled: 0 });
     expect(escalationRows()[0]).toMatchObject({ status: "open" });
-    expect(gateListMock).not.toHaveBeenCalled(); // no candidate, so no gate read either
+    // One call for the board-outage recheck every pass makes (buildPassState) — no gate-wait
+    // candidate here, so `reconcileGateWaits`'s own read never fires.
+    expect(gateListMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1447,6 +1451,19 @@ describe("board-wide outage escalations", () => {
 
     expect(await sweep()).toMatchObject({ findings: 0, settled: 1 });
     expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("keeps the outage open when the board list recovers but the gate list still can't be read", async () => {
+    // run-health raises this finding from `Promise.all([list, gateList])` — either read failing
+    // writes it. A recheck that only re-reads `list` would call the board readable again while the
+    // exact read that raised the outage is still down.
+    await seedReport(outageFinding("p1"));
+    gateListMock.mockRejectedValue(new Error(OUTAGE));
+    expect(await sweep()).toMatchObject({ escalated: 1 });
+
+    await seedReport();
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
   });
 
   it("raises one persisted escalation per project for sixteen queued outage jobs, separates causes, and retires it after recovery", async () => {

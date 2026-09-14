@@ -767,15 +767,24 @@ async function buildPassState(
   // A board outage must still let the escalation pass process the report that names it. An empty
   // board is deliberately untrusted: it prevents lease-sensitive resumes and makes no claim that
   // absent beads have settled.
+  //
+  // Both reads, because run-health raises the outage this recovers from `Promise.all([list,
+  // gateList])` (run-health.ts) — either one failing there writes the finding, so only a `list`
+  // recheck would call the board readable again while the exact read that raised the outage (say,
+  // a `gateList` timeout) is still down, and `classifyExhaustedJob` would hold the escalation on a
+  // false recovery.
   let board: Bead[] = [];
   let boardReadable = true;
   try {
-    board = await beads.list(repoPath, ["--status", "all"]);
+    [board] = await Promise.all([
+      beads.list(repoPath, ["--status", "all"]),
+      beads.gateList(repoPath),
+    ]);
   } catch (e) {
     boardFresh = false;
     boardReadable = false;
     console.error(
-      `[unstick] beads list failed for ${projectId}; holding every lease-gated resume this pass`,
+      `[unstick] beads list/gate-list failed for ${projectId}; holding every lease-gated resume this pass`,
       e,
     );
   }
