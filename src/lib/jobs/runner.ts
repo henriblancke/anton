@@ -212,6 +212,13 @@ export type ProjectUsageResolver = (
 ) => Promise<ClaudeUsage | null>;
 
 /**
+ * Fresh counterpart to {@link ProjectUsageResolver} for the two ends of a burn-sampling window.
+ * Routed jobs must sample their router's meter, while unrouted jobs retain the account-wide fresh
+ * read. The resolver is optional so existing runner consumers keep the account-only behavior.
+ */
+export type ProjectUsageFreshResolver = ProjectUsageResolver;
+
+/**
  * Job types the budget governor may proactively defer (anton-szld). An allowlist by design: only
  * anton's *autonomous* background work is held when the governor says the budget is scarce, and the
  * governor only delays when the runner *leases* a job — a human-approved epic still *enqueues* the
@@ -532,6 +539,7 @@ export class JobRunner {
   private readonly resolveBudgetPolicy: BudgetPolicyResolver | null;
   private readonly resolveProjectSpend: ProjectSpendResolver | null;
   private readonly resolveProjectUsage: ProjectUsageResolver | null;
+  private readonly resolveProjectUsageFresh: ProjectUsageFreshResolver | null;
   private readonly liveRunCheck: LiveRunCheck | null;
   private readonly readBeadLabels: BeadLabelsReader | null;
   private readonly readUsage: () => Promise<ClaudeUsage | null>;
@@ -581,6 +589,11 @@ export class JobRunner {
      */
     resolveProjectUsage?: ProjectUsageResolver;
     /**
+     * Fresh per-project meter source for burn sampling. Routed jobs sample their router instead of
+     * Anthropic; omitted keeps the existing account-wide fresh meter for every job.
+     */
+    resolveProjectUsageFresh?: ProjectUsageFreshResolver;
+    /**
      * Cross-machine run-liveness source (anton-jz1). When set, a fresh execute-epic enqueue that
      * has no active job in THIS machine's store is gated on it: if a run is already live for the
      * epic on another machine (read from the shared beads board), no second run is started. Omit
@@ -616,6 +629,7 @@ export class JobRunner {
     this.resolveBudgetPolicy = deps.resolveBudgetPolicy ?? null;
     this.resolveProjectSpend = deps.resolveProjectSpend ?? null;
     this.resolveProjectUsage = deps.resolveProjectUsage ?? null;
+    this.resolveProjectUsageFresh = deps.resolveProjectUsageFresh ?? null;
     this.liveRunCheck = deps.liveRunCheck ?? null;
     this.readBeadLabels = deps.readBeadLabels ?? null;
     this.readUsage = deps.readUsage ?? getClaudeUsageCached;
@@ -1104,6 +1118,18 @@ export class JobRunner {
     let accountRead: Promise<ClaudeUsage | null> | null = null;
     const accountUsage = () => (accountRead ??= this.readUsageSafe());
 
+    // Independent router reads must not serialize their five-second timeout. Resolve the meter
+    // snapshots together, then apply the queue mutations in deterministic project order below.
+    const usages = await Promise.all(
+      governed.map(async ({ pid }) => ({
+        pid,
+        usage: this.resolveProjectUsage
+          ? await this.resolveProjectUsage(pid, accountUsage).catch(() => accountUsage())
+          : await accountUsage(),
+      })),
+    );
+    const usageByProject = new Map(usages.map(({ pid, usage }) => [pid, usage]));
+
     const now = this.clock.now();
     for (const { pid, policy } of governed) {
       // The meter this project actually paces against (anton-gnvw): its own router when routed,
@@ -1111,9 +1137,7 @@ export class JobRunner {
       // causes it to be read at all. Resolve it even when the account meter is absent: an
       // unreadable Anthropic endpoint says nothing about a healthy routed meter. A resolver failure
       // falls back to the account read, preserving the fail-open behavior for that project.
-      const projectUsage = this.resolveProjectUsage
-        ? await this.resolveProjectUsage(pid, accountUsage).catch(() => accountUsage())
-        : await accountUsage();
+      const projectUsage = usageByProject.get(pid) ?? null;
       if (!projectUsage) {
         // Fail open only for the project whose meter is unavailable. Resume its own stale governor
         // deferrals, but keep evaluating other governed projects with their independent meters.
@@ -1142,21 +1166,18 @@ export class JobRunner {
         });
         // But "work may run" is not "any work may run": the fine-grained gate (anton-k05r) still
         // decides which queued jobs are worth the budget that's left — e.g. scarce session headroom
-        // at night admits high-value work only. A null projectUsage (routed + unreadable) skips the
-        // value gate the same way a null account read always has — admits without ranking.
-        if (projectUsage) {
-          await this.applyValueGate(
-            projectUsage,
-            policy,
-            pid,
-            now,
-            heldBucketKeys,
-            valueHeldJobIds,
-            valueHeldReclaimIds,
-            projectWeeklyPct,
-            bucketCapOf,
-          );
-        }
+        // at night admits high-value work only.
+        await this.applyValueGate(
+          projectUsage,
+          policy,
+          pid,
+          now,
+          heldBucketKeys,
+          valueHeldJobIds,
+          valueHeldReclaimIds,
+          projectWeeklyPct,
+          bucketCapOf,
+        );
         continue;
       }
       const retryAtMs = decision.retryAt.getTime();
@@ -1540,7 +1561,7 @@ export class JobRunner {
             // the snapshot it is measured against has been taken.
             if (!burnEligible || this.dispatchSeq !== seqAtStart) return;
             this.lastBurnSampleAt = this.clock.now();
-            burnBefore = this.readUsageFreshSafe();
+            burnBefore = this.readProjectUsageFreshSafe(job.projectId ?? null);
             await burnBefore;
           },
           enqueueReviewFixPr: (projectId, epicBeadId) =>
@@ -1590,7 +1611,7 @@ export class JobRunner {
           // belong to no project's share.
           job.projectId ?? null,
           await burnBefore,
-          () => this.readUsageFreshSafe(),
+          () => this.readProjectUsageFreshSafe(job.projectId ?? null),
         );
       }
       this.inFlight.delete(job.id);
@@ -1625,6 +1646,19 @@ export class JobRunner {
     try {
       return await this.readUsageFresh();
     } catch {
+      return null;
+    }
+  }
+
+  /** The fresh meter this project's burn window actually moves: router when routed, account otherwise. */
+  private async readProjectUsageFreshSafe(projectId: string | null): Promise<ClaudeUsage | null> {
+    const accountUsage = () => this.readUsageFreshSafe();
+    if (!this.resolveProjectUsageFresh) return accountUsage();
+    try {
+      return await this.resolveProjectUsageFresh(projectId, accountUsage);
+    } catch {
+      // A routed resolver's failure cannot be represented by the account meter: its usage is from
+      // another quota pool. Suppress the sample rather than corrupting the project's burn average.
       return null;
     }
   }

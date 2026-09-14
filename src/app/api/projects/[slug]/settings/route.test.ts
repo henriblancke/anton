@@ -510,7 +510,11 @@ describe("settings route — Claude gateway routing (anton-n16m)", () => {
    * fields: bounded, cleared by "" / null, and refused if it looks like a pasted credential rather
    * than the router's own connection id.
    */
-  it("PATCH persists a router connection id, and GET restores it", async () => {
+  it("PATCH persists a router connection id with its configured gateway, and GET restores it", async () => {
+    await PATCH(
+      patchReq({ claudeBaseUrl: "http://localhost:20128", claudeAuthTokenEnv: "ROUTER_TOKEN" }),
+      ctx("tmp"),
+    );
     const res = await PATCH(patchReq({ routerConnectionId: "conn_ab12cd34" }), ctx("tmp"));
     expect(res.status).toBe(200);
     expect((await res.json()).settings).toMatchObject({ routerConnectionId: "conn_ab12cd34" });
@@ -520,8 +524,33 @@ describe("settings route — Claude gateway routing (anton-n16m)", () => {
     expect((await get.json()).settings).toMatchObject({ routerConnectionId: "conn_ab12cd34" });
   });
 
+  it("PATCH refuses a router connection id without its gateway, including when a later patch clears it", async () => {
+    const orphaned = await PATCH(patchReq({ routerConnectionId: "conn_ab12cd34" }), ctx("tmp"));
+    expect(orphaned.status).toBe(400);
+    expect((await orphaned.json()).error).toMatch(/claudeBaseUrl/);
+
+    await PATCH(
+      patchReq({
+        claudeBaseUrl: "http://localhost:20128",
+        claudeAuthTokenEnv: "ROUTER_TOKEN",
+        routerConnectionId: "conn_ab12cd34",
+      }),
+      ctx("tmp"),
+    );
+    const clearingGateway = await PATCH(patchReq({ claudeBaseUrl: null }), ctx("tmp"));
+    expect(clearingGateway.status).toBe(400);
+    expect((await clearingGateway.json()).error).toMatch(/routerConnectionId/);
+  });
+
   it('PATCH "" / null clears the router connection id back to the default (key removed)', async () => {
-    await PATCH(patchReq({ routerConnectionId: "conn_ab12cd34" }), ctx("tmp"));
+    await PATCH(
+      patchReq({
+        claudeBaseUrl: "http://localhost:20128",
+        claudeAuthTokenEnv: "ROUTER_TOKEN",
+        routerConnectionId: "conn_ab12cd34",
+      }),
+      ctx("tmp"),
+    );
     await PATCH(patchReq({ routerConnectionId: "" }), ctx("tmp"));
     expect("routerConnectionId" in persisted()).toBe(false);
   });

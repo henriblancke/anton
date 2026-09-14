@@ -14,6 +14,7 @@ import {
   DEFAULT_REVIEW_FIX_CONCURRENCY,
   getProjectById,
   getProjectSettings,
+  quotaMeterKey,
   resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
 } from "../projects";
 import {
@@ -24,7 +25,7 @@ import {
 import { projectWeeklySpendPct } from "../quota-spend";
 import { withQuotaShare } from "./budget";
 import type { ClaudeUsage } from "../claude/usage";
-import { getRouterUsageCached } from "../claude/router-usage";
+import { getRouterUsageCached, getRouterUsageFresh } from "../claude/router-usage";
 import { beads } from "../beads/bd";
 import { allIssues } from "../beads/issues";
 
@@ -55,9 +56,9 @@ export async function resolvePolicy(projectId: string | undefined) {
  * The quota share (R6.1) is applied HERE rather than as a second gate downstream: several repos run
  * against one subscription, so a governed project's weekly ceiling carries its share of the target,
  * and the one place that already decides "governed or not" is the one place that should decide "how
- * much". A share is a fact about the BOARD, not about this project's settings, so it is resolved
- * from every budget-aware project rather than inside the pure settings projection — which is also
- * why an ungoverned project is untouched: it returns null above, before any share is read.
+ * much". A share belongs to a meter pool, so projects on different router connections (or a router
+ * and Anthropic) normalize independently; ungoverned projects remain untouched because they return
+ * null before any board share is read.
  */
 export async function resolveBudgetPolicy(projectId: string | undefined) {
   const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
@@ -65,7 +66,7 @@ export async function resolveBudgetPolicy(projectId: string | undefined) {
   // Fail open, like every other governor read: an unreadable board is an EMPTY board, on which the
   // subject is absent and so ungoverned — the full weekly target for one tick — rather than a
   // rejection shared by every policy the coalesced read served, which would error the whole tick.
-  const share = resolveGovernedShare(projectId, await quotaShareBoard().catch(() => []));
+  const share = resolveGovernedShare(projectId, meterShareBoard(await quotaShareBoard().catch(() => []), settings));
   announceImbalance(share);
   return withQuotaShare(resolveBudgetPolicyFromSettings(settings), share.sharePct);
 }
@@ -91,6 +92,12 @@ function quotaShareBoard(): Promise<GovernedShare[]> {
   });
   inFlightShareBoard = board;
   return board;
+}
+
+/** The share denominator is one effective meter, never unrelated account/router pools. */
+function meterShareBoard(board: readonly GovernedShare[], settings: Parameters<typeof quotaMeterKey>[0]) {
+  const meterKey = quotaMeterKey(settings);
+  return board.filter((project) => (project.meterKey ?? "anthropic") === meterKey);
 }
 
 /**
@@ -127,6 +134,25 @@ export async function resolveProjectUsage(
   projectId: string | null,
   accountUsage: () => Promise<ClaudeUsage | null>,
 ): Promise<ClaudeUsage | null> {
+  return resolveProjectMeter(projectId, accountUsage, getRouterUsageCached);
+}
+
+/**
+ * Fresh meter resolver for burn samples. Unlike governor reads, both window edges must hit the
+ * upstream meter so a routed job cannot subtract a cached router snapshot from itself.
+ */
+export async function resolveProjectUsageFresh(
+  projectId: string | null,
+  accountUsage: () => Promise<ClaudeUsage | null>,
+): Promise<ClaudeUsage | null> {
+  return resolveProjectMeter(projectId, accountUsage, getRouterUsageFresh);
+}
+
+async function resolveProjectMeter(
+  projectId: string | null,
+  accountUsage: () => Promise<ClaudeUsage | null>,
+  readRouter: typeof getRouterUsageCached,
+): Promise<ClaudeUsage | null> {
   if (!projectId) return accountUsage();
   const settings = await getProjectSettings(getDb(), projectId).catch(() => null);
   const baseUrl = settings?.claudeBaseUrl?.trim();
@@ -134,7 +160,7 @@ export async function resolveProjectUsage(
   if (!settings || !baseUrl || !connectionId) return accountUsage(); // unrouted → today's meter
   // Routed: the account meter is not this project's traffic, so it is never read on its behalf —
   // `accountUsage` goes uncalled and a router-only board makes no Anthropic request this tick.
-  return getRouterUsageCached(settings).catch(() => null);
+  return readRouter(settings).catch(() => null);
 }
 
 /** The last imbalance announced, so a per-tick resolve reports a change rather than a stream. */

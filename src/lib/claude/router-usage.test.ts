@@ -4,6 +4,7 @@ import {
   armRouterBackoffForTest,
   fetchRouterUsage,
   getRouterUsageCached,
+  getRouterUsageFresh,
   parseRouterUsage,
   resetRouterUsageCache,
   routerUsageUrl,
@@ -251,6 +252,64 @@ describe("fetchRouterUsage", () => {
     );
     expect(calls).toBe(0);
     resetRouterUsageCache();
+  });
+});
+
+describe("getRouterUsageFresh", () => {
+  afterEach(() => resetRouterUsageCache());
+
+  it("bypasses a warm TTL cache and refreshes it with the burn-window endpoint read", async () => {
+    process.env.ROUTER_TOKEN_TEST = "secret";
+    let clock = 1_000;
+    const now = () => clock;
+    const first = {
+      ...ROUTER_FIXTURE,
+      quotas: {
+        ...ROUTER_FIXTURE.quotas,
+        "session (5h)": { ...ROUTER_FIXTURE.quotas["session (5h)"], used: 10 },
+      },
+    };
+    const second = {
+      ...ROUTER_FIXTURE,
+      quotas: {
+        ...ROUTER_FIXTURE.quotas,
+        "session (5h)": { ...ROUTER_FIXTURE.quotas["session (5h)"], used: 20 },
+      },
+    };
+    let calls = 0;
+    const fetcher = async () => {
+      calls += 1;
+      return withResponse(200, true, calls === 1 ? first : second);
+    };
+
+    await getRouterUsageCached(SETTINGS, fetcher, now);
+    clock += 1;
+    expect((await getRouterUsageFresh(SETTINGS, fetcher, now))?.sessionPct).toBe(20);
+    expect(calls).toBe(2);
+    expect((await getRouterUsageCached(SETTINGS, fetcher, now))?.sessionPct).toBe(20);
+    expect(calls).toBe(2);
+  });
+
+  it("honors shared 429 backoff instead of retrying a router during a burn window", async () => {
+    process.env.ROUTER_TOKEN_TEST = "secret";
+    const clock = 1_000;
+    const now = () => clock;
+    const cached = async () => withResponse(200, true, ROUTER_FIXTURE);
+    await getRouterUsageCached(SETTINGS, cached, now);
+    armRouterBackoffForTest(SETTINGS.claudeBaseUrl, SETTINGS.routerConnectionId, clock + 5 * 60_000);
+
+    let calls = 0;
+    const result = await getRouterUsageFresh(
+      SETTINGS,
+      async () => {
+        calls += 1;
+        return withResponse(200, true, ROUTER_FIXTURE);
+      },
+      now,
+    );
+
+    expect(result).not.toBeNull();
+    expect(calls).toBe(0);
   });
 });
 

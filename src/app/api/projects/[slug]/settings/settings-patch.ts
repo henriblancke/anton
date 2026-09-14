@@ -280,6 +280,24 @@ function checkGatewayCredentialed(
   return null;
 }
 
+/** A routed meter names a connection on the configured gateway; without that endpoint it cannot run. */
+function checkRouterConnectionNeedsGateway(
+  patch: Partial<ProjectSettings>,
+  current: ProjectSettings,
+): string | null {
+  if (!("routerConnectionId" in patch || "claudeBaseUrl" in patch)) return null;
+  const connectionId =
+    "routerConnectionId" in patch ? patch.routerConnectionId : current.routerConnectionId;
+  const baseUrl = "claudeBaseUrl" in patch ? patch.claudeBaseUrl : current.claudeBaseUrl;
+  if (connectionId && !baseUrl) {
+    return (
+      `routerConnectionId needs claudeBaseUrl — the router connection is metered through that ` +
+      `gateway. Set the gateway base URL, or clear the router connection id.`
+    );
+  }
+  return null;
+}
+
 /**
  * The cross-field checks that read settings as they STAND. Both weigh a patched field against a
  * sibling that may not be in this patch, so they must run against the settings AT WRITE TIME — i.e.
@@ -292,7 +310,11 @@ export function checkSettingsCrossFields(
   patch: Partial<ProjectSettings>,
   current: ProjectSettings,
 ): string | null {
-  return checkReviewAlarmReachable(patch, current) ?? checkGatewayCredentialed(patch, current);
+  return (
+    checkReviewAlarmReachable(patch, current) ??
+    checkGatewayCredentialed(patch, current) ??
+    checkRouterConnectionNeedsGateway(patch, current)
+  );
 }
 
 /**

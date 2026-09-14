@@ -20,9 +20,11 @@ import type { UsageSnapshot } from "@/lib/usage";
 let tdb: TestDb;
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
 
-/** Swap in a router read for the resolveProjectUsage cases; null routes to the real (network) fn. */
+/** Swap in router reads for resolver cases; null routes to the real (network) function. */
 type GetRouterUsageCached = typeof import("../claude/router-usage").getRouterUsageCached;
+type GetRouterUsageFresh = typeof import("../claude/router-usage").getRouterUsageFresh;
 let routerUsageOverride: GetRouterUsageCached | null = null;
+let routerUsageFreshOverride: GetRouterUsageFresh | null = null;
 vi.mock("../claude/router-usage", async () => {
   const actual = await vi.importActual<typeof import("../claude/router-usage")>(
     "../claude/router-usage",
@@ -33,10 +35,14 @@ vi.mock("../claude/router-usage", async () => {
       routerUsageOverride
         ? routerUsageOverride(...args)
         : actual.getRouterUsageCached(...args)) satisfies GetRouterUsageCached,
+    getRouterUsageFresh: ((...args: Parameters<GetRouterUsageFresh>) =>
+      routerUsageFreshOverride
+        ? routerUsageFreshOverride(...args)
+        : actual.getRouterUsageFresh(...args)) satisfies GetRouterUsageFresh,
   };
 });
 
-const { resolveBudgetPolicy, resolveProjectSpend, resolveProjectUsage } = await import(
+const { resolveBudgetPolicy, resolveProjectSpend, resolveProjectUsage, resolveProjectUsageFresh } = await import(
   "./service-policy"
 );
 
@@ -89,6 +95,37 @@ describe("resolveBudgetPolicy (quota share)", () => {
 
     expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
     expect((await resolveBudgetPolicy("b"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
+  });
+
+  it("partitions default quota shares across independent meters", async () => {
+    project("account", armed());
+    project(
+      "router",
+      armed({
+        claudeBaseUrl: "https://router.example/v1",
+        claudeAuthTokenEnv: "ROUTER_TOKEN",
+        routerConnectionId: "conn_1",
+      }),
+    );
+
+    // Each project is the only governed consumer of its own meter, so neither loses half its quota.
+    expect((await resolveBudgetPolicy("account"))?.projectWeeklyCapPct).toBe(TARGET);
+    expect((await resolveBudgetPolicy("router"))?.projectWeeklyCapPct).toBe(TARGET);
+  });
+
+  it("splits quota shares only among projects using the same router connection", async () => {
+    const connection = {
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: "ROUTER_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("a", armed(connection));
+    project("b", armed(connection));
+    project("other", armed({ ...connection, routerConnectionId: "conn_2" }));
+
+    expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("b"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("other"))?.projectWeeklyCapPct).toBe(TARGET);
   });
 
   it("keeps an ungoverned project out of the denominator", async () => {
@@ -365,6 +402,7 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
   beforeEach(() => {
     tdb = makeTestDb();
     routerUsageOverride = null;
+    routerUsageFreshOverride = null;
   });
   afterEach(() => {
     tdb.close();
@@ -382,6 +420,19 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
 
     expect(await resolveProjectUsage("routed", account.read)).toEqual(ROUTER_USAGE);
     expect(account.calls()).toBe(0); // the whole point of routing: no Anthropic request at all
+  });
+
+  it("uses the routed resolver for a fresh burn sample too", async () => {
+    project("routed", {
+      claudeBaseUrl: "https://gw.example.com",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+    routerUsageFreshOverride = async () => ROUTER_USAGE;
+    const account = accountThunk();
+
+    expect(await resolveProjectUsageFresh("routed", account.read)).toEqual(ROUTER_USAGE);
+    expect(account.calls()).toBe(0);
   });
 
   it("returns the account usage unchanged for an unrouted project — byte-identical to today", async () => {

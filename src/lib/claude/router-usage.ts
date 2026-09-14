@@ -177,6 +177,36 @@ const cache = new Map<string, RouterCacheEntry>();
 const inFlight = new Map<string, Promise<RouterUsage | null>>();
 
 /**
+ * TTL-bypassing read for a routed burn-sampling window. It still honors a router's shared 429
+ * backoff and refreshes the short-TTL cache for ordinary readers, but never reuses a pre-job value
+ * for either side of the delta.
+ */
+export async function getRouterUsageFresh(
+  settings: RouterSettings,
+  fetcher: typeof fetch = fetch,
+  now: () => number = Date.now,
+): Promise<RouterUsage | null> {
+  const baseUrl = settings.claudeBaseUrl?.trim();
+  const connectionId = settings.routerConnectionId?.trim();
+  if (!baseUrl || !connectionId) return null;
+
+  let url: string;
+  try {
+    url = routerUsageUrl(baseUrl, connectionId);
+  } catch {
+    return null;
+  }
+
+  const k = key(url, connectionId);
+  const ts = now();
+  if (ts < (backoffUntil.get(k) ?? 0)) return cache.get(k)?.value ?? null;
+
+  const value = await fetchRouterUsage(settings, fetcher);
+  cache.set(k, { at: ts, value });
+  return value;
+}
+
+/**
  * Cached, single-flight, backoff-honoring read for one project's routed meter — the same TTL and
  * 429 discipline as `getClaudeUsageCached`, keyed per (baseUrl, connectionId) rather than global,
  * since distinct routed projects can point at distinct routers or distinct connections on the same

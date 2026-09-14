@@ -1255,6 +1255,33 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     expect(accountReads).toBe(0);
   });
 
+  it("starts independent routed meter reads together before applying governor mutations", async () => {
+    h.seedProjects("routed-a", "routed-b");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Set<string>();
+    const resolveProjectUsage: ProjectUsageResolver = async (projectId) => {
+      if (projectId) started.add(projectId);
+      await gate;
+      return usage({ sessionPct: 10, weeklyPct: 0 });
+    };
+    const r = budgetRunner(h, async () => {}, {
+      readUsage: async () => usage({ sessionPct: 99 }),
+      resolveProjectUsage,
+    });
+    await r.enqueue({ type: "execute-epic", projectId: "routed-a" });
+    await r.enqueue({ type: "execute-epic", projectId: "routed-b" });
+
+    const tick = r.tickOnce();
+    await waitUntil(() => started.size === 2);
+    release();
+
+    expect(await tick).toBe(2);
+    await r.whenIdle();
+  });
+
   it("a mixed board reads the account meter ONCE, however many unrouted projects want it", async () => {
     // Lazy must not become per-project: the account read is shared across every unrouted project in
     // the tick, exactly as the single eager read was.

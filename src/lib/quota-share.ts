@@ -106,6 +106,8 @@ function isImbalanced(governedCount: number, declaredTotalPct: number): boolean 
 /** One budget-aware project's declaration, as the governor reads it off the store. */
 export interface GovernedShare {
   projectId: string;
+  /** The effective quota pool this project spends from; absent is the Anthropic account meter. */
+  meterKey?: string;
   /** What the operator declared, or absent when this project has never declared a share. */
   declaredPct?: number;
   /**

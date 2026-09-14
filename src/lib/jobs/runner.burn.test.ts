@@ -69,6 +69,37 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect(rows[0]!.projectId).toBe("P");
   });
 
+  it("samples a routed job from its router meter, never the Anthropic meter", async () => {
+    h.seedProjects("routed");
+    const routerFresh = freshSequence(
+      { sessionPct: 10, weeklyPct: 5 },
+      { sessionPct: 30, weeklyPct: 8 },
+    );
+    let accountFreshReads = 0;
+    let routerReads = 0;
+    const r = h.makeRunner({
+      handlers: { "execute-epic": async (ctx) => ctx.claudeReached() },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
+      readUsageFresh: async () => {
+        accountFreshReads += 1;
+        return usage({ sessionPct: 90, weeklyPct: 90 });
+      },
+      resolveProjectUsageFresh: async (projectId) => {
+        expect(projectId).toBe("routed");
+        routerReads += 1;
+        return routerFresh();
+      },
+    });
+    await r.enqueue({ type: "execute-epic", projectId: "routed" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect(routerReads).toBe(2);
+    expect(accountFreshReads).toBe(0);
+    expect((await getBurnAverage(h.db, "execute-epic", 1)).sessionAvg).toBe(20);
+  });
+
   it("leaves the project null for a job that belongs to none", async () => {
     const r = h.makeRunner({
       handlers: {
