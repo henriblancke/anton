@@ -1270,6 +1270,9 @@ export class JobRunner {
         // whole bucket as the starvation guard, matching the schedule master-switch.
         heldBucketKeys.add(scheduleGateKey("execute-epic", pid));
       } else {
+        // An immediate row remains leasable after its paced siblings move out, so preserve the
+        // snapshot for the route-change check before that row can dispatch through a new meter.
+        admittedMeters.set(pid, snapshot);
         // Immediate rows run this tick — do NOT hold the execute-epic bucket. The paced *queued*
         // rows were just pushed to a future runAt, so they're not runnable and can't crowd the
         // finite scan window (the reason the bucket is normally held). But a paced row that

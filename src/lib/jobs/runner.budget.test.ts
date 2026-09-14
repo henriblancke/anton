@@ -1249,6 +1249,45 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     expect(deferred?.lastError).toMatch(/budget: session-headroom/);
   });
 
+  it("revalidates an immediate bypass admission when weekly pacing defers its siblings", async () => {
+    // The coarse gate defers the paced rows, but an approved immediate row remains leasable. Its
+    // admission snapshot must therefore get the same route-change revalidation as a fully-admitted
+    // project; otherwise it could dispatch through the newly selected exhausted router.
+    h.seedProjects("routed");
+    let reads = 0;
+    const weeklyResetAt = new Date(
+      h.clock.now() + 3.5 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const oldRoute = {
+      policy: withQuotaShare(DEFAULT_BUDGET_POLICY, 100),
+      meterKey: "router:https://old-router.example/api/usage/conn_1",
+      usage: usage({ sessionPct: 10, weeklyPct: 80, weeklyResetAt }),
+    };
+    const newRoute = {
+      policy: withQuotaShare(DEFAULT_BUDGET_POLICY, 100),
+      meterKey: "router:https://new-router.example/api/usage/conn_1",
+      usage: usage({ sessionPct: 99, weeklyPct: 0 }),
+    };
+    const resolveProjectGovernor: ProjectGovernorResolver = async () =>
+      ++reads === 1 ? oldRoute : newRoute;
+    const ran = vi.fn();
+    const r = budgetRunner(h, ran, {
+      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 0 }),
+      resolveProjectGovernor,
+    });
+    const id = await r.enqueue({
+      type: "execute-epic",
+      projectId: "routed",
+      payload: { projectId: "routed", epicBeadId: "routed-1", bypassBudget: true },
+    });
+
+    // The old meter admits the bypass, but the re-read sees a changed, exhausted router and holds
+    // the bucket. The new route's next-tick gate owns its deferral decision.
+    expect(await r.tickOnce()).toBe(0);
+    expect(ran).not.toHaveBeenCalled();
+    expect((await getJob(h.db, id))?.status).toBe("queued");
+  });
+
   it("paces a routed project when the Anthropic meter is unavailable but its router is exhausted", async () => {
     // The machine-wide Anthropic subscription meter is absent (for example, OAuth is unreadable),
     // but the routed project's router still reports a real exhausted session. The account outage
