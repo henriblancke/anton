@@ -4,8 +4,9 @@
 --
 -- Existing burn samples predate router attribution. Rows belonging to a project that still has a
 -- gateway URL are quarantined as `unattributed`; its current route cannot safely identify their old
--- router connection or prove Anthropic produced them. Only legacy rows on an unrouted project retain
--- `anthropic`. The append-only `quota_attempts` ledger intentionally starts at this migration;
+-- router connection or prove Anthropic produced them. The column's `anthropic` default serves new
+-- writes, while this migration explicitly quarantines only the legacy gateway rows. The append-only
+-- `quota_attempts` ledger intentionally starts at this migration;
 -- historical counters have no per-attempt meter identity and must not be guessed or backfilled.
 -- Its rows deliberately carry no foreign keys, preserving the accounting record across job cleanup;
 -- project teardown removes that project's ledger entries with its jobs.
@@ -29,19 +30,18 @@ CREATE INDEX `quota_attempts_meter_created_project_idx` ON `quota_attempts` (`me
 --> statement-breakpoint
 DROP INDEX `burn_samples_project_type_created_idx`;
 --> statement-breakpoint
-ALTER TABLE `burn_samples` ADD `meter_key` text DEFAULT 'unattributed' NOT NULL;
+ALTER TABLE `burn_samples` ADD `meter_key` text DEFAULT 'anthropic' NOT NULL;
 --> statement-breakpoint
 UPDATE `burn_samples`
-SET `meter_key` = 'anthropic'
-WHERE `project_id` IS NULL
-   OR `project_id` IN (
-     SELECT `id`
-     FROM `projects`
-     WHERE COALESCE(
-       NULLIF(trim(CASE WHEN json_valid(`settings_json`) THEN json_extract(`settings_json`, '$.claudeBaseUrl') END), ''),
-       ''
-     ) = ''
-   );
+SET `meter_key` = 'unattributed'
+WHERE `project_id` IN (
+  SELECT `id`
+  FROM `projects`
+  WHERE COALESCE(
+    NULLIF(trim(CASE WHEN json_valid(`settings_json`) THEN json_extract(`settings_json`, '$.claudeBaseUrl') END), ''),
+    ''
+  ) <> ''
+);
 --> statement-breakpoint
 CREATE INDEX `burn_samples_project_type_meter_created_idx` ON `burn_samples` (`project_id`,`job_type`,`meter_key`,`created_at`);
 --> statement-breakpoint

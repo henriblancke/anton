@@ -91,6 +91,17 @@ describe("drizzle/0038 — quota meter history", () => {
     expect(sqlite.prepare("select count(*) as n from quota_attempts").get()).toEqual({ n: 0 });
   });
 
+  it("matches future burn samples to the schema's Anthropic default", () => {
+    applyMigrationFile(sqlite, MIGRATION);
+    sqlite
+      .prepare("insert into burn_samples (id, job_type, project_id, session_delta, weekly_delta) values ('new', 'execute-epic', 'project', 1, 1)")
+      .run();
+
+    expect(sqlite.prepare("select meter_key from burn_samples where id = 'new'").get()).toEqual({
+      meter_key: "anthropic",
+    });
+  });
+
   it("creates the indexed append-only ledger for future meter-attributed attempts", () => {
     applyMigrationFile(sqlite, MIGRATION);
     sqlite
