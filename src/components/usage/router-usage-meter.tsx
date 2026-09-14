@@ -37,28 +37,34 @@ function useRouterUsage(slug: string): RouterUsageView | null {
 
   useEffect(() => {
     let cancelled = false;
+    // `cancelled` only catches a response landing after unmount/slug-change; it's shared across
+    // every tick, so two overlapping same-slug requests (a slow poll still in flight when the next
+    // interval fires) can still race each other. Guard with a per-call sequence number too, so an
+    // older response arriving after a newer one can't overwrite it.
+    let requestSeq = 0;
 
     async function load() {
+      const seq = ++requestSeq;
       try {
         const res = await fetch(`/api/projects/${slug}/router-usage`, { cache: "no-store" });
-        if (cancelled) return;
+        if (cancelled || seq !== requestSeq) return;
         if (res.status === 204) {
           setReading({ slug, view: null }); // not routed — nothing to show here, the nav pill already covers it
           return;
         }
         if (!res.ok) return; // transient error — keep last known good
         const data = (await res.json()) as RouterUsageView;
-        if (!cancelled) setReading({ slug, view: data });
+        if (!cancelled && seq === requestSeq) setReading({ slug, view: data });
       } catch {
         // network error / aborted — retry on the next tick, keep the current reading
       }
     }
 
     load();
-    const id = setInterval(load, REFRESH_MS);
+    const intervalId = setInterval(load, REFRESH_MS);
     return () => {
       cancelled = true;
-      clearInterval(id);
+      clearInterval(intervalId);
     };
   }, [slug]);
 

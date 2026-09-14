@@ -551,6 +551,15 @@ export function hasPriorAttempt(job: Pick<JobRow, "attempts" | "lastError">): bo
 interface InFlightEntry {
   controller: AbortController;
   type: JobType;
+  /**
+   * The effective meter this attempt spends against, for burn-sampling overlap tracking:
+   * `null` while a burn-candidate job's meter is still resolving (treated as a conflict with
+   * every other burn candidate, conservatively) or once resolved for a job that never invokes
+   * Claude (never conflicts with anything). Set to the resolved meter key otherwise.
+   */
+  meterKey: string | null;
+  /** True once `meterKey` reflects a resolved meter rather than the not-yet-known placeholder. */
+  meterKeyResolved: boolean;
   /** Filled by the handler via ctx.report; deleted with the entry when the job settles. */
   live: LiveJobInfo;
 }
@@ -582,10 +591,14 @@ export class JobRunner {
   /** Last logged value-gate hold set (sorted ids) — logs only on change, not every 2s tick. */
   private valueHoldLogKey = "";
 
-  /** Monotonic dispatch counter — lets a burn window detect that another job started inside it. */
-  private dispatchSeq = 0;
-  /** Clock time of the last burn-sampler fresh read — throttles fresh usage reads (see config). */
-  private lastBurnSampleAt = 0;
+  /**
+   * Monotonic dispatch counter per meter — lets a burn window detect that another job on the SAME
+   * meter started inside it. Partitioned (anton-dgtz review) so traffic on one meter (e.g. a busy
+   * router) can't invalidate a sample being taken for an unrelated meter (e.g. Anthropic).
+   */
+  private readonly dispatchSeq = new Map<string, number>();
+  /** Clock time of the last burn-sampler fresh read, per meter — throttles fresh usage reads (see config). */
+  private readonly lastBurnSampleAt = new Map<string, number>();
   private readonly inFlight = new Map<string, InFlightEntry>();
   /** Settlement promises for jobs dispatched but not yet settled — the drain set for whenIdle(). */
   private readonly pending = new Set<Promise<void>>();
@@ -1291,6 +1304,14 @@ export class JobRunner {
    * each admitted project's atomic settings view; when its meter identity changed, hold that bucket for
    * this tick so the next tick gates it against the route the handler will dispatch through. A failed
    * revalidation deliberately fails open — it must not turn a transient settings read into a held queue.
+   *
+   * `resolveProjectGovernor` itself reads settings ONCE, before its own policy/router awaits — an edit
+   * landing during those (a slow router call in particular) returns a `meterKey` already stale by the
+   * time it resolves here, so comparing straight against it would still miss the race. When a plain
+   * meter-key resolver is wired, take one more cheap settings-only read (no router hit) AFTER that
+   * work finishes: it can't close the whole window (an edit inside the eventual `leaseDue` gap always
+   * remains — that's why the actual spend charge freezes its own routing right before spawn) but it
+   * collapses the far larger one down to the round trip of one query.
    */
   private async revalidateAdmittedGovernorMeters(
     admittedMeters: ReadonlyMap<string | null, ProjectMeterSnapshot>,
@@ -1302,7 +1323,14 @@ export class JobRunner {
     await Promise.all(
       [...admittedMeters].map(async ([pid, admitted]) => {
         const current = await resolveProjectGovernor(pid, () => this.readUsageSafe()).catch(() => null);
-        if (!current || current.meterKey === admitted.meterKey) return;
+        if (!current) return;
+        if (current.meterKey !== admitted.meterKey) {
+          for (const type of GOVERNED_JOB_TYPES) heldBucketKeys.add(scheduleGateKey(type, pid));
+          return;
+        }
+        if (!this.resolveProjectMeterKey) return;
+        const freshMeterKey = await this.resolveProjectMeterKeySafe(pid);
+        if (freshMeterKey === admitted.meterKey) return;
         for (const type of GOVERNED_JOB_TYPES) heldBucketKeys.add(scheduleGateKey(type, pid));
       }),
     );
@@ -1531,33 +1559,35 @@ export class JobRunner {
     // durably settled — that's what keeps global/per-project capacity from oversubscribing. The
     // entry's `live` handle is what ctx.report fills (anton-susu); deleting the entry in the
     // finally below is what makes a settled job report nothing.
-    const entry: InFlightEntry = { controller, type: job.type as JobType, live: {} };
+    // Whether this TYPE ever invokes Claude at all (`burnsClaudeQuota`) — known synchronously from
+    // the type, unlike the effective METER it will spend against, which isn't known until the
+    // frozen routing resolves at `claudeReached`. A type that never invokes Claude resolves its
+    // entry's meter tracking immediately: it can never contaminate any meter's burn window.
+    const invokesClaude = burnsClaudeQuota(job.type as JobType);
+    const entry: InFlightEntry = {
+      controller,
+      type: job.type as JobType,
+      meterKey: null,
+      meterKeyResolved: !invokesClaude,
+      live: {},
+    };
     this.inFlight.set(job.id, entry);
 
     // Burn sampler (anton-w8ny): snapshot Claude usage around the job so we can attribute the
     // session%/weekly% that moves across it to this job's TYPE and PROJECT. Attribution needs a solo
-    // window — with jobs overlapping (maxConcurrent > 1), each delta would include the siblings'
-    // burn and double-count across types — so only open a window when nothing else is in flight; a
-    // sibling dispatched mid-window is caught via `dispatchSeq`. Types that never invoke Claude
-    // (`burnsClaudeQuota`) are skipped outright — sampling them would blame an operator's own
-    // Claude usage on a `git push` and spend the throttle a real job needs. Fail-soft — a null read
-    // just means no sample; it never gates dispatch.
+    // window per METER — with jobs overlapping (maxConcurrent > 1) or routed through independent
+    // meters (anton-dgtz review), each delta must only reflect traffic on the SAME quota pool, so a
+    // window only opens when no other in-flight job resolves (or might yet resolve) to that meter; a
+    // same-meter sibling dispatched mid-window is caught via the per-meter `dispatchSeq`. Types that
+    // never invoke Claude (`burnsClaudeQuota`) are skipped outright — sampling them would blame an
+    // operator's own Claude usage on a `git push` and spend the throttle a real job needs. Fail-soft
+    // — a null read just means no sample; it never gates dispatch.
     //
     // Gated behind the project's budget-aware opt-in (anton-7mpv.1), like the governor: burn data
     // only feeds budget pacing, so in the default feature-off state the sampler must not shell out
     // to credentials / hit the usage endpoint around every solo job — nor cache a transient null
     // into the shared cache the nav pill reads.
-    const seqAtStart = ++this.dispatchSeq;
-    // Throttle the sampler: both of its reads bypass the usage cache, so with maxConcurrent: 1 every
-    // solo job would hit the endpoint twice. Only open a window once per burnSampleMinIntervalMs,
-    // measured from the last window that actually took its opening read — a window the handler
-    // never opened (a preflight exit) spent nothing and leaves the interval for the next real job.
-    const burnDue = this.clock.now() - this.lastBurnSampleAt >= this.config.burnSampleMinIntervalMs;
-    const burnEligible =
-      burnDue &&
-      burnsClaudeQuota(job.type as JobType) &&
-      this.inFlight.size === 1 &&
-      (await this.budgetAwareFor(job.projectId ?? undefined));
+    const isBudgetAware = invokesClaude && (await this.budgetAwareFor(job.projectId ?? undefined));
 
     // The window opens when the handler says it is about to spawn Claude — the moment the attempt
     // starts spending — not at dispatch, and with a FRESH read rather than the cached snapshot. The
@@ -1566,9 +1596,11 @@ export class JobRunner {
     // and charge it to this project's share, repricing every attempt it has and throttling the wrong
     // project (PR #248 review). The same moment is when the attempt is charged to the project's
     // spend meter; an attempt that never gets there spent nothing, is charged nothing, and has no
-    // window to close.
+    // window to close. It's also the earliest point the EFFECTIVE meter is known, so the solo-window
+    // and throttle checks (both keyed by that meter) live here too rather than at dispatch.
     let claudeReached = false;
     let meterKey = "anthropic";
+    let seqAtStart: number | null = null;
     let burnBefore: Promise<ClaudeUsage | null> | null = null;
     try {
       const policy = await this.policyFor(job.projectId ?? undefined);
@@ -1635,15 +1667,32 @@ export class JobRunner {
             // the lease, so a crash in preflight leaves nothing to refund. Fail-soft: the meter is a
             // pacing estimate, and a write that fails must not stand between the job and Claude.
             meterKey = effectiveMeterKey ?? await this.resolveProjectMeterKeySafe(job.projectId);
+            entry.meterKey = meterKey;
+            entry.meterKeyResolved = true;
             await chargeSpentAttempt(this.db, job, meterKey, this.clock).catch((e) => {
               this.log.error(`job ${job.id} (${job.type}): could not charge the spend meter`, e);
             });
-            // Re-check the window is still solo: a sibling dispatched between lease and spawn would
-            // already contaminate it, so don't spend a read (or the throttle) on a sample that can't
-            // land. The opening read is AWAITED so the spawn cannot start moving the meter before
-            // the snapshot it is measured against has been taken.
-            if (!burnEligible || this.dispatchSeq !== seqAtStart) return;
-            this.lastBurnSampleAt = this.clock.now();
+            // Bump for every attempt that actually reaches this meter, whether or not THIS attempt
+            // ends up opening its own window below — any concurrent window open on the same meter
+            // must see this as contamination, since it's real Claude spend on that meter's pool.
+            const seq = this.bumpDispatchSeq(meterKey);
+            if (!isBudgetAware) return;
+            // Solo-for-THIS-meter, checked now that it's known: any other in-flight entry already
+            // resolved to the same meter conflicts, and one still resolving (a sibling that hasn't
+            // reached its own `claudeReached` yet) conflicts conservatively, since it might land on
+            // this same meter a moment later. An entry that never invokes Claude, or that resolved to
+            // a DIFFERENT meter, cannot contaminate this delta and is not a conflict.
+            const soloForMeter = [...this.inFlight.values()].every(
+              (other) =>
+                other === entry || (other.meterKeyResolved && other.meterKey !== meterKey),
+            );
+            const lastSample = this.lastBurnSampleAt.get(meterKey) ?? 0;
+            const burnDue = this.clock.now() - lastSample >= this.config.burnSampleMinIntervalMs;
+            if (!soloForMeter || !burnDue) return;
+            this.lastBurnSampleAt.set(meterKey, this.clock.now());
+            seqAtStart = seq;
+            // The opening read is AWAITED so the spawn cannot start moving the meter before the
+            // snapshot it is measured against has been taken.
             burnBefore = this.readProjectUsageFreshSafe(job.projectId ?? null, meterKey);
             await burnBefore;
           },
@@ -1675,9 +1724,10 @@ export class JobRunner {
       // Close the burn window: a fresh (TTL-bypassing) read minus the opening one is this type's
       // cost — a cached read would subtract a cache entry from itself for any job that finishes
       // inside the TTL and record a bogus zero. Runs for every outcome (even a failed attempt
-      // burned quota) but only when the window stayed solo (no sibling dispatched across it —
-      // `dispatchSeq` unchanged), and is fully fail-soft — sampleJobBurn records nothing on a null
-      // read or a mid-job meter reset and swallows its own errors.
+      // burned quota) but only when the window stayed solo on ITS meter (no same-meter sibling
+      // reached Claude across it — that meter's `dispatchSeq` unchanged), and is fully fail-soft —
+      // sampleJobBurn records nothing on a null read or a mid-job meter reset and swallows its own
+      // errors.
       //
       // A window only exists if the handler said it reached Claude: an attempt that exited in
       // preflight (a lease held elsewhere, an abandoned or vanished target, a run already carried to
@@ -1685,7 +1735,7 @@ export class JobRunner {
       // would let a few such exits drag the type's rolling average (and the project's attributed
       // spend) toward zero, repricing every attempt as free and letting the project run past its
       // share.
-      if (burnBefore && this.dispatchSeq === seqAtStart) {
+      if (burnBefore && seqAtStart !== null && this.dispatchSeq.get(meterKey) === seqAtStart) {
         await sampleJobBurn(
           this.db,
           this.clock,
@@ -1700,6 +1750,13 @@ export class JobRunner {
       }
       this.inFlight.delete(job.id);
     }
+  }
+
+  /** Bump and return the dispatch sequence for one meter (see `dispatchSeq`). */
+  private bumpDispatchSeq(meterKey: string): number {
+    const next = (this.dispatchSeq.get(meterKey) ?? 0) + 1;
+    this.dispatchSeq.set(meterKey, next);
+    return next;
   }
 
   /**
