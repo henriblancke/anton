@@ -104,6 +104,11 @@ function insertSchedule(
       cron: input.cron,
       enabled,
       nextRunAt: nextRunAt != null ? secDate(nextRunAt) : null,
+      // This row's `enabled` is a deliberate choice the instant it's created (the caller's own
+      // input, or today's DEFAULT_SCHEDULES) — never the stale default a later migration arm exists
+      // to fix. Stamping it here, not just on that arm, is what stops a schedule type whose default
+      // flips AFTER this row exists from re-arming a brand new row an operator has since disabled.
+      autoArmed: true,
     })
     .run();
   return id;
@@ -397,8 +402,16 @@ export interface ScheduleBackfill {
  * outages must be detected for existing projects too, and {@link updateSchedule} restores the
  * scheduler's `nextRunAt` instead of leaving an enabled-but-never-due row.
  *
+ * The arm is ONE-TIME, gated on `autoArmed` rather than on `enabled` alone: without it, an operator
+ * who explicitly disables run-health again would have it silently re-enabled on the very next boot,
+ * because a disabled row looks identical to the pre-migration default this backfill exists to fix.
+ * `autoArmed` is what tells the two apart — it is set the moment a row's `enabled` reflects a
+ * deliberate choice (this arm, or the row's own creation; see `insertSchedule`), so only a row that
+ * has never once been through either stays eligible.
+ *
  * Other existing rows remain exactly as their operator left them. Safe to repeat: after the first
- * pass the row is enabled, so later boots make no change.
+ * pass the row is marked `autoArmed`, so later boots make no change even if the operator disables it
+ * again.
  */
 export async function backfillDefaultSchedules(
   db: AntonDb,
@@ -409,7 +422,11 @@ export async function backfillDefaultSchedules(
   for (const project of projects) {
     const created = await seedDefaultSchedules(db, clock, project.id);
     const runHealth = await db
-      .select({ id: schema.schedules.id, enabled: schema.schedules.enabled })
+      .select({
+        id: schema.schedules.id,
+        enabled: schema.schedules.enabled,
+        autoArmed: schema.schedules.autoArmed,
+      })
       .from(schema.schedules)
       .where(
         and(
@@ -418,8 +435,14 @@ export async function backfillDefaultSchedules(
         ),
       )
       .limit(1);
-    const armedRunHealth = runHealth[0]?.enabled === false;
-    if (armedRunHealth) await updateSchedule(db, clock, runHealth[0].id, { enabled: true });
+    const armedRunHealth = runHealth[0]?.enabled === false && runHealth[0]?.autoArmed === false;
+    if (armedRunHealth) {
+      await updateSchedule(db, clock, runHealth[0].id, { enabled: true });
+      await db
+        .update(schema.schedules)
+        .set({ autoArmed: true })
+        .where(eq(schema.schedules.id, runHealth[0].id));
+    }
     if (created.length > 0 || armedRunHealth) {
       backfills.push({ projectId: project.id, created, armedRunHealth });
     }

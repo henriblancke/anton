@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { toMs, type Clock } from "./queue";
 import { Scheduler } from "./scheduler";
 import {
@@ -36,6 +36,27 @@ function seedProject(tdb: TestDb, id = "p1"): string {
 
 function jobsFor(tdb: TestDb, projectId: string) {
   return tdb.db.select().from(schema.jobs).where(eq(schema.jobs.projectId, projectId)).all();
+}
+
+/**
+ * A run-health row as it exists on an installation that predates the `autoArmed` column: disabled,
+ * and never through the one-time arm that stamps it. `createSchedule` itself always marks a row
+ * `autoArmed` the moment it's created (today's default is enabled), so simulating the pre-migration
+ * state needs a direct write after — exactly what the migration's `auto_armed = enabled` backfill
+ * leaves behind for a row that was disabled at the time it ran.
+ */
+async function createLegacyDisabledRunHealth(tdb: TestDb, clock: Clock, projectId: string) {
+  await createSchedule(tdb.db, clock, {
+    projectId,
+    type: "run-health",
+    cron: "0 * * * *",
+    enabled: false,
+  });
+  tdb.db
+    .update(schema.schedules)
+    .set({ autoArmed: false })
+    .where(and(eq(schema.schedules.projectId, projectId), eq(schema.schedules.type, "run-health")))
+    .run();
 }
 
 describe("Scheduler.tickOnce", () => {
@@ -450,12 +471,7 @@ describe("Scheduler.tickOnce", () => {
   });
 
   it("arms a pre-existing disabled run-health row without re-arming other opt-in schedules", async () => {
-    await createSchedule(tdb.db, clock, {
-      projectId: "p1",
-      type: "run-health",
-      cron: "0 * * * *",
-      enabled: false,
-    });
+    await createLegacyDisabledRunHealth(tdb, clock, "p1");
     await createSchedule(tdb.db, clock, {
       projectId: "p1",
       type: "gardener",
@@ -478,6 +494,35 @@ describe("Scheduler.tickOnce", () => {
     expect(gardener).toMatchObject({ enabled: false, nextRunAt: null });
 
     expect(await backfillDefaultSchedules(tdb.db, clock)).toEqual([]);
+  });
+
+  it("does not re-arm run-health once an operator disables it again", async () => {
+    // The arm above is one-time by design: without a marker surviving it, this exact sequence —
+    // legacy disabled row -> armed by backfill -> operator turns it back off -> next boot — would
+    // silently flip it back on, making the documented ability to disable run-health last only until
+    // a restart.
+    await createLegacyDisabledRunHealth(tdb, clock, "p1");
+    await backfillDefaultSchedules(tdb.db, clock);
+    const armed = tdb.db
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.projectId, "p1"))
+      .all()
+      .find((r) => r.type === "run-health")!;
+    expect(armed.enabled).toBe(true);
+
+    await updateSchedule(tdb.db, clock, armed.id, { enabled: false });
+
+    const backfills = await backfillDefaultSchedules(tdb.db, clock);
+
+    expect(backfills.find((b) => b.projectId === "p1")).toBeUndefined();
+    const runHealth = tdb.db
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.projectId, "p1"))
+      .all()
+      .find((r) => r.type === "run-health")!;
+    expect(runHealth.enabled).toBe(false);
   });
 
   it("ensureSchedule is idempotent per (project,type)", async () => {

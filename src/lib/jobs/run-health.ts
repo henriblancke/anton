@@ -335,6 +335,18 @@ export function outageSince(
  * raise their own — the claim is "one escalation per outage IN ONE PROJECT" — and a different cause
  * (an identity mismatch is one project's own misconfiguration, not the shared server being down)
  * always raises its own row rather than being folded into an unrelated outage's.
+ *
+ * This grouping is a MIGRATION AID, not the live outage path, and is expected to see no new members
+ * after this ships: `nextAction`'s `board-unreachable` branch always reschedules with the attempt
+ * refunded, never parks (that's `boardUnreachableFinding`'s job — raised directly at the failed board
+ * read in the run-health handler, from jobs still `queued`). The only production `park()` call site
+ * is gated by `nextAction`'s `poison`/`error` outcomes, neither of which board-unreachable ever
+ * produces. So a row `outages` groups can only be one that parked with board-unreachable text BEFORE
+ * this PR — e.g. the 1,183-row incident above — or, in principle, a `poison` whose message coincides
+ * with a board-outage cause string for an unrelated reason. Once every such legacy row has been
+ * resolved, this branch never fires again; it stays rather than being deleted so an upgraded
+ * installation's still-parked pre-migration rows get the same one-escalation-per-outage treatment
+ * instead of flooding the report one row per job.
  */
 export function detectExhaustedJobs(
   jobs: JobRow[],

@@ -176,6 +176,11 @@ export const schedules = sqliteTable("schedules", {
   enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
   lastRunAt: ts("last_run_at"),
   nextRunAt: ts("next_run_at"),
+  // Whether `enabled` reflects a deliberate choice — this row's own creation, or a one-time
+  // migration arm (see `backfillDefaultSchedules`) — rather than a default this release has since
+  // changed. False only on a row a migration still owes a one-time arm; true forever after, so an
+  // operator's own later toggle is never mistaken for that stale default again.
+  autoArmed: integer("auto_armed", { mode: "boolean" }).notNull().default(false),
 });
 
 /**
