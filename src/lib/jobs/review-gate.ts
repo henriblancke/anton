@@ -17,6 +17,7 @@ import { type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
+import { quotaMeterKey } from "../quota-meter";
 import {
   commitAll,
   diffAgainstBase,
@@ -611,7 +612,8 @@ async function runReviewSession(args: {
           `${args.baseRev.slice(0, 12)} as ${describeReviewer(reviewer)}\n`,
       );
 
-      await ctx.claudeReached();
+      const reviewRouting = claudeRouting(settings);
+      await ctx.claudeReached(quotaMeterKey(settings));
       const result = await claude({
         cwd: worktreePath,
         prompt,
@@ -620,7 +622,7 @@ async function runReviewSession(args: {
           step: "review",
           labels: [target, ...tickets].flatMap((bead) => bead.labels ?? []),
         }),
-        routing: claudeRouting(settings),
+        routing: reviewRouting,
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         disallowedTools: REVIEW_DENIED_TOOLS,
         settingSources: [...REVIEW_SETTING_SOURCES],
@@ -944,7 +946,8 @@ async function runGateFixSession(args: {
     let verified = false;
 
     try {
-      await ctx.claudeReached();
+      const fixRouting = claudeRouting(settings);
+      await ctx.claudeReached(quotaMeterKey(settings));
       const result = await claude({
         cwd: worktreePath,
         prompt,
@@ -954,7 +957,7 @@ async function runGateFixSession(args: {
           step: "review",
           labels: [target, ...tickets].flatMap((bead) => bead.labels ?? []),
         }),
-        routing: claudeRouting(settings),
+        routing: fixRouting,
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         signal: ctx.signal,
         onEvent,

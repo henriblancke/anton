@@ -10,19 +10,51 @@
  * here moves, so shrinking it per share would stop the whole machine at one repo's cut.
  */
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
 import { insertProject } from "@/lib/testing/project";
 import { DEFAULT_PROJECT_BUDGET_POLICY, type ProjectSettings } from "@/lib/projects";
+import type { UsageSnapshot } from "@/lib/usage";
 
 let tdb: TestDb;
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
 
-const { resolveBudgetPolicy, resolveProjectSpend } = await import("./service-policy");
+/** Swap in router reads for resolver cases; null routes to the real (network) function. */
+type GetRouterUsageCached = typeof import("../claude/router-usage").getRouterUsageCached;
+type GetRouterUsageFresh = typeof import("../claude/router-usage").getRouterUsageFresh;
+let routerUsageOverride: GetRouterUsageCached | null = null;
+let routerUsageFreshOverride: GetRouterUsageFresh | null = null;
+vi.mock("../claude/router-usage", async () => {
+  const actual = await vi.importActual<typeof import("../claude/router-usage")>(
+    "../claude/router-usage",
+  );
+  return {
+    ...actual,
+    getRouterUsageCached: ((...args: Parameters<GetRouterUsageCached>) =>
+      routerUsageOverride
+        ? routerUsageOverride(...args)
+        : actual.getRouterUsageCached(...args)) satisfies GetRouterUsageCached,
+    getRouterUsageFresh: ((...args: Parameters<GetRouterUsageFresh>) =>
+      routerUsageFreshOverride
+        ? routerUsageFreshOverride(...args)
+        : actual.getRouterUsageFresh(...args)) satisfies GetRouterUsageFresh,
+  };
+});
+
+const {
+  resolveBudgetPolicy,
+  resolveProjectGovernor,
+  resolveProjectMeterKey,
+  resolveProjectSpend,
+  resolveProjectUsage,
+  resolveProjectUsageFresh,
+} = await import("./service-policy");
 
 /** The shipped weekly ceiling a share is a cut OF. */
 const TARGET = DEFAULT_PROJECT_BUDGET_POLICY.weeklyTargetPct;
+const ACCOUNT_SNAPSHOT = { meterKey: "anthropic", usage: null };
 
 function project(id: string, settings: ProjectSettings): string {
   return insertProject(tdb.db, {
@@ -70,6 +102,37 @@ describe("resolveBudgetPolicy (quota share)", () => {
 
     expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
     expect((await resolveBudgetPolicy("b"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
+  });
+
+  it("partitions default quota shares across independent meters", async () => {
+    project("account", armed());
+    project(
+      "router",
+      armed({
+        claudeBaseUrl: "https://router.example/v1",
+        claudeAuthTokenEnv: "ROUTER_TOKEN",
+        routerConnectionId: "conn_1",
+      }),
+    );
+
+    // Each project is the only governed consumer of its own meter, so neither loses half its quota.
+    expect((await resolveBudgetPolicy("account"))?.projectWeeklyCapPct).toBe(TARGET);
+    expect((await resolveBudgetPolicy("router"))?.projectWeeklyCapPct).toBe(TARGET);
+  });
+
+  it("splits quota shares only among projects using the same router connection", async () => {
+    const connection = {
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: "ROUTER_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("a", armed(connection));
+    project("b", armed(connection));
+    project("other", armed({ ...connection, routerConnectionId: "conn_2" }));
+
+    expect((await resolveBudgetPolicy("a"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("b"))?.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
+    expect((await resolveBudgetPolicy("other"))?.projectWeeklyCapPct).toBe(TARGET);
   });
 
   it("keeps an ungoverned project out of the denominator", async () => {
@@ -255,6 +318,30 @@ describe("resolveBudgetPolicy (quota share)", () => {
 
     expect(warn).not.toHaveBeenCalled();
   });
+
+  it("keeps imbalance announcement suppression separate for independent meters", async () => {
+    const router = {
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: "ROUTER_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("account-a", armed({ quotaSharePct: 44 }));
+    project("account-b", armed({ quotaSharePct: 44 }));
+    project("router-a", armed({ ...router, quotaSharePct: 55 }));
+    project("router-b", armed({ ...router, quotaSharePct: 55 }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await resolveBudgetPolicy("account-a");
+    await resolveBudgetPolicy("router-a");
+    await resolveBudgetPolicy("account-b");
+    await resolveBudgetPolicy("router-b");
+
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls.map(([message]) => message)).toEqual([
+      expect.stringContaining("total 88%, not 100%"),
+      expect.stringContaining("total 110%, not 100%"),
+    ]);
+  });
 });
 
 /**
@@ -277,21 +364,34 @@ describe("resolveProjectSpend", () => {
    */
   function burned(
     projectId: string | null,
-    opts: { attempts?: number; status?: string } = {},
+    opts: { attempts?: number; meterKey?: string; status?: string } = {},
   ): void {
+    const id = randomUUID();
+    const attempts = opts.attempts ?? 1;
     tdb.db
       .insert(schema.jobs)
       .values({
-        id: randomUUID(),
+        id,
         projectId,
         type: "execute-epic",
         status: opts.status ?? "done",
         payloadJson: "{}",
-        attempts: opts.attempts ?? 1,
-        spentAttempts: opts.attempts ?? 1,
+        attempts,
+        spentAttempts: attempts,
         updatedAt: new Date(),
       })
       .run();
+    if (!projectId) return;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      tdb.db.insert(schema.quotaAttempts).values({
+        id: `${id}-${attempt}`,
+        jobId: id,
+        projectId,
+        jobType: "execute-epic",
+        meterKey: opts.meterKey ?? "anthropic",
+        createdAt: new Date(),
+      }).run();
+    }
   }
 
   it("charges only the attempts this project made", async () => {
@@ -302,8 +402,107 @@ describe("resolveProjectSpend", () => {
     burned("theirs");
 
     // execute-epic's L-tier seed is 3 weekly points until real samples accrue.
-    expect(await resolveProjectSpend("mine", null)).toBeCloseTo(6, 6);
-    expect(await resolveProjectSpend("theirs", null)).toBeCloseTo(3, 6);
+    expect(await resolveProjectSpend("mine", ACCOUNT_SNAPSHOT)).toBeCloseTo(6, 6);
+    expect(await resolveProjectSpend("theirs", ACCOUNT_SNAPSHOT)).toBeCloseTo(3, 6);
+  });
+
+  it("keeps spend in the snapshot meter when routing changes during a governor read", async () => {
+    const oldSettings = {
+      claudeBaseUrl: "https://old-router.example/v1",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("routed", oldSettings);
+    routerUsageOverride = async () => null;
+    const snapshot = await resolveProjectUsage("routed", async () => null);
+    const oldMeterKey = "router:https://old-router.example/api/usage/conn_1";
+    const newMeterKey = "router:https://new-router.example/api/usage/conn_1";
+    burned("routed", { meterKey: oldMeterKey });
+    burned("routed", { meterKey: newMeterKey });
+    burned("routed", { meterKey: newMeterKey });
+    await tdb.db
+      .update(schema.projects)
+      .set({
+        settingsJson: JSON.stringify({
+          ...oldSettings,
+          claudeBaseUrl: "https://new-router.example/v1",
+        }),
+      })
+      .where(eq(schema.projects.id, "routed"));
+
+    // One old-meter attempt is attributed; the two new-meter attempts must never be mixed in.
+    expect(await resolveProjectSpend("routed", snapshot)).toBeCloseTo(3, 6);
+  });
+
+  it("keeps a governor policy and meter paired when routing changes after resolution", async () => {
+    const oldSettings = {
+      budgetAware: true,
+      quotaSharePct: 100,
+      claudeBaseUrl: "https://old-router.example/v1",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("routed", oldSettings);
+    routerUsageOverride = async () => ({
+      sessionPct: 10,
+      weeklyPct: 20,
+      sessionResetAt: null,
+      weeklyResetAt: null,
+      plan: "router",
+    });
+
+    const governor = await resolveProjectGovernor("routed", async () => null);
+    await tdb.db
+      .update(schema.projects)
+      .set({
+        settingsJson: JSON.stringify({ ...oldSettings, claudeBaseUrl: "https://new-router.example/v1" }),
+      })
+      .where(eq(schema.projects.id, "routed"));
+
+    expect(governor?.meterKey).toBe("router:https://old-router.example/api/usage/conn_1");
+    expect(governor?.policy.projectWeeklyCapPct).toBe(TARGET);
+  });
+
+  it("keeps the frozen route in the share board when routing changes before the board read", async () => {
+    const oldRoute = {
+      budgetAware: true,
+      quotaSharePct: 50,
+      claudeBaseUrl: "https://old-router.example/v1",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("routed", oldRoute);
+    project("peer", oldRoute);
+    routerUsageOverride = async () => ({
+      sessionPct: 5,
+      weeklyPct: 1,
+      sessionResetAt: null,
+      weeklyResetAt: null,
+      plan: "Claude Code",
+    });
+
+    const select = tdb.db.select.bind(tdb.db);
+    let subjectSettingsRead = false;
+    const selects = vi.spyOn(tdb.db, "select").mockImplementation(((columns?: Record<string, unknown>) => {
+      if (columns && "settingsJson" in columns && !("id" in columns)) subjectSettingsRead = true;
+      if (subjectSettingsRead && columns && "id" in columns && "settingsJson" in columns) {
+        tdb.db
+          .update(schema.projects)
+          .set({ settingsJson: JSON.stringify({ budgetAware: true, quotaSharePct: 50 }) })
+          .where(eq(schema.projects.id, "routed"))
+          .run();
+        subjectSettingsRead = false;
+      }
+      return select(columns as never);
+    }) as typeof tdb.db.select);
+
+    const governor = await resolveProjectGovernor("routed", async () => null);
+
+    // The job will still dispatch through the old router, so its budget must stay half of that
+    // router's shared pool even though the independently read board already sees Anthropic.
+    expect(governor?.meterKey).toBe("router:https://old-router.example/api/usage/conn_1");
+    expect(governor?.policy.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
+    selects.mockRestore();
   });
 
   it("charges an attempt that failed exactly like one that succeeded", async () => {
@@ -312,7 +511,7 @@ describe("resolveProjectSpend", () => {
     project("flaky", armed());
     burned("flaky", { status: "parked", attempts: 3 });
 
-    expect(await resolveProjectSpend("flaky", null)).toBeCloseTo(9, 6);
+    expect(await resolveProjectSpend("flaky", ACCOUNT_SNAPSHOT)).toBeCloseTo(9, 6);
   });
 
   it("answers null — unattributed, never zero — when nothing is charged to it", async () => {
@@ -320,7 +519,178 @@ describe("resolveProjectSpend", () => {
     burned(null); // anton's own plumbing belongs to nobody's share
     burned("quiet", { status: "queued", attempts: 0 }); // enqueued, never dispatched
 
-    expect(await resolveProjectSpend("quiet", null)).toBeNull();
-    expect(await resolveProjectSpend(null, null)).toBeNull();
+    expect(await resolveProjectSpend("quiet", ACCOUNT_SNAPSHOT)).toBeNull();
+    expect(await resolveProjectSpend(null, ACCOUNT_SNAPSHOT)).toBeNull();
+  });
+});
+
+describe("resolveProjectUsage (anton-gnvw)", () => {
+  const ACCOUNT_USAGE = { sessionPct: 40, weeklyPct: 20, sessionResetAt: null, weeklyResetAt: null, plan: "max" };
+  const ROUTER_USAGE = { sessionPct: 5, weeklyPct: 1, sessionResetAt: null, weeklyResetAt: null, plan: "Claude Code" };
+
+  /**
+   * The account meter as the governor passes it: a thunk, plus the call count. The count is the
+   * assertion that matters for a routed project — "resolved off the router" and "never asked
+   * Anthropic" are different claims, and only the second one is what routing buys.
+   */
+  function accountThunk(value: UsageSnapshot | null = ACCOUNT_USAGE) {
+    let calls = 0;
+    const read = async () => {
+      calls += 1;
+      return value;
+    };
+    return { read, calls: () => calls };
+  }
+
+  beforeEach(() => {
+    tdb = makeTestDb();
+    routerUsageOverride = null;
+    routerUsageFreshOverride = null;
+  });
+  afterEach(() => {
+    tdb.close();
+    vi.restoreAllMocks();
+  });
+
+  it("reads the router for a routed project, never touching the account read", async () => {
+    project("routed", {
+      claudeBaseUrl: "https://gw.example.com",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+    routerUsageOverride = async () => ROUTER_USAGE;
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage("routed", account.read)).toEqual({
+      meterKey: "router:https://gw.example.com/api/usage/conn_1",
+      usage: ROUTER_USAGE,
+    });
+    expect(account.calls()).toBe(0); // the whole point of routing: no Anthropic request at all
+  });
+
+  it("uses the routed resolver for a fresh burn sample too", async () => {
+    const settings = {
+      claudeBaseUrl: "https://gw.example.com",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("routed", settings);
+    routerUsageFreshOverride = async () => ROUTER_USAGE;
+    const account = accountThunk();
+
+    expect(
+      await resolveProjectUsageFresh("routed", account.read, await resolveProjectMeterKey("routed")),
+    ).toEqual(ROUTER_USAGE);
+    expect(account.calls()).toBe(0);
+  });
+
+  it("skips a fresh sample when routing changes after the attempt starts", async () => {
+    const oldSettings = {
+      claudeBaseUrl: "https://old-router.example/v1",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("routed", oldSettings);
+    const expectedMeterKey = await resolveProjectMeterKey("routed");
+    await tdb.db
+      .update(schema.projects)
+      .set({
+        settingsJson: JSON.stringify({
+          ...oldSettings,
+          claudeBaseUrl: "https://new-router.example/v1",
+        }),
+      })
+      .where(eq(schema.projects.id, "routed"));
+    const account = accountThunk();
+
+    expect(await resolveProjectUsageFresh("routed", account.read, expectedMeterKey)).toBeNull();
+    expect(account.calls()).toBe(0);
+  });
+
+  it("returns the account usage unchanged for an unrouted project — byte-identical to today", async () => {
+    project("plain", {});
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage("plain", account.read)).toEqual({
+      meterKey: "anthropic",
+      usage: ACCOUNT_USAGE,
+    });
+    expect(account.calls()).toBe(1);
+  });
+
+  it("uses the account meter when the shared meter-key resolver rejects an invalid route", async () => {
+    project("invalid-route", {
+      claudeBaseUrl: "not-a-url",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage("invalid-route", account.read)).toEqual({
+      meterKey: "anthropic",
+      usage: ACCOUNT_USAGE,
+    });
+    expect(account.calls()).toBe(1);
+  });
+
+  it("fails open to null when a routed project's router cannot be read", async () => {
+    project("routed", {
+      claudeBaseUrl: "https://gw.example.com",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+    routerUsageOverride = async () => null; // unreadable: no creds, timeout, non-200, malformed body
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage("routed", account.read)).toEqual({
+      meterKey: "router:https://gw.example.com/api/usage/conn_1",
+      usage: null,
+    });
+    // Fails open to null rather than silently borrowing the account meter, which is not its traffic.
+    expect(account.calls()).toBe(0);
+  });
+
+  it("falls back to the account usage for a successfully read but missing project", async () => {
+    // A missing row is an actual `{}` settings result, so it remains byte-identical to today's
+    // unrouted behavior. A rejected settings read is distinct and must not borrow the account meter.
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage("missing", account.read)).toEqual({
+      meterKey: "anthropic",
+      usage: ACCOUNT_USAGE,
+    });
+    expect(account.calls()).toBe(1);
+  });
+
+  it("fails open when the project's settings cannot be reread", async () => {
+    project("routed", {
+      claudeBaseUrl: "https://gw.example.com",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+    const select = tdb.db.select.bind(tdb.db);
+    const selects = vi.spyOn(tdb.db, "select").mockImplementation(((columns?: Record<string, unknown>) => {
+      if (columns && "settingsJson" in columns) throw new Error("db read failed");
+      return select(columns as never);
+    }) as typeof tdb.db.select);
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage("routed", account.read)).toEqual({
+      meterKey: "anthropic",
+      usage: null,
+    });
+    expect(account.calls()).toBe(0);
+
+    selects.mockRestore();
+  });
+
+  it("returns the account usage unchanged for the null-project bucket", async () => {
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage(null, account.read)).toEqual({
+      meterKey: "anthropic",
+      usage: ACCOUNT_USAGE,
+    });
+    expect(account.calls()).toBe(1);
   });
 });

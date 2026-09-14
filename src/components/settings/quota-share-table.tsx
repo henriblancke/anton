@@ -16,9 +16,9 @@ import { Button } from "@/components/ui/button";
 /**
  * Settings → Quota shares (anton-68hl / R6.3), as a table following the Automation panel.
  *
- * Several repos run against one Claude subscription, and this is where an operator declares how it
- * is divided. Rendered as rows because the question is comparative — "what is my cut against
- * everyone else's" — and a card per project would put the two numbers being compared on different
+ * Several repos can pace against one quota meter, and this is where an operator declares how it is
+ * divided. Rendered as rows because the question is comparative — "what is my cut against everyone
+ * else's" — and a card per project would put the two numbers being compared on different
  * lines.
  *
  * EVERY derived figure here is marked approximate, and that is the panel's whole reason to be
@@ -37,6 +37,7 @@ export function QuotaShareTable({
   share,
   reserved,
   equalSplitPct,
+  meterKey,
   onShareChange,
   onReserveChange,
 }: {
@@ -49,6 +50,8 @@ export function QuotaShareTable({
   reserved: boolean;
   /** What an undeclared share resolves to: an equal cut of the governed projects. */
   equalSplitPct: number;
+  /** The quota pool currently displayed: Anthropic or one router connection. */
+  meterKey?: string;
   onShareChange: (next: number | null) => void;
   onReserveChange: (next: boolean) => void;
 }) {
@@ -59,7 +62,7 @@ export function QuotaShareTable({
       ? { ...project, sharePct: share ?? equalSplitPct, declared: share !== null, reserved }
       : project,
   );
-  const split = resolveQuotaSplit(staged);
+  const split = resolveQuotaSplit(staged, meterKey);
   const governed = split.rows.filter((row) => row.governed).length;
   const lending = split.rows.filter((row) => row.reallocated);
 

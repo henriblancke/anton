@@ -27,6 +27,7 @@ function project(id: string, governed: boolean): QuotaShareProject {
     sharePct: 50,
     declared: false,
     governed,
+    meterKey: "anthropic",
     reserved: false,
     eligible: true,
     spentWeeklyPct: null,
@@ -35,9 +36,21 @@ function project(id: string, governed: boolean): QuotaShareProject {
 }
 
 /** Only `draft` and `set` are read here; the rest of the form is another panel's concern. */
-function form(budgetAware: boolean): SettingsForm {
+function form(budgetAware: boolean, routed = false): SettingsForm {
   return {
-    draft: { ...draftFromSettings({ budgetAware }, [], {}) },
+    draft: {
+      ...draftFromSettings(
+        routed
+          ? {
+              budgetAware,
+              claudeBaseUrl: "https://router.example/v1",
+              routerConnectionId: "conn_1",
+            }
+          : { budgetAware },
+        [],
+        {},
+      ),
+    },
     set: vi.fn(),
   } as unknown as SettingsForm;
 }
@@ -59,5 +72,59 @@ describe("QuotaSection", () => {
 
     expect(screen.getByText(/Declared 100% across 2 paced projects/)).toBeTruthy();
     expect(screen.queryByText(/Shares add up to/)).toBeNull();
+  });
+
+  it("shows only the project meter's quota pool", () => {
+    const routed: QuotaShareProject = {
+      ...project("router", true),
+      meterKey: "router:https://router.example/api/usage/conn_1",
+    };
+    render(<QuotaSection form={form(true)} project={{ id: "mine" }} quotaProjects={[...BOARD, routed]} />);
+
+    expect(screen.queryByText("router")).toBeNull();
+    expect(screen.getByText(/Declared 100% across 3 paced projects/)).toBeTruthy();
+  });
+
+  it("previews the routed project's split from its staged router connection", () => {
+    const routerOne: QuotaShareProject = {
+      ...project("router-one", true),
+      meterKey: "router:https://router.example/api/usage/conn_1",
+    };
+    const routerTwo: QuotaShareProject = {
+      ...project("router-two", true),
+      meterKey: "router:https://router.example/api/usage/conn_2",
+    };
+    render(
+      <QuotaSection
+        form={form(true, true)}
+        project={{ id: "mine" }}
+        quotaProjects={[...BOARD, routerOne, routerTwo]}
+      />,
+    );
+
+    expect(screen.getByText("router-one")).toBeTruthy();
+    expect(screen.queryByText("router-two")).toBeNull();
+    expect(screen.queryByText("a")).toBeNull();
+    expect(screen.getByText(/Declared 100% across 2 paced projects/)).toBeTruthy();
+  });
+
+  it("does not attribute the previous meter's spend to a staged connection", () => {
+    const mine = { ...project("mine", true), spentWeeklyPct: 42, seeded: true };
+    const router: QuotaShareProject = {
+      ...project("router", true),
+      meterKey: "router:https://router.example/api/usage/conn_1",
+      spentWeeklyPct: 8,
+    };
+    render(
+      <QuotaSection
+        form={form(true, true)}
+        project={{ id: "mine" }}
+        quotaProjects={[mine, router]}
+      />,
+    );
+
+    expect(screen.getByText(/≈ 8\.0% of the weekly quota attributed so far/)).toBeTruthy();
+    expect(screen.queryByText(/≈ 50\.0% of the weekly quota attributed so far/)).toBeNull();
+    expect(screen.queryByText(/Some spend is still estimated from tier seeds/)).toBeNull();
   });
 });

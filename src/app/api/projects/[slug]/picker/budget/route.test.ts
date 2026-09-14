@@ -223,6 +223,18 @@ describe("GET /picker/budget", () => {
     expect(body.headroom.sharePct).toBeCloseTo(18, 6);
   });
 
+  it("keeps independent router and Anthropic pools at their full shares", async () => {
+    await settings({ budgetAware: true, budgetPolicy: { weeklyTargetPct: 90 } });
+    await neighbour("routed", {
+      budgetAware: true,
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: "ROUTER_TOKEN",
+      routerConnectionId: "router-connection",
+    });
+
+    expect(await shareHeadroom()).toBeCloseTo(90, 6);
+  });
+
   it("holds the lane at the share cap when the spend read fails", async () => {
     // Unattributed is not "spent" — a db hiccup must relax the share back to its full cap, the same
     // fail-soft posture the governor takes, rather than throwing or blanking the line.

@@ -17,8 +17,12 @@ import {
   liveRunCheck,
   readBeadLabels,
   resolveBudgetPolicy,
+  resolveProjectGovernor,
   resolvePolicy,
+  resolveProjectMeterKey,
   resolveProjectSpend,
+  resolveProjectUsage,
+  resolveProjectUsageFresh,
 } from "./service-policy";
 
 const log: RunnerLogger = {
@@ -88,7 +92,11 @@ export function getRunner(): JobRunner {
     },
     resolvePolicy,
     resolveBudgetPolicy,
+    resolveProjectGovernor,
     resolveProjectSpend,
+    resolveProjectMeterKey,
+    resolveProjectUsage,
+    resolveProjectUsageFresh,
     liveRunCheck,
     readBeadLabels,
   });

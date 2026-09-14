@@ -149,6 +149,29 @@ export function httpUrl(max: number): FieldParser<string> {
   };
 }
 
+/**
+ * A router connection id — the router's own opaque identifier for one provider connection, e.g.
+ * `conn_ab12cd34`. Bounded and scanned for a credential marker like the other routing fields: it is
+ * pasted by the operator from the router's dashboard, and that is also where an API key lives on the
+ * same page.
+ */
+export function connectionId(max: number): FieldParser<string> {
+  return (raw, key) => {
+    if (isClear(raw)) return accept(undefined);
+    if (typeof raw !== "string") return reject(`${key} must be a string`);
+    const trimmed = raw.trim();
+    if (!trimmed) return reject(`${key} must not be blank`);
+    if (trimmed.length > max) return reject(`${key} too long (max ${max} chars)`);
+    if (hasCredentialMarker(trimmed)) {
+      return reject(
+        `${key} looks like a credential value, not a connection id — paste the connection's id ` +
+          `from the router's dashboard, not an API key`,
+      );
+    }
+    return accept(trimmed);
+  };
+}
+
 /** A POSIX env-var NAME: an uppercase identifier, never a value that happens to look like one. */
 const ENV_VAR_NAME = /^[A-Z_][A-Z0-9_]*$/;
 

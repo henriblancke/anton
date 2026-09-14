@@ -5,6 +5,7 @@ import { BoardFilters } from "@/components/board/board-filters";
 import { BoardGroupingToggle } from "@/components/board/board-grouping-toggle";
 import { HealthPill } from "@/components/board/health-pill";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
+import { RouterUsageMeter } from "@/components/usage/router-usage-meter";
 import {
   BOARD_SORT_LABELS,
   type BoardFilters as BoardFilterState,
@@ -70,6 +71,10 @@ export function BoardToolbar({
         scanHealth={board.scanHealth}
       />
       <SyncStatusBadge sync={board.sync} />
+      {/* The meter that actually governs this project's spend when it's routed to a gateway
+          (anton-ds7e) — never the global pill above, which stays machine-wide and reads the
+          Anthropic subscription regardless. Renders nothing for an unrouted project. */}
+      <RouterUsageMeter slug={slug} />
     </div>
   );
 }

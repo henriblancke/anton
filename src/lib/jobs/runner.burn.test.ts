@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "vitest";
 import * as schema from "../db/schema";
-import { getBurnAverage } from "../burn";
+import { getBurnAverage, getProjectBurnAverage } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
 import { DEFAULT_BUDGET_POLICY } from "./budget";
 import { PoisonEpic, RunAlreadyLiveError } from "./errors";
@@ -67,6 +67,76 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     const rows = await h.db.select().from(schema.burnSamples);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.projectId).toBe("P");
+  });
+
+  it("samples a routed job from its router meter, never the Anthropic meter", async () => {
+    h.seedProjects("routed");
+    const routerFresh = freshSequence(
+      { sessionPct: 10, weeklyPct: 5 },
+      { sessionPct: 30, weeklyPct: 8 },
+    );
+    let accountFreshReads = 0;
+    let routerReads = 0;
+    const r = h.makeRunner({
+      handlers: { "execute-epic": async (ctx) => ctx.claudeReached() },
+      resolveBudgetPolicy: budgetAware,
+      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
+      readUsageFresh: async () => {
+        accountFreshReads += 1;
+        return usage({ sessionPct: 90, weeklyPct: 90 });
+      },
+      resolveProjectUsageFresh: async (projectId) => {
+        expect(projectId).toBe("routed");
+        routerReads += 1;
+        return routerFresh();
+      },
+    });
+    await r.enqueue({ type: "execute-epic", projectId: "routed" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect(routerReads).toBe(2);
+    expect(accountFreshReads).toBe(0);
+    expect((await getBurnAverage(h.db, "execute-epic", 1)).sessionAvg).toBe(20);
+  });
+
+  it("stamps a routed sample with the meter captured at Claude reach", async () => {
+    h.seedProjects("routed");
+    const meterKey = "router:https://router.example/api/usage/conn";
+    const r = h.makeRunner({
+      handlers: { "execute-epic": async (ctx) => ctx.claudeReached() },
+      resolveBudgetPolicy: budgetAware,
+      resolveProjectMeterKey: () => meterKey,
+      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
+      readUsageFresh: freshSequence({ sessionPct: 10, weeklyPct: 5 }, { sessionPct: 30, weeklyPct: 8 }),
+    });
+    await r.enqueue({ type: "execute-epic", projectId: "routed" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect((await h.db.select().from(schema.burnSamples))[0]?.meterKey).toBe(meterKey);
+    expect((await getProjectBurnAverage(h.db, "routed", "execute-epic", meterKey)).weeklyAvg).toBe(3);
+  });
+
+  it("charges the routing meter frozen by the handler, not settings reread at the spawn", async () => {
+    h.seedProjects("routed");
+    const routedMeter = "router:https://router.example/api/usage/frozen";
+    let currentMeter = routedMeter;
+    const r = h.makeRunner({
+      handlers: { "execute-epic": async (ctx) => ctx.claudeReached(routedMeter) },
+      resolveBudgetPolicy: budgetAware,
+      resolveProjectMeterKey: () => currentMeter,
+      readUsageFresh: freshSequence({ sessionPct: 10, weeklyPct: 5 }, { sessionPct: 30, weeklyPct: 8 }),
+    });
+    currentMeter = "anthropic";
+    await r.enqueue({ type: "execute-epic", projectId: "routed" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const [sample] = await h.db.select().from(schema.burnSamples);
+    const [attempt] = await h.db.select().from(schema.quotaAttempts);
+    expect(sample?.meterKey).toBe(routedMeter);
+    expect(attempt?.meterKey).toBe(routedMeter);
   });
 
   it("leaves the project null for a job that belongs to none", async () => {

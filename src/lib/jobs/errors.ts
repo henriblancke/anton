@@ -279,6 +279,29 @@ export class StaleCheckoutError extends Error {
   }
 }
 
+/**
+ * The project's routing changed between this job's budget admission (the governor's per-tick check,
+ * narrowed by a revalidation read — see `revalidateAdmittedGovernorMeters`) and the settings read
+ * closest to actual dispatch (a run's own read, taken before it holds anything). The admitted meter
+ * no longer names the pool this run would actually spend from, so the admission decision doesn't
+ * apply to it — proceeding could spend an unvalidated, possibly exhausted meter that never cleared
+ * `budgetGate`. Not this job's failure: the runner reschedules shortly with the attempt refunded, so
+ * the next tick's governor pass admits against the route that is now live (PR #269 review).
+ */
+export class RouteAdmissionStaleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RouteAdmissionStaleError";
+  }
+}
+
+export function isRouteAdmissionStaleError(e: unknown): e is RouteAdmissionStaleError {
+  return (
+    e instanceof RouteAdmissionStaleError ||
+    (e as { name?: string })?.name === "RouteAdmissionStaleError"
+  );
+}
+
 export function isUsageLimitError(e: unknown): e is UsageLimitError {
   return e instanceof UsageLimitError || (e as { name?: string })?.name === "UsageLimitError";
 }

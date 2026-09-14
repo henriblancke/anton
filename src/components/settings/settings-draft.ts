@@ -48,6 +48,8 @@ export interface SettingsDraft {
   claudeBaseUrl: string;
   claudeAuthTokenEnv: string;
   claudeGatewayModelDiscovery: boolean;
+  /** Which router connection this project meters on (anton-m5oc); "" clears (no routed meter). */
+  routerConnectionId: string;
   seedPrompt: string;
   reviewFixPrompt: string;
   reviewFixConcurrency: number;
@@ -118,6 +120,7 @@ export function draftFromSettings(
     claudeBaseUrl: settings.claudeBaseUrl ?? "",
     claudeAuthTokenEnv: settings.claudeAuthTokenEnv ?? "",
     claudeGatewayModelDiscovery: settings.claudeGatewayModelDiscovery ?? false,
+    routerConnectionId: settings.routerConnectionId ?? "",
     seedPrompt: settings.seedPrompt ?? "",
     reviewFixPrompt: settings.reviewFixPrompt ?? "",
     reviewFixConcurrency: settings.reviewFixConcurrency ?? DEFAULT_REVIEW_FIX_CONCURRENCY,
@@ -179,7 +182,12 @@ export function draftFromSettings(
  */
 const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
   model: ["model"],
-  gateway: ["claudeBaseUrl", "claudeAuthTokenEnv", "claudeGatewayModelDiscovery"],
+  gateway: [
+    "claudeBaseUrl",
+    "claudeAuthTokenEnv",
+    "claudeGatewayModelDiscovery",
+    "routerConnectionId",
+  ],
   seedPrompt: ["seedPrompt"],
   reviewFixPrompt: ["reviewFixPrompt"],
   reviewFixConcurrency: ["reviewFixConcurrency"],
@@ -283,6 +291,7 @@ export function settingsPatchBody(
     claudeBaseUrl: orNull(draft.claudeBaseUrl),
     claudeAuthTokenEnv: orNull(draft.claudeAuthTokenEnv),
     claudeGatewayModelDiscovery: draft.claudeGatewayModelDiscovery,
+    routerConnectionId: orNull(draft.routerConnectionId),
     seedPrompt: orNull(draft.seedPrompt),
     reviewFixPrompt: orNull(draft.reviewFixPrompt),
     reviewFixConcurrency: draft.reviewFixConcurrency,
