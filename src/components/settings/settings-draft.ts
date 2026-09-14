@@ -3,6 +3,7 @@ import {
   DEFAULT_AUTOPILOT_SCORE_FLOOR,
   DEFAULT_AUTOPILOT_SCORE_WINDOW,
   DEFAULT_AUTOPILOT_WIP_LIMIT,
+  DEFAULT_COMMIT_TIMEOUT_MINUTES,
   DEFAULT_CONCURRENCY,
   DEFAULT_DAYTIME_RESERVE_PCT,
   DEFAULT_JOB_TIMEOUT_MINUTES,
@@ -63,6 +64,7 @@ export interface SettingsDraft {
   concurrency: number;
   jobTimeoutMinutes: number;
   ticketTimeoutMinutes: number;
+  commitTimeoutMinutes: number;
   maxRetries: number;
   autonomy: boolean;
   conventionalCommits: boolean;
@@ -132,6 +134,7 @@ export function draftFromSettings(
     concurrency: settings.concurrency ?? DEFAULT_CONCURRENCY,
     jobTimeoutMinutes: settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES,
     ticketTimeoutMinutes: settings.ticketTimeoutMinutes ?? DEFAULT_TICKET_TIMEOUT_MINUTES,
+    commitTimeoutMinutes: settings.commitTimeoutMinutes ?? DEFAULT_COMMIT_TIMEOUT_MINUTES,
     maxRetries: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
     autonomy: settings.autonomy ?? true,
     conventionalCommits: settings.conventionalCommits ?? false,
@@ -181,6 +184,7 @@ const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
   concurrency: ["concurrency"],
   jobTimeoutMinutes: ["jobTimeoutMinutes"],
   ticketTimeoutMinutes: ["ticketTimeoutMinutes"],
+  commitTimeoutMinutes: ["commitTimeoutMinutes"],
   maxRetries: ["maxRetries"],
   autonomy: ["autonomy"],
   conventionalCommits: ["conventionalCommits"],
@@ -313,6 +317,7 @@ export function settingsPatchBody(
     concurrency: draft.concurrency,
     jobTimeoutMinutes: draft.jobTimeoutMinutes,
     ticketTimeoutMinutes: draft.ticketTimeoutMinutes,
+    commitTimeoutMinutes: draft.commitTimeoutMinutes,
     maxRetries: draft.maxRetries,
     // The enabled BUNDLED ids, in discovered order. Only bundled ids we actually rendered — a
     // stale id from a since-deleted or user agent (still in the seeded set) is pruned rather than

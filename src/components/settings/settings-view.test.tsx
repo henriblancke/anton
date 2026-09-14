@@ -231,6 +231,35 @@ describe("SettingsView budget-aware master-switch (anton-7mpv.1)", () => {
   });
 });
 
+describe("SettingsView commit timeout (anton-n5e7)", () => {
+  showing("execution");
+
+  it("resolves an absent setting to the default, rather than an empty box", () => {
+    renderView({});
+    expect((screen.getByLabelText("Commit timeout in minutes") as HTMLInputElement).value).toBe(
+      "2",
+    );
+  });
+
+  it("seeds from a persisted value (round-trip in)", () => {
+    renderView({ commitTimeoutMinutes: 10 });
+    expect((screen.getByLabelText("Commit timeout in minutes") as HTMLInputElement).value).toBe(
+      "10",
+    );
+  });
+
+  it("marks the execution section dirty and PATCHes the edited value (round-trip out)", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+    fireEvent.change(screen.getByLabelText("Commit timeout in minutes"), {
+      target: { value: "10" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.commitTimeoutMinutes).toBe(10);
+  });
+});
+
 describe("SettingsView self-review section (anton-of1m)", () => {
   showing("review");
 

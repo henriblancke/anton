@@ -66,7 +66,8 @@ import {
   satisfiedMarkerTarget,
   SATISFIES_TRAILER,
 } from "./ops";
-import { GH_BIN_ENV } from "./ops";
+import { DEFAULT_COMMIT_TIMEOUT_MS, GH_BIN_ENV } from "./ops";
+import { DEFAULT_COMMIT_TIMEOUT_MINUTES } from "@/lib/projects";
 
 function has(cmd: string): boolean {
   try {
@@ -3424,6 +3425,76 @@ suite("commitAll (real git · a hook that outlives the kill)", () => {
       expect(existsSync(marker)).toBe(true);
     },
   );
+
+  it.runIf(process.platform !== "win32")(
+    "reaps an in-flight commit hook when the job aborts before its configured budget",
+    async () => {
+      // A project may deliberately budget this commit for much longer than the runner's no-progress
+      // watchdog. The abort has to own the same process-group reap as the commit budget, or this
+      // hook keeps a runner slot and can still write after the job has moved on.
+      const controller = new AbortController();
+      const reason = new Error("job made no progress");
+      const pending = commitAll(repo, "t1: work the hook is sitting on", {
+        timeoutMs: 30 * 60_000,
+        signal: controller.signal,
+      });
+
+      await vi.waitFor(() => expect(existsSync(started)).toBe(true));
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+      // The hook writes only after TERM. Seeing it before the abort reaches the caller proves the
+      // cancellation path waited for the group, not merely for git's direct child process.
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  // anton-b3it: the env var is a CAP on a caller's requested budget, not an override — a caller
+  // asking for a real 30-minute setting must still be bounded by it.
+  it.runIf(process.platform !== "win32")(
+    "caps a caller's requested timeoutMs at the env value instead of honoring it",
+    async () => {
+      process.env[COMMIT_TIMEOUT_ENV] = "2000";
+      const start = Date.now();
+
+      await expect(
+        commitAll(repo, "t1: work the hook is sitting on", { timeoutMs: 30 * 60_000 }),
+      ).rejects.toThrow(/timed out/);
+
+      // Killed at the 2s cap, nowhere near the 30-minute request.
+      expect(Date.now() - start).toBeLessThan(15_000);
+      expect(existsSync(started)).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "bounds the commit by the passed timeoutMs when no env override is set",
+    async () => {
+      delete process.env[COMMIT_TIMEOUT_ENV];
+      const start = Date.now();
+
+      await expect(
+        commitAll(repo, "t1: work the hook is sitting on", { timeoutMs: 2_000 }),
+      ).rejects.toThrow(/timed out/);
+
+      expect(Date.now() - start).toBeLessThan(15_000);
+      expect(existsSync(started)).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "names the effective sub-minute budget and points at the project's Commit timeout setting",
+    async () => {
+      delete process.env[COMMIT_TIMEOUT_ENV];
+
+      await expect(
+        commitAll(repo, "t1: work the hook is sitting on", { timeoutMs: 2_000 }),
+      ).rejects.toThrow(/timed out after 2,000 ms \(0\.033 minute\(s\)\).*Commit timeout/);
+    },
+  );
+
 });
 
 // PR #228 review: the marker is EMPTY, so it is made with this project's hooks bypassed — the only
@@ -3648,5 +3719,11 @@ suite("sibling attribution trailers (real git)", () => {
     expect(await branchSatisfiesTicket(gone, "anton-s1")).toBeUndefined();
     // …and `strict` is how a caller whose safe answer is the other one sees the failure instead.
     await expect(readSatisfiedClaims(gone, { strict: true })).rejects.toThrow();
+  });
+});
+
+describe("commit timeout default", () => {
+  it("agrees with the project setting's default (anton-wq0k) — the two must never drift apart", () => {
+    expect(DEFAULT_COMMIT_TIMEOUT_MINUTES * 60_000).toBe(DEFAULT_COMMIT_TIMEOUT_MS);
   });
 });

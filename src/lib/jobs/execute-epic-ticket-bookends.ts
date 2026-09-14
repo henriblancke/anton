@@ -20,6 +20,7 @@ import {
   satisfiedMarkerSubject,
   type WorktreeState,
 } from "../git/ops";
+import { resolveCommitTimeoutMs } from "../projects";
 import { updateRun } from "../runs";
 import { appendSessionLog, endSession, startJobSession, type JobSession } from "../sessions";
 import { PoisonEpic } from "./errors";
@@ -634,7 +635,9 @@ export function narrowToTicket(
 ): StepContext {
   return {
     ...run,
-    ctx: { ...run.ctx, signal: budget.signal },
+    // Keep the run-level signal available alongside the ticket deadline so a step can preserve a
+    // landed commit for a ticket timeout without swallowing an operator's whole-job cancellation.
+    ctx: { ...run.ctx, signal: budget.signal, jobSignal: run.ctx.signal },
     tickets: [ticket],
     session,
     ...(baseline ? { ticketStartHead: baseline.head } : {}),
@@ -693,6 +696,11 @@ export async function finishTicket(
     // re-verifies the same claim and writes it then. Recorded once the gate has accepted the claim,
     // never on the agent's word alone — this is the same settlement the note cites.
     await recordSatisfiedOnBranch(run, ticket, settlement.by);
+    // The marker's commit observes this ticket's deadline, but it can settle immediately before that
+    // deadline fires. Do not let that narrow window close the bead after its budget has expired.
+    if (run.ctx.signal.aborted) {
+      throw new Error(`${ticket.id} was aborted while recording its satisfied-ticket attribution`);
+    }
   }
   // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
   // → done). A standalone target isn't closed until its PR merges, so instead move it to
@@ -747,7 +755,12 @@ async function recordSatisfiedOnBranch(
         `own. This empty commit records the attribution no subject on this branch carries — it is ` +
         `what a later attempt reads to see the ticket as delivered instead of dispatching it into ` +
         `a zero diff.`,
-      { satisfies: [ticket.id], hooksPath },
+      {
+        satisfies: [ticket.id],
+        hooksPath,
+        timeoutMs: resolveCommitTimeoutMs(run.settings),
+        signal: run.ctx.signal,
+      },
     );
   } catch (e) {
     throw new PoisonEpic(

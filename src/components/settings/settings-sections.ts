@@ -51,6 +51,7 @@ export const SECTIONS = [
       "concurrency",
       "jobTimeoutMinutes",
       "ticketTimeoutMinutes",
+      "commitTimeoutMinutes",
       "maxRetries",
       "autonomy",
       "conventionalCommits",

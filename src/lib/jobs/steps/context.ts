@@ -70,7 +70,10 @@ export interface StepContext {
    * identity, which the spend ledger records as the dimension separating what a run cost from what a
    * nightly pass cost (anton-77l9).
    */
-  ctx: Pick<JobContext, "signal" | "heartbeat" | "report" | "claudeReached" | "jobId" | "type">;
+  ctx: Pick<JobContext, "signal" | "heartbeat" | "report" | "claudeReached" | "jobId" | "type"> & {
+    /** The run-level signal when `signal` is a derived ticket deadline. */
+    jobSignal?: AbortSignal;
+  };
   projectId: string;
   runId: string;
   /** The project repo — where bd and gh run. Never the worktree. */

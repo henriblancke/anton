@@ -100,12 +100,14 @@ export async function runTicket(args: {
     // during one aborts nothing: the walk returns as if in time, and nothing below would ask. Asked
     // here, the last point before the board is written — a ticket the clock caught on its final
     // read settles as the timeout it is, never as a close.
-    if (budget.ranOutOfTime()) {
+    if (budget.ranOutOfTime() || ctx.signal.aborted) {
       throw new Error(
-        `${ticket.id} ran out of its ticket budget while the delivery gate was reading the branch`,
+        budget.ranOutOfTime()
+          ? `${ticket.id} ran out of its ticket budget while the delivery gate was reading the branch`
+          : `${ticket.id}'s run was aborted while the delivery gate was reading the branch`,
       );
     }
-    const { closed } = await finishTicket(run, ticket, session.sessionId, closeOnDone, settlement);
+    const { closed } = await finishTicket(ticketCtx, ticket, session.sessionId, closeOnDone, settlement);
     return { ...settlement, closed };
   } catch (e) {
     // Always throws; returned so the signature carries the `never` and the walk's answer is typed.
