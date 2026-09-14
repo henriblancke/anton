@@ -214,9 +214,18 @@ export type ProjectUsageResolver = (
 /**
  * Fresh counterpart to {@link ProjectUsageResolver} for the two ends of a burn-sampling window.
  * Routed jobs must sample their router's meter, while unrouted jobs retain the account-wide fresh
- * read. The resolver is optional so existing runner consumers keep the account-only behavior.
+ * read. `expectedMeterKey` pins both window edges to the meter captured at spawn: a routing change
+ * mid-run skips the sample instead of measuring one meter and attributing it to another. The resolver
+ * is optional so existing runner consumers keep the account-only behavior.
  */
-export type ProjectUsageFreshResolver = ProjectUsageResolver;
+export type ProjectUsageFreshResolver = (
+  projectId: string | null,
+  accountUsage: () => Promise<ClaudeUsage | null>,
+  expectedMeterKey?: string,
+) => Promise<ClaudeUsage | null>;
+
+/** Resolve the durable identity of the meter an attempt is about to spend from. */
+export type ProjectMeterKeyResolver = (projectId: string | null) => Promise<string> | string;
 
 /**
  * Job types the budget governor may proactively defer (anton-szld). An allowlist by design: only
@@ -540,6 +549,7 @@ export class JobRunner {
   private readonly resolveProjectSpend: ProjectSpendResolver | null;
   private readonly resolveProjectUsage: ProjectUsageResolver | null;
   private readonly resolveProjectUsageFresh: ProjectUsageFreshResolver | null;
+  private readonly resolveProjectMeterKey: ProjectMeterKeyResolver | null;
   private readonly liveRunCheck: LiveRunCheck | null;
   private readonly readBeadLabels: BeadLabelsReader | null;
   private readonly readUsage: () => Promise<ClaudeUsage | null>;
@@ -593,6 +603,8 @@ export class JobRunner {
      * Anthropic; omitted keeps the existing account-wide fresh meter for every job.
      */
     resolveProjectUsageFresh?: ProjectUsageFreshResolver;
+    /** Immutable quota-meter identity recorded with an attempt and any burn sample it produces. */
+    resolveProjectMeterKey?: ProjectMeterKeyResolver;
     /**
      * Cross-machine run-liveness source (anton-jz1). When set, a fresh execute-epic enqueue that
      * has no active job in THIS machine's store is gated on it: if a run is already live for the
@@ -630,6 +642,7 @@ export class JobRunner {
     this.resolveProjectSpend = deps.resolveProjectSpend ?? null;
     this.resolveProjectUsage = deps.resolveProjectUsage ?? null;
     this.resolveProjectUsageFresh = deps.resolveProjectUsageFresh ?? null;
+    this.resolveProjectMeterKey = deps.resolveProjectMeterKey ?? null;
     this.liveRunCheck = deps.liveRunCheck ?? null;
     this.readBeadLabels = deps.readBeadLabels ?? null;
     this.readUsage = deps.readUsage ?? getClaudeUsageCached;
@@ -1285,6 +1298,9 @@ export class JobRunner {
     projectWeeklyPct: number | null,
     bucketCapOf: (job: JobRow) => number,
   ): Promise<void> {
+    // Resolve once for this pass so projected attempts reserve against the same meter-scoped samples
+    // as the current spend read. A resolver failure falls back to Anthropic, matching charge-time.
+    const meterKey = await this.resolveProjectMeterKeySafe(pid);
     const candidates = await queuedDueJobs(this.db, this.clock, {
       types: VALUE_GATE_JOB_TYPES,
       projectId: pid,
@@ -1347,6 +1363,7 @@ export class JobRunner {
         if (pid !== null && shareCap !== null) {
           projectedWeeklyPct += await this.projectWeeklyBurn(
             pid,
+            meterKey,
             job.type as JobType,
             shareCostByType,
           );
@@ -1374,7 +1391,7 @@ export class JobRunner {
       // anton-ld7j). Every job BEHIND it — including behind a bypass run — must fit in what the
       // share has left after the ones ahead, charged at this project's own measured rate.
       if (pid !== null && shareCap !== null) {
-        const cost = await this.projectWeeklyBurn(pid, job.type as JobType, shareCostByType);
+        const cost = await this.projectWeeklyBurn(pid, meterKey, job.type as JobType, shareCostByType);
         if (admitted > 0 && projectedWeeklyPct + cost > shareCap) {
           hold();
           continue;
@@ -1432,15 +1449,17 @@ export class JobRunner {
    */
   private async projectWeeklyBurn(
     projectId: string,
+    meterKey: string,
     type: JobType,
     memo: Map<string, number>,
   ): Promise<number> {
-    let cost = memo.get(type);
+    const cacheKey = `${meterKey}:${type}`;
+    let cost = memo.get(cacheKey);
     if (cost === undefined) {
-      cost = await getProjectBurnAverage(this.db, projectId, type)
+      cost = await getProjectBurnAverage(this.db, projectId, type, meterKey)
         .then((average) => average.weeklyAvg)
         .catch(() => 0);
-      memo.set(type, cost);
+      memo.set(cacheKey, cost);
     }
     return cost;
   }
@@ -1489,6 +1508,7 @@ export class JobRunner {
     // spend meter; an attempt that never gets there spent nothing, is charged nothing, and has no
     // window to close.
     let claudeReached = false;
+    let meterKey = "anthropic";
     let burnBefore: Promise<ClaudeUsage | null> | null = null;
     try {
       const policy = await this.policyFor(job.projectId ?? undefined);
@@ -1552,7 +1572,8 @@ export class JobRunner {
             // The charge is the durable record that this attempt burned quota — written now, not at
             // the lease, so a crash in preflight leaves nothing to refund. Fail-soft: the meter is a
             // pacing estimate, and a write that fails must not stand between the job and Claude.
-            await chargeSpentAttempt(this.db, job.id).catch((e) => {
+            meterKey = await this.resolveProjectMeterKeySafe(job.projectId);
+            await chargeSpentAttempt(this.db, job, meterKey, this.clock).catch((e) => {
               this.log.error(`job ${job.id} (${job.type}): could not charge the spend meter`, e);
             });
             // Re-check the window is still solo: a sibling dispatched between lease and spawn would
@@ -1561,7 +1582,7 @@ export class JobRunner {
             // the snapshot it is measured against has been taken.
             if (!burnEligible || this.dispatchSeq !== seqAtStart) return;
             this.lastBurnSampleAt = this.clock.now();
-            burnBefore = this.readProjectUsageFreshSafe(job.projectId ?? null);
+            burnBefore = this.readProjectUsageFreshSafe(job.projectId ?? null, meterKey);
             await burnBefore;
           },
           enqueueReviewFixPr: (projectId, epicBeadId) =>
@@ -1611,7 +1632,8 @@ export class JobRunner {
           // belong to no project's share.
           job.projectId ?? null,
           await burnBefore,
-          () => this.readProjectUsageFreshSafe(job.projectId ?? null),
+          () => this.readProjectUsageFreshSafe(job.projectId ?? null, meterKey),
+          meterKey,
         );
       }
       this.inFlight.delete(job.id);
@@ -1650,12 +1672,25 @@ export class JobRunner {
     }
   }
 
+  /** The key captured at spawn, defaulting to Anthropic when settings cannot be read. */
+  private async resolveProjectMeterKeySafe(projectId: string | null): Promise<string> {
+    if (!this.resolveProjectMeterKey) return "anthropic";
+    try {
+      return await this.resolveProjectMeterKey(projectId);
+    } catch {
+      return "anthropic";
+    }
+  }
+
   /** The fresh meter this project's burn window actually moves: router when routed, account otherwise. */
-  private async readProjectUsageFreshSafe(projectId: string | null): Promise<ClaudeUsage | null> {
+  private async readProjectUsageFreshSafe(
+    projectId: string | null,
+    expectedMeterKey: string,
+  ): Promise<ClaudeUsage | null> {
     const accountUsage = () => this.readUsageFreshSafe();
     if (!this.resolveProjectUsageFresh) return accountUsage();
     try {
-      return await this.resolveProjectUsageFresh(projectId, accountUsage);
+      return await this.resolveProjectUsageFresh(projectId, accountUsage, expectedMeterKey);
     } catch {
       // A routed resolver's failure cannot be represented by the account meter: its usage is from
       // another quota pool. Suppress the sample rather than corrupting the project's burn average.

@@ -3,9 +3,10 @@ import { NextResponse } from "next/server";
 import { RUN_JOB_TYPE, type BudgetSignal } from "@/lib/budget-line";
 import { getBurnAverage, getProjectBurnAverage } from "@/lib/burn";
 import { getClaudeUsageCached } from "@/lib/claude/usage";
+import { getRouterUsageCached } from "@/lib/claude/router-usage";
 import { getDb } from "@/lib/db";
 import { budgetHeadroom, withQuotaShare } from "@/lib/jobs/budget";
-import { budgetAwareQuotaShares, getProjectSettings, resolveBudgetPolicy } from "@/lib/projects";
+import { budgetAwareQuotaShares, getProjectSettings, quotaMeterKey, resolveBudgetPolicy } from "@/lib/projects";
 import { resolveGovernedShare } from "@/lib/quota-share";
 import { projectWeeklySpendPct } from "@/lib/quota-spend";
 import { withProject } from "../../resolve-project";
@@ -45,10 +46,14 @@ export const GET = withProject<{ slug: string }>(async (_request, { project }) =
   const share = resolveGovernedShare(project.id, await budgetAwareQuotaShares().catch(() => []));
   const policy = withQuotaShare(resolveBudgetPolicy(settings), share.sharePct);
 
-  const usage = await getClaudeUsageCached();
+  const meterKey = quotaMeterKey(settings);
+  const usage = meterKey === "anthropic"
+    ? await getClaudeUsageCached()
+    : await getRouterUsageCached(settings).catch(() => null);
   // The share is spent against this project's own attributed burn, so the lane has to charge the
   // same meter the governor does: the account-wide read above cannot say whose spend it is.
-  const projectWeeklyPct = await projectWeeklySpendPct(db, project.id, usage).catch(() => null);
+  const projectWeeklyPct = await projectWeeklySpendPct(db, project.id, usage, Date.now(), meterKey)
+    .catch(() => null);
   const headroom = budgetHeadroom(usage, policy, Date.now(), { projectWeeklyPct });
   if (!headroom) return new NextResponse(null, { status: 204 });
 
@@ -61,7 +66,7 @@ export const GET = withProject<{ slug: string }>(async (_request, { project }) =
   // the reverse for an expensive one.
   const [account, projectAverage] = await Promise.all([
     getBurnAverage(db, RUN_JOB_TYPE),
-    getProjectBurnAverage(db, project.id, RUN_JOB_TYPE),
+    getProjectBurnAverage(db, project.id, RUN_JOB_TYPE, meterKey),
   ]);
   const signal: BudgetSignal = {
     headroom,

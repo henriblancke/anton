@@ -10,6 +10,7 @@
  * here moves, so shrinking it per share would stop the whole machine at one repo's cut.
  */
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
@@ -42,9 +43,13 @@ vi.mock("../claude/router-usage", async () => {
   };
 });
 
-const { resolveBudgetPolicy, resolveProjectSpend, resolveProjectUsage, resolveProjectUsageFresh } = await import(
-  "./service-policy"
-);
+const {
+  resolveBudgetPolicy,
+  resolveProjectMeterKey,
+  resolveProjectSpend,
+  resolveProjectUsage,
+  resolveProjectUsageFresh,
+} = await import("./service-policy");
 
 /** The shipped weekly ceiling a share is a cut OF. */
 const TARGET = DEFAULT_PROJECT_BUDGET_POLICY.weeklyTargetPct;
@@ -359,19 +364,32 @@ describe("resolveProjectSpend", () => {
     projectId: string | null,
     opts: { attempts?: number; status?: string } = {},
   ): void {
+    const id = randomUUID();
+    const attempts = opts.attempts ?? 1;
     tdb.db
       .insert(schema.jobs)
       .values({
-        id: randomUUID(),
+        id,
         projectId,
         type: "execute-epic",
         status: opts.status ?? "done",
         payloadJson: "{}",
-        attempts: opts.attempts ?? 1,
-        spentAttempts: opts.attempts ?? 1,
+        attempts,
+        spentAttempts: attempts,
         updatedAt: new Date(),
       })
       .run();
+    if (!projectId) return;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      tdb.db.insert(schema.quotaAttempts).values({
+        id: `${id}-${attempt}`,
+        jobId: id,
+        projectId,
+        jobType: "execute-epic",
+        meterKey: "anthropic",
+        createdAt: new Date(),
+      }).run();
+    }
   }
 
   it("charges only the attempts this project made", async () => {
@@ -447,15 +465,41 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
   });
 
   it("uses the routed resolver for a fresh burn sample too", async () => {
-    project("routed", {
+    const settings = {
       claudeBaseUrl: "https://gw.example.com",
       claudeAuthTokenEnv: "GW_TOKEN",
       routerConnectionId: "conn_1",
-    });
+    };
+    project("routed", settings);
     routerUsageFreshOverride = async () => ROUTER_USAGE;
     const account = accountThunk();
 
-    expect(await resolveProjectUsageFresh("routed", account.read)).toEqual(ROUTER_USAGE);
+    expect(
+      await resolveProjectUsageFresh("routed", account.read, await resolveProjectMeterKey("routed")),
+    ).toEqual(ROUTER_USAGE);
+    expect(account.calls()).toBe(0);
+  });
+
+  it("skips a fresh sample when routing changes after the attempt starts", async () => {
+    const oldSettings = {
+      claudeBaseUrl: "https://old-router.example/v1",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("routed", oldSettings);
+    const expectedMeterKey = await resolveProjectMeterKey("routed");
+    await tdb.db
+      .update(schema.projects)
+      .set({
+        settingsJson: JSON.stringify({
+          ...oldSettings,
+          claudeBaseUrl: "https://new-router.example/v1",
+        }),
+      })
+      .where(eq(schema.projects.id, "routed"));
+    const account = accountThunk();
+
+    expect(await resolveProjectUsageFresh("routed", account.read, expectedMeterKey)).toBeNull();
     expect(account.calls()).toBe(0);
   });
 

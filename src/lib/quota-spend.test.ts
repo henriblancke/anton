@@ -4,15 +4,42 @@
  * let a failing project run free (every attempt burned quota, not just the ones that finished), and
  * it must not charge one project at another's measured rate.
  */
-import { beforeEach, afterEach, describe, expect, it } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { recordBurnSample } from "./burn";
 import * as schema from "./db/schema";
 import { makeTestDb, type TestDb } from "./db/testing";
 import { chargeSpentAttempt, leaseDue, reschedule, resumeJob, type Clock } from "./jobs/queue";
-import { projectWeeklySpendPct, weeklyWindowStart } from "./quota-spend";
+import { projectWeeklySpendPct, quotaShareProjects, weeklyWindowStart } from "./quota-spend";
 import { insertProject } from "@/lib/testing/project";
 import type { ClaudeUsage } from "./claude/usage";
+import type { ProjectSettings } from "./projects";
+
+const routerUsageForTest = new Map<string, ClaudeUsage | null>();
+vi.mock("./db", async () => {
+  const actual = await vi.importActual<typeof import("./db")>("./db");
+  return { ...actual, getDb: () => tdb.db };
+});
+vi.mock("./projects", async () => {
+  const actual = await vi.importActual<typeof import("./projects")>("./projects");
+  return { ...actual, listProjects: async () => actual.listProjects() };
+});
+vi.mock("./claude/usage", async () => {
+  const actual = await vi.importActual<typeof import("./claude/usage")>("./claude/usage");
+  return { ...actual, getClaudeUsageCached: async () => usage() };
+});
+vi.mock("./claude/router-usage", async () => {
+  const actual = await vi.importActual<typeof import("./claude/router-usage")>("./claude/router-usage");
+  return {
+    ...actual,
+    getRouterUsageCached: async (settings: ProjectSettings) =>
+      routerUsageForTest.get(settings.routerConnectionId ?? "") ?? null,
+  };
+});
+vi.mock("./quota-eligibility", async () => {
+  const actual = await vi.importActual<typeof import("./quota-eligibility")>("./quota-eligibility");
+  return { ...actual, observedWorkEligibility: async () => new Map<string, boolean | null>() };
+});
 
 const NOW = 1_700_000_000_000;
 const clock: Clock = { now: () => NOW };
@@ -30,18 +57,21 @@ let tdb: TestDb;
 
 beforeEach(() => {
   tdb = makeTestDb();
+  routerUsageForTest.clear();
 });
 afterEach(() => tdb.close());
 
-/** One job row inside the window, with `attempts` leases already spent on it. */
+/** One job row inside the window, with one immutable ledger entry for each Claude reach. */
 async function seedJob(
   projectId: string,
-  opts: { status: string; attempts: number; type?: string; id?: string },
+  opts: { status: string; attempts: number; type?: string; id?: string; meterKey?: string },
 ): Promise<string> {
   const id = opts.id ?? `${projectId}-${opts.status}-${opts.attempts}-${Math.random()}`;
+  const type = opts.type ?? "execute-epic";
+  const meterKey = opts.meterKey ?? "anthropic";
   await tdb.db.insert(schema.jobs).values({
     id,
-    type: opts.type ?? "execute-epic",
+    type,
     projectId,
     status: opts.status,
     runAt: new Date(NOW - 60_000),
@@ -49,17 +79,38 @@ async function seedJob(
     attempts: opts.attempts,
     spentAttempts: opts.attempts,
   });
+  for (let i = 0; i < opts.attempts; i++) {
+    await tdb.db.insert(schema.quotaAttempts).values({
+      id: `${id}-attempt-${i}`,
+      jobId: id,
+      projectId,
+      jobType: type,
+      meterKey,
+      createdAt: new Date(NOW - 60_000),
+    });
+  }
   return id;
 }
 
 /** A full sample window for one project, so its rate is measured (`seeded: false`) rather than the tier seed. */
-async function seedSamples(projectId: string | null, weeklyDelta: number): Promise<void> {
+async function seedSamples(
+  projectId: string | null,
+  weeklyDelta: number,
+  meterKey: string = "anthropic",
+): Promise<void> {
   for (let i = 0; i < 5; i++) {
     await recordBurnSample(tdb.db, clock, "execute-epic", projectId, {
       sessionDelta: 20,
       weeklyDelta,
-    });
+    }, meterKey);
   }
+}
+
+async function setSettings(projectId: string, settings: ProjectSettings): Promise<void> {
+  await tdb.db
+    .update(schema.projects)
+    .set({ settingsJson: JSON.stringify(settings) })
+    .where(eq(schema.projects.id, projectId));
 }
 
 describe("projectWeeklySpendPct", () => {
@@ -149,7 +200,7 @@ describe("projectWeeklySpendPct", () => {
     // This attempt reaches Claude: charged at the spawn, and a quota hit that refunds the RETRY
     // budget keeps the charge — Claude was reached, and a multi-call handler may have finished real
     // work before the wall.
-    await chargeSpentAttempt(tdb.db, "due");
+    await chargeSpentAttempt(tdb.db, leased!, "anthropic", clock);
     expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
     await reschedule(tdb.db, clock, "due", NOW + 120_000, { refundAttempt: true });
     expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBe(2);
@@ -164,17 +215,77 @@ describe("projectWeeklySpendPct", () => {
     const p = insertProject(tdb.db, { id: "W", slug: "w", name: "W", repoPath: "/tmp/W" });
     await seedSamples(p, 2);
     const before = weeklyWindowStart(usage(), NOW) - 60_000;
-    await tdb.db.insert(schema.jobs).values({
-      id: "stale",
-      type: "execute-epic",
-      projectId: p,
-      status: "done",
-      runAt: new Date(before),
-      updatedAt: new Date(before),
-      attempts: 9,
-      spentAttempts: 9,
-    });
+    const id = await seedJob(p, { status: "done", attempts: 1, id: "stale" });
+    await tdb.db
+      .update(schema.quotaAttempts)
+      .set({ createdAt: new Date(before) })
+      .where(eq(schema.quotaAttempts.jobId, id));
 
     expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW)).toBeNull();
+  });
+
+  it("does not price history from a former meter in the project's current meter", async () => {
+    const p = insertProject(tdb.db, { id: "M", slug: "m", name: "M", repoPath: "/tmp/M" });
+    const oldMeter = "router:https://router.example/api/usage/old";
+    const currentMeter = "router:https://router.example/api/usage/current";
+    await seedSamples(p, 9, oldMeter);
+    await seedJob(p, { status: "done", attempts: 2, meterKey: oldMeter });
+    await seedSamples(p, 2, currentMeter);
+    await seedJob(p, { status: "done", attempts: 1, meterKey: currentMeter });
+
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW, currentMeter)).toBe(2);
+    expect(await projectWeeklySpendPct(tdb.db, p, usage(), NOW, oldMeter)).toBe(18);
+  });
+});
+
+describe("quotaShareProjects", () => {
+  it("keeps mixed account and router history in each project's current meter window", async () => {
+    const account = insertProject(tdb.db, { id: "account", slug: "account", name: "Account", repoPath: "/tmp/account" });
+    const routerA = insertProject(tdb.db, { id: "router-a", slug: "router-a", name: "Router A", repoPath: "/tmp/router-a" });
+    const routerB = insertProject(tdb.db, { id: "router-b", slug: "router-b", name: "Router B", repoPath: "/tmp/router-b" });
+    const routerSettings = (connectionId: string): ProjectSettings => ({
+      budgetAware: true,
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: "ROUTER_TOKEN",
+      routerConnectionId: connectionId,
+    });
+    await setSettings(account, { budgetAware: true });
+    await setSettings(routerA, routerSettings("conn-a"));
+    await setSettings(routerB, routerSettings("conn-b"));
+
+    const resetSoon = new Date(NOW + 2 * 24 * 60 * 60 * 1000).toISOString();
+    const resetLate = new Date(NOW + 6 * 24 * 60 * 60 * 1000).toISOString();
+    routerUsageForTest.set("conn-a", { ...usage(), weeklyResetAt: resetSoon });
+    routerUsageForTest.set("conn-b", { ...usage(), weeklyResetAt: resetLate });
+
+    const meterA = "router:https://router.example/api/usage/conn-a";
+    const meterB = "router:https://router.example/api/usage/conn-b";
+    await seedSamples(account, 1);
+    await seedSamples(routerA, 2, meterA);
+    await seedSamples(routerB, 4, meterB);
+    await seedJob(account, { status: "done", attempts: 2 });
+    await seedJob(routerA, { status: "done", attempts: 3, meterKey: meterA });
+    await seedJob(routerB, { status: "done", attempts: 1, meterKey: meterB });
+    // Router A's window starts five days ago, while router B's starts one day ago. The prior A
+    // attempt belongs in A's independently reset window and must not affect another meter's pool.
+    const oldRouterA = await seedJob(routerA, {
+      status: "done",
+      attempts: 5,
+      meterKey: meterA,
+      id: "old-router-a",
+    });
+    await tdb.db
+      .update(schema.quotaAttempts)
+      .set({ createdAt: new Date(NOW - 3 * 24 * 60 * 60 * 1000) })
+      .where(eq(schema.quotaAttempts.jobId, oldRouterA));
+
+    const shares = await quotaShareProjects(NOW);
+    expect(shares).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: account, meterKey: "anthropic", spentWeeklyPct: 2 }),
+        expect.objectContaining({ id: routerA, meterKey: meterA, spentWeeklyPct: 16 }),
+        expect.objectContaining({ id: routerB, meterKey: meterB, spentWeeklyPct: 4 }),
+      ]),
+    );
   });
 });

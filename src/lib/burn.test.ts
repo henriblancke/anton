@@ -269,6 +269,26 @@ describe("getProjectBurnAverage", () => {
     expect((await getBurnAverage(t.db, "execute-epic")).sessionAvg).toBe(22);
   });
 
+  it("keeps one meter's samples out of another meter's average after routing changes", async () => {
+    const oldMeter = "router:https://router.example/api/usage/old";
+    const currentMeter = "router:https://router.example/api/usage/current";
+    for (let i = 0; i < BURN_SAMPLE_WINDOW; i++) {
+      await recordBurnSample(t.db, clock, "execute-epic", "proj-a", {
+        sessionDelta: 40,
+        weeklyDelta: 8,
+      }, oldMeter);
+      clock.advance(1_000);
+      await recordBurnSample(t.db, clock, "execute-epic", "proj-a", {
+        sessionDelta: 10,
+        weeklyDelta: 2,
+      }, currentMeter);
+      clock.advance(1_000);
+    }
+
+    expect((await getProjectBurnAverage(t.db, "proj-a", "execute-epic", oldMeter)).weeklyAvg).toBe(8);
+    expect((await getProjectBurnAverage(t.db, "proj-a", "execute-epic", currentMeter)).weeklyAvg).toBe(2);
+  });
+
   it("excludes unattributed samples rather than charging them to a project", async () => {
     for (let i = 0; i < BURN_SAMPLE_WINDOW; i++) {
       await recordBurnSample(t.db, clock, "execute-epic", null, { sessionDelta: 40, weeklyDelta: 5 });

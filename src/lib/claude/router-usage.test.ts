@@ -290,6 +290,31 @@ describe("getRouterUsageFresh", () => {
     expect(calls).toBe(2);
   });
 
+  it("joins an overlapping cached read instead of double-hitting the router", async () => {
+    process.env.ROUTER_TOKEN_TEST = "secret";
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetcher = async () => {
+      calls += 1;
+      await gate;
+      return withResponse(200, true, ROUTER_FIXTURE);
+    };
+    const now = () => 1_000;
+
+    const cached = getRouterUsageCached(SETTINGS, fetcher, now);
+    const fresh = getRouterUsageFresh(SETTINGS, fetcher, now);
+    release();
+
+    await expect(Promise.all([cached, fresh])).resolves.toEqual([
+      expect.objectContaining({ weeklyPct: 37 }),
+      expect.objectContaining({ weeklyPct: 37 }),
+    ]);
+    expect(calls).toBe(1);
+  });
+
   it("returns null during shared 429 backoff so a burn window cannot sample stale usage", async () => {
     process.env.ROUTER_TOKEN_TEST = "secret";
     const clock = 1_000;

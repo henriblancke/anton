@@ -102,13 +102,9 @@ export const jobs = sqliteTable(
     runAt: ts("run_at").notNull().default(now),
     leaseExpiresAt: ts("lease_expires_at"),
     attempts: integer("attempts").notNull().default(0),
-    // Attempts that ran Claude on this row, for the quota-share spend estimate (R6.3, ./quota-spend).
-    // `attempts` is the RETRY budget and is rewound on purpose — `resumeJob` zeroes it so an un-parked
-    // job gets a fresh run at `maxAttempts` — so a meter summing it lost every attempt the job had
-    // already burned the moment an operator or the picker resumed it, and the governor granted that
-    // quota again (PR #248 review). This counter is charged when the handler reaches Claude
-    // (`chargeSpentAttempt`), never at the lease — an attempt that exits in preflight is not spend —
-    // and is never rewound or refunded: nothing else touches it.
+    // Attempts that ran Claude on this row. This remains a cheap row-level diagnostic, but quota
+    // attribution reads the append-only `quota_attempts` ledger because one resumed job can spend
+    // through more than one meter after an operator changes its routing.
     spentAttempts: integer("spent_attempts").notNull().default(0),
     lastError: text("last_error"),
     // What the handler reported it actually DID, written when the job completes (anton-znoz).
@@ -157,14 +153,28 @@ export const jobs = sqliteTable(
     index("jobs_project_parked_idx")
       .on(table.projectId, table.updatedAt)
       .where(sql`${table.status} = 'parked'`),
-    // Serves the quota-share spend estimate (R6.3, ./quota-spend), which sums spent attempts over the
-    // current quota week: once per governor tick for one project, and once per settings render for
-    // every project. `updated_at` leads because the week window is the predicate BOTH readers share
-    // — the all-project read has no project to seek on, so a (project_id, updated_at) index would
-    // leave it scanning a jobs table that keeps every finished job for the life of the project.
-    // Seeking the week first bounds both to the same small slice, and the per-project read narrows
-    // inside it without a second index to maintain on every job write.
-    index("jobs_updated_project_idx").on(table.updatedAt, table.projectId),
+  ],
+);
+
+/** Every Claude-reaching attempt, frozen against the meter that was configured at its spawn. */
+export const quotaAttempts = sqliteTable(
+  "quota_attempts",
+  {
+    id: text("id").primaryKey(),
+    jobId: text("job_id").notNull(),
+    projectId: text("project_id").notNull(),
+    jobType: text("job_type").notNull(),
+    meterKey: text("meter_key").notNull(),
+    createdAt: ts("created_at").notNull().default(now),
+  },
+  (table) => [
+    // The meter and quota week bound both board-wide and per-project reads; the latter narrows inside.
+    index("quota_attempts_meter_created_project_idx").on(
+      table.meterKey,
+      table.createdAt,
+      table.projectId,
+      table.jobType,
+    ),
   ],
 );
 
@@ -200,6 +210,9 @@ export const burnSamples = sqliteTable(
     // belong to no project's share. Per-project reads match on equality, so unattributed rows are
     // excluded by construction rather than misattributed.
     projectId: text("project_id").references(() => projects.id),
+    // The meter whose before/after snapshots produced this delta. Frozen at spawn so later routing
+    // changes cannot price an Anthropic sample in a router's quota points (or vice versa).
+    meterKey: text("meter_key").notNull().default("anthropic"),
     // session/weekly utilization delta (0–100 percentage points) burned across the job.
     sessionDelta: real("session_delta").notNull(),
     weeklyDelta: real("weekly_delta").notNull(),
@@ -209,10 +222,11 @@ export const burnSamples = sqliteTable(
     // Serve the "most recent N samples for this type" query without a full scan. Kept alongside the
     // per-project index: the per-type average is still read globally for cost estimates.
     index("burn_samples_type_created_idx").on(table.jobType, table.createdAt),
-    // Serve "most recent N samples for this project and type" — the per-project spend read.
-    index("burn_samples_project_type_created_idx").on(
+    // Serve "most recent N samples for this project, type and meter" — the per-project spend read.
+    index("burn_samples_project_type_meter_created_idx").on(
       table.projectId,
       table.jobType,
+      table.meterKey,
       table.createdAt,
     ),
   ],

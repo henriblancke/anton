@@ -58,22 +58,24 @@ export function weeklyWindowStart(usage: ClaudeUsage | null, now: number): numbe
 async function attemptsByProject(
   db: AntonDb,
   since: number,
+  meterKey: string,
   projectId?: string,
 ): Promise<Map<string, Map<string, number>>> {
   const rows = await db
     .select({
-      projectId: schema.jobs.projectId,
-      type: schema.jobs.type,
-      attempts: sql<number>`sum(${schema.jobs.spentAttempts})`,
+      projectId: schema.quotaAttempts.projectId,
+      type: schema.quotaAttempts.jobType,
+      attempts: sql<number>`count(*)`,
     })
-    .from(schema.jobs)
+    .from(schema.quotaAttempts)
     .where(
       and(
-        gte(schema.jobs.updatedAt, new Date(since)),
-        ...(projectId ? [eq(schema.jobs.projectId, projectId)] : []),
+        gte(schema.quotaAttempts.createdAt, new Date(since)),
+        eq(schema.quotaAttempts.meterKey, meterKey),
+        ...(projectId ? [eq(schema.quotaAttempts.projectId, projectId)] : []),
       ),
     )
-    .groupBy(schema.jobs.projectId, schema.jobs.type);
+    .groupBy(schema.quotaAttempts.projectId, schema.quotaAttempts.jobType);
 
   const byProject = new Map<string, Map<string, number>>();
   for (const row of rows) {
@@ -93,14 +95,19 @@ async function attemptsByProject(
  * per-type average. A project with no samples of its own falls back to the tier seed and reports
  * `seeded`, which is the honest answer; borrowing a neighbour's measured rate is not.
  */
-async function burnAveragesFor(db: AntonDb, projectId: string, types: Iterable<string>) {
+async function burnAveragesFor(
+  db: AntonDb,
+  projectId: string,
+  meterKey: string,
+  types: Iterable<string>,
+) {
   const charged = [...new Set(types)].filter((type): type is JobType =>
     burnsClaudeQuota(type as JobType),
   );
   return new Map(
     await Promise.all(
       charged.map(
-        async (type) => [type, await getProjectBurnAverage(db, projectId, type)] as const,
+        async (type) => [type, await getProjectBurnAverage(db, projectId, type, meterKey)] as const,
       ),
     ),
   );
@@ -137,10 +144,11 @@ export async function projectWeeklySpendPct(
   projectId: string,
   usage: ClaudeUsage | null,
   now: number = Date.now(),
+  meterKey: string = "anthropic",
 ): Promise<number | null> {
-  const byProject = await attemptsByProject(db, weeklyWindowStart(usage, now), projectId);
+  const byProject = await attemptsByProject(db, weeklyWindowStart(usage, now), meterKey, projectId);
   const types = byProject.get(projectId);
-  return chargeSpend(types, await burnAveragesFor(db, projectId, types?.keys() ?? []))
+  return chargeSpend(types, await burnAveragesFor(db, projectId, meterKey, types?.keys() ?? []))
     .spentWeeklyPct;
 }
 
@@ -171,12 +179,15 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
       return getRouterUsageCached(stored).catch(() => null);
     }),
   );
-  const windowStarts = [...new Set(meterUsage.map((usage) => weeklyWindowStart(usage, now)))];
-  const attemptsByWindow = new Map(
+  const meterWindows = new Map<string, number>();
+  for (const [index, stored] of settings.entries()) {
+    meterWindows.set(quotaMeterKey(stored), weeklyWindowStart(meterUsage[index] ?? null, now));
+  }
+  const attemptsByMeter = new Map(
     await Promise.all(
-      windowStarts.map(async (since) => [
-        since,
-        await attemptsByProject(db, since).catch(() => new Map<string, Map<string, number>>()),
+      [...meterWindows].map(async ([meterKey, since]) => [
+        meterKey,
+        await attemptsByProject(db, since, meterKey).catch(() => new Map<string, Map<string, number>>()),
       ] as const),
     ),
   );
@@ -191,11 +202,12 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
 
   return Promise.all(projects.map(async (project, index) => {
     const stored = settings[index];
-    const attempts = attemptsByWindow.get(weeklyWindowStart(meterUsage[index] ?? null, now)) ?? new Map();
+    const meterKey = quotaMeterKey(stored);
+    const attempts = attemptsByMeter.get(meterKey) ?? new Map();
     const types = attempts.get(project.id);
     const { spentWeeklyPct, seeded } = chargeSpend(
       types,
-      await burnAveragesFor(db, project.id, types?.keys() ?? []),
+      await burnAveragesFor(db, project.id, meterKey, types?.keys() ?? []),
     );
     return {
       id: project.id,
@@ -204,7 +216,7 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
       sharePct: stored.quotaSharePct ?? defaultQuotaSharePct(governedCounts.get(quotaMeterKey(stored)) ?? 0),
       declared: stored.quotaSharePct !== undefined,
       governed: stored.budgetAware === true,
-      meterKey: quotaMeterKey(stored),
+      meterKey,
       reserved: stored.reserveQuotaShare === true,
       eligible: eligibilityOf(eligible, project.id),
       spentWeeklyPct,

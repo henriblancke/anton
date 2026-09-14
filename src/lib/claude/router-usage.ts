@@ -191,12 +191,25 @@ export async function getRouterUsageFresh(
   }
 
   const k = key(url, connectionId, tokenEnv);
-  const ts = now();
-  if (ts < (backoffUntil.get(k) ?? 0)) return null;
+  if (now() < (backoffUntil.get(k) ?? 0)) return null;
 
-  const value = await fetchRouterUsage(settings, fetcher);
-  cache.set(k, { at: ts, value });
-  return value;
+  // A fresh sampling edge cannot reuse a settled cache entry, but it joins an overlapping read:
+  // otherwise a governor read and this edge double-hit the same router at the same instant.
+  const stale = inFlight.get(k);
+  if (stale) return stale;
+
+  const ts = now();
+  const promise = (async () => {
+    try {
+      const value = await fetchRouterUsage(settings, fetcher);
+      cache.set(k, { at: ts, value });
+      return value;
+    } finally {
+      inFlight.delete(k);
+    }
+  })();
+  inFlight.set(k, promise);
+  return promise;
 }
 
 /**

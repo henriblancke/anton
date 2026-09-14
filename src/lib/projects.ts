@@ -1627,13 +1627,14 @@ async function deleteSessionLogs(db: AntonDb, projectId: string): Promise<void> 
  * DELETE CASCADE in the schema): sessions → runs → jobs → schedules → run-health → picker plan →
  * picker verdicts → picker starts → claude invocations → hygiene → scan summaries → autopilot
  * disarms → escalations →
- * burn samples (detached, not deleted) → projects.
+ * burn samples (detached, not deleted) → quota-attempt ledger → projects.
  */
 function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
   try {
     db.transaction((tx) => {
       tx.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId)).run();
       tx.delete(schema.runs).where(eq(schema.runs.projectId, projectId)).run();
+      tx.delete(schema.quotaAttempts).where(eq(schema.quotaAttempts.projectId, projectId)).run();
       tx.delete(schema.jobs).where(eq(schema.jobs.projectId, projectId)).run();
       tx.delete(schema.schedules).where(eq(schema.schedules.projectId, projectId)).run();
       tx.delete(schema.runHealthReports).where(eq(schema.runHealthReports.projectId, projectId)).run();

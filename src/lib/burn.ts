@@ -122,11 +122,13 @@ export async function recordBurnSample(
   jobType: JobType,
   projectId: string | null,
   sample: BurnSample,
+  meterKey: string = "anthropic",
 ): Promise<void> {
   await db.insert(schema.burnSamples).values({
     id: randomUUID(),
     jobType,
     projectId,
+    meterKey,
     sessionDelta: sample.sessionDelta,
     weeklyDelta: sample.weeklyDelta,
     createdAt: new Date(Math.floor(clock.now() / 1000) * 1000),
@@ -157,7 +159,7 @@ export async function getBurnAverage(
   jobType: JobType,
   window: number = BURN_SAMPLE_WINDOW,
 ): Promise<BurnAverage> {
-  return averageOf(await recentSamples(db, jobType, undefined, window), jobType, window);
+  return averageOf(await recentSamples(db, jobType, undefined, undefined, window), jobType, window);
 }
 
 /**
@@ -173,16 +175,18 @@ export async function getProjectBurnAverage(
   db: AntonDb,
   projectId: string,
   jobType: JobType,
+  meterKey: string = "anthropic",
   window: number = BURN_SAMPLE_WINDOW,
 ): Promise<BurnAverage> {
-  return averageOf(await recentSamples(db, jobType, projectId, window), jobType, window);
+  return averageOf(await recentSamples(db, jobType, projectId, meterKey, window), jobType, window);
 }
 
-/** The most recent `window` samples for a type, optionally narrowed to one project. */
+/** The most recent `window` samples for a type, optionally narrowed to one project and meter. */
 async function recentSamples(
   db: AntonDb,
   jobType: JobType,
   projectId: string | undefined,
+  meterKey: string | undefined,
   window: number,
 ): Promise<BurnSample[]> {
   return db
@@ -197,6 +201,7 @@ async function recentSamples(
         : and(
             eq(schema.burnSamples.jobType, jobType),
             eq(schema.burnSamples.projectId, projectId),
+            eq(schema.burnSamples.meterKey, meterKey!),
           ),
     )
     .orderBy(desc(schema.burnSamples.createdAt))
@@ -239,12 +244,13 @@ export async function sampleJobBurn(
   projectId: string | null,
   before: ClaudeUsage | null,
   read: () => Promise<ClaudeUsage | null>,
+  meterKey: string = "anthropic",
 ): Promise<BurnSample | null> {
   try {
     const after = await read();
     const sample = burnDelta(before, after);
     if (!sample) return null;
-    await recordBurnSample(db, clock, jobType, projectId, sample);
+    await recordBurnSample(db, clock, jobType, projectId, sample, meterKey);
     return sample;
   } catch {
     return null;

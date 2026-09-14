@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "vitest";
 import * as schema from "../db/schema";
-import { getBurnAverage } from "../burn";
+import { getBurnAverage, getProjectBurnAverage } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
 import { DEFAULT_BUDGET_POLICY } from "./budget";
 import { PoisonEpic, RunAlreadyLiveError } from "./errors";
@@ -98,6 +98,24 @@ describe("JobRunner per-job burn sampling (anton-w8ny)", () => {
     expect(routerReads).toBe(2);
     expect(accountFreshReads).toBe(0);
     expect((await getBurnAverage(h.db, "execute-epic", 1)).sessionAvg).toBe(20);
+  });
+
+  it("stamps a routed sample with the meter captured at Claude reach", async () => {
+    h.seedProjects("routed");
+    const meterKey = "router:https://router.example/api/usage/conn";
+    const r = h.makeRunner({
+      handlers: { "execute-epic": async (ctx) => ctx.claudeReached() },
+      resolveBudgetPolicy: budgetAware,
+      resolveProjectMeterKey: () => meterKey,
+      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 5 }),
+      readUsageFresh: freshSequence({ sessionPct: 10, weeklyPct: 5 }, { sessionPct: 30, weeklyPct: 8 }),
+    });
+    await r.enqueue({ type: "execute-epic", projectId: "routed" });
+    await r.tickOnce();
+    await r.whenIdle();
+
+    expect((await h.db.select().from(schema.burnSamples))[0]?.meterKey).toBe(meterKey);
+    expect((await getProjectBurnAverage(h.db, "routed", "execute-epic", meterKey)).weeklyAvg).toBe(3);
   });
 
   it("leaves the project null for a job that belongs to none", async () => {

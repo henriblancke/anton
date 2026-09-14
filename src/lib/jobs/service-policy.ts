@@ -110,13 +110,25 @@ function meterShareBoard(board: readonly GovernedShare[], settings: Parameters<t
  * reset the gate is deciding against. Fails soft to `null` — unattributed, never zero — so a db
  * hiccup relaxes the share rather than parking the project.
  */
+export async function resolveProjectMeterKey(projectId: string | null): Promise<string> {
+  if (!projectId) return "anthropic";
+  const settings = await getProjectSettings(getDb(), projectId);
+  return quotaMeterKey(settings);
+}
+
 export async function resolveProjectSpend(
   projectId: string | null,
   usage: ClaudeUsage | null,
 ): Promise<number | null> {
   if (!projectId) return null;
   try {
-    return await projectWeeklySpendPct(getDb(), projectId, usage);
+    return await projectWeeklySpendPct(
+      getDb(),
+      projectId,
+      usage,
+      Date.now(),
+      await resolveProjectMeterKey(projectId),
+    );
   } catch {
     return null;
   }
@@ -144,8 +156,15 @@ export async function resolveProjectUsage(
 export async function resolveProjectUsageFresh(
   projectId: string | null,
   accountUsage: () => Promise<ClaudeUsage | null>,
+  expectedMeterKey?: string,
 ): Promise<ClaudeUsage | null> {
-  return resolveProjectMeter(projectId, accountUsage, getRouterUsageFresh);
+  if (!projectId) return expectedMeterKey && expectedMeterKey !== "anthropic" ? null : accountUsage();
+  const settings = await getProjectSettings(getDb(), projectId).catch(() => null);
+  if (!settings) return null;
+  const meterKey = quotaMeterKey(settings);
+  if (expectedMeterKey && meterKey !== expectedMeterKey) return null;
+  if (meterKey === "anthropic") return accountUsage();
+  return getRouterUsageFresh(settings).catch(() => null);
 }
 
 async function resolveProjectMeter(
