@@ -5,7 +5,12 @@
  * sibling `runner.lifecycle.test.ts`.
  */
 import { describe, expect, it } from "vitest";
-import { RunAlreadyLiveError, StaleCheckoutError, SyncNotWiredError } from "./errors";
+import {
+  BoardUnreachableError,
+  RunAlreadyLiveError,
+  StaleCheckoutError,
+  SyncNotWiredError,
+} from "./errors";
 import { BUDGET_DEFER_PREFIX, BUDGET_DEFER_PRIOR_SEP } from "./queue";
 import { classifyError, hasPriorAttempt, nextAction } from "./runner";
 import { CONFIG } from "./runner.fixture";
@@ -144,6 +149,32 @@ describe("nextAction (pure durability policy)", () => {
     expect(classifyError(new StaleCheckoutError("behind its own code"))).toEqual({
       kind: "stale-checkout",
       error: "behind its own code",
+    });
+  });
+
+  it("reschedules a board outage to a probe cadence and refunds the attempt (anton-1q70)", () => {
+    // The board itself is down, not this job — spending the retry budget in minutes would still
+    // leave the queue parked long after the board returns. It refunds and never counts toward a
+    // park, however many attempts it has already spent.
+    const a = nextAction(
+      CONFIG,
+      { attempts: 3 },
+      { kind: "board-unreachable", error: "Dolt server unreachable" },
+      now,
+    );
+    expect(a.action).toBe("reschedule");
+    if (a.action !== "reschedule") throw new Error("unreachable");
+    expect(a.runAtMs).toBe(now + CONFIG.boardUnreachableRetryMs);
+    expect(a.refundAttempt).toBe(true);
+    // The classified reason is the row's only durable, operator-facing record of the outage.
+    expect(a.lastError).toContain("Dolt server unreachable");
+    expect(a.lastError).toContain(new Date(now + CONFIG.boardUnreachableRetryMs).toISOString());
+  });
+
+  it("classifies BoardUnreachableError as a board-unreachable outcome (anton-1q70)", () => {
+    expect(classifyError(new BoardUnreachableError("Dolt server unreachable"))).toEqual({
+      kind: "board-unreachable",
+      error: "Dolt server unreachable",
     });
   });
 
