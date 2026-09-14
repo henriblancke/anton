@@ -214,14 +214,20 @@ describe("bd timeout reaps the whole process group (anton-jfjw.1)", () => {
   });
 
   it("surfaces the wedge through runDoltSync instead of burying it under partial output", async () => {
-    // A wedged step's captured stderr is startup noise; runDoltSync prefers attached output over the
-    // message, so attaching it would hide the real cause (the anton-be1s failure mode). It must not.
+    // A wedged step's captured stderr is startup noise; runDoltSync must not let it bury the real
+    // cause (the anton-be1s failure mode) — and must preserve the typed BoardUnreachableError bd()
+    // already raised rather than reclassifying it from output text (PR #277 review), so the message
+    // is the timeout's own, not a re-wrapped "bd dolt pull failed in ...: bd dolt pull in ..." echo.
     fakeBd("bd-noisy-hang", [
       "#!/bin/sh",
       'echo "warning: whatever" >&2',
       "sleep 30",
     ]);
-    await expect(runDoltSync(dir)).rejects.toThrow(/bd dolt pull failed[\s\S]*exceeded its \d+ms budget/);
+    const err = (await runDoltSync(dir).catch((e: Error) => e)) as Error & { boardCause?: string };
+    expect(err.message).toMatch(/exceeded its \d+ms budget/);
+    expect(err.message).not.toContain("warning: whatever");
+    expect(isBoardUnreachableError(err)).toBe(true);
+    expect(err.boardCause).toBe("board-timeout");
   });
 });
 

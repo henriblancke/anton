@@ -6,7 +6,7 @@
  * pull → commit → push. ./sync-coalescer decides WHEN a pass runs and imports the pass from here;
  * ./bd re-exports the public surface. Neither imports back, so each side is testable alone.
  */
-import { BoardUnreachableError } from "../jobs/errors";
+import { BoardUnreachableError, isBoardUnreachableError } from "../jobs/errors";
 import { passwordVarHint } from "./bd-env";
 import { boardUnreachableCause, isBoardUnreachableOutput } from "./board-unreachable";
 import { isServerMode, readBoardMode, type BoardModeInfo } from "./board-mode";
@@ -307,6 +307,13 @@ export async function runDoltSync(
       // local state, real divergence) rejects here — in a full pass, before push — so a pass that
       // never applied inbound changes is never silently recorded as "synced" on a no-op push.
       if (args[1] === "pull" && isFirstPublishPullOutput(output)) continue;
+      // `bd()` itself already classifies some failures structurally — the per-step budget timeout
+      // throws a BoardUnreachableError with boardCause: "board-timeout" and no stdout/stderr to
+      // pattern-match. Reclassifying via doltSyncFailure's output regexes would silently downgrade
+      // that to a plain Error (the timeout message matches none of them), and callers like the
+      // sync-push handler would burn their retry budget instead of using the refunded board-outage
+      // cadence (PR #277 review).
+      if (isBoardUnreachableError(e)) throw e;
       throw doltSyncFailure(`bd ${args.join(" ")} failed in ${cwd}: ${output}`, output, e);
     }
   }
