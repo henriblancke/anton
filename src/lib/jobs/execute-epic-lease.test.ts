@@ -11,7 +11,11 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
-import { isRunAlreadyLiveError } from "./errors";
+import {
+  BoardUnreachableError,
+  isBoardUnreachableError,
+  isRunAlreadyLiveError,
+} from "./errors";
 
 const publishRunLeaseMock = vi.fn();
 const clearRunLeaseMock = vi.fn();
@@ -94,6 +98,19 @@ describe("claim", () => {
     const l = lease(fakeClock());
     await expect(l.claim(true)).rejects.toThrow(/could not publish its run-lease/);
     await l.claim(true).catch((e) => expect(isRunAlreadyLiveError(e)).toBe(true));
+  });
+
+  it("preserves a typed board outage so the runner can refund it at probe cadence", async () => {
+    syncMock.mockRejectedValueOnce(new BoardUnreachableError("Dolt server unreachable"));
+
+    await lease(fakeClock())
+      .claim(true)
+      .then(() => expect.unreachable("claim should preserve the board outage"))
+      .catch((e) => {
+        expect(e).toBeInstanceOf(BoardUnreachableError);
+        expect(isBoardUnreachableError(e)).toBe(true);
+        expect(isRunAlreadyLiveError(e)).toBe(false);
+      });
   });
 
   it("parks when the arbitration pull fails — a stale view cannot prove the race was won", async () => {

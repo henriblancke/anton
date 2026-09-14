@@ -7,7 +7,7 @@
  * of either is how a stopped run leaves an epic looking live until its TTL runs out.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { RunAlreadyLiveError } from "./errors";
+import { isBoardUnreachableError, RunAlreadyLiveError } from "./errors";
 import { safe } from "./execute-epic-persist";
 import type { Clock } from "./queue";
 
@@ -302,19 +302,15 @@ export function makeRunLease(args: {
 }
 
 /**
- * The initial publish, which fails closed as a PARK rather than a hard failure (anton-jz1).
- *
- * A transient board outage (Dolt remote/CLI unavailable) at run start leaves us unable to prove we
- * hold the shared lease — the same "can't prove liveness" condition the arbitration and
- * {@link RunLease.assertHeld} already treat as a RunAlreadyLiveError (park + retry, refunding the
- * attempt and cooling off until the board is reachable). Marking it `failed` instead would burn retry
- * attempts on a temporary outage and eventually strand an approved job for a human. Not proceeding is
- * what matters here; parking doesn't proceed any more than failing does, and it recovers on its own.
+ * The initial publish fails closed: an unpublished lease cannot authorize work other machines cannot
+ * see. A typed board outage remains typed so the runner refunds it at the board probe cadence and
+ * run-health can surface the project/cause outage; other publication failures are lease uncertainty.
  */
 async function publishOrPark(state: LeaseState): Promise<void> {
   try {
     await publishLease(state);
   } catch (e) {
+    if (isBoardUnreachableError(e)) throw e;
     throw new RunAlreadyLiveError(
       `${state.targetId} could not publish its run-lease to the shared board (${
         e instanceof Error ? e.message : String(e)
