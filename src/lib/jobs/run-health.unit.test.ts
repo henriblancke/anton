@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import type { Bead, Gate } from "../beads/bd";
 import { LABELS } from "../beads/bd";
 import {
+  boardUnreachableFinding,
   detectDeadLeases,
   detectExhaustedJobs,
   detectOpenHumanGates,
@@ -442,6 +443,19 @@ describe("detectExhaustedJobs", () => {
       );
       const second = detectExhaustedJobs([outageJob("j-2", "sync-push", 45)], 3, NOW);
       expect(first[0]?.key).toBe(second[0]?.key);
+    });
+
+    it("never collides with a live outage's key for the same project and cause (PR #277 review)", () => {
+      // A release starting mid-outage first raises boardUnreachableFinding's jobless live alert;
+      // once the board recovers, detectExhaustedJobs' legacy branch reports the still-parked
+      // pre-upgrade job under the same project/cause. Sharing one key would make raiseEscalation
+      // return the live row untouched — jobless, no Resume/Abandon — forever.
+      const live = boardUnreachableFinding("p1", "server-unreachable", NOW);
+      const [legacy] = detectExhaustedJobs([outageJob("j-1", "execute-epic", 60)], 3, NOW);
+      expect(legacy.key).not.toBe(live.key);
+      expect(legacy.key.startsWith(live.key)).toBe(true);
+      expect(legacy.jobId).toBe("j-1");
+      expect(live.jobId).toBeUndefined();
     });
   });
 });

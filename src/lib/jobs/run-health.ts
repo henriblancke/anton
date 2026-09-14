@@ -272,6 +272,17 @@ const BOARD_OUTAGE_REMEDY: Record<BoardUnreachableCause, { target: string; remed
   },
 };
 
+/**
+ * Marks a legacy migration-aid aggregate's key as distinct from the live outage's (PR #277 review).
+ * Both start from the same `BOARD_UNREACHABLE_FINDING_PREFIX`, so `isBoardUnreachableFindingKey`
+ * still buckets them together in the UI — but sharing the exact key let a legacy aggregate collide
+ * with an open live-outage row: `raiseEscalation` looks up the open row by key alone and returns it
+ * unchanged when found, so the row stayed jobless (no Resume/Abandon) even once a still-parked
+ * representative job was known. Distinct keys mean the legacy aggregate always raises (or keeps) its
+ * own row, and the live row is freed to retire on the next successful board read.
+ */
+const LEGACY_OUTAGE_KEY_SUFFIX = ":legacy";
+
 /** One board-wide outage's still-growing tally, kept while the job loop finds more of its jobs. */
 interface OutageGroup {
   cause: BoardUnreachableCause;
@@ -403,7 +414,7 @@ export function detectExhaustedJobs(
     const { representative, since, count } = outage;
     findings.push({
       kind: "exhausted-job",
-      key: `${BOARD_UNREACHABLE_FINDING_PREFIX}${representative.projectId ?? "?"}:${outage.cause}`,
+      key: `${BOARD_UNREACHABLE_FINDING_PREFIX}${representative.projectId ?? "?"}:${outage.cause}${LEGACY_OUTAGE_KEY_SUFFIX}`,
       reason:
         `${target} is unreachable — ${count} job${count === 1 ? "" : "s"} parked on the same ` +
         `outage. ${remedy}.`,
