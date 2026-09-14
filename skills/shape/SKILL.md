@@ -246,13 +246,17 @@ for (const bead of all) for (const edge of bead.dependencies ?? []) {
 // feature that depends on one of them — same shape as computeEpicGraph's blocked-children rollup
 // (epic-graph.ts), simplified to "closed" for done (this audit runs on freshly shaped work, so a
 // merged-but-not-closed distinction does not arise).
-const heldIds = (tickets) => {
+const heldIds = (feature, tickets) => {
   const ids = new Set(tickets.map((t) => t.id));
-  const heldByExternal = (id) => (blockersOf.get(id) ?? []).some((blockerId) => {
+  const isHeld = (blockerId) => {
     if (ids.has(blockerId)) return false; // inside this feature — ordering, not a gate
     const blocker = byId.get(blockerId);
     return !blocker || blocker.status !== "closed"; // unknown or open blocker reads as held (fail-safe)
-  });
+  };
+  // Same short-circuit as unitHeld in runReadiness (epic-graph.ts): a `blocks` edge on the
+  // feature itself gates every ticket underneath, not just the ones naming the blocker directly.
+  if ((blockersOf.get(feature.id) ?? []).some(isHeld)) return ids;
+  const heldByExternal = (id) => (blockersOf.get(id) ?? []).some(isHeld);
   const held = new Set(tickets.filter((t) => heldByExternal(t.id)).map((t) => t.id));
   for (let grew = true; grew; ) {
     grew = false;
@@ -286,7 +290,7 @@ const orderTickets = (tickets) => {
 for (const feature of all.filter((b) => b.issue_type === "feature")) {
   console.log(`feature ${feature.id}:`);
   const tickets = runTickets(feature.id);
-  const held = heldIds(tickets);
+  const held = heldIds(feature, tickets);
   const dispatchable = tickets.filter((t) => !held.has(t.id));
   for (const [index, ticket] of orderTickets(dispatchable).entries())
     console.log(`  ${index + 1}. ${ticket.id}\t${ticket.title}`);
