@@ -175,9 +175,7 @@ async function resolveProjectMeter(
   if (!projectId) return accountUsage();
   const settings = await getProjectSettings(getDb(), projectId).catch(() => undefined);
   if (settings === undefined) return null;
-  const baseUrl = settings.claudeBaseUrl?.trim();
-  const connectionId = settings.routerConnectionId?.trim();
-  if (!baseUrl || !connectionId) return accountUsage(); // unrouted → today's meter
+  if (quotaMeterKey(settings) === "anthropic") return accountUsage(); // unrouted → today's meter
   // Routed: the account meter is not this project's traffic, so it is never read on its behalf —
   // `accountUsage` goes uncalled and a router-only board makes no Anthropic request this tick.
   return readRouter(settings).catch(() => null);

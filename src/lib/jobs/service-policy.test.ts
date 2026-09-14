@@ -511,6 +511,18 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
     expect(account.calls()).toBe(1);
   });
 
+  it("uses the account meter when the shared meter-key resolver rejects an invalid route", async () => {
+    project("invalid-route", {
+      claudeBaseUrl: "not-a-url",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage("invalid-route", account.read)).toBe(ACCOUNT_USAGE);
+    expect(account.calls()).toBe(1);
+  });
+
   it("fails open to null when a routed project's router cannot be read", async () => {
     project("routed", {
       claudeBaseUrl: "https://gw.example.com",

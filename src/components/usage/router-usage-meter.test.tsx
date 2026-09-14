@@ -34,6 +34,38 @@ describe("RouterUsageMeter", () => {
     expect(container.textContent).toBe("");
   });
 
+  it("clears the previous project's meter before a replacement slug can fail", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/first/router-usage")) {
+        return new Response(
+          JSON.stringify({
+            state: "ok",
+            usage: {
+              sessionPct: 20,
+              weeklyPct: 30,
+              sessionResetAt: null,
+              weeklyResetAt: null,
+              plan: "Claude Code",
+            },
+            endpointHost: "first-router.example",
+            connectionId: "conn_first",
+            dashboardUrl: "https://first-router.example",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(null, { status: 503 });
+    });
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+    const { rerender } = render(<RouterUsageMeter slug="first" />);
+
+    await screen.findByRole("button", { name: /Routed quota via first-router.example/ });
+    rerender(<RouterUsageMeter slug="second" />);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/projects/second/router-usage", { cache: "no-store" }));
+    expect(screen.queryByRole("button", { name: /first-router.example/ })).toBeNull();
+  });
+
   it("labels a routed project's meter with the endpoint host and the collapse rule, and links the router's dashboard", async () => {
     stubFetch(
       json({

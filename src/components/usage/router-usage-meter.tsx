@@ -33,7 +33,7 @@ const TONE_BORDER: Record<UsageTone, string> = {
  * known view rather than flashing the meter away for one bad poll.
  */
 function useRouterUsage(slug: string): RouterUsageView | null {
-  const [view, setView] = useState<RouterUsageView | null>(null);
+  const [reading, setReading] = useState<{ slug: string; view: RouterUsageView | null }>({ slug, view: null });
 
   useEffect(() => {
     let cancelled = false;
@@ -43,12 +43,12 @@ function useRouterUsage(slug: string): RouterUsageView | null {
         const res = await fetch(`/api/projects/${slug}/router-usage`, { cache: "no-store" });
         if (cancelled) return;
         if (res.status === 204) {
-          setView(null); // not routed — nothing to show here, the nav pill already covers it
+          setReading({ slug, view: null }); // not routed — nothing to show here, the nav pill already covers it
           return;
         }
         if (!res.ok) return; // transient error — keep last known good
         const data = (await res.json()) as RouterUsageView;
-        if (!cancelled) setView(data);
+        if (!cancelled) setReading({ slug, view: data });
       } catch {
         // network error / aborted — retry on the next tick, keep the current reading
       }
@@ -62,7 +62,8 @@ function useRouterUsage(slug: string): RouterUsageView | null {
     };
   }, [slug]);
 
-  return view;
+  // A new project must never temporarily inherit another project's routed quota on a reused view.
+  return reading.slug === slug ? reading.view : null;
 }
 
 function DashboardLink({ url }: { url: string }) {
