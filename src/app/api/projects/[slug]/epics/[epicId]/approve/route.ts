@@ -161,7 +161,7 @@ async function applyProposalResponse(
 }
 
 export const POST = withProject<{ slug: string; epicId: string }>(async (request, { project, params }) => {
-  const { epicId } = await params;
+  const { epicId } = params;
 
   // Gate approval on readiness: approving enqueues execute-epic immediately, so an epic with open
   // blockers must not be startable before its blocker completes. Locate it across stages first.

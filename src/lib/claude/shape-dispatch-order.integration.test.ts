@@ -6,10 +6,10 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { describeBd, hasBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
+import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { skillPath } from "./prompt";
 
-const REAL_BD = hasBd() ? execFileSync("which", ["bd"], { encoding: "utf8" }).trim() : "";
+let realBd = "";
 
 function phaseFiveOrderCommand(): string {
   const skill = readFileSync(skillPath("shape"), "utf8");
@@ -44,6 +44,7 @@ describeBd("/shape Phase 5 dispatch-order audit (real bd)", () => {
   let bdRepo: BdRepo;
 
   beforeAll(() => {
+    realBd = execFileSync("which", ["bd"], { encoding: "utf8" }).trim();
     bdRepo = makeBdRepo();
   });
 
@@ -76,7 +77,7 @@ describeBd("/shape Phase 5 dispatch-order audit (real bd)", () => {
       env: {
         ...process.env,
         FAKE_BD_LOG: log,
-        REAL_BD,
+        REAL_BD: realBd,
         PATH: [bin, process.env.PATH].filter(Boolean).join(delimiter),
       },
     });

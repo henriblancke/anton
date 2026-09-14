@@ -186,13 +186,27 @@ describe("validateBoardStructure", () => {
       expect(violations[0].message).toContain("bd dep add");
     });
 
-    it("keeps partially parseable bd cycle evidence blocking at board scope", () => {
+    it("keeps partially parseable bd cycle evidence blocking for each mapped member and at board scope", () => {
       const violations = validateBoardStructure(HEALTHY, {
         cycles: [{ ids: ["t1", "unknown"], raw: { ids: ["t1", "unknown"] } }],
       });
       expect(violations.map((v) => [v.id, v.rule])).toEqual([
+        ["t1", "blocks-cycle"],
         ["board", "blocks-cycle"],
       ]);
+    });
+
+    it("blocks mapped cycle members even when a raced board snapshot no longer carries their edges", () => {
+      const board = [task("a"), task("b")];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }],
+      });
+
+      expect(violations.map((v) => [v.id, v.rule])).toEqual([
+        ["a", "blocks-cycle"],
+        ["b", "blocks-cycle"],
+      ]);
+      expect(violations.every((v) => v.message.includes("bd dep remove"))).toBe(true);
     });
 
     it("does not fault a plain chain that merely converges, with no loop", () => {

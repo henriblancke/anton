@@ -8,6 +8,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead, type BeadDep } from "../beads/bd";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import type { PickerExclusionReason } from "../board-picker-plan";
 import { proposalFingerprint } from "../gardener/detections";
 import { eligibleTargets, ineligibility } from "./picker-targets";
@@ -239,6 +240,20 @@ describe("eligibleTargets", () => {
     const board = [bead("t3"), bead("t1"), bead("t2")];
 
     expect(eligibleTargets(board).eligible.map((b) => b.id)).toEqual(["t3", "t1", "t2"]);
+  });
+
+  it("excludes a target from picker apply when its snapshot carries a reported cycle", () => {
+    const board = attachCycleEvidence([
+      authored("a", { dependencies: [blockedBy("a", "b")] }),
+      authored("b", { dependencies: [blockedBy("b", "a")] }),
+    ], [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }]);
+
+    const { eligible, exclusions } = eligibleTargets(board);
+    expect(eligible).toEqual([]);
+    expect(exclusions).toEqual([
+      expect.objectContaining({ beadId: "a", reason: "approval-gap", detail: expect.stringContaining("blocks cycle") }),
+      expect.objectContaining({ beadId: "b", reason: "approval-gap", detail: expect.stringContaining("blocks cycle") }),
+    ]);
   });
 });
 

@@ -289,7 +289,12 @@ export function parseOrphans(raw: string): OrphanBead[] {
  */
 export function parseDepCycles(raw: string): DepCycle[] {
   const cycles = parseDepCyclesForCli(raw);
-  if (cycles === null) return [];
+  if (cycles === null) {
+    throw new Error(
+      `bd dep cycles: could not read its --json output (bd output format changed?) — ` +
+        `refusing to report unreadable cycle evidence as a cycle-free board. Output: ${raw.slice(0, 200)}`,
+    );
+  }
   return cycles;
 }
 

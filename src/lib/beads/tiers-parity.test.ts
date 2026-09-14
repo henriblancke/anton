@@ -106,10 +106,11 @@ describe("tiers.mjs agrees with the app's TypeScript predicates", () => {
     expect(parseDepCycles(raw)).toEqual(parseDepCyclesForCli(raw));
   });
 
-  it("preserves malformed cycle evidence for the CLI to reject", () => {
+  it("keeps malformed cycle evidence unreadable at both seams", () => {
     expect(parseDepCyclesForCli("not json")).toBeNull();
     expect(parseDepCyclesForCli(JSON.stringify({ cycle: ["a", "b"] }))).toBeNull();
-    expect(parseDepCycles("not json")).toEqual([]);
+    expect(() => parseDepCycles("not json")).toThrow(/refusing to report unreadable cycle evidence/);
+    expect(() => parseDepCycles(JSON.stringify({ cycle: ["a", "b"] }))).toThrow(/could not read its --json output/);
   });
 
   it("forwards parsed bd cycle evidence through the typed facade", () => {

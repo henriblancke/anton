@@ -90,7 +90,7 @@ function isJudged(bead) {
 export function validateBoardStructure(board, { cycles } = {}) {
   const byId = new Map(board.map((b) => [b.id, b]));
   const childrenOf = childIndex(board);
-  const { memberships: cycleMemberships, unmapped: unmappedCycles } = cycleMembers(byId, cycles);
+  const { memberships: cycleMemberships, unreadable: unreadableCycles } = cycleMembers(byId, cycles);
 
   const violations = [];
   const fault = (id, rule, severity, message) => violations.push({ id, rule, severity, message });
@@ -149,14 +149,9 @@ export function validateBoardStructure(board, { cycles } = {}) {
       }
     }
 
-    const cycle = cycleMemberships.get(bead.id)?.find((members) =>
-      (bead.dependencies ?? []).some(
-        (dep) => dep?.type === "blocks" && members.has(dep.depends_on_id),
-      ),
-    );
-    if (cycle) {
+    for (const cycle of cycleMemberships.get(bead.id) ?? []) {
       const partner = (bead.dependencies ?? []).find(
-        (dep) => dep?.type === "blocks" && cycle.has(dep.depends_on_id),
+        (dep) => dep?.type === "blocks" && cycle.members.has(dep.depends_on_id),
       )?.depends_on_id;
       fault(
         bead.id,
@@ -277,7 +272,7 @@ export function validateBoardStructure(board, { cycles } = {}) {
   // `bd dep cycles` may report a real graph cycle in an encoding whose bead ids this version of
   // anton cannot read. That is still blocking evidence, not an empty answer: put it on a stable
   // board-level id so the CLI refuses instead of silently calling the board healthy.
-  for (const cycle of unmappedCycles) {
+  for (const cycle of unreadableCycles) {
     fault(
       "board",
       "blocks-cycle",
@@ -320,21 +315,22 @@ export function structureGaps(targetId, board, options) {
  */
 function cycleMembers(byId, cycles) {
   const memberships = new Map();
-  const unmapped = [];
+  const unreadable = [];
   for (const cycle of cycles ?? []) {
     const ids = Array.isArray(cycle?.ids) ? cycle.ids.filter((id) => typeof id === "string") : [];
     const mapped = ids.filter((id) => byId.has(id));
     const members = new Set(mapped);
+    const evidence = { members, complete: ids.length > 0 && mapped.length === ids.length };
     for (const id of mapped) {
       const memberCycles = memberships.get(id);
-      if (memberCycles) memberCycles.push(members);
-      else memberships.set(id, [members]);
+      if (memberCycles) memberCycles.push(evidence);
+      else memberships.set(id, [evidence]);
     }
-    // A partially readable record still leaves a cycle member unnamed. Preserve it as a board-level
-    // fault rather than letting the unrecognised part of bd's authoritative evidence disappear.
-    if (ids.length === 0 || mapped.length !== ids.length) unmapped.push(cycle?.raw ?? cycle);
+    // The cycle query is authoritative. Even when the listing raced and no longer carries every
+    // edge, each mapped member must block; only the missing members need a board-level fallback.
+    if (!evidence.complete) unreadable.push(cycle?.raw ?? cycle);
   }
-  return { memberships, unmapped };
+  return { memberships, unreadable };
 }
 
 /** Keep unfamiliar authoritative metadata diagnosable without letting an unexpected value throw. */

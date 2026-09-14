@@ -13,6 +13,7 @@
 import { describe, expect, it } from "vitest";
 
 import { LABELS, type Bead } from "../beads/bd";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { revalidateApprovals } from "./revalidate";
 
 const NOW = Date.parse("2026-08-03T00:00:00Z");
@@ -121,6 +122,16 @@ describe("re-validating approvals the board has moved past", () => {
     const [detection] = revalidateApprovals(board, NOW);
     expect(detection.subjects).toEqual(["anton-a"]);
     expect(detection.evidence.join("\n")).toMatch(/blocked by anton-b/);
+  });
+
+  it("surfaces a reported cycle on approved work", () => {
+    const board = attachCycleEvidence([
+      approved("anton-a", waitsOn("anton-a", "anton-b")),
+      approved("anton-b", waitsOn("anton-b", "anton-a")),
+    ], [{ ids: ["anton-a", "anton-b"], raw: { cycle: ["anton-a", "anton-b"] } }]);
+
+    expect(subjectsOf(board)).toEqual([["anton-a"], ["anton-b"]]);
+    expect(revalidateApprovals(board, NOW)[0]?.evidence.join("\n")).toMatch(/blocks cycle/);
   });
 
   it("leaves a PARTIALLY-gated target approved — the run starts, so nothing degraded", () => {
