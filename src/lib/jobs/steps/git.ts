@@ -18,7 +18,7 @@ import {
   type WorktreeState,
 } from "../../git/ops";
 import { PoisonEpic } from "../errors";
-import { resolveCommitTimeoutMs } from "../../projects";
+import { resolveCommitTimeoutMs, resolvePushTimeoutMs } from "../../projects";
 import { buildPrTitle } from "../pr-title";
 import { stepSubject, type StepContext } from "./context";
 import { prBody } from "./prompts";
@@ -252,6 +252,7 @@ export async function prStep(ctx: StepContext): Promise<StepResultWith<"pr">> {
     base: ctx.baseBranch,
     title: buildPrTitle(ctx.target, ctx.target.id, ctx.settings.conventionalCommits),
     body: prBody(ctx.target, ctx.tickets, ctx.advisories ?? [], ctx.satisfied),
+    pushTimeoutMs: resolvePushTimeoutMs(ctx.settings),
   });
   return { ok: true, detail: `PR ${pr.ref}`, facts: { pr } };
 }

@@ -583,6 +583,16 @@ export function resolveCommitTimeoutMs(settings: ProjectSettings): number {
   return (settings.commitTimeoutMinutes ?? DEFAULT_COMMIT_TIMEOUT_MINUTES) * 60_000;
 }
 
+/**
+ * The push budget every `pushBranch` call runs under, in ms (anton-n93lo) — the push counterpart to
+ * {@link resolveCommitTimeoutMs}. An unset setting resolves to {@link DEFAULT_PUSH_TIMEOUT_MINUTES} —
+ * the same default `gitPush` itself falls back to, so a project with no setting is byte-identical to
+ * before this existed.
+ */
+export function resolvePushTimeoutMs(settings: ProjectSettings): number {
+  return (settings.pushTimeoutMinutes ?? DEFAULT_PUSH_TIMEOUT_MINUTES) * 60_000;
+}
+
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const REVIEW_FIX_CONCURRENCY_RANGE = { min: 1, max: 6 } as const;

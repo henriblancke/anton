@@ -190,4 +190,31 @@ describe("step:pr", () => {
     expect(body).toContain("Unresolved review findings (1, advisory)");
     expect(body).toContain("- src/a.ts:3 — tidy this");
   });
+
+  // A project with no pushTimeoutMinutes setting must resolve to the same 2-minute default
+  // pushBranch itself falls back to — byte-identical to before this option existed.
+  it("resolves the push budget to the 2-minute default when the project has no setting", async () => {
+    await prStep(sandbox.context({ settings: {} }));
+
+    expect(ops.openPullRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ pushTimeoutMs: 120_000 }),
+    );
+  });
+
+  // The configured budget must ride through openPullRequest to pushBranch, read from the run's
+  // PINNED settings snapshot (ctx.settings) rather than re-read mid-run.
+  it("round-trips the saved push timeout from ctx.settings into openPullRequest", async () => {
+    sandbox.tdb.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ pushTimeoutMinutes: 7 }) })
+      .where(eq(schema.projects.id, sandbox.projectId))
+      .run();
+    const settings = await getProjectSettings(sandbox.tdb.db, sandbox.projectId);
+
+    await prStep(sandbox.context({ settings }));
+
+    expect(ops.openPullRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ pushTimeoutMs: 7 * 60_000 }),
+    );
+  });
 });

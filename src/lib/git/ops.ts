@@ -3070,6 +3070,11 @@ export async function openPullRequest(opts: {
   base: string;
   title: string;
   body: string;
+  /**
+   * The project's push budget, in ms — forwarded to {@link pushBranch} untouched. `gh` itself is
+   * unaffected: only the push ahead of it is bounded. Absent → {@link pushBranch}'s own default.
+   */
+  pushTimeoutMs?: number;
 }): Promise<PullRequest> {
   if (!(await hasRemote(opts.repoPath))) {
     throw new Error(
@@ -3077,7 +3082,7 @@ export async function openPullRequest(opts: {
     );
   }
   const hooksPath = await resolveHooksPathOverride(opts.repoPath, opts.worktreePath);
-  await pushBranch(opts.worktreePath ?? opts.repoPath, opts.branch, hooksPath);
+  await pushBranch(opts.worktreePath ?? opts.repoPath, opts.branch, hooksPath, opts.pushTimeoutMs);
 
   const existing = await findOpenPullRequest(opts.repoPath, opts.branch);
   if (existing) {
