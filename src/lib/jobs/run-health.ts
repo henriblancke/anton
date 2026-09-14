@@ -33,7 +33,12 @@ import {
 } from "../projects";
 import { listRunsByStatus, type RunRow } from "../runs";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
-import { parkedAskGateIds, poisonBlockerIds, PoisonError } from "./errors";
+import {
+  isBoardUnreachableError,
+  parkedAskGateIds,
+  poisonBlockerIds,
+  PoisonError,
+} from "./errors";
 import { beadBlockedByGate, runTargetAbove } from "./gate-targets";
 import {
   activeExecuteEpicKeys,
@@ -262,6 +267,33 @@ interface OutageGroup {
   count: number;
 }
 
+/** Stable key prefix for the one project/cause escalation a board outage may raise. */
+export const BOARD_UNREACHABLE_FINDING_PREFIX = "exhausted-job:board-unreachable:";
+
+/** Whether a finding or escalation key represents a project-wide board outage. */
+export function isBoardUnreachableFindingKey(key: string): boolean {
+  return key.startsWith(BOARD_UNREACHABLE_FINDING_PREFIX);
+}
+
+/**
+ * One live board outage finding. Unlike the legacy parked-job aggregation, this is created at the
+ * failed board read itself, while affected jobs remain queued with their attempts refunded.
+ */
+export function boardUnreachableFinding(
+  projectId: string,
+  cause: BoardUnreachableCause,
+  nowMs: number,
+): RunHealthFinding {
+  const { target, remedy } = BOARD_OUTAGE_REMEDY[cause];
+  return {
+    kind: "exhausted-job",
+    key: `${BOARD_UNREACHABLE_FINDING_PREFIX}${projectId}:${cause}`,
+    reason: `${target} is unreachable. ${remedy}.`,
+    since: nowMs,
+    ageMs: 0,
+  };
+}
+
 /**
  * Jobs the runner has stopped retrying — recoverable only by a human, so they sit forever unless
  * something surfaces them. Three shapes qualify:
@@ -341,7 +373,7 @@ export function detectExhaustedJobs(
     const { representative, since, count } = outage;
     findings.push({
       kind: "exhausted-job",
-      key: `exhausted-job:board-unreachable:${representative.projectId ?? "?"}:${outage.cause}`,
+      key: `${BOARD_UNREACHABLE_FINDING_PREFIX}${representative.projectId ?? "?"}:${outage.cause}`,
       reason:
         `${target} is unreachable — ${count} job${count === 1 ? "" : "s"} parked on the same ` +
         `outage. ${remedy}.`,
@@ -533,12 +565,26 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
     // ordinary listing (only `--type gate` / `bd gate list` carries them) while the `blocks` edge a
     // gate puts on the bead it gates IS carried by the plain list — so the gates come from one read
     // and the work they block from the other. Open gates only, which is `gate list`'s default.
-    // NOT best-effort: a swallowed gate read reads as "no human is waiting", which is exactly the
-    // false all-clear this sweep exists to prevent. A rejection retries the sweep instead.
-    const [board, gates] = await Promise.all([
-      beads.list(project.repoPath, ["--status", "all"]),
-      beads.gateList(project.repoPath),
-    ]);
+    // A classified board failure is the exceptional partial report: saving it makes the project-wide
+    // outage visible while the runner refunds affected jobs, then rethrowing preserves that slow probe.
+    let board: Bead[];
+    let gates: Gate[];
+    try {
+      [board, gates] = await Promise.all([
+        beads.list(project.repoPath, ["--status", "all"]),
+        beads.gateList(project.repoPath),
+      ]);
+    } catch (e) {
+      if (!isBoardUnreachableError(e)) throw e;
+      const cause = boardUnreachableCause(e.message);
+      if (!cause) throw e;
+      await saveRunHealthReport(db, clock, {
+        projectId,
+        jobId: ctx.jobId,
+        findings: [boardUnreachableFinding(projectId, cause, nowMs)],
+      });
+      throw e;
+    }
     const [parkedRuns, settledJobs, activeEpicKeys] = await Promise.all([
       listRunsByStatus(db, projectId, ["parked"]),
       listJobsByStatus(db, projectId, ["parked", "failed"]),

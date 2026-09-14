@@ -281,12 +281,10 @@ export class StaleCheckoutError extends Error {
 
 /**
  * The bd/dolt board itself is unreachable — not this one job failing, but every job that touches
- * the board failing the same way (anton-ej1l). Raised where dolt-sync.ts already classifies a bd
- * failure's raw output (`isBoardUnreachableOutput`), so a caller can tell "the board is gone" apart
- * from an ordinary bd error (a refused claim, a bad id) without re-parsing bd's text itself.
- *
- * Classification only for now — nothing reacts to this type differently yet. It exists so a single
- * outage stops reading as N independent job failures once something does.
+ * the board failing the same way (anton-ej1l). The common bd process boundary classifies matching
+ * raw output, and dolt-sync preserves that classification around its additional context, so a caller
+ * can tell "the board is gone" apart from an ordinary bd error (a refused claim, a bad id) without
+ * re-parsing bd's text itself.
  */
 export class BoardUnreachableError extends Error {
   constructor(message: string, options?: ErrorOptions) {

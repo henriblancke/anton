@@ -7,7 +7,8 @@
  * ./bd re-exports the public surface. Neither imports back, so each side is testable alone.
  */
 import { BoardUnreachableError } from "../jobs/errors";
-import { IDENTITY_MISMATCH_TEXT, passwordVarHint } from "./bd-env";
+import { passwordVarHint } from "./bd-env";
+import { isBoardUnreachableOutput } from "./board-unreachable";
 import { isServerMode, readBoardMode, type BoardModeInfo } from "./board-mode";
 import { BOARD_READ_PROBE, formatServerTarget } from "./config.mjs";
 import { bd, type BdExec } from "./dolt-exec";
@@ -68,38 +69,8 @@ export function isFirstPublishPullOutput(output: string): boolean {
   return FIRST_PUBLISH_PULL_OUTPUT.some((re) => re.test(output));
 }
 
-/**
- * Which board-unreachable cause bd/dolt's failure text names, or undefined for an ordinary bd error
- * (a refused claim, an unknown bead id) — matched on bd's own wording so classification stays
- * accurate however anton's message around it is worded. Named rather than a single yes/no flag
- * (anton-ej1l) because a caller grouping escalations by cause (anton-ifz2) must NOT fold the
- * project-identity guard in with the other three: that one is a single project's own database
- * misconfiguration, not the shared board being down, and the two need different remedies even
- * though every one of them fails every job that touches the board the same way.
- */
-export type BoardUnreachableCause =
-  | "identity-mismatch"
-  | "server-unreachable"
-  | "dolt-missing"
-  | "disk-full";
-
-const BOARD_UNREACHABLE_CAUSES: ReadonlyArray<{
-  cause: Exclude<BoardUnreachableCause, "identity-mismatch">;
-  pattern: RegExp;
-}> = [
-  { cause: "server-unreachable", pattern: /Dolt server unreachable/i },
-  { cause: "dolt-missing", pattern: /dolt is not installed|not found in PATH/i },
-  { cause: "disk-full", pattern: /no space left|ENOSPC/i },
-];
-
-export function boardUnreachableCause(output: string): BoardUnreachableCause | undefined {
-  if (output.includes(IDENTITY_MISMATCH_TEXT)) return "identity-mismatch";
-  return BOARD_UNREACHABLE_CAUSES.find(({ pattern }) => pattern.test(output))?.cause;
-}
-
-export function isBoardUnreachableOutput(output: string): boolean {
-  return boardUnreachableCause(output) !== undefined;
-}
+export { boardUnreachableCause, isBoardUnreachableOutput } from "./board-unreachable";
+export type { BoardUnreachableCause } from "./board-unreachable";
 
 /** Wraps `message` in {@link BoardUnreachableError} when `output` matches {@link isBoardUnreachableOutput},
  * else in a plain `Error` — the one place both of dolt-sync's bd-failure throw sites decide which. */

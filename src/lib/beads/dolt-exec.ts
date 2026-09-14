@@ -8,7 +8,9 @@
  */
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { BoardUnreachableError } from "../jobs/errors";
 import { resolveBdBin } from "./bd-bin";
+import { isBoardUnreachableOutput } from "./board-unreachable";
 import { buildBdEnv } from "./bd-env";
 
 /**
@@ -165,15 +167,23 @@ export async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<st
      * execFile-shaped failure for a non-zero exit: promisified execFile attached the captured
      * streams to the error, and runDoltSync's benign/first-publish matchers read them off it.
      */
-    const exitFailure = (code: number | null, signal: NodeJS.Signals | null) =>
-      Object.assign(new Error(`Command failed: ${[bin, ...args].join(" ")}\n${stderr}`), {
-        cmd: [bin, ...args].join(" "),
-        code: code ?? undefined,
-        signal,
-        killed: child.killed,
-        stdout,
-        stderr,
-      });
+    const exitFailure = (code: number | null, signal: NodeJS.Signals | null) => {
+      const message = `Command failed: ${[bin, ...args].join(" ")}\n${stderr}`;
+      const output = `${stderr}\n${stdout}`;
+      return Object.assign(
+        isBoardUnreachableOutput(output)
+          ? new BoardUnreachableError(message)
+          : new Error(message),
+        {
+          cmd: [bin, ...args].join(" "),
+          code: code ?? undefined,
+          signal,
+          killed: child.killed,
+          stdout,
+          stderr,
+        },
+      );
+    };
 
     const finish = (code: number | null, signal: NodeJS.Signals | null) => {
       // Flush whatever the decoders held back (an output that ends mid-character), as execFile did.

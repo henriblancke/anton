@@ -23,6 +23,7 @@ import {
   runDoltSync,
 } from "./bd";
 import { BD_BIN_ENV, resetBdBinCache } from "./bd-bin";
+import { isBoardUnreachableError } from "../jobs/errors";
 
 /** Budget for the hang tests: long enough to clear process startup, short enough to stay a unit test. */
 const BUDGET_MS = 1_500;
@@ -311,13 +312,33 @@ describe("bd normal calls are unchanged (anton-jfjw.1)", () => {
     );
   });
 
-  it("rejects a non-zero exit with the captured streams attached (runDoltSync reads them)", async () => {
+  it("classifies a raw board outage while preserving its process diagnostics", async () => {
+    fakeBd("bd-board-down", [
+      "#!/bin/sh",
+      'echo "partial board response"',
+      'echo "Dolt server unreachable at 127.0.0.1:5432" >&2',
+      "exit 3",
+    ]);
+    const err = (await runBd(dir, ["list", "--json"]).catch((e: Error) => e)) as Error & {
+      code?: number;
+      stdout?: string;
+      stderr?: string;
+    };
+    expect(isBoardUnreachableError(err)).toBe(true);
+    expect(err.code).toBe(3);
+    expect(err.stdout).toContain("partial board response");
+    expect(err.stderr).toContain("Dolt server unreachable");
+    expect(err.message).toContain("Command failed");
+  });
+
+  it("leaves an ordinary non-zero bd error ordinary", async () => {
     fakeBd("bd-fails", ["#!/bin/sh", 'echo "partial" ', 'echo "Error: boom" >&2', "exit 3"]);
     const err = (await runBd(dir, ["dolt", "push"]).catch((e: Error) => e)) as Error & {
       code?: number;
       stdout?: string;
       stderr?: string;
     };
+    expect(isBoardUnreachableError(err)).toBe(false);
     expect(err.code).toBe(3);
     expect(err.stdout).toContain("partial");
     expect(err.stderr).toContain("Error: boom");

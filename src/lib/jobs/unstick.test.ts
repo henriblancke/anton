@@ -18,7 +18,7 @@ import type { PrActivity } from "../git/pr";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
 import { blockedByPoison, parkedOnGateClause } from "./errors";
 import type { Clock } from "./queue";
-import { makeProjectDb } from "@/lib/testing/project";
+import { insertProject, makeProjectDb } from "@/lib/testing/project";
 
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
 const noteMock = vi.fn<(cwd: string, id: string, text: string) => Promise<void>>();
@@ -164,15 +164,23 @@ function seedReport(...findings: RunHealthFinding[]): Promise<void> {
 /** A settled job the report's `exhausted-job` finding points at, re-read before escalating. */
 function seedJob(
   id: string,
-  o: { status: string; attempts: number; lastError: string; epicBeadId?: string },
+  o: {
+    status: string;
+    attempts: number;
+    lastError: string;
+    epicBeadId?: string;
+    projectId?: string;
+    type?: "execute-epic" | "sync-push" | "review-fix-pr" | "gate-check";
+  },
 ): void {
+  const projectId = o.projectId ?? "p1";
   t.db
     .insert(schema.jobs)
     .values({
       id,
-      type: "execute-epic",
-      projectId: "p1",
-      payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: o.epicBeadId ?? "e-9" }),
+      type: o.type ?? "execute-epic",
+      projectId,
+      payloadJson: JSON.stringify({ projectId, epicBeadId: o.epicBeadId ?? "e-9" }),
       status: o.status,
       attempts: o.attempts,
       lastError: o.lastError,
@@ -235,15 +243,18 @@ function parkedRunFinding(runId: string, beadId: string, reason: string): RunHea
   };
 }
 
-const sweep = (opts: { signal?: AbortSignal } = {}) =>
-  unstickPass(
+const sweep = (opts: { signal?: AbortSignal } = {}) => sweepProject("p1", REPO, opts);
+
+function sweepProject(projectId: string, repoPath: string, opts: { signal?: AbortSignal } = {}) {
+  return unstickPass(
     {
       db: t.db,
       clock,
       readPrActivity: (repo, number, signal) => prActivityMock(repo, number, signal),
     },
-    { projectId: "p1", repoPath: REPO, ...opts },
+    { projectId, repoPath, ...opts },
   );
+}
 
 function jobRows() {
   return t.db.select().from(schema.jobs).all();
@@ -1391,6 +1402,77 @@ describe("open escalations are retired once the stall they report ends", () => {
     // The next pass reconciles what this one deferred.
     expect(await sweep()).toMatchObject({ settled: 1 });
     expect(rowById("esc-pr")).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+});
+
+describe("board-wide outage escalations", () => {
+  const OUTAGE = "Dolt server unreachable at 127.0.0.1:5432";
+  const JOB_TYPES = ["execute-epic", "sync-push", "review-fix-pr", "gate-check"] as const;
+
+  function outageFinding(projectId: string, cause = "server-unreachable"): RunHealthFinding {
+    return {
+      kind: "exhausted-job",
+      key: `exhausted-job:board-unreachable:${projectId}:${cause}`,
+      reason: "the shared Dolt server is unreachable. check the server is up and reachable.",
+      since: NOW - HOUR,
+      ageMs: HOUR,
+    };
+  }
+
+  it("raises one persisted escalation per project for sixteen queued outage jobs, separates causes, and retires it after recovery", async () => {
+    const projects = ["p1", "p2", "p3", "p4"] as const;
+    for (const projectId of projects.slice(1)) {
+      insertProject(t.db, {
+        id: projectId,
+        slug: projectId,
+        name: projectId,
+        repoPath: `/tmp/${projectId}`,
+      });
+    }
+    for (const projectId of projects) {
+      for (const [index, type] of JOB_TYPES.entries()) {
+        seedJob(`${projectId}-${type}`, {
+          projectId,
+          type,
+          status: "queued",
+          attempts: 0,
+          lastError: `${OUTAGE} — rechecks at ${new Date(NOW + HOUR).toISOString()}`,
+          epicBeadId: `e-${projectId}-${index}`,
+        });
+      }
+      await saveRunHealthReport(t.db, clock, {
+        projectId,
+        findings: [outageFinding(projectId)],
+      });
+    }
+    // One distinct cause in p1 must be independently actionable rather than folded into the server
+    // outage. It shares the same project but represents a different target and remedy.
+    await saveRunHealthReport(t.db, clock, {
+      projectId: "p1",
+      findings: [outageFinding("p1"), outageFinding("p1", "identity-mismatch")],
+    });
+
+    listMock.mockRejectedValue(new Error(OUTAGE));
+    for (const projectId of projects) {
+      await sweepProject(projectId, `/tmp/${projectId}`);
+    }
+
+    const open = escalationRows().filter((row) => row.status === "open");
+    expect(open).toHaveLength(5);
+    expect(open.filter((row) => row.findingKey.includes(":server-unreachable"))).toHaveLength(4);
+    expect(open.filter((row) => row.projectId === "p1")).toHaveLength(2);
+    expect(jobRows()).toHaveLength(16);
+    expect(jobRows().every((job) => job.status === "queued" && job.attempts === 0)).toBe(true);
+
+    listMock.mockResolvedValue([]);
+    await saveRunHealthReport(t.db, clock, { projectId: "p1", findings: [] });
+    expect(await sweepProject("p1", "/tmp/p1")).toMatchObject({ findings: 0, settled: 2 });
+    expect(escalationRows().filter((row) => row.projectId === "p1")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: "resolved", resolution: "dismissed" }),
+        expect.objectContaining({ status: "resolved", resolution: "dismissed" }),
+      ]),
+    );
   });
 });
 

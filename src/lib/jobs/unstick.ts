@@ -43,7 +43,12 @@ import {
 } from "../projects";
 import { getRunHealthReport, type RunHealthFinding } from "../run-health";
 import { listRunsByStatus, type RunRow } from "../runs";
-import { detectExhaustedJobs, detectOpenHumanGates, detectStalePrs } from "./run-health";
+import {
+  detectExhaustedJobs,
+  detectOpenHumanGates,
+  detectStalePrs,
+  isBoardUnreachableFindingKey,
+} from "./run-health";
 import {
   listOpenEscalations,
   markEscalationNoted,
@@ -443,6 +448,11 @@ export function classifyExhaustedJob(
 ): UnstickVerdict {
   const settled = finding.beadId ? epicSettled(ctx, finding.beadId) : undefined;
   if (settled) return hold(settled);
+  if (isBoardUnreachableFindingKey(finding.key)) {
+    return ctx.boardFresh
+      ? hold("the board is answering again")
+      : escalate(finding.reason);
+  }
   return ctx.stillStuck(finding)
     ? escalate(finding.reason)
     : hold("the job has since been resumed or settled");
@@ -753,8 +763,20 @@ async function buildPassState(
     );
   });
 
-  const [board, activeEpicKeys, parkedRunRows, settings] = await Promise.all([
-    beads.list(repoPath, ["--status", "all"]),
+  // A board outage must still let the escalation pass process the report that names it. An empty
+  // board is deliberately untrusted: it prevents lease-sensitive resumes and makes no claim that
+  // absent beads have settled.
+  let board: Bead[] = [];
+  try {
+    board = await beads.list(repoPath, ["--status", "all"]);
+  } catch (e) {
+    boardFresh = false;
+    console.error(
+      `[unstick] beads list failed for ${projectId}; holding every lease-gated resume this pass`,
+      e,
+    );
+  }
+  const [activeEpicKeys, parkedRunRows, settings] = await Promise.all([
     activeExecuteEpicKeys(db),
     listRunsByStatus(db, projectId, ["parked"]),
     getProjectSettings(db, projectId),
@@ -1071,6 +1093,9 @@ async function stallEnded(
         : "the PR has since merged, closed, or been picked back up";
 
     case "exhausted-job":
+      if (isBoardUnreachableFindingKey(row.findingKey)) {
+        return live.ctx.boardFresh ? "the board is answering again" : undefined;
+      }
       return (await exhaustedJobStillStuck(db, view, live))
         ? undefined
         : "the job has since been resumed or settled";
