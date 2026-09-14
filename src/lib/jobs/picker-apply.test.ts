@@ -43,8 +43,11 @@ const clock: Clock = { now: () => NOW };
 /** The fake board every seam below reads and writes. */
 const board = vi.hoisted(() => ({ current: new Map<string, Record<string, unknown>>() }));
 
+// The real `loadAllIssues` attaches authoritative `bd dep cycles` evidence when asked for it
+// (`withCycles: true`); every caller here needs that promise, so the stub attaches nominal
+// evidence (no cycles) to the fresh array it hands back each call.
 vi.mock("../beads/issues", () => ({
-  loadAllIssues: vi.fn(async () => [...board.current.values()]),
+  loadAllIssues: vi.fn(async () => attachCycleEvidence([...board.current.values()] as Bead[], [])),
 }));
 /** This machine's claim identity — mutable, because a machine that has none must start nothing. */
 const operator = vi.hoisted(() => ({ current: undefined as string | undefined }));
@@ -699,9 +702,12 @@ describe("applyPickerPlan", () => {
     put(bead("t1"), bead("t2"));
     vi.mocked(loadAllIssues).mockImplementation(async () => {
       const snapshot = [...board.current.values()] as unknown as Bead[];
-      return snapshot.some((bead) => bead.dependencies?.length)
-        ? attachCycleEvidence(snapshot, [{ ids: ["t1", "t2"], raw: { cycle: ["t1", "t2"] } }])
-        : snapshot;
+      return attachCycleEvidence(
+        snapshot,
+        snapshot.some((bead) => bead.dependencies?.length)
+          ? [{ ids: ["t1", "t2"], raw: { cycle: ["t1", "t2"] } }]
+          : [],
+      );
     });
 
     const outcome = await apply("t1", 1, wired(), {
@@ -958,7 +964,7 @@ describe("applyPickerPlan", () => {
       const outcome = await apply("t1", 1, {
         board: async () => {
           arm({}, "shadow");
-          return [...board.current.values()] as unknown as Bead[];
+          return attachCycleEvidence([...board.current.values()] as Bead[], []);
         },
       });
 
@@ -990,7 +996,7 @@ describe("applyPickerPlan", () => {
         board: async () => {
           const b = board.current.get("t1")!;
           b.labels = [...((b.labels as string[]) ?? []), LABELS.agentHuman];
-          return [...board.current.values()] as unknown as Bead[];
+          return attachCycleEvidence([...board.current.values()] as Bead[], []);
         },
       });
 

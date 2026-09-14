@@ -65,19 +65,25 @@ function partiallyGatedBoard(gated: string[] = ["anton-t3"]): Bead[] {
           : []),
       ],
     });
-  return [
-    approved("anton-fa", { issue_type: "feature" }),
-    ticket("anton-t1"),
-    ticket("anton-t2"),
-    ticket("anton-t3"),
-    bead("anton-fb", { issue_type: "feature" }),
-    child("anton-b1", "anton-fb", { acceptance_criteria: "- [ ] ok" }),
-  ];
+  return attachCycleEvidence(
+    [
+      approved("anton-fa", { issue_type: "feature" }),
+      ticket("anton-t1"),
+      ticket("anton-t2"),
+      ticket("anton-t3"),
+      bead("anton-fb", { issue_type: "feature" }),
+      child("anton-b1", "anton-fb", { acceptance_criteria: "- [ ] ok" }),
+    ],
+    [],
+  );
 }
 
 describe("re-validating approvals the board has moved past", () => {
   it("files exactly one proposal for an approved bead whose Acceptance was stripped", () => {
-    const board = [approved("anton-a", { acceptance_criteria: undefined }), approved("anton-b")];
+    const board = attachCycleEvidence(
+      [approved("anton-a", { acceptance_criteria: undefined }), approved("anton-b")],
+      [],
+    );
     const [detection, ...rest] = revalidateApprovals(board, NOW);
 
     expect(rest).toEqual([]);
@@ -162,7 +168,9 @@ describe("re-validating approvals the board has moved past", () => {
   });
 
   it("files nothing for a board whose approvals all still hold", () => {
-    expect(revalidateApprovals([approved("anton-a"), approved("anton-b")], NOW)).toEqual([]);
+    expect(
+      revalidateApprovals(attachCycleEvidence([approved("anton-a"), approved("anton-b")], []), NOW),
+    ).toEqual([]);
   });
 
   it("says nothing about work no approval covers — an unapproved gap is not rot", () => {
@@ -205,10 +213,13 @@ describe("re-validating approvals the board has moved past", () => {
   it("surfaces an approved bead re-parented into somebody else's ticket set", () => {
     // A parentless task approved on its own, since re-homed under a feature: it now runs as one of
     // that feature's tickets, so its own approval stops meaning anything.
-    const board = [
-      approved("anton-f", { issue_type: "feature" }),
-      child("anton-t", "anton-f", { labels: [LABELS.approved], acceptance_criteria: "- [ ] ok" }),
-    ];
+    const board = attachCycleEvidence(
+      [
+        approved("anton-f", { issue_type: "feature" }),
+        child("anton-t", "anton-f", { labels: [LABELS.approved], acceptance_criteria: "- [ ] ok" }),
+      ],
+      [],
+    );
     const [detection, ...rest] = revalidateApprovals(board, NOW);
 
     expect(rest).toEqual([]);

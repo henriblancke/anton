@@ -9,6 +9,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import type { Bead, BeadDep } from "../beads/bd";
+import { attachCycleEvidence, cycleEvidenceFor } from "../beads/cycle-evidence";
 import { decideBoardPickerPlan, ADMIT_ALL_POLICY, type PickerPolicy } from "./picker-decision";
 
 const spawned = vi.hoisted(() => vi.fn());
@@ -43,8 +44,13 @@ const blockedBy = (dependent: string, blocker: string): BeadDep => ({
   type: "blocks",
 });
 
+/** Nominal fixtures represent a completed `bd dep cycles` read with no cycles (mirrors
+ *  picker-targets.test.ts) — the approve gate now refuses to answer without that evidence. */
+const authoritative = <T extends Bead[]>(board: T): T =>
+  cycleEvidenceFor(board) === undefined ? attachCycleEvidence(board, []) : board;
+
 const decide = (board: Bead[], policy: PickerPolicy = ADMIT_ALL_POLICY) =>
-  decideBoardPickerPlan({ board, policy, runtime: { observedAtMs: OBSERVED } });
+  decideBoardPickerPlan({ board: authoritative(board), policy, runtime: { observedAtMs: OBSERVED } });
 
 describe("decideBoardPickerPlan", () => {
   it("ranks the claimable set in the PRIME order and numbers it from 1", () => {
@@ -153,7 +159,7 @@ describe("decideBoardPickerPlan", () => {
     // the exclusion names the veto rather than whatever rule would otherwise have spoken.
     const until = OBSERVED + 3_600_000;
     const plan = decideBoardPickerPlan({
-      board: [bead("t1", { priority: 0 }), bead("t2", { priority: 1 })],
+      board: authoritative([bead("t1", { priority: 0 }), bead("t2", { priority: 1 })]),
       policy: ADMIT_ALL_POLICY,
       runtime: { observedAtMs: OBSERVED, deferrals: new Map([["t1", until]]) },
     });
@@ -169,7 +175,7 @@ describe("decideBoardPickerPlan", () => {
     // The two are different answers to "why not this one?", and only one of them is the operator's.
     const refuseAll: PickerPolicy = { admits: () => ({ admitted: false, detail: "no" }) };
     const plan = decideBoardPickerPlan({
-      board: [bead("t1")],
+      board: authoritative([bead("t1")]),
       policy: refuseAll,
       runtime: { observedAtMs: OBSERVED, deferrals: new Map([["t1", OBSERVED + 1000]]) },
     });
@@ -180,7 +186,7 @@ describe("decideBoardPickerPlan", () => {
 
   it("offers a target again once its window has closed — the caller passes only live holds", () => {
     const plan = decideBoardPickerPlan({
-      board: [bead("t1")],
+      board: authoritative([bead("t1")]),
       policy: ADMIT_ALL_POLICY,
       runtime: { observedAtMs: OBSERVED, deferrals: new Map() },
     });

@@ -33,6 +33,7 @@ import { LABELS } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import type { Bead } from "../beads/types";
 import { loadAllIssues } from "../beads/issues";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import {
   invalidateIssueSnapshot,
   refreshIssueSnapshot,
@@ -55,7 +56,10 @@ const board = vi.hoisted(() => ({ current: [] as Bead[], calls: [] as unknown[][
 vi.mock("../beads/issues", () => ({
   loadAllIssues: vi.fn(async (...args: unknown[]) => {
     board.calls.push(args);
-    return board.current;
+    // The real `loadAllIssues` attaches authoritative `bd dep cycles` evidence when asked
+    // (`withCycles: true`); every caller here needs that promise, so the stub attaches nominal
+    // evidence (no cycles) to whatever board a case has set.
+    return attachCycleEvidence(board.current, []);
   }),
 }));
 
@@ -689,7 +693,7 @@ describe("makeBoardPickerHandler", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     // The pass's own read stands; the RESTAMP's re-read is the one that falls over.
     vi.mocked(loadAllIssues)
-      .mockImplementationOnce(async () => board.current)
+      .mockImplementationOnce(async () => attachCycleEvidence(board.current, []))
       .mockImplementationOnce(async () => {
         throw new Error("bd is gone");
       });
