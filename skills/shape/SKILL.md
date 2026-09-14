@@ -1,6 +1,6 @@
 ---
 name: shape
-version: c4e8dfb2ec1e
+version: bcd28df71182
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -242,8 +242,8 @@ for (const bead of all) for (const edge of bead.dependencies ?? []) {
   prereqs.push(edge.depends_on_id);
   blockersOf.set(edge.issue_id, prereqs);
 }
-// Tickets gated by a blocker outside this feature's own set, propagated to anything inside the
-// feature that depends on one of them — same shape as computeEpicGraph's blocked-children rollup
+// Tickets gated by a blocker outside this feature ticket set, propagated to anything inside the
+// feature that depends on one of them — same shape as the computeEpicGraph blocked-children rollup
 // (epic-graph.ts), simplified to "closed" for done (this audit runs on freshly shaped work, so a
 // merged-but-not-closed distinction does not arise).
 const heldIds = (feature, tickets) => {
