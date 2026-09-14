@@ -94,9 +94,8 @@ describe("schedules route", () => {
       "unstick",
       "worktree-reaper",
     ]);
-    // Enabled state comes straight off the seeded row: run-health is the opt-in one (anton-4ks0).
-    // unstick (anton-wvcy) is armed by default but no-ops until run-health has written a report, so
-    // turning the sweep on is the single switch that arms the whole detect → act loop.
+    // The detector and consumer both ship armed: a board outage must create its project escalation
+    // without an unrelated settings opt-in.
     const enabledByType = Object.fromEntries(
       schedules.map((s: { type: string; enabled: boolean }) => [s.type, s.enabled]),
     );
@@ -104,7 +103,7 @@ describe("schedules route", () => {
       "nightly-stringer": true,
       "orphan-grooming": true,
       "review-fix": true,
-      "run-health": false,
+      "run-health": true,
       unstick: true,
       // gate-check (anton-286r) is armed by default: nothing else resumes a run parked on a gate.
       "gate-check": true,

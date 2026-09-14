@@ -335,7 +335,7 @@ export const DEFAULT_SCHEDULES: Array<{
   { type: "review-fix", cron: "*/15 * * * *" }, // poll open PRs for review events every 15 min
   { type: "nightly-stringer", cron: "0 3 * * *" }, // scan + triage nightly at 03:00
   { type: "orphan-grooming", cron: "0 4 * * 1" }, // bucket loose tickets weekly, Mon 04:00
-  { type: "run-health", cron: "0 * * * *", enabled: false }, // sweep for stalls hourly; opt-in
+  { type: "run-health", cron: "0 * * * *" }, // sweep for stalls and board outages hourly
   { type: "unstick", cron: "10 * * * *" }, // act on the sweep's findings, 10 min after it
   { type: "gate-check", cron: "*/10 * * * *" }, // close satisfied gates + resume their work
   { type: "gardener", cron: "0 5 * * *", enabled: false }, // board hygiene patrol daily 05:00; opt-in

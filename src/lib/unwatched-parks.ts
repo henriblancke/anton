@@ -2,10 +2,9 @@
  * Parked work nobody is watching (anton-kh98).
  *
  * The stall loop is two automations: `run-health` DETECTS (it writes the report) and `unstick` ACTS
- * (it reads that report and raises escalations). run-health ships opt-in and unstick is a strict
- * no-op without it — so on a default install a job can park and nothing anywhere says so. The
- * escalation strip stays empty because its only producer never ran, which reads exactly like a
- * healthy board.
+ * (it reads that report and raises escalations). Both ship armed by default, so a new install
+ * detects and escalates parked work. An operator may still turn either off, at which point the
+ * escalation strip cannot distinguish a quiet board from a queue nobody is watching.
  *
  * This is the signal that closes that gap: it says parked work exists AND that nothing is watching
  * it. Deliberately not a detector — the sweep's detectors already cover these jobs — just a count
@@ -69,9 +68,8 @@ export function unwatchedParks(input: {
  * Which of the watcher's automations this project has NOT armed.
  *
  * A missing row counts as off, unlike {@link isScheduleEnabled}'s "absence reads as enabled" rule:
- * both of these ship opt-in (run-health by design, and a project predating the type has no row at
- * all), so treating absence as armed would silence this signal on exactly the installs it exists
- * for — the ones where the sweep has never run.
+ * default rows are created with a project, but a project predating either type has never been
+ * armed. Treating absence as armed would silence this signal on exactly those installs.
  */
 export async function disarmedWatchers(
   db: AntonDb,

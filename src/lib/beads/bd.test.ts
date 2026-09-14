@@ -539,7 +539,12 @@ describe("boardUnreachableCause", () => {
     expect(boardUnreachableCause("Dolt server unreachable at 127.0.0.1:0")).toBe(
       "server-unreachable",
     );
-    expect(boardUnreachableCause("dolt is not installed (not found in PATH)")).toBe("dolt-missing");
+    expect(
+      boardUnreachableCause(
+        "Dolt server unreachable at 127.0.0.1:0 and auto-start failed:\n" +
+          "dolt is not installed (not found in PATH)",
+      ),
+    ).toBe("dolt-missing");
     expect(boardUnreachableCause("ENOSPC: no space left on device")).toBe("disk-full");
   });
 

@@ -380,8 +380,7 @@ describe("Scheduler.tickOnce", () => {
     const rows = tdb.db.select().from(schema.schedules).all();
     expect(rows.length).toBe(DEFAULT_SCHEDULES.length);
     expect(new Set(rows.map((r) => r.type))).toEqual(new Set(DEFAULT_SCHEDULES.map((d) => d.type)));
-    // A seeded schedule is armed (nextRunAt computed) iff the default says it starts enabled — an
-    // opt-in default like run-health seeds the ROW but never fires until the operator turns it on.
+    // A seeded schedule is armed (nextRunAt computed) iff the default says it starts enabled.
     for (const d of DEFAULT_SCHEDULES) {
       const row = rows.find((r) => r.type === d.type)!;
       const enabled = d.enabled ?? true;

@@ -14,8 +14,10 @@ const BOARD_UNREACHABLE_CAUSES: ReadonlyArray<{
   cause: Exclude<BoardUnreachableCause, "identity-mismatch">;
   pattern: RegExp;
 }> = [
-  { cause: "server-unreachable", pattern: /Dolt server unreachable/i },
+  // bd's failed auto-start names both its absent binary and the unavailable target; the binary is
+  // the actionable cause, so it must win over the generic server phrase.
   { cause: "dolt-missing", pattern: /dolt is not installed|not found in PATH/i },
+  { cause: "server-unreachable", pattern: /Dolt server unreachable/i },
   { cause: "disk-full", pattern: /no space left|ENOSPC/i },
 ];
 
