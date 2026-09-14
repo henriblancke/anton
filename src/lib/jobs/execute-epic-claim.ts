@@ -12,7 +12,6 @@ import { assignChildren, formatReservedChildren } from "../beads/child-assign";
 import { resolveForkPoint, resolveFreshBase } from "../git/ops";
 import {
   acquireWorktreeClaim,
-  branchExists,
   createWorktree,
   releaseWorktreeClaim,
   removeWorktree,
@@ -57,11 +56,6 @@ export async function warmRunWorktree(
   const worktreeClaim = claimOwnerFor(runId);
   run.worktreeClaim = worktreeClaim;
   await acquireWorktreeClaim(repo, branch, worktreeClaim);
-  // Asked BEFORE the create, which is the only moment it can be: `createWorktree` checks out an
-  // existing branch as it stands and cuts a new one off `freshBase` only when none exists, so this
-  // is what tells a REUSED checkout from a first creation — and a reused one inherits a prior
-  // attempt's fork point rather than forking here (see the pin below).
-  const reusedCheckout = await branchExists(repo, branch);
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
@@ -73,6 +67,9 @@ export async function warmRunWorktree(
     signal: ctx.signal,
   });
   run.worktree = worktree;
+  // `createWorktree` made this decision under its branch lock; a caller-side ref probe could go
+  // stale while the checkout is created and misclassify the fork provenance.
+  const reusedCheckout = !worktree.createdBranch;
   // Pin the fork COMMIT now, while origin/<base> is freshly fetched and — on a FIRST creation — HEAD
   // still sits at it (PR #238 review). A fresh creation's fork is already fixed at the instant
   // `createWorktree` cut the branch (before warming could rewind the base); only a legacy row or a

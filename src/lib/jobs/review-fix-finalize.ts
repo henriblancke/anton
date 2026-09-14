@@ -433,6 +433,7 @@ async function removeMergedWorktree(
     path: worktreePathFor(repo, branch),
     branch,
     baseBranch: branch,
+    createdBranch: false,
     repoPath: repo,
   };
   await safe(() => removeWorktree(wt, { deleteBranch: true }));

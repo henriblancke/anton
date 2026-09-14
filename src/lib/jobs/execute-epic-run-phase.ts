@@ -10,6 +10,7 @@
 import { beads, LABELS } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { updateRun } from "../runs";
+import { PoisonEpic } from "./errors";
 import { releaseRunResources } from "./worktree-reaper";
 import type { RetiredTicketOutcome, SkipCause } from "./execute-epic-board";
 import type { DispatchOutcome } from "./execute-epic-dispatch";
@@ -17,6 +18,10 @@ import { armMergeGate } from "./execute-epic-merge-gate";
 import { runReviewStep } from "./execute-epic-review-step";
 import type { RunPhaseCarry, RunStepDispatch } from "./execute-epic-run-step";
 import { safe } from "./execute-epic-persist";
+import {
+  readVerifiedStandaloneRetirement,
+  verifiedStandaloneRetirementStillHeld,
+} from "./execute-epic-retired-standalone";
 import type { RunPreparation } from "./execute-epic-prepare";
 import { stalePrBodyNote, stalePrBodyRunError } from "./execute-epic-review";
 import type { EpicRun } from "./execute-epic-run";
@@ -204,6 +209,29 @@ async function finishRun(
     : null;
   if (skippedNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${skippedNotice}`));
 
+  // A target this attempt retired has no PR to make its terminal path self-evident. Reconstruct its
+  // durable repair evidence, then fence the board before and after the terminal row: a child, reopen,
+  // or replacement survivor racing this write means this run must not report an obsolete retirement
+  // as settled.
+  const retirement = targetRetired
+    ? await readVerifiedStandaloneRetirement(repo, epicBeadId)
+    : undefined;
+  if (targetRetired && !retirement) {
+    throw new PoisonEpic(
+      `${epicBeadId} no longer proves the already-shipped retirement this run verified — anton will ` +
+        `not settle a terminal row for a target whose durable repair evidence is missing. Re-read the ` +
+        `target and resolve its current state before resuming.`,
+    );
+  }
+  if (retirement && !(await verifiedStandaloneRetirementStillHeld(repo, epicBeadId, retirement))) {
+    throw new PoisonEpic(
+      `${epicBeadId} changed after anton verified its already-shipped retirement — it may have gained ` +
+        `child tickets, reopened, or been superseded differently. Anton will not settle a terminal row ` +
+        `for a retirement the board no longer proves. Re-read the target and resolve its current state ` +
+        `before resuming.`,
+    );
+  }
+
   // 5. Finalize run + clean up the worktree (the branch/PR carry the work now). The run IS done —
   //    the branch and its PR carry the work — so a stale-body salvage rides along as the row's
   //    error rather than failing a delivery that landed.
@@ -214,6 +242,13 @@ async function finishRun(
       [timeoutNotice, retiredNotice, skippedNotice, staleBodyFallback].filter(Boolean).join(" — ") ||
       null,
   });
+  if (retirement && !(await verifiedStandaloneRetirementStillHeld(repo, epicBeadId, retirement))) {
+    throw new PoisonEpic(
+      `${epicBeadId} changed while anton recorded its already-shipped retirement — it may have gained ` +
+        `child tickets, reopened, or been superseded differently. Anton will not report that earlier ` +
+        `retirement as settled; re-read the target and resolve its current state before resuming.`,
+    );
+  }
   // The branch and its PR carry the work now, so the checkout is residue; the branch survives
   // because the target is still open in review (anton-hrun.1). The claim comes off first: the
   // release below force-removes the checkout, which a live claim refuses — ours as much as

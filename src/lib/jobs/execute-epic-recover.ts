@@ -7,18 +7,19 @@
  * either answer wrong opens a duplicate pull request or re-dispatches shipped work.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { readCurrentClosureVersion } from "../beads/closure-cycle";
-import { isServerMode } from "../beads/board-mode";
 import { loadAllIssues } from "../beads/issues";
 import { runTickets } from "../ticket-view";
-import { priorRepair } from "../gardener/repair";
 import { pullRequestState } from "../git/ops";
 import { findWorktree, worktreePathFor, type Worktree } from "../git/worktree";
 import { updateRun } from "../runs";
 import { releaseRunResources } from "./worktree-reaper";
 import { PoisonEpic } from "./errors";
 import { armMergeGate } from "./execute-epic-merge-gate";
-import { mustReadBoard, safe } from "./execute-epic-persist";
+import { safe } from "./execute-epic-persist";
+import {
+  readVerifiedStandaloneRetirement,
+  verifiedStandaloneRetirementStillHeld,
+} from "./execute-epic-retired-standalone";
 import type { EpicRun } from "./execute-epic-run";
 
 /**
@@ -254,6 +255,7 @@ export async function settleCompletedRun(
           path: worktreePathFor(repo, branch),
           branch,
           baseBranch: branch,
+          createdBranch: false,
           repoPath: repo,
         };
         await releaseRunResources({
@@ -348,37 +350,15 @@ export async function settleCompletedRun(
  */
 async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise<boolean> {
   const { db, clock, ctx, projectId, repo, runId, branch, targetId, lease } = run;
-  const survivor = beads.supersededBy(leaseTarget);
-  if (!survivor) return false;
-  // The stamp and the note both live on the full bead; the lease read may be a list row.
-  const stamped = await beads.show(repo, targetId).catch(() => undefined);
-  if (!stamped || beads.supersededBy(stamped) !== survivor) return false;
-  const repair = priorRepair(stamped, "already-shipped");
-  if (!repair?.closure || repair.survivor !== survivor) return false;
-  // A stamp survives reopen/re-supersede cycles. Its closure version and survivor must still be the
-  // verified retirement; timestamps cannot distinguish two cycles that close in the same second.
-  const closure = await readCurrentClosureVersion(repo, targetId).catch(() => undefined);
-  if (closure !== repair.closure) return false;
+  // The stamp and closure are durable evidence; the lease read may only carry a list row.
+  const retirement = await readVerifiedStandaloneRetirement(repo, targetId, leaseTarget);
+  if (!retirement) return false;
 
   // The refresh that admitted this settlement and its terminal row write are unordered with other
   // board writers. Pull before each fence on embedded boards: another machine can publish a child,
   // reopen the target, or replace its survivor after the startup refresh. A local list alone would
   // preserve that stale childless snapshot and let a terminal row claim an obsolete retirement.
-  const retirementStillHeld = async (): Promise<boolean> => {
-    if (!isServerMode(repo)) {
-      try {
-        await beads.pull(repo);
-      } catch {
-        return false;
-      }
-    }
-    const current = await mustReadBoard(repo);
-    const currentTarget = current?.find((bead) => bead.id === targetId);
-    if (!current || !currentTarget || beads.groupsChildren(currentTarget, runTickets(current, targetId))) return false;
-    if (currentTarget.status !== "closed" || beads.supersededBy(currentTarget) !== survivor) return false;
-    return (await readCurrentClosureVersion(repo, targetId).catch(() => undefined)) === repair.closure;
-  };
-  if (!(await retirementStillHeld())) {
+  if (!(await verifiedStandaloneRetirementStillHeld(repo, targetId, retirement))) {
     throw new PoisonEpic(
       `${targetId} changed after anton verified its already-shipped retirement — it may have gained ` +
         `child tickets, reopened, or been superseded differently. Anton will not settle a terminal row ` +
@@ -402,8 +382,7 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
     endedAt: clock.now(),
     error:
       `${targetId} had already shipped — anton verified that against the repository and the board ` +
-      `and retired it as superseded by ${survivor}` +
-      `${repair.attempted ? ` (${repair.attempted})` : ""}. Nothing was committed here, so this ` +
+      `and retired it as superseded by ${retirement.survivor}. Nothing was committed here, so this ` +
       `run opened no pull request and nothing is left to run.`,
   });
   // `updateRun` is local, but it is still the boundary that makes this attempt terminal. A re-parent
@@ -411,7 +390,7 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
   // safely enter grouped preparation — its claim gate accepts only open targets — and returning false
   // would both continue through that invalid path and leave a terminal row behind. Poison so the
   // attempt's normal settlement records the topology conflict as failed instead of as a false success.
-  if (!(await retirementStillHeld())) {
+  if (!(await verifiedStandaloneRetirementStillHeld(repo, targetId, retirement))) {
     throw new PoisonEpic(
       `${targetId} changed while anton recorded its already-shipped retirement — it may have gained ` +
         `child tickets, reopened, or been superseded differently. Anton will not report that earlier ` +
@@ -427,6 +406,7 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
       path: worktreePathFor(repo, branch),
       branch,
       baseBranch: branch,
+      createdBranch: false,
       repoPath: repo,
     };
     await releaseRunResources({

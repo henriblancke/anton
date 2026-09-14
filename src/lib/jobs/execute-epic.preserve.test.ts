@@ -1167,6 +1167,7 @@ suite("assertPreservedWorkFitsShape — preserved work may only ride the shape t
     path: repo,
     branch: BRANCH,
     baseBranch: "main",
+    createdBranch: false,
     repoPath: repo,
   });
   const epicRun = (standaloneRun: boolean): EpicRun =>

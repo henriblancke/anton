@@ -1584,7 +1584,13 @@ async function removeProjectWorktrees(
   const worktrees = await projectWorktrees(db, project);
   for (const wt of worktrees) {
     await removeWorktree(
-      { path: wt.path, branch: wt.branch, baseBranch: wt.branch, repoPath: project.repoPath },
+      {
+        path: wt.path,
+        branch: wt.branch,
+        baseBranch: wt.branch,
+        createdBranch: false,
+        repoPath: project.repoPath,
+      },
       { deleteBranch: Boolean(wt.branch) },
     );
   }

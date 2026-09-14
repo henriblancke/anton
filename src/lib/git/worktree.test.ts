@@ -126,6 +126,7 @@ suite("worktree manager (real git)", () => {
 
     expect(wt.repoPath).toBe(repo);
     expect(wt.branch).toBe(branch);
+    expect(wt.createdBranch).toBe(true);
     expect(existsSync(wt.path)).toBe(true);
     expect(realpathSync(wt.path)).toBe(realpathSync(worktreePathFor(repo, branch)));
 
@@ -142,7 +143,9 @@ suite("worktree manager (real git)", () => {
     const first = await createWorktree({ repoPath: repo, branch });
     const second = await createWorktree({ repoPath: repo, branch });
 
+    expect(first.createdBranch).toBe(true);
     expect(second.path).toBe(first.path);
+    expect(second.createdBranch).toBe(false);
     expect(existsSync(second.path)).toBe(true);
   });
 
@@ -177,6 +180,7 @@ suite("worktree manager (real git)", () => {
     const second = await createWorktree({ repoPath: repo, branch });
 
     expect(second.path).toBe(first.path);
+    expect(second.createdBranch).toBe(false);
     expect(existsSync(second.path)).toBe(true);
   });
 
@@ -192,6 +196,7 @@ suite("worktree manager (real git)", () => {
     const second = await createWorktree({ repoPath: repo, branch });
 
     expect(second.path).toBe(first.path);
+    expect(second.createdBranch).toBe(false);
     expect(existsSync(second.path)).toBe(true);
   });
 
@@ -290,6 +295,7 @@ suite("worktree manager (real git)", () => {
         path: worktreePathFor(repo, branch),
         branch,
         baseBranch: "master",
+        createdBranch: false,
         repoPath: repo,
       }, { deleteBranch: true });
     }
@@ -527,7 +533,7 @@ suite("worktree manager (real git)", () => {
 
     try {
       const removal = await removeWorktree(
-        { path: wt.path, branch: stale, baseBranch: stale, repoPath: repo },
+        { path: wt.path, branch: stale, baseBranch: stale, createdBranch: false, repoPath: repo },
         { deleteBranch: true },
       );
 
@@ -554,7 +560,13 @@ suite("worktree manager (real git)", () => {
     );
     rmSync(orphanRepo, { recursive: true, force: true });
 
-    await removeWorktree({ path: orphanPath, branch, baseBranch: branch, repoPath: orphanRepo });
+    await removeWorktree({
+      path: orphanPath,
+      branch,
+      baseBranch: branch,
+      createdBranch: false,
+      repoPath: orphanRepo,
+    });
 
     expect(existsSync(orphanPath)).toBe(false);
   });
@@ -572,6 +584,7 @@ suite("worktree manager (real git)", () => {
       path: orphanPath,
       branch: "anton/relative",
       baseBranch: "anton/relative",
+      createdBranch: false,
       repoPath: orphanRepo,
     });
 
@@ -608,7 +621,7 @@ suite("worktree manager (real git)", () => {
 
     try {
       const removal = await removeWorktree(
-        { path: wt.path, branch: gone, baseBranch: gone, repoPath: repo },
+        { path: wt.path, branch: gone, baseBranch: gone, createdBranch: false, repoPath: repo },
         { deleteBranch: true },
       );
 
@@ -979,6 +992,7 @@ suite("worktree manager (real git)", () => {
       path: arbitraryPath,
       branch: "anton/unverified",
       baseBranch: "anton/unverified",
+      createdBranch: false,
       repoPath: join(arbitraryPath, "missing-repo"),
     });
 

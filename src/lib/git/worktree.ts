@@ -35,6 +35,8 @@ export interface Worktree {
   baseBranch: string;
   /** The commit the checkout forked from, captured at creation — see {@link readForkAtCreation}. */
   forkSha?: string;
+  /** Whether this call created the branch under its branch lock, rather than reusing it. */
+  createdBranch: boolean;
   /** The main repo the worktree belongs to. */
   repoPath: string;
 }
@@ -452,7 +454,7 @@ export async function createWorktree(opts: {
     }
     const claimed = holders[0];
     const existing: Worktree | null = record
-      ? { path: record.path, branch, baseBranch: branch, repoPath }
+      ? { path: record.path, branch, baseBranch: branch, createdBranch: false, repoPath }
       : null;
     // A registration can outlive its checkout: `git worktree list` reports an administrative record,
     // and the directory may already be gone (anton-2wvb). Reusing such a path hands a non-existent
@@ -500,7 +502,7 @@ export async function createWorktree(opts: {
       // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
       // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
       const resolved = await realpath(path);
-      return { path: resolved, branch, baseBranch, forkSha, repoPath };
+      return { path: resolved, branch, baseBranch, forkSha, createdBranch, repoPath };
     } catch (error) {
       // Returning an unpinned checkout lets a retry classify its branch as reused and derive a fork
       // against a base ref that may have moved. This checkout did not exist before this call, so tear
@@ -630,14 +632,12 @@ async function clearUnsafeForkBranch(repoPath: string, branch: string): Promise<
 }
 
 /**
- * Whether `branch` already exists locally. Also what tells a run whether its checkout is REUSED
- * (PR #238 review): {@link createWorktree} checks out an existing branch as it stands and only cuts
- * a new one off the base when none exists, so the answer here — asked BEFORE the create — is
- * whether this run inherits a prior attempt's history or starts its own.
+ * Whether `branch` already exists locally. {@link createWorktree} asks this under its branch lock
+ * and returns whether it actually created the branch; callers must use that result instead of
+ * observing this mutable ref before creation.
  *
  * A missing ref is the one expected false result. Operational failures must propagate: treating an
- * unreadable ref store as a new branch lets the caller misclassify a reused checkout as fresh and
- * lose its inherited fork pin.
+ * unreadable ref store as a new branch lets creation misclassify a reused checkout as fresh.
  */
 export async function branchExists(repoPath: string, branch: string): Promise<boolean> {
   try {
@@ -833,7 +833,7 @@ export async function listWorktrees(repoPath: string): Promise<WorktreeRecord[]>
 /** Return the existing worktree for `branch`, or null. */
 export async function findWorktree(repoPath: string, branch: string): Promise<Worktree | null> {
   const record = (await listWorktrees(repoPath)).find((w) => w.branch === branch);
-  return record ? { path: record.path, branch, baseBranch: branch, repoPath } : null;
+  return record ? { path: record.path, branch, baseBranch: branch, createdBranch: false, repoPath } : null;
 }
 
 /** What {@link removeWorktree} actually did — the evidence a reaper's log is written from. */

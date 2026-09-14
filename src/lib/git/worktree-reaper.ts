@@ -406,6 +406,7 @@ async function applyPlan(
     path: entry.path ?? worktreePathFor(repoPath, entry.branch),
     branch: entry.branch,
     baseBranch: entry.branch,
+    createdBranch: false,
     repoPath,
   };
   const outcome = await removeWorktree(wt, { deleteBranch: plan.deleteBranch });
