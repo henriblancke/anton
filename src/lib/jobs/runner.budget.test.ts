@@ -1215,6 +1215,40 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     });
   });
 
+  it("revalidates an admitted routed meter before leasing when its route changes", async () => {
+    h.seedProjects("routed");
+    let reads = 0;
+    const oldRoute = {
+      policy: withQuotaShare(DEFAULT_BUDGET_POLICY, 100),
+      meterKey: "router:https://old-router.example/api/usage/conn_1",
+      usage: usage({ sessionPct: 10, weeklyPct: 0 }),
+    };
+    const newRoute = {
+      policy: withQuotaShare(DEFAULT_BUDGET_POLICY, 100),
+      meterKey: "router:https://new-router.example/api/usage/conn_1",
+      usage: usage({ sessionPct: 99, weeklyPct: 0 }),
+    };
+    const resolveProjectGovernor: ProjectGovernorResolver = async () =>
+      ++reads === 1 ? oldRoute : newRoute;
+    const ran = vi.fn();
+    const r = budgetRunner(h, ran, {
+      readUsage: async () => usage({ sessionPct: 10, weeklyPct: 0 }),
+      resolveProjectGovernor,
+    });
+    const id = await r.enqueue({ type: "execute-epic", projectId: "routed" });
+
+    // The old meter admitted, but the second atomic settings snapshot points at an exhausted router.
+    // Hold this claim and let the next tick gate the new route rather than dispatching through it now.
+    expect(await r.tickOnce()).toBe(0);
+    expect(ran).not.toHaveBeenCalled();
+    expect((await getJob(h.db, id))?.status).toBe("queued");
+
+    expect(await r.tickOnce()).toBe(0);
+    const deferred = await getJob(h.db, id);
+    expect(toMs(deferred?.runAt)).toBeGreaterThan(h.clock.now());
+    expect(deferred?.lastError).toMatch(/budget: session-headroom/);
+  });
+
   it("paces a routed project when the Anthropic meter is unavailable but its router is exhausted", async () => {
     // The machine-wide Anthropic subscription meter is absent (for example, OAuth is unreadable),
     // but the routed project's router still reports a real exhausted session. The account outage

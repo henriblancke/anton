@@ -1005,13 +1005,14 @@ export class JobRunner {
     const pacedExecuteEpicHolds = new Set<string>();
     const valueHeldJobIds = new Set<string>();
     const valueHeldReclaimIds = new Set<string>();
-    await this.applyBudgetGovernor(
+    const admittedMeters = await this.applyBudgetGovernor(
       heldBucketKeys,
       pacedExecuteEpicHolds,
       valueHeldJobIds,
       valueHeldReclaimIds,
       policyCapOf ?? (() => Infinity),
     );
+    await this.revalidateAdmittedGovernorMeters(admittedMeters, heldBucketKeys);
     const holdLogKey = [...valueHeldJobIds, ...valueHeldReclaimIds].sort().join(",");
     if (holdLogKey !== this.valueHoldLogKey) {
       this.valueHoldLogKey = holdLogKey;
@@ -1109,9 +1110,10 @@ export class JobRunner {
     valueHeldJobIds: Set<string>,
     valueHeldReclaimIds: Set<string>,
     bucketCapOf: (job: JobRow) => number,
-  ): Promise<void> {
+  ): Promise<Map<string | null, ProjectMeterSnapshot>> {
+    const admittedMeters = new Map<string | null, ProjectMeterSnapshot>();
     const resolveBudgetPolicy = this.resolveBudgetPolicy;
-    if (!resolveBudgetPolicy) return;
+    if (!resolveBudgetPolicy) return admittedMeters;
 
     // The gate decides per project (day window / reserve are per-project knobs), so gather every
     // project — including the null-project bucket — that has a pending job of a governed type.
@@ -1119,7 +1121,7 @@ export class JobRunner {
     for (const type of GOVERNED_JOB_TYPES) {
       for (const pid of await projectIdsWithPendingJobs(this.db, type)) projectIds.add(pid);
     }
-    if (projectIds.size === 0) return;
+    if (projectIds.size === 0) return admittedMeters;
 
     // The tick's Anthropic read is deferred until an unrouted project needs it. A router-only board
     // therefore never waits on an OAuth endpoint the operator deliberately stopped using.
@@ -1165,7 +1167,7 @@ export class JobRunner {
         projectId: pid,
       });
     }
-    if (governed.length === 0) return;
+    if (governed.length === 0) return admittedMeters;
 
     const snapshotByProject = new Map(
       governed.map(({ pid, snapshot }) => [pid, snapshot]),
@@ -1221,6 +1223,7 @@ export class JobRunner {
           projectWeeklyPct,
           bucketCapOf,
         );
+        admittedMeters.set(pid, snapshot);
         continue;
       }
       const retryAtMs = decision.retryAt.getTime();
@@ -1277,6 +1280,29 @@ export class JobRunner {
         pacedExecuteEpicHolds.add(scheduleGateKey("execute-epic", pid));
       }
     }
+    return admittedMeters;
+  }
+
+  /**
+   * A route can change after its governor snapshot admits work but before `leaseDue` claims it. Re-read
+   * each admitted project's atomic settings view; when its meter identity changed, hold that bucket for
+   * this tick so the next tick gates it against the route the handler will dispatch through. A failed
+   * revalidation deliberately fails open — it must not turn a transient settings read into a held queue.
+   */
+  private async revalidateAdmittedGovernorMeters(
+    admittedMeters: ReadonlyMap<string | null, ProjectMeterSnapshot>,
+    heldBucketKeys: Set<string>,
+  ): Promise<void> {
+    const resolveProjectGovernor = this.resolveProjectGovernor;
+    if (!resolveProjectGovernor || admittedMeters.size === 0) return;
+
+    await Promise.all(
+      [...admittedMeters].map(async ([pid, admitted]) => {
+        const current = await resolveProjectGovernor(pid, () => this.readUsageSafe()).catch(() => null);
+        if (!current || current.meterKey === admitted.meterKey) return;
+        for (const type of GOVERNED_JOB_TYPES) heldBucketKeys.add(scheduleGateKey(type, pid));
+      }),
+    );
   }
 
   /**
