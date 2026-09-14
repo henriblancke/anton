@@ -176,15 +176,24 @@ export type BudgetPolicyResolver = (
 ) => Promise<BudgetPolicy | null> | BudgetPolicy | null;
 
 /**
+ * One governor read paired with the immutable quota-meter identity that produced it. The pairing
+ * keeps spend attribution and gate evaluation in the same pool if project routing changes mid-tick.
+ */
+export interface ProjectMeterSnapshot {
+  meterKey: string;
+  usage: ClaudeUsage | null;
+}
+
+/**
  * This project's own attributed weekly spend, read at gate time so the quota share (R6.1) can be
  * enforced against it. The account-wide meter the governor reads is shared by every repo on the
- * machine, so it cannot say whose quota was spent — see `withQuotaShare` in ./budget. `usage` is
- * the governor's own read, passed through so the spend window anchors to the same weekly reset.
+ * machine, so it cannot say whose quota was spent — see `withQuotaShare` in ./budget. `snapshot`
+ * anchors attribution to the same usage window and meter identity the gate is deciding against.
  * Returns `null` when nothing is attributable (or the read failed): the share then doesn't bind.
  */
 export type ProjectSpendResolver = (
   projectId: string | null,
-  usage: ClaudeUsage | null,
+  snapshot: ProjectMeterSnapshot,
 ) => Promise<number | null>;
 
 /**
@@ -209,7 +218,7 @@ export type ProjectSpendResolver = (
 export type ProjectUsageResolver = (
   projectId: string | null,
   accountUsage: () => Promise<ClaudeUsage | null>,
-) => Promise<ClaudeUsage | null>;
+) => Promise<ProjectMeterSnapshot>;
 
 /**
  * Fresh counterpart to {@link ProjectUsageResolver} for the two ends of a burn-sampling window.
@@ -1133,15 +1142,18 @@ export class JobRunner {
 
     // Independent router reads must not serialize their five-second timeout. Resolve the meter
     // snapshots together, then apply the queue mutations in deterministic project order below.
-    const usages = await Promise.all(
+    const snapshots = await Promise.all(
       governed.map(async ({ pid }) => ({
         pid,
-        usage: this.resolveProjectUsage
-          ? await this.resolveProjectUsage(pid, accountUsage).catch(() => accountUsage())
-          : await accountUsage(),
+        snapshot: this.resolveProjectUsage
+          ? await this.resolveProjectUsage(pid, accountUsage).catch(async () => ({
+              meterKey: "anthropic",
+              usage: await accountUsage(),
+            }))
+          : { meterKey: "anthropic", usage: await accountUsage() },
       })),
     );
-    const usageByProject = new Map(usages.map(({ pid, usage }) => [pid, usage]));
+    const snapshotByProject = new Map(snapshots.map(({ pid, snapshot }) => [pid, snapshot]));
 
     const now = this.clock.now();
     for (const { pid, policy } of governed) {
@@ -1150,7 +1162,8 @@ export class JobRunner {
       // causes it to be read at all. Resolve it even when the account meter is absent: an
       // unreadable Anthropic endpoint says nothing about a healthy routed meter. A resolver failure
       // falls back to the account read, preserving the fail-open behavior for that project.
-      const projectUsage = usageByProject.get(pid) ?? null;
+      const snapshot = snapshotByProject.get(pid) ?? { meterKey: "anthropic", usage: null };
+      const projectUsage = snapshot.usage;
       if (!projectUsage) {
         // Fail open only for the project whose meter is unavailable. Resume its own stale governor
         // deferrals, but keep evaluating other governed projects with their independent meters.
@@ -1164,7 +1177,7 @@ export class JobRunner {
       // meter above — that one is moved by every repo here. Unresolvable spend leaves the share
       // unbound, the same fail-open posture as a null usage read.
       const projectWeeklyPct = this.resolveProjectSpend
-        ? await this.resolveProjectSpend(pid, projectUsage).catch(() => null)
+        ? await this.resolveProjectSpend(pid, snapshot).catch(() => null)
         : null;
       const decision = budgetGate(projectUsage, policy, now, { projectWeeklyPct });
       if (decision.admit) {
@@ -1182,6 +1195,7 @@ export class JobRunner {
         // at night admits high-value work only.
         await this.applyValueGate(
           projectUsage,
+          snapshot.meterKey,
           policy,
           pid,
           now,
@@ -1289,6 +1303,7 @@ export class JobRunner {
    */
   private async applyValueGate(
     usage: ClaudeUsage,
+    meterKey: string,
     policy: BudgetPolicy,
     pid: string | null,
     nowMs: number,
@@ -1298,9 +1313,8 @@ export class JobRunner {
     projectWeeklyPct: number | null,
     bucketCapOf: (job: JobRow) => number,
   ): Promise<void> {
-    // Resolve once for this pass so projected attempts reserve against the same meter-scoped samples
-    // as the current spend read. A resolver failure falls back to Anthropic, matching charge-time.
-    const meterKey = await this.resolveProjectMeterKeySafe(pid);
+    // The governor snapshot anchors projected attempts to the same meter-scoped samples as the
+    // current spend read, even if routing changes while this tick is applying its queue mutations.
     const candidates = await queuedDueJobs(this.db, this.clock, {
       types: VALUE_GATE_JOB_TYPES,
       projectId: pid,

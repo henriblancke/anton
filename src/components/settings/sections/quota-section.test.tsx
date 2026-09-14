@@ -107,4 +107,24 @@ describe("QuotaSection", () => {
     expect(screen.queryByText("a")).toBeNull();
     expect(screen.getByText(/Declared 100% across 2 paced projects/)).toBeTruthy();
   });
+
+  it("does not attribute the previous meter's spend to a staged connection", () => {
+    const mine = { ...project("mine", true), spentWeeklyPct: 42, seeded: true };
+    const router: QuotaShareProject = {
+      ...project("router", true),
+      meterKey: "router:https://router.example/api/usage/conn_1",
+      spentWeeklyPct: 8,
+    };
+    render(
+      <QuotaSection
+        form={form(true, true)}
+        project={{ id: "mine" }}
+        quotaProjects={[mine, router]}
+      />,
+    );
+
+    expect(screen.getByText(/≈ 8\.0% of the weekly quota attributed so far/)).toBeTruthy();
+    expect(screen.queryByText(/≈ 50\.0% of the weekly quota attributed so far/)).toBeNull();
+    expect(screen.queryByText(/Some spend is still estimated from tier seeds/)).toBeNull();
+  });
 });

@@ -1130,7 +1130,9 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     h.seedProjects("routed", "unrouted");
     const ran: string[] = [];
     const resolveProjectUsage: ProjectUsageResolver = async (pid, accountUsage) =>
-      pid === "routed" ? usage({ sessionPct: 10, weeklyPct: 0 }) : accountUsage();
+      pid === "routed"
+        ? { meterKey: "router:routed", usage: usage({ sessionPct: 10, weeklyPct: 0 }) }
+        : { meterKey: "anthropic", usage: await accountUsage() };
     const r = budgetRunner(
       h,
       async (ctx) => {
@@ -1161,6 +1163,30 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     expect(deferred?.lastError).toMatch(/budget: session-headroom/);
   });
 
+  it("uses the usage snapshot's meter for the same tick's spend attribution", async () => {
+    h.seedProjects("routed");
+    const routedUsage = usage({ sessionPct: 10, weeklyPct: 0 });
+    const resolveProjectUsage: ProjectUsageResolver = async () => ({
+      meterKey: "router:https://old-router.example/api/usage/conn_1",
+      usage: routedUsage,
+    });
+    const resolveProjectSpend = vi.fn(async () => null);
+    const r = budgetRunner(h, async () => {}, {
+      readUsage: async () => usage({ sessionPct: 99 }),
+      resolveProjectUsage,
+      resolveProjectSpend,
+    });
+    await r.enqueue({ type: "execute-epic", projectId: "routed" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+
+    expect(resolveProjectSpend).toHaveBeenCalledWith("routed", {
+      meterKey: "router:https://old-router.example/api/usage/conn_1",
+      usage: routedUsage,
+    });
+  });
+
   it("paces a routed project when the Anthropic meter is unavailable but its router is exhausted", async () => {
     // The machine-wide Anthropic subscription meter is absent (for example, OAuth is unreadable),
     // but the routed project's router still reports a real exhausted session. The account outage
@@ -1170,7 +1196,7 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     const resolveProjectUsage: ProjectUsageResolver = async (pid, accountUsage) => {
       expect(pid).toBe("routed");
       expect(await accountUsage()).toBeNull();
-      return usage({ sessionPct: 99, weeklyPct: 0 });
+      return { meterKey: "router:routed", usage: usage({ sessionPct: 99, weeklyPct: 0 }) };
     };
     const r = budgetRunner(
       h,
@@ -1200,7 +1226,10 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     // on (or defer to) a meter reading that was never its own.
     h.seedProjects("routed");
     let ran = 0;
-    const resolveProjectUsage: ProjectUsageResolver = async () => null;
+    const resolveProjectUsage: ProjectUsageResolver = async () => ({
+      meterKey: "router:routed",
+      usage: null,
+    });
     const r = budgetRunner(
       h,
       async () => {
@@ -1231,7 +1260,10 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     h.seedProjects("routed-a", "routed-b");
     let accountReads = 0;
     const ran: string[] = [];
-    const resolveProjectUsage: ProjectUsageResolver = async () => usage({ sessionPct: 10, weeklyPct: 0 });
+    const resolveProjectUsage: ProjectUsageResolver = async () => ({
+      meterKey: "router:routed",
+      usage: usage({ sessionPct: 10, weeklyPct: 0 }),
+    });
     const r = budgetRunner(
       h,
       async (ctx) => {
@@ -1265,7 +1297,7 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     const resolveProjectUsage: ProjectUsageResolver = async (projectId) => {
       if (projectId) started.add(projectId);
       await gate;
-      return usage({ sessionPct: 10, weeklyPct: 0 });
+      return { meterKey: `router:${projectId}`, usage: usage({ sessionPct: 10, weeklyPct: 0 }) };
     };
     const r = budgetRunner(h, async () => {}, {
       readUsage: async () => usage({ sessionPct: 99 }),
@@ -1288,7 +1320,9 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     h.seedProjects("routed", "unrouted-a", "unrouted-b");
     let accountReads = 0;
     const resolveProjectUsage: ProjectUsageResolver = async (pid, accountUsage) =>
-      pid === "routed" ? usage({ sessionPct: 10, weeklyPct: 0 }) : accountUsage();
+      pid === "routed"
+        ? { meterKey: "router:routed", usage: usage({ sessionPct: 10, weeklyPct: 0 }) }
+        : { meterKey: "anthropic", usage: await accountUsage() };
     const r = budgetRunner(
       h,
       async () => {},

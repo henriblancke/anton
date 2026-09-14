@@ -35,7 +35,14 @@ export function QuotaSection({
   // The staged switch and meter decide whether this row belongs in this split at all. A project's
   // quota share never crosses into another router connection or the Anthropic account pool.
   const staged = quotaProjects.map((p) =>
-    p.id === project.id ? { ...p, governed: draft.budgetAware, meterKey } : p,
+    p.id === project.id
+      ? {
+          ...p,
+          governed: draft.budgetAware,
+          meterKey,
+          ...(p.meterKey === meterKey ? {} : { spentWeeklyPct: null, seeded: false }),
+        }
+      : p,
   );
   const meterProjects = staged.filter((p) => p.meterKey === meterKey);
   const equalSplitPct = defaultQuotaSharePct(meterProjects.filter((p) => p.governed).length);

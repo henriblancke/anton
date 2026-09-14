@@ -53,6 +53,7 @@ const {
 
 /** The shipped weekly ceiling a share is a cut OF. */
 const TARGET = DEFAULT_PROJECT_BUDGET_POLICY.weeklyTargetPct;
+const ACCOUNT_SNAPSHOT = { meterKey: "anthropic", usage: null };
 
 function project(id: string, settings: ProjectSettings): string {
   return insertProject(tdb.db, {
@@ -362,7 +363,7 @@ describe("resolveProjectSpend", () => {
    */
   function burned(
     projectId: string | null,
-    opts: { attempts?: number; status?: string } = {},
+    opts: { attempts?: number; meterKey?: string; status?: string } = {},
   ): void {
     const id = randomUUID();
     const attempts = opts.attempts ?? 1;
@@ -386,7 +387,7 @@ describe("resolveProjectSpend", () => {
         jobId: id,
         projectId,
         jobType: "execute-epic",
-        meterKey: "anthropic",
+        meterKey: opts.meterKey ?? "anthropic",
         createdAt: new Date(),
       }).run();
     }
@@ -400,8 +401,36 @@ describe("resolveProjectSpend", () => {
     burned("theirs");
 
     // execute-epic's L-tier seed is 3 weekly points until real samples accrue.
-    expect(await resolveProjectSpend("mine", null)).toBeCloseTo(6, 6);
-    expect(await resolveProjectSpend("theirs", null)).toBeCloseTo(3, 6);
+    expect(await resolveProjectSpend("mine", ACCOUNT_SNAPSHOT)).toBeCloseTo(6, 6);
+    expect(await resolveProjectSpend("theirs", ACCOUNT_SNAPSHOT)).toBeCloseTo(3, 6);
+  });
+
+  it("keeps spend in the snapshot meter when routing changes during a governor read", async () => {
+    const oldSettings = {
+      claudeBaseUrl: "https://old-router.example/v1",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("routed", oldSettings);
+    routerUsageOverride = async () => null;
+    const snapshot = await resolveProjectUsage("routed", async () => null);
+    const oldMeterKey = "router:https://old-router.example/api/usage/conn_1";
+    const newMeterKey = "router:https://new-router.example/api/usage/conn_1";
+    burned("routed", { meterKey: oldMeterKey });
+    burned("routed", { meterKey: newMeterKey });
+    burned("routed", { meterKey: newMeterKey });
+    await tdb.db
+      .update(schema.projects)
+      .set({
+        settingsJson: JSON.stringify({
+          ...oldSettings,
+          claudeBaseUrl: "https://new-router.example/v1",
+        }),
+      })
+      .where(eq(schema.projects.id, "routed"));
+
+    // One old-meter attempt is attributed; the two new-meter attempts must never be mixed in.
+    expect(await resolveProjectSpend("routed", snapshot)).toBeCloseTo(3, 6);
   });
 
   it("charges an attempt that failed exactly like one that succeeded", async () => {
@@ -410,7 +439,7 @@ describe("resolveProjectSpend", () => {
     project("flaky", armed());
     burned("flaky", { status: "parked", attempts: 3 });
 
-    expect(await resolveProjectSpend("flaky", null)).toBeCloseTo(9, 6);
+    expect(await resolveProjectSpend("flaky", ACCOUNT_SNAPSHOT)).toBeCloseTo(9, 6);
   });
 
   it("answers null — unattributed, never zero — when nothing is charged to it", async () => {
@@ -418,8 +447,8 @@ describe("resolveProjectSpend", () => {
     burned(null); // anton's own plumbing belongs to nobody's share
     burned("quiet", { status: "queued", attempts: 0 }); // enqueued, never dispatched
 
-    expect(await resolveProjectSpend("quiet", null)).toBeNull();
-    expect(await resolveProjectSpend(null, null)).toBeNull();
+    expect(await resolveProjectSpend("quiet", ACCOUNT_SNAPSHOT)).toBeNull();
+    expect(await resolveProjectSpend(null, ACCOUNT_SNAPSHOT)).toBeNull();
   });
 });
 
@@ -460,7 +489,10 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
     routerUsageOverride = async () => ROUTER_USAGE;
     const account = accountThunk();
 
-    expect(await resolveProjectUsage("routed", account.read)).toEqual(ROUTER_USAGE);
+    expect(await resolveProjectUsage("routed", account.read)).toEqual({
+      meterKey: "router:https://gw.example.com/api/usage/conn_1",
+      usage: ROUTER_USAGE,
+    });
     expect(account.calls()).toBe(0); // the whole point of routing: no Anthropic request at all
   });
 
@@ -507,7 +539,10 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
     project("plain", {});
     const account = accountThunk();
 
-    expect(await resolveProjectUsage("plain", account.read)).toBe(ACCOUNT_USAGE);
+    expect(await resolveProjectUsage("plain", account.read)).toEqual({
+      meterKey: "anthropic",
+      usage: ACCOUNT_USAGE,
+    });
     expect(account.calls()).toBe(1);
   });
 
@@ -519,7 +554,10 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
     });
     const account = accountThunk();
 
-    expect(await resolveProjectUsage("invalid-route", account.read)).toBe(ACCOUNT_USAGE);
+    expect(await resolveProjectUsage("invalid-route", account.read)).toEqual({
+      meterKey: "anthropic",
+      usage: ACCOUNT_USAGE,
+    });
     expect(account.calls()).toBe(1);
   });
 
@@ -532,7 +570,10 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
     routerUsageOverride = async () => null; // unreadable: no creds, timeout, non-200, malformed body
     const account = accountThunk();
 
-    expect(await resolveProjectUsage("routed", account.read)).toBeNull();
+    expect(await resolveProjectUsage("routed", account.read)).toEqual({
+      meterKey: "router:https://gw.example.com/api/usage/conn_1",
+      usage: null,
+    });
     // Fails open to null rather than silently borrowing the account meter, which is not its traffic.
     expect(account.calls()).toBe(0);
   });
@@ -542,7 +583,10 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
     // unrouted behavior. A rejected settings read is distinct and must not borrow the account meter.
     const account = accountThunk();
 
-    expect(await resolveProjectUsage("missing", account.read)).toBe(ACCOUNT_USAGE);
+    expect(await resolveProjectUsage("missing", account.read)).toEqual({
+      meterKey: "anthropic",
+      usage: ACCOUNT_USAGE,
+    });
     expect(account.calls()).toBe(1);
   });
 
@@ -559,7 +603,10 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
     }) as typeof tdb.db.select);
     const account = accountThunk();
 
-    expect(await resolveProjectUsage("routed", account.read)).toBeNull();
+    expect(await resolveProjectUsage("routed", account.read)).toEqual({
+      meterKey: "anthropic",
+      usage: null,
+    });
     expect(account.calls()).toBe(0);
 
     selects.mockRestore();
@@ -568,7 +615,10 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
   it("returns the account usage unchanged for the null-project bucket", async () => {
     const account = accountThunk();
 
-    expect(await resolveProjectUsage(null, account.read)).toBe(ACCOUNT_USAGE);
+    expect(await resolveProjectUsage(null, account.read)).toEqual({
+      meterKey: "anthropic",
+      usage: ACCOUNT_USAGE,
+    });
     expect(account.calls()).toBe(1);
   });
 });

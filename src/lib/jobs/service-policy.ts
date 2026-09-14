@@ -25,6 +25,7 @@ import {
 import { projectWeeklySpendPct } from "../quota-spend";
 import { withQuotaShare } from "./budget";
 import type { ClaudeUsage } from "../claude/usage";
+import type { ProjectMeterSnapshot } from "./runner";
 import { getRouterUsageCached, getRouterUsageFresh } from "../claude/router-usage";
 import { beads } from "../beads/bd";
 import { allIssues } from "../beads/issues";
@@ -106,9 +107,10 @@ function meterShareBoard(board: readonly GovernedShare[], settings: Parameters<t
  * is moved by every repo on the machine, so gating it per-share would stop them all at one repo's
  * cut and leave the rest of the operator's weekly target unspendable (idle-fill, anton-ld7j).
  *
- * `usage` comes from the governor's own read so the spend window is anchored to the same weekly
- * reset the gate is deciding against. Fails soft to `null` — unattributed, never zero — so a db
- * hiccup relaxes the share rather than parking the project.
+ * `snapshot` freezes the meter identity with the governor's usage read, so a settings edit while
+ * that read is in flight cannot combine one pool's reset window with another pool's attempts.
+ * Fails soft to `null` — unattributed, never zero — so a db hiccup relaxes the share rather than
+ * parking the project.
  */
 export async function resolveProjectMeterKey(projectId: string | null): Promise<string> {
   if (!projectId) return "anthropic";
@@ -118,16 +120,16 @@ export async function resolveProjectMeterKey(projectId: string | null): Promise<
 
 export async function resolveProjectSpend(
   projectId: string | null,
-  usage: ClaudeUsage | null,
+  snapshot: ProjectMeterSnapshot,
 ): Promise<number | null> {
   if (!projectId) return null;
   try {
     return await projectWeeklySpendPct(
       getDb(),
       projectId,
-      usage,
+      snapshot.usage,
       Date.now(),
-      await resolveProjectMeterKey(projectId),
+      snapshot.meterKey,
     );
   } catch {
     return null;
@@ -145,8 +147,18 @@ export async function resolveProjectSpend(
 export async function resolveProjectUsage(
   projectId: string | null,
   accountUsage: () => Promise<ClaudeUsage | null>,
-): Promise<ClaudeUsage | null> {
-  return resolveProjectMeter(projectId, accountUsage, getRouterUsageCached);
+): Promise<ProjectMeterSnapshot> {
+  if (!projectId) return { meterKey: "anthropic", usage: await accountUsage() };
+  const settings = await getProjectSettings(getDb(), projectId).catch(() => undefined);
+  if (settings === undefined) return { meterKey: "anthropic", usage: null };
+  const meterKey = quotaMeterKey(settings);
+  return {
+    meterKey,
+    usage:
+      meterKey === "anthropic"
+        ? await accountUsage()
+        : await getRouterUsageCached(settings).catch(() => null),
+  };
 }
 
 /**
@@ -165,20 +177,6 @@ export async function resolveProjectUsageFresh(
   if (expectedMeterKey && meterKey !== expectedMeterKey) return null;
   if (meterKey === "anthropic") return accountUsage();
   return getRouterUsageFresh(settings).catch(() => null);
-}
-
-async function resolveProjectMeter(
-  projectId: string | null,
-  accountUsage: () => Promise<ClaudeUsage | null>,
-  readRouter: typeof getRouterUsageCached,
-): Promise<ClaudeUsage | null> {
-  if (!projectId) return accountUsage();
-  const settings = await getProjectSettings(getDb(), projectId).catch(() => undefined);
-  if (settings === undefined) return null;
-  if (quotaMeterKey(settings) === "anthropic") return accountUsage(); // unrouted → today's meter
-  // Routed: the account meter is not this project's traffic, so it is never read on its behalf —
-  // `accountUsage` goes uncalled and a router-only board makes no Anthropic request this tick.
-  return readRouter(settings).catch(() => null);
 }
 
 /** The last imbalance announced for each independent quota meter. */
