@@ -21,6 +21,8 @@ const acquireClaimMock = vi.fn<(...a: unknown[]) => Promise<void>>();
 const releaseClaimMock = vi.fn<(...a: unknown[]) => Promise<void>>();
 const removeWorktreeMock = vi.fn();
 const updateRunMock = vi.fn();
+const getRunBaseForkShaMock = vi.fn();
+const findRunBaseForkShaForBranchMock = vi.fn();
 vi.mock("../git/worktree", async () => {
   const actual = await vi.importActual<typeof import("../git/worktree")>("../git/worktree");
   return {
@@ -45,7 +47,12 @@ vi.mock("../git/ops", async () => {
 
 vi.mock("../runs", async () => {
   const actual = await vi.importActual<typeof import("../runs")>("../runs");
-  return { ...actual, updateRun: (...a: unknown[]) => updateRunMock(...a) };
+  return {
+    ...actual,
+    getRunBaseForkSha: (...a: unknown[]) => getRunBaseForkShaMock(...a),
+    findRunBaseForkShaForBranch: (...a: unknown[]) => findRunBaseForkShaForBranchMock(...a),
+    updateRun: (...a: unknown[]) => updateRunMock(...a),
+  };
 });
 
 const { warmRunWorktree } = await import("./execute-epic-claim");
@@ -94,6 +101,8 @@ beforeEach(async () => {
   acquireClaimMock.mockReset().mockResolvedValue(undefined);
   releaseClaimMock.mockReset().mockResolvedValue(undefined);
   removeWorktreeMock.mockReset().mockResolvedValue({ removed: true, branchDeleted: true });
+  getRunBaseForkShaMock.mockReset().mockImplementation(actualRuns.getRunBaseForkSha);
+  findRunBaseForkShaForBranchMock.mockReset().mockImplementation(actualRuns.findRunBaseForkShaForBranch);
   updateRunMock.mockReset().mockImplementation(actualRuns.updateRun);
   resolveFreshBaseMock.mockReset().mockResolvedValue(FRESH_BASE);
   resolveForkPointMock.mockReset().mockResolvedValue("f0f0f0forkcommit");
@@ -231,6 +240,18 @@ it("ignores a reused checkout's forkSha — it reads the branch's current HEAD, 
 
 it("removes a newly created checkout and branch when fork-pin persistence fails", async () => {
   updateRunMock.mockRejectedValueOnce(new Error("database unavailable"));
+
+  await expect(warmRunWorktree(makeRun())).rejects.toThrow("database unavailable");
+
+  expect(releaseClaimMock).toHaveBeenCalledWith("/repo", BRANCH, "execute-epic#run-1");
+  expect(removeWorktreeMock).toHaveBeenCalledWith(
+    expect.objectContaining({ path: WORKTREE, branch: BRANCH }),
+    { deleteBranch: true },
+  );
+});
+
+it("removes a fresh checkout and branch when reading its fork pin fails", async () => {
+  getRunBaseForkShaMock.mockRejectedValueOnce(new Error("database unavailable"));
 
   await expect(warmRunWorktree(makeRun())).rejects.toThrow("database unavailable");
 

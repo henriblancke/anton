@@ -87,37 +87,40 @@ export async function warmRunWorktree(
   // run that INHERITED its branch recovers what the attempt that cut it recorded, and only one
   // standing on a branch it just created resolves a fork point of its own. A pre-column branch has
   // neither, and recomputes once — no worse than the old behaviour — storing the answer on its row.
-  const storedFork = await getRunBaseForkSha(db, runId);
-  const reusedFork =
-    storedFork ??
-    (reusedCheckout
-      ? await findRunBaseForkShaForBranch(db, projectId, run.targetId, branch)
-      : undefined);
+  let storedFork: string | undefined;
   let baseForkSha: string;
   try {
-    // The creation-captured fork is FROZEN only on a first creation (PR #238 review): there
-    // `readForkAtCreation` reads the checkout's HEAD in the instant `worktree add -b` cut it, so the
-    // base cannot since have rewound it. A reused checkout's `forkSha` is read off the SAME call
-    // checking the existing branch out, so it returns the branch's current HEAD — already carrying
-    // this run's prior-attempt commits — not the fork point. Preferring it would partition against
-    // `<HEAD>..HEAD>` and read a ticket already closed on a prior attempt as a pre-existing
-    // retirement. Only a checkout this call just created takes `worktree.forkSha`; a reused one asks
-    // `reusedFork` first, the row and the attempt that cut the branch.
-    baseForkSha = reusedCheckout
-      ? reusedFork ?? (await resolveForkPoint(worktree.path, freshBase))
-      : worktree.forkSha ?? reusedFork ?? (await resolveForkPoint(worktree.path, freshBase));
-  } catch (e) {
-    // Only reachable when a legacy row (no pinned fork) resumes over a worktree whose base was
-    // rewritten to an unrelated history — a fresh creation forks off `freshBase` and always shares
-    // it. Partitioning the run's tickets against a moving ref instead could read work this checkout
-    // never forked from as its own delivery, so stop rather than guess a fork point.
-    throw new PoisonEpic(
-      `anton could not resolve the commit \`${worktree.branch}\` forked from ${freshBase} in ` +
-        `${worktree.path} (${e instanceof Error ? e.message : String(e)}) — refusing to partition ` +
-        `the run's tickets against a moving base. Repair the worktree, then resume the run`,
-    );
-  }
-  try {
+    // Pin reads are part of the same atomic setup as the pin write: a fresh checkout with neither
+    // must be removed, or a retry could reuse its branch and derive a fork from a moved base.
+    storedFork = await getRunBaseForkSha(db, runId);
+    const reusedFork =
+      storedFork ??
+      (reusedCheckout
+        ? await findRunBaseForkShaForBranch(db, projectId, run.targetId, branch)
+        : undefined);
+    try {
+      // The creation-captured fork is FROZEN only on a first creation (PR #238 review): there
+      // `readForkAtCreation` reads the checkout's HEAD in the instant `worktree add -b` cut it, so the
+      // base cannot since have rewound it. A reused checkout's `forkSha` is read off the SAME call
+      // checking the existing branch out, so it returns the branch's current HEAD — already carrying
+      // this run's prior-attempt commits — not the fork point. Preferring it would partition against
+      // `<HEAD>..HEAD>` and read a ticket already closed on a prior attempt as a pre-existing
+      // retirement. Only a checkout this call just created takes `worktree.forkSha`; a reused one asks
+      // `reusedFork` first, the row and the attempt that cut the branch.
+      baseForkSha = reusedCheckout
+        ? reusedFork ?? (await resolveForkPoint(worktree.path, freshBase))
+        : worktree.forkSha ?? reusedFork ?? (await resolveForkPoint(worktree.path, freshBase));
+    } catch (e) {
+      // Only reachable when a legacy row (no pinned fork) resumes over a worktree whose base was
+      // rewritten to an unrelated history — a fresh creation forks off `freshBase` and always shares
+      // it. Partitioning the run's tickets against a moving ref instead could read work this checkout
+      // never forked from as its own delivery, so stop rather than guess a fork point.
+      throw new PoisonEpic(
+        `anton could not resolve the commit \`${worktree.branch}\` forked from ${freshBase} in ` +
+          `${worktree.path} (${e instanceof Error ? e.message : String(e)}) — refusing to partition ` +
+          `the run's tickets against a moving base. Repair the worktree, then resume the run`,
+      );
+    }
     await updateRun(db, clock, runId, {
       worktreePath: worktree.path,
       branch: worktree.branch,
@@ -128,9 +131,10 @@ export async function warmRunWorktree(
       ...(!reusedCheckout || !storedFork ? { baseForkSha } : {}),
     });
   } catch (error) {
-    // A newly-created checkout without its fork pin is unsafe to reuse: a retry would find the
-    // branch and derive a different base against a ref another run may have moved. A reused checkout
-    // belongs to its prior attempt and is already pinned, so this attempt must leave it intact.
+    // A newly-created checkout without a pinned fork is unsafe to reuse: any setup failure before
+    // persistence would otherwise leave a retry free to derive against a base another run has moved.
+    // A reused checkout belongs to its prior attempt and is already pinned, so this attempt leaves it
+    // intact.
     if (!reusedCheckout) {
       await releaseWorktreeClaim(repo, branch, worktreeClaim).catch((cleanupError) => {
         console.error(`[execute-epic] could not release the failed worktree claim for ${branch}`, cleanupError);
