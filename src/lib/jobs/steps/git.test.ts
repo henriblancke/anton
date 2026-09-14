@@ -47,16 +47,20 @@ describe("step:commit", () => {
   // A ticket-phase step speaks for its one ticket; a run-phase step speaks for the run, so its
   // commit must not be filed under whichever ticket happened to be first.
   it("names the ticket it covers in the commit subject, else the run target", async () => {
-    await commitStep(sandbox.context({ tickets: [ticket("anton-a")] }));
+    const ticketContext = sandbox.context({ tickets: [ticket("anton-a")] });
+    await commitStep(ticketContext);
     expect(ops.commitAll).toHaveBeenLastCalledWith(sandbox.dir, "anton-a: ticket anton-a", {
       hooksPath: undefined,
       timeoutMs: 120_000,
+      signal: ticketContext.ctx.signal,
     });
 
-    await commitStep(sandbox.context({ tickets: [ticket("anton-a"), ticket("anton-b")] }));
+    const runContext = sandbox.context({ tickets: [ticket("anton-a"), ticket("anton-b")] });
+    await commitStep(runContext);
     expect(ops.commitAll).toHaveBeenLastCalledWith(sandbox.dir, `${target.id}: ${target.title}`, {
       hooksPath: undefined,
       timeoutMs: 120_000,
+      signal: runContext.ctx.signal,
     });
   });
 

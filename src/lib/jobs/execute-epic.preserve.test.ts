@@ -738,10 +738,9 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
   });
 
-  // The abort's other landing spot: `commitAll` runs on no signal (a pre-commit hook can hold it for
-  // minutes), so a kill can arrive with the preserved commit already made. Read as an ordinary
-  // preserve it would write the board a human is deciding on; read as a failure it would roll the
-  // commit away. It is neither — the work stays on the branch and the bead belongs to the abort.
+  // The abort's other landing spot: a pre-commit hook can hold the commit open. The signal now
+  // reaches `commitAll`, which reaps that hook group before this preserve returns, so an abort that
+  // lands before git creates its commit leaves neither a WIP commit nor a later hook writing here.
   it("reports the JOB's abort that lands while the preserved commit is being made", async () => {
     const baseline = await readWorktreeState(repo);
     write("HALF_WRITTEN.md", "finished work the kill must not delete\n");
@@ -751,9 +750,12 @@ suite("preserveTimedOutWork (real git)", () => {
     // longer than any timer chosen here, and the abort would land in the gate window instead — a
     // different path, whose pass says nothing about this one.
     const committing = join(sandbox, "committing");
-    writeFileSync(join(hooks, "pre-commit"), `#!/bin/sh\ntouch "${committing}"\nsleep 1\n`, {
-      mode: 0o755,
-    });
+    const reaped = join(sandbox, "hook-reaped");
+    writeFileSync(
+      join(hooks, "pre-commit"),
+      `#!/bin/sh\ntouch "${committing}"\ntrap 'touch "${reaped}"; exit 1' TERM\nsleep 120 &\nwait\n`,
+      { mode: 0o755 },
+    );
     const abort = new AbortController();
     const watch = setInterval(() => {
       if (existsSync(committing)) abort.abort();
@@ -770,9 +772,9 @@ suite("preserveTimedOutWork (real git)", () => {
     }).finally(() => clearInterval(watch));
 
     expect(kept).toEqual({ jobAborted: true });
-    // The commit landed before the kill was noticed — it stays, and the caller writes nothing.
-    expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
-    expect(head()).not.toBe(baseline.head);
+    expect(existsSync(reaped)).toBe(true);
+    expect(subjects()).not.toContain(`WIP ${ticket.id}: ${ticket.title}`);
+    expect(head()).toBe(baseline.head);
   });
 });
 

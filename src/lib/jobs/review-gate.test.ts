@@ -234,7 +234,7 @@ function gate(
   result: Promise<ReviewGateResult>;
   calls: RunClaudeOptions[];
   commitMessages: string[];
-  commitOptions: Array<{ timeoutMs?: number }>;
+  commitOptions: Array<{ timeoutMs?: number; signal?: AbortSignal }>;
   restores: string[];
   /** The worktree's dirt as each round's diff was read — the review must see a settled tree. */
   diffStates: string[];
@@ -243,7 +243,7 @@ function gate(
 } {
   const { run, calls } = fakeClaude(replies);
   const commitMessages: string[] = [];
-  const commitOptions: Array<{ timeoutMs?: number }> = [];
+  const commitOptions: Array<{ timeoutMs?: number; signal?: AbortSignal }> = [];
   const diffStates: string[] = [];
   const rounds: ReviewRound[] = [];
   const result = runReviewGate({
@@ -337,7 +337,9 @@ describe("runReviewGate — convergence", () => {
 
     await result;
 
-    expect(commitOptions).toEqual([{ timeoutMs: 10 * 60_000 }]);
+    expect(commitOptions).toHaveLength(1);
+    expect(commitOptions[0]?.timeoutMs).toBe(10 * 60_000);
+    expect(commitOptions[0]?.signal).toBe(ctx.signal);
   });
 
   it("keeps child-ticket label routing through review fixes", async () => {

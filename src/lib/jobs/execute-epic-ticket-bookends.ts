@@ -402,7 +402,12 @@ async function recordSatisfiedOnBranch(
         `own. This empty commit records the attribution no subject on this branch carries — it is ` +
         `what a later attempt reads to see the ticket as delivered instead of dispatching it into ` +
         `a zero diff.`,
-      { satisfies: [ticket.id], hooksPath, timeoutMs: resolveCommitTimeoutMs(run.settings) },
+      {
+        satisfies: [ticket.id],
+        hooksPath,
+        timeoutMs: resolveCommitTimeoutMs(run.settings),
+        signal: run.ctx.signal,
+      },
     );
   } catch (e) {
     throw new PoisonEpic(

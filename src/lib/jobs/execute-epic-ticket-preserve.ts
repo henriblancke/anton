@@ -266,9 +266,10 @@ export async function preserveTimedOutWork(args: {
     message: preservedCommitMessage(ticket, timeoutMs),
     before: now,
     timeoutMs: resolveCommitTimeoutMs(settings),
+    signal: run.ctx.signal,
   });
-  // The abort outranks the timeout on THIS side of the commit too (PR #228 review). `commitAll` runs
-  // on no signal — a pre-commit hook can hold it for minutes — so an operator's kill, a lost lease or
+  // The abort outranks the timeout on THIS side of the commit too (PR #228 review). `commitAll`
+  // reaps the hook process group when this signal fires, so an operator's kill, a lost lease or
   // the no-progress timeout can land here just as it can in the gate window above, and neither
   // outcome of the commit is a verdict once it has: a commit that landed simply stays on the branch,
   // and one that did not must not be read as "unfit" and rolled back. Reported as the abort so the
@@ -303,6 +304,7 @@ export async function preserveTimedOutWork(args: {
         ticket,
         timeoutMs,
         settings,
+        signal: run.ctx.signal,
         logPath,
         why:
           "error" in kept
@@ -365,6 +367,7 @@ async function adoptSelfCommittedWork(args: {
   ticket: Bead;
   timeoutMs: number;
   settings: ProjectSettings;
+  signal: AbortSignal;
   logPath: string;
   /** How the commits on this branch came to be there, for the operator reading the log. */
   why: string;
@@ -375,7 +378,7 @@ async function adoptSelfCommittedWork(args: {
    */
   alreadyMarked: boolean;
 }): Promise<PreservedWork> {
-  const { repoPath, worktreePath, branch, ticket, timeoutMs, settings, logPath, why, alreadyMarked } = args;
+  const { repoPath, worktreePath, branch, ticket, timeoutMs, settings, signal, logPath, why, alreadyMarked } = args;
   const message = preservedCommitMessage(ticket, timeoutMs, { marker: true });
   // A REJECTED marker call is not proof the marker is absent (PR #228 review). `--no-verify` bypasses
   // only `pre-commit` and `commit-msg` (git-commit(1)); `post-commit` runs AFTER the commit is made,
@@ -403,6 +406,7 @@ async function adoptSelfCommittedWork(args: {
       commitMarker(worktreePath, message, {
         hooksPath,
         timeoutMs: resolveCommitTimeoutMs(settings),
+        signal,
       }),
     )) ||
     (await worktreeTipIsPreservedCommitFor(worktreePath, ticket.id));
@@ -520,8 +524,9 @@ async function commitPreservedTree(args: {
   message: string;
   before: WorktreeState;
   timeoutMs: number;
+  signal: AbortSignal;
 }): Promise<{ committed: boolean } | { committed: false; error: unknown }> {
-  const { repoPath, worktreePath, logPath, message, before, timeoutMs } = args;
+  const { repoPath, worktreePath, logPath, message, before, timeoutMs, signal } = args;
   const rejected = (error: unknown) => ({ committed: false as const, error });
   // Hashed BEFORE the attempt, because after it a hook's edits are indistinguishable from the
   // agent's own work. This also happens to be the right order for `resolveHooksPathOverride` below
@@ -531,7 +536,7 @@ async function commitPreservedTree(args: {
   // `commitStep`/`commitAndPushFix`, which had no staging step of their own before this fix.
   const verified = await stageAllAndHashTree(worktreePath).catch(() => null);
   const hooksPath = await resolveHooksPathOverride(repoPath, worktreePath);
-  const first = await commitAll(worktreePath, message, { hooksPath, timeoutMs }).catch(rejected);
+  const first = await commitAll(worktreePath, message, { hooksPath, timeoutMs, signal }).catch(rejected);
   // Accepted by this project's hooks — the same proof an ordinary commit ships on, so `verified` is
   // not re-compared here; it exists for the bypass below, where no hook is left to say yes.
   if (!("error" in first)) return first;
@@ -557,7 +562,7 @@ async function commitPreservedTree(args: {
   //
   // Same `timeoutMs` as the first attempt (anton-zse2) — a retry bounded differently would make the
   // two failures tell different stories about the same budget.
-  return commitAll(worktreePath, message, { bypassHooks: true, hooksPath, timeoutMs }).catch(
+  return commitAll(worktreePath, message, { bypassHooks: true, hooksPath, timeoutMs, signal }).catch(
     rejected,
   );
 }

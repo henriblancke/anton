@@ -120,7 +120,7 @@ export interface ReviewGateDeps {
   commit?: (
     worktreePath: string,
     message: string,
-    options: { timeoutMs?: number },
+    options: { timeoutMs?: number; signal?: AbortSignal },
   ) => Promise<{ committed: boolean }>;
   /** Fingerprint the worktree around a review — the read-only guard's before/after. */
   readState?: (worktreePath: string) => Promise<WorktreeState>;
@@ -290,8 +290,8 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const mergeBase = args.deps?.mergeBase ?? resolveMergeBase;
   const commit =
     args.deps?.commit ??
-    ((commitWorktreePath: string, message: string, _options: { timeoutMs?: number }) =>
-      commitAll(commitWorktreePath, message, { timeoutMs: resolveCommitTimeoutMs(settings) }));
+    ((commitWorktreePath: string, message: string, options: { timeoutMs?: number; signal?: AbortSignal }) =>
+      commitAll(commitWorktreePath, message, options));
   const readState = args.deps?.readState ?? readWorktreeState;
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
   const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
@@ -887,7 +887,7 @@ async function runGateFixSession(args: {
   commit: (
     worktreePath: string,
     message: string,
-    options: { timeoutMs?: number },
+    options: { timeoutMs?: number; signal?: AbortSignal },
   ) => Promise<{ committed: boolean }>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
@@ -978,6 +978,7 @@ async function runGateFixSession(args: {
       const testedTree = await hashTreeOrUnknown(args.hashTree, worktreePath);
       const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`, {
         timeoutMs: resolveCommitTimeoutMs(settings),
+        signal: ctx.signal,
       });
       // Set the instant the commit lands, BEFORE the second hash: past here the round's work is
       // verified and committed, and the rollback below must not touch it however this session ends.

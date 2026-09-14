@@ -651,6 +651,7 @@ async function runFixSession(args: {
       branch,
       number,
       settings,
+      ctx.signal,
     );
 
     await applyThreadOutcomes({
@@ -726,6 +727,7 @@ async function commitAndPushFix(
   branch: string,
   number: number,
   settings: ProjectSettings,
+  signal: AbortSignal,
 ): Promise<boolean> {
   // Staged BEFORE `resolveHooksPathOverride` is asked anything (PR #263 review, round 37) — the
   // same fix `commitStep` applies for the same reason: its submodule-staleness check reads the
@@ -740,7 +742,7 @@ async function commitAndPushFix(
   const { committed } = await commitAll(
     worktreePath,
     `${epicId}: address review feedback (PR #${number})`,
-    { hooksPath, timeoutMs: resolveCommitTimeoutMs(settings) },
+    { hooksPath, timeoutMs: resolveCommitTimeoutMs(settings), signal },
   );
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
   // From the worktree, not `repo` (the base checkout) — see pushBranch's doc comment: a project's

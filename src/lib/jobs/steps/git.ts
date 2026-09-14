@@ -68,6 +68,7 @@ export async function commitStep(ctx: StepContext): Promise<StepResultWith<"comm
   const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx), {
     hooksPath,
     timeoutMs: resolveCommitTimeoutMs(ctx.settings),
+    signal: ctx.ctx.signal,
   });
   if (committed) return { ok: true, detail: "committed", facts: { committed: true } };
 
@@ -212,6 +213,7 @@ async function recordAttribution(ctx: StepContext, why: string): Promise<boolean
   await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`, {
     hooksPath,
     timeoutMs: resolveCommitTimeoutMs(ctx.settings),
+    signal: ctx.ctx.signal,
   });
   return true;
 }

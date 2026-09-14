@@ -3073,6 +3073,29 @@ suite("commitAll (real git · a hook that outlives the kill)", () => {
     },
   );
 
+  it.runIf(process.platform !== "win32")(
+    "reaps an in-flight commit hook when the job aborts before its configured budget",
+    async () => {
+      // A project may deliberately budget this commit for much longer than the runner's no-progress
+      // watchdog. The abort has to own the same process-group reap as the commit budget, or this
+      // hook keeps a runner slot and can still write after the job has moved on.
+      const controller = new AbortController();
+      const reason = new Error("job made no progress");
+      const pending = commitAll(repo, "t1: work the hook is sitting on", {
+        timeoutMs: 30 * 60_000,
+        signal: controller.signal,
+      });
+
+      await vi.waitFor(() => expect(existsSync(started)).toBe(true));
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+      // The hook writes only after TERM. Seeing it before the abort reaches the caller proves the
+      // cancellation path waited for the group, not merely for git's direct child process.
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
   // anton-b3it: the env var is a CAP on a caller's requested budget, not an override — a caller
   // asking for a real 30-minute setting must still be bounded by it.
   it.runIf(process.platform !== "win32")(

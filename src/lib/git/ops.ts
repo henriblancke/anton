@@ -860,8 +860,14 @@ function gitCommit(
   args: string[],
   hooksPath?: string,
   requestedTimeoutMs?: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   return new Promise((resolvePromise, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+      return;
+    }
+
     const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
     // stdout is dropped rather than piped: nothing here reads it, and a chatty hook filling an
     // unread pipe would block the commit outright.
@@ -877,15 +883,24 @@ function gitCommit(
       if (settled) return;
       settled = true;
       clearTimeout(budget);
+      signal?.removeEventListener("abort", abort);
       emit();
     };
-
+    const abort = () => {
+      if (killing || settled) return;
+      killing = true;
+      void reapCommitGroup(child).then(() =>
+        settle(() => reject(signal?.reason ?? new DOMException("The operation was aborted", "AbortError"))),
+      );
+    };
     const budget = setTimeout(() => {
+      if (killing || settled) return;
       killing = true;
       void reapCommitGroup(child).then(() =>
         settle(() => reject(commitTimedOut(args, timeoutMs, stderr()))),
       );
     }, timeoutMs);
+    signal?.addEventListener("abort", abort, { once: true });
 
     child.on("error", (err) => settle(() => reject(err)));
     child.on("close", (code) => {
@@ -1161,7 +1176,7 @@ export async function stageAll(worktreePath: string, hooksPath?: string): Promis
 export async function commitAll(
   worktreePath: string,
   message: string,
-  options: { bypassHooks?: boolean; hooksPath?: string; timeoutMs?: number } = {},
+  options: { bypassHooks?: boolean; hooksPath?: string; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<{ committed: boolean }> {
   await stageAll(worktreePath, options.hooksPath);
   const bypass = options.bypassHooks ? ["--no-verify"] : [];
@@ -1175,6 +1190,7 @@ export async function commitAll(
       ["commit", ...bypass, "-m", message],
       options.hooksPath,
       options.timeoutMs,
+      options.signal,
     );
     return { committed: true };
   }
@@ -1250,7 +1266,7 @@ export async function isAncestor(
 export async function commitMarker(
   worktreePath: string,
   message: string,
-  options: { satisfies?: string[]; hooksPath?: string; timeoutMs?: number } = {},
+  options: { satisfies?: string[]; hooksPath?: string; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<void> {
   // `--allow-empty` PERMITS an empty commit; it does not FORCE one. Anything a caller happened to
   // leave staged would ship under a message saying this commit is empty, so the index is pinned to
@@ -1268,6 +1284,7 @@ export async function commitMarker(
     ["commit", "--allow-empty", "--no-verify", "-m", body],
     options.hooksPath,
     options.timeoutMs,
+    options.signal,
   );
 }
 
