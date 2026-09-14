@@ -99,6 +99,7 @@ async function arbitrateLease(state: LeaseState, preCheckTrusted: boolean): Prom
   try {
     await beads.pull(repo);
   } catch (e) {
+    if (isBoardUnreachableError(e)) throw e;
     throw new RunAlreadyLiveError(
       `${targetId} could not refresh the shared board to arbitrate the run-lease race (${
         e instanceof Error ? e.message : String(e)
@@ -106,7 +107,13 @@ async function arbitrateLease(state: LeaseState, preCheckTrusted: boolean): Prom
         `once the board is reachable`,
     );
   }
-  const acquired = await beads.show(repo, targetId).catch(() => null);
+  let acquired: Bead | null;
+  try {
+    acquired = await beads.show(repo, targetId);
+  } catch (e) {
+    if (isBoardUnreachableError(e)) throw e;
+    acquired = null;
+  }
   // Fail closed when this re-read fails (anton-jz1). It's the ONLY check confirming no concurrent
   // lease won the race; a null here (DB lock, transient CLI error, malformed output) means we can't
   // prove we won, so park + retry like the pull failure above rather than fall through and proceed

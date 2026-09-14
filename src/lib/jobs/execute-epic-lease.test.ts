@@ -113,9 +113,29 @@ describe("claim", () => {
       });
   });
 
+  it("preserves a typed board outage from the arbitration pull", async () => {
+    pullMock.mockRejectedValueOnce(new BoardUnreachableError("Dolt server unreachable"));
+
+    await expect(lease(fakeClock()).claim(true)).rejects.toSatisfy((e: unknown) => {
+      expect(isBoardUnreachableError(e)).toBe(true);
+      expect(isRunAlreadyLiveError(e)).toBe(false);
+      return true;
+    });
+  });
+
   it("parks when the arbitration pull fails — a stale view cannot prove the race was won", async () => {
     pullMock.mockRejectedValueOnce(new Error("offline"));
     await expect(lease(fakeClock()).claim(true)).rejects.toThrow(/arbitrate the run-lease race/);
+  });
+
+  it("preserves a typed board outage from the arbitration re-read", async () => {
+    showMock.mockRejectedValueOnce(new BoardUnreachableError("Dolt server unreachable"));
+
+    await expect(lease(fakeClock()).claim(true)).rejects.toSatisfy((e: unknown) => {
+      expect(isBoardUnreachableError(e)).toBe(true);
+      expect(isRunAlreadyLiveError(e)).toBe(false);
+      return true;
+    });
   });
 
   it("parks when the arbitration re-read fails, rather than proceeding unproven", async () => {
