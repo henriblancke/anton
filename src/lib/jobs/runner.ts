@@ -59,6 +59,7 @@ import { reconcileInterruptedRuns } from "../runs";
 import { runScheduleNow, type RunNowResult } from "../schedules";
 import {
   isPoisonError,
+  isRouteAdmissionStaleError,
   isRunAlreadyLiveError,
   isStaleCheckoutError,
   isSyncNotWiredError,
@@ -96,6 +97,14 @@ export interface RunnerConfig {
    * deferred row waits before the fresh process leases it.
    */
   staleCheckoutRetryMs: number;
+  /**
+   * Recheck cadence for a run refused because its routing changed after budget admission (see
+   * `RouteAdmissionStaleError`). Short, unlike the other soft-reschedule cadences above: the
+   * condition isn't a standing outage to wait out, it's this project's NEXT tick — the governor
+   * re-admits against the route that is now live within one or two polls, so there is nothing to
+   * gain from a longer cool-off.
+   */
+  routeRevalidationRetryMs: number;
   /** Max jobs in flight at once. */
   maxConcurrent: number;
   /**
@@ -126,6 +135,7 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   quotaCooloffMs: 30 * 60_000,
   notWiredRetryMs: 5 * 60_000,
   staleCheckoutRetryMs: 5 * 60_000,
+  routeRevalidationRetryMs: 10_000,
   maxConcurrent: 1,
   maxReviewFixConcurrent: 1,
   tickMs: 2_000,
@@ -332,6 +342,17 @@ export interface JobContext {
   projectId?: string;
   payload: unknown;
   attempt: number;
+  /**
+   * The quota-meter identity this project's budget admission was granted under this tick
+   * (`ProjectMeterSnapshot.meterKey`), when the project went through the governor at all. Carries the
+   * admitted routing snapshot through the lease into dispatch (PR #269 review) so a handler that
+   * reads settings fresh — closest to the point it actually spends quota — can tell a live routing
+   * change apart from a still-valid admission, rather than trusting a decision that may no longer
+   * describe the meter it is about to dispatch through. Undefined for an ungoverned project (no
+   * admission ran) or a job type the governor doesn't gate; a handler with nothing to compare against
+   * should proceed as before.
+   */
+  admittedMeterKey?: string;
   /** Extend the lease while doing long work. */
   heartbeat: () => Promise<void>;
   /** Aborted when the runner stops or the lease is lost — pass to child processes. */
@@ -383,6 +404,7 @@ export type Outcome =
   | { kind: "lease-held"; error: string }
   | { kind: "not-wired"; error: string }
   | { kind: "stale-checkout"; error: string }
+  | { kind: "route-stale"; error: string }
   | { kind: "poison"; error: string }
   | { kind: "error"; error: string };
 
@@ -429,6 +451,7 @@ export function classifyError(e: unknown): Outcome {
   if (isRunAlreadyLiveError(e)) return { kind: "lease-held", error: e.message };
   if (isSyncNotWiredError(e)) return { kind: "not-wired", error: e.message };
   if (isStaleCheckoutError(e)) return { kind: "stale-checkout", error: e.message };
+  if (isRouteAdmissionStaleError(e)) return { kind: "route-stale", error: e.message };
   if (isPoisonError(e)) return { kind: "poison", error: e.message };
   return { kind: "error", error: e instanceof Error ? e.message : String(e) };
 }
@@ -496,6 +519,20 @@ export function nextAction(
       // KEEP the classified reason (like lease-held/not-wired): it names WHAT is stale and the
       // command that clears it, and is the only durable record on the row for the run-health sweep.
       const runAtMs = nowMs + config.staleCheckoutRetryMs;
+      return {
+        action: "reschedule",
+        runAtMs,
+        refundAttempt: true,
+        lastError: `${outcome.error} — rechecks at ${new Date(runAtMs).toISOString()}`,
+      };
+    }
+    case "route-stale": {
+      // The project's routing moved between this job's budget admission and its own settings read
+      // right before it would hold anything (PR #269 review) — the admitted meter no longer names
+      // the pool this run would spend from. Not the job's failure and not a poison: the very next
+      // governor pass re-admits against the now-live route, so a short reschedule with the attempt
+      // refunded is all this needs, unlike the longer standing-outage cadences above.
+      const runAtMs = nowMs + config.routeRevalidationRetryMs;
       return {
         action: "reschedule",
         runAtMs,
@@ -1095,7 +1132,12 @@ export class JobRunner {
     // Rolling dispatch: kick each leased job off without awaiting it, tracking its settlement
     // promise so whenIdle() (tests) and stop() (shutdown) can drain deterministically.
     for (const job of jobs) {
-      const p = this.processJob(job);
+      // Carry THIS tick's admitted meter identity through the lease (PR #269 review) — the same
+      // map the revalidation pass above just checked, keyed the same way (project id, `null` for an
+      // unrouted/no-project job). A job whose project never went through the governor (ungoverned,
+      // or a job type the governor doesn't gate) gets `undefined`, same as no admission happened.
+      const admittedMeterKey = admittedMeters.get(job.projectId)?.meterKey;
+      const p = this.processJob(job, admittedMeterKey);
       this.pending.add(p);
       void p.finally(() => this.pending.delete(p));
     }
@@ -1309,9 +1351,14 @@ export class JobRunner {
    * landing during those (a slow router call in particular) returns a `meterKey` already stale by the
    * time it resolves here, so comparing straight against it would still miss the race. When a plain
    * meter-key resolver is wired, take one more cheap settings-only read (no router hit) AFTER that
-   * work finishes: it can't close the whole window (an edit inside the eventual `leaseDue` gap always
-   * remains — that's why the actual spend charge freezes its own routing right before spawn) but it
-   * collapses the far larger one down to the round trip of one query.
+   * work finishes: it can't close the whole window on its own (an edit inside the eventual `leaseDue`
+   * gap always remains possible) but it collapses the far larger one down to the round trip of one
+   * query. The admitted `meterKey` this pass confirms (or lets stand unrevalidated on a failed read)
+   * is carried through the lease into dispatch as `JobContext.admittedMeterKey` (PR #269 review): the
+   * handler compares it against its OWN settings read, closest to the point it would actually spend
+   * quota, and refuses (`RouteAdmissionStaleError`) rather than dispatch through a meter that changed
+   * again after this check and never cleared `budgetGate` — closing the remaining gap at the one place
+   * that can, rather than only pricing it accurately after the fact.
    */
   private async revalidateAdmittedGovernorMeters(
     admittedMeters: ReadonlyMap<string | null, ProjectMeterSnapshot>,
@@ -1552,7 +1599,7 @@ export class JobRunner {
     return cost;
   }
 
-  private async processJob(job: JobRow): Promise<void> {
+  private async processJob(job: JobRow, admittedMeterKey: string | undefined): Promise<void> {
     const handler = this.handlers.get(job.type as JobType);
     const controller = new AbortController();
     // Held for the whole lifetime (handler + settle) so the slot isn't freed until the job is
@@ -1649,6 +1696,7 @@ export class JobRunner {
           projectId: job.projectId ?? undefined,
           payload: parsePayload(job.payloadJson),
           attempt: job.attempts,
+          admittedMeterKey,
           heartbeat: () => {
             // Progress reported — the handler is alive and moving, so restart the no-progress clock.
             armTimeout();
