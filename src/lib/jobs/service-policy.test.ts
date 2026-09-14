@@ -463,6 +463,48 @@ describe("resolveProjectSpend", () => {
     expect(governor?.policy.projectWeeklyCapPct).toBe(TARGET);
   });
 
+  it("keeps the frozen route in the share board when routing changes before the board read", async () => {
+    const oldRoute = {
+      budgetAware: true,
+      quotaSharePct: 50,
+      claudeBaseUrl: "https://old-router.example/v1",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("routed", oldRoute);
+    project("peer", oldRoute);
+    routerUsageOverride = async () => ({
+      sessionPct: 5,
+      weeklyPct: 1,
+      sessionResetAt: null,
+      weeklyResetAt: null,
+      plan: "Claude Code",
+    });
+
+    const select = tdb.db.select.bind(tdb.db);
+    let subjectSettingsRead = false;
+    const selects = vi.spyOn(tdb.db, "select").mockImplementation(((columns?: Record<string, unknown>) => {
+      if (columns && "settingsJson" in columns && !("id" in columns)) subjectSettingsRead = true;
+      if (subjectSettingsRead && columns && "id" in columns && "settingsJson" in columns) {
+        tdb.db
+          .update(schema.projects)
+          .set({ settingsJson: JSON.stringify({ budgetAware: true, quotaSharePct: 50 }) })
+          .where(eq(schema.projects.id, "routed"))
+          .run();
+        subjectSettingsRead = false;
+      }
+      return select(columns as never);
+    }) as typeof tdb.db.select);
+
+    const governor = await resolveProjectGovernor("routed", async () => null);
+
+    // The job will still dispatch through the old router, so its budget must stay half of that
+    // router's shared pool even though the independently read board already sees Anthropic.
+    expect(governor?.meterKey).toBe("router:https://old-router.example/api/usage/conn_1");
+    expect(governor?.policy.projectWeeklyCapPct).toBeCloseTo(TARGET / 2, 6);
+    selects.mockRestore();
+  });
+
   it("charges an attempt that failed exactly like one that succeeded", async () => {
     // A project whose runs keep failing spends the account's quota all the same; a meter that
     // counted completions would let it run past its share reading zero.

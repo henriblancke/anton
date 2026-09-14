@@ -1,10 +1,11 @@
 -- Preserve the existing Anthropic pacing estimate across the quota-attempt-ledger upgrade.
 --
 -- `spent_attempts` was the prior estimate's durable counter (0033) and `updated_at` was its
--- deliberately approximate weekly boundary. A current router configuration cannot identify the
--- historical meter, so only projects with no legacy gateway URL are carried forward. A connection id
--- was introduced after gateway routing, so it cannot identify routed history on upgrade. Already recorded
--- ledger rows are subtracted, making this safe if a machine had applied 0039 before 0041.
+-- deliberately approximate weekly boundary. It contains no meter provenance, and a current route cannot
+-- prove a past attempt used Anthropic: a project may have used a gateway earlier this quota week and
+-- cleared its URL before upgrading. Preserve that ambiguity instead of misattributing the attempt to
+-- Anthropic; already recorded ledger rows are subtracted, making this safe if a machine had applied
+-- 0039 before 0041.
 --
 -- Reverse:
 --   DELETE FROM `quota_attempts` WHERE `id` LIKE 'legacy:%';
@@ -18,10 +19,11 @@ WITH RECURSIVE attempts (`id`, `job_id`, `project_id`, `job_type`, `created_at`,
     `jobs`.`updated_at`,
     `jobs`.`spent_attempts` - (SELECT count(*) FROM `quota_attempts` WHERE `job_id` = `jobs`.`id`)
   FROM `jobs`
-  INNER JOIN `projects` ON `projects`.`id` = `jobs`.`project_id`
   WHERE `jobs`.`spent_attempts` > (SELECT count(*) FROM `quota_attempts` WHERE `job_id` = `jobs`.`id`)
     AND `jobs`.`updated_at` >= unixepoch() - 7 * 24 * 60 * 60
-    AND COALESCE(NULLIF(trim(CASE WHEN json_valid(`projects`.`settings_json`) THEN json_extract(`projects`.`settings_json`, '$.claudeBaseUrl') END), ''), '') = ''
+    -- No legacy counter has a meter identity. Do not create Anthropic-attributed rows from a
+    -- mutable project's current router settings; all pre-ledger attempts remain unattributed.
+    AND 0
   UNION ALL
   SELECT
     'legacy:' || `job_id` || ':' || (`remaining` + 1),

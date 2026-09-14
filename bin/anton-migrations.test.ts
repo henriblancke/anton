@@ -52,6 +52,31 @@ describe("applyMigrations (in-process, no drizzle-kit)", () => {
       expect(tables.n).toBeGreaterThan(1);
     });
   });
+
+  it("leaves legacy attempt counters unattributed because routing was not recorded", async () => {
+    dir = await tempDir("anton-mig-provenance-");
+    const dbPath = join(dir, "anton.db");
+    applyMigrations(dbPath, { appRoot: REPO_ROOT });
+
+    withDb(dbPath, (sqlite) => {
+      const now = Math.floor(Date.now() / 1000);
+      sqlite.prepare(
+        "INSERT INTO projects (id, slug, name, repo_path, settings_json) VALUES (?, ?, ?, ?, ?)",
+      ).run("project", "project", "project", "/tmp/project", "{}");
+      sqlite.prepare(
+        "INSERT INTO jobs (id, type, project_id, payload_json, status, spent_attempts, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ).run("job", "execute-epic", "project", "{}", "done", 3, now);
+      sqlite.prepare("DELETE FROM __anton_migrations WHERE name = ?").run("0041_legacy-quota-attempt-backfill.sql");
+    });
+
+    // Replaying the real migration models an upgrader whose current settings no longer reveal
+    // whether this week's legacy attempts went through a router or Anthropic.
+    applyMigrations(dbPath, { appRoot: REPO_ROOT });
+    withDb(dbPath, (sqlite) => {
+      const rows = sqlite.prepare("SELECT meter_key FROM quota_attempts WHERE job_id = ?").all("job");
+      expect(rows).toEqual([]);
+    });
+  });
 });
 
 describe("ensureMigrated (bundle mode → in-process apply, before serving)", () => {

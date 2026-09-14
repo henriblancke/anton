@@ -70,7 +70,11 @@ async function budgetPolicyFor(
   // Fail open, like every other governor read: an unreadable board is an EMPTY board, on which the
   // subject is absent and so ungoverned — the full weekly target for one tick — rather than a
   // rejection shared by every policy the coalesced read served, which would error the whole tick.
-  const share = resolveGovernedShare(projectId, meterShareBoard(await quotaShareBoard().catch(() => []), settings));
+  const board = await quotaShareBoard().catch(() => []);
+  const share = resolveGovernedShare(
+    projectId,
+    meterShareBoard(board, settings, projectId),
+  );
   announceImbalance(quotaMeterKey(settings), share);
   return withQuotaShare(resolveBudgetPolicyFromSettings(settings), share.sharePct);
 }
@@ -103,10 +107,20 @@ function quotaShareBoard(): Promise<GovernedShare[]> {
   return board;
 }
 
-/** The share denominator is one effective meter, never unrelated account/router pools. */
-function meterShareBoard(board: readonly GovernedShare[], settings: Parameters<typeof quotaMeterKey>[0]) {
+/**
+ * The share denominator is one effective meter, never unrelated account/router pools. Keep the
+ * subject's frozen routing even if the board was read after a settings edit, or a stale route could
+ * resolve itself as the only member of an unrelated pool.
+ */
+function meterShareBoard(
+  board: readonly GovernedShare[],
+  settings: Parameters<typeof quotaMeterKey>[0],
+  projectId: string,
+) {
   const meterKey = quotaMeterKey(settings);
-  return board.filter((project) => (project.meterKey ?? "anthropic") === meterKey);
+  return board.filter(
+    (project) => project.projectId === projectId || (project.meterKey ?? "anthropic") === meterKey,
+  );
 }
 
 /**

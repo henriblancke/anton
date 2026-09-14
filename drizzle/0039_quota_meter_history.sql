@@ -2,12 +2,12 @@
 -- A project's router can change while a job is retried, so the mutable project settings and the
 -- row-level `jobs.spent_attempts` diagnostic cannot reconstruct which meter an old attempt used.
 --
--- Existing burn samples predate router attribution. Rows belonging to a project that still has a
--- gateway URL are quarantined as `unattributed`; its current route cannot safely identify their old
--- router connection or prove Anthropic produced them. The column's `anthropic` default serves new
--- writes, while this migration explicitly quarantines only the legacy gateway rows. The append-only
--- `quota_attempts` ledger intentionally starts at this migration;
--- historical counters have no per-attempt meter identity and must not be guessed or backfilled.
+-- Existing burn samples predate meter attribution. Current project settings cannot prove which meter
+-- a historical sample moved: a gateway route may have changed or been cleared before upgrade. Quarantine
+-- every pre-ledger sample as `unattributed`; the column's `anthropic` default serves only new writes whose
+-- meter is captured at collection time. The append-only `quota_attempts` ledger intentionally starts at
+-- this migration; historical counters have no per-attempt meter identity and must not be guessed or
+-- backfilled.
 -- Its rows deliberately carry no foreign keys, preserving the accounting record across job cleanup;
 -- project teardown removes that project's ledger entries with its jobs.
 --
@@ -33,15 +33,7 @@ DROP INDEX `burn_samples_project_type_created_idx`;
 ALTER TABLE `burn_samples` ADD `meter_key` text DEFAULT 'anthropic' NOT NULL;
 --> statement-breakpoint
 UPDATE `burn_samples`
-SET `meter_key` = 'unattributed'
-WHERE `project_id` IN (
-  SELECT `id`
-  FROM `projects`
-  WHERE COALESCE(
-    NULLIF(trim(CASE WHEN json_valid(`settings_json`) THEN json_extract(`settings_json`, '$.claudeBaseUrl') END), ''),
-    ''
-  ) <> ''
-);
+SET `meter_key` = 'unattributed';
 --> statement-breakpoint
 CREATE INDEX `burn_samples_project_type_meter_created_idx` ON `burn_samples` (`project_id`,`job_type`,`meter_key`,`created_at`);
 --> statement-breakpoint

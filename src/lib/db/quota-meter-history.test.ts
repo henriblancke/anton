@@ -1,6 +1,6 @@
 /**
- * Meter-attribution migration (drizzle/0039) preserves safely known Anthropic samples while
- * quarantining legacy gateway samples, and its follow-up index (0040) bounds routed-meter reads.
+ * Meter-attribution migration (drizzle/0039) quarantines history without recorded provenance, and
+ * its follow-up index (0040) bounds routed-meter reads.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
@@ -47,27 +47,17 @@ beforeEach(() => {
 afterEach(() => sqlite.close());
 
 describe("drizzle/0039 — quota meter history", () => {
-  it("carries legacy unrouted history forward on the prior Anthropic approximation", () => {
+  it("leaves legacy attempts and burn samples unattributed without captured meter provenance", () => {
     applyMigrationFile(sqlite, MIGRATION);
     applyMigrationFile(sqlite, BACKFILL_MIGRATION);
 
     expect(sqlite.prepare("select meter_key from burn_samples where id = 'sample'").get()).toEqual({
-      meter_key: "anthropic",
+      meter_key: "unattributed",
     });
-    expect(
-      sqlite
-        .prepare("select job_id, project_id, job_type, meter_key, count(*) as n from quota_attempts group by job_id, project_id, job_type, meter_key")
-        .get(),
-    ).toEqual({
-      job_id: "job",
-      project_id: "project",
-      job_type: "execute-epic",
-      meter_key: "anthropic",
-      n: 2,
-    });
+    expect(sqlite.prepare("select count(*) as n from quota_attempts").get()).toEqual({ n: 0 });
   });
 
-  it("fills only the legacy gap when a machine already wrote ledger attempts", () => {
+  it("does not synthesize a legacy gap beside a provenance-backed ledger attempt", () => {
     applyMigrationFile(sqlite, MIGRATION);
     sqlite
       .prepare("insert into quota_attempts (id, job_id, project_id, job_type, meter_key) values ('current', 'job', 'project', 'execute-epic', 'anthropic')")
@@ -75,13 +65,11 @@ describe("drizzle/0039 — quota meter history", () => {
 
     applyMigrationFile(sqlite, BACKFILL_MIGRATION);
 
-    expect(sqlite.prepare("select count(*) as n from quota_attempts").get()).toEqual({ n: 2 });
+    expect(sqlite.prepare("select count(*) as n from quota_attempts").get()).toEqual({ n: 1 });
   });
 
-  it("quarantines legacy gateway burn samples and does not backfill their attempts", () => {
-    sqlite
-      .prepare("update projects set settings_json = ? where id = 'project'")
-      .run(JSON.stringify({ claudeBaseUrl: "https://router.example/v1", claudeAuthTokenEnv: "ROUTER_TOKEN" }));
+  it("quarantines legacy samples after a gateway was cleared before upgrade", () => {
+    // Current settings cannot prove this sample preceded the route being cleared.
     applyMigrationFile(sqlite, MIGRATION);
     applyMigrationFile(sqlite, BACKFILL_MIGRATION);
 
