@@ -200,6 +200,8 @@ export type RunPatch = Partial<{
   /** The pipeline this run walked (anton-aa3m) — written once the formula is selected + validated. */
   formula: string | null;
   formulaVariant: string | null;
+  /** The commit this run's branch forked from, pinned at worktree creation (anton-5bpd) — see schema. */
+  baseForkSha: string | null;
   attempts: number;
   error: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
@@ -225,6 +227,57 @@ export async function updateRun(
     else set[k] = v;
   }
   await db.update(schema.runs).set(set).where(eq(schema.runs.id, id));
+}
+
+/**
+ * The fork commit a prior attempt on this run pinned at worktree creation (anton-5bpd), or undefined
+ * when none did — a first attempt, or a row written before the column existed. Read on resume so the
+ * fork point is the one the branch was actually cut from, never recomputed against a base ref a
+ * sibling run's fetch may have rewound since (see the column's own note).
+ */
+export async function getRunBaseForkSha(db: AntonDb, runId: string): Promise<string | undefined> {
+  const rows = await db
+    .select({ baseForkSha: schema.runs.baseForkSha })
+    .from(schema.runs)
+    .where(eq(schema.runs.id, runId))
+    .limit(1);
+  return rows[0]?.baseForkSha ?? undefined;
+}
+
+/**
+ * The fork commit the most recent attempt on this epic's BRANCH pinned, whatever became of that run
+ * (PR #238 review) — the branch-scoped half of {@link getRunBaseForkSha}, and the same continuity
+ * {@link findRunFormulaForBranch} exists for.
+ *
+ * Attempts do not all share a run row: an ordinary handler failure settles the row `failed`, so
+ * `findOpenRunForEpic` returns nothing and the runner's retry opens a FRESH row while deliberately
+ * reusing the prior attempt's branch and worktree. Keyed by run id alone, that retry finds no pin and
+ * recomputes `merge-base <base> HEAD` against a base ref a sibling run's fetch can have rewound
+ * meanwhile — widening the delta back into pre-fork history, where an old `<id>:` commit reads as
+ * this run's delivery. So the pin follows the CHECKOUT, which is what it describes.
+ */
+export async function findRunBaseForkShaForBranch(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  branch: string,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({ baseForkSha: schema.runs.baseForkSha })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        eq(schema.runs.branch, branch),
+        isNotNull(schema.runs.baseForkSha),
+      ),
+    )
+    // Ordered exactly as findRunFormulaForBranch is, and for its reason: `updatedAt` is
+    // second-granular, so `writeSeq` breaks a tie by which attempt settled last.
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt))
+    .limit(1);
+  return rows[0]?.baseForkSha ?? undefined;
 }
 
 /**

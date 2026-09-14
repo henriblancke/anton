@@ -48,10 +48,23 @@ export function stepTaskBlock(
       ``,
       `Tickets in this run:`,
       ...ctx.tickets.map((t) => `- ${t.id} — ${t.title}`),
+      ...ctx.tickets.flatMap(ticketContractBlock),
     );
   }
   lines.push(...stepContinuationSection(preserved));
   return lines.join("\n");
+}
+
+/** The immutable ticket contract a generic step receives beside the run overview. */
+function ticketContractBlock(ticket: Bead): string[] {
+  return [
+    ``,
+    `## Ticket contract — ${ticket.id}`,
+    ...ticketSpecSections(ticket),
+    ``,
+    `The full ticket spec is inlined above so you can assess this ticket even if the worktree's beads ` +
+      `DB is unreadable. \`bd show ${ticket.id}\` gives the same content when bd is healthy.`,
+  ];
 }
 
 /**

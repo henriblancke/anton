@@ -27,6 +27,11 @@ export type AntonOutcome = "delivered" | "blocked" | "needs-human" | "satisfied"
  * prompt asks a blocked agent to name. `gardener/repair.ts` repairs a SUBSET of these
  * (`REPAIR_CLASSES`); `env` and `other` are here to be named honestly, not to be acted on.
  *
+ * `already-shipped` (anton-ob1q) is the agent's CLAIM that the ticket's work already landed, named
+ * with the bead, commit or PR that shipped it. Naming it is all this enum does — until a repair
+ * verifies the claim against the board and the repository it escalates like any unrepairable class,
+ * because an unverified claim of work done is exactly what the zero-diff gate exists to catch.
+ *
  * The two enums are deliberately independent: both directions of drift fail closed, because a class
  * one side does not recognise escalates rather than repairs.
  */
@@ -35,6 +40,7 @@ export const BLOCK_CLASSES = [
   "dep-missing",
   "acceptance-missing",
   "oversized",
+  "already-shipped",
   "env",
   "other",
 ] as const;

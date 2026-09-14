@@ -7,6 +7,7 @@
  * (mirrors board-move.ts).
  */
 import { beads, type Bead } from "./beads/bd";
+import { withBeadWriteLock } from "./beads/claim-lock";
 import { nudgeSync } from "./beads/sync-nudge";
 import { planMove, type MoveOp } from "./board-move";
 import type { Project } from "./types";
@@ -92,6 +93,12 @@ export function planPrLink(target: Bead, ref: string, board: Bead[]): PrLinkPlan
  * planPrLink, then best-effort sync so teammates + the review-fix sweep see it within a heartbeat
  * (mirrors board-move/claim — a sync hiccup never fails the write that already landed locally). The
  * in-review plan only ever yields tag/untag ops; a defensive default ignores anything else.
+ *
+ * Under the target's bead write lock (PR #238 review): the `already-shipped` retirement verifies a
+ * survivor through a PR pointer and re-reads that pointer inside the same lock before it writes, so
+ * a link that swaps a verified merged PR for an unmerged one either lands before that reread — and
+ * is refused — or waits behind the supersede. Written outside the lock, the swap could land in the
+ * window and the ticket would retire against evidence that was no longer on the board.
  */
 export async function linkPr(
   project: Project,
@@ -100,11 +107,13 @@ export async function linkPr(
   board: Bead[],
 ): Promise<void> {
   const { stageOps } = planPrLink(target, ref, board);
-  await beads.setPrRef(project.repoPath, target.id, ref);
-  for (const op of stageOps) {
-    if (op.kind === "tag") await beads.tag(project.repoPath, target.id, op.labels);
-    else if (op.kind === "untag") await beads.untag(project.repoPath, target.id, op.labels);
-  }
+  await withBeadWriteLock(project.repoPath, target.id, async () => {
+    await beads.setPrRef(project.repoPath, target.id, ref);
+    for (const op of stageOps) {
+      if (op.kind === "tag") await beads.tag(project.repoPath, target.id, op.labels);
+      else if (op.kind === "untag") await beads.untag(project.repoPath, target.id, op.labels);
+    }
+  });
   // The ref + stage ops landed locally; propagate via the immediate push + durable sync-push job.
   nudgeSync(project, "pr-link");
 }

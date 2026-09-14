@@ -32,6 +32,12 @@ export interface Bead {
   priority?: number;
   assignee?: string | null; // who claimed the bead; null/absent when unclaimed
   created_at?: string; // ISO timestamp
+  /**
+   * When the bead was LAST closed (`bd close` sets it; `bd reopen` clears it) — so on a closed
+   * bead it dates the close the board holds now, not the first one. `started_at` is the opposite:
+   * set on the first claim and never reset by a reopen, so it says nothing about the current cycle.
+   */
+  closed_at?: string;
   created_by?: string | null; // who created the bead
   parent?: string; // parent epic id (present in `bd list --json` for structured boards)
   parent_id?: string;

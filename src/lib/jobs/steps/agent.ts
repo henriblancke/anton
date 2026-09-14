@@ -35,7 +35,7 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
       agentPrompt: await loadAgentPrompt(agentTag, { projectDir: ctx.worktreePath }),
       seedPrompt: ctx.settings.seedPrompt,
     });
-    const dispatched = await withDispatchNotes(ctx.repoPath, ticket);
+    const dispatched = await readForDispatch(ctx.repoPath, ticket);
     // Asked per ticket, not once per run: the answer is about THIS bead's own preserved commit, and
     // a resume can carry one for some tickets and not others. The fork point lets the continuation
     // range span the whole preserved delta, self-committed work beneath an empty marker included.
@@ -49,7 +49,8 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
     sessionIds.push(...(last.facts?.sessionIds ?? []));
     // The LAST dispatch's self-report is the one that speaks for the step: a caller running a step
     // per ticket (as execute-epic does) sees one either way, and a run-wide dispatch is judged on
-    // where it ended up.
+    // where it ended up. The bead it was prompted with travels beside it, for the same caller.
+    last = { ...last, facts: { ...last.facts, dispatched } };
     if (!last.ok) return { ...last, facts: { ...last.facts, sessionIds } };
   }
   return { ok: true, detail: last.detail, facts: { ...last.facts, sessionIds } };
@@ -73,13 +74,30 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
   // A formula can run this generic step before `step:implement`, so a resume is dispatched here
   // first onto a timed-out attempt's preserved commits (PR #255 review). Read them per ticket — as
   // implementStep does — so the step is told the work exists rather than reverting or re-doing it.
-  const preserved = await readTicketsPreserved(ctx);
-  return dispatchClaude(ctx, {
+  const [preserved, dispatchedTickets] = await Promise.all([
+    readTicketsPreserved(ctx),
+    Promise.all(ctx.tickets.map((ticket) => readForDispatch(ctx.repoPath, ticket))),
+  ]);
+  const result = await dispatchClaude(ctx, {
     beadId: ctx.target.id,
-    prompt: [reasoning, "", "---", "", stepTaskBlock(ctx, stepId, preserved)].join("\n"),
+    prompt: [
+      reasoning,
+      "",
+      "---",
+      "",
+      stepTaskBlock({ ...ctx, tickets: dispatchedTickets }, stepId, preserved),
+    ].join("\n"),
     appendSystemPrompt: await buildExecutionSystemPrompt({ seedPrompt: ctx.settings.seedPrompt }),
     failure: (text) => `claude reported an error for step ${stepId}: ${text ?? "unknown"}`,
   });
+  // A generic step can report `already-shipped`, so its report carries the contract it received.
+  return {
+    ...result,
+    facts: {
+      ...result.facts,
+      ...(dispatchedTickets.length === 1 ? { dispatched: dispatchedTickets[0] } : {}),
+    },
+  };
 }
 
 /** Preserved work on the branch for each ticket in scope, in ticket order; empty when none has any. */
@@ -93,12 +111,21 @@ async function readTicketsPreserved(ctx: StepContext): Promise<TicketPreserved[]
 }
 
 /**
- * The ticket as it should be dispatched: the board-snapshot bead plus its CURRENT notes blob, read
- * fresh so an operator's steer written after the run started still reaches this ticket's prompt.
- * `bd show` failing (e.g. a locked DB) must never block the run — the snapshot bead is returned.
+ * The ticket as it should be dispatched: the board-snapshot bead plus what only a fresh `bd show`
+ * can add to it. Its CURRENT notes blob, so an operator's steer written after the run started still
+ * reaches this ticket's prompt; and its description when the listing dropped it (issues.ts
+ * `ensureDescription` — the one field `bd list` omits on some bd versions), so the agent is never
+ * prompted without the contract and the `already-shipped` fence has the contract it read to hold
+ * the claim to (PR #238 review). A show that succeeds is the whole truth about the description: a
+ * bead it carries none for is dispatched with an empty one, not an unknown one.
+ *
+ * `bd show` failing (e.g. a locked DB) must never block the run — the snapshot bead is returned,
+ * attesting to nothing the listing did not carry.
  */
-export async function withDispatchNotes(repo: string, ticket: Bead): Promise<Bead> {
+export async function readForDispatch(repo: string, ticket: Bead): Promise<Bead> {
   const fresh = await beads.show(repo, ticket.id).catch(() => null);
-  return fresh?.notes ? { ...ticket, notes: fresh.notes } : ticket;
+  if (!fresh) return ticket;
+  const dispatched = fresh.notes ? { ...ticket, notes: fresh.notes } : ticket;
+  return ticket.description === undefined ? { ...dispatched, description: fresh.description ?? "" } : dispatched;
 }
 
