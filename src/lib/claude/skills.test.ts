@@ -189,6 +189,40 @@ describe("required skill assets", () => {
       expect(shape).toMatch(/If the audit and your intent disagree, the audit is right/);
     });
 
+    // A well-formed `blocks` edge pointing the wrong way is the one ordering fault no checker can
+    // decide (anton-q6vu6): bd accepts it silently, so the printed dispatch order is the only
+    // evidence and asserting it is on the author, not a mechanical gate.
+    it("shape's Phase 5 requires the ordering audit beside the tier audit, equally non-optional", () => {
+      expect(shape).toMatch(/Audit the ordering\. This step is not optional either/);
+      expect(shape).toMatch(/topological order over `blocks`\s+edges/);
+      expect(shape).toMatch(/not\*\* board order, not creation order/);
+      expect(shape).toMatch(/naming the tickets/);
+    });
+
+    it("shape and bd state the same unmisreadable edge direction, with the schema worked example", () => {
+      for (const body of [shape, bd]) {
+        expect(body).toMatch(/one spelling of[\s\S]{0,60}cannot be misread/);
+        expect(body).toMatch(/`bd dep add/);
+        expect(body).toMatch(/\*\*LATER\*\* ticket/);
+        expect(body).toMatch(/\*\*EARLIER\*\* ticket/);
+        expect(body).toMatch(
+          /a ticket that uses a schema depends on the ticket that\s+builds the schema/,
+        );
+        expect(body).toMatch(/never the reverse/);
+      }
+    });
+
+    it("shape and bd both state bd accepts a reversed edge silently", () => {
+      for (const body of [shape, bd]) {
+        expect(body).toMatch(/reversed edge/);
+        expect(body).toMatch(/backwards `blocks` edge\s+creates\s+with exit 0/);
+        expect(body).toMatch(/`bd lint` reports it clean/);
+        expect(body).toMatch(/`bd dep cycles` finds nothing/);
+      }
+      // The mismatch is fixed before confirming, never explained away — stated in shape only.
+      expect(shape).toMatch(/never\s+explain the mismatch away/);
+    });
+
     it("shape maps a mid-shape structural instruction onto the tiers instead of obeying it", () => {
       // "make everything a feature", applied literally, is exactly what produced the bad board.
       expect(shape).toMatch(/structural instruction mid-shape is a reading, not a command/i);

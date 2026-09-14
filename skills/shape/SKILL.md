@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 1ee53194bc2e
+version: 7b9fa35ca66b
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -187,6 +187,40 @@ Then assert the five invariants out loud against what you just printed, naming c
   signature of leaves mistyped as features; fix it before you confirm, don't explain it away.
 
 If the audit and your intent disagree, the audit is right.
+
+**Audit the ordering. This step is not optional either, and it is the one no checker can do for
+you** — a `blocks` edge pointing the wrong way is well-formed: `bd lint` passes, `bd dep cycles`
+finds nothing, and `bd create --graph` exits 0. The edge is syntactically fine and semantically
+backwards, and nothing mechanical can tell the difference between "t2 blocks t1" meant and "t1
+blocks t2" meant — only you, holding the intended build order, can. For every feature, print the
+tickets in the order the executor will actually dispatch them (the topological order over `blocks`
+edges — **not** board order, not creation order):
+
+```bash
+bd list --status all --json --limit 0 \
+  | jq -r --arg f "<feature-id>" '[.[] | select(.parent == $f)] | .[] | "\(.id)\t\(.title)"'
+bd dep tree <feature-id>       # or: bd show <ticket-id> to read its blocked-on edges directly
+```
+
+Then assert out loud, naming the tickets: "feature `<id>` dispatches `t1` → `t2` → `t3`; that
+matches the intended build order because `t2` uses the schema `t1` builds, and `t3`'s endpoint
+needs `t2`'s wiring." If you cannot name the reason each step precedes the next, you have not
+audited it — you have read the list back.
+
+**The one spelling of the edge that cannot be misread:** `bd dep add <blocked> <blocker>` — the
+**LATER** ticket (the one that depends) is the first argument, the **EARLIER** ticket (the one it
+depends on) is the second. Worked example: a ticket that uses a schema depends on the ticket that
+builds the schema, so `bd dep add <uses-schema-ticket> <builds-schema-ticket>` — never the reverse.
+Read `--graph`'s `blocks` edges the same way: `{"from_key": "t2", "to_key": "t1", "type": "blocks"}`
+means `t2` depends on `t1`, so `t1` runs first.
+
+**bd will not catch a reversed edge for you.** Verified on bd 1.1.2: a backwards `blocks` edge
+creates with exit 0, `bd lint` reports it clean, and `bd dep cycles` finds nothing — the wrong
+ticket simply surfaces in `bd ready` first, silently. The printed dispatch order above is the
+**only** evidence you get. If it doesn't match the build order you intended, fix the edge
+(`bd dep remove` the wrong one, `bd dep add` the right direction) before you confirm — never
+explain the mismatch away as acceptable, because there is no mechanical check downstream that will
+catch it later.
 
 **Confirm.** Show the user the tree with the feature's one-line PR scope and its ticket count, name
 the epic it attached to and whether you created it, report the `anton board-check` result, and confirm
