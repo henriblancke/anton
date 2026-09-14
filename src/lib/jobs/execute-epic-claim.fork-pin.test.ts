@@ -171,24 +171,24 @@ it("resolves its OWN fork point when it just created the branch, ignoring anothe
   expect(await getRunBaseForkSha(t.db, FRESH)).toBe("f0f0f0forkcommit");
 });
 
-it("prefers the creation-captured fork over re-resolving the mutable base (PR #238 review)", async () => {
-  // The checkout's own HEAD, captured by `createWorktree` before warming, is the fork as the branch
-  // was cut — a ref a sibling fetch could rewind only AFTER the checkout materialized. Resolving the
-  // base again (or reading it later) would answer the rewound tip, so the captured value must win.
+it("replaces a deleted checkout's stale fork pin with the recreated branch's creation fork", async () => {
+  // A parked run can retain its row after an operator deletes its checkout and branch. This next
+  // attempt is a new branch, so the old pin no longer describes its history and must be overwritten.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, { baseForkSha: "deleted-checkout-fork" });
   createWorktreeMock.mockResolvedValue({
     path: WORKTREE,
     branch: BRANCH,
     baseBranch: FRESH_BASE,
     repoPath: "/repo",
-    forkSha: "creation-fork",
+    forkSha: "recreated-branch-fork",
   });
   resolveForkPointMock.mockRejectedValue(new Error("resolver must not run when the checkout returned its own fork"));
 
   const { runStep } = await warmRunWorktree(makeRun());
 
   expect(resolveForkPointMock).not.toHaveBeenCalled();
-  expect(runStep.baseForkSha).toBe("creation-fork");
-  expect(await getRunBaseForkSha(t.db, RUN_ID)).toBe("creation-fork");
+  expect(runStep.baseForkSha).toBe("recreated-branch-fork");
+  expect(await getRunBaseForkSha(t.db, RUN_ID)).toBe("recreated-branch-fork");
 });
 
 it("ignores a reused checkout's forkSha — it reads the branch's current HEAD, not the fork (PR #238 review)", async () => {

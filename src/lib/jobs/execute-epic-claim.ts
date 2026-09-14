@@ -125,9 +125,10 @@ export async function warmRunWorktree(
       worktreePath: worktree.path,
       branch: worktree.branch,
       attempts: ctx.attempt,
-      // Persist the creation-captured fork (and a recovered sibling's pin) onto this row; only a
-      // value already stored on this row is left as-is so a resume does not rewrite what it read.
-      ...(storedFork ? {} : { baseForkSha }),
+      // Persist the creation-captured fork (and a recovered sibling's pin) onto this row. A reused
+      // checkout retains its own pin, but a recreated branch must replace a stale row pin: that old
+      // value describes the deleted checkout and could widen delivery evidence on a later retry.
+      ...(!reusedCheckout || !storedFork ? { baseForkSha } : {}),
     });
   } catch (error) {
     // A newly-created checkout without its fork pin is unsafe to reuse: a retry would find the
