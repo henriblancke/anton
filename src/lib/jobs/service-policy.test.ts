@@ -45,6 +45,7 @@ vi.mock("../claude/router-usage", async () => {
 
 const {
   resolveBudgetPolicy,
+  resolveProjectGovernor,
   resolveProjectMeterKey,
   resolveProjectSpend,
   resolveProjectUsage,
@@ -431,6 +432,35 @@ describe("resolveProjectSpend", () => {
 
     // One old-meter attempt is attributed; the two new-meter attempts must never be mixed in.
     expect(await resolveProjectSpend("routed", snapshot)).toBeCloseTo(3, 6);
+  });
+
+  it("keeps a governor policy and meter paired when routing changes after resolution", async () => {
+    const oldSettings = {
+      budgetAware: true,
+      quotaSharePct: 100,
+      claudeBaseUrl: "https://old-router.example/v1",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("routed", oldSettings);
+    routerUsageOverride = async () => ({
+      sessionPct: 10,
+      weeklyPct: 20,
+      sessionResetAt: null,
+      weeklyResetAt: null,
+      plan: "router",
+    });
+
+    const governor = await resolveProjectGovernor("routed", async () => null);
+    await tdb.db
+      .update(schema.projects)
+      .set({
+        settingsJson: JSON.stringify({ ...oldSettings, claudeBaseUrl: "https://new-router.example/v1" }),
+      })
+      .where(eq(schema.projects.id, "routed"));
+
+    expect(governor?.meterKey).toBe("router:https://old-router.example/api/usage/conn_1");
+    expect(governor?.policy.projectWeeklyCapPct).toBe(TARGET);
   });
 
   it("charges an attempt that failed exactly like one that succeeded", async () => {

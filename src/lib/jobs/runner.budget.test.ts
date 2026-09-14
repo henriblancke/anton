@@ -23,6 +23,7 @@ import type {
   BudgetPolicyResolver,
   JobHandler,
   JobPolicyResolver,
+  ProjectGovernorResolver,
   ProjectSpendResolver,
   ProjectUsageResolver,
 } from "./runner";
@@ -63,6 +64,7 @@ function budgetRunner(
     readUsage: () => Promise<ClaudeUsage | null>;
     policy?: BudgetPolicy;
     resolveBudgetPolicy?: BudgetPolicyResolver;
+    resolveProjectGovernor?: ProjectGovernorResolver;
     resolveProjectSpend?: ProjectSpendResolver;
     resolveProjectUsage?: ProjectUsageResolver;
     readBeadLabels?: BeadLabelsReader;
@@ -78,6 +80,7 @@ function budgetRunner(
     readUsageFresh: async () => null,
     resolveBudgetPolicy:
       opts.resolveBudgetPolicy ?? (() => opts.policy ?? DEFAULT_BUDGET_POLICY),
+    resolveProjectGovernor: opts.resolveProjectGovernor,
     resolveProjectSpend: opts.resolveProjectSpend,
     resolveProjectUsage: opts.resolveProjectUsage,
     readBeadLabels: opts.readBeadLabels,
@@ -1184,6 +1187,31 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     expect(resolveProjectSpend).toHaveBeenCalledWith("routed", {
       meterKey: "router:https://old-router.example/api/usage/conn_1",
       usage: routedUsage,
+    });
+  });
+
+  it("keeps policy shares and usage on one meter snapshot", async () => {
+    h.seedProjects("routed");
+    const routerUsage = usage({ sessionPct: 10, weeklyPct: 0 });
+    const resolveProjectGovernor: ProjectGovernorResolver = async () => ({
+      policy: withQuotaShare(DEFAULT_BUDGET_POLICY, 100),
+      meterKey: "router:https://old-router.example/api/usage/conn_1",
+      usage: routerUsage,
+    });
+    const resolveProjectSpend = vi.fn(async () => null);
+    const r = budgetRunner(h, async () => {}, {
+      readUsage: async () => usage({ sessionPct: 99 }),
+      resolveProjectGovernor,
+      resolveProjectSpend,
+    });
+    await r.enqueue({ type: "execute-epic", projectId: "routed" });
+
+    expect(await r.tickOnce()).toBe(1);
+    await r.whenIdle();
+
+    expect(resolveProjectSpend).toHaveBeenCalledWith("routed", {
+      meterKey: "router:https://old-router.example/api/usage/conn_1",
+      usage: routerUsage,
     });
   });
 

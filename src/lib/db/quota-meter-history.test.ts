@@ -1,6 +1,6 @@
 /**
- * Meter-attribution migration (drizzle/0038) preserves historical samples as Anthropic, while the
- * follow-up index (0039) keeps a routed meter's global rolling average bounded as history grows.
+ * Meter-attribution migration (drizzle/0038) preserves safely known Anthropic samples while
+ * quarantining legacy gateway samples, and its follow-up index (0039) bounds routed-meter reads.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
@@ -47,7 +47,7 @@ beforeEach(() => {
 afterEach(() => sqlite.close());
 
 describe("drizzle/0038 — quota meter history", () => {
-  it("carries legacy unrouted attempts forward on the prior weekly approximation", () => {
+  it("carries legacy unrouted history forward on the prior Anthropic approximation", () => {
     applyMigrationFile(sqlite, MIGRATION);
     applyMigrationFile(sqlite, BACKFILL_MIGRATION);
 
@@ -78,14 +78,16 @@ describe("drizzle/0038 — quota meter history", () => {
     expect(sqlite.prepare("select count(*) as n from quota_attempts").get()).toEqual({ n: 2 });
   });
 
-  it("does not attribute legacy gateway attempts to Anthropic", () => {
-    applyMigrationFile(sqlite, MIGRATION);
+  it("quarantines legacy gateway burn samples and does not backfill their attempts", () => {
     sqlite
       .prepare("update projects set settings_json = ? where id = 'project'")
       .run(JSON.stringify({ claudeBaseUrl: "https://router.example/v1", claudeAuthTokenEnv: "ROUTER_TOKEN" }));
-
+    applyMigrationFile(sqlite, MIGRATION);
     applyMigrationFile(sqlite, BACKFILL_MIGRATION);
 
+    expect(sqlite.prepare("select meter_key from burn_samples where id = 'sample'").get()).toEqual({
+      meter_key: "unattributed",
+    });
     expect(sqlite.prepare("select count(*) as n from quota_attempts").get()).toEqual({ n: 0 });
   });
 

@@ -16,6 +16,7 @@ import {
   getProjectSettings,
   quotaMeterKey,
   resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
+  type ProjectSettings,
 } from "../projects";
 import {
   resolveGovernedShare,
@@ -25,7 +26,7 @@ import {
 import { projectWeeklySpendPct } from "../quota-spend";
 import { withQuotaShare } from "./budget";
 import type { ClaudeUsage } from "../claude/usage";
-import type { ProjectMeterSnapshot } from "./runner";
+import type { ProjectGovernorSnapshot, ProjectMeterSnapshot } from "./runner";
 import { getRouterUsageCached, getRouterUsageFresh } from "../claude/router-usage";
 import { beads } from "../beads/bd";
 import { allIssues } from "../beads/issues";
@@ -61,8 +62,10 @@ export async function resolvePolicy(projectId: string | undefined) {
  * and Anthropic) normalize independently; ungoverned projects remain untouched because they return
  * null before any board share is read.
  */
-export async function resolveBudgetPolicy(projectId: string | undefined) {
-  const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
+async function budgetPolicyFor(
+  projectId: string | undefined,
+  settings: ProjectSettings,
+) {
   if (!projectId || !settings.budgetAware) return null;
   // Fail open, like every other governor read: an unreadable board is an EMPTY board, on which the
   // subject is absent and so ungoverned — the full weekly target for one tick — rather than a
@@ -70,6 +73,11 @@ export async function resolveBudgetPolicy(projectId: string | undefined) {
   const share = resolveGovernedShare(projectId, meterShareBoard(await quotaShareBoard().catch(() => []), settings));
   announceImbalance(quotaMeterKey(settings), share);
   return withQuotaShare(resolveBudgetPolicyFromSettings(settings), share.sharePct);
+}
+
+export async function resolveBudgetPolicy(projectId: string | undefined) {
+  const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
+  return budgetPolicyFor(projectId, settings);
 }
 
 /** The board read currently in flight, so concurrent resolutions share it. Never held past settle. */
@@ -159,6 +167,26 @@ export async function resolveProjectUsage(
         ? await accountUsage()
         : await getRouterUsageCached(settings).catch(() => null),
   };
+}
+
+/**
+ * Resolve a governor policy and usage from one project settings read. Keeping these coupled prevents
+ * a route edit mid-tick from applying a share for one pool to a snapshot from another.
+ */
+export async function resolveProjectGovernor(
+  projectId: string | null,
+  accountUsage: () => Promise<ClaudeUsage | null>,
+): Promise<ProjectGovernorSnapshot | null> {
+  if (!projectId) return null;
+  const settings = await getProjectSettings(getDb(), projectId).catch(() => undefined);
+  if (settings === undefined) return null;
+  const policy = await budgetPolicyFor(projectId, settings);
+  if (!policy) return null;
+  const meterKey = quotaMeterKey(settings);
+  const usage = meterKey === "anthropic"
+    ? await accountUsage()
+    : await getRouterUsageCached(settings).catch(() => null);
+  return { policy, meterKey, usage };
 }
 
 /**

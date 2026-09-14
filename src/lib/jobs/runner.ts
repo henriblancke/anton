@@ -221,6 +221,21 @@ export type ProjectUsageResolver = (
 ) => Promise<ProjectMeterSnapshot>;
 
 /**
+ * An atomic governor view of a project's settings-derived policy and its meter. The settings read
+ * supplies both, so a route change during a tick cannot apply one pool's share to another pool's
+ * usage snapshot.
+ */
+export interface ProjectGovernorSnapshot extends ProjectMeterSnapshot {
+  policy: BudgetPolicy;
+}
+
+/** Resolve a governed project's policy and meter from one settings snapshot; null means ungoverned. */
+export type ProjectGovernorResolver = (
+  projectId: string | null,
+  accountUsage: () => Promise<ClaudeUsage | null>,
+) => Promise<ProjectGovernorSnapshot | null>;
+
+/**
  * Fresh counterpart to {@link ProjectUsageResolver} for the two ends of a burn-sampling window.
  * Routed jobs must sample their router's meter, while unrouted jobs retain the account-wide fresh
  * read. `expectedMeterKey` pins both window edges to the meter captured at spawn: a routing change
@@ -555,6 +570,7 @@ export class JobRunner {
   private readonly log: RunnerLogger;
   private readonly resolvePolicy: JobPolicyResolver | null;
   private readonly resolveBudgetPolicy: BudgetPolicyResolver | null;
+  private readonly resolveProjectGovernor: ProjectGovernorResolver | null;
   private readonly resolveProjectSpend: ProjectSpendResolver | null;
   private readonly resolveProjectUsage: ProjectUsageResolver | null;
   private readonly resolveProjectUsageFresh: ProjectUsageFreshResolver | null;
@@ -594,6 +610,11 @@ export class JobRunner {
      * is unaffected either way).
      */
     resolveBudgetPolicy?: BudgetPolicyResolver;
+    /**
+     * Atomic settings-derived governor source. When provided, a project policy and its meter usage
+     * come from the same settings snapshot, so routing changes cannot mix quota pools mid-tick.
+     */
+    resolveProjectGovernor?: ProjectGovernorResolver;
     /**
      * Per-project attributed weekly spend for the governor's quota-share ceiling (R6.1). Only
      * consulted alongside `resolveBudgetPolicy`; omit it and a project's declared share simply
@@ -648,6 +669,7 @@ export class JobRunner {
     this.log = deps.log ?? noopLog;
     this.resolvePolicy = deps.resolvePolicy ?? null;
     this.resolveBudgetPolicy = deps.resolveBudgetPolicy ?? null;
+    this.resolveProjectGovernor = deps.resolveProjectGovernor ?? null;
     this.resolveProjectSpend = deps.resolveProjectSpend ?? null;
     this.resolveProjectUsage = deps.resolveProjectUsage ?? null;
     this.resolveProjectUsageFresh = deps.resolveProjectUsageFresh ?? null;
@@ -1099,61 +1121,55 @@ export class JobRunner {
     }
     if (projectIds.size === 0) return;
 
-    // Resolve each project's budget policy FIRST. A null policy means budget-aware execution is off
-    // for that project (anton-7mpv.1) — the default — so it isn't governed. Reading usage only AFTER
-    // finding a governed project is deliberate: when no project has opted in (the default state), the
-    // governor never calls the usage endpoint, so it can't cache a transient null into the shared
-    // cache the nav pill reads (which is what darkened the pill on this branch) or hammer the keychain.
-    //
-    // Resolved TOGETHER, not one after another (PR #248 review): a governed project's policy carries
-    // its cut of the machine's quota (R6.1), which is a fact about the whole board — so resolving N
-    // of them in sequence re-reads one unchanging board N times per 2s tick. Overlapping the reads
-    // lets the resolver serve them all from a single pass.
+    // The tick's Anthropic read is deferred until an unrouted project needs it. A router-only board
+    // therefore never waits on an OAuth endpoint the operator deliberately stopped using.
+    let accountRead: Promise<ClaudeUsage | null> | null = null;
+    const accountUsage = () => (accountRead ??= this.readUsageSafe());
+
+    // The normal resolver remains for callers that only expose separate policy and meter sources.
+    // The service resolver instead reads both from one settings snapshot, so a route edit between
+    // independent reads cannot combine an old share with a new meter (or vice versa).
     const resolved = await Promise.all(
-      [...projectIds].map(async (pid) => ({
-        pid,
-        policy: await resolveBudgetPolicy(pid ?? undefined),
-      })),
+      [...projectIds].map(async (pid) => {
+        if (this.resolveProjectGovernor) {
+          return {
+            pid,
+            governor: await this.resolveProjectGovernor(pid, accountUsage).catch(() => null),
+          };
+        }
+        const policy = await resolveBudgetPolicy(pid ?? undefined);
+        if (!policy) return { pid, governor: null };
+        const snapshot = this.resolveProjectUsage
+          ? await this.resolveProjectUsage(pid, accountUsage).catch(async () => ({
+              meterKey: "anthropic",
+              usage: await accountUsage(),
+            }))
+          : { meterKey: "anthropic", usage: await accountUsage() };
+        return { pid, governor: { policy, ...snapshot } };
+      }),
     );
-    const governed: Array<{ pid: string | null; policy: BudgetPolicy }> = [];
-    for (const { pid, policy } of resolved) {
-      if (policy) {
-        governed.push({ pid, policy });
+    const governed: Array<{ pid: string | null; policy: BudgetPolicy; snapshot: ProjectMeterSnapshot }> = [];
+    for (const { pid, governor } of resolved) {
+      if (governor) {
+        governed.push({
+          pid,
+          policy: governor.policy,
+          snapshot: { meterKey: governor.meterKey, usage: governor.usage },
+        });
         continue;
       }
-      // Pacing turned OFF for this project: pull back any rows a prior governed tick pushed to a
-      // future runAt, or they'd sit parked until that stale pace boundary (leaseDue only scans due
-      // rows). Scoped to the governor's own deferrals via the `budget: ` lastError marker.
+      // Either pacing was turned off or its settings could not be read. Both fail open by releasing
+      // only this project's prior governor deferrals.
       await resumeBudgetDeferredJobs(this.db, this.clock, {
         types: GOVERNED_JOB_TYPES,
         projectId: pid,
       });
     }
-    if (governed.length === 0) return; // no project is budget-aware → never read usage
+    if (governed.length === 0) return;
 
-    // The tick's Anthropic read, deferred until a project actually needs it. Reading it eagerly
-    // here would make every governed tick call the account endpoint even when every governed
-    // project is routed and none of the results would be used — on a router-only board that is a
-    // request to an endpoint the operator has deliberately stopped using, and its latency (up to
-    // the 5s fetch ceiling on a cold/unreachable read) lands in front of the router reads that DO
-    // decide pacing. Memoized, so the N unrouted projects that do want it still share one read.
-    let accountRead: Promise<ClaudeUsage | null> | null = null;
-    const accountUsage = () => (accountRead ??= this.readUsageSafe());
-
-    // Independent router reads must not serialize their five-second timeout. Resolve the meter
-    // snapshots together, then apply the queue mutations in deterministic project order below.
-    const snapshots = await Promise.all(
-      governed.map(async ({ pid }) => ({
-        pid,
-        snapshot: this.resolveProjectUsage
-          ? await this.resolveProjectUsage(pid, accountUsage).catch(async () => ({
-              meterKey: "anthropic",
-              usage: await accountUsage(),
-            }))
-          : { meterKey: "anthropic", usage: await accountUsage() },
-      })),
+    const snapshotByProject = new Map(
+      governed.map(({ pid, snapshot }) => [pid, snapshot]),
     );
-    const snapshotByProject = new Map(snapshots.map(({ pid, snapshot }) => [pid, snapshot]));
 
     const now = this.clock.now();
     for (const { pid, policy } of governed) {
