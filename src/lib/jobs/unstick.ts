@@ -622,7 +622,7 @@ export async function unstickPass(
   // Retirement runs BEFORE the finding loop, and in this order: the gate list answers every gate
   // wait at once, and a row the gate path retires needs no second live re-read to reach the same
   // verdict.
-  summary.settled = await reconcileGateWaits(db, clock, repoPath, findings, pending, state);
+  summary.settled = await reconcileGateWaits(db, clock, findings, pending, state);
   summary.settled += await reconcileOrphanStalls(db, clock, repoPath, pending, state.live);
   await recheckLiveFindings(db, findings, state);
 
@@ -734,6 +734,13 @@ interface PassState {
   live: LiveRecheck;
   /** Per-finding re-check verdicts, read back through {@link UnstickContext.stillStuck}. */
   stillStuck: Map<string, boolean>;
+  /**
+   * The gate list the board-reachability probe already fetched, undefined when that read failed.
+   * {@link reconcileGateWaits} reuses this instead of re-reading — one `bd gate list` per pass, not
+   * two, since the two reads happen back to back with nothing that could change gate state between
+   * them.
+   */
+  openGates: Gate[] | undefined;
 }
 
 /**
@@ -775,8 +782,9 @@ async function buildPassState(
   // false recovery.
   let board: Bead[] = [];
   let boardReadable = true;
+  let openGates: Gate[] | undefined;
   try {
-    [board] = await Promise.all([
+    [board, openGates] = await Promise.all([
       beads.list(repoPath, ["--status", "all"]),
       beads.gateList(repoPath),
     ]);
@@ -815,6 +823,7 @@ async function buildPassState(
   return {
     ctx,
     stillStuck,
+    openGates,
     // The re-checks the classifier and the retirement share, spelled once: a row can never be
     // retired on a different bar than the one its finding was raised on.
     live: {
@@ -860,23 +869,23 @@ async function primeLatestJobs(
 }
 
 /**
- * Let ONE gate-list read answer both halves of a gate wait's lifecycle: whether each `needs-human`
- * finding is still waiting on somebody (recorded for the classifier), and whether an already-raised
- * wait has since been answered (retired here). Gate beads are absent from the ordinary board read,
- * so this is a read of its own — one per pass, not one per finding. Returns how many waits it
+ * Answer both halves of a gate wait's lifecycle off the gate list {@link buildPassState} already
+ * fetched: whether each `needs-human` finding is still waiting on somebody (recorded for the
+ * classifier), and whether an already-raised wait has since been answered (retired here). Gate
+ * beads are absent from the ordinary board read, but the probe read already covers them (see
+ * {@link PassState.openGates}), so this reads nothing of its own. Returns how many waits it
  * retired.
  */
 async function reconcileGateWaits(
   db: AntonDb,
   clock: Clock,
-  repoPath: string,
   findings: RunHealthFinding[],
   pending: PendingEscalations,
   state: PassState,
 ): Promise<number> {
   const gateFindings = findings.filter((f) => f.kind === "needs-human");
   if (gateFindings.length === 0 && pending.gateWaits.length === 0) return 0;
-  const openGates = await readOpenGates(repoPath);
+  const openGates = state.openGates;
   const { nowMs } = state.ctx;
   const board = [...state.ctx.board.values()];
   for (const finding of gateFindings) {
@@ -1193,21 +1202,6 @@ async function stalePrStillStuck(
   if (prTargetSettled(finding, live.ctx)) return false;
   if (finding.prNumber === undefined || !finding.beadId) return true;
   return prStillIdle(finding.beadId, finding.prNumber, live);
-}
-
-/**
- * The project's OPEN gates (bd's `gate list` default), or undefined when bd could not answer. That
- * undefined fails OPEN in {@link gateStillOpen}, the same posture as the other two re-checks: an
- * unreadable board is no evidence a wait ended, and a missed escalation strands the human the sweep
- * exists to find.
- */
-async function readOpenGates(repoPath: string): Promise<Gate[] | undefined> {
-  try {
-    return await beads.gateList(repoPath);
-  } catch (e) {
-    console.error("[unstick] could not re-read the gate list; escalating on the report's word", e);
-    return undefined;
-  }
 }
 
 /**
