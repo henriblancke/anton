@@ -152,6 +152,22 @@ describe("validateBoardStructure", () => {
       expect(rulesFor(board, "c", { cycles })).toEqual(["blocks-cycle"]);
     });
 
+    it("recommends an edge from the reported cycle, not a different overlapping cycle", () => {
+      const board = [
+        task("a", undefined, { dependencies: [blocks("a", "b"), blocks("a", "c")] }),
+        task("b", undefined, { dependencies: [blocks("b", "a")] }),
+        task("c", undefined, { dependencies: [blocks("c", "a")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [
+          { ids: ["a", "c"], raw: { cycle: ["a", "c"] } },
+          { ids: ["a", "b"], raw: { cycle: ["a", "b"] } },
+        ],
+      });
+      const aCycle = violations.find((violation) => violation.id === "a" && violation.rule === "blocks-cycle");
+      expect(aCycle?.message).toContain("bd dep remove a c");
+    });
+
     it("does not infer cycles when bd supplies no cycle evidence", () => {
       const board = [
         task("a", undefined, { dependencies: [blocks("a", "b")] }),
@@ -175,7 +191,6 @@ describe("validateBoardStructure", () => {
         cycles: [{ ids: ["t1", "unknown"], raw: { ids: ["t1", "unknown"] } }],
       });
       expect(violations.map((v) => [v.id, v.rule])).toEqual([
-        ["t1", "blocks-cycle"],
         ["board", "blocks-cycle"],
       ]);
     });

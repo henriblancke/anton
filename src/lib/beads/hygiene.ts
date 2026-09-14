@@ -4,6 +4,7 @@
  * everything here is pure over bd's stdout.
  */
 import { num, pick, str, strings } from "./bd-json";
+import { parseDepCycles as parseDepCyclesForCli } from "./cycles.mjs";
 import type { Bead } from "./types";
 
 // ── board hygiene verbs (anton-6qbc) ──
@@ -287,19 +288,9 @@ export function parseOrphans(raw: string): OrphanBead[] {
  * is the finding, and swallowing it would hide the one condition this verb exists to surface.
  */
 export function parseDepCycles(raw: string): DepCycle[] {
-  const parsed = parseHygieneJson(raw, "dep cycles");
-  if (!Array.isArray(parsed)) return [];
-  const idsOf = (node: unknown): string[] => {
-    if (typeof node === "string") return [node];
-    if (Array.isArray(node)) return node.flatMap(idsOf);
-    const o = node as Record<string, unknown> | null;
-    if (!o || typeof o !== "object") return [];
-    const named = o.cycle ?? o.path ?? o.ids ?? o.issue_ids ?? o.issues ?? o.nodes;
-    if (named !== undefined) return idsOf(named);
-    const id = str(o.id) ?? str(o.issue_id);
-    return id ? [id] : [];
-  };
-  return parsed.map((entry) => ({ ids: idsOf(entry), raw: entry }));
+  const cycles = parseDepCyclesForCli(raw);
+  if (cycles === null) return [];
+  return cycles;
 }
 
 /**

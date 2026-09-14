@@ -1,4 +1,5 @@
 import { beads, type Bead } from "./bd";
+import { attachCycleEvidence } from "./cycle-evidence";
 import {
   getBeadDescription,
   getIssueSnapshot,
@@ -82,6 +83,13 @@ function loadGateIssues(cwd: string, strict: boolean, dangling: string[]): Promi
 
 export interface LoadIssuesOptions {
   /**
+   * Read and attach authoritative `bd dep cycles` evidence for consumers that must refuse cycles.
+   *
+   * A snapshot without this option remains a cheap UI read. A caller that can approve, unapprove, or
+   * enqueue work must opt in so every pure approval gate it composes sees the same graph evidence.
+   */
+  withCycles?: boolean;
+  /**
    * Fail the whole read when the gate listing fails, instead of degrading to a gate-less board.
    *
    * For a page render, degrading is right: a gate edge that reads as an open blocker renders one
@@ -106,11 +114,14 @@ export async function loadAllIssues(
   // has no gate that could change any answer, so it keeps paying for one read; only a board that
   // actually holds a gate edge pays for the second.
   const dangling = danglingBlockerIds(work);
-  if (dangling.length === 0) return work;
   // Deduped rather than concatenated: a future bd that starts carrying gates in the ordinary
   // listing must not double them (and a test double answering both reads alike must not either).
-  return dedupeById([...work, ...await loadGateIssues(cwd, opts.strictGates ?? false, dangling)]);
+  const board = dangling.length === 0
+    ? work
+    : dedupeById([...work, ...await loadGateIssues(cwd, opts.strictGates ?? false, dangling)]);
+  return opts.withCycles ? attachCycleEvidence(board, await beads.depCycles(cwd)) : board;
 }
+
 
 export function allIssues(
   cwd: string,

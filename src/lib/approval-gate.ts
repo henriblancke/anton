@@ -23,6 +23,7 @@
  * besides, which a merged list cannot express.
  */
 import { beads } from "./beads/bd";
+import { cycleEvidenceFor } from "./beads/cycle-evidence";
 import { contractGaps, formatContractGaps } from "./beads/contract";
 import { formatStructureViolations, structureGaps } from "./beads/structure";
 import type { Bead } from "./beads/types";
@@ -76,7 +77,7 @@ export function makeApprovalGate(board: Bead[]): ApprovalGate {
       ),
       // The tier taxonomy, scoped to this target's subtree exactly as the route scopes it: a stray
       // chore three branches away is not this target's fault and must not withdraw its approval.
-      ...structureGaps(target.id, board).blocking.map(
+      ...structureGaps(target.id, board, { cycles: cycleEvidenceFor(board) }).blocking.map(
         (violation): ApprovalGap => ({
           rule: "structure",
           message: formatStructureViolations([violation]),

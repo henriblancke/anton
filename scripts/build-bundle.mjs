@@ -139,6 +139,8 @@ function main(argv) {
     // The tier rules `anton board-check` judges through (anton-i4al). Plain JS precisely so it can
     // ship here and be imported by the pure-Node launcher — the same seam config.mjs uses.
     join("src", "lib", "beads", "tiers.mjs"),
+    // The cycle parser `anton board-check` shares with the typed bd seam (anton-gh4a9).
+    join("src", "lib", "beads", "cycles.mjs"),
     // `anton server-mode` — same pure-JS seam, and the command must work from an installed bundle
     // (that is where a teammate moves their board onto the shared server, anton-yvjd).
     join("src", "lib", "beads", "server-mode.mjs"),

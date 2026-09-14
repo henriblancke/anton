@@ -311,7 +311,7 @@ describe("makeBoardPickerHandler", () => {
 
   it("reads the board strictly, so a gate-less read retries instead of recording it as blocked", async () => {
     await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
-    expect(board.calls[0]).toEqual(["/tmp/p1", { strictGates: true }]);
+    expect(board.calls[0]).toEqual(["/tmp/p1", { strictGates: true, withCycles: true }]);
   });
 
   it("records an EMPTY plan on a board with nothing claimable", async () => {

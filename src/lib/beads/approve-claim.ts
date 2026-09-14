@@ -120,7 +120,7 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
     const unrefreshed = await input.refresh?.();
     if (unrefreshed !== undefined) return { refused: unrefreshed };
 
-    const board = await loadAllIssues(repoPath);
+    const board = await loadAllIssues(repoPath, { withCycles: true });
     const locked = board.find((b) => b.id === beadId);
     if (!locked) return { vanished: true };
 

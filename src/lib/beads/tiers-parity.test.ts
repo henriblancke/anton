@@ -12,6 +12,8 @@
 import { describe, expect, it } from "vitest";
 import { beads } from "./bd";
 import { isPipelineArtifact } from "./contract";
+import { parseDepCycles as parseDepCyclesForCli } from "./cycles.mjs";
+import { parseDepCycles } from "./hygiene";
 import { isContainer, parentOf, validateBoardStructure } from "./structure";
 import type { Bead } from "./types";
 
@@ -94,9 +96,28 @@ describe("tiers.mjs agrees with the app's TypeScript predicates", () => {
     expect(validateBoardStructure(board).some((v) => v.rule === "blocks-edge-dangling")).toBe(false);
   });
 
-  it("forwards bd cycle evidence through the typed facade", () => {
-    const board = [bead("a", "task"), bead("b", "task")];
-    const cycles = [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }];
+  it("shares cycle parsing between the release CLI and typed facade", () => {
+    const raw = JSON.stringify([
+      { cycle: ["a", { id: "b" }] },
+      { path: [{ issue_id: "c" }, "d"] },
+      { ids: ["e"] },
+    ]);
+
+    expect(parseDepCycles(raw)).toEqual(parseDepCyclesForCli(raw));
+  });
+
+  it("preserves malformed cycle evidence for the CLI to reject", () => {
+    expect(parseDepCyclesForCli("not json")).toBeNull();
+    expect(parseDepCyclesForCli(JSON.stringify({ cycle: ["a", "b"] }))).toBeNull();
+    expect(parseDepCycles("not json")).toEqual([]);
+  });
+
+  it("forwards parsed bd cycle evidence through the typed facade", () => {
+    const board = [
+      bead("a", "task", { dependencies: [{ issue_id: "a", depends_on_id: "b", type: "blocks" }] }),
+      bead("b", "task", { dependencies: [{ issue_id: "b", depends_on_id: "a", type: "blocks" }] }),
+    ];
+    const cycles = parseDepCycles(JSON.stringify([{ cycle: ["a", "b"] }]));
 
     expect(validateBoardStructure(board, { cycles }).map((v) => [v.id, v.rule])).toEqual([
       ["a", "blocks-cycle"],

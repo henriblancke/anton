@@ -51,14 +51,14 @@ describe("decideBoardPickerPlan", () => {
     // P0 first, then unblocking value, then age. `t4` is the only bead here that frees other work,
     // so it outranks the older `t2` despite being younger — the whole reason the rank is not a date.
     const board = [
-      bead("t1", { priority: 2, created_at: "2026-08-05T00:00:00Z" }),
-      bead("t2", { priority: 1, created_at: "2026-08-01T00:00:00Z" }),
-      bead("t3", { priority: 0, created_at: "2026-08-09T00:00:00Z" }),
-      bead("t4", {
-        priority: 1,
-        created_at: "2026-08-07T00:00:00Z",
+      bead("t1", {
+        priority: 2,
+        created_at: "2026-08-05T00:00:00Z",
         dependencies: [blockedBy("t1", "t4")],
       }),
+      bead("t2", { priority: 1, created_at: "2026-08-01T00:00:00Z" }),
+      bead("t3", { priority: 0, created_at: "2026-08-09T00:00:00Z" }),
+      bead("t4", { priority: 1, created_at: "2026-08-07T00:00:00Z" }),
     ];
 
     const plan = decide(board);

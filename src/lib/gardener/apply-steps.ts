@@ -649,7 +649,7 @@ function assertStillDegraded(id: string, board: BoardIndex): ApprovalGap[] {
  * costs nothing extra, because every caller here already refuses on a read it could not make.
  */
 export function readWholeBoard(repo: string): Promise<Bead[]> {
-  return loadAllIssues(repo, { strictGates: true });
+  return loadAllIssues(repo, { strictGates: true, withCycles: true });
 }
 
 /** A bead read from inside its own write lock. A read that FAILED is never a bead that vanished. */

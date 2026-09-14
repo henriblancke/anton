@@ -17,6 +17,7 @@ import {
   notRunnableWhy,
 } from "./approval-gate";
 import type { Bead } from "./beads/bd";
+import { attachCycleEvidence } from "./beads/cycle-evidence";
 import { contractGatedBeads, runTickets } from "./ticket-view";
 
 /** Any bd stamp: without one a bead never came from a bd read, and the contract never judges it. */
@@ -225,6 +226,23 @@ describe("the `structure` rule — the tier shape under the target", () => {
     ];
 
     expect(of(find(board, "anton-f"), board)).toEqual([]);
+  });
+});
+
+describe("authoritative cycle evidence", () => {
+  it("refuses a target whose same-run tickets form a reported dependency cycle", () => {
+    const board = attachCycleEvidence([
+      feature("anton-f"),
+      ticket("anton-a", "anton-f", waitsOn("anton-a", "anton-b")),
+      ticket("anton-b", "anton-f", waitsOn("anton-b", "anton-a")),
+    ], [{ ids: ["anton-a", "anton-b"], raw: { cycle: ["anton-a", "anton-b"] } }]);
+
+    const gaps = of(find(board, "anton-f"), board);
+    expect(rulesOf(gaps)).toEqual(["structure", "structure"]);
+    expect(gaps.map((gap) => gap.message)).toEqual([
+      expect.stringContaining("anton-a → sits in a blocks cycle with anton-b"),
+      expect.stringContaining("anton-b → sits in a blocks cycle with anton-a"),
+    ]);
   });
 });
 

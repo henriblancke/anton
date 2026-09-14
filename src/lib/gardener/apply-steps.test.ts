@@ -69,6 +69,7 @@ vi.mock("../beads/bd", async () => {
       ...actual.beads,
       show: (_cwd: string, id: string) => showBead(id),
       list: (_cwd: string, extra: string[] = []) => listBoard(extra),
+      depCycles: async () => [],
       reparent: (_cwd: string, id: string, parent: string) => record("reparent", id, parent),
       link: (_cwd: string, a: string, b: string, type: string) => record("link", a, b, type),
       close: (_cwd: string, id: string, reason?: string) => record("close", id, reason ?? ""),

@@ -60,6 +60,7 @@ import {
 } from "../src/lib/beads/config.mjs";
 import { configureServerMode } from "../src/lib/beads/server-mode.mjs";
 import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
+import { parseDepCycles } from "../src/lib/beads/cycles.mjs";
 import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
 import {
   buildDrift,
@@ -1215,27 +1216,6 @@ function bdDepCycles(repo) {
   return exec("bd", ["-C", repo, "dep", "cycles", "--json"], budgetMs("network"));
 }
 
-/** Parse bd's cycle records best-effort, retaining every raw entry if its shape evolves. */
-function parseDepCycles(stdout) {
-  let parsed;
-  try {
-    parsed = JSON.parse((stdout ?? "").trim() || "null");
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(parsed)) return null;
-  const idsOf = (node) => {
-    if (typeof node === "string") return [node];
-    if (Array.isArray(node)) return node.flatMap(idsOf);
-    if (!node || typeof node !== "object") return [];
-    const named = node.cycle ?? node.path ?? node.ids ?? node.issue_ids ?? node.issues ?? node.nodes;
-    if (named !== undefined) return idsOf(named);
-    const id = typeof node.id === "string" ? node.id : typeof node.issue_id === "string" ? node.issue_id : undefined;
-    return id ? [id] : [];
-  };
-  return parsed.map((raw) => ({ ids: idsOf(raw), raw }));
-}
-
 /** bd's listing as an array, or null when this build's output can't be parsed. */
 function parseBoard(stdout) {
   try {
@@ -1299,10 +1279,27 @@ function readBoard(repo) {
   if (!needsGates) return { board: work };
 
   const gates = bdList(repo, ["--status", "all", "--type", "gate"]);
-  if (gates.error || gates.status !== 0) {
-    return { error: gates.error?.message || (gates.stderr ?? "").trim() || `bd list --type gate exited ${gates.status}` };
+  let parsedGates;
+  if (gates.error) {
+    return { error: gates.error.message };
+  } else if (gates.status === 0) {
+    parsedGates = parseBoard(gates.stdout);
+  } else {
+    // Gates are omitted from the regular list, so they need the same status compatibility fallback.
+    // Otherwise `/shape` supports the work listing but hard-fails when its graph has a gate edge.
+    const [open, closed] = [
+      bdList(repo, ["--type", "gate"]),
+      bdList(repo, ["--status", "closed", "--type", "gate"]),
+    ];
+    if ([open, closed].some((result) => result.error || result.status !== 0)) {
+      return { error: (gates.stderr ?? "").trim() || `bd list --type gate exited ${gates.status}` };
+    }
+    const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
+    if (listings.some((listing) => listing === null)) return { error: "bd returned output this build can't parse." };
+    const byId = new Map();
+    for (const gate of listings.flat()) if (!byId.has(gate.id)) byId.set(gate.id, gate);
+    parsedGates = [...byId.values()];
   }
-  const parsedGates = parseBoard(gates.stdout);
   if (!parsedGates) return { error: "bd returned output this build can't parse." };
   const byId = new Map(work.map((bead) => [bead.id, bead]));
   for (const gate of parsedGates) if (!byId.has(gate.id)) byId.set(gate.id, gate);

@@ -42,6 +42,7 @@
  * apply-steps.ts, and this file is what locks the proposal, asks the one for the other, and settles.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
 import {
   notePrefix,
@@ -229,7 +230,7 @@ async function applyApproved(
   // the moment the patrol judged the board, which is what every "has this moved since we asked"
   // check compares to.
   const at: ApplyMoment = { nowMs: Date.now(), observedAtMs: observedAtOf(proposal) };
-  const decision = planApply(plan, board, at);
+  const decision = planApply(plan, attachCycleEvidence(board, await beads.depCycles(repo)), at);
   if (decision.status === "refuse") {
     throw await attachFailure(
       repo,

@@ -170,13 +170,14 @@ describe("anton board-check (bd stubbed on PATH)", () => {
         "}",
         'const i = a.indexOf("--status");',
         'const status = i >= 0 ? a[i + 1] : "";',
-        'if (a.includes("--type") && a[a.indexOf("--type") + 1] === "gate") {',
-        "  console.log(gates);",
-        "  process.exit(0);",
-        "}",
         `if (status === "all" && ${rejectsStatusAll}) {`,
         '  console.error("unknown value for --status: all");',
         "  process.exit(2);",
+        "}",
+        'if (a.includes("--type") && a[a.indexOf("--type") + 1] === "gate") {',
+        '  const gateBoard = JSON.parse(gates);',
+        '  console.log(JSON.stringify(status === "all" ? gateBoard : status === "closed" ? gateBoard.filter((b) => b.status === "closed") : gateBoard.filter((b) => b.status !== "closed")));',
+        "  process.exit(0);",
         "}",
         'console.log(status === "all" ? all : status === "closed" ? closed : open);',
         "process.exit(0);",
@@ -335,6 +336,23 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     // The closed bead is read (so container-ness sees the whole graph) but never judged: 5 live of 6.
     expect(r.stdout).toContain("5 live beads");
     expect(r.status).toBe(1);
+  });
+
+  it("hydrates gates through the fallback when bd rejects --status all", async () => {
+    const board = [
+      ...HEALTHY,
+      { id: "gate1", issue_type: "gate", status: "open" },
+      {
+        id: "waiter",
+        issue_type: "task",
+        status: "open",
+        parent: "f1",
+        dependencies: [{ issue_id: "waiter", depends_on_id: "gate1", type: "blocks" }],
+      },
+    ];
+    const r = runCheck(await fakeBd(board, { rejectsStatusAll: true }));
+    expect(r.stdout).not.toContain("[blocks-edge-dangling]");
+    expect(r.status).toBe(0);
   });
 
   // The form rate belongs to `bun scripts/contract-report.ts` alone (anton-5ltn). board-check judges

@@ -11,6 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { disarmAutopilot } from "../autopilot-disarm";
 import { beads, LABELS } from "../beads/bd";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { loadAllIssues } from "../beads/issues";
 import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
 import { proposalFingerprint, type GardenerDetectionKind } from "../gardener/detections";
@@ -649,6 +650,77 @@ describe("applyPickerPlan", () => {
 
     expect(outcome).toMatchObject({ started: { beadId: "t1" } });
     expect(await jobs()).toHaveLength(1);
+  });
+
+  it("refuses a reported cycle during every approval and start re-validation", async () => {
+    put(
+      bead("t1", { dependencies: [{ issue_id: "t1", depends_on_id: "t2", type: "blocks" }] }),
+      bead("t2", { dependencies: [{ issue_id: "t2", depends_on_id: "t1", type: "blocks" }] }),
+    );
+    vi.mocked(loadAllIssues).mockImplementationOnce(async () => {
+      const snapshot = [...board.current.values()] as unknown as Bead[];
+      return attachCycleEvidence(snapshot, [{ ids: ["t1", "t2"], raw: { cycle: ["t1", "t2"] } }]);
+    });
+
+    const outcome = await apply("t1", 1, wired());
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain("sits in a blocks cycle");
+    expect(read("t1").assignee).toBeUndefined();
+    expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    expect(await jobs()).toHaveLength(0);
+  });
+
+  it("takes its writes back when a reported cycle appears while the claim settles", async () => {
+    put(bead("t1"), bead("t2"));
+
+    const outcome = await apply(
+      "t1",
+      1,
+      wired({
+        board: async () => {
+          const snapshot = [
+            { ...read("t1"), dependencies: [{ issue_id: "t1", depends_on_id: "t2", type: "blocks" }] },
+            { ...read("t2"), dependencies: [{ issue_id: "t2", depends_on_id: "t1", type: "blocks" }] },
+          ];
+          return attachCycleEvidence(snapshot, [{ ids: ["t1", "t2"], raw: { cycle: ["t1", "t2"] } }]);
+        },
+      }),
+    );
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain("sits in a blocks cycle");
+    expect(read("t1").assignee).toBeUndefined();
+    expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    expect(await jobs()).toHaveLength(0);
+  });
+
+  it("takes its writes back when a reported cycle appears while the review queue is checked", async () => {
+    put(bead("t1"), bead("t2"));
+    vi.mocked(loadAllIssues).mockImplementation(async () => {
+      const snapshot = [...board.current.values()] as unknown as Bead[];
+      return snapshot.some((bead) => bead.dependencies?.length)
+        ? attachCycleEvidence(snapshot, [{ ids: ["t1", "t2"], raw: { cycle: ["t1", "t2"] } }])
+        : snapshot;
+    });
+
+    const outcome = await apply("t1", 1, wired(), {
+      held: async () => {
+        board.current.get("t1")!.dependencies = [
+          { issue_id: "t1", depends_on_id: "t2", type: "blocks" },
+        ];
+        board.current.get("t2")!.dependencies = [
+          { issue_id: "t2", depends_on_id: "t1", type: "blocks" },
+        ];
+        return CLEAR;
+      },
+    });
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain("sits in a blocks cycle");
+    expect(read("t1").assignee).toBeUndefined();
+    expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    expect(await jobs()).toHaveLength(0);
   });
 
   it("enqueues nothing when the target stops being startable while the claim settles", async () => {

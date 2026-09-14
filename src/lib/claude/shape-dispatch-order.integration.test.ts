@@ -6,10 +6,10 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
+import { describeBd, hasBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { skillPath } from "./prompt";
 
-const REAL_BD = execFileSync("which", ["bd"], { encoding: "utf8" }).trim();
+const REAL_BD = hasBd() ? execFileSync("which", ["bd"], { encoding: "utf8" }).trim() : "";
 
 function phaseFiveOrderCommand(): string {
   const skill = readFileSync(skillPath("shape"), "utf8");

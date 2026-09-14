@@ -105,7 +105,7 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // Read DIRECTLY rather than through the UI snapshot, and STRICT on the gate listing: a job that
     // silently got a gate-less board would read every dangling gate edge as an open blocker and
     // record a plan that excludes half the board as `blocked`. A rejection retries the pass instead.
-    const board = await loadAllIssues(project.repoPath, { strictGates: true });
+    const board = await loadAllIssues(project.repoPath, { strictGates: true, withCycles: true });
 
     // The brake before the ranking (R4.4). A project whose last N runs all stopped without
     // delivering is disarmed here, on the same board read the plan is computed from — the plan is
@@ -352,7 +352,7 @@ async function restampAfterWrites(
     // the superseded digest — which the next pass reads as stale, withholding Up Next for another
     // cadence, the very thing this restamp exists to prevent.
     const armed = resolvePickerPolicy(await getProjectSettings(db, projectId));
-    const board = await loadAllIssues(repoPath, { strictGates: true });
+    const board = await loadAllIssues(repoPath, { strictGates: true, withCycles: true });
     const decision = await decideOver(db, { projectId, board, observedAtMs, armed });
     if (ctx.signal.aborted) return;
     // Still the pass, so still the fallback writer (anton-m4il): the correction this restamp exists

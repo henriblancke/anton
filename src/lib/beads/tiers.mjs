@@ -90,7 +90,7 @@ function isJudged(bead) {
 export function validateBoardStructure(board, { cycles } = {}) {
   const byId = new Map(board.map((b) => [b.id, b]));
   const childrenOf = childIndex(board);
-  const { members: onBlocksCycle, unmapped: unmappedCycles } = cycleMembers(board, byId, cycles);
+  const { memberships: cycleMemberships, unmapped: unmappedCycles } = cycleMembers(byId, cycles);
 
   const violations = [];
   const fault = (id, rule, severity, message) => violations.push({ id, rule, severity, message });
@@ -149,9 +149,14 @@ export function validateBoardStructure(board, { cycles } = {}) {
       }
     }
 
-    if (onBlocksCycle.has(bead.id)) {
+    const cycle = cycleMemberships.get(bead.id)?.find((members) =>
+      (bead.dependencies ?? []).some(
+        (dep) => dep?.type === "blocks" && members.has(dep.depends_on_id),
+      ),
+    );
+    if (cycle) {
       const partner = (bead.dependencies ?? []).find(
-        (d) => d?.type === "blocks" && onBlocksCycle.has(d.depends_on_id),
+        (dep) => dep?.type === "blocks" && cycle.has(dep.depends_on_id),
       )?.depends_on_id;
       fault(
         bead.id,
@@ -313,18 +318,23 @@ export function structureGaps(targetId, board, options) {
  * and it owns the definition of a cycle. `cycles` is the parsed `bd dep cycles --json` result; raw
  * entries are deliberately retained so a format bd adds later cannot turn into a clean report.
  */
-function cycleMembers(board, byId, cycles) {
-  const members = new Set();
+function cycleMembers(byId, cycles) {
+  const memberships = new Map();
   const unmapped = [];
   for (const cycle of cycles ?? []) {
     const ids = Array.isArray(cycle?.ids) ? cycle.ids.filter((id) => typeof id === "string") : [];
     const mapped = ids.filter((id) => byId.has(id));
-    for (const id of mapped) members.add(id);
+    const members = new Set(mapped);
+    for (const id of mapped) {
+      const memberCycles = memberships.get(id);
+      if (memberCycles) memberCycles.push(members);
+      else memberships.set(id, [members]);
+    }
     // A partially readable record still leaves a cycle member unnamed. Preserve it as a board-level
     // fault rather than letting the unrecognised part of bd's authoritative evidence disappear.
     if (ids.length === 0 || mapped.length !== ids.length) unmapped.push(cycle?.raw ?? cycle);
   }
-  return { members, unmapped };
+  return { memberships, unmapped };
 }
 
 /** Keep unfamiliar authoritative metadata diagnosable without letting an unexpected value throw. */

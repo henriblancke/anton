@@ -15,6 +15,7 @@ import { beads, CLAIM_SETTLE_MS, type SyncOutcome } from "../beads/bd";
 import { approveAndClaim, unwindApproveClaim } from "../beads/approve-claim";
 import { isServerMode } from "../beads/board-mode";
 import { ownerOf } from "../beads/claim";
+import { attachCycleEvidence, cycleEvidenceFor } from "../beads/cycle-evidence";
 import { loadAllIssues } from "../beads/issues";
 import type { Bead } from "../beads/types";
 import { errorText, sleepMs } from "../retry-helpers";
@@ -94,7 +95,9 @@ type SettleVerdict =
  */
 function asUnclaimed(board: Bead[], target: Bead): { free: Bead; board: Bead[] } {
   const free = { ...target, assignee: undefined };
-  return { free, board: board.map((b) => (b.id === target.id ? free : b)) };
+  const projected = board.map((b) => (b.id === target.id ? free : b));
+  const cycles = cycleEvidenceFor(board);
+  return { free, board: cycles ? attachCycleEvidence(projected, cycles) : projected };
 }
 
 /**
@@ -143,7 +146,7 @@ async function settleClaim(
   const shared = isServerMode(repoPath);
   const push = deps.push ?? beads.push;
   const pull = deps.pull ?? beads.pull;
-  const readBoard = deps.board ?? loadAllIssues;
+  const readBoard = deps.board ?? ((cwd: string) => loadAllIssues(cwd, { withCycles: true }));
   const sleep = deps.sleep ?? sleepMs;
 
   // Is there a second writer whose write this pass has to WAIT OUT? A shared server always has one;
