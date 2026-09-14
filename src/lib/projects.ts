@@ -292,6 +292,14 @@ export interface ProjectSettings {
    */
   ticketTimeoutMinutes?: number;
   /**
+   * How long a single `git commit` (and the hook chain it triggers) may run before anton kills it,
+   * in minutes. A commit budget separate from {@link ticketTimeoutMinutes} exists because a
+   * pre-commit/commit-msg hook chain can legitimately run for a while — long enough that a
+   * sub-minute budget would kill it before it finishes, which is why the range floor is 1, not 0.
+   * Absent → DEFAULT_COMMIT_TIMEOUT_MINUTES (2 min).
+   */
+  commitTimeoutMinutes?: number;
+  /**
    * Max attempts for a job before it is parked for a human (anton-xbk). A failed ticket fails the
    * execute-epic job, which retries and resumes past already-closed tickets — so this is the
    * effective per-task retry budget. Absent → DEFAULT_MAX_RETRIES.
@@ -511,6 +519,9 @@ export const DEFAULT_CONCURRENCY = 3;
 export const DEFAULT_REVIEW_FIX_CONCURRENCY = 2;
 export const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2 hours without progress
 export const DEFAULT_TICKET_TIMEOUT_MINUTES = 45;
+/** Kept in minutes for consistency with the other two timeouts; ops.ts's git-commit default is
+ *  {@link DEFAULT_COMMIT_TIMEOUT_MINUTES} * 60_000 ms — asserted equal in ops.test.ts. */
+export const DEFAULT_COMMIT_TIMEOUT_MINUTES = 2;
 export const DEFAULT_MAX_RETRIES = 3;
 /** Two rounds: the reviewer's first pass plus one chance to confirm the fixes landed. */
 export const DEFAULT_REVIEW_MAX_ROUNDS = 2;
@@ -552,11 +563,27 @@ export const DEFAULT_AUTOPILOT_SCORE_WINDOW = 3;
  */
 export const DEFAULT_AUTOPILOT_WIP_LIMIT = 3;
 
+/**
+ * The commit budget every `commitAll`/`commitMarker` call runs under, in ms (anton-zse2). An unset
+ * setting resolves to {@link DEFAULT_COMMIT_TIMEOUT_MINUTES} — the same default `commitAll` itself
+ * falls back to, so a project with no setting is byte-identical to before this existed.
+ */
+export function resolveCommitTimeoutMs(settings: ProjectSettings): number {
+  return (settings.commitTimeoutMinutes ?? DEFAULT_COMMIT_TIMEOUT_MINUTES) * 60_000;
+}
+
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const REVIEW_FIX_CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const JOB_TIMEOUT_MINUTES_RANGE = { min: 5, max: 720 } as const; // 5 min … 12 h
 export const TICKET_TIMEOUT_MINUTES_RANGE = { min: 5, max: 240 } as const; // 5 min … 4 h
+/**
+ * 1 min … 60 min. The floor is deliberate — a sub-minute commit budget kills the hook chain this
+ * setting exists to accommodate. The ceiling is a guard, not a guess: past an hour,
+ * {@link JOB_TIMEOUT_MINUTES_RANGE}'s job timeout (default {@link DEFAULT_JOB_TIMEOUT_MINUTES}) is
+ * the thing that should be bounding the run.
+ */
+export const COMMIT_TIMEOUT_MINUTES_RANGE = { min: 1, max: 60 } as const;
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
 export const REVIEW_MAX_ROUNDS_RANGE = { min: 1, max: 5 } as const;
 /** `0` is in range on purpose: it is how the operator turns the score-regression alarm off. */
@@ -1584,7 +1611,13 @@ async function removeProjectWorktrees(
   const worktrees = await projectWorktrees(db, project);
   for (const wt of worktrees) {
     await removeWorktree(
-      { path: wt.path, branch: wt.branch, baseBranch: wt.branch, repoPath: project.repoPath },
+      {
+        path: wt.path,
+        branch: wt.branch,
+        baseBranch: wt.branch,
+        createdBranch: false,
+        repoPath: project.repoPath,
+      },
       { deleteBranch: Boolean(wt.branch) },
     );
   }

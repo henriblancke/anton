@@ -74,6 +74,50 @@ describe("exitError", () => {
     expect(err?.message).toBe("claude exited with code 2: three tests fail");
   });
 
+  it("classifies a gateway [402] billing stop as a quota hit, not a resumed transient (anton-x96g)", () => {
+    // Observed verbatim in .anton/sessions/*.log for PR #238 and #252: OpenRouter's billing stop
+    // arrives wrapped in a 503 envelope, which otherwise matches TRANSIENT_STDERR_RE's bare `503`
+    // and gets resumed against a wall that never moves. Quota must win ahead of the exit-code path.
+    const err = exitError(
+      exit({
+        code: 1,
+        stderr:
+          'API Error: 503 [openrouter/anthropic/claude-sonnet-5] [402]: {"error":{"message":"This request requires more credits, or fewer max_tokens.","code":402}}',
+      }),
+    );
+
+    expect(isUsageLimitError(err)).toBe(true);
+    expect(isRecoverableClaudeError(err)).toBe(false);
+  });
+
+  it("still resumes a genuine gateway 503 with no [402] inside as transient (anton-x96g)", () => {
+    const err = exitError(
+      exit({
+        code: 1,
+        stderr: "API Error: 503 [openrouter/anthropic/claude-sonnet-5] Service Unavailable",
+      }),
+    );
+
+    expect(isUsageLimitError(err)).toBe(false);
+    expect(isRecoverableClaudeError(err)).toBe(true);
+    expect(recoverable(err).signature).toBe("503");
+  });
+
+  it("classifies a rate_limit_error [429] as a quota hit, not a resumed transient (anton-h8z4)", () => {
+    // Observed verbatim in anton.db (anton-fmlb): three consecutive RESUMEs in ~60s against a wall
+    // that never moved, because the bare `429` in this envelope also matches TRANSIENT_STDERR_RE.
+    const err = exitError(
+      exit({
+        code: 1,
+        stderr:
+          'API Error: 503 [claude/claude-opus-5] [429]: {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your (reset after 2m 41s)."}}',
+      }),
+    );
+
+    expect(isUsageLimitError(err)).toBe(true);
+    expect(isRecoverableClaudeError(err)).toBe(false);
+  });
+
   it("makes a transient non-zero exit resume-eligible, signed by its cause", () => {
     const err = exitError(
       exit({

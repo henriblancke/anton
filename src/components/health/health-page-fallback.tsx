@@ -1,9 +1,12 @@
 /**
- * Instant skeleton for the Health page's route-level `loading.tsx` — the page's data read (the board's
- * hygiene/scan/trajectory reads plus the open-escalation read, see lib/health.ts) happens before the
- * page returns any markup, so only a route-level boundary can cover it. Mirrors the report's own
- * shape (a main column of panels beside a narrower rail) rather than a generic spinner, so the layout
- * doesn't jump once the real data lands.
+ * Instant skeleton for the Health page's route-level `loading.tsx` — the page's data read (the
+ * board's hygiene/scan/trajectory reads, the escalation reads, the breaker, and the park signal;
+ * see lib/health.ts) happens before the page returns any markup, so only a route-level boundary can
+ * cover it. Mirrors the report's own shape (a main column of panels beside a narrower rail) rather
+ * than a generic spinner, so the layout doesn't jump once the real data lands.
+ *
+ * Four panels, not three, since the alerts moved here (anton-7gxs): the page now leads with the
+ * "Needs you" list, and a skeleton one panel short would visibly reflow the moment it lands.
  */
 export function HealthPageFallback({ slug }: { slug?: string }) {
   return (
@@ -20,7 +23,7 @@ export function HealthPageFallback({ slug }: { slug?: string }) {
         aria-label="Loading health report"
       >
         <div className="flex min-w-0 flex-1 flex-col gap-3">
-          {[0, 1, 2].map((i) => (
+          {[0, 1, 2, 3].map((i) => (
             <div key={i} className="flex flex-col gap-2.5 rounded-xl border border-border bg-card/60 p-3">
               <span className="anton-shimmer h-3 w-1/4 rounded" />
               <span className="anton-shimmer h-3 w-3/4 rounded" />

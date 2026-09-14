@@ -18,6 +18,7 @@ import { filterDeadcodeSignals, type DeadcodeFilter } from "./scan-deadcode";
 import { filterDuplicationSignals, type DuplicationFilter } from "./scan-duplication";
 import { filterSecretSignals, type SecretFilter } from "./scan-secrets";
 import { PoisonError } from "./jobs/errors";
+import { GH_BIN_ENV } from "./git/ops";
 
 const execFileAsync = promisify(execFile);
 
@@ -683,6 +684,40 @@ async function readAnnotatedSignals(
  * poison so the runner parks the job instead of retrying past the lost window (see
  * `rejectWithBaselineRestored`).
  */
+/**
+ * `gh auth token` — the same credential anton already uses for `gh pr`/`gh issue` calls (see
+ * git/ops.ts, git/pr.ts). stringer's `github` collector (open issues/PRs/review-todos) reads its
+ * own `GITHUB_TOKEN` env var rather than shelling out to `gh`, so without this it silently logs
+ * "GITHUB_TOKEN not set, skipping GitHub collector" and that whole signal source is dark — every
+ * other collector still runs. Best-effort: `gh` missing or unauthenticated just means no GitHub
+ * signals this scan, not a failed scan.
+ *
+ * Bounded by (and cancellable via) the caller's own scan deadline/signal — this lookup must not
+ * outlive a scan a caller already gave up on, so it never adds its own independent wait past that.
+ */
+async function githubToken(timeoutMs: number, signal?: AbortSignal): Promise<string | undefined> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  try {
+    // stringer's github collector always calls api.github.com, never an enterprise host -- so
+    // without --hostname, a machine whose `gh` default host is a GHE instance would hand stringer
+    // that host's token, which api.github.com rejects (or worse, silently mismatches an account).
+    const { stdout } = await execFileAsync(gh, ["auth", "token", "--hostname", "github.com"], {
+      timeout: Math.min(10_000, timeoutMs),
+      maxBuffer: 1024 * 1024,
+      signal,
+    });
+    const token = stdout.trim();
+    return token || undefined;
+  } catch (err) {
+    // A caller abort must propagate, not collapse into "no token": swallowing it here would let
+    // scan() spawn stringer with an already-aborted signal and then run the baseline-unwind path
+    // for what should have short-circuited as cancellation (see toScanError's own AbortError check).
+    const e = err as { name?: string; code?: unknown } | null;
+    if (e?.name === "AbortError" || e?.code === "ABORT_ERR") throw err;
+    return undefined;
+  }
+}
+
 export async function scan(opts: {
   repoPath: string;
   scanFile: string;
@@ -715,10 +750,37 @@ export async function scan(opts: {
   args.push("--no-color");
 
   const timeoutMs = scanTimeoutMs();
+  const deadline = Date.now() + timeoutMs;
+  // A caller's own GITHUB_TOKEN (CI, an operator's shell) wins — `gh auth token` is only a
+  // fallback for when nothing already set it, and only set when it actually resolves. Bounded by
+  // and cancellable via the same deadline/signal as the scan itself, so a slow credential store
+  // can't add its own wait on top of (or outlive) an already-cancelled/short-deadline scan.
+  const env = { ...process.env };
+  if (!env.GITHUB_TOKEN) {
+    const token = await githubToken(timeoutMs, opts.signal);
+    if (token) env.GITHUB_TOKEN = token;
+  }
+  // The lookup above can itself consume part of the outer deadline -- charge that against what's
+  // left rather than handing stringer the full timeoutMs again, or a slow `gh auth token` lets the
+  // whole scan overrun ANTON_STRINGER_TIMEOUT_MS by however long the lookup took.
+  const remainingMs = deadline - Date.now();
+  // execFile treats `timeout: 0` as "no timeout" (Node and Bun both), so a budget already
+  // exhausted by the token lookup must reject here instead of spawning stringer uncapped. This is
+  // BEFORE the try below on purpose: stringer never ran, so the baseline is untouched and doesn't
+  // need unwinding -- routing it through rejectWithBaselineRestored would risk turning a harmless
+  // credential-lookup timeout into a poison error if that (unneeded) restore itself failed.
+  if (remainingMs <= 0) {
+    // Not toScanError -- that formatter's message says stringer was killed, but stringer was
+    // never spawned here; blaming it would send an operator chasing the wrong executable.
+    throw new Error(
+      `gh auth token lookup consumed the scan's ${formatTimeout(timeoutMs)} deadline before stringer could start (no output written).`,
+    );
+  }
   let stderr = "";
   try {
     ({ stderr } = await execFileAsync(bin, args, {
-      timeout: timeoutMs,
+      env,
+      timeout: remainingMs,
       maxBuffer: 64 * 1024 * 1024,
       signal: opts.signal,
     }));
@@ -729,7 +791,10 @@ export async function scan(opts: {
     // measures from the advanced state, finds nothing, and closes green over findings nobody
     // triaged. The original error passes through unchanged when the unwind works, so the runner
     // still classifies a timeout as a timeout and an abort as cancellation.
-    throw await rejectWithBaselineRestored(toScanError(err, { timeoutMs }), unwind);
+    // Report the budget stringer actually ran under (remainingMs, after the token lookup's own
+    // share was deducted), not the outer timeoutMs -- otherwise a slow `gh auth token` makes the
+    // error claim a much longer deadline than what killed the process.
+    throw await rejectWithBaselineRestored(toScanError(err, { timeoutMs: remainingMs }), unwind);
   }
 
   let read: Awaited<ReturnType<typeof readAnnotatedSignals>>;

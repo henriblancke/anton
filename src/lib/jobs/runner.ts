@@ -35,6 +35,7 @@ import {
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
   enqueueReviewFixPrIfAbsent,
+  enqueueScheduledTypeIfAbsent,
   getJob,
   leaseDue,
   park,
@@ -55,6 +56,7 @@ import {
   type JobType,
 } from "./queue";
 import { reconcileInterruptedRuns } from "../runs";
+import { runScheduleNow, type RunNowResult } from "../schedules";
 import {
   isPoisonError,
   isRunAlreadyLiveError,
@@ -694,6 +696,38 @@ export class JobRunner {
   enqueueReviewFixPrIfAbsent(projectId: string, epicBeadId: string): string | undefined {
     return enqueueReviewFixPrIfAbsent(this.db, this.clock, projectId, epicBeadId, {
       refuseProject: (pid) => this.quiescedProjects.has(pid),
+    });
+  }
+
+  /**
+   * Enqueue one of the SCHEDULED job types (board-picker, nightly-stringer, …) for a project unless
+   * one is already covering it (PR #264 review) — see `enqueueScheduledTypeIfAbsent` (queue.ts) for
+   * why this needs its own transactional dedupe rather than the bare `enqueue()` above, and for what
+   * `coveredBy` changes. The board-change nudge (picker-nudge.ts) is the current caller.
+   */
+  enqueueScheduledTypeIfAbsent(
+    type: JobType,
+    projectId: string,
+    payload: unknown,
+    opts?: { coveredBy?: readonly string[]; scheduleId?: string },
+  ): string {
+    return enqueueScheduledTypeIfAbsent(this.db, this.clock, type, projectId, payload, {
+      refuseProject: (pid) => this.quiescedProjects.has(pid),
+      coveredBy: opts?.coveredBy,
+      scheduleId: opts?.scheduleId,
+    });
+  }
+
+  /**
+   * Fire one schedule's job right now, outside its cron (Settings → Automation's "Run now").
+   * Delegates to `runScheduleNow` (schedules.ts), which mirrors the scheduler's own tick — same
+   * payload shape, same `lastRunAt` stamp — passing the project-teardown veto through exactly as
+   * `resume`/`enqueueReviewFixPrIfAbsent` do: asked inside the write's own transaction, not read
+   * here first, so a fire racing `quiesceProject` can't land behind its sweep.
+   */
+  runScheduleNow(scheduleId: string): Promise<RunNowResult> {
+    return runScheduleNow(this.db, this.clock, scheduleId, {
+      refuseProject: (projectId) => this.quiescedProjects.has(projectId),
     });
   }
 

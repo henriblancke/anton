@@ -9,14 +9,10 @@
  *   • hold — the calm register, the self-clearing promise, and NO buttons.
  *   • disarm — the failure register, the evidence it tripped on, `Investigate`, and `Re-arm`.
  */
-import { Suspense } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
-import {
-  AutopilotBreakerBand,
-  AutopilotBreakerHeader,
-} from "@/components/board/autopilot-breaker-header";
+import { AutopilotBreakerHeader } from "@/components/health/autopilot-breaker-band";
 import { staleBreaker } from "@/lib/autopilot-breaker";
 import type { AutopilotDisarm, AutopilotHold, AutopilotStale } from "@/lib/autopilot-breaker";
 
@@ -268,51 +264,5 @@ describe("AutopilotBreakerHeader", () => {
       );
       expect(container.innerHTML).toBe("");
     });
-  });
-});
-
-/**
- * The band is decided by a read that spawns `gh` per in-review PR, so the page hands it over
- * unresolved and it suspends on its own. What that buys — and what these cases hold — is that the
- * cards render on GitHub's schedule for nobody.
- */
-describe("streamed, not awaited by the page", () => {
-  it("leaves the board around it rendered while the read is still outstanding", () => {
-    // The whole point of the arrangement: a GitHub read that never answers costs a missing band,
-    // not a missing board.
-    render(
-      <Suspense fallback={<p>the board, already rendered</p>}>
-        <AutopilotBreakerBand slug="anton" breaker={new Promise<undefined>(() => {})} />
-      </Suspense>,
-    );
-
-    expect(screen.getByText("the board, already rendered")).toBeTruthy();
-    expect(screen.queryByRole("region")).toBeNull();
-  });
-
-  it("fills the band in once the read answers", async () => {
-    const read = Promise.resolve(hold());
-    await act(async () => {
-      render(
-        <Suspense fallback={<p>the board, already rendered</p>}>
-          <AutopilotBreakerBand slug="anton" breaker={read} />
-        </Suspense>,
-      );
-    });
-
-    expect(screen.getByText("Autopilot is holding")).toBeTruthy();
-  });
-
-  it("renders no band at all once the read answers that nothing is stopped", async () => {
-    await act(async () => {
-      render(
-        <Suspense fallback={<p>pending</p>}>
-          <AutopilotBreakerBand slug="anton" breaker={Promise.resolve(undefined)} />
-        </Suspense>,
-      );
-    });
-
-    expect(screen.queryByText("pending")).toBeNull();
-    expect(screen.queryByRole("region")).toBeNull();
   });
 });

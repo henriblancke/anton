@@ -13,13 +13,14 @@ import {
   isAncestor,
   preservedCommitPrefix,
   readWorktreeState,
+  resolveHooksPathOverride,
   stageAllAndHashTree,
   sameWorktreeState,
   worktreeHasPreservedCommitFor,
   worktreeTipIsPreservedCommitFor,
   type WorktreeState,
 } from "../git/ops";
-import { resolveVerifyGates } from "../projects";
+import { resolveCommitTimeoutMs, resolveVerifyGates, type ProjectSettings } from "../projects";
 import { appendSessionLog } from "../sessions";
 import { safe } from "./execute-epic-persist";
 import { startTicketBudget } from "./execute-epic-ticket-bookends";
@@ -259,13 +260,16 @@ export async function preserveTimedOutWork(args: {
   // locked index, a rejecting pre-commit hook or a full disk is what they need to see, and the
   // rollback below is safe either way.
   const kept = await commitPreservedTree({
+    repoPath: run.repoPath,
     worktreePath,
     logPath,
     message: preservedCommitMessage(ticket, timeoutMs),
     before: now,
+    timeoutMs: resolveCommitTimeoutMs(settings),
+    signal: run.ctx.signal,
   });
-  // The abort outranks the timeout on THIS side of the commit too (PR #228 review). `commitAll` runs
-  // on no signal — a pre-commit hook can hold it for minutes — so an operator's kill, a lost lease or
+  // The abort outranks the timeout on THIS side of the commit too (PR #228 review). `commitAll`
+  // reaps the hook process group when this signal fires, so an operator's kill, a lost lease or
   // the no-progress timeout can land here just as it can in the gate window above, and neither
   // outcome of the commit is a verdict once it has: a commit that landed simply stays on the branch,
   // and one that did not must not be read as "unfit" and rolled back. Reported as the abort so the
@@ -294,10 +298,13 @@ export async function preserveTimedOutWork(args: {
     const after = "error" in kept ? await readWorktreeState(worktreePath).catch(() => null) : now;
     if (after && (await movedForwardOnBranch(worktreePath, baseline, after, branch))) {
       return adoptSelfCommittedWork({
+        repoPath: run.repoPath,
         worktreePath,
         branch,
         ticket,
         timeoutMs,
+        settings,
+        signal: run.ctx.signal,
         logPath,
         why:
           "error" in kept
@@ -354,10 +361,13 @@ export async function preserveTimedOutWork(args: {
  * outrank their bookkeeping, but handed to a person instead of reported as preserved.
  */
 async function adoptSelfCommittedWork(args: {
+  repoPath: string;
   worktreePath: string;
   branch: string;
   ticket: Bead;
   timeoutMs: number;
+  settings: ProjectSettings;
+  signal: AbortSignal;
   logPath: string;
   /** How the commits on this branch came to be there, for the operator reading the log. */
   why: string;
@@ -368,7 +378,7 @@ async function adoptSelfCommittedWork(args: {
    */
   alreadyMarked: boolean;
 }): Promise<PreservedWork> {
-  const { worktreePath, branch, ticket, timeoutMs, logPath, why, alreadyMarked } = args;
+  const { repoPath, worktreePath, branch, ticket, timeoutMs, settings, signal, logPath, why, alreadyMarked } = args;
   const message = preservedCommitMessage(ticket, timeoutMs, { marker: true });
   // A REJECTED marker call is not proof the marker is absent (PR #228 review). `--no-verify` bypasses
   // only `pre-commit` and `commit-msg` (git-commit(1)); `post-commit` runs AFTER the commit is made,
@@ -378,9 +388,27 @@ async function adoptSelfCommittedWork(args: {
   // older marker beneath these self-commits does not cover them, so it must not pass for the fresh
   // tip marker this call meant to make. A read that fails stays "unmarked": that answer stops for a
   // person, where a wrong "marked" reports work no resume can see as preserved.
+  //
+  // `hooksPath` is resolved and passed through for the same reason `commitPreservedTree` below
+  // already does it: `--no-verify` bypasses only `pre-commit`/`commit-msg`, so a generated,
+  // base-only hook still needs the base repo's copy resolved rather than the cold worktree's own,
+  // nonexistent one (PR #263 review, round 15).
+  //
+  // No round-37 stage-before-resolve fix needed here, for the same reason `commitStep`'s own marker
+  // call needs none (see `steps/git.ts`'s `recordAttribution`): `commitMarker` stages nothing of its
+  // own, and this call is reached only after the self-commits it marks already landed on HEAD — so
+  // any submodule gitlink `resolveHooksPathOverride` reads here is already committed, not merely
+  // staged.
+  const hooksPath = await resolveHooksPathOverride(repoPath, worktreePath);
   const marked =
     alreadyMarked ||
-    (await safe(() => commitMarker(worktreePath, message))) ||
+    (await safe(() =>
+      commitMarker(worktreePath, message, {
+        hooksPath,
+        timeoutMs: resolveCommitTimeoutMs(settings),
+        signal,
+      }),
+    )) ||
     (await worktreeTipIsPreservedCommitFor(worktreePath, ticket.id));
   if (!marked) {
     await logPreserve(
@@ -490,20 +518,30 @@ function preservedCommitMessage(
  * landed — the one act this whole path exists to refuse.
  */
 async function commitPreservedTree(args: {
+  repoPath: string;
   worktreePath: string;
   logPath: string;
   message: string;
   before: WorktreeState;
+  timeoutMs: number;
+  signal: AbortSignal;
 }): Promise<{ committed: boolean } | { committed: false; error: unknown }> {
-  const { worktreePath, logPath, message, before } = args;
+  const { repoPath, worktreePath, logPath, message, before, timeoutMs, signal } = args;
   const rejected = (error: unknown) => ({ committed: false as const, error });
   // Hashed BEFORE the attempt, because after it a hook's edits are indistinguishable from the
-  // agent's own work.
+  // agent's own work. This also happens to be the right order for `resolveHooksPathOverride` below
+  // (PR #263 review, round 37): `stageAllAndHashTree` stages everything first, so a hooks-path
+  // submodule bump the preserved tree carries but never had `git add` run on it is already reflected
+  // in the index by the time the resolver reads it — no separate `stageAll` needed here, unlike
+  // `commitStep`/`commitAndPushFix`, which had no staging step of their own before this fix.
   const verified = await stageAllAndHashTree(worktreePath).catch(() => null);
-  const first = await commitAll(worktreePath, message).catch(rejected);
+  const hooksPath = await resolveHooksPathOverride(repoPath, worktreePath);
+  const first = await commitAll(worktreePath, message, { hooksPath, timeoutMs, signal }).catch(rejected);
   // Accepted by this project's hooks — the same proof an ordinary commit ships on, so `verified` is
   // not re-compared here; it exists for the bypass below, where no hook is left to say yes.
-  if (!("error" in first)) return first;
+  // A job abort intentionally leaves either outcome to the stopping actor, so HEAD recovery here
+  // would only make the operator-facing log more specific; it must not adopt or roll back anything.
+  if (!("error" in first) || signal.aborted) return first;
   const after = await readWorktreeState(worktreePath).catch(() => null);
   if (!after || after.head !== before.head) return first;
   const retried = await stageAllAndHashTree(worktreePath).catch(() => null);
@@ -519,5 +557,14 @@ async function commitPreservedTree(args: {
     await logPreserve(logPath, `${why} — anton did not retry with the hooks bypassed`);
     return first;
   }
-  return commitAll(worktreePath, message, { bypassHooks: true }).catch(rejected);
+  // `hooksPath`, not just `bypassHooks`: `--no-verify` bypasses only `pre-commit`/`commit-msg`
+  // (git-commit(1)) — `post-commit` still runs, and without the same override this retry resolves it
+  // against a cold worktree where a generated hooks directory (Husky's `.husky/_`) was never
+  // installed, silently skipping it (PR #263 review).
+  //
+  // Same `timeoutMs` as the first attempt (anton-zse2) — a retry bounded differently would make the
+  // two failures tell different stories about the same budget.
+  return commitAll(worktreePath, message, { bypassHooks: true, hooksPath, timeoutMs, signal }).catch(
+    rejected,
+  );
 }

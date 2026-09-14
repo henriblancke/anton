@@ -5,7 +5,7 @@ import Link from "next/link";
 
 import { MetaChip } from "@/components/atoms";
 import { ArmWatcherButton } from "@/components/board/arm-watcher-button";
-import { stuckFor } from "@/components/board/escalation-age";
+import { stuckFor } from "@/components/health/escalation-age";
 import { buttonVariants } from "@/components/ui/button";
 import type { UnwatchedParks, WatcherAutomation } from "@/lib/types";
 
@@ -61,8 +61,15 @@ export function UnwatchedParksBand({
   slug: string;
   /** Absent when the watcher is armed or nothing is parked — the band is silent in both cases. */
   parks?: UnwatchedParks;
-  /** Re-read the signal: the band is a read of the schedule rows the button just wrote. */
-  onArmed: () => void;
+  /**
+   * Re-read the signal: the band is a read of the schedule rows the button just wrote.
+   *
+   * Optional since anton-7gxs, when this band moved to the Health page. The board polls this signal
+   * and hands its own re-read down; the page has no poll and re-renders from the server instead, so
+   * there the honest refresh is `router.refresh()` — which is what {@link ArmWatcherButton} falls
+   * back to when no callback is given.
+   */
+  onArmed?: () => void;
 }) {
   if (!parks) return null;
 

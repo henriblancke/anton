@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { EyeIcon } from "lucide-react";
 
@@ -34,9 +35,16 @@ export function ArmWatcherButton({
   slug: string;
   /** The automations that are off — arming turns on exactly these. */
   disarmed: WatcherAutomation[];
-  /** Re-read the band's signal once the writes have settled, either way. */
-  onArmed: () => void;
+  /**
+   * Re-read the band's signal once the writes have settled, either way.
+   *
+   * Optional since anton-7gxs: the board polls this signal and hands down its own re-read, while
+   * the Health page and the board's strip re-render from the server. Without a callback this falls
+   * back to `router.refresh()`, which is the correct re-read for a server-rendered caller.
+   */
+  onArmed?: () => void;
 }) {
+  const router = useRouter();
   const [pending, setPending] = useState(false);
 
   async function arm() {
@@ -65,7 +73,8 @@ export function ArmWatcherButton({
       setPending(false);
       // The band is a read of the schedule rows this click wrote, and a partial arm is a DIFFERENT
       // band (one half still off) — re-read rather than keep showing the state it started from.
-      onArmed();
+      if (onArmed) onArmed();
+      else router.refresh();
     }
   }
 

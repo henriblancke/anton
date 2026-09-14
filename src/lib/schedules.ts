@@ -7,10 +7,10 @@
  * path uses the shared anton.db.
  */
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
-import { systemClock, type AntonDb, type Clock } from "./jobs/queue";
+import { newJobRow, systemClock, type AntonDb, type Clock } from "./jobs/queue";
 import type { JobType } from "./jobs/queue";
 import { isValidCron, nextRun } from "./jobs/cron";
 import {
@@ -169,6 +169,76 @@ export async function updateSchedule(
       set.nextRunAt = secDate(nextRun(cron, clock.now()));
     }
     tx.update(schema.schedules).set(set).where(eq(schema.schedules.id, id)).run();
+  }, TAKE_WRITE_LOCK);
+}
+
+/** Why a manual fire was refused — the route maps each to its own status code. */
+export type RunNowRefusal = "not-found" | "disabled" | "already-running" | "project-refused";
+
+export type RunNowResult = { ok: true; jobId: string } | { ok: false; reason: RunNowRefusal };
+
+/**
+ * Fire one automation's job right now, outside its cron (Settings → Automation's "Run now"). Builds and
+ * inserts the row exactly as the scheduler's own tick does (jobs/scheduler.ts) — same payload shape
+ * (`{ projectId, scheduleId }`), same `lastRunAt` stamp in the same transaction — so a manual fire
+ * is indistinguishable from a cron fire to every reader downstream (schedule-runs.ts's outcome
+ * pairing, the Automation table's Last-run cell). `nextRunAt` is left untouched: a manual fire does
+ * not reschedule the automation's own cadence.
+ *
+ * Refused when the automation is off (an operator must arm it first — the switch is the one place
+ * that decides whether this type may run at all) or when a job of this type is already active
+ * (`queued`/`running`) for the project, mirroring the scheduler's own inflight coalescing so a click
+ * can never double-fire a pass that is already running. `refuseProject` is the runner's
+ * project-teardown veto, asked inside the same transaction as the insert for the same reason
+ * `enqueueReviewFixPrIfAbsent` asks it (queue.ts) — a check made before this call would still race
+ * `quiesceProject`.
+ */
+export async function runScheduleNow(
+  db: AntonDb,
+  clock: Clock,
+  id: string,
+  opts?: { refuseProject?: (projectId: string) => boolean },
+): Promise<RunNowResult> {
+  const nowMs = clock.now();
+  return db.transaction((tx) => {
+    const row = tx
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, id))
+      .limit(1)
+      .get();
+    if (!row) return { ok: false, reason: "not-found" };
+    if (!row.enabled) return { ok: false, reason: "disabled" };
+    if (opts?.refuseProject?.(row.projectId)) return { ok: false, reason: "project-refused" };
+
+    const active = tx
+      .select({ id: schema.jobs.id })
+      .from(schema.jobs)
+      .where(
+        and(
+          eq(schema.jobs.type, row.type),
+          eq(schema.jobs.projectId, row.projectId),
+          inArray(schema.jobs.status, ["queued", "running"]),
+        ),
+      )
+      .limit(1)
+      .get();
+    if (active) return { ok: false, reason: "already-running" };
+
+    const job = newJobRow(
+      {
+        type: row.type as JobType,
+        projectId: row.projectId,
+        payload: { projectId: row.projectId, scheduleId: row.id },
+      },
+      nowMs,
+    );
+    tx.insert(schema.jobs).values(job).run();
+    tx.update(schema.schedules)
+      .set({ lastRunAt: job.createdAt })
+      .where(eq(schema.schedules.id, row.id))
+      .run();
+    return { ok: true, jobId: job.id };
   }, TAKE_WRITE_LOCK);
 }
 
@@ -381,6 +451,28 @@ export async function scheduleEnabled(
     .where(and(eq(schema.schedules.projectId, projectId), eq(schema.schedules.type, type)))
     .limit(1);
   return rows[0]?.enabled ?? true;
+}
+
+/**
+ * This project's schedule id for `type`, if the row exists (PR #264 review). A caller that enqueues
+ * OUTSIDE the scheduler's own tick — the board-picker nudge is the one caller today — needs this to
+ * stamp the same `{ scheduleId }` payload shape `runScheduleNow` and the scheduler both use, so its
+ * jobs are visible to `pendingRunsBySchedule`/`lastRunsBySchedule` (both keyed on that payload field,
+ * not on type+project) instead of being invisible to every schedule-keyed read while still counting
+ * against `runScheduleNow`'s own type+project "already-running" check — the split that let the Run
+ * now button stay enabled through a 409 a nudge job was already causing.
+ */
+export async function scheduleIdFor(
+  db: AntonDb,
+  projectId: string,
+  type: ScheduledJobType,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({ id: schema.schedules.id })
+    .from(schema.schedules)
+    .where(and(eq(schema.schedules.projectId, projectId), eq(schema.schedules.type, type)))
+    .limit(1);
+  return rows[0]?.id;
 }
 
 /** {@link scheduleEnabled} over the shared anton.db — the UI read path. */

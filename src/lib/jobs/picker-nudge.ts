@@ -24,7 +24,7 @@ import { eq } from "drizzle-orm";
 import { activeDisarm } from "../autopilot-disarm";
 import { onBoardChanged } from "../beads/snapshot";
 import * as schema from "../db/schema";
-import { scheduleEnabled } from "../schedules";
+import { scheduleEnabled, scheduleIdFor } from "../schedules";
 import { queuedJobId, type AntonDb } from "./queue";
 import type { RunnerLogger } from "./runner";
 
@@ -44,10 +44,23 @@ const noopLog: RunnerLogger = { info: () => {}, error: () => {} };
 export interface BoardPickerNudgeDeps {
   db: AntonDb;
   /**
-   * How a pass reaches the queue. Wired to the runner in `service.ts` so a project mid-teardown is
-   * refused by the same quiesce barrier every other enqueue path crosses; a test passes its own.
+   * How a pass reaches the queue. Wired to the runner's transactional
+   * `enqueueScheduledTypeIfAbsent` in `service-runner.ts` (PR #264 review) — not the bare
+   * `enqueue()` — so a scheduler tick or a manual "Run now" fire landing between this module's own
+   * `queuedJobId` pre-check (below) and the insert can't double-fire the pass; that check and the
+   * insert this calls are still two separate operations, but the insert re-checks freshly inside its
+   * own transaction regardless of what this pre-check saw. Refused (project mid-teardown) by the
+   * same quiesce barrier every other enqueue path crosses; a test passes its own.
+   *
+   * `scheduleId` is passed through to the payload the same way the scheduler and `runScheduleNow`
+   * both stamp it (PR #264 review): `pendingRunsBySchedule`/`lastRunsBySchedule` key on that payload
+   * field, not on type+project, so a nudge job with a bare `{ projectId }` payload was invisible to
+   * both — reading as "no fire in flight" to the Automation table's Run now button, and to its
+   * Last-run cell, while `runScheduleNow`'s own type+project check still saw it and refused a click
+   * with a 409 the UI never explained. Absent when the project has no `board-picker` row yet (a
+   * fresh install racing its own seed) — the job still enqueues, just without that visibility.
    */
-  enqueue: (projectId: string) => Promise<unknown>;
+  enqueue: (projectId: string, scheduleId?: string) => Promise<unknown>;
   windowMs?: number;
   log?: RunnerLogger;
 }
@@ -71,7 +84,7 @@ function projectByRepoPath(db: AntonDb, repoPath: string): { id: string } | unde
  */
 export class BoardPickerNudge {
   private readonly db: AntonDb;
-  private readonly enqueueJob: (projectId: string) => Promise<unknown>;
+  private readonly enqueueJob: (projectId: string, scheduleId?: string) => Promise<unknown>;
   private readonly windowMs: number;
   private readonly log: RunnerLogger;
 
@@ -144,7 +157,8 @@ export class BoardPickerNudge {
       if (!(await scheduleEnabled(this.db, project.id, "board-picker"))) return;
       if (await activeDisarm(this.db, project.id)) return;
       if (queuedJobId(this.db, "board-picker", project.id)) return;
-      await this.enqueueJob(project.id);
+      const scheduleId = await scheduleIdFor(this.db, project.id, "board-picker");
+      await this.enqueueJob(project.id, scheduleId);
     } catch (e) {
       this.log.error(`board-picker nudge failed for ${repoPath}`, e);
     }

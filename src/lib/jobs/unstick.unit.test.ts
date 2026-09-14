@@ -46,6 +46,7 @@ function run(o: Partial<RunRow> = {}): RunRow {
     endpointHost: null,
     formula: null,
     formulaVariant: null,
+    baseForkSha: null,
     status: "parked",
     reviewScore: null,
     attempts: 1,
@@ -556,6 +557,8 @@ describe("partitionOpenEscalations", () => {
       status: "open",
       resolution: null,
       notedAt: null,
+      dismissedAt: null,
+      signature: null,
       raisedAt: secDate(NOW),
       updatedAt: secDate(NOW),
     };

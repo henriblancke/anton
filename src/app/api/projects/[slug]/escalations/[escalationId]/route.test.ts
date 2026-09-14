@@ -259,7 +259,7 @@ describe("POST /api/projects/[slug]/escalations/[escalationId]", () => {
       const id = await open();
       const res = await POST(req(body), ctx("alpha", id));
       expect(res.status).toBe(400);
-      expect((await res.json()).error).toBe('action must be "resume", "abandon", or "dismiss"');
+      expect((await res.json()).error).toBe('action must be "resume", "abandon", "dismiss", or "restore"');
       // A rejected request must not have settled anything on its way to the 400.
       expect(rowOf(id)?.status).toBe("open");
     });

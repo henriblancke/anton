@@ -102,10 +102,22 @@ export class Scheduler {
         if (inflightKeys.has(`${s.type}\0${s.projectId}`)) {
           this.log.info(`scheduler: ${s.type} for ${s.projectId} still in flight — skipping this slot`);
           // The slot is skipped, so `lastRunAt` keeps pointing at the fire actually in flight.
+          // Guarded by cron+enabled still matching the `due`-query snapshot this `nextRunAt` was
+          // computed from (PR #264 review): an operator's settings PATCH landing in the gap between
+          // that snapshot and this write already recomputed its own `nextRunAt` off the NEW cron
+          // (updateSchedule, schedules.ts) — writing this stale one over it would fire the automation
+          // once more on its old cadence despite the successful edit. A no-match here means the PATCH
+          // won the race and its own write stands; nothing to advance.
           await this.db
             .update(schema.schedules)
             .set({ nextRunAt })
-            .where(eq(schema.schedules.id, s.id));
+            .where(
+              and(
+                eq(schema.schedules.id, s.id),
+                eq(schema.schedules.cron, s.cron),
+                eq(schema.schedules.enabled, true),
+              ),
+            );
           continue;
         }
 
@@ -121,14 +133,58 @@ export class Scheduler {
           },
           nowMs,
         );
-        this.db.transaction((tx) => {
+        const inserted = this.db.transaction((tx) => {
+          // Re-check freshly INSIDE this transaction rather than trusting the batch `inflightKeys`
+          // snapshot taken above (PR #264 review): that snapshot is one `await`ed read for the whole
+          // tick, so a manual "Run now" fire (schedules.ts's runScheduleNow) landing after it but
+          // before this schedule's own insert would be invisible to it, and this tick would insert a
+          // SECOND active job for the same (type, project). better-sqlite3 transactions are
+          // synchronous and Node is single-threaded, so a check made HERE — immediately before the
+          // insert, inside the same uninterruptible transaction — cannot itself be raced; it is the
+          // freshest read possible. Mirrors `runScheduleNow`'s own read-then-insert (schedules.ts).
+          const active = tx
+            .select({ id: schema.jobs.id })
+            .from(schema.jobs)
+            .where(
+              and(
+                eq(schema.jobs.type, s.type),
+                eq(schema.jobs.projectId, s.projectId),
+                inArray(schema.jobs.status, ["queued", "running"]),
+              ),
+            )
+            .limit(1)
+            .get();
+          if (active) return false;
+
           tx.insert(schema.jobs).values(row).run();
           tx.update(schema.schedules)
             .set({ lastRunAt: row.createdAt, nextRunAt })
             .where(eq(schema.schedules.id, s.id))
             .run();
+          return true;
         });
-        enqueued += 1;
+
+        if (inserted) {
+          enqueued += 1;
+        } else {
+          // Lost the race to a fire the batch snapshot couldn't see — coalesce exactly like the
+          // pre-check above: advance nextRunAt so this slot isn't retried every tick, no error.
+          // Same cron+enabled guard as that pre-check (PR #264 review) — a settings PATCH could have
+          // landed in this same gap and already written its own recomputed `nextRunAt`.
+          this.log.info(
+            `scheduler: ${s.type} for ${s.projectId} raced a concurrent enqueue — skipping this slot`,
+          );
+          await this.db
+            .update(schema.schedules)
+            .set({ nextRunAt })
+            .where(
+              and(
+                eq(schema.schedules.id, s.id),
+                eq(schema.schedules.cron, s.cron),
+                eq(schema.schedules.enabled, true),
+              ),
+            );
+        }
       } catch (e) {
         // A bad cron shouldn't wedge the whole loop; log and skip this schedule.
         this.log.error(`scheduler: failed to enqueue schedule ${s.id} (${s.type})`, e);

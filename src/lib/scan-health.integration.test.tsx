@@ -233,6 +233,11 @@ process.stdin.on('end',()=>{
             scanHealth: health,
             trajectory: undefined,
             stoppedCount: 0,
+            escalations: [],
+            dismissed: [],
+    dismissedTotal: 0,
+            breaker: undefined,
+            parks: undefined,
             staleServers: [],
             pickerLog: [],
           }}

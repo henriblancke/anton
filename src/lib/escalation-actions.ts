@@ -26,18 +26,31 @@
  * list's own resume/cancel. Without that last path such an escalation would have no settling move at
  * all and would sit on the board forever.
  *
- * `dismiss` is the third answer, and the honest one for a STALE PR: the work is already delivered
- * and open for review, so execute-epic's PR short-circuit makes a resume a no-op — it would settle
- * the escalation while changing nothing about the PR, and the next sweep would raise it again. What
- * a stale PR actually needs is a reviewer, which is a human act outside anton. Dismiss says exactly
- * that: it settles the row, touches nothing, and lets the sweep re-raise the finding if the PR is
- * still idle — so acknowledging a stall can never hide one. It is refused on a wait for a person,
- * which settling the row alone cannot end (see escalation-gate.ts).
+ * `dismiss` is the third answer: it settles the row, touches the work not at all, and — since
+ * anton-7gxs — STAYS settled. A dismissal stamps `dismissedAt` and the stall's signature, and
+ * `raiseEscalation` refuses to re-raise a finding whose signature a human already put down. That is
+ * what makes it an answer rather than a snooze: one 503 storm dismissed once does not come back
+ * hourly, while the same job failing a NEW way carries a new signature and does.
+ *
+ * It is offered on every kind except two, and the exceptions are about what dismissing would HIDE
+ * rather than about tidiness. A wait on a PERSON (`needs-human`) is an open gate: settling the row
+ * ends nothing, and suppressing the re-raise would bury an ask someone is still blocked on. An
+ * `autopilot-disarm` is a frozen project: only a re-arm clears it, and a dismissal would clear the
+ * one row saying so while every card stayed stopped. Both are refused as `not-dismissable`.
+ *
+ * `restore` is dismissal's undo, and the reason dismissal can be this durable: a founder who put a
+ * storm down and wants it back does not have to wait for the stall to change shape.
  */
 import { RunRestartedError } from "./abandon";
 import { getDb } from "./db";
-import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
+import {
+  getEscalation,
+  restoreEscalation,
+  settleEscalation,
+  toEscalationView,
+} from "./escalations";
 import { answerGateWait } from "./escalation-gate";
+import { isDismissable } from "./escalation-kinds";
 import { actOnBead, actOnJob, readTargetState, restartedLocally } from "./escalation-work";
 import { systemClock } from "./jobs/queue";
 import type { AntonDb } from "./jobs/queue";
@@ -49,11 +62,13 @@ import type { Project } from "./types";
 export type { EscalationAction };
 
 export function isEscalationAction(value: unknown): value is EscalationAction {
-  return value === "resume" || value === "abandon" || value === "dismiss";
+  return (
+    value === "resume" || value === "abandon" || value === "dismiss" || value === "restore"
+  );
 }
 
 /** The two answers that act on work — everything a `dismiss` deliberately does not do. */
-type EscalationVerb = Exclude<EscalationAction, "dismiss">;
+type EscalationVerb = Exclude<EscalationAction, "dismiss" | "restore">;
 
 /**
  * Why an action couldn't run:
@@ -65,6 +80,9 @@ type EscalationVerb = Exclude<EscalationAction, "dismiss">;
  *                  — a wait on a PERSON, which dismissing cannot settle (the gate stays open and the
  *                    next sweep raises the same row again), or an autopilot DISARM, which no sweep
  *                    re-raises at all — only a re-arm clears it (409).
+ *   • `not-dismissed`
+ *                  — a `restore` on a row nobody dismissed, or one an open row already covers, so
+ *                    there is nothing to bring back (409).
  *   • `contested`  — the work was picked back up since the stall was raised, here or on another
  *                    machine (409).
  *   • `unverified` — bd could not confirm CURRENT shared state (the pull or a bead read failed), so
@@ -76,6 +94,8 @@ export type EscalationActionFailure =
   | "not-open"
   | "no-target"
   | "not-dismissable"
+  | "not-dismissed"
+  | "restore-conflicted"
   | "contested"
   | "unverified";
 
@@ -101,31 +121,83 @@ export async function actOnEscalation(
   const db = getDb();
   const row = await getEscalation(db, project.id, escalationId);
   if (!row) return { ok: false, reason: "not-found" };
-  if (row.status !== "open") return { ok: false, reason: "not-open" };
 
   const view = toEscalationView(row);
+  if (action === "restore") return restoreStall(db, project.id, view);
+  if (row.status !== "open") return { ok: false, reason: "not-open" };
   if (action === "dismiss") return dismissStall(db, view);
   return applyVerb(project, view, action);
 }
 
 /**
+ * Put a dismissed alert back on the list. The only answer that acts on a row that is NOT open, which
+ * is why it is routed before the open guard above.
+ */
+async function restoreStall(
+  db: AntonDb,
+  projectId: string,
+  view: EscalationView,
+): Promise<EscalationActionResult> {
+  const result = await restoreEscalation(db, systemClock, projectId, view.id);
+  if (result !== "restored") {
+    return { ok: false, reason: result === "conflicted" ? "restore-conflicted" : "not-dismissed" };
+  }
+  return { ok: true, action: "restore", escalation: view, detail: "restored" };
+}
+
+/**
  * Dismiss settles the row and nothing else, so it needs no target and can't fail half-way.
  *
- * Except on a wait for a PERSON, where settling the row alone settles nothing: the gate stays open,
- * `detectOpenHumanGates` sees it on the very next sweep, and the board bounces the same "Waiting on
- * you" row forever. The panel offers no Dismiss there (see escalation-gate.ts); this is that rule
- * where it is enforceable, since a direct POST never passes through the panel.
+ * `byHuman` is the whole point of the call: the stamp it writes is what stops the next sweep raising
+ * this stall again (see escalations.ts). Two kinds are refused — see {@link isDismissable} and the
+ * module note. The rule is enforced HERE and not only in the panel, since a direct POST never passes
+ * through a button.
  */
 async function dismissStall(db: AntonDb, view: EscalationView): Promise<EscalationActionResult> {
-  if (view.kind === "needs-human") return { ok: false, reason: "not-dismissable" };
-  // A disarm is refused for the mirror reason: no sweep re-raises one (it is raised on the latch,
-  // once), so a dismissal would clear the row for good while the project stayed frozen. Re-arming
-  // is the only answer, and it settles this row itself.
-  if (view.kind === "autopilot-disarm") return { ok: false, reason: "not-dismissable" };
-  if (!(await settleEscalation(db, systemClock, view.id, "dismissed"))) {
+  if (!isDismissable(view.kind)) return { ok: false, reason: "not-dismissable" };
+  if (!(await settleEscalation(db, systemClock, view.id, "dismissed", true))) {
     return { ok: false, reason: "not-open" };
   }
   return { ok: true, action: "dismiss", escalation: view, detail: "dismissed" };
+}
+
+/** One id's outcome in a bulk dismissal — enough for the route to report what it skipped and why. */
+export interface BulkDismissResult {
+  dismissed: string[];
+  /** Ids left alone: already settled, not this project's, or a kind that can't be put down. */
+  skipped: { id: string; reason: EscalationActionFailure }[];
+}
+
+/**
+ * Dismiss a set of alerts in one call (anton-7gxs) — what "Dismiss all 30" on a storm needs.
+ *
+ * Per-row rather than all-or-nothing, and that is deliberate: a group the operator selected can
+ * contain one row someone else settled a second ago, or (via a hand-rolled POST) one that can't be
+ * dismissed at all. Failing the whole batch over either would make the button unusable exactly when
+ * it matters. Each id gets the same guard the single-row path applies, and the caller is told which
+ * ones didn't take.
+ */
+export async function dismissEscalations(
+  project: Project,
+  ids: string[],
+): Promise<BulkDismissResult> {
+  const db = getDb();
+  const result: BulkDismissResult = { dismissed: [], skipped: [] };
+  for (const id of ids) {
+    const row = await getEscalation(db, project.id, id);
+    if (!row) {
+      result.skipped.push({ id, reason: "not-found" });
+      continue;
+    }
+    if (row.status !== "open") {
+      result.skipped.push({ id, reason: "not-open" });
+      continue;
+    }
+    const outcome = await dismissStall(db, toEscalationView(row));
+    if (outcome.ok) result.dismissed.push(id);
+    else result.skipped.push({ id, reason: outcome.reason });
+  }
+  return result;
 }
 
 /**

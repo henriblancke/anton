@@ -328,9 +328,13 @@ describe("EpicBoard operator queue (anton-qfso.1)", () => {
 });
 
 /**
- * The band that says the escalation strip below it has no producer (anton-kh98). It is wired here
- * and not on the Health page because the silence it corrects is the BOARD's: an empty strip on an
- * unwatched queue reads exactly like a healthy one.
+ * The unwatched-park signal as the BOARD carries it (anton-kh98, reshaped by anton-7gxs): a count
+ * on the one alert line, not a band of its own.
+ *
+ * The signal still belongs on this surface even though its full band moved to the Health page — the
+ * silence it corrects is the board's, where an alert-free board on an unwatched queue reads exactly
+ * like a healthy one. What changed is the size of the correction: one chip and the arm button,
+ * rather than a paragraph the columns have to scroll past.
  */
 describe("EpicBoard unwatched parked work (anton-kh98)", () => {
   const parks: UnwatchedParks = {
@@ -351,7 +355,7 @@ describe("EpicBoard unwatched parked work (anton-kh98)", () => {
     raisedAt: 0,
   };
 
-  it("sits above the escalation strip it explains", () => {
+  it("reports the park count on the same line as the stalls, with the switch that ends it", () => {
     render(
       <EpicBoard
         slug="tmp"
@@ -361,21 +365,22 @@ describe("EpicBoard unwatched parked work (anton-kh98)", () => {
       />,
     );
 
-    const unwatched = screen.getByText("Parked work, unwatched");
-    const needsYou = screen.getByText("Needs you");
-    expect(
-      unwatched.compareDocumentPosition(needsYou) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    expect(screen.getByText("Needs you")).toBeTruthy();
+    expect(screen.getByText("13 parked, unwatched")).toBeTruthy();
+    expect(screen.getByText("1 stopped")).toBeTruthy();
+    // Arming the watcher is the WHOLE answer to this signal — there is nothing to read first and no
+    // row to pick — so it is one of the two verbs that stay on the board rather than moving.
+    expect(screen.getByText("Turn on the watcher")).toBeTruthy();
   });
 
-  it("adds no band to a board whose watcher is armed", () => {
+  it("says nothing about parks on a board whose watcher is armed", () => {
     render(<EpicBoard slug="tmp" initialBoard={board("1:sync", "backlog")} />);
-    expect(screen.queryByText("Parked work, unwatched")).toBeNull();
+    expect(screen.queryByText(/parked, unwatched/)).toBeNull();
   });
 
   // A job parks from a run happening elsewhere, so a board that only ever read this signal at page
   // load would stay silent through exactly the hours work was stopped.
-  it("raises the band for work that parked after the board loaded", async () => {
+  it("raises the signal for work that parked after the board loaded", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) =>
@@ -386,12 +391,11 @@ describe("EpicBoard unwatched parked work (anton-kh98)", () => {
     );
 
     render(<EpicBoard slug="tmp" initialBoard={board("1:sync", "backlog")} />);
-    expect(screen.queryByText("Parked work, unwatched")).toBeNull();
+    expect(screen.queryByText(/parked, unwatched/)).toBeNull();
 
     fireEvent(document, new Event("visibilitychange"));
 
-    await waitFor(() => expect(screen.getByText("Parked work, unwatched")).toBeTruthy());
-    expect(screen.getByText("13 parked jobs")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("13 parked, unwatched")).toBeTruthy());
   });
 });
 
