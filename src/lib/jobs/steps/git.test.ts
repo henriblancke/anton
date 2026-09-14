@@ -6,8 +6,11 @@
  * repository, so its cases run against real git in `step-registry.commit.test.ts`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 
 import type { Bead } from "../../beads/bd";
+import { schema } from "../../db";
+import { getProjectSettings } from "../../projects";
 import { closeSandbox, openSandbox, target } from "./step.fixture";
 
 const ops = vi.hoisted(() => ({
@@ -55,6 +58,35 @@ describe("step:commit", () => {
       hooksPath: undefined,
       timeoutMs: 120_000,
     });
+  });
+
+  it("round-trips the saved commit timeout into both normal and attribution commits", async () => {
+    sandbox.tdb.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ commitTimeoutMinutes: 5 }) })
+      .where(eq(schema.projects.id, sandbox.projectId))
+      .run();
+    const settings = await getProjectSettings(sandbox.tdb.db, sandbox.projectId);
+    ops.commitAll.mockResolvedValue({ committed: false });
+    ops.readWorktreeState.mockResolvedValue({
+      ref: `refs/heads/${sandbox.context().branch}`,
+      head: "agent-head",
+    });
+    ops.isAncestor.mockResolvedValue(true);
+    ops.worktreeHasCommitFor.mockResolvedValue(false);
+
+    await commitStep(sandbox.context({ settings, ticketStartHead: "start-head" }));
+
+    expect(ops.commitAll).toHaveBeenCalledWith(
+      sandbox.dir,
+      `${target.id}: ${target.title}`,
+      expect.objectContaining({ timeoutMs: 5 * 60_000 }),
+    );
+    expect(ops.commitMarker).toHaveBeenCalledWith(
+      sandbox.dir,
+      expect.any(String),
+      expect.objectContaining({ timeoutMs: 5 * 60_000 }),
+    );
   });
 
   // PR #263 review, round 37: the caller must stage the worktree BEFORE asking

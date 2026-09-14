@@ -209,7 +209,10 @@ async function recordAttribution(ctx: StepContext, why: string): Promise<boolean
   // `resolveHooksPathOverride` here reads a submodule gitlink that is already committed, not merely
   // staged — the round-36/37 index-vs-HEAD gap this file's other call site closes does not apply.
   const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
-  await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`, { hooksPath });
+  await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`, {
+    hooksPath,
+    timeoutMs: resolveCommitTimeoutMs(ctx.settings),
+  });
   return true;
 }
 

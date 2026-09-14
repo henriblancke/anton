@@ -20,7 +20,7 @@ import {
   worktreeTipIsPreservedCommitFor,
   type WorktreeState,
 } from "../git/ops";
-import { resolveCommitTimeoutMs, resolveVerifyGates } from "../projects";
+import { resolveCommitTimeoutMs, resolveVerifyGates, type ProjectSettings } from "../projects";
 import { appendSessionLog } from "../sessions";
 import { safe } from "./execute-epic-persist";
 import { startTicketBudget } from "./execute-epic-ticket-bookends";
@@ -302,6 +302,7 @@ export async function preserveTimedOutWork(args: {
         branch,
         ticket,
         timeoutMs,
+        settings,
         logPath,
         why:
           "error" in kept
@@ -363,6 +364,7 @@ async function adoptSelfCommittedWork(args: {
   branch: string;
   ticket: Bead;
   timeoutMs: number;
+  settings: ProjectSettings;
   logPath: string;
   /** How the commits on this branch came to be there, for the operator reading the log. */
   why: string;
@@ -373,7 +375,7 @@ async function adoptSelfCommittedWork(args: {
    */
   alreadyMarked: boolean;
 }): Promise<PreservedWork> {
-  const { repoPath, worktreePath, branch, ticket, timeoutMs, logPath, why, alreadyMarked } = args;
+  const { repoPath, worktreePath, branch, ticket, timeoutMs, settings, logPath, why, alreadyMarked } = args;
   const message = preservedCommitMessage(ticket, timeoutMs, { marker: true });
   // A REJECTED marker call is not proof the marker is absent (PR #228 review). `--no-verify` bypasses
   // only `pre-commit` and `commit-msg` (git-commit(1)); `post-commit` runs AFTER the commit is made,
@@ -397,7 +399,12 @@ async function adoptSelfCommittedWork(args: {
   const hooksPath = await resolveHooksPathOverride(repoPath, worktreePath);
   const marked =
     alreadyMarked ||
-    (await safe(() => commitMarker(worktreePath, message, { hooksPath }))) ||
+    (await safe(() =>
+      commitMarker(worktreePath, message, {
+        hooksPath,
+        timeoutMs: resolveCommitTimeoutMs(settings),
+      }),
+    )) ||
     (await worktreeTipIsPreservedCommitFor(worktreePath, ticket.id));
   if (!marked) {
     await logPreserve(

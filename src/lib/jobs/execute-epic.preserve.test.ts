@@ -20,6 +20,18 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
+
+const ops = vi.hoisted(() => ({ commitMarker: vi.fn() }));
+vi.mock("../git/ops", async () => {
+  const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
+  return {
+    ...actual,
+    commitMarker: (...args: Parameters<typeof actual.commitMarker>) => {
+      ops.commitMarker(...args);
+      return actual.commitMarker(...args);
+    },
+  };
+});
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -29,7 +41,11 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import type { Worktree } from "../git/worktree";
 import type { ProjectSettings } from "../projects";
-import { COMMIT_TIMEOUT_ENV, readPreservedCommitFor, readWorktreeState } from "../git/ops";
+import {
+  COMMIT_TIMEOUT_ENV,
+  readPreservedCommitFor,
+  readWorktreeState,
+} from "../git/ops";
 import { isPoisonError } from "./errors";
 import { TicketTimeoutError } from "./execute-epic-errors";
 import { outOfTimeParkMessage } from "./execute-epic-dispatch";
@@ -102,6 +118,7 @@ suite("preserveTimedOutWork (real git)", () => {
   }
 
   beforeEach(() => {
+    ops.commitMarker.mockReset();
     tdb = makeTestDb();
     sandbox = mkdtempSync(join(tmpdir(), "anton-preserve-"));
     repo = join(sandbox, "repo");
@@ -295,6 +312,28 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(out(["rev-list", "--count", `${selfCommitted}..HEAD`])).toBe("1");
     expect(subjects()).toContain("feat: the agent's own subject");
     expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
+  });
+
+  it("honors the configured commit timeout in the preserved-work marker", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("FINISHED.md", "work the agent committed itself, against the contract\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: the agent's own subject"]);
+    await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true", commitTimeoutMinutes: 5 }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(ops.commitMarker).toHaveBeenCalledWith(
+      repo,
+      expect.any(String),
+      expect.objectContaining({ timeoutMs: 5 * 60_000 }),
+    );
   });
 
   // The marker is the ONLY way either reader finds self-committed work, and a project whose

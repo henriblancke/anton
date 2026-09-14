@@ -59,7 +59,7 @@ import {
   SATISFIES_TRAILER,
 } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MS, GH_BIN_ENV } from "./ops";
-import { DEFAULT_COMMIT_TIMEOUT_MINUTES, resolveCommitTimeoutMs } from "@/lib/projects";
+import { DEFAULT_COMMIT_TIMEOUT_MINUTES } from "@/lib/projects";
 
 function has(cmd: string): boolean {
   try {
@@ -3119,28 +3119,6 @@ suite("commitAll (real git · a hook that outlives the kill)", () => {
     },
   );
 
-  // anton-zse2: every call site resolves its budget through resolveCommitTimeoutMs(settings) rather
-  // than a hardcoded default, so a project's configured commitTimeoutMinutes has to actually change
-  // what commitAll does — not just exist as an unread field.
-  it.runIf(process.platform !== "win32")(
-    "kills a slow hook at a project's configured commitTimeoutMinutes, not the 2-minute default",
-    async () => {
-      delete process.env[COMMIT_TIMEOUT_ENV];
-      const start = Date.now();
-
-      await expect(
-        commitAll(repo, "t1: work the hook is sitting on", {
-          // 2 seconds — nowhere near DEFAULT_COMMIT_TIMEOUT_MS (2 minutes), so a pass here proves the
-          // project's own setting drove the kill rather than the default.
-          timeoutMs: resolveCommitTimeoutMs({ commitTimeoutMinutes: 2 / 60 }),
-        }),
-      ).rejects.toThrow(/timed out/);
-
-      expect(Date.now() - start).toBeLessThan(15_000);
-      expect(existsSync(started)).toBe(true);
-      expect(existsSync(marker)).toBe(true);
-    },
-  );
 });
 
 // PR #228 review: the marker is EMPTY, so it is made with this project's hooks bypassed — the only
