@@ -1,5 +1,5 @@
 {
-  "version": "7",
+  "version": "6",
   "dialect": "sqlite",
   "entries": [
     {
@@ -278,8 +278,29 @@
     {
       "idx": 39,
       "version": "6",
+      "when": 1789358279635,
+      "tag": "0039_quota_meter_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "6",
+      "when": 1789369299929,
+      "tag": "0040_common_scarlet_spider",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "6",
+      "when": 1789372220292,
+      "tag": "0041_legacy-quota-attempt-backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "6",
       "when": 1789411097199,
-      "tag": "0039_schedules_auto_armed",
+      "tag": "0042_schedules_auto_armed",
       "breakpoints": true
     }
   ]

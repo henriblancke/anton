@@ -22,6 +22,7 @@ function project(overrides: Partial<QuotaShareProject> & { id: string }): QuotaS
     sharePct: 50,
     declared: true,
     governed: true,
+    meterKey: "anthropic",
     reserved: false,
     eligible: true,
     spentWeeklyPct: null,
@@ -44,6 +45,21 @@ describe("resolveQuotaSplit", () => {
     expect(row(split, "b").effectivePct).toBe(30);
     expect(split.rows.some((r) => r.reallocated)).toBe(false);
     expect(split.imbalanced).toBe(false);
+  });
+
+  it("resolves a share only against projects on the same meter", () => {
+    const split = resolveQuotaSplit(
+      [
+        project({ id: "account", meterKey: "anthropic", sharePct: 50 }),
+        project({ id: "router-a", meterKey: "router:https://router.example/api/usage/a", sharePct: 50 }),
+        project({ id: "router-b", meterKey: "router:https://router.example/api/usage/b", sharePct: 50 }),
+      ],
+      "router:https://router.example/api/usage/a",
+    );
+
+    expect(split.rows.map((project) => project.id)).toEqual(["router-a"]);
+    expect(row(split, "router-a").effectivePct).toBe(100);
+    expect(split.spentTotalPct).toBeNull();
   });
 
   it("drops an idle project out of the denominator and says whose share moved", () => {

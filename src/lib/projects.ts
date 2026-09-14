@@ -12,6 +12,7 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
+import { quotaMeterKey } from "./quota-meter";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
 import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./jobs/budget";
 import { resolveGovernedShare, type GovernedShare } from "./quota-share";
@@ -163,6 +164,15 @@ export interface ProjectSettings {
    * alongside {@link claudeBaseUrl}.
    */
   claudeGatewayModelDiscovery?: boolean;
+  /**
+   * Which router connection this project meters on (anton-m5oc) — the router's own connection id,
+   * not a name anton invents. A router fronts N provider connections; this names the ONE anton reads
+   * quota from, because the router's usage endpoint is per-connection, not per-router. Only
+   * meaningful alongside {@link claudeBaseUrl} — a project not routed through a gateway has no router
+   * to meter on. Absent → no routed meter; the governor and the project view fall back to today's
+   * behavior (sibling tickets anton-gnvw, anton-ds7e).
+   */
+  routerConnectionId?: string;
   testCommand?: string;
   /**
    * Optional operator-pinned verify gates (anton-3oh8), run in the worktree after the agent and
@@ -1327,6 +1337,8 @@ export async function budgetAwareQuotaShares(): Promise<GovernedShare[]> {
   return governedQuotaBoard(await governedProjects());
 }
 
+export { quotaMeterKey } from "./quota-meter";
+
 /** The board above, over an already-read governed set — so a caller needing both reads once. */
 async function governedQuotaBoard(
   governed: readonly { projectId: string; settings: ProjectSettings }[],
@@ -1334,6 +1346,7 @@ async function governedQuotaBoard(
   const eligible = await observedWorkEligibility(getDb()).catch(() => null);
   return governed.map(({ projectId, settings }) => ({
     projectId,
+    meterKey: quotaMeterKey(settings),
     declaredPct: settings.quotaSharePct,
     eligible: eligibilityOf(eligible, projectId),
     reserved: settings.reserveQuotaShare === true,
@@ -1350,12 +1363,12 @@ async function governedQuotaBoard(
  * The nudge passes no per-project spend to `budgetGate`, so the share ceiling each policy carries is
  * checked against a spend of 0 there: it binds only for a 0% share — a parked repo defers, as it
  * should, since its governor would never burn the quota being nudged about — and for any positive
- * share it is the whole weekly target on the account meter that answers. Deliberate: the nudge asks
- * whether the MACHINE has idle weekly quota worth shaping work for; which repo gets to spend it, and
- * how much of its share is already gone, is the governor's decision at lease time, not the nudge's.
+ * share it is the whole weekly target on the account meter that answers. Routed projects are excluded:
+ * this nudge reads the Anthropic meter and must never shape work that spends a router's independent
+ * pool.
  */
 export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
-  const governed = await governedProjects();
+  const governed = (await governedProjects()).filter(({ settings }) => quotaMeterKey(settings) === "anthropic");
   const board = await governedQuotaBoard(governed);
   return governed.map(({ projectId, settings }) =>
     withQuotaShare(resolveBudgetPolicy(settings), resolveGovernedShare(projectId, board).sharePct),
@@ -1674,13 +1687,14 @@ async function deleteSessionLogs(db: AntonDb, projectId: string): Promise<void> 
  * DELETE CASCADE in the schema): sessions → runs → jobs → schedules → run-health → picker plan →
  * picker verdicts → picker starts → claude invocations → hygiene → scan summaries → autopilot
  * disarms → escalations →
- * burn samples (detached, not deleted) → projects.
+ * burn samples (detached, not deleted) → quota-attempt ledger → projects.
  */
 function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
   try {
     db.transaction((tx) => {
       tx.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId)).run();
       tx.delete(schema.runs).where(eq(schema.runs.projectId, projectId)).run();
+      tx.delete(schema.quotaAttempts).where(eq(schema.quotaAttempts.projectId, projectId)).run();
       tx.delete(schema.jobs).where(eq(schema.jobs.projectId, projectId)).run();
       tx.delete(schema.schedules).where(eq(schema.schedules.projectId, projectId)).run();
       tx.delete(schema.runHealthReports).where(eq(schema.runHealthReports.projectId, projectId)).run();

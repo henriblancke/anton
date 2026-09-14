@@ -56,12 +56,12 @@ jobs:
   # a green `check`.
   #
   # Sharded 4 ways (anton-m4b5.3): the suite's cost is per-file subprocess overhead (each test shells
-  # out to real bd/git many times), not CPU, so 4 GitHub-hosted runners in parallel cut wall time
-  # roughly 4x over one job running all ~76 files sequentially through `maxWorkers: 4`. Measured
-  # single-job baseline before sharding: 22-35 minutes (runs 34654794714, 34630896615, 34630019901,
-  # 34627803658, 34627448106). Each shard keeps its OWN `maxWorkers: 4` — sharding adds more isolated
-  # runners, it does not raise per-job fork concurrency, so it does not reopen the Dolt port/lock race
-  # anton-vgoh tracks (a fresh runner per shard means no two shards share a port-selection window).
+  # out to real bd/git many times), so 4 GitHub-hosted runners in parallel cut wall time roughly 4x
+  # over one job running all ~76 files sequentially. Each shard keeps its OWN single Vitest worker:
+  # real bd/Dolt cases create temporary repositories and servers, and concurrent files can starve valid
+  # cases long enough to hit their uniform timeout. Sharding preserves isolated runner-level parallelism
+  # without reintroducing the per-worker contention that anton-vgoh tracks (a fresh runner per shard
+  # means no two shards share a port-selection window).
   integration:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -111,8 +111,8 @@ jobs:
       - name: "Test (integration suites, shard ${{ matrix.shard }}/4)"
         # Dedicated config: `*.integration.test.ts` only, with a capped fork pool so the per-repo
         # Dolt sql-servers don't race and deadlock `bd dolt pull` under full parallelism (anton-0oi).
-        # `--shard` splits the file list across the 4 matrix runners (anton-m4b5.3); each runner still
-        # enforces its own `maxWorkers: 4` from vitest.integration.config.ts.
+        # `--shard` splits the file list across the 4 matrix runners (anton-m4b5.3); each runner
+        # enforces its own single-worker cap from vitest.integration.config.ts.
         run: bun run test:integration -- --shard=${{ matrix.shard }}/4
 
   # Coverage (anton-7jy). Report-only — a separate, non-blocking job. V8 instrumentation adds ~5x

@@ -122,11 +122,13 @@ export async function recordBurnSample(
   jobType: JobType,
   projectId: string | null,
   sample: BurnSample,
+  meterKey: string = "anthropic",
 ): Promise<void> {
   await db.insert(schema.burnSamples).values({
     id: randomUUID(),
     jobType,
     projectId,
+    meterKey,
     sessionDelta: sample.sessionDelta,
     weeklyDelta: sample.weeklyDelta,
     createdAt: new Date(Math.floor(clock.now() / 1000) * 1000),
@@ -147,17 +149,31 @@ export interface BurnAverage {
 }
 
 /**
- * Rolling per-type burn average over the most recent `window` samples. Under-sampled types blend the
- * real samples they have with the tier seed (empty slots padded with the seed), so callers always get
- * a usable number that tracks real burn from the first sample. Read path via the shared anton.db by
- * default; the runner/tests inject their own connection.
+ * Rolling per-type burn average over the most recent `window` samples on one effective meter. Under-
+ * sampled types blend the real samples they have with the tier seed (empty slots padded with the seed),
+ * so callers always get a usable number that tracks real burn from the first sample. Read path via the
+ * shared anton.db by default; the runner/tests inject their own connection.
  */
+export function getBurnAverage(
+  db: AntonDb,
+  jobType: JobType,
+  window?: number,
+): Promise<BurnAverage>;
+export function getBurnAverage(
+  db: AntonDb,
+  jobType: JobType,
+  meterKey: string,
+  window?: number,
+): Promise<BurnAverage>;
 export async function getBurnAverage(
   db: AntonDb,
   jobType: JobType,
-  window: number = BURN_SAMPLE_WINDOW,
+  meterOrWindow: string | number = BURN_SAMPLE_WINDOW,
+  maybeWindow?: number,
 ): Promise<BurnAverage> {
-  return averageOf(await recentSamples(db, jobType, undefined, window), jobType, window);
+  const meterKey = typeof meterOrWindow === "string" ? meterOrWindow : "anthropic";
+  const window = typeof meterOrWindow === "number" ? meterOrWindow : (maybeWindow ?? BURN_SAMPLE_WINDOW);
+  return averageOf(await recentSamples(db, jobType, undefined, meterKey, window), jobType, window);
 }
 
 /**
@@ -173,16 +189,18 @@ export async function getProjectBurnAverage(
   db: AntonDb,
   projectId: string,
   jobType: JobType,
+  meterKey: string = "anthropic",
   window: number = BURN_SAMPLE_WINDOW,
 ): Promise<BurnAverage> {
-  return averageOf(await recentSamples(db, jobType, projectId, window), jobType, window);
+  return averageOf(await recentSamples(db, jobType, projectId, meterKey, window), jobType, window);
 }
 
-/** The most recent `window` samples for a type, optionally narrowed to one project. */
+/** The most recent `window` samples for a type, optionally narrowed to one project and meter. */
 async function recentSamples(
   db: AntonDb,
   jobType: JobType,
   projectId: string | undefined,
+  meterKey: string | undefined,
   window: number,
 ): Promise<BurnSample[]> {
   return db
@@ -192,12 +210,11 @@ async function recentSamples(
     })
     .from(schema.burnSamples)
     .where(
-      projectId === undefined
-        ? eq(schema.burnSamples.jobType, jobType)
-        : and(
-            eq(schema.burnSamples.jobType, jobType),
-            eq(schema.burnSamples.projectId, projectId),
-          ),
+      and(
+        eq(schema.burnSamples.jobType, jobType),
+        ...(projectId === undefined ? [] : [eq(schema.burnSamples.projectId, projectId)]),
+        ...(meterKey === undefined ? [] : [eq(schema.burnSamples.meterKey, meterKey)]),
+      ),
     )
     .orderBy(desc(schema.burnSamples.createdAt))
     .limit(window);
@@ -239,12 +256,13 @@ export async function sampleJobBurn(
   projectId: string | null,
   before: ClaudeUsage | null,
   read: () => Promise<ClaudeUsage | null>,
+  meterKey: string = "anthropic",
 ): Promise<BurnSample | null> {
   try {
     const after = await read();
     const sample = burnDelta(before, after);
     if (!sample) return null;
-    await recordBurnSample(db, clock, jobType, projectId, sample);
+    await recordBurnSample(db, clock, jobType, projectId, sample, meterKey);
     return sample;
   } catch {
     return null;

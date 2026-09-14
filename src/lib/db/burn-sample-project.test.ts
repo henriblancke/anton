@@ -74,6 +74,10 @@ describe("drizzle/0030 — burn samples gain a project", () => {
 
   it("excludes unattributed rows from per-project math, not from the global average", async () => {
     applyMigrationFile(sqlite, MIGRATION);
+    // This historical-shape test deliberately stops at 0031, but the current typed reader also
+    // requires 0038's meter identity. Add only that compatible trailing column to exercise the
+    // invariant this test owns: pre-0031 rows remain unattributed to a project.
+    sqlite.exec("alter table burn_samples add meter_key text default 'anthropic' not null");
     const db = drizzle(sqlite, { schema });
 
     // The pre-migration burn is real and still worth averaging globally — it just belongs to nobody.

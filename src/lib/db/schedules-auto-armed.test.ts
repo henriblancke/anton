@@ -1,5 +1,5 @@
 /**
- * The schedules `auto_armed` backfill migration (drizzle/0039, for anton-g81s), asserted against the
+ * The schedules `auto_armed` backfill migration (drizzle/0042, for anton-g81s), asserted against the
  * shapes it can get wrong: a `run-health` row an operator explicitly enabled and then, before this
  * upgrade, deliberately disabled again — or one they repointed via the cron-only PATCH while leaving
  * it disabled.
@@ -18,7 +18,7 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import Database from "better-sqlite3";
 import { applyMigrationFile, applyMigrationsTo } from "./testing";
 
-const MIGRATION = "0039_schedules_auto_armed.sql";
+const MIGRATION = "0042_schedules_auto_armed.sql";
 
 let sqlite: Database.Database;
 
@@ -48,7 +48,7 @@ beforeEach(() => {
 
 afterEach(() => sqlite.close());
 
-describe("drizzle/0039 — schedules gain auto_armed", () => {
+describe("drizzle/0042 — schedules gain auto_armed", () => {
   it("marks an enabled row armed", () => {
     seedSchedule({ id: "s-enabled", enabled: 1, lastRunAt: null });
     applyMigrationFile(sqlite, MIGRATION);

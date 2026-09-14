@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "6bfed568-b35b-4320-8c6d-ea38b3c661ee",
+  "id": "61774828-f7cc-4013-baa2-e67ff3961d8e",
   "prevId": "e18155e4-d177-4988-81d9-d0101aadc51f",
   "tables": {
     "autopilot_disarms": {
@@ -234,6 +234,14 @@
           "notNull": false,
           "autoincrement": false
         },
+        "meter_key": {
+          "name": "meter_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'anthropic'"
+        },
         "session_delta": {
           "name": "session_delta",
           "type": "real",
@@ -266,11 +274,12 @@
           ],
           "isUnique": false
         },
-        "burn_samples_project_type_created_idx": {
-          "name": "burn_samples_project_type_created_idx",
+        "burn_samples_project_type_meter_created_idx": {
+          "name": "burn_samples_project_type_meter_created_idx",
           "columns": [
             "project_id",
             "job_type",
+            "meter_key",
             "created_at"
           ],
           "isUnique": false
@@ -937,14 +946,6 @@
           ],
           "isUnique": false,
           "where": "\"jobs\".\"status\" = 'parked'"
-        },
-        "jobs_updated_project_idx": {
-          "name": "jobs_updated_project_idx",
-          "columns": [
-            "updated_at",
-            "project_id"
-          ],
-          "isUnique": false
         }
       },
       "foreignKeys": {
@@ -1262,6 +1263,70 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
+    "quota_attempts": {
+      "name": "quota_attempts",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "job_id": {
+          "name": "job_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "job_type": {
+          "name": "job_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "meter_key": {
+          "name": "meter_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(unixepoch())"
+        }
+      },
+      "indexes": {
+        "quota_attempts_meter_created_project_idx": {
+          "name": "quota_attempts_meter_created_project_idx",
+          "columns": [
+            "meter_key",
+            "created_at",
+            "project_id",
+            "job_type"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
     "run_health_reports": {
       "name": "run_health_reports",
       "columns": {
@@ -1411,13 +1476,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "base_fork_sha": {
-          "name": "base_fork_sha",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "status": {
           "name": "status",
           "type": "text",
@@ -1487,6 +1545,13 @@
         "write_seq": {
           "name": "write_seq",
           "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "base_fork_sha": {
+          "name": "base_fork_sha",
+          "type": "text",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
@@ -1729,14 +1794,6 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
-        },
-        "auto_armed": {
-          "name": "auto_armed",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
         }
       },
       "indexes": {},

@@ -1113,11 +1113,29 @@ export function toJobOutcome(
  * sums every status. `updatedAt` is left alone — it is the lease's timestamp, and on a cancelled
  * row the cancel's, which `resumeEpic` reads as evidence.
  */
-export async function chargeSpentAttempt(db: AntonDb, jobId: string): Promise<void> {
-  await db
-    .update(schema.jobs)
-    .set({ spentAttempts: sql`${schema.jobs.spentAttempts} + 1` })
-    .where(eq(schema.jobs.id, jobId));
+export async function chargeSpentAttempt(
+  db: AntonDb,
+  job: Pick<JobRow, "id" | "projectId" | "type">,
+  meterKey: string,
+  clock: Clock,
+): Promise<void> {
+  const createdAt = secDate(clock.now());
+  await db.transaction((tx) => {
+    tx.update(schema.jobs)
+      .set({ spentAttempts: sql`${schema.jobs.spentAttempts} + 1` })
+      .where(eq(schema.jobs.id, job.id))
+      .run();
+    if (job.projectId) {
+      tx.insert(schema.quotaAttempts).values({
+        id: randomUUID(),
+        jobId: job.id,
+        projectId: job.projectId,
+        jobType: job.type,
+        meterKey,
+        createdAt,
+      }).run();
+    }
+  });
 }
 
 /**

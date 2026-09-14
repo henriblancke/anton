@@ -1,8 +1,9 @@
 /**
  * What each project has spent of this week's quota, as far as this machine can tell (R6.3).
  *
- * There is no per-project meter to read. The estimate is built the only way the recorded data allows:
- * charge every Claude-burning ATTEMPT a project made this week at that project's own sampled burn
+ * A quota meter does not report a project-specific spend total. The estimate is built the only way
+ * the recorded data allows: charge every Claude-burning ATTEMPT a project made this week at that
+ * project's own sampled burn
  * average for the job type (`getProjectBurnAverage`). Attempts, not completed jobs, because the
  * runner samples every attempt — a retried, parked, failed or cancelled job burned real quota, and a
  * meter that counted only successes would let a repeatedly failing project spend the account dry
@@ -24,9 +25,11 @@ import { and, eq, gte, sql } from "drizzle-orm";
 
 import { getProjectBurnAverage, burnsClaudeQuota, type BurnAverage } from "./burn";
 import { getClaudeUsageCached, type ClaudeUsage } from "./claude/usage";
+import { getRouterUsageCached } from "./claude/router-usage";
 import { getDb, schema } from "./db";
 import type { AntonDb, JobType } from "./jobs/queue";
 import { getProjectSettings, listProjects } from "./projects";
+import { quotaMeterKey } from "./quota-meter";
 import { eligibilityOf, observedWorkEligibility } from "./quota-eligibility";
 import { defaultQuotaSharePct, type QuotaShareProject } from "./quota-share";
 
@@ -47,30 +50,31 @@ export function weeklyWindowStart(usage: ClaudeUsage | null, now: number): numbe
  * `running` has already spent most of what it will. Rows with no attempt yet contribute nothing, so
  * a project that has only ENQUEUED work stays unattributed rather than reading as a measured zero.
  *
- * Summed from `spentAttempts`, not `attempts`: the latter is the retry budget, and `resumeJob` zeroes
- * it so an un-parked job gets a fresh run at `maxAttempts`. A meter on that column forgot every
- * attempt a job had burned the moment it was resumed, and each park/resume cycle handed the project
- * its share back (PR #248 review).
+ * Read from the append-only `quota_attempts` ledger, which freezes the meter and timestamp when
+ * Claude is reached. The legacy `attempts` retry budget is mutable, and the row-level
+ * `spentAttempts` diagnostic cannot preserve either fact after a route changes or a job resumes.
  */
 async function attemptsByProject(
   db: AntonDb,
   since: number,
+  meterKey: string,
   projectId?: string,
 ): Promise<Map<string, Map<string, number>>> {
   const rows = await db
     .select({
-      projectId: schema.jobs.projectId,
-      type: schema.jobs.type,
-      attempts: sql<number>`sum(${schema.jobs.spentAttempts})`,
+      projectId: schema.quotaAttempts.projectId,
+      type: schema.quotaAttempts.jobType,
+      attempts: sql<number>`count(*)`,
     })
-    .from(schema.jobs)
+    .from(schema.quotaAttempts)
     .where(
       and(
-        gte(schema.jobs.updatedAt, new Date(since)),
-        ...(projectId ? [eq(schema.jobs.projectId, projectId)] : []),
+        gte(schema.quotaAttempts.createdAt, new Date(since)),
+        eq(schema.quotaAttempts.meterKey, meterKey),
+        ...(projectId ? [eq(schema.quotaAttempts.projectId, projectId)] : []),
       ),
     )
-    .groupBy(schema.jobs.projectId, schema.jobs.type);
+    .groupBy(schema.quotaAttempts.projectId, schema.quotaAttempts.jobType);
 
   const byProject = new Map<string, Map<string, number>>();
   for (const row of rows) {
@@ -90,14 +94,19 @@ async function attemptsByProject(
  * per-type average. A project with no samples of its own falls back to the tier seed and reports
  * `seeded`, which is the honest answer; borrowing a neighbour's measured rate is not.
  */
-async function burnAveragesFor(db: AntonDb, projectId: string, types: Iterable<string>) {
+async function burnAveragesFor(
+  db: AntonDb,
+  projectId: string,
+  meterKey: string,
+  types: Iterable<string>,
+) {
   const charged = [...new Set(types)].filter((type): type is JobType =>
     burnsClaudeQuota(type as JobType),
   );
   return new Map(
     await Promise.all(
       charged.map(
-        async (type) => [type, await getProjectBurnAverage(db, projectId, type)] as const,
+        async (type) => [type, await getProjectBurnAverage(db, projectId, type, meterKey)] as const,
       ),
     ),
   );
@@ -134,10 +143,11 @@ export async function projectWeeklySpendPct(
   projectId: string,
   usage: ClaudeUsage | null,
   now: number = Date.now(),
+  meterKey: string = "anthropic",
 ): Promise<number | null> {
-  const byProject = await attemptsByProject(db, weeklyWindowStart(usage, now), projectId);
+  const byProject = await attemptsByProject(db, weeklyWindowStart(usage, now), meterKey, projectId);
   const types = byProject.get(projectId);
-  return chargeSpend(types, await burnAveragesFor(db, projectId, types?.keys() ?? []))
+  return chargeSpend(types, await burnAveragesFor(db, projectId, meterKey, types?.keys() ?? []))
     .spentWeeklyPct;
 }
 
@@ -153,49 +163,72 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
   const projects = await listProjects();
   const settings = await Promise.all(projects.map((p) => getProjectSettings(db, p.id)));
 
-  const [usage, eligible] = await Promise.all([
-    getClaudeUsageCached().catch(() => null),
+  const hasAnthropicMeter = settings.some(
+    (stored) => !stored.claudeBaseUrl?.trim() || !stored.routerConnectionId?.trim(),
+  );
+  const [accountUsage, eligible] = await Promise.all([
+    hasAnthropicMeter ? getClaudeUsageCached().catch(() => null) : Promise.resolve(null),
     // A failed read leaves every project UNOBSERVED, not idle: nobody's share moves on a query that
     // did not answer.
     observedWorkEligibility(db, now).catch(() => null),
   ]);
-  const attempts = await attemptsByProject(db, weeklyWindowStart(usage, now)).catch(
-    () => new Map<string, Map<string, number>>(),
+  const meterUsage = await Promise.all(
+    settings.map(async (stored) => {
+      if (!stored.claudeBaseUrl?.trim() || !stored.routerConnectionId?.trim()) return accountUsage;
+      return getRouterUsageCached(stored).catch(() => null);
+    }),
   );
-
-  // Each project is charged at its OWN measured rates, so the averages are resolved per project.
-  const averages = new Map(
+  // One connection can have credentials that differ between projects. A rejected credential must not
+  // replace a successful read of that same meter's reset window merely because it was listed later.
+  const usageByMeter = new Map<string, ClaudeUsage | null>();
+  for (const [index, stored] of settings.entries()) {
+    const meterKey = quotaMeterKey(stored);
+    const usage = meterUsage[index] ?? null;
+    if (!usageByMeter.has(meterKey) || (usage && !usageByMeter.get(meterKey))) {
+      usageByMeter.set(meterKey, usage);
+    }
+  }
+  const meterWindows = new Map(
+    [...usageByMeter].map(([meterKey, usage]) => [meterKey, weeklyWindowStart(usage, now)]),
+  );
+  const attemptsByMeter = new Map(
     await Promise.all(
-      projects.map(
-        async (project) =>
-          [
-            project.id,
-            await burnAveragesFor(db, project.id, attempts.get(project.id)?.keys() ?? []),
-          ] as const,
-      ),
+      [...meterWindows].map(async ([meterKey, since]) => [
+        meterKey,
+        await attemptsByProject(db, since, meterKey).catch(() => new Map<string, Map<string, number>>()),
+      ] as const),
     ),
   );
 
-  const governedCount = settings.filter((s) => s.budgetAware === true).length;
-  const equalSplit = defaultQuotaSharePct(governedCount);
+  const governedCounts = new Map<string, number>();
+  for (const stored of settings) {
+    if (stored.budgetAware === true) {
+      const meter = quotaMeterKey(stored);
+      governedCounts.set(meter, (governedCounts.get(meter) ?? 0) + 1);
+    }
+  }
 
-  return projects.map((project, index) => {
+  return Promise.all(projects.map(async (project, index) => {
     const stored = settings[index];
+    const meterKey = quotaMeterKey(stored);
+    const attempts = attemptsByMeter.get(meterKey) ?? new Map();
+    const types = attempts.get(project.id);
     const { spentWeeklyPct, seeded } = chargeSpend(
-      attempts.get(project.id),
-      averages.get(project.id) ?? new Map(),
+      types,
+      await burnAveragesFor(db, project.id, meterKey, types?.keys() ?? []),
     );
     return {
       id: project.id,
       slug: project.slug,
       name: project.name,
-      sharePct: stored.quotaSharePct ?? equalSplit,
+      sharePct: stored.quotaSharePct ?? defaultQuotaSharePct(governedCounts.get(quotaMeterKey(stored)) ?? 0),
       declared: stored.quotaSharePct !== undefined,
       governed: stored.budgetAware === true,
+      meterKey,
       reserved: stored.reserveQuotaShare === true,
       eligible: eligibilityOf(eligible, project.id),
       spentWeeklyPct,
       seeded,
     };
-  });
+  }));
 }

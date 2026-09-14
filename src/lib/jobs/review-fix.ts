@@ -51,6 +51,7 @@ import { existsSync } from "node:fs";
 import { beads, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { claudeRouting, runClaude } from "../claude/driver";
+import { quotaMeterKey } from "../quota-meter";
 import { resolveModel } from "./model-routing";
 import {
   branchAheadOfRemote,
@@ -620,7 +621,8 @@ async function runFixSession(args: {
       projectDir: worktree.path,
     });
 
-    await ctx.claudeReached();
+    const routing = claudeRouting(settings);
+    await ctx.claudeReached(quotaMeterKey(settings));
     const result = await metered(db, clock, {
       projectId,
       jobType: ctx.type,
@@ -634,7 +636,7 @@ async function runFixSession(args: {
       prompt,
       appendSystemPrompt,
       model: resolveReviewFixModel(settings, epic),
-      routing: claudeRouting(settings),
+      routing,
       permissionMode: settings.permissionMode ?? "bypassPermissions",
       signal: ctx.signal,
       onEvent,

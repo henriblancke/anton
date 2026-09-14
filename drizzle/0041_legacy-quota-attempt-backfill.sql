@@ -1,0 +1,7 @@
+-- 0039 introduced meter-attributed quota attempts, but the prior `jobs.spent_attempts` counter has
+-- no meter provenance. A current route cannot establish that a historical attempt used Anthropic:
+-- the project may have used a gateway before clearing its settings. Leave all pre-ledger attempts
+-- unattributed rather than inventing Anthropic rows from mutable routing state.
+--
+-- Reverse:
+--   DELETE FROM `quota_attempts` WHERE `id` LIKE 'legacy:%';

@@ -1,9 +1,9 @@
 /**
  * The per-job policy sources the runner reads at lease time (anton-6fo2): a project's
- * concurrency/timeout/retry policy, the budget governor's policy, the cross-machine run-liveness
- * gate, and the bead labels the value gate ranks on. Split out of service.ts so anton's public job
- * API doesn't carry the settings + beads fan-out these four resolvers need. Wired into the runner
- * by ./service-runner.
+ * concurrency/timeout/retry policy, the budget governor's policy, the meter it paces against, the
+ * cross-machine run-liveness gate, and the bead labels the value gate ranks on. Split out of
+ * service.ts so anton's public job API doesn't carry the settings + beads fan-out these resolvers
+ * need. Wired into the runner by ./service-runner.
  */
 import { getDb } from "../db";
 import {
@@ -14,7 +14,9 @@ import {
   DEFAULT_REVIEW_FIX_CONCURRENCY,
   getProjectById,
   getProjectSettings,
+  quotaMeterKey,
   resolveBudgetPolicy as resolveBudgetPolicyFromSettings,
+  type ProjectSettings,
 } from "../projects";
 import {
   resolveGovernedShare,
@@ -24,6 +26,8 @@ import {
 import { projectWeeklySpendPct } from "../quota-spend";
 import { withQuotaShare } from "./budget";
 import type { ClaudeUsage } from "../claude/usage";
+import type { ProjectGovernorSnapshot, ProjectMeterSnapshot } from "./runner";
+import { getRouterUsageCached, getRouterUsageFresh } from "../claude/router-usage";
 import { beads } from "../beads/bd";
 import { allIssues } from "../beads/issues";
 
@@ -54,19 +58,30 @@ export async function resolvePolicy(projectId: string | undefined) {
  * The quota share (R6.1) is applied HERE rather than as a second gate downstream: several repos run
  * against one subscription, so a governed project's weekly ceiling carries its share of the target,
  * and the one place that already decides "governed or not" is the one place that should decide "how
- * much". A share is a fact about the BOARD, not about this project's settings, so it is resolved
- * from every budget-aware project rather than inside the pure settings projection — which is also
- * why an ungoverned project is untouched: it returns null above, before any share is read.
+ * much". A share belongs to a meter pool, so projects on different router connections (or a router
+ * and Anthropic) normalize independently; ungoverned projects remain untouched because they return
+ * null before any board share is read.
  */
-export async function resolveBudgetPolicy(projectId: string | undefined) {
-  const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
+async function budgetPolicyFor(
+  projectId: string | undefined,
+  settings: ProjectSettings,
+) {
   if (!projectId || !settings.budgetAware) return null;
   // Fail open, like every other governor read: an unreadable board is an EMPTY board, on which the
   // subject is absent and so ungoverned — the full weekly target for one tick — rather than a
   // rejection shared by every policy the coalesced read served, which would error the whole tick.
-  const share = resolveGovernedShare(projectId, await quotaShareBoard().catch(() => []));
-  announceImbalance(share);
+  const board = await quotaShareBoard().catch(() => []);
+  const share = resolveGovernedShare(
+    projectId,
+    meterShareBoard(board, settings, projectId),
+  );
+  announceImbalance(quotaMeterKey(settings), share);
   return withQuotaShare(resolveBudgetPolicyFromSettings(settings), share.sharePct);
+}
+
+export async function resolveBudgetPolicy(projectId: string | undefined) {
+  const settings = projectId ? await getProjectSettings(getDb(), projectId) : {};
+  return budgetPolicyFor(projectId, settings);
 }
 
 /** The board read currently in flight, so concurrent resolutions share it. Never held past settle. */
@@ -93,29 +108,126 @@ function quotaShareBoard(): Promise<GovernedShare[]> {
 }
 
 /**
+ * The share denominator is one effective meter, never unrelated account/router pools. Keep the
+ * subject's frozen routing even if the board was read after a settings edit, or a stale route could
+ * resolve itself as the only member of an unrelated pool.
+ */
+function meterShareBoard(
+  board: readonly GovernedShare[],
+  settings: Parameters<typeof quotaMeterKey>[0],
+  projectId: string,
+) {
+  const meterKey = quotaMeterKey(settings);
+  return board.filter(
+    (project) => project.projectId === projectId || (project.meterKey ?? "anthropic") === meterKey,
+  );
+}
+
+/**
+ * The meter key a project's share is attributed to. No fail-soft here — a settings-read error
+ * propagates to the caller; `resolveProjectMeterKeySafe` in runner.ts is the fail-soft wrapper
+ * that falls back to `"anthropic"`.
+ */
+export async function resolveProjectMeterKey(projectId: string | null): Promise<string> {
+  if (!projectId) return "anthropic";
+  const settings = await getProjectSettings(getDb(), projectId);
+  return quotaMeterKey(settings);
+}
+
+/**
  * What the governor measures a project's share ceiling against (R6.1): this project's OWN attributed
  * weekly spend. The share cannot be enforced on the account meter `budgetGate` reads — that number
  * is moved by every repo on the machine, so gating it per-share would stop them all at one repo's
  * cut and leave the rest of the operator's weekly target unspendable (idle-fill, anton-ld7j).
  *
- * `usage` comes from the governor's own read so the spend window is anchored to the same weekly
- * reset the gate is deciding against. Fails soft to `null` — unattributed, never zero — so a db
- * hiccup relaxes the share rather than parking the project.
+ * `snapshot` freezes the meter identity with the governor's usage read, so a settings edit while
+ * that read is in flight cannot combine one pool's reset window with another pool's attempts.
+ * Fails soft to `null` — unattributed, never zero — so a db hiccup relaxes the share rather than
+ * parking the project.
  */
 export async function resolveProjectSpend(
   projectId: string | null,
-  usage: ClaudeUsage | null,
+  snapshot: ProjectMeterSnapshot,
 ): Promise<number | null> {
   if (!projectId) return null;
   try {
-    return await projectWeeklySpendPct(getDb(), projectId, usage);
+    return await projectWeeklySpendPct(
+      getDb(),
+      projectId,
+      snapshot.usage,
+      Date.now(),
+      snapshot.meterKey,
+    );
   } catch {
     return null;
   }
 }
 
-/** The last imbalance announced, so a per-tick resolve reports a change rather than a stream. */
-let lastImbalanceAnnounced = "";
+/**
+ * The meter a governed project actually paces against (anton-gnvw): its router's own usage when
+ * routed through a gateway, the tick's account-wide read otherwise. `getRouterUsageCached` already
+ * carries the short-TTL cache + single-flight + 429 backoff, keyed per (baseUrl, connectionId) — so
+ * two routed projects sharing one router connection in the same tick still take one request. A router
+ * or settings read that cannot be completed collapses to `null`; only successfully read, genuinely
+ * unrouted settings use the account meter.
+ */
+export async function resolveProjectUsage(
+  projectId: string | null,
+  accountUsage: () => Promise<ClaudeUsage | null>,
+): Promise<ProjectMeterSnapshot> {
+  if (!projectId) return { meterKey: "anthropic", usage: await accountUsage() };
+  const settings = await getProjectSettings(getDb(), projectId).catch(() => undefined);
+  if (settings === undefined) return { meterKey: "anthropic", usage: null };
+  const meterKey = quotaMeterKey(settings);
+  return {
+    meterKey,
+    usage:
+      meterKey === "anthropic"
+        ? await accountUsage()
+        : await getRouterUsageCached(settings).catch(() => null),
+  };
+}
+
+/**
+ * Resolve a governor policy and usage from one project settings read. Keeping these coupled prevents
+ * a route edit mid-tick from applying a share for one pool to a snapshot from another.
+ */
+export async function resolveProjectGovernor(
+  projectId: string | null,
+  accountUsage: () => Promise<ClaudeUsage | null>,
+): Promise<ProjectGovernorSnapshot | null> {
+  if (!projectId) return null;
+  const settings = await getProjectSettings(getDb(), projectId).catch(() => undefined);
+  if (settings === undefined) return null;
+  const policy = await budgetPolicyFor(projectId, settings);
+  if (!policy) return null;
+  const meterKey = quotaMeterKey(settings);
+  const usage = meterKey === "anthropic"
+    ? await accountUsage()
+    : await getRouterUsageCached(settings).catch(() => null);
+  return { policy, meterKey, usage };
+}
+
+/**
+ * Fresh meter resolver for burn samples. Unlike governor reads, both window edges must hit the
+ * upstream meter so a routed job cannot subtract a cached router snapshot from itself.
+ */
+export async function resolveProjectUsageFresh(
+  projectId: string | null,
+  accountUsage: () => Promise<ClaudeUsage | null>,
+  expectedMeterKey?: string,
+): Promise<ClaudeUsage | null> {
+  if (!projectId) return expectedMeterKey && expectedMeterKey !== "anthropic" ? null : accountUsage();
+  const settings = await getProjectSettings(getDb(), projectId).catch(() => null);
+  if (!settings) return null;
+  const meterKey = quotaMeterKey(settings);
+  if (expectedMeterKey && meterKey !== expectedMeterKey) return null;
+  if (meterKey === "anthropic") return accountUsage();
+  return getRouterUsageFresh(settings).catch(() => null);
+}
+
+/** The last imbalance announced for each independent quota meter. */
+const lastImbalanceAnnounced = new Map<string, string>();
 
 /**
  * Say out loud when the declared shares don't sum to 100. The governor proportions them anyway — an
@@ -124,13 +236,13 @@ let lastImbalanceAnnounced = "";
  * silently changed under them. The settings panel carries the same fact; this is for the operator
  * watching the runner rather than the panel.
  */
-function announceImbalance(share: ResolvedQuotaShare): void {
-  const key = share.imbalanced ? String(Math.round(share.declaredTotalPct)) : "";
-  if (key === lastImbalanceAnnounced) return;
-  lastImbalanceAnnounced = key;
-  if (!key) return;
+function announceImbalance(meterKey: string, share: ResolvedQuotaShare): void {
+  const imbalance = share.imbalanced ? String(Math.round(share.declaredTotalPct)) : "";
+  if (imbalance === lastImbalanceAnnounced.get(meterKey)) return;
+  lastImbalanceAnnounced.set(meterKey, imbalance);
+  if (!imbalance) return;
   console.warn(
-    `[jobs] quota shares across budget-aware projects total ${key}%, not 100% — each project's weekly ceiling is its declared share in proportion (Settings → Quota shares)`,
+    `[jobs] quota shares across budget-aware projects total ${imbalance}%, not 100% — each project's weekly ceiling is its declared share in proportion (Settings → Quota shares)`,
   );
 }
 

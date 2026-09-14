@@ -85,6 +85,7 @@ const QUOTA_PROJECTS: Parameters<typeof SettingsView>[0]["quotaProjects"] = [
     sharePct: 100,
     declared: false,
     governed: false,
+    meterKey: "anthropic",
     reserved: false,
     eligible: true,
     spentWeeklyPct: null,

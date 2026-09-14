@@ -7,6 +7,7 @@
 import { describe, expect, it } from "vitest";
 import {
   BoardUnreachableError,
+  RouteAdmissionStaleError,
   RunAlreadyLiveError,
   StaleCheckoutError,
   SyncNotWiredError,
@@ -175,6 +176,31 @@ describe("nextAction (pure durability policy)", () => {
     expect(classifyError(new BoardUnreachableError("Dolt server unreachable"))).toEqual({
       kind: "board-unreachable",
       error: "Dolt server unreachable",
+    });
+  });
+
+  it("reschedules a route-admission-stale hit shortly and refunds the attempt (PR #269 review)", () => {
+    // Routing moved between this job's budget admission and its own settings read closest to
+    // dispatch — not the job's failure, and self-clearing within a tick or two once the governor
+    // re-admits against the now-live route, so the cadence is short (unlike the other soft
+    // reschedules above, which wait out a standing condition) and never burns attempts toward a park.
+    const a = nextAction(
+      CONFIG,
+      { attempts: 3 },
+      { kind: "route-stale", error: 'routing changed from admitted meter "anthropic" to "router:x"' },
+      now,
+    );
+    expect(a.action).toBe("reschedule");
+    if (a.action !== "reschedule") throw new Error("unreachable");
+    expect(a.runAtMs).toBe(now + CONFIG.routeRevalidationRetryMs);
+    expect(a.refundAttempt).toBe(true);
+    expect(a.lastError).toContain('routing changed from admitted meter "anthropic" to "router:x"');
+  });
+
+  it("classifies RouteAdmissionStaleError as a route-stale outcome (PR #269 review)", () => {
+    expect(classifyError(new RouteAdmissionStaleError("routing changed"))).toEqual({
+      kind: "route-stale",
+      error: "routing changed",
     });
   });
 

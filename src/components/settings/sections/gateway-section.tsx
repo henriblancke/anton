@@ -60,7 +60,22 @@ export function GatewaySection({ form }: { form: SettingsForm }) {
           hint="the NAME of an env var, not the token"
           maxLength={256}
         />
+        <TextField
+          label="Router connection id"
+          value={draft.routerConnectionId}
+          onChange={(value) => set("routerConnectionId", value)}
+          placeholder="e.g. conn_ab12cd34"
+          hint="which connection to meter on · from the router's dashboard · empty = no routed meter"
+          maxLength={256}
+        />
       </div>
+
+      <span className="max-w-2xl text-[11px] text-subtle">
+        A router can front several provider connections at once. anton meters this project on{" "}
+        <strong className="font-semibold text-foreground">exactly one</strong> — the connection id
+        above — and reads it as a single quota snapshot. It never sums or averages across
+        connections: the router&apos;s own dashboard is what shows a per-provider breakdown.
+      </span>
 
       <div className="flex max-w-2xl items-center gap-2.5 rounded-[10px] border border-border bg-card px-3 py-3">
         <div className="flex flex-col gap-0.5">
