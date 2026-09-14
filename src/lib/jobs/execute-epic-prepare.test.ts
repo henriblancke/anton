@@ -411,6 +411,36 @@ describe("prepareEpicRun — the structure/cycle gate re-runs on the board the r
     expect(prep.done).toBe(false);
     expect(publishRunClaimMock).toHaveBeenCalled();
   });
+
+  // The gate above proves an acyclic edge landing in this window doesn't false-poison the run — but
+  // proving that alone left the edge itself un-adopted: `structureGaps` only rejects a CYCLE, so a
+  // valid `blocks` edge between the run's own tickets passes it and, before this fix, was then
+  // discarded — `run.all`/`run.tickets` kept the pre-edge board, and dispatch's
+  // `orderTickets(tickets, all)` would never see the new prerequisite (PR #274 review, round 3).
+  it("adopts the board publishRunClaim's own sync pulled, edge and all, once it clears the gate", async () => {
+    const preEdge = board(ticket("t-1"), ticket("t-2"));
+    attachCycleEvidence(preEdge, []);
+    const t2WithEdge: Bead = {
+      ...ticket("t-2"),
+      dependencies: [{ type: "blocks", issue_id: "t-2", depends_on_id: "t-1" }],
+    } as Bead;
+    const postEdge = board(ticket("t-1"), t2WithEdge);
+    attachCycleEvidence(postEdge, []);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(preEdge));
+    // The first two reads (the lease's confirmation, then the pre-publish claimability check) see
+    // no edge; only the read after `publishRunClaim`'s own sync — the one this gate covers — does.
+    loadAllIssuesMock.mockResolvedValueOnce(preEdge).mockResolvedValueOnce(preEdge).mockResolvedValue(postEdge);
+
+    const theRun = run(preEdge);
+    const prep = await prepareEpicRun(theRun);
+
+    expect(prep.done).toBe(false);
+    expect(theRun.all).toBe(postEdge);
+    const adoptedT2 = theRun.tickets.find((t) => t.id === "t-2");
+    expect(adoptedT2?.dependencies).toEqual([
+      { type: "blocks", issue_id: "t-2", depends_on_id: "t-1" },
+    ]);
+  });
 });
 
 describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)", () => {

@@ -505,6 +505,13 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
  *
  * No pull of its own: `beads.sync` already pulled as its first step, so the local db already carries
  * whatever landed, and pulling again would race the push that same sync may still be finishing.
+ *
+ * ADOPTED, not merely checked (PR #274 review, round 3): a valid `blocks` edge landing in this same
+ * window is invisible to the structure gate above — it is acyclic, so nothing blocks — but it is a
+ * new prerequisite `orderTickets` must place. Judging it against `board` and then dispatching from
+ * the stale `run.all`/`run.tickets` would carry it nowhere, so `partitionTickets`'s
+ * `orderTickets(tickets, all)` would still sort by the pre-pull edges and could dispatch the
+ * dependent first. Adopted the same way {@link confirmSelectionUnderLease} adopts its own read.
  */
 async function assertPublishedBoardCycleFree(run: EpicRun): Promise<void> {
   const { repo, targetId: epicBeadId } = run;
@@ -524,6 +531,9 @@ async function assertPublishedBoardCycleFree(run: EpicRun): Promise<void> {
       `${epicBeadId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
     );
   }
+  run.all = board;
+  run.target = adoptRefreshedTarget(board, epicBeadId, run.target);
+  run.tickets = run.standaloneRun ? [run.target] : runTickets(board, epicBeadId);
 }
 
 /**
