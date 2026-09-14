@@ -287,6 +287,18 @@ describe("scanMarkdown", () => {
       ]);
     });
 
+    it("forms a Setext heading from lowercase declaration-shaped prose", () => {
+      // CommonMark only gives declarations an uppercase ASCII letter. A lowercase `<!todo` remains
+      // in the paragraph, whose underline forms an h1 that closes the h2 Acceptance section.
+      expect(headings("## Acceptance\nBackend\n<!todo\n===\n- [ ] implement it")).toEqual([
+        { depth: 2, key: "acceptance" },
+        { depth: 1, key: "backend" },
+        undefined,
+        undefined,
+        undefined,
+      ]);
+    });
+
     it("opens no heading inside a fence or an HTML comment, as the render shows none", () => {
       expect(headings("```\nAcceptance\n===\n```").every((h) => h === undefined)).toBe(true);
       expect(headings("<!--\nAcceptance\n===\n-->").every((h) => h === undefined)).toBe(true);

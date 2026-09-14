@@ -14,7 +14,8 @@ const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const SETEXT_UNDERLINE = /^ {0,3}(?:=+|-+)[ \t]*$/;
 const THEMATIC_BREAK = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 const BLOCK_LINE = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)|^ {0,3}>|^ {0,3}#{1,6}(?:[ \t]|$)|^ {4}/;
-const HTML_BLOCK_LINE = /^ {0,3}<(?:pre|script|style|textarea)(?:[ \t>]|$)|^ {0,3}<(?:div|address|article|aside|blockquote|body|section|table|ul|ol|li|p)(?:[ \t>]|\/>|$)|^ {0,3}(?:<!--|<\?|<!\[CDATA\[|<![A-Z])/i;
+const HTML_BLOCK_LINE = /^ {0,3}<(?:pre|script|style|textarea)(?:[ \t>]|$)|^ {0,3}<(?:div|address|article|aside|blockquote|body|section|table|ul|ol|li|p)(?:[ \t>]|\/>|$)/i;
+const HTML_DECLARATION_LINE = /^ {0,3}(?:<!--|<\?|<!\[CDATA\[|<![A-Z])/;
 
 /** Heading text → comparison key, case- and punctuation-insensitive. */
 const slug = (heading: string) => heading.toLowerCase().replace(/[^a-z0-9]+/g, "");
@@ -174,7 +175,8 @@ const paragraphLine = (line: Line): boolean =>
   line.visible.trim() !== "" &&
   !THEMATIC_BREAK.test(line.text) &&
   !BLOCK_LINE.test(line.text) &&
-  !HTML_BLOCK_LINE.test(line.masked);
+  !HTML_BLOCK_LINE.test(line.masked) &&
+  !HTML_DECLARATION_LINE.test(line.masked);
 
 /**
  * Preserve the contract scanner's conservative Setext projection. Micromark correctly models

@@ -199,6 +199,16 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
   });
 
+  it("does not let lowercase declaration-shaped prose satisfy Acceptance", () => {
+    // `<!todo` is prose, so its Setext underline makes an h1 that ends Acceptance. It must not be
+    // rejected as an HTML declaration and left inside Acceptance as a vacuous rubric.
+    const bead = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "Backend", "<!todo", "===", "- [ ] implement it"].join("\n"),
+    });
+    expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
+  });
+
   it("treats a nested Setext heading inside Acceptance as scaffolding", () => {
     // `Backend` is deeper than the h1 Acceptance heading, so it remains part of that section.
     // Keep its underline in the body so the scanner can identify the complete heading.
