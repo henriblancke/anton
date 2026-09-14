@@ -8,6 +8,7 @@
  * costs a caller nothing else — no bd, no `gh`, no board read — which is also what lets the rework
  * dialog import it: what the dialog refuses and what the route refuses are one judgement.
  */
+import { LIST_MARKER } from "./beads/contract";
 import {
   closingFence,
   type Fence,
@@ -131,25 +132,21 @@ export function doneGap(instructions: string, findings: readonly ReviewFinding[]
 }
 
 /**
- * A leading `-`, `*`, `+`, `•`, `1.` or `1)` bullet, a checkbox, or both — and the whitespace after
- * them. The bullets are CommonMark's three (the same set lib/beads/contract.ts scans for) plus the `•`
- * a founder pastes from rich text. The bullet must be followed by whitespace or end the line, so a
- * bare `-` or `+` is scaffolding while `-1 is the sentinel` and `+1` keep their sign. An ordered
- * marker is at most nine digits, as CommonMark bounds it and lib/beads/contract.ts parses it — a
- * longer number is an identifier that merely resembles numbering, and stays in the criterion. A
- * checkbox is held to the same rule as a bullet: `]` must be followed by whitespace or end the line,
- * so `[x].disabled must stay matched` — a CSS selector, not a ticked box — keeps its brackets and
- * lands in the criterion exactly as the note carries it. The box may be the zero-character `[]`, as
- * lib/beads/contract.ts reads it: a founder who types `- []` has started a box and stopped, and
- * reading it as text filed `[]` as the follow-up's one criterion.
+ * A leading contract list marker, a checkbox, or both — and the whitespace after them. The marker
+ * comes from lib/beads/contract.ts so criterion derivation and the contract judge agree about
+ * abandoned bullets. It must be followed by whitespace or end the line, so a bare `-` or `+` is
+ * scaffolding while `-1 is the sentinel` and `+1` keep their sign. A checkbox follows the same rule:
+ * `[x].disabled` remains a CSS selector, while `[]` is an abandoned task marker.
  */
-const LIST_MARKER = /^(?:(?:[-*+•]|\d{1,9}[.)])(?:\s+|$))?(?:\[[ xX]?\](?:\s+|$))?/;
+const CRITERION_LIST_MARKER = new RegExp(
+  `^(?:(?:${LIST_MARKER.source})(?:\\s+|$))?(?:\\[[ xX]?\\](?:\\s+|$))?`,
+);
 
 /**
  * A GFM task-list checkbox at a step's head — `[ ]`, `[x]`, `[X]` or the zero-character `[]`, and the
- * whitespace after it — held to {@link LIST_MARKER}'s rule that `]` is followed by whitespace or the
- * line's end, so a CSS selector like `[x].disabled` keeps its brackets. It is the checkbox half of
- * {@link LIST_MARKER} on its own: a container peel ({@link peelContainers}) strips the bullet but
+ * whitespace after it — held to {@link CRITERION_LIST_MARKER}'s rule that `]` is followed by whitespace
+ * or the line's end, so a CSS selector like `[x].disabled` keeps its brackets. It is the checkbox half
+ * of {@link CRITERION_LIST_MARKER} on its own: a container peel ({@link peelContainers}) strips the bullet but
  * leaves the checkbox, since CommonMark makes it the item paragraph's text, not a container. A fence
  * still opens beneath it as it does beneath the bullet, so it comes off before fence detection just as
  * {@link shorn} takes it off an ordinary step — without it `- [ ] ```md` files the opener as a plain
@@ -1152,7 +1149,7 @@ function shorn(line: string): string {
   let text = line.trim();
   for (;;) {
     if (THEMATIC_BREAK.test(text) || isHeading(text)) return "";
-    const next = text.replace(QUOTE_MARKER, "").trim().replace(LIST_MARKER, "");
+    const next = text.replace(QUOTE_MARKER, "").trim().replace(CRITERION_LIST_MARKER, "");
     if (next === text) return PROMPT_LINE.test(text) ? "" : text;
     text = next;
   }
@@ -1173,7 +1170,7 @@ function shorn(line: string): string {
 function continued(line: string): string {
   let text = line.trim();
   for (;;) {
-    const next = text.replace(QUOTE_MARKER, "").trim().replace(LIST_MARKER, "");
+    const next = text.replace(QUOTE_MARKER, "").trim().replace(CRITERION_LIST_MARKER, "");
     if (next === text) return PROMPT_LINE.test(text) ? "" : text;
     text = next;
   }

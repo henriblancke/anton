@@ -191,8 +191,9 @@ describe("instructionCriteria", () => {
   it("reads a bare marker as scaffolding, not as a criterion", () => {
     // `-` alone and `- [ ]` are what the founder leaves behind when they start a list and stop.
     expect(texts("-\n- \n1.\n- [ ]\n[ ]\n  ")).toEqual([]);
-    // `+` is CommonMark's third bullet; alone it is the same abandoned list, not a criterion.
-    expect(texts("+\n+ \n+ [ ]")).toEqual([]);
+    // `+` is CommonMark's third bullet and `•` is a rich-text paste marker; alone either is the
+    // same abandoned list, not a criterion, and the contract judge agrees.
+    expect(texts("+\n+ \n+ [ ]\n•\n• \n• [ ]")).toEqual([]);
     // The zero-character box lib/beads/contract.ts accepts is the same abandoned list here.
     expect(texts("[]\n- []\n* []\n1. []\n- [] []\n> []")).toEqual([]);
     expect(texts("- [] boxed empty\n[] bare")).toEqual(["boxed empty", "bare"]);

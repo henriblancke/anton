@@ -140,7 +140,7 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(summarize(ticket({ acceptance_criteria: "- [ ]" }))).toEqual([["Acceptance", "blocking"]]);
     const scaffold = ticket({
       acceptance_criteria: undefined,
-      description: [DESCRIPTION, "", "## Acceptance", "- [ ]", "- [x]", "-", "1."].join("\n"),
+      description: [DESCRIPTION, "", "## Acceptance", "- [ ]", "- [x]", "-", "+", "•", "1."].join("\n"),
     });
     expect(summarize(scaffold)).toEqual([["Acceptance", "blocking"]]);
     // A box WITH text is a criterion — the marker is only scaffolding when it carries nothing.

@@ -215,11 +215,12 @@ export function preambleOf(description: string): string {
   return lines.join("\n").trim();
 }
 
-/** A list marker — a bullet or an ordered item (`-`, `*`, `+`, `1.`, `1)`), as CommonMark counts
- * them. Shared by the two scaffolding judges below so an ordered placeholder reads exactly like the
- * bulleted one: {@link EMPTY_LIST_ITEM} already accepted both, and {@link PROMPT_LINE} not doing so
- * let `1. TODO — …` pass the blocking gate that `- TODO — …` was refused by. */
-const LIST_MARKER = /(?:[-*+]|\d{1,9}[.)])/;
+/**
+ * A list marker — CommonMark's bullets and ordered items, plus the `•` founders paste from rich text.
+ * Shared by the contract's scaffolding judges and rework's criterion derivation, so a marker-only
+ * instruction is refused before filing exactly when its generated acceptance would be unwritten.
+ */
+export const LIST_MARKER = /(?:[-*+•]|\d{1,9}[.)])/;
 
 /**
  * Every variable default in `anton-bead.formula.json` is a PROMPT, not content — "- [ ] TODO — a
