@@ -339,6 +339,13 @@ it("flags a fence opened beside a container marker — the marker is the item's 
   expect(rendered(">   ```\n> x\n> ```")).toEqual(["> x"]);
 });
 
+it("keeps trailing fence-length content in an unterminated fence", () => {
+  // The AST includes the final line in an unterminated code node. A delimiter-length suffix after
+  // authored content is not a closer, so the criterion must remain visible to the contract reader.
+  expect(rendered("```markdown\n- [ ] expected ```")).toEqual(["- [ ] expected ```"]);
+  expect(rendered("> ```markdown\n> - [ ] expected ```")).toEqual(["> - [ ] expected ```"]);
+});
+
 it("drops the delimiters of a fence nested in several containers, empty ones included", () => {
   // The closer carries every container marker (`> > ````), and stripping only the first `>` left
   // the rest to render as authored text — an Acceptance section holding a bare nested fence then

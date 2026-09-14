@@ -128,6 +128,29 @@ function stripContainerMarkers(text: string): string {
   return rest;
 }
 
+/** The source spelling required before a fence closer nested in containers. */
+function fenceContainerPrefix(text: string): string {
+  let rest = text;
+  let prefix = "";
+  for (;;) {
+    const quote = /^ {0,3}>[ \t]?/.exec(rest);
+    if (quote) {
+      prefix += quote[0];
+      rest = rest.slice(quote[0].length);
+      continue;
+    }
+    const item = /^ {0,3}(?:[-*+]|\d{1,9}[.)])([ \t]+)/.exec(rest);
+    if (item) {
+      let column = 0;
+      for (const char of item[0]) column = char === "\t" ? column + (4 - (column % 4)) : column + 1;
+      prefix += blanks(column);
+      rest = rest.slice(item[0].length);
+      continue;
+    }
+    return prefix;
+  }
+}
+
 /** `text` is a heading precisely when the CommonMark parser produces one complete heading node. */
 export function isHeading(text: string): boolean {
   const root = fromMarkdown(text) as unknown as MarkdownNode;
@@ -272,13 +295,15 @@ export function scanMarkdown(source: string): ScannedLine[] {
       if (!opening) return; // Indented code is not a fenced literal for the contract.
       for (let index = start; index <= end; index++) lines[index]!.fenced = true;
       lines[start]!.delimiter = true;
-      // A closing delimiter ends at the code node's source column, which may include legal trailing
-      // whitespace. Find the delimiter run from the trimmed line end instead: counting back from
-      // that column slices into the whitespace and exposes an empty fence's closer as authored text.
-      const trimmed = lines[end]?.text.trimEnd() ?? "";
-      const delimiter = new RegExp(`${opening.char}{${opening.len},}$`).exec(trimmed);
-      const closing = delimiter ? trimmed.slice(delimiter.index) : "";
-      if (end !== start && closingFence(closing, opening)) lines[end]!.delimiter = true;
+      // The parser includes an unterminated block's final content line in the code node. Its trailing
+      // run can resemble a delimiter, but only a full container-stripped line may close the fence.
+      const closingLine = lines[end]?.text ?? "";
+      const directCloser = stripContainerMarkers(closingLine);
+      const prefix = fenceContainerPrefix(lines[start]?.text.slice(0, node.position.start.column - 1) ?? "");
+      const continuationCloser = prefix && closingLine.startsWith(prefix) ? closingLine.slice(prefix.length) : "";
+      if (end !== start && (closingFence(directCloser, opening) || closingFence(continuationCloser, opening))) {
+        lines[end]!.delimiter = true;
+      }
       return;
     }
   });
