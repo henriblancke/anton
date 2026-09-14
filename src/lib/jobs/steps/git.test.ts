@@ -210,11 +210,12 @@ describe("step:pr", () => {
       .where(eq(schema.projects.id, sandbox.projectId))
       .run();
     const settings = await getProjectSettings(sandbox.tdb.db, sandbox.projectId);
+    const ctx = sandbox.context({ settings });
 
-    await prStep(sandbox.context({ settings }));
+    await prStep(ctx);
 
     expect(ops.openPullRequest).toHaveBeenCalledWith(
-      expect.objectContaining({ pushTimeoutMs: 7 * 60_000 }),
+      expect.objectContaining({ pushTimeoutMs: 7 * 60_000, signal: ctx.ctx.signal }),
     );
   });
 });

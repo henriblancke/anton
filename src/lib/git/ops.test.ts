@@ -3844,6 +3844,23 @@ suite("pushBranch (real git · a pre-push hook that outlives the kill)", () => {
     },
   );
 
+  it.runIf(process.platform !== "win32")(
+    "reaps an in-flight pre-push hook when the job aborts before its configured budget",
+    async () => {
+      const controller = new AbortController();
+      const reason = new Error("job made no progress");
+      const pending = pushBranch(repo, "main", undefined, 30 * 60_000, controller.signal);
+
+      await vi.waitFor(() => expect(existsSync(started)).toBe(true));
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+      // The hook writes only after TERM. Seeing it before the abort reaches the caller proves the
+      // cancellation path waited for the group, not merely for git's direct child process.
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
   // anton-o74nf: the env var is a CAP on a caller's requested budget, not an override — a caller
   // asking for a real 30-minute setting must still be bounded by it.
   it.runIf(process.platform !== "win32")(

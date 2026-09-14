@@ -253,6 +253,7 @@ export async function prStep(ctx: StepContext): Promise<StepResultWith<"pr">> {
     title: buildPrTitle(ctx.target, ctx.target.id, ctx.settings.conventionalCommits),
     body: prBody(ctx.target, ctx.tickets, ctx.advisories ?? [], ctx.satisfied),
     pushTimeoutMs: resolvePushTimeoutMs(ctx.settings),
+    signal: ctx.ctx.signal,
   });
   return { ok: true, detail: `PR ${pr.ref}`, facts: { pr } };
 }

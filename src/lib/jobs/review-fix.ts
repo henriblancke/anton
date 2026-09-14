@@ -780,7 +780,9 @@ async function commitAndPushFix(
   // worktreePath) queries worktreePath when given, per its own contract) — the same "read from the
   // worktree, not the base repo" behavior this file's onbranch-includeIf reasoning depends on
   // elsewhere, not the base checkout's config.
-  if (pushed) await pushBranch(worktreePath, branch, hooksPath, resolvePushTimeoutMs(settings));
+  if (pushed) {
+    await pushBranch(worktreePath, branch, hooksPath, resolvePushTimeoutMs(settings), signal);
+  }
   return pushed;
 }
 

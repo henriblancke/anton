@@ -271,6 +271,7 @@ process.exit(0);`,
     // No pushTimeoutMinutes setting on this project — resolves to the 2-minute default, the same
     // one `pushBranch` itself falls back to (anton-n93lo): byte-identical to before this existed.
     expect(pushBranchCalls.at(-1)?.[3]).toBe(2 * 60_000);
+    expect(pushBranchCalls.at(-1)?.[4]).toBeInstanceOf(AbortSignal);
   });
 
   it.runIf(process.platform !== "win32")(
@@ -337,6 +338,7 @@ process.exit(0);`,
       // Read from the run's PINNED settings snapshot (same rule claudeRouting(settings) follows),
       // not re-read mid-run — proven here by the resolved budget actually reaching pushBranch.
       expect(pushBranchCalls.at(-1)?.[3]).toBe(7 * 60_000);
+      expect(pushBranchCalls.at(-1)?.[4]).toBeInstanceOf(AbortSignal);
     } finally {
       await tdb.db
         .update(schema.projects)

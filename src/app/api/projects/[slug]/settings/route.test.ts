@@ -793,15 +793,17 @@ describe("settings route — self-review settings (anton-of1m)", () => {
         options.branch,
         undefined,
         options.pushTimeoutMs,
+        options.signal,
       );
       return { url: "https://example.test/pr/7", ref: "gh-7" };
     });
 
+    const signal = new AbortController().signal;
     await prStep({
       db: tdb.db,
       clock: { now: () => 0 },
       ctx: {
-        signal: new AbortController().signal,
+        signal,
         heartbeat: async () => {},
         report: () => {},
         claudeReached: async () => {},
@@ -826,6 +828,7 @@ describe("settings route — self-review settings (anton-of1m)", () => {
       "anton/settings-round-trip",
       undefined,
       5 * 60_000,
+      signal,
     );
   });
 

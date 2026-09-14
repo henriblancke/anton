@@ -1485,8 +1485,14 @@ function gitPush(
   args: string[],
   hooksPath?: string,
   requestedTimeoutMs?: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   return new Promise((resolvePromise, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+      return;
+    }
+
     const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
     // stdout is dropped rather than piped, same as gitCommit: nothing here reads it, and a chatty
     // hook filling an unread pipe would block the push outright.
@@ -1502,7 +1508,15 @@ function gitPush(
       if (settled) return;
       settled = true;
       clearTimeout(budget);
+      signal?.removeEventListener("abort", abort);
       emit();
+    };
+    const abort = () => {
+      if (killing || settled) return;
+      killing = true;
+      void reapCommitGroup(child).then(() =>
+        settle(() => reject(signal?.reason ?? new DOMException("The operation was aborted", "AbortError"))),
+      );
     };
     const budget = setTimeout(() => {
       if (killing || settled) return;
@@ -1511,6 +1525,7 @@ function gitPush(
         settle(() => reject(pushTimedOut(args, timeoutMs, stderr()))),
       );
     }, timeoutMs);
+    signal?.addEventListener("abort", abort, { once: true });
 
     child.on("error", (err) => settle(() => reject(err)));
     child.on("close", (code) => {
@@ -1533,15 +1548,17 @@ function gitPush(
  * the hook sees what it expects.
  *
  * `timeoutMs` is optional so every existing caller keeps its current behavior (anton-o74nf); see
- * {@link gitPush} for what bounds it.
+ * {@link gitPush} for what bounds it. `signal` gives cancellation the same whole-process-group
+ * reap as a budget expiry, so a cancelled run cannot leave its pre-push hook behind.
  */
 export async function pushBranch(
   cwd: string,
   branch: string,
   hooksPath?: string,
   timeoutMs?: number,
+  signal?: AbortSignal,
 ): Promise<void> {
-  await gitPush(cwd, ["push", "-u", "origin", branch], hooksPath, timeoutMs);
+  await gitPush(cwd, ["push", "-u", "origin", branch], hooksPath, timeoutMs, signal);
 }
 
 /**
@@ -3075,6 +3092,8 @@ export async function openPullRequest(opts: {
    * unaffected: only the push ahead of it is bounded. Absent → {@link pushBranch}'s own default.
    */
   pushTimeoutMs?: number;
+  /** Cancels and reaps the in-flight push with its whole process group. */
+  signal?: AbortSignal;
 }): Promise<PullRequest> {
   if (!(await hasRemote(opts.repoPath))) {
     throw new Error(
@@ -3082,7 +3101,13 @@ export async function openPullRequest(opts: {
     );
   }
   const hooksPath = await resolveHooksPathOverride(opts.repoPath, opts.worktreePath);
-  await pushBranch(opts.worktreePath ?? opts.repoPath, opts.branch, hooksPath, opts.pushTimeoutMs);
+  await pushBranch(
+    opts.worktreePath ?? opts.repoPath,
+    opts.branch,
+    hooksPath,
+    opts.pushTimeoutMs,
+    opts.signal,
+  );
 
   const existing = await findOpenPullRequest(opts.repoPath, opts.branch);
   if (existing) {
