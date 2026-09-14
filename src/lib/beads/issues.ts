@@ -3,6 +3,7 @@ import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import {
   getBeadDescription,
   getIssueSnapshot,
+  markCycleEvidenceRecovered,
   probeIssueSnapshot,
   readIssueSnapshot,
   refreshIssueSnapshot,
@@ -187,6 +188,36 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
 
 export function probeAllIssues(cwd: string): void {
   probeIssueSnapshot(cwd, () => loadAllIssues(cwd));
+}
+
+/**
+ * Nudge a stuck cycle-evidence gap toward recovery without making the caller wait (PR #274 review,
+ * round 2 on this file: a failed `bd dep cycles` call has no retry path once the poll stops reaching
+ * `allIssues`/`readAllIssues`). Those two are only where {@link attachCyclesBestEffort} retries, and
+ * they only run when the board route's freshness token has already changed — a token sourced solely
+ * from `issueSnapshotVersion`, which never moves on a `bd` recovery, only on the bead CONTENT
+ * changing. So a transient `bd` failure on the first authoritative read leaves every following poll
+ * 304-ing the same "evidence unavailable" verdict until an unrelated bead edit or a manual reload
+ * happens to force a fresh read.
+ *
+ * Called alongside {@link probeAllIssues} on the poll path: it retries the missing evidence against
+ * the CURRENTLY retained snapshot and, on success, attaches it AND bumps the snapshot version, so a
+ * poll that already matched the pre-recovery token stops 304-ing and rebuilds the board with the
+ * evidence startability needs.
+ */
+export function probeCycleEvidence(cwd: string): void {
+  void (async () => {
+    try {
+      const board = await getIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, {
+        blockOnPendingWrite: false,
+      });
+      if (cycleEvidenceFor(board) !== undefined) return;
+      attachCycleEvidence(board, await beads.depCycles(cwd));
+      markCycleEvidenceRecovered(cwd);
+    } catch {
+      // Still unavailable — the next probe (or an explicit `withCycles` read) retries.
+    }
+  })();
 }
 
 /**

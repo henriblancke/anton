@@ -230,7 +230,7 @@ async function applyApproved(
   // the moment the patrol judged the board, which is what every "has this moved since we asked"
   // check compares to.
   const at: ApplyMoment = { nowMs: Date.now(), observedAtMs: observedAtOf(proposal) };
-  const decision = planApply(plan, attachCycleEvidence(board, await beads.depCycles(repo)), at);
+  const decision = planApply(plan, await withCycleEvidenceIfNeeded(repo, plan, board), at);
   if (decision.status === "refuse") {
     throw await attachFailure(
       repo,
@@ -242,6 +242,41 @@ async function applyApproved(
     return settleUnwritten(repo, proposal, plan, decision, at, actor, signal);
   }
   return applySteps(repo, proposal, plan, decision.steps, decision.summary, actor, signal);
+}
+
+/** Move kinds whose decision consults `cycleEvidenceFor` — directly or through the picker. */
+const CYCLE_AWARE_MOVES: ReadonlySet<GardenerPlan["move"]> = new Set(["approve", "unapprove"]);
+
+/**
+ * `bd dep cycles` evidence, fetched only for the moves that consume it — `unapprove`, via
+ * `unapproveSubject`'s `approvalGaps`, and `approve`, via `approveBarred`'s `startBarred` →
+ * `ineligibility` → `makeApprovalGate` (apply-plan.ts, picker-targets.ts) — and best-effort like
+ * `issues.ts`'s `attachCyclesBestEffort`, not required like execute-epic's own reads.
+ *
+ * Every other move (`reparent`, `link`, `retire`, `reprioritize`, `split`, `undefer`) never looks at
+ * `cycleEvidenceFor`, so paying for a `bd` subprocess under the proposal's write lock for those would
+ * extend the lock hold and gain nothing. And a `depCycles` failure (bd unavailable, timeout,
+ * unreadable output — a real, documented failure mode per hygiene.ts's `parseDepCycles`) must not
+ * fail the WHOLE apply for moves that have nothing to do with cycles or approval: it degrades to
+ * missing evidence instead, which `approvalGaps`'s own `missingCycleEvidenceGap` already fails closed
+ * on for the two decisions that ask.
+ */
+async function withCycleEvidenceIfNeeded(
+  repo: string,
+  plan: GardenerPlan,
+  board: Bead[],
+): Promise<Bead[]> {
+  if (!CYCLE_AWARE_MOVES.has(plan.move)) return board;
+  try {
+    return attachCycleEvidence(board, await beads.depCycles(repo));
+  } catch (e) {
+    console.warn(
+      `[gardener.apply] ${repo}: dep cycles read failed while applying a "${plan.move}" proposal — ` +
+        `proceeding without cycle evidence, so its own approval-gap check fails closed on the ` +
+        `missing evidence rather than this failing the whole apply: ${messageOf(e)}`,
+    );
+    return board;
+  }
 }
 
 /**

@@ -146,6 +146,20 @@ export function issueSnapshotVersion(cwd: string): number {
 }
 
 /**
+ * Bump the version alone — no content changed, no beads replaced, no generation advance — for a side
+ * channel that recovers independently of the bead data itself (PR #274 review, round 2 on
+ * `issues.ts:158`: a `bd dep cycles` retry landing evidence that a prior read couldn't get).
+ *
+ * The poll path's freshness token is sourced from this number and nothing else it can move on its
+ * own, so without this a `bd` hiccup on the first authoritative read would leave every later poll
+ * 304-ing the same "evidence unavailable" verdict until the bead content itself changed or a manual
+ * reload forced a read — never on `bd` simply recovering.
+ */
+export function markCycleEvidenceRecovered(cwd: string): void {
+  entryFor(cwd).version += 1;
+}
+
+/**
  * Mark cached data stale while retaining it so a background-refresh reader (the poll path) keeps
  * serving last-good data and never waits behind a Dolt sync. `localWrite` additionally bumps the
  * version (so clients detect the change), clears any in-flight loader — forcing a fresh read that

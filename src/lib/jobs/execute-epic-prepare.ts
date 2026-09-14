@@ -513,6 +513,18 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
  * `orderTickets(tickets, all)` would still sort by the pre-pull edges and could dispatch the
  * dependent first. Adopted the same way {@link confirmSelectionUnderLease} adopts its own read.
  *
+ * MEMBERSHIP is not adopted the same way (PR #274 review, round 5): the board this reads is the one
+ * `publishRunClaim`'s own sync just pulled, and that pull can bring back a child ticket attached
+ * (say, an approved gardener re-parent landing in the same window `confirmSelectionUnderLease`
+ * already guards earlier) AFTER `assertBeadContract`, `assertAgentsEnabled` and
+ * `assertReservedTicketsClaimable` have all already run over the set this run reserved. Silently
+ * widening `run.tickets` to `runTickets(board, epicBeadId)` here would carry a ticket into dispatch
+ * that none of those gates, nor the cascade, ever looked at — the exact drift
+ * {@link confirmSelectionUnderLease} exists to catch, just one window later. So membership is
+ * DIFFED against the set this run already reserved, the same way that function diffs its own read,
+ * and a change retries preparation rather than being adopted — the retry re-reserves and re-gates
+ * whatever set the board holds by then.
+ *
  * READINESS is re-derived from the same adopted board, for the same reason (PR #274 review, round
  * 4): the edge this window can land is not only an internal cycle — it is just as validly a new
  * EXTERNAL blocker on one of this run's own tickets (or on the target itself). `partitionTickets`
@@ -541,9 +553,19 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
       `${epicBeadId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
     );
   }
+  const adoptedTarget = adoptRefreshedTarget(board, epicBeadId, run.target);
+  const freshTickets = run.standaloneRun ? [adoptedTarget] : runTickets(board, epicBeadId);
+  const drift = ticketSetDrift(run.tickets, freshTickets);
+  if (drift) {
+    throw new Error(
+      `${epicBeadId}'s ticket set changed while its claim was publishing (${drift}) — retrying so ` +
+        `the contract, agent and reserved-ticket gates run over the whole set rather than ` +
+        `dispatching a ticket none of them judged`,
+    );
+  }
   run.all = board;
-  run.target = adoptRefreshedTarget(board, epicBeadId, run.target);
-  run.tickets = run.standaloneRun ? [run.target] : runTickets(board, epicBeadId);
+  run.target = adoptedTarget;
+  run.tickets = freshTickets;
   const freshReadiness = run.readiness(run.all);
   if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness, run.all);
   gates.readiness = freshReadiness;
