@@ -1,8 +1,9 @@
 /**
  * What each project has spent of this week's quota, as far as this machine can tell (R6.3).
  *
- * There is no per-project meter to read. The estimate is built the only way the recorded data allows:
- * charge every Claude-burning ATTEMPT a project made this week at that project's own sampled burn
+ * A quota meter does not report a project-specific spend total. The estimate is built the only way
+ * the recorded data allows: charge every Claude-burning ATTEMPT a project made this week at that
+ * project's own sampled burn
  * average for the job type (`getProjectBurnAverage`). Attempts, not completed jobs, because the
  * runner samples every attempt — a retried, parked, failed or cancelled job burned real quota, and a
  * meter that counted only successes would let a repeatedly failing project spend the account dry
@@ -27,6 +28,7 @@ import { getClaudeUsageCached, type ClaudeUsage } from "./claude/usage";
 import { getDb, schema } from "./db";
 import type { AntonDb, JobType } from "./jobs/queue";
 import { getProjectSettings, listProjects } from "./projects";
+import { quotaMeterKey } from "./quota-meter";
 import { eligibilityOf, observedWorkEligibility } from "./quota-eligibility";
 import { defaultQuotaSharePct, type QuotaShareProject } from "./quota-share";
 
@@ -192,6 +194,7 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
       sharePct: stored.quotaSharePct ?? equalSplit,
       declared: stored.quotaSharePct !== undefined,
       governed: stored.budgetAware === true,
+      meterKey: quotaMeterKey(stored),
       reserved: stored.reserveQuotaShare === true,
       eligible: eligibilityOf(eligible, project.id),
       spentWeeklyPct,

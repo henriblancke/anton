@@ -1,8 +1,8 @@
 /**
  * Per-project quota shares, as arithmetic (R6.1 / R6.3 / R6.4).
  *
- * Several repos run against ONE Claude subscription, so each declares a share of the weekly quota
- * rather than racing for whichever job the runner leases first. This module owns what that
+ * Several repos can pace against one quota meter, so each declares a share of that meter's weekly
+ * quota rather than racing for whichever job the runner leases first. This module owns what that
  * declaration means: who is in the denominator right now, what each project's share works out to,
  * and which declared share is currently being spent somewhere else.
  *
@@ -29,6 +29,8 @@ export interface QuotaShareProject {
   declared: boolean;
   /** Budget-aware execution is on. An ungoverned project spends unpaced and is not in the split. */
   governed: boolean;
+  /** The effective quota pool this project spends from: one router connection or Anthropic. */
+  meterKey: string;
   /** `reserve my share` (R6.5): held out of reallocation even while idle. */
   reserved: boolean;
   /**
@@ -217,13 +219,17 @@ export function resolveGovernedShare(
  * With nothing left in the denominator no share is in force and nothing is reallocated: an idle
  * machine is not lending anyone anything, and saying so would name a beneficiary that doesn't exist.
  */
-export function resolveQuotaSplit(projects: readonly QuotaShareProject[]): QuotaSplit {
-  const governed = projects.filter((p) => p.governed);
+export function resolveQuotaSplit(
+  projects: readonly QuotaShareProject[],
+  meterKey?: string,
+): QuotaSplit {
+  const meterProjects = meterKey ? projects.filter((project) => project.meterKey === meterKey) : projects;
+  const governed = meterProjects.filter((p) => p.governed);
   const declaredTotalPct = governed.reduce((sum, p) => sum + p.sharePct, 0);
   const participants = governed.filter(canSpend);
   const participantTotal = participants.reduce((sum, p) => sum + p.sharePct, 0);
 
-  const rows = projects.map<QuotaShareRow>((project) => {
+  const rows = meterProjects.map<QuotaShareRow>((project) => {
     const participating = project.governed && canSpend(project);
     const normalizedPct = project.governed ? proportionOf(project.sharePct, declaredTotalPct) : 0;
     const effectivePct = participating ? proportionOf(project.sharePct, participantTotal) : 0;
@@ -237,13 +243,13 @@ export function resolveQuotaSplit(projects: readonly QuotaShareProject[]): Quota
     };
   });
 
-  const attributed = projects.filter((p) => p.spentWeeklyPct !== null);
+  const attributed = meterProjects.filter((p) => p.spentWeeklyPct !== null);
   return {
     rows,
     declaredTotalPct,
     reallocatedPct: rows.reduce((sum, r) => (r.reallocated ? sum + r.normalizedPct : sum), 0),
     imbalanced: isImbalanced(governed.length, declaredTotalPct),
-    seeded: projects.some((p) => p.seeded),
+    seeded: meterProjects.some((p) => p.seeded),
     spentTotalPct:
       attributed.length > 0 ? attributed.reduce((sum, p) => sum + (p.spentWeeklyPct ?? 0), 0) : null,
   };

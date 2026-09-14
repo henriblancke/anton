@@ -33,6 +33,7 @@
  */
 import type { UsageSnapshot } from "@/lib/usage";
 import type { ProjectSettings } from "../projects";
+import { routerUsageUrl } from "./router-endpoint";
 import { backoffMsFor, USAGE_CACHE_TTL_MS } from "./usage";
 
 /** Request timeout — mirrors `usage.ts`'s 5 s budget for its own upstream fetch. */
@@ -102,17 +103,7 @@ export function parseRouterUsage(body: unknown, plan: string | null = null): Rou
   };
 }
 
-/**
- * Build the per-connection management endpoint from the router's origin. Claude-compatible gateway
- * URLs may include an API version (for example `/v1`), but 9Router's management API never does.
- */
-export function routerUsageUrl(baseUrl: string, connectionId: string): string {
-  const url = new URL(baseUrl);
-  url.pathname = `/api/usage/${encodeURIComponent(connectionId)}`;
-  url.search = "";
-  url.hash = "";
-  return url.toString();
-}
+export { routerUsageUrl } from "./router-endpoint";
 
 /** The canonical management endpoint makes equivalent configured gateway URLs share one read. */
 const key = (url: string, connectionId: string): string => `${url}::${connectionId}`;
@@ -177,9 +168,9 @@ const cache = new Map<string, RouterCacheEntry>();
 const inFlight = new Map<string, Promise<RouterUsage | null>>();
 
 /**
- * TTL-bypassing read for a routed burn-sampling window. It still honors a router's shared 429
- * backoff and refreshes the short-TTL cache for ordinary readers, but never reuses a pre-job value
- * for either side of the delta.
+ * TTL-bypassing read for a routed burn-sampling window. It honors a router's shared 429 backoff and
+ * refreshes the short-TTL cache for ordinary readers, but returns `null` during backoff rather than
+ * reusing a pre-job value for either side of the delta.
  */
 export async function getRouterUsageFresh(
   settings: RouterSettings,
@@ -199,7 +190,7 @@ export async function getRouterUsageFresh(
 
   const k = key(url, connectionId);
   const ts = now();
-  if (ts < (backoffUntil.get(k) ?? 0)) return cache.get(k)?.value ?? null;
+  if (ts < (backoffUntil.get(k) ?? 0)) return null;
 
   const value = await fetchRouterUsage(settings, fetcher);
   cache.set(k, { at: ts, value });

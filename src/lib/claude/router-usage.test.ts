@@ -290,7 +290,7 @@ describe("getRouterUsageFresh", () => {
     expect(calls).toBe(2);
   });
 
-  it("honors shared 429 backoff instead of retrying a router during a burn window", async () => {
+  it("returns null during shared 429 backoff so a burn window cannot sample stale usage", async () => {
     process.env.ROUTER_TOKEN_TEST = "secret";
     const clock = 1_000;
     const now = () => clock;
@@ -308,7 +308,7 @@ describe("getRouterUsageFresh", () => {
       now,
     );
 
-    expect(result).not.toBeNull();
+    expect(result).toBeNull();
     expect(calls).toBe(0);
   });
 });

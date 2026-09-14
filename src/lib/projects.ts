@@ -12,6 +12,7 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
+import { quotaMeterKey } from "./quota-meter";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
 import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./jobs/budget";
 import { resolveGovernedShare, type GovernedShare } from "./quota-share";
@@ -1282,21 +1283,7 @@ export async function budgetAwareQuotaShares(): Promise<GovernedShare[]> {
   return governedQuotaBoard(await governedProjects());
 }
 
-/** The quota pool a project paces against: one router connection, or the shared Anthropic meter. */
-export function quotaMeterKey(settings: ProjectSettings): string {
-  const baseUrl = settings.claudeBaseUrl?.trim();
-  const connectionId = settings.routerConnectionId?.trim();
-  if (!baseUrl || !connectionId) return "anthropic";
-  try {
-    const url = new URL(baseUrl);
-    url.pathname = `/api/usage/${encodeURIComponent(connectionId)}`;
-    url.search = "";
-    url.hash = "";
-    return `router:${url}`;
-  } catch {
-    return "anthropic";
-  }
-}
+export { quotaMeterKey } from "./quota-meter";
 
 /** The board above, over an already-read governed set — so a caller needing both reads once. */
 async function governedQuotaBoard(
