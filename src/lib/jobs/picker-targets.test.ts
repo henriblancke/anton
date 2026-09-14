@@ -8,10 +8,13 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead, type BeadDep } from "../beads/bd";
-import { attachCycleEvidence } from "../beads/cycle-evidence";
+import { attachCycleEvidence, cycleEvidenceFor } from "../beads/cycle-evidence";
 import type { PickerExclusionReason } from "../board-picker-plan";
 import { proposalFingerprint } from "../gardener/detections";
-import { eligibleTargets, ineligibility } from "./picker-targets";
+import {
+  eligibleTargets as projectEligibleTargets,
+  ineligibility as projectIneligibility,
+} from "./picker-targets";
 
 // Nothing in the decision may shell out: it is a pure function of a snapshot, and a `bd` spawn on
 // the picker's tick is the cost the whole mechanical-picker design exists to avoid (D3).
@@ -29,6 +32,13 @@ vi.mock("node:child_process", async (importOriginal) => ({
 function bead(id: string, o: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", issue_type: "task", ...o };
 }
+
+/** Nominal fixtures represent a completed `bd dep cycles` read with no cycles. */
+const authoritative = <T extends Bead[]>(board: T): T =>
+  cycleEvidenceFor(board) === undefined ? attachCycleEvidence(board, []) : board;
+const eligibleTargets = (board: Bead[]) => projectEligibleTargets(authoritative(board));
+const ineligibility = (target: Bead, board: Bead[]) =>
+  projectIneligibility(target, authoritative(board));
 
 /** A `blocks` edge as bd inlines it: from = the dependent, to = the blocker. */
 const blockedBy = (dependent: string, blocker: string): BeadDep => ({

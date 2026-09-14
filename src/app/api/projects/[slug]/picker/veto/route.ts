@@ -120,7 +120,7 @@ async function resolveCriterion(
 ): Promise<ReturnType<typeof admittingCriterion>> {
   const policy = resolvePickerPolicy(await getProjectSettings(getDb(), project.id));
   if (!policy) return undefined;
-  const board = await allIssues(project.repoPath).catch(() => []);
+  const board = await allIssues(project.repoPath, { withCycles: true }).catch(() => []);
   const candidate = policyCandidates(board).candidates.find((c) => c.id === beadId);
   return candidate ? admittingCriterion(candidate, policy) : undefined;
 }

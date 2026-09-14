@@ -26,7 +26,7 @@ vi.mock("./bd", async () => {
   };
 });
 
-const { allIssues, loadAllIssues } = await import("./issues");
+const { allIssues, loadAllIssues, readAllIssues } = await import("./issues");
 const { cycleEvidenceFor } = await import("./cycle-evidence");
 const { resetIssueSnapshots } = await import("./snapshot");
 
@@ -142,6 +142,16 @@ describe("loadAllIssues", () => {
     expect(approval).toBe(ordinary);
     expect(cycleEvidenceFor(approval)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
     expect(cyclesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("enriches a versioned board read before it reaches a policy projection", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const snapshot = await readAllIssues(REPO, { withCycles: true });
+
+    expect(cycleEvidenceFor(snapshot.beads)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cyclesMock).toHaveBeenCalledWith(REPO);
   });
 
   it("dedupes, so a bd that starts carrying gates in the ordinary listing doesn't double them", async () => {

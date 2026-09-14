@@ -139,11 +139,17 @@ export async function allIssues(
 
 /** Beads plus the snapshot version they carry, read atomically — for callers that stamp a response
  * with the version (the board freshness token) and must not desync data from version. */
-export function readAllIssues(
+export async function readAllIssues(
   cwd: string,
-  opts?: SnapshotReadOptions,
+  opts?: SnapshotReadOptions & { withCycles?: boolean },
 ): Promise<SnapshotRead> {
-  return readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
+  const snapshot = await readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
+  // Keep evidence attached to the cached array itself: `SnapshotRead` is a wrapper and copying the
+  // board would lose the sidecar that pure approval projections consume.
+  if (opts?.withCycles && cycleEvidenceFor(snapshot.beads) === undefined) {
+    attachCycleEvidence(snapshot.beads, await beads.depCycles(cwd));
+  }
+  return snapshot;
 }
 
 export function refreshAllIssues(cwd: string): Promise<Bead[]> {

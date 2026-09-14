@@ -9,6 +9,7 @@ import type { ScanHealth } from "./scan-health";
 import type { HygieneReport, Project } from "./types";
 
 const listMock = vi.fn();
+const cyclesMock = vi.fn();
 
 vi.mock("./beads/bd", async () => {
   const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
@@ -17,6 +18,7 @@ vi.mock("./beads/bd", async () => {
     beads: {
       ...actual.beads,
       list: (...args: unknown[]) => listMock(...args),
+      depCycles: (...args: unknown[]) => cyclesMock(...args),
     },
   };
 });
@@ -194,6 +196,8 @@ const { stampBoard } = await import("./board-picker-plan");
 beforeEach(() => {
   resetIssueSnapshots();
   listMock.mockReset();
+  cyclesMock.mockReset();
+  cyclesMock.mockResolvedValue([]);
   hygieneReport = undefined;
   scanHealth = undefined;
   deferrals = new Map();
