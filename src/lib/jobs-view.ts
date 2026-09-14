@@ -2,13 +2,15 @@
  * Read-only view over the durable `jobs` table for the runs UI (anton-ner.3). The jobs table is
  * the single source of truth the runner mutates (queue.ts), so reading it directly keeps the UI
  * status consistent with the runner — including job types that never write a `runs` row
- * (review-fix, nightly-stringer, orphan-grooming) and parked/failed jobs kept for audit.
+ * (review-fix, review-fix-pr, nightly-stringer, orphan-grooming) and parked/failed jobs kept for
+ * audit.
  *
  * Mirrors runs.ts: uses the shared `getDb()` connection and exposes a pure row→summary mapper so
  * the field extraction (JSON payload parse, timestamp normalization) is unit-testable.
  */
 import { and, count, desc, eq, inArray } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { epochOrZero } from "./db/epoch";
 import type { JobStatus, JobType } from "./jobs/queue";
 import { isJobType, resolveStatusFilter, type JobFilters } from "./jobs-filters";
 
@@ -21,7 +23,7 @@ export interface JobSummary {
   type: JobType;
   status: JobStatus;
   projectId?: string;
-  /** Epic the job targets, when the payload names one (execute-epic, scoped review-fix). */
+  /** Epic the job targets, when the payload names one (execute-epic, review-fix-pr). */
   epicBeadId?: string;
   /** Schedule that fired this job, when cron-enqueued (nightly-stringer, orphan-grooming, review-fix). */
   scheduleId?: string;
@@ -31,12 +33,6 @@ export interface JobSummary {
   createdAt: number;
   /** Epoch seconds. Last transition; for terminal jobs (done/parked/failed) this is the end. */
   updatedAt: number;
-}
-
-function toEpoch(value: unknown): number {
-  if (value == null) return 0;
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value);
 }
 
 /** Pull a string field out of the JSON payload without throwing on malformed data. */
@@ -63,8 +59,8 @@ export function toJobSummary(row: typeof schema.jobs.$inferSelect): JobSummary {
     scheduleId: stringFromPayload(row.payloadJson, "scheduleId"),
     attempts: row.attempts,
     lastError: row.lastError ?? undefined,
-    createdAt: toEpoch(row.createdAt),
-    updatedAt: toEpoch(row.updatedAt),
+    createdAt: epochOrZero(row.createdAt),
+    updatedAt: epochOrZero(row.updatedAt),
   };
 }
 

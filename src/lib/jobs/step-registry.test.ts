@@ -11,7 +11,6 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { makeTestDb, type TestDb } from "../db/testing";
 import { schema } from "../db";
 import type { Bead } from "../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
@@ -35,6 +34,7 @@ import {
   type CookedStep,
   type StepContext,
 } from "./step-registry";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const FORMULA = ".beads/formulas/anton-run.formula.toml";
 
@@ -61,13 +61,15 @@ function fakeClaude(...replies: Array<string | ClaudeResult | Error>) {
     const next = replies[calls.length - 1];
     if (next === undefined) throw new Error(`unscripted claude dispatch #${calls.length}`);
     if (next instanceof Error) throw next;
-    return typeof next === "string" ? { ok: true, text: next } : next;
+    // `modelUsage: []` is what a result with no readable usage carries — the spend ledger records
+    // such an invocation with unknown usage rather than dropping it (anton-77l9).
+    return typeof next === "string" ? { ok: true, text: next, modelUsage: [] } : next;
   };
   return { run, calls };
 }
 
 let dir: string;
-let tdb: TestDb;
+let tdb: TestProjectDb;
 let projectId: string;
 let runId: string;
 let priorSessionsRoot: string | undefined;
@@ -78,16 +80,9 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "anton-step-registry-"));
   priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
-  tdb = makeTestDb();
-  projectId = randomUUID();
+  tdb = makeProjectDb({ repoPath: dir });
+  projectId = tdb.projectId;
   runId = randomUUID();
-  await tdb.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: dir,
-    defaultBranch: "main",
-  });
   await tdb.db.insert(schema.runs).values({
     id: runId,
     projectId,
@@ -108,7 +103,7 @@ function context(overrides: Partial<StepContext> = {}): StepContext {
   return {
     db: tdb.db,
     clock,
-    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {}, jobId: "job-test", type: "execute-epic" },
     projectId,
     runId,
     repoPath: dir,
@@ -116,6 +111,7 @@ function context(overrides: Partial<StepContext> = {}): StepContext {
     branch: "anton/anton-step1",
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target,
     tickets: [target],
     settings,

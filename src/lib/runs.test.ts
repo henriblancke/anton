@@ -1,5 +1,6 @@
 /**
- * `findRunFormulaForBranch` (anton-aa3m): which pipeline a later attempt on a branch pins to.
+ * `findRunFormulaForBranch` (anton-aa3m): which pipeline a later attempt on a branch pins to, and
+ * the order `listRecentRunOutcomes` hands the autopilot breakers their evidence in (anton-rgso).
  *
  * The failure it exists to prevent: an ordinary handler error settles the run row `failed`, and the
  * runner's automatic retry reuses the prior attempt's worktree and skips its committed tickets — but
@@ -10,7 +11,17 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "./db/testing";
 import * as schema from "./db/schema";
-import { findRunFormulaForBranch } from "./runs";
+import {
+  ANTHROPIC_DEFAULT_ENDPOINT_HOST,
+  createRun,
+  endpointHostFromBaseUrl,
+  findRunFormulaForBranch,
+  getRunBaseForkSha,
+  listDeliveriesByBead,
+  listRecentRunOutcomes,
+  updateRun,
+} from "./runs";
+import type { Clock } from "./jobs/queue";
 
 let t: TestDb;
 const PROJECT = "p1";
@@ -37,6 +48,9 @@ interface SeedRun {
   branch?: string;
   epicBeadId?: string;
   projectId?: string;
+  startedAt?: number;
+  endedAt?: number;
+  ticketBeadId?: string;
 }
 
 async function seed(run: SeedRun): Promise<void> {
@@ -48,8 +62,28 @@ async function seed(run: SeedRun): Promise<void> {
     status: run.status,
     formula: run.formula,
     formulaVariant: run.formulaVariant,
-    startedAt: new Date(run.updatedAt),
+    ticketBeadId: run.ticketBeadId,
+    startedAt: new Date(run.startedAt ?? run.updatedAt),
+    endedAt: run.endedAt === undefined ? null : new Date(run.endedAt),
     updatedAt: new Date(run.updatedAt),
+  });
+}
+
+/** A ticket's own `execute` session — the per-child completion record a grouped run leaves. */
+async function seedSession(row: {
+  id: string;
+  beadId: string;
+  status: string;
+  endedAt?: number;
+  kind?: string;
+}): Promise<void> {
+  await t.db.insert(schema.sessions).values({
+    id: row.id,
+    projectId: PROJECT,
+    kind: row.kind ?? "execute",
+    beadId: row.beadId,
+    status: row.status,
+    endedAt: row.endedAt === undefined ? null : new Date(row.endedAt),
   });
 }
 
@@ -121,5 +155,198 @@ describe("findRunFormulaForBranch", () => {
       variant: undefined,
     });
     expect(await findRunFormulaForBranch(t.db, "p2", "anton-zzz", BRANCH)).toBeUndefined();
+  });
+});
+
+describe("listRecentRunOutcomes", () => {
+  // Whole seconds; `updatedAt` stores nothing finer, so concurrent runs settle onto the same value.
+  const SETTLED = 1_800_000_000_000;
+
+  it("orders same-second settlements by attempt, not by whatever SQLite returns", async () => {
+    // The breakers read this list as a SEQUENCE. Left to tie, a delivered run could come back either
+    // side of two same-second failures — resetting a streak on one read and latching a disarm on the
+    // next, off rows that never changed.
+    await seed({ id: "earlier", status: "failed", updatedAt: SETTLED, startedAt: SETTLED - 600_000 });
+    await seed({ id: "later", status: "done", updatedAt: SETTLED, startedAt: SETTLED - 60_000 });
+
+    const runs = await listRecentRunOutcomes(t.db, PROJECT, 10);
+
+    expect(runs.map((r) => r.id)).toEqual(["later", "earlier"]);
+  });
+
+  it("orders same-second settlements by which run SETTLED last, not which started last", async () => {
+    // Start order is only a proxy, and it inverts exactly where it matters: two runs overlap, the
+    // one that started first settles second. Read by start order the later-started delivery sorts
+    // newest and resets the streak that the failure settling after it should have kept.
+    const clock: Clock = { now: () => SETTLED };
+    await createRun(t.db, clock, { id: "started-first", projectId: PROJECT, epicBeadId: EPIC });
+    await createRun(t.db, clock, { id: "started-second", projectId: PROJECT, epicBeadId: EPIC });
+    await updateRun(t.db, clock, "started-second", { status: "done", endedAt: SETTLED });
+    await updateRun(t.db, clock, "started-first", { status: "failed", endedAt: SETTLED });
+
+    expect((await listRecentRunOutcomes(t.db, PROJECT, 10)).map((r) => r.id)).toEqual([
+      "started-first",
+      "started-second",
+    ]);
+  });
+
+  it("is still total when the attempts also started in the same second", async () => {
+    await seed({ id: "first", status: "failed", updatedAt: SETTLED, startedAt: SETTLED - 60_000 });
+    await seed({ id: "second", status: "failed", updatedAt: SETTLED, startedAt: SETTLED - 60_000 });
+
+    // Insertion order is the last thing left that says which run came after which.
+    expect((await listRecentRunOutcomes(t.db, PROJECT, 10)).map((r) => r.id)).toEqual([
+      "second",
+      "first",
+    ]);
+    // And the `limit` boundary takes the same row every time rather than an arbitrary one.
+    expect((await listRecentRunOutcomes(t.db, PROJECT, 1)).map((r) => r.id)).toEqual(["second"]);
+  });
+});
+
+/**
+ * The delivery evidence the repair weigher bounds itself with (gardener/repair.ts): a repair only
+ * weighs a later failure double until the bead it was made on next DELIVERS, and a delivery that old
+ * is behind the streak window the breaker walks.
+ */
+describe("getRunBaseForkSha (anton-5bpd)", () => {
+  const NOW = 1_800_000_000_000;
+  const clock: Clock = { now: () => NOW };
+
+  it("round-trips the fork sha a run pinned at creation", async () => {
+    await createRun(t.db, clock, { id: "r-fork", projectId: PROJECT, epicBeadId: EPIC });
+    await updateRun(t.db, clock, "r-fork", { baseForkSha: "f0f0f0forkcommit" });
+
+    expect(await getRunBaseForkSha(t.db, "r-fork")).toBe("f0f0f0forkcommit");
+  });
+
+  // A first attempt has pinned nothing yet — the caller must resolve and store it, not read a stale
+  // value. A row from before the column existed reads the same way.
+  it("is undefined for a run that has not pinned one", async () => {
+    await createRun(t.db, clock, { id: "r-unpinned", projectId: PROJECT, epicBeadId: EPIC });
+
+    expect(await getRunBaseForkSha(t.db, "r-unpinned")).toBeUndefined();
+    expect(await getRunBaseForkSha(t.db, "r-missing")).toBeUndefined();
+  });
+});
+
+describe("listDeliveriesByBead", () => {
+  const SETTLED = 1_800_000_000_000;
+  const sec = (ms: number) => Math.floor(ms / 1000);
+
+  it("names every delivery of a bead, as target and as the ticket a run stopped inside", async () => {
+    await seed({ id: "d1", status: "done", updatedAt: SETTLED, endedAt: SETTLED });
+    await seed({
+      id: "d2",
+      status: "done",
+      updatedAt: SETTLED + 60_000,
+      endedAt: SETTLED + 60_000,
+      epicBeadId: "anton-epic",
+      ticketBeadId: EPIC,
+    });
+
+    const deliveries = await listDeliveriesByBead(t.db, PROJECT, [EPIC]);
+
+    expect([...(deliveries.get(EPIC) ?? [])].sort()).toEqual([sec(SETTLED), sec(SETTLED + 60_000)]);
+  });
+
+  it("counts only runs that DELIVERED, for the beads asked about", async () => {
+    await seed({ id: "failed", status: "failed", updatedAt: SETTLED, endedAt: SETTLED });
+    await seed({ id: "parked", status: "parked", updatedAt: SETTLED, endedAt: SETTLED });
+    await seed({
+      id: "other-bead",
+      status: "done",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      epicBeadId: "anton-zzz",
+    });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(new Map());
+    // No ids, no query: an unrepaired board asks nothing of the runs table.
+    expect(await listDeliveriesByBead(t.db, PROJECT, [])).toEqual(new Map());
+  });
+
+  it("credits a grouped run's EVERY completed child, not only the ticket its row kept", async () => {
+    // `openTicketSession` rewrites `ticketBeadId` per child, so the row remembers the LAST one. A
+    // child repaired and delivered earlier in the same run would otherwise have no delivery at all,
+    // and its stamp would go on weighing later unrelated failures double.
+    await seed({
+      id: "grouped",
+      status: "done",
+      updatedAt: SETTLED + 120_000,
+      endedAt: SETTLED + 120_000,
+      epicBeadId: "anton-epic",
+      ticketBeadId: "anton-last",
+    });
+    await seedSession({ id: "s1", beadId: EPIC, status: "done", endedAt: SETTLED + 60_000 });
+    await seedSession({ id: "s2", beadId: "anton-last", status: "done", endedAt: SETTLED + 120_000 });
+
+    const deliveries = await listDeliveriesByBead(t.db, PROJECT, [EPIC, "anton-last"]);
+
+    expect(deliveries.get(EPIC)).toEqual([sec(SETTLED + 60_000)]);
+    expect(deliveries.get("anton-last")).toEqual([sec(SETTLED + 120_000), sec(SETTLED + 120_000)]);
+  });
+
+  it("counts only the ticket sessions that COMPLETED their work", async () => {
+    await seedSession({ id: "failed", beadId: EPIC, status: "failed", endedAt: SETTLED });
+    await seedSession({ id: "running", beadId: EPIC, status: "running" });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(new Map());
+  });
+
+  it("reads a row written before `endedAt` existed at the time it settled", async () => {
+    await seed({ id: "legacy", status: "done", updatedAt: SETTLED });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(
+      new Map([[EPIC, [sec(SETTLED)]]]),
+    );
+  });
+});
+
+/** The endpoint a run drove is recorded as provenance (anton-oom5). */
+describe("endpoint host", () => {
+  const clock: Clock = { now: () => 1_800_000_000_000 };
+
+  it("reduces a routing base URL to its host, never carrying userinfo or a token", () => {
+    const host = endpointHostFromBaseUrl("https://user:sk-secret-token@gateway.example:20128/v1");
+    expect(host).toBe("gateway.example:20128");
+    expect(host).not.toContain("sk-secret-token");
+    expect(host).not.toContain("user");
+    expect(host).not.toContain("@");
+  });
+
+  it("keeps the port, which is how a local gateway is told from Anthropic direct", () => {
+    expect(endpointHostFromBaseUrl("http://localhost:20128")).toBe("localhost:20128");
+  });
+
+  it("treats a missing or unparseable base URL as unrouted — the Anthropic default", () => {
+    expect(endpointHostFromBaseUrl(undefined)).toBe(ANTHROPIC_DEFAULT_ENDPOINT_HOST);
+    expect(endpointHostFromBaseUrl("")).toBe(ANTHROPIC_DEFAULT_ENDPOINT_HOST);
+    expect(endpointHostFromBaseUrl("   ")).toBe(ANTHROPIC_DEFAULT_ENDPOINT_HOST);
+    expect(endpointHostFromBaseUrl("not a url")).toBe(ANTHROPIC_DEFAULT_ENDPOINT_HOST);
+  });
+
+  async function endpointHostOf(id: string): Promise<string | null> {
+    const row = t.sqlite.prepare("select endpoint_host from runs where id = ?").get(id) as {
+      endpoint_host: string | null;
+    };
+    return row.endpoint_host;
+  }
+
+  it("records the Anthropic default for an unrouted run, distinct from a pre-column NULL", async () => {
+    await createRun(t.db, clock, { id: "unrouted", projectId: PROJECT, epicBeadId: EPIC });
+
+    expect(await endpointHostOf("unrouted")).toBe(ANTHROPIC_DEFAULT_ENDPOINT_HOST);
+  });
+
+  it("records the gateway host for a routed run", async () => {
+    await createRun(t.db, clock, {
+      id: "routed",
+      projectId: PROJECT,
+      epicBeadId: EPIC,
+      endpointHost: endpointHostFromBaseUrl("https://token@router.local:20128"),
+    });
+
+    expect(await endpointHostOf("routed")).toBe("router.local:20128");
   });
 });

@@ -14,21 +14,32 @@ import * as schema from "./schema";
  * Shared by `makeTestDb` (in-memory) and `src/lib/testing/integration.ts`'s `makeFileDb` (temp
  * file) so both apply the exact same schema the exact same way — no duplicated SQL parsing.
  */
-export function applyMigrationsTo(sqlite: Database.Database): void {
-  const dir = join(process.cwd(), "drizzle");
-  const files = readdirSync(dir)
+export function applyMigrationsTo(sqlite: Database.Database, opts: { before?: string } = {}): void {
+  for (const file of migrationFiles()) {
+    // `before` reconstructs the schema as it stood just before a migration, so a migration test can
+    // seed the rows an upgrading machine already has and then apply the migration to them.
+    if (file === opts.before) break;
+    applyMigrationFile(sqlite, file);
+  }
+}
+
+/** Every committed migration, in the filename order both the harness and the packaged runner apply. */
+export function migrationFiles(): string[] {
+  return readdirSync(join(process.cwd(), "drizzle"))
     .filter((f) => f.endsWith(".sql"))
     .sort();
-  for (const file of files) {
-    const raw = readFileSync(join(dir, file), "utf8");
-    // Drizzle separates statements with a `--> statement-breakpoint` marker line.
-    const sql = raw
-      .split("--> statement-breakpoint")
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .join(";\n");
-    sqlite.exec(sql);
-  }
+}
+
+/** Apply one committed migration by filename (e.g. `0031_burn_sample_project.sql`). */
+export function applyMigrationFile(sqlite: Database.Database, file: string): void {
+  const raw = readFileSync(join(process.cwd(), "drizzle", file), "utf8");
+  // Drizzle separates statements with a `--> statement-breakpoint` marker line.
+  const sql = raw
+    .split("--> statement-breakpoint")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join(";\n");
+  sqlite.exec(sql);
 }
 
 export interface TestDb {

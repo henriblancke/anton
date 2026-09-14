@@ -16,9 +16,9 @@ import { describe, expect, it } from "vitest";
 
 import type { CookedFormula, CookedStep } from "../beads/bd";
 import { PoisonEpic } from "./errors";
-import { assertRunFormulaFloor, checkFormulaFloor, type StepRegistry } from "./formula-floor";
+import { assertRunFormulaFloor, checkFormulaFloor } from "./formula-floor";
 import { bundledRunFormulaPath, parseRunFormulaSource } from "./run-formula";
-import { BUILTIN_STEPS } from "./step-registry";
+import { BUILTIN_STEPS, type StepRegistry } from "./step-registry";
 
 /** A cooked step, written the way a formula names its handler: an id plus one `step:<name>` label. */
 const step = (id: string, name: string): CookedStep => ({ id, labels: [`step:${name}`] });

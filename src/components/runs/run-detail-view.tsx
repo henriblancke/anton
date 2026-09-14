@@ -4,46 +4,25 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { TriangleAlertIcon } from "lucide-react";
 
+import { DISPLAY_LOCALE } from "@/lib/time";
 import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
+import { ErrorState } from "@/components/ui/error-state";
 import { CopyButton } from "@/components/ui/copy-button";
 import { agentDotClass } from "@/components/board/board-utils";
 import { RunTerminal } from "@/components/runs/run-terminal";
+// The run shape, status types and pure helpers all come from run-view-utils — never from
+// `@/lib/runs`, which would pull better-sqlite3 into the browser bundle.
 import {
   fmtDuration,
   formatRunPipeline,
   isActiveRun,
   pickAttachSession,
   timelineOrder,
+  type RunDetail,
   type RunStatus,
   type SessionStatus,
   type SessionSummary,
 } from "@/components/runs/run-view-utils";
-
-/**
- * Local mirror of the run-detail API's run shape. Defined here (not imported from `@/lib/runs`) so
- * this client module never pulls better-sqlite3 into the browser bundle — same guard settings-view
- * uses. Session/status types + the pure helpers live in run-view-utils (unit-tested).
- */
-interface RunDetail {
-  id: string;
-  epicBeadId: string;
-  ticketBeadId?: string;
-  worktreePath?: string;
-  branch?: string;
-  model?: string;
-  agentTag?: string;
-  status: RunStatus;
-  attempts: number;
-  leaseExpiresAt?: number;
-  error?: string;
-  /** The pipeline this run walked, and the label that selected it (anton-aa3m). */
-  formula?: string;
-  formulaVariant?: string;
-  startedAt?: number;
-  endedAt?: number;
-  updatedAt: number;
-}
 
 const RUN_STATUS_STYLE: Record<RunStatus, { dot: string; text: string; pulse?: boolean }> = {
   running: { dot: "bg-stage-implementing", text: "text-stage-implementing", pulse: true },
@@ -53,9 +32,15 @@ const RUN_STATUS_STYLE: Record<RunStatus, { dot: string; text: string; pulse?: b
   done: { dot: "bg-stage-done", text: "text-stage-done" },
 };
 
+/**
+ * Not hydration-sensitive today — the run arrives from a `useEffect` fetch, so nothing here is
+ * server-rendered — but it uses {@link DISPLAY_LOCALE} anyway: the property that makes it safe is
+ * one refactor to a server-fetched prop away from being false, and the convention shouldn't depend
+ * on re-deriving it.
+ */
 function fmtTime(epoch?: number): string {
   if (!epoch) return "—";
-  return new Date(epoch * 1000).toLocaleString(undefined, {
+  return new Date(epoch * 1000).toLocaleString(DISPLAY_LOCALE, {
     month: "short",
     day: "numeric",
     hour: "2-digit",
@@ -116,15 +101,10 @@ export function RunDetailView({ slug, runId }: { slug: string; runId: string }) 
 
   if (error && !run) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
-        <span className="flex size-11 items-center justify-center rounded-xl border border-risk-high/30 bg-risk-high/10">
-          <TriangleAlertIcon className="size-5 text-risk-high" aria-hidden="true" />
-        </span>
-        <p className="text-sm text-risk-high">{error}</p>
-        <Button size="sm" variant="outline" onClick={() => setAttempt((n) => n + 1)}>
-          Try again
-        </Button>
-      </div>
+      <ErrorState
+        message={error}
+        onRetry={() => setAttempt((n) => n + 1)}
+      />
     );
   }
 
@@ -188,6 +168,7 @@ export function RunDetailView({ slug, runId }: { slug: string; runId: string }) 
               <MetaRow label="ticket" value={run.ticketBeadId ?? "—"} mono copy />
               <MetaRow label="agent" value={run.agentTag} mono dotClass={run.agentTag ? agentDotClass(run.agentTag) : undefined} />
               <MetaRow label="model" value={run.model ?? "default"} mono />
+              <MetaRow label="endpoint" value={run.endpointHost ?? "—"} mono />
               <MetaRow label="branch" value={run.branch ?? "—"} mono copy />
               <MetaRow label="worktree" value={run.worktreePath ?? "—"} mono title={run.worktreePath} copy />
               <MetaRow

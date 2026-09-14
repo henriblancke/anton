@@ -5,17 +5,23 @@
  * reason, closed bead, live lease, attempts still on the clock).
  */
 import { describe, expect, it } from "vitest";
-import type { Bead } from "../beads/bd";
+import type { Bead, Gate } from "../beads/bd";
 import { LABELS } from "../beads/bd";
 import {
   detectDeadLeases,
   detectExhaustedJobs,
+  detectOpenHumanGates,
   detectParkedRuns,
   detectStalePrs,
   inReviewTargets,
   settledExecuteEpicJobsByEpic,
+  sweepOutcome,
+  withoutGateBlockedJobs,
   type InReviewPr,
 } from "./run-health";
+import { blockedByPoison, parkedOnGateClause } from "./errors";
+import { POISON_PARK_PREFIX } from "./runner";
+import { sortFindings, type RunHealthFinding } from "../run-health";
 import type { RunRow } from "../runs";
 import type { JobRow } from "./queue";
 
@@ -34,17 +40,23 @@ function run(id: string, o: Partial<RunRow> = {}): RunRow {
     projectId: "p1",
     epicBeadId: "e-1",
     ticketBeadId: null,
+    jobId: null,
+    writeSeq: null,
     worktreePath: null,
     branch: null,
     model: null,
     agentTag: null,
+    endpointHost: null,
     formula: null,
     formulaVariant: null,
+    baseForkSha: null,
     status: "parked",
+    reviewScore: null,
     attempts: 1,
     leaseExpiresAt: null,
     error: null,
     startedAt: secDate(NOW - 4 * HOUR),
+    attemptStartedAt: secDate(NOW - 4 * HOUR),
     endedAt: null,
     updatedAt: secDate(NOW - 4 * HOUR),
     ...o,
@@ -61,7 +73,10 @@ function job(id: string, o: Partial<JobRow> = {}): JobRow {
     runAt: secDate(NOW - HOUR),
     leaseExpiresAt: null,
     attempts: 3,
+    spentAttempts: 3,
     lastError: null,
+    outcome: null,
+    outcomeNote: null,
     createdAt: secDate(NOW - 4 * HOUR),
     updatedAt: secDate(NOW - HOUR),
     ...o,
@@ -337,6 +352,152 @@ describe("detectExhaustedJobs", () => {
   });
 });
 
+describe("detectOpenHumanGates", () => {
+  /** A gate bead as `bd gate list --json` returns it — reason INSIDE the description, as bd stores it. */
+  function gate(id: string, o: Partial<Gate> = {}): Gate {
+    return {
+      id,
+      title: "Gate: human",
+      status: "open",
+      issue_type: "gate",
+      await_type: "human",
+      description: "Ad-hoc gate blocking t-1\n\nReason: needs a design call",
+      created_at: new Date(NOW - 3 * HOUR).toISOString(),
+      ...o,
+    };
+  }
+
+  /** A ticket gated under a feature — the shape a resume has to climb out of. */
+  const gatedBoard = (gateId = "g-1"): Bead[] => [
+    bead("f-1", { issue_type: "feature" }),
+    bead("t-1", {
+      issue_type: "task",
+      parent: "f-1",
+      dependencies: [{ issue_id: "t-1", depends_on_id: gateId, type: "blocks" }],
+    }),
+  ];
+
+  it("reports an open human gate, with its reason, its age, and what it blocks", () => {
+    const [finding, ...rest] = detectOpenHumanGates([gate("g-1")], gatedBoard(), NOW);
+
+    expect(rest).toEqual([]);
+    expect(finding).toMatchObject({
+      kind: "needs-human",
+      key: "needs-human:g-1",
+      gateId: "g-1",
+      // The bead the wait is ON, and the bead a resume would re-enqueue — the feature above it,
+      // never the gated ticket, which anton never dispatches on its own.
+      beadId: "t-1",
+      targetBeadId: "f-1",
+    });
+    expect(finding.reason).toContain("needs a design call");
+    expect(finding.since).toBe(NOW - 3 * HOUR);
+    expect(finding.ageMs).toBe(3 * HOUR);
+  });
+
+  it("recovers the asking TICKET from a gate anton armed, and strips it off the reason", () => {
+    // The gate blocks the RUN TARGET, so on a feature with several children nothing else on the
+    // board says which one stopped (PR #205 review) — and an answer only steers the resumed session
+    // from that child's notes. anton stamps it into the reason; this is the read back.
+    const armed = gate("g-1", {
+      description: "Ad-hoc gate blocking f-1\n\nReason: t-1 needs a human: which region do we bill from?",
+    });
+
+    const [finding] = detectOpenHumanGates([armed], gatedBoard(), NOW);
+
+    expect(finding.askBeadId).toBe("t-1");
+    // Read once, not twice: the row prints the reason, and a "t-1 needs a human:" left inside it
+    // would repeat the id the row already shows on its own.
+    expect(finding.reason).toContain("which region do we bill from?");
+    expect(finding.reason).not.toContain("needs a human:");
+  });
+
+  it("leaves a hand-made gate's reason whole — a person's hold names no asking ticket", () => {
+    const [finding] = detectOpenHumanGates([gate("g-1")], gatedBoard(), NOW);
+
+    expect(finding.askBeadId).toBeUndefined();
+    expect(finding.reason).toContain("needs a design call");
+  });
+
+  it("says so plainly when the gate carries no reason, rather than reporting nothing", () => {
+    const bare = gate("g-1", { description: "Ad-hoc gate blocking t-1" });
+
+    const [finding] = detectOpenHumanGates([bare], gatedBoard(), NOW);
+
+    expect(finding).toMatchObject({ kind: "needs-human", gateId: "g-1" });
+    expect(finding.reason).toContain("no reason recorded");
+  });
+
+  it("ignores a closed gate — that wait is over", () => {
+    expect(detectOpenHumanGates([gate("g-1", { status: "closed" })], gatedBoard(), NOW)).toEqual([]);
+  });
+
+  it("ignores the gates bd resolves by itself — only a human gate needs a human", () => {
+    const machine: Gate[] = [
+      gate("g-timer", { await_type: "timer" }),
+      gate("g-run", { await_type: "gh:run" }),
+      gate("g-pr", { await_type: "gh:pr" }),
+    ];
+    expect(detectOpenHumanGates(machine, gatedBoard("g-timer"), NOW)).toEqual([]);
+  });
+
+  it("still reports a gate whose blocked bead has no run target above it", () => {
+    // A gated step of a poured molecule: `runTargetAbove` stops at the plumbing, so anton has
+    // nothing to re-enqueue — but a person is still being waited on, which is the whole finding.
+    const board = [
+      bead("m-1", { issue_type: "molecule" }),
+      bead("s-1", {
+        issue_type: "task",
+        parent: "m-1",
+        dependencies: [{ issue_id: "s-1", depends_on_id: "g-1", type: "blocks" }],
+      }),
+    ];
+
+    const [finding] = detectOpenHumanGates([gate("g-1")], board, NOW);
+
+    expect(finding).toMatchObject({ kind: "needs-human", beadId: "s-1" });
+    expect(finding.targetBeadId).toBeUndefined();
+  });
+
+  it("still reports a gate whose blocked bead this board read doesn't carry", () => {
+    const [finding] = detectOpenHumanGates([gate("g-1")], [], NOW);
+    expect(finding).toMatchObject({ kind: "needs-human", gateId: "g-1" });
+    expect(finding.beadId).toBeUndefined();
+    expect(finding.targetBeadId).toBeUndefined();
+  });
+
+  it("reads a gate with no timestamp as new, not as a 1970 stall", () => {
+    const [finding] = detectOpenHumanGates(
+      [gate("g-1", { created_at: undefined })],
+      gatedBoard(),
+      NOW,
+    );
+    expect(finding.since).toBe(NOW);
+    expect(finding.ageMs).toBe(0);
+  });
+
+  it("serializes identically over two sweeps of unchanged state, whatever order bd lists gates in", () => {
+    const gates = [gate("g-2"), gate("g-1")];
+    const board = gatedBoard();
+
+    const first = sortFindings(detectOpenHumanGates(gates, board, NOW));
+    const second = sortFindings(detectOpenHumanGates([...gates].reverse(), board, NOW));
+
+    expect(first.map((f) => f.key)).toEqual(["needs-human:g-1", "needs-human:g-2"]);
+    expect(JSON.stringify(second)).toEqual(JSON.stringify(first));
+  });
+
+  it("keeps the key stable as the wait ages, so one wait is one escalation", () => {
+    // The sweep re-runs on a schedule and the escalation table dedupes on this key alone — a key
+    // that moved with the clock (or with the age in the reason) would raise a fresh escalation
+    // every single pass.
+    const later = sortFindings(detectOpenHumanGates([gate("g-1")], gatedBoard(), NOW + 12 * HOUR));
+
+    expect(later.map((f) => f.key)).toEqual(["needs-human:g-1"]);
+    expect(later[0].ageMs).toBe(15 * HOUR);
+  });
+});
+
 describe("inReviewTargets", () => {
   const IN_REVIEW = LABELS.stage("in-review");
 
@@ -358,5 +519,140 @@ describe("inReviewTargets", () => {
       bead("feat", { issue_type: "feature", parent: "container" }),
     ];
     expect(inReviewTargets(board)).toEqual([]);
+  });
+});
+
+describe("withoutGateBlockedJobs", () => {
+  /** The park a run takes when execute-epic's readiness re-check finds an open blocker. */
+  function blockedPark(...blockers: string[]): JobRow {
+    return job("j-1", {
+      attempts: 1,
+      lastError: `${POISON_PARK_PREFIX} ${blockedByPoison("e-1", blockers).message}`,
+    });
+  }
+
+  const gateWait = (gateId: string): RunHealthFinding => ({
+    kind: "needs-human",
+    key: `needs-human:${gateId}`,
+    reason: "waiting on a human 3h: needs a design call",
+    since: NOW - 3 * HOUR,
+    ageMs: 3 * HOUR,
+    gateId,
+  });
+
+  it("drops the job a gate poison-parked — one wait must not raise two escalations", () => {
+    // A gate hung after the job was queued parks it on that gate, so both detectors see the SAME
+    // stall. Reported twice, resolve-and-resume settles only the gate row and leaves the "retries
+    // spent" one open as a false failure with a stale Abandon on it.
+    const findings = [
+      ...detectExhaustedJobs([blockedPark("g-1")], 3, NOW),
+      gateWait("g-1"),
+    ];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["needs-human"]);
+  });
+
+  it("keeps a job also held by an ordinary prerequisite — answering the gate won't free it", () => {
+    const findings = [
+      ...detectExhaustedJobs([blockedPark("g-1", "anton-dep")], 3, NOW),
+      gateWait("g-1"),
+    ];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual([
+      "exhausted-job",
+      "needs-human",
+    ]);
+  });
+
+  it("keeps a job blocked by a DIFFERENT gate than the one waiting on a human", () => {
+    const findings = [...detectExhaustedJobs([blockedPark("g-2")], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings)).toHaveLength(2);
+  });
+
+  it("keeps every other poison park — only a blocker refusal is the gate's own wait", () => {
+    const other = job("j-2", {
+      attempts: 1,
+      lastError: `${POISON_PARK_PREFIX} agent 'svelte' is disabled for this project`,
+    });
+    const findings = [...detectExhaustedJobs([other], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings)).toHaveLength(2);
+  });
+
+  it("reports the blocked job again once the gate is gone — nothing else surfaces it", () => {
+    // The mirror case: a gate resolved off-board (`bd gate resolve`) with no resume leaves the job
+    // parked, and with no gate wait left to speak for it the finding has to come back.
+    const findings = detectExhaustedJobs([blockedPark("g-1")], 3, NOW);
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["exhausted-job"]);
+  });
+
+  /** The park a run takes when it ARMED a human gate for its own ask (anton-287p). */
+  function armedAskPark(gateId: string, held: string[] = []): JobRow {
+    return job("j-1", {
+      attempts: 1,
+      lastError:
+        `${POISON_PARK_PREFIX} t-1 needs a human: the staging DB password has to be rotated. ` +
+        parkedOnGateClause(gateId, held),
+    });
+  }
+
+  it("drops the job an ARMED ask parked — asking a person is not a permanent failure", () => {
+    // Every successful needs-human park books a poison job beside the gate it just armed (PR #205
+    // review). Reported as well as the gate, one question to the operator arrives twice: once as
+    // the wait they answer, once as an exhausted job claiming the run failed for good.
+    const findings = [...detectExhaustedJobs([armedAskPark("g-1")], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["needs-human"]);
+  });
+
+  it("keeps an armed-ask park whose gate is no longer open — the run is stuck with nothing to answer", () => {
+    const findings = [...detectExhaustedJobs([armedAskPark("g-2")], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual([
+      "exhausted-job",
+      "needs-human",
+    ]);
+  });
+
+  it("drops an armed ask whose own gate was answered while a manual hold still blocks the target", () => {
+    // Resolving anton's gate first doesn't resume the run — the person's own gate still blocks the
+    // target — so the park is still that wait, not a permanent failure (PR #205 review).
+    const findings = [
+      ...detectExhaustedJobs([armedAskPark("g-1", ["g-2"])], 3, NOW),
+      gateWait("g-2"),
+    ];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["needs-human"]);
+  });
+
+  it("reports an armed ask once EVERY gate it names is answered — nothing else surfaces it", () => {
+    const findings = [
+      ...detectExhaustedJobs([armedAskPark("g-1", ["g-2"])], 3, NOW),
+      gateWait("g-9"),
+    ];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual([
+      "exhausted-job",
+      "needs-human",
+    ]);
+  });
+});
+
+describe("sweepOutcome", () => {
+  it("calls a complete sweep with nothing wrong a clean bill of health", () => {
+    expect(sweepOutcome(0, 0)).toEqual({ changed: false, note: "no stalls found" });
+  });
+
+  it("refuses to claim 'no stalls' for a sweep that never checked every PR", () => {
+    // A `gh` read that failed (unauthenticated, rate-limited) means that PR was never checked for
+    // staleness — reporting the pass as clean would be a false all-clear.
+    const effect = sweepOutcome(0, 2);
+    expect(effect.changed).toBe(false);
+    expect(effect.note).toContain("partial sweep");
+    expect(effect.note).toContain("2 PR check(s) skipped");
+  });
+
+  it("carries the skipped count beside the findings a partial sweep did produce", () => {
+    expect(sweepOutcome(3, 1)).toEqual({
+      changed: true,
+      note: "3 finding(s); 1 PR check(s) skipped",
+    });
+  });
+
+  it("says nothing about skips when there were none", () => {
+    expect(sweepOutcome(3, 0)).toEqual({ changed: true, note: "3 finding(s)" });
   });
 });

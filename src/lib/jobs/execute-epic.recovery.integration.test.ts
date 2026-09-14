@@ -10,11 +10,15 @@
  * files (anton-0oi).
  */
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beads } from "../beads/bd";
+import { proposalFingerprint } from "../gardener/detections";
+import { worktreePathFor } from "../git/worktree";
 import * as schema from "../db/schema";
 import { resetOperatorCache } from "../operator";
+import { updateRun } from "../runs";
 import { describeBd } from "@/lib/testing/integration";
 import { expectJobStatus } from "@/lib/testing/jobs";
 import {
@@ -161,6 +165,79 @@ process.exit(0);`,
     expect(
       (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === choreId),
     ).toBeUndefined();
+  });
+
+  it("refuses a forced dispatch of an agent:human target, terminally and by name", async () => {
+    // anton-mv70: the claimable set already excludes `agent:human`, but a Force run (or a job queued
+    // before the label landed) can still reach the handler. Routing it would hand a credential /
+    // purchase / taste call to the DEFAULT agent, so the run must park on the FIRST attempt —
+    // no retry budget is spent on work no agent can do.
+    const humanId = createTicket(repo, {
+      title: "Register the production domain",
+      type: "task",
+      labels: ["agent:human"],
+    });
+    await beads.approve(repo, humanId);
+
+    const runner = makeEpicRunner(ctx);
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: humanId });
+
+    const job = await expectJobStatus(tdb.db, jobId, "parked");
+    expect(job.lastError).toContain(humanId);
+    expect(job.lastError).toContain("agent:human");
+    expect(job.lastError).toMatch(/person executes/i);
+    // Terminal, not a retry: poison parks immediately instead of burning `maxAttempts`.
+    expect(job.attempts).toBe(1);
+    // Pre-flight gate: no run row, no claim, no agent session, and the bead is left for its person.
+    expect(
+      (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === humanId),
+    ).toBeUndefined();
+    expect(await tdb.db.select().from(schema.sessions)).toHaveLength(0);
+    const bead = await beads.show(repo, humanId);
+    expect(bead.status).not.toBe("closed");
+    expect(bead.assignee ?? null).toBeNull();
+  });
+
+  it("refuses a PROPOSAL target terminally, before any worktree exists (anton-x37c)", async () => {
+    // A proposal is a decision about the board, not work on it — anton files one as a parentless
+    // task carrying a full contract, so it reads as an ordinary run target to every gate but this
+    // one. Reaching the runner at all means a Force run or an enqueue that predates the label; what
+    // must NOT follow is a worktree and an agent dispatched to "implement" a move anton applies
+    // itself the moment a person approves it.
+    const fingerprint = proposalFingerprint("stale", "t9");
+    const proposalId = createTicket(repo, {
+      title: "Retire anton-t9 — untouched for 90 days",
+      type: "task",
+      labels: [fingerprint],
+    });
+    await beads.approve(repo, proposalId);
+
+    const runner = makeEpicRunner(ctx);
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: proposalId });
+
+    const job = await expectJobStatus(tdb.db, jobId, "parked");
+    expect(job.lastError).toContain(proposalId);
+    expect(job.lastError).toContain(fingerprint);
+    expect(job.lastError).toMatch(/proposal, not work/i);
+    // Terminal, not a retry: no number of attempts turns a decision into work.
+    expect(job.attempts).toBe(1);
+    // Pre-flight: no run row, no worktree on disk or in git's list, no session, and the proposal is
+    // left exactly as its founder will find it.
+    expect(
+      (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === proposalId),
+    ).toBeUndefined();
+    expect(execFileSync("git", ["worktree", "list"], { cwd: repo, encoding: "utf8" })).not.toContain(
+      proposalId,
+    );
+    expect(existsSync(worktreePathFor(repo, `anton/${proposalId}`))).toBe(false);
+    expect(await tdb.db.select().from(schema.sessions)).toHaveLength(0);
+    const bead = await beads.show(repo, proposalId);
+    expect(bead.status).toBe("open");
+    expect(bead.assignee ?? null).toBeNull();
   });
 
   it("poison-parks a CONTAINER epic — one with feature children — naming why, and never starts a run", async () => {
@@ -426,6 +503,13 @@ process.exit(0);`),
       const run3 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic3)!;
       expect(run3.status).toBe("parked");
       expect(existsSync(run3.worktreePath!)).toBe(true);
+      // The run names the job behind it (anton-rgso): that id is what a later cancel of this parked
+      // job is matched on, however long after the park the operator gets to it.
+      expect(run3.jobId).toBe(jobId);
+      // A score this attempt earned before it parked. The resume reuses this row, so it must not
+      // survive into the next attempt — the score breaker reads one score per row and would judge
+      // an attempt that never reached review on a number it never earned.
+      await updateRun(tdb.db, clock, run3.id, { reviewScore: 4 });
 
       // Exactly one ticket closed before the park; the other is still open.
       const statusAtPark = {
@@ -455,6 +539,11 @@ process.exit(0);`),
       expect(run3b[0].id).toBe(run3.id);
       expect(run3b[0].worktreePath).toBe(run3.worktreePath); // same worktree reused
       expect(run3b[0].status).toBe("done");
+      // The gate is off in this fixture, so this attempt earned no score — and the parked row's
+      // stale one was cleared rather than inherited.
+      expect(run3b[0].reviewScore).toBeNull();
+      // The resume rewrote it to the job that carried the attempt — here the same rescheduled row.
+      expect(run3b[0].jobId).toBe(jobId);
 
       // Both tickets closed; the already-closed ticket was SKIPPED on resume (invoked once total),
       // while the previously-quota'd ticket was invoked twice (quota + resumed success).

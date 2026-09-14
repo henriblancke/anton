@@ -41,8 +41,19 @@ export type SignalClass = (typeof SIGNAL_CLASSES)[number];
 export interface ScanSignal {
   Source?: string | null;
   source?: string | null;
+  /** Repo-relative path the finding is about; absent for a signal that isn't about one file. */
+  FilePath?: string | null;
+  filePath?: string | null;
+  /** 1-based line the finding starts at; 0 when the collector is about the file as a whole. */
+  Line?: number | null;
+  line?: number | null;
   Kind?: string | null;
   kind?: string | null;
+  /** The one-line finding, as stringer phrases it — some collectors put the whole claim in it. */
+  Title?: string | null;
+  title?: string | null;
+  Description?: string | null;
+  description?: string | null;
   Priority?: number | string | null;
   priority?: number | string | null;
   /** Not emitted today; read first if a future stringer adds it, rather than guessing around it. */
@@ -52,8 +63,13 @@ export interface ScanSignal {
   tags?: string[] | null;
 }
 
-/** Anything that reads as a leaked credential, wherever it was found. */
-const SECRET_PATTERN = /secret|credential|password|private[-_]?key|api[-_]?key/i;
+/**
+ * Anything that reads as a leaked credential, wherever it was found. Exported so the fixture-secret
+ * filter (lib/scan-secrets) selects exactly the signals this file classes as `security` — two
+ * readings of "is this a secret" that drifted apart would leave the filter clearing signals the
+ * health record never counted as secrets, or missing the ones it did.
+ */
+export const SECRET_PATTERN = /secret|credential|password|private[-_]?key|api[-_]?key/i;
 
 /** Which class each stringer collector reports on (`stringer collectors list`). */
 const CLASS_BY_COLLECTOR: Record<string, SignalClass> = {

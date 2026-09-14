@@ -104,49 +104,65 @@ export function formatReviewScoreComment(entry: ReviewScoreEntry): string {
  * Called on every exit the gate RETURNS from — the PR path and the park path — because a run parked
  * on blocking findings is precisely the one whose score the founder needs on the board. The exit it
  * cannot cover is the one that throws; {@link persistPartialReviewScores} is that path.
+ *
+ * Returns the score this attempt earned, which its caller stamps on the run row.
  */
 export async function persistReviewScores(
   repo: string,
   targetId: string,
   result: ReviewGateResult,
-): Promise<void> {
+): Promise<number | undefined> {
   return persistEntries(repo, targetId, reviewScoreEntries(result));
 }
 
 /**
  * Persist the rounds of a gate that THREW — poison or retryable — so a mid-flight death still leaves
- * its history on the board rather than only in the run log.
+ * its history on the board rather than only in the run log. Returns that attempt's score, if any of
+ * its finished rounds reported one.
  */
 export async function persistPartialReviewScores(
   repo: string,
   targetId: string,
   rounds: ReviewRound[],
-): Promise<void> {
-  if (rounds.length === 0) return;
+): Promise<number | undefined> {
+  if (rounds.length === 0) return undefined;
   return persistEntries(repo, targetId, partialReviewScoreEntries(rounds));
 }
 
+/**
+ * The score this attempt earned: the last round that actually reported one. A final protocol
+ * violation must not erase the score the round before it earned, and must not invent one of its own.
+ */
+function latestReviewScore(entries: readonly ReviewScoreEntry[]): number | undefined {
+  return [...entries].reverse().find((e) => e.score !== undefined)?.score;
+}
+
+/**
+ * Writes the board history and returns the attempt's score — returned rather than only written,
+ * because the RUN row records it too (anton-cekf): the board label is the target's latest score
+ * across every attempt, so the score-regression breaker needs the one this attempt produced, and
+ * needs it even on the pass where the best-effort board write did not land.
+ */
 async function persistEntries(
   repo: string,
   targetId: string,
   entries: ReviewScoreEntry[],
-): Promise<void> {
+): Promise<number | undefined> {
   for (const entry of entries) {
     await safeWrite(`round ${entry.round} comment`, targetId, () =>
       beads.comment(repo, targetId, formatReviewScoreComment(entry)),
     );
   }
 
-  // The latest score is the last round that actually reported one: a final protocol violation must
-  // not erase the score the round before it earned, and must not invent one of its own.
-  const latest = [...entries].reverse().find((e) => e.score !== undefined)?.score;
-  if (latest === undefined) return;
+  const latest = latestReviewScore(entries);
+  if (latest === undefined) return undefined;
   await safeWrite("score label", targetId, async () => {
     // A failed read costs the prefix-diff, not the label: an extra `review-score:*` reads ambiguous
     // until the next round rewrites it, which is far cheaper than losing the latest score entirely.
     const bead = await beads.show(repo, targetId).catch(() => undefined);
     await beads.setReviewScore(repo, targetId, latest, bead ? beads.reviewScoreLabels(bead) : []);
   });
+  return latest;
 }
 
 async function safeWrite(what: string, targetId: string, fn: () => Promise<unknown>): Promise<void> {

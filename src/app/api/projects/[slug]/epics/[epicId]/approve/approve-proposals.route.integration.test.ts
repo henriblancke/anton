@@ -18,7 +18,7 @@
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { setupApproveSuite, type ApproveSuiteCtx } from "../approve.fixture";
-import { describeBd } from "@/lib/testing/integration";
+import { describeBd, nextBdSecond } from "@/lib/testing/integration";
 import { resetIssueSnapshots } from "@/lib/beads/snapshot";
 import { makeDetection, type DetectionInput } from "@/lib/gardener/detections";
 import { proposalDraft } from "@/lib/gardener/emit";
@@ -32,25 +32,6 @@ let beads: ApproveSuiteCtx["beads"];
 
 describeBd("POST approve — gardener proposals apply their move (temp anton.db + real bd)", () => {
   /**
-   * Wait until every write already made carries a stamp STRICTLY BELOW the current second. bd stamps
-   * at one-second resolution, so a subject stamped in the same second the proposal was filed cannot
-   * be ordered against it, and every retirement then fails closed on "carries no write stamp this
-   * proposal's filing can be ordered against" (apply.ts `writtenSinceFiling`). A real patrol files
-   * hours after the writes it judges; only a fixture is fast enough to collide, so the wait belongs
-   * here — not in a looser rule.
-   *
-   * bd ROUNDS to that grid rather than truncating: a write landing at `S.6` is stamped `S+1`, a
-   * second AHEAD of the clock it landed on. So clearing the boundary is not enough — waiting to
-   * `S+1.05` leaves a subject written at `S.6` sharing the filing's second, which is exactly the tie
-   * this exists to avoid (it flaked CI ~1 run in 4). The target second is therefore taken from the
-   * highest stamp a completed write can already hold, `round(now)`, not from `now`.
-   */
-  const nextSecond = (): Promise<void> => {
-    const settled = Math.round(Date.now() / 1_000) * 1_000; // the latest stamp prior writes can carry
-    return new Promise((resolve) => setTimeout(resolve, settled + 1_050 - Date.now()));
-  };
-
-  /**
    * File a proposal the way the patrol would: the emitter's own draft, created through the seam.
    * `observedAtMs` is when the board the detection judged was READ — passed only by the case that
    * proves it fences separately from the bead's own creation stamp.
@@ -59,7 +40,7 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
     input: DetectionInput,
     observedAtMs?: number,
   ): Promise<{ id: string; fingerprint: string }> => {
-    await nextSecond(); // the subjects were just written — see nextSecond
+    await nextBdSecond(); // the subjects were just written — see nextBdSecond
     const detection = makeDetection(input);
     const id = await beads.create(repo, proposalDraft(detection, observedAtMs));
     return { id, fingerprint: detection.fingerprint };
@@ -91,10 +72,33 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
     resetIssueSnapshots();
   });
 
+  // The subjects state a SUBJECT with the card and the card already carries a ticket, because that
+  // is what makes a cluster proposal applyable at all: approving one re-derives the detector's own
+  // grouping over the survivors (`regroupSurvivors`) and re-asks the container bar on the home
+  // (`homeStoppedCarrying`). A board of "Loose one"/"Loose two" beads under an empty card could
+  // never have produced this proposal, so approving it would (rightly) refuse.
   it("re-parents a cluster under its card, and settles the proposal with what changed", async () => {
-    const card = await beads.create(repo, { title: "The home", type: "feature", acceptance: "- [ ] a" });
-    const one = await beads.create(repo, { title: "Loose one", type: "task", acceptance: "- [ ] a" });
-    const two = await beads.create(repo, { title: "Loose two", type: "task", acceptance: "- [ ] a" });
+    const card = await beads.create(repo, {
+      title: "Escalation banner rollout",
+      type: "feature",
+      acceptance: "- [ ] a",
+    });
+    await beads.create(repo, {
+      title: "Escalation banner shell",
+      type: "task",
+      acceptance: "- [ ] a",
+      deps: [`parent-child:${card}`],
+    });
+    const one = await beads.create(repo, {
+      title: "Escalation banner copy",
+      type: "task",
+      acceptance: "- [ ] a",
+    });
+    const two = await beads.create(repo, {
+      title: "Escalation banner timing",
+      type: "task",
+      acceptance: "- [ ] a",
+    });
     const proposal = await file({
       kind: "parentless-cluster",
       move: "reparent",
@@ -254,6 +258,39 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
     expect(String(still.notes ?? "")).toContain("apply FAILED");
   });
 
+  /**
+   * The OTHER end of the move, and the one nothing re-checked before anton-9hpp: a target validated
+   * when the patrol ran, then read by a human days later. Two cluster proposals named cards that had
+   * closed in between; approving either would have parented open work under a shipped feature.
+   */
+  it("refuses a re-parent whose target closed after the proposal was filed", async () => {
+    const card = await beads.create(repo, { title: "Doomed home", type: "feature", acceptance: "- [ ] a" });
+    const one = await beads.create(repo, { title: "Loose alpha", type: "task", acceptance: "- [ ] a" });
+    const two = await beads.create(repo, { title: "Loose beta", type: "task", acceptance: "- [ ] a" });
+    const proposal = await file({
+      kind: "parentless-cluster",
+      move: "reparent",
+      subjects: [one, two],
+      target: card,
+      summary: "two loose beads belong under the card",
+      evidence: ["they state the card's subject"],
+    });
+    await beads.close(repo, card);
+    resetIssueSnapshots();
+
+    const res = await approve(proposal.id);
+    const body = (await res.json()) as { error?: string };
+
+    // A refusal an approver can read, not a 500 — and not a move onto a shipped card.
+    expect(res.status).toBe(409);
+    expect(body.error).toContain(card);
+    expect(body.error).toMatch(/hang it off a card nothing will run/);
+    expect(beads.parentOf(await show(one))).toBeUndefined();
+    expect(beads.parentOf(await show(two))).toBeUndefined();
+    expect((await show(proposal.id)).status).toBe("open");
+    expect(await notesOf(proposal.id)).toContain("apply FAILED");
+  });
+
   // The filing→approval window a live board is the only place to prove: `bd update --claim` writes
   // the assignee and in_progress with NO run-lease behind it, so the bead reads as free work to
   // every liveness signal the approval consults. What dates it as news is bd's own write stamp
@@ -295,15 +332,15 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
   it("refuses a subject edited after the board snapshot but before the proposal was created", async () => {
     const ticket = await beads.create(repo, { title: "Rescoped mid-pass", type: "task", acceptance: "- [ ] a" });
 
-    await nextSecond();
+    await nextBdSecond();
     const observedAtMs = Date.now(); // the patrol reads the board here…
 
-    await nextSecond();
+    await nextBdSecond();
     // …somebody rescopes the subject here. A description edit, because that is what bd's own write
     // stamp moves — the fact every premise check downstream reads.
     await beads.update(repo, ticket, { description: "Goal: actually, there is more to do here." });
 
-    await nextSecond();
+    await nextBdSecond();
     const proposal = await file(
       {
         kind: "stale",

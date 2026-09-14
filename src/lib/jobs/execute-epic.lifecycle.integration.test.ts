@@ -10,12 +10,13 @@
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { beads } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
+import { findWorktree } from "../git/worktree";
 import { epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob } from "./queue";
@@ -28,6 +29,7 @@ import {
   resetPerCaseState,
   HUMAN_NOTE,
   FakeClock,
+  fakeClaudeReadingStdin,
   writeBin,
   createExecuteEpicSandbox,
   createTicket,
@@ -139,12 +141,24 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
 
     // Two execute sessions recorded + logged.
     const sessions = await tdb.db.select().from(schema.sessions);
-    expect(sessions).toHaveLength(2);
-    expect(sessions.every((s) => s.status === "done" && s.kind === "execute")).toBe(true);
-    for (const s of sessions) {
+    const executeSessions = sessions.filter((s) => s.kind === "execute");
+    expect(executeSessions).toHaveLength(2);
+    expect(executeSessions.every((s) => s.status === "done")).toBe(true);
+    for (const s of executeSessions) {
       expect(existsSync(s.logPath!)).toBe(true);
       expect(readFileSync(s.logPath!, "utf8")).toContain("[result]");
     }
+
+    // …and the run's teardown accounted for what it handed back (anton-hrun.1): the worktree is
+    // released, the branch is kept because the PR is built on it, and the log says both.
+    const teardown = sessions.filter((s) => s.kind === "worktree-reaper");
+    expect(teardown).toHaveLength(1);
+    const teardownLog = readFileSync(teardown[0].logPath!, "utf8");
+    expect(teardownLog).toContain(
+      `released worktree ${join(realpathSync(sandbox), "worktrees", `anton-${epicId}`)}`,
+    );
+    expect(teardownLog).toContain(`kept branch anton/${epicId}`);
+    expect(await findWorktree(repo, `anton/${epicId}`)).toBeNull();
 
     // Composed system prompt reached claude for BOTH tickets: locked base + operator seed on
     // every invocation, and the agent layer only for the agent-tagged ticket (t1: agent:nextjs).
@@ -236,6 +250,57 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     expect(sessions).toHaveLength(1);
   });
 
+  it("CLAIMS its checkout for the whole run, so a second anton process cannot reap it mid-run", async () => {
+    // A run's occupancy is invisible outside this process (anton-hrun.1): a second anton over the
+    // same repository judges residue from ITS OWN run rows and the board, both of which say the bead
+    // is merely open — which reads as "release the worktree" — and would force-remove this run's
+    // checkout with its uncommitted work in it. The `git worktree lock` the claim installs is the one
+    // piece of evidence that crosses the process boundary, so it must be on the checkout for as long
+    // as claude is executing in it, and off it again by the time the run's own teardown removes it.
+    const bugId = await beads.create(repo, {
+      title: "Claim the checkout for the run",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the run holds its checkout.",
+    });
+    await beads.approve(repo, bugId);
+
+    // What a second anton would read: git's own view of the checkout, taken from inside it while
+    // claude is running.
+    const dump = join(sandbox, "claim-during-run.txt");
+    const claimClaude = writeBin(
+      binDir,
+      "claude-claimdump",
+      fakeClaudeReadingStdin(`fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+'\\n');
+fs.writeFileSync(${JSON.stringify(dump)},require('child_process').execFileSync('git',['worktree','list','--porcelain'],{cwd:process.cwd(),encoding:'utf8'}));
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'scl'});
+e({type:'assistant',message:{content:[{type:'text',text:'implemented'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'scl',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claimClaude;
+    try {
+      await driveEpicRun(runner, { projectId, epicBeadId: bugId });
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+
+    const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === bugId)!;
+    expect(run.status).toBe("done");
+    // Locked, by THIS run, while it was executing — pid and all, which is what lets a second anton
+    // tell a live claim from a crashed one's leftovers.
+    expect(readFileSync(dump, "utf8")).toContain(
+      `locked anton-claim execute-epic#${run.id} pid=${process.pid}`,
+    );
+    // …and given back before the teardown, which force-removes the checkout — an operation the
+    // run's own live claim would otherwise refuse, leaking the worktree until anton restarts.
+    expect(existsSync(run.worktreePath!)).toBe(false);
+    expect(await findWorktree(repo, `anton/${bugId}`)).toBeNull();
+  });
+
   it("standalone PR-step failure: stays OPEN + in-review, then resumes at the PR step without re-running claude", async () => {
     // anton-cmz review (both threads): a standalone is never closed by execute-epic — it stays
     // OPEN + stage:in-review + PR ref until its PR merges. If push/`gh pr create` fails AFTER the
@@ -279,6 +344,17 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
         (s) => s.beadId === bugId,
       );
       expect(sessionsAfter1).toHaveLength(1);
+
+      // anton-hrun.1: a run that FAILS releases its worktree exactly like one that delivers —
+      // before this, only the success path tore anything down and every failure leaked a checkout.
+      // The branch stays: the bead is still open, so the work is not finished with it.
+      expect(await findWorktree(repo, `anton/${bugId}`)).toBeNull();
+      expect(existsSync(join(sandbox, "worktrees", `anton-${bugId}`))).toBe(false);
+      expect(
+        execFileSync("git", ["-C", repo, "branch", "--list", `anton/${bugId}`], {
+          encoding: "utf8",
+        }).trim(),
+      ).not.toBe("");
 
       // Resume with a working gh. The retry must skip the already-committed ticket (resume marker)
       // and pick up at the PR step — no second claude session, one PR opened.
@@ -440,6 +516,52 @@ process.exit(0);`,
     const after = await beads.show(repo, bugId);
     expect(beads.runLeaseLabels(after)).toEqual([]);
     expect(beads.getPrRef(after)).toBe("gh-77");
+  });
+
+  it("hands back the leftover BRANCH on the PR-ref short-circuit when the checkout is already gone", async () => {
+    // anton-hrun.1 review (thread PRRT_kwDOTWcq8c6dfU5B): the prior attempt already tore its
+    // worktree down, so the only residue left is the run branch that carried the PR. A later
+    // shortcut that finds the PR merged and the target closed owes that branch back — the teardown
+    // takes a synthetic descriptor for branch-only residue, so cleanup must not be conditional on a
+    // checkout still existing, or the branch lingers until a scheduled sweep happens to catch it.
+    const bugId = await beads.create(repo, {
+      title: "Merged, checkout already gone",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve branch-only teardown on the idempotent path.",
+    });
+    await beads.approve(repo, bugId);
+    await beads.setPrRef(repo, bugId, "gh-91");
+    await beads.close(repo, bugId, "merged");
+    await beads.sync(repo);
+    const branch = `anton/${bugId}`;
+    execFileSync("git", ["-C", repo, "branch", branch]);
+    expect(await findWorktree(repo, branch)).toBeNull(); // branch-only residue: no checkout left
+
+    // gh reports the PR MERGED and no open PR on the branch — the state that lets the teardown take
+    // the branch. `pr create` booms so a fall-through to the PR step fails instead of short-circuiting.
+    const mergedGh = writeBin(
+      binDir,
+      "gh-merged-hrun",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'MERGED',url:'https://github.com/acme/repo/pull/91',number:91})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = mergedGh;
+    try {
+      const job = await driveEpicRun(makeEpicRunner(ctx), { projectId, epicBeadId: bugId });
+      expect((await getJob(tdb.db, job))?.status).toBe("done");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+
+    const branchesNow = execFileSync("git", ["-C", repo, "branch", "--list", branch], {
+      encoding: "utf8",
+    });
+    expect(branchesNow.trim()).toBe(""); // the branch was released, not left for the daily sweep
   });
 
   it("retries (does not false-complete) when a target's PR ref state can't be read", async () => {

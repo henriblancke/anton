@@ -180,6 +180,19 @@ describe("ReworkDialog", () => {
     );
   });
 
+  it("says the findings are loading rather than claiming the review left none", async () => {
+    // "No findings" is a verdict on the review; showing it while the read is still in flight tells
+    // the founder there is nothing to tick when there may be plenty.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>(() => {})),
+    );
+    open();
+
+    expect(screen.getByText("Loading findings…")).toBeTruthy();
+    expect(screen.queryByText(/left no findings/)).toBeNull();
+  });
+
   it("uses the report the page already loaded instead of reading it again (anton-tprv)", async () => {
     // The epic page holds the same report for its score series; a second hydrated read per dialog
     // open would be pure duplication.

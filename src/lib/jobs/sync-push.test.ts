@@ -5,14 +5,15 @@
  * heartbeat backstop share one per-repo coalescer, so they can never overlap.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeTestDb, type TestDb } from "../db/testing";
-import * as schema from "../db/schema";
-import { createDoltSync, type SyncOutcome } from "../beads/bd";
+import type { TestDb } from "../db/testing";
+import { type SyncOutcome } from "../beads/bd";
+import { createDoltSync } from "../beads/sync-coalescer";
 import { PoisonError, SyncNotWiredError } from "./errors";
 import { enqueueSyncPushDeduped, getJob, type Clock } from "./queue";
 import { JobRunner, type JobContext, type RunnerConfig } from "./runner";
 import { DEFAULT_CONFIG } from "./runner";
 import { makeSyncPushHandler } from "./sync-push";
+import { makeProjectDb } from "@/lib/testing/project";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -32,18 +33,16 @@ function fakeCtx(over: Partial<JobContext> & { payload: unknown }): JobContext {
     attempt: 1,
     heartbeat: async () => {},
     report: () => {},
+    claudeReached: async () => {},
     signal: new AbortController().signal,
+    enqueueReviewFixPr: () => undefined,
     ...over,
   };
 }
 
 let t: TestDb;
 beforeEach(() => {
-  t = makeTestDb();
-  t.db
-    .insert(schema.projects)
-    .values({ id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" })
-    .run();
+  t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" });
 });
 afterEach(() => t.close());
 

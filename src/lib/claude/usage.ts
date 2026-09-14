@@ -21,6 +21,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
+import type { UsageSnapshot } from "@/lib/usage";
+
 const execFileAsync = promisify(execFile);
 
 /** Kill switch: usage fetching is on by default; set this env var falsy to turn the pill dark. */
@@ -79,19 +81,12 @@ export function backoffMsFor(retryAfter: string | null, now: () => number = Date
   return Math.max(MIN_BACKOFF_MS, hint && hint > 0 ? hint : DEFAULT_BACKOFF_MS);
 }
 
-/** Normalized usage snapshot the pill consumes. `null` when a limit is absent for the tier. */
-export interface ClaudeUsage {
-  /** Current 5-hour session utilization, 0–100 percent. */
-  sessionPct: number;
-  /** Current week (all models) utilization, 0–100 percent. */
-  weeklyPct: number;
-  /** ISO-8601 timestamp the session limit resets, or null if unknown. */
-  sessionResetAt: string | null;
-  /** ISO-8601 timestamp the weekly limit resets, or null if unknown. */
-  weeklyResetAt: string | null;
-  /** Subscription plan (`max` / `pro` / …), or null if unknown. */
-  plan: string | null;
-}
+/**
+ * Normalized usage snapshot the pill consumes — the client-safe {@link UsageSnapshot} under this
+ * module's name (anton-mw7q). Aliased, not re-declared: the pill's thresholds and `GET /api/usage`
+ * must not be able to drift apart. The dependency points server → client-safe; never the reverse.
+ */
+export type ClaudeUsage = UsageSnapshot;
 
 /**
  * True when the usage pill is switched on for this deployment. On by default; only an explicit

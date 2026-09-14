@@ -3,20 +3,22 @@
  * their job when due and advance lastRun/nextRun; disabled ones never fire; a bad cron doesn't
  * wedge the loop. Uses a fake clock so "due" is deterministic.
  */
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { eq } from "drizzle-orm";
-import type { Clock } from "./queue";
+import { toMs, type Clock } from "./queue";
 import { Scheduler } from "./scheduler";
 import {
   backfillDefaultSchedules,
   createSchedule,
   DEFAULT_SCHEDULES,
   ensureSchedule,
+  runScheduleNow,
   seedDefaultSchedules,
   updateSchedule,
 } from "../schedules";
+import { insertProject } from "@/lib/testing/project";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -28,14 +30,8 @@ class FakeClock implements Clock {
   }
 }
 
-async function seedProject(tdb: TestDb, id = "p1"): Promise<string> {
-  await tdb.db.insert(schema.projects).values({
-    id,
-    slug: id,
-    name: id,
-    repoPath: `/tmp/${id}`,
-  });
-  return id;
+function seedProject(tdb: TestDb, id = "p1"): string {
+  return insertProject(tdb.db, { id, slug: id, name: id, repoPath: `/tmp/${id}` });
 }
 
 function jobsFor(tdb: TestDb, projectId: string) {
@@ -51,7 +47,7 @@ describe("Scheduler.tickOnce", () => {
   beforeEach(async () => {
     tdb = makeTestDb();
     clock = new FakeClock(base);
-    await seedProject(tdb);
+    seedProject(tdb);
   });
 
   it("enqueues a due schedule and advances lastRun/nextRun", async () => {
@@ -81,6 +77,25 @@ describe("Scheduler.tickOnce", () => {
     const next = row.nextRunAt as Date;
     expect(next.getDate()).toBe(12);
     expect(next.getHours()).toBe(3);
+  });
+
+  it("stamps lastRunAt from the enqueued job's own createdAt, in one write", async () => {
+    // The Automation table pairs a fire with its outcome by matching the job's enqueue time against
+    // this stamp, so the two must be written together and from one instant: a job newer than the
+    // stamp would show its verdict beside an earlier fire's date (anton-znoz review).
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "nightly-stringer",
+      cron: "0 3 * * *",
+    });
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    clock.set(new Date(2026, 6, 11, 3, 0, 0, 0).getTime());
+    expect(await sched.tickOnce()).toBe(1);
+
+    const job = jobsFor(tdb, "p1")[0];
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect(toMs(row.lastRunAt)).toBe(toMs(job.createdAt));
   });
 
   it("does not double-enqueue on a second tick before the next slot", async () => {
@@ -143,6 +158,166 @@ describe("Scheduler.tickOnce", () => {
     expect(await sched.tickOnce()).toBe(1);
   });
 
+  /**
+   * PR #264 review: the `inflightKeys` snapshot above is ONE `await`ed read for the whole tick,
+   * taken before any per-schedule transaction. A manual "Run now" fire (schedules.ts's
+   * runScheduleNow) that lands after that snapshot but before this schedule's own insert would be
+   * invisible to it — without a fresh re-check made INSIDE the insert's own transaction, this tick
+   * would insert a second active job for the same (type, project) instead of coalescing onto the
+   * manual one. Proves the tick absorbs that race cleanly: no throw, no duplicate row, nextRunAt
+   * still advances so the slot is not retried forever.
+   */
+  it("absorbs a manual fire that lands in the snapshot-to-insert gap (PR #264 review)", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "nightly-stringer",
+      cron: "0 3 * * *",
+    });
+    clock.set(new Date(2026, 6, 11, 3, 0, 0, 0).getTime());
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    // Simulate the race: the tick's inflight snapshot reads an EMPTY set (nothing in flight yet),
+    // but a concurrent manual fire lands and commits its own job before this tick reaches its insert.
+    const select = tdb.db.select.bind(tdb.db);
+    let injected = false;
+    const selects = vi.spyOn(tdb.db, "select").mockImplementation(((
+      columns?: Record<string, unknown>,
+    ) => {
+      if (!injected && columns && "type" in columns && "projectId" in columns) {
+        injected = true;
+        // Runs synchronously, landing between the tick's batch snapshot and its later per-schedule
+        // insert — exactly the gap the fresh re-check inside that insert's transaction now closes.
+        void runScheduleNow(tdb.db, clock, id);
+      }
+      return select(columns as never);
+    }) as typeof tdb.db.select);
+
+    let count: number;
+    try {
+      count = await sched.tickOnce();
+    } finally {
+      selects.mockRestore();
+    }
+
+    expect(injected).toBe(true);
+    // The tick's own insert lost the race and was absorbed — only the manual fire's job exists.
+    expect(count).toBe(0);
+    expect(jobsFor(tdb, "p1").filter((j) => j.type === "nightly-stringer")).toHaveLength(1);
+    // nextRunAt still advanced, so this slot is not retried forever.
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect((row.nextRunAt as Date).getTime()).toBeGreaterThan(clock.now());
+  });
+
+  /**
+   * PR #264 review: the still-in-flight branch's `nextRunAt` write is computed from the `s.cron`
+   * the batch `due`-query snapshot read at the top of the tick. If an operator's settings PATCH
+   * changes the cron and lands AFTER that snapshot but BEFORE this write, an unconditional write
+   * would clobber `updateSchedule`'s own freshly-recomputed `nextRunAt` with one computed from the
+   * now-stale cron — firing the automation once more on its OLD cadence despite the successful edit.
+   * Guarding the write on cron+enabled still matching what `nextRunAt` was computed from means the
+   * PATCH's own write is left standing instead.
+   */
+  it("does not clobber a concurrent cron PATCH's nextRunAt on the in-flight-skip branch", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "review-fix",
+      cron: "*/5 * * * *",
+    });
+    await tdb.db.insert(schema.jobs).values({
+      id: "inflight-2",
+      type: "review-fix",
+      projectId: "p1",
+      status: "running",
+      payloadJson: "{}",
+    });
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    const select = tdb.db.select.bind(tdb.db);
+    let patched = false;
+    const selects = vi.spyOn(tdb.db, "select").mockImplementation(((
+      columns?: Record<string, unknown>,
+    ) => {
+      // The tick's due-query snapshot selects a bare `.select()` over schedules (no column map) —
+      // land the race right after it, before this tick reaches its own nextRunAt write.
+      if (!patched && !columns) {
+        patched = true;
+        void updateSchedule(tdb.db, clock, id, { cron: "0 0 * * *" });
+      }
+      return select(columns as never);
+    }) as typeof tdb.db.select);
+
+    clock.set(base + 5 * 60_000);
+    try {
+      expect(await sched.tickOnce()).toBe(0);
+    } finally {
+      selects.mockRestore();
+    }
+
+    expect(patched).toBe(true);
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    // The PATCH's own cron and nextRunAt stand — the tick's stale-cron write did not land.
+    expect(row.cron).toBe("0 0 * * *");
+    const expectedNextRunAt = tdb.db
+      .select({ nextRunAt: schema.schedules.nextRunAt })
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, id))
+      .get()!.nextRunAt as Date;
+    // Midnight cadence, not the every-5-minutes one the tick would have written.
+    expect(expectedNextRunAt.getMinutes()).toBe(0);
+    expect(expectedNextRunAt.getHours()).toBe(0);
+  });
+
+  /**
+   * anton-y771. The coalescing key is the job TYPE, so work the poll DISPATCHES must not suppress
+   * the poll: measured on anton's own history, 505 of 10062 review-fix jobs outlived their 15-minute
+   * slot, and with a shared type a 45-minute fix on one PR swallowed the next three polls — the ones
+   * that would have found the OTHER PRs' feedback.
+   */
+  it("does not skip a due review-fix slot for a running review-fix-pr job", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "review-fix",
+      cron: "*/5 * * * *",
+    });
+    await tdb.db.insert(schema.jobs).values({
+      id: "pr-fix-1",
+      type: "review-fix-pr",
+      projectId: "p1",
+      status: "running",
+      payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "epic-1" }),
+    });
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    clock.set(base + 5 * 60_000);
+    expect(await sched.tickOnce()).toBe(1);
+    expect(jobsFor(tdb, "p1").filter((j) => j.type === "review-fix")).toHaveLength(1);
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect((row.nextRunAt as Date).getTime()).toBeGreaterThan(clock.now());
+  });
+
+  it("still skips a due review-fix slot for an in-flight dispatcher of its own type", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "review-fix",
+      cron: "*/5 * * * *",
+    });
+    await tdb.db.insert(schema.jobs).values({
+      id: "dispatcher-1",
+      type: "review-fix",
+      projectId: "p1",
+      status: "queued",
+      payloadJson: JSON.stringify({ projectId: "p1" }),
+    });
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    clock.set(base + 5 * 60_000);
+    expect(await sched.tickOnce()).toBe(0);
+    expect(jobsFor(tdb, "p1").filter((j) => j.type === "review-fix")).toHaveLength(1);
+    // The skip costs one slot, not a re-fire the moment the in-flight pass ends.
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect((row.nextRunAt as Date).getTime()).toBeGreaterThan(clock.now());
+  });
+
   it("skips disabled schedules", async () => {
     const id = await createSchedule(tdb.db, clock, {
       projectId: "p1",
@@ -159,6 +334,31 @@ describe("Scheduler.tickOnce", () => {
     await updateSchedule(tdb.db, clock, id, { enabled: true });
     clock.set(clock.now() + 2 * 60_000);
     expect(await sched.tickOnce()).toBe(1);
+  });
+
+  /**
+   * The settings panel has two writers to one schedule row — an accepted cadence and the row's
+   * toggle — and each patch sends only its own field, so `updateSchedule` fills the other in from
+   * what it read. With the read and the write settled as one unit, the second patch reads what the
+   * first committed; interleaved, both read the same row and the loser's intent is quietly restored.
+   */
+  it("keeps both intents when a cron patch and an enabled patch race the same row", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "product-master",
+      cron: "0 6 * * 1", // weekly
+    });
+
+    await Promise.all([
+      updateSchedule(tdb.db, clock, id, { cron: "0 6 * * *" }), // raise to daily
+      updateSchedule(tdb.db, clock, id, { enabled: false }), // and switch the job off
+    ]);
+
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect(row.cron).toBe("0 6 * * *");
+    expect(row.enabled).toBe(false);
+    // Whichever order they settled in, a disabled row carries no next fire.
+    expect(row.nextRunAt).toBeNull();
   });
 
   it("collapses missed slots — one enqueue after a long sleep, not one per slot", async () => {
@@ -188,6 +388,13 @@ describe("Scheduler.tickOnce", () => {
       expect(row.enabled).toBe(enabled);
       expect(row.nextRunAt != null).toBe(enabled);
     }
+    // board-picker (anton-albm) named explicitly, not just covered by the loop above: it is the one
+    // automation that STARTS work rather than reporting on it, so a default that ever shipped armed
+    // would hand anton a standing approval the operator never gave.
+    const picker = rows.find((r) => r.type === "board-picker")!;
+    expect(picker.enabled).toBe(false);
+    expect(picker.cron).toBe("*/10 * * * *");
+    expect(picker.nextRunAt).toBeNull();
   });
 
   it("seeds once when two boots race the backfill — the read and the inserts are one transaction", async () => {
@@ -208,7 +415,7 @@ describe("Scheduler.tickOnce", () => {
     // The upgrade path: seeding runs only while inserting a project and no migration adds schedule
     // rows, so without this an installed project never gets a new automation — enabling run-health
     // would leave unstick unscheduled and its reports would pile up with nothing acting on them.
-    await seedProject(tdb, "p2");
+    seedProject(tdb, "p2");
     await createSchedule(tdb.db, clock, {
       projectId: "p1",
       type: "review-fix",

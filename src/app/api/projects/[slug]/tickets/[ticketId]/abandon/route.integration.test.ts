@@ -9,7 +9,7 @@
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
 import { resetIssueSnapshots } from "@/lib/beads/snapshot";
-import { describeBd, jsonRequest, makeBdRepo, paramsCtx, type BdRepo } from "@/lib/testing/integration";
+import { describeBd, jsonRequest, makeBdRepo, paramsCtx, tmpProject, type BdRepo } from "@/lib/testing/integration";
 import type { Project, TicketDetail } from "@/lib/types";
 
 let project: Project | null = null;
@@ -43,15 +43,7 @@ describeBd("ticket abandon route (real bd)", () => {
   beforeAll(async () => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
-    project = {
-      id: "proj-1",
-      slug: "tmp",
-      name: "tmp",
-      repoPath: repo,
-      defaultBranch: "main",
-      hasBeads: true,
-      createdAt: 0,
-    };
+    project = tmpProject(repo, { id: "proj-1" });
     epicId = await beads.create(repo, { title: "An epic", type: "epic" });
     childId = await beads.create(repo, {
       title: "Won't do this",

@@ -18,7 +18,6 @@
  *      defers the subject against real bd and settles the ask. The one pm kind that changes board
  *      state has to be proven end to end, not just through the mocked bd seam.
  */
-import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
@@ -28,17 +27,16 @@ import type { ClaudeResult } from "../claude/driver";
 import { contractGaps } from "../beads/contract";
 import { loadAllIssues } from "../beads/issues";
 import { resetIssueSnapshots } from "../beads/snapshot";
-import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { applyProposal } from "../gardener/apply";
 import { isProposalBead, proposalPlanOf } from "../gardener/detections";
 import { makeProductMasterHandler } from "./product-master";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 describeBd("product-master pass e2e (real handler · real bd)", () => {
   let repoDir: BdRepo;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let projectId: string;
   const clock: Clock = { now: () => 1_700_000_000_000 };
   const nudge = vi.fn();
@@ -57,6 +55,15 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
    * fence orders the two, and stamps landing in the same whole second cannot be ordered at all.
    */
   let doomed: string;
+  /**
+   * The misfiled trio (anton-02po), seeded for the same stamp reason as {@link doomed}: a ticket
+   * riding the card that does NOT run its surface, and the card that does. Both are real board
+   * cards, which is exactly what the gardener's re-parents refuse — a home that is wrong rather
+   * than missing is the product master's claim to make.
+   */
+  let wrongCard: string;
+  let rightCard: string;
+  let misfiled: string;
 
   /** What the stubbed session reports this pass — set per phase. */
   let reported = `{"proposals":[]}`;
@@ -122,15 +129,25 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
       labels: ["review-score:2"],
     });
 
-    tdb = makeTestDb();
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
+    wrongCard = await beads.create(repo, {
+      title: "reporting exports",
+      type: "feature",
+      acceptance: "- [ ] exports report data",
     });
+    rightCard = await beads.create(repo, {
+      title: "billing invoices",
+      type: "feature",
+      acceptance: "- [ ] renders invoices",
+    });
+    misfiled = await beads.create(repo, {
+      title: "invoice line-item rounding",
+      type: "task",
+      acceptance: "- [ ] rounds line items",
+    });
+    await beads.reparent(repo, misfiled, wrongCard);
+
+    tdb = makeProjectDb({ repoPath: repo });
+    projectId = tdb.projectId;
 
     before = await boardStatuses();
 
@@ -290,7 +307,7 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
     ) as Bead;
     expect(proposalPlanOf(proposal)).toMatchObject({ kind: "low-value", retireAs: "defer" });
 
-    const result = await applyProposal(repo, proposal, await loadAllIssues(repo));
+    const result = await applyProposal(repo, proposal, await loadAllIssues(repo), "approval");
     expect(result.changed).toEqual([doomed]);
 
     // Deferred, not closed: a product judgment must stay reversible with `bd undefer`.
@@ -300,6 +317,59 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
     expect(beads.isAbandoned(subject)).toBe(false);
 
     // Applied, not declined — the distinction a later pass reads to know the ask was answered.
+    const settled = await beads.show(repo, proposal.id);
+    expect(settled.status).toBe("closed");
+    expect(beads.isAbandoned(settled)).toBe(false);
+  });
+
+  /**
+   * The home claim end to end (anton-02po). Its subject already rides a real board card — the state
+   * both gardener re-parents refuse to touch — so this is the only path by which anton can move work
+   * that has a home into a better one, and the only proof the whole chain (claim → refusals →
+   * fingerprint → bead → evidence fence → `bd update --parent`) actually lands against real bd.
+   */
+  it("applies an approved home claim: the parent really moves on the board", async () => {
+    reported = JSON.stringify({
+      proposals: [
+        {
+          kind: "rehome",
+          bead: misfiled,
+          home: rightCard,
+          summary: "it is invoice work filed under the reporting card",
+          evidence: [
+            `${misfiled}'s Acceptance is about invoice line items, which is ${rightCard}'s contract`,
+            `${wrongCard} carries reporting exports and names no invoice surface`,
+          ],
+        },
+      ],
+    });
+    // Real time, like the kill above: the evidence fence dates the filing against bd's own stamps.
+    await pass({ now: () => Date.now() });
+
+    const proposal = (await proposals()).find(
+      (p) => proposalPlanOf(p)?.kind === "misfiled",
+    ) as Bead;
+    expect(proposalPlanOf(proposal)).toMatchObject({
+      kind: "misfiled",
+      move: "reparent",
+      subjects: [misfiled],
+      target: rightCard,
+    });
+    expect(proposal.labels?.some((l) => /^pm:misfiled:[0-9a-f]{12}$/.test(l))).toBe(true);
+    expect(contractGaps([proposal], "blocking")).toEqual([]);
+    expect(proposal.title).toBe(`Product master: re-parent ${misfiled} under ${rightCard}`);
+    // Provenance hangs off BOTH beads the move concerns, not just the one it writes to.
+    const edges = beads.edgesOf([proposal]);
+    for (const to of [misfiled, rightCard]) {
+      expect(edges).toContainEqual({ from: proposal.id, to, type: "discovered-from" });
+    }
+    // Still a proposal, not a write: nothing moved until the founder approved it.
+    expect(beads.parentOf(await beads.show(repo, misfiled))).toBe(wrongCard);
+
+    const result = await applyProposal(repo, proposal, await loadAllIssues(repo), "approval");
+    expect(result.changed).toEqual([misfiled]);
+
+    expect(beads.parentOf(await beads.show(repo, misfiled))).toBe(rightCard);
     const settled = await beads.show(repo, proposal.id);
     expect(settled.status).toBe("closed");
     expect(beads.isAbandoned(settled)).toBe(false);

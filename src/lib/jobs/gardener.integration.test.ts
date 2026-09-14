@@ -14,7 +14,6 @@
  *      — and the patrol asks ONCE: a second pass over the same board files nothing (anton-9qwq).
  */
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
@@ -25,16 +24,15 @@ import { beads, type Bead } from "../beads/bd";
 import { contractGaps } from "../beads/contract";
 import { resetIssueSnapshots } from "../beads/snapshot";
 import { isProposalBead } from "../gardener/detections";
-import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { getHygieneReportForJob, type HygieneReport } from "../hygiene";
 import { makeGardenerHandler } from "./gardener";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 describeBd("gardener patrol e2e (real handler · real bd)", () => {
   let repoDir: BdRepo;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let projectId: string;
   const clock: Clock = { now: () => 1_700_000_000_000 };
   const nudge = vi.fn();
@@ -147,15 +145,8 @@ describeBd("gardener patrol e2e (real handler · real bd)", () => {
       stdio: "ignore",
     });
 
-    tdb = makeTestDb();
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    tdb = makeProjectDb({ repoPath: repo });
+    projectId = tdb.projectId;
 
     before = await boardStatuses();
     const jobId = await patrol();

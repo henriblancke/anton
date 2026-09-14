@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { KILL_GRACE_ENV, MAX_OUTPUT_ENV, runShell, runVerifyGates } from "./shell";
+import { captureVerifyGates, KILL_GRACE_ENV, MAX_OUTPUT_ENV, runShell, runVerifyGates } from "./shell";
 import type { VerifyGate } from "../projects";
 
 // runVerifyGates is the shared backstop (anton-3oh8) that both execute-epic and review-fix run
@@ -51,6 +51,67 @@ describe("runVerifyGates (anton-3oh8)", () => {
 
   it("is a no-op when there are no gates (unchanged behavior)", async () => {
     await expect(runVerifyGates([], dir, undefined, logPath, fail)).resolves.toBeUndefined();
+  });
+});
+
+// The reporting half the review gate hands to the reviewer instead of letting it run the suite
+// itself — the one suite run on this host that used to take no verify lock.
+describe("captureVerifyGates", () => {
+  let dir: string;
+  let logPath: string;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "anton-capture-gates-test-"));
+    logPath = join(dir, "session.log");
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reports every gate's command, exit and output when they all pass", async () => {
+    const gates: VerifyGate[] = [
+      { label: "tests", command: "echo tests-ran" },
+      { label: "lint", command: "echo lint-ran" },
+    ];
+    const out = await captureVerifyGates(gates, dir, undefined, logPath);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toMatchObject({ label: "tests", command: "echo tests-ran", ok: true, code: 0 });
+    expect(out[0].output).toContain("tests-ran");
+    expect(out[1]).toMatchObject({ label: "lint", ok: true });
+  });
+
+  it("RETURNS a red gate rather than throwing — a red tree at review time is a finding, not a crash", async () => {
+    const marker = join(dir, "capture-should-not-exist");
+    const gates: VerifyGate[] = [
+      { label: "tests", command: "true" },
+      { label: "lint", command: "echo boom >&2; exit 3" },
+      { label: "build", command: `touch ${marker}` },
+    ];
+    const out = await captureVerifyGates(gates, dir, undefined, logPath);
+    expect(out).toHaveLength(2); // stops at the red one, exactly where the throwing half stops
+    expect(out[1]).toMatchObject({ label: "lint", ok: false, code: 3 });
+    expect(out[1].output).toContain("boom");
+    expect(() => readFileSync(marker)).toThrow();
+  });
+
+  it("runs EVERY gate under stopOnFail:false, so a red one cannot hide the rest", async () => {
+    // Evidence, not enforcement: a caller that stops at a red `tests` learns nothing about lint.
+    const gates: VerifyGate[] = [
+      { label: "tests", command: "exit 3" },
+      { label: "lint", command: "echo lint-ran" },
+      { label: "typecheck", command: "exit 2" },
+    ];
+    const out = await captureVerifyGates(gates, dir, undefined, logPath, { stopOnFail: false });
+    expect(out.map((o) => [o.label, o.ok])).toEqual([
+      ["tests", false],
+      ["lint", true],
+      ["typecheck", false],
+    ]);
+  });
+
+  it("returns nothing for a project that pins no gates, without taking the lock", async () => {
+    await expect(captureVerifyGates([], dir, undefined, logPath)).resolves.toEqual([]);
   });
 });
 
@@ -135,7 +196,10 @@ describe("runShell cancellation (anton-jfjw.6)", () => {
     expect(await waitForDeath(shPid)).toBe(true);
   });
 
-  it("escalates SIGTERM to SIGKILL for a gate that traps the signal", async () => {
+  // The rejection is what the timeout-preservation path reads as "this gate is done", and it rolls
+  // the worktree back on it — so a gate still alive at that moment can write past the cleanliness
+  // check and have its leftovers swept into the next ticket's commit (PR #228 review).
+  it("escalates to SIGKILL and settles only once the trapping gate is gone", async () => {
     process.env[KILL_GRACE_ENV] = "1000";
     const shPidFile = join(dir, "trap-sh.pid");
     const cmd = `trap "" TERM; echo $$ > ${shPidFile}; while true; do sleep 0.1; done`;
@@ -146,11 +210,30 @@ describe("runShell cancellation (anton-jfjw.6)", () => {
     strays.push(shPid);
 
     ac.abort();
+    // The trap makes SIGTERM a no-op, so only the escalation can end it — and the promise waits
+    // for that rather than rejecting into a caller that would then roll back under a live gate.
     await expect(promise).rejects.toMatchObject({ name: "AbortError" });
-    // The trap makes SIGTERM a no-op, so the process is still up when the run unwinds...
-    expect(isAlive(shPid)).toBe(true);
-    // ...and only the escalation can end it.
-    expect(await waitForDeath(shPid)).toBe(true);
+    expect(isAlive(shPid)).toBe(false);
+  });
+
+  it("keeps escalating for a worker that outlived the shell, and settles only once it is gone", async () => {
+    process.env[KILL_GRACE_ENV] = "200";
+    const kidPidFile = join(dir, "outlive-kid.pid");
+    // `exec` replaces the shell with a short sleep, so the direct child exits while its worker is
+    // still running: the escalation used to be cancelled by that exit, leaving the worker alive.
+    const cmd =
+      `${process.execPath} -e 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1 << 30)' & ` +
+      `echo $! > ${kidPidFile}; exec sleep 0.2`;
+
+    const ac = new AbortController();
+    const promise = runShell(cmd, dir, ac.signal);
+    const kidPid = await readPid(kidPidFile);
+    strays.push(kidPid);
+
+    await new Promise((r) => setTimeout(r, 600)); // let the shell exit, leaving only the worker
+    ac.abort();
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+    expect(isAlive(kidPid)).toBe(false);
   });
 
   it("settles on exit even when a leaked descendant still holds stdio", async () => {

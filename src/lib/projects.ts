@@ -13,14 +13,56 @@ import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
-import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
+import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./jobs/budget";
+import { resolveGovernedShare, type GovernedShare } from "./quota-share";
+import { eligibilityOf, observedWorkEligibility } from "./quota-eligibility";
+import { GARDENER_DETECTION_KINDS } from "./gardener/detections";
+import {
+  pickerApplyVerdict,
+  PROPOSAL_AUTONOMY_LEVELS,
+  resolveProposalAutonomyPolicy,
+  type DeliberateArming,
+  type PickerRecordCounts,
+  type ProposalAutonomyOverrides,
+  type ProposalAutonomyPolicy,
+} from "./gardener/autonomy";
+import {
+  isArmableRepairClass,
+  resolveRepairAutonomyPolicy,
+  type RepairAutonomyOverrides,
+  type RepairAutonomyPolicy,
+} from "./gardener/repair-autonomy";
+import { REPAIR_CLASSES, type RepairClass } from "./gardener/repair";
 import {
   DEFAULT_SCAN_SEVERITY_POLICY,
   resolveScanSeverityPolicy,
   type ScanSeverityOverrides,
   type ScanSeverityPolicy,
 } from "./scan-severity";
+import {
+  POLICY_BOUND_MAX,
+  POLICY_CONTROL_NAMESPACES,
+  POLICY_CRITERION_VALUES_MAX,
+  POLICY_LABEL_CRITERIA_MAX,
+  POLICY_PRIORITY_MAX,
+  POLICY_TEXT_MAX,
+  POLICY_TYPES_MAX,
+  PICKER_AUTONOMY_LEVELS,
+  type PickerAutonomy,
+  type Policy,
+} from "./policy/types";
+import type { FailureBreakerConfig } from "./autopilot-failure-streak";
+import type { ScoreBreakerConfig } from "./autopilot-score-slide";
+import type { WipLimitConfig } from "./autopilot-wip";
 import type { ScoreAlarm } from "./jobs/review-alarm";
+import {
+  MODEL_ROUTABLE_JOB_TYPES,
+  isModelRoutableJobType,
+  isModelRoutableJobTypeWithLabelContext,
+  subsumes,
+  type ModelRoute,
+} from "./jobs/model-routing";
+import { MODEL_ROUTABLE_STEP_IDS, PIPELINE_JOB_TYPE, isModelRoutableStepId } from "./jobs/step-ids";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
 import type { Project } from "./types";
@@ -98,6 +140,29 @@ export async function getProjectById(db: AntonDb, id: string): Promise<Project |
 /** Parsed project settings (settingsJson). All optional; sensible defaults applied by callers. */
 export interface ProjectSettings {
   model?: string;
+  /**
+   * Route this project through a Claude-compatible gateway instead of the Claude API (anton-n16m):
+   * the base URL the driver points at, e.g. `https://api.9router.dev/v1`. Absent → the Claude API.
+   * Stored and validated only here; the run reads it when it records its endpoint host
+   * (`endpointHostFromBaseUrl`) and a later step drives it at spawn time. A base URL without
+   * {@link claudeAuthTokenEnv} is refused at the API boundary — a gateway with no credential is a
+   * misconfiguration, not a state to persist.
+   */
+  claudeBaseUrl?: string;
+  /**
+   * The NAME of the environment variable anton reads the gateway token from at spawn time
+   * (anton-n16m) — never the token itself. The secret lives in anton's own environment, so nothing
+   * sensitive touches this row; a value shaped like a token rather than a var name is rejected at the
+   * boundary. Absent → no gateway credential, which is only valid when {@link claudeBaseUrl} is also
+   * absent.
+   */
+  claudeAuthTokenEnv?: string;
+  /**
+   * Whether anton asks the gateway which models it serves (anton-n16m). Absent → off, so a project
+   * that only points at a gateway keeps the shipped model list until it opts in. Only meaningful
+   * alongside {@link claudeBaseUrl}.
+   */
+  claudeGatewayModelDiscovery?: boolean;
   testCommand?: string;
   /**
    * Optional operator-pinned verify gates (anton-3oh8), run in the worktree after the agent and
@@ -160,11 +225,49 @@ export interface ProjectSettings {
    */
   reviewLowScoreRounds?: number;
   /**
+   * How many runs in a row ending parked, failed, or abandoned disarm the picker for this project
+   * (anton-rgso / R4.4). A delivered run resets the count; a run an operator CANCELLED is not
+   * counted at all. `0` turns the breaker off outright — the single knob for an operator who would
+   * rather anton kept trying. Absent → DEFAULT_AUTOPILOT_FAILURE_STREAK.
+   */
+  autopilotFailureStreak?: number;
+  /**
+   * The review-score floor the picker disarms below (anton-cekf / R4.3). A finished run whose target
+   * scored BELOW this counts toward the slide; {@link autopilotScoreWindow} consecutive such runs
+   * disarm the project. `0` turns the breaker off outright — no score is below zero. Absent →
+   * DEFAULT_AUTOPILOT_SCORE_FLOOR.
+   *
+   * Distinct from {@link reviewMinScore}, which parks ONE run mid-gate on its own rounds. This floor
+   * judges the trend across runs that already shipped, so it is set higher: work good enough to
+   * leave the gate can still be getting worse.
+   */
+  autopilotScoreFloor?: number;
+  /**
+   * How many consecutive scored runs below {@link autopilotScoreFloor} disarm the picker
+   * (anton-cekf). A run at or above the floor resets it; a settled run that left NO score voids the
+   * window entirely rather than being read through. Absent → DEFAULT_AUTOPILOT_SCORE_WINDOW.
+   */
+  autopilotScoreWindow?: number;
+  /**
+   * How many unmerged PRs in review HOLD the picker for this project (anton-wy9y / R4.2). Not a
+   * disarm: nothing is wrong, in-flight work is untouched, and the next merge or close releases it
+   * with no human act. `0` turns the hold off outright — the single knob for an operator who
+   * reviews faster than anton ships. Absent → DEFAULT_AUTOPILOT_WIP_LIMIT.
+   */
+  autopilotWipLimit?: number;
+  /**
    * Max concurrent execute-epic runs for this project (anton-xbk). The runner gates approved-epic
    * execution per project against this; other job types (review-fix/nightly) don't count against
    * it. Absent → DEFAULT_CONCURRENCY.
    */
   concurrency?: number;
+  /**
+   * Max concurrent per-PR review fixes for this project (anton-kwi6). The scheduled review-fix poll
+   * fans out one `review-fix-pr` job per actionable PR, and the runner gates that type per project
+   * against this — so a burst of review activity cannot fill the global slot pool and starve
+   * execute-epic. Absent → DEFAULT_REVIEW_FIX_CONCURRENCY.
+   */
+  reviewFixConcurrency?: number;
   /**
    * How long a job attempt may go WITHOUT PROGRESS before the runner aborts it, in minutes
    * (anton-xbk; re-scoped from a total wall clock in anton-t1mo). Measured from the handler's last
@@ -188,6 +291,14 @@ export interface ProjectSettings {
    * thing on the board for a human.
    */
   ticketTimeoutMinutes?: number;
+  /**
+   * How long a single `git commit` (and the hook chain it triggers) may run before anton kills it,
+   * in minutes. A commit budget separate from {@link ticketTimeoutMinutes} exists because a
+   * pre-commit/commit-msg hook chain can legitimately run for a while — long enough that a
+   * sub-minute budget would kill it before it finishes, which is why the range floor is 1, not 0.
+   * Absent → DEFAULT_COMMIT_TIMEOUT_MINUTES (2 min).
+   */
+  commitTimeoutMinutes?: number;
   /**
    * Max attempts for a job before it is parked for a human (anton-xbk). A failed ticket fails the
    * execute-epic job, which retries and resumes past already-closed tickets — so this is the
@@ -241,6 +352,19 @@ export interface ProjectSettings {
    */
   budgetPolicy?: ProjectBudgetPolicy;
   /**
+   * This project's declared cut of the shared weekly Claude quota, 0–100 (R6.1). Absent → an equal
+   * split across the projects with budget-aware execution on ({@link defaultQuotaSharePct}), so a
+   * machine that never declares anything still divides its quota rather than racing for it. Only
+   * consulted when {@link budgetAware} is on — an ungoverned project spends unpaced either way.
+   */
+  quotaSharePct?: number;
+  /**
+   * `reserve my share` (R6.5): hold this project's share out of renormalization even while it has no
+   * eligible work, for a repo touched irregularly. Absent → off, which is what lets an idle repo's
+   * share flow to the projects that can use it rather than resetting unspent.
+   */
+  reserveQuotaShare?: boolean;
+  /**
    * Per-label pipeline variants (anton-aa3m): bead label → the run formula a target carrying it
    * walks, in PRECEDENCE ORDER (first match wins — see `selectRunFormula`). Lets risk and size drive
    * process, so `risk:high` can carry a design step or a sign-off gate while a docs-only ticket
@@ -250,6 +374,17 @@ export interface ProjectSettings {
    * boundary; every selected variant is held to the same invariant floor as the default.
    */
   formulaVariants?: FormulaVariant[];
+  /**
+   * Which model each kind of work runs on (anton-uu7r), in PRECEDENCE ORDER — first match wins,
+   * with {@link model} as the fallback when nothing matches. Authored in the same shape as
+   * {@link formulaVariants} beside it, because it answers the same shape of question: let the work
+   * itself pick, instead of one setting having to be expensive enough for the hardest job.
+   *
+   * Absent/empty ⇒ every job runs on {@link model} (or the driver's own default), so this is
+   * invisible to a zero-config project. Validated with {@link modelRoutesSchema} at the API
+   * boundary — including the save-time rejection of a rule that could never fire.
+   */
+  modelRoutes?: ModelRoute[];
   /**
    * How long a run may sit stuck before the run-health sweep (anton-4ks0) calls it a finding.
    * Absent → {@link DEFAULT_RUN_HEALTH_THRESHOLDS}; a stored value need only carry the knobs the
@@ -274,6 +409,80 @@ export interface ProjectSettings {
    * schedule, which is off by default.
    */
   productMasterPrompt?: string;
+  /**
+   * How far a pass may go with the proposals it files, per detection kind (anton-nbyy). Absent → the
+   * shipped {@link DEFAULT_PROPOSAL_AUTONOMY_POLICY} (`propose` for everything, i.e. no behaviour
+   * change); a stored value need only carry the kinds the operator armed. Validated with
+   * {@link proposalAutonomySchema} at the API boundary and resolved through
+   * {@link resolveAutonomyPolicy}, which drops entries anton no longer recognises rather than
+   * failing a pass over a hand-edited settings blob.
+   *
+   * Distinct from {@link autonomy}, which is the run-execution master switch. This one is about board
+   * state a pass proposes; that one is about whether approved epics execute at all.
+   */
+  proposalAutonomy?: ProposalAutonomyOverrides;
+  /**
+   * How far anton may go REPAIRING a blocked ticket, per block class (R5.3). Absent → the shipped
+   * {@link DEFAULT_REPAIR_AUTONOMY_POLICY} (`shadow` for the factual pair: the repair is worked out
+   * and recorded, and the block still goes to a human); a stored value need only carry the classes
+   * the operator moved.
+   *
+   * Its own policy rather than an entry in {@link proposalAutonomy}, because a repair is not a
+   * proposal — it files no bead, so it can never build the settled-proposal record the earned floor
+   * weighs. See gardener/repair-autonomy.ts.
+   */
+  repairAutonomy?: RepairAutonomyOverrides;
+  /**
+   * The operator's standing answer to the cadence offer arming the board-picker makes (anton-3xa9,
+   * design R7.1): true = keep product-master weekly, and never ask again. Absent = not yet asked.
+   *
+   * Stored rather than dismissed in the session because the offer is per DECISION, not per visit:
+   * an operator who said "keep weekly" and then toggled the picker off and on again would otherwise
+   * be asked the same question forever. Nothing reads this but the settings panel — the cadence
+   * itself lives on the schedule row, which is the one place a cadence is meant to be legible.
+   */
+  keepProductMasterWeekly?: boolean;
+  /**
+   * Bead labels this project nominates as value signals (anton-prng), highest tier first — the input
+   * to `jobValueScore`, which is what ranks governed work for admission. anton ships NO vocabulary:
+   * absent/empty means work ranks on its native fields alone (age), because a label anton guessed at
+   * would silently rank a board that never uses it. The order is the band order, so a project can
+   * nominate more than two tiers. Validated with {@link valueLabelsSchema} at the API boundary.
+   */
+  valueLabels?: string[];
+  /**
+   * The standing policy narrowing what anton may start on its own (anton-c7iv, R2.1). MACHINE-LOCAL:
+   * it lives here rather than on the board because two machines on one repo may legitimately hold
+   * different policies, and bd's claim protocol — not a shared setting — resolves the race.
+   *
+   * Absent is load-bearing: it means the operator has never armed this project, which is what makes
+   * first arm propose a calibrated draft (`policy/calibrate.ts`) instead of a blank form. Nothing
+   * writes it but an explicit accept. Validated with {@link pickerPolicySchema} at the API boundary.
+   */
+  pickerPolicy?: Policy;
+  /**
+   * How far the picker may go with the plan it decides (R3.5) — the level {@link
+   * resolvePickerAutonomy} floors, structurally and by the earned record, before anything acts on
+   * it. Absent means the operator has never chosen one, which is NOT the same as `propose`: an
+   * armed project defaults to `shadow`, where the picker offers its picks and the operator's
+   * releases and vetoes become the record `apply` is earned on. Validated with
+   * {@link pickerAutonomySchema} at the API boundary.
+   */
+  pickerAutonomy?: PickerAutonomy;
+  /**
+   * A DELIBERATE arming of `apply` (anton-d1lk): the operator's explicit, signed bypass of the
+   * earned floor, or absent — which is every project until somebody arms one, since nothing writes
+   * this but the arming route. Revoking is deleting it, and the very next pass re-floors the project
+   * on its record.
+   *
+   * Deliberately NOT in the settings PATCH table: the actor is resolved SERVER-side
+   * (`resolveOperator`), because a caller-supplied author on the one field that starts unattended
+   * work with no evidence behind it would make the audit trail worth nothing.
+   *
+   * It bypasses the earned floor and nothing else. The structural floor below still refuses an
+   * unarmed project, and the brakes and the budget governor sit downstream of the level entirely.
+   */
+  pickerApplyOverride?: DeliberateArming;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -300,8 +509,19 @@ export function resolveVerifyGates(settings: ProjectSettings): VerifyGate[] {
 
 /** Defaults for the per-project job policy when a setting is unset. */
 export const DEFAULT_CONCURRENCY = 3;
+/**
+ * Two, not three: the global ceiling is 8 (ANTON_MAX_CONCURRENT) and {@link DEFAULT_CONCURRENCY} is
+ * already 3, so 2 still fixes PRs in parallel while leaving headroom for gate-check, sync-push and
+ * the other polls to keep their slots. This bounds ONE project; the sum across projects is bounded
+ * by the runner-wide ANTON_MAX_REVIEW_FIX_CONCURRENT (half the pool by default), which is what
+ * actually keeps those slots free when several projects have actionable PRs at once.
+ */
+export const DEFAULT_REVIEW_FIX_CONCURRENCY = 2;
 export const DEFAULT_JOB_TIMEOUT_MINUTES = 120; // 2 hours without progress
 export const DEFAULT_TICKET_TIMEOUT_MINUTES = 45;
+/** Kept in minutes for consistency with the other two timeouts; ops.ts's git-commit default is
+ *  {@link DEFAULT_COMMIT_TIMEOUT_MINUTES} * 60_000 ms — asserted equal in ops.test.ts. */
+export const DEFAULT_COMMIT_TIMEOUT_MINUTES = 2;
 export const DEFAULT_MAX_RETRIES = 3;
 /** Two rounds: the reviewer's first pass plus one chance to confirm the fixes landed. */
 export const DEFAULT_REVIEW_MAX_ROUNDS = 2;
@@ -313,16 +533,69 @@ export const DEFAULT_REVIEW_MAX_ROUNDS = 2;
 export const DEFAULT_REVIEW_MIN_SCORE = 5;
 /** Twice is a trend, once is a round the fix loop exists to answer. */
 export const DEFAULT_REVIEW_LOW_SCORE_ROUNDS = 2;
+/**
+ * Three is the smallest count that can only be a pattern. One failure is a hard ticket; two in a row
+ * is bad luck often enough that disarming on it would train an operator to re-arm without reading.
+ */
+export const DEFAULT_AUTOPILOT_FAILURE_STREAK = 3;
+/**
+ * The picker's score floor, read off what this project has actually shipped rather than picked to
+ * sound strict: across 59 scored run targets on anton's own board the scores are 8s and 9s (mean
+ * 8.8, minimum 8) — the review contract's "ships as-is" band. Below 7 is therefore under everything
+ * a healthy run here has ever produced, and on the anchored scale (skills/review) it is the 5-6
+ * "needs another round" band or worse. A 7 itself is acceptable work, so it deliberately does not
+ * count: the breaker fires on work that would have been sent back, not on work a reviewer merely
+ * had notes about.
+ */
+export const DEFAULT_AUTOPILOT_SCORE_FLOOR = 7;
+/**
+ * Three, for the reason {@link DEFAULT_AUTOPILOT_FAILURE_STREAK} is three: it is the smallest count
+ * that can only be a pattern. One low score is a hard feature; two is a bad week — and unlike the
+ * within-run alarm, nothing downstream re-reviews these, so a breaker that cried wolf would train an
+ * operator to re-arm without reading the series.
+ */
+export const DEFAULT_AUTOPILOT_SCORE_WINDOW = 3;
+/**
+ * Three unmerged PRs is already a full sitting for one reviewer, and it is the same number as
+ * {@link DEFAULT_CONCURRENCY} on purpose: a project running flat out can carry every one of its
+ * concurrent runs through to review before the brake bites. So the hold fires on the queue growing
+ * past what anton can produce at once — a review backlog — rather than on anton's own concurrency.
+ */
+export const DEFAULT_AUTOPILOT_WIP_LIMIT = 3;
+
+/**
+ * The commit budget every `commitAll`/`commitMarker` call runs under, in ms (anton-zse2). An unset
+ * setting resolves to {@link DEFAULT_COMMIT_TIMEOUT_MINUTES} — the same default `commitAll` itself
+ * falls back to, so a project with no setting is byte-identical to before this existed.
+ */
+export function resolveCommitTimeoutMs(settings: ProjectSettings): number {
+  return (settings.commitTimeoutMinutes ?? DEFAULT_COMMIT_TIMEOUT_MINUTES) * 60_000;
+}
 
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
+export const REVIEW_FIX_CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const JOB_TIMEOUT_MINUTES_RANGE = { min: 5, max: 720 } as const; // 5 min … 12 h
 export const TICKET_TIMEOUT_MINUTES_RANGE = { min: 5, max: 240 } as const; // 5 min … 4 h
+/**
+ * 1 min … 60 min. The floor is deliberate — a sub-minute commit budget kills the hook chain this
+ * setting exists to accommodate. The ceiling is a guard, not a guess: past an hour,
+ * {@link JOB_TIMEOUT_MINUTES_RANGE}'s job timeout (default {@link DEFAULT_JOB_TIMEOUT_MINUTES}) is
+ * the thing that should be bounding the run.
+ */
+export const COMMIT_TIMEOUT_MINUTES_RANGE = { min: 1, max: 60 } as const;
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
 export const REVIEW_MAX_ROUNDS_RANGE = { min: 1, max: 5 } as const;
 /** `0` is in range on purpose: it is how the operator turns the score-regression alarm off. */
 export const REVIEW_MIN_SCORE_RANGE = { min: 0, max: 10 } as const;
 export const REVIEW_LOW_SCORE_ROUNDS_RANGE = { min: 1, max: 5 } as const;
+/** `0` is in range on purpose: it is how the operator turns the consecutive-failure breaker off. */
+export const AUTOPILOT_FAILURE_STREAK_RANGE = { min: 0, max: 10 } as const;
+/** `0` is in range on purpose: it is how the operator turns the score-regression breaker off. */
+export const AUTOPILOT_SCORE_FLOOR_RANGE = { min: 0, max: 10 } as const;
+export const AUTOPILOT_SCORE_WINDOW_RANGE = { min: 1, max: 10 } as const;
+/** `0` is in range on purpose: it is how the operator turns the WIP hold off. */
+export const AUTOPILOT_WIP_LIMIT_RANGE = { min: 0, max: 20 } as const;
 
 /** A project's resolved self-review configuration (anton-3apm) — never partial. */
 export interface ReviewConfig {
@@ -364,6 +637,43 @@ export function resolveReviewConfig(settings: ProjectSettings): ReviewConfig {
   };
 }
 
+/**
+ * The consecutive-failure breaker's configuration, with the default applied (anton-rgso).
+ *
+ * Resolved to ABSENT rather than to a threshold of 0, so the picker pass reads "no breaker" as a
+ * shape instead of having to know that 0 is the off switch — the same seam `resolveReviewConfig`
+ * gives the score alarm, and for the same reason.
+ */
+export function resolveFailureBreaker(
+  settings: ProjectSettings,
+): FailureBreakerConfig | undefined {
+  const threshold = settings.autopilotFailureStreak ?? DEFAULT_AUTOPILOT_FAILURE_STREAK;
+  return threshold > 0 ? { threshold } : undefined;
+}
+
+/**
+ * The score-regression breaker's configuration, with the defaults applied (anton-cekf).
+ *
+ * Absent rather than a floor of 0, the same seam its two siblings give their detectors — the picker
+ * pass reads "no breaker" as a shape rather than having to know that 0 is the off switch.
+ */
+export function resolveScoreBreaker(settings: ProjectSettings): ScoreBreakerConfig | undefined {
+  const floor = settings.autopilotScoreFloor ?? DEFAULT_AUTOPILOT_SCORE_FLOOR;
+  if (floor <= 0) return undefined;
+  return { floor, window: settings.autopilotScoreWindow ?? DEFAULT_AUTOPILOT_SCORE_WINDOW };
+}
+
+/**
+ * The WIP hold's configuration, with the default applied (anton-wy9y).
+ *
+ * Absent rather than a limit of 0, the same seam its three siblings give their detectors — the
+ * picker pass reads "no hold" as a shape rather than having to know that 0 is the off switch.
+ */
+export function resolveWipLimit(settings: ProjectSettings): WipLimitConfig | undefined {
+  const limit = settings.autopilotWipLimit ?? DEFAULT_AUTOPILOT_WIP_LIMIT;
+  return limit > 0 ? { limit } : undefined;
+}
+
 /** A project's resolved product-master configuration (anton-d2sx) — never partial. */
 export interface ProductMasterConfig {
   /** Operator prompt replacing anton's shipped contract; absent → the shipped `product-master` skill. */
@@ -377,6 +687,61 @@ export interface ProductMasterConfig {
  */
 export function resolveProductMasterConfig(settings: ProjectSettings): ProductMasterConfig {
   return { prompt: settings.productMasterPrompt?.trim() || undefined };
+}
+
+/**
+ * Per-kind proposal autonomy as submitted (anton-nbyy). Keyed by the detection kinds and valued by
+ * the levels the policy module owns, so a kind added to `detections.ts` is accepted here the moment
+ * it exists rather than after someone remembers to widen a second list. Partial (an operator arms
+ * one kind at a time) and strict about both halves: an unknown kind or an unknown level 400s instead
+ * of persisting a policy that would silently resolve back to `propose`.
+ */
+export const proposalAutonomySchema = z.partialRecord(
+  z.enum(GARDENER_DETECTION_KINDS),
+  z.enum(PROPOSAL_AUTONOMY_LEVELS),
+);
+
+/**
+ * Per-class repair autonomy as submitted (R5.3), the mirror of {@link proposalAutonomySchema}: keyed
+ * by the block classes the repair guard owns and valued by the same three levels, so a class added
+ * to `repair.ts` is accepted here the moment it exists. Strict about both halves — an unknown class
+ * or an unknown level 400s rather than persisting a policy the pass would silently ignore.
+ *
+ * And strict about a third thing the proposal side has no equivalent of: a class anton has no
+ * repair FOR may only be `propose` (PR #223 review). Arming `acceptance-missing` or `oversized`
+ * would otherwise persist and 200, then be ignored by every run and read back as `propose` — a
+ * stored policy that can never be honoured, which is the silence this boundary exists to refuse.
+ */
+export const repairAutonomySchema = z
+  .partialRecord(z.enum(REPAIR_CLASSES), z.enum(PROPOSAL_AUTONOMY_LEVELS))
+  .superRefine((policy, ctx) => {
+    for (const [klass, level] of Object.entries(policy)) {
+      if (!level || level === "propose" || isArmableRepairClass(klass as RepairClass)) continue;
+      ctx.addIssue({
+        code: "custom",
+        path: [klass],
+        message: `anton has no \`${klass}\` repair, so it can only be \`propose\``,
+      });
+    }
+  });
+
+/**
+ * How far anton may go repairing each block class on this project — the shipped policy with the
+ * operator's overrides applied, never partial. The single seam the run reads, so "absent means the
+ * shipped default" cannot drift between the settings surface and the repair itself.
+ */
+export function resolveRepairAutonomy(settings: ProjectSettings): RepairAutonomyPolicy {
+  return resolveRepairAutonomyPolicy(settings.repairAutonomy);
+}
+
+/**
+ * How far each detection kind's proposals may go for this project — the shipped policy with the
+ * operator's overrides applied, never partial. The single seam the passes read, so "absent means
+ * propose" and the split/targetless-reparent floor can't drift between the gardener and the product
+ * master.
+ */
+export function resolveAutonomyPolicy(settings: ProjectSettings): ProposalAutonomyPolicy {
+  return resolveProposalAutonomyPolicy(settings.proposalAutonomy);
 }
 
 /**
@@ -467,7 +832,199 @@ export function resolveBudgetPolicy(settings: ProjectSettings): BudgetPolicy {
     utcOffsetMinutes: -new Date().getTimezoneOffset(),
     weeklyTargetPct: p.weeklyTargetPct,
     nightValueDiscount: p.preferNightForHeavy ? DEFAULT_BUDGET_POLICY.nightValueDiscount : 0,
+    // Board vocabulary, not a budget knob — carried on the policy because the value gate is what
+    // consumes it. Absent nominations rank on age alone rather than on labels anton assumed.
+    valueLabels: resolveValueLabels(settings),
   };
+}
+
+/**
+ * A project's nominated value labels (anton-prng). An ORDERED list, not a set, because the order IS
+ * the band order `jobValueScore` ranks by: the first entry is the top tier. Bounded like every other
+ * operator list, and duplicate-free — a label already nominated can never be reached a second time,
+ * so a repeat is a mistake, not a lower tier.
+ */
+export const valueLabelsSchema = z
+  .array(z.string().trim().min(1).max(120))
+  .max(8)
+  .refine((labels) => new Set(labels).size === labels.length, {
+    message: "each label may be nominated once",
+  });
+
+/** The project's nominations, in band order — empty when it has nominated none (the default). */
+export function resolveValueLabels(settings: ProjectSettings): string[] {
+  return settings.valueLabels ?? [];
+}
+
+/**
+ * The standing work policy (anton-c7iv). Strict on every field, because a policy that fails to parse
+ * is a policy that silently admits everything: absent means "never armed", and the picker treats
+ * that as "start nothing", so a malformed store must 400 at the boundary rather than round-trip.
+ *
+ * `values` may not be empty. An empty membership set matches NOTHING (criteria fail closed, R2.5),
+ * so it is never what an operator meant — dropping the namespace is how you stop constraining it.
+ * Bounded like every other operator list.
+ *
+ * Both ends of each ordered native field are accepted, but nothing here rejects a pair that crosses
+ * (`minPriority` above `maxPriority`): an empty window is a legible policy that admits nothing, and
+ * the editor's live match count already says so louder than a 400 would.
+ */
+export const pickerPolicySchema = z
+  .object({
+    // A membership set, so duplicate-free like every other one here: a repeat is a test the first
+    // entry already answered, and it burns a slot against POLICY_TYPES_MAX — which the editor reads
+    // as a ceiling reached, disabling every type the operator has not already selected.
+    types: z
+      .array(z.string().trim().min(1).max(POLICY_TEXT_MAX.type))
+      .min(1)
+      .max(POLICY_TYPES_MAX)
+      .refine((ts) => new Set(ts).size === ts.length, {
+        message: "each type may be listed once",
+      }),
+    // bd's priority NUMBER, not the printed label: P0 is 0 and larger is less urgent, so `max` is
+    // the floor and `min` the ceiling.
+    maxPriority: z.number().int().min(0).max(POLICY_PRIORITY_MAX),
+    minPriority: z.number().int().min(0).max(POLICY_PRIORITY_MAX),
+    // Parent hops above the bead — 0 is top-level. Bounded rather than open-ended because a board
+    // nests epic → feature → ticket, and a depth beyond that is a typo, not a policy.
+    maxParentDepth: z.number().int().min(0).max(POLICY_BOUND_MAX.parentDepth),
+    minParentDepth: z.number().int().min(0).max(POLICY_BOUND_MAX.parentDepth),
+    // Whole days. A year is the outer edge of a rule an operator could mean by "old".
+    minAgeDays: z.number().int().min(0).max(POLICY_BOUND_MAX.minAgeDays),
+    maxAgeDays: z.number().int().min(0).max(POLICY_BOUND_MAX.maxAgeDays),
+    labels: z
+      .array(
+        z
+          .object({
+            // Never one of anton's own bookkeeping namespaces. The editor already keeps them out of
+            // the offered criteria, and the boundary has to agree: a criterion over a namespace
+            // anton rewrites mid-run tests a label set that moves under the picker, so the symptom
+            // is "policy armed, picker starts nothing" — unreadable from the plan output.
+            namespace: z
+              .string()
+              .trim()
+              .min(1)
+              .max(POLICY_TEXT_MAX.namespace)
+              .refine((ns) => !POLICY_CONTROL_NAMESPACES.has(ns), {
+                message: "cannot constrain an anton bookkeeping namespace",
+              }),
+            // ORDERED when `ranked` — the drag order the operator gave these values (R2.3), which is
+            // why nothing on this path sorts them. Duplicate-free: a repeat is a second membership
+            // test the first already answered, and under a ranking it is a value at two positions at
+            // once — which `admittedValues` resolves by its first, so a bound could admit a slice
+            // the stored order does not show.
+            values: z
+              .array(z.string().trim().min(1).max(POLICY_TEXT_MAX.value))
+              .min(1)
+              .max(POLICY_CRITERION_VALUES_MAX)
+              .refine((vs) => new Set(vs).size === vs.length, {
+                message: "each value may be listed once",
+              }),
+            ranked: z.boolean().optional(),
+            // A `≤`/`≥` over that ranking. Rejected without `ranked`, and rejected when it names a
+            // value the ranking does not carry: the predicate fails such a criterion CLOSED against
+            // every bead (R2.5), so persisting one would arm a policy that admits nothing and says
+            // so only per bead.
+            compare: z
+              .object({
+                op: z.enum(["lte", "gte"]),
+                value: z.string().trim().min(1).max(POLICY_TEXT_MAX.value),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .refine((c) => !c.compare || (c.ranked && c.values.includes(c.compare.value)), {
+            message: "a comparison needs a ranking that contains its bound",
+          }),
+      )
+      .max(POLICY_LABEL_CRITERIA_MAX)
+      .refine((cs) => new Set(cs.map((c) => c.namespace)).size === cs.length, {
+        message: "each namespace may be constrained once",
+      }),
+    requireUnblocked: z.boolean(),
+  })
+  .partial()
+  .strict();
+
+/** The armed policy, or undefined when this project has never been armed (the first-arm case). */
+export function resolvePickerPolicy(settings: ProjectSettings): Policy | undefined {
+  return settings.pickerPolicy;
+}
+
+/** The stored autonomy level. Strict, because an unrecognised level must not resolve to `apply`. */
+export const pickerAutonomySchema = z.enum(PICKER_AUTONOMY_LEVELS);
+
+/**
+ * A stored deliberate arming (anton-d1lk). Both halves required and the instant a real one: an
+ * arming that cannot say who or when is not an audit trail, and the whole justification for letting
+ * it stand in for the record is that it names somebody.
+ */
+export const deliberateArmingSchema = z
+  .object({
+    by: z.string().trim().min(1).max(200),
+    at: z.iso.datetime(),
+  })
+  .strict();
+
+/**
+ * The deliberate arming stored on this project, or undefined when there is none — or when what is
+ * stored cannot be read as one.
+ *
+ * Validated on the way OUT, not merely on the way in, and that is the point: settingsJson is
+ * hand-editable, and a half-written arming must fall back to the earned floor rather than arm
+ * `apply` off a fragment. Same fail-safe direction as {@link resolveProposalAutonomyPolicy}, which
+ * drops what it cannot read instead of failing a pass over it.
+ */
+export function resolvePickerApplyOverride(
+  settings: ProjectSettings,
+): DeliberateArming | undefined {
+  const parsed = deliberateArmingSchema.safeParse(settings.pickerApplyOverride);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
+ * How far the picker may go on this project — the stored level with BOTH floors applied here, so no
+ * caller has to remember either.
+ *
+ * The STRUCTURAL floor: `apply` requires an ARMED POLICY. Without one the pass falls back to the
+ * structural default, which admits every claimable run target — and a pass that wrote `approved` off
+ * THAT would be autopilot with no approval in it, the one thing the design refuses (see
+ * `picker-decision.ts`'s ADMIT_ALL_POLICY).
+ *
+ * The EARNED floor (anton-vkp9): `apply` also has to be earned, by this project's own record of
+ * releases and vetoes, against the same bars the gardener's kinds clear
+ * ({@link pickerApplyVerdict}). A policy is what anton MAY start; the record is whether its picks
+ * have been worth starting, and only the operator's answers say so.
+ *
+ * That second floor — and ONLY that one — takes a stored deliberate arming as its answer
+ * (anton-d1lk): an operator who accepts the risk today signs for it, and the signature stands in for
+ * the evidence. The structural floor above it does not move for anybody, so a project with no work
+ * policy still cannot reach `apply` however deliberately it was armed — there is no boundary there
+ * to accept the risk OF.
+ *
+ * Both land on `shadow` rather than on `propose`, and that is deliberate: `shadow` is the lane where
+ * picks are offered and answered, so it is where the record is MADE. Demoting to `propose` would
+ * empty the lane and leave the project with no way to earn back the level it just lost — a floor
+ * that locks the door and pockets the key. (The gardener demotes to `propose` for the opposite
+ * reason: its `shadow` writes records nobody asked for.)
+ *
+ * Re-asked on every pass, never latched, which is what makes the earned floor bite after arming too:
+ * a record that degrades returns the picker to `shadow` on the next tick — and a project standing on
+ * a deliberate arming returns there on the tick after it is revoked.
+ */
+export function resolvePickerAutonomy(
+  settings: ProjectSettings,
+  record: PickerRecordCounts,
+): PickerAutonomy {
+  const armed = !!settings.pickerPolicy;
+  const stored = settings.pickerAutonomy;
+  if (!stored) return armed ? "shadow" : "propose";
+  if (stored !== "apply") return stored;
+  if (!armed) return "shadow";
+  return pickerApplyVerdict(record, resolvePickerApplyOverride(settings)).allowed
+    ? "apply"
+    : "shadow";
 }
 
 /**
@@ -508,6 +1065,98 @@ export const formulaVariantsSchema = z
  * field optional so a patch carries only the knobs the operator touched; each is range-checked (fail
  * loud) and unknown keys rejected, matching {@link budgetPolicySchema}.
  */
+/**
+ * How many routing rules one project may declare (anton-uu7r). Bounded for the reason every other
+ * operator list is: the table is walked per unit of work, and a table nobody can read is a table
+ * nobody can debug. Generously above what a real routing policy needs.
+ */
+export const MODEL_ROUTES_MAX = 20;
+
+/**
+ * The model routing table (anton-uu7r) — an ORDERED list, matching {@link formulaVariantsSchema}'s
+ * shape and for the same reason: the order IS the documented precedence, so first match wins and
+ * `settings.model` is the fallback when nothing matches.
+ *
+ * `model` is a FREE bounded string, never an allowlist: a gateway combo name (`cc/claude-opus-5[1m]`)
+ * is not knowable to anton, so validating against a catalogue would reject the exact value an
+ * operator with a gateway has to write. Only Claude-capable job types and steps are accepted, so a
+ * saved rule always describes a context that can actually invoke the selected model.
+ */
+export const modelRoutesSchema = z
+  .array(
+    z
+      .object({
+        jobType: z
+          .string()
+          .refine(isModelRoutableJobType, {
+            message: `job type must be one of: ${MODEL_ROUTABLE_JOB_TYPES.join(", ")}`,
+          })
+          .optional(),
+        step: z
+          .string()
+          .refine(isModelRoutableStepId, {
+            message: `step must be one of: ${MODEL_ROUTABLE_STEP_IDS.join(", ")}`,
+          })
+          .optional(),
+        label: z.string().trim().min(1).max(120).optional(),
+        model: z.string().trim().min(1).max(200),
+      })
+      .strict(),
+  )
+  .max(MODEL_ROUTES_MAX)
+  .superRefine(unreachableRoutes) as z.ZodType<ModelRoute[]>;
+
+/**
+ * Rejects, at SAVE time, a rule that can never fire — the alternative is a row an operator authored,
+ * saved, and will never see take effect, with nothing anywhere to say why.
+ *
+ * Two ways a rule matches nothing:
+ *
+ * 1. **An impossible pair.** Only `execute-epic` walks a run formula, so `step:` alongside any other
+ *    job type describes work that does not exist.
+ * 2. **A label on a job without a bead.** Scheduled jobs have no bead labels to match.
+ * 3. **A row an earlier row shadows.** First match wins, so a rule already subsumed by one above it
+ *    is unreachable — the same reasoning that rejects a twice-mapped pipeline variant.
+ */
+function unreachableRoutes(routes: ModelRoute[], ctx: z.RefinementCtx): void {
+  routes.forEach((route, i) => {
+    if (route.step !== undefined && route.jobType !== undefined && route.jobType !== PIPELINE_JOB_TYPE) {
+      ctx.addIssue({
+        code: "custom",
+        path: [i, "step"],
+        message:
+          `only \`${PIPELINE_JOB_TYPE}\` walks a pipeline, so a \`${route.jobType}\` rule naming ` +
+          `step \`${route.step}\` can never match — drop the step, or route the job type instead`,
+      });
+      return;
+    }
+    if (
+      route.label !== undefined &&
+      route.jobType !== undefined &&
+      !isModelRoutableJobTypeWithLabelContext(route.jobType)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: [i, "label"],
+        message:
+          `a \`${route.jobType}\` job has no bead labels, so a label route can never match — ` +
+          "drop the label, or route a bead-backed job instead",
+      });
+      return;
+    }
+    const shadowedBy = routes.findIndex((earlier, j) => j < i && subsumes(earlier, route));
+    if (shadowedBy >= 0) {
+      ctx.addIssue({
+        code: "custom",
+        path: [i],
+        message:
+          `rule ${i + 1} can never match — rule ${shadowedBy + 1} already matches everything it ` +
+          `does, and the first match wins`,
+      });
+    }
+  });
+}
+
 export const runHealthThresholdsSchema = z
   .object({
     parkedRunMinutes: z.number().int().min(1).max(10_080), // 1 min … 7 days
@@ -567,17 +1216,23 @@ export function resolveRunHealthThresholds(
   return { ...DEFAULT_RUN_HEALTH_THRESHOLDS, ...(settings.runHealth ?? {}) };
 }
 
+/** A stored settings blob, or `{}` for a missing row and for one no longer parseable. */
+function parseSettings(settingsJson: string | undefined): ProjectSettings {
+  if (settingsJson === undefined) return {};
+  try {
+    return JSON.parse(settingsJson) as ProjectSettings;
+  } catch {
+    return {};
+  }
+}
+
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
   const rows = await db
     .select({ settingsJson: schema.projects.settingsJson })
     .from(schema.projects)
     .where(eq(schema.projects.id, id))
     .limit(1);
-  try {
-    return rows[0] ? (JSON.parse(rows[0].settingsJson) as ProjectSettings) : {};
-  } catch {
-    return {};
-  }
+  return parseSettings(rows[0]?.settingsJson);
 }
 
 /** Read this project's settings via the shared anton.db (UI/API read path). */
@@ -605,36 +1260,86 @@ export async function isBudgetAwareEnabledAnywhere(): Promise<boolean> {
 }
 
 /**
- * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
- * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) the per-project
- * governor applies — rather than a hard-coded default, so an operator who tunes `weeklyTargetPct`
- * or `daytimeReservePct` sees the nudge agree with what the runner actually admits. Empty when no
- * project has opted in (the nudge's hide gate); a project with unparseable settingsJson is treated
- * as off, mirroring {@link isBudgetAwareEnabledAnywhere}.
+ * Every budget-aware project on this machine, with its settings — the board a quota share is
+ * proportioned against, and the denominator of the equal-split default. An unparseable settingsJson
+ * reads as off, mirroring {@link isBudgetAwareEnabledAnywhere}.
  */
-export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
-  const rows = await getDb().select({ settingsJson: schema.projects.settingsJson }).from(schema.projects);
-  const policies: BudgetPolicy[] = [];
+async function governedProjects(): Promise<{ projectId: string; settings: ProjectSettings }[]> {
+  const rows = await getDb()
+    .select({ id: schema.projects.id, settingsJson: schema.projects.settingsJson })
+    .from(schema.projects);
+  const governed: { projectId: string; settings: ProjectSettings }[] = [];
   for (const row of rows) {
     try {
       const settings = JSON.parse(row.settingsJson) as ProjectSettings;
-      if (settings.budgetAware === true) policies.push(resolveBudgetPolicy(settings));
+      if (settings.budgetAware === true) governed.push({ projectId: row.id, settings });
     } catch {
       // unparseable settings → not budget-aware; skip
     }
   }
-  return policies;
+  return governed;
 }
 
-/** Merge a settings patch into the project's settingsJson. Returns the merged settings. */
-export async function updateProjectSettings(
-  slug: string,
+/**
+ * The quota-share board of every budget-aware project on this machine (R6.1 / R6.4 / R6.5) — what
+ * one project's share is proportioned against by `resolveGovernedShare` (./quota-share).
+ *
+ * Ungoverned projects are absent by construction: they spend unpaced, so counting them in the
+ * denominator would shrink everyone else's cut to fund a project no share binds. An undeclared
+ * project carries no `declaredPct` (it rides the equal split), which is NOT the same as declaring 0
+ * — that parks a repo.
+ *
+ * Live eligibility rides along so the denominator is recomputed per pass rather than fixed at the
+ * declarations: an idle repo drops out and its share is spent by the repos that have work, unless it
+ * reserved it. Read fresh on every call for the same reason — that is what makes a waking repo
+ * reclaim its cut on the next pass instead of after an operator action. An unobservable or failed
+ * read resolves to `null`, which reads as "can spend": nobody loses a share to a question this
+ * machine never managed to ask.
+ */
+export async function budgetAwareQuotaShares(): Promise<GovernedShare[]> {
+  return governedQuotaBoard(await governedProjects());
+}
+
+/** The board above, over an already-read governed set — so a caller needing both reads once. */
+async function governedQuotaBoard(
+  governed: readonly { projectId: string; settings: ProjectSettings }[],
+): Promise<GovernedShare[]> {
+  const eligible = await observedWorkEligibility(getDb()).catch(() => null);
+  return governed.map(({ projectId, settings }) => ({
+    projectId,
+    declaredPct: settings.quotaSharePct,
+    eligible: eligibilityOf(eligible, projectId),
+    reserved: settings.reserveQuotaShare === true,
+  }));
+}
+
+/**
+ * The resolved governor policies of every budget-aware project (anton-7mpv.1). The shaping nudge
+ * evaluates pace/headroom against these — the SAME knobs (`resolveBudgetPolicy`) and the SAME quota
+ * share (R6.1) the per-project governor applies — rather than a hard-coded default, so an operator
+ * who tunes `weeklyTargetPct` or `daytimeReservePct` sees the nudge agree with what the runner
+ * actually admits. Empty when no project has opted in (the nudge's hide gate).
+ *
+ * The nudge passes no per-project spend to `budgetGate`, so the share ceiling each policy carries is
+ * checked against a spend of 0 there: it binds only for a 0% share — a parked repo defers, as it
+ * should, since its governor would never burn the quota being nudged about — and for any positive
+ * share it is the whole weekly target on the account meter that answers. Deliberate: the nudge asks
+ * whether the MACHINE has idle weekly quota worth shaping work for; which repo gets to spend it, and
+ * how much of its share is already gone, is the governor's decision at lease time, not the nudge's.
+ */
+export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
+  const governed = await governedProjects();
+  const board = await governedQuotaBoard(governed);
+  return governed.map(({ projectId, settings }) =>
+    withQuotaShare(resolveBudgetPolicy(settings), resolveGovernedShare(projectId, board).sharePct),
+  );
+}
+
+/** Apply a patch to a settings blob, key by key. Pure — the store's read/write is the caller's. */
+function mergeSettings(
+  current: ProjectSettings,
   patch: Partial<ProjectSettings>,
-): Promise<ProjectSettings> {
-  const db = getDb();
-  const p = await getProjectBySlug(slug);
-  if (!p) throw new Error(`Project not found: ${slug}`);
-  const current = await getProjectSettings(db, p.id);
+): ProjectSettings {
   // Drop keys explicitly set to undefined so "Default" clears rather than persists.
   const next: ProjectSettings = { ...current };
   for (const [k, v] of Object.entries(patch)) {
@@ -648,13 +1353,146 @@ export async function updateProjectSettings(
     // Same reasoning, one level down: the merge is per SEVERITY, and each severity's rule carries
     // both knobs (the schema requires it), so re-weighting `critical` can't half-write `high`.
     else if (k === "scanSeverity") next.scanSeverity = { ...current.scanSeverity, ...(v as object) };
+    // Per KIND, for the same reason: a client that renders only the kinds it knows must not disarm
+    // the ones it didn't send. Setting a kind back to `propose` is an explicit value, not an absence.
+    else if (k === "proposalAutonomy") {
+      next.proposalAutonomy = { ...current.proposalAutonomy, ...(v as object) };
+    }
+    // Per CLASS, for the same reason.
+    else if (k === "repairAutonomy") {
+      next.repairAutonomy = { ...current.repairAutonomy, ...(v as object) };
+    }
     else (next as Record<string, unknown>)[k] = v;
   }
-  await db
-    .update(schema.projects)
-    .set({ settingsJson: JSON.stringify(next) })
-    .where(eq(schema.projects.id, p.id));
   return next;
+}
+
+/** What a conditional writer decides once it can see the settings it is writing against. */
+export type SettingsWriteDecision<R> = { write: Partial<ProjectSettings> } | { refuse: R };
+
+/** The outcome of a conditional write. `settings` is the standing blob either way. */
+export type SettingsWriteResult<R> =
+  | { applied: true; settings: ProjectSettings }
+  | { applied: false; settings: ProjectSettings; refused: R };
+
+/**
+ * Merge a settings patch into the project's settingsJson, unless `decide` refuses once it has seen
+ * the settings as they stand AT WRITE TIME. Returns the merged blob, or the untouched one plus the
+ * refusal.
+ *
+ * The read, the decision, the merge and the write happen inside ONE immediate transaction,
+ * synchronously, for two reasons. Every writer here rewrites the WHOLE blob and the settings page
+ * has several of them — the global Save, the automation table (which saves on change) and the
+ * work-policy panel each PATCH on their own — so two in flight at once would both read the pre-save
+ * row and the later write would silently erase the earlier one's keys while both reported success.
+ * And a guard that ran BEFORE the transaction is only a hint: two callers can both read a state
+ * their guard admits and both write, which is how a conflict the caller reports as a 409 becomes a
+ * silent overwrite instead. Deciding under the write lock is what makes the refusal true.
+ */
+export async function updateProjectSettingsIf<R>(
+  slug: string,
+  decide: (current: ProjectSettings) => SettingsWriteDecision<R>,
+): Promise<SettingsWriteResult<R>> {
+  const db = getDb();
+  const p = await getProjectBySlug(slug);
+  if (!p) throw new Error(`Project not found: ${slug}`);
+  return db.transaction(
+    (tx) => {
+      const row = tx
+        .select({ settingsJson: schema.projects.settingsJson })
+        .from(schema.projects)
+        .where(eq(schema.projects.id, p.id))
+        .limit(1)
+        .get();
+      const current = parseSettings(row?.settingsJson);
+      const decision = decide(current);
+      if ("refuse" in decision) {
+        return { applied: false as const, settings: current, refused: decision.refuse };
+      }
+      const next = mergeSettings(current, decision.write);
+      tx
+        .update(schema.projects)
+        .set({ settingsJson: JSON.stringify(next) })
+        .where(eq(schema.projects.id, p.id))
+        .run();
+      return { applied: true as const, settings: next };
+    },
+    // The write lock is taken up front: a deferred transaction would read first and only then try to
+    // upgrade, which is the shape that loses to SQLITE_BUSY under exactly the concurrency this
+    // guards against.
+    { behavior: "immediate" },
+  );
+}
+
+/** Merge a settings patch into the project's settingsJson. Returns the merged settings. */
+export async function updateProjectSettings(
+  slug: string,
+  patch: Partial<ProjectSettings>,
+): Promise<ProjectSettings> {
+  return (await updateProjectSettingsIf(slug, () => ({ write: patch }))).settings;
+}
+
+/** What the shared beads config path reports back — the one seam the log helpers below read. */
+type BeadsConfigResult = ReturnType<typeof configureBeadsForRepo>;
+
+/**
+ * Whether the config path got the repo all the way there. A partial run is logged, never thrown:
+ * the projects row is valid without a board, and the operator needs to see which step fell over.
+ */
+function logBeadsConfig(repoPath: string, result: BeadsConfigResult): void {
+  if (result.errors.length) {
+    console.warn(`[projects] beads config partial for ${repoPath}: ${result.errors.join("; ")}`);
+  } else if (result.configured && result.ranInit) {
+    console.log(`[projects] beads configured for ${repoPath}`);
+  }
+}
+
+/**
+ * Why a wired Dolt remote still has no `refs/dolt/data` on origin. A failed FIRST publish leaves the
+ * remote EMPTY — nothing for the next clone to bootstrap from — so it reads louder than a retry note
+ * on a remote that already carries history.
+ */
+function doltPushFailureWarning(
+  repoPath: string,
+  dolt: Pick<NonNullable<BeadsConfigResult["doltSync"]>, "firstPublish" | "pushAttempts">,
+): string {
+  if (dolt.firstPublish) {
+    return (
+      `[projects] Dolt remote wired for ${repoPath} but the FIRST publish failed after ` +
+      `${dolt.pushAttempts} attempts — origin has no refs/dolt/data yet (empty remote); ` +
+      `retry \`bd dolt pull && bd dolt push\` once auth/network is available`
+    );
+  }
+  return (
+    `[projects] Dolt remote wired for ${repoPath} — bd dolt push failed after ` +
+    `${dolt.pushAttempts} attempts; retry once auth/network is available`
+  );
+}
+
+/**
+ * Push is non-fatal but reported (anton-8qx): the remote is wired locally even when the publish push
+ * fails (e.g. no push access yet), so only claim refs/dolt/data is on origin when it actually is.
+ */
+function logDoltSync(repoPath: string, result: BeadsConfigResult): void {
+  const dolt = result.doltSync;
+  if (dolt?.status !== "configured") return;
+  if (dolt.pushed !== false) {
+    console.log(`[projects] Dolt remote wired for ${repoPath} (refs/dolt/data on origin)`);
+    return;
+  }
+  console.warn(doltPushFailureWarning(repoPath, dolt));
+}
+
+/**
+ * Hooks are optional for anton-driven repos (the runner pushes Dolt explicitly); just note the
+ * manager so bd's post-merge/post-checkout hydration loss under it isn't a silent surprise.
+ */
+function logHooksWarning(repoPath: string, result: BeadsConfigResult): void {
+  if (!result.hooksWarning) return;
+  console.warn(
+    `[projects] ${result.hooksWarning.manager} owns core.hooksPath in ${repoPath}; ` +
+      `bd hydration hooks won't run — chain 'bd hooks run <hook>' manually if you rely on them.`,
+  );
 }
 
 /**
@@ -675,41 +1513,9 @@ function healBeads(repoPath: string, prefix?: string): boolean {
     // with cwd: APP_ROOT — the same anchor formula.ts uses), so UI registration installs the bundled
     // bead formula just like `anton init` instead of reporting `missing-asset`.
     const result = configureBeadsForRepo(repoPath, { prefix, appRoot: process.cwd() });
-    if (result.errors.length) {
-      console.warn(
-        `[projects] beads config partial for ${repoPath}: ${result.errors.join("; ")}`,
-      );
-    } else if (result.configured && result.ranInit) {
-      console.log(`[projects] beads configured for ${repoPath}`);
-    }
-    if (result.doltSync?.status === "configured") {
-      // Push is non-fatal + reported (anton-8qx): the remote is wired locally even when the publish
-      // push fails (e.g. no push access yet), so only claim refs/dolt/data is on origin when it is.
-      // A failed FIRST publish leaves the remote EMPTY (nothing for the next clone to bootstrap
-      // from) — warn LOUD on that case rather than logging it as a routine retry note.
-      if (result.doltSync.pushed !== false) {
-        console.log(`[projects] Dolt remote wired for ${repoPath} (refs/dolt/data on origin)`);
-      } else if (result.doltSync.firstPublish) {
-        console.warn(
-          `[projects] Dolt remote wired for ${repoPath} but the FIRST publish failed after ` +
-            `${result.doltSync.pushAttempts} attempts — origin has no refs/dolt/data yet (empty remote); ` +
-            `retry \`bd dolt pull && bd dolt push\` once auth/network is available`,
-        );
-      } else {
-        console.warn(
-          `[projects] Dolt remote wired for ${repoPath} — bd dolt push failed after ` +
-            `${result.doltSync.pushAttempts} attempts; retry once auth/network is available`,
-        );
-      }
-    }
-    if (result.hooksWarning) {
-      // Hooks are optional for anton-driven repos (runner pushes Dolt explicitly); just note the
-      // manager so bd's post-merge/post-checkout hydration loss under it isn't a silent surprise.
-      console.warn(
-        `[projects] ${result.hooksWarning.manager} owns core.hooksPath in ${repoPath}; ` +
-          `bd hydration hooks won't run — chain 'bd hooks run <hook>' manually if you rely on them.`,
-      );
-    }
+    logBeadsConfig(repoPath, result);
+    logDoltSync(repoPath, result);
+    logHooksWarning(repoPath, result);
     return result.hasBeads;
   } catch (err) {
     console.warn(`[projects] beads self-heal failed for ${repoPath}: ${String(err)}`);
@@ -734,11 +1540,173 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** A projects row as stored — what each teardown step is handed instead of re-reading it. */
+type ProjectRow = typeof schema.projects.$inferSelect;
+
+/** One anton-created worktree recorded on a run, with the branch to delete alongside it. */
+interface ProjectWorktree {
+  path: string;
+  branch: string;
+}
+
 /**
- * Full local teardown for a project (anton-adt): abort its live work, remove every anton-created
- * worktree + branch, delete its session logs, then drop its anton.db rows. Leaves the repo itself
- * pristine — the only git commands run are `worktree remove/prune` and `branch -D` on anton's own
- * branches; nothing touches the repo's working tree, tracked files, or `.beads/`.
+ * Teardown step 1 — stop live work before anything else. Raise BOTH enqueue barriers, then drain: a
+ * scheduler tick or approval that already crossed the barrier is caught by `quiesceProject`'s abort
+ * sweep, anything later is rejected, so the runner can't re-claim this project mid-teardown.
+ *
+ * Dynamic import — the service statically imports this module for its policy resolver, so a static
+ * import here would cycle.
+ */
+async function quiesceProjectWork(slug: string, projectId: string): Promise<void> {
+  try {
+    const { getRunner, getScheduler } = await import("./jobs/service");
+    getScheduler().quiesceProject(projectId);
+    await getRunner().quiesceProject(projectId);
+  } catch (e) {
+    throw new Error(`deleteProject(${slug}): aborting in-flight jobs failed: ${errMsg(e)}`);
+  }
+}
+
+/** The distinct worktrees this project's runs created — never the repo's own working tree. */
+async function projectWorktrees(db: AntonDb, project: ProjectRow): Promise<ProjectWorktree[]> {
+  const runRows = await db
+    .select({ worktreePath: schema.runs.worktreePath, branch: schema.runs.branch })
+    .from(schema.runs)
+    .where(eq(schema.runs.projectId, project.id));
+  const worktrees = new Map<string, ProjectWorktree>();
+  for (const run of runRows) {
+    if (!run.worktreePath) continue;
+    // Paranoia guard: never operate on the repo's own working tree, whatever the row says.
+    if (resolve(run.worktreePath) === resolve(project.repoPath)) continue;
+    worktrees.set(run.worktreePath, { path: run.worktreePath, branch: run.branch ?? "" });
+  }
+  return [...worktrees.values()];
+}
+
+/** What survived removal. `removeWorktree` is best-effort internally, so the result is verified. */
+async function worktreeResidue(
+  repoPath: string,
+  worktrees: ProjectWorktree[],
+): Promise<string[]> {
+  const residue: string[] = [];
+  for (const wt of worktrees) {
+    if (existsSync(wt.path)) residue.push(`worktree ${wt.path}`);
+    if (wt.branch && (await branchExists(repoPath, wt.branch))) {
+      residue.push(`branch ${wt.branch}`);
+    }
+  }
+  return residue;
+}
+
+/**
+ * Teardown step 2 — remove every anton-created worktree + branch recorded on this project's runs,
+ * then fail loud BEFORE any row is touched. If a worktree or branch survived, the DB state is kept
+ * so a retry can finish the cleanup instead of deleting the only record of where the residue lives.
+ */
+async function removeProjectWorktrees(
+  db: AntonDb,
+  slug: string,
+  project: ProjectRow,
+): Promise<void> {
+  const worktrees = await projectWorktrees(db, project);
+  for (const wt of worktrees) {
+    await removeWorktree(
+      {
+        path: wt.path,
+        branch: wt.branch,
+        baseBranch: wt.branch,
+        createdBranch: false,
+        repoPath: project.repoPath,
+      },
+      { deleteBranch: Boolean(wt.branch) },
+    );
+  }
+  const residue = await worktreeResidue(project.repoPath, worktrees);
+  if (residue.length > 0) {
+    throw new Error(
+      `deleteProject(${slug}): worktree cleanup left residue (${residue.join(", ")}); ` +
+        `rows kept so a retry can complete the teardown`,
+    );
+  }
+}
+
+/** Teardown step 3 — session logs are disposable local diagnostics: best-effort, never blocking. */
+async function deleteSessionLogs(db: AntonDb, projectId: string): Promise<void> {
+  const sessionRows = await db
+    .select({ logPath: schema.sessions.logPath })
+    .from(schema.sessions)
+    .where(eq(schema.sessions.projectId, projectId));
+  for (const session of sessionRows) {
+    if (!session.logPath) continue;
+    await unlink(session.logPath).catch(() => {});
+  }
+}
+
+/**
+ * Teardown step 4 — drop the project's anton.db rows atomically, children before parents (no ON
+ * DELETE CASCADE in the schema): sessions → runs → jobs → schedules → run-health → picker plan →
+ * picker verdicts → picker starts → claude invocations → hygiene → scan summaries → autopilot
+ * disarms → escalations →
+ * burn samples (detached, not deleted) → projects.
+ */
+function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
+  try {
+    db.transaction((tx) => {
+      tx.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId)).run();
+      tx.delete(schema.runs).where(eq(schema.runs.projectId, projectId)).run();
+      tx.delete(schema.jobs).where(eq(schema.jobs.projectId, projectId)).run();
+      tx.delete(schema.schedules).where(eq(schema.schedules.projectId, projectId)).run();
+      tx.delete(schema.runHealthReports).where(eq(schema.runHealthReports.projectId, projectId)).run();
+      tx
+        .delete(schema.boardPickerPlans)
+        .where(eq(schema.boardPickerPlans.projectId, projectId))
+        .run();
+      tx
+        .delete(schema.pickerVerdicts)
+        .where(eq(schema.pickerVerdicts.projectId, projectId))
+        .run();
+      tx.delete(schema.pickerStarts).where(eq(schema.pickerStarts.projectId, projectId)).run();
+      // The spend ledger references the project, so it goes before the project DELETE or the whole
+      // teardown rolls back on the foreign key. DELETED, not detached like burn samples: those are a
+      // property of the MACHINE and outlive the project, while what a project's own tasks spent is
+      // meaningless once the project is gone.
+      tx
+        .delete(schema.claudeInvocations)
+        .where(eq(schema.claudeInvocations.projectId, projectId))
+        .run();
+      tx.delete(schema.hygieneReports).where(eq(schema.hygieneReports.projectId, projectId)).run();
+      tx.delete(schema.scanSummaries).where(eq(schema.scanSummaries.projectId, projectId)).run();
+      // Before the escalations they point at, and before the project they reference: a project
+      // disarmed even once keeps its whole disarm history, so leaving these behind fails the
+      // project DELETE on the foreign key and rolls the entire teardown back.
+      tx
+        .delete(schema.autopilotDisarms)
+        .where(eq(schema.autopilotDisarms.projectId, projectId))
+        .run();
+      tx.delete(schema.escalations).where(eq(schema.escalations.projectId, projectId)).run();
+      // Burn samples are DETACHED rather than dropped: what each job type costs this machine is a
+      // property of the machine, not of the project that happened to spend it, and the per-type
+      // averages pacing reads would otherwise regress to the tier seeds on every deregistration.
+      // Nulling the attribution is exactly what the column's null already means (unattributed), and
+      // it clears the foreign key that would otherwise roll the whole teardown back.
+      tx
+        .update(schema.burnSamples)
+        .set({ projectId: null })
+        .where(eq(schema.burnSamples.projectId, projectId))
+        .run();
+      tx.delete(schema.projects).where(eq(schema.projects.id, projectId)).run();
+    });
+  } catch (e) {
+    throw new Error(`deleteProject(${slug}): deleting anton.db rows failed: ${errMsg(e)}`);
+  }
+}
+
+/**
+ * Full local teardown for a project (anton-adt), in the order the steps below must run: stop live
+ * work, remove every anton-created worktree + branch, delete its session logs, then drop its
+ * anton.db rows. Leaves the repo itself pristine — the only git commands run are `worktree
+ * remove/prune` and `branch -D` on anton's own branches; nothing touches the repo's working tree,
+ * tracked files, or `.beads/`.
  *
  * Idempotent-by-absence: a second call (or an unknown slug) throws the clear not-found error, with
  * nothing left to clean. Fails loud mid-way: if a step leaves residue (a worktree/branch that
@@ -755,85 +1723,38 @@ export async function deleteProject(slug: string): Promise<void> {
   const project = rows[0];
   if (!project) throw new Error(`Project not found: ${slug}`);
 
-  // 1. Stop live work first: force-abort in-flight jobs and drop queued/running rows so the
-  //    runner can't re-claim this project's work mid-teardown. Dynamic import — the service
-  //    statically imports this module for its policy resolver, so a static import would cycle.
+  await quiesceProjectWork(slug, project.id);
+  await removeProjectWorktrees(db, slug, project);
+  await deleteSessionLogs(db, project.id);
+  deleteProjectRows(db, slug, project.id);
+}
+
+/** The row registration writes: a unique slug and the repo's own default branch, resolved once. */
+async function insertProjectRow(
+  db: AntonDb,
+  repoPath: string,
+  requestedName?: string,
+): Promise<Omit<Project, "hasBeads" | "createdAt">> {
+  const name = requestedName?.trim() || basename(repoPath);
+  const slug = await uniqueSlug(toSlug(name) || "project");
+  const defaultBranch = await detectDefaultBranch(repoPath);
+  const id = randomUUID();
+  await db.insert(schema.projects).values({ id, slug, name, repoPath, defaultBranch });
+  return { id, slug, name, repoPath, defaultBranch };
+}
+
+/**
+ * Seed the default background-job schedules (nightly stringer, review-fix poll, orphan grooming) so
+ * the Phase 2 jobs run without manual setup. Best-effort — a scheduling hiccup must not fail project
+ * creation, and schedules can be added later.
+ */
+async function seedProjectSchedules(db: AntonDb, projectId: string): Promise<void> {
   try {
-    const { getRunner, getScheduler } = await import("./jobs/service");
-    // Raise both enqueue barriers before draining work. A scheduler tick or approval that already
-    // crossed the barrier is caught by quiesceProject's abort sweep; anything later is rejected.
-    getScheduler().quiesceProject(project.id);
-    await getRunner().quiesceProject(project.id);
-  } catch (e) {
-    throw new Error(`deleteProject(${slug}): aborting in-flight jobs failed: ${errMsg(e)}`);
-  }
-
-  // 2. Remove every anton-created worktree + branch recorded on this project's runs.
-  const runRows = await db
-    .select({ worktreePath: schema.runs.worktreePath, branch: schema.runs.branch })
-    .from(schema.runs)
-    .where(eq(schema.runs.projectId, project.id));
-  const worktrees = new Map<string, { path: string; branch: string }>();
-  for (const run of runRows) {
-    if (!run.worktreePath) continue;
-    // Paranoia guard: never operate on the repo's own working tree, whatever the row says.
-    if (resolve(run.worktreePath) === resolve(project.repoPath)) continue;
-    worktrees.set(run.worktreePath, { path: run.worktreePath, branch: run.branch ?? "" });
-  }
-  for (const wt of worktrees.values()) {
-    await removeWorktree(
-      { path: wt.path, branch: wt.branch, baseBranch: wt.branch, repoPath: project.repoPath },
-      { deleteBranch: Boolean(wt.branch) },
-    );
-  }
-
-  // Fail loud before touching rows: removeWorktree is best-effort internally, so verify. If a
-  // worktree or branch survived, keep the DB state so a retry can finish the cleanup instead of
-  // deleting the only record of where the residue lives.
-  const residue: string[] = [];
-  for (const wt of worktrees.values()) {
-    if (existsSync(wt.path)) residue.push(`worktree ${wt.path}`);
-    if (wt.branch && (await branchExists(project.repoPath, wt.branch))) {
-      residue.push(`branch ${wt.branch}`);
-    }
-  }
-  if (residue.length > 0) {
-    throw new Error(
-      `deleteProject(${slug}): worktree cleanup left residue (${residue.join(", ")}); ` +
-        `rows kept so a retry can complete the teardown`,
-    );
-  }
-
-  // 3. Session logs are disposable local diagnostics — delete best-effort, never block teardown.
-  const sessionRows = await db
-    .select({ logPath: schema.sessions.logPath })
-    .from(schema.sessions)
-    .where(eq(schema.sessions.projectId, project.id));
-  for (const session of sessionRows) {
-    if (!session.logPath) continue;
-    await unlink(session.logPath).catch(() => {});
-  }
-
-  // 4. Drop the project's anton.db rows atomically, children before parents (no ON DELETE
-  //    CASCADE in the schema): sessions → runs → jobs → schedules → run-health → hygiene →
-  //    scan summaries → escalations → projects.
-  try {
-    db.transaction((tx) => {
-      tx.delete(schema.sessions).where(eq(schema.sessions.projectId, project.id)).run();
-      tx.delete(schema.runs).where(eq(schema.runs.projectId, project.id)).run();
-      tx.delete(schema.jobs).where(eq(schema.jobs.projectId, project.id)).run();
-      tx.delete(schema.schedules).where(eq(schema.schedules.projectId, project.id)).run();
-      tx
-        .delete(schema.runHealthReports)
-        .where(eq(schema.runHealthReports.projectId, project.id))
-        .run();
-      tx.delete(schema.hygieneReports).where(eq(schema.hygieneReports.projectId, project.id)).run();
-      tx.delete(schema.scanSummaries).where(eq(schema.scanSummaries.projectId, project.id)).run();
-      tx.delete(schema.escalations).where(eq(schema.escalations.projectId, project.id)).run();
-      tx.delete(schema.projects).where(eq(schema.projects.id, project.id)).run();
-    });
-  } catch (e) {
-    throw new Error(`deleteProject(${slug}): deleting anton.db rows failed: ${errMsg(e)}`);
+    const { seedDefaultSchedules } = await import("./schedules");
+    const { systemClock } = await import("./jobs/queue");
+    await seedDefaultSchedules(db, systemClock, projectId);
+  } catch {
+    // non-fatal — schedules can be added later.
   }
 }
 
@@ -863,45 +1784,13 @@ export async function addProject(input: {
     return toProject(existing[0]);
   }
 
-  const name = input.name?.trim() || basename(repoPath);
-  const baseSlug = toSlug(input.name?.trim() || basename(repoPath)) || "project";
-  const slug = await uniqueSlug(baseSlug);
-  const defaultBranch = await detectDefaultBranch(repoPath);
-  const id = randomUUID();
-
-  await db.insert(schema.projects).values({
-    id,
-    slug,
-    name,
-    repoPath,
-    defaultBranch,
-  });
-
-  // Seed the default background-job schedules (nightly stringer, review-fix poll, orphan grooming)
-  // so the Phase 2 jobs run without manual setup. Best-effort — a scheduling hiccup must not fail
-  // project creation.
-  try {
-    const { seedDefaultSchedules } = await import("./schedules");
-    const { systemClock } = await import("./jobs/queue");
-    await seedDefaultSchedules(db, systemClock, id);
-  } catch {
-    // non-fatal — schedules can be added later.
-  }
+  const row = await insertProjectRow(db, repoPath, input.name);
+  await seedProjectSchedules(db, row.id);
 
   // Self-heal beads so a UI/API-added repo converges to the same end state as `anton init`
   // (anton-uez). Best-effort; `hasBeads` reflects the post-heal reality. The chosen prefix
   // (anton-ivtj) is threaded to `bd init` so a fresh board gets the operator's ticket-ID prefix.
   const hasBeads = healBeads(repoPath, input.prefix);
 
-  const createdAt = Math.floor(Date.now() / 1000);
-
-  return {
-    id,
-    slug,
-    name,
-    repoPath,
-    defaultBranch,
-    hasBeads,
-    createdAt,
-  };
+  return { ...row, hasBeads, createdAt: Math.floor(Date.now() / 1000) };
 }

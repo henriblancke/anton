@@ -1,0 +1,171 @@
+/**
+ * Which projects can spend right now — the denominator of the live quota split (R6.4).
+ *
+ * One definition, shared by the settings panel and the governor, because the two must never
+ * disagree about whether a repo is idle: a panel that says "your share is in use elsewhere" while
+ * the governor still holds that share back is worse than either answer alone. For the same reason
+ * it answers with the runner's OWN claim gates: work the runner would refuse to lease — a queued row
+ * or an expired running lease under an autonomy-off project's execute-epic bucket or a disabled
+ * schedule — is not startable, whatever its `runAt` says (PR #248 review).
+ *
+ * The answer is THREE-VALUED, and that is the whole care of this module. `true` = the picker ranks
+ * startable work here, or quota-burning work is already startable — running, or queued and due —
+ * or the governor is holding work back on this project's own share, which is demand, not idleness.
+ * `false` = the picker looked and found nothing, or what it found nothing here can start — its own
+ * schedule or the autonomy switch is off. ABSENT = nobody looked — the board-picker pass ships
+ * disabled, so a project that never armed it has no observation at all, and reading that silence
+ * as "idle" would strip a busy repo's share on a question this machine never asked.
+ *
+ * Work in flight counts alongside the picker's ranking because that is what makes reclaim prompt: a
+ * repo that wakes up on Friday is back in the denominator the moment work is DUE, rather than
+ * waiting for the next scheduled pass to re-rank its board.
+ */
+import { and, eq, like, lte, or } from "drizzle-orm";
+
+import { burnsClaudeQuota } from "./burn";
+import { schema } from "./db";
+import {
+  BUDGET_DEFER_PREFIX,
+  disabledScheduleKeys,
+  scheduleGateKey,
+  type AntonDb,
+  type JobType,
+} from "./jobs/queue";
+
+/** Per-project eligibility; a project absent from the map was never observed, which is not `false`. */
+export type WorkEligibility = ReadonlyMap<string, boolean>;
+
+/** What this machine can observe about who holds eligible work, by project id. */
+export async function observedWorkEligibility(
+  db: AntonDb,
+  now: number = Date.now(),
+): Promise<WorkEligibility> {
+  const [plans, inFlight, autonomyOff, disabledSchedules] = await Promise.all([
+    db
+      .select({
+        projectId: schema.boardPickerPlans.projectId,
+        targetCount: schema.boardPickerPlans.targetCount,
+      })
+      .from(schema.boardPickerPlans),
+    db
+      .select({
+        projectId: schema.jobs.projectId,
+        type: schema.jobs.type,
+        status: schema.jobs.status,
+        leaseExpiresAt: schema.jobs.leaseExpiresAt,
+      })
+      .from(schema.jobs)
+      // The same definition of "startable" the queue itself leases on (`leaseDue`): running, or
+      // queued AND DUE. A queued row pushed to a future `runAt` by a retry backoff or a usage-limit
+      // reschedule cannot start before then, so counting it holds the project in the denominator
+      // while none of its work can spend, blocking the very reallocation that window exists to
+      // allow, and telling the settings panel it has work ready when it has none.
+      //
+      // A row the GOVERNOR deferred is the one exception (PR #248 review): it is demand the project's
+      // own share turned away, not work that cannot start. Reading it as idle would drop the project
+      // from the divisor the moment it hit its cap, widen every neighbour's share by its cut — and,
+      // since each project's share resolves with itself always in the divisor, widen its own too, so
+      // the next admitting tick resumes the very rows the share just held. Two capped projects would
+      // then take turns handing each other the capacity a third, reserved repo declared. The
+      // governor marks its deferrals (`deferQueuedJobs`), so they are told apart by that marker —
+      // and it stamps only rows that were DUE, so a row still inside a retry or usage-limit backoff
+      // never carries it and stays out of the divisor until its backoff elapses.
+      .where(
+        or(
+          eq(schema.jobs.status, "running"),
+          and(
+            eq(schema.jobs.status, "queued"),
+            or(
+              lte(schema.jobs.runAt, new Date(now)),
+              like(schema.jobs.lastError, `${BUDGET_DEFER_PREFIX}%`),
+            ),
+          ),
+        ),
+      ),
+    autonomyOffProjects(db),
+    disabledScheduleKeys(db),
+  ]);
+
+  // The picker only ever starts execute-epic work, so its ranking is no claim on the quota where
+  // the autonomy switch would leave every start it makes queued. Nor where the picker itself is
+  // switched OFF: disabling its schedule leaves the last plan row in place (only teardown deletes
+  // it) and stops every refresh — the cron and the board-change nudge both refuse — so a nonempty
+  // plan there is a stale ranking nothing will act on, and reading it as a claim would hold the
+  // project in the denominator for as long as the switch stays off.
+  const eligibility = new Map(
+    plans.map((p) => [
+      p.projectId,
+      p.targetCount > 0 &&
+        !autonomyOff.has(p.projectId) &&
+        !disabledSchedules.has(scheduleGateKey("board-picker", p.projectId)),
+    ]),
+  );
+  for (const job of inFlight) {
+    // A job with no project is anton's own plumbing and belongs to nobody's share.
+    if (!job.projectId) continue;
+    // Plumbing costs no quota, so a queued sync-push is not a claim on anyone's share.
+    if (!burnsClaudeQuota(job.type as JobType)) continue;
+    // A live running row is spending whatever the switches say — both gate the CLAIM, not the run.
+    // A queued one the runner holds at cap 0 (`tickOnce`) cannot spend until an operator flips the
+    // switch back, which is an operator action, not the idle window's business. A running row whose
+    // lease has EXPIRED is a reclaim — the runner leases it through the same held-bucket filter as a
+    // queued row — so it holds no share either: a restart expires every surviving lease, and the
+    // held project would otherwise sit in the denominator until the operator's next visit.
+    const reclaimable =
+      job.status === "queued" ||
+      (job.leaseExpiresAt !== null && job.leaseExpiresAt.getTime() <= now);
+    if (reclaimable && isHeld(job.type, job.projectId, autonomyOff, disabledSchedules)) {
+      // A held row IS an observation — "this project has work, and its own switch keeps it from
+      // starting" — so it records `false` where nothing else has spoken (PR #248 review). The map is
+      // seeded from picker plans alone, and the picker ships disabled, so a plan-less project whose
+      // only due row is held would otherwise stay ABSENT, read as unobserved, and keep its share for
+      // as long as the switch stays off. Never demotes: a plan or a startable row already found here
+      // is the stronger claim.
+      if (!eligibility.has(job.projectId)) eligibility.set(job.projectId, false);
+      continue;
+    }
+    eligibility.set(job.projectId, true);
+  }
+  return eligibility;
+}
+
+/**
+ * The runner's hard holds: autonomy off parks every execute-epic; a disabled schedule parks its type.
+ * A per-PR fix has no schedule row of its own — the runner holds it by its DISPATCHER's switch
+ * (`review-fix`, see `tickOnce`), so the same derivation applies here or the two would disagree.
+ */
+function isHeld(
+  type: string,
+  projectId: string,
+  autonomyOff: ReadonlySet<string>,
+  disabledSchedules: ReadonlySet<string>,
+): boolean {
+  if (type === "execute-epic" && autonomyOff.has(projectId)) return true;
+  const gate = type === "review-fix-pr" ? "review-fix" : type;
+  return disabledSchedules.has(scheduleGateKey(gate, projectId));
+}
+
+/**
+ * Projects whose autonomy master-switch is OFF. Read off the raw settings blob rather than through
+ * `getProjectSettings`: projects.ts is a consumer of this module, and one boolean is not worth the
+ * import cycle. Same lenient parse as there — an unparseable blob reads as defaults (autonomy on).
+ */
+async function autonomyOffProjects(db: AntonDb): Promise<Set<string>> {
+  const rows = await db
+    .select({ id: schema.projects.id, settingsJson: schema.projects.settingsJson })
+    .from(schema.projects);
+  const off = new Set<string>();
+  for (const row of rows) {
+    try {
+      if ((JSON.parse(row.settingsJson) as { autonomy?: unknown }).autonomy === false) off.add(row.id);
+    } catch {
+      // Unparseable settings resolve to defaults everywhere else too.
+    }
+  }
+  return off;
+}
+
+/** One project's eligibility as the split reads it: `null` where nothing observed it. */
+export function eligibilityOf(eligibility: WorkEligibility | null, projectId: string): boolean | null {
+  return eligibility?.get(projectId) ?? null;
+}

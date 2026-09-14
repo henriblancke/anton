@@ -1,17 +1,23 @@
 import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
+import { humanGates } from "@/lib/approval-gate";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
 import { formatStructureViolations, structureGaps } from "@/lib/beads/structure";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
-import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
+import { conflictBody, ownerOf, stealRefused } from "@/lib/beads/claim";
+import { approveAndClaim, unwindApproveClaim } from "@/lib/beads/approve-claim";
 import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
 import { isProposalBead } from "@/lib/gardener/detections";
+import { getDb } from "@/lib/db";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
+import { systemClock } from "@/lib/jobs/queue";
 import { resolveOperator } from "@/lib/operator";
-import type { Project } from "@/lib/types";
+import { recordRelease, resolveRelease } from "@/lib/picker-release";
+import { withdrawPickerAccept } from "@/lib/picker-veto";
+import type { ApprovalRunOutcome, Project } from "@/lib/types";
 import { contractGatedBeads, deriveStage, runTickets } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
 import { notFoundResponse, withProject } from "../../../resolve-project";
@@ -33,24 +39,86 @@ export const dynamic = "force-dynamic";
  * Take over button posts `{ steal: true }` with no `immediate` field, and a pure ownership transfer
  * must not promote a teammate's paced ("Queue for optimal usage") job to an immediate `bypassBudget`
  * run the operator never requested.
+ *
+ * `release` is the Up Next lane's one-click start (anton-d2h6 / R3.5). It changes NOTHING about what
+ * this route does — a release is exactly this approval, with the same contract gate, structure gate,
+ * blocker check, auto-claim and enqueue — and only adds what release MEANS that approve does not: the
+ * target was anton's pick and the operator agreed with it, so the choice is recorded as an accept.
+ * The flag ASKS for that record; whether the target really was a live pick is re-derived server-side
+ * (`picker-release.ts` → `resolveRelease`), because a client cannot be the witness to its own
+ * evidence.
+ *
+ * `planId` rides with it: the plan GENERATION the operator was looking at, exactly as the veto route
+ * takes one (PR #212 review). The client is not trusted to say the target was a pick, but it IS the
+ * only witness to WHICH decision it was answering — a later pass can have re-picked the same bead
+ * since the card was drawn, and an accept resolved from the newer generation would credit the picker
+ * with an agreement to a pick nobody was shown.
  */
-async function readApprovalBody(
-  request: Request,
-): Promise<{ steal: boolean; immediate: boolean; immediateExplicit: boolean }> {
+async function readApprovalBody(request: Request): Promise<{
+  steal: boolean;
+  immediate: boolean;
+  immediateExplicit: boolean;
+  release: boolean;
+  planId?: string;
+}> {
   try {
-    const body = (await request.json()) as { steal?: unknown; immediate?: unknown };
+    const body = (await request.json()) as {
+      steal?: unknown;
+      immediate?: unknown;
+      release?: unknown;
+      planId?: unknown;
+    };
+    const planId = typeof body?.planId === "string" ? body.planId.trim() : "";
     return {
       steal: body?.steal === true,
       immediate: body?.immediate !== false,
       immediateExplicit: body?.immediate === true,
+      release: body?.release === true,
+      ...(planId && planId.length <= 120 ? { planId } : {}),
     };
   } catch {
-    return { steal: false, immediate: true, immediateExplicit: false };
+    return { steal: false, immediate: true, immediateExplicit: false, release: false };
   }
 }
 
-/** HTTP status per apply failure: the caller's mistake, the board's, or ours. */
-const APPLY_STATUS = { unusable: 422, refused: 409, failed: 500 } as const;
+/**
+ * HTTP status per apply failure: the caller's mistake, the board's, or ours. `unsettled` is ours too
+ * — the move is on the board and only its proposal could not be closed, and the error text is what
+ * tells the operator that approving it again settles it.
+ */
+const APPLY_STATUS = { unusable: 422, refused: 409, failed: 500, unsettled: 500 } as const;
+
+/**
+ * What the under-lock guard can refuse an approval for — the two verdicts that can only be taken
+ * against the board as of the write: the target is not (or is no longer) a run target, or a steal's
+ * victim started their run while this approval was in flight.
+ */
+type ApproveRefusal = { notRunTarget: string } | { moved: string };
+
+/**
+ * Why this bead is not something approval may enqueue, or undefined when it is a run target. Reuses
+ * the same `beads.isRunTarget` gate execute-epic enforces (a shared helper, no duplicated type
+ * logic) so the route and the runner agree on what "runnable" means, and names WHICH of the three
+ * ways it fails so the operator is told what to approve instead.
+ *
+ * One function because this question is asked TWICE per approval — once off the pre-lock board read,
+ * once again under the claim lock (see the swap below) — and the two answers must read identically.
+ */
+function notRunTargetReason(target: Bead, board: Bead[]): string | undefined {
+  if (beads.isRunTarget(target, board)) return undefined;
+  const id = target.id;
+  if (beads.isContainer(target, board)) {
+    // Approval is a per-PR gate, so it must never be offered on a bead whose approval would
+    // launch one PR per feature under it (design 2026-07-26: "Approval stays per feature").
+    return `${id} is a container epic, not a run target — approve one of its features instead; each feature is its own run and its own PR`;
+  }
+  const parent = beads.parentOf(target);
+  const type = target.issue_type ?? "unknown";
+  if ((type === "task" || type === "bug") && parent) {
+    return `${id} is a child ticket of ${parent} — approve its epic ${parent} instead; a child runs via its epic's PR, not on its own`;
+  }
+  return `${id} is not runnable: type "${type}" — only a feature, a parentless task/bug, or an epic with no feature children can be approved to run`;
+}
 
 /**
  * Approve a gardener proposal: apply its board move and close it (anton-1t3n). Never enqueues a run
@@ -67,7 +135,7 @@ async function applyProposalResponse(
   board: Bead[],
 ): Promise<NextResponse> {
   try {
-    const applied = await applyProposal(project.repoPath, proposal, board);
+    const applied = await applyProposal(project.repoPath, proposal, board, "approval");
     // The move landed locally; propagate it like every other operator write (immediate coalesced
     // push + the durable backstop), off the response path.
     nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");
@@ -126,20 +194,11 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     return applyProposalResponse(project, target, allBeads);
   }
 
-  if (!beads.isRunTarget(target, allBeads)) {
-    const parent = beads.parentOf(target);
-    const type = target.issue_type ?? "unknown";
-    let reason: string;
-    if (beads.isContainer(target, allBeads)) {
-      // Approval is a per-PR gate, so it must never be offered on a bead whose approval would
-      // launch one PR per feature under it (design 2026-07-26: "Approval stays per feature").
-      reason = `${epicId} is a container epic, not a run target — approve one of its features instead; each feature is its own run and its own PR`;
-    } else if ((type === "task" || type === "bug") && parent) {
-      reason = `${epicId} is a child ticket of ${parent} — approve its epic ${parent} instead; a child runs via its epic's PR, not on its own`;
-    } else {
-      reason = `${epicId} is not runnable: type "${type}" — only a feature, a parentless task/bug, or an epic with no feature children can be approved to run`;
-    }
-    return NextResponse.json({ error: reason }, { status: 422 });
+  // Cheap refusal first, off the read above — most non-run-targets never get near the lock. The
+  // verdict is re-taken under the lock before anything is written, because this read cannot hold.
+  const notRunnable = notRunTargetReason(target, allBeads);
+  if (notRunnable) {
+    return NextResponse.json({ error: notRunnable }, { status: 422 });
   }
 
   // The bead contract, judged over the SAME set execute-epic gates on — the target plus every
@@ -196,7 +255,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // Read before the approve below, which would otherwise make every request look like a re-approve.
   // See the enqueue gate at the end for what this distinguishes.
   const wasApproved = beads.isApproved(target);
-  const { steal, immediate, immediateExplicit } = await readApprovalBody(request);
+  const { steal, immediate, immediateExplicit, release, planId } = await readApprovalBody(request);
   // A pure take-over reassigns the reservation and nothing more (the enqueue gate at the end skips its
   // run), so it bypasses the blocker gate — but never the steal-validity checks below, which still
   // confine it to a backlog target with a resolvable operator identity. Mirrors the enqueue-suppression
@@ -207,20 +266,31 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // the epic-graph rollup (epic→epic + cross-epic child blocks) PLUS any parentless standalone
   // (task/bug) prerequisite the rollup DROPS (epicStandaloneBlockers) — otherwise an epic that
   // depends on an open standalone item would read ready. For a standalone target the rollup never
-  // carries it, so derive from its own `blocks` edges. Two consumers below: the readiness gate (a
-  // fresh approval enqueues immediately, so a still-blocked target must be rejected before we
-  // label + enqueue work `bd ready` would keep blocked), and the take-over enqueue at the end (which
-  // only fires when nothing is open).
+  // carries it, so derive from its own `blocks` edges. Two consumers below: the standalone half of
+  // the readiness gate (a fresh approval enqueues immediately, so a still-blocked target must be
+  // rejected before we label + enqueue work `bd ready` would keep blocked), and the refusal message,
+  // which names what the operator is waiting on.
   const openBlockers = epic
     ? [...epic.blockedBy, ...epicStandaloneBlockers(allBeads, epicId)]
     : standaloneBlockers(allBeads, epicId);
+  // Whether this request can actually start work. `openBlockers` is a target-level roll-up: it fires
+  // on ANY open blocker under the target, so one gated tail child made the whole run unapprovable
+  // while its independent siblings sat idle (issue #58). The rollup's per-child verdict answers the
+  // question that actually matters — is there a ticket this run could dispatch right now — so a
+  // partially-gated target approves and runs its ready children, and only a target with ZERO of them
+  // is refused. A standalone task/bug (epic-of-one) carries no such verdict and has no children to
+  // be partial about: it stays gated on its own open blockers.
+  const runnable = epic ? epic.childReadiness !== "blocked" : openBlockers.length === 0;
   // A pure take-over bypasses this gate — it only reassigns the reservation and enqueues no run that
   // would start blocked work (see the enqueue gate at the end) — so a target that gained a blocker
   // AFTER its original approval stays transferable to a new owner rather than stranded with the old.
-  if (!takeOver && openBlockers.length > 0) {
-    const message = epic
-      ? `Epic is blocked by ${openBlockers.join(", ")}`
-      : `${epicId} is blocked by ${openBlockers.join(", ")}`;
+  if (!takeOver && !runnable) {
+    const message =
+      openBlockers.length > 0
+        ? epic
+          ? `Epic is blocked by ${openBlockers.join(", ")}`
+          : `${epicId} is blocked by ${openBlockers.join(", ")}`
+        : `${epicId} is blocked: every ticket it would run is held by an open blocker`;
     return NextResponse.json({ error: message }, { status: 409 });
   }
 
@@ -237,9 +307,9 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // enqueues nothing (the enqueue gate at the end skips it) — it only moves the reservation — so
   // refusing it on a contract gap would strand an approved target with its previous owner over a
   // section no run of ours is about to read. The condition mirrors that enqueue gate exactly: a
-  // non-take-over always enqueues (a blocked one already 409'd above), a take-over only when
-  // nothing is open.
-  const willEnqueue = !takeOver || openBlockers.length === 0;
+  // non-take-over always enqueues (an unrunnable one already 409'd above), a take-over only when the
+  // target has work it can actually start.
+  const willEnqueue = !takeOver || runnable;
   const blocking = willEnqueue ? contractGaps(contractGated, "blocking") : [];
   if (blocking.length > 0) {
     return NextResponse.json(
@@ -293,17 +363,48 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       ]
     : [];
 
+  // What this run will cost the OPERATOR, on the same advisory channel (anton-qfso.2): every bead in
+  // the dispatch set labelled `agent:human` is a point the run reaches and then holds, waiting for a
+  // person. Never a refusal — human work is real, shaped, approved work — but it is the one cost the
+  // operator can only weigh before starting. Same `willEnqueue` gate as the advisory above, so a
+  // take-over that starts no run promises no gates either.
+  //
+  // Derived under the lock from the SAME locked board as `humanTarget`, not from the pre-lock
+  // `contractGated`: a child gaining or losing `agent:human` in that window changes which gates the
+  // run actually arms, and the executor reloads the board and gates off the label as of the write.
+  // Answering from the stale set would omit a stop the run will hold at, or promise a stop for work
+  // an agent will just do (PR #214 review).
+  let humanWork: string[] = [];
+  // The one case where "anton runs the rest" is a lie (PR #214 review): when the TARGET itself
+  // carries the label, execute-epic poisons it before dispatching a single child, so the run the
+  // operator just triggered never starts. Reported separately from the gate lines because the two
+  // ask for different things — hold-and-resume versus do-it-yourself, no run pending.
+  //
+  // Read off the TARGET's own label, never off the gate lines: `contractGatedBeads` empties on the
+  // two recovery shapes — a grouped target whose children are all closed, and a standalone target
+  // already in review — and both still hit the target-level poison when re-run. Conditioning this on
+  // a non-empty dispatch set would answer those with silence about the one thing that decides the
+  // outcome (PR #214 review).
+  //
+  // Filled from the LOCKED read below, not from the pre-lock `target`: the label can be added or
+  // removed in the window between them, and the executor acts on the label as of the write. Deciding
+  // it here would announce a started run for a target that is already poison, or promise silence
+  // about a run that in fact never starts (PR #214 review).
+  let humanTarget = false;
+
+  // Whether the `approved` label would be OURS to take back if the sequence then falls over — off
+  // the LOCKED read, not the pre-lock one, because that is the state the write is made against. A
+  // target somebody already approved keeps its label through the unwind (PR #218 review).
+  let wroteLabel = false;
+
   // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.
   if (owner && owner !== operator) {
     // Claimed by someone else → approving would silently run a teammate's reservation. Require an
     // explicit steal to take it over, mirroring the claim route's 409.
     if (!steal) {
-      return NextResponse.json(
-        {
-          error: `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
-          owner,
-        },
-        { status: 409 },
+      return stealRefused(
+        `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
+        owner,
       );
     }
     // A steal only moves the reservation; it does not stop a run already executing under the current
@@ -315,13 +416,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     // can't bypass it. Derive from the fresh `target` read above.
     const stage = deriveStage(target);
     if (stage !== "backlog") {
-      return NextResponse.json(
-        {
-          error: `${epicId} is claimed by ${owner} and is already ${stage} — its run is in progress, so it can't be taken over; wait for it to finish or have ${owner} release it`,
-          owner,
-          stage,
-        },
-        { status: 409 },
+      return stealRefused(
+        `${epicId} is claimed by ${owner} and is already ${stage} — its run is in progress, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+        owner,
+        stage,
       );
     }
     // Steal requested, but no operator identity resolves (no ANTON_OPERATOR, no global git user.name),
@@ -329,16 +427,43 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     // reservation while leaving them as assignee — a half-steal that breaks the soft-lock the response
     // text and DESIGN.md promise. Reject until an operator identity is set to take ownership.
     if (!operator) {
-      return NextResponse.json(
-        {
-          error: `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is taking it over before approving`,
-          owner,
-        },
-        { status: 409 },
+      return stealRefused(
+        `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is taking it over before approving`,
+        owner,
       );
     }
   }
-  // Auto-claim, then approve, both under the bead's claim-write lock.
+
+  // WHICH pick a release answers, resolved BEFORE anything is written (anton-d2h6, anton-k4qr).
+  //
+  // Judged against `allBeads` — the forced-fresh, pre-write snapshot this request already read —
+  // because the approval's own label and claim would otherwise invalidate the very plan they are
+  // answering. Ahead of the write for the one verdict that has to be: a release naming a generation
+  // a later pass replaced is re-derived against that board, and a target the current ranking leaves
+  // out is REFUSED — anton would not start it now, so neither the approval nor the enqueue may land.
+  // Every other outcome is unchanged: the pick is carried to the reservation below, or the run goes
+  // ahead recording nothing (the run is the operator's to have, the evidence is not).
+  const pick = release
+    ? await resolveRelease(getDb(), {
+        projectId: project.id,
+        beadId: epicId,
+        board: allBeads,
+        ...(planId ? { displayedPlanId: planId } : {}),
+      })
+    : undefined;
+  if (pick && "refuse" in pick) {
+    // 409, the same status a lost claim race answers with, and for the same reason: this surface's
+    // copy of the board is provably behind, which is exactly what the release control re-reads on.
+    // `pickRefused` is what tells it apart FROM that claim race: the card reports a retired pick as
+    // its own state rather than as a failed request, and must never report it as one still waiting to
+    // be recorded (anton-84lx).
+    return NextResponse.json({ error: pick.refuse, pickRefused: pick.refusal }, { status: 409 });
+  }
+
+  // Re-check the board shape, auto-claim, then approve — all under the bead's claim-write lock.
+  //
+  // The shape re-check: every gate above judged a read taken before the lock existed, so the lock is
+  // also what makes the run-target verdict hold through the write. See the body.
   //
   // The claim: an unclaimed target (or one being stolen) gets assigned to the approver so the
   // reservation is set BEFORE the runtime execution-claim, closing the gap where a teammate could
@@ -361,39 +486,159 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // With no operator identity (no ANTON_OPERATOR, no git user.name) there's no one to assign, so
   // the swap is owner→owner: a verified no-op that still takes the lock and still serializes the
   // label against concurrent claims.
-  const swap = await withClaimLock(project.repoPath, epicId, async (cas) => {
-    // Re-derive the stage HERE, under the lock — not only from the pre-lock `target` read above.
-    // On a steal (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then
-    // the original owner's runner starts in the window before this CAS: it moves the bead to
-    // in_progress/stage:implementing but leaves the assignee as the old owner, so `cas(owner, …)`
-    // (which matches on assignee alone) would still succeed and reassign a *live* run to the
-    // approver — the exact implementing/in-review takeover the pre-lock gate rejects. Reading the
-    // stage inside the lock makes a run that started in that window lose the swap instead. A
-    // self-owned re-approve (owner === operator, e.g. Force run on an implementing epic) is
-    // deliberately excluded: it's the operator asking to re-run their own target, not a takeover.
-    let locked: Bead | undefined;
-    if (owner && owner !== operator) {
-      locked = await beads.show(project.repoPath, epicId);
-      const lockedStage = locked ? deriveStage(locked) : undefined;
-      if (lockedStage && lockedStage !== "backlog") return { moved: lockedStage } as const;
-    }
-    // Hand the stage gate's read to the CAS: it needs the assignee as of this lock, which is exactly
-    // what `locked` holds — re-reading it would be a second `bd show` of a bead nothing can move.
-    const result = await cas(owner, operator ?? owner, locked);
-    if (result.ok) await beads.approve(project.repoPath, epicId);
-    return result;
+  //
+  // The sequence itself lives in `beads/approve-claim.ts` — shared with the board-picker's apply
+  // step, which is the second writer of this label and must not rebuild the ordering above. What
+  // stays here is what is this route's: which re-checks the locked board has to survive.
+  const swap = await approveAndClaim<ApproveRefusal>({
+    repoPath: project.repoPath,
+    beadId: epicId,
+    expectedOwner: owner,
+    nextOwner: operator ?? owner,
+    guard: (locked, lockedBoard) => {
+      // Re-take the run-target verdict HERE, under the lock. The pre-lock gate answered from a read
+      // taken before every gate below it ran, and the Add-work commit (lib/backlog.ts
+      // `createDraftFeature`) attaches a feature child while holding THIS SAME per-bead lock. Without
+      // this the two orders are asymmetric: the feature landing first turns a standalone run target
+      // into a container behind the pre-lock gate's back, and we would label it `approved` and
+      // enqueue a run that execute-epic's own `isRunTarget` gate only poison-parks — a false green,
+      // the exact failure the pre-lock gate exists to prevent. Under the lock the shape cannot move
+      // between this verdict and the `approved` write, so the two writes are genuinely ordered:
+      // either the feature lands first and this refuses, or approval lands first and
+      // `createDraftFeature`'s own re-check refuses the draft.
+      const refusal = notRunTargetReason(locked, lockedBoard);
+      if (refusal) return { notRunTarget: refusal };
+
+      wroteLabel = !beads.isApproved(locked);
+
+      // The human-work report, taken off the same locked read the approval writes against — see the
+      // declarations above for why the pre-lock read is not good enough. The child gates are
+      // re-derived through the same `runTickets`/`contractGatedBeads` pair the pre-lock gate used, so
+      // the lines describe the board the run is about to consume rather than the one that passed it.
+      humanTarget = willEnqueue && beads.isHumanWork(locked);
+      humanWork = willEnqueue
+        ? humanGates(contractGatedBeads(locked, runTickets(lockedBoard, epicId)))
+        : [];
+
+      // Re-derive the stage HERE too — not only from the pre-lock `target` read above. On a steal
+      // (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then the
+      // original owner's runner starts in the window before this CAS: it moves the bead to
+      // in_progress/stage:implementing but leaves the assignee as the old owner, so `cas(owner, …)`
+      // (which matches on assignee alone) would still succeed and reassign a *live* run to the
+      // approver — the exact implementing/in-review takeover the pre-lock gate rejects. Reading the
+      // stage inside the lock makes a run that started in that window lose the swap instead. A
+      // self-owned re-approve (owner === operator, e.g. Force run on an implementing epic) is
+      // deliberately excluded: it's the operator asking to re-run their own target, not a takeover.
+      if (owner && owner !== operator) {
+        const lockedStage = deriveStage(locked);
+        if (lockedStage !== "backlog") return { moved: lockedStage };
+      }
+      return undefined;
+    },
   });
-  if ("moved" in swap) {
-    return NextResponse.json(
-      {
-        error: `${epicId} is claimed by ${owner} and is already ${swap.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+  if ("vanished" in swap) {
+    return notFoundResponse(`Ticket ${epicId} not found on the board`);
+  }
+  if ("refused" in swap) {
+    const refusal = swap.refused;
+    if ("moved" in refusal) {
+      return stealRefused(
+        `${epicId} is claimed by ${owner} and is already ${refusal.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
         owner,
-        stage: swap.moved,
-      },
-      { status: 409 },
-    );
+        refusal.moved,
+      );
+    }
+    return NextResponse.json({ error: refusal.notRunTarget }, { status: 422 });
+  }
+  // The claim write fell over ambiguously (PR #218 review): `bd assign` can commit and then throw or
+  // time out, so a 500 alone could leave the target reserved by an approver whose request reported
+  // nothing changed. approve-claim re-reads and hands the reservation back under the lock; only what
+  // it could not take off is the operator's to clear.
+  if ("claimFailed" in swap) {
+    const error = swap.stranded
+      ? `${epicId} could not be approved, and the claim this request took could not be handed ` +
+        `back — it is left assigned to ${operator ?? owner}; clear its assignee by hand. ` +
+        swap.claimFailed
+      : `${epicId} could not be approved — nothing was changed. ${swap.claimFailed}`;
+    // Published either way (PR #218 review). Both halves of this branch left local-only writes: the
+    // hand-back that worked, or the reservation it could not take off. An unpublished stranded claim
+    // reads as FREE on every other machine until a later heartbeat — so the target this response
+    // says is held stays claimable by a picker pass elsewhere, which is the second run the claim
+    // exists to prevent. The nudge coalesces per repo, so the no-op case costs an idle push.
+    nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");
+    return NextResponse.json({ error }, { status: 500 });
+  }
+  // The claim landed and the label did not (PR #218 review). The CAS has already moved the assignee,
+  // so failing the request here would leave the target reserved by an approver who never approved
+  // it — claimed-looking work with no approval and no run. Take this request's writes back, then
+  // report the failure the operator can retry.
+  if ("approveFailed" in swap) {
+    // Through the shared unwind, not a bare hand-back: `bd update --add-label` can commit and THEN
+    // throw or time out, so releasing the claim alone would publish an approved, unassigned target —
+    // the exact shape a picker pass or a worker starts on — while this response says nothing was
+    // changed (PR #218 review). The unwind re-reads the bead and removes only an approval this
+    // request introduced, and a label that will not come off keeps its claim rather than arming the
+    // target.
+    //
+    // The compensation's own verdict decides the message: reporting "nothing was changed" over
+    // writes that are still standing would leave the operator with a target that reads as taken or
+    // approved, has no run, and never comes back on a picker pass.
+    const leftover = await unwindApproveClaim({
+      repoPath: project.repoPath,
+      beadId: epicId,
+      owner: operator ?? owner,
+      restoreTo: owner,
+      wroteLabel,
+      wroteClaim: swap.swap.wrote,
+    });
+    const error =
+      leftover === "approval"
+        ? `${epicId} could not be approved, and the approval this request wrote was not taken ` +
+          `back — it is left approved and assigned to ${operator ?? owner}; unapprove it by ` +
+          `hand. ${swap.approveFailed}`
+        : leftover === "claim"
+          ? `${epicId} could not be approved, and the claim this request took could not be handed ` +
+            `back — it is left assigned to ${operator ?? owner}; clear its assignee by hand. ` +
+            swap.approveFailed
+          : // The reservation changed hands while this request's writes were being taken back, so
+            // they stopped being ours to reverse (PR #218 review): whoever holds the target now owns
+            // the approval standing on it, and stripping it would strand THEIR run. Nothing for the
+            // operator to clear — but the target did move, so the response says so rather than
+            // claiming nothing changed.
+            leftover === "transferred"
+            ? `${epicId} could not be approved by this request — it was claimed by another worker ` +
+              `while it was in flight, and its approval now stands for them. ${swap.approveFailed}`
+            : // The same take-over, caught only after the approval had come off theirs (PR #218
+              // review). Nothing of this request's is left standing — what needs a hand is the label
+              // it took off the worker who now holds the target, whose run waits on it.
+              leftover === "stripped"
+              ? `${epicId} could not be approved by this request — it was claimed by another ` +
+                `worker while it was in flight, and the approval this request took back could not ` +
+                `be put back for them; re-approve it by hand. ${swap.approveFailed}`
+              : `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}`;
+    // Same reason as the claim-failure branch above: the unwind is itself a board write, and what it
+    // could not take back is a partial write standing. Neither reaches another machine until it is
+    // published (PR #218 review).
+    nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");
+    return NextResponse.json({ error }, { status: 500 });
   }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
+
+  // A release is this approval plus its answer to the picker (anton-d2h6), and the answer is taken
+  // BEFORE the run rather than after it (PR #212 review). The accept and the veto are two answers to
+  // one decision, settled in the store under its write lock — so whichever the operator's other tab
+  // posts, it resolves against a verdict that is already durable instead of into the window the
+  // enqueue would otherwise hold open. Only a release that loses the CLAIM race records nothing at
+  // all, which is why this sits after the swap and not before it.
+  //
+  // The evidence rule is unchanged — no accept for a run that never started — and is now kept by
+  // withdrawing the reservation below rather than by waiting for the enqueue's verdict.
+  // WHICH pick is being answered was settled before the write (`resolveRelease` above); what is left
+  // here is filing it, which is the half that has to sit after the swap.
+  const acceptId =
+    pick && "accept" in pick
+      ? await recordRelease(getDb(), { projectId: project.id, beadId: epicId, pick: pick.accept })
+      : undefined;
 
   // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7). Two paths:
   //
@@ -415,10 +660,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   //    job and reuses it (returns no new id), so a parked prior run stays resumable rather than
   //    shadowed by a duplicate.
   //
-  //    Skip the take-over enqueue when the target is currently blocked: a take-over bypasses the
-  //    readiness gate above (to stay transferable), but starting blocked work is exactly what that
-  //    gate prevents — the runner would only park it. The operator force-runs it once the blocker
-  //    clears, matching a fresh approval's own blocker rejection.
+  //    Skip the take-over enqueue when the target has nothing it can start: a take-over bypasses the
+  //    readiness gate above (to stay transferable), but starting fully blocked work is exactly what
+  //    that gate prevents — the runner would only park it. The operator force-runs it once the
+  //    blocker clears, matching a fresh approval's own refusal.
   //
   // Best-effort — approving must still succeed even if the runner enqueue hiccups.
   // The autonomy master-switch (anton-y3l) gates at *claim* in the runner instead, so with autonomy
@@ -431,15 +676,49 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // `{ steal: true }` with no `immediate` field, and a pure ownership transfer must preserve the
   // existing pacing choice — a defaulted `bypassBudget: true` would promote a covering paced job
   // (or enqueue a fresh bypass one) and silently override the operator's Queue decision.
+  //
+  // A missing `jobId` is NOT one outcome (PR #212): both enqueues withhold an id on purpose when a
+  // run already covers the epic — `enqueueExecuteEpic` when the shared board shows one live on
+  // another machine (anton-jz1), `enqueueExecuteEpicIfAbsent` when this instance already holds one.
+  // Reporting all three as "nothing started" tells the operator to retry a target that is running,
+  // so `run` names which it was and only a thrown enqueue reads as a failure.
   let jobId: string | undefined;
+  let run: ApprovalRunOutcome = "none";
   try {
     if (!takeOver) {
       jobId = await enqueueExecuteEpic(project.id, epicId, { bypassBudget: immediate });
+      run = jobId ? "started" : "elsewhere";
     } else if (willEnqueue) {
       jobId = await enqueueExecuteEpicIfAbsent(project.id, epicId, { bypassBudget: immediateExplicit });
+      run = jobId ? "started" : "covered";
     }
   } catch (err) {
+    run = "failed";
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
+  }
+
+  // No run, no accept: the reservation above is taken back when nothing ended up covering the
+  // target, because an accept for a run that never started would be evidence of nothing and earned
+  // autonomy reads these counts to decide whether the picker may ever be armed. A run live on
+  // another machine KEEPS it — the operator accepted the pick and the work is running, which is what
+  // the accept records; only a failed or suppressed enqueue leaves nothing to answer for.
+  //
+  // Withdrawing also REPLAYS a veto that lost only to this reservation (PR #212 review): that
+  // operator was told the target was already running, and with no run there is nothing left for
+  // their decline to contradict — so the store files it rather than letting the failed release
+  // swallow it.
+  if (acceptId && run !== "started" && run !== "elsewhere") {
+    await withdrawPickerAccept(getDb(), acceptId, systemClock)
+      .then((replayed) => {
+        if (replayed) {
+          console.warn(
+            `[approve] ${epicId} started no run, so the veto that lost to its reservation was recorded after all`,
+          );
+        }
+      })
+      .catch((err: unknown) => {
+        console.error(`[approve] failed to withdraw the picker accept for ${epicId}`, err);
+      });
   }
 
   // Fire-and-forget: the approve write already landed locally and the run enqueues off that local
@@ -459,13 +738,29 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // `advisory` carries the contract gaps that did NOT refuse the approval — the run is starting
   // despite them, so the operator hears about them once, here, rather than never. Empty when this
   // request enqueued nothing (a pure take-over of a blocked target): no run, nothing degraded.
+  // `humanGates` rides the same channel and is OMITTED when the run stops for nobody, so the common
+  // case adds nothing to the body and the client has nothing to say. `humanTarget` marks the shape
+  // of that report: gates on a running target hold it, a human target starts no run at all.
+  //
+  // The gate lines are withheld when the enqueue THREW (PR #214 review): they describe a run that
+  // reaches each ticket and holds there, and with no run enqueued that is a promise about something
+  // that does not exist — contradicting the failure the same response reports. `elsewhere` and
+  // `covered` keep them: a run does cover the target, it is just not a new one. `humanTarget` is
+  // unaffected — "no agent-run starts" is true of a poisoned target however the enqueue went.
   const written = { approved: true, assignee: swap.bead.assignee ?? null };
+  const reported = {
+    jobId,
+    run,
+    advisory,
+    ...(humanWork.length > 0 && run !== "failed" ? { humanGates: humanWork } : {}),
+    ...(humanTarget ? { humanTarget: true } : {}),
+  };
   if (epic) {
     const updatedEpic = { ...epic, ...written };
-    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId, advisory });
+    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, ...reported });
   }
   if (standalone) {
-    return NextResponse.json({ item: { ...standalone, ...written }, jobId, advisory });
+    return NextResponse.json({ item: { ...standalone, ...written }, ...reported });
   }
   return notFoundResponse("Run target not found");
 });

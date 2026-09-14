@@ -10,8 +10,13 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { proposalFingerprint } from "../gardener/detections";
 
 const read = (...parts: string[]): string => readFileSync(join(process.cwd(), ...parts), "utf8");
+
+/** Line wraps and blockquote markers are prose formatting, not protocol — drop them before matching
+ *  a sentence, so rewrapping a paragraph never breaks a rule assertion. */
+const flat = (doc: string): string => doc.replace(/\n>\s*/g, "\n").replace(/\s+/g, " ");
 
 const PRIME = read(".beads", "PRIME.md");
 const SKILL = read("skills", "bd", "SKILL.md");
@@ -33,6 +38,31 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
         // Must stay in step with buildClaimableReadyArgs (bd.ts): every flag is load-bearing.
         expect(doc).toMatch(/bd ready --label approved --unassigned --json --limit 0/);
         expect(doc).toMatch(/bd list --status all --json --limit 0/);
+      });
+
+      // anton-mv70: `agent:human` is the one agent value that resolves to no specialist prompt, so
+      // a set that still carried it would dispatch human work to the DEFAULT agent.
+      it("excludes agent:human from the claimable set, and says why", () => {
+        expect(flat(doc)).toMatch(/not labelled `agent:human`/);
+        expect(flat(doc)).toMatch(
+          /credential, an account, a purchase, a signature, or a taste call/,
+        );
+        expect(flat(doc)).toMatch(/`human` resolves to none/);
+      });
+
+      // anton-x37c: isClaimable drops a proposal, so a doc that still offered one would teach a
+      // worker to claim a board move anton applies itself on approval.
+      it("excludes proposals from the claimable set, and says how one is recognised", () => {
+        expect(flat(doc)).toMatch(/\*\*not a proposal\*\*/);
+        expect(flat(doc)).toMatch(/\*\*A proposal is a decision, not work\.\*\*/);
+        // The fingerprint label is the predicate isProposalBead tests, in both namespaces.
+        expect(flat(doc)).toMatch(/`gardener:<kind>:<hash>` or `pm:<kind>:<hash>`/);
+      });
+
+      it("keeps that exclusion out of the pool query's flags", () => {
+        // isClaimable narrows; the argv stays byte-identical to buildClaimableReadyArgs. A doc that
+        // taught `bd ready --exclude-label` here would teach a pool no anton caller ever asks for.
+        expect(doc).not.toMatch(/bd ready[^\n]*--exclude-label/);
       });
 
       it("gives the rank order every consumer sorts by", () => {
@@ -63,6 +93,15 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
         expect(doc).toMatch(/assert assignee == "\$ACTOR"/);
       });
 
+      // The sync legs are embedded-only (anton-0tul): on a shared server they reconcile nothing and
+      // fail outright — `bd dolt pull/push` runs ON the server, which cannot reach the git remote.
+      // A doc that teaches them unconditionally hands every server-mode worker a failing publish.
+      it("scopes the sync legs to an embedded board", () => {
+        expect(doc).toMatch(/\*\*On a shared-server board, run steps 2, 6 and 7 only\.\*\*/);
+        expect(doc).toMatch(/`dolt_mode`[\s\S]{0,80}`\.beads\/metadata\.json`/);
+        expect(doc).toMatch(/absent or unreadable means embedded/);
+      });
+
       it("names all four claim outcomes, and licenses a run only on the first", () => {
         expect(doc).toMatch(/assignee is you, and §1 still holds\*\* → you hold it/);
         expect(doc).toMatch(/Back off \*without writing anything\*/);
@@ -80,12 +119,51 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
     });
   }
 
+  // The docs teach a proposal by its LABEL, so the shape they teach must be the shape
+  // proposalFingerprint writes — a template that drifted would have a worker claim proposals it
+  // could not recognise. Both namespaces, because the namespace comes from the kind.
+  it("the fingerprint template both docs teach is the label anton actually writes", () => {
+    const asRegex = (template: string) =>
+      new RegExp(`^${template.replace("<kind>", "[a-z-]+").replace("<hash>", "[0-9a-f]+")}$`);
+    for (const [where, doc] of PROTOCOL_HOMES) {
+      const templates = [...flat(doc).matchAll(/`((?:gardener|pm):<kind>:<hash>)`/g)].map(
+        (m) => m[1],
+      );
+      expect(templates, where).toEqual(["gardener:<kind>:<hash>", "pm:<kind>:<hash>"]);
+      expect(proposalFingerprint("stale", "subject"), where).toMatch(asRegex(templates[0]));
+      expect(proposalFingerprint("low-value", "subject"), where).toMatch(asRegex(templates[1]));
+    }
+  });
+
   it("PRIME.md is self-sufficient: it carries the run-target rule it filters on", () => {
     // The override replaces bd's whole reference, so a rule it only cites is a rule a primed
     // session doesn't have.
     expect(PRIME).toMatch(
       /run target if it is a `feature`, \*\*or\*\* a parentless `task`\/`bug`, \*\*or\*\* an `epic`[\s>]+with no `feature` children/,
     );
+  });
+
+  // Shaping applies the label, so its test lives with the label table — the worker docs only need
+  // to know the set drops it.
+  it("SKILL.md's label table carries agent:human and the question that applies it", () => {
+    expect(SKILL).toMatch(/\|\s*`agent:`[^\n]*`human`/);
+    expect(flat(SKILL)).toMatch(
+      /Can an agent complete this end to end, or does it need a credential, an account, a purchase, a signature, or a taste call\?/,
+    );
+  });
+
+  // AGENTS.md is the third home of the same rule: a session that reads only it must not be taught a
+  // claimable set that still contains human work.
+  it("AGENTS.md's pickup section agrees on the exclusion", () => {
+    const agents = read("AGENTS.md");
+    expect(flat(agents)).toMatch(
+      /drops proposals — a bead carrying a `gardener:`\/`pm:` fingerprint/,
+    );
+    expect(flat(agents)).toMatch(/anything labelled `agent:human`/);
+    expect(flat(agents)).toMatch(
+      /credential, an account, a purchase, a signature, or a taste call/,
+    );
+    expect(agents).not.toMatch(/bd ready[^\n]*--exclude-label/);
   });
 
   it("PRIME.md says how to recover what the override hides", () => {

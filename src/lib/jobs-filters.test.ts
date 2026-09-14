@@ -124,6 +124,7 @@ describe("option lists", () => {
     expect(JOB_TYPES).toEqual([
       "execute-epic",
       "review-fix",
+      "review-fix-pr",
       "nightly-stringer",
       "orphan-grooming",
       "sync-push",
@@ -132,6 +133,8 @@ describe("option lists", () => {
       "gate-check",
       "gardener",
       "product-master",
+      "board-picker",
+      "worktree-reaper",
     ]);
     expect(JOB_TYPE_FILTER_OPTIONS.map((o) => o.value)).toEqual(["", ...JOB_TYPES]);
   });

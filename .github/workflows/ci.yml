@@ -1,6 +1,7 @@
-# CI (anton-1j1). Runs the quality gates on every push to main and every PR: lint, typecheck,
-# tests, and a production build. The release workflow (release.yml) runs the same gates on a `v*`
-# tag before cutting a Release, so a tag can only point at a green commit.
+# CI (anton-1j1). Runs the quality gates on every push to main and every PR: control bytes, lint,
+# typecheck, tests, and a production build. The release workflow (release.yml) runs the same gates on a `v*`
+# tag (plus a CLI-launch smoke check) before cutting a Release, so a tag can only point at a green
+# commit. Keep the two lists in sync: a gate added here belongs in release.yml's `gates` job too.
 name: ci
 
 on:
@@ -21,10 +22,17 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.14" # match package.json `packageManager`
+          bun-version: "1.4.2" # match package.json `packageManager`
 
       - name: Install
         run: bun install --frozen-lockfile
+
+      - name: Control bytes
+        # Replaces the `Binary files differ` alarm that .gitattributes retires by forcing source
+        # globs diffable: a stray control byte makes a module invisible to every diff-based
+        # reviewer (anton-74f8/anton-flih). Ahead of the slower gates: it is instant, and a diff
+        # nobody can read is not worth linting.
+        run: bun run check:control-bytes
 
       - name: Lint
         run: bun run lint
@@ -46,11 +54,31 @@ jobs:
   # instead of self-skipping in `check`. Report-only for now — flip `continue-on-error` off once the
   # suite is reliably green here; the job exists to make failures *visible* rather than hidden behind
   # a green `check`.
+  #
+  # Sharded 4 ways (anton-m4b5.3): the suite's cost is per-file subprocess overhead (each test shells
+  # out to real bd/git many times), not CPU, so 4 GitHub-hosted runners in parallel cut wall time
+  # roughly 4x over one job running all ~76 files sequentially through `maxWorkers: 4`. Measured
+  # single-job baseline before sharding: 22-35 minutes (runs 34654794714, 34630896615, 34630019901,
+  # 34627803658, 34627448106). Each shard keeps its OWN `maxWorkers: 4` — sharding adds more isolated
+  # runners, it does not raise per-job fork concurrency, so it does not reopen the Dolt port/lock race
+  # anton-vgoh tracks (a fresh runner per shard means no two shards share a port-selection window).
   integration:
     runs-on: ubuntu-latest
     continue-on-error: true
     # Real bd/Dolt work shells out per issue and is slow; cap it so a hang can't run for hours.
-    timeout-minutes: 45
+    # 45 min left zero headroom for runner variance: every bd/Dolt suite (including ones that
+    # touch none of the diff) slows 2.5-3x UNIFORMLY on a busy GitHub runner, so a normal ~20-min
+    # shard became a ~50-60-min one and got cancelled at the cap with zero test failures (PR #190
+    # run 33760581986; reproduced on main with none of that PR's code, run 33580380717, commit
+    # b5278ee — the `check`/`coverage` jobs on those same runs stayed fast, the tell that it's
+    # runner variance, not the diff). 75 min buys ~15 min of headroom above that worst observed
+    # 3x slowdown, so a slow-runner run reports its real result instead of being killed at the cap,
+    # while the normal ~20-min baseline is untouched (report-only job, so this never slows a merge).
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       # PINNED deliberately (beads' install.sh always takes the LATEST release, which once made this
       # job non-deterministic). Moved to 1.1.0 with anton-qhoz: bd 1.1.0 nests `export.*`/`dolt.*` in
@@ -62,7 +90,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.14" # match package.json `packageManager`
+          bun-version: "1.4.2" # match package.json `packageManager`
       - name: Install bd
         run: |
           set -euo pipefail
@@ -80,10 +108,12 @@ jobs:
             echo "::error::bd version mismatch — expected ${BD_VERSION}, got: $(bd version)"; exit 1; }
       - name: Install
         run: bun install --frozen-lockfile
-      - name: Test (integration suites)
+      - name: "Test (integration suites, shard ${{ matrix.shard }}/4)"
         # Dedicated config: `*.integration.test.ts` only, with a capped fork pool so the per-repo
         # Dolt sql-servers don't race and deadlock `bd dolt pull` under full parallelism (anton-0oi).
-        run: bun run test:integration
+        # `--shard` splits the file list across the 4 matrix runners (anton-m4b5.3); each runner still
+        # enforces its own `maxWorkers: 4` from vitest.integration.config.ts.
+        run: bun run test:integration -- --shard=${{ matrix.shard }}/4
 
   # Coverage (anton-7jy). Report-only — a separate, non-blocking job. V8 instrumentation adds ~5x
   # runtime, so it's kept OFF the blocking `check` gate to avoid slowing/flaking it; the html+lcov
@@ -96,7 +126,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.3.14" # match package.json `packageManager`
+          bun-version: "1.4.2" # match package.json `packageManager`
       - name: Install
         run: bun install --frozen-lockfile
       - name: Test with coverage

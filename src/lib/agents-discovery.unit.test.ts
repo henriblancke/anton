@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { AGENT_PROMPTS_DIR, USER_AGENTS_DIR } from "./claude/agent-prompt";
-import { discoverAgents, parseFrontmatter } from "./agents-discovery";
+import { bundledAgentIds, discoverAgents, parseFrontmatter } from "./agents-discovery";
 
 describe("parseFrontmatter", () => {
   it("reads a plain scalar", () => {
@@ -27,6 +27,16 @@ describe("parseFrontmatter", () => {
   it("returns empty for missing or unterminated frontmatter", () => {
     expect(parseFrontmatter("no frontmatter here")).toEqual({});
     expect(parseFrontmatter("---\nname: x\nstill going")).toEqual({});
+  });
+
+  it("reads a literal (|) block scalar and keeps line breaks", () => {
+    const md = "---\nname: x\ndescription: |\n  Line one\n\n  line two.\nmodel: sonnet\n---\n";
+    expect(parseFrontmatter(md).description).toBe("Line one\n\nline two.");
+  });
+
+  it("reads a bare key whose value continues on the following indented lines", () => {
+    const md = "---\ndescription:\n  Line one\n  line two.\nname: x\n---\n";
+    expect(parseFrontmatter(md)).toEqual({ name: "x", description: "Line one line two." });
   });
 
   it("ignores list/nested keys it doesn't need", () => {
@@ -132,5 +142,21 @@ describe("discoverAgents — installed Claude Code plugins", () => {
       source: "plugin",
       description: "develop@market/prompt-engineer",
     });
+  });
+});
+
+describe("bundledAgentIds", () => {
+  it("lists sorted .md stems and returns empty for a missing dir", async () => {
+    const root = await mkdtemp(join(tmpdir(), "anton-bundled-"));
+    try {
+      await mkdir(join(root, AGENT_PROMPTS_DIR), { recursive: true });
+      await writeFile(join(root, AGENT_PROMPTS_DIR, "nextjs.md"), "body");
+      await writeFile(join(root, AGENT_PROMPTS_DIR, "fastapi.md"), "body");
+      await writeFile(join(root, AGENT_PROMPTS_DIR, "README.txt"), "ignored");
+      expect(await bundledAgentIds(root)).toEqual(["fastapi", "nextjs"]);
+      expect(await bundledAgentIds(join(root, "nope"))).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

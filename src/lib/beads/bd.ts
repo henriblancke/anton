@@ -3,19 +3,88 @@
  * work: epics/tickets, and — via labels + external-ref — approval, stage, and the PR link.
  * anton reads/writes here and never duplicates that state in anton.db. See DESIGN.md §3.
  */
-import { spawn } from "node:child_process";
-import { StringDecoder } from "node:string_decoder";
-import { githubRepoSlug } from "../git/remote";
-import { resolveBdBin } from "./bd-bin";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { isProposalBead } from "../gardener/detections";
+import { errorText, sleepMs } from "../retry-helpers";
+import {
+  batchEnabled,
+  batchOpArgs,
+  BD_BATCH_ENV,
+  buildPruneArgs,
+  buildUpdateArgs,
+  encodeBatchOps,
+  isMissingBatchCommand,
+  type BatchOp,
+  type BeadPatch,
+  type PruneAge,
+} from "./bd-args";
+import { asArray, str } from "./bd-json";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
+import {
+  buildCookArgs,
+  parseCookedFormula,
+  type CookedFormula,
+  type CookOptions,
+} from "./cook";
+import { bd, type BdExec, type BdOpts } from "./dolt-exec";
+import type { SyncOutcome } from "./dolt-sync";
+import {
+  bdGate,
+  bdGateWrite,
+  buildGateCheckArgs,
+  buildGateCreateArgs,
+  buildGateDiscoverArgs,
+  parseGateCheck,
+  type Gate,
+  type GateCheckOpts,
+  type GateCheckResult,
+  type GateCreateOpts,
+  type GatedMolecule,
+  type GateDiscoverOpts,
+} from "./gate";
+import { graphPlanError, type GraphPlan } from "./graph-plan";
+import {
+  buildLintArgs,
+  buildStaleArgs,
+  parseDepCycles,
+  parseDuplicateGroups,
+  parseEpicCloseEligible,
+  parseLintReport,
+  parseOrphans,
+  parseRecomputeBlocked,
+  type DepCycle,
+  type DuplicateGroup,
+  type EpicCloseSweep,
+  type LintOpts,
+  type LintReport,
+  type OrphanBead,
+  type StaleOpts,
+} from "./hygiene";
+import { rankTargets, type RankedTarget } from "./rank";
 import { invalidateIssueSnapshot } from "./snapshot";
+import { doltSync } from "./sync-coalescer";
 
 // Bead/BeadDep live in the leaf ./types module so snapshot.ts can share them without importing
 // bd.ts back (breaking the bd ↔ snapshot cycle, anton-mur). Re-exported here so every existing
 // `from ".../beads/bd"` import keeps working.
 export type { Bead, BeadComment, BeadDep } from "./types";
-import type { Bead } from "./types";
+import type { Bead, BeadDep } from "./types";
+
+// The dependency types anton may write, validated at the link seam because bd validates nothing
+// there (anton-igkb). Re-exported so callers reach the set through the same module as `link`.
+export { LINK_TYPES, assertLinkType, isLinkType, type LinkType } from "./link-types";
+import { assertLinkType, type LinkType } from "./link-types";
+
+/**
+ * The `agent:` VALUE that names no agent — the half {@link labelValueOf}(labels, "agent") returns,
+ * as distinct from the whole label {@link LABELS.agentHuman}. Exported because the routing
+ * chokepoints read the value, not the label: the active-agents allowlist compares agent ids, and
+ * `human` is not one anybody can enable.
+ */
+export const HUMAN_AGENT = "human";
 
 export const LABELS = {
   approved: "approved",
@@ -28,6 +97,16 @@ export const LABELS = {
    * it — see beads.isAbandoned.
    */
   abandoned: "abandoned",
+  /**
+   * Work a run reserved but did NOT deliver (anton-67xj): a ticket skipped behind a timed-out one
+   * whose partial work was rolled back, or the timed-out ticket itself — or one the run RETIRED as
+   * already shipped (anton-5bpd), whose work is in the run's base rather than its diff. Nothing
+   * from it is on the run's branch, so it is in no PR — which is exactly what merge finalization
+   * cannot see for itself: `bd` has no "this bead is not in that diff" fact, and a still-open child
+   * otherwise reads as one the run merely forgot to close. Cleared the moment a run dispatches the
+   * ticket again. See beads.isNotDelivered.
+   */
+  notDelivered: "not-delivered",
   /**
    * Cross-machine run-liveness lease (anton-jz1): `run-lease:<expiresAtEpochMs>[:<ownerRunId>]` on
    * the run target. Present + unexpired ⇒ a run is actively executing this epic on SOME machine, so
@@ -52,6 +131,14 @@ export const LABELS = {
    * comments beside it.
    */
   reviewScore: (score: number) => `review-score:${score}`,
+  /**
+   * The one `agent:` value that names no agent (anton-mv70): a person executes this bead — it needs
+   * a credential, an account, a purchase, a signature, or a taste call. Every other `agent:<id>`
+   * resolves to a specialist prompt, so a human bead left unmarked would dispatch to the DEFAULT
+   * agent and burn a run failing at work no agent can do. Written by shaping (skills/bd/SKILL.md),
+   * read here by every chokepoint that must refuse it — see {@link beads.isHumanWork}.
+   */
+  agentHuman: `agent:${HUMAN_AGENT}`,
 } as const;
 
 /** Prefix of the run-lease label (see LABELS.runLease). */
@@ -68,6 +155,12 @@ const REVIEW_SCORE_PREFIX = "review-score:";
 export const GH_PR_REF = /^gh-\d+$/i;
 
 /**
+ * Metadata key holding the PR a send-back retired off a bead (anton-leit) — see
+ * {@link beads.retirePrRef}. Deliberately NOT `pr`: nothing may read it as a live pointer.
+ */
+const RETIRED_PR_KEY = "retiredPr";
+
+/**
  * Parse a `run-lease:<expiry>[:<owner>]` label into its expiry (ms epoch) and optional owner (the
  * publishing run's id, anton-jz1). `expiry` is undefined for a malformed/non-numeric value. A label
  * with no `:<owner>` suffix (legacy format, or a liveness-only publish) parses `owner: undefined`.
@@ -81,451 +174,35 @@ function parseRunLease(label: string): { expiry: number | undefined; owner: stri
   return { expiry: Number.isFinite(n) ? n : undefined, owner };
 }
 
-/** The managed-metadata label prefixes anton edits. Control labels (approved, stage:*,
- * source:*) are NOT in this set and are never touched by a patch.
- * `area` is the epic tier's product-surface designator — its own axis, deliberately not folded into
- * `domain:` (.product/decisions/2026-07-26-engine-designator-prefix.md). */
-export const LABEL_PREFIXES = ["agent", "risk", "size", "domain", "area"] as const;
-export type LabelPrefix = (typeof LABEL_PREFIXES)[number];
-
-/**
- * A field patch for a bead. Every field is optional; an undefined (or empty-string) field is a
- * no-op that never clobbers the current value. `labels` carries new values for the managed
- * prefixes only — each is diffed against the bead's current labels so a single prefix moves.
- */
-export interface BeadPatch {
-  title?: string;
-  status?: string;
-  priority?: number;
-  acceptance?: string;
-  description?: string;
-  labels?: Partial<Record<LabelPrefix, string>>;
-}
-
-/** Read the value of a single-valued `prefix:` label off a bead's labels, or undefined. */
-export function labelValueOf(labels: string[] | undefined, prefix: string): string | undefined {
-  const label = labels?.find((l) => l.startsWith(`${prefix}:`));
-  return label ? label.slice(prefix.length + 1) : undefined;
-}
-
-/**
- * Build the single `bd update` argv for a patch, or `null` when nothing changed (no write).
- * Label edits diff each managed prefix against `currentLabels`, so only the prefix that
- * actually changed is remove/add-labelled — approved, stage:*, and source:* are preserved.
- */
-export function buildUpdateArgs(
-  id: string,
-  patch: BeadPatch,
-  currentLabels: string[] = [],
-): string[] | null {
-  const args = ["update", id];
-  if (patch.title) args.push("--title", patch.title);
-  if (patch.status) args.push("--status", patch.status);
-  if (patch.priority !== undefined) args.push("--priority", String(patch.priority));
-  if (patch.acceptance) args.push("--acceptance", patch.acceptance);
-  if (patch.description) args.push("--description", patch.description);
-  if (patch.labels) {
-    for (const prefix of LABEL_PREFIXES) {
-      const next = patch.labels[prefix];
-      if (!next) continue; // untouched (undefined) or empty prefix — no-op
-      const current = labelValueOf(currentLabels, prefix);
-      if (current === next) continue; // unchanged
-      if (current !== undefined) args.push("--remove-label", `${prefix}:${current}`);
-      args.push("--add-label", `${prefix}:${next}`);
-    }
-  }
-  return args.length > 2 ? args : null;
-}
-
-// ── multi-bead transactions (`bd batch`, anton-aijz) ──
+// ── the seams this module composes (anton-n1m0, anton-ladt, anton-lsad) ──
 //
-// A sequence of independent `bd` calls can fail half-way and strand a unit in a state no reader can
-// interpret — half a merged epic closed, half a cascade abandoned. `bd batch` reads its commands
-// from stdin and applies them inside ONE dolt transaction: on any error the whole batch rolls back.
-
-/**
- * One line of a `bd batch` transaction. Only the two verbs anton's multi-bead mutations need —
- * bd's grammar also accepts `create` and `dep`, deliberately left out (anton-aijz out of scope).
- */
-export type BatchOp =
-  | { op: "close"; id: string; reason?: string }
-  | { op: "update"; id: string; fields: BatchUpdateFields };
-
-/**
- * The ONLY fields bd's batch `update` accepts. Notably NOT labels: every label write (`abandoned`,
- * `stage:*`, `run-lease:*`) has to stay its own `bd update` and therefore cannot join a
- * transaction — which is why the abandon path labels FIRST and closes in the batch (see
- * {@link beads.abandonAll}).
- */
-export interface BatchUpdateFields {
-  status?: string;
-  priority?: number;
-  title?: string;
-  assignee?: string;
-}
-
-/** Fixed key order, so an encoded `update` line is deterministic regardless of object literal order. */
-const BATCH_UPDATE_KEYS = ["status", "priority", "title", "assignee"] as const;
-
-/**
- * Quote a free-text value for bd's batch tokenizer: whitespace-separated tokens, double-quoted
- * strings whose ONLY escapes are `\"` and `\\`. There is no newline escape and the grammar is one
- * command per line, so embedded newlines collapse to spaces — a multi-line abandon reason keeps
- * every word, not its line breaks.
- */
-export function quoteBatchValue(value: string): string {
-  return `"${value.replace(/\s+/g, " ").trim().replace(/([\\"])/g, "\\$1")}"`;
-}
-
-/** Render one op as a batch line. */
-function encodeBatchOp(op: BatchOp): string {
-  // A whitespace-bearing id would silently become two tokens (a different command entirely), so it
-  // is a bug to report rather than to quote around.
-  if (!op.id || /[\s"\\]/.test(op.id)) throw new Error(`bd batch: unusable bead id ${JSON.stringify(op.id)}`);
-  if (op.op === "close") {
-    const reason = op.reason?.trim();
-    return reason ? `close ${op.id} ${quoteBatchValue(reason)}` : `close ${op.id}`;
-  }
-  const fields = BATCH_UPDATE_KEYS.filter((k) => op.fields[k] !== undefined).map(
-    (k) => `${k}=${quoteBatchValue(String(op.fields[k]))}`,
-  );
-  if (fields.length === 0) throw new Error(`bd batch: update ${op.id} sets no fields`);
-  return `update ${op.id} ${fields.join(" ")}`;
-}
-
-/** Render batch ops as the line-oriented input `bd batch` reads from stdin. */
-export function encodeBatchOps(ops: BatchOp[]): string {
-  return ops.map(encodeBatchOp).join("\n") + "\n";
-}
-
-/** The argv that applies one batch op on its own — the sequential (non-transactional) fallback. */
-export function batchOpArgs(op: BatchOp): string[] {
-  if (op.op === "close") {
-    const reason = op.reason?.trim();
-    return reason ? ["close", op.id, "--reason", reason] : ["close", op.id];
-  }
-  const args = ["update", op.id];
-  for (const key of BATCH_UPDATE_KEYS) {
-    const value = op.fields[key];
-    if (value !== undefined) args.push(`--${key}`, String(value));
-  }
-  return args;
-}
-
-/**
- * Force the pre-batch sequential path: set `ANTON_BD_BATCH` to `0`/`off`/`false`/`no` for a bd too
- * old to have `batch`, or to bisect a suspected batch bug. Read per call so a change lands without
- * a module reload. Unset (the default) uses the transaction.
- */
-export const BD_BATCH_ENV = "ANTON_BD_BATCH";
-
-export function batchEnabled(): boolean {
-  const raw = (process.env[BD_BATCH_ENV] ?? "").trim().toLowerCase();
-  return raw !== "0" && raw !== "off" && raw !== "false" && raw !== "no";
-}
-
-/**
- * Cobra's subcommand-not-found line, verbatim: `Error: unknown command "batch" for "bd"`. bd emits
- * nothing machine-readable for this case, so the whole gate is a heuristic on that one string —
- * kept strict (both quoted operands, and the diagnostic must BE the line, not sit inside one) so no
- * batch line's own text can forge it. bd reports a rolled-back op as `line 1 (close bd-9 "…"): …`,
- * echoing the operation mid-line, so an abandon reason quoting this phrase never anchors here.
- */
-const MISSING_BATCH_COMMAND = /^(?:Error:\s*)?unknown command "batch" for "[^"\n]+"\r?$/im;
-
-/**
- * Does this failure mean "this bd has no `batch` subcommand" rather than "the transaction failed"?
- * Only the former may fall back to sequential writes: bd rolls the batch back on every other error,
- * so retrying those one-at-a-time would convert a clean no-op into exactly the half-applied unit
- * the transaction exists to prevent.
- *
- * Each field is tested on its own — concatenating them would let a stderr ending in "unknown
- * command" and an unrelated message supply half the phrase each. An unrecognized variant falls
- * through to "the transaction failed", which is the safe direction: loud, with nothing half
- * applied, and `ANTON_BD_BATCH=0` as the deliberate opt-out. Recheck the pattern above when
- * upgrading bd across a cobra major — a reworded error silently costs the fallback, not safety.
- */
-export function isMissingBatchCommand(e: unknown): boolean {
-  const err = e as { stderr?: unknown; message?: unknown } | null | undefined;
-  return [err?.stderr, err?.message].some(
-    (field) => typeof field === "string" && MISSING_BATCH_COMMAND.test(field),
-  );
-}
-
-/** Age scope for `beads.prune`: a relative window bd accepts, or "all" (every closed bead). */
-export type PruneAge = "30d" | "90d" | "all";
-
-/**
- * Pure argv builder for `bd prune`, exposed for testing (like buildUpdateArgs). bd requires
- * `--older-than` OR `--pattern` as a safety gate; "all" maps to `--pattern '*'` (sweep every
- * closed bead). Preview is `--dry-run`; only `force` actually deletes.
- */
-export function buildPruneArgs(age: PruneAge, opts: { force?: boolean } = {}): string[] {
-  return [
-    "prune",
-    ...(age === "all" ? ["--pattern", "*"] : ["--older-than", age]),
-    opts.force ? "--force" : "--dry-run",
-    "--json",
-  ];
-}
-
-/**
- * Wall-clock budget for ONE `bd` invocation. Note what it does NOT bound: it is a per-step budget,
- * so a full sync pass (pull → commit → push) may legitimately spend 3× it. Callers that need a
- * bounded PASS must add their own deadline on top (see beatDeadlineMs in sync-engine.ts).
- */
-export const BD_STEP_TIMEOUT_MS = 60_000;
-
-/** Override the per-step budget (tests shrink it; also an ops escape hatch). Read per call so a
- * change lands without a module reload. */
-export const BD_STEP_TIMEOUT_ENV = "ANTON_BD_STEP_TIMEOUT_MS";
-
-/** Override the SIGTERM→SIGKILL grace (tests shrink it). Read per call. */
-export const BD_KILL_GRACE_ENV = "ANTON_BD_KILL_GRACE_MS";
-
-/**
- * How long a bd that blew its budget gets to unwind on SIGTERM before SIGKILL. bd traps SIGTERM to
- * release the exclusive Dolt lock, so the polite signal comes first — but a bd that then blocks on
- * its own wedged `git fetch` survived that SIGTERM in the field for days, so the escalation is
- * mandatory, not optional (anton-jfjw.1).
- */
-const DEFAULT_BD_KILL_GRACE_MS = 5_000;
-
-/**
- * How long to keep draining stdio after bd exits. `close` is the only event that guarantees the
- * pipes drained, but a grandchild that inherited them holds them open long after bd is gone — and
- * waiting on it is exactly what left the caller's promise pending for days while a heartbeat sat
- * wedged. So `exit` starts a bounded drain and the promise settles either way. A normal bd exits
- * with nothing else holding the pipes, so `close` lands immediately and this never comes into play.
- */
-const DRAIN_AFTER_EXIT_MS = 2_000;
-
-/** Output ceiling per stream, carried over from the execFile `maxBuffer` this replaced: a runaway
- * stream is killed rather than grown until the server OOMs. A whole-board `bd list --json` is
- * comfortably under it. */
-const BD_MAX_BUFFER = 32 * 1024 * 1024;
-
-/** Override the per-stream output ceiling (tests shrink it so the overflow path is exercisable
- * without producing 32 MB). Read per call, like the budget and the kill grace. */
-export const BD_MAX_BUFFER_ENV = "ANTON_BD_MAX_BUFFER";
-
-function stepTimeoutMs(): number {
-  const raw = Number(process.env[BD_STEP_TIMEOUT_ENV]);
-  return Number.isFinite(raw) && raw > 0 ? raw : BD_STEP_TIMEOUT_MS;
-}
-
-function maxBuffer(): number {
-  const raw = Number(process.env[BD_MAX_BUFFER_ENV]);
-  return Number.isFinite(raw) && raw > 0 ? raw : BD_MAX_BUFFER;
-}
-
-function killGraceMs(): number {
-  const raw = Number(process.env[BD_KILL_GRACE_ENV]);
-  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_BD_KILL_GRACE_MS;
-}
-
-/** Per-invocation knobs for {@link bd}: extra env, and stdin for the commands that read it. */
-interface BdOpts {
-  /** Merged over `process.env` (e.g. BEADS_ACTOR for an attributed write). An `undefined` value
-   * REMOVES the variable rather than inheriting the server's — see {@link childEnv}. */
-  env?: Record<string, string | undefined>;
-  /** Written to bd's stdin, which is then closed. Required by `bd batch`, which reads its
-   * commands from stdin — without it bd would block on an open pipe until the step budget. */
-  stdin?: string;
-}
-
-/**
- * The server's env with `overrides` applied, where an `undefined` override REMOVES the variable
- * rather than leaving whatever the server was launched with. That deletion is the point: a gate call
- * that can't derive a slug must not inherit an ambient `GH_REPO`, which would override `gh`'s repo
- * resolution and answer this project's gates with another repository's verdict.
- */
-function childEnv(overrides: Record<string, string | undefined>): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, ...overrides };
-  for (const [key, value] of Object.entries(overrides)) if (value === undefined) delete env[key];
-  return env;
-}
-
-/**
- * Run one `bd` command and return its stdout.
- *
- * Two properties this owes its callers, both learned the hard way (anton-jfjw.1 — a `bd dolt pull`
- * whose `git fetch` entered uninterruptible wait when the network died under it, leaving the parent
- * alive for two days, the Dolt lock held, and anton's heartbeat pinned forever):
- *
- * 1. **The reap targets the process group.** bd's own git/dolt children are what actually wedge, and
- *    signalling only bd leaves them running — still holding the exclusive Dolt lock that then fails
- *    every later `bd list` in that repo. So bd leads its own group and the budget kills the group,
- *    escalating SIGTERM → SIGKILL.
- * 2. **The promise settles on `exit`, not on stdio `close`.** A leaked grandchild holds the inherited
- *    pipes open, so `close` may never fire; and past the budget the caller is released immediately —
- *    the reap runs on in the background, because a grandchild in uninterruptible wait can survive
- *    even SIGKILL and must not be able to hold a caller hostage while it does.
- *
- * `async` so a resolveBdBin() failure (no bd on the box) surfaces as a rejection rather than a
- * synchronous throw — every call site awaits or `.catch()`es this.
- */
-async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
-  // Spawn bd by its resolved absolute path (anton-346): a background-launched server's PATH may not
-  // reach bd's install dir, so a bare `spawn("bd", …)` fails with `spawn bd ENOENT`.
-  const bin = resolveBdBin();
-  const budgetMs = stepTimeoutMs();
-  const bufferLimit = maxBuffer();
-  const startedAt = Date.now();
-
-  return new Promise<string>((resolve, reject) => {
-    const child = spawn(bin, args, {
-      cwd,
-      // POSIX: make bd the leader of a new process group so the whole tree is reachable as one.
-      detached: process.platform !== "win32",
-      ...(opts?.env ? { env: childEnv(opts.env) } : {}),
-    });
-
-    if (opts?.stdin !== undefined) {
-      // EPIPE is expected whenever bd rejects its input and exits before draining the pipe (a batch
-      // whose first line is malformed): the exit code carries the verdict, so the write error is
-      // noise. Ignoring it keeps the real failure — bd's own stderr — as the one the caller sees.
-      child.stdin?.on("error", () => {});
-      child.stdin?.end(opts.stdin);
-    }
-
-    // StringDecoder, not per-chunk toString: a multi-byte character split across two chunks would
-    // otherwise corrupt the JSON every read path parses.
-    const outDecoder = new StringDecoder("utf8");
-    const errDecoder = new StringDecoder("utf8");
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let drainTimer: NodeJS.Timeout | undefined;
-    let escalateTimer: NodeJS.Timeout | undefined;
-
-    const killGroup = (sig: NodeJS.Signals) => {
-      if (process.platform !== "win32" && child.pid) {
-        try {
-          process.kill(-child.pid, sig);
-          return;
-        } catch {
-          // The group may never have formed (spawn failed, or the leader is already reaped) — fall
-          // back to the direct child handle so the reap still reaches bd itself.
-        }
-      }
-      child.kill(sig);
-    };
-
-    const settle = (emit: () => void) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(budgetTimer);
-      if (drainTimer) clearTimeout(drainTimer);
-      emit();
-    };
-
-    /** Drop the pipes a leaked grandchild is still holding — nothing will read them again. */
-    const dropPipes = () => {
-      child.stdout?.destroy();
-      child.stderr?.destroy();
-    };
-
-    /**
-     * execFile-shaped failure for a non-zero exit: promisified execFile attached the captured
-     * streams to the error, and runDoltSync's benign/first-publish matchers read them off it.
-     */
-    const exitFailure = (code: number | null, signal: NodeJS.Signals | null) =>
-      Object.assign(new Error(`Command failed: ${[bin, ...args].join(" ")}\n${stderr}`), {
-        cmd: [bin, ...args].join(" "),
-        code: code ?? undefined,
-        signal,
-        killed: child.killed,
-        stdout,
-        stderr,
-      });
-
-    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
-      // Flush whatever the decoders held back (an output that ends mid-character), as execFile did.
-      stdout += outDecoder.end();
-      stderr += errDecoder.end();
-      if (code === 0) resolve(stdout);
-      else reject(exitFailure(code, signal));
-    };
-
-    const budgetTimer = setTimeout(() => {
-      killGroup("SIGTERM");
-      // The escalation deliberately outlives the promise (as in runShell): the caller unwinds now,
-      // while the group still gets killed. Cleared as soon as bd actually exits.
-      escalateTimer = setTimeout(() => killGroup("SIGKILL"), killGraceMs());
-      settle(() => {
-        dropPipes();
-        // Partial stdout/stderr is deliberately NOT attached: a wedged step's captured output is
-        // startup noise, and runDoltSync prefers it over the message — which would bury the real
-        // cause exactly as it did for stringer (anton-be1s).
-        reject(
-          Object.assign(
-            new Error(
-              `bd ${args.join(" ")} in ${cwd} exceeded its ${budgetMs}ms budget ` +
-                `(elapsed ${Date.now() - startedAt}ms) and its process group was killed. ` +
-                `bd or a child of it (typically \`git fetch\` against an unreachable remote) hung; ` +
-                `if it held the Dolt lock, later bd calls in this repo may fail until the tree is gone.`,
-            ),
-            { killed: true, signal: "SIGTERM" as NodeJS.Signals },
-          ),
-        );
-      });
-    }, budgetMs);
-
-    /** maxBuffer parity: kill the tree and reject rather than buffer without bound. */
-    const overflow = (stream: "stdout" | "stderr") => {
-      killGroup("SIGKILL");
-      settle(() => {
-        dropPipes();
-        reject(
-          Object.assign(
-            new Error(
-              `bd ${args.join(" ")} in ${cwd}: ${stream} exceeded ${bufferLimit} bytes ` +
-                `(maxBuffer length exceeded)`,
-            ),
-            { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", killed: true, stdout, stderr },
-          ),
-        );
-      });
-    };
-
-    child.stdout?.on("data", (c: Buffer) => {
-      stdout += outDecoder.write(c);
-      if (stdout.length > bufferLimit) overflow("stdout");
-    });
-    child.stderr?.on("data", (c: Buffer) => {
-      stderr += errDecoder.write(c);
-      if (stderr.length > bufferLimit) overflow("stderr");
-    });
-
-    // `spawn bd ENOENT` and friends — bd never ran, so there is no group to reap.
-    child.on("error", (err) => settle(() => reject(err)));
-
-    // The fast path for every healthy call: `close` follows `exit` immediately when nothing else
-    // holds the pipes, so stdout is complete and capture is byte-identical to the execFile it replaced.
-    child.on("close", (code, signal) => settle(() => finish(code, signal)));
-
-    child.on("exit", (code, signal) => {
-      if (escalateTimer) clearTimeout(escalateTimer); // bd is gone; no SIGKILL needed
-      if (settled) return; // already timed out (or overflowed) — the caller has its verdict
-      drainTimer = setTimeout(
-        () =>
-          settle(() => {
-            dropPipes();
-            finish(code, signal);
-          }),
-        DRAIN_AFTER_EXIT_MS,
-      );
-    });
-  });
-}
-
-/**
- * Test-only handle on the single bd invoker (anton-jfjw.1): the process-lifecycle suite drives real
- * fake-`bd` scripts through it to prove the group reap and the settle-on-exit contract. Production
- * code goes through the `beads` object.
- */
-export const runBdForTest = bd;
+// bd.ts is the single import site for beads state, not the single home of the code behind it. The
+// bd spawn lives in ./dolt-exec (HOW one invocation runs), the sync pass and the shared-server
+// preflight in ./dolt-sync, the coalescer and sync-status registry in ./sync-coalescer (WHEN a pass
+// runs); the pure argv builders, output parsers and refusal readers each sit in the sibling named
+// below. None imports this module back, so every seam is testable apart. All of it is re-exported
+// here so every existing `from ".../beads/bd"` import keeps working.
+export { BD_KILL_GRACE_ENV, BD_MAX_BUFFER_ENV, BD_STEP_TIMEOUT_ENV, BD_STEP_TIMEOUT_MS } from "./dolt-exec";
+export { runBdForTest, type BdExec } from "./dolt-exec";
+export { isBenignSyncOutput, isFirstPublishPullOutput, isNotWiredOutput } from "./dolt-sync";
+export { PREFLIGHT_TTL_MS, preflightSharedServer, resetServerPreflight, runDoltSync } from "./dolt-sync";
+export type { SyncMode, SyncOutcome } from "./dolt-sync";
+export { getSyncStatus, getSyncStatusToken, SYNC_STALL_MS } from "./sync-coalescer";
+export type { SyncRequest, SyncState, SyncStatus } from "./sync-coalescer";
+export { BD_BATCH_ENV, batchEnabled, batchOpArgs, encodeBatchOps, quoteBatchValue } from "./bd-args";
+export { buildPruneArgs, buildUpdateArgs, isMissingBatchCommand, LABEL_PREFIXES, labelValueOf } from "./bd-args";
+export type { BatchOp, BatchUpdateFields, BeadPatch, LabelPrefix, PruneAge } from "./bd-args";
+export { isMissingBeadError, unclaimableStatus } from "./bd-errors";
+export { buildGateCheckArgs, buildGateCreateArgs, buildGateDiscoverArgs, gateReason, parseGateCheck } from "./gate";
+export type { Gate, GateCheckOpts, GateCheckResult, GateCheckScope, GateCreateOpts } from "./gate";
+export type { GatedMolecule, GateDiscoverOpts, GateType } from "./gate";
+export { buildCookArgs, parseCookedFormula } from "./cook";
+export type { CookedFormula, CookedGate, CookedStep, CookMode, CookOptions } from "./cook";
+export { buildLintArgs, buildStaleArgs, parseDepCycles, parseDuplicateGroups } from "./hygiene";
+export { parseEpicCloseEligible, parseLintReport, parseOrphans, parseRecomputeBlocked } from "./hygiene";
+export type { DepCycle, DuplicateGroup, DuplicateMember, EpicCloseCandidate, EpicCloseSweep } from "./hygiene";
+export type { LintOpts, LintReport, LintViolation, OrphanBead, StaleOpts, StaleStatus } from "./hygiene";
+export type { GraphPlan, GraphPlanNode } from "./graph-plan";
 
 async function bdWrite(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
   const stdout = await bd(cwd, args, opts);
@@ -535,1170 +212,42 @@ async function bdWrite(cwd: string, args: string[], opts?: BdOpts): Promise<stri
   return stdout;
 }
 
-type BdExec = typeof bd;
-
-// ── Dolt sync: push every bd write to the remote explicitly (anton-nyf) ──
-//
-// refs/dolt/data only moves when `bd dolt push` runs; git hooks are per-machine and don't fire
-// for anton's own writes, so every write path syncs explicitly through here.
-
 /**
- * Benign sync outcomes that must NOT fail a sync: a clean working set ("Nothing to commit.")
- * and a workspace with no Dolt remote ("No remote is configured — skipping."). Current bd exits
- * 0 for both; the matcher keeps sync tolerant if a bd version turns them into errors.
+ * One version of a bead, as `bd history` records it — see {@link parseBeadHistory}.
  */
-const BENIGN_SYNC_OUTPUT = [/nothing to commit/i, /no remotes? (?:is )?configured/i];
-
-export function isBenignSyncOutput(output: string): boolean {
-  return BENIGN_SYNC_OUTPUT.some((re) => re.test(output));
-}
-
-/**
- * A workspace with no Dolt remote — not an error, but a distinct visible state (not-wired): the
- * board must show "not wired to a shared remote" rather than pretending it's synced.
- *
- * bd words the SAME condition differently per verb: `dolt push` prints "No remote is configured —
- * skipping.", while `dolt pull` fails with dolt's own `fetch from origin/main: Error 1105: no
- * remote`. Matching only the push wording left a solo board reading as `failing` on every heartbeat
- * pull, and would have failed a verified claim closed on a board that has no second machine to race
- * (anton-9anc). The pull pattern is deliberately strict — the whole `fetch from <ref>: Error <n>: no
- * remote` shape, and it must END the line, so a genuine fetch failure that merely starts that way
- * ("… no remote branch found") can't be read as "this workspace has no remote".
- */
-const NOT_WIRED_OUTPUT = [
-  /no remotes? (?:is )?configured/i,
-  /fetch from \S+: Error \d+: no remote\s*$/im,
-];
-
-export function isNotWiredOutput(output: string): boolean {
-  return NOT_WIRED_OUTPUT.some((re) => re.test(output));
-}
-
-/**
- * The ONLY `bd dolt pull` failure that is benign: a never-pushed remote has no refs/dolt/data yet,
- * so the first pull finds no dolt branches on the remote ("no branches found in remote", or on some
- * git backends "couldn't find remote ref"). In a full pass the push that follows publishes it; on a
- * heartbeat it just means "nothing to pull yet" and must NOT mark the project failing. Every OTHER
- * pull failure (auth, network, unreachable remote, dirty local state, real divergence) must reject —
- * in a full pass, before push — or a pass that never applied inbound changes could still be recorded
- * as "synced" whenever the trailing push happens to be a no-op (anton-live-sync review).
- */
-const FIRST_PUBLISH_PULL_OUTPUT = [
-  /no branches found in remote/i,
-  /(?:could ?n['’]t|could not) find remote ref/i,
-  /remote ref .*does not exist/i,
-];
-
-export function isFirstPublishPullOutput(output: string): boolean {
-  return FIRST_PUBLISH_PULL_OUTPUT.some((re) => re.test(output));
-}
-
-// ── Sync status registry (anton-live-sync) ──
-//
-// Keyed on globalThis via Symbol.for: the instrumentation-started sync engine and Next.js API
-// route handlers can load DIFFERENT compiled instances of this module (separate bundles), so a
-// plain module-level Map would leave routes reading an empty registry forever.
-
-export type SyncState = "unknown" | "not-wired" | "syncing" | "stalled" | "synced" | "failing";
-
-export interface SyncStatus {
-  state: SyncState;
-  /** ms epoch of the last successful pass (pull OR push); survives later failures for "last synced Xs ago". */
-  lastSyncedAt: number | null;
-  /** ms epoch of the last successful PUSH. Distinct from lastSyncedAt: a pull-only pass moves
-   * lastSyncedAt but NOT this, so "unpushed for a while" is visible even while pulls keep succeeding. */
-  lastPushedAt: number | null;
-  /** Write-nudged full passes that committed new local work but failed to push, since the last
-   * successful push — the count of local changes queued for the backstop to retry. 0 when the repo
-   * is caught up with its remote; >0 means work is queued locally. Backstop retries never grow it:
-   * they re-attempt already-counted commits, so a flaky remote can't inflate one stranded change
-   * into "N unpushed". */
-  unpushedCount: number;
-  lastError: string | null;
-  /** How long the pass has been pinned at `syncing`, once past the staleness window. Non-null only
-   * for state `stalled` — it is what lets the badge say "stuck 4h" instead of spinning forever. */
-  stalledForMs: number | null;
-}
-
-/** What the registry actually stores. `stalled` is never written — it is derived on read from
- * `syncingSince`, so a wedged process (which by definition runs no more code) still ages out. */
-interface SyncRecord extends Omit<SyncStatus, "stalledForMs"> {
-  /** ms epoch this pass stamped `syncing`; null in every terminal state. The stall clock. */
-  syncingSince: number | null;
-}
-
-/**
- * How long a pass may sit in `syncing` before the registry reads it as `stalled`. A hang is not a
- * rejection: nothing throws, so the `.catch` that records `failing` never runs and the repo would
- * otherwise stay pinned at `syncing` forever — the anton-jfjw.3 defect, where two boards were
- * un-syncable for days with nothing anywhere saying so. Ten missed heartbeats (30s each): long
- * enough that a genuinely slow pull over a big board is not flagged, short enough that an operator
- * sees the stall in minutes rather than days. `ANTON_SYNC_STALL_MS` overrides it (read per call so
- * a change lands without a module reload).
- */
-export const SYNC_STALL_MS = 300_000;
-
-function stallWindowMs(): number {
-  const raw = Number(process.env.ANTON_SYNC_STALL_MS);
-  return Number.isFinite(raw) && raw > 0 ? raw : SYNC_STALL_MS;
-}
-
-const SYNC_STATUS_KEY = Symbol.for("anton.beads.syncStatus");
-const SYNC_STALL_LOGGED_KEY = Symbol.for("anton.beads.syncStallLogged");
-
-function statusRegistry(): Map<string, SyncRecord> {
-  const g = globalThis as unknown as Record<symbol, Map<string, SyncRecord> | undefined>;
-  return (g[SYNC_STATUS_KEY] ??= new Map());
-}
-
-/** cwd → the `syncingSince` of the stall already logged, so a stall is announced once per
- * occurrence rather than once per read (the board polls getSyncStatus every few seconds). */
-function stallLogRegistry(): Map<string, number> {
-  const g = globalThis as unknown as Record<symbol, Map<string, number> | undefined>;
-  return (g[SYNC_STALL_LOGGED_KEY] ??= new Map());
-}
-
-function rawStatus(cwd: string): SyncRecord {
-  return (
-    statusRegistry().get(cwd) ?? {
-      state: "unknown",
-      lastSyncedAt: null,
-      lastPushedAt: null,
-      unpushedCount: 0,
-      lastError: null,
-      syncingSince: null,
-    }
-  );
-}
-
-/**
- * The repo's sync health, with a wedged pass aged out of `syncing` into `stalled`. Every consumer
- * of the registry reads through here, so the backstop needs no timer and no cooperation from the
- * hung pass itself — which is the point: the process that would have reported the failure is the
- * one that is stuck. `now` is injectable for tests.
- */
-export function getSyncStatus(cwd: string, now: number = Date.now()): SyncStatus {
-  const { syncingSince, ...view } = rawStatus(cwd);
-  if (view.state !== "syncing" || syncingSince === null) return { ...view, stalledForMs: null };
-  const stuckForMs = now - syncingSince;
-  if (stuckForMs < stallWindowMs()) return { ...view, stalledForMs: null };
-  logStallOnce(cwd, syncingSince, stuckForMs, view.lastSyncedAt);
-  return { ...view, state: "stalled", stalledForMs: stuckForMs };
-}
-
-/** One line per distinct stall, matching sync-engine's log-on-change discipline — an operator
- * tailing the console sees the wedge without running `ps`, and a polling board doesn't flood it. */
-function logStallOnce(
-  cwd: string,
-  syncingSince: number,
-  stuckForMs: number,
-  lastSyncedAt: number | null,
-): void {
-  const logged = stallLogRegistry();
-  if (logged.get(cwd) === syncingSince) return;
-  logged.set(cwd, syncingSince);
-  const mins = Math.round(stuckForMs / 60_000);
-  const lastSynced =
-    lastSyncedAt === null ? "never synced" : `last synced ${new Date(lastSyncedAt).toISOString()}`;
-  console.error(
-    `[beads.sync] ${cwd} has been stuck in 'syncing' for ${mins}m with no completion and no ` +
-      `error — the sync pass is wedged (${lastSynced}).`,
-  );
-}
-
-/**
- * Compact token for board refreshes. Repeated successful heartbeats do not change it, while every
- * user-visible health transition does (including gaining the first successful-sync timestamp and any
- * change to the unpushed-backlog count, which the badge renders). While stalled it also advances
- * once a minute: the badge renders a server-computed "stuck Xm", which would otherwise freeze at
- * the value captured when the stall was first detected — exactly the frozen-truth failure this
- * state exists to fix.
- */
-export function getSyncStatusToken(cwd: string, now: number = Date.now()): string {
-  const status = getSyncStatus(cwd, now);
-  const seen = status.lastSyncedAt === null ? "never" : "seen";
-  const stuck = status.stalledForMs === null ? "" : `:${Math.floor(status.stalledForMs / 60_000)}`;
-  return `${status.state}:${seen}:${status.unpushedCount}:${status.lastError ?? ""}${stuck}`;
-}
-
-function recordStatus(cwd: string, patch: Partial<SyncRecord>): void {
-  const next = { ...rawStatus(cwd), ...patch };
-  // Single owner of the stall clock: it starts the moment a pass stamps `syncing` and is cleared by
-  // any terminal state, so `syncingSince` always means "the pass currently in flight began here".
-  if (patch.state !== undefined) next.syncingSince = patch.state === "syncing" ? Date.now() : null;
-  statusRegistry().set(cwd, next);
-}
-
-/**
- * Concrete sync passes runDoltSync executes. "full" (write-nudged): pull → commit → push.
- * "pull": pull only — the heartbeat's default, which must NOT push when there are no local
- * changes; every anton instance pushing a shared remote every ~10s is the concurrent-push
- * manifest-corruption pattern (beads GH#2466).
- */
-export type SyncMode = "full" | "pull";
-
-/**
- * What the coalescer accepts. "backstop" is the heartbeat's push safety net (anton-sr8f): the
- * coalescer resolves it to "full" when the repo has unpushed local commits (a prior push failed) OR
- * has not yet been reconciled by this process (a cold start after a crash can't trust the in-memory
- * backlog count), and to "pull" otherwise — so stranded commits are always retried until they land,
- * while a caught-up, reconciled repo stays quiet. Routes through the same per-repo coalescer as
- * "full"/"pull", so a backstop push can never overlap a write-nudged one (beads GH#2466).
- *
- * "push" is the durable sync-push job's request (anton-nowq): it ALWAYS runs a full push pass to
- * retry the write's commit, but — unlike "full" — never grows the unpushed backlog (its work is
- * already counted by the write-nudged pass). "backstop" is wrong for the job: it snapshots
- * `unpushedCount` at call time and, if it coalesces behind a still-in-flight write push, reads 0 and
- * drops to pull-only — so a push that then fails goes unretried by the very job meant to retry/park
- * it. "push" forces the retry unconditionally without the count-inflation "full" would cause.
- */
-export type SyncRequest = SyncMode | "backstop" | "push";
-
-export type SyncOutcome = "synced" | "not-wired";
-
-/**
- * One sync pass. Full mode: `bd dolt pull` (remote changes land locally, and pull-before-push
- * shrinks divergence windows), then `bd dolt commit` (a no-op under dolt.auto-commit, but
- * catches externally-made changes), then `bd dolt push`. Pull mode runs only the pull.
- *
- * Outcomes: benign steps are skipped; a workspace with no remote resolves "not-wired" and stops
- * the pass. A pull failure in FULL mode is tolerated (a never-pushed remote has no refs/dolt
- * yet — the push that follows publishes it); a real commit/push failure (auth, network, remote
- * conflict) rejects with the bd output attached — callers surface it, never swallow it.
- * `exec` is injectable for tests.
- *
- * No explicit `bd recompute-blocked` here: bd 1.1.0 recomputes the denormalized `is_blocked` flag
- * automatically on every pull, scoped to what the merge changed, so `bd ready` never reads a stale
- * flag on the hot sync path. The unconditional repair (`bd recompute-blocked`) is reserved for the
- * places that gap can't reach — a freshly bootstrapped clone that never ran a local merge (see
- * configureBeadsForRepo in config.mjs) — rather than paid on every heartbeat pull.
- */
-export async function runDoltSync(
-  cwd: string,
-  exec: BdExec = bd,
-  mode: SyncMode = "full",
-): Promise<SyncOutcome> {
-  const steps =
-    mode === "pull"
-      ? [["dolt", "pull"]]
-      : [
-          ["dolt", "pull"],
-          ["dolt", "commit"],
-          ["dolt", "push"],
-        ];
-  for (const args of steps) {
-    try {
-      await exec(cwd, args);
-    } catch (e) {
-      const err = e as Error & { stdout?: string; stderr?: string };
-      const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
-      if (isNotWiredOutput(output)) return "not-wired";
-      if (isBenignSyncOutput(output)) continue;
-      // A pull tolerates ONLY the first-publish case (a never-pushed remote has no dolt branches
-      // yet): in a full pass the push that follows publishes them; on a heartbeat it's just
-      // "nothing to pull yet". Any OTHER pull failure (auth, network, unreachable remote, dirty
-      // local state, real divergence) rejects here — in a full pass, before push — so a pass that
-      // never applied inbound changes is never silently recorded as "synced" on a no-op push.
-      if (args[1] === "pull" && isFirstPublishPullOutput(output)) continue;
-      throw new Error(`bd ${args.join(" ")} failed in ${cwd}: ${output}`, { cause: e });
-    }
-  }
-  return "synced";
-}
-
-/**
- * Coalescing wrapper around runDoltSync, keyed by cwd: while a sync runs, every request that
- * arrives shares ONE trailing sync (which starts after the current one and therefore sees all
- * their writes) — a burst of writes costs one extra push, not one each. A "pull" request
- * piggybacks on any in-flight or queued pass (full ⊃ pull); a "full" request upgrades a queued
- * pull-only trailing pass. Updates the sync status registry on every pass. Exported for testing.
- *
- * Also tracks the per-repo unpushed backlog on the sync-status registry (anton-sr8f, anton-rn88): a
- * write-nudged full pass that fails to reach "synced" committed new local work it couldn't push, so
- * the repo is left ahead of its remote — recorded as `unpushedCount > 0`. A backstop retry that also
- * fails does NOT grow the count: it re-attempts the same stranded commits and adds no new work, so a
- * flaky remote can't inflate one change into "N unpushed". That count lets a "backstop" request (the
- * heartbeat) resolve to a push-retry while a caught-up repo stays pull-only, and it is the
- * operator-visible "N unpushed" surface. A full pass that reaches "synced"/"not-wired" clears the
- * count and stamps `lastPushedAt` (nothing left to push).
- *
- * Resolves with the pass's `SyncOutcome` so callers can tell delivery from non-delivery: a
- * "not-wired" repo has no remote to publish to, so the write is still only local. The durable
- * sync-push job depends on that distinction — resolving void would let it settle `done` on work it
- * never delivered (anton-x7la review). Coalesced callers share the outcome of the pass that covers
- * them, which is the pass their own request ran in.
- */
-export function createDoltSync(
-  exec: BdExec = bd,
-): (cwd: string, mode?: SyncRequest) => Promise<SyncOutcome> {
-  const running = new Map<string, Promise<SyncOutcome>>();
-  const trailing = new Map<string, { promise: Promise<SyncOutcome>; mode: SyncMode }>();
-  const trailingMode = new Map<string, SyncMode>(); // live handle so an upgrade reaches the queued run
-  const trailingNewWork = new Map<string, boolean>(); // did any queued request carry new local work?
-
-  // Repos whose backlog this process has reconciled against the remote — a full pass has pushed
-  // (or resolved not-wired) at least once. `unpushedCount` lives only in memory, so after a restart
-  // a repo left ahead by a crashed process reads count 0; until reconciled, a backstop must run a
-  // full pass rather than trust that 0 to mean "caught up" and pull forever (anton-z908 review).
-  const reconciled = new Set<string>();
-
-  // `newWork` is true only for a write-nudged full pass, which may carry a genuinely new local
-  // commit. A backstop retry (newWork=false) re-attempts already-counted work and commits nothing
-  // new, so it must never grow the backlog — otherwise a flaky remote turns one stranded change into
-  // "N unpushed" after N failed retries (anton-rn88 review).
-  const start = (cwd: string, mode: SyncMode, newWork: boolean): Promise<SyncOutcome> => {
-    recordStatus(cwd, { state: "syncing" });
-    const p = runDoltSync(cwd, exec, mode).then((outcome) => {
-      if (outcome === "not-wired") {
-        recordStatus(cwd, { state: "not-wired", lastError: null });
-        reconciled.add(cwd); // no remote to reconcile against — stop forcing full backstop passes
-      } else {
-        // Retain the last valid data while a background read refreshes after the remote pull.
-        invalidateIssueSnapshot(cwd);
-        const now = Date.now();
-        // A full pass pushed everything — stamp the push and clear the backlog. A pull-only pass
-        // moves lastSyncedAt but leaves lastPushedAt/unpushedCount alone (it never pushes).
-        recordStatus(cwd, {
-          state: "synced",
-          lastSyncedAt: now,
-          lastError: null,
-          ...(mode === "full" ? { lastPushedAt: now, unpushedCount: 0 } : {}),
-        });
-        if (mode === "full") reconciled.add(cwd); // a full pass pushed — the backlog is reconciled
-      }
-      return outcome;
-    });
-    running.set(cwd, p);
-    // Bookkeeping only — callers hold `p` and see its rejection; this chain must not re-reject.
-    void p
-      .catch((e: Error) => {
-        // A write-nudged full pass committed new work but never landed its push — grow the unpushed
-        // backlog so the next heartbeat backstop retries, and the operator sees a truthful "N
-        // unpushed" count instead of the failure hiding in server logs. A backstop retry (newWork
-        // false) or a pull-only failure leaves the count as-is: the stranded work is already counted.
-        const patch: Partial<SyncRecord> = { state: "failing", lastError: e.message };
-        if (mode === "full" && newWork) patch.unpushedCount = getSyncStatus(cwd).unpushedCount + 1;
-        recordStatus(cwd, patch);
-      })
-      .finally(() => {
-        if (running.get(cwd) === p) running.delete(cwd);
-      });
-    return p;
-  };
-
-  return function sync(cwd: string, request: SyncRequest = "full"): Promise<SyncOutcome> {
-    // Resolve the backstop to a push-retry when a prior push failed (recorded backlog) OR when this
-    // process has not yet reconciled the repo — the backlog is in-memory only, so a cold start after
-    // a crash that stranded local commits reads count 0 and must NOT pull forever without shipping
-    // them (anton-z908 review). A caught-up, already-reconciled repo stays pull-only and quiet.
-    const mode: SyncMode =
-      request === "backstop"
-        ? getSyncStatus(cwd).unpushedCount > 0 || !reconciled.has(cwd)
-          ? "full"
-          : "pull"
-        : request === "push"
-          ? "full" // durable job: always retry the push, regardless of the (possibly stale) count
-          : request;
-    // Only a write-nudge introduces new local work; a backstop or durable "push" retry re-attempts
-    // already-counted commits and must never inflate the backlog (anton-rn88).
-    const newWork = request === "full";
-    const queued = trailing.get(cwd);
-    if (queued) {
-      if (mode === "full") trailingMode.set(cwd, "full");
-      if (newWork) trailingNewWork.set(cwd, true); // a coalesced write carries new work into the pass
-      return queued.promise;
-    }
-    const current = running.get(cwd);
-    if (!current) return start(cwd, mode, newWork);
-    trailingMode.set(cwd, mode);
-    trailingNewWork.set(cwd, newWork);
-    const next = current
-      .catch(() => {}) // the current run's failure belongs to its own callers
-      .then(() => {
-        trailing.delete(cwd);
-        const m = trailingMode.get(cwd) ?? "full";
-        const nw = trailingNewWork.get(cwd) ?? false;
-        trailingMode.delete(cwd);
-        trailingNewWork.delete(cwd);
-        return start(cwd, m, nw);
-      });
-    trailing.set(cwd, { promise: next, mode });
-    return next;
-  };
-}
-
-// The singleton is globalThis-anchored for the same cross-bundle reason as the status registry:
-// two module instances with separate coalescing maps would defeat the never-overlap invariant.
-const DOLT_SYNC_KEY = Symbol.for("anton.beads.doltSync");
-const doltSync = ((globalThis as unknown as Record<symbol, ReturnType<typeof createDoltSync>>)[
-  DOLT_SYNC_KEY
-] ??= createDoltSync());
-
-/**
- * bd --json returns either a top-level array or a `{ <key>: [...] }` envelope. Normalize to an
- * array. `molecules` is `bd ready --gated`'s envelope (`{ count, molecules }`).
- */
-function asArray<T>(raw: string): T[] {
-  const d = JSON.parse(raw || "[]");
-  if (Array.isArray(d)) return d;
-  if (d && Array.isArray(d.issues)) return d.issues;
-  if (d && Array.isArray(d.results)) return d.results;
-  if (d && Array.isArray(d.molecules)) return d.molecules;
-  return [];
-}
-
-/**
- * Did bd ANSWER that there is no such bead, or did it fail to answer at all? A lookup for a deleted
- * id exits non-zero with `no issue found matching …`, and that is evidence the work was removed on
- * purpose. Every other failure — bd absent, dolt wedged, the step budget expired — is the absence of
- * evidence, so a caller that acts on a deletion (refusing to resume work that no longer exists) must
- * not read it as one. Matches stderr first and the message second: {@link bd}'s rejection carries the
- * raw stderr on both.
- *
- * Both alternatives name an ISSUE, because "not found" on its own is a shape half of bd's
- * operational failures share — a missing database, a missing schema, an unresolvable remote — and
- * reading one of those as a deletion turns "bd couldn't answer" into "the bead was deleted", which
- * is the one conversion every caller here is written to prevent.
- */
-export function isMissingBeadError(e: unknown): boolean {
-  const err = e as { stderr?: unknown; message?: unknown } | null | undefined;
-  const stderr = typeof err?.stderr === "string" ? err.stderr : "";
-  const message = typeof err?.message === "string" ? err.message : "";
-  return /no issues? found|\bissues?(?: \S+)? not found/i.test(`${stderr}\n${message}`);
-}
-
-/**
- * Did bd refuse a `--claim` because the bead's STATUS can never be claimed — `issue not claimable:
- * status blocked` (also `closed`, `deferred`, `in_progress` when the bead isn't already ours)? That
- * refusal is permanent: a status is a decision written to the board, so the identical call repeats
- * the identical error and a caller that buckets it with a Dolt lock burns its whole retry budget
- * before parking with the wrong cause (anton-e5ix). Returns the status bd named so the caller can
- * report it; undefined for every other failure — including "already claimed by <other>", which is an
- * ownership conflict, not a status one — which keeps the retryable path unchanged.
- *
- * Reads stderr first and the message second: {@link bd}'s rejection carries the raw stderr on both.
- */
-export function unclaimableStatus(e: unknown): string | undefined {
-  const err = e as { stderr?: unknown; message?: unknown } | null | undefined;
-  const stderr = typeof err?.stderr === "string" ? err.stderr : "";
-  const message = typeof err?.message === "string" ? err.message : "";
-  return /not claimable:\s*status\s+([a-z_]+)/i.exec(`${stderr}\n${message}`)?.[1];
-}
-
-// ── gate seam (anton-uk95) ──
-//
-// A gate is a real bead (`issue_type: gate`) that blocks its step with an ordinary `blocks` edge, so
-// an async wait is board-visible state and costs nothing while it waits. `bd gate check` evaluates
-// open timer/GitHub gates and closes the satisfied ones.
-//
-// THE INVARIANT EVERY CALL HERE EXISTS TO HOLD: bd is spawned with `cwd` = the project repo, and
-// NEVER with `-C`. `bd -C <dir>` changes only which DATABASE bd reads — it does not change the
-// process cwd — while the `gh` subprocess bd spawns to evaluate a `gh:run` / `gh:pr` gate resolves
-// its repository from that cwd. So `-C` yields a verdict from whatever repo the caller happened to
-// start in, in BOTH directions: a green CI run in project A resolves project B's gate (a false
-// green), and a failed run in A escalates B's (a false escalation). Proven on bd 1.1.0 and 1.1.2 in
-// .product/decisions/2026-07-28-bd-workflow-primitives.md §5; locked in by gate-cwd.integration.test.ts.
-// `bd gate discover` draws its candidate runs from the same cwd, so the rule covers it too.
-
-/** Gate flavours `bd gate create --type` accepts. `bead` is deliberately absent — unresolvable here. */
-export type GateType = "human" | "timer" | "gh:run" | "gh:pr";
-
-/** What `bd gate check --type` may be scoped to: one gate type, `gh` (both GitHub types), or all. */
-export type GateCheckScope = GateType | "gh" | "bead" | "all";
-
-/** A gate bead, as `bd gate list --json` returns it. */
-export interface Gate extends Bead {
-  /** The gate's flavour (bd's `await_type`). */
-  await_type?: GateType;
-  /** The condition identifier — a workflow run id for `gh:run`, a PR number for `gh:pr`. */
-  await_id?: string;
-  /**
-   * Timeout in NANOSECONDS — bd serialises a Go `time.Duration` as an integer, so `--timeout=2h`
-   * reads back as 7.2e12. Absent when the gate has no deadline (bd's default: wait forever).
-   * {@link gateDeadline} is the only place that converts it.
-   */
-  timeout?: number;
-}
-
-export interface GateCreateOpts {
-  /** Bead the gate blocks (required by bd). */
-  blocks: string;
-  /** Defaults to bd's own default, `human`. */
-  type?: GateType;
-  /** Workflow run id (`gh:run`) or PR number (`gh:pr`). Omit for a gate `gate discover` will fill. */
-  awaitId?: string;
-  /** Timer gates only, e.g. `2h`. */
-  timeout?: string;
-  reason?: string;
-}
-
-export interface GateCheckOpts {
-  scope?: GateCheckScope;
-  /** Report the verdicts without closing anything. */
-  dryRun?: boolean;
-  /** Also run bd's escalation for failed/expired gates. Escalation does NOT close the gate. */
-  escalate?: boolean;
-}
-
-export interface GateDiscoverOpts {
-  dryRun?: boolean;
-  /** Branch whose runs are candidates; bd defaults to the cwd repo's current branch. */
-  branch?: string;
-  /** Max runs to query from GitHub. */
-  limit?: number;
-  /** Max age for gate/run matching, e.g. `30m`. */
-  maxAge?: string;
-}
-
-/**
- * What one `bd gate check` pass did. `errors` is the field that must never be ignored: a gate bd
- * could not evaluate (no `gh`, an API failure) is UNKNOWN — not resolved and not unresolved — so a
- * caller must treat `errors > 0` the way execute-epic treats an unreadable PR state: retry with a
- * counting error rather than reading `resolved: 0` as "still waiting".
- */
-export interface GateCheckResult {
-  checked: number;
-  resolved: number;
-  escalated: number;
-  errors: number;
-  dryRun: boolean;
-}
-
-/** One entry of `bd ready --gated` — a molecule whose gate closed, with the step now runnable. */
-export interface GatedMolecule {
-  molecule_id: string;
-  molecule_title?: string;
-  closed_gate?: Gate;
-  ready_step?: Bead;
-}
-
-/** Pure argv builder for `bd gate create`, exposed for testing (like buildUpdateArgs). */
-export function buildGateCreateArgs(opts: GateCreateOpts): string[] {
-  if (!opts.blocks) throw new Error("bd gate create requires the id of the bead the gate blocks");
-  const args = ["gate", "create", "--blocks", opts.blocks];
-  if (opts.type) args.push("--type", opts.type);
-  if (opts.awaitId) args.push("--await-id", opts.awaitId);
-  if (opts.timeout) args.push("--timeout", opts.timeout);
-  if (opts.reason) args.push("--reason", opts.reason);
-  args.push("--json"); // plain output appends dispatch hints (for `bd sling`, which doesn't exist)
-  return args;
-}
-
-/** Pure argv builder for `bd gate check`, exposed for testing. */
-export function buildGateCheckArgs(opts: GateCheckOpts = {}): string[] {
-  const args = ["gate", "check"];
-  if (opts.scope) args.push("--type", opts.scope);
-  if (opts.dryRun) args.push("--dry-run");
-  if (opts.escalate) args.push("--escalate");
-  args.push("--json");
-  return args;
-}
-
-/** Pure argv builder for `bd gate discover`, exposed for testing. */
-export function buildGateDiscoverArgs(opts: GateDiscoverOpts = {}): string[] {
-  const args = ["gate", "discover"];
-  if (opts.dryRun) args.push("--dry-run");
-  if (opts.branch) args.push("--branch", opts.branch);
-  if (opts.limit !== undefined) args.push("--limit", String(opts.limit));
-  if (opts.maxAge) args.push("--max-age", opts.maxAge);
-  return args;
-}
-
-/**
- * Pull the trailing `--json` object out of a bd stdout that also carries progress lines. `bd gate
- * check --json` prints its per-gate verdicts and a "Checked N gates" summary on STDOUT before the
- * JSON, so a plain JSON.parse of the whole stream throws. Scans candidate `{` offsets from the last
- * back to the first and returns the first that parses, so a future nested summary still lands.
- */
-function parseJsonTail(raw: string): unknown {
-  // The `i > 0` guard is load-bearing: `lastIndexOf("{", -1)` clamps its start to 0 rather than
-  // giving up, so a leading `{` that fails to parse would hand back 0 forever.
-  for (let i = raw.lastIndexOf("{"); i >= 0; i = i > 0 ? raw.lastIndexOf("{", i - 1) : -1) {
-    try {
-      return JSON.parse(raw.slice(i));
-    } catch {
-      // not the start of the summary object — keep walking left
-    }
-  }
-  return undefined;
-}
-
-/**
- * Read a `bd gate check` summary, or THROW. The throw is the point: a check whose result can't be
- * read is the unknown state, and returning zeros would render it as "nothing satisfied yet" — a
- * wait that never ends on a bd whose output format moved. Fail loud instead.
- */
-export function parseGateCheck(raw: string): GateCheckResult {
-  const s = parseJsonTail(raw) as Record<string, unknown> | undefined;
-  if (!s || typeof s.checked !== "number") {
-    throw new Error(
-      `bd gate check: could not read its --json summary (bd output format changed?) — refusing to ` +
-        `report an unreadable check as "no gates resolved". Output: ${raw.slice(0, 200)}`,
-    );
-  }
-  const n = (v: unknown) => (typeof v === "number" ? v : 0);
-  return {
-    checked: s.checked,
-    resolved: n(s.resolved),
-    escalated: n(s.escalated),
-    errors: n(s.errors),
-    dryRun: s.dry_run === true,
-  };
-}
-
-/**
- * The ONE invoker every gate call goes through. It exists so the cwd invariant cannot be forgotten
- * at a call site: `repo` is bd's spawn cwd (empty is a loud failure, never the server's own cwd),
- * and `GH_REPO` is set alongside it — belt and braces for the case a future call site can't control
- * cwd, since GH_REPO overrides gh's repo resolution outright. A non-github.com origin (or no remote)
- * yields no slug, and then GH_REPO is explicitly UNSET rather than left inherited: a server launched
- * with GH_REPO in its own environment would otherwise have every gate here evaluated against that
- * other repository. No slug means cwd alone governs. Never pass `-C` in `args`.
- */
-async function bdGate(repo: string, args: string[]): Promise<string> {
-  if (!repo) throw new Error(`bd ${args.join(" ")}: a gate call requires the project repo as cwd`);
-  const slug = await githubRepoSlug(repo).catch(() => undefined);
-  return bd(repo, args, { env: { GH_REPO: slug } });
-}
-
-/** {@link bdGate} for the calls that mutate gates — invalidates the board snapshot like bdWrite. */
-async function bdGateWrite(repo: string, args: string[]): Promise<string> {
-  const stdout = await bdGate(repo, args);
-  invalidateIssueSnapshot(repo, true);
-  return stdout;
-}
-
-// ── formula cooking (anton-brdg) ──
-//
-// `bd cook` resolves a `.formula.{toml,json}` into its steps. This is the ONLY place anton shells a
-// formula verb, so the pipeline stays swappable: the loader (anton-hrql) and the invariant-floor
-// validator (anton-6b99) consume {@link CookedFormula}, never bd stdout.
-//
-// Deliberately a READ: `--persist` is never passed. Persisting materialises a proto bead, which is a
-// write — it would need bdWrite's snapshot invalidation and a dolt sync, and anton has no use for a
-// stored proto (it cooks per run). See formula.ts for why anton cooks rather than pours.
-
-/**
- * A step's gate — the async wait condition bd blocks it on. `type` is bd's gate kind (`human`,
- * `timer`, `gh:run`, `gh:pr`, `bead`); `await_id` and `timeout` are that kind's parameter. Read-only
- * here: resolving gates is anton-uk95's, so this seam reports a gate rather than acting on one.
- */
-export interface CookedGate {
-  type: string;
-  /** What the gate waits on: a run/PR ref for `gh:*`, `<rig>:<bead-id>` for `bead`. */
-  await_id?: string;
-  /** `timer` only — the window after which the gate expires. */
-  timeout?: string;
-}
-
-/**
- * One resolved step of a cooked formula, in declaration order.
- *
- * `labels` is where a step names its handler (`step:<name>`) and its prompt: `bd cook` silently
- * DROPS step keys it doesn't recognise, so anton's per-step configuration has to ride on labels
- * rather than a custom formula key. `needs` carries the DAG edges (a `blocks` edge once poured).
- */
-export interface CookedStep {
-  id: string;
-  title?: string;
-  /** The bd issue type the step materialises as (`task`, `feature`, …). */
-  type?: string;
-  labels?: string[];
-  /** Ids of the steps this one depends on — bd's `needs` AND `depends_on` merged (see {@link needsOf}). */
-  needs?: string[];
-  gate?: CookedGate;
-}
-
-/** A cooked formula — the resolved pipeline the runtime walks. */
-export interface CookedFormula {
-  /** The formula's own name. bd's key is `formula`, NOT `name`: a formula written with `name`
-   * parses and then fails cook with "name is required" (verified on bd 1.1.2, anton-upfc). */
-  formula: string;
-  description?: string;
-  /** Absolute path bd cooked from — what a park message must name so an operator finds the file. */
-  source?: string;
-  steps: CookedStep[];
-}
-
-/**
- * How a formula is cooked. `compile` keeps `{{var}}` placeholders (modelling, validation of the
- * shipped default); `runtime` substitutes them and requires every variable to have a value —
- * a missing one exits non-zero rather than rendering a half-resolved pipeline.
- */
-export type CookMode = "compile" | "runtime";
-
-export interface CookOptions {
-  /** Defaults to `runtime` when `vars` are given, `compile` otherwise. */
-  mode?: CookMode;
-  /** `{{var}}` values for this run, passed as `--var k=v`. */
-  vars?: Record<string, string>;
-}
-
-/**
- * Pure argv builder for `bd cook`, exposed for testing (like {@link buildUpdateArgs}).
- *
- * `--mode` is always explicit so the argv never depends on bd's implicit "any --var enables runtime"
- * rule. That rule is also why `mode: "compile"` WITH vars is rejected rather than emitted: bd
- * substitutes whenever a `--var` is present, so such an argv would declare an intent bd ignores.
- */
-export function buildCookArgs(formula: string, opts: CookOptions = {}): string[] {
-  const vars = Object.entries(opts.vars ?? {});
-  if (opts.mode === "compile" && vars.length > 0) {
-    throw new Error(
-      `bd cook ${formula}: mode "compile" cannot be combined with vars — bd substitutes whenever ` +
-        `--var is present, so the placeholders would not survive. Cook without vars, or use "runtime".`,
-    );
-  }
-  for (const [k] of vars) {
-    // bd splits `--var k=v` on the FIRST `=`, so a key containing one silently sets a different
-    // variable (values may contain `=` freely). Fail loud rather than parameterise the wrong var.
-    if (!k || k.includes("=")) {
-      throw new Error(`bd cook ${formula}: invalid variable name ${JSON.stringify(k)}`);
-    }
-  }
-  const mode: CookMode = opts.mode ?? (vars.length > 0 ? "runtime" : "compile");
-  return [
-    "cook",
-    formula,
-    `--mode=${mode}`,
-    ...vars.flatMap(([k, v]) => ["--var", `${k}=${v}`]),
-    "--json",
-  ];
-}
-
-function str(v: unknown): string | undefined {
-  return typeof v === "string" && v ? v : undefined;
-}
-
-function strings(v: unknown): string[] | undefined {
-  if (!Array.isArray(v)) return undefined;
-  const out = v.filter((x): x is string => typeof x === "string");
-  return out.length > 0 ? out : undefined;
-}
-
-/**
- * A step's prerequisites, from EITHER spelling bd accepts. bd cooks `needs` and `depends_on` through
- * verbatim — it normalises neither into the other (measured on bd 1.1.2) — so reading only `needs`
- * would hand the walker a formula with no edges at all: it would run in declaration order, or be
- * rejected by the invariant floor for an ordering the file actually expressed. Merged and deduped
- * here so every consumer downstream reads ONE field.
- */
-function needsOf(s: Record<string, unknown> | null | undefined): string[] | undefined {
-  const merged = [...(strings(s?.needs) ?? []), ...(strings(s?.depends_on) ?? [])];
-  return merged.length > 0 ? [...new Set(merged)] : undefined;
-}
-
-function gateOf(v: unknown): CookedGate | undefined {
-  const g = v as Record<string, unknown> | null | undefined;
-  const type = str(g?.type);
-  if (!type) return undefined;
-  return { type, ...pick("await_id", str(g?.await_id)), ...pick("timeout", str(g?.timeout)) };
-}
-
-/** Include a key only when it has a value, so an absent field stays absent rather than `undefined`. */
-function pick<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
-  return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
-}
-
-/**
- * Parse `bd cook --json` into the typed pipeline, normalising each step to {@link CookedStep} so no
- * caller ever touches bd's raw output. Fails loud on anything that is not a cooked formula —
- * a step with no id has no handler, no park message, and no place in the DAG, so it cannot be
- * silently dropped. `formula` names the cooked formula in every message.
- */
-export function parseCookedFormula(raw: string, formula: string): CookedFormula {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (e) {
-    throw new Error(
-      `bd cook ${formula}: output was not JSON (got ${JSON.stringify(raw.slice(0, 200))})`,
-      { cause: e },
-    );
-  }
-  const doc = parsed as Record<string, unknown> | null;
-  if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
-    throw new Error(`bd cook ${formula}: expected a formula object, got ${typeof parsed}`);
-  }
-  if (!Array.isArray(doc.steps)) {
-    throw new Error(`bd cook ${formula}: cooked output has no steps array`);
-  }
-  const steps = doc.steps.map((step, i): CookedStep => {
-    const s = step as Record<string, unknown> | null;
-    const id = str(s?.id)?.trim();
-    if (!id) {
-      throw new Error(`bd cook ${formula}: step ${i} has no id — every step must declare one`);
-    }
-    return {
-      id,
-      ...pick("title", str(s?.title)),
-      ...pick("type", str(s?.type)),
-      ...pick("labels", strings(s?.labels)),
-      ...pick("needs", needsOf(s)),
-      ...pick("gate", gateOf(s?.gate)),
-    };
-  });
-  return {
-    formula: str(doc.formula) ?? formula,
-    ...pick("description", str(doc.description)),
-    ...pick("source", str(doc.source)),
-    steps,
-  };
-}
-
-// ── board hygiene verbs (anton-6qbc) ──
-//
-// The typed seam for the gardener patrol (anton-bci0): bd's own hygiene commands, so anton composes
-// them rather than reimplementing epic-closure, staleness or duplicate detection over a board read.
-// Every verb here rides the same budgeted, process-group-reaped spawn as the rest of the file, and
-// the two WRITE-class ones (`epic close-eligible` applying, `recompute-blocked`) go through bdWrite
-// so the board snapshot invalidates exactly like any other write.
-//
-// All seven support `--json`, verified by EXECUTING each against a seeded scratch board on bd 1.1.2
-// AND on the 1.1.0 floor (`~/.local/bin/bd.1.1.0.bak`) — output was identical on both. Per
-// .product/decisions/2026-07-28-bd-workflow-primitives.md, `--help` is not an oracle; the shapes
-// below are what bd actually printed. Three of them are traps a `--help` reading would have missed:
-//
-//   1. `bd epic close-eligible --json` returns TWO different shapes — an ARRAY of candidates on
-//      `--dry-run`, an OBJECT `{closed, count}` when it applies (and a bare `[]` when it applies and
-//      nothing was eligible). See {@link parseEpicCloseEligible}.
-//   2. `bd lint --json`'s `total` is the WARNING count and `issues` is the ISSUE count — one bug
-//      missing two sections reports `{total: 2, issues: 1}`. Reading `total` as "beads to fix"
-//      overcounts, so the wrapper renames both.
-//   3. `bd orphans --json` prints bare `null` (not `[]`) when nothing is orphaned, and `bd lint
-//      --json` prints `"results": null` — both would crash a naive `.map`.
-//
-// Only READ verbs and the two safe writes live here. `bd duplicates --auto-merge` and `bd orphans
-// --fix` are deliberately absent: they are judgment moves the patrol must never make (anton-bci0
-// "Out of scope"), and a wrapper is the easiest place for one to leak in.
-
-/**
- * One epic `bd epic close-eligible --dry-run` judged ready to close, with the counts behind the
- * verdict so a report can say WHY. bd lists only eligible epics (an epic with an open child, and a
- * childless epic, are both omitted — measured), so `eligible` is expected true; it is carried
- * verbatim rather than assumed, and a `false` entry is dropped by the parser.
- */
-export interface EpicCloseCandidate {
-  epic: Bead;
-  totalChildren: number;
-  closedChildren: number;
-  eligible: boolean;
-}
-
-/**
- * The outcome of one `bd epic close-eligible` pass. The two halves are populated by the two modes
- * bd answers in, never both: a preview fills `eligible`, an apply fills `closed`.
- */
-export interface EpicCloseSweep {
-  /** Was this a preview? A preview closes nothing. */
-  dryRun: boolean;
-  /** Epics bd judged eligible — PREVIEW ONLY: an apply reports ids alone, not the counts. */
-  eligible: EpicCloseCandidate[];
-  /** The epic ids bd actually closed — empty on a preview. */
-  closed: string[];
-}
-
-/** One bead `bd lint` flags, with the template sections it is missing. */
-export interface LintViolation {
-  id: string;
-  title: string;
-  /** The bead's issue type — what decided which sections were required. */
-  type: string;
-  /** Section headings bd expected and did not find, e.g. `## Acceptance Criteria`. */
-  missing: string[];
-  /** How many warnings this bead accrued (one per missing section). */
-  warnings: number;
-}
-
-/**
- * `bd lint --json`, with bd's two counters renamed to what they actually count: bd's `total` is the
- * WARNING count and its `issues` is the number of beads carrying them (a bug missing both required
- * sections reports `{total: 2, issues: 1}`).
- */
-export interface LintReport {
-  /** Total warnings across every flagged bead — bd's `total`. */
-  warnings: number;
-  /** How many beads were flagged — bd's `issues`, and always `violations.length`. */
-  issues: number;
-  violations: LintViolation[];
-}
-
-/** What `bd lint` may be scoped to. `status: "all"` includes closed beads; the default is open only. */
-export interface LintOpts {
-  status?: string;
-  type?: string;
-}
-
-/** The statuses `bd stale -s` accepts. Omit for every non-closed status at once. */
-export type StaleStatus = "open" | "in_progress" | "blocked" | "deferred";
-
-export interface StaleOpts {
-  /** One status, or omitted for all of them — the gardener sweeps open and in_progress separately,
-   * because "untouched for 30 days" means something different for each. */
-  status?: StaleStatus;
-  /** bd's `--days` window. bd REJECTS 0 ("--days must be at least 1"), so this does too, up front. */
-  days?: number;
-  /** bd's `--limit`; 0 is unlimited and is this seam's default (bd's own default of 50 truncates). */
-  limit?: number;
-}
-
-/** A bead named by a commit message that is still open — `bd orphans`: shipped but never closed. */
-export interface OrphanBead {
-  /** bd's field here is `issue_id`; normalized to `id` so it reads like every other bead value. */
-  id: string;
-  title: string;
+export interface BeadVersion {
+  /** The immutable Dolt commit that wrote this version. */
+  hash: string;
+  /** When this version was written (ISO 8601, the Dolt commit's date). */
+  at: string;
+  /** The bead's status in this version. */
   status: string;
-  /** Abbreviated sha of the most recent commit bd matched to this bead. */
-  latestCommit?: string;
-  latestCommitMessage?: string;
 }
 
 /**
- * One cycle in the dependency graph, as `bd dep cycles` reports it.
+ * Read `bd history <id> --json` — every version of one bead, NEWEST FIRST, each as
+ * `{ CommitHash, Committer, CommitDate, Issue }` — down to the two fields a reader replays: when the
+ * version was written and what status it held. The bead's row itself holds no record of a REOPEN
+ * (`closed_at` is cleared by one and overwritten by the next close, `started_at` never moves), so
+ * this is the only place the board says a bead's current closure is not its first (PR #238 review).
  *
- * `raw` is carried deliberately. bd REFUSES to create a blocking cycle at every write path there is
- * — `dep add` (with and without `--no-cycle-check`), `link`, `batch`, and `import` (which skips the
- * offending edge) all reject it, measured on 1.1.0 and 1.1.2 — so a populated cycle list can only
- * come from a merge or a corrupted graph, and the EMPTY shape (`[]`) is the only one obtainable to
- * pin a parse against. Rather than guess, {@link parseDepCycles} extracts ids from the encodings bd
- * plausibly uses and hands the untouched element through as `raw`, so a report can always render
- * something truthful even if `ids` comes back empty.
+ * Throws on anything but an array of versions: a reader that measures evidence against the reopen
+ * this history holds must fail closed on a history it could not read, not on one that read empty.
  */
-export interface DepCycle {
-  /** The bead ids on the cycle, best-effort — may be empty if bd's element shape is unrecognised. */
-  ids: string[];
-  /** bd's element, untouched. */
-  raw: unknown;
-}
-
-/** One member of a `bd duplicates` group. */
-export interface DuplicateMember {
-  id: string;
-  title: string;
-  status: string;
-  priority?: number;
-  /** How many other beads reference this one — bd's tiebreak for picking the merge target. */
-  references: number;
-  /** Did bd pick this bead as the group's merge target? */
-  isMergeTarget: boolean;
-}
-
-/** A set of beads with identical content (title + body + design + acceptance), per `bd duplicates`. */
-export interface DuplicateGroup {
-  title: string;
-  /** The bead bd suggests keeping. */
-  target?: string;
-  /** The beads bd suggests folding into `target`. */
-  sources: string[];
-  /** bd's own summary line and the shell command it suggests — reported, NEVER executed here. */
-  note?: string;
-  suggestedAction?: string;
-  members: DuplicateMember[];
-}
-
-/** Pure argv builder for `bd lint`, exposed for testing (like {@link buildUpdateArgs}). */
-export function buildLintArgs(opts: LintOpts = {}): string[] {
-  return [
-    "lint",
-    ...(opts.status ? ["--status", opts.status] : []),
-    ...(opts.type ? ["--type", opts.type] : []),
-    "--json",
-  ];
-}
-
-/**
- * Pure argv builder for `bd stale`, exposed for testing. `--limit 0` (unlimited) is the default for
- * the same reason `list`/`ready` pass it: bd's own default of 50 silently drops findings.
- */
-export function buildStaleArgs(opts: StaleOpts = {}): string[] {
-  // bd exits with `{"error": "--days must be at least 1"}` — refuse here so the caller gets a
-  // message naming ITS mistake instead of a spawn whose JSON is an error envelope.
-  if (opts.days !== undefined && (!Number.isInteger(opts.days) || opts.days < 1)) {
-    throw new Error(`bd stale: --days must be an integer >= 1, got ${opts.days}`);
-  }
-  const limit = opts.limit ?? 0;
-  return [
-    "stale",
-    ...(opts.status ? ["--status", opts.status] : []),
-    ...(opts.days !== undefined ? ["--days", String(opts.days)] : []),
-    "--limit",
-    String(limit),
-    "--json",
-  ];
-}
-
-/** JSON.parse with the verb named in the failure — bd printing non-JSON is a format change, not data. */
-function parseHygieneJson(raw: string, verb: string): unknown {
-  try {
-    return JSON.parse(raw.trim() || "null");
-  } catch (e) {
-    throw new Error(
-      `bd ${verb}: output was not JSON (got ${JSON.stringify(raw.slice(0, 200))})`,
-      { cause: e },
-    );
-  }
-}
-
-function num(v: unknown): number | undefined {
-  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
-}
-
-/**
- * Read one `bd epic close-eligible --json` pass, keyed on the SHAPE bd returned rather than on the
- * flag we passed — the two are meant to agree, and if they ever stop, the payload is the truth.
- * A preview answers an array of candidates; an apply answers `{closed: [...], count: n}`, except
- * when nothing was eligible, where it answers a bare `[]` (which reads correctly as neither).
- */
-export function parseEpicCloseEligible(raw: string, dryRun: boolean): EpicCloseSweep {
-  const parsed = parseHygieneJson(raw, "epic close-eligible");
-  if (Array.isArray(parsed)) {
-    const eligible = parsed
-      .map((entry): EpicCloseCandidate | undefined => {
-        const e = entry as Record<string, unknown> | null;
-        const epic = e?.epic as Bead | undefined;
-        if (!epic?.id) return undefined;
-        return {
-          epic,
-          totalChildren: num(e?.total_children) ?? 0,
-          closedChildren: num(e?.closed_children) ?? 0,
-          eligible: e?.eligible_for_close !== false,
-        };
-      })
-      .filter((c): c is EpicCloseCandidate => c !== undefined && c.eligible);
-    return { dryRun, eligible, closed: [] };
-  }
-  const closed = (parsed as Record<string, unknown> | null)?.closed;
-  if (Array.isArray(closed)) {
-    return { dryRun, eligible: [], closed: closed.filter((id): id is string => typeof id === "string") };
-  }
-  throw new Error(
-    `bd epic close-eligible: could not read its --json output (bd output format changed?) — ` +
-      `refusing to report an unreadable sweep as "nothing to close". Output: ${raw.slice(0, 200)}`,
-  );
-}
-
-/** Read `bd lint --json`. `results` is `null` (not `[]`) on a clean board — hence the guard. */
-export function parseLintReport(raw: string): LintReport {
-  const doc = parseHygieneJson(raw, "lint") as Record<string, unknown> | null;
-  const results = Array.isArray(doc?.results) ? doc.results : [];
-  const violations = results.flatMap((r): LintViolation[] => {
-    const v = r as Record<string, unknown> | null;
-    const id = str(v?.id);
-    if (!id) return [];
-    const missing = strings(v?.missing) ?? [];
-    return [
-      {
-        id,
-        title: str(v?.title) ?? "",
-        type: str(v?.type) ?? "",
-        missing,
-        warnings: num(v?.warnings) ?? missing.length,
-      },
-    ];
+export function parseBeadHistory(raw: string): BeadVersion[] {
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) throw new Error("bd history: expected a JSON array of versions");
+  return parsed.map((entry, i): BeadVersion => {
+    const e = entry as Record<string, unknown> | null;
+    const issue = e?.Issue as Record<string, unknown> | null | undefined;
+    const hash = str(e?.CommitHash);
+    const at = str(e?.CommitDate);
+    const status = str(issue?.status);
+    if (!hash || !at || !status) {
+      throw new Error(`bd history: version ${i} carries no CommitHash, CommitDate, or Issue.status`);
+    }
+    return { hash, at, status };
   });
-  return {
-    warnings: num(doc?.total) ?? violations.reduce((n, v) => n + v.warnings, 0),
-    issues: num(doc?.issues) ?? violations.length,
-    violations,
-  };
-}
-
-/** Read `bd orphans --json`, whose empty answer is a bare `null`. */
-export function parseOrphans(raw: string): OrphanBead[] {
-  const parsed = parseHygieneJson(raw, "orphans");
-  if (!Array.isArray(parsed)) return [];
-  return parsed.flatMap((entry): OrphanBead[] => {
-    const o = entry as Record<string, unknown> | null;
-    const id = str(o?.issue_id) ?? str(o?.id);
-    if (!id) return [];
-    return [
-      {
-        id,
-        title: str(o?.title) ?? "",
-        status: str(o?.status) ?? "",
-        ...pick("latestCommit", str(o?.latest_commit)),
-        ...pick("latestCommitMessage", str(o?.latest_commit_message)),
-      },
-    ];
-  });
-}
-
-/**
- * Read `bd dep cycles --json`. The empty answer (`[]`) is pinned against real bd; the populated one
- * cannot be — no bd write path will create a cycle (see {@link DepCycle}) — so ids are extracted
- * best-effort from the encodings bd plausibly uses and the element is preserved either way. A cycle
- * whose ids can't be read is still REPORTED (never dropped): "the graph has a cycle we can't name"
- * is the finding, and swallowing it would hide the one condition this verb exists to surface.
- */
-export function parseDepCycles(raw: string): DepCycle[] {
-  const parsed = parseHygieneJson(raw, "dep cycles");
-  if (!Array.isArray(parsed)) return [];
-  const idsOf = (node: unknown): string[] => {
-    if (typeof node === "string") return [node];
-    if (Array.isArray(node)) return node.flatMap(idsOf);
-    const o = node as Record<string, unknown> | null;
-    if (!o || typeof o !== "object") return [];
-    const named = o.cycle ?? o.path ?? o.ids ?? o.issue_ids ?? o.issues ?? o.nodes;
-    if (named !== undefined) return idsOf(named);
-    const id = str(o.id) ?? str(o.issue_id);
-    return id ? [id] : [];
-  };
-  return parsed.map((entry) => ({ ids: idsOf(entry), raw: entry }));
-}
-
-/**
- * Read `bd duplicates --json` — an object envelope `{duplicate_groups, groups, schema_version}`
- * where `groups` carries the groups and `duplicate_groups` is their COUNT, not a second encoding of
- * them. Only `groups` is read; the count is redundant with it.
- */
-export function parseDuplicateGroups(raw: string): DuplicateGroup[] {
-  const doc = parseHygieneJson(raw, "duplicates") as Record<string, unknown> | null;
-  const groups = Array.isArray(doc?.groups) ? doc.groups : [];
-  return groups.map((entry): DuplicateGroup => {
-    const g = entry as Record<string, unknown> | null;
-    const members = (Array.isArray(g?.issues) ? g.issues : []).flatMap(
-      (issue): DuplicateMember[] => {
-        const m = issue as Record<string, unknown> | null;
-        const id = str(m?.id);
-        if (!id) return [];
-        return [
-          {
-            id,
-            title: str(m?.title) ?? "",
-            status: str(m?.status) ?? "",
-            ...pick("priority", num(m?.priority)),
-            references: num(m?.references) ?? 0,
-            isMergeTarget: m?.is_merge_target === true,
-          },
-        ];
-      },
-    );
-    return {
-      title: str(g?.title) ?? "",
-      ...pick("target", str(g?.suggested_target)),
-      sources: strings(g?.suggested_sources) ?? [],
-      ...pick("note", str(g?.note)),
-      ...pick("suggestedAction", str(g?.suggested_action)),
-      members,
-    };
-  });
-}
-
-/**
- * Read `bd recompute-blocked --json` (`{"rows_corrected": n}`) — or THROW. The throw is the point:
- * this verb exists to report how many stale `is_blocked` flags it repaired, and a silent 0 on an
- * unreadable answer would render a repair anton could not see as "the graph was already consistent".
- */
-export function parseRecomputeBlocked(raw: string): number {
-  const doc = parseHygieneJson(raw, "recompute-blocked") as Record<string, unknown> | null;
-  const rows = num(doc?.rows_corrected);
-  if (rows === undefined) {
-    throw new Error(
-      `bd recompute-blocked: could not read rows_corrected from its --json output (bd output ` +
-        `format changed?). Output: ${raw.slice(0, 200)}`,
-    );
-  }
-  return rows;
 }
 
 // ── the claimable set + the verified claim (anton-9anc) ──
@@ -1712,18 +261,11 @@ export function parseRecomputeBlocked(raw: string): number {
 export const ownerOf = (b: Bead | undefined): string | undefined => b?.assignee?.trim() || undefined;
 
 /**
- * A claimable run target plus the facts it was ranked on, so "why is this next?" is answerable from
- * the value itself rather than by re-deriving the comparator at each consumer.
+ * A claimable run target plus the facts it was ranked on. The shape and the order both come from
+ * `./rank` — the PRIME order is the SAME order the picker and an external `bd` worker follow, so
+ * there is one definition of it and this module composes it (see {@link rankClaimableTargets}).
  */
-export interface ClaimableTarget {
-  bead: Bead;
-  /** bd priority: 0 = critical … 4 = lowest. A bead with none is treated as lowest. */
-  priority: number;
-  /** How many open beads this target transitively unblocks via `blocks` edges. */
-  unblocks: number;
-  /** The bead's `created_at`, the age tiebreak (oldest first); "" when bd reported none. */
-  createdAt: string;
-}
+export type ClaimableTarget = RankedTarget;
 
 /**
  * The claimable POOL query: every approved, unclaimed bead bd itself considers ready — its
@@ -1741,13 +283,6 @@ export function buildClaimableReadyArgs(): string[] {
   return ["ready", "--label", LABELS.approved, "--unassigned", "--json", "--limit", "0"];
 }
 
-/** Missing bead priority sorts after every explicit priority (bd uses 0=critical … 4=lowest). */
-const DEFAULT_CLAIMABLE_PRIORITY = 4;
-
-/** A bead with no `created_at` sorts LAST on the age tiebreak — an unstamped bead must not jump
- * the queue ahead of work that has genuinely been waiting. */
-const UNDATED = "\uffff";
-
 /**
  * May a worker claim this bead and run it? The anton-side half of the claimable rule, applied to a
  * bead bd already reported as ready:
@@ -1760,83 +295,45 @@ const UNDATED = "\uffff";
  *     the claimable set can never disagree with what anton will actually execute. That is what
  *     keeps container epics (their features each run on their own) and child tickets (executed as
  *     part of their target's run, never distributed) out of the set.
+ *   - not {@link isProposalBead} — a proposal is a DECISION about the board, not work on it. It is
+ *     shaped as a parentless task carrying a full contract, so every other clause here admits it,
+ *     and a worker that claimed one would dispatch an agent to "implement" a board move anton
+ *     applies itself on approval. The picker refuses one for the same reason (picker-targets.ts);
+ *     this is the same rule for the workers that never see the picker — a human following
+ *     `.beads/PRIME.md` and a second anton read this set instead.
+ *   - not {@link beads.isHumanWork} — `agent:human` names the one specialist anton does not have,
+ *     so a claimed human target would dispatch to the DEFAULT agent and burn a run failing at work
+ *     no agent can do. It is approved work waiting for a person, not backlog: leaving it in the set
+ *     is the hazard, leaving it on the board is the point.
+ *
+ * The human exclusion belongs here rather than in {@link buildClaimableReadyArgs}: bd's own
+ * `--exclude-label` would move it into the argv every external worker copies, where it could drift
+ * from this rule; the board read this narrowing already holds answers it for free.
  */
 function isClaimable(b: Bead, board: Bead[]): boolean {
   return (
     b.status === "open" &&
     beads.isApproved(b) &&
     !ownerOf(b) &&
-    beads.isRunTarget(b, board)
+    beads.isRunTarget(b, board) &&
+    !isProposalBead(b) &&
+    !beads.isHumanWork(b)
   );
 }
 
 /**
- * `id → how many open beads it transitively unblocks`, built once per board.
- *
- * A `blocks` edge is (from = dependent, to = blocker), so the dependents of a target are what its
- * completion releases; the count is the transitive closure of that, restricted to beads that are
- * still open (a closed dependent was never waiting). Cycle-guarded via `seen`, and a dependent that
- * isn't on the board is traversed but not counted — it is evidence of an edge, not of open work.
- */
-function unblockCounter(board: Bead[]): (id: string) => number {
-  const dependents = new Map<string, string[]>();
-  for (const e of beads.edgesOf(board)) {
-    if (e.type !== "blocks") continue;
-    const list = dependents.get(e.to);
-    if (list) list.push(e.from);
-    else dependents.set(e.to, [e.from]);
-  }
-  const openIds = new Set(board.filter((b) => b.status !== "closed").map((b) => b.id));
-
-  return (id: string): number => {
-    const seen = new Set<string>([id]);
-    const queue = [id];
-    let count = 0;
-    while (queue.length) {
-      for (const next of dependents.get(queue.shift() as string) ?? []) {
-        if (seen.has(next)) continue;
-        seen.add(next);
-        queue.push(next);
-        if (openIds.has(next)) count++;
-      }
-    }
-    return count;
-  };
-}
-
-/**
- * The rank order itself — priority, then unblocking value, then age, then id. Total and
- * deterministic (the id tiebreak is what makes it total), so two machines reading the same board
- * agree on what anton picks up next.
- */
-function compareClaimable(a: ClaimableTarget, b: ClaimableTarget): number {
-  if (a.priority !== b.priority) return a.priority - b.priority; // P0 first
-  if (a.unblocks !== b.unblocks) return b.unblocks - a.unblocks; // frees the most work first
-  const ageA = a.createdAt || UNDATED;
-  const ageB = b.createdAt || UNDATED;
-  if (ageA !== ageB) return ageA < ageB ? -1 : 1; // oldest first
-  return a.bead.id < b.bead.id ? -1 : 1;
-}
-
-/**
- * Narrow bd's ready pool to the claimable run targets and RANK them (see {@link compareClaimable}).
- * Pure over its input — no bd spawn — so the rule is testable against fixture boards and reusable by
- * any caller that already holds a board.
+ * Narrow bd's ready pool to the claimable run targets and RANK them in the PRIME order
+ * ({@link rankTargets}). Pure over its input — no bd spawn — so the rule is testable against
+ * fixture boards and reusable by any caller that already holds a board.
  *
  * `pool` is bd's blocker-aware ready answer; `board` is the full `--status all` list, which supplies
  * the parentage, `blocks` edges and feature children the narrowing and the unblocking count need.
  */
 export function rankClaimableTargets(pool: Bead[], board: Bead[]): ClaimableTarget[] {
-  const unblocks = unblockCounter(board);
-  return pool
-    .filter((b) => isClaimable(b, board))
-    .map((bead) => ({
-      bead,
-      priority: bead.priority ?? DEFAULT_CLAIMABLE_PRIORITY,
-      unblocks: unblocks(bead.id),
-      createdAt: bead.created_at ?? "",
-    }))
-    .sort(compareClaimable);
+  return rankTargets(
+    pool.filter((b) => isClaimable(b, board)),
+    board,
+  );
 }
 
 /**
@@ -1899,17 +396,10 @@ export function staleClaimReason(bead: Bead, board: Bead[]): string | undefined 
   if (!beads.isRunTarget(bead, board)) {
     return "the target is no longer a run target (a container epic or a child ticket)";
   }
+  if (beads.isHumanWork(bead)) {
+    return `the target was labelled ${LABELS.agentHuman} while the claim settled — a person executes it, no agent can`;
+  }
   return undefined;
-}
-
-const sleepMs = (ms: number): Promise<void> =>
-  new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    if (typeof t.unref === "function") t.unref();
-  });
-
-function errorText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }
 
 /**
@@ -1969,7 +459,10 @@ async function runClaimVerified(
   // 4/5. Settle, then re-pull — but only when there is a remote at all. A not-wired board has no
   //      second machine to race, so waiting out a propagation window it can't have would stall every
   //      single-machine pickup for nothing.
-  if (outcome !== "not-wired") {
+  // Only a real remote sync needs a settle window. A not-wired board has no second machine to
+  // race; a shared server has no propagation delay at all — the claim was visible to every other
+  // machine the moment it committed, so waiting would slow every pickup for nothing (anton-0tul).
+  if (outcome === "synced") {
     await sleep(settleMs);
     try {
       await pull(cwd);
@@ -2006,6 +499,20 @@ async function runClaimVerified(
     ? { ok: false, reason: "stale", detail: `${id}: ${stale}`, bead: verified }
     : { ok: true, bead: verified };
 }
+
+/**
+ * Every issue type a run target can have. NECESSARY, not sufficient — the structural clauses in
+ * {@link beads.isRunTarget} still decide (a container epic and a parented task are both out) — but
+ * a type absent here can never be started, whatever its shape. Exported so anything that has to
+ * name the runnable vocabulary without a board in hand (the policy calibration fallback) reads it
+ * from the predicate rather than restating it: a `chore` fallback would propose work no pass can
+ * ever admit.
+ */
+export const RUN_TARGET_TYPES = ["feature", "epic", "task", "bug"] as const;
+export type RunTargetType = (typeof RUN_TARGET_TYPES)[number];
+
+const isRunTargetType = (t: string | undefined): t is RunTargetType =>
+  RUN_TARGET_TYPES.includes(t as RunTargetType);
 
 export const beads = {
   /**
@@ -2081,6 +588,16 @@ export const beads = {
    */
   isMergeWaitGate: (b: Bead): b is Gate =>
     b.issue_type === "gate" && (b as Gate).await_type === "gh:pr",
+
+  /**
+   * A `human` gate — the wait anton arms on a run target whose agent reported `needs-human`
+   * (anton-287p). The opposite of the merge wait in every way that matters here: it IS a real
+   * blocker (epic-graph counts it, so nothing re-runs the target behind it), and NOTHING closes it
+   * on its own — `bd gate check` never evaluates it and gate-check's expiry pass skips it — so it
+   * ends only when a person runs `bd gate resolve`.
+   */
+  isHumanGate: (b: Bead): b is Gate =>
+    b.issue_type === "gate" && (b as Gate).await_type === "human",
 
   /**
    * Molecules whose gate has closed and whose next step is runnable — the gate-resume discovery
@@ -2213,14 +730,78 @@ export const beads = {
     return bead.id as string;
   },
 
+  /**
+   * Create a whole tree in ONE bd write (`bd create --graph`), answering plan key → real bead id.
+   *
+   * This is the atomic form, and therefore the only correct one for a multi-bead write. N sequential
+   * {@link beads.create} calls fail halfway and strand whatever already landed (skills/bd/SKILL.md):
+   * the retry then renumbers around the orphans instead of replacing them. Measured on bd 1.1.2, a
+   * plan that fails MID-write — a `parent_id` the board does not hold, so the failure comes after the
+   * first node — rolls the whole plan back and leaves the board byte-identical; up-front schema
+   * faults (an unknown `type`) never reach a write at all. Both mean the same thing to a caller: a
+   * rejection here created nothing, so the retry is the unchanged plan.
+   *
+   * bd reads the plan from a FILE, not stdin, so one is written to a private temp dir and removed
+   * whatever the outcome — a plan carries the founder's draft prose, which has no business outliving
+   * the call in `$TMPDIR`.
+   *
+   * Every planned key is asserted present in the answer: bd drops an unknown node field with only a
+   * warning, and a schema that drifts under us must fail loud here rather than hand back an id map
+   * with a hole in it that a caller would read as `undefined`.
+   */
+  async createGraph(cwd: string, plan: GraphPlan): Promise<Record<string, string>> {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-graph-"));
+    try {
+      const file = join(dir, "plan.json");
+      writeFileSync(file, JSON.stringify(plan));
+      const out = await bdWrite(cwd, ["create", "--graph", file, "--json"]).catch((err: unknown) => {
+        const reason = graphPlanError(err) ?? (err as Error).message;
+        throw new Error(`bd create --graph: ${reason}`);
+      });
+      const ids = (JSON.parse(out) as { ids?: Record<string, string> }).ids ?? {};
+      const missing = plan.nodes.filter((n) => !ids[n.key]).map((n) => n.key);
+      if (missing.length > 0) {
+        throw new Error(`bd create --graph: no id came back for node(s) ${missing.join(", ")}`);
+      }
+      return ids;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+
   // `bd tag` takes a single label; use the repeatable --add-label/--remove-label instead.
   tag: (cwd: string, id: string, labels: string[]) =>
     bdWrite(cwd, ["update", id, ...labels.flatMap((l) => ["--add-label", l])]),
   untag: (cwd: string, id: string, labels: string[]) =>
     bdWrite(cwd, ["update", id, ...labels.flatMap((l) => ["--remove-label", l])]),
 
-  link: (cwd: string, a: string, b: string, type: string) =>
-    bdWrite(cwd, ["link", a, b, "--type", type]),
+  /**
+   * Write one dependency edge, `type` validated HERE because bd will not validate it (anton-igkb):
+   * `--type` is free text, and every value but `blocks`/`conditional-blocks` yields a non-blocking
+   * edge with no error — see {@link assertLinkType}. The runtime check backs the compile-time type:
+   * an edge type that arrives as data (a gardener plan, a JSON payload) never sees the type checker.
+   *
+   * `async` so a refused type REJECTS rather than throwing synchronously — every other verb here
+   * fails as a rejection, and a caller's `.catch()` must not be bypassed by where the failure came
+   * from. `exec` is injectable for tests, like {@link beads.cook}, which is what lets the guard be
+   * proven to reject BEFORE a spawn rather than after one.
+   */
+  link: async (cwd: string, a: string, b: string, type: LinkType, exec: BdExec = bdWrite) => {
+    assertLinkType(type);
+    return exec(cwd, ["link", a, b, "--type", type]);
+  },
+
+  /**
+   * Take a dependency edge back — the exact undo of {@link beads.link}, which is why the argument
+   * order is identical: `bd link a b` and `bd dep remove a b` both read "a depends on b".
+   *
+   * bd holds ONE edge per directed pair whatever its type (anton-wsap), so this removes whichever
+   * edge that pair carries rather than only a `blocks` one — a caller that wants a specific type
+   * gone must know it is the one there. The one write that makes an anton-drawn ordering reversible
+   * (gardener/repair-dep-missing.ts): an edge nothing can un-draw is a board fact anton may not
+   * record on its own judgement.
+   */
+  unlink: (cwd: string, a: string, b: string) => bdWrite(cwd, ["dep", "remove", a, b]),
 
   /**
    * Move a bead under a new parent (`bd update --parent`), or — with an empty `parentId` — detach
@@ -2248,9 +829,13 @@ export const beads = {
    * Write the PR pointer to `metadata.pr` — the single seam anton uses for the PR link (anton-is7x).
    * Keeping it out of `external_ref` frees that field for tracker integrations; every read goes
    * through getPrRef, every write through here, so no call site touches `external_ref` for PRs.
+   *
+   * Any RETIRED pointer ({@link retirePrRef}) is dropped in the same write: that key exists only to
+   * name the PR a bead no longer points at, so a live pointer makes it stale by definition — and
+   * leaving both would have two channels answering "which PR is this bead's?".
    */
   setPrRef: (cwd: string, id: string, ref: string) =>
-    bdWrite(cwd, ["update", id, "--set-metadata", `pr=${ref}`]),
+    bdWrite(cwd, ["update", id, "--set-metadata", `pr=${ref}`, "--unset-metadata", RETIRED_PR_KEY]),
 
   /**
    * Read a bead's PR pointer through the seam (anton-is7x). `metadata.pr` is authoritative; until the
@@ -2263,6 +848,42 @@ export const beads = {
     if (typeof pr === "string" && pr) return pr;
     const ref = b.external_ref;
     return ref && GH_PR_REF.test(ref) ? ref : undefined;
+  },
+
+  /**
+   * RETIRE a bead's PR pointer (anton-leit): the live pointer comes off and the same PR lands on
+   * `metadata.retiredPr`, in ONE atomic `bd update`. What a send-back does to a target it is putting
+   * back in front of a runner — the bead must stop reading as in-review (every surface derives that
+   * from {@link getPrRef}, and execute-epic's step 0a finishes an attempt on it), while the PR it
+   * just came off stays reachable from the bead: that link is the only way a later reader — or
+   * {@link getRetiredPrRef}'s callers — can tell a target whose PR merged after the retire from one
+   * that never had a PR at all.
+   *
+   * Both live channels are cleared, because {@link getPrRef} reads both: unsetting `metadata.pr`
+   * alone would leave a legacy `gh-*` external_ref readable and the bead would still look in-review.
+   * A NON-`gh-` external_ref (a tracker URL) is left untouched for the same reason getPrRef ignores
+   * it. Takes the bead rather than an id because that decision is a property of its current state.
+   */
+  retirePrRef: (cwd: string, bead: Bead, ref: string) =>
+    bdWrite(cwd, [
+      "update",
+      bead.id,
+      "--unset-metadata",
+      "pr",
+      "--set-metadata",
+      `${RETIRED_PR_KEY}=${ref}`,
+      ...(bead.external_ref && GH_PR_REF.test(bead.external_ref) ? ["--external-ref", ""] : []),
+    ]),
+
+  /**
+   * The PR a send-back retired off this bead ({@link retirePrRef}), if any. Never a live pointer —
+   * {@link setPrRef} drops this key — so a reader that wants "the PR this bead is in review on"
+   * must keep asking {@link getPrRef}, and this answers the different question: "which PR did the
+   * run that finished this bead open, before the send-back put it back to work?"
+   */
+  getRetiredPrRef: (b: Bead): string | undefined => {
+    const pr = b.metadata?.[RETIRED_PR_KEY];
+    return typeof pr === "string" && pr ? pr : undefined;
   },
 
   /**
@@ -2456,6 +1077,14 @@ export const beads = {
     bdWrite(cwd, ["reopen", id, ...(reason ? ["--reason", reason] : [])]),
 
   /**
+   * Every version of a bead, newest first — the record a reopen leaves that the bead's own row does
+   * not ({@link parseBeadHistory}). Whole, not `--limit`ed: the reader wants the LAST transition out
+   * of `closed`, and a window that misses it would read a reopened bead as never reopened.
+   */
+  history: (cwd: string, id: string): Promise<BeadVersion[]> =>
+    bd(cwd, ["history", id, "--json"]).then(parseBeadHistory),
+
+  /**
    * Snooze a bead (`bd defer`) / restore it (`bd undefer`) — the "not now, but not dead" state
    * (anton-ywi8). A deferred bead keeps its contract, notes, and edges but drops out of `bd ready`,
    * so the runtime never picks it up; undefer returns it to `open`. Deliberately distinct from
@@ -2518,6 +1147,53 @@ export const beads = {
 
   /** A bead a human abandoned (closed + `abandoned`) — closed, but explicitly NOT delivered. */
   isAbandoned: (b: Bead) => b.labels?.includes(LABELS.abandoned) ?? false,
+
+  /**
+   * The bead that SUPERSEDED this one — the survivor `bd supersede <id> --with <survivor>` points
+   * its `supersedes` edge at — or undefined when the board records no such retirement. Read off the
+   * bead's own inline `dependencies` ({@link beads.supersedesTarget}), so it costs nothing beyond the
+   * board read every caller already has.
+   *
+   * Closed is part of the question, not a separate check: the edge is written alongside the close,
+   * and a bead someone REOPENED is live work again whatever pointer it still carries — so this gates
+   * `supersedesTarget` to `closed`, and a run re-executing a reopened retirement clears the now-stale
+   * edge through the ungated reader instead.
+   *
+   * The distinction this exists for (anton-5bpd): a superseded bead has the same shape as an
+   * abandoned one — closed, with no commit under its own id on any branch — and anything that reads
+   * "closed with nothing on this branch" as a cross-machine resume must tell all three apart.
+   */
+  supersededBy: (b: Bead): string | undefined =>
+    b.status === "closed" ? beads.supersedesTarget(b) : undefined,
+
+  /**
+   * The survivor a `supersedes` edge on this bead names, whatever the bead's STATUS — the
+   * status-agnostic half of {@link beads.supersededBy}, which is that answer gated to `closed`.
+   *
+   * The edge outlives the close it was written beside: `bd reopen` returns the bead to `open` but
+   * leaves its `supersedes` pointer in place, so a retirement an operator reopened to re-run still
+   * carries it (PR #238 review). To every reader that gates on `closed`, that reopened edge is inert
+   * — but the run about to re-execute the ticket must CLEAR it, or the ticket's honest close reads as
+   * superseded all over again (execute-epic-ticket-bookends `claimTicket`). That reader needs the id
+   * on an OPEN bead, which {@link beads.supersededBy} withholds by design; this is what it reads.
+   *
+   * TWO SHAPES of `dependencies`, because bd's two reads disagree (measured on 1.1.2). `bd list
+   * --json` carries EDGE rows — `{ issue_id, depends_on_id, type }`, the {@link BeadDep} shape.
+   * `bd show --json` carries the depended-on ISSUES themselves, each stamped with `dependency_type`
+   * and no edge fields at all. A reader that knew only the list shape read every `show` of a
+   * superseded bead as "not superseded" (PR #238 review — the post-write fence in
+   * gardener/repair-already-shipped.ts is a `show` reader), so both are accepted here.
+   */
+  supersedesTarget: (b: Bead): string | undefined => {
+    for (const d of (b.dependencies ?? []) as Array<Partial<BeadDep> & { id?: string; dependency_type?: string }>) {
+      if (d.type === "supersedes" && d.issue_id === b.id && d.depends_on_id) return d.depends_on_id;
+      if (d.dependency_type === "supersedes" && d.id) return d.id;
+    }
+    return undefined;
+  },
+
+  /** A bead a run reserved but never delivered (see LABELS.notDelivered) — open, and in no PR. */
+  isNotDelivered: (b: Bead) => b.labels?.includes(LABELS.notDelivered) ?? false,
 
   setStatus: (cwd: string, id: string, status: string) =>
     bdWrite(cwd, ["update", id, "--status", status]),
@@ -2683,6 +1359,18 @@ export const beads = {
   // ── convenience: anton's stage/approval semantics, all in beads ──
   approve: (cwd: string, epicId: string) => beads.tag(cwd, epicId, [LABELS.approved]),
   isApproved: (b: Bead) => b.labels?.includes(LABELS.approved) ?? false,
+
+  /**
+   * Work a PERSON executes, not an agent (`agent:human`, see {@link LABELS.agentHuman}). Approved,
+   * shaped, real work — it just resolves to no specialist prompt, so anton must refuse it at every
+   * point where a bead turns into a dispatch rather than let it fall through to the default agent.
+   * Shared by {@link isClaimable} (it never enters the claimable set), execute-epic's run gate (a
+   * forced dispatch of a human TARGET is poisoned) and its per-ticket gate (a human TICKET inside an
+   * ordinary run is held behind a human gate at its own boundary), so the set anton picks from and
+   * the runner agree at every level of the tree.
+   */
+  isHumanWork: (b: Bead) => b.labels?.includes(LABELS.agentHuman) ?? false,
+
   isEpic: (b: Bead) => b.issue_type === "epic",
 
   /** The bead's parent id, from whichever field the bd read populated (`list` vs `show`). */
@@ -2719,6 +1407,7 @@ export const beads = {
    */
   isRunTarget: (b: Bead, board: Bead[]): boolean =>
     !isPipelineArtifact(b) &&
+    isRunTargetType(b.issue_type) &&
     (b.issue_type === "feature" ||
       (beads.isEpic(b) && !beads.isContainer(b, board)) ||
       ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b))),

@@ -3,7 +3,7 @@
  * among {epic + tickets}. Edges come from `bd dep list` on each ticket, filtered to members
  * of the epic's own graph. See DESIGN.md §2/§3.
  */
-import { beads, type Bead, type BeadPatch } from "./beads/bd";
+import { beads, isLinkType, type Bead, type BeadPatch } from "./beads/bd";
 import { withBeadWriteLocks } from "./beads/claim-lock";
 import { isPipelineArtifact } from "./beads/contract";
 import { ensureDescription } from "./beads/issues";
@@ -14,7 +14,7 @@ import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import { findOpenRunForEpic } from "./runs";
 import { parentEpicOf, parseAcceptance, parseGoal, runTickets, toEpic, toTicket } from "./ticket-view";
 import { listAllBeads } from "./tickets";
-import type { DepEdge, DepType, EpicDetail, EpicRun, Project } from "./types";
+import type { DepEdge, EpicDetail, EpicRun, Project } from "./types";
 
 /** The open run backing this epic (if any), for the "View run" / worktree affordances. */
 async function openRunFor(project: Project, epicId: string): Promise<EpicRun | undefined> {
@@ -27,8 +27,6 @@ async function openRunFor(project: Project, epicId: string): Promise<EpicRun | u
     return undefined;
   }
 }
-
-const DEP_TYPES = new Set<DepType>(["parent-child", "blocks", "related", "discovered-from"]);
 
 export async function getEpicDetail(project: Project, epicId: string): Promise<EpicDetail> {
   const all = await listAllBeads(project); // one call: carries parent + inline dependencies
@@ -93,11 +91,13 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   const edges: DepEdge[] = [];
   for (const e of beads.edgesOf(all.filter((b) => memberIds.has(b.id)))) {
     if (!memberIds.has(e.from) || !memberIds.has(e.to)) continue;
-    if (!DEP_TYPES.has(e.type as DepType)) continue;
+    // The same set the link seam validates writes against, so what anton draws and what anton
+    // writes can never drift apart (anton-igkb).
+    if (!isLinkType(e.type)) continue;
     const key = `${e.from}->${e.to}:${e.type}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    edges.push({ from: e.from, to: e.to, type: e.type as DepType });
+    edges.push({ from: e.from, to: e.to, type: e.type });
   }
 
   return { epic, description: full.description, tickets, edges, run, parentEpic };
@@ -171,8 +171,8 @@ async function cascadeSubtree(repo: string, epicId: string): Promise<Bead[]> {
  * that step's locked re-read and its write — destroying the home mid-move, while the step still
  * reported success and its proposal closed as applied over a subject that no longer exists.
  * Serialized, the delete either lands first — and the step's own locked home re-check refuses
- * (`assertHomeIsCard`: a deleted bead is no board card) — or it waits behind the move and then sees
- * the newcomer in the re-derived subtree below.
+ * (`assertHomeFitsSubject`: a deleted bead is no home at all) — or it waits behind the move and
+ * then sees the newcomer in the re-derived subtree below.
  *
  * The subtree is re-derived inside the locks and a CHANGED one refuses, because the lock set was
  * chosen from a snapshot: `bd delete --cascade` erases whatever hangs beneath the epic at write

@@ -21,7 +21,9 @@ import {
   buildGateCheckArgs,
   buildGateCreateArgs,
   buildGateDiscoverArgs,
+  gateReason,
   parseGateCheck,
+  type Gate,
 } from "./bd";
 import { BD_BIN_ENV, resetBdBinCache } from "./bd-bin";
 
@@ -320,5 +322,32 @@ describe("parseGateCheck", () => {
     // `{` would otherwise hand back offset 0 on every iteration and hang the gate-check job.
     expect(() => parseGateCheck('{"checked":')).toThrow(/could not read its --json summary/);
     expect(() => parseGateCheck("{truncated")).toThrow(/could not read its --json summary/);
+  });
+});
+
+/**
+ * bd keeps no reason field — `gate create --reason X` lands inside the description bd composes
+ * (`Ad-hoc gate blocking <bead>\n\nReason: X`, measured on 1.1.2, verbatim and untruncated). Reading
+ * it back is what lets anton tell one human gate's ask from another's (anton-287p.4), so the format
+ * is pinned here rather than re-derived at each call site.
+ */
+describe("gateReason", () => {
+  const gate = (description?: string): Gate =>
+    ({ id: "acme-g1", title: "Gate: human", status: "open", issue_type: "gate", description }) as Gate;
+
+  it("reads the reason bd folded into the description", () => {
+    expect(gateReason(gate("Ad-hoc gate blocking acme-1\n\nReason: the API key is not mine to make"))).toBe(
+      "the API key is not mine to make",
+    );
+  });
+
+  it("keeps a multi-line ask whole, including one that says 'Reason: ' itself", () => {
+    const ask = "two things:\n- a DNS record\nReason: the registrar console is human-only";
+    expect(gateReason(gate(`Ad-hoc gate blocking acme-1\n\nReason: ${ask}`))).toBe(ask);
+  });
+
+  it("is undefined for a gate carrying no reason at all", () => {
+    expect(gateReason(gate("Ad-hoc gate blocking acme-1"))).toBeUndefined();
+    expect(gateReason(gate())).toBeUndefined();
   });
 });

@@ -13,6 +13,10 @@ Tags: `scope`, `bug`, `security`, `test`, `shape`, `perf`, `dx`, `false-park`, `
 -->
 
 ## New
+- 2026-09-05 [bug] Second live NUL-as-dedupe-key found (`gardener/record.ts`), same class as the
+  epic-graph.ts one — a literal control byte makes git call the module binary, so no diff-based
+  reviewer sees it → composite Map keys use `JSON.stringify([a, b])`, never a raw `\0`; the
+  `control-bytes` CI gate now blocks the class outright.
 
 ## Compacted
 <!-- promoted entries move here once they graduate into principles.md -->

@@ -8,16 +8,9 @@ import {
   jobFiltersFromSearchParams,
   jobsQueryString,
   normalizeJobFilters,
-  type JobFilterOption,
 } from "@/lib/jobs-filters";
-import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
-
-const selectClassName = cn(
-  "h-8 min-w-28 rounded-lg border border-border bg-card px-2 text-xs text-foreground outline-none transition-colors",
-  "focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
-);
+import { FilterSelect } from "@/components/ui/filter-select";
 
 /**
  * Status/type filter toolbar for the Jobs page (anton-mjdo.3). Filters live in the URL so the
@@ -45,15 +38,21 @@ export function JobsFilters() {
       className="flex shrink-0 flex-wrap items-center gap-2.5 border-b border-border px-5 py-3 sm:px-6"
     >
       <FilterSelect
+        idPrefix="job-filter"
         field="status"
         label="Status"
+        className="min-w-28"
+        wrapperClassName="flex flex-col gap-1"
         value={filters.status ?? ""}
         options={JOB_STATUS_FILTER_OPTIONS}
         onChange={(value) => apply({ ...filters, status: value || undefined })}
       />
       <FilterSelect
+        idPrefix="job-filter"
         field="type"
         label="Type"
+        className="min-w-28"
+        wrapperClassName="flex flex-col gap-1"
         value={filters.type ?? ""}
         options={JOB_TYPE_FILTER_OPTIONS}
         onChange={(value) => apply({ ...filters, type: value || undefined })}
@@ -70,41 +69,6 @@ export function JobsFilters() {
           Clear all
         </Button>
       )}
-    </div>
-  );
-}
-
-function FilterSelect({
-  field,
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  field: string;
-  label: string;
-  value: string;
-  options: JobFilterOption[];
-  onChange: (value: string) => void;
-}) {
-  const id = `job-filter-${field}`;
-  return (
-    <div className="flex flex-col gap-1">
-      <Label htmlFor={id} className="sr-only">
-        {label}
-      </Label>
-      <select
-        id={id}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className={selectClassName}
-      >
-        {options.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
     </div>
   );
 }

@@ -14,14 +14,20 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
 import { contractGaps } from "../beads/contract";
 import { parseAcceptance, parseGoal, toStandaloneItem } from "../ticket-view";
+import { indexBoard } from "./board-index";
 import { detectBoard } from "./detect";
 import {
   concernedBeads,
+  fingerprintLabelOf,
+  GARDENER_PLAN_KEY,
   makeDetection,
+  proposalFingerprint,
   proposalPlanOf,
+  REASK_AFTER_DAYS,
   type DetectionInput,
   type GardenerDetection,
 } from "./detections";
+import { detectDeferredRejudgements } from "./rejudge";
 import type { HygieneFinding } from "../hygiene";
 
 /** Every proposal this pass filed, as the bead bd would hand back on the next board read. */
@@ -105,6 +111,17 @@ const MISPARENTED: Bead[] = [
   bead("anton-cont", { issue_type: "epic", title: "Container epic" }),
   bead("anton-feat", { issue_type: "feature", title: "The runnable feature", parent: "anton-cont" }),
   bead("anton-lost", { title: "Loose ticket", parent: "anton-cont" }),
+];
+
+/**
+ * The parentless-cluster fixture: a card the board already files tickets under, and two loose beads
+ * that state its subject between them — what `detectParentlessClusters` needs to speak at all.
+ */
+const CLUSTERED: Bead[] = [
+  bead("anton-card", { issue_type: "feature", title: "Escalation settle route" }),
+  bead("anton-card-t", { title: "Escalation settle route smoke test", parent: "anton-card" }),
+  bead("anton-l1", { title: "Escalation banner copy" }),
+  bead("anton-l2", { title: "Escalation banner retry" }),
 ];
 
 const detect = (board: Bead[], findings: HygieneFinding[] = []): GardenerDetection[] =>
@@ -214,6 +231,28 @@ describe("the proposal bead", () => {
     expect(draft.acceptance).toMatch(/DECLINED/);
   });
 
+  // A membership is a SET, and for the kind whose identity is its TARGET the hash no longer guards
+  // the list (anton-9hpp) — so the canonical form has to be deduped at emission, which is the bar
+  // `parseGardenerPlan` then holds every plan to on read.
+  it("files a subject list as a set — a bead named twice is one member", () => {
+    const detection = makeDetection({
+      kind: "parentless-cluster",
+      move: "reparent",
+      subjects: ["anton-l2", "anton-l1", "anton-l2"],
+      target: "anton-card",
+      summary: "anton-l1 and anton-l2 state one subject — re-parent them under anton-card",
+      evidence: ["anton-card already carries anton-card-t"],
+    });
+
+    const draft = proposalDraft(detection);
+    expect(detection.subjects).toEqual(["anton-l1", "anton-l2"]);
+    // And it reads back: the plan a duplicate would have written is one apply refuses outright.
+    expect(proposalPlanOf({ labels: draft.labels, metadata: draft.metadata })?.subjects).toEqual([
+      "anton-l1",
+      "anton-l2",
+    ]);
+  });
+
   it("carries its MOVE as metadata, so applying it never has to parse the prose (anton-1t3n)", () => {
     const detection = reparent();
     const draft = proposalDraft(detection);
@@ -291,6 +330,25 @@ describe("the proposal bead", () => {
       evidence: ["identical content"],
     });
     expect(proposalDraft(supersede).acceptance).toContain("superseded by anton-kept");
+  });
+
+  // The one box whose over-promise would be unfalsifiable by `bd show`: anton's own grant reserves
+  // the target, but a human (or a concurrent pass) granting the label first settles the ask with no
+  // claim written over their write (apply-plan.ts `planApprove`), leaving the bead approved and
+  // unassigned — which is exactly the state the picker's pool expects. So the gate is what it states.
+  it("promises the approve gate alone, never a reservation the applied state may not carry", () => {
+    const approve = makeDetection({
+      kind: "withheld-approval",
+      move: "approve",
+      subjects: ["anton-next"],
+      summary: "the board's next work is unapproved",
+      evidence: ["anton-next tops the ranked pool and carries no `approved`"],
+    });
+
+    expect(proposalDraft(approve).acceptance).toContain("anton-next is approved");
+    expect(proposalDraft(approve).acceptance).not.toMatch(/reserv|claim/);
+    // The Verify section restates the same assertion, so it must not re-promise it either.
+    expect(proposalDraft(approve).description).not.toMatch(/reserved for anton/);
   });
 
   // A container orphan with no single obvious home files without a target on purpose, and apply
@@ -382,21 +440,27 @@ describe("duplicate proposals from overlapping patrols", () => {
     // Ordered by id, not by board order: two patrols reconciling the same board concurrently must
     // pick the same survivor, or they fold each other away and no ask survives.
     expect(planReconciliation([twin("anton-p2"), twin("anton-p1")])).toEqual([
-      { fingerprint, keep: "anton-p1", fold: ["anton-p2"], held: [] },
+      {
+        fingerprint,
+        keep: "anton-p1",
+        keepLabel: fingerprint,
+        fold: [{ id: "anton-p2", label: fingerprint }],
+        held: [],
+      },
     ]);
   });
 
   it("keeps the twin a human approved, however late it was filed", () => {
     const [duplicate] = planReconciliation([twin("anton-p1"), approved("anton-p2")]);
     expect(duplicate.keep).toBe("anton-p2");
-    expect(duplicate.fold).toEqual(["anton-p1"]);
+    expect(duplicate.fold).toEqual([{ id: "anton-p1", label: fingerprint }]);
   });
 
   it("keeps the twin a run is applying rather than closing it mid-flight", () => {
     const claimed = twin("anton-p2", { status: "in_progress", assignee: "runner-1" });
     const [duplicate] = planReconciliation([twin("anton-p1"), claimed]);
     expect(duplicate.keep).toBe("anton-p2");
-    expect(duplicate.fold).toEqual(["anton-p1"]);
+    expect(duplicate.fold).toEqual([{ id: "anton-p1", label: fingerprint }]);
   });
 
   it("leaves a second APPROVED twin standing — folding one discards a decision", () => {
@@ -412,6 +476,48 @@ describe("duplicate proposals from overlapping patrols", () => {
     });
     expect(planReconciliation([twin("anton-p1"), declined])).toEqual([]);
     expect(planReconciliation([twin("anton-p1"), twin("anton-p2", { status: "closed" })])).toEqual([]);
+  });
+
+  /**
+   * The other half of the identity rollout (anton-9hpp). Suppression stops the NEXT patrol filing a
+   * fresh-format twin, but the pre-rollout asks it was filed beside are still there: several open
+   * `parentless-cluster` proposals for ONE target, each carrying the membership hash of whatever was
+   * loose the night it ran. Grouped by label they look like different claims and nothing ever folds
+   * them, so the duplicate pile target identity exists to remove would sit on the board forever.
+   * They are one claim, and each is closed against its OWN label — not the claim they grouped under.
+   */
+  it("folds pre-rollout cluster twins for one target, whatever labels they carry", async () => {
+    const [detection] = detect(CLUSTERED).filter((d) => d.kind === "parentless-cluster");
+    const legacy = (id: string, subjects: string[]): Bead => {
+      const label = proposalFingerprint(
+        "parentless-cluster",
+        `parentless-cluster:${[...subjects].sort().join("+")}>${detection.target}`,
+      );
+      return bead(id, {
+        labels: [label, ...PROPOSAL_LABELS],
+        metadata: {
+          [GARDENER_PLAN_KEY]: {
+            kind: detection.kind,
+            move: detection.move,
+            fingerprint: label,
+            subjects,
+            target: detection.target,
+          },
+        },
+      });
+    };
+    const older = legacy("anton-p1", ["anton-l1", "anton-l2"]);
+    const newer = legacy("anton-p2", ["anton-l1", "anton-l2", "anton-l3"]);
+    expect(fingerprintLabelOf(older)).not.toBe(fingerprintLabelOf(newer));
+
+    const [duplicate] = planReconciliation(onBoard(older, newer));
+
+    expect(duplicate.fingerprint).toBe(detection.fingerprint);
+    expect(duplicate.keep).toBe("anton-p1");
+    expect(duplicate.fold).toEqual([{ id: "anton-p2", label: fingerprintLabelOf(newer) }]);
+
+    const result = await reconcileDuplicateProposals(REPO, [older, newer]);
+    expect(result.folded).toEqual([{ id: "anton-p2", into: "anton-p1" }]);
   });
 
   it("closes the fold plainly, naming the survivor — never as abandoned", async () => {
@@ -663,6 +769,68 @@ describe("a patrol pass", () => {
     expect(createMock).toHaveBeenCalledTimes(1);
   });
 
+  /**
+   * A cluster's membership is whatever was parentless and free when the patrol read the board, so
+   * hashing it gave the SAME claim a fresh fingerprint every night: four proposals naming anton-5ahy
+   * stood open at once, and the bead's own promise that "the patrol makes this claim no second time"
+   * was false for this kind (anton-9hpp). One target, one open ask.
+   */
+  it("files one cluster proposal per target, whatever membership the next patrol finds", async () => {
+    const first = await emitProposals(REPO, { board: CLUSTERED, detections: detect(CLUSTERED) });
+    expect(first.created).toHaveLength(1);
+
+    // The next patrol finds a third loose bead on the same subject: a different cluster, one claim.
+    const grown = [
+      ...CLUSTERED,
+      ...createdBeads,
+      bead("anton-l3", { title: "Escalation banner timeout" }),
+    ];
+    const detections = detect(grown).filter((d) => d.kind === "parentless-cluster");
+    expect(detections[0].subjects).toEqual(["anton-l1", "anton-l2", "anton-l3"]);
+
+    const second = await emitProposals(REPO, { board: grown, detections });
+
+    expect(second.created).toEqual([]);
+    expect(second.suppressed).toBe(1);
+    expect(createMock).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The rollout of that change (anton-9hpp). A cluster proposal already open when the identity moved
+   * carries the membership hash, which the detector no longer produces — so on label alone the next
+   * patrol would file a fresh-format twin of an ask the board already carries, the exact duplicate
+   * state target-identity exists to remove. Suppression reads the claim the bead's own PLAN makes.
+   */
+  it("suppresses a cluster proposal filed before the identity moved, rather than twinning it", async () => {
+    const [detection] = detect(CLUSTERED).filter((d) => d.kind === "parentless-cluster");
+    const legacy = proposalFingerprint(
+      "parentless-cluster",
+      `parentless-cluster:${[...detection.subjects].sort().join("+")}>${detection.target}`,
+    );
+    expect(legacy).not.toBe(detection.fingerprint);
+
+    const board = [
+      ...CLUSTERED,
+      proposal(legacy, {
+        metadata: {
+          [GARDENER_PLAN_KEY]: {
+            kind: detection.kind,
+            move: detection.move,
+            fingerprint: legacy,
+            subjects: detection.subjects,
+            target: detection.target,
+          },
+        },
+      }),
+    ];
+
+    const result = await emitProposals(REPO, { board, detections: detect(board) });
+
+    expect(result.created).toEqual([]);
+    expect(result.suppressed).toBe(1);
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
   it("files nothing at all once the proposal is declined", async () => {
     const declined: Bead = {
       ...proposal(detect(MISPARENTED)[0].fingerprint),
@@ -738,5 +906,135 @@ describe("a patrol pass", () => {
     const result = await emitProposals(REPO, { board: quiet, detections: detect(quiet) });
     expect(result).toEqual({ created: [], suppressed: 0, deferred: 0 });
     expect(createMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The re-judgement of parked work, as an ORDINARY proposal (anton-rozm).
+ *
+ * The whole point of the ticket is that it is ordinary: same draft, same fingerprint, same
+ * provenance, same dedup. What is NOT ordinary is what a decline buys — every other one holds
+ * forever, and this one states a window and expires with it, because "still parked" is an answer
+ * about today. Both halves are asserted here, because a window that only existed in the prose would
+ * be a promise the emitter does not keep.
+ */
+describe("the re-judgement proposal", () => {
+  /** A bead parked well past the window, on a board with nothing else to say. */
+  const PARKED: Bead[] = [
+    bead("anton-old", { status: "deferred", updated_at: daysAgo(200), title: "Escalation digest" }),
+  ];
+
+  const rejudgement = (board: Bead[] = PARKED): GardenerDetection => {
+    const [found] = detectDeferredRejudgements(indexBoard(board), NOW);
+    expect(found).toBeDefined();
+    return found;
+  };
+
+  it("carries the verb the detector deliberately left off", () => {
+    const detection = rejudgement();
+
+    expect(detection.kind).toBe("aged-defer");
+    expect(detection.move).toBe("undefer");
+    expect(detection.subjects).toEqual(["anton-old"]);
+    expect(detection.fingerprint).toBe(
+      proposalFingerprint("aged-defer", "aged-defer:anton-old"),
+    );
+  });
+
+  it("files evidence, fingerprint and provenance like every other proposal", () => {
+    const detection = rejudgement();
+    const draft = proposalDraft(detection);
+
+    expect(draft.labels).toContain(detection.fingerprint);
+    expect(draft.labels).toContain("source:gardener");
+    expect(draft.labels).toEqual(expect.arrayContaining([...PROPOSAL_LABELS]));
+    for (const line of detection.evidence) expect(draft.description).toContain(line);
+    // Provenance: the proposal hangs off the bead it is about, so it is reachable from it.
+    expect(draft.deps).toEqual(["discovered-from:anton-old"]);
+    expect(proposalPlanOf({ labels: draft.labels, metadata: draft.metadata })).toMatchObject({
+      kind: "aged-defer",
+      move: "undefer",
+      subjects: ["anton-old"],
+    });
+
+    // …and it renders as a bead, judged by the contract validator the board itself reads through.
+    const asBoardSees: Bead = {
+      id: "anton-prop",
+      title: draft.title,
+      status: "open",
+      issue_type: draft.type,
+      labels: draft.labels,
+      description: draft.description,
+      acceptance_criteria: draft.acceptance,
+    };
+    expect(contractGaps([asBoardSees], "blocking")).toEqual([]);
+    expect(contractGaps([asBoardSees], "advisory")).toEqual([]);
+  });
+
+  it("states the decline window, and that the permanent retirement is the founder's own write", () => {
+    const draft = proposalDraft(rejudgement());
+
+    expect(draft.description).toContain(`${REASK_AFTER_DAYS} days`);
+    expect(draft.description).toContain("bd close --reason abandoned");
+    expect(draft.description).toContain("never applies one");
+    // Approving is a real move here, unlike a manual proposal's.
+    expect(draft.description).not.toContain("Approve is refused");
+    expect(draft.acceptance).toContain("open again rather than deferred");
+  });
+
+  describe("declining holds for the stated window, and no longer", () => {
+    const declined = (over: Partial<Bead>): Bead[] => [
+      ...PARKED,
+      proposal(rejudgement().fingerprint, {
+        status: "closed",
+        labels: [rejudgement().fingerprint, ...PROPOSAL_LABELS, LABELS.abandoned],
+        ...over,
+      }),
+    ];
+
+    const emitted = (board: Bead[]) =>
+      planEmission({ detections: [rejudgement()], board, observedAtMs: NOW });
+
+    it("suppresses a decline still inside the window", () => {
+      const plan = emitted(declined({ updated_at: daysAgo(REASK_AFTER_DAYS - 1) }));
+      expect(plan.emit).toEqual([]);
+      expect(plan.suppressed).toHaveLength(1);
+    });
+
+    it("asks once more when the window has run out", () => {
+      const plan = emitted(declined({ updated_at: daysAgo(REASK_AFTER_DAYS) }));
+      expect(plan.emit).toHaveLength(1);
+      expect(plan.suppressed).toEqual([]);
+    });
+
+    // Fails closed: a proposal nothing can date is one we cannot prove has aged out, and asking a
+    // founder the same question every night is the worse of the two mistakes.
+    it("keeps suppressing a decline it cannot date", () => {
+      const undated = declined({ updated_at: undefined, created_at: undefined });
+      expect(emitted(undated).emit).toEqual([]);
+    });
+
+    // An OPEN re-judgement is suppressed on the label alone, like every other ask: the window is
+    // about how long a NO holds, not about how long the question stands.
+    it("suppresses a re-judgement still standing on the board, however old", () => {
+      const standing = [...PARKED, proposal(rejudgement().fingerprint, { updated_at: daysAgo(400) })];
+      expect(emitted(standing).emit).toEqual([]);
+    });
+
+    // The rule everywhere else, unchanged — the window is one kind's exception, not a new default.
+    it("still holds another kind's decline forever", () => {
+      const detection = reparent();
+      const forever = proposal(detection.fingerprint, {
+        status: "closed",
+        updated_at: daysAgo(4000),
+        labels: [detection.fingerprint, ...PROPOSAL_LABELS, LABELS.abandoned],
+      });
+      const plan = planEmission({
+        detections: [detection],
+        board: [...MISPARENTED, forever],
+        observedAtMs: NOW,
+      });
+      expect(plan.emit).toEqual([]);
+    });
   });
 });

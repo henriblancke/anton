@@ -4,16 +4,17 @@
  * in the node test env — mirroring board-utils.ts. The API accepts a flat patch of
  * title/status/priority/agent/risk/size (see ticket-patch.ts).
  */
+import { ACCEPTANCE_HEADING } from "@/lib/beads/contract";
 import type { TicketDetail } from "@/lib/types";
 
 /**
  * The editable fields of a ticket. Scalar/label fields plus the markdown contract, which is
  * decomposed into three editable pieces: `goal` (the `## Goal` section), `acceptance` (the
- * `## Acceptance` section, falling back to the bead's acceptance field), and `body` (the rest
- * of the description). Absent labels are held as "" in the draft.
+ * `## Acceptance Criteria` section, falling back to the bead's acceptance field), and `body` (the
+ * rest of the description). Absent labels are held as "" in the draft.
  *
  * Storage rule: the whole contract is canonically the bead DESCRIPTION markdown. On save the
- * description is recomposed as `## Goal` + `## Acceptance` + body (see `composeDescription`),
+ * description is recomposed as `## Goal` + `## Acceptance Criteria` + body (`composeDescription`),
  * and the acceptance text is mirrored into bd's dedicated acceptance field so the two never
  * drift — `parseGoal`/`parseAcceptance` both read the `## <section>` from the description first.
  */
@@ -96,12 +97,17 @@ export const AGENT_OPTIONS = [
   "kubernetes",
 ] as const;
 
-/** The contract sections that live in their own draft fields — everything else stays in `body`. */
+/**
+ * The contract sections that live in their own draft fields — everything else stays in `body`.
+ * `Acceptance` is the PREFIX, not the full heading: the `\b` match below also claims the
+ * `## Acceptance Criteria` we now write, so a description in either spelling strips to the same
+ * body and recomposes under the canonical one.
+ */
 const CONTRACT_SECTIONS = ["Goal", "Acceptance"] as const;
 
 /**
- * Drop the `## Goal` / `## Acceptance` blocks (heading through the line before the next `##`)
- * from a description, leaving "the rest" that the Description textarea edits. Mirrors the
+ * Drop the `## Goal` / `## Acceptance Criteria` blocks (heading through the line before the next
+ * `##`) from a description, leaving "the rest" that the Description textarea edits. Mirrors the
  * heading semantics of `parseSection` in src/lib/tickets.ts so the split round-trips cleanly.
  */
 export function stripContractSections(description: string): string {
@@ -124,8 +130,8 @@ export function stripContractSections(description: string): string {
 
 /**
  * Recompose a draft's contract into a single canonical description markdown: `## Goal`, then
- * `## Acceptance`, then the remaining body. Empty pieces are omitted. This is what gets written
- * to `--description`, and `parseGoal`/`parseAcceptance` read it straight back.
+ * `## Acceptance Criteria`, then the remaining body. Empty pieces are omitted. This is what gets
+ * written to `--description`, and `parseGoal`/`parseAcceptance` read it straight back.
  */
 export function composeDescription(draft: TicketDraft): string {
   const parts: string[] = [];
@@ -133,7 +139,7 @@ export function composeDescription(draft: TicketDraft): string {
   const acceptance = draft.acceptance.trim();
   const body = draft.body.trim();
   if (goal) parts.push(`## Goal\n\n${goal}`);
-  if (acceptance) parts.push(`## Acceptance\n\n${acceptance}`);
+  if (acceptance) parts.push(`## ${ACCEPTANCE_HEADING}\n\n${acceptance}`);
   if (body) parts.push(body);
   return parts.join("\n\n");
 }
@@ -209,4 +215,40 @@ export function detailsSummary(draft: TicketDraft, deferred: boolean): string {
 /** Whether a draft has any field the dialog would PATCH (drives the Save-disabled state). */
 export function hasTicketChanges(original: TicketDraft, draft: TicketDraft): boolean {
   return Object.keys(diffTicketPatch(original, draft)).length > 0;
+}
+
+/**
+ * Only a parentless task/bug is a run target of its own (mirrors `beads.isRunTarget`, which the
+ * approve/claim routes gate on): a child ticket runs via its epic's PR, and a parentless
+ * `learning`/`chore`/etc. is never runnable, so its controls would only ever 422.
+ */
+export function isStandaloneRunTarget(detail: Pick<TicketDetail, "epicId" | "type">): boolean {
+  return !detail.epicId && (detail.type === "task" || detail.type === "bug");
+}
+
+/**
+ * Whether the Approve & run / Force run affordance is offered at all — narrower than the claim
+ * control. A `done` (closed) standalone target has already finished its run and produced its PR, so
+ * re-approving it would only enqueue duplicate/no-op PR work. A snoozed target hides it too: the
+ * whole point of the snooze is "don't pick this up yet", so offering the one control that would
+ * start it immediately contradicts the state it's in.
+ */
+export function canRunTicket(
+  detail: Pick<TicketDetail, "epicId" | "type" | "stage" | "deferred">,
+): boolean {
+  return isStandaloneRunTarget(detail) && detail.stage !== "done" && !detail.deferred;
+}
+
+/**
+ * What the approve POST reports back. A gardener proposal is applied, not run: it names the board
+ * move it made rather than a run that never started (anton-1t3n). Otherwise re-approving an
+ * already-approved target is a Force run, not a first approval.
+ */
+export function runToastMessage(
+  title: string,
+  wasApproved: boolean,
+  applied: string | undefined,
+): string {
+  if (applied) return `Applied — ${applied}`;
+  return wasApproved ? `Re-running "${title}"` : `Approved & running "${title}"`;
 }

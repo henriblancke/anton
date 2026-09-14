@@ -190,7 +190,9 @@ export function ClaimControl({
     return (
       <div className={cn("pointer-events-auto flex flex-col gap-2", className)}>
         {nameEl}
-        <div className="flex items-center gap-2">
+        {/* Wraps: a picked card in a swimlane column carries claim, Release, both vetoes and delete
+            on one row, which is more than a lane-width column fits. */}
+        <div className="flex flex-wrap items-center gap-2">
           {actionEl}
           {children}
         </div>

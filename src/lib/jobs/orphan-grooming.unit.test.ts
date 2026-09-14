@@ -7,7 +7,13 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
-import { findOrphans, ORPHAN_EPIC_LABEL } from "./orphan-grooming";
+import { validateBeadContract } from "../beads/contract";
+import {
+  findOrphans,
+  ORPHAN_EPIC_DESCRIPTION,
+  ORPHAN_EPIC_LABEL,
+  ORPHAN_EPIC_TITLE,
+} from "./orphan-grooming";
 
 function bead(id: string, o: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", issue_type: "chore", ...o };
@@ -79,5 +85,28 @@ describe("findOrphans", () => {
       bead("c-2"),
     ];
     expect(findOrphans(all).map((b) => b.id).sort()).toEqual(["c-1", "c-2"]);
+  });
+});
+
+describe("the grooming epic anton writes for itself", () => {
+  const epic: Bead = {
+    id: "e-orphans",
+    title: ORPHAN_EPIC_TITLE,
+    status: "open",
+    issue_type: "epic",
+    labels: [ORPHAN_EPIC_LABEL],
+    description: ORPHAN_EPIC_DESCRIPTION,
+  };
+
+  it("uses the epic tier's rubric heading, not a ticket's `## Acceptance`", () => {
+    // `bd create --validate` refuses an epic without `## Success Criteria`, and gardener's lint
+    // sweep would file this self-created epic as a standing hygiene finding on every run.
+    expect(ORPHAN_EPIC_DESCRIPTION).toContain("## Success Criteria");
+    expect(ORPHAN_EPIC_DESCRIPTION).not.toContain("## Acceptance");
+  });
+
+  it("satisfies the epic contract anton enforces on every other bead", () => {
+    const blocking = validateBeadContract(epic).filter((v) => v.severity === "blocking");
+    expect(blocking).toEqual([]);
   });
 });

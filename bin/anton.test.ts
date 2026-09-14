@@ -2,81 +2,39 @@
  * Smoke tests for the anton CLI (anton-hji). Only exercises argument dispatch — the paths that
  * don't depend on external tools or a build — so it's deterministic in CI (where bd/gh/stringer
  * aren't installed). setup/start/doctor behavior is covered by the manual run + the prereq logic.
+ *
+ * This file holds the launcher's own surface: dispatch and flag parsing, `board-check`, and
+ * `doctor`. The rest of the CLI is asserted in the sibling suites the file was split into
+ * (anton-k7q2) — `anton-init.test.ts`, `anton-skills.test.ts`, `anton-migrations.test.ts`,
+ * `anton-release.test.ts` — over the harness they all share, `anton.fixture.ts`.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { createServer, type Server } from "node:http";
+import { delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
-import { basename, delimiter, dirname, join, resolve } from "node:path";
-import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+
 import {
   agentsFromArgs,
-  applyMigrations,
-  compareVersions,
-  ensureBeadsGitignore,
-  ensureBetterSqlite3,
-  ensureMigrated,
-  fetchLatestRelease,
+  cmdStop,
+  daemonState,
+  ensureFreshBuild,
+  lifecycleVerdict,
   nextArgs,
-  parseInitArgs,
-  platformLabel,
-  provisionAgentsSkills,
-  installSkillDir,
-  registerProject,
-  staleSkills,
-  INSTALLED_SKILLS,
-  REQUIRED_SKILLS,
+  procfsListeningEndpoints,
+  resolveAntonDb,
   resolvePort,
+  runningPid,
+  serverPort,
+  stoppedFor,
+  unstampedServers,
+  writePidFile,
 } from "./anton.mjs";
 
-import {
-  // The single Dolt-sync path (anton-8qx): one configureBeadsDoltSync shared by `anton setup`
-  // (bin/anton.mjs) and `anton init` (via configureBeadsForRepo). normalizeRemoteUrl is its URL
-  // equality helper.
-  configureBeadsDoltSync,
-  detectHooksManager,
-  normalizeRemoteUrl,
-  untrackBeadsExports,
-} from "../src/lib/beads/config.mjs";
+import { processStartedAt } from "../src/lib/build/identity.mjs";
 
-// The runtime's canonical skill lists. The launcher must stay pure Node (it runs before any build),
-// so it duplicates them; these aliases exist only to pin the copies equal.
-import {
-  INSTALLED_SKILLS as RUNTIME_INSTALLED_SKILLS,
-  REQUIRED_SKILLS as RUNTIME_REQUIRED_SKILLS,
-} from "../src/lib/claude/prompt";
-import { readSkillStamp, skillDigest } from "../src/lib/claude/skill-stamp.mjs";
-
-const CLI = join(dirname(fileURLToPath(import.meta.url)), "anton.mjs");
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-
-/**
- * Overwrite an installed skill copy so it looks like an UNTOUCHED copy of some other release:
- * different content, carrying a `version:` stamp that matches that content (anton-gsyh). This is the
- * state anton is allowed to refresh on its own — as opposed to a hand-edited copy, whose stamp
- * describes a body it no longer has. Two writes because the stamp digests the file minus its own
- * stamp line, so the placeholder pass computes the value the final pass declares.
- */
-function seedOtherRelease(skillDir: string, body: string) {
-  const render = (stamp: string) => `---\nname: ${basename(skillDir)}\nversion: ${stamp}\n---\n\n${body}`;
-  writeFileSync(join(skillDir, "SKILL.md"), render("placeholder"));
-  writeFileSync(join(skillDir, "SKILL.md"), render(skillDigest(skillDir)));
-}
-
-async function exists(p: string): Promise<boolean> {
-  try {
-    await stat(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function run(args: string[]) {
-  return spawnSync("node", [CLI, ...args], { encoding: "utf8" });
-}
+import { CLI, REPO_ROOT, run, seedOtherRelease, tempDirs, writeFakeBd } from "./anton.fixture";
 
 describe("anton CLI dispatch", () => {
   it("--help prints usage and exits 0", () => {
@@ -135,6 +93,31 @@ describe("port resolution", () => {
   });
 });
 
+/**
+ * A relative `ANTON_DB` names a different file for every reader unless one directory settles it
+ * (PR #217). The server always runs with the app root as its cwd, so its build record lands beside
+ * the app-root-relative database — and doctor invoked from any other directory used to scan the
+ * caller's, reporting "no running server recorded" over a live, stale server.
+ */
+describe("the ANTON_DB override", () => {
+  const declared = process.env.ANTON_DB;
+
+  afterEach(() => {
+    if (declared === undefined) delete process.env.ANTON_DB;
+    else process.env.ANTON_DB = declared;
+  });
+
+  it("resolves a relative path against the app root, not the caller's cwd", () => {
+    process.env.ANTON_DB = "state/anton.db";
+    expect(resolveAntonDb()).toBe(join(REPO_ROOT, "state", "anton.db"));
+  });
+
+  it("leaves an absolute path exactly as given", () => {
+    process.env.ANTON_DB = join(tmpdir(), "elsewhere.db");
+    expect(resolveAntonDb()).toBe(join(tmpdir(), "elsewhere.db"));
+  });
+});
+
 describe("agentsFromArgs", () => {
   it("returns null when unspecified, [] for --no-agents, csv/all otherwise", () => {
     expect(agentsFromArgs([])).toBeNull();
@@ -144,1266 +127,20 @@ describe("agentsFromArgs", () => {
   });
 });
 
-describe("parseInitArgs (anton init)", () => {
-  it("defaults path/prefix to null and parses a bare path", () => {
-    expect(parseInitArgs([])).toEqual({ path: null, prefix: null });
-    expect(parseInitArgs(["/repos/foo"])).toEqual({ path: "/repos/foo", prefix: null });
-  });
-
-  it("parses --prefix <p>, --prefix=<p>, and -p <p>, keeping the first bare token as path", () => {
-    expect(parseInitArgs(["/repos/foo", "--prefix", "acme"])).toEqual({ path: "/repos/foo", prefix: "acme" });
-    expect(parseInitArgs(["--prefix=acme", "/repos/foo"])).toEqual({ path: "/repos/foo", prefix: "acme" });
-    expect(parseInitArgs(["-p", "acme"])).toEqual({ path: null, prefix: "acme" });
-    // The prefix value is not mistaken for the path.
-    expect(parseInitArgs(["--prefix", "acme", "/repos/foo"])).toEqual({ path: "/repos/foo", prefix: "acme" });
-  });
-});
-
-describe("ensureBeadsGitignore (anton init)", () => {
-  let dir: string;
-  afterEach(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true });
-  });
-
-  it("appends missing entries, preserves existing content, and is idempotent (no-clobber)", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-gi-"));
-    const beadsDir = join(dir, ".beads");
-    mkdirSync(beadsDir, { recursive: true });
-    // A bd-init-style .gitignore already covers the Dolt runtime, but not the JSONL exports.
-    writeFileSync(join(beadsDir, ".gitignore"), "dolt/\nembeddeddolt/\n");
-
-    const first = ensureBeadsGitignore(beadsDir);
-    expect(first.added).toEqual(["issues.jsonl", "interactions.jsonl"]);
-    const after = await readFile(join(beadsDir, ".gitignore"), "utf8");
-    expect(after).toContain("dolt/"); // pre-existing content preserved
-    expect(after).toContain("issues.jsonl");
-    expect(after).toContain("interactions.jsonl");
-
-    // Re-run: everything present → no additions, file byte-identical.
-    const second = ensureBeadsGitignore(beadsDir);
-    expect(second.added).toEqual([]);
-    expect(await readFile(join(beadsDir, ".gitignore"), "utf8")).toBe(after);
-  });
-
-  it("creates the file with all required entries when absent", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-gi-"));
-    const beadsDir = join(dir, ".beads");
-    mkdirSync(beadsDir, { recursive: true });
-
-    const r = ensureBeadsGitignore(beadsDir);
-    expect(r.added).toEqual(["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]);
-    const text = await readFile(join(beadsDir, ".gitignore"), "utf8");
-    for (const e of ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]) {
-      expect(text).toContain(e);
-    }
-  });
-});
-
-// anton-vqgw: .gitignore only suppresses UNTRACKED files. A repo that committed issues.jsonl before
-// the ignore existed keeps shipping a frozen board snapshot to every clone and branch, which inbound
-// tooling can replay over live state — so anton init has to untrack it, not just ignore it.
-describe("untrackBeadsExports (anton init)", () => {
-  let dir: string;
-
-  function gitRepoWith(files: Record<string, string>): void {
-    spawnSync("git", ["init", "-q"], { cwd: dir });
-    spawnSync("git", ["config", "user.email", "t@example.com"], { cwd: dir });
-    spawnSync("git", ["config", "user.name", "anton-test"], { cwd: dir });
-    mkdirSync(join(dir, ".beads"), { recursive: true });
-    for (const [rel, body] of Object.entries(files)) writeFileSync(join(dir, rel), body);
-    spawnSync("git", ["add", "-A"], { cwd: dir });
-    spawnSync("git", ["commit", "-qm", "seed"], { cwd: dir });
-  }
-
-  const tracked = (): string[] =>
-    (spawnSync("git", ["ls-files", "--", ".beads/"], { cwd: dir, encoding: "utf8" }).stdout || "")
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
-
-  afterEach(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true });
-  });
-
-  it("untracks a committed issues.jsonl while leaving real config files tracked", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-untrack-"));
-    gitRepoWith({
-      ".beads/issues.jsonl": '{"id":"x-1","status":"open"}\n',
-      ".beads/config.yaml": "issue-prefix: x\n",
-    });
-    expect(tracked()).toContain(".beads/issues.jsonl");
-
-    const r = untrackBeadsExports(dir);
-
-    expect(r.untracked).toEqual([".beads/issues.jsonl"]);
-    expect(tracked()).not.toContain(".beads/issues.jsonl");
-    // config.yaml is team-config and must stay in git.
-    expect(tracked()).toContain(".beads/config.yaml");
-    // Untracked, not deleted — the export is still on disk for bd to use.
-    await expect(stat(join(dir, ".beads/issues.jsonl"))).resolves.toBeDefined();
-  });
-
-  it("is a no-op when nothing is tracked", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-untrack-"));
-    gitRepoWith({ ".beads/config.yaml": "issue-prefix: x\n" });
-
-    const r = untrackBeadsExports(dir);
-
-    expect(r.untracked).toEqual([]);
-    expect(tracked()).toEqual([".beads/config.yaml"]);
-  });
-
-  it("does not throw outside a git repo", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-untrack-"));
-    mkdirSync(join(dir, ".beads"), { recursive: true });
-    expect(untrackBeadsExports(dir).untracked).toEqual([]);
-  });
-});
-
-describe("detectHooksManager (anton init — hooks warning, anton-43b)", () => {
-  let dir: string;
-  afterEach(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true });
-  });
-
-  it("flags a husky repo by its committed .husky/ dir", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-hooks-"));
-    mkdirSync(join(dir, ".husky"), { recursive: true });
-    expect(detectHooksManager(dir)).toEqual({ manager: "husky", path: ".husky" });
-  });
-
-  it("flags a lefthook repo by its committed config file", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-hooks-"));
-    writeFileSync(join(dir, "lefthook.yml"), "pre-commit:\n");
-    expect(detectHooksManager(dir)).toEqual({ manager: "lefthook", path: "lefthook.yml" });
-  });
-
-  it("flags a bare custom core.hooksPath captured before bd init clobbered it", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-hooks-"));
-    expect(detectHooksManager(dir, ".config/hooks")).toEqual({ manager: "custom", path: ".config/hooks" });
-  });
-
-  it("does NOT flag a plain-git repo, nor bd's own .beads/hooks value", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-hooks-"));
-    expect(detectHooksManager(dir, null)).toBeNull();
-    expect(detectHooksManager(dir, ".beads/hooks")).toBeNull();
-    expect(detectHooksManager(dir, ".git/hooks")).toBeNull();
-  });
-});
-
-describe("configureBeadsDoltSync (anton init — skip branches, anton-43b)", () => {
-  let dir: string;
-  afterEach(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true });
-  });
-
-  it("returns no-workspace when there is no .beads/", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
-    expect(configureBeadsDoltSync({ repoDir: dir })).toEqual({ status: "no-workspace" });
-  });
-
-  it("returns no-remote when the repo has no origin remote", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
-    mkdirSync(join(dir, ".beads"), { recursive: true });
-    spawnSync("git", ["-C", dir, "init"], { stdio: "ignore" });
-    expect(configureBeadsDoltSync({ repoDir: dir })).toEqual({ status: "no-remote" });
-  });
-});
-
-describe("compareVersions", () => {
-  it("orders dotted versions, tolerating a leading v", () => {
-    expect(compareVersions("0.2.0", "0.1.9")).toBe(1);
-    expect(compareVersions("v1.0.0", "1.0.1")).toBe(-1);
-    expect(compareVersions("0.1.0", "0.1.0")).toBe(0);
-    expect(compareVersions("1.2", "1.2.0")).toBe(0); // missing parts treated as 0
-    expect(compareVersions("1.10.0", "1.9.0")).toBe(1); // numeric, not lexical
-  });
-});
-
-describe("platformLabel", () => {
-  it("is a <os>-<arch> label matching the running platform", () => {
-    const label = platformLabel();
-    expect(label).toMatch(/^[a-z0-9]+-[a-z0-9]+$/);
-    expect(label).toContain(process.arch === "x64" ? "x64" : process.arch);
-  });
-});
-
-describe("ensureBetterSqlite3", () => {
-  it("returns 'ok' when the shipped binary matches the running Node (repo build)", () => {
-    // The repo's better-sqlite3 was built for this exact Node, so no ABI fix is needed.
-    expect(ensureBetterSqlite3(REPO_ROOT)).toBe("ok");
-  });
-});
-
-describe("applyMigrations (in-process, no drizzle-kit)", () => {
-  let dir: string;
-  afterEach(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true });
-  });
-
-  it("applies the real migration set to a temp DB, idempotently", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-mig-"));
-    const dbPath = join(dir, "anton.db");
-
-    // Uses the repo's real drizzle/*.sql + better-sqlite3 (appRoot = REPO_ROOT).
-    const first = applyMigrations(dbPath, { appRoot: REPO_ROOT });
-    expect(first.total).toBeGreaterThan(0);
-    expect(first.ran).toBe(first.total);
-    expect(await exists(dbPath)).toBe(true);
-
-    // Second run is a no-op — the journal records what's applied.
-    const second = applyMigrations(dbPath, { appRoot: REPO_ROOT });
-    expect(second.ran).toBe(0);
-    expect(second.total).toBe(first.total);
-
-    // The schema is really there: journal table + more than one user table.
-    const require = createRequire(join(REPO_ROOT, "package.json"));
-    const Database = require("better-sqlite3");
-    const sqlite = new Database(dbPath);
-    try {
-      const journal = sqlite.prepare("SELECT COUNT(*) AS n FROM __anton_migrations").get() as { n: number };
-      expect(journal.n).toBe(first.total);
-      const tables = sqlite
-        .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table'")
-        .get() as { n: number };
-      expect(tables.n).toBeGreaterThan(1);
-    } finally {
-      sqlite.close();
-    }
-  });
-});
-
-describe("ensureMigrated (bundle mode → in-process apply, before serving)", () => {
-  let dir: string;
-  afterEach(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true });
-  });
-
-  it("applies pending migrations, then is a clean no-op on the next start", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-start-mig-"));
-    const dbPath = join(dir, "anton.db");
-
-    // Bundle branch: apply the real committed SQL in-process (no drizzle-kit), like `anton start`.
-    const first = ensureMigrated({ isBundle: true, dbPath, appRoot: REPO_ROOT });
-    expect(first.ran).toBeGreaterThan(0);
-    expect(await exists(dbPath)).toBe(true);
-
-    // Re-running start with nothing pending applies zero migrations.
-    const second = ensureMigrated({ isBundle: true, dbPath, appRoot: REPO_ROOT });
-    expect(second.ran).toBe(0);
-  });
-});
-
-describe("registerProject (anton init → projects board, anton-uez)", () => {
-  let dir: string;
-  afterEach(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true });
-  });
-
-  it("registers a repo in anton.db + seeds schedules, idempotently by repoPath", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-reg-"));
-    const dbPath = join(dir, "anton.db");
-    const repoPath = join(dir, "repo");
-    mkdirSync(repoPath, { recursive: true });
-
-    const first = registerProject(repoPath, { appRoot: REPO_ROOT, dbPath });
-    expect(first.ok).toBe(true);
-    expect(first.created).toBe(true);
-    expect(first.slug).toBe("repo");
-
-    // Re-registering the same repoPath is a no-op — no duplicate row.
-    const second = registerProject(repoPath, { appRoot: REPO_ROOT, dbPath });
-    expect(second.ok).toBe(true);
-    expect(second.created).toBe(false);
-    expect(second.slug).toBe("repo");
-
-    const require = createRequire(join(REPO_ROOT, "package.json"));
-    const Database = require("better-sqlite3");
-    const sqlite = new Database(dbPath);
-    try {
-      const projects = sqlite
-        .prepare("SELECT COUNT(*) AS n FROM projects WHERE repo_path = ?")
-        .get(repoPath) as { n: number };
-      expect(projects.n).toBe(1);
-      // The three default schedules are seeded once (idempotent per type).
-      const schedules = sqlite.prepare("SELECT COUNT(*) AS n FROM schedules").get() as { n: number };
-      expect(schedules.n).toBe(3);
-    } finally {
-      sqlite.close();
-    }
-  });
-
-  it("self-heals: re-registering backfills a missing default schedule (anton-mxy)", async () => {
-    dir = await mkdtemp(join(tmpdir(), "anton-reg-heal-"));
-    const dbPath = join(dir, "anton.db");
-    const repoPath = join(dir, "repo");
-    mkdirSync(repoPath, { recursive: true });
-
-    const first = registerProject(repoPath, { appRoot: REPO_ROOT, dbPath });
-    expect(first.created).toBe(true);
-    expect(first.backfilled).toBe(3);
-
-    const require = createRequire(join(REPO_ROOT, "package.json"));
-    const Database = require("better-sqlite3");
-    const sqlite = new Database(dbPath);
-    try {
-      // Simulate a project that predates seeding one of its types (e.g. the anton project).
-      sqlite.prepare("DELETE FROM schedules WHERE type = 'nightly-stringer'").run();
-      expect((sqlite.prepare("SELECT COUNT(*) AS n FROM schedules").get() as { n: number }).n).toBe(2);
-
-      // Re-registering the existing repo backfills only the missing type.
-      const healed = registerProject(repoPath, { appRoot: REPO_ROOT, dbPath });
-      expect(healed.created).toBe(false);
-      expect(healed.backfilled).toBe(1);
-
-      const types = sqlite
-        .prepare("SELECT type FROM schedules ORDER BY type")
-        .all()
-        .map((r: { type: string }) => r.type);
-      expect(types).toEqual(["nightly-stringer", "orphan-grooming", "review-fix"]);
-
-      // A second re-register is now a clean no-op.
-      expect(registerProject(repoPath, { appRoot: REPO_ROOT, dbPath }).backfilled).toBe(0);
-    } finally {
-      sqlite.close();
-    }
-  });
-});
-
-// The launcher's skill lists are a hand-maintained copy of src/lib/claude/prompt.ts's — the
-// installer is pure Node and can't import the TS module. Nothing but this assertion stops them
-// drifting, and drift is silent-but-fatal in one direction: a skill the runtime loads but the
-// installer never copies makes every job that needs it die on a missing SKILL.md. Iterating the
-// launcher's own stale list (as the install tests do) can't catch that.
-describe("launcher skill lists match the runtime's", () => {
-  it("REQUIRED_SKILLS is identical to src/lib/claude/prompt.ts's, in order", () => {
-    expect(REQUIRED_SKILLS).toEqual([...RUNTIME_REQUIRED_SKILLS]);
-  });
-
-  it("INSTALLED_SKILLS is identical to src/lib/claude/prompt.ts's, in order", () => {
-    expect(INSTALLED_SKILLS).toEqual([...RUNTIME_INSTALLED_SKILLS]);
-  });
-
-  it("every listed skill exists as a shippable asset", () => {
-    for (const name of INSTALLED_SKILLS) {
-      expect(existsSync(join(REPO_ROOT, "skills", name, "SKILL.md"))).toBe(true);
-    }
-  });
-});
-
-// A release bundle symlinks `anton` straight at $RUNTIME/bin/anton.mjs, so every `../src` module the
-// launcher statically imports must also be in build-bundle.mjs's hand-maintained copy list. Forget
-// one and EVERY command — setup, doctor, start, board-check — dies at module load with
-// ERR_MODULE_NOT_FOUND. npm installs are immune (package.json `files` ships all of `src`), so only
-// this assertion stands between a new launcher import and a broken release.
-describe("launcher's src imports are all in the release bundle", () => {
-  /** The cwd-rooted paths build-bundle.mjs copies into the stage, as repo-relative POSIX paths. */
-  function bundledPaths(): string[] {
-    const script = readFileSync(join(REPO_ROOT, "scripts", "build-bundle.mjs"), "utf8");
-    const block = script.match(/for \(const rel of \[\n([\s\S]*?)\n\s*\]\) \{/);
-    expect(block, "build-bundle.mjs no longer has a multi-line `for (const rel of [...])` copy list").toBeTruthy();
-    return [...(block?.[1] ?? "").matchAll(/join\(([^)]*)\)|^\s*"([^"]+)",/gm)]
-      .map(([, args, bare]) => bare ?? [...args.matchAll(/"([^"]+)"/g)].map((m) => m[1]).join("/"))
-      .filter(Boolean);
-  }
-
-  it("every ../src module bin/anton.mjs imports is copied by build-bundle.mjs", () => {
-    const bundled = bundledPaths();
-    const imports = [...readFileSync(CLI, "utf8").matchAll(/(?:from|import\()\s*"\.\.\/(src\/[^"]+)"/g)].map(
-      (m) => m[1],
-    );
-
-    expect(imports.length).toBeGreaterThan(0);
-    for (const spec of imports) {
-      const covered = bundled.some((p) => p === spec || spec.startsWith(`${p}/`));
-      expect(covered, `${spec} is imported by bin/anton.mjs but missing from build-bundle.mjs`).toBe(true);
-    }
-  });
-});
-
-describe("provisionAgentsSkills (into a temp ~/.claude)", () => {
-  let claudeRoot: string;
-  const skillPath = (name: string) => join(claudeRoot, "skills", name, "SKILL.md");
-
-  afterEach(async () => {
-    if (claudeRoot) await rm(claudeRoot, { recursive: true, force: true });
-  });
-
-  it("installs required skills + a selected agent, and is idempotent (no-clobber)", async () => {
-    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
-
-    // Non-interactive selection via flag so no TTY prompt is needed.
-    const first = await provisionAgentsSkills(["--agents", "nextjs"], { claudeRoot, appRoot: REPO_ROOT });
-    expect(first.installed).toBe(INSTALLED_SKILLS.length + 1); // every installed skill + 1 agent
-    for (const req of INSTALLED_SKILLS) expect(await exists(skillPath(req))).toBe(true);
-    expect(await exists(join(claudeRoot, "agents", "nextjs.md"))).toBe(true);
-    // setup's bundled templates travel with the skill directory (anton-olh) — the `.product/` layer
-    // and the `.beads/formulas/` assets `/setup` installs into a project (anton-8mnr, anton-hrql).
-    for (const rel of [
-      [".product", "PRODUCT.md"],
-      [".beads", "formulas", "anton-bead.formula.json"],
-      [".beads", "formulas", "anton-run.formula.toml"],
-    ]) {
-      expect(await exists(join(claudeRoot, "skills", "setup", "templates", ...rel))).toBe(true);
-    }
-
-    // Re-run: everything already present, zero writes.
-    const second = await provisionAgentsSkills(["--agents", "nextjs"], { claudeRoot, appRoot: REPO_ROOT });
-    expect(second.installed).toBe(0);
-    expect(second.skipped).toBe(INSTALLED_SKILLS.length + 1);
-  });
-
-  it("with --no-agents installs only the required skills", async () => {
-    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
-    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-    expect(r.installed).toBe(INSTALLED_SKILLS.length);
-    expect(r.agents).toEqual([]);
-    expect(await exists(join(claudeRoot, "agents"))).toBe(false);
-  });
-
-  // No-clobber used to make a skill installed once frozen at that release forever, reported as
-  // "already present" by every later setup (anton-tier-invariants). Drift is now named, and
-  // --force-skills is the way out.
-  it("reports a drifted skill as stale and leaves it untouched", async () => {
-    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
-    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-
-    writeFileSync(skillPath("shape"), "# an old release's copy\n");
-    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-
-    expect(r.stale).toEqual(["shape"]);
-    expect(r.updated).toBe(0);
-    expect(r.refreshed).toEqual([]);
-    expect(r.skipped).toBe(INSTALLED_SKILLS.length - 1);
-    expect(await readFile(skillPath("shape"), "utf8")).toBe("# an old release's copy\n");
-  });
-
-  // The regression the stamp exists for (anton-gsyh): a copy left behind by an older release keeps
-  // producing that release's conventions — a pre-tier `~/.claude/skills/bd` shaped epics-as-work-
-  // buckets for weeks. Because such a copy is UNTOUCHED (its stamp matches its own content), a plain
-  // re-run may re-sync it: no flag, no lost edits, and it says which skills it refreshed.
-  it("refreshes an untouched copy of another release with no flag, and reports it", async () => {
-    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
-    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-    seedOtherRelease(join(claudeRoot, "skills", "bd"), "# the pre-tier conventions\n");
-
-    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-
-    expect(r.refreshed).toEqual(["bd"]);
-    expect(r.stale).toEqual([]);
-    expect(r.updated).toBe(0);
-    const bundled = await readFile(join(REPO_ROOT, "skills", "bd", "SKILL.md"), "utf8");
-    expect(await readFile(skillPath("bd"), "utf8")).toBe(bundled);
-
-    // …and the re-run after that has nothing left to do.
-    expect((await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT })).refreshed).toEqual([]);
-  });
-
-  // A refresh has to leave the copy hashing to the stamp it just wrote. When an older bundle shipped
-  // an asset this one dropped, rewriting only what the bundle still ships leaves that file behind and
-  // the digest permanently off its own stamp — so the copy reads as hand-edited from then on, doctor
-  // tells the user it "carries local edits" when it carries none, and it never auto-refreshes again.
-  it("deletes assets the bundle no longer ships, so a refreshed copy matches its own stamp", async () => {
-    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
-    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-    const dest = join(claudeRoot, "skills", "bd");
-    // An asset the older release shipped and this bundle does not. Seeding AFTER it means the stamp
-    // covers it — this is a pristine copy of that release, not a user who added a file.
-    mkdirSync(join(dest, "templates"), { recursive: true });
-    writeFileSync(join(dest, "templates", "dropped.md"), "# shipped by v1, gone in v2\n");
-    seedOtherRelease(dest, "# the pre-tier conventions\n");
-
-    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-
-    expect(r.refreshed).toEqual(["bd"]);
-    expect(await exists(join(dest, "templates", "dropped.md"))).toBe(false);
-    expect(await exists(join(dest, "templates"))).toBe(false); // …and no empty debris directory.
-    // The point of the prune: the copy's content hashes to the stamp it now declares, so it stays
-    // refreshable instead of being misread as edited forever.
-    expect(readSkillStamp(dest)).toBe(skillDigest(dest));
-    expect((await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT })).stale).toEqual([]);
-  });
-
-  // The mirror case: an extra file anton cannot prove it wrote. Dropping a note into a skill dir is
-  // not drift — every shipped file is still byte-identical — so it stays silent and never pruned.
-  it("leaves a user-added file alone without calling the copy drifted", async () => {
-    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
-    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-    const dest = join(claudeRoot, "skills", "bd");
-    writeFileSync(join(dest, "my-notes.md"), "# mine\n");
-
-    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-
-    expect(r.refreshed).toEqual([]);
-    expect(r.stale).toEqual([]);
-    expect(r.skipped).toBe(INSTALLED_SKILLS.length);
-    expect(await readFile(join(dest, "my-notes.md"), "utf8")).toBe("# mine\n");
-  });
-
-  // …and once a real release difference arrives, that added file is what proves the copy is not
-  // anton's to overwrite: it breaks the destination digest, so the copy is edited, not refreshable.
-  it("treats a copy carrying a user-added file as edited once it actually drifts", async () => {
-    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
-    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-    const dest = join(claudeRoot, "skills", "bd");
-    // A pristine copy of some other release — drift anton would refresh — that the user then adds a
-    // file to. Seeding BEFORE the note is what makes it the user's file rather than that release's.
-    seedOtherRelease(dest, "# the pre-tier conventions\n");
-    writeFileSync(join(dest, "my-notes.md"), "# mine\n");
-
-    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-
-    expect(r.refreshed).toEqual([]);
-    expect(r.stale).toEqual(["bd"]);
-    expect(await readFile(join(dest, "my-notes.md"), "utf8")).toBe("# mine\n");
-    expect(await readFile(skillPath("bd"), "utf8")).toContain("# the pre-tier conventions");
-  });
-
-  it("never auto-refreshes a copy carrying local edits", async () => {
-    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
-    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-    // A stamped copy the user then edited: the stamp no longer describes the body, which is exactly
-    // how anton tells "my file, out of date" from "their file, customized".
-    seedOtherRelease(join(claudeRoot, "skills", "bd"), "# mine\n");
-    const edited = (await readFile(skillPath("bd"), "utf8")) + "\nmy own note\n";
-    writeFileSync(skillPath("bd"), edited);
-
-    const r = await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-
-    expect(r.refreshed).toEqual([]);
-    expect(r.stale).toEqual(["bd"]);
-    expect(await readFile(skillPath("bd"), "utf8")).toBe(edited);
-  });
-
-  it("--force-skills re-syncs a drifted skill from the bundle", async () => {
-    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
-    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-    writeFileSync(skillPath("shape"), "# an old release's copy\n");
-
-    const r = await provisionAgentsSkills(["--no-agents", "--force-skills"], {
-      claudeRoot,
-      appRoot: REPO_ROOT,
-    });
-
-    expect(r.stale).toEqual([]);
-    expect(r.updated).toBe(1);
-    const bundled = await readFile(join(REPO_ROOT, "skills", "shape", "SKILL.md"), "utf8");
-    expect(await readFile(skillPath("shape"), "utf8")).toBe(bundled);
-  });
-
-  it("leaves a user's extra file in a skill dir alone when forcing", async () => {
-    claudeRoot = await mkdtemp(join(tmpdir(), "anton-claude-"));
-    await provisionAgentsSkills(["--no-agents"], { claudeRoot, appRoot: REPO_ROOT });
-    const mine = join(claudeRoot, "skills", "shape", "NOTES.md");
-    writeFileSync(mine, "mine\n");
-    writeFileSync(skillPath("shape"), "drifted\n");
-
-    await provisionAgentsSkills(["--no-agents", "--force-skills"], { claudeRoot, appRoot: REPO_ROOT });
-
-    expect(await readFile(mine, "utf8")).toBe("mine\n");
-  });
-});
-
-describe("installSkillDir", () => {
-  let dest: string;
-  let src: string;
-
-  beforeEach(async () => {
-    src = await mkdtemp(join(tmpdir(), "anton-skill-src-"));
-    dest = await mkdtemp(join(tmpdir(), "anton-skill-dest-"));
-    writeFileSync(join(src, "SKILL.md"), "v2\n");
-    await rm(dest, { recursive: true, force: true }); // an absent destination, not an empty one
-  });
-
-  afterEach(async () => {
-    for (const d of [src, dest]) if (d) await rm(d, { recursive: true, force: true });
-  });
-
-  it("installs when absent, skips when byte-identical", () => {
-    expect(installSkillDir(src, dest)).toBe("installed");
-    expect(installSkillDir(src, dest)).toBe("skipped");
-  });
-
-  it("reports stale rather than clobbering, and updates only under force", () => {
-    installSkillDir(src, dest);
-    writeFileSync(join(dest, "SKILL.md"), "v1\n");
-    expect(installSkillDir(src, dest)).toBe("stale");
-    expect(installSkillDir(src, dest, { force: true })).toBe("updated");
-    expect(installSkillDir(src, dest)).toBe("skipped");
-  });
-
-  it("refreshes — without force — a copy whose stamp still matches its own content", () => {
-    installSkillDir(src, dest);
-    seedOtherRelease(dest, "an older release\n");
-    expect(installSkillDir(src, dest)).toBe("refreshed");
-    expect(readFileSync(join(dest, "SKILL.md"), "utf8")).toBe("v2\n");
-    expect(installSkillDir(src, dest)).toBe("skipped");
-  });
-
-  it("restores a bundled file the user deleted", () => {
-    writeFileSync(join(src, "templates.md"), "t\n");
-    installSkillDir(src, dest);
-    rmSync(join(dest, "templates.md"));
-    expect(installSkillDir(src, dest)).toBe("stale");
-    expect(installSkillDir(src, dest, { force: true })).toBe("updated");
-    expect(existsSync(join(dest, "templates.md"))).toBe(true);
-  });
-});
-
-// `bd` isn't installed in CI, so the init flow is exercised end-to-end against a STUB `bd` placed
-// first on PATH (git stays real, run over a throwaway temp repo). The stub mutates the real .beads/
-// files (config.yaml, dolt-remote state) so config.mjs's file-reading logic — configYamlHas, the
-// idempotency skips, the drift patch — sees a realistic workspace. This is the "inject exec" seam the
-// ticket calls for, applied at the process boundary rather than by forking config.mjs's spawnSync.
-const FAKE_BD = [
-  "#!/usr/bin/env node",
-  'const fs = require("node:fs");',
-  'const path = require("node:path");',
-  "const a = process.argv.slice(2);",
-  'const beads = path.join(process.cwd(), ".beads");',
-  'const cfg = path.join(beads, "config.yaml");',
-  'const marker = path.join(beads, ".fake-dolt-remotes");',
-  'const setlog = path.join(beads, ".fake-config-set-order");',
-  // onPath() probes --version/--help; beadsPrereqs parses the version and gates on >= 1.1.0
-  // (anton-qwsq), so the stub must report a supported version to reach the init path under test.
-  'if (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.1.0 (fake)"); process.exit(0); }',
-  // `bd init` creates the workspace + the (gitignored) local Dolt DB dir — its presence is how the
-  // real config path tells an existing workspace from a fresh clone. The team-config keys are
-  // intentionally left OUT so the subsequent `bd config set` calls (config.yaml enforcement) run.
-  'if (a[0] === "init") {',
-  "  fs.mkdirSync(beads, { recursive: true });",
-  '  fs.mkdirSync(path.join(beads, "dolt"), { recursive: true });',
-  '  const pi = a.indexOf("--prefix");',
-  '  const prefix = pi >= 0 ? a[pi + 1] : "bd";',
-  '  if (!fs.existsSync(cfg)) fs.writeFileSync(cfg, "# beads config (fake)\\nprefix: " + prefix + "\\n");',
-  "  process.exit(0);",
-  "}",
-  // `bd bootstrap` hydrates a fresh clone: it creates the local Dolt DB (which the clone lacked) and
-  // records that it ran so the fresh-clone test can assert bootstrap — not init — was the entry point.
-  'if (a[0] === "bootstrap") {',
-  "  fs.mkdirSync(beads, { recursive: true });",
-  '  fs.mkdirSync(path.join(beads, "dolt"), { recursive: true });',
-  '  fs.writeFileSync(path.join(beads, ".fake-bootstrapped"), "1");',
-  "  process.exit(0);",
-  "}",
-  // `bd config set` patches an existing uncommented `key:` line in place (drift), else appends it.
-  'if (a[0] === "config" && a[1] === "set") {',
-  "  const key = a[2], val = a[3];",
-  // Record each enforced key in order so tests can assert export.auto is disabled FIRST (anton-1th):
-  // a real `bd config set` write regenerates the JSONL under export.auto=true, so ordering matters.
-  '  try { fs.appendFileSync(setlog, key + "\\n"); } catch {}',
-  '  let text = ""; try { text = fs.readFileSync(cfg, "utf8"); } catch {}',
-  '  const lines = text.split("\\n");',
-  "  let replaced = false;",
-  "  for (let i = 0; i < lines.length; i++) {",
-  "    const t = lines[i].trimStart();",
-  '    if (!t.startsWith("#") && t.startsWith(key + ":")) { lines[i] = key + ": " + val; replaced = true; break; }',
-  "  }",
-  '  const out = replaced ? lines.join("\\n") : (text.length && !text.endsWith("\\n") ? text + "\\n" : text) + key + ": " + val + "\\n";',
-  "  fs.writeFileSync(cfg, out);",
-  "  process.exit(0);",
-  "}",
-  // Dolt remote state is tracked in a marker file so `remote list` reflects prior `remote add`s.
-  'if (a[0] === "dolt" && a[1] === "remote" && a[2] === "list") {',
-  '  let r = []; try { r = JSON.parse(fs.readFileSync(marker, "utf8")); } catch {}',
-  '  if (!r.length) console.log("no remotes configured");',
-  '  else for (const x of r) console.log(x.name + "\\t" + x.url);',
-  "  process.exit(0);",
-  "}",
-  'if (a[0] === "dolt" && a[1] === "remote" && a[2] === "add") {',
-  '  let r = []; try { r = JSON.parse(fs.readFileSync(marker, "utf8")); } catch {}',
-  "  r.push({ name: a[3], url: a[4] });",
-  "  fs.writeFileSync(marker, JSON.stringify(r));",
-  "  process.exit(0);",
-  "}",
-  'if (a[0] === "dolt" && (a[1] === "pull" || a[1] === "push")) process.exit(0);',
-  "process.exit(0);",
-].join("\n");
-
-describe("anton init (end-to-end, bd stubbed on PATH)", () => {
-  let fakeBin: string;
-  let dbPath: string;
-  const cleanups: string[] = [];
-
-  async function tmp(prefix: string): Promise<string> {
-    const d = await mkdtemp(join(tmpdir(), prefix));
-    cleanups.push(d);
-    return d;
-  }
-
-  beforeEach(async () => {
-    fakeBin = await tmp("anton-fakebin-");
-    const bd = join(fakeBin, "bd");
-    writeFileSync(bd, FAKE_BD);
-    chmodSync(bd, 0o755);
-    dbPath = join(await tmp("anton-initdb-"), "anton.db");
-  });
-
-  afterEach(async () => {
-    for (const d of cleanups.splice(0)) await rm(d, { recursive: true, force: true });
-  });
-
-  // Spawn the CLI under the SAME runtime as this test (so its native better-sqlite3 — already proven
-  // loadable in-process above — matches), with the stub `bd` first on PATH and a throwaway anton.db.
-  function runInit(target: string, extra: string[] = []) {
-    return spawnSync(process.execPath, [CLI, "init", target, ...extra], {
-      encoding: "utf8",
-      env: { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`, ANTON_DB: dbPath },
-    });
-  }
-
-  function gitInit(dir: string, withOrigin: boolean) {
-    spawnSync("git", ["-C", dir, "init"], { stdio: "ignore" });
-    if (withOrigin) {
-      spawnSync("git", ["-C", dir, "remote", "add", "origin", join(dir, "origin.git")], { stdio: "ignore" });
-    }
-  }
-
-  function projectCount(repoPath?: string): number {
-    const require = createRequire(join(REPO_ROOT, "package.json"));
-    const Database = require("better-sqlite3");
-    const sqlite = new Database(dbPath);
-    try {
-      const sql = repoPath
-        ? "SELECT COUNT(*) AS n FROM projects WHERE repo_path = ?"
-        : "SELECT COUNT(*) AS n FROM projects";
-      const row = (repoPath ? sqlite.prepare(sql).get(repoPath) : sqlite.prepare(sql).get()) as { n: number };
-      return row.n;
-    } finally {
-      sqlite.close();
-    }
-  }
-
-  it("fails loud on a non-git directory (no-git)", async () => {
-    const dir = await tmp("anton-init-");
-    const r = runInit(dir);
-    expect(r.status).toBe(1);
-    expect(r.stdout).toContain("not a git repository");
-  });
-
-  it("fails loud on a git repo with no origin remote (no-origin)", async () => {
-    const dir = await tmp("anton-init-");
-    gitInit(dir, false);
-    const r = runInit(dir);
-    expect(r.status).toBe(1);
-    expect(r.stdout).toContain('no "origin" remote');
-  });
-
-  it("fails loud when bd is present but older than 1.1.0 (bd-too-old, anton-qwsq)", async () => {
-    // Swap the on-PATH stub for one that reports an unsupported version. The version gate runs
-    // before the git/origin checks, so a fully-wired repo still fails here with upgrade guidance.
-    writeFileSync(
-      join(fakeBin, "bd"),
-      '#!/usr/bin/env node\nconst a = process.argv.slice(2);\nif (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.0.4 (old)"); process.exit(0); }\nprocess.exit(0);\n',
-    );
-    chmodSync(join(fakeBin, "bd"), 0o755);
-    const dir = await tmp("anton-init-");
-    gitInit(dir, true);
-    const r = runInit(dir);
-    expect(r.status).toBe(1);
-    expect(r.stdout).toContain("bd 1.0.4 is too old");
-    expect(r.stdout).toContain("1.1.0");
-    expect(r.stdout).toContain("migration.md");
-  });
-
-  it("doctor's prereq check flags a too-old bd (anton-qwsq)", () => {
-    writeFileSync(
-      join(fakeBin, "bd"),
-      '#!/usr/bin/env node\nconst a = process.argv.slice(2);\nif (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.0.4 (old)"); process.exit(0); }\nprocess.exit(0);\n',
-    );
-    chmodSync(join(fakeBin, "bd"), 0o755);
-    const r = spawnSync(process.execPath, [CLI, "doctor"], {
-      encoding: "utf8",
-      env: { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`, ANTON_DB: dbPath },
-    });
-    expect(r.status).toBe(1);
-    expect(r.stdout).toContain("need >= 1.1.0");
-  });
-
-  it("configures beads team-config + registers the repo on a fresh repo (fresh-init)", async () => {
-    const dir = await tmp("anton-init-");
-    gitInit(dir, true);
-
-    const r = runInit(dir);
-    expect(r.status).toBe(0);
-    expect(r.stdout).toContain("beads team-config enforced");
-    expect(r.stdout).toContain("registered with anton");
-
-    // config.yaml carries the enforced Dolt-first keys…
-    const cfg = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
-    expect(cfg).toContain("dolt.auto-commit: on");
-    // export.auto AND export.git-add are both disabled — export.auto stops the periodic JSONL
-    // regeneration itself, export.git-add only stops staging it (anton-1th).
-    expect(cfg).toContain("export.auto: false");
-    expect(cfg).toContain("export.git-add: false");
-    // …and .gitignore untracks the derived exports + Dolt runtime state.
-    const gi = await readFile(join(dir, ".beads", ".gitignore"), "utf8");
-    for (const e of ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]) {
-      expect(gi).toContain(e);
-    }
-    // The .product/ layer is scaffolded so /shape + /scan-triage aren't left in a vacuum.
-    expect(r.stdout).toContain("scaffolded .product/");
-    expect(existsSync(join(dir, ".product", "PRODUCT.md"))).toBe(true);
-    expect(existsSync(join(dir, ".product", "principles.md"))).toBe(true);
-    // The repo is registered exactly once in the (temp) anton.db.
-    expect(projectCount(resolve(dir))).toBe(1);
-  });
-
-  it("installs the required skills into the repo's own .claude/, no-clobber on re-run (skills-install)", async () => {
-    const dir = await tmp("anton-init-");
-    gitInit(dir, true);
-
-    const first = runInit(dir);
-    expect(first.status).toBe(0);
-    // The required runtime skills land in the PROJECT .claude/ — not just the global ~/.claude that
-    // `anton setup` provisions (anton-jvsd).
-    for (const name of REQUIRED_SKILLS) {
-      expect(existsSync(join(dir, ".claude", "skills", name, "SKILL.md"))).toBe(true);
-    }
-
-    // Re-run is a no-op: a pre-existing (user-modified) skill file is never overwritten.
-    const marker = join(dir, ".claude", "skills", "bd", "SKILL.md");
-    const edited = (await readFile(marker, "utf8")) + "\n<!-- user edit -->\n";
-    writeFileSync(marker, edited);
-    const second = runInit(dir);
-    expect(second.status).toBe(0);
-    expect(await readFile(marker, "utf8")).toBe(edited);
-  });
-
-  it("hydrates a fresh clone via bd bootstrap, then enforces team-config (fresh-clone)", async () => {
-    const dir = await tmp("anton-init-");
-    gitInit(dir, true);
-    // A fresh clone: .beads/config.yaml arrived via git, but the gitignored local Dolt DB
-    // (.beads/dolt/) never travels with the clone — the signal that init must bootstrap, not re-init.
-    mkdirSync(join(dir, ".beads"), { recursive: true });
-    writeFileSync(join(dir, ".beads", "config.yaml"), "# beads config (cloned)\nprefix: ex\n");
-
-    const r = runInit(dir);
-    expect(r.status).toBe(0);
-    // bd bootstrap ran (not bd init) — its marker + the hydrated local Dolt DB are present.
-    expect(existsSync(join(dir, ".beads", ".fake-bootstrapped"))).toBe(true);
-    expect(existsSync(join(dir, ".beads", "dolt"))).toBe(true);
-    expect(r.stdout).toContain("bd bootstrap");
-    // Team-config is still enforced on top of the hydrated workspace.
-    const cfg = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
-    expect(cfg).toContain("dolt.auto-commit: on");
-    expect(cfg).toContain("export.auto: false");
-  });
-
-  it("is a no-op on re-run — no clobber, no duplicate registration (idempotent)", async () => {
-    const dir = await tmp("anton-init-");
-    gitInit(dir, true);
-
-    const first = runInit(dir);
-    expect(first.status).toBe(0);
-    const cfgAfterFirst = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
-
-    const second = runInit(dir);
-    expect(second.status).toBe(0);
-    expect(second.stdout).toContain("already registered");
-    // config.yaml is byte-identical — no key re-written on the second pass.
-    expect(await readFile(join(dir, ".beads", "config.yaml"), "utf8")).toBe(cfgAfterFirst);
-    // Still exactly one project row (idempotent by repo_path).
-    expect(projectCount()).toBe(1);
-  });
-
-  it("patches a drifted config.yaml key without clobbering the file (config-drift patch)", async () => {
-    const dir = await tmp("anton-init-");
-    gitInit(dir, true);
-    // A pre-existing workspace whose config.yaml has DRIFTED values + a missing key. Because .beads/
-    // is present WITH a local Dolt DB, init skips `bd init`/`bd bootstrap` and only enforces the
-    // team-config keys. export.auto: true is the inherited bd default anton must flip to false (anton-1th).
-    mkdirSync(join(dir, ".beads", "dolt"), { recursive: true });
-    writeFileSync(join(dir, ".beads", "config.yaml"), "# beads config\ndolt.auto-commit: off\nexport.auto: true\n");
-
-    const r = runInit(dir);
-    expect(r.status).toBe(0);
-
-    const cfg = await readFile(join(dir, ".beads", "config.yaml"), "utf8");
-    expect(cfg).toContain("dolt.auto-commit: on"); // drift patched in place…
-    expect(cfg).not.toContain("dolt.auto-commit: off"); // …not left alongside the stale value
-    expect(cfg).toContain("export.auto: false"); // export.auto=true flipped to false…
-    expect(cfg).not.toContain("export.auto: true"); // …patched in place, not duplicated
-    expect((cfg.match(/^export\.auto:/gm) ?? []).length).toBe(1); // exactly one export.auto key
-    expect(cfg).toContain("export.git-add: false"); // missing key appended
-
-    // export.auto=false is enforced BEFORE any other `bd config set` write (anton-1th): each write is
-    // itself a bd command that regenerates the JSONL while export.auto is still true, so disabling it
-    // first closes that window. dolt.auto-commit here is drifted (off), so it too issues a write.
-    const order = (await readFile(join(dir, ".beads", ".fake-config-set-order"), "utf8")).trim().split("\n");
-    expect(order.indexOf("export.auto")).toBeGreaterThanOrEqual(0);
-    expect(order.indexOf("export.auto")).toBeLessThan(order.indexOf("dolt.auto-commit"));
-  });
-});
-
-describe("normalizeRemoteUrl", () => {
-  it("equates the git-origin form with what bd dolt remote list reports", () => {
-    // bd rewrites scp form to git+ssh:// with a literal /./ path segment.
-    expect(normalizeRemoteUrl("git@github.com:henriblancke/anton.git")).toBe(
-      normalizeRemoteUrl("git+ssh://git@github.com/./henriblancke/anton.git"),
-    );
-    expect(normalizeRemoteUrl("https://github.com/org/repo.git")).toBe(
-      normalizeRemoteUrl("git+https://github.com/org/repo.git"),
-    );
-    expect(normalizeRemoteUrl("/tmp/remote.git")).toBe(normalizeRemoteUrl("git+file:///tmp/remote.git"));
-    expect(normalizeRemoteUrl("https://github.com/a/b")).not.toBe(normalizeRemoteUrl("https://github.com/a/c"));
-  });
-});
-
-describe("configureBeadsDoltSync (bd/git stubbed — CI has no bd)", () => {
-  let repoDir: string;
-  afterEach(async () => {
-    if (repoDir) await rm(repoDir, { recursive: true, force: true });
-  });
-
-  /** A fake exec keyed by "<cmd> <subcommand…>" prefix; records every invocation. Unless a test
-   * overrides it, `sync.remote` reads as unset — bd's real "(not set…)" prose with exit 0. */
-  function fakeExec(responses: Record<string, { status: number; stdout?: string; stderr?: string }>) {
-    const calls: string[] = [];
-    const withDefaults = {
-      "bd config get sync.remote": { status: 0, stdout: "sync.remote (not set in config.yaml)\n" },
-      ...responses,
-    };
-    const exec = (cmd: string, args: string[]) => {
-      const line = [cmd, ...args].join(" ");
-      calls.push(line);
-      for (const [prefix, res] of Object.entries(withDefaults)) {
-        if (line.startsWith(prefix)) return Object.assign({ stdout: "", stderr: "" }, res);
-      }
-      throw new Error(`unexpected exec: ${line}`);
-    };
-    return { exec, calls };
-  }
-
-  async function beadsRepo(): Promise<string> {
-    const dir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
-    await mkdir(join(dir, ".beads"), { recursive: true });
-    return dir;
-  }
-
-  it("skips (no-workspace) when the root has no .beads", async () => {
-    repoDir = await mkdtemp(join(tmpdir(), "anton-dolt-"));
-    const { exec } = fakeExec({});
-    expect(configureBeadsDoltSync({ repoDir, exec })).toEqual({ status: "no-workspace" });
-  });
-
-  it("fails loud (no-remote) when .beads exists but git has no origin", async () => {
-    repoDir = await beadsRepo();
-    const { exec } = fakeExec({
-      "git remote get-url origin": { status: 2, stderr: "error: No such remote 'origin'" },
-    });
-    expect(configureBeadsDoltSync({ repoDir, exec })).toEqual({ status: "no-remote" });
-  });
-
-  it("adds the git origin as Dolt remote, hydrates (pull), and pushes refs/dolt", async () => {
-    repoDir = await beadsRepo();
-    const { exec, calls } = fakeExec({
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
-      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
-      "bd dolt remote add origin": { status: 0, stdout: 'Added remote "origin"' },
-      "bd dolt pull": { status: 0, stdout: "Everything up-to-date." },
-      "bd dolt push": { status: 0, stdout: "Push complete." },
-      "git ls-remote origin refs/dolt/data": { status: 0, stdout: "abc123\trefs/dolt/data\n" },
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({
-      status: "configured",
-      url: "git@github.com:org/repo.git",
-      pulled: true,
-      pushed: true,
-    });
-    expect(calls).toContain("bd dolt remote add origin git@github.com:org/repo.git");
-    // A fresh clone has no JSONL to hydrate from (anton-hg9): the board must come from
-    // refs/dolt/data, so the pull runs before the push can publish anything local.
-    expect(calls.indexOf("bd dolt pull")).toBeLessThan(calls.indexOf("bd dolt push"));
-  });
-
-  it("treats a failed pull as benign (first-ever setup: no refs/dolt/data on the remote)", async () => {
-    repoDir = await beadsRepo();
-    const { exec } = fakeExec({
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
-      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
-      "bd dolt remote add origin": { status: 0 },
-      "bd dolt pull": { status: 1, stderr: "remote ref refs/dolt/data not found" },
-      "bd dolt push": { status: 0 },
-      "git ls-remote origin refs/dolt/data": { status: 0, stdout: "abc123\trefs/dolt/data\n" },
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    // First publish: nothing hydrated, but the push landed refs/dolt/data on origin.
-    expect(r).toMatchObject({ status: "configured", pulled: false, pushed: true, firstPublish: true });
-  });
-
-  it("stops before push when pull fails for a reason other than a missing first-publish ref", async () => {
-    repoDir = await beadsRepo();
-    const { exec, calls } = fakeExec({
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
-      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
-      "bd dolt remote add origin": { status: 0 },
-      "bd dolt pull": { status: 1, stderr: "authentication required" },
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({ status: "error", detail: expect.stringContaining("authentication required") });
-    expect(calls.some((line) => line === "bd dolt push")).toBe(false);
-  });
-
-  it("is idempotent: skips add+push when origin already matches (bd's rewritten form)", async () => {
-    repoDir = await beadsRepo();
-    const { exec, calls } = fakeExec({
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
-      "bd dolt remote list": {
-        status: 0,
-        stdout: "origin               git+ssh://git@github.com/./org/repo.git\n",
-      },
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toEqual({ status: "already", url: "git@github.com:org/repo.git" });
-    expect(calls.some((l) => l.startsWith("bd dolt remote add"))).toBe(false);
-    expect(calls.some((l) => l.startsWith("bd dolt push"))).toBe(false);
-  });
-
-  it("respects a declared sync.remote (aws://) over the git origin — dynamic per project", async () => {
-    repoDir = await beadsRepo();
-    const declared = "aws://[optura-beads-dolt-manifest:optura-beads]/some-project";
-    const { exec, calls } = fakeExec({
-      "bd config get sync.remote": { status: 0, stdout: `sync.remote = ${declared}\n` },
-      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
-      "bd dolt remote add origin": { status: 0 },
-      "bd dolt pull": { status: 0 },
-      "bd dolt push": { status: 0 },
-      // A declared non-git remote isn't verifiable via `git ls-remote origin` — no ls-remote call.
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({ status: "configured", url: declared });
-    expect(calls).toContain(`bd dolt remote add origin ${declared}`);
-    // git origin is never consulted when the beads config declares the remote — neither to read the
-    // URL nor to verify the push (a non-git remote isn't inspectable via `git ls-remote origin`).
-    expect(calls.some((l) => l.startsWith("git remote get-url"))).toBe(false);
-    expect(calls.some((l) => l.startsWith("git ls-remote"))).toBe(false);
-  });
-
-  it("treats bd's '(not set in config.yaml)' prose as absent — exit code is 0 either way", async () => {
-    repoDir = await beadsRepo();
-    const { exec, calls } = fakeExec({
-      "bd config get sync.remote": { status: 0, stdout: "sync.remote (not set in config.yaml)\n" },
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
-      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
-      "bd dolt remote add origin": { status: 0 },
-      "bd dolt pull": { status: 0 },
-      "bd dolt push": { status: 0 },
-      "git ls-remote origin refs/dolt/data": { status: 0, stdout: "abc123\trefs/dolt/data\n" },
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({ status: "configured", url: "git@github.com:org/repo.git" });
-    expect(calls).toContain("bd dolt remote add origin git@github.com:org/repo.git");
-  });
-
-  it("re-points a stale Dolt remote at the current git origin", async () => {
-    repoDir = await beadsRepo();
-    const { exec, calls } = fakeExec({
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/new.git\n" },
-      "bd dolt remote list": { status: 0, stdout: "origin  git+ssh://git@github.com/./org/old.git\n" },
-      "bd dolt remote add origin": { status: 0 },
-      "bd dolt pull": { status: 0 },
-      "bd dolt push": { status: 0 },
-      "git ls-remote origin refs/dolt/data": { status: 0, stdout: "abc123\trefs/dolt/data\n" },
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({ status: "configured", url: "git@github.com:org/new.git" });
-    expect(calls).toContain("bd dolt remote add origin git@github.com:org/new.git");
-  });
-
-  it("reports a failed push (pushed: false) without hiding the remote configuration", async () => {
-    repoDir = await beadsRepo();
-    const { exec, calls } = fakeExec({
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
-      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
-      "bd dolt remote add origin": { status: 0 },
-      "bd dolt pull": { status: 0 },
-      "bd dolt push": { status: 1, stderr: "Error: push to origin/main: auth required" },
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    // The push is retried a bounded number of times before giving up (non-fatal).
-    expect(r).toMatchObject({ status: "configured", pushed: false, pushAttempts: 3 });
-    expect((r as { pushOutput: string }).pushOutput).toContain("auth required");
-    expect(calls.filter((l) => l === "bd dolt push").length).toBe(3);
-  });
-
-  it("flags a failed FIRST publish loud (firstPublish) — an empty remote must not pass silently", async () => {
-    repoDir = await beadsRepo();
-    const { exec } = fakeExec({
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
-      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
-      "bd dolt remote add origin": { status: 0 },
-      // Fresh origin: nothing to hydrate, so this is the first publish…
-      "bd dolt pull": { status: 1, stderr: "remote ref refs/dolt/data not found" },
-      // …and it never lands (no push access) — the remote stays empty.
-      "bd dolt push": { status: 1, stderr: "auth required" },
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({ status: "configured", pulled: false, pushed: false, firstPublish: true });
-  });
-
-  it("retries when a push exits 0 but the ref never lands (verify beats a no-op push)", async () => {
-    repoDir = await beadsRepo();
-    const { exec, calls } = fakeExec({
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
-      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
-      "bd dolt remote add origin": { status: 0 },
-      "bd dolt pull": { status: 0 },
-      "bd dolt push": { status: 0 }, // exits 0…
-      "git ls-remote origin refs/dolt/data": { status: 0, stdout: "" }, // …but nothing on origin
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    // Verification fails ⇒ not treated as published; retried up to the cap.
-    expect(r).toMatchObject({ status: "configured", pushed: false, pushAttempts: 3 });
-    expect(calls.filter((l) => l === "bd dolt push").length).toBe(3);
-  });
-
-  it("retries and reports failure when remote verification itself fails", async () => {
-    repoDir = await beadsRepo();
-    const { exec, calls } = fakeExec({
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
-      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
-      "bd dolt remote add origin": { status: 0 },
-      "bd dolt pull": { status: 0 },
-      "bd dolt push": { status: 0 },
-      "git ls-remote origin refs/dolt/data": { status: 128, stderr: "authentication required" },
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({ status: "configured", pushed: false, pushAttempts: 3 });
-    expect(calls.filter((line) => line === "bd dolt push").length).toBe(3);
-  });
-
-  it("surfaces a bd dolt remote add failure as an error", async () => {
-    repoDir = await beadsRepo();
-    const { exec } = fakeExec({
-      "git remote get-url origin": { status: 0, stdout: "git@github.com:org/repo.git\n" },
-      "bd dolt remote list": { status: 0, stdout: "No remotes configured.\n" },
-      "bd dolt remote add origin": { status: 1, stderr: "dolt server unreachable" },
-    });
-    const r = configureBeadsDoltSync({ repoDir, exec });
-    expect(r).toMatchObject({ status: "error" });
-    expect((r as { detail: string }).detail).toContain("dolt server unreachable");
-  });
-});
-
-describe("fetchLatestRelease", () => {
-  const TOKEN_VARS = ["ANTON_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] as const;
-  let realFetch: typeof globalThis.fetch;
-  let savedTokens: Record<string, string | undefined>;
-
-  beforeEach(() => {
-    realFetch = globalThis.fetch;
-    // Clear token env so header assertions aren't polluted by a token CI itself sets.
-    savedTokens = {};
-    for (const name of TOKEN_VARS) {
-      savedTokens[name] = process.env[name];
-      delete process.env[name];
-    }
-  });
-
-  afterEach(() => {
-    globalThis.fetch = realFetch;
-    for (const name of TOKEN_VARS) {
-      if (savedTokens[name] === undefined) delete process.env[name];
-      else process.env[name] = savedTokens[name];
-    }
-  });
-
-  /** Minimal Response-shaped stub with a case-insensitive header lookup. */
-  function fakeResponse({
-    ok,
-    status,
-    headers = {},
-    body,
-  }: {
-    ok: boolean;
-    status: number;
-    headers?: Record<string, string>;
-    body?: unknown;
-  }) {
-    const lower = new Map(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
-    // Only the fields fetchLatestRelease reads; cast past the full Response shape.
-    return {
-      ok,
-      status,
-      headers: { get: (name: string) => lower.get(name.toLowerCase()) ?? null },
-      json: async () => body,
-    } as unknown as Response;
-  }
-
-  it("returns the release on a 200", async () => {
-    const release = { tag_name: "v1.2.3", assets: [] };
-    globalThis.fetch = (async () => fakeResponse({ ok: true, status: 200, body: release })) as typeof fetch;
-    const result = await fetchLatestRelease();
-    expect(result).toEqual({ release });
-  });
-
-  it("maps 403 + x-ratelimit-remaining:0 to a rate_limit error carrying the reset time", async () => {
-    globalThis.fetch = (async () =>
-      fakeResponse({
-        ok: false,
-        status: 403,
-        headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1700000000" },
-      })) as typeof fetch;
-    const result = await fetchLatestRelease();
-    expect(result).toEqual({ error: { kind: "rate_limit", reset: 1700000000 } });
-  });
-
-  it("maps a timeout/AbortError to a timeout error", async () => {
-    globalThis.fetch = (async () => {
-      const err = new Error("The operation timed out.");
-      err.name = "TimeoutError";
-      throw err;
-    }) as typeof fetch;
-    const result = await fetchLatestRelease();
-    expect(result).toEqual({ error: { kind: "timeout" } });
-  });
-
-  it("maps a 404 to a not_found error", async () => {
-    globalThis.fetch = (async () => fakeResponse({ ok: false, status: 404 })) as typeof fetch;
-    const result = await fetchLatestRelease();
-    expect(result).toEqual({ error: { kind: "not_found" } });
-  });
-
-  it("sends an Authorization header when a token env var is set, and none when unset", async () => {
-    let capturedHeaders: Record<string, string> = {};
-    globalThis.fetch = (async (_url: string, init: RequestInit) => {
-      capturedHeaders = (init.headers ?? {}) as Record<string, string>;
-      return fakeResponse({ ok: true, status: 200, body: { tag_name: "v1.0.0" } });
-    }) as typeof fetch;
-
-    // No token set (cleared in beforeEach) → no Authorization header.
-    await fetchLatestRelease();
-    expect(capturedHeaders.Authorization).toBeUndefined();
-
-    // Token set → Bearer header present.
-    process.env.ANTON_GITHUB_TOKEN = "secret-token";
-    await fetchLatestRelease();
-    expect(capturedHeaders.Authorization).toBe("Bearer secret-token");
-  });
-});
-
 // `anton board-check` against a STUB `bd` on PATH — the same process-boundary seam the init tests
 // use. What's under test is the READ, not the tier rules (those are unit-tested off literal boards
 // in src/lib/beads/structure.test.ts): which bd invocations the checker survives.
 describe("anton board-check (bd stubbed on PATH)", () => {
-  const cleanups: string[] = [];
+  const dirs = tempDirs();
   let repo: string;
-
-  async function tmp(prefix: string): Promise<string> {
-    const d = await mkdtemp(join(tmpdir(), prefix));
-    cleanups.push(d);
-    return d;
-  }
 
   /** A `bd` whose `list` serves BOARD, optionally refusing `--status all` the way lean builds do. */
   async function fakeBd(board: unknown[], { rejectsStatusAll = false } = {}): Promise<string> {
-    const bin = await tmp("anton-bdbin-");
+    const bin = await dirs.make("anton-bdbin-");
     const open = board.filter((b) => (b as { status?: string }).status !== "closed");
     const closed = board.filter((b) => (b as { status?: string }).status === "closed");
-    writeFileSync(
-      join(bin, "bd"),
+    writeFakeBd(
+      bin,
       [
         "#!/usr/bin/env node",
         "const a = process.argv.slice(2);",
@@ -1420,11 +157,10 @@ describe("anton board-check (bd stubbed on PATH)", () => {
         "process.exit(0);",
       ].join("\n"),
     );
-    chmodSync(join(bin, "bd"), 0o755);
     return bin;
   }
 
-  function runCheck(bin: string | null) {
+  function runCheck(bin: string | null, extraEnv: Record<string, string> = {}) {
     return spawnSync(process.execPath, [CLI, "board-check", repo], {
       encoding: "utf8",
       // A PATH holding ONLY the stub (plus node, which the stub's shebang resolves through) — so
@@ -1432,19 +168,18 @@ describe("anton board-check (bd stubbed on PATH)", () => {
       // a null `stderr`.
       env: {
         ...process.env,
+        ...extraEnv,
         PATH: [bin, dirname(process.execPath)].filter(Boolean).join(delimiter),
       },
     });
   }
 
   beforeEach(async () => {
-    repo = await tmp("anton-boardcheck-");
+    repo = await dirs.make("anton-boardcheck-");
     mkdirSync(join(repo, ".beads"), { recursive: true });
   });
 
-  afterEach(async () => {
-    for (const d of cleanups.splice(0)) await rm(d, { recursive: true, force: true });
-  });
+  afterEach(dirs.cleanup);
 
   const HEALTHY = [
     { id: "e1", issue_type: "epic", status: "open" },
@@ -1479,6 +214,41 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     expect(r.status).toBe(1);
   });
 
+  // The form rate belongs to `bun scripts/contract-report.ts` alone (anton-5ltn). board-check judges
+  // TIERS, and its advisory stream stays that signal: the board carries ~104 beads whose rubric lives
+  // only in bd's field, and printing those here would bury the handful of tier faults this command
+  // exists to show. One board described two ways — the output may not move.
+  it("says nothing about description form, however the beads are written", async () => {
+    const SHAPED = [
+      "## Goal",
+      "Ship it.",
+      "## Acceptance Criteria",
+      "- [ ] it works",
+      "## Context",
+      "touches: nothing",
+      "## Out of scope",
+      "- the other thing",
+      "## Verify",
+      "- a test covers it",
+    ].join("\n");
+    // A lone ticket under a feature: an ADVISORY tier fault, so the stream under test is non-empty.
+    const board = [
+      { id: "e1", issue_type: "epic", status: "open" },
+      { id: "f1", issue_type: "feature", status: "open", parent: "e1" },
+      { id: "t1", issue_type: "task", status: "open", parent: "f1" },
+    ];
+    const described = board.map((b) => ({ ...b, description: SHAPED }));
+    // The drifted shape: same beads, rubric in bd's field only and no contract sections at all.
+    const drifted = board.map((b) => ({ ...b, acceptance_criteria: "- [ ] it works" }));
+
+    const formed = runCheck(await fakeBd(described));
+    const bare = runCheck(await fakeBd(drifted));
+    expect(formed.stdout).toContain("[feature-under-ticket-budget]");
+    expect(bare.stdout).toBe(formed.stdout);
+    expect(bare.status).toBe(0);
+    expect(formed.status).toBe(0);
+  });
+
   // The ENOENT is on `error`, never on `stderr` — reporting stderr alone printed a bare failure and
   // left a user without bd installed nothing to act on.
   it("says bd is missing rather than failing with an empty reason", () => {
@@ -1486,65 +256,56 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     expect(r.stderr).toContain("bd not found");
     expect(r.status).toBe(1);
   });
-});
 
-describe("staleSkills", () => {
-  const cleanups: string[] = [];
+  /**
+   * board-check's spawn is project-scoped like every other bd anton runs (anton-ffmw.1, PR #174
+   * review). It takes MANY repos in one invocation, so an ambient `BEADS_DOLT_*` — a launch
+   * directory's `.envrc` exported for some other project — would have each of them listed out of
+   * whichever database that names, and a project whose account has its own
+   * `BEADS_DOLT_PASSWORD_<USER>` would never receive it and simply fail to authenticate.
+   *
+   * Asserted against a real stub on PATH, because what is under test is the environment a real
+   * spawn receives — an injected exec would prove nothing about it.
+   */
+  it("strips ambient project identity and delivers the per-user password to its bd", async () => {
+    writeFileSync(
+      join(repo, ".beads", "metadata.json"),
+      JSON.stringify({
+        dolt_mode: "server",
+        dolt_server_host: "dolt.example.dev",
+        dolt_server_port: 3306,
+        dolt_server_user: "beads",
+        dolt_database: "this-project",
+      }),
+    );
+    const bin = await dirs.make("anton-bdenv-");
+    const log = join(bin, "env.json");
+    writeFakeBd(
+      bin,
+      [
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        'const seen = Object.fromEntries(Object.entries(process.env).filter(([k]) => k.startsWith("BEADS_DOLT_")));',
+        `fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify(seen));`,
+        "console.log(JSON.stringify([]));",
+        "process.exit(0);",
+      ].join("\n"),
+    );
 
-  async function tmp(prefix: string): Promise<string> {
-    const d = await mkdtemp(join(tmpdir(), prefix));
-    cleanups.push(d);
-    return d;
-  }
-
-  afterEach(async () => {
-    for (const d of cleanups.splice(0)) await rm(d, { recursive: true, force: true });
-  });
-
-  /** A skill source tree with one skill, plus an install root holding a copy of it. */
-  async function fixture(body: string | ((dir: string) => void)) {
-    const src = await tmp("anton-skillsrc-");
-    const root = await tmp("anton-skillroot-");
-    mkdirSync(join(src, "bd"), { recursive: true });
-    writeFileSync(join(src, "bd", "SKILL.md"), "---\nname: bd\nversion: bundled-stamp\n---\n\nbundled\n");
-    const installed = join(root, ".claude", "skills", "bd");
-    mkdirSync(installed, { recursive: true });
-    if (typeof body === "string") writeFileSync(join(installed, "SKILL.md"), body);
-    else body(installed);
-    return { src, root };
-  }
-
-  const check = async (src: string, root: string) =>
-    staleSkills(src, { claudeRoot: await tmp("anton-empty-"), projectRoot: root });
-
-  it("reports a project-scope skill that differs from the bundle", async () => {
-    const { src, root } = await fixture("frozen at an old release\n");
-    expect(await check(src, root)).toEqual([
-      { scope: "project", name: "bd", state: "unstamped", installed: null, bundled: "bundled-stamp" },
-    ]);
-  });
-
-  // The state is the whole point: it decides whether the fix anton prints is "re-run setup" or
-  // "your call — --force-skills". An untouched copy of another release is anton's to refresh…
-  it("calls an untouched copy of another release outdated", async () => {
-    const { src, root } = await fixture((dir) => seedOtherRelease(dir, "an older release\n"));
-    const [drift] = await check(src, root);
-    expect(drift.state).toBe("outdated");
-    expect(drift.bundled).toBe("bundled-stamp");
-  });
-
-  // …while a stamped copy whose content no longer matches its stamp was edited by hand.
-  it("calls a hand-edited copy modified", async () => {
-    const { src, root } = await fixture((dir) => {
-      seedOtherRelease(dir, "an older release\n");
-      writeFileSync(join(dir, "SKILL.md"), readFileSync(join(dir, "SKILL.md"), "utf8") + "my note\n");
+    runCheck(bin, {
+      // Another project's identity and the shared credential, as an .envrc would export them.
+      BEADS_DOLT_SERVER_DATABASE: "someone-elses-board",
+      BEADS_DOLT_SERVER_HOST: "elsewhere.example.dev",
+      BEADS_DOLT_PASSWORD: "shared-account-secret",
+      BEADS_DOLT_PASSWORD_BEADS: "this-projects-secret",
     });
-    expect((await check(src, root))[0].state).toBe("modified");
-  });
 
-  it("stays silent when the installed copy matches", async () => {
-    const { src, root } = await fixture("---\nname: bd\nversion: bundled-stamp\n---\n\nbundled\n");
-    expect(await check(src, root)).toEqual([]);
+    const seen = JSON.parse(readFileSync(log, "utf8")) as Record<string, string>;
+    // Identity is stripped, so THIS repo's metadata.json decides which database is opened.
+    expect(seen.BEADS_DOLT_SERVER_DATABASE).toBeUndefined();
+    expect(seen.BEADS_DOLT_SERVER_HOST).toBeUndefined();
+    // ...and the credential is the one this project's account needs, not the ambient fallback.
+    expect(seen.BEADS_DOLT_PASSWORD).toBe("this-projects-secret");
   });
 });
 
@@ -1552,17 +313,9 @@ describe("staleSkills", () => {
 // sees the user-level ~/.claude shadow copy every plain `claude` session resolves (anton-gsyh), and
 // it must report it without ever writing to it.
 describe("anton doctor — skill drift", () => {
-  const cleanups: string[] = [];
+  const dirs = tempDirs();
 
-  async function tmp(prefix: string): Promise<string> {
-    const d = await mkdtemp(join(tmpdir(), prefix));
-    cleanups.push(d);
-    return d;
-  }
-
-  afterEach(async () => {
-    for (const d of cleanups.splice(0)) await rm(d, { recursive: true, force: true });
-  });
+  afterEach(dirs.cleanup);
 
   /** Run `anton doctor` with HOME and cwd pointed at throwaway roots so both scopes are ours. */
   function runDoctor(home: string, cwd: string) {
@@ -1582,10 +335,10 @@ describe("anton doctor — skill drift", () => {
   }
 
   it("warns on a user-level copy that predates stamps, and does not touch it", async () => {
-    const home = await tmp("anton-home-");
+    const home = await dirs.make("anton-home-");
     const path = seedCopy(home, (dir) => writeFileSync(join(dir, "SKILL.md"), "# the pre-tier copy\n"));
 
-    const r = runDoctor(home, await tmp("anton-cwd-"));
+    const r = runDoctor(home, await dirs.make("anton-cwd-"));
 
     expect(r.stdout).toContain("bd (global)");
     expect(r.stdout).toContain("predates version stamps");
@@ -1594,8 +347,8 @@ describe("anton doctor — skill drift", () => {
   });
 
   it("names an untouched copy of another release as refreshable by a plain re-run", async () => {
-    const home = await tmp("anton-home-");
-    const cwd = await tmp("anton-cwd-");
+    const home = await dirs.make("anton-home-");
+    const cwd = await dirs.make("anton-cwd-");
     const path = seedCopy(cwd, (dir) => seedOtherRelease(dir, "# an older release\n"));
     const before = readFileSync(path, "utf8");
 
@@ -1608,7 +361,856 @@ describe("anton doctor — skill drift", () => {
   });
 
   it("says nothing is drifted when no copy is installed at either scope", async () => {
-    const r = runDoctor(await tmp("anton-home-"), await tmp("anton-cwd-"));
+    const r = runDoctor(await dirs.make("anton-home-"), await dirs.make("anton-cwd-"));
     expect(r.stdout).toContain("installed copies match the bundle");
+  });
+});
+
+/**
+ * Whose server the liveness evidence belongs to (anton-pzfb), and which servers a live record is
+ * allowed to speak for (PR #217). Both signals are shared across installs — the pidfile sits in the
+ * global state dir, and any anton can hold a port — so each mode may read only its own, and a
+ * stamped record answers for its own process alone. The end-to-end cases below all run from this
+ * source checkout, which is why bundle mode is asserted on the unit here.
+ */
+describe("anton doctor — servers no record accounts for", () => {
+  const answers = () => Promise.resolve(true);
+  const silent = () => Promise.resolve(false);
+  const listening = (...pids: number[]) => () => pids.map((pid, i) => ({ pid, port: 4000 + i }));
+
+  it("trusts only the daemon pidfile in bundle mode", async () => {
+    expect(await unstampedServers({ isBundle: true, pid: () => 42, servers: listening(7), answering: answers })).toEqual([42]);
+    // A separate source checkout serving anton's page is not this bundle's stopped daemon.
+    expect(await unstampedServers({ isBundle: true, pid: () => null, servers: listening(7), answering: answers })).toEqual([]);
+  });
+
+  it("trusts only this checkout's listeners in source mode", async () => {
+    expect(await unstampedServers({ isBundle: false, pid: () => 42, servers: listening(7), answering: answers })).toEqual([7]);
+    // `anton dev` writes no pidfile, so the one on disk is the installed bundle's.
+    expect(await unstampedServers({ isBundle: false, pid: () => 42, servers: listening(7), answering: silent })).toEqual([]);
+  });
+
+  // A record proves what ONE process is running. A second, older server — the pre-stamp one an
+  // upgrade leaves behind on another port — is exactly what nothing else can see.
+  it("keeps the servers a live record already speaks for out of the answer", async () => {
+    const livePids = new Set([7]);
+    expect(await unstampedServers({ isBundle: false, livePids, servers: listening(7), answering: answers })).toEqual([]);
+    expect(await unstampedServers({ isBundle: false, livePids, servers: listening(7, 9), answering: answers })).toEqual([9]);
+    expect(await unstampedServers({ isBundle: true, livePids: new Set([42]), pid: () => 42, answering: answers })).toEqual([]);
+  });
+});
+
+/**
+ * The daemon pidfile is a liveness CLAIM, and a pid is not an identity (PR #217). A daemon that
+ * crashed without clearing its pidfile leaves a number the OS hands to something else, and every
+ * caller here acts on it — `anton stop` signals it, doctor names it an unstamped anton and tells the
+ * operator to stop it. So the file carries the pid's birth stamp and the read proves it.
+ */
+describe("the daemon pidfile", () => {
+  const dirs = tempDirs();
+
+  afterEach(dirs.cleanup);
+
+  const pidFile = async () => join(await dirs.make("anton-state-"), "anton.pid");
+
+  // A stamp from THIS machine's birth-time reader naming some other process — the reuse case. The
+  // reader's tag has to be the local one: a stamp from the OTHER reader is not comparable, and so
+  // proves nothing either way (PR #217 review).
+  const reusedStamp = () =>
+    `${(processStartedAt(process.pid) ?? "ps:").split(":", 1)[0]}:a process that has exited`;
+
+  it("answers with the pid it recorded while that process is the one running", async () => {
+    const path = await pidFile();
+    writePidFile(process.pid, path);
+    expect(readFileSync(path, "utf8").split("\n")[0]).toBe(String(process.pid));
+    expect(runningPid(path)).toBe(process.pid);
+  });
+
+  // The reuse case: the pid is alive, and it is not anton's. Answering with it would send `anton
+  // stop` at a stranger.
+  it("does not answer with a live pid that is no longer the process it recorded", async () => {
+    const path = await pidFile();
+    writeFileSync(path, `${process.pid}\n${reusedStamp()}\n`);
+    expect(runningPid(path)).toBeNull();
+    expect(existsSync(path)).toBe(false);
+  });
+
+  // A pidfile written by an older anton carries no stamp. An absence is not evidence — it degrades
+  // to the bare pid check, which is exactly what this always was.
+  it("still answers on the pid alone for a pidfile written before the stamp existed", async () => {
+    const path = await pidFile();
+    writeFileSync(path, String(process.pid));
+    expect(runningPid(path)).toBe(process.pid);
+  });
+
+  it("reads a dead pid as stopped and clears the file", async () => {
+    const path = await pidFile();
+    // Spawned and reaped, so the number named a process and now names nothing.
+    const dead = spawnSync("node", ["-e", "process.exit(0)"]);
+    writeFileSync(path, `${dead.pid}\n`);
+    expect(runningPid(path)).toBeNull();
+    expect(existsSync(path)).toBe(false);
+  });
+
+  /**
+   * What `anton start`, `anton update` and `anton uninstall` act on (PR #217 review). Those three
+   * read a null pid as "nothing is running" and then do something irreversible to a daemon that may
+   * be alive — spawn a duplicate over its pidfile, swap the runtime under it, delete it. So the
+   * unverifiable case is reported as its own state and they abort instead.
+   */
+  describe("a daemon that cannot be verified either way", () => {
+    it("names the recorded pid so a lifecycle command can refuse to act", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(lifecycleVerdict(path, () => null)).toEqual({ pid: null, unverifiable: process.pid });
+    });
+
+    it("names nobody once the read settles it — live, reused, dead, or absent", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(lifecycleVerdict(path).unverifiable).toBeNull();
+
+      writeFileSync(path, `${process.pid}\n${reusedStamp()}\n`);
+      expect(lifecycleVerdict(path).unverifiable).toBeNull();
+
+      const dead = spawnSync("node", ["-e", "process.exit(0)"]);
+      writeFileSync(path, `${dead.pid}\n`);
+      expect(lifecycleVerdict(path).unverifiable).toBeNull();
+
+      expect(lifecycleVerdict(join(await dirs.make("anton-state-"), "absent.pid")).unverifiable).toBeNull();
+    });
+
+    /**
+     * The two fields have to be ONE read (PR #217 review). Split across two, a birth time that
+     * resolves once and fails the next second clears the pre-flight and then reports no daemon —
+     * and `update` swaps the runtime out from under the live server it just decided was absent.
+     */
+    it("answers both halves of the decision from a single birth-time read", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      const reads: number[] = [];
+      // Resolves for the pre-flight, fails for anything asking a second time.
+      const flaky = (pid: number) => {
+        reads.push(pid);
+        return reads.length === 1 ? processStartedAt(pid) : null;
+      };
+
+      const verdict = lifecycleVerdict(path, flaky);
+
+      expect(reads).toHaveLength(1);
+      expect(verdict).toEqual({ pid: process.pid, unverifiable: null });
+      expect(existsSync(path)).toBe(true);
+    });
+  });
+
+  /**
+   * What `anton stop` acts on, in both directions. `runningPid` going quiet is not the daemon
+   * exiting: a birth time that cannot be reread mid-wait leaves a live daemon unnameable, and stop
+   * reading that as death would drop its SIGKILL and delete the pidfile — stranding a server no
+   * later stop can find. Nor is "not gone" proof the pid is still the daemon's: the same silence
+   * over a pid the OS has since reused would aim that SIGKILL at a stranger (PR #217 review). So
+   * the unverifiable case answers neither.
+   */
+  describe("proving the daemon gone", () => {
+    it("proves neither for a pid that is merely unverifiable", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(daemonState(process.pid, path, () => null)).toBe("unproven");
+      expect(existsSync(path)).toBe(true); // and so the file `anton stop` needs is still there
+    });
+
+    it("proves neither once the pidfile names some other daemon", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(daemonState(process.pid + 1, path)).toBe("unproven");
+    });
+
+    it("is running while the recorded process is still the one stop signalled", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(daemonState(process.pid, path)).toBe("running");
+    });
+
+    it("is proven by a dead pid, by a reused one, and by a file that is gone", async () => {
+      const path = await pidFile();
+      const dead = spawnSync("node", ["-e", "process.exit(0)"]);
+      writeFileSync(path, `${dead.pid}\n`);
+      expect(daemonState(dead.pid, path)).toBe("exited");
+
+      writeFileSync(path, `${process.pid}\n${reusedStamp()}\n`);
+      expect(daemonState(process.pid, path)).toBe("exited");
+
+      expect(daemonState(process.pid, join(await dirs.make("anton-state-"), "absent.pid"))).toBe("exited");
+    });
+  });
+
+  /**
+   * `anton stop` reporting success is what `update` and `uninstall` go on to destroy a runtime over
+   * (PR #217 review). Only the unverifiable branches are exercised here: both return before any
+   * signal is sent, so the suite never SIGTERMs its own process to assert them.
+   */
+  describe("stopping a daemon that cannot be verified either way", () => {
+    it("fails rather than reporting a stop it never attempted", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(await cmdStop(path, () => null)).toBe(1);
+      expect(existsSync(path)).toBe(true); // kept, so the next stop can still name the daemon
+    });
+
+    it("reports nothing running only where the pidfile names nobody", async () => {
+      expect(await cmdStop(join(await dirs.make("anton-state-"), "absent.pid"))).toBe(0);
+    });
+
+    it("blocks the lifecycle commands that would destroy the runtime under it", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(await stoppedFor("update", path, () => null)).toBe(false);
+
+      expect(await stoppedFor("uninstall", join(await dirs.make("anton-state-"), "absent.pid"))).toBe(true);
+    });
+  });
+
+  /**
+   * The URL `anton status` prints belongs to the pid it just named. The port used to live in one
+   * note per install, which whatever started LAST overwrote: `anton start --foreground --port 4100`
+   * beside a running daemon made status print the daemon's pid against the foreground server's URL,
+   * and go on printing it after that process exited (PR #217 review). Recorded on the pidfile, the
+   * port is the port of the process being reported, and it is gone when that record is.
+   */
+  describe("the port a status line names", () => {
+    beforeEach(() => {
+      delete process.env.PORT;
+    });
+
+    afterEach(() => {
+      delete process.env.PORT;
+    });
+
+    it("is the one the daemon recorded when it started", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path, "4100");
+      expect(serverPort([], path)).toBe("4100");
+      expect(runningPid(path)).toBe(process.pid); // and the record still proves whose port it is
+    });
+
+    it("is Next's default where the record names no port", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(serverPort([], path)).toBe("3000");
+    });
+
+    // A status line describes a process that is ALREADY running, so this invocation's own
+    // environment cannot outrank the record that process left: `PORT=4200 anton status` combined a
+    // validated daemon pid with a URL nothing was listening on — the very line the pid-scoped port
+    // record exists to prevent (PR #217 review).
+    it("is the recorded one even where this invocation names another port", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path, "4100");
+      process.env.PORT = "4200";
+      expect(serverPort([], path)).toBe("4100");
+      expect(serverPort(["--port", "4300"], path)).toBe("4100");
+    });
+
+    // Only a pidfile written before the port was recorded there leaves the caller's environment as
+    // the best evidence available.
+    it("falls back to this invocation's port where a legacy record names none", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(serverPort(["--port", "4200"], path)).toBe("4200");
+      process.env.PORT = "4300";
+      expect(serverPort([], path)).toBe("4300");
+    });
+
+    it("is gone once the daemon's record is, rather than outliving the server", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path, "4100");
+      rmSync(path);
+      expect(serverPort([], path)).toBe("3000");
+    });
+  });
+});
+
+/**
+ * Port ownership on Linux is read from procfs, not from lsof (anton-pzfb): anton neither installs
+ * lsof nor declares it a prereq, and most distros ship without it — an enumerator that is merely
+ * absent would answer "nothing is listening" about every live source server on those boxes.
+ */
+describe("listeningEndpoints — procfs", () => {
+  const dirs = tempDirs();
+
+  afterEach(dirs.cleanup);
+
+  const row = (portHex: string, inode: string, state = "0A") =>
+    `   0: 0100007F:${portHex} 00000000:0000 ${state} 00000000:00000000 00:00000000 00000000  1000        0 ${inode} 1 0000000000000000 100 0 0 10 0`;
+  const table = (...rows: string[]) =>
+    ["  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode", ...rows, ""].join("\n");
+
+  /** A procfs with the given tcp table, and one process per [pid, inode] holding that socket. */
+  const fakeProc = async (tcp: string, owners: Array<[number, string]> = []) => {
+    const root = await dirs.make("anton-proc-");
+    mkdirSync(join(root, "net"), { recursive: true });
+    writeFileSync(join(root, "net", "tcp"), tcp);
+    for (const [pid, inode] of owners) {
+      mkdirSync(join(root, String(pid), "fd"), { recursive: true });
+      symlinkSync(`socket:[${inode}]`, join(root, String(pid), "fd", "3"));
+    }
+    return root;
+  };
+
+  it("resolves the pid and port of each listening socket", async () => {
+    const root = await fakeProc(table(row("0BB8", "99001"), row("0FA0", "99002")), [
+      [4242, "99001"],
+      [4243, "99002"],
+    ]);
+    expect(procfsListeningEndpoints(root)).toEqual([
+      { pid: 4242, port: 3000 },
+      { pid: 4243, port: 4000 },
+    ]);
+  });
+
+  it("says nothing is listening when no socket is in LISTEN", async () => {
+    const root = await fakeProc(table(row("0BB8", "99001", "01")), [[4242, "99001"]]);
+    expect(procfsListeningEndpoints(root)).toEqual([]);
+  });
+
+  it("cannot say when there is no procfs to read", async () => {
+    expect(procfsListeningEndpoints(await dirs.make("anton-noproc-"))).toBeNull();
+  });
+
+  // "Found, owned by someone else" is not "not listening": the socket is real, so the port is not
+  // free — it just belongs to a process anton cannot attribute, which is no evidence about it.
+  it("names the port but no pid when the socket belongs to a process anton can't read", async () => {
+    // Another user's server: the socket is in the table, but no readable fd links back to it.
+    const root = await fakeProc(table(row("0BB8", "99001")));
+    expect(procfsListeningEndpoints(root)).toEqual([{ pid: null, port: 3000 }]);
+  });
+
+  // One server holds a socket per address family, and both have to resolve back to it — stopping at
+  // the first match would leave whatever it holds beyond that one unattributed.
+  it("attributes every socket a process holds, not just the first", async () => {
+    const root = await fakeProc(table(row("0BB8", "99001"), row("0FA0", "99002")));
+    mkdirSync(join(root, "4242", "fd"), { recursive: true });
+    symlinkSync("socket:[99001]", join(root, "4242", "fd", "3"));
+    symlinkSync("socket:[99002]", join(root, "4242", "fd", "4"));
+    expect(procfsListeningEndpoints(root)).toEqual([
+      { pid: 4242, port: 3000 },
+      { pid: 4242, port: 4000 },
+    ]);
+  });
+});
+
+/**
+ * `anton doctor` on the RUNNING server (anton-pzfb). A server holds the code it booted with, so a
+ * fix can ship, sit on disk, and never run — which is how three nightly scans re-filed a signal two
+ * landed filters already dropped. Doctor is the CLI half of saying so, and like the skill-drift
+ * check beside it, it only ever reports: a restart can kill an in-flight run.
+ */
+describe("anton doctor — stale server build", () => {
+  const dirs = tempDirs();
+
+  afterEach(dirs.cleanup);
+
+  const servers: Server[] = [];
+
+  afterEach(async () => {
+    await Promise.all(servers.splice(0).map((s) => new Promise((done) => s.close(done))));
+  });
+
+  /**
+   * Serve `body` on a free port, so doctor's liveness probe has something real to ask.
+   *
+   * In-process on purpose: the probe now also asks WHERE the listener runs from, and this process's
+   * cwd is the checkout doctor is diagnosing — which is what a source-mode `anton dev` looks like.
+   */
+  async function serve(body: string): Promise<number> {
+    const server = createServer((_req, res) => res.end(body));
+    servers.push(server);
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    return (server.address() as { port: number }).port;
+  }
+
+  const strangers: ChildProcess[] = [];
+
+  afterEach(() => {
+    for (const child of strangers.splice(0)) child.kill();
+  });
+
+  /** The same page served from ANOTHER directory — a second anton install holding this port. */
+  async function serveFrom(body: string, cwd: string): Promise<number> {
+    const script =
+      'require("node:http").createServer((_q, r) => r.end(process.env.BODY)).listen(0, "127.0.0.1", function () {\n' +
+      "  console.log(this.address().port);\n" +
+      "});";
+    const child = spawn(process.execPath, ["-e", script], {
+      cwd,
+      env: { ...process.env, BODY: body },
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    strangers.push(child);
+    child.stdout.setEncoding("utf8");
+    return new Promise((ready) => child.stdout.once("data", (chunk) => ready(Number(String(chunk).trim()))));
+  }
+
+  /**
+   * Point doctor's state dir at a temp dir and leave `record` there as the running server's stamp.
+   *
+   * No port is pinned, because doctor no longer probes one: it enumerates the servers listening
+   * from this checkout (PR #217). A case that must find nothing running therefore serves nothing,
+   * and one that must find a server serves it from this process — whose cwd IS the checkout doctor
+   * is diagnosing, so an `anton dev` of your own in THIS worktree would join the answer.
+   */
+  async function runDoctorWith(
+    record: { pid: number } | ({ pid: number } | null)[] | null,
+    { daemonPid }: { daemonPid?: number } = {},
+  ) {
+    const records = (Array.isArray(record) ? record : [record]).filter((one) => one !== null);
+    const home = await dirs.make("anton-home-");
+    const state = await dirs.make("anton-state-");
+    // Records are named for the process that wrote them, so doctor reads the record and the pid it
+    // claims as one thing — a name that disagrees with the contents names no process at all.
+    for (const one of records) writeFileSync(join(state, `server-build.${one.pid}.json`), JSON.stringify(one));
+    if (daemonPid) writeFileSync(join(state, "anton.pid"), String(daemonPid));
+    // Spawned ASYNCHRONOUSLY on purpose: doctor asks the servers it finds for anton's page, and
+    // `spawnSync` would block this process's event loop — the very loop the stubs above answer from.
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, ANTON_DB: join(state, "anton.db"), ANTON_STATE_DIR: state };
+    const child = spawn(process.execPath, [CLI, "doctor"], { cwd: await dirs.make("anton-cwd-"), env });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.resume();
+    await new Promise((done) => child.on("close", done));
+    return { stdout };
+  }
+
+  // The vitest process itself stands in for the running server: its pid is alive, which is the only
+  // thing that makes a record a claim about NOW rather than a leftover.
+  const running = (over: object) => ({ version: "0.4.0", revision: null, pid: process.pid, bootedAt: Date.now(), ...over });
+
+  /** The identity of the code doctor will read on disk — what a server has to match to be current. */
+  const current = () => ({
+    version: JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).version,
+    revision: spawnSync("git", ["-C", REPO_ROOT, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(),
+  });
+
+  it("names the running build, the one on disk, and the restart that clears it", async () => {
+    const r = await runDoctorWith(running({ version: "0.0.1" }));
+    expect(r.stdout).toContain("is running 0.0.1");
+    expect(r.stdout).toContain(String(JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).version));
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  it("says nothing is running when no record and no daemon exist", async () => {
+    const r = await runDoctorWith(null);
+    expect(r.stdout).toContain("no running server recorded");
+    expect(r.stdout).not.toContain("Restart it");
+  });
+
+  // The pidfile lives under the GLOBAL state dir and only the bundle's daemon writes one, so a
+  // source checkout that read it would call the installed bundle's server its own — and print
+  // source-mode restart instructions for a process `anton stop` owns.
+  it("does not read the installed bundle's daemon as this checkout's server", async () => {
+    const r = await runDoctorWith(null, { daemonPid: process.pid });
+    expect(r.stdout).toContain("no running server recorded");
+    expect(r.stdout).not.toContain("Restart it");
+  });
+
+  // A source checkout's `anton dev` / `anton start` writes no pidfile, so on the first upgrade past
+  // this change — an old server, no record, no daemon — the listener is the only evidence anton
+  // has. Without it doctor calls that exact case "nothing running" and the stale server stays
+  // silent. The port is whatever the stub took, which is the point: nothing on disk names it.
+  it("reports a source-mode server that is up but left no record", async () => {
+    await serve("<html><head><title>anton</title></head>");
+    const r = await runDoctorWith(null);
+    expect(r.stdout).toContain("recorded no build identity");
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  // Any dev server can hold a port. Claiming a stranger's is anton would send the operator to
+  // restart a server that was never up.
+  it("does not claim another app on the port is a stale anton", async () => {
+    await serve("<html><head><title>grafana</title></head>");
+    const r = await runDoctorWith(null);
+    expect(r.stdout).toContain("no running server recorded");
+    expect(r.stdout).not.toContain("Restart it");
+  });
+
+  // Any anton can hold a port, and the page it serves is the same page — so the response alone
+  // attributes a neighbouring install's server (a bundle, a second worktree) to this checkout, and
+  // hands the operator restart instructions for an install they are not in.
+  it("does not claim another anton install's server", async () => {
+    const elsewhere = await dirs.make("anton-elsewhere-");
+    await serveFrom("<html><head><title>anton</title></head>", elsewhere);
+    const r = await runDoctorWith(null);
+    expect(r.stdout).toContain("no running server recorded");
+    expect(r.stdout).not.toContain("Restart it");
+  });
+
+  it("stays silent for a server started from the current checkout", async () => {
+    const r = await runDoctorWith(running(current()));
+    expect(r.stdout).toContain("running the build on disk");
+    expect(r.stdout).not.toContain("Restart it");
+  });
+
+  // A record outlives the server that wrote it, and the pid it names gets reused. Read as live it
+  // would both vouch for a build nothing is serving AND stand in for the liveness check — so the
+  // one server that IS up, too old to have left a record of its own, stays invisible.
+  it("does not let a stopped server's leftover record answer for a server that is running", async () => {
+    await serve("<html><head><title>anton</title></head>");
+    const r = await runDoctorWith(running({ pid: process.pid, startedAt: "a process that has exited" }));
+    expect(r.stdout).toContain("recorded no build identity");
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  // A live record proves what ONE process is running and nothing about a second, older one. The
+  // upgrade this check exists for leaves a pre-stamp server up while the operator, having pulled,
+  // starts a current one on the next free port — and that stale process keeps running the nightly
+  // jobs. Behind the records it has no line at all; beside them it has its own.
+  it("names a running server no live record accounts for, beside the ones that do", async () => {
+    await serve("<html><head><title>anton</title></head>");
+    // The parent of this test process stands in for the recorded server; this one, which holds the
+    // listening socket, is the server nothing recorded.
+    const r = await runDoctorWith([{ ...running(current()), pid: process.ppid }]);
+    expect(r.stdout).toContain(`pid ${process.ppid} running the build on disk`);
+    expect(r.stdout).toContain(`pid ${process.pid} is running but recorded no build identity`);
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  // `ANTON_DB` deliberately points two checkouts at one database — a runner and an
+  // `ANTON_RUNNER=off` UI, or two worktrees — so a record beside it is not necessarily this
+  // checkout's. Compared against this one it prints a stale-or-current verdict about a repo the
+  // operator is not standing in.
+  it("does not compare a neighbouring install's record against this checkout", async () => {
+    const elsewhere = await dirs.make("anton-elsewhere-");
+    const r = await runDoctorWith(running({ version: "0.0.1", appRoot: elsewhere }));
+    expect(r.stdout).toContain("no running server recorded");
+    expect(r.stdout).not.toContain("0.0.1");
+  });
+
+  it("still answers for a record that names this checkout as the install it booted from", async () => {
+    const r = await runDoctorWith(running({ version: "0.0.1", appRoot: REPO_ROOT }));
+    expect(r.stdout).toContain("is running 0.0.1");
+  });
+
+  // Two servers from one install — a UI-only `ANTON_RUNNER=off` one beside the runner. Each is its
+  // own answer: under a shared record the newer one spoke for both and the stale one went unnamed.
+  it("answers for every running server, not just the last one to boot", async () => {
+    const r = await runDoctorWith([
+      running({ version: "0.0.1", bootedAt: 1 }),
+      // The parent of this test process: a second pid that is genuinely alive.
+      { ...running(current()), pid: process.ppid, bootedAt: 2 },
+    ]);
+    expect(r.stdout).toContain(`pid ${process.pid} is running 0.0.1`);
+    expect(r.stdout).toContain(`pid ${process.ppid} running the build on disk`);
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+});
+
+/**
+ * `anton doctor` on a shared-server board (anton-eg46). Server mode keeps no local copy, so a server
+ * this machine cannot reach is a board outage, not slow sync — doctor probes it and fails, because
+ * doctor is where an operator looks first and bd's own error names neither the target nor the fix.
+ *
+ * Every required tool is stubbed on PATH: what is asserted is the exit code, so a CI box without
+ * `bd`/`claude` must not be what decides it.
+ */
+describe("anton doctor — shared-server board reachability", () => {
+  const dirs = tempDirs();
+
+  afterEach(dirs.cleanup);
+
+  const SERVER_METADATA = {
+    database: "dolt",
+    backend: "dolt",
+    dolt_mode: "server",
+    dolt_server_host: "dolt.example.dev",
+    dolt_server_port: 3306,
+    dolt_server_user: "beads",
+    dolt_database: "anton",
+  };
+
+  /**
+   * A bd stub answering the version gate and the two health probes. `board` picks which one fails:
+   * `"unreachable"` refuses the connection, `"unreadable"` accepts it and then refuses the board the
+   * way bd's project-identity guard does — the case `bd dolt test` alone cannot see.
+   */
+  function fakeBdServer(board: "ok" | "unreachable" | "unreadable"): string {
+    return [
+      "#!/usr/bin/env node",
+      "const a = process.argv.slice(2);",
+      'if (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.1.2 (fake)"); process.exit(0); }',
+      ...(board === "unreachable"
+        ? ['if (a[0] === "dolt" && a[1] === "test") { console.error("dial tcp 10.0.0.9:3306: connect: connection refused"); process.exit(1); }']
+        : []),
+      ...(board === "unreadable"
+        ? ['if (a[0] === "count") { console.error("PROJECT IDENTITY MISMATCH — refusing to connect"); process.exit(1); }']
+        : []),
+      "process.exit(0);",
+    ].join("\n");
+  }
+
+  /** A repo with the given board metadata, and `doctor` run in it against stubbed tools. */
+  async function runDoctorIn(metadata: Record<string, unknown> | null, board: "ok" | "unreachable" | "unreadable" = "ok") {
+    const home = await dirs.make("anton-home-");
+    const cwd = await dirs.make("anton-board-");
+    if (metadata) {
+      mkdirSync(join(cwd, ".beads"), { recursive: true });
+      writeFileSync(join(cwd, ".beads", "metadata.json"), JSON.stringify(metadata, null, 2));
+    }
+    const bin = await dirs.make("anton-bin-");
+    writeFakeBd(bin, fakeBdServer(board));
+    // The other required tools, so a missing `claude` in CI can't be what fails the check.
+    for (const tool of ["git", "claude"]) {
+      writeFileSync(join(bin, tool), `#!/usr/bin/env node\nprocess.exit(0);\n`);
+      chmodSync(join(bin, tool), 0o755);
+    }
+    return spawnSync(process.execPath, [CLI, "doctor"], {
+      encoding: "utf8",
+      cwd,
+      env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, HOME: home, ANTON_DB: join(home, "anton.db") },
+    });
+  }
+
+  it("fails with the configured host/port and both ways out when the server is unreachable", async () => {
+    const r = await runDoctorIn(SERVER_METADATA, "unreachable");
+
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("dolt.example.dev:3306/anton");
+    expect(r.stdout).toContain("UNREACHABLE");
+    expect(r.stdout).toContain("connection refused");
+    // The per-USER password variable, and the escape hatch back to the local copy.
+    expect(r.stdout).toContain("BEADS_DOLT_PASSWORD_BEADS");
+    expect(r.stdout).toContain('"dolt_mode": "embedded"');
+  });
+
+  /**
+   * The gap `bd dolt test` cannot see (PR #174 review): it names no database and reads nothing, so a
+   * connection is accepted over a database that is missing, unmigrated, or another project's. Server
+   * mode keeps no local copy behind it, so a doctor that stopped at the connection test would exit 0
+   * on a board where no operation works.
+   */
+  it("fails when the server answers but will not serve this project's board", async () => {
+    const r = await runDoctorIn(SERVER_METADATA, "unreadable");
+
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("WILL NOT SERVE this board");
+    expect(r.stdout).toContain("PROJECT IDENTITY MISMATCH");
+    // Named for the database, not the network: host, port and account were just proven to work, and
+    // sending the reader back to them is the wasted hour this wording exists to avoid.
+    expect(r.stdout).toContain('names the database this board lives in (now "anton")');
+    expect(r.stdout).not.toContain("Start the server");
+    expect(r.stdout).toContain('"dolt_mode": "embedded"');
+  });
+
+  it("passes and names the server when it serves the board", async () => {
+    const r = await runDoctorIn(SERVER_METADATA);
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("dolt.example.dev:3306/anton serving this board");
+  });
+
+  it("says nothing — and probes nothing — on an embedded board", async () => {
+    const r = await runDoctorIn({ dolt_mode: "embedded", dolt_database: "anton" });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).not.toContain("shared Dolt server");
+    expect(r.stdout).toContain("All required tools present");
+  });
+});
+
+/**
+ * What `anton start` will actually serve (anton-pzfb). `next start` never checks which code produced
+ * `.next`, so the launcher has to: it rebuilds a checkout that moved, and — since a build takes
+ * minutes — proves the tree held still across the compile before stamping the artifact with it.
+ */
+describe("anton start — the build it will serve", () => {
+  const dirs = tempDirs();
+  afterEach(dirs.cleanup);
+
+  /** Nullable throughout: every field is a read that git or the filesystem can fail to answer. */
+  type Identity = { version: string | null; revision: string | null; worktree: string | null };
+  const CHECKOUT: Identity = { version: "0.4.0", revision: "a".repeat(40), worktree: "clean" };
+  const EDITED = { ...CHECKOUT, worktree: "9f2c1a4bb001" };
+
+  /** A checkout whose `.next` was compiled from `stamp` — omitted, it has never been built. */
+  async function checkout(stamp?: object): Promise<string> {
+    const dir = await dirs.make("anton-app-");
+    if (stamp) {
+      mkdirSync(join(dir, ".next"), { recursive: true });
+      writeFileSync(join(dir, ".next", "anton-build.json"), JSON.stringify(stamp));
+    }
+    return dir;
+  }
+
+  const stampOf = (dir: string) => JSON.parse(readFileSync(join(dir, ".next", "anton-build.json"), "utf8"));
+
+  /** Feed the identity reader a scripted sequence: one read before the build, one after each. */
+  const reads = (...seq: Identity[]) => () => (seq.length > 1 ? seq.shift()! : seq[0]);
+
+  it("builds and stamps the checkout it compiled when nothing is built", async () => {
+    const dir = await checkout();
+    const builds: number[] = [];
+    const code = ensureFreshBuild({
+      appRoot: dir,
+      isBundle: false,
+      build: () => (builds.push(1), 0),
+      readIdentity: reads(CHECKOUT, CHECKOUT),
+    });
+    expect(code).toBe(0);
+    expect(builds).toHaveLength(1);
+    expect(stampOf(dir)).toMatchObject(CHECKOUT);
+  });
+
+  // A stamp anton could not write leaves a server that IS this checkout unable to prove it, and
+  // every drift surface then reports the freshly-started process as unstamped. Starting is still
+  // right — the code is current — but doing it silently makes that false alarm unreadable.
+  it("starts, saying so, when the stamp cannot be written", async () => {
+    const dir = await dirs.make("anton-app-");
+    writeFileSync(join(dir, ".next"), ""); // a file where the build goes: every write under it fails
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const code = ensureFreshBuild({
+        appRoot: dir,
+        isBundle: false,
+        build: () => 0,
+        readIdentity: reads(CHECKOUT, CHECKOUT),
+      });
+      expect(code).toBe(0);
+      expect(log.mock.calls.flat().join("\n")).toContain("anton-build.json");
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  // `next build` rewrites `.next` IN PLACE, and a running `next start` loads its route chunks from
+  // there as requests arrive — so compiling underneath one breaks the responses it is mid-way through
+  // serving, and this process could not take the occupied port afterwards either (PR #217 review).
+  it("refuses to rebuild .next while a server is still serving out of it", async () => {
+    const dir = await checkout(EDITED);
+    const build = vi.fn(() => 0);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const code = ensureFreshBuild({
+        appRoot: dir,
+        isBundle: false,
+        build,
+        readIdentity: () => CHECKOUT,
+        liveServers: () => [{ path: join(dir, "server-build.4242.json"), record: { pid: 4242 } }],
+      });
+      expect(code).toBe(1);
+      expect(build).not.toHaveBeenCalled();
+      // The operator is told which process holds it, and left to stop it: a restart can kill a run.
+      expect(log.mock.calls.flat().join("\n")).toContain("4242");
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  // Two servers from one install stay supported — a UI-only `ANTON_RUNNER=off` one beside the runner
+  // — because the refusal is of the REBUILD, not of the start: a `.next` that already matches this
+  // checkout is one a second server can serve from without anything being rewritten under the first.
+  it("starts a second server against a .next that already matches, without building", async () => {
+    const dir = await checkout(CHECKOUT);
+    const build = vi.fn(() => 0);
+    const code = ensureFreshBuild({
+      appRoot: dir,
+      isBundle: false,
+      build,
+      readIdentity: () => CHECKOUT,
+      liveServers: () => [{ path: join(dir, "server-build.4242.json"), record: { pid: 4242 } }],
+    });
+    expect(code).toBe(0);
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  // ...and with nothing serving, the rebuild is exactly as it was.
+  it("rebuilds when the checkout moved and no server is serving from .next", async () => {
+    const dir = await checkout(EDITED);
+    const build = vi.fn(() => 0);
+    const code = ensureFreshBuild({
+      appRoot: dir,
+      isBundle: false,
+      build,
+      readIdentity: reads(CHECKOUT, CHECKOUT),
+      liveServers: () => [],
+    });
+    expect(code).toBe(0);
+    expect(build).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts without building when .next is already this checkout", async () => {
+    const dir = await checkout(CHECKOUT);
+    const build = vi.fn(() => 0);
+    expect(ensureFreshBuild({ appRoot: dir, isBundle: false, build, readIdentity: () => CHECKOUT })).toBe(0);
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  it("rebuilds a .next compiled before the edit sitting in the worktree", async () => {
+    const dir = await checkout(CHECKOUT);
+    const build = vi.fn(() => 0);
+    expect(ensureFreshBuild({ appRoot: dir, isBundle: false, build, readIdentity: reads(EDITED, EDITED) })).toBe(0);
+    expect(build).toHaveBeenCalledTimes(1);
+    expect(stampOf(dir)).toMatchObject(EDITED);
+  });
+
+  // The stale artifact nothing else catches: a save lands after Next has compiled that file, so the
+  // build is pre-edit while the server boots recording the post-edit checkout — and every drift
+  // surface then calls that stale process current.
+  it("rebuilds when a save lands mid-compile, and stamps only the tree that survived one", async () => {
+    const dir = await checkout();
+    const build = vi.fn(() => 0);
+    expect(ensureFreshBuild({ appRoot: dir, isBundle: false, build, readIdentity: reads(CHECKOUT, EDITED, EDITED) })).toBe(0);
+    expect(build).toHaveBeenCalledTimes(2);
+    expect(stampOf(dir)).toMatchObject(EDITED);
+  });
+
+  // Rebuilding forever behind someone who is still typing is worse than saying so: an unstamped
+  // `.next` is what makes the next `anton start` rebuild rather than serve code nobody can name.
+  it("refuses to start a checkout that never stops moving", async () => {
+    const dir = await checkout();
+    let n = 0;
+    const build = vi.fn(() => 0);
+    const code = ensureFreshBuild({
+      appRoot: dir,
+      isBundle: false,
+      build,
+      readIdentity: () => ({ ...CHECKOUT, worktree: `edit${n++}` }),
+    });
+    expect(code).toBe(1);
+    expect(build).toHaveBeenCalledTimes(3);
+    expect(existsSync(join(dir, ".next", "anton-build.json"))).toBe(false);
+  });
+
+  // The post-build read is what catches a save that landed mid-compile — so a read that came back
+  // with nothing to say is not agreement, it is the check failing open. (Git times out, or an edit
+  // made during the build pushed the diff past GIT_MAX_BUFFER.) Starting there would serve an
+  // artifact that may predate the edit while stamping it as current.
+  it("refuses to start when the post-build read cannot say what the checkout holds", async () => {
+    const dir = await checkout();
+    const build = vi.fn(() => 0);
+    const code = ensureFreshBuild({
+      appRoot: dir,
+      isBundle: false,
+      build,
+      readIdentity: reads(CHECKOUT, { ...CHECKOUT, worktree: null }),
+    });
+    expect(code).toBe(1);
+    expect(build).toHaveBeenCalledTimes(3);
+    expect(existsSync(join(dir, ".next", "anton-build.json"))).toBe(false);
+  });
+
+  it("gives up when the build itself fails", async () => {
+    const dir = await checkout();
+    expect(ensureFreshBuild({ appRoot: dir, isBundle: false, build: () => 2, readIdentity: () => CHECKOUT })).toBe(2);
+  });
+
+  // A bundle ships its own prebuilt .next and no toolchain to rebuild with, and its RELEASE_VERSION
+  // already identifies it exactly.
+  it("leaves a bundle's prebuilt .next alone", async () => {
+    const dir = await checkout({ version: "0.9.1", revision: null });
+    const build = vi.fn(() => 0);
+    const readIdentity = vi.fn(() => CHECKOUT);
+    expect(ensureFreshBuild({ appRoot: dir, isBundle: true, build, readIdentity })).toBe(0);
+    expect(build).not.toHaveBeenCalled();
+    expect(readIdentity).not.toHaveBeenCalled();
   });
 });

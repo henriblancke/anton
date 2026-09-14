@@ -11,13 +11,13 @@ import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { driveJob, makeJobRunner } from "@/lib/testing/jobs";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import { getRunHealthReport, type RunHealthFinding } from "../run-health";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
 import { makeRunHealthHandler } from "./run-health";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const HOUR = 3_600_000;
 const NOW = 1_900_000_000_000;
@@ -36,7 +36,7 @@ function secDate(ms: number): Date {
 describeBd("run-health e2e (real handler · real bd)", () => {
   let bdRepo: BdRepo;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let clock: FakeClock;
   let projectId: string;
   /** stage:in-review + a PR ref — the stale-PR subject. */
@@ -45,6 +45,10 @@ describeBd("run-health e2e (real handler · real bd)", () => {
   let deadLeaseEpic: string;
   /** A healthy epic: no lease, no PR, nothing to say about it. */
   let healthyEpic: string;
+  /** An open human gate on `gatedTicket` — the needs-human subject, under the epic a resume runs. */
+  let humanGate: string;
+  let gatedEpic: string;
+  let gatedTicket: string;
   let parkedRunId: string;
   let exhaustedJobId: string;
 
@@ -97,16 +101,31 @@ describeBd("run-health e2e (real handler · real bd)", () => {
       description: "## Goal\nx",
     });
 
-    tdb = makeTestDb();
-    clock = new FakeClock(NOW);
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
+    gatedEpic = await beads.create(repo, {
+      title: "Waiting on the founder",
+      type: "epic",
+      description: "## Goal\nx",
     });
+    // The gate hangs on the TICKET, which is the only shape bd allows (it refuses a gate on an
+    // epic: "epics can only block other epics") and the one that proves the climb — a resume
+    // re-enqueues the epic above it, never the ticket.
+    gatedTicket = await beads.create(repo, {
+      title: "Blocked until the founder looks",
+      type: "task",
+      acceptance: "- [ ] x",
+      deps: [`parent-child:${gatedEpic}`],
+    });
+    // The real thing, through bd: a gate bead is ABSENT from `bd list --status all`, so this also
+    // proves the sweep sources gates from the listing that carries them.
+    humanGate = await beads.gateCreate(repo, {
+      blocks: gatedTicket,
+      type: "human",
+      reason: "the founder wants to see the design first",
+    });
+
+    tdb = makeProjectDb({ repoPath: repo });
+    clock = new FakeClock(NOW);
+    projectId = tdb.projectId;
   });
 
   beforeEach(async () => {
@@ -178,6 +197,17 @@ describeBd("run-health e2e (real handler · real bd)", () => {
     const exhausted = findingsByKind(report!.findings, "exhausted-job");
     expect(exhausted).toHaveLength(1);
     expect(exhausted[0]).toMatchObject({ jobId: exhaustedJobId, beadId: healthyEpic });
+
+    const human = findingsByKind(report!.findings, "needs-human");
+    expect(human).toHaveLength(1);
+    // Gate, the ticket it blocks, and the run target a resume would re-enqueue — the epic above it.
+    expect(human[0]).toMatchObject({
+      key: `needs-human:${humanGate}`,
+      gateId: humanGate,
+      beadId: gatedTicket,
+      targetBeadId: gatedEpic,
+    });
+    expect(human[0].reason).toContain("the founder wants to see the design first");
 
     // The healthy epic is the control: it appears in no finding at all.
     expect(report!.findings.some((f) => f.kind === "dead-lease" && f.beadId === healthyEpic)).toBe(
@@ -267,6 +297,26 @@ describeBd("run-health e2e (real handler · real bd)", () => {
 
     expect((await getJob(tdb.db, jobId))?.status).toBe("cancelled");
     expect(await getRunHealthReport(tdb.db, projectId)).toEqual(before);
+  });
+
+  it("carries the skipped-read count alongside the findings a partial sweep did produce", async () => {
+    const jobId = await driveJob({
+      db: tdb.db,
+      clock,
+      type: "run-health",
+      handler: (deps) =>
+        makeRunHealthHandler({
+          ...deps,
+          readPrActivity: async () => {
+            throw new Error("gh: rate limited");
+          },
+        }),
+      projectId,
+    });
+
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.outcome).toBe("ok");
+    expect(job?.outcomeNote).toContain("1 PR check(s) skipped");
   });
 
   it("is idempotent — a second sweep over unchanged state stores the identical report", async () => {

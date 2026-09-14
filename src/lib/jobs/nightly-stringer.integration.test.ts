@@ -7,14 +7,13 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
 import { driveJob } from "@/lib/testing/jobs";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -35,7 +34,7 @@ describeBd("nightly-stringer e2e (real handler · real bd · fake stringer/claud
   let sandbox: string;
   let repo: string;
   let binDir: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let clock: FakeClock;
   let projectId: string;
   let restoreEnv: () => void;
@@ -52,7 +51,9 @@ describeBd("nightly-stringer e2e (real handler · real bd · fake stringer/claud
     });
 
   beforeAll(async () => {
-    bdRepo = makeBdRepo({ initialCommit: true });
+    // `bare`: the pass refreshes the checkout against origin before it scans and stands down when
+    // it can't (anton-qor2), so a remote-less sandbox would park every case here.
+    bdRepo = makeBdRepo({ bare: true, initialCommit: true });
     sandbox = bdRepo.dir;
     repo = bdRepo.repo;
     binDir = join(sandbox, "bin");
@@ -68,6 +69,8 @@ describeBd("nightly-stringer e2e (real handler · real bd · fake stringer/claud
 const oi=a.indexOf('-o');const out=oi>=0?a[oi+1]:null;
 const n=Number(process.env.FAKE_STRINGER_SIGNALS||'0');
 const signals=Array.from({length:n},(_,i)=>({Source:'todo',Kind:'todo',FilePath:'x.ts',Line:i+1,Title:'TODO '+i}));
+// A githygiene finding about a file git does not track — anton drops it before anyone counts it.
+if(process.env.FAKE_STRINGER_UNTRACKED)signals.push({Source:'githygiene',Kind:'large-binary',FilePath:'phantom.db',Line:0,Title:'Large binary file: phantom.db (4.2 MB)'});
 if(out)fs.writeFileSync(out,JSON.stringify({signals,metadata:{}}));
 // Advance the --delta baseline on the way out, as the real stringer does: the window a scan saw
 // is gone from the next one unless the caller puts this file back.
@@ -119,16 +122,9 @@ process.stdin.on('end',()=>{
     process.env.ANTON_SCANS_ROOT = join(sandbox, "scans");
     process.env.ANTON_TEST_CLAUDE_ARGV = join(sandbox, "claude-argv.jsonl");
 
-    tdb = makeTestDb();
+    tdb = makeProjectDb({ repoPath: repo });
     clock = new FakeClock(1_700_000_000_000);
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    projectId = tdb.projectId;
   });
 
   afterAll(() => {
@@ -208,6 +204,85 @@ process.stdin.on('end',()=>{
     // ...and the retry gets all the way to beads.
     expect((await getJob(tdb.db, await runScan()))?.status).toBe("done");
     expect((await beads.list(repo, ["--status", "all"])).length).toBe(beadsBefore + 2);
+  });
+
+  // anton-j2zg: a pass whose only finding was about a file git doesn't track must read as a
+  // FILTERED scan, not as a collector that found nothing — otherwise the phantom looks like health.
+  it("says on the session what it dropped for being untracked (anton-j2zg)", async () => {
+    process.env.FAKE_STRINGER_SIGNALS = "0";
+    process.env.FAKE_STRINGER_UNTRACKED = "1";
+    rmSync(join(sandbox, "claude-argv.jsonl"), { force: true });
+    const before = new Set((await tdb.db.select().from(schema.sessions)).map((s) => s.id));
+
+    let jobId: string;
+    try {
+      jobId = await runScan();
+    } finally {
+      delete process.env.FAKE_STRINGER_UNTRACKED;
+    }
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+    // Nothing survived the filter, so triage never ran — and the log says why it had nothing.
+    expect(existsSync(join(sandbox, "claude-argv.jsonl"))).toBe(false);
+    const sessions = await tdb.db.select().from(schema.sessions);
+    const newSession = sessions.find((s) => !before.has(s.id));
+    expect(newSession, "no new session was created during the scan run").toBeDefined();
+    const log = readFileSync(newSession!.logPath!, "utf8");
+    expect(log).toContain("dropped 1 signal(s)");
+    expect(log).toContain("phantom.db");
+  });
+
+  // anton-o827: the filter has to reach the PROMPT, not just the counts. Triage is handed a path,
+  // and the only thing that makes that path safe is that it names the one artifact anton filtered —
+  // a pass that scanned a phantom beside real work would otherwise let the agent file a bead for a
+  // file git has never heard of, a judgment call every unattended pass has to make again.
+  it("hands triage the filtered scan file, so a dropped signal is not in the prompt's artifact", async () => {
+    process.env.FAKE_STRINGER_SIGNALS = "1";
+    process.env.FAKE_STRINGER_UNTRACKED = "1";
+    rmSync(join(sandbox, "claude-argv.jsonl"), { force: true });
+    const beadsBefore = (await beads.list(repo, ["--status", "all"])).length;
+    const before = new Set((await tdb.db.select().from(schema.sessions)).map((s) => s.id));
+
+    let jobId: string;
+    try {
+      jobId = await runScan();
+    } finally {
+      delete process.env.FAKE_STRINGER_UNTRACKED;
+    }
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+    // The file the prompt NAMES — the artifact triage actually opens — carries only the survivor.
+    const inv = readFileSync(join(sandbox, "claude-argv.jsonl"), "utf8").trim().split("\n").pop()!;
+    expect(
+      inv,
+      "claude-argv.jsonl was empty or contained only blank lines — claude was never invoked",
+    ).toBeTruthy();
+    const prompt = (JSON.parse(inv) as { prompt: string }).prompt;
+    const match = /scan file to triage is: (\S+)/.exec(prompt);
+    expect(
+      match,
+      `prompt did not contain expected 'scan file to triage is: <path>' — got:\n${prompt}`,
+    ).not.toBeNull();
+    const scanFile = match![1];
+    const handed = JSON.parse(readFileSync(scanFile, "utf8")) as { signals: { Source: string }[] };
+    expect(handed.signals.map((s) => s.Source)).toEqual(["todo"]);
+    expect(readFileSync(scanFile, "utf8")).not.toContain("phantom.db");
+
+    // ...and the agent that read it filed a bead for the survivor only — no phantom reached the
+    // board. One snapshot, so the count and the titles are assertions about the same board state.
+    const board = await beads.list(repo, ["--status", "all"]);
+    expect(board.length).toBe(beadsBefore + 1);
+    const created = board.filter((b) => b.title.startsWith("Triaged:"));
+    expect(created.some((b) => b.title.includes("phantom.db"))).toBe(false);
+
+    // The drop stays visible: filtered out of the prompt is not filtered out of the record.
+    const sessions = await tdb.db.select().from(schema.sessions);
+    const newSession = sessions.find((s) => !before.has(s.id));
+    expect(newSession, "no new session was created during the scan run").toBeDefined();
+    const log = readFileSync(newSession!.logPath!, "utf8");
+    expect(log).toContain("dropped 1 signal(s)");
+    expect(log).toContain("phantom.db");
   });
 
   it("warns on the session when a collector died, even with no signals to triage (anton-uspu)", async () => {

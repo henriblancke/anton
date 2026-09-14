@@ -106,6 +106,174 @@
       "when": 1785848364109,
       "tag": "0014_shocking_red_hulk",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1785977684307,
+      "tag": "0015_real_guardsmen",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1786995892686,
+      "tag": "0016_exotic_kabuki",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1787104815953,
+      "tag": "0017_rare_slapstick",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1787110055236,
+      "tag": "0018_backfill_value_labels",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1788027982729,
+      "tag": "0019_last_the_professor",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1788050421756,
+      "tag": "0020_thankful_sharon_carter",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1788076296734,
+      "tag": "0021_careless_leopardon",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1788088356829,
+      "tag": "0022_cheerful_lady_mastermind",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1788141768792,
+      "tag": "0023_job_outcome",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1788224800321,
+      "tag": "0024_picker_verdicts",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1788239020478,
+      "tag": "0025_picker_accept_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1788325420478,
+      "tag": "0026_picker_plan_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1788411820478,
+      "tag": "0027_picker_starts",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1788498220478,
+      "tag": "0028_jobs_parked_idx",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1788584620478,
+      "tag": "0029_run_attempt_started_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1788724007937,
+      "tag": "0030_picker_veto_kind",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1788734620828,
+      "tag": "0031_burn_sample_project",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1788810018109,
+      "tag": "0032_jobs_updated_idx",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1788815301862,
+      "tag": "0033_jobs_spent_attempts",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1788898577006,
+      "tag": "0034_run_endpoint_host",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "6",
+      "when": 1788995759594,
+      "tag": "0035_claude_invocations",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "6",
+      "when": 1789045442716,
+      "tag": "0036_claude_invocation_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "6",
+      "when": 1789055614769,
+      "tag": "0037_escalation_dismissal",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "6",
+      "when": 1789085199274,
+      "tag": "0038_big_rawhide_kid",
+      "breakpoints": true
     }
   ]
 }

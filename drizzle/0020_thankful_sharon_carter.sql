@@ -1,0 +1,1 @@
+ALTER TABLE `runs` ADD `review_score` integer;

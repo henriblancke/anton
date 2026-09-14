@@ -8,6 +8,7 @@
  *      "what does anton pick up next", identical on every machine reading the same board.
  */
 import { describe, expect, it } from "vitest";
+import { proposalFingerprint, type GardenerDetectionKind } from "../gardener/detections";
 import { beads, buildClaimableReadyArgs, rankClaimableTargets, type Bead, type BeadDep } from "./bd";
 
 const bead = (b: Partial<Bead>): Bead =>
@@ -84,6 +85,85 @@ describe("rankClaimableTargets — the set", () => {
     expect(ids(rankClaimableTargets(board, board))).toEqual(["f2"]);
   });
 
+  it("drops an agent:human target — no agent can do it, at any priority", () => {
+    // anton-mv70: `agent:human` resolves to no specialist prompt, so a claimed human target would
+    // dispatch to the DEFAULT agent. Asserted at P0 and with no priority at all: the exclusion is a
+    // property of the label, never of where the bead would have ranked.
+    const board = [
+      bead({ id: "f1", issue_type: "feature", priority: 0, labels: ["approved", "agent:human"] }),
+      bead({ id: "t2", issue_type: "task", labels: ["approved", "agent:human"] }),
+      bead({ id: "e3", issue_type: "epic", priority: 1, labels: ["approved", "agent:human"] }),
+      bead({ id: "f4", issue_type: "feature", priority: 2, labels: ["approved", "agent:nextjs"] }),
+    ];
+
+    expect(ids(rankClaimableTargets(board, board))).toEqual(["f4"]);
+  });
+
+  it("drops a proposal — a decision a person applies, not work an agent implements", () => {
+    // anton-x37c: a proposal is a parentless task carrying a full contract, so every other clause
+    // admits it. Both producers file one, and the fingerprint — not the namespace — is the rule.
+    const board = [
+      bead({
+        id: "p1",
+        issue_type: "task",
+        priority: 0,
+        labels: ["approved", proposalFingerprint("stale", "t9")],
+      }),
+      bead({
+        id: "p2",
+        issue_type: "task",
+        labels: ["approved", proposalFingerprint("low-value", "t9")],
+      }),
+      bead({ id: "t1", issue_type: "task", priority: 2 }),
+    ];
+
+    expect(ids(rankClaimableTargets(board, board))).toEqual(["t1"]);
+  });
+
+  it("leaves the ranking of every other target untouched when proposals are open", () => {
+    // The epic's measure: the order of real work must not move with how many proposals sit open.
+    const others = [
+      bead({ id: "f1", issue_type: "feature", priority: 1, created_at: "2026-01-01T00:00:00Z" }),
+      bead({ id: "f2", issue_type: "feature", priority: 0, created_at: "2026-02-01T00:00:00Z" }),
+      bead({ id: "t3", issue_type: "task", priority: 1, created_at: "2026-03-01T00:00:00Z" }),
+    ];
+    const kinds: GardenerDetectionKind[] = ["mispriority", "misfiled", "oversized"];
+    const proposals = kinds.map((kind, i) =>
+      bead({
+        id: `p${i}`,
+        issue_type: "task",
+        priority: 0,
+        created_at: "2026-01-01T00:00:00Z",
+        labels: ["approved", proposalFingerprint(kind, "t9")],
+      }),
+    );
+
+    expect(rankClaimableTargets([...others, ...proposals], [...others, ...proposals])).toEqual(
+      rankClaimableTargets(others, others),
+    );
+  });
+
+  it("leaves the ranking of every other target untouched when human work is on the board", () => {
+    // The label removes its own bead and changes nothing else — same order, same unblocks counts.
+    const others = [
+      bead({ id: "f1", issue_type: "feature", priority: 1, created_at: "2026-01-01T00:00:00Z" }),
+      bead({ id: "f2", issue_type: "feature", priority: 0, created_at: "2026-02-01T00:00:00Z" }),
+      bead({ id: "t3", issue_type: "task", priority: 1, created_at: "2026-03-01T00:00:00Z" }),
+    ];
+    const human = bead({
+      id: "h1",
+      issue_type: "feature",
+      priority: 0,
+      created_at: "2026-01-01T00:00:00Z",
+      labels: ["approved", "agent:human"],
+    });
+
+    const without = rankClaimableTargets(others, others);
+    const withHuman = rankClaimableTargets([...others, human], [...others, human]);
+
+    expect(withHuman).toEqual(without);
+  });
+
   it("drops anything not open — closed, in_progress and deferred are nobody's free work", () => {
     const board = [
       bead({ id: "f1", issue_type: "feature", status: "closed" }),
@@ -125,16 +205,18 @@ describe("rankClaimableTargets — the order", () => {
     expect(ids(rankClaimableTargets(board, board))).toEqual(["f2", "f3", "f1"]);
   });
 
-  it("treats a bead with no priority as bd's lowest (4), not as unranked", () => {
+  it("sorts a bead with no priority last, behind even an explicit P4", () => {
+    // `.beads/PRIME.md`: "a bead with none sorts last" — unset is the absence of a decision, not a
+    // synonym for bd's lowest. The full property lives in rank.test.ts.
     const board = [
-      bead({ id: "f9", issue_type: "feature" }), // no priority — ties with an explicit 4
+      bead({ id: "f9", issue_type: "feature" }), // no priority
       bead({ id: "f2", issue_type: "feature", priority: 4 }),
       bead({ id: "f3", issue_type: "feature", priority: 3 }),
     ];
 
     const ranked = rankClaimableTargets(board, board);
     expect(ids(ranked)).toEqual(["f3", "f2", "f9"]);
-    expect(ranked.map((t) => t.priority)).toEqual([3, 4, 4]);
+    expect(ranked.map((t) => t.priority)).toEqual([3, 4, undefined]);
   });
 
   it("breaks a priority tie by how much open work the target unblocks, transitively", () => {
@@ -161,13 +243,15 @@ describe("rankClaimableTargets — the order", () => {
     const board = [
       bead({ id: "f1", issue_type: "feature" }),
       bead({ id: "f2", issue_type: "feature", status: "closed", dependencies: [blocks("f2", "f1")] }),
-      // A malformed cycle f3 → f4 → f3 must not hang the traversal.
-      bead({ id: "f3", issue_type: "feature", dependencies: [blocks("f3", "f1"), blocks("f3", "f4")] }),
-      bead({ id: "f4", issue_type: "feature", dependencies: [blocks("f4", "f3")] }),
+      bead({ id: "f3", issue_type: "feature", dependencies: [blocks("f3", "f1")] }),
+      // A malformed cycle f4 → f5 → f4 must not hang the traversal — or credit f1 for work that
+      // holds itself no matter what f1 does.
+      bead({ id: "f4", issue_type: "feature", dependencies: [blocks("f4", "f3"), blocks("f4", "f5")] }),
+      bead({ id: "f5", issue_type: "feature", dependencies: [blocks("f5", "f4")] }),
     ];
 
     const byId = new Map(rankClaimableTargets(board, board).map((t) => [t.bead.id, t.unblocks]));
-    expect(byId.get("f1")).toBe(2); // f3 and f4; the closed f2 was never waiting
+    expect(byId.get("f1")).toBe(1); // f3 alone: the closed f2 was never waiting, the cycle never frees
   });
 
   it("falls back to age, then id, so two machines agree exactly", () => {

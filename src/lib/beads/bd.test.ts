@@ -6,19 +6,22 @@ import {
   buildCookArgs,
   buildPruneArgs,
   buildUpdateArgs,
-  createDoltSync,
   getSyncStatus,
   getSyncStatusToken,
   isBenignSyncOutput,
   isMissingBeadError,
   isNotWiredOutput,
   LABELS,
+  LINK_TYPES,
   parseCookedFormula,
   runDoltSync,
   SYNC_STALL_MS,
   unclaimableStatus,
   type Bead,
+  type LinkType,
 } from "./bd";
+import { refreshIssueSnapshot, resetIssueSnapshots } from "./snapshot";
+import { createDoltSync } from "./sync-coalescer";
 
 const bead = (b: Partial<Bead>): Bead => ({ id: "x", title: "x", status: "open", ...b }) as Bead;
 
@@ -645,6 +648,54 @@ describe("createDoltSync", () => {
     expect(runs).toBe(2); // 3 requests → 1 running + 1 trailing
   });
 
+  it("waits for an in-flight background board read before taking the Dolt lock (anton-3dpp)", async () => {
+    // An embedded board is single-holder: `bd dolt pull` FAILS (it does not queue) while a `bd list`
+    // still holds the repo's lock — and the snapshot layer fires those reads un-awaited, including
+    // one this engine itself triggers when a pass ends. A pass that starts on top of one is a
+    // self-inflicted failure, and a run publishing its lease through it parks as "live elsewhere".
+    resetIssueSnapshots();
+    let releaseRead!: () => void;
+    const read = new Promise<void>((r) => (releaseRead = r));
+    void refreshIssueSnapshot("/repo", async () => {
+      await read;
+      return [];
+    });
+
+    const spawned: string[] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      spawned.push(args.join(" "));
+      return "";
+    });
+
+    const pass = sync("/repo");
+    // A full macrotask turn: without the guard the pass reaches `bd dolt pull` well inside this.
+    await new Promise((r) => setTimeout(r, 5));
+    expect(spawned).toEqual([]); // it must not have: the read still holds the lock
+
+    releaseRead();
+    await expect(pass).resolves.toBe("synced");
+    expect(spawned).toContain("dolt pull");
+    resetIssueSnapshots();
+  });
+
+  it("still runs its pass when the background read it waited on FAILED (anton-3dpp)", async () => {
+    // The read's rejection is the reader's business — it released the lock either way, so a failed
+    // board read must never swallow the push that publishes a run's work.
+    resetIssueSnapshots();
+    void refreshIssueSnapshot("/repo-read-fails", async () => {
+      throw new Error("bd list failed");
+    }).catch(() => {});
+
+    const spawned: string[] = [];
+    const sync = createDoltSync(async (_cwd, args) => {
+      spawned.push(args.join(" "));
+      return "";
+    });
+    await expect(sync("/repo-read-fails")).resolves.toBe("synced");
+    expect(spawned).toContain("dolt push");
+    resetIssueSnapshots();
+  });
+
   it("does not coalesce across different repos", async () => {
     const cwds: string[] = [];
     const sync = createDoltSync(async (cwd, args) => {
@@ -1095,6 +1146,31 @@ describe("sync stall detection (anton-jfjw.3)", () => {
     expect(getSyncStatusToken(cwd, startedAt + SYNC_STALL_MS + 120_000)).not.toBe(stalled);
   });
 
+  it("never announces a stall for a slow pass that COMPLETED — even one that failed", async () => {
+    // Recording a failure reads the backlog count while the registry still holds this pass at
+    // `syncing`. Reading it through getSyncStatus would fire the wedged log for a pass that
+    // actually returned — the stall message exists only for passes that never come back.
+    const previous = process.env.ANTON_SYNC_STALL_MS;
+    process.env.ANTON_SYNC_STALL_MS = "1";
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cwd = `/repo-slow-failure-${Math.random()}`;
+      const sync = createDoltSync(async (_cwd, args) => {
+        await new Promise((r) => setTimeout(r, 10)); // outlives the stall window, then returns
+        if (args[1] === "push") throw execError({ stderr: "Error: push failed: reset" });
+        return "";
+      });
+
+      await sync(cwd, "full").catch(() => {});
+      expect(spy.mock.calls.filter((c) => String(c[0]).includes(cwd))).toHaveLength(0);
+      expect(getSyncStatus(cwd).unpushedCount).toBe(1); // the backlog still grows
+    } finally {
+      spy.mockRestore();
+      if (previous === undefined) delete process.env.ANTON_SYNC_STALL_MS;
+      else process.env.ANTON_SYNC_STALL_MS = previous;
+    }
+  });
+
   it("clears the stall clock when a pass completes, so a later slow pass isn't born stalled", async () => {
     const cwd = `/repo-stall-clear-${Math.random()}`;
     const sync = createDoltSync(async () => "");
@@ -1378,5 +1454,38 @@ describe("the bd seam takes cwd explicitly (anton-brdg)", () => {
   it("bd.ts never calls process.cwd() — every verb is told which repo it acts on", () => {
     const src = readFileSync(join(process.cwd(), "src/lib/beads/bd.ts"), "utf8");
     expect(src).not.toContain("process.cwd()");
+  });
+});
+
+describe("beads.link validates --type at the seam (anton-igkb)", () => {
+  // bd accepts ANY non-empty string for --type and writes a non-blocking edge for all but
+  // `blocks`/`conditional-blocks`, reporting nothing. So the seam has to reject before the spawn —
+  // once bd has the argv, the mistake is already on the board and round-trips through export.
+  it("throws on a bogus type WITHOUT spawning bd", async () => {
+    const { calls, exec } = recordingExec("");
+    await expect(
+      beads.link("/repo", "a-1", "a-2", "totally-bogus-type" as LinkType, exec),
+    ).rejects.toThrow(/refusing dependency type "totally-bogus-type"/);
+    expect(calls).toEqual([]); // never reached bd
+  });
+
+  it("rejects the no-op aliases, the empty string, and wrong-case spellings bd itself would also reject", async () => {
+    const { calls, exec } = recordingExec("");
+    for (const t of ["waits-for", "conditional-blocks", "", "Blocks"]) {
+      await expect(beads.link("/repo", "a-1", "a-2", t as LinkType, exec)).rejects.toThrow(
+        /refusing dependency type/,
+      );
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it("passes every allowed type through, in the cwd it was given", async () => {
+    for (const type of LINK_TYPES) {
+      const { calls, exec } = recordingExec("");
+      await beads.link("/repos/other", "a-1", "a-2", type, exec);
+      expect(calls).toEqual([
+        { cwd: "/repos/other", args: ["link", "a-1", "a-2", "--type", type] },
+      ]);
+    }
   });
 });

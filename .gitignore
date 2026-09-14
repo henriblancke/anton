@@ -2,6 +2,11 @@
 
 # dependencies
 /node_modules
+# bun.lock is the ONLY lockfile: CI and release both run `bun install --frozen-lockfile`, so a
+# lockfile from another package manager is never validated and can drift from what ships.
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
 /.pnp
 .pnp.*
 .yarn/*
@@ -45,6 +50,11 @@ anton.db
 anton.db-*
 .anton/
 .stringer/
+# Written beside anton.db at every server boot (anton-pzfb) — on a source checkout that is the repo
+# root, and the record holds a pid and a boot timestamp. One file per running server, named for its
+# pid; the glob is kept in sync with BUILD_RECORD_PREFIX (src/lib/build/identity.mjs), which
+# identity.test.ts asserts is ignored here.
+server-build.*.json
 
 # Beads / Dolt files (added by bd init)
 .dolt/

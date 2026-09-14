@@ -236,6 +236,217 @@ describe("computeEpicGraph", () => {
   });
 });
 
+/**
+ * anton-nywj: per-run-target child readiness. `blockedBy` answers "does anything block this target",
+ * which conflates one cross-run-gated tail child with a target that can't run at all — the readiness
+ * sets are what let the executor and the board ship the ready children instead of stalling (#58).
+ */
+describe("per-run-target child readiness", () => {
+  it("reports PARTIALLY-BLOCKED when only the tail child is gated by another run target", () => {
+    const g = graphOf([
+      feature("FA"),
+      feature("FB"),
+      ticket("a1", "FA"),
+      ticket("a2", "FA"),
+      ticket("a3", "FA", { dependencies: [blocks("a3", "b1")] }),
+      ticket("b1", "FB"),
+    ]);
+
+    expect(node(g, "FA").childReadiness).toBe("partially-blocked");
+    expect(node(g, "FA").readyChildren).toEqual(["a1", "a2"]);
+    expect(node(g, "FA").blockedChildren).toEqual(["a3"]);
+    // The target-level rollup is unchanged: the DAG page still sees FA blocked by FB.
+    expect(node(g, "FA").blockedBy).toEqual(["FB"]);
+    expect(node(g, "FA").ready).toBe(false);
+    expect(g.edges).toHaveLength(1);
+    expect(g.edges[0]).toMatchObject({ from: "FA", to: "FB", inferred: true });
+    // Nothing gates FB's own children.
+    expect(node(g, "FB").childReadiness).toBe("ready");
+    expect(node(g, "FB").readyChildren).toEqual(["b1"]);
+  });
+
+  it("reports BLOCKED when every child is gated from outside the run", () => {
+    const g = graphOf([
+      feature("FA"),
+      feature("FB"),
+      ticket("a1", "FA", { dependencies: [blocks("a1", "b1")] }),
+      ticket("a2", "FA", { dependencies: [blocks("a2", "b1")] }),
+      ticket("b1", "FB"),
+    ]);
+
+    expect(node(g, "FA").childReadiness).toBe("blocked");
+    expect(node(g, "FA").readyChildren).toEqual([]);
+    expect(node(g, "FA").blockedChildren).toEqual(["a1", "a2"]);
+  });
+
+  it("reports READY when no child is gated", () => {
+    const g = graphOf([
+      feature("FA"),
+      feature("FB"),
+      ticket("a1", "FA"),
+      ticket("a2", "FA"),
+      ticket("b1", "FB"),
+    ]);
+
+    expect(node(g, "FA").childReadiness).toBe("ready");
+    expect(node(g, "FA").readyChildren).toEqual(["a1", "a2"]);
+    expect(node(g, "FA").blockedChildren).toEqual([]);
+  });
+
+  it("treats a SIBLING blocker as ordering, not a gate — the run's own loop produces it", () => {
+    const g = graphOf([
+      feature("FA"),
+      ticket("a1", "FA"),
+      ticket("a2", "FA", { dependencies: [blocks("a2", "a1")] }),
+    ]);
+
+    expect(node(g, "FA").childReadiness).toBe("ready");
+    expect(node(g, "FA").readyChildren).toEqual(["a1", "a2"]);
+  });
+
+  it("holds a child queued BEHIND a gated sibling — never reported runnable", () => {
+    const g = graphOf([
+      feature("FA"),
+      feature("FB"),
+      ticket("a1", "FA"),
+      ticket("a2", "FA", { dependencies: [blocks("a2", "b1")] }),
+      ticket("a3", "FA", { dependencies: [blocks("a3", "a2")] }),
+      ticket("b1", "FB"),
+    ]);
+
+    expect(node(g, "FA").childReadiness).toBe("partially-blocked");
+    expect(node(g, "FA").readyChildren).toEqual(["a1"]);
+    expect(node(g, "FA").blockedChildren).toEqual(["a2", "a3"]);
+  });
+
+  it("releases a child once the run target shipping its blocker is done", () => {
+    const beadsOf = (fb: Partial<Bead>) => [
+      feature("FA"),
+      feature("FB", undefined, fb),
+      ticket("a1", "FA", { dependencies: [blocks("a1", "b1")] }),
+      ticket("b1", "FB", { status: "closed" }),
+    ];
+
+    // b1 is closed but FB's PR hasn't merged — the code hasn't landed, so a1 stays held.
+    const inReview = graphOf(beadsOf({ labels: ["stage:in-review"] }));
+    expect(node(inReview, "FA").childReadiness).toBe("blocked");
+    expect(node(inReview, "FA").blockedChildren).toEqual(["a1"]);
+
+    const shipped = graphOf(beadsOf({ status: "closed" }));
+    expect(node(shipped, "FA").childReadiness).toBe("ready");
+    expect(node(shipped, "FA").readyChildren).toEqual(["a1"]);
+  });
+
+  it("gates every child on the run target's OWN open blocker — nothing may start ahead of it", () => {
+    const g = graphOf([
+      feature("FA", undefined, { dependencies: [blocks("FA", "FB")] }),
+      feature("FB"),
+      ticket("a1", "FA"),
+      ticket("a2", "FA"),
+      ticket("b1", "FB"),
+    ]);
+
+    expect(node(g, "FA").childReadiness).toBe("blocked");
+    expect(node(g, "FA").blockedChildren).toEqual(["a1", "a2"]);
+  });
+
+  it("counts only the children a run would dispatch — closed ones are in neither set", () => {
+    const g = graphOf([
+      feature("FA"),
+      ticket("a1", "FA", { status: "closed" }),
+      ticket("a2", "FA"),
+    ]);
+
+    expect(node(g, "FA").readyChildren).toEqual(["a2"]);
+    expect(node(g, "FA").blockedChildren).toEqual([]);
+    expect(node(g, "FA").childReadiness).toBe("ready");
+  });
+
+  it("reports a LEAF feature (no tickets shaped under it) as its own single ticket", () => {
+    const ready = graphOf([feature("F")]);
+    expect(node(ready, "F").readyChildren).toEqual(["F"]);
+    expect(node(ready, "F").childReadiness).toBe("ready");
+
+    const gated = graphOf([
+      feature("F", undefined, { dependencies: [blocks("F", "G")] }),
+      feature("G"),
+    ]);
+    expect(node(gated, "F").blockedChildren).toEqual(["F"]);
+    expect(node(gated, "F").childReadiness).toBe("blocked");
+  });
+
+  it("reads an UNKNOWN blocker as still open — fail safe, same as the blocker helpers", () => {
+    const g = graphOf([feature("FA"), ticket("a1", "FA", { dependencies: [blocks("a1", "GONE")] })]);
+    expect(node(g, "FA").childReadiness).toBe("blocked");
+    expect(node(g, "FA").blockedChildren).toEqual(["a1"]);
+  });
+
+  it("ignores the target's own gh:pr merge gate — a target is not blocked by itself", () => {
+    const gate: Bead = {
+      id: "G",
+      title: "Gate: gh:pr",
+      status: "open",
+      issue_type: "gate",
+      await_type: "gh:pr",
+    } as Bead;
+    const g = graphOf([
+      feature("FA", undefined, { dependencies: [blocks("FA", "G")] }),
+      ticket("a1", "FA"),
+      gate,
+    ]);
+
+    expect(node(g, "FA").childReadiness).toBe("ready");
+    expect(node(g, "FA").readyChildren).toEqual(["a1"]);
+  });
+
+  it("releases a child whose only blocker is a RESOLVED gate — the gate bead must be in the read", () => {
+    // A `human` gate is a real wait, so it holds while open; `bd gate resolve` closes the bead and
+    // the hold ends. Both verdicts need the gate BEAD (loadAllIssues reads it via `--type gate`) —
+    // over a gate-stripped list the missing-blocker fail-safe would read it as open forever, and the
+    // run target would sit permanently blocked with nothing on the board to explain why.
+    const gate = (status: string): Bead =>
+      ({ id: "G", title: "Gate: human", status, issue_type: "gate", await_type: "human" }) as Bead;
+    const beadsOf = (g: Bead) => [
+      feature("FA"),
+      ticket("a1", "FA", { dependencies: [blocks("a1", "G")] }),
+      g,
+    ];
+
+    const open = graphOf(beadsOf(gate("open")));
+    expect(node(open, "FA").childReadiness).toBe("blocked");
+    expect(node(open, "FA").blockedChildren).toEqual(["a1"]);
+
+    const resolved = graphOf(beadsOf(gate("closed")));
+    expect(node(resolved, "FA").childReadiness).toBe("ready");
+    expect(node(resolved, "FA").readyChildren).toEqual(["a1"]);
+    // The gate is plumbing, not work: it carries no node and draws no edge either way.
+    expect(resolved.epics.map((n) => n.id)).toEqual(["FA"]);
+    expect(resolved.edges).toEqual([]);
+  });
+
+  it("rolls a task under a feature up to the FEATURE, so the epic above reports no held work", () => {
+    const g = graphOf([
+      epic("E"),
+      feature("F1", "E"),
+      feature("F2", "E"),
+      ticket("t1", "F1", { dependencies: [blocks("t1", "t2")] }),
+      ticket("t2", "F2"),
+    ]);
+
+    expect(node(g, "F1").childReadiness).toBe("blocked");
+    expect(node(g, "F1").blockedChildren).toEqual(["t1"]);
+    // A container epic ships nothing itself — its features each run on their own.
+    expect(node(g, "E").readyChildren).toEqual([]);
+    expect(node(g, "E").childReadiness).toBe("ready");
+  });
+
+  it("keeps a childless epic with its own open blocker BLOCKED, never an empty ready set", () => {
+    const g = graphOf([epic("E1", { dependencies: [blocks("E1", "E2")] }), epic("E2")]);
+    expect(node(g, "E1").readyChildren).toEqual([]);
+    expect(node(g, "E1").childReadiness).toBe("blocked");
+  });
+});
+
 describe("standaloneBlockers", () => {
   it("returns a standalone target's OPEN blockers from its own blocks edges", () => {
     // S is a parentless task blocked by another parentless task B — B never appears in the epic

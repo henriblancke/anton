@@ -1,0 +1,420 @@
+/**
+ * The stopping conditions an execute-epic run raises for itself (anton-1lix — extracted from
+ * execute-epic.ts). Every one of them is read by name somewhere downstream — the run's settle picks
+ * the row status off them, the ticket loop absorbs exactly one, the runner classifies the poison
+ * ones — so they live together rather than beside the code that happens to throw them.
+ */
+import type { SatisfiedBy } from "../beads/satisfied-note";
+import { blockedByPoison, parkedOnGateClause, PoisonEpic } from "./errors";
+
+/**
+ * The run ran every ticket it could and the rest are held by a prerequisite outside it (anton-1two).
+ * Poison (`PoisonEpic`), so the runner parks the JOB for a human rather than burning retries on a
+ * wait no retry shortens — and, like {@link ReviewBlockedError}, the RUN row is parked instead of
+ * failed: its tickets' commits are on the branch, and the resume that follows the blocker landing
+ * continues in this same row and worktree rather than reading as a crash.
+ */
+export class BlockedTailError extends PoisonEpic {}
+
+/**
+ * A timed-out ticket's partial work could NOT be rolled back, so the run halted rather than let the
+ * next ticket commit the leftovers as its own (anton-t1mo). Poison (`PoisonEpic`) like the tail
+ * above, but distinguishable at the teardown: the worktree named in this error is the only copy of
+ * that work and the very path the operator is told to clear, so it must survive the run's release
+ * (`holdsPartialWork`) instead of being force-removed with the rest of a failed run's residue.
+ */
+export class WorktreeDirtyError extends PoisonEpic {}
+
+/**
+ * The agent exited clean but delivered no code — a zero-diff commit (issue #46 root cause #1).
+ * Poison-classified (`name = "PoisonError"`), so the runner parks the run for a human rather than
+ * burning retries: re-running the agent on the same unchanged ticket would just reproduce the empty
+ * result. A distinct subclass so runTicket's catch can tell "delivered nothing" apart from other
+ * failures and block (never re-queue open) the ticket accordingly.
+ */
+export class NoDeliveryError extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * The agent committed changes but SELF-REPORTED `ANTON-RESULT: blocked` (anton-j5i8) — it declared
+ * the ticket incomplete despite leaving a diff. Poison-classified (`name = "PoisonError"`) so the
+ * runner parks for a human rather than retrying: the agent has said it can't finish, so re-running
+ * would reproduce the same block. A distinct subclass so runTicket's catch can surface it (block +
+ * agent-specific note) apart from a genuine post-commit failure.
+ */
+export class BlockedByAgentError extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * A block anton REPAIRED, so the run retries instead of parking (anton-fzas / R5.10).
+ *
+ * Thrown in place of the poison the block would otherwise have raised — {@link NoDeliveryError} or
+ * {@link BlockedByAgentError} — and deliberately NOT poison itself. That single difference is the
+ * whole mechanism: a plain error goes back through the runner's ordinary retry budget and backoff,
+ * so the repaired bead re-enters the queue exactly like any other retried work, behind the same
+ * brakes, with no special standing. There is no bypass to review because there is no bypass.
+ *
+ * "Retried ONCE" is not counted here and must not be: the repair stamp on the bead is what bounds it
+ * (R5.6). A second block of the same class finds a bead anton has already repaired, the guard
+ * (`gardener/repair.ts` `decideRepair`) escalates instead of repairing, and the run parks on the
+ * poison it would have parked on the first time — so the retry happens at most once per bead per class no matter how many
+ * attempts the runner's budget allows.
+ */
+export class RepairedBlockError extends Error {
+  constructor(
+    readonly ticketId: string,
+    /** What the repair did, in the words the bead's own note carries. */
+    readonly attempted: string,
+    /** The block this repair answered — kept so the run's error still states what stopped it. */
+    readonly block: unknown,
+  ) {
+    super(
+      `${ticketId} blocked, and anton repaired it: ${attempted}. The run failed so the ticket goes ` +
+        `back through the queue for one retry against the corrected bead; a second block of the ` +
+        `same kind will park it for a human instead. It stopped with: ` +
+        (block instanceof Error ? block.message : String(block)),
+    );
+    this.name = "RepairedBlockError";
+  }
+}
+
+/**
+ * The block anton answered by DRAWING THE EDGE it was missing (anton-qg4h / R5.4): the ticket needs
+ * another bead to land first, so the ordering is recorded and the run parks behind it.
+ *
+ * A {@link BlockedTailError}, which is precisely what this now is — a run holding work that waits on
+ * a prerequisite outside it — and that inheritance is the whole behaviour: the RUN row parks rather
+ * than failing, so the resume continues in this same row and worktree once the blocker lands, and
+ * the JOB parks rather than retrying. The contrast with {@link RepairedBlockError} is deliberate: a
+ * rewritten pointer earns an immediate retry because the bead is now correct, while an ordering
+ * earns a WAIT — retrying now would spend an attempt proving the edge anton just drew.
+ *
+ * Phrased through {@link blockedByPoison} so the blocker id is readable back out of the park message
+ * by the run-health sweep, exactly as it is for a run that was already blocked when it started.
+ */
+export class ParkedOnPrereqError extends BlockedTailError {
+  constructor(
+    readonly ticketId: string,
+    /** The prerequisite the new edge points at. */
+    readonly blockerId: string,
+    /** What the repair did, in the words the bead's own note carries. */
+    readonly attempted: string,
+    /** The block this repair answered — kept so the park still states what stopped the run. */
+    readonly block: unknown,
+  ) {
+    super(
+      `${blockedByPoison(ticketId, [blockerId]).message} — anton drew that edge itself after the ` +
+        `agent reported \`dep-missing\`: ${attempted}. It stopped with: ` +
+        (block instanceof Error ? block.message : String(block)),
+    );
+  }
+}
+
+/**
+ * The same ordering, where the prerequisite is a ticket THIS RUN already holds (anton-0gm2) — a
+ * correction to the run's own dispatch order rather than a wait.
+ *
+ * Deliberately NOT a {@link ParkedOnPrereqError}, and not poison at all. That park's own argument —
+ * "retrying now would spend an attempt proving the edge anton just drew" — holds only while somebody
+ * ELSE lands the prerequisite. Here the run is the thing that lands it, so parking behind it parks
+ * the run against itself: three real runs did exactly that in one incident and tripped the
+ * consecutive-failure breaker. The dispatch loop catches this one error, re-orders what it has left
+ * so the prerequisite goes next, and carries on — so nothing about this case is a failure and
+ * nothing is counted as one.
+ *
+ * The only way it leaves that loop is {@link PrereqCycleError}.
+ */
+export class ReorderedOnPrereqError extends Error {
+  constructor(
+    readonly ticketId: string,
+    /** The prerequisite the new edge points at — a ticket of this run's own set. */
+    readonly blockerId: string,
+    /** What the repair did, in the words the bead's own note carries. */
+    readonly attempted: string,
+    /** This ticket's session log — where the loop's account of the re-order lands. */
+    readonly logPath: string,
+    /** The block this repair answered — kept so the account still states what stopped the ticket. */
+    readonly block: unknown,
+  ) {
+    super(
+      `${ticketId} blocked on \`${blockerId}\`, which is a ticket THIS run holds: ${attempted}. ` +
+        `The run re-orders itself to dispatch ${blockerId} first rather than parking behind its ` +
+        `own work. It stopped with: ` +
+        (block instanceof Error ? block.message : String(block)),
+    );
+    this.name = "ReorderedOnPrereqError";
+  }
+}
+
+/**
+ * The edge the `dep-missing` repair drew closes a CYCLE among the run's own tickets (anton-0gm2):
+ * no dispatch order satisfies it.
+ *
+ * Poison, because the alternative is the one thing a re-order must never do — fall through to
+ * {@link orderTickets}'s input-order fallback and dispatch an ordering anton has just recorded as
+ * impossible, which is how a bad edge gets executed. The edge is on the board and reversible
+ * (`bd dep remove`), so the message names it: a person decides which half of the cycle is wrong.
+ */
+export class PrereqCycleError extends PoisonEpic {
+  constructor(ticketId: string, blockerId: string, cycle: string[]) {
+    super(
+      `${ticketId} reported \`dep-missing\` naming \`${blockerId}\`, and anton drew that edge — but ` +
+        `it closes a dependency cycle inside this run's own tickets (${cycle.join(" → ")}), so no ` +
+        `dispatch order can satisfy it. The run stopped rather than run the tickets in an order the ` +
+        `board says is impossible. Take the wrong half back — ` +
+        `\`bd dep remove ${ticketId} ${blockerId}\` undoes the one anton drew — then resume the run`,
+    );
+  }
+}
+
+/**
+ * The agent reported `ANTON-RESULT: needs-human — <ask>` (anton-287p): it stopped because only a
+ * person can take the next step, not because it hit a broken state. Distinct from
+ * {@link BlockedByAgentError} in what it COSTS the operator — a block is a defect to diagnose, an ask
+ * is a minute of their attention — and the run-level catch is what turns it into board state: a
+ * `human` gate on the run target carrying {@link ask} verbatim.
+ *
+ * Poison-classified (`name = "PoisonError"`) so the runner parks rather than burning attempts. A
+ * retry cannot answer an ask; only the person can, and resolving their gate is what releases the run.
+ */
+export class NeedsHumanError extends Error {
+  constructor(
+    readonly ticketId: string,
+    /** The agent's ask, verbatim — the gate's reason. Undefined when it named none. */
+    readonly ask: string | undefined,
+    /** Overridden only by {@link ParkedAskError}, which names the gate the ask actually reached. */
+    message = `${ticketId} needs a human: ${ask ?? "(the agent named no ask)"}. The run is parked ` +
+      `until someone answers it.`,
+  ) {
+    super(message);
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * The ask once its gate is LIVE and the run row records the park (anton-287p) — thrown in the plain
+ * ask's place so the runner's poison park NAMES that gate.
+ *
+ * The id is what keeps ONE wait from being escalated twice (PR #205 review). Every poison park is an
+ * `exhausted-job` finding — "parked without retrying (permanent failure)" — while the run-health
+ * sweep already reports this same pause as the gate's own `needs-human`, the half that says what a
+ * person does about it. Carrying the id in the park message is how the sweep recognises the two as
+ * one wait ({@link parkedAskGateId}) and keeps only the actionable half; without it the operator
+ * gets a second escalation calling a wait on them a permanent failure.
+ */
+export class ParkedAskError extends NeedsHumanError {
+  constructor(
+    ask: NeedsHumanError,
+    readonly gateId: string,
+    /**
+     * The target's OTHER open human gates, named in the park for the same reason (PR #205 review):
+     * they outlive this ask, so a sweep that knew only {@link gateId} would call the still-waiting
+     * job a permanent failure as soon as anton's own gate is answered.
+     */
+    readonly held: string[] = [],
+  ) {
+    super(
+      ask.ticketId,
+      ask.ask,
+      `${ask.ticketId} needs a human: ${ask.ask ?? "(the agent named no ask)"}. ` +
+        parkedOnGateClause(gateId, held),
+    );
+  }
+}
+
+/**
+ * A {@link NeedsHumanError} that a cancellation overtook (anton-287p): the agent asked for a human,
+ * and by the time the ask reached the run's catch the job had been force-killed or the ticket
+ * abandoned. Thrown in the ask's place so NO gate is armed — a `human` gate is new board state that
+ * blocks the target until a person resolves it by hand, and arming one on a run someone just stopped
+ * (an abandoned target especially, which gate-check will never resume) leaves a wait nobody asked
+ * for. The ask still reaches the operator, through this run's error.
+ *
+ * Poison-classified exactly like the error it replaces: a retry cannot answer an ask either.
+ */
+export class CancelledAskError extends Error {
+  constructor(ticketId: string, why: "aborted" | "abandoned", ask: string | undefined) {
+    super(
+      `${ticketId} needed a human: ${ask ?? "(the agent named no ask)"}. The ticket was ${why} ` +
+        `first, so the run stopped there and armed NO gate — nothing on the board carries the ask. ` +
+        `Answer it and re-run the target if the work is still wanted.`,
+    );
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * A cancelled arm that could not undo its own write (anton-287p): the kill landed while `gate create`
+ * ran, so the gate exists — and the `gate resolve` that would have taken it back failed too. Nothing
+ * automatic ever closes a human gate, so {@link gateId} keeps blocking {@link targetId} until a
+ * person resolves it; the run settles FAILED naming it, because that id exists nowhere else.
+ */
+export class StrandedHumanGateError extends Error {
+  /** Every human gate left open on the target — the wait this run armed first. */
+  readonly gateIds: string[];
+  constructor(
+    readonly targetId: string,
+    readonly gateId: string,
+    detail: string,
+    alsoOpen: string[] = [],
+  ) {
+    const ids = [gateId, ...alsoOpen];
+    super(
+      `${detail} — ${targetId} stays blocked until ` +
+        `${ids.map((id) => `\`bd gate resolve ${id}\``).join(" and ")} runs`,
+    );
+    this.gateIds = ids;
+  }
+}
+
+/**
+ * What a run settles on when its ticket asked for a human — the ask itself, or the cancelled form
+ * that arms no gate (anton-287p).
+ *
+ * Takes the LIVE signal, never a snapshot of `aborted`: the epic handler unwinds through several
+ * awaited bd writes (releasing the children it reserved) before it settles, and a force-kill that
+ * lands during them is still an operator stopping the run. Read too early, the ask would go on to
+ * arm a `human` gate that blocks the target until someone clears it by hand, for a run nobody is
+ * waiting on. So callers must pass the signal and call this at the settle, not at the catch.
+ */
+export function askSettleError(raw: unknown, signal: AbortSignal): unknown {
+  return raw instanceof NeedsHumanError && signal.aborted
+    ? new CancelledAskError(raw.ticketId, "aborted", raw.ask)
+    : raw;
+}
+
+/**
+ * The ticket's work had ALREADY LANDED, so anton retired it as superseded and the run carries on
+ * (anton-5bpd / R5.4).
+ *
+ * Deliberately NOT poison, and — like {@link TicketTimeoutError} — deliberately not fatal to the
+ * run: the ticket loop catches this one error and moves to the next ticket. The contrast with the
+ * other repairs is the point. A rewritten pointer earns a RETRY because the bead is now correct, an
+ * ordering earns a WAIT because the work cannot start yet; a retirement earns neither, because there
+ * is nothing left to run. Halting the epic over it would park a whole feature on a ticket that is
+ * finished.
+ *
+ * `repairAlreadyShipped` has already closed the bead against its survivor and put the evidence on it
+ * by the time this is thrown, so nothing downstream settles it — the loop only records which ticket
+ * it was, so the target can say what its pull request does not contain.
+ */
+export class TicketRetiredError extends Error {
+  constructor(
+    readonly ticketId: string,
+    /** The bead the ticket is now recorded as superseded by. */
+    readonly replacementId: string,
+    /** What the repair did, in the words the bead's own note carries. */
+    readonly attempted: string,
+  ) {
+    super(
+      `${ticketId} was already shipped by ${replacementId}: anton verified that against the ` +
+        `repository and the board, retired the ticket as superseded, and the run carried on with ` +
+        `the rest of the feature. ${attempted}`,
+    );
+    this.name = "TicketRetiredError";
+  }
+}
+
+/**
+ * One ticket outlived its wall-clock budget (anton-t1mo — `ticketTimeoutMinutes`).
+ *
+ * Deliberately NOT poison, and deliberately not fatal to the run: the ticket loop catches this one
+ * error and moves to the next ticket, so a feature is never ended by a single ticket that couldn't
+ * converge. runTicket has already blocked the bead and settled its partial work by the time this is
+ * thrown, so nothing downstream needs to settle it — the loop only records which ticket it was.
+ *
+ * Carrying on is safe only because the worktree is provably clean of this ticket, by one of two
+ * routes: its work was PRESERVED in a commit of its own (anton-d967), or it was rolled back. Either
+ * way the tree is re-read afterwards, and a settle that could not prove it raises {@link PoisonEpic}
+ * instead, halting the run so no later ticket commits the leftovers as its own.
+ */
+export class TicketTimeoutError extends Error {
+  constructor(
+    readonly ticketId: string,
+    readonly budgetMs: number,
+    /**
+     * Whether this ticket DELIVERED before the clock ran out (the narrow case of a deadline landing
+     * on the bookkeeping AFTER a commit the delivery gate accepted). Its diff is on the branch, so
+     * the run still lists it as delivered — only its bead is left unfinished.
+     *
+     * A commit alone is not enough (PR #228 review): a deadline can land while `assertDelivered` is
+     * REFUSING one — a previous attempt's adopted `WIP`, or work the agent declared blocked — and
+     * that commit stays on the branch but is nobody's delivery. That case never reaches this error
+     * at all: the settlement raises {@link PoisonEpic} instead, because the refused diff is on the
+     * branch and absorbing the timeout would carry it into the pull request the run's other tickets
+     * open. So this is `true` for an ACCEPTED commit and `false` for a ticket the budget stopped
+     * before one, and both are safe for the loop to absorb.
+     */
+    readonly delivered: boolean,
+    /**
+     * The branch an UNDELIVERED ticket's work was preserved on (anton-d967), or null when it was
+     * rolled back. Only a CHILDLESS run target can preserve — with no sibling ticket there is no
+     * pull request its unfinished diff could ride into. Preserved work is on the branch but is NOT
+     * a delivery: the ticket stays blocked, keeps its `not-delivered` marker, and is in no PR's
+     * delivered list — what the branch carries is a verified-but-incomplete commit a resume
+     * continues from.
+     */
+    readonly preservedOn: string | null = null,
+    /**
+     * Whether that null `preservedOn` is a READ that failed rather than a branch anton looked at
+     * (PR #228 review). A rollback restores a baseline a previous attempt's preserved commit is part
+     * of, so when the history probe could not run, "nothing of this ticket is on the branch" is
+     * unproven — and every reader that turns this error into an operator's account owes the doubt
+     * rather than the claim that the work was removed.
+     */
+    readonly preservedUnknown: boolean = false,
+    /**
+     * The earlier commit a DELIVERED ticket settled on instead of one of its own (PR #253 review):
+     * the deadline landed after `assertDelivered` accepted its `satisfied` claim and before the close
+     * that would have recorded it. The dispatch loop writes this to the run's satisfied ledger, so
+     * the pull request attributes the ticket to that commit rather than listing a delivery the
+     * branch carries under no such name. Null for an ordinary delivery.
+     */
+    readonly satisfiedBy: SatisfiedBy | null = null,
+  ) {
+    super(
+      `${ticketId} exceeded its ${Math.round(budgetMs / 60_000)}m ticket budget and was stopped. ` +
+        (delivered
+          ? satisfiedBy
+            ? `Its work was already on the branch — an earlier commit of this run ` +
+              `(${satisfiedBy.commit.slice(0, 7)}) met it, and the delivery gate had settled it on ` +
+              `that commit (only its bead was left unfinished)`
+            : `Its work IS committed on the branch (only its bead was left unfinished)`
+          : preservedOn
+            ? `Its work passed this project's verify gates, so it was PRESERVED on ` +
+              `\`${preservedOn}\` as an explicitly incomplete commit — a resume continues from it`
+            : preservedUnknown
+              ? `What this attempt added was rolled back, but anton could not read the branch's ` +
+                `history, so work a previous attempt preserved may still be on it`
+              : `Its partial work was rolled back`) +
+        ` and the ticket is blocked for review; the rest of the run continued. ` +
+        `Split it into smaller tickets (or raise ticketTimeoutMinutes), then resume.`,
+    );
+    this.name = "TicketTimeoutError";
+  }
+}
+
+/**
+ * The review gate refused to let this run open a PR (anton-omum): blocking findings it could not
+ * converge, a reviewer that broke the report protocol, or poison the gate raised itself (a reviewer
+ * commit it could not revert, a fixer that moved to a branch of its own).
+ *
+ * Poison-classified (`name = "PoisonError"`) like {@link NoDeliveryError}, so the runner parks the run
+ * for the founder instead of retrying: the reviewer has already had its bounded rounds to converge,
+ * and re-running the same gate on the same diff would reproduce the same verdict. Marks the run
+ * PARKED rather than failed, so the resume the founder is instructed to do reuses this row.
+ */
+export class ReviewBlockedError extends Error {
+  constructor(msg: string, options?: ErrorOptions) {
+    super(msg, options);
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}

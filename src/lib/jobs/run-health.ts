@@ -4,8 +4,9 @@
  *
  * The point is to sweep the CLASS, not the instance: a run parked at 02:00, a PR whose reviewer
  * went on holiday, a laptop that closed mid-run and left its lease behind, a job that quietly spent
- * its last retry — none of these announce themselves, and each strands work indefinitely. One
- * scheduled pass over anton.db's runs/jobs joined with the board finds all of them.
+ * its last retry, a human gate the founder hung and forgot — none of these announce themselves, and
+ * each strands work indefinitely. One scheduled pass over anton.db's runs/jobs joined with the board
+ * finds all of them.
  *
  * READ-ONLY by construction (this ticket): the sweep never touches runs, jobs, or beads. Its only
  * write is the report row, which is upserted per project — so re-running it over unchanged state
@@ -14,7 +15,7 @@
  *
  * Off by default: the schedule is seeded disabled (schedules.ts), so a project opts in.
  */
-import { beads, LABELS, type Bead } from "../beads/bd";
+import { beads, gateReason as bdGateReason, LABELS, type Bead, type Gate } from "../beads/bd";
 import { getPrActivity, prNumberFromRef, type PrActivity } from "../git/pr";
 import {
   DEFAULT_MAX_RETRIES,
@@ -24,7 +25,8 @@ import {
 } from "../projects";
 import { listRunsByStatus, type RunRow } from "../runs";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
-import { PoisonError } from "./errors";
+import { parkedAskGateIds, poisonBlockerIds, PoisonError } from "./errors";
+import { beadBlockedByGate, runTargetAbove } from "./gate-targets";
 import {
   activeExecuteEpicKeys,
   listJobsByStatus,
@@ -38,6 +40,7 @@ import {
   exhaustedParkAttempts,
   POISON_PARK_PREFIX,
   type JobContext,
+  type JobEffect,
   type JobHandler,
 } from "./runner";
 
@@ -259,6 +262,133 @@ export function detectExhaustedJobs(
   return findings;
 }
 
+/**
+ * The prose a human wrote when they hung the gate, collapsed to one line — a report row is one
+ * line, and bd accepts a multi-line reason.
+ *
+ * The parse itself is {@link bdGateReason}'s (PR #205 review): bd folds the reason into the gate's
+ * description rather than giving it a field, and exactly one place in anton should know that
+ * format, so a bd change is fixed once instead of in two parsers that drifted apart.
+ */
+function gateReason(gate: Gate): string | undefined {
+  return bdGateReason(gate)?.replace(/\s+/g, " ").trim() || undefined;
+}
+
+/**
+ * The ticket anton stamped on the gate when it armed the ask (`<ticket> needs a human: <ask>`,
+ * jobs/execute-epic.ts), split off the reason so the row can NAME it.
+ *
+ * It is the only way back to that ticket (PR #205 review): the gate blocks the RUN TARGET, so on a
+ * feature with several children the blocked bead says nothing about which child stopped — and an
+ * answer belongs on the child, whose notes the resumed session reads as binding steering. A gate a
+ * person hung by hand carries no such prefix and keeps its reason whole.
+ */
+const ARMED_ASK = /^(\S+) needs a human:\s*/;
+
+function askOf(reason: string | undefined): { askBeadId?: string; reason?: string } {
+  const match = reason ? ARMED_ASK.exec(reason) : null;
+  if (!match || !reason) return { reason };
+  return { askBeadId: match[1], reason: reason.slice(match[0].length) || undefined };
+}
+
+/**
+ * OPEN human gates — the one stall class that is stuck BY DESIGN. Every other detector reports work
+ * that stopped by accident; a human gate is a wait somebody asked for, and precisely because bd will
+ * never resolve it (`bd gate check` skips `human` entirely) it waits forever unless a person is told
+ * it is waiting. Off the board it is invisible: gate beads are absent from a plain `bd list`, so
+ * without this the founder's own "not until I've looked at it" outlives the looking.
+ *
+ * NO THRESHOLD, unlike the accidental stalls: a human gate needs a human from the instant it opens,
+ * and its age is context, not a deadline (bd's own timeout is the deadline mechanism, and this
+ * detector deliberately doesn't second-guess it).
+ *
+ * The finding names three beads, because a resume needs all three: the GATE to resolve, the bead it
+ * BLOCKS (where the wait is visible on the board), and the run TARGET above that bead — the thing
+ * anton actually re-enqueues, which for a gated ticket is its feature, not the ticket. A gate whose
+ * blocked bead has no run target above it (pipeline plumbing, or a bead this board read doesn't
+ * carry) still reports: the wait is real even when anton cannot map it to a run.
+ *
+ * A fourth, for ANSWERING rather than resuming: the ticket that raised the ask ({@link askOf}),
+ * which none of the three above recover on a feature with several children.
+ */
+export function detectOpenHumanGates(
+  gates: Gate[],
+  board: Bead[],
+  nowMs: number,
+): RunHealthFinding[] {
+  const findings: RunHealthFinding[] = [];
+  for (const gate of gates) {
+    if (gate.issue_type !== "gate" || gate.status === "closed") continue;
+    if (gate.await_type !== "human") continue;
+    const blocked = beadBlockedByGate(board, gate.id);
+    const target = blocked ? runTargetAbove(board, blocked.id) : undefined;
+    // A gate bd stamped with no readable `created_at` reports as brand new rather than as 1970 —
+    // an age nobody can act on beats an age that reads as a 56-year stall.
+    const created = gate.created_at ? Date.parse(gate.created_at) : NaN;
+    const since = Number.isNaN(created) ? nowMs : created;
+    const ageMs = Math.max(0, nowMs - since);
+    const { askBeadId, reason } = askOf(gateReason(gate));
+    findings.push({
+      kind: "needs-human",
+      // Keyed on the GATE, which is the stall: stable across sweeps (bd ids never change), so one
+      // wait raises one escalation however many times the sweep runs.
+      key: `needs-human:${gate.id}`,
+      reason: `waiting on a human ${humanAge(ageMs)}: ${reason ?? "no reason recorded on the gate"}`,
+      since,
+      ageMs,
+      gateId: gate.id,
+      beadId: blocked?.id,
+      targetBeadId: target?.id,
+      askBeadId,
+    });
+  }
+  return findings;
+}
+
+/**
+ * Drop the `exhausted-job` findings that are the SAME wait an open human gate already reports.
+ *
+ * Two ways a job ends up as that second half:
+ *
+ *   • a gate hung on work whose execute-epic job was ALREADY queued poison-parks that job on the
+ *     gate (execute-epic's readiness re-check) — the stall seen once as the gate, once as the job
+ *     that refused to start because of it; and
+ *   • a run that ARMED a human gate for its own ask parks on it (`ParkedAskError`), so the very act
+ *     of asking a person a question also books a job whose park reads "permanent failure"
+ *     (PR #205 review).
+ *
+ * Reported both ways each raises two escalations for one wait — and only the gate row is reconciled
+ * when the wait ends, so the "retries spent" row survives as a false failure with a stale Abandon on
+ * it long after the run resumed.
+ *
+ * The gate wait is the RIGHT half to keep: it names what a human actually does about it, and its
+ * resolve-and-resume restarts the parked job on the way through.
+ *
+ * A blocked park is suppressed only when EVERY blocker it names is one of those gates — a job also
+ * held back by an ordinary prerequisite outlives the gate being answered, and nothing else would
+ * surface it.
+ *
+ * An armed ask names its own gate AND the holds a person hung on the same target, and it is
+ * suppressed while ANY of them is open (PR #205 review). Answering anton's gate does not release a
+ * target a manual gate still blocks, so keying on the armed gate alone would flip the still-waiting
+ * job to "permanent failure" — with an Abandon on it — the moment anton's half is resolved first.
+ * Once every named gate is closed the park is a genuine stall again (nothing resumed the job), and
+ * this reports it.
+ */
+export function withoutGateBlockedJobs(findings: RunHealthFinding[]): RunHealthFinding[] {
+  const openGateIds = new Set(
+    findings.flatMap((f) => (f.kind === "needs-human" && f.gateId ? [f.gateId] : [])),
+  );
+  if (openGateIds.size === 0) return findings;
+  return findings.filter((finding) => {
+    if (finding.kind !== "exhausted-job") return true;
+    const parkedOn = parkedAskGateIds(finding.reason);
+    if (parkedOn !== undefined) return !parkedOn.some((id) => openGateIds.has(id));
+    const blockers = poisonBlockerIds(finding.reason);
+    return !blockers?.every((id) => openGateIds.has(id));
+  });
+}
+
 /** The `epicBeadId` a job payload targets, so an exhausted job links to the work it stranded. */
 function epicBeadIdOf(payloadJson: string | null): string | undefined {
   try {
@@ -296,7 +426,7 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
   const clock = deps.clock ?? systemClock;
   const readPrActivity = deps.readPrActivity ?? getPrActivity;
 
-  return async function runHealth(ctx: JobContext): Promise<void> {
+  return async function runHealth(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as RunHealthPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -306,14 +436,25 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
     const maxAttempts = settings.maxRetries ?? DEFAULT_MAX_RETRIES;
     const nowMs = clock.now();
 
-    const board = await beads.list(project.repoPath, ["--status", "all"]);
+    // Two board reads, because bd answers them separately: gate beads are OMITTED from every
+    // ordinary listing (only `--type gate` / `bd gate list` carries them) while the `blocks` edge a
+    // gate puts on the bead it gates IS carried by the plain list — so the gates come from one read
+    // and the work they block from the other. Open gates only, which is `gate list`'s default.
+    // NOT best-effort: a swallowed gate read reads as "no human is waiting", which is exactly the
+    // false all-clear this sweep exists to prevent. A rejection retries the sweep instead.
+    const [board, gates] = await Promise.all([
+      beads.list(project.repoPath, ["--status", "all"]),
+      beads.gateList(project.repoPath),
+    ]);
     const [parkedRuns, settledJobs, activeEpicKeys] = await Promise.all([
       listRunsByStatus(db, projectId, ["parked"]),
       listJobsByStatus(db, projectId, ["parked", "failed"]),
       activeExecuteEpicKeys(db),
     ]);
 
-    const findings: RunHealthFinding[] = [
+    // Deduped across detectors before anything acts on them: a job that poison-parked ON one of
+    // these gates is that gate's wait, not a second stall (see {@link withoutGateBlockedJobs}).
+    const findings: RunHealthFinding[] = withoutGateBlockedJobs([
       ...detectParkedRuns(
         parkedRuns,
         nowMs,
@@ -326,16 +467,12 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
         graceMs: thresholds.deadLeaseMinutes * 60_000,
       }),
       ...detectExhaustedJobs(settledJobs, maxAttempts, nowMs),
-    ];
+      ...detectOpenHumanGates(gates, board, nowMs),
+    ]);
 
     await ctx.heartbeat();
-    findings.push(
-      ...detectStalePrs(
-        await readInReviewPrs(board, project.repoPath, readPrActivity, ctx),
-        nowMs,
-        thresholds.stalePrHours * 3_600_000,
-      ),
-    );
+    const inReview = await readInReviewPrs(board, project.repoPath, readPrActivity, ctx);
+    findings.push(...detectStalePrs(inReview.prs, nowMs, thresholds.stalePrHours * 3_600_000));
 
     // The report is upserted per project, so saving a partial sweep REPLACES the last good one with
     // something indistinguishable from a clean bill of health. Nothing above is guaranteed to notice
@@ -344,14 +481,41 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
     // gated here explicitly. A cancelled sweep must leave the previous report standing.
     ctx.signal.throwIfAborted();
     await saveRunHealthReport(db, clock, { projectId, jobId: ctx.jobId, findings });
+
+    // The report row is replaced every sweep, so writing it is not the effect — FINDING something
+    // is (see {@link sweepOutcome}).
+    return sweepOutcome(findings.length, inReview.skipped);
+  };
+}
+
+/**
+ * The sweep's outcome line. A clean sweep is the healthy outcome and says so — but only when it
+ * actually swept everything: a PR whose activity couldn't be read was never checked for staleness,
+ * so a sweep that skipped one reports as PARTIAL rather than as a clean bill of health, and a sweep
+ * that did find stalls carries the skipped count beside them (anton-znoz review). Exported for the
+ * unit test — the report row is replaced every sweep, so this note is the only record of a pass that
+ * ran on incomplete input.
+ */
+export function sweepOutcome(findingCount: number, skippedPrReads: number): JobEffect {
+  const skipped = skippedPrReads > 0 ? `${skippedPrReads} PR check(s) skipped` : "";
+  if (findingCount > 0) {
+    return {
+      changed: true,
+      note: skipped ? `${findingCount} finding(s); ${skipped}` : `${findingCount} finding(s)`,
+    };
+  }
+  return {
+    changed: false,
+    note: skipped ? `partial sweep — ${skipped}; no stalls in what was checked` : "no stalls found",
   };
 }
 
 /**
  * Read each in-review target's PR activity. A per-PR failure is logged and skipped rather than
  * failing the sweep: one unreachable PR (a deleted repo, a rate-limited token) must not cost the
- * operator the parked-run and dead-lease findings that were already computed. The skip is loud in
- * the logs precisely because a silently under-reported PR class would read as "all clear".
+ * operator the parked-run and dead-lease findings that were already computed. The skips are counted
+ * as well as logged — an unchecked PR class that reported as "all clear" is exactly the false
+ * all-clear this sweep exists to prevent, so the count rides out in the job's outcome note.
  *
  * An ABORT is the one failure that isn't per-PR: the job itself is being cancelled or has timed out,
  * so every remaining read would fail the same way and the report saved at the end would be a partial
@@ -363,16 +527,18 @@ async function readInReviewPrs(
   repo: string,
   readPrActivity: NonNullable<RunHealthDeps["readPrActivity"]>,
   ctx: JobContext,
-): Promise<InReviewPr[]> {
+): Promise<{ prs: InReviewPr[]; skipped: number }> {
   const prs: InReviewPr[] = [];
+  let skipped = 0;
   for (const { bead, prNumber } of inReviewTargets(board)) {
     try {
       prs.push({ beadId: bead.id, activity: await readPrActivity(repo, prNumber, ctx.signal) });
     } catch (e) {
       ctx.signal.throwIfAborted();
+      skipped += 1;
       console.error(`[run-health] could not read PR #${prNumber} for ${bead.id}; skipping`, e);
     }
     await ctx.heartbeat();
   }
-  return prs;
+  return { prs, skipped };
 }

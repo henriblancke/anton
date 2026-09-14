@@ -1,0 +1,268 @@
+// @vitest-environment jsdom
+/**
+ * The hold/disarm distinction (anton-5c8h / R4.1, R4.5) — the whole UX risk of the brakes, so these
+ * cases assert the DIFFERENCE between the two states rather than each one in isolation: a hold drawn
+ * and worded like a disarm trains the operator to ignore the disarm that matters.
+ *
+ * What each state owes the operator:
+ *   • both — a reason and a clearing condition, on the board, without opening settings.
+ *   • hold — the calm register, the self-clearing promise, and NO buttons.
+ *   • disarm — the failure register, the evidence it tripped on, `Investigate`, and `Re-arm`.
+ */
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+
+import { AutopilotBreakerHeader } from "@/components/health/autopilot-breaker-band";
+import { staleBreaker } from "@/lib/autopilot-breaker";
+import type { AutopilotDisarm, AutopilotHold, AutopilotStale } from "@/lib/autopilot-breaker";
+
+const refresh = vi.fn();
+const success = vi.fn();
+const error = vi.fn();
+
+vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh }) }));
+vi.mock("sonner", () => ({
+  toast: {
+    success: (...a: unknown[]) => success(...a),
+    error: (...a: unknown[]) => error(...a),
+  },
+}));
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  vi.restoreAllMocks();
+});
+
+function stubFetch(body: unknown, status = 200) {
+  const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(body), { status }));
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+function hold(o: Partial<AutopilotHold> = {}): AutopilotHold {
+  return { kind: "hold", reason: "wip-limit", detail: "3 of 3 PRs are open in review.", ...o };
+}
+
+const SERIES = ["anton-abc1 · 8.5", "anton-def2 · 6.0", "anton-ghi3 · 5.5"];
+
+function disarm(o: Partial<AutopilotDisarm> = {}): AutopilotDisarm {
+  return {
+    kind: "disarm",
+    reason: "score-regression",
+    detail: "The rolling review score fell below the floor of 7.",
+    evidence: SERIES,
+    ...o,
+  };
+}
+
+function stale(o: Partial<AutopilotStale> = {}): AutopilotStale {
+  return {
+    kind: "stale",
+    reason: "behind-own-code",
+    detail: "The running anton is behind its own latest code: 3 commits behind origin/main.",
+    evidence: ["Checkout is 3 commits behind origin/main — run `git pull`"],
+    ...o,
+  };
+}
+
+/** The band itself, so "does the hold offer buttons" is asked of the band and not of the document. */
+function band(): HTMLElement {
+  return screen.getByRole("region", {
+    name: /Autopilot is (holding|disarmed)|Anton is running old code/,
+  });
+}
+
+describe("AutopilotBreakerHeader", () => {
+  it("renders nothing while the autopilot is running", () => {
+    // The band's PRESENCE is the signal. An "all clear" row would be one more thing to read on every
+    // board load, saying what the absence of a stopped state already says.
+    const { container } = render(<AutopilotBreakerHeader slug="anton" />);
+    expect(container.innerHTML).toBe("");
+  });
+
+  describe("hold", () => {
+    it("names the kind, the limit, and what would release it", () => {
+      render(<AutopilotBreakerHeader slug="anton" breaker={hold()} />);
+      expect(screen.getByText("Autopilot is holding")).toBeTruthy();
+      expect(screen.getByText("Review queue is full")).toBeTruthy();
+      expect(screen.getByText("3 of 3 PRs are open in review.")).toBeTruthy();
+      // R4.5's sentence: what would start anton again, read off the board.
+      expect(
+        screen.getByText("Releases itself when one PR merges or closes — nothing for you to do."),
+      ).toBeTruthy();
+    });
+
+    it("reads as a limit being respected, not as a failure", () => {
+      render(<AutopilotBreakerHeader slug="anton" breaker={hold()} />);
+      expect(screen.getByText(/Nothing is wrong/)).toBeTruthy();
+      // The word beside the colour: the two kinds must be distinguishable without the palette.
+      expect(within(band()).getByText("hold")).toBeTruthy();
+      expect(within(band()).queryByText("disarm")).toBeNull();
+      // The destructive wash is reserved for the state that actually needs a human.
+      expect(band().className).not.toMatch(/destructive/);
+    });
+
+    it("says in-flight work is unaffected", () => {
+      // "Autopilot is stopped" reads as "everything is stopped" unless something says otherwise.
+      render(<AutopilotBreakerHeader slug="anton" breaker={hold()} />);
+      expect(screen.getByText(/only starting new work is stopped/)).toBeTruthy();
+    });
+
+    it("offers no buttons at all", () => {
+      // Every affordance on a self-clearing state is an invitation to override a limit the operator
+      // set for themselves — and there is nothing here for a human to do.
+      render(<AutopilotBreakerHeader slug="anton" breaker={hold()} />);
+      expect(within(band()).queryByRole("button")).toBeNull();
+      expect(within(band()).queryByRole("link")).toBeNull();
+    });
+  });
+
+  describe("disarm", () => {
+    it("says why, in the failure register", () => {
+      render(<AutopilotBreakerHeader slug="anton" breaker={disarm()} />);
+      expect(screen.getByText("Autopilot is disarmed")).toBeTruthy();
+      expect(screen.getByText("Review scores fell below the floor")).toBeTruthy();
+      expect(screen.getByText("The rolling review score fell below the floor of 7.")).toBeTruthy();
+      expect(within(band()).getByText("disarm")).toBeTruthy();
+      expect(within(band()).queryByText("hold")).toBeNull();
+      expect(band().className).toMatch(/destructive/);
+    });
+
+    it("promises no automatic clearing", () => {
+      // An operator waiting on a machine that is waiting on them is a stopped autopilot nobody comes
+      // back to — so a disarm names the human act and nothing else.
+      render(<AutopilotBreakerHeader slug="anton" breaker={disarm()} />);
+      expect(
+        screen.getByText("Stays off until you re-arm it. Nothing re-arms it automatically."),
+      ).toBeTruthy();
+      expect(screen.queryByText(/Releases itself/)).toBeNull();
+    });
+
+    it("shows every evidence line it tripped on", () => {
+      // This list IS the decision Re-arm asks for; clipping it would re-arm on a summary.
+      render(<AutopilotBreakerHeader slug="anton" breaker={disarm()} />);
+      for (const line of SERIES) expect(within(band()).getByText(line)).toBeTruthy();
+    });
+
+    it("sends Investigate to where that kind of evidence lives", () => {
+      const { unmount } = render(<AutopilotBreakerHeader slug="anton" breaker={disarm()} />);
+      expect(screen.getByRole("link", { name: "Investigate" }).getAttribute("href")).toBe(
+        "/projects/anton/health",
+      );
+      unmount();
+
+      render(
+        <AutopilotBreakerHeader
+          slug="anton"
+          breaker={disarm({ reason: "consecutive-failures", evidence: [] })}
+        />,
+      );
+      expect(screen.getByRole("link", { name: "Investigate" }).getAttribute("href")).toBe(
+        "/projects/anton/runs",
+      );
+    });
+
+    it("re-arms only after an explicit confirm, and reports the actor the server recorded", async () => {
+      const fetchMock = stubFetch({ rearmedBy: "Henri Blancke", rearmedAt: 1_800_000_000 });
+      render(<AutopilotBreakerHeader slug="anton" breaker={disarm()} />);
+
+      // Resuming unattended execution after a quality signal is not a one-click act.
+      fireEvent.click(screen.getByRole("button", { name: "Re-arm" }));
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: "Confirm re-arm" }));
+
+      await waitFor(() => expect(refresh).toHaveBeenCalled());
+      expect(fetchMock).toHaveBeenCalledWith("/api/projects/anton/autopilot/re-arm", {
+        method: "POST",
+      });
+      // The author is the SERVER's answer, shown back at the moment the decision is made.
+      expect(success).toHaveBeenCalledWith("Autopilot re-armed", {
+        description: "Recorded as Henri Blancke.",
+      });
+    });
+
+    it("surfaces a refused re-arm and re-reads the state", async () => {
+      stubFetch({ error: "This project's autopilot is already armed — nothing was changed" }, 409);
+      render(<AutopilotBreakerHeader slug="anton" breaker={disarm()} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Re-arm" }));
+      fireEvent.click(screen.getByRole("button", { name: "Confirm re-arm" }));
+
+      await waitFor(() =>
+        expect(error).toHaveBeenCalledWith(
+          "This project's autopilot is already armed — nothing was changed",
+        ),
+      );
+      // Someone else lifted it: re-read rather than leave a band that errors on every click.
+      expect(refresh).toHaveBeenCalled();
+    });
+  });
+
+  describe("stale", () => {
+    it("says why anton stopped, in the failure register", () => {
+      render(<AutopilotBreakerHeader slug="anton" breaker={stale()} />);
+      expect(screen.getByText("Anton is running old code")).toBeTruthy();
+      expect(screen.getByText("Behind its own latest code")).toBeTruthy();
+      expect(
+        screen.getByText(/The running anton is behind its own latest code/),
+      ).toBeTruthy();
+      // Red like a disarm — it needs a human — and told apart by the word beside the colour.
+      expect(within(band()).getByText("stale")).toBeTruthy();
+      expect(band().className).toMatch(/destructive/);
+    });
+
+    it("states the remedy on the surface — the command to run and the restart it needs", () => {
+      // R4.5's whole point: the fix is on the board, not buried in a run's park message.
+      render(<AutopilotBreakerHeader slug="anton" breaker={stale()} />);
+      expect(
+        within(band()).getByText("Checkout is 3 commits behind origin/main — run `git pull`"),
+      ).toBeTruthy();
+      expect(
+        screen.getByText("Update anton and restart it. Nothing starts new work until you do."),
+      ).toBeTruthy();
+      expect(screen.getByText(/only starting new work is stopped/)).toBeTruthy();
+    });
+
+    it("carries a line for each stale half", () => {
+      render(
+        <AutopilotBreakerHeader
+          slug="anton"
+          breaker={stale({
+            evidence: [
+              "Checkout is 3 commits behind origin/main — run `git pull`",
+              "Installed packages no longer match bun.lock (drizzle-orm, next) — run `bun install`",
+            ],
+          })}
+        />,
+      );
+      expect(
+        within(band()).getByText(/Installed packages no longer match bun.lock/),
+      ).toBeTruthy();
+    });
+
+    it("offers no buttons — there is nothing to re-arm and no page to investigate", () => {
+      render(<AutopilotBreakerHeader slug="anton" breaker={stale()} />);
+      expect(within(band()).queryByRole("button")).toBeNull();
+      expect(within(band()).queryByRole("link")).toBeNull();
+      expect(screen.queryByText(/re-arm/i)).toBeNull();
+    });
+
+    it("renders nothing for a clean self-freshness verdict", () => {
+      // The verdict → band step is what the board actually runs; a current checkout with matched
+      // packages must produce no band at all.
+      const { container } = render(
+        <AutopilotBreakerHeader
+          slug="anton"
+          breaker={staleBreaker({
+            checkout: { state: "current" },
+            dependencies: { state: "match" },
+            build: { state: "current" },
+          })}
+        />,
+      );
+      expect(container.innerHTML).toBe("");
+    });
+  });
+});

@@ -19,6 +19,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe } from "vitest";
 import { applyMigrationsTo } from "@/lib/db/testing";
+import type { Project } from "@/lib/types";
 
 // ── binary probes + suite selector ──
 
@@ -70,13 +71,28 @@ export interface BdRepo {
  * friends already index-pack every push, so this makes the sandbox match production rather than
  * papering over a real failure.
  *
+ * Auto-gc is switched OFF for the same class of reason, and it is not a hypothetical: `git gc --auto`
+ * DETACHES, so a repack runs in the background while the suite keeps using the remote — and a repack
+ * deletes the packs it just rewrote out from under whatever is reading or writing them. That surfaces
+ * as an ENOENT on a temp file with every assertion green ("failed to copy file to
+ * .git/objects/pack/tmp_pack_…: No such file or directory" from a concurrent `git clone`; "unable to
+ * create temporary file" from a concurrent `bd dolt push`), which reddened two runs of PR #174. One
+ * `bd dolt push` lands ~4 packs, so a suite crosses `gc.autoPackLimit` (50) after about a dozen syncs
+ * — every e2e here does far more than that, making the race routine rather than rare. Nothing in a
+ * throwaway sandbox benefits from gc, so both the heuristic (`gc.auto`) and receive-pack's call into
+ * it (`receive.autogc`) are disabled.
+ *
  * `-b main` pins the bare HEAD to refs/heads/main so clones of this remote check out main;
  * otherwise hosts whose default branch is `master` leave a clone on an unborn `master` and
  * `git push origin main` fails with "src refspec main does not match any".
  */
 export function initBareRemote(path: string): void {
   execFileSync("git", ["init", "--bare", "-q", "-b", "main", path], { stdio: "ignore" });
-  execFileSync("git", ["-C", path, "config", "receive.unpackLimit", "0"], { stdio: "ignore" });
+  const config = (key: string, value: string) =>
+    execFileSync("git", ["-C", path, "config", key, value], { stdio: "ignore" });
+  config("receive.unpackLimit", "0");
+  config("gc.auto", "0");
+  config("receive.autogc", "false");
 }
 
 /**
@@ -160,6 +176,36 @@ export function removeTempRepo(dir: string, rm: typeof rmSync = rmSync): void {
   }
 }
 
+// ── bd's one-second stamp grid ──
+
+/**
+ * The moment every bd write made up to `nowMs` is stamped STRICTLY BELOW — `round(nowMs) + 1.05s`.
+ *
+ * bd ROUNDS write stamps to whole seconds rather than truncating, so a write landing at `S.6` is
+ * stamped `S+1` — a second AHEAD of the clock it landed on. Clearing the next boundary is therefore
+ * not enough: the target is taken from `round(nowMs)`, the highest stamp a completed write can
+ * already hold, plus a full second and a hair of slack.
+ *
+ * Exported separately from {@link nextBdSecond} so the arithmetic is testable without sleeping.
+ */
+export function settledAfterBdWrites(nowMs: number): number {
+  return Math.round(nowMs / 1_000) * 1_000 + 1_050;
+}
+
+/**
+ * Wait until every bd write already made can be ORDERED against what happens next.
+ *
+ * Anything comparing two bd stamps at one-second resolution reads an equal pair as unorderable and
+ * fails closed — a subject written in the same second a patrol read the board cannot be shown to
+ * predate that read, so the gardener's evidence fence refuses the move (apply-plan.ts
+ * `writtenSinceFiling`). Real passes judge writes made hours earlier; only a fixture is fast enough
+ * to collide, so the wait belongs in the fixtures — not in a looser rule.
+ */
+export function nextBdSecond(): Promise<void> {
+  const target = settledAfterBdWrites(Date.now());
+  return new Promise((resolve) => setTimeout(resolve, target - Date.now()));
+}
+
 // ── temp file-backed anton.db ──
 
 export interface FileDb {
@@ -195,6 +241,30 @@ export function makeFileDb(): FileDb {
       if (prevDb === undefined) delete process.env.ANTON_DB;
       else process.env.ANTON_DB = prevDb;
     },
+  };
+}
+
+// ── project fixture ──
+
+/**
+ * The `Project` a real-bd suite arranges around: a throwaway {@link makeBdRepo} repo, addressed as
+ * slug `tmp`. Every such suite used to inline this literal, so a new `Project` field (or a changed
+ * default) meant a dozen identical edits and any missed one left a suite exercising a subtly
+ * different project.
+ *
+ * `overrides` exists for the handful of suites that assert on a field — the abandon routes match
+ * the project id handed to `cancelRunForTarget`, so they pin `id`.
+ */
+export function tmpProject(repoPath: string, overrides: Partial<Project> = {}): Project {
+  return {
+    id: "x",
+    slug: "tmp",
+    name: "tmp",
+    repoPath,
+    defaultBranch: "main",
+    hasBeads: true,
+    createdAt: 0,
+    ...overrides,
   };
 }
 

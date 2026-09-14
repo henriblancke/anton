@@ -36,9 +36,12 @@ const JOB_STATUS_LABELS: Record<JobStatus, string> = {
   cancelled: "Cancelled",
 };
 
-const JOB_TYPE_LABELS: Record<JobType, string> = {
+/** Every job type's display name. Exported so any control that OFFERS a job type — the Jobs
+ *  toolbar's filter, the model routing table — names it the same way. */
+export const JOB_TYPE_LABELS: Record<JobType, string> = {
   "execute-epic": "Execute epic",
   "review-fix": "Review fix",
+  "review-fix-pr": "Review fix (PR)",
   "nightly-stringer": "Nightly stringer",
   "orphan-grooming": "Orphan grooming",
   "sync-push": "Sync push",
@@ -47,6 +50,8 @@ const JOB_TYPE_LABELS: Record<JobType, string> = {
   "gate-check": "Gate check",
   gardener: "Gardener",
   "product-master": "Product master",
+  "board-picker": "Board picker",
+  "worktree-reaper": "Worktree reaper",
 };
 
 export const JOB_STATUSES = Object.keys(JOB_STATUS_LABELS) as JobStatus[];

@@ -12,11 +12,24 @@
  * reads its parent, so counting its missing Success Criteria as blocking would fail the command over
  * a run that was never going to be refused.
  *
+ * Those same beads are measured a SECOND way (anton-5ltn): the form rate, "does the description
+ * alone carry the contract, in the order the contract states it" ({@link contractFormGaps} and
+ * {@link contractOrderGaps}). Same denominator so the two rates compare; separate from the
+ * violations because producer drift into bd's acceptance field — or out of the contract's order —
+ * is not a gap the gate has, or should have, an opinion about. It never touches the exit code.
+ *
  * Pure (no bd calls, no IO) so the shape of the report is unit-tested; `scripts/contract-report.ts`
  * is the shell that reads the boards and prints it.
  */
 import { contractGatedBoard } from "../ticket-view";
-import { isContractJudged, validateBeadContract, type ContractViolation } from "./contract";
+import {
+  contractFormGaps,
+  contractOrderGaps,
+  isContractJudged,
+  validateBeadContract,
+  type ContractSection,
+  type ContractViolation,
+} from "./contract";
 import type { Bead } from "./types";
 
 export interface ContractReportRow {
@@ -34,6 +47,48 @@ export interface ContractSectionCount {
   count: number;
 }
 
+/** One bead whose DESCRIPTION does not carry the whole contract, and how it falls short. */
+export interface ContractFormRow {
+  id: string;
+  title: string;
+  issueType: string;
+  status: string;
+  /** Sections the description does not carry at all — AUTHOR these. In the contract's own order. */
+  missing: ContractSection[];
+  /**
+   * Sections it carries out of the contract's order — MOVE these. Kept apart from `missing` so a
+   * repair note can tell the two apart: authoring a section nobody wrote and moving one that is
+   * already written are different jobs, and merging them would prescribe the wrong one.
+   */
+  misplaced: ContractSection[];
+}
+
+/** How often one section falls short — the form line's "Acceptance 78" tally, per gap kind. */
+export interface ContractFormSectionCount {
+  section: ContractSection;
+  count: number;
+}
+
+/**
+ * The form question over the same denominator as the contract rate: does the markdown ALONE carry
+ * every section the bead's tier owes ({@link contractFormGaps}), in the order the contract states
+ * them ({@link contractOrderGaps})?
+ *
+ * Never blocking and never in the exit code, by construction — a bead whose rubric lives only in
+ * bd's `acceptance_criteria` field approves and runs today, correctly. This measures producer drift
+ * into that shape, which is exactly the drift every existing check is blind to.
+ */
+export interface ContractFormReport {
+  /** Beads whose description carries every section its tier owes, in order — over `judged`. */
+  conformant: number;
+  /** How often each section is absent. */
+  bySection: ContractFormSectionCount[];
+  /** How often each section is present but out of the contract's order. */
+  misplacedBySection: ContractFormSectionCount[];
+  /** Only beads falling short, most sections missing first. A clean board reports an empty list. */
+  rows: ContractFormRow[];
+}
+
 export interface ContractReport {
   /** Run-gated beads the contract applies to — the only honest denominator for a conformance rate. */
   judged: number;
@@ -45,6 +100,8 @@ export interface ContractReport {
   bySection: ContractSectionCount[];
   /** Only beads with violations, worst first. A clean board reports an empty list. */
   rows: ContractReportRow[];
+  /** The second, non-gating judgement over the same `judged` beads. */
+  form: ContractFormReport;
 }
 
 /** Does this row carry a gap the hard gate would refuse the run over? Blocking rows rank first. */
@@ -74,6 +131,47 @@ export function buildContractReport(all: Bead[]): ContractReport {
     advisory: violations.filter((v) => v.severity !== "blocking").length,
     bySection: tallySections(violations),
     rows,
+    form: buildFormReport(judged),
+  };
+}
+
+/**
+ * The form judgement over the beads the contract rate already divides by, so the two rates read as
+ * one board measured two ways. Calls {@link contractFormGaps} — the sections are never re-derived
+ * here, exactly as the contract half calls {@link validateBeadContract}.
+ */
+function buildFormReport(judged: Bead[]): ContractFormReport {
+  // Absent sections rank ahead of misplaced ones: a description missing three sections is further
+  // from the contract than one carrying all five in the wrong sequence.
+  const rows = judged
+    .map(formRowOf)
+    .filter((row): row is ContractFormRow => row !== undefined)
+    .sort(
+      (a, b) =>
+        b.missing.length - a.missing.length ||
+        b.misplaced.length - a.misplaced.length ||
+        a.id.localeCompare(b.id),
+    );
+  return {
+    conformant: judged.length - rows.length,
+    bySection: tallyFormSections(rows.flatMap((r) => r.missing)),
+    misplacedBySection: tallyFormSections(rows.flatMap((r) => r.misplaced)),
+    rows,
+  };
+}
+
+/** A bead's form row, or undefined when its description carries the whole contract, in order. */
+function formRowOf(bead: Bead): ContractFormRow | undefined {
+  const missing = contractFormGaps(bead);
+  const misplaced = contractOrderGaps(bead);
+  if (missing.length === 0 && misplaced.length === 0) return undefined;
+  return {
+    id: bead.id,
+    title: bead.title,
+    issueType: bead.issue_type ?? "",
+    status: bead.status,
+    missing,
+    misplaced,
   };
 }
 
@@ -116,6 +214,17 @@ function tallySections(violations: ContractViolation[]): ContractSectionCount[] 
   );
 }
 
+/** How often each section appears in one kind of form gap, most frequent first then by name. */
+function tallyFormSections(sections: ContractSection[]): ContractFormSectionCount[] {
+  const counts = new Map<ContractSection, number>();
+  for (const section of sections) {
+    counts.set(section, (counts.get(section) ?? 0) + 1);
+  }
+  return [...counts]
+    .map(([section, count]) => ({ section, count }))
+    .sort((a, b) => b.count - a.count || a.section.localeCompare(b.section));
+}
+
 const pct = (part: number, whole: number) => (whole === 0 ? 100 : Math.round((part / whole) * 100));
 
 const tally = (counts: ContractSectionCount[], severity: string) =>
@@ -124,9 +233,28 @@ const tally = (counts: ContractSectionCount[], severity: string) =>
     .map((c) => `${c.section} ${c.count}`)
     .join(", ");
 
+const formTally = (counts: ContractFormSectionCount[]) =>
+  counts.map((c) => `${c.section} ${c.count}`).join(", ");
+
+/** The form headline's tail: what is absent, then what is merely out of place, each named so the
+ * repair is unambiguous. Empty when the board's descriptions carry the whole contract in order. */
+const formGapTally = (form: ContractFormReport) =>
+  [
+    form.bySection.length ? `missing ${formTally(form.bySection)}` : "",
+    form.misplacedBySection.length ? `out of order ${formTally(form.misplacedBySection)}` : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+
 /**
  * The report as text: a headline the switch-on decision can be made from, then every violation by
- * bead and section. Returned rather than printed so it is testable and can be pasted into a bead.
+ * bead and section, then the same beads' form gaps. Returned rather than printed so it is testable
+ * and can be pasted into a bead.
+ *
+ * The form block is LAST and marked non-gating on purpose. It answers a different question over the
+ * same denominator, and reading it as a second severity would misread the exit code — which stays
+ * keyed to blocking Acceptance gaps alone. Its two gap kinds print on separate lines so the repair
+ * they prescribe stays distinguishable: author the missing section, move the misplaced one.
  */
 export function formatContractReport(report: ContractReport, label = ""): string {
   const head = label ? `${label}: ` : "";
@@ -134,17 +262,37 @@ export function formatContractReport(report: ContractReport, label = ""): string
     `${head}${report.conformant}/${report.judged} run-gated beads conformant (${pct(report.conformant, report.judged)}%)`,
     `  BLOCKING ${report.blocking} across ${report.blocked} bead(s)${report.blocking ? ` — ${tally(report.bySection, "blocking")}` : ""}`,
     `  advisory ${report.advisory}${report.advisory ? ` — ${tally(report.bySection, "advisory")}` : ""}`,
+    `  form     ${report.form.conformant}/${report.judged} descriptions carry every section, in order (${pct(report.form.conformant, report.judged)}%)${report.form.rows.length ? ` — ${formGapTally(report.form)}` : ""}`,
   ];
   if (report.rows.length === 0) {
     lines.push("", "  No violations. The hard gate can be switched on without stranding work.");
-    return lines.join("\n");
+  } else {
+    lines.push("");
+    for (const row of report.rows) {
+      lines.push(`${row.id}  [${row.issueType}/${row.status}]  ${row.title}`);
+      for (const v of row.violations) {
+        const severity = v.severity === "blocking" ? "BLOCKING" : "advisory";
+        lines.push(`    ${severity}  ${v.section.padEnd(16)} ${v.message}`);
+      }
+    }
   }
-  lines.push("");
-  for (const row of report.rows) {
-    lines.push(`${row.id}  [${row.issueType}/${row.status}]  ${row.title}`);
-    for (const v of row.violations) {
-      const severity = v.severity === "blocking" ? "BLOCKING" : "advisory";
-      lines.push(`    ${severity}  ${v.section.padEnd(16)} ${v.message}`);
+  if (report.form.rows.length > 0) {
+    lines.push(
+      "",
+      "FORM — sections the description does not carry, or carries out of the contract's order (Goal →",
+      "Acceptance Criteria → Context → Out of scope → Verify). Never blocking, never in the exit code:",
+      "the gate reads acceptance from bd's field too, so a form gap alone never withholds a run" +
+        // The BLOCKING caveat only reads as one when there is a BLOCKING list above to point at; on a
+        // clean board it contradicts the "No violations" headline the operator just read.
+        (report.blocking > 0 ? " — but a" : "."),
+      ...(report.blocking > 0 ? ["bead listed BLOCKING above is refused all the same."] : []),
+      "",
+    );
+    for (const row of report.form.rows) {
+      lines.push(`${row.id}  [${row.issueType}/${row.status}]  ${row.title}`);
+      // Two lines, not one: `missing` sections must be authored, `misplaced` ones only moved.
+      if (row.missing.length > 0) lines.push(`    missing   ${row.missing.join(", ")}`);
+      if (row.misplaced.length > 0) lines.push(`    misplaced ${row.misplaced.join(", ")}`);
     }
   }
   return lines.join("\n");

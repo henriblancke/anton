@@ -4,19 +4,18 @@
  * in-memory anton.db) so "each review and each fix is its own recorded session" is asserted on the
  * rows the UI reads, not on a spy.
  *
- * The verify gates are deliberately left unconfigured here: `runVerifyGates` takes the host-wide
- * verify-gate lock and shells out, which belongs to the execute-epic integration suite (anton-omum),
- * not to a loop test.
+ * The verify gates are left unconfigured in most cases here: running a real suite belongs to the
+ * execute-epic integration suite (anton-omum), not to a loop test. The exception is the block at the
+ * bottom, which pins a trivial `echo` gate — the gate evidence the reviewer is handed is loop
+ * behavior (which session runs the gates, and how often), so it is asserted where the loop is.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { asc } from "drizzle-orm";
 
-import { makeTestDb, type TestDb } from "../db/testing";
 import { schema } from "../db";
 import type { Bead } from "../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
@@ -33,6 +32,7 @@ import {
   type ReviewGateResult,
   type ReviewRound,
 } from "./review-gate";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 /** A one-commit `main` repo: the least a gate round needs to read its (absent) rules from. */
 function initRepo(path: string): void {
@@ -69,6 +69,7 @@ const ticket: Bead = {
   issue_type: "task",
   parent: "anton-gate1",
   description: "## Goal\n\nA bounded loop.\n\n## Acceptance\n\n- [ ] bounded\n",
+  labels: ["risk:high"],
 };
 
 const diff: BranchDiff = {
@@ -105,23 +106,30 @@ function fakeClaude(replies: ScriptedReply[]) {
     const next = replies[calls.length - 1];
     if (next === undefined) throw new Error(`unscripted claude dispatch #${calls.length}`);
     if (next instanceof Error) throw next;
-    return typeof next === "string" ? { ok: true, text: next } : next;
+    // `modelUsage: []` is what a result with no readable usage carries (anton-77l9).
+    return typeof next === "string" ? { ok: true, text: next, modelUsage: [] } : next;
   };
   return { run, calls };
 }
 
 let dir: string;
-let tdb: TestDb;
+let tdb: TestProjectDb;
 let projectId: string;
 let priorSessionsRoot: string | undefined;
 const clock = new TickingClock(1_700_000_000_000);
+/** What each session reported live — asserted so an investigate terminal can hit the right endpoint. */
+let reportedInfos: Parameters<ReviewGateContext["report"]>[0][] = [];
 const ctx: ReviewGateContext = {
   signal: new AbortController().signal,
   heartbeat: async () => {},
-  report: () => {},
+  report: (info) => reportedInfos.push(info),
+  claudeReached: async () => {},
+  jobId: "job-test",
+  type: "execute-epic",
 };
 
 beforeEach(async () => {
+  reportedInfos = [];
   dir = mkdtempSync(join(tmpdir(), "anton-review-gate-"));
   // A real one-commit repo even though claude, the diff and the worktree state are all faked: the
   // gate reads its trusted inputs (the rulebook) at the base commit and FAILS on a read it cannot
@@ -129,15 +137,8 @@ beforeEach(async () => {
   initRepo(dir);
   priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
-  tdb = makeTestDb();
-  projectId = randomUUID();
-  await tdb.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: dir,
-    defaultBranch: "main",
-  });
+  tdb = makeProjectDb({ repoPath: dir });
+  projectId = tdb.projectId;
 });
 
 afterEach(() => {
@@ -228,10 +229,12 @@ function gate(
   worktree = fakeWorktree(),
   assertLeaseHeld?: () => void,
   carried?: ReviewFinding[],
+  hashTree?: (worktreePath: string) => Promise<string>,
 ): {
   result: Promise<ReviewGateResult>;
   calls: RunClaudeOptions[];
   commitMessages: string[];
+  commitOptions: Array<{ timeoutMs?: number; signal?: AbortSignal }>;
   restores: string[];
   /** The worktree's dirt as each round's diff was read — the review must see a settled tree. */
   diffStates: string[];
@@ -240,6 +243,7 @@ function gate(
 } {
   const { run, calls } = fakeClaude(replies);
   const commitMessages: string[] = [];
+  const commitOptions: Array<{ timeoutMs?: number; signal?: AbortSignal }> = [];
   const diffStates: string[] = [];
   const rounds: ReviewRound[] = [];
   const result = runReviewGate({
@@ -264,17 +268,19 @@ function gate(
         diffStates.push((await worktree.readState()).status);
         return diff;
       },
-      commit: async (_path, message) => {
+      commit: async (_path, message, options) => {
         commitMessages.push(message);
+        commitOptions.push(options ?? {});
         const committed = commits[commitMessages.length - 1] ?? true;
         if (committed) worktree.onCommit();
         return { committed };
       },
       readState: worktree.readState,
       restoreState: worktree.restoreState,
+      ...(hashTree ? { hashTree } : {}),
     },
   });
-  return { result, calls, commitMessages, restores: worktree.restores, diffStates, rounds };
+  return { result, calls, commitMessages, commitOptions, restores: worktree.restores, diffStates, rounds };
 }
 
 /** The recorded sessions in start order — the UI's view of the gate. */
@@ -285,7 +291,10 @@ async function sessionKinds(): Promise<Array<{ kind: string; status: string; bea
 
 describe("runReviewGate — convergence", () => {
   it("stops after one review when nothing blocking is reported", async () => {
-    const { result, calls, commitMessages } = gate([report(9, [ADVISORY])]);
+    const { result, calls, commitMessages } = gate([report(9, [ADVISORY])], {
+      model: "fallback",
+      modelRoutes: [{ jobType: "execute-epic", step: "review", model: "review-model" }],
+    });
     const out = await result;
 
     expect(out.outcome).toBe("clean");
@@ -299,6 +308,7 @@ describe("runReviewGate — convergence", () => {
     ]);
     expect(blockingFindings(out.unresolved)).toEqual([]);
     expect(calls).toHaveLength(1); // one review, no fix
+    expect(calls[0].model).toBe("review-model");
     expect(commitMessages).toEqual([]);
   });
 
@@ -318,6 +328,48 @@ describe("runReviewGate — convergence", () => {
     expect(blockingFindings(out.unresolved)).toEqual([]);
     expect(calls).toHaveLength(3); // review → fix → review
     expect(commitMessages).toEqual(["anton-gate1: address self-review findings (round 1)"]);
+  });
+
+  it("gives the self-review fix commit the project's configured budget", async () => {
+    const { result, commitOptions } = gate([report(4, [BLOCKING]), "fixed", report(9, [])], {
+      commitTimeoutMinutes: 10,
+    });
+
+    await result;
+
+    expect(commitOptions).toHaveLength(1);
+    expect(commitOptions[0]?.timeoutMs).toBe(10 * 60_000);
+    expect(commitOptions[0]?.signal).toBe(ctx.signal);
+  });
+
+  it("keeps child-ticket label routing through review fixes", async () => {
+    const { result, calls } = gate([report(4, [BLOCKING]), "fixed", report(9, [])], {
+      model: "fallback",
+      modelRoutes: [{ jobType: "execute-epic", step: "review", label: "risk:high", model: "careful" }],
+    });
+
+    await result;
+
+    expect(calls.map((call) => call.model)).toEqual(["careful", "careful", "careful"]);
+  });
+
+  it("pins every session report to the run's routing — so investigate hits the reviewed endpoint", async () => {
+    // A same-machine resume that skips every runTicket never seeds the live handle with routing;
+    // the gate's own reports must carry it, or an investigate terminal falls back to current settings.
+    const routed: ProjectSettings = { claudeBaseUrl: "https://gw.example/api", claudeAuthTokenEnv: "GW_TOKEN" };
+    const { result } = gate([report(4, [BLOCKING]), "fixed", report(9, [])], routed);
+    await result;
+
+    // review → fix → re-review: each session's live report carries the pinned gateway route.
+    expect(reportedInfos).toHaveLength(3);
+    for (const info of reportedInfos) {
+      expect(info.routing).toEqual({
+        routed: true,
+        baseUrl: "https://gw.example/api",
+        authTokenEnv: "GW_TOKEN",
+        gatewayModelDiscovery: false,
+      });
+    }
   });
 
   it("dispatches only the BLOCKING findings to the fix session", async () => {
@@ -729,7 +781,7 @@ describe("runReviewGate — quota", () => {
   });
 
   it("marks the review session failed when claude reports an error result", async () => {
-    const failing = async (): Promise<ClaudeResult> => ({ ok: false, text: "boom" });
+    const failing = async (): Promise<ClaudeResult> => ({ ok: false, text: "boom", modelUsage: [] });
     const worktree = fakeWorktree();
     await expect(
       runReviewGate({
@@ -828,7 +880,7 @@ describe("runReviewGate — the review is read-only", () => {
     // clean tree, so `settleBaseline` would adopt it as the baseline and a later clean review would
     // hand it to the PR unreviewed.
     const worktree = fakeWorktree([], "", [1]);
-    const { result, restores } = gate([{ ok: false, text: "boom" }], {}, [], worktree);
+    const { result, restores } = gate([{ ok: false, text: "boom", modelUsage: [] }], {}, [], worktree);
 
     await expect(result).rejects.toThrow(/claude reported an error reviewing anton-gate1/);
     expect(restores).toHaveLength(1);
@@ -1210,5 +1262,169 @@ describe("runReviewGate — the base is pinned to the fork point", () => {
 
     // And no reviewer was dispatched on the half-read rulebook.
     expect(calls).toEqual([]);
+  });
+});
+
+/**
+ * The gates the REVIEWER is handed instead of running (anton-3jwh's fallout). A trivial `echo` gate
+ * stands in for the project's suite: what is under test is which session runs the gates and how
+ * often, not what they do.
+ */
+describe("verify-gate evidence", () => {
+  it("runs the project's gates in the review session and hands the reviewer their output", async () => {
+    const { result, calls } = gate([report(9, [])], { testCommand: "echo unit-suite-green" });
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    expect(calls[0].prompt).toContain("The checks anton already ran");
+    expect(calls[0].prompt).toContain("`echo unit-suite-green`");
+    // The reviewer reads the result rather than re-deriving it — the whole point of running it here.
+    expect(calls[0].prompt).toContain("unit-suite-green");
+  });
+
+  it("runs the gates ONCE per tree, reusing the fix session's run for the next round", async () => {
+    const counter = join(dir, "gate-runs");
+    const { result } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { testCommand: `echo ran >> ${counter}` },
+      [true],
+    );
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    // Round 1's review ran them, then the fix session ran them on what it committed. Round 2 is
+    // handed that evidence: a third run would be the suite twice on one tree, which is the
+    // contention this whole change exists to remove.
+    expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  it("tells a reviewer with no gates to run the checks itself, in the foreground", async () => {
+    const { result, calls } = gate([report(9, [])]);
+    await expect(result).resolves.toMatchObject({ outcome: "clean" });
+    expect(calls[0].prompt).not.toContain("The checks anton already ran");
+    expect(calls[0].prompt).toContain("This project pins no verify gates");
+  });
+
+  it("DISCARDS what a gate wrote where git can see it, rather than adopting it as the baseline", async () => {
+    // Adopting it would let the reviewer grade content off disk that `openPullRequest` never
+    // pushes; blaming the reviewer for it would reject a good report for anton's own write. The
+    // third answer is to throw it away before the reviewer runs.
+    const sentinel = join(dir, "gate-wrote-this");
+    const worktree = fakeWorktree();
+    let restored = false;
+    const dirty = {
+      ...worktree,
+      readState: async () => {
+        const state = await worktree.readState();
+        const dirtyNow = existsSync(sentinel) && !restored;
+        return dirtyNow ? { ...state, status: "?? generated-by-the-gate.ts" } : state;
+      },
+      restoreState: async (path: string, to: WorktreeState) => {
+        restored = true;
+        return worktree.restoreState(path, to);
+      },
+    };
+    const { result } = gate([report(9, [])], { testCommand: `touch ${sentinel}` }, [], dirty);
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    expect(restored).toBe(true); // the gate's write was thrown away, not reviewed
+  });
+
+  it("voids the gate RESULTS too, not just the writes — a later gate may have consumed them", async () => {
+    const sentinel = join(dir, "generated-by-gate-one");
+    const worktree = fakeWorktree();
+    let restored = false;
+    const dirty = {
+      ...worktree,
+      readState: async () => {
+        const state = await worktree.readState();
+        return existsSync(sentinel) && !restored ? { ...state, status: "?? generated.ts" } : state;
+      },
+      restoreState: async (path: string, to: WorktreeState) => {
+        restored = true;
+        return worktree.restoreState(path, to);
+      },
+    };
+    const { result, calls } = gate([report(9, [])], { testCommand: `touch ${sentinel}` }, [], dirty);
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    // The reviewer is told the gates ran and their results were discarded — never shown a "passed"
+    // for a tree that has since been reverted out from under it.
+    expect(calls[0].prompt).toContain("The checks anton ran, and threw away");
+    expect(calls[0].prompt).not.toContain("The checks anton already ran");
+  });
+
+  it("re-asserts the run lease after the gates, before spending a reviewer session", async () => {
+    // The gates can run for minutes; the round's earlier check is stale by the time claude starts.
+    let asserts = 0;
+    const { result, calls } = gate(
+      [report(9, [])],
+      { testCommand: "echo slow-suite" },
+      [],
+      fakeWorktree(),
+      () => {
+        asserts += 1;
+        if (asserts === 2) throw new Error("run lease lapsed");
+      },
+    );
+    await expect(result).rejects.toThrow("run lease lapsed");
+    expect(calls).toEqual([]); // no reviewer session was charged under the lapsed lease
+  });
+});
+
+/**
+ * The fix session's evidence is only good for the tree it describes (PR #254 review). `commitAll`
+ * runs the project's hooks, and a lint-staged that rewrites files leaves HEAD holding content the
+ * gates never saw — this repo's own pre-commit hook does exactly that.
+ */
+describe("verify-gate evidence across a commit hook", () => {
+  it("drops the fix session's evidence when a hook rewrote the tree, so the next round re-runs", async () => {
+    const counter = join(dir, "hooked-gate-runs");
+    let hashes = 0;
+    const { result } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { testCommand: `echo ran >> ${counter}` },
+      [true],
+      fakeWorktree(),
+      undefined,
+      undefined,
+      // Every call differs: the tree the gates tested is never the tree that got committed.
+      async () => `tree${++hashes}`,
+    );
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    // Round 1's review, the fix session's own gates, and round 2 re-running them: three, not two.
+    expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(3);
+  });
+
+  it("never rolls back a committed fix because the tree hash could not be taken", async () => {
+    // The hash only decides whether the evidence is reusable. A git that cannot answer must not put
+    // a verified, committed fix behind the failure path's `discardSessionWrites`.
+    const counter = join(dir, "unhashable-gate-runs");
+    const worktree = fakeWorktree();
+    const { result, commitMessages } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { testCommand: `echo ran >> ${counter}` },
+      [true],
+      worktree,
+      undefined,
+      undefined,
+      async () => {
+        throw new Error("git write-tree failed");
+      },
+    );
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    expect(commitMessages).toHaveLength(1); // the fix committed, and was kept
+    expect(worktree.restores).toEqual([]); // nothing was discarded
+    // Unproven evidence is not reused, so round 2 runs the gates itself.
+    expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(3);
+  });
+
+  it("keeps the evidence when the commit left the tree the gates tested", async () => {
+    const counter = join(dir, "unhooked-gate-runs");
+    const { result } = gate(
+      [report(4, [BLOCKING]), "fixed it", report(9, [])],
+      { testCommand: `echo ran >> ${counter}` },
+      [true],
+      fakeWorktree(),
+      undefined,
+      undefined,
+      async () => "same-tree",
+    );
+    await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
+    expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(2);
   });
 });

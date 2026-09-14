@@ -7,7 +7,7 @@
  *
  * This lives beside `integration.ts` rather than inside it on purpose: `integration.ts` probes
  * `bd`/`git` with `execFileSync` at import time (for `describeBd`), a cost unit suites like
- * `runner.test.ts` should not pay just to reach this helper.
+ * `runner.*.test.ts` should not pay just to reach this helper.
  */
 import { expect } from "vitest";
 import {
@@ -44,10 +44,24 @@ export function makeJobRunner(
 ): JobRunner {
   const { db, clock, type, handler, config } = opts;
 
-  const runner = new JobRunner({ db, clock, config: { maxConcurrent: 1, ...config } });
+  const runner = new JobRunner({ db, clock, config: { maxConcurrent: 1, ...config }, log: TEST_LOG });
   runner.registerHandler(type, handler({ db, clock }));
   return runner;
 }
+
+/**
+ * The runner's own diagnostics, on stderr (anton-3dpp).
+ *
+ * Without a logger the runner falls back to `noopLog`, and the error it classified — the ONLY thing
+ * that says why a job rescheduled or parked — is discarded at the moment it is known. A flake that
+ * then reproduces once a month in CI leaves an assertion diff and nothing else; the classified cause
+ * has to be re-derived from a run that no longer exists. Errors only: `info` would narrate every
+ * tick of every suite.
+ */
+const TEST_LOG = {
+  info: () => {},
+  error: (msg: string, meta?: unknown) => console.error(`[runner] ${msg}`, meta ?? ""),
+};
 
 /**
  * Assert a driven job settled in `expected`, and return the row so a caller can go on asserting on

@@ -1,0 +1,270 @@
+/**
+ * The RUN phase of the walk (anton-lnkt — extracted from execute-epic.ts in anton-1lix): every
+ * formula step after the commit, in the order the project's formula puts them, dispatched through
+ * the same registry the ticket phase uses.
+ *
+ * These steps speak for the run as a whole — they read its whole diff and open its single PR — so
+ * each runs ONCE, and one at a time: they share a worktree and a PR, so a formula whose steps could
+ * overlap is still not a licence to fan out.
+ */
+import { beads, LABELS } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
+import { updateRun } from "../runs";
+import { PoisonEpic } from "./errors";
+import { releaseRunResources } from "./worktree-reaper";
+import type { RetiredTicketOutcome, SkipCause } from "./execute-epic-board";
+import type { DispatchOutcome } from "./execute-epic-dispatch";
+import { armMergeGate } from "./execute-epic-merge-gate";
+import { runReviewStep } from "./execute-epic-review-step";
+import type { RunPhaseCarry, RunStepDispatch } from "./execute-epic-run-step";
+import { safe } from "./execute-epic-persist";
+import {
+  readVerifiedStandaloneRetirement,
+  verifiedStandaloneRetirementStillHeld,
+} from "./execute-epic-retired-standalone";
+import type { RunPreparation } from "./execute-epic-prepare";
+import { stalePrBodyNote, stalePrBodyRunError } from "./execute-epic-review";
+import type { EpicRun } from "./execute-epic-run";
+
+
+/** Walk the formula's post-commit steps, then finalize the run and release its checkout. */
+export async function walkRunPhase(
+  run: EpicRun,
+  prep: Extract<RunPreparation, { done: false }>,
+  dispatched: DispatchOutcome,
+): Promise<void> {
+  const carry: RunPhaseCarry = { advisories: [], staleBodyFallback: null };
+  // A standalone target THIS attempt verified and retired as already shipped has nothing for these
+  // steps to speak for (PR #238 review): the bead is closed as superseded with anton's evidence on
+  // it, and no commit is on the branch — so there is no diff to review and no pull request to open
+  // (`gh pr create` would fail on an empty diff). Skip to the finish, which settles the row as done
+  // rather than parking a run on a target the board has already settled.
+  for (const { step: cooked, definition } of dispatched.targetRetired ? [] : prep.runSteps) {
+    // A step boundary is a lease checkpoint: never dispatch run-level work — and never open a
+    // PR — under a lease this run can no longer prove it holds.
+    run.lease.assertHeld();
+    const dispatch: RunStepDispatch = {
+      cooked,
+      definition,
+      stepCtx: {
+        ...prep.runStep,
+        tickets: dispatched.delivered,
+        satisfied: dispatched.satisfied,
+        step: cooked,
+        advisories: carry.advisories,
+      },
+    };
+    if (definition.name === "review") {
+      await runReviewStep(run, prep, dispatch, carry);
+      continue;
+    }
+    if (definition.name === "pr") {
+      await runPrStep(run, dispatch, carry);
+      continue;
+    }
+    await runOtherStep(run, dispatch);
+  }
+  await finishRun(run, prep, dispatched.skipped, carry, dispatched.targetRetired);
+}
+
+/** Open the run's ONE pull request, stamp the ref, and move the target into review. */
+async function runPrStep(
+  run: EpicRun,
+  dispatch: RunStepDispatch,
+  carry: RunPhaseCarry,
+): Promise<void> {
+  const { repo, targetId: epicBeadId, all, standaloneRun } = run;
+  const { cooked, definition, stepCtx } = dispatch;
+  const advisoryFindings = carry.advisories;
+  // Open the run's ONE PR, stamp the ref, and (for an epic) move it to in-review. A
+  // standalone target is NOT closed here: like an epic it stays OPEN, tagged stage:in-review
+  // (the ticket phase already applied that on commit), carrying its PR ref until the PR
+  // actually MERGES — at which point review-fix's merge-finalize path closes it. Closing it
+  // now would derive it as Done on the board while its PR is still open and drop it out of
+  // review-fix's in-review sweep.
+  const pr = (await definition.handler(stepCtx)).facts?.pr;
+  if (!pr) {
+    throw new Error(
+      `formula step "${cooked.id}" (step:pr) reported no pull request — the run has no way to ` +
+        `reach a human, so it is not done`,
+    );
+  }
+  if (pr.bodyStale) {
+    // The satisfied attribution rides the same salvage as the findings (PR #253 review): the stale
+    // body says nothing about which tickets an earlier commit covered, and no commit does either.
+    const note = stalePrBodyNote(pr, advisoryFindings, stepCtx.tickets, stepCtx.satisfied);
+    // If that write ALSO fails (a locked or unavailable beads DB) the findings have no home
+    // left, and the run would still finish `done` — the advisory detail silently dropped
+    // between this review and the merge gate. Carry the whole note out on the run row
+    // instead, the same durable fallback the park path uses (see reviewParkMessage).
+    if (!(await safe(() => beads.note(repo, epicBeadId, note)))) {
+      carry.staleBodyFallback = stalePrBodyRunError(epicBeadId, note);
+    }
+  }
+  // Under the bead's write lock, like every other live PR-ref write (pr-link.ts gives the reason):
+  // an `already-shipped` retirement elsewhere may be re-reading this pointer as its evidence.
+  await safe(() => withBeadWriteLock(repo, epicBeadId, () => beads.setPrRef(repo, epicBeadId, pr.ref)));
+  // The merge wait becomes board state, not a polling job (anton-k0kj): past this step the
+  // only thing left to learn is whether this PR merges, which `bd gate check` answers for the
+  // whole project in one call per slot. Best-effort like the writes around it — the
+  // review-fix sweep still finalizes a merge it happens to see, so a failed arm costs
+  // latency, not correctness.
+  await safe(() => armMergeGate(repo, epicBeadId, pr.ref, all));
+  if (!standaloneRun) {
+    await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
+    await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
+  }
+}
+
+/** Any other step the project put after its commit — a `step:verify` it moved there. */
+async function runOtherStep(run: EpicRun, dispatch: RunStepDispatch): Promise<void> {
+  const { targetId: epicBeadId } = run;
+  const { cooked, definition, stepCtx } = dispatch;
+  // Anything else the project put after its commit — a `step:verify` it moved there. Never a
+  // step that DISPATCHES an agent: the floor (anton-6b99, `diff-after-commit`) refuses every
+  // `producesDiff` step here, which is both `implement` and `claude`, and it is asserted on
+  // every attempt before the walk begins. So nothing reaching this line carries a
+  // `facts.selfReport`, and an agent's ask or block is judged where the agents actually run —
+  // the ticket phase (see the `needs-human` throw in runTicket). A step that RAN and did not
+  // achieve its work stops the run: the registry leaves that judgement to the caller, and
+  // carrying on would report a delivery on a pipeline that didn't finish.
+  const result = await definition.handler(stepCtx);
+  if (!result.ok) {
+    throw new Error(
+      result.detail ??
+        `formula step "${cooked.id}" (step:${definition.name}) failed for ${epicBeadId}`,
+    );
+  }
+}
+
+/** Step 5. Say what the run did NOT deliver, settle the row, and hand the checkout back. */
+async function finishRun(
+  run: EpicRun,
+  prep: Extract<RunPreparation, { done: false }>,
+  skipped: Map<string, SkipCause>,
+  carry: RunPhaseCarry,
+  /** The run opened no pull request: its standalone target was retired as already shipped. */
+  targetRetired: boolean,
+): Promise<void> {
+  const { db, clock, ctx, projectId, repo, runId, targetId: epicBeadId, timedOut, retired } = run;
+  const { worktree } = prep;
+  const staleBodyFallback = carry.staleBodyFallback;
+  // A feature that delivered most of itself still owes the founder the part it didn't
+  // (anton-t1mo). The timed-out tickets are blocked on the board with their own notes, but the
+  // TARGET is what the founder opens at the merge gate — so it says, in one place, that this PR
+  // is the feature minus these tickets. Best-effort like the other target writes; the run row
+  // below carries the same sentence when the bead write fails.
+  const timeoutNotice = timedOut.length
+    ? `${timedOut.length} ticket(s) ran out of time and did not finish — ` +
+      `${timedOut.map((t) => t.id).join(", ")}. Each is blocked with its own note saying ` +
+      `whether its work is in this PR; re-scope them or raise ticketTimeoutMinutes, then run them.`
+    : null;
+  if (timeoutNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${timeoutNotice}`));
+
+  // The tickets RETIRED as already shipped (anton-5bpd) — this attempt's and any an earlier one
+  // left on the board. The founder reads the TARGET at the merge gate, and a ticket that is closed
+  // but in no diff would otherwise look like work this PR carries. Each bead carries its own record
+  // of where the work went; this says, in one place, that the feature shipped minus these because
+  // they were already in the tree.
+  //
+  // Split by PROVENANCE, because only one half is anton's word (PR #238 review): the `this-run` ones
+  // anton checked against git and the board itself, the `pre-existing` ones it merely FOUND already
+  // superseded — by a human's scope call, a gardener dedup, an earlier attempt. Collapsing them
+  // would put anton's verification behind a decision it never made.
+  const names = (rs: RetiredTicketOutcome[]) =>
+    rs.map((r) => `${r.id} (superseded by ${r.replacedBy})`).join(", ");
+  const verified = retired.filter((r) => r.source === "this-run");
+  const preExisting = retired.filter((r) => r.source === "pre-existing");
+  const retiredNotice = retired.length
+    ? [
+        verified.length
+          ? `${verified.length} ticket(s) had already shipped — anton verified that against the ` +
+            `repository and the board and retired them as superseded: ${names(verified)}.`
+          : null,
+        preExisting.length
+          ? `${preExisting.length} ticket(s) were already settled as superseded on the board when ` +
+            `this run read it: ${names(preExisting)}. anton did not verify those; each bead ` +
+            `carries the record of whoever did.`
+          : null,
+        // Worded for the run that actually happened (PR #238 review): a retired STANDALONE target
+        // left nothing on the branch, so no pull request was opened at all, and "None of them is in
+        // this PR" would point the founder at one that does not exist.
+        targetRetired
+          ? `Nothing was committed here, so this run opened no pull request and nothing is left ` +
+            `to run.`
+          : `None of them is in this PR.`,
+      ]
+        .filter(Boolean)
+        .join(" ")
+    : null;
+  if (retiredNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${retiredNotice}`));
+
+  // The tickets the timeout took down with it (anton-67xj) — the founder reads the TARGET at the
+  // merge gate, so the PR's missing half is named there too, not only on each skipped bead.
+  const skippedNotice = skipped.size
+    ? `${skipped.size} ticket(s) were never dispatched because the work they depend on was ` +
+      `rolled back — ` +
+      `${[...skipped].map(([id, c]) => `${id} (waiting on ${c.waitingOn})`).join(", ")}. ` +
+      `Each is open, unassigned and noted; run them once the tickets they wait on land.`
+    : null;
+  if (skippedNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${skippedNotice}`));
+
+  // A target this attempt retired has no PR to make its terminal path self-evident. Reconstruct its
+  // durable repair evidence, then fence the board before and after the terminal row: a child, reopen,
+  // or replacement survivor racing this write means this run must not report an obsolete retirement
+  // as settled.
+  const retirement = targetRetired
+    ? await readVerifiedStandaloneRetirement(repo, epicBeadId)
+    : undefined;
+  if (targetRetired && !retirement) {
+    throw new PoisonEpic(
+      `${epicBeadId} no longer proves the already-shipped retirement this run verified — anton will ` +
+        `not settle a terminal row for a target whose durable repair evidence is missing. Re-read the ` +
+        `target and resolve its current state before resuming.`,
+    );
+  }
+  if (retirement && !(await verifiedStandaloneRetirementStillHeld(repo, epicBeadId, retirement))) {
+    throw new PoisonEpic(
+      `${epicBeadId} changed after anton verified its already-shipped retirement — it may have gained ` +
+        `child tickets, reopened, or been superseded differently. Anton will not settle a terminal row ` +
+        `for a retirement the board no longer proves. Re-read the target and resolve its current state ` +
+        `before resuming.`,
+    );
+  }
+
+  // 5. Finalize run + clean up the worktree (the branch/PR carry the work now). The run IS done —
+  //    the branch and its PR carry the work — so a stale-body salvage rides along as the row's
+  //    error rather than failing a delivery that landed.
+  await updateRun(db, clock, runId, {
+    status: "done",
+    endedAt: clock.now(),
+    error:
+      [timeoutNotice, retiredNotice, skippedNotice, staleBodyFallback].filter(Boolean).join(" — ") ||
+      null,
+  });
+  if (retirement && !(await verifiedStandaloneRetirementStillHeld(repo, epicBeadId, retirement))) {
+    throw new PoisonEpic(
+      `${epicBeadId} changed while anton recorded its already-shipped retirement — it may have gained ` +
+        `child tickets, reopened, or been superseded differently. Anton will not report that earlier ` +
+        `retirement as settled; re-read the target and resolve its current state before resuming.`,
+    );
+  }
+  // The branch and its PR carry the work now, so the checkout is residue; the branch survives
+  // because the target is still open in review (anton-hrun.1). The claim comes off first: the
+  // release below force-removes the checkout, which a live claim refuses — ours as much as
+  // anyone's, since the lock says nothing about which run inside this process took it.
+  await run.releaseWorktreeHold();
+  await safe(() =>
+    releaseRunResources({
+      db,
+      clock,
+      ctx,
+      projectId,
+      runId,
+      repoPath: repo,
+      worktree,
+      beadId: epicBeadId,
+      status: "done",
+    }),
+  );
+}

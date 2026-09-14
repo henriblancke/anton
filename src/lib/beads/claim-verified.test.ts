@@ -180,6 +180,12 @@ describe("beads.claimVerified — the target left the claimable set while we set
   it("rejects a target whose approval was withdrawn", () =>
     stale({ labels: [] }, /approval was withdrawn/));
 
+  // anton-mv70: a relabel to `agent:human` inside the settle window means a PERSON now owns this
+  // work. Caught here rather than at execute-epic's dispatch backstop, which costs a queued job and
+  // a wasted attempt to reach the same refusal.
+  it("rejects a target labelled agent:human under us", () =>
+    stale({ labels: ["approved", "agent:human"] }, /agent:human/));
+
   it("rejects a legacy epic that became a container while we settled", async () => {
     const board = fakeBoard({
       bead: { issue_type: "epic" },

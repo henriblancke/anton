@@ -18,7 +18,8 @@ export type SyncBadgeKind =
   | "stalled"
   | "synced"
   | "unpushed-retrying"
-  | "failing";
+  | "failing"
+  | "shared-server";
 
 export function deriveSyncBadge(status: SyncStatusView): SyncBadgeKind {
   switch (status.state) {
@@ -29,6 +30,8 @@ export function deriveSyncBadge(status: SyncStatusView): SyncBadgeKind {
       return "stalled";
     case "not-wired":
       return "not-wired";
+    case "shared-server":
+      return "shared-server";
     case "unknown":
       return "unknown";
     case "failing":

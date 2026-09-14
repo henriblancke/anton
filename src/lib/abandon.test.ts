@@ -9,6 +9,7 @@ const abandonAllMock = vi.fn();
 const noteMock = vi.fn();
 const cancelRunMock = vi.fn();
 const runIsLiveMock = vi.fn<(projectId: string, epicBeadId: string) => boolean>();
+const pullMock = vi.fn();
 
 vi.mock("./beads/bd", async () => {
   const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
@@ -20,6 +21,7 @@ vi.mock("./beads/bd", async () => {
       list: (...args: unknown[]) => listMock(...args),
       abandonAll: (...args: unknown[]) => abandonAllMock(...args),
       note: (...args: unknown[]) => noteMock(...args),
+      pull: (...args: unknown[]) => pullMock(...args),
       sync: vi.fn().mockResolvedValue(undefined),
     },
   };
@@ -133,6 +135,7 @@ describe("abandonTicket cascade", () => {
     noteMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
     runIsLiveMock.mockReset().mockReturnValue(false);
+    pullMock.mockReset().mockResolvedValue(undefined);
   });
 
   /** The route hit by a direct API call on a feature id — the path the UI's epic deep-link skips. */
@@ -394,6 +397,7 @@ describe("abandonTicket with requireStopped", () => {
     noteMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
     runIsLiveMock.mockReset().mockReturnValue(false);
+    pullMock.mockReset().mockResolvedValue(undefined);
   });
 
   it("refuses at the cancel boundary when the run restarted, writing nothing", async () => {
@@ -458,5 +462,179 @@ describe("abandonTicket with requireStopped", () => {
 
     expect(cancelRunMock.mock.calls).toEqual([["p1", "feature"]]);
     expect(soleAbandonedIds()).toEqual(["t1"]);
+  });
+
+  // The caller's own lease check judges the ancestor the escalation FROZE; this boundary judges the
+  // run target the abandon re-derives. Reparenting is a supported move, so after one the two are
+  // different beads and only the read here can see a run holding the new one — the local job table
+  // never can (anton-mivh).
+  describe("against a run on ANOTHER machine", () => {
+    const liveLease = (owner: string) => `run-lease:${Date.now() + 60_000}:${owner}`;
+
+    /** feature-new carries `labels`; the ticket sits under it, not under the frozen `feature-old`. */
+    const reparented = (labels: string[]) => {
+      const ticket = makeBead({ id: "t1", parent: "feature-new" });
+      showMock.mockResolvedValue(ticket);
+      listMock.mockResolvedValue([
+        makeBead({ id: "feature-old", issue_type: "feature", parent: "epic" }),
+        makeBead({ id: "feature-new", issue_type: "feature", parent: "epic", labels }),
+        ticket,
+      ]);
+    };
+
+    it("refuses on the re-derived target's live lease, writing nothing", async () => {
+      reparented([liveLease("run-elsewhere")]);
+
+      await expect(
+        abandonTicket(project, "t1", "won't do", { requireStopped: true }),
+      ).rejects.toThrow(/another machine/);
+      expect(abandonAllMock).not.toHaveBeenCalled();
+      expect(cancelRunMock).not.toHaveBeenCalled();
+    });
+
+    it("proceeds past the stalled run's OWN leftover lease — that is the work being abandoned", async () => {
+      reparented([liveLease("run-stalled")]);
+
+      await abandonTicket(project, "t1", "won't do", {
+        requireStopped: true,
+        ownRunId: "run-stalled",
+      });
+
+      expect(soleAbandonedIds()).toEqual(["t1"]);
+    });
+
+    it("proceeds past an EXPIRED lease — a crashed machine holds nothing", async () => {
+      reparented([`run-lease:${Date.now() - 1_000}:run-elsewhere`]);
+
+      await abandonTicket(project, "t1", "won't do", { requireStopped: true });
+
+      expect(soleAbandonedIds()).toEqual(["t1"]);
+    });
+
+    it("refuses when it is a CASCADED descendant another machine is executing", async () => {
+      const epic = makeBead({ id: "epic", issue_type: "epic" });
+      showMock.mockResolvedValue(epic);
+      listMock.mockResolvedValue([
+        epic,
+        makeBead({
+          id: "feature",
+          issue_type: "feature",
+          parent: "epic",
+          labels: [liveLease("run-elsewhere")],
+        }),
+        makeBead({ id: "t1", parent: "feature" }),
+      ]);
+
+      await expect(
+        abandonTicket(project, "epic", "won't do", { requireStopped: true }),
+      ).rejects.toThrow(RunRestartedError);
+      expect(abandonAllMock).not.toHaveBeenCalled();
+    });
+
+    it("ignores a foreign lease when the option is absent — an explicit abandon kills what it finds", async () => {
+      reparented([liveLease("run-elsewhere")]);
+
+      await abandonTicket(project, "t1", "obsolete");
+
+      expect(cancelRunMock.mock.calls).toEqual([["p1", "feature-new"]]);
+      expect(soleAbandonedIds()).toEqual(["t1"]);
+      // The plain abandon reads no lease, so it pays no pull.
+      expect(pullMock).not.toHaveBeenCalled();
+    });
+
+    // bd answers `list`/`show` from the LOCAL Dolt working set, and the caller's pull is several
+    // awaits back (a gate close, the escalation settle). Without a pull of its own this boundary
+    // derives the FORMER run target, finds no lease on it, and closes the ticket underneath the
+    // reparented target's live foreign run.
+    it("pulls first, so the reparent it judges is the one the remote already has", async () => {
+      const under = (parent: string) => makeBead({ id: "t1", parent });
+      const boardWith = (ticket: Bead) => [
+        makeBead({ id: "feature-old", issue_type: "feature", parent: "epic" }),
+        makeBead({
+          id: "feature-new",
+          issue_type: "feature",
+          parent: "epic",
+          labels: [liveLease("run-elsewhere")],
+        }),
+        ticket,
+      ];
+      // The mirror only learns of the move — and so of the lease that matters — through the pull.
+      let pulled = false;
+      pullMock.mockImplementation(async () => {
+        pulled = true;
+      });
+      showMock.mockImplementation(async () => under(pulled ? "feature-new" : "feature-old"));
+      listMock.mockImplementation(async () => boardWith(under(pulled ? "feature-new" : "feature-old")));
+
+      await expect(
+        abandonTicket(project, "t1", "won't do", { requireStopped: true }),
+      ).rejects.toThrow(/another machine/);
+      expect(abandonAllMock).not.toHaveBeenCalled();
+      expect(cancelRunMock).not.toHaveBeenCalled();
+    });
+
+    // The boundary check runs before the cascade's write locks are acquired, and a gardener re-parent
+    // takes the lock of the bead it MOVES — so a move landing in that gap is invisible to it. The
+    // locked re-read judges the target the board actually holds now, not the one the plan derived.
+    it("refuses on a re-parent that lands between the boundary check and the lock", async () => {
+      const under = (parent: string) => makeBead({ id: "t1", parent });
+      const boardWith = (ticket: Bead) => [
+        makeBead({ id: "feature-old", issue_type: "feature", parent: "epic" }),
+        makeBead({
+          id: "feature-new",
+          issue_type: "feature",
+          parent: "epic",
+          labels: [liveLease("run-elsewhere")],
+        }),
+        ticket,
+      ];
+      // Quiet under feature-old when the abandon is planned; under the running feature-new by the
+      // time it holds the locks.
+      showMock
+        .mockResolvedValueOnce(under("feature-old"))
+        .mockResolvedValue(under("feature-new"));
+      listMock
+        .mockResolvedValueOnce(boardWith(under("feature-old")))
+        .mockResolvedValue(boardWith(under("feature-new")));
+
+      await expect(
+        abandonTicket(project, "t1", "won't do", { requireStopped: true }),
+      ).rejects.toThrow(/another machine/);
+      expect(abandonAllMock).not.toHaveBeenCalled();
+    });
+
+    it("settles a re-parent onto a QUIET target — a move is not by itself a live run", async () => {
+      const under = (parent: string) => makeBead({ id: "t1", parent });
+      const boardWith = (ticket: Bead) => [
+        makeBead({ id: "feature-old", issue_type: "feature", parent: "epic" }),
+        makeBead({ id: "feature-new", issue_type: "feature", parent: "epic" }),
+        ticket,
+      ];
+      showMock
+        .mockResolvedValueOnce(under("feature-old"))
+        .mockResolvedValue(under("feature-new"));
+      listMock
+        .mockResolvedValueOnce(boardWith(under("feature-old")))
+        .mockResolvedValue(boardWith(under("feature-new")));
+
+      await abandonTicket(project, "t1", "won't do", { requireStopped: true });
+
+      expect(soleAbandonedIds()).toEqual(["t1"]);
+    });
+
+    // Fail closed, like readTargetState and gateDispatch on the same read: an unread board is not a
+    // clear one, and nothing has been written yet, so refusing costs only a retry.
+    it("refuses when the pull fails — an unread board can't rule out a foreign run", async () => {
+      reparented([]);
+      pullMock.mockRejectedValue(new Error("remote unreachable"));
+
+      await expect(
+        abandonTicket(project, "t1", "won't do", { requireStopped: true }),
+      ).rejects.toThrow(/shared board could not be re-read/);
+      // Refused before it read anything off the stale mirror, let alone wrote.
+      expect(showMock).not.toHaveBeenCalled();
+      expect(listMock).not.toHaveBeenCalled();
+      expect(abandonAllMock).not.toHaveBeenCalled();
+    });
   });
 });

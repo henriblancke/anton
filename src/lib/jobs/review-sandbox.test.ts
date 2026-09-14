@@ -89,6 +89,25 @@ describe("resolveReviewSandbox (anton-t6tu)", () => {
     expect(settings.sandbox.enabled).toBe(true);
   });
 
+  it("refuses a relative git-common-dir rather than sandboxing a path that matches nothing", async () => {
+    // An older git (< 2.31) ignores `--path-format=absolute` instead of rejecting it and answers
+    // relative to the worktree. That path resolves against the node process's cwd, matches nothing,
+    // and leaves the ref store writable with the settings still looking populated — so the shape of
+    // git's answer is checked, not the version of the binary.
+    let thrown: unknown;
+    try {
+      await resolveReviewSandbox({
+        worktreePath: WORKTREE,
+        readGitCommonDir: async () => ".git",
+        platform: "darwin",
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(isPoisonError(thrown)).toBe(true);
+    expect(String(thrown)).toMatch(/2\.31/);
+  });
+
   it("refuses before it even reads git when the platform cannot be sandboxed", async () => {
     let read = false;
     await expect(

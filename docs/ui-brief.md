@@ -28,6 +28,14 @@ Vercel dashboard) — confident, legible, quietly polished. Not flashy, not gene
   contrast in both themes.
 - **States:** design the empty state, the loading state (skeletons, not spinners where a shape
   is known), and the error state for every data surface. They should feel considered.
+- **Dates/times:** format every user-facing timestamp with `DISPLAY_LOCALE` from `@/lib/time`
+  (`en-US`) — never a host-derived locale. `toLocale*` with no locale is not "the user's locale":
+  it resolves to the *server's* during SSR and the *browser's* after hydration, so any client
+  component that server-renders can hydrate to different text. Pinning settles that by construction
+  rather than per call site, and keeps dates identical across tests, screenshots, and machines. The
+  UI is English-only (i18n is out of scope), so a host locale would only reorder dates under labels
+  that stay English. **Timezone stays the host's** — anton runs on the operator's machine and times
+  should read in their own clock. Lint enforces the locale (`no-restricted-syntax`).
 
 ## App shell
 

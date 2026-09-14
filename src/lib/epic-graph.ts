@@ -6,17 +6,28 @@
  * Only `blocks` drives ordering. Every blocks edge is rolled up to its run target — the nearest
  * self-or-ancestor unit (see isUnit) — so a direct epic→epic block, a ticket-level block across two
  * epics, and a task-under-a-feature block all produce an edge between the units that actually ship.
- * related / discovered-from / parent-child never create ordering. Direction mirrors
+ * related / discovered-from / parent-child never create ordering. The same rollup also reports each
+ * run target's per-child readiness (see ChildReadiness), so "one gated tail child" and "nothing can
+ * run" are one derivation apart instead of one conflated `blockedBy`. Direction mirrors
  * beads.edgesOf + dependency-graph.tsx (source=from=the blocked/dependent side, target=to=the
  * blocker) so both graphs read the same way.
  */
 import { beads, type Bead } from "./beads/bd";
 import { isPipelineArtifact } from "./beads/contract";
-import { deriveStage } from "./ticket-view";
+import { boardCards, deriveStage, isRunTicket } from "./ticket-view";
 import type { Stage } from "./types";
 
 /** Missing bead priority sorts after every explicit priority (bd uses 0=critical … 4=lowest). */
 const DEFAULT_PRIORITY = 4;
+
+/**
+ * How much of a run target's work is actually runnable right now (anton-nywj).
+ * `ready` — nothing outside this run is holding any ticket; `partially-blocked` — some tickets are
+ * held but at least one can run; `blocked` — zero runnable tickets. The rollup's unit-level
+ * `blockedBy` can't tell the last two apart: one cross-run-gated tail child makes the whole target
+ * read blocked, which is what stalled a target whose other children were independent (issue #58).
+ */
+export type ChildReadiness = "ready" | "partially-blocked" | "blocked";
 
 export interface EpicGraphNode {
   id: string;
@@ -31,6 +42,16 @@ export interface EpicGraphNode {
   ready: boolean;
   /** Topological rank (0 = no blockers). Degrades to a priority/created ordering on a cycle. */
   rank: number;
+  /**
+   * The tickets this run would dispatch that nothing outside it holds — dispatchable now, in board
+   * order. A leaf target (a feature with no tickets shaped under it) IS its own ticket, so it
+   * reports itself here; closed tickets are in neither set (the run skips them).
+   */
+  readyChildren: string[];
+  /** The tickets held by an open blocker outside this run, or queued behind such a ticket. */
+  blockedChildren: string[];
+  /** ready / partially-blocked / blocked over those two sets — see {@link ChildReadiness}. */
+  childReadiness: ChildReadiness;
 }
 
 export interface EpicGraphEdge {
@@ -173,9 +194,12 @@ export function computeEpicGraph(all: Bead[]): EpicGraph {
     ordered.forEach((b, i) => rank.set(b.id, i));
   }
 
+  const childReadiness = computeChildReadiness(all, unitBeads, runTargetOf);
+
   const epics: EpicGraphNode[] = unitBeads
     .map((b): EpicGraphNode => {
       const blockers = blockedBy.get(b.id) ?? [];
+      const children = childReadiness.get(b.id) as ChildReadinessResult;
       return {
         id: b.id,
         title: b.title,
@@ -186,11 +210,121 @@ export function computeEpicGraph(all: Bead[]): EpicGraph {
         blockedBy: blockers,
         ready: blockers.length === 0,
         rank: rank.get(b.id) ?? 0,
+        readyChildren: children.readyChildren,
+        blockedChildren: children.blockedChildren,
+        childReadiness: children.childReadiness,
       };
     })
     .sort((a, b) => a.rank - b.rank || a.priority - b.priority || (a.id < b.id ? -1 : 1));
 
   return { epics, edges, hasCycle };
+}
+
+interface ChildReadinessResult {
+  readyChildren: string[];
+  blockedChildren: string[];
+  childReadiness: ChildReadiness;
+}
+
+/**
+ * Per-run-target child readiness — the primitive that tells "one gated tail child" apart from
+ * "nothing can run" (anton-nywj). The unit-level `blockedBy` above answers a coarser question: it
+ * rolls every child's cross-run block up to the target, so a target whose other children are
+ * independent still reads fully blocked, and every consumer stalls the whole run (issue #58).
+ *
+ * A ticket is held when a blocker OUTSIDE this run is still open — gated on the run target that
+ * ships that blocker (a child closes at commit, but its code lands only when its target's PR merges,
+ * matching {@link standaloneBlockers}), with an unknown blocker read as open (fail safe). A blocker
+ * INSIDE the run is ordering, not a gate: the run's own ticket loop produces it, so it holds its
+ * dependent only while it is itself held — propagated transitively, so a ticket queued behind a
+ * gated sibling is never reported runnable.
+ *
+ * The target's own `blocks` edges gate every ticket in it: nothing in the run may start ahead of the
+ * target's prerequisite.
+ */
+function computeChildReadiness(
+  all: Bead[],
+  unitBeads: Bead[],
+  runTargetOf: (id: string) => string | undefined,
+): Map<string, ChildReadinessResult> {
+  const byId = new Map(all.map((b) => [b.id, b]));
+  const isDone = (id: string): boolean => {
+    const b = byId.get(id);
+    return b !== undefined && deriveStage(b) === "done";
+  };
+
+  // `runTickets` for every unit in ONE pass — the same working-layer subtree the run dispatches and
+  // the board counts, so readiness is reported over exactly the tickets that will run.
+  const cards = boardCards(all);
+  const ticketsOf = new Map<string, Bead[]>(unitBeads.map((b) => [b.id, []]));
+  for (const b of all) {
+    if (!isRunTicket(b, cards)) continue;
+    const card = cards.cardOf(b);
+    if (card !== undefined) ticketsOf.get(card)?.push(b);
+  }
+
+  const blockersOf = new Map<string, string[]>();
+  for (const e of beads.edgesOf(all)) {
+    if (e.type !== "blocks") continue;
+    const existing = blockersOf.get(e.from);
+    if (existing) existing.push(e.to);
+    else blockersOf.set(e.from, [e.to]);
+  }
+
+  const readiness = new Map<string, ChildReadinessResult>();
+  for (const unit of unitBeads) {
+    const tickets = ticketsOf.get(unit.id) ?? [];
+    // Same shape rule the run uses: a leaf target (a feature with nothing shaped under it) IS its
+    // own single ticket, so it reports itself rather than an empty, unreadable set.
+    const work = (beads.groupsChildren(unit, tickets) ? tickets : [unit]).filter(
+      (b) => deriveStage(b) !== "done",
+    );
+    const workIds = new Set(work.map((b) => b.id));
+
+    const heldExternally = (blockerId: string): boolean => {
+      if (isOwnMergeWait(byId.get(blockerId))) return false; // the target's own PR, not a prerequisite
+      const gate = runTargetOf(blockerId) ?? blockerId;
+      if (gate === unit.id) return false; // inside this run — ordering, handled below
+      return !isDone(gate);
+    };
+    const unitHeld = (blockersOf.get(unit.id) ?? []).some(heldExternally);
+
+    const heldOutside = (b: Bead): boolean =>
+      (blockersOf.get(b.id) ?? []).some(heldExternally);
+    const blocked = new Set<string>(
+      unitHeld ? workIds : work.filter(heldOutside).map((b) => b.id),
+    );
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const b of work) {
+        if (blocked.has(b.id)) continue;
+        if ((blockersOf.get(b.id) ?? []).some((id) => workIds.has(id) && blocked.has(id))) {
+          blocked.add(b.id);
+          grew = true;
+        }
+      }
+    }
+
+    const readyChildren = work.filter((b) => !blocked.has(b.id)).map((b) => b.id);
+    const blockedChildren = work.filter((b) => blocked.has(b.id)).map((b) => b.id);
+    readiness.set(unit.id, {
+      readyChildren,
+      blockedChildren,
+      // Nothing left to dispatch (every ticket closed, or an epic with none shaped) reports the
+      // TARGET's own gate: an empty set must never read as runnable while the target itself is held.
+      childReadiness:
+        work.length === 0
+          ? unitHeld
+            ? "blocked"
+            : "ready"
+          : readyChildren.length === 0
+            ? "blocked"
+            : blockedChildren.length === 0
+              ? "ready"
+              : "partially-blocked",
+    });
+  }
+  return readiness;
 }
 
 /**

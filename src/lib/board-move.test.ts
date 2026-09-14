@@ -78,10 +78,10 @@ describe("planMove", () => {
 });
 
 // A drag to Done closes the card, and the gardener decides whether it may hang work under that card
-// from a read taken inside the card's write lock (apply.ts `homeUnusable`/`assertHomeIsCard`), then
-// yields before its write. Outside the lock this close lands in exactly that gap: the re-parent
-// passes every check and attaches open work beneath a card that is closed by the time it writes,
-// settling as successfully applied.
+// from a read taken inside the card's write lock (apply.ts `homeUnusable`/`assertHomeFitsSubject`),
+// then yields before its write. Outside the lock this close lands in exactly that gap: the
+// re-parent passes every check and attaches open work beneath a card that is closed by the time it
+// writes, settling as successfully applied.
 describe("moveCard serializes with the gardener's apply lock", () => {
   const project: Project = {
     id: "p",

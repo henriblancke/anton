@@ -15,19 +15,20 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Share2Icon, TriangleAlertIcon } from "lucide-react";
+import { Share2Icon } from "lucide-react";
 
 import type { EpicGraphEdge, EpicGraphNode } from "@/lib/epic-graph";
 import type { Stage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Toggle } from "@/components/atoms";
-import { Button } from "@/components/ui/button";
+import { ErrorState } from "@/components/ui/error-state";
 import {
   buildProjectGraph,
   EPIC_H,
   EPIC_W,
   type ProjectGraphNodeData,
 } from "@/components/epic/project-graph-model";
+import { REACT_FLOW_CONTROLS_THEME_CLASS } from "@/components/epic/graph-theme";
 
 const STAGE_VAR: Record<Stage, string> = {
   backlog: "var(--stage-backlog)",
@@ -116,16 +117,7 @@ const CHROME = [
   "[&_.react-flow__controls]:rounded-lg",
   "[&_.react-flow__controls]:border",
   "[&_.react-flow__controls]:border-border",
-  // Theme the Controls through ReactFlow's own CSS variables. ReactFlow only applies its dark
-  // palette under `.react-flow.dark` (a class we never set — the app toggles dark on an ancestor),
-  // so its light defaults (white button, grey border) otherwise leak into dark mode. Driving the
-  // vars here follows the app theme in both modes; the button glyph is an <svg fill="currentColor">,
-  // so the button *color* var (not `fill`) is what makes the icon visible.
-  "[--xy-controls-button-background-color:var(--color-card)]",
-  "[--xy-controls-button-background-color-hover:var(--color-muted)]",
-  "[--xy-controls-button-color:var(--color-foreground)]",
-  "[--xy-controls-button-color-hover:var(--color-foreground)]",
-  "[--xy-controls-button-border-color:var(--color-border)]",
+  REACT_FLOW_CONTROLS_THEME_CLASS,
 ].join(" ");
 
 export function ProjectGraph({ slug }: { slug: string }) {
@@ -167,15 +159,10 @@ export function ProjectGraph({ slug }: { slug: string }) {
 
   if (error) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
-        <span className="flex size-11 items-center justify-center rounded-xl border border-risk-high/30 bg-risk-high/10">
-          <TriangleAlertIcon className="size-5 text-risk-high" aria-hidden="true" />
-        </span>
-        <p className="text-sm text-risk-high">{error}</p>
-        <Button size="sm" variant="outline" onClick={() => setAttempt((n) => n + 1)}>
-          Try again
-        </Button>
-      </div>
+      <ErrorState
+        message={error}
+        onRetry={() => setAttempt((n) => n + 1)}
+      />
     );
   }
 

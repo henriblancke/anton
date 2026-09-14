@@ -6,19 +6,27 @@ import { Button } from "@/components/ui/button";
 import { RunTerminal } from "@/components/runs/run-terminal";
 
 /**
- * Live output for a running job (anton-x10l), expanded under the job row: the read-only session
- * log viewer attached to the session the job's handler reported. Purely observational — closing
- * just unmounts the viewer (which aborts its SSE fetch); nothing on the server to tear down,
- * unlike the investigate pty.
+ * A job's output (anton-x10l), expanded under the job row: the read-only session log viewer
+ * attached to the session that job opened. Purely observational — closing just unmounts the viewer
+ * (which aborts its SSE fetch); nothing on the server to tear down, unlike the investigate pty.
+ *
+ * Serves a settled job as well as a running one: the stream endpoint replays a finished session's
+ * whole log and ends, so a nightly pass read the next morning shows exactly what it wrote.
  */
 export function JobOutputPanel({
   slug,
   sessionId,
+  live = false,
   onClose,
 }: {
   slug: string;
-  /** The running job's live session, resolved server-side from the runner's in-memory handle. */
+  /**
+   * The job's session — the runner's in-memory handle while it runs here, otherwise the durable
+   * link the session row carries (anton-lmps).
+   */
   sessionId: string;
+  /** Still running: the viewer follows appends rather than announcing a replay. */
+  live?: boolean;
   onClose: () => void;
 }) {
   return (
@@ -34,7 +42,7 @@ export function JobOutputPanel({
         </Button>
       </div>
       <div className="flex h-80 flex-col">
-        <RunTerminal slug={slug} sessionId={sessionId} live />
+        <RunTerminal slug={slug} sessionId={sessionId} live={live} />
       </div>
     </div>
   );

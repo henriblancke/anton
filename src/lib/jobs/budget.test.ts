@@ -9,9 +9,11 @@ import {
   admissibleJobs,
   admitJob,
   budgetGate,
+  budgetHeadroom,
   DEFAULT_BUDGET_POLICY,
   isBehindPace,
   jobValueScore,
+  withQuotaShare,
   type BudgetPolicy,
 } from "./budget";
 
@@ -300,11 +302,46 @@ const BLOCKING_PR = { value: 0.6, sessionCost: 2 };
 const CLEANUP = { value: 0.2, sessionCost: 2 };
 const MIXED_QUEUE = [CLEANUP, RISK_HIGH, BLOCKING_PR];
 
+/**
+ * anton's OWN board vocabulary (anton-prng) — nominated in this project's settings, not shipped by
+ * the scorer. Every assertion that speaks of `risk:high` / `blocking-PR` scores this policy, because
+ * on a board that nominates nothing those strings mean nothing.
+ */
+const ANTON_POLICY: BudgetPolicy = { ...POLICY, valueLabels: ["risk:high", "blocking-PR"] };
+
 describe("jobValueScore", () => {
-  it("bands labels risk:high > blocking-PR > age, disjointly", () => {
-    const high = jobValueScore({ labels: ["risk:high", "size:L"] }, POLICY);
-    const pr = jobValueScore({ labels: ["blocking-PR"] }, POLICY);
-    const cleanup = jobValueScore({ labels: ["size:S"], ageMs: DAY_MS }, POLICY);
+  it("nominates nothing by default — every bead ranks in the age band", () => {
+    // The agnosticism default: a repo anton has never seen the conventions of ranks on native
+    // fields alone, and says so by scoring identically whatever labels a bead happens to carry.
+    const risky = jobValueScore({ labels: ["risk:high", "blocking-PR"], ageMs: DAY_MS }, POLICY);
+    const plain = jobValueScore({ labels: ["whatever"], ageMs: DAY_MS }, POLICY);
+    expect(risky).toBe(plain);
+    expect(risky).toBe(0.4 * (DAY_MS / POLICY.valueAgeWindowMs));
+    // Age still orders the queue; it is simply the only signal left.
+    expect(jobValueScore({ labels: [], ageMs: 7 * DAY_MS }, POLICY)).toBe(0.4);
+  });
+
+  it("reproduces the shipped bands exactly under anton's own two-tier nomination", () => {
+    const ageFrac = 3 / 7; // three days into the seven-day age window
+    const aged = 3 * DAY_MS;
+    expect(jobValueScore({ labels: ["risk:high", "size:L"], ageMs: aged }, ANTON_POLICY)).toBe(
+      0.8 + 0.2 * ageFrac,
+    );
+    expect(jobValueScore({ labels: ["blocking-PR"], ageMs: aged }, ANTON_POLICY)).toBe(
+      0.5 + 0.2 * ageFrac,
+    );
+    expect(jobValueScore({ labels: ["size:S"], ageMs: aged }, ANTON_POLICY)).toBe(0.4 * ageFrac);
+    // Band edges, where the thresholds admitJob was tuned against sit.
+    expect(jobValueScore({ labels: ["risk:high"], ageMs: 0 }, ANTON_POLICY)).toBe(0.8);
+    expect(jobValueScore({ labels: ["risk:high"], ageMs: 30 * DAY_MS }, ANTON_POLICY)).toBe(1);
+    expect(jobValueScore({ labels: ["blocking-PR"], ageMs: 0 }, ANTON_POLICY)).toBe(0.5);
+    expect(jobValueScore({ labels: ["blocking-PR"], ageMs: 30 * DAY_MS }, ANTON_POLICY)).toBe(0.7);
+  });
+
+  it("bands the nominations in order, disjointly", () => {
+    const high = jobValueScore({ labels: ["risk:high", "size:L"] }, ANTON_POLICY);
+    const pr = jobValueScore({ labels: ["blocking-PR"] }, ANTON_POLICY);
+    const cleanup = jobValueScore({ labels: ["size:S"], ageMs: DAY_MS }, ANTON_POLICY);
     expect(high).toBeGreaterThanOrEqual(0.8);
     expect(pr).toBeGreaterThanOrEqual(0.5);
     expect(pr).toBeLessThan(0.7 + 1e-9);
@@ -314,12 +351,57 @@ describe("jobValueScore", () => {
     expect(high).toBeGreaterThan(pr);
   });
 
+  it("scores a bead in the HIGHEST nomination it carries, not the first label it has", () => {
+    // The nomination order is the tier order — a bead carrying both bands in the top one.
+    const both = jobValueScore({ labels: ["blocking-PR", "risk:high"] }, ANTON_POLICY);
+    expect(both).toBe(jobValueScore({ labels: ["risk:high"] }, ANTON_POLICY));
+  });
+
+  it("keeps three nominated tiers disjoint — the structure generalises past two", () => {
+    const three: BudgetPolicy = { ...POLICY, valueLabels: ["sev:1", "sev:2", "sev:3"] };
+    const oldest = (label: string) =>
+      jobValueScore({ labels: [label], ageMs: 30 * DAY_MS }, three);
+    const freshest = (label: string) => jobValueScore({ labels: [label], ageMs: 0 }, three);
+    // Every band's ceiling stays below the next band's floor: the oldest bead in a tier still loses
+    // to the freshest bead one tier up, so the ordering is total rather than age-contaminated.
+    expect(oldest("sev:2")).toBeLessThan(freshest("sev:1"));
+    expect(oldest("sev:3")).toBeLessThan(freshest("sev:2"));
+    expect(oldest("nothing")).toBeLessThan(freshest("sev:3"));
+    // Still bounded by [0,1], with the nominated region above the unnominated one.
+    expect(oldest("sev:1")).toBeLessThanOrEqual(1);
+    expect(freshest("sev:3")).toBeGreaterThanOrEqual(0.5);
+    expect(oldest("nothing")).toBe(0.4);
+  });
+
+  it("floors the top band on the scarce bar and the lowest on the normal bar, at any tier count", () => {
+    // The bands are what admitJob's thresholds cut against, so "scarce admits the top tier only" and
+    // "on-pace admits anything nominated" have to hold for one nomination or five — not just for the
+    // two anton's own board happens to use. A single nomination that floored at 0.5 would be held by
+    // every scarce tick, silently, which is the whole class of bug this ticket exists to kill.
+    for (const valueLabels of [["a"], ["a", "b"], ["a", "b", "c"], ["a", "b", "c", "d", "e"]]) {
+      const policy: BudgetPolicy = { ...POLICY, valueLabels };
+      const top = valueLabels[0];
+      const bottom = valueLabels[valueLabels.length - 1];
+      expect(jobValueScore({ labels: [top], ageMs: 0 }, policy)).toBe(
+        POLICY.valueThresholdScarce,
+      );
+      // A sole nomination IS the top tier — there is no lower one to floor on the normal bar.
+      if (valueLabels.length > 1) {
+        expect(jobValueScore({ labels: [bottom], ageMs: 0 }, policy)).toBe(
+          POLICY.valueThresholdNormal,
+        );
+      }
+      // And the whole nominated region stays inside [normal bar, 1].
+      expect(jobValueScore({ labels: [top], ageMs: 30 * DAY_MS }, policy)).toBeLessThanOrEqual(1);
+    }
+  });
+
   it("uses age only as a within-band tie-break", () => {
-    const fresh = jobValueScore({ labels: ["blocking-PR"], ageMs: 0 }, POLICY);
-    const old = jobValueScore({ labels: ["blocking-PR"], ageMs: 7 * DAY_MS }, POLICY);
+    const fresh = jobValueScore({ labels: ["blocking-PR"], ageMs: 0 }, ANTON_POLICY);
+    const old = jobValueScore({ labels: ["blocking-PR"], ageMs: 7 * DAY_MS }, ANTON_POLICY);
     expect(old).toBeGreaterThan(fresh);
     // Even a week-old cleanup job stays below the freshest blocking-PR job.
-    const oldCleanup = jobValueScore({ labels: [], ageMs: 30 * DAY_MS }, POLICY);
+    const oldCleanup = jobValueScore({ labels: [], ageMs: 30 * DAY_MS }, ANTON_POLICY);
     expect(oldCleanup).toBeLessThan(fresh);
   });
 });
@@ -392,5 +474,272 @@ describe("isBehindPace (shaping-nudge input)", () => {
 
   it("is false on a null read — never nags when the pace is unknown", () => {
     expect(isBehindPace(null, POLICY, NOON)).toBe(false);
+  });
+});
+
+describe("budgetHeadroom (the budget line's placement input, anton-vlom)", () => {
+  it("returns null on a null read — the line is omitted, never guessed", () => {
+    expect(budgetHeadroom(null, POLICY, NOON)).toBeNull();
+  });
+
+  it("reports the session floor's remaining points at night", () => {
+    // Night: the daytime reserve is not in force, so the hard floor (100 − 5) is what's left.
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 50, sessionPct: 60 }), POLICY, NIGHT);
+    expect(h).toMatchObject({ sessionPct: 35, sessionReason: "session-headroom" });
+  });
+
+  it("reports the daytime reserve inside the day window — the tighter hold on the same meter", () => {
+    // On pace, so the reserve holds: 100 − 40 = 60 is the ceiling, 20 points below current usage.
+    const h = budgetHeadroom(usageAt(NOON, { elapsed: 0.5, weeklyPct: 50, sessionPct: 40 }), POLICY, NOON);
+    expect(h).toMatchObject({ sessionPct: 20, sessionReason: "daytime-reserve" });
+  });
+
+  it("waives the daytime reserve when behind the weekly plan — work spills into the day", () => {
+    const h = budgetHeadroom(usageAt(NOON, { elapsed: 0.5, weeklyPct: 10, sessionPct: 40 }), POLICY, NOON);
+    expect(h).toMatchObject({ sessionPct: 55, sessionReason: "session-headroom" });
+  });
+
+  it("says how much weekly burn the behind-pace waiver survives — it is not permanent", () => {
+    // A projection spends weekly budget as it walks the queue, and the reserve is waived only while
+    // usage stays behind pace: 35 more points (the 45-point line, less the 10 already spent) and the
+    // gate stops waiving it, from which point the reserve's own ceiling (60) is what binds.
+    const h = budgetHeadroom(usageAt(NOON, { elapsed: 0.5, weeklyPct: 10, sessionPct: 40 }), POLICY, NOON);
+    expect(h?.reserveWaiver).toEqual({ afterWeeklyPct: 35, sessionPct: 20 });
+  });
+
+  it("carries no waiver where the reserve is not being waived at all", () => {
+    // Night (out of the day window), and on-pace daytime (the reserve holds outright): in neither
+    // case is there a waiver to expire, so a projection has nothing to re-apply.
+    expect(
+      budgetHeadroom(usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 10, sessionPct: 40 }), POLICY, NIGHT)
+        ?.reserveWaiver,
+    ).toBeNull();
+    expect(
+      budgetHeadroom(usageAt(NOON, { elapsed: 0.5, weeklyPct: 50, sessionPct: 40 }), POLICY, NOON)
+        ?.reserveWaiver,
+    ).toBeNull();
+    // No weekly signal: no pace to be behind, so the reserve was never waived either.
+    expect(
+      budgetHeadroom(makeUsage({ sessionPct: 40, weeklyPct: 10, weeklyResetAt: null }), POLICY, NOON)
+        ?.reserveWaiver,
+    ).toBeNull();
+  });
+
+  it("reports the weekly cap when the pace-line is above it", () => {
+    // Late week: the pace-line has risen past the cap, so the cap is the only weekly hold left.
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.99, weeklyPct: 88, sessionPct: 10 }), POLICY, NIGHT);
+    expect(h).toMatchObject({ weeklyPct: 12, weeklyReason: "weekly-cap", weeklyInclusive: true });
+  });
+
+  it("reports the pace-line inside the throttle band, not the cap it hasn't reached", () => {
+    // Mid-week, ahead of pace: idle-fill runs free to the throttle floor (80), and no further.
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 62, sessionPct: 10 }), POLICY, NIGHT);
+    // Held up by the throttle floor, which — like the cap — the gate defers AT.
+    expect(h).toMatchObject({ weeklyPct: 18, weeklyReason: "weekly-on-track", weeklyInclusive: true });
+  });
+
+  it("marks the pace-line itself exclusive — the gate defers only PAST the ceiling", () => {
+    // Late enough in the week that the pace-line has risen clear of the throttle floor (80) without
+    // reaching the cap: 100 × 0.8 + 5 = 85 is the limit, and `usage > 85` is what defers.
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.8, weeklyPct: 82, sessionPct: 10 }), POLICY, NIGHT);
+    expect(h).toMatchObject({ weeklyPct: 3, weeklyReason: "weekly-on-track", weeklyInclusive: false });
+  });
+
+  it("reports no weekly headroom without a weekly signal — unknown, not zero", () => {
+    const usage = makeUsage({ sessionPct: 10, weeklyPct: 40, weeklyResetAt: null });
+    expect(budgetHeadroom(usage, POLICY, NIGHT)?.weeklyPct).toBeNull();
+  });
+
+  it("never reports negative headroom once a hold is already tripped", () => {
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 99, sessionPct: 99 }), POLICY, NIGHT);
+    expect(h).toMatchObject({ sessionPct: 0, weeklyPct: 0 });
+  });
+
+  it("agrees with the gate on whether work may start now", () => {
+    // The property the budget line rests on: a surface that computed its own idea of "remaining"
+    // would draw a line the governor does not keep. Zero on either side must mean the gate defers.
+    //
+    // The sampled points sit OFF the exact pace-line (ceilings here are 15 / 55 / 95): landing on
+    // it exactly is the one hair's-width disagreement — the gate admits the run that would cross
+    // the line, this reports no room for it — and it is a one-card difference on a float coincidence.
+    for (const now of [NOON, NIGHT]) {
+      for (const sessionPct of [0, 40, 59, 61, 94, 96]) {
+        for (const weeklyPct of [0, 50, 79, 86, 96, 100]) {
+          for (const elapsed of [0.1, 0.5, 0.9]) {
+            const usage = usageAt(now, { elapsed, weeklyPct, sessionPct });
+            const h = budgetHeadroom(usage, POLICY, now);
+            const affordsOne = h!.sessionPct > 0 && (h!.weeklyPct === null || h!.weeklyPct > 0);
+            expect(
+              affordsOne,
+              `now=${now} session=${sessionPct} weekly=${weeklyPct} elapsed=${elapsed}`,
+            ).toBe(budgetGate(usage, POLICY, now).admit);
+          }
+        }
+      }
+    }
+  });
+});
+
+/**
+ * Quota shares (anton-81x2 / R6.1). Several repos run against ONE subscription, so a governed
+ * project may spend its declared share of the weekly target. The share and the machine-wide target
+ * sit on different meters, and these tests exist to keep them there: `usage.weeklyPct` is the
+ * ACCOUNT's reading (every repo plus the operator's own sessions), so a share enforced on it would
+ * cap the whole machine at one project's cut.
+ */
+describe("withQuotaShare", () => {
+  /** A project's attributed weekly spend, as the governor reads it off `quota-spend`. */
+  const spent = (pct: number | null) => ({ projectWeeklyPct: pct });
+
+  it("carries the share as its own ceiling and leaves the machine-wide target whole", () => {
+    const shared = withQuotaShare(POLICY, 40);
+    expect(shared.weeklyTargetPct).toBe(POLICY.weeklyTargetPct);
+    expect(shared.projectWeeklyCapPct).toBe(POLICY.weeklyTargetPct * 0.4);
+    expect({ ...shared, projectWeeklyCapPct: POLICY.projectWeeklyCapPct }).toEqual(POLICY);
+  });
+
+  it("defers once THIS project has spent its share", () => {
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 50,
+      weeklyResetAt: resetForElapsed(NIGHT, 0.5),
+    });
+    const shared = withQuotaShare(POLICY, 40);
+    // 39 of a 40-point share left over: still inside it.
+    expect(budgetGate(usage, shared, NIGHT, spent(39)).admit).toBe(true);
+
+    const d = budgetGate(usage, shared, NIGHT, spent(40));
+    if (d.admit) throw new Error("expected defer");
+    expect(d.reason).toBe("share-cap");
+    expect(d.retryAt.toISOString()).toBe(usage.weeklyResetAt);
+  });
+
+  it("does NOT defer on a neighbour's spend showing in the shared account meter", () => {
+    // The regression this whole split exists to prevent: 50 points on the ACCOUNT meter, none of it
+    // this project's. Gating the shared number against a 40% share would stop a project that has
+    // spent nothing — and, with every project stopped the same way, leave most of the operator's
+    // weekly target unspendable every week (idle-fill, anton-ld7j).
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 50,
+      weeklyResetAt: resetForElapsed(NIGHT, 0.5),
+    });
+    expect(budgetGate(usage, withQuotaShare(POLICY, 40), NIGHT, spent(0))).toEqual({ admit: true });
+  });
+
+  it("lets two governed projects between them still reach the whole weekly target", () => {
+    // One armed repo caps at the target; arming a second must not halve what the MACHINE can spend.
+    // Walk the account meter up to the target with an even split, charging each project its own half.
+    const shared = withQuotaShare(POLICY, 50);
+    const target = POLICY.weeklyTargetPct;
+    // Late in the week, so the pace-line sits above the burn and only the ceilings can defer.
+    for (let accountPct = 0; accountPct < target; accountPct += 10) {
+      const usage = makeUsage({
+        sessionPct: 10,
+        weeklyPct: accountPct,
+        weeklyResetAt: resetForElapsed(NIGHT, 0.9),
+      });
+      // Each project has burned half of what the account meter reads — inside its 50% share
+      // throughout, so neither may be deferred before the machine's own target is reached.
+      expect(budgetGate(usage, shared, NIGHT, spent(accountPct / 2))).toEqual({ admit: true });
+    }
+    // …and at the target the machine-wide cap stops them, share or no share.
+    const atCap = makeUsage({
+      sessionPct: 10,
+      weeklyPct: target,
+      weeklyResetAt: resetForElapsed(NIGHT, 0.9),
+    });
+    const d = budgetGate(atCap, shared, NIGHT, spent(target / 2));
+    if (d.admit) throw new Error("expected defer");
+    expect(d.reason).toBe("weekly-cap");
+  });
+
+  it("holds the loser of the race at its share instead of first-come-first-served", () => {
+    // A=70 / B=30. A runs first and burns the account meter to 27. B has spent nothing, so B keeps
+    // its whole 30-point cut — the guarantee the split is for — while A, at 27 of its own 70, runs.
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 27,
+      weeklyResetAt: resetForElapsed(NIGHT, 0),
+    });
+    expect(budgetGate(usage, withQuotaShare(POLICY, 30), NIGHT, spent(0)).admit).toBe(true);
+    expect(budgetGate(usage, withQuotaShare(POLICY, 70), NIGHT, spent(27)).admit).toBe(true);
+    // Once A HAS spent its 70, it stops even though the machine's own target is nowhere near.
+    const a = budgetGate(usage, withQuotaShare(POLICY, 70), NIGHT, spent(70));
+    if (a.admit) throw new Error("expected defer");
+    expect(a.reason).toBe("share-cap");
+  });
+
+  it("still admits below the share ceiling", () => {
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 10,
+      weeklyResetAt: resetForElapsed(NIGHT, 0.5),
+    });
+    expect(budgetGate(usage, withQuotaShare(POLICY, 40), NIGHT, spent(10))).toEqual({ admit: true });
+  });
+
+  it("leaves a full share exactly as it found it", () => {
+    expect(withQuotaShare(POLICY, 100).projectWeeklyCapPct).toBe(POLICY.weeklyTargetPct);
+    expect({ ...withQuotaShare(POLICY, 100), projectWeeklyCapPct: null }).toEqual(POLICY);
+  });
+
+  it("leaves the share unbound when nothing is attributable yet", () => {
+    // Unattributed spend is not zero spend, but it is the only honest floor to gate on — and gating
+    // it as "spent everything" would park a project the moment its samples went missing.
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 60,
+      weeklyResetAt: resetForElapsed(NIGHT, 0.5),
+    });
+    expect(budgetGate(usage, withQuotaShare(POLICY, 40), NIGHT, spent(null))).toEqual({
+      admit: true,
+    });
+    expect(budgetGate(usage, withQuotaShare(POLICY, 40), NIGHT)).toEqual({ admit: true });
+  });
+
+  it("parks a 0% share whether or not anything has been sampled", () => {
+    // The trap: a 0 ceiling read as "no data" would run the project UNPACED — the exact opposite of
+    // what declaring a 0% share asks for.
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 0,
+      weeklyResetAt: resetForElapsed(NIGHT, 0.1),
+    });
+    const parked = withQuotaShare(POLICY, 0);
+    for (const opts of [spent(null), spent(0), undefined]) {
+      const d = budgetGate(usage, parked, NIGHT, opts);
+      if (d.admit) throw new Error("expected defer");
+      expect(d.reason).toBe("share-cap");
+    }
+    // …and the headroom read agrees with the gate: nothing left on the share.
+    expect(budgetHeadroom(usage, parked, NIGHT)).toMatchObject({ sharePct: 0 });
+  });
+
+  it("clamps a share outside 0-100 instead of inventing budget", () => {
+    expect(withQuotaShare(POLICY, 140).projectWeeklyCapPct).toBe(POLICY.weeklyTargetPct);
+    expect(withQuotaShare(POLICY, -10).projectWeeklyCapPct).toBe(0);
+  });
+
+  it("reports the share beside the account headroom, each on its own meter", () => {
+    const usage = makeUsage({
+      sessionPct: 10,
+      weeklyPct: 10,
+      weeklyResetAt: resetForElapsed(NIGHT, 0),
+    });
+    // Machine-wide: the throttle floor (100 − 20) less 10 spent = 70 points left. The 40-point
+    // share, 25 of it spent, leaves 15. Neither replaces the other (PR #248 review): they are spent
+    // at different rates, so which runs out first is the caller's walk to decide, not this read's.
+    expect(budgetHeadroom(usage, withQuotaShare(POLICY, 40), NIGHT, spent(25))).toMatchObject({
+      weeklyPct: 70,
+      sharePct: 15,
+    });
+    // Unattributed spend reads as nothing spent — the whole share is left.
+    expect(budgetHeadroom(usage, withQuotaShare(POLICY, 100), NIGHT, spent(null))).toMatchObject({
+      weeklyPct: 70,
+      sharePct: POLICY.weeklyTargetPct,
+    });
+    // No share declared: no share hold to report.
+    expect(budgetHeadroom(usage, POLICY, NIGHT)).toMatchObject({ sharePct: null });
   });
 });

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { DeleteConflictError, deleteEpic, getEpicDetail, updateEpic } from "@/lib/epic-detail";
 import { parseEpicPatch } from "@/lib/epic-patch";
-import { notFoundResponse, withProject } from "../../resolve-project";
+import { notFoundResponse, parseJsonBody, withProject } from "../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -18,12 +18,8 @@ export const GET = withProject<{ slug: string; epicId: string }>(
 
 export const PATCH = withProject<{ slug: string; epicId: string }>(
   async (request, { project, params }) => {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-    }
+    const { body, response: badBody } = await parseJsonBody(request);
+    if (badBody) return badBody;
 
     const parsed = parseEpicPatch(body);
     if ("error" in parsed) {

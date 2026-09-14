@@ -15,6 +15,9 @@ export default defineConfig({
     // `.tsx` too: an e2e whose acceptance is what the BOARD renders (anton-bz1w) drives the real
     // job and then renders the panel off what it stored, so the suite is both bd-backed and JSX.
     include: ["src/**/*.integration.test.ts", "src/**/*.integration.test.tsx"],
+    // The same database guard the unit config installs. These suites build their own temp anton.db
+    // via `makeFileDb`, which assigns ANTON_DB inside the test file and so wins over this default.
+    setupFiles: ["./vitest.setup.ts"],
     // Generous, UNIFORM headroom: each case shells out to bd/Dolt/git many times, so under load (or
     // a busy CI runner) a normally-15s e2e case can spike well past a tight limit. Integration tests
     // rely on this single ceiling rather than scattered per-`it` literals — a per-test timeout would
@@ -26,6 +29,12 @@ export default defineConfig({
     // above reappears. `maxWorkers` caps how many test FILES run at once (vitest 4 replaced
     // `poolOptions.forks.maxForks` with this top-level option). Tune up only alongside evidence the
     // suite still completes without hanging.
+    //
+    // CI additionally shards ACROSS jobs (ci.yml `integration`, 4-way `--shard`, anton-m4b5.3):
+    // each shard is a separate GitHub-hosted runner with its OWN `maxWorkers: 4`, so sharding adds
+    // parallel runners rather than raising per-job fork concurrency — it does not reopen the
+    // port/lock race anton-vgoh tracks. `--shard` is a CLI flag, not a config option, so it is
+    // passed on the command line (`bun run test:integration -- --shard=N/4`) rather than here.
     maxWorkers: 4,
   },
 });

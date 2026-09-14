@@ -3,7 +3,9 @@ import type { Bead } from "./types";
 import {
   ACCEPTANCE_KEYS,
   acceptanceBody,
+  contractFormGaps,
   contractGaps,
+  contractOrderGaps,
   formatContractGaps,
   isContractJudged,
   isContractReadable,
@@ -18,18 +20,20 @@ import {
 /** The stamps bd puts on every issue it returns — what marks a bead as actually read (not projected). */
 const STAMPS = { created_at: "2026-07-28T00:00:00Z", updated_at: "2026-07-28T00:00:00Z" };
 
+/** A ticket description in the contract's own order, minus the rubric: like most of the board, this
+ * fixture's acceptance lives only in bd's field. */
 const DESCRIPTION = [
   "## Goal",
   "Ship the thing.",
+  "",
+  "## Context",
+  "touches: src/lib/beads/contract.ts",
   "",
   "## Out of scope",
   "- not the other thing",
   "",
   "## Verify",
   "- unit test covers it",
-  "",
-  "## Context",
-  "touches: src/lib/beads/contract.ts",
 ].join("\n");
 
 /** A fully contract-complete ticket; overrides carve pieces out of it. */
@@ -141,6 +145,16 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(summarize(scaffold)).toEqual([["Acceptance", "blocking"]]);
     // A box WITH text is a criterion — the marker is only scaffolding when it carries nothing.
     expect(validateBeadContract(ticket({ acceptance_criteria: "- [ ] it works" }))).toEqual([]);
+  });
+
+  it("treats a section holding only a bare heading marker as unwritten", () => {
+    // `###` alone renders as an empty heading — scaffolding over nothing. Reading the marker as
+    // content passed the blocking gate on a section stating no definition of done.
+    const bead = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "###"].join("\n"),
+    });
+    expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
   });
 
   it("treats a section holding only a thematic break as unwritten", () => {
@@ -863,5 +877,281 @@ describe("contractGaps + formatContractGaps (the gates' shared input, anton-j9zs
 
   it("formats empty gaps as an empty string", () => {
     expect(formatContractGaps([])).toBe("");
+  });
+});
+
+/** The rubric written into a description in the contract's own position — after Goal, ahead of
+ * Context (skills/bd/SKILL.md). The ticket fixture deliberately lacks it. */
+function withRubric(description: string, heading = "## Acceptance Criteria"): string {
+  const at = description.indexOf("## Context");
+  expect(at).toBeGreaterThanOrEqual(0);
+  return `${description.slice(0, at)}${heading}\n- [ ] it works\n\n${description.slice(at)}`;
+}
+
+/** The same sections, re-emitted in the given order — how order drift is staged. */
+function reorder(description: string, headings: string[]): string {
+  return headings
+    .map((h) => {
+      const lines = description.split("\n");
+      const start = lines.findIndex((l) => l.trim().toLowerCase() === `## ${h.toLowerCase()}`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const rest = lines.slice(start + 1);
+      const end = rest.findIndex((l) => l.startsWith("## "));
+      return [lines[start], ...(end === -1 ? rest : rest.slice(0, end))].join("\n").trim();
+    })
+    .join("\n\n");
+}
+
+/** The ticket fixture's description plus the Acceptance heading it deliberately lacks — all five
+ * sections, in the contract's order. */
+const FULL_DESCRIPTION = withRubric(DESCRIPTION);
+
+describe("contractFormGaps (the form question, separate from the run gate)", () => {
+
+  /** An epic carrying both of its sections in the description. */
+  const FULL_EPIC_DESCRIPTION = [
+    "## Outcome",
+    "Reports are shareable outside the app.",
+    "",
+    "## Success Criteria",
+    "- [ ] every report leaves the app in a customer-openable format",
+  ].join("\n");
+
+  it("reports nothing for a ticket whose description carries all five", () => {
+    expect(contractFormGaps(ticket({ description: FULL_DESCRIPTION }))).toEqual([]);
+  });
+
+  it("accepts the bare `## Acceptance` spelling older beads still carry", () => {
+    const older = ticket({ description: withRubric(DESCRIPTION, "## Acceptance") });
+    expect(contractFormGaps(older)).toEqual([]);
+  });
+
+  it("reports Acceptance when it lives only in bd's field — the drift the gate cannot see", () => {
+    // The whole point of the split: this bead is contract-complete to the gate, because
+    // `acceptanceBodies` accepts bd's field as an equal home. The form question still names it.
+    const fieldOnly = ticket();
+    expect(validateBeadContract(fieldOnly)).toEqual([]);
+    expect(contractFormGaps(fieldOnly)).toEqual(["Acceptance"]);
+  });
+
+  it("reads a section holding the formula's TODO prompt as absent", () => {
+    const prompted = ticket({
+      description: FULL_DESCRIPTION.replace(
+        "Ship the thing.",
+        "TODO — one sentence: what this delivers",
+      ),
+    });
+    expect(contractFormGaps(prompted)).toEqual(["Goal"]);
+  });
+
+  it("names every section of a bead cooked from the formula and never authored", () => {
+    const cooked = ticket({
+      acceptance_criteria: "- [ ] TODO — a concrete, checkable statement of done",
+      description: [
+        "## Goal",
+        "TODO — one sentence: what this delivers, and why it matters",
+        "",
+        "## Acceptance Criteria",
+        "- [ ] TODO — a concrete, checkable statement of done",
+        "",
+        "## Context",
+        "TODO — touches: <files/areas>; follow the pattern in <file>",
+        "",
+        "## Out of scope",
+        "- TODO — what this deliberately does not change",
+        "",
+        "## Verify",
+        "TODO — the tests that prove this landed, and which to add",
+      ].join("\n"),
+    });
+    // The contract's own order, so the report reads as the description should have been written.
+    expect(contractFormGaps(cooked)).toEqual([
+      "Goal",
+      "Acceptance",
+      "Context",
+      "Out of scope",
+      "Verify",
+    ]);
+  });
+
+  it("judges an epic on its own two sections, not a ticket's five", () => {
+    // The fixture's outcome is a bare preamble line — a heading is the convention, not the
+    // requirement — and its Success Criteria lives only in bd's field.
+    expect(contractFormGaps(epic())).toEqual(["Success Criteria"]);
+  });
+
+  it("reports nothing for an epic carrying both sections in the description", () => {
+    expect(contractFormGaps(epic({ description: FULL_EPIC_DESCRIPTION }))).toEqual([]);
+  });
+
+  it("is silent on the `area:` label — that gap is the gate's, not the description's", () => {
+    const noArea = epic({ description: FULL_EPIC_DESCRIPTION, labels: [] });
+    expect(summarize(noArea)).toEqual([["area:", "advisory"]]);
+    expect(contractFormGaps(noArea)).toEqual([]);
+  });
+
+  it("faults neither an exempt type nor a bead no bd read produced", () => {
+    const shallow: Bead = { id: "anton-p", title: "projection", status: "open", issue_type: "task" };
+    expect(contractFormGaps(shallow)).toEqual([]);
+    expect(contractFormGaps(ticket({ issue_type: "learning", description: "" }))).toEqual([]);
+  });
+});
+
+// The form's other half (anton-um80): the contract states an ORDER — Goal → Acceptance Criteria →
+// Context → Out of scope → Verify (skills/bd/SKILL.md) — and presence alone reads all five shuffled
+// as conformant. Reported apart from the missing sections because the repairs differ: author an
+// absent section, move a misplaced one.
+describe("contractOrderGaps (the form's order question)", () => {
+  const FULL_EPIC_DESCRIPTION = [
+    "## Outcome",
+    "Reports are shareable outside the app.",
+    "",
+    "## Success Criteria",
+    "- [ ] every report leaves the app in a customer-openable format",
+  ].join("\n");
+
+  it("reports nothing for a description carrying the five in the contract's order", () => {
+    expect(contractOrderGaps(ticket({ description: FULL_DESCRIPTION }))).toEqual([]);
+  });
+
+  it("reads all five shuffled as drift, where presence alone reads them as conformant", () => {
+    const shuffled = ticket({
+      description: reorder(FULL_DESCRIPTION, [
+        "Verify",
+        "Out of scope",
+        "Context",
+        "Acceptance Criteria",
+        "Goal",
+      ]),
+    });
+    expect(contractFormGaps(shuffled)).toEqual([]);
+    expect(contractOrderGaps(shuffled)).toEqual([
+      "Acceptance",
+      "Context",
+      "Out of scope",
+      "Verify",
+    ]);
+  });
+
+  it("names only the section that moved, not everything it stepped over", () => {
+    // Exactly what `bd create --context` produces: a trailing `## Context` after `## Verify`.
+    const appended = ticket({
+      description: reorder(FULL_DESCRIPTION, [
+        "Goal",
+        "Acceptance Criteria",
+        "Out of scope",
+        "Verify",
+        "Context",
+      ]),
+    });
+    expect(contractOrderGaps(appended)).toEqual(["Context"]);
+  });
+
+  it("is silent about a section the description does not carry — that gap is the presence one's", () => {
+    const noContext = ticket({ description: withoutSection(FULL_DESCRIPTION, "Context") });
+    expect(contractFormGaps(noContext)).toEqual(["Context"]);
+    expect(contractOrderGaps(noContext)).toEqual([]);
+  });
+
+  it("places a repeated heading at the copy that carries the content, not at the empty first one", () => {
+    // The canonical `## Acceptance Criteria` holds nothing but the formula's prompt; the criteria
+    // were authored under a second heading after Verify. The bodies concatenate, so reading the
+    // aggregate at the FIRST heading's position would call this ordered.
+    const late = ticket({
+      description: [
+        reorder(FULL_DESCRIPTION, ["Goal", "Context", "Out of scope", "Verify"]).replace(
+          "## Context",
+          "## Acceptance Criteria\n- [ ] TODO — a concrete, checkable statement of done\n\n## Context",
+        ),
+        "## Acceptance Criteria",
+        "- [ ] the report opens in Excel",
+      ].join("\n\n"),
+    });
+    expect(contractFormGaps(late)).toEqual([]);
+    expect(contractOrderGaps(late)).toEqual(["Acceptance"]);
+  });
+
+  it("faults a section CONTINUED after Verify, where both copies are authored", () => {
+    // The canonical five read in order and the early Acceptance is authored — but more criteria
+    // were written under a second heading after Verify, and `sectionsOf` counts them as contract.
+    // Placing the section at its first copy would report this description as ordered.
+    const continued = ticket({
+      description: [FULL_DESCRIPTION, "## Acceptance Criteria", "- [ ] the report opens in Excel"].join(
+        "\n\n",
+      ),
+    });
+    expect(contractFormGaps(continued)).toEqual([]);
+    expect(contractOrderGaps(continued)).toEqual(["Acceptance"]);
+  });
+
+  it("faults a section authored BOTH ahead of its canonical place and at it", () => {
+    // Criteria written before `## Goal` and continued under the canonical heading: the LAST copy
+    // reads in sequence, so placing the section there alone called this description ordered — while
+    // the early copy, contract content all the same, still has to move down to join the rest.
+    const split = ticket({
+      description: [
+        "## Acceptance Criteria",
+        "- [ ] the report opens in Excel",
+        "",
+        FULL_DESCRIPTION,
+      ].join("\n"),
+    });
+    expect(contractFormGaps(split)).toEqual([]);
+    expect(contractOrderGaps(split)).toEqual(["Acceptance"]);
+  });
+
+  it("reads a section repeated back-to-back as ordered — its content moves nowhere", () => {
+    const doubled = ticket({
+      description: reorder(FULL_DESCRIPTION, [
+        "Goal",
+        "Acceptance Criteria",
+        "Acceptance Criteria",
+        "Context",
+        "Out of scope",
+        "Verify",
+      ]),
+    });
+    expect(contractOrderGaps(doubled)).toEqual([]);
+  });
+
+  it("accepts an epic's outcome written as a bare preamble line, ahead of every heading", () => {
+    expect(contractOrderGaps(epic({ description: FULL_EPIC_DESCRIPTION }))).toEqual([]);
+    expect(contractOrderGaps(epic({ description: "It is shareable.\n\n## Success Criteria\n- [ ] x" }))).toEqual([]);
+  });
+
+  it("still reads an epic's LATER authored Outcome, where the preamble also states one", () => {
+    // The preamble is a home, not a short-circuit: the outcome is restated under `## Outcome` after
+    // the rubric, so contract content continues past Success Criteria. Placing the section at -1 on
+    // the preamble alone reported this description as ordered.
+    const continued = epic({
+      description: [FULL_EPIC_DESCRIPTION.replace("## Outcome\n", ""), "", "## Outcome", "Reports leave the app."].join(
+        "\n",
+      ),
+    });
+    expect(contractFormGaps(continued)).toEqual([]);
+    expect(contractOrderGaps(continued)).toEqual(["Success Criteria"]);
+  });
+
+  it("judges an epic on its own two sections, in its own order", () => {
+    const inverted = epic({
+      description: reorder(FULL_EPIC_DESCRIPTION, ["Success Criteria", "Outcome"]),
+    });
+    expect(contractFormGaps(inverted)).toEqual([]);
+    expect(contractOrderGaps(inverted)).toEqual(["Success Criteria"]);
+  });
+
+  it("faults neither an exempt type nor a bead no bd read produced", () => {
+    const shallow: Bead = { id: "anton-p", title: "projection", status: "open", issue_type: "task" };
+    expect(contractOrderGaps(shallow)).toEqual([]);
+    expect(contractOrderGaps(ticket({ issue_type: "learning", description: "" }))).toEqual([]);
+  });
+
+  // The order question is the FORM's, not the gate's: approve and the run gate read the sections
+  // wherever they sit, and widening the form judgement must not narrow what runs.
+  it("leaves the run gate blind to order, exactly as before", () => {
+    const shuffled = ticket({
+      description: reorder(FULL_DESCRIPTION, ["Verify", "Context", "Acceptance Criteria", "Goal", "Out of scope"]),
+    });
+    expect(validateBeadContract(shuffled)).toEqual([]);
   });
 });

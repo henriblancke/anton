@@ -11,9 +11,14 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { annotateSignal, type ScanSignal } from "./scan-severity";
+import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
+import { filterCouplingSignals, type CouplingFilter } from "./scan-coupling";
+import { filterDeadcodeSignals, type DeadcodeFilter } from "./scan-deadcode";
+import { filterDuplicationSignals, type DuplicationFilter } from "./scan-duplication";
+import { filterSecretSignals, type SecretFilter } from "./scan-secrets";
 import { PoisonError } from "./jobs/errors";
+import { GH_BIN_ENV } from "./git/ops";
 
 const execFileAsync = promisify(execFile);
 
@@ -71,6 +76,12 @@ export const DEFAULT_SCAN_EXCLUDES = [
   ".git/**",
   ".anton/**",
   ".beads/**",
+  // anton's own database, which lives at the repo root of the project it is run FROM. It is
+  // gitignored and disposable, but `githygiene` walks the working tree rather than the index and
+  // reports it as a multi-megabyte "large binary file" on every single scan of anton's own repo —
+  // a finding that is never actionable and that triage pays for nightly. The `*` also covers
+  // SQLite's `-wal`/`-shm` sidecars, which are flagged the same way.
+  "anton.db*",
   // Claude Code's `isolation: worktree` checks a SECOND copy of the whole tree out at
   // `.claude/worktrees/<name>/`, inside the repo. Walking it double-counts every file: the
   // 2026-08-05 scan spent 118 of its 211 signals reporting src/x as a clone of
@@ -163,6 +174,28 @@ export interface ScanResult {
   signals: ScanSignal[];
   /** Collectors that died during the scan — their signals are silently absent from the JSON. */
   collectorFailures: CollectorFailure[];
+  /** What the untracked-file filter removed from `signals` before anyone counted them. */
+  untracked: UntrackedFilter;
+  /**
+   * What the type-only filter removed from `signals`, and which fan-outs it re-priced, before anyone
+   * counted them (see {@link filterCouplingSignals}).
+   */
+  coupling: CouplingFilter;
+  /**
+   * What the non-code filter removed from `signals` before anyone counted them — the duplication
+   * signals whose reported block holds no executable statement (see {@link filterDuplicationSignals}).
+   */
+  duplication: DuplicationFilter;
+  /**
+   * What the fixture filter removed from `signals` before anyone counted them — the committed-secret
+   * signals whose flagged line holds a test placeholder (see {@link filterSecretSignals}).
+   */
+  secrets: SecretFilter;
+  /**
+   * What the reference check removed from `signals` — dead-code findings whose symbol has callers
+   * elsewhere in the tree — before anyone counted them (see {@link filterDeadcodeSignals}).
+   */
+  deadcode: DeadcodeFilter;
   /** Which baseline this scan measured against, and which one it left (see {@link DeltaState}). */
   deltaState: DeltaState;
   /**
@@ -367,13 +400,25 @@ const SIGNAL_ENVELOPE_KEYS = ["signals", "issues", "results"] as const;
  */
 export function extractSignals(parsed: unknown): ScanSignal[] | undefined {
   if (Array.isArray(parsed)) return parsed as ScanSignal[];
-  if (parsed && typeof parsed === "object") {
-    const o = parsed as Record<string, unknown>;
-    for (const key of SIGNAL_ENVELOPE_KEYS) {
-      if (Array.isArray(o[key])) return o[key] as ScanSignal[];
-    }
-  }
-  return undefined;
+  const key = envelopeKeyOf(parsed);
+  return key ? ((parsed as Record<string, unknown>)[key] as ScanSignal[]) : undefined;
+}
+
+/** Which key {@link extractSignals} read the signals out of; undefined for an array or a shape it can't read. */
+function envelopeKeyOf(parsed: unknown): (typeof SIGNAL_ENVELOPE_KEYS)[number] | undefined {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const o = parsed as Record<string, unknown>;
+  return SIGNAL_ENVELOPE_KEYS.find((key) => Array.isArray(o[key]));
+}
+
+/**
+ * The scan file with a REPLACED signal list, in whatever shape it arrived in — so a filtered signal
+ * is gone from the file triage reads, not just from the array anton counted. Everything else the
+ * envelope carries (stringer's metadata) rides through untouched.
+ */
+function withSignals(parsed: unknown, signals: ScanSignal[]): unknown {
+  const key = envelopeKeyOf(parsed);
+  return key ? { ...(parsed as Record<string, unknown>), [key]: signals } : signals;
 }
 
 /** What the unrecognized output looked like, so an operator can tell a rename from a broken write. */
@@ -382,6 +427,167 @@ function describeShape(parsed: unknown): string {
   if (typeof parsed !== "object") return typeof parsed;
   const keys = Object.keys(parsed as Record<string, unknown>);
   return keys.length > 0 ? `object with keys: ${keys.join(", ")}` : "empty object";
+}
+
+/**
+ * Collectors whose findings are a claim about the REPOSITORY, so a file git doesn't track can't
+ * support one. `githygiene` reports large binaries, mixed line endings and conflict markers off the
+ * working tree, not the index: every scan of this repo flagged anton's own `anton.db` — gitignored
+ * three times over and unknown to `git ls-files` — as a medium-severity "large binary file",
+ * unactionable by construction and re-triaged every night (anton-j2zg).
+ *
+ * Deliberately not every collector: a `todos` or `patterns` finding is about the source in front of
+ * you and reads the same whether or not it is committed yet, and a signal naming no file at all is
+ * never in question. This drops only what git can positively contradict.
+ */
+const TRACKED_ONLY_COLLECTORS = new Set(["githygiene"]);
+
+/**
+ * One finding the filter removed. The path alone doesn't say what was lost — `githygiene` reports
+ * committed secrets beside stale binaries, so a drop is logged with what the signal CLAIMED and the
+ * severity it would have carried. An operator reading the session must be able to tell "routine
+ * hygiene noise" from "a secret anton stopped watching" without re-running the scan.
+ */
+export interface DroppedSignal {
+  /** The repo-relative path, as git would spell it. */
+  path: string;
+  /** stringer's `Kind` for the finding — its collector, when the signal named no kind. */
+  kind: string;
+  /** The severity the signal would have been counted at, derived before the drop. */
+  severity: string;
+}
+
+/** What the untracked filter did to this scan — every drop is surfaced, never silent. */
+export interface UntrackedFilter {
+  /** The signals dropped because git does not track the file they are about. */
+  dropped: DroppedSignal[];
+  /**
+   * Why git could not be asked, when it couldn't be. Nothing is dropped in that case: a filter that
+   * can't prove a file is untracked must leave the signal in, so an unreadable repo under-filters
+   * rather than silently deleting findings.
+   */
+  unavailable?: string;
+}
+
+/** Everything in the index, exactly as git spells it — or why anton couldn't ask. */
+async function readTrackedPaths(repoPath: string): Promise<Set<string> | { unavailable: string }> {
+  try {
+    // -z for the same reason git/ops.ts uses it: under core.quotePath a non-ASCII path comes back
+    // C-quoted, and a mangled path would read as untracked and drop a real finding.
+    // 30s, not the scan's own budget: `ls-files` reads the index and returns in well under a second
+    // even on a huge monorepo, so anything near the deadline is git stuck (stale lock, dead NFS
+    // mount) — and a stuck git should surface fast rather than hold the scan slot for minutes.
+    const { stdout } = await execFileAsync("git", ["-C", repoPath, "ls-files", "-z"], {
+      timeout: 30_000,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return new Set(stdout.split("\0").filter(Boolean));
+  } catch (err) {
+    return { unavailable: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * A signal's path as git would spell it, or undefined when it isn't one git can be asked about:
+ * no path, the repo root itself (collectors spell it `.`), or a path outside the scanned repo.
+ * None of those is evidence of anything.
+ */
+function repoRelativePath(repoPath: string, signal: ScanSignal): string | undefined {
+  const raw = signal.FilePath ?? signal.filePath;
+  if (typeof raw !== "string" || !raw) return undefined;
+  // normalize, not a `./` strip: it also collapses mid-path traversals, so a collector spelling a
+  // tracked file `src/../app.ts` matches the index instead of missing it and losing a real finding.
+  const rel = isAbsolute(raw) ? relative(repoPath, raw) : normalize(raw);
+  if (!rel || rel === "." || rel === ".." || rel.startsWith(`..${sep}`)) return undefined;
+  return rel;
+}
+
+/** What a signal says it found, falling back to its collector when it named no kind. */
+function kindOf(signal: ScanSignal): string {
+  const kind = signal.Kind ?? signal.kind;
+  if (typeof kind === "string" && kind) return kind;
+  return collectorOf(signal) || "unknown";
+}
+
+/**
+ * Whether git tracks this path. A path with tracked files UNDER it counts: a signal can name a
+ * directory, which is never itself in the index but is plainly part of the repo.
+ */
+function isTracked(tracked: Set<string>, path: string): boolean {
+  if (tracked.has(path)) return true;
+  const prefix = path.endsWith("/") ? path : `${path}/`;
+  for (const file of tracked) {
+    if (file.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+/**
+ * Drop the signals git contradicts, and say how many. Runs BEFORE annotation so the health record's
+ * severity counts and the triage prompt see one set — a filter applied downstream of either would
+ * leave the trend charting findings the agent never saw.
+ *
+ * Asks git rather than re-reading `.gitignore`: the index is the one answer that already accounts
+ * for negated patterns, nested ignore files, `core.excludesFile`, and files committed despite a
+ * matching rule. Only reached when a signal actually raises the question, so an ordinary scan pays
+ * no git call at all.
+ */
+async function dropUntrackedSignals(
+  repoPath: string,
+  signals: ScanSignal[],
+): Promise<{ kept: ScanSignal[]; untracked: UntrackedFilter }> {
+  const candidates = new Map<ScanSignal, string>();
+  for (const signal of signals) {
+    if (!TRACKED_ONLY_COLLECTORS.has(collectorOf(signal))) continue;
+    const path = repoRelativePath(repoPath, signal);
+    if (path) candidates.set(signal, path);
+  }
+  if (candidates.size === 0) return { kept: signals, untracked: { dropped: [] } };
+
+  const tracked = await readTrackedPaths(repoPath);
+  if (!(tracked instanceof Set)) {
+    return { kept: signals, untracked: { dropped: [], ...tracked } };
+  }
+
+  const dropped: DroppedSignal[] = [];
+  const kept = signals.filter((signal) => {
+    const path = candidates.get(signal);
+    if (path === undefined || isTracked(tracked, path)) return true;
+    dropped.push({ path, kind: kindOf(signal), severity: severityOfSignal(signal) });
+    return false;
+  });
+  return { kept, untracked: { dropped } };
+}
+
+/**
+ * What the untracked filter removed, and what each drop CLAIMED; undefined when it removed nothing.
+ *
+ * Each path carries its findings' severity and kind, because that is what an operator triages on: a
+ * dropped `medium large-binary` is the phantom this filter exists for, a dropped `critical
+ * committed-secret` is anton going quiet about a leaked key and wants a look.
+ */
+export function describeUntrackedFilter(filter: UntrackedFilter): string | undefined {
+  if (filter.unavailable) {
+    return (
+      `git could not be asked which files it tracks (${filter.unavailable}) — findings for files ` +
+      `git does not track are counted this pass`
+    );
+  }
+  if (filter.dropped.length === 0) return undefined;
+  const byPath = new Map<string, Set<string>>();
+  for (const { path, kind, severity } of filter.dropped) {
+    const kinds = byPath.get(path) ?? new Set<string>();
+    kinds.add(`${severity} ${kind}`);
+    byPath.set(path, kinds);
+  }
+  // "; " between paths, since each entry already spends ", " on its kinds.
+  const entries = [...byPath].map(([path, kinds]) => `${path} (${[...kinds].join(", ")})`);
+  const shown = entries.slice(0, 10);
+  const rest = entries.length - shown.length;
+  return (
+    `dropped ${filter.dropped.length} signal(s) about ${byPath.size} path(s) git does not track: ` +
+    `${shown.join("; ")}${rest > 0 ? ` (+${rest} more)` : ""}`
+  );
 }
 
 /**
@@ -397,8 +603,23 @@ function describeShape(parsed: unknown): string {
  * - **Triage labels the signal anton counted.** stringer emits no severity of its own; annotating
  *   here means the agent reads anton's derivation off the file instead of re-deriving one from the
  *   raw fields and drifting from the trend (see {@link annotateSignal}).
+ *
+ * It is also the one seam where a signal can still be dropped from BOTH readers at once — see
+ * {@link dropUntrackedSignals}, {@link filterSecretSignals}, {@link filterCouplingSignals},
+ * {@link filterDuplicationSignals} and {@link filterDeadcodeSignals}.
  */
-async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
+async function readAnnotatedSignals(
+  scanFile: string,
+  repoPath: string,
+  opts: { exclude: readonly string[]; abort?: AbortSignal },
+): Promise<{
+  signals: ScanSignal[];
+  untracked: UntrackedFilter;
+  coupling: CouplingFilter;
+  duplication: DuplicationFilter;
+  secrets: SecretFilter;
+  deadcode: DeadcodeFilter;
+}> {
   let parsed: unknown;
   try {
     const raw = await readFile(scanFile, "utf8");
@@ -428,9 +649,25 @@ async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
     );
   }
 
-  for (const signal of signals) annotateSignal(signal);
-  await writeFile(scanFile, JSON.stringify(parsed), "utf8");
-  return signals;
+  const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, signals);
+  // Secrets next, while the githygiene findings are together: it reads the flagged line, so it
+  // should never be paid for a finding the index already contradicted.
+  const { kept: unfaked, secrets } = await filterSecretSignals(repoPath, tracked);
+  // Coupling after that: it reads the source of the modules a signal names, so it should never be
+  // paid for a finding the index already contradicted.
+  const { kept: coupled, coupling } = await filterCouplingSignals(repoPath, unfaked);
+  // Same reason, same order: reading the source at a reported clone window is only worth paying for
+  // a finding the index hasn't already contradicted.
+  const { kept: deduped, duplication } = await filterDuplicationSignals(repoPath, coupled);
+  // Deadcode last: one `git grep` per symbol is cheap but not free, so it runs over only what every
+  // cheaper filter left.
+  const { kept, deadcode } = await filterDeadcodeSignals(repoPath, deduped, {
+    exclude: opts.exclude,
+    abort: opts.abort,
+  });
+  for (const signal of kept) annotateSignal(signal);
+  await writeFile(scanFile, JSON.stringify(withSignals(parsed, kept)), "utf8");
+  return { signals: kept, untracked, coupling, duplication, secrets, deadcode };
 }
 
 /**
@@ -447,6 +684,40 @@ async function readAnnotatedSignals(scanFile: string): Promise<ScanSignal[]> {
  * poison so the runner parks the job instead of retrying past the lost window (see
  * `rejectWithBaselineRestored`).
  */
+/**
+ * `gh auth token` — the same credential anton already uses for `gh pr`/`gh issue` calls (see
+ * git/ops.ts, git/pr.ts). stringer's `github` collector (open issues/PRs/review-todos) reads its
+ * own `GITHUB_TOKEN` env var rather than shelling out to `gh`, so without this it silently logs
+ * "GITHUB_TOKEN not set, skipping GitHub collector" and that whole signal source is dark — every
+ * other collector still runs. Best-effort: `gh` missing or unauthenticated just means no GitHub
+ * signals this scan, not a failed scan.
+ *
+ * Bounded by (and cancellable via) the caller's own scan deadline/signal — this lookup must not
+ * outlive a scan a caller already gave up on, so it never adds its own independent wait past that.
+ */
+async function githubToken(timeoutMs: number, signal?: AbortSignal): Promise<string | undefined> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  try {
+    // stringer's github collector always calls api.github.com, never an enterprise host -- so
+    // without --hostname, a machine whose `gh` default host is a GHE instance would hand stringer
+    // that host's token, which api.github.com rejects (or worse, silently mismatches an account).
+    const { stdout } = await execFileAsync(gh, ["auth", "token", "--hostname", "github.com"], {
+      timeout: Math.min(10_000, timeoutMs),
+      maxBuffer: 1024 * 1024,
+      signal,
+    });
+    const token = stdout.trim();
+    return token || undefined;
+  } catch (err) {
+    // A caller abort must propagate, not collapse into "no token": swallowing it here would let
+    // scan() spawn stringer with an already-aborted signal and then run the baseline-unwind path
+    // for what should have short-circuited as cancellation (see toScanError's own AbortError check).
+    const e = err as { name?: string; code?: unknown } | null;
+    if (e?.name === "AbortError" || e?.code === "ABORT_ERR") throw err;
+    return undefined;
+  }
+}
+
 export async function scan(opts: {
   repoPath: string;
   scanFile: string;
@@ -472,16 +743,44 @@ export async function scan(opts: {
   if (delta) args.push("--delta");
   // Skip build output / caches so the walk stays on source (the .next build dir alone made this scan
   // time out), and cap each collector so a runaway one can't hang the whole scan past the timeout.
-  args.push("--exclude", [...DEFAULT_SCAN_EXCLUDES, ...(opts.exclude ?? [])].join(","));
+  const exclude = [...DEFAULT_SCAN_EXCLUDES, ...(opts.exclude ?? [])];
+  args.push("--exclude", exclude.join(","));
   args.push("--collector-timeout", COLLECTOR_TIMEOUT);
   // Keep stderr free of ANSI escapes so the collector-failure parse stays reliable when a TTY leaks in.
   args.push("--no-color");
 
   const timeoutMs = scanTimeoutMs();
+  const deadline = Date.now() + timeoutMs;
+  // A caller's own GITHUB_TOKEN (CI, an operator's shell) wins — `gh auth token` is only a
+  // fallback for when nothing already set it, and only set when it actually resolves. Bounded by
+  // and cancellable via the same deadline/signal as the scan itself, so a slow credential store
+  // can't add its own wait on top of (or outlive) an already-cancelled/short-deadline scan.
+  const env = { ...process.env };
+  if (!env.GITHUB_TOKEN) {
+    const token = await githubToken(timeoutMs, opts.signal);
+    if (token) env.GITHUB_TOKEN = token;
+  }
+  // The lookup above can itself consume part of the outer deadline -- charge that against what's
+  // left rather than handing stringer the full timeoutMs again, or a slow `gh auth token` lets the
+  // whole scan overrun ANTON_STRINGER_TIMEOUT_MS by however long the lookup took.
+  const remainingMs = deadline - Date.now();
+  // execFile treats `timeout: 0` as "no timeout" (Node and Bun both), so a budget already
+  // exhausted by the token lookup must reject here instead of spawning stringer uncapped. This is
+  // BEFORE the try below on purpose: stringer never ran, so the baseline is untouched and doesn't
+  // need unwinding -- routing it through rejectWithBaselineRestored would risk turning a harmless
+  // credential-lookup timeout into a poison error if that (unneeded) restore itself failed.
+  if (remainingMs <= 0) {
+    // Not toScanError -- that formatter's message says stringer was killed, but stringer was
+    // never spawned here; blaming it would send an operator chasing the wrong executable.
+    throw new Error(
+      `gh auth token lookup consumed the scan's ${formatTimeout(timeoutMs)} deadline before stringer could start (no output written).`,
+    );
+  }
   let stderr = "";
   try {
     ({ stderr } = await execFileAsync(bin, args, {
-      timeout: timeoutMs,
+      env,
+      timeout: remainingMs,
       maxBuffer: 64 * 1024 * 1024,
       signal: opts.signal,
     }));
@@ -492,15 +791,23 @@ export async function scan(opts: {
     // measures from the advanced state, finds nothing, and closes green over findings nobody
     // triaged. The original error passes through unchanged when the unwind works, so the runner
     // still classifies a timeout as a timeout and an abort as cancellation.
-    throw await rejectWithBaselineRestored(toScanError(err, { timeoutMs }), unwind);
+    // Report the budget stringer actually ran under (remainingMs, after the token lookup's own
+    // share was deducted), not the outer timeoutMs -- otherwise a slow `gh auth token` makes the
+    // error claim a much longer deadline than what killed the process.
+    throw await rejectWithBaselineRestored(toScanError(err, { timeoutMs: remainingMs }), unwind);
   }
 
-  let signals: ScanSignal[];
+  let read: Awaited<ReturnType<typeof readAnnotatedSignals>>;
   try {
-    signals = await readAnnotatedSignals(opts.scanFile);
+    read = await readAnnotatedSignals(opts.scanFile, opts.repoPath, {
+      exclude,
+      abort: opts.signal,
+    });
   } catch (err) {
     // Refusing the output means refusing the whole pass, baseline included: the retry has to see the
-    // same window this attempt consumed, or its findings are lost to a clean-looking rescan.
+    // same window this attempt consumed, or its findings are lost to a clean-looking rescan. A
+    // cancel lands here too — the reference check stops on the caller's signal, and the pass it
+    // abandons still consumed the window.
     throw await rejectWithBaselineRestored(err, unwind);
   }
 
@@ -508,8 +815,13 @@ export async function scan(opts: {
   const baselineScan = classifyScanBasis(baseline, after);
   return {
     scanFile: opts.scanFile,
-    signals,
+    signals: read.signals,
     collectorFailures: parseCollectorFailures(stderr),
+    untracked: read.untracked,
+    coupling: read.coupling,
+    duplication: read.duplication,
+    secrets: read.secrets,
+    deadcode: read.deadcode,
     deltaState: {
       ...(before ? { before } : {}),
       ...(after ? { after } : {}),

@@ -80,9 +80,10 @@ describe("schedules route", () => {
     const res = await GET(new Request("http://t/"), ctx("tmp"));
     expect(res.status).toBe(200);
     const { schedules } = await res.json();
-    expect(schedules).toHaveLength(8);
+    expect(schedules).toHaveLength(10);
     const types = schedules.map((s: { type: string }) => s.type).sort();
     expect(types).toEqual([
+      "board-picker",
       "gardener",
       "gate-check",
       "nightly-stringer",
@@ -91,6 +92,7 @@ describe("schedules route", () => {
       "review-fix",
       "run-health",
       "unstick",
+      "worktree-reaper",
     ]);
     // Enabled state comes straight off the seeded row: run-health is the opt-in one (anton-4ks0).
     // unstick (anton-wvcy) is armed by default but no-ops until run-health has written a report, so
@@ -112,6 +114,12 @@ describe("schedules route", () => {
       // product-master (anton-d2sx) likewise: it spends a claude session and a founder's attention
       // on every proposal it files.
       "product-master": false,
+      // board-picker (anton-albm) is the sharpest opt-in of the three: it is the only automation
+      // that starts work, so arming it is the operator giving anton a standing approval.
+      "board-picker": false,
+      // worktree-reaper (anton-hrun.1) is armed despite deleting things: what it deletes is anton's
+      // own residue, and an operator who never asked for it is the one it exists for.
+      "worktree-reaper": true,
     });
   });
 

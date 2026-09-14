@@ -14,6 +14,7 @@ import { JobRunner } from "./runner";
 import { systemClock } from "./queue";
 import { beads } from "../beads/bd";
 import { describeBd, makeBdRepo } from "@/lib/testing/integration";
+import { insertProject } from "@/lib/testing/project";
 
 let bdRepo: ReturnType<typeof makeBdRepo>;
 let repo: string;
@@ -21,7 +22,7 @@ let epic: string;
 
 /** A runner over its own store but pointed at the one shared board for liveness (anton-jz1). */
 function machine(store: TestDb): JobRunner {
-  store.db.insert(schema.projects).values({ id: "p1", slug: "p1", name: "p1", repoPath: repo }).run();
+  insertProject(store.db, { id: "p1", slug: "p1", name: "p1", repoPath: repo });
   return new JobRunner({
     db: store.db,
     clock: systemClock,

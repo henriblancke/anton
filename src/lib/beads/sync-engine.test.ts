@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BD_STEP_TIMEOUT_MS, createDoltSync, getSyncStatus, type SyncRequest } from "./bd";
+import { BD_STEP_TIMEOUT_MS, getSyncStatus, type SyncRequest } from "./bd";
+import { createDoltSync } from "./sync-coalescer";
 import { beatDeadlineMs, createSyncEngine, type SyncEngineDeps } from "./sync-engine";
 
 const silentLog = { info: () => {}, error: () => {} };

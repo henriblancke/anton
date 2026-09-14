@@ -32,29 +32,55 @@ Narrow that pool to **run targets** against one full board read
 > A bead is a run target if it is a `feature`, **or** a parentless `task`/`bug`, **or** an `epic`
 > with no `feature` children.
 
-Keep only run targets that are `open`, carry `approved`, and have no assignee. Then rank — the order
-is total and deterministic, so two machines agree on what is next:
+Keep only run targets that are `open`, carry `approved`, have no assignee, are **not a proposal**,
+and are **not labelled `agent:human`**.
+
+**A proposal is a decision, not work.** The gardener and the product master file proposals as
+parentless tasks carrying a full contract, so every other rule above admits them; what marks one is
+a fingerprint label — `gardener:<kind>:<hash>` or `pm:<kind>:<hash>`. Skip any bead carrying one.
+Approving a proposal applies a board move (rehome, reprioritize, kill, split) and closes the bead;
+it never starts a run, so claiming one would send an agent to implement a change anton makes itself.
+They stay on the board, visible and decidable — by a person, not by a worker.
+
+**Human work is excluded, and it is not a bug that it sits there.** `agent:human` marks a bead no
+agent can complete end to end — it needs a credential, an account, a purchase, a signature, or a
+taste call. Every other `agent:` value resolves to a specialist prompt; `human` resolves to none, so
+a human bead left in the set would dispatch to the DEFAULT agent and burn a run failing at work no
+agent can do. It is approved, real, and waiting for a person — not backlog, not unshaped.
+
+Both exclusions belong to this narrowing step, **not** to the pool query: bd's own `--exclude-label`
+flag would move them into the argv and drift from the one flag set every worker and anton share.
+Whatever holds the board already reads it for parentage, so the labels cost nothing to check here.
+
+Then rank — the order is total and deterministic, so two machines agree on what is next:
 
 1. **priority**, P0 first (a bead with none sorts last);
 2. then **unblocking value** — how many open beads it transitively unblocks via `blocks` edges, most
-   first;
+   first (a bead another open blocker still holds is not unblocked by this one, so it does not count);
 3. then **age**, oldest `created_at` first;
 4. then **id**, which is what makes the order total.
 
 ## 2. Claim, then prove the claim held
 
-Claims ride eventually-consistent Dolt sync, so *writing* a claim is not *holding* one. Run the
-whole sequence, in order, for the top-ranked target:
+On an **embedded** board a claim rides eventually-consistent Dolt sync, so *writing* a claim is not
+*holding* one. Run the whole sequence, in order, for the top-ranked target:
 
 ```bash
-bd dolt pull                                 # 1. see a claim another machine already published
+bd dolt pull                                 # 1. embedded only: see a claim another machine already published
 BEADS_ACTOR="$ACTOR" bd update <id> --claim  # 2. bd's atomic local CAS — refuses a bead someone else holds
-bd dolt commit && bd dolt push               # 3. publish; a claim nobody else can see is not a claim
-sleep 2                                      # 4. settle — let a near-simultaneous rival reach the remote
-bd dolt pull                                 # 5. re-read after the merge has picked a winner
+bd dolt commit && bd dolt push               # 3. embedded only: publish; a claim nobody else can see is not a claim
+sleep 2                                      # 4. embedded only: settle — let a near-simultaneous rival reach the remote
+bd dolt pull                                 # 5. embedded only: re-read after the merge has picked a winner
 bd show <id> --json                          # 6. assert assignee == "$ACTOR"
 bd list --status all --json --limit 0        # 7. re-apply §1 to the target you now hold
 ```
+
+**On a shared-server board, run steps 2, 6 and 7 only.** Read the mode before you start — `dolt_mode`
+in `.beads/metadata.json`; absent or unreadable means embedded. When every worker writes the one
+`dolt sql-server` there is nothing to reconcile: the claim is visible to everybody the moment bd
+commits it, so the settle window buys nothing — and the sync steps don't merely waste time, they
+fail. `bd dolt pull/push` executes ON the server, which cannot reach the git remote
+(`Error 1105 (HY000): command denied to user`).
 
 Steps 6 and 7 are what make the claim trustworthy — winning the assignee proves the race, not that
 the prize is still worth having. Four outcomes, and only the first licenses a run:

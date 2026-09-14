@@ -48,12 +48,13 @@ export function planMove(fromBead: Bead, toStage: Stage): MoveOp[] {
  * lock (anton-e42l) — the same chain a run's claim and the gardener's apply take.
  *
  * Dragging to Done closes the card, and `gardener/apply.ts` `applyStep` decides whether it may hang
- * work under that card from a read taken inside that lock (`homeUnusable`, `assertHomeIsCard`), then
- * yields before its write. Outside the lock, this close lands in exactly that gap: the re-parent
- * passes every check and attaches open work beneath a card that is closed by the time it writes,
- * settling as successfully applied. Holding the lock across the read and the ops makes the two
- * orders — either the close lands first and the apply's own locked re-read refuses it, or the
- * re-parent lands first and this close is planned against a board that already holds it.
+ * work under that card from a read taken inside that lock (`homeUnusable`,
+ * `assertHomeFitsSubject`), then yields before its write. Outside the lock, this close lands in
+ * exactly that gap: the re-parent passes every check and attaches open work beneath a card that is
+ * closed by the time it writes, settling as successfully applied. Holding the lock across the read
+ * and the ops makes the two orders — either the close lands first and the apply's own locked
+ * re-read refuses it, or the re-parent lands first and this close is planned against a board that
+ * already holds it.
  */
 export async function moveCard(project: Project, cardId: string, toStage: Stage): Promise<void> {
   const ops = await withBeadWriteLock(project.repoPath, cardId, async () => {

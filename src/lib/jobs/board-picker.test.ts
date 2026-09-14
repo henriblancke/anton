@@ -1,0 +1,1289 @@
+/**
+ * The board-picker handler (anton-albm): one pass = one board read, one decision, one recorded plan.
+ *
+ * The decision itself is pinned in picker-decision.test.ts. What is pinned here is the WIRING — that
+ * arming the schedule actually produces a row a surface can read, at the job that produced it, and
+ * that two overlapping passes leave one plan rather than two. A pass that resolved without writing
+ * would be indistinguishable from an armed schedule that never fired.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import type { TestDb } from "../db/testing";
+import * as schema from "../db/schema";
+import {
+  getBoardPickerPlan,
+  isPlanStale,
+  saveBoardPickerPlan,
+  stampBoard,
+} from "../board-picker-plan";
+import { PICKER_DEFER_WINDOW_MS, recordPickerVeto } from "../picker-veto";
+import {
+  EARNED_AUTONOMY_BARS,
+  PICKER_AUTONOMY_TIER,
+  type DeliberateArming,
+} from "../gardener/autonomy";
+import {
+  activeDisarm,
+  disarmAutopilot,
+  listDisarms,
+  reArmAutopilot,
+} from "../autopilot-disarm";
+import { listOpenEscalations } from "../escalations";
+import { createSchedule } from "../schedules";
+import { LABELS } from "../beads/bd";
+import type { PrActivity } from "../git/pr";
+import type { Bead } from "../beads/types";
+import { loadAllIssues } from "../beads/issues";
+import {
+  invalidateIssueSnapshot,
+  refreshIssueSnapshot,
+  resetIssueSnapshots,
+} from "../beads/snapshot";
+import { PoisonError } from "./errors";
+import { enqueue, enqueueScheduledTypeIfAbsent, queuedJobId, type Clock } from "./queue";
+import type { JobContext } from "./runner";
+import { makeBoardPickerHandler } from "./board-picker";
+import { BoardPickerNudge, PICKER_NUDGE_WINDOW_MS } from "./picker-nudge";
+import type {
+  ConfirmStart,
+  PickerApplyInput,
+  PickerApplyOutcome,
+  PickerStart,
+} from "./picker-apply";
+import { makeProjectDb } from "@/lib/testing/project";
+
+const board = vi.hoisted(() => ({ current: [] as Bead[], calls: [] as unknown[][] }));
+vi.mock("../beads/issues", () => ({
+  loadAllIssues: vi.fn(async (...args: unknown[]) => {
+    board.calls.push(args);
+    return board.current;
+  }),
+}));
+
+/**
+ * The apply step is mocked, not driven: what this suite pins is the GATING — which passes reach a
+ * start at all — while what a start writes is picker-apply.test.ts's (and the e2e's).
+ */
+const applyPickerPlan = vi.hoisted(() =>
+  vi.fn<(input: PickerApplyInput) => Promise<PickerApplyOutcome>>(async () => ({
+    skipped: { reason: "stubbed" },
+  })),
+);
+/** The flow brake's re-check, built by this module and re-asked at the apply's own final gate. */
+const pickerWipHold = vi.hoisted(() => vi.fn(() => async () => undefined));
+vi.mock("./picker-apply", () => ({ applyPickerPlan, pickerWipHold }));
+
+/**
+ * A start, with the post-restamp re-confirmation the real apply hands back (PR #218 review). Default
+ * `confirmStart` answers "the run still stands"; the teardown case below hands its own.
+ */
+function started(
+  over: Partial<PickerStart> = {},
+  confirmStart: ConfirmStart = async () => undefined,
+) {
+  return {
+    started: {
+      beadId: "t1",
+      rank: 1,
+      rule: "the work policy armed on this machine",
+      jobId: "j1",
+      ...over,
+    },
+    confirmStart,
+  } satisfies PickerApplyOutcome;
+}
+
+const NOW = 1_800_000_000_000;
+const clock: Clock = { now: () => NOW };
+
+/** A dated, contract-shaped bead — nothing for the approve gate to fault. */
+function bead(id: string, o: Partial<Bead> = {}): Bead {
+  return {
+    id,
+    title: id,
+    status: "open",
+    issue_type: "task",
+    created_at: "2026-08-01T00:00:00Z",
+    description: "## Goal\n\nShip it.\n",
+    acceptance_criteria: "- [ ] it ships",
+    ...o,
+  };
+}
+
+/** Just the pass's hold lines — other modules log to console.info too. */
+function holdLines(spy: MockInstance<typeof console.info>): string[] {
+  return spy.mock.calls.map((args) => String(args[0])).filter((line) => line.includes("holding"));
+}
+
+/** Three failed runs, an hour apart and all settled before `NOW` — a streak at the default 3. */
+function threeFailedRuns(t: TestDb): void {
+  for (const [i, id] of ["r1", "r2", "r3"].entries()) {
+    const at = new Date(NOW - (3 - i) * 3_600_000);
+    t.db
+      .insert(schema.runs)
+      .values({
+        id,
+        projectId: "p1",
+        epicBeadId: `anton-${id}`,
+        status: "failed",
+        error: "verify gate failed",
+        startedAt: at,
+        endedAt: at,
+        updatedAt: at,
+      })
+      .run();
+  }
+}
+
+/** A `gh pr view` stand-in for the WIP hold's PR confirmation. */
+function prActivity(number: number, state: string): PrActivity {
+  return { number, state, url: `https://example.test/pull/${number}`, updatedAtMs: 0, isDraft: false };
+}
+
+/**
+ * A db that trips `controller` on the plan write — the one instant between the write's own signal
+ * gate and the start, which is the window an abort has to be re-checked in.
+ *
+ * The transaction handle is proxied along with the connection: the plan write picks its generation
+ * by comparing against the row, so it reads and inserts inside ONE transaction (anton-f12y) and the
+ * insert never touches the outer db.
+ */
+function abortOnPlanWrite(db: TestDb["db"], controller: AbortController): TestDb["db"] {
+  const trip = <T extends object>(handle: T): T =>
+    new Proxy(handle, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop) as unknown;
+        if (typeof value !== "function") return value;
+        const fn = value as (...args: unknown[]) => unknown;
+        if (prop === "transaction") {
+          return (cb: (tx: object) => unknown, ...rest: unknown[]) =>
+            fn.call(target, (tx: object) => cb(trip(tx)), ...rest);
+        }
+        if (prop !== "insert") return fn.bind(target);
+        return (...args: unknown[]) => {
+          controller.abort();
+          return fn.apply(target, args);
+        };
+      },
+    });
+  return trip(db);
+}
+
+function fakeCtx(over: Partial<JobContext> = {}): JobContext {
+  return {
+    jobId: "job-1",
+    type: "board-picker",
+    projectId: "p1",
+    payload: { projectId: "p1" },
+    attempt: 1,
+    heartbeat: async () => {},
+    report: () => {},
+    claudeReached: async () => {},
+    signal: new AbortController().signal,
+    enqueueReviewFixPr: () => undefined,
+    ...over,
+  };
+}
+
+/**
+ * Arm the project: a policy, the autonomy level that lets a pass act on it, and — at `apply` — the
+ * accept/veto record that level has to be EARNED on (anton-vkp9). All three are what "armed" means
+ * to the pass, so a test about the brakes does not have to restate the gate it is not testing.
+ */
+function arm(
+  t: TestDb,
+  autonomy: string,
+  {
+    policy = { types: ["task"] } as unknown,
+    record = true,
+    override,
+  }: { policy?: unknown; record?: boolean; override?: DeliberateArming } = {},
+): void {
+  t.db
+    .update(schema.projects)
+    .set({
+      settingsJson: JSON.stringify({
+        pickerPolicy: policy,
+        pickerAutonomy: autonomy,
+        ...(override ? { pickerApplyOverride: override } : {}),
+      }),
+    })
+    .run();
+  if (record) answerPicks(t, PICKER_BAR.minSettled, PICKER_BAR.minSettled);
+}
+
+/** The bar the picker's own record clears — read off the shared ladder, never restated here. */
+const PICKER_BAR = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+
+/**
+ * `settled` answered picks, `accepted` of them released — the operator's record, written where the
+ * release route and the veto route write it.
+ */
+function answerPicks(t: TestDb, settled: number, accepted: number): void {
+  for (let i = 0; i < settled; i++) {
+    t.db
+      .insert(schema.pickerVerdicts)
+      .values({
+        id: `v${i}`,
+        projectId: "p1",
+        beadId: `answered-${i}`,
+        verdict: i < accepted ? "accepted" : "declined",
+        // Declines are seeded as disagreement: pacing is not evidence about the ranking, so a
+        // `not-now` seed would leave `settled` counting rows the record does not read (anton-31gm).
+        action: i < accepted ? "release" : "never",
+        vetoKind: i < accepted ? null : "disagreement",
+        planId: `plan-${i}`,
+        decidedAt: new Date(NOW - (settled - i) * 60_000),
+      })
+      .run();
+  }
+}
+
+let t: TestDb;
+beforeEach(() => {
+  board.current = [];
+  board.calls = [];
+  applyPickerPlan.mockClear();
+  t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" });
+});
+afterEach(() => t.close());
+
+describe("makeBoardPickerHandler", () => {
+  it("records the pass's ranked plan, stamped with the board it decided over", async () => {
+    board.current = [bead("t1", { priority: 2 }), bead("t2", { priority: 0 })];
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries.map((e) => e.beadId)).toEqual(["t2", "t1"]);
+    // Every entry names the rule that admitted it — a plan whose picks cannot be explained is one
+    // an operator can only accept on faith.
+    expect(plan?.entries.every((e) => e.rule.length > 0)).toBe(true);
+    expect(plan?.jobId).toBe("job-1");
+    expect(plan?.stamp.beadCount).toBe(2);
+    expect(plan?.stamp.observedAtMs).toBe(NOW);
+    expect(plan?.generatedAt).toBe(Math.floor(NOW / 1000));
+  });
+
+  // A pass ALWAYS writes a plan row, so the write is not the effect — the ranking is. An empty
+  // board makes every ten-minute slot look like work if the two are conflated (anton-znoz).
+  it("reports a ranked plan as work done and an empty one as nothing to do", async () => {
+    board.current = [bead("t1", { priority: 2 })];
+    expect(await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx())).toEqual({
+      changed: true,
+      note: "ranked 1 target(s)",
+    });
+
+    board.current = [];
+    expect(await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx())).toEqual({
+      changed: false,
+      note: "nothing claimable to rank",
+    });
+  });
+
+  it("keeps a vetoed target out of the NEXT pass's plan, until its window closes", async () => {
+    // R3.9 end to end: the operator's veto is stored, the next pass reads it, and the target leaves
+    // the plan — named as deferred, not silently absent — until the bounded window runs out.
+    board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 1 })];
+    const run = makeBoardPickerHandler({ db: t.db, clock });
+
+    await run(fakeCtx());
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual([
+      "t1",
+      "t2",
+    ]);
+
+    await recordPickerVeto(t.db, clock, { projectId: "p1", beadId: "t1", action: "not-now" });
+
+    await run(fakeCtx());
+    const after = await getBoardPickerPlan(t.db, "p1");
+    expect(after?.entries.map((e) => e.beadId)).toEqual(["t2"]);
+    expect(after?.exclusions.find((e) => e.beadId === "t1")?.reason).toBe("deferred");
+
+    // Past the window the pass offers it again — the hold expires on its own, and nothing about the
+    // veto is a per-bead blocklist.
+    const later: Clock = { now: () => NOW + PICKER_DEFER_WINDOW_MS + 1000 };
+    await makeBoardPickerHandler({ db: t.db, clock: later })(fakeCtx());
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual([
+      "t1",
+      "t2",
+    ]);
+  });
+
+  it("reads the board strictly, so a gate-less read retries instead of recording it as blocked", async () => {
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+    expect(board.calls[0]).toEqual(["/tmp/p1", { strictGates: true }]);
+  });
+
+  it("records an EMPTY plan on a board with nothing claimable", async () => {
+    // "Decided, nothing to start" has to be storable: absent it, a lane cannot tell an idle board
+    // from a schedule that never fired.
+    board.current = [bead("t1", { status: "closed" })];
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries).toEqual([]);
+    // A finished bead nothing depends on is outside the decision's reach, and `beadCount` counts
+    // what the fence covers rather than the snapshot (anton-t01f) — so this board is decided, has
+    // nothing to start, and stamps no bead at all.
+    expect(plan?.stamp.beadCount).toBe(0);
+  });
+
+  it("leaves one plan behind when two passes overlap", async () => {
+    board.current = [bead("t1")];
+    const handler = makeBoardPickerHandler({ db: t.db, clock });
+
+    await Promise.all([handler(fakeCtx()), handler(fakeCtx({ jobId: "job-2" }))]);
+
+    const rows = await t.db.select().from(schema.boardPickerPlans);
+    expect(rows.length).toBe(1);
+    expect(rows[0].entriesJson).toBe(
+      JSON.stringify([{ beadId: "t1", rank: 1, rule: "any claimable run target" }]),
+    );
+  });
+
+  /**
+   * The pass is the FALLBACK writer (anton-m4il). It stamps its observation before a board read that
+   * costs seconds, so the operator's own read — which records the same decision from the board it is
+   * holding (anton-f12y) — can be looking at a newer board than this tick is. Clobbering it would
+   * retire the generation the Release button on screen names, and the accept would be refused.
+   */
+  describe("beside the board read's own writes", () => {
+    /** A generation recorded from a board observed after this pass looked. */
+    async function fresherPlan(): Promise<string> {
+      const plan = await saveBoardPickerPlan(t.db, clock, {
+        projectId: "p1",
+        stamp: { observedAtMs: NOW + 1_000, digest: "feedfacefeedface", beadCount: 1 },
+        entries: [{ beadId: "t9", rank: 1, rule: "any claimable run target" }],
+        exclusions: [],
+      });
+      return plan.planId;
+    }
+
+    it("keeps a generation derived from a fresher board rather than recording over it", async () => {
+      board.current = [bead("t1")];
+      const standing = await fresherPlan();
+
+      // The pass still decides — the ranking is what it reports as work done — it just does not
+      // replace a plan decided from a later look at the board.
+      expect(await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx())).toEqual({
+        changed: true,
+        note: "ranked 1 target(s)",
+      });
+
+      const plan = await getBoardPickerPlan(t.db, "p1");
+      expect(plan?.planId).toBe(standing);
+      expect(plan?.entries.map((e) => e.beadId)).toEqual(["t9"]);
+    });
+
+    it("still starts its own top pick — the apply acts on this pass's decision, not on the row", async () => {
+      board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2 })];
+      arm(t, "apply");
+      await fresherPlan();
+
+      await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+      expect(applyPickerPlan.mock.calls[0]?.[0].entries.map((e) => e.beadId)).toEqual(["t1", "t2"]);
+    });
+  });
+
+  it("heartbeats after the board read, so a slow `bd` isn't killed as no progress", async () => {
+    board.current = [bead("t1")];
+    const beats: string[] = [];
+
+    await makeBoardPickerHandler({ db: t.db, clock })(
+      fakeCtx({ heartbeat: async () => void beats.push("beat") }),
+    );
+
+    expect(beats).toEqual(["beat"]);
+  });
+
+  it("starts NOTHING when the abort lands after the plan is written", async () => {
+    // The plan write's own gate is not enough: `abortProject` aborts this pass AND deletes the
+    // project's queued rows, so a start that ran in the window after it would write `approved` and a
+    // claim to the real board and insert a job the teardown then trips over.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const controller = new AbortController();
+
+    await expect(
+      makeBoardPickerHandler({ db: abortOnPlanWrite(t.db, controller), clock })(
+        fakeCtx({ signal: controller.signal }),
+      ),
+    ).rejects.toThrow();
+
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+  });
+
+  it("writes NOTHING once the pass is cancelled", async () => {
+    // The plan is replaced whole, so a cancelled pass that still wrote would overwrite the last good
+    // plan — and during project teardown resurrect a row the abort just deleted.
+    board.current = [bead("t1")];
+    const aborted = AbortSignal.abort();
+
+    await expect(
+      makeBoardPickerHandler({ db: t.db, clock })(fakeCtx({ signal: aborted })),
+    ).rejects.toThrow();
+
+    expect(await getBoardPickerPlan(t.db, "p1")).toBeUndefined();
+  });
+
+  it("narrows the plan with the policy the operator armed", async () => {
+    // The settings panel says an accepted policy is what anton may start on; a plan that still
+    // admitted everything would advertise a boundary anton does not keep.
+    t.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ pickerPolicy: { types: ["bug"] } }) })
+      .run();
+    board.current = [bead("t1", { issue_type: "bug" }), bead("t2", { issue_type: "task" })];
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+    // The refusal stays answerable: it is the policy's, not the board's, and it names the criterion.
+    const refused = plan?.exclusions.find((e) => e.beadId === "t2");
+    expect(refused?.reason).toBe("policy");
+    expect(refused?.detail).toContain("the policy admits only bug");
+  });
+
+  it("keeps the structural default on a project that has armed nothing", async () => {
+    board.current = [bead("t1", { issue_type: "task" })];
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries).toEqual([{ beadId: "t1", rank: 1, rule: "any claimable run target" }]);
+  });
+
+  it("disarms the project when its recent runs are a streak of failures, and still ranks", async () => {
+    // The brake and the ranking are different jobs: the pass starts nothing, so the plan stays
+    // useful reading while the latch is what the arming step refuses on (R4.4 / R1.5).
+    board.current = [bead("t1")];
+    threeFailedRuns(t);
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const disarm = await activeDisarm(t.db, "p1");
+    expect(disarm?.reason).toBe("consecutive-failures");
+    expect(disarm?.evidence).toHaveLength(3);
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+    // The freeze is also in the "Needs you" strip, carrying the same case (R4.6).
+    expect(await listOpenEscalations(t.db, "p1")).toHaveLength(1);
+  });
+
+  it("leaves the project armed on the next pass once the operator re-arms it", async () => {
+    // The other half of "a disarmed picker stays disarmed until re-armed": a re-arm has to STICK.
+    // Nothing new has run, so the same three failures are still the most recent evidence — a pass
+    // that re-read them would re-latch within one cadence and silently overrule the operator.
+    board.current = [bead("t1")];
+    threeFailedRuns(t);
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    await pass(fakeCtx());
+    expect(await reArmAutopilot(t.db, clock, { projectId: "p1", actor: "ops" })).toMatchObject({
+      ok: true,
+    });
+
+    await pass(fakeCtx());
+
+    expect(await activeDisarm(t.db, "p1")).toBeUndefined();
+    // One freeze in the whole history, and no second row in the strip to clear.
+    expect(await listDisarms(t.db, "p1")).toHaveLength(1);
+    expect(await listOpenEscalations(t.db, "p1")).toHaveLength(0);
+  });
+
+  it("disarms the project when its delivered runs keep scoring below the floor", async () => {
+    // The other quality brake (R4.3): these runs all DELIVERED, so the failure breaker sees nothing
+    // — what stops the picker is the trend in what they shipped.
+    const targets = ["anton-a", "anton-b", "anton-c"];
+    board.current = [bead("t1"), ...targets.map((id) => bead(id, { status: "closed" }))];
+    for (const [i, id] of targets.entries()) {
+      const at = new Date(NOW - (3 - i) * 3_600_000);
+      t.db
+        .insert(schema.runs)
+        .values({
+          id: `r${i}`,
+          projectId: "p1",
+          epicBeadId: id,
+          status: "done",
+          // The score each ATTEMPT earned, as its review gate reported it (anton-cekf).
+          reviewScore: 4 + i,
+          startedAt: at,
+          endedAt: at,
+          updatedAt: at,
+        })
+        .run();
+    }
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const disarm = await activeDisarm(t.db, "p1");
+    expect(disarm?.reason).toBe("score-regression");
+    expect(disarm?.evidence).toHaveLength(3);
+    // The brake and the ranking remain different jobs, exactly as for the failure streak.
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+  });
+
+  it("holds — not disarms — while the operator's review queue is full, and says so as a limit", async () => {
+    // The flow brake (R4.2). Nothing is latched and nothing is written: the pass still records its
+    // ranking, because a hold stops STARTING work, not deciding what would start.
+    const IN_REVIEW = LABELS.stage("in-review");
+    const prs = [11, 12, 13];
+    board.current = [
+      bead("t1"),
+      ...prs.map((n) =>
+        bead(`anton-${n}`, { labels: [IN_REVIEW], metadata: { pr: `gh-${n}` } }),
+      ),
+    ];
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    await makeBoardPickerHandler({
+      db: t.db,
+      clock,
+      readPrActivity: async (_repo, number) => prActivity(number, "OPEN"),
+    })(fakeCtx());
+
+    expect(await activeDisarm(t.db, "p1")).toBeUndefined();
+    expect(holdLines(info)).toEqual([
+      "[board-picker] p1: holding — 3 open PRs are waiting on review — " +
+        "this project pauses new work at 3 (#11, #12, #13)",
+    ]);
+    // The brake and the ranking remain different jobs, exactly as for the two disarms.
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toContain("t1");
+    info.mockRestore();
+  });
+
+  it("stops holding on the next pass once one of those PRs merges", async () => {
+    const IN_REVIEW = LABELS.stage("in-review");
+    const prs = [11, 12, 13];
+    board.current = [
+      bead("t1"),
+      ...prs.map((n) =>
+        bead(`anton-${n}`, { labels: [IN_REVIEW], metadata: { pr: `gh-${n}` } }),
+      ),
+    ];
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    // #12 merges between the passes. The board is untouched — review-fix has not finalized the bead
+    // yet — so the release can only come from the PR state itself.
+    let merged = false;
+    const pass = makeBoardPickerHandler({
+      db: t.db,
+      clock,
+      readPrActivity: async (_repo, number) =>
+        prActivity(number, merged && number === 12 ? "MERGED" : "OPEN"),
+    });
+
+    await pass(fakeCtx());
+    expect(holdLines(info)).toHaveLength(1);
+
+    merged = true;
+    await pass(fakeCtx());
+
+    // No second hold line, and nothing an operator had to clear to get there.
+    expect(holdLines(info)).toHaveLength(1);
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toContain("t1");
+    info.mockRestore();
+  });
+
+
+  it("starts its top pick once the project is armed to apply", async () => {
+    // R1.5 wiring: the pass hands the plan it just recorded to the apply step — the ranking is not
+    // re-derived there, so the start and the lane can never name different targets.
+    board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2 })];
+    arm(t, "apply");
+    applyPickerPlan.mockResolvedValueOnce(started());
+
+    const effect = await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+    expect(applyPickerPlan.mock.calls[0][0]).toMatchObject({
+      projectId: "p1",
+      repoPath: "/tmp/p1",
+      entries: [
+        { beadId: "t1", rank: 1 },
+        { beadId: "t2", rank: 2 },
+      ],
+    });
+    // A start outranks "ranked N": it is the one outcome of this pass that moved something.
+    expect(effect).toEqual({ changed: true, note: "started t1 (rank 1 of 2)" });
+  });
+
+  it("hands the start its cancellation and the runner's queue verbs", async () => {
+    // The pre-call abort gate only proves the pass was live when the apply began (PR #218 review):
+    // the apply itself spends seconds on `bd`, so it needs the signal to re-ask at its own seams —
+    // and the runner's enqueue, whose quiesce barrier refuses a project mid-teardown.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const run = { enqueueIfAbsent: () => undefined, resume: async () => false };
+    const ctx = fakeCtx();
+
+    await makeBoardPickerHandler({ db: t.db, clock, run })(ctx);
+
+    expect(applyPickerPlan.mock.calls[0][0]).toMatchObject({ signal: ctx.signal, run });
+  });
+
+  it("restamps the plan against the board its own start rewrote", async () => {
+    // R3.5's apply lane is a LIVE PREVIEW: the start writes `approved` and the assignee, both inputs
+    // to the plan's freshness fence, so the row saved before it reads stale the instant it lands —
+    // and a stale plan withholds Up Next whole (PR #218 review). The pass therefore re-decides over
+    // the post-write board, which drops the started target and leaves the survivors current.
+    board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2 })];
+    arm(t, "apply");
+    applyPickerPlan.mockImplementationOnce(async () => {
+      board.current = [
+        bead("t1", { priority: 0, assignee: "anton-box", labels: [LABELS.approved] }),
+        bead("t2", { priority: 2 }),
+      ];
+      return started();
+    });
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries.map((e) => e.beadId)).toEqual(["t2"]);
+    expect(plan?.exclusions).toContainEqual(
+      expect.objectContaining({ beadId: "t1", reason: "claimed" }),
+    );
+    // The whole point: the recorded plan describes the board as it now reads, so the lane survives.
+    expect(isPlanStale(plan!, stampBoard(board.current, clock.now(), { types: ["task"] }))).toBe(
+      false,
+    );
+  });
+
+  it("restamps under the policy as it reads NOW, not the snapshot the pass opened with", async () => {
+    // The apply is seconds of `bd`, and the policy is half the plan's freshness fence. Restamping a
+    // fresh board under the pre-start policy would record survivors the current one excludes and
+    // stamp them with the superseded digest — read as stale on the next pass, withholding Up Next
+    // for the cadence this restamp exists to save (PR #218 review).
+    board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2, issue_type: "bug" })];
+    arm(t, "apply", { policy: { types: ["task", "bug"] } });
+    applyPickerPlan.mockImplementationOnce(async () => {
+      board.current = [
+        bead("t1", { priority: 0, assignee: "anton-box", labels: [LABELS.approved] }),
+        bead("t2", { priority: 2, issue_type: "bug" }),
+      ];
+      arm(t, "apply", { policy: { types: ["task"] }, record: false });
+      return started();
+    });
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries.map((e) => e.beadId)).toEqual([]);
+    expect(plan?.exclusions).toContainEqual(
+      expect.objectContaining({ beadId: "t2", reason: "policy" }),
+    );
+    // Stamped with the NARROWED policy, so the next pass reads the row as current.
+    expect(isPlanStale(plan!, stampBoard(board.current, clock.now(), { types: ["task"] }))).toBe(
+      false,
+    );
+  });
+
+  it("keeps the start when the restamp fails, rather than retrying the pass", async () => {
+    // The run is already enqueued: a throw here would retry the pass, and the retry — reading a
+    // board whose top pick is now claimed — would start the NEXT target.
+    board.current = [bead("t1", { priority: 0 })];
+    arm(t, "apply");
+    applyPickerPlan.mockResolvedValueOnce(started());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // The pass's own read stands; the RESTAMP's re-read is the one that falls over.
+    vi.mocked(loadAllIssues)
+      .mockImplementationOnce(async () => board.current)
+      .mockImplementationOnce(async () => {
+        throw new Error("bd is gone");
+      });
+
+    const effect = await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(effect).toEqual({ changed: true, note: "started t1 (rank 1 of 1)" });
+    expect(warn.mock.calls.some((args) => String(args[0]).includes("restamped"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("restamps when a SKIP left this pass's writes on the board", async () => {
+    // A skip is not always a no-op (PR #218 review): an approved, unassigned target whose run is
+    // still queued keeps the approval and the claim the apply wrote, which move the same freshness
+    // fence a start does. Restamping only started outcomes would withhold Up Next for a cadence over
+    // a board change anton made itself.
+    board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2 })];
+    arm(t, "apply");
+    applyPickerPlan.mockImplementationOnce(async () => {
+      board.current = [
+        bead("t1", { priority: 0, assignee: "anton-box", labels: [LABELS.approved] }),
+        bead("t2", { priority: 2 }),
+      ];
+      return {
+        skipped: { beadId: "t1", reason: "a run already covers this target", wroteBoard: true },
+      };
+    });
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries.map((e) => e.beadId)).toEqual(["t2"]);
+    expect(isPlanStale(plan!, stampBoard(board.current, clock.now(), { types: ["task"] }))).toBe(
+      false,
+    );
+  });
+
+  it("re-confirms a board-writing skip whose covering run teardown removed", async () => {
+    // The far-side window is not the start's alone (PR #218 review): a skip that deferred to a live
+    // run keeps this pass's approval and claim, and the restamp behind it is a board read
+    // `abortProject` can land in. A covering run swept away leaves those writes over nothing, so the
+    // apply's seam check is re-asked here exactly as it is after a start.
+    board.current = [bead("t1", { priority: 0 })];
+    arm(t, "apply");
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    applyPickerPlan.mockResolvedValueOnce({
+      skipped: { beadId: "t1", reason: "a run already covers this target", wroteBoard: true },
+      confirmStart: async () => ({
+        skipped: {
+          beadId: "t1",
+          reason: "the pass was cancelled and the run covering this target removed with it",
+          wroteBoard: false,
+        },
+      }),
+    });
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(info.mock.calls.map((args) => String(args[0]))).toContainEqual(
+      expect.stringContaining("covering this target removed with it"),
+    );
+    info.mockRestore();
+  });
+
+  it("leaves the plan alone when a skip wrote nothing", async () => {
+    // The other half of that rule: a stand-down that took its own writes back left the board exactly
+    // as the plan above was stamped from, so a second board read would buy nothing.
+    board.current = [bead("t1", { priority: 0 })];
+    arm(t, "apply");
+    applyPickerPlan.mockResolvedValueOnce({
+      skipped: { beadId: "t1", reason: "the run could not be enqueued", wroteBoard: false },
+    });
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    // One read: the pass's own. No restamp followed it.
+    expect(board.calls).toHaveLength(1);
+  });
+
+  it("reports no start when teardown removed the run while the plan was restamped", async () => {
+    // The window on the far side of the apply (PR #218 review): the restamp is a board read long,
+    // and `abortProject` landing in it deletes the run the apply just enqueued. Reporting `started`
+    // there would leave the target approved and claimed by anton with nothing behind it — so the
+    // apply's own seam check is re-asked after the restamp, and the pass reports what it became.
+    board.current = [bead("t1", { priority: 0 })];
+    arm(t, "apply");
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    applyPickerPlan.mockResolvedValueOnce(
+      started({}, async () => ({
+        skipped: {
+          beadId: "t1",
+          reason: "the pass was cancelled and its run removed with it",
+          wroteBoard: false,
+        },
+      })),
+    );
+
+    const effect = await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(effect).toEqual({ changed: true, note: "ranked 1 target(s)" });
+    expect(info.mock.calls.map((args) => String(args[0]))).toContainEqual(
+      expect.stringContaining("run removed with it"),
+    );
+    info.mockRestore();
+  });
+
+  it("still only ranks at shadow — the level below apply starts nothing", async () => {
+    board.current = [bead("t1")];
+    arm(t, "shadow");
+
+    expect(await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx())).toEqual({
+      changed: true,
+      note: "ranked 1 target(s)",
+    });
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+  });
+
+  it("refuses to apply on a project that has armed no policy", async () => {
+    // The structural default admits everything, so a pass that wrote `approved` off it would be
+    // autopilot with no approval in it. The level floors to shadow rather than starting anything.
+    board.current = [bead("t1")];
+    t.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ pickerAutonomy: "apply" }) })
+      .run();
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+  });
+
+  it("refuses to apply until this project's own picks have earned it (anton-vkp9)", async () => {
+    // The second gate. A policy says what anton MAY start; nothing but the operator's own releases
+    // says whether its picks have been worth starting — so an armed `apply` with no record ranks and
+    // starts nothing, and the pass says what it is short of rather than ignoring the setting quietly.
+    board.current = [bead("t1")];
+    arm(t, "apply", { record: false });
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+    expect(info.mock.calls.map((args) => String(args[0])).join("\n")).toContain(
+      "apply not earned — no answered picks yet",
+    );
+    // Still a ranking: the floor freezes STARTING, not deciding.
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+    info.mockRestore();
+  });
+
+  it("returns an armed picker to shadow once its record degrades", async () => {
+    // Re-asked on every pass over a rolling window, so the disagreements the operator files after
+    // arming push the record back below the bar and the next pass starts nothing — no latch, nothing
+    // to clear.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+
+    const veto = (i: number) =>
+      recordPickerVeto(t.db, clock, {
+        projectId: "p1",
+        beadId: `late-${i}`,
+        action: "never",
+        planId: `late-plan-${i}`,
+      });
+
+    // One refusal still clears the bar — the floor is a threshold, not a hair trigger, and a pass
+    // that stopped here would prove nothing about the one below.
+    await veto(1);
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(2);
+
+    // Two more displace releases out of the rolling window, and the record no longer supports apply.
+    await veto(2);
+    await veto(3);
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps applying through a week of `✕ not now` — pacing is not distrust (anton-31gm)", async () => {
+    // The counterpart to the degrade above. An operator who defers every pick for a week has said
+    // nothing about the RANKING, so a record that counted their schedule would disarm the picker for
+    // being asked at the wrong hour.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    for (let i = 0; i < PICKER_BAR.minSettled; i++) {
+      await recordPickerVeto(t.db, clock, {
+        projectId: "p1",
+        beadId: `paced-${i}`,
+        action: "not-now",
+        planId: `paced-plan-${i}`,
+      });
+    }
+    await pass(fakeCtx());
+
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts on a deliberate arming with no record, and the brakes still disarm it (anton-d1lk)", async () => {
+    // The signature stands in for the EVIDENCE and for nothing else. A project nobody has answered a
+    // single pick on starts work on it — and the pass names whose signature it is standing on, since
+    // that is the only place an unattended start off no record is legible. The failure breaker below
+    // it is untouched by the bypass and freezes the very next pass.
+    board.current = [bead("t1")];
+    arm(t, "apply", {
+      record: false,
+      override: { by: "Henri Blancke", at: "2026-09-06T10:00:00.000Z" },
+    });
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls.map((args) => String(args[0])).join("\n")).toContain(
+      "apply armed deliberately by Henri Blancke on 2026-09-06T10:00:00.000Z",
+    );
+
+    threeFailedRuns(t);
+    await pass(fakeCtx());
+
+    expect(await activeDisarm(t.db, "p1")).toBeDefined();
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+    info.mockRestore();
+  });
+
+  it("starts nothing while the project is disarmed, on this pass and every later one", async () => {
+    // The latch is what the apply step refuses on (R4.4) — and it must keep refusing: the breaker
+    // itself answers `undefined` once a disarm stands, so a pass reading only its verdict would
+    // treat the second tick as armed again.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    threeFailedRuns(t);
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    await pass(fakeCtx());
+    await pass(fakeCtx());
+
+    expect(await activeDisarm(t.db, "p1")).toBeDefined();
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+    // The ranking is still recorded — a disarm freezes starting, not deciding.
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+  });
+
+  it("starts nothing while the WIP hold is on, and starts again once it releases", async () => {
+    const IN_REVIEW = LABELS.stage("in-review");
+    const prs = [11, 12, 13];
+    board.current = [
+      bead("t1"),
+      ...prs.map((n) => bead(`anton-${n}`, { labels: [IN_REVIEW], metadata: { pr: `gh-${n}` } })),
+    ];
+    arm(t, "apply");
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    let merged = false;
+    const pass = makeBoardPickerHandler({
+      db: t.db,
+      clock,
+      readPrActivity: async (_repo, number) =>
+        prActivity(number, merged && number === 12 ? "MERGED" : "OPEN"),
+    });
+
+    await pass(fakeCtx());
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+
+    // Nothing was latched and nothing needed clearing: the next merge releases the hold by itself.
+    merged = true;
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+    info.mockRestore();
+  });
+
+  it("hands the apply a hold re-check built on this pass's own PR reader", async () => {
+    // The entry verdict above is read before the ranking, and the apply spends a claim and a settle
+    // after it — so the brake is re-asked there, through the same `gh` reader rather than a fresh
+    // spawn of its own (PR #218 review).
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const readPrActivity = async (_repo: string, number: number) => prActivity(number, "OPEN");
+
+    await makeBoardPickerHandler({ db: t.db, clock, readPrActivity })(fakeCtx());
+
+    expect(applyPickerPlan).toHaveBeenCalledWith(
+      expect.objectContaining({ held: expect.any(Function) }),
+    );
+    expect(pickerWipHold).toHaveBeenCalledWith(
+      t.db,
+      expect.objectContaining({ projectId: "p1", readPrActivity }),
+    );
+  });
+
+  it("parks a payload naming a project that is gone rather than retrying it forever", async () => {
+    const handler = makeBoardPickerHandler({ db: t.db, clock });
+    await expect(handler(fakeCtx({ payload: { projectId: "ghost" } }))).rejects.toThrow(PoisonError);
+  });
+});
+
+
+/**
+ * The board-change nudge (anton-h32k): the picker re-decides when the board MOVES, not only when the
+ * clock says so. What is pinned here is the gap the cadence used to own — that a burst of writes
+ * costs one pass and not N, that a frozen project buys none, and that the signal enqueues a job
+ * rather than deciding anything itself. And what is pinned beside it is the other half of "moves":
+ * a read that finds the board unchanged buys nothing, so the sync heartbeat cannot turn this into a
+ * second cron (PR #241 review).
+ */
+describe("BoardPickerNudge", () => {
+  let nudge: BoardPickerNudge;
+  let enqueued: string[];
+
+  /** One board read landing `now`. The nudge hears a read whose CONTENT moved, so a change is two
+   *  reads: a baseline, then a different one. */
+  const read = (cwd: string, now: Bead[]) => refreshIssueSnapshot(cwd, async () => now);
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    // The listener registry and the snapshot cache are process-global (Next compiles the app and
+    // instrumentation into separate registries), so a suite that fires board reads must start from
+    // a clean one or it inherits the previous test's entries and subscribers.
+    resetIssueSnapshots();
+    enqueued = [];
+    nudge = new BoardPickerNudge({
+      db: t.db,
+      enqueue: async (projectId) => {
+        enqueued.push(projectId);
+        await enqueue(t.db, clock, { type: "board-picker", projectId, payload: { projectId } });
+      },
+    });
+    nudge.start();
+  });
+  afterEach(() => {
+    nudge.stop();
+    vi.useRealTimers();
+  });
+
+  it("folds a burst of board writes into exactly one pass", async () => {
+    await read("/tmp/p1", []);
+
+    // One claim is a label, an assignee and a note — three writes the operator reads as one move.
+    for (let i = 0; i < 5; i++) await read("/tmp/p1", [bead(`t${i}`)]);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual(["p1"]);
+  });
+
+  it("enqueues nothing before its window is up", async () => {
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", [bead("t1")]);
+
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS - 1);
+
+    expect(enqueued).toEqual([]);
+  });
+
+  /**
+   * The signal is CONTENT, not invalidation — the reason it can be wired to the picker at all. The
+   * sync coalescer invalidates on every pass that reaches `synced`, landed commits or not, and the
+   * heartbeat behind it beats every 30s on any wired board; a nudge that fired on the invalidation
+   * would spend a `bd list` under the repo's exclusive Dolt lock every window, forever, on a board
+   * nobody touched.
+   */
+  it("stays quiet when a sync pass leaves the board exactly as it was", async () => {
+    const unchanged = [bead("t1")];
+    await read("/tmp/p1", unchanged);
+
+    for (let i = 0; i < 3; i++) {
+      invalidateIssueSnapshot("/tmp/p1");
+      await read("/tmp/p1", [bead("t1")]);
+      await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    }
+
+    expect(enqueued).toEqual([]);
+  });
+
+  // A cold snapshot has no board to differ from, so the read that fills it is a baseline rather than
+  // a move — otherwise every boot would buy a pass the cron was about to run anyway.
+  it("stays quiet on the first read of a board", async () => {
+    await read("/tmp/p1", [bead("t1")]);
+
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual([]);
+  });
+
+  // Switching the schedule off is how an operator STOPS the picker. Before anton-h32k the scheduler
+  // was its only enqueuer, so the switch was the whole answer; a listener that ignored it would
+  // re-decide 30s after any board move — and at `apply` a pass writes `approved`, claims the target
+  // and starts the run the switch exists to prevent.
+  it("stays quiet while the board-picker schedule is switched off", async () => {
+    await createSchedule(t.db, clock, {
+      projectId: "p1",
+      type: "board-picker",
+      cron: "*/10 * * * *",
+      enabled: false,
+    });
+
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", [bead("t1")]);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual([]);
+  });
+
+  it("stays quiet while the project is frozen", async () => {
+    await disarmAutopilot(t.db, clock, {
+      projectId: "p1",
+      reason: "consecutive-failures",
+      detail: "three runs stopped without delivering",
+    });
+
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", [bead("t1")]);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual([]);
+  });
+
+  // The whole point of routing through the queue: the signal says "re-decide", the JOB decides. A
+  // board read that wrote a plan would give the lane a second producer to disagree with.
+  it("writes no plan of its own — it only enqueues the pass that writes one", async () => {
+    board.current = [bead("t1")];
+
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", board.current);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(await getBoardPickerPlan(t.db, "p1")).toBeUndefined();
+    expect(queuedJobId(t.db, "board-picker", "p1")).toBeDefined();
+  });
+
+  it("folds onto the pass already queued rather than stacking a second", async () => {
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", [bead("t1")]);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    await read("/tmp/p1", [bead("t2")]);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual(["p1"]);
+  });
+
+  // A pass in flight may have read the board BEFORE this change landed, so it does not cover it —
+  // the dedupe above is on the queued row only, which is what keeps the window one window wide.
+  it("schedules a follow-up for a change that lands while a pass is running", async () => {
+    await read("/tmp/p1", []);
+    await read("/tmp/p1", [bead("t1")]);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    t.db.update(schema.jobs).set({ status: "running" }).run();
+
+    await read("/tmp/p1", [bead("t2")]);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual(["p1", "p1"]);
+  });
+
+  it("ignores a board no project on this machine owns", async () => {
+    await read("/tmp/somebody-elses-repo", []);
+    await read("/tmp/somebody-elses-repo", [bead("t1")]);
+
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual([]);
+  });
+
+  // A pull moves the board as surely as a local write does, and it is the only way another machine's
+  // work ever reaches this one. It reaches the nudge through the same door: the coalescer marks the
+  // snapshot stale, and the read behind it comes back holding work this machine had never seen.
+  it("hears a remote pull that landed work, not just a local write", async () => {
+    await read("/tmp/p1", []);
+
+    invalidateIssueSnapshot("/tmp/p1");
+    await read("/tmp/p1", [bead("t1", { assignee: "another-machine" })]);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual(["p1"]);
+  });
+
+  it("hears nothing once stopped", async () => {
+    await read("/tmp/p1", []);
+    nudge.stop();
+
+    await read("/tmp/p1", [bead("t1")]);
+    await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+
+    expect(enqueued).toEqual([]);
+  });
+
+  /**
+   * PR #264 review: this suite's own `nudge` above is wired with the BARE `enqueue()`, which is
+   * fine for pinning the debounce/gating logic but does not exercise the real production wiring
+   * (service-runner.ts) — `queuedJobId` and the insert it guards are two separate operations, and a
+   * scheduler tick or a manual "Run now" fire landing between them is invisible to the check. This
+   * pins the real wiring: `enqueue` calls `enqueueScheduledTypeIfAbsent` (matching
+   * `getPickerNudge()`), and a competing insert is injected into the exact gap between the nudge's
+   * own pre-check and its call — the transactional re-check inside `enqueueScheduledTypeIfAbsent`
+   * must still coalesce onto one job.
+   */
+  it("does not double-fire when a job lands between its own pre-check and its enqueue call", async () => {
+    let raced = false;
+    const select = t.db.select.bind(t.db);
+    vi.spyOn(t.db, "select").mockImplementation(((columns?: Record<string, unknown>) => {
+      // `queuedJobId`'s query (the pass's pre-check, called before its enqueue) is the only
+      // single-column `{ id }` select made before the race is injected — land the competing insert
+      // right there, in the gap between that check and this nudge's own transactional enqueue.
+      if (!raced && columns && Object.keys(columns).length === 1 && "id" in columns) {
+        raced = true;
+        enqueueScheduledTypeIfAbsent(t.db, clock, "board-picker", "p1", { projectId: "p1" });
+      }
+      return select(columns as never);
+    }) as typeof t.db.select);
+
+    const raceNudge = new BoardPickerNudge({
+      db: t.db,
+      enqueue: (projectId) =>
+        Promise.resolve(
+          enqueueScheduledTypeIfAbsent(
+            t.db,
+            clock,
+            "board-picker",
+            projectId,
+            { projectId },
+            { coveredBy: ["queued"] },
+          ),
+        ),
+    });
+    raceNudge.start();
+    try {
+      await read("/tmp/p1", []);
+      await read("/tmp/p1", [bead("t1")]);
+      await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    } finally {
+      raceNudge.stop();
+      vi.mocked(t.db.select).mockRestore();
+    }
+
+    expect(raced).toBe(true);
+    expect(
+      t.db.select().from(schema.jobs).all().filter((j) => j.type === "board-picker"),
+    ).toHaveLength(1);
+  });
+
+  /**
+   * PR #264 review: the production wiring in service-runner.ts passes `enqueue` a `scheduleId` so
+   * the job it enqueues carries `{ projectId, scheduleId }` — the same payload shape the scheduler
+   * and `runScheduleNow` both stamp. Without it, `pendingRunsBySchedule`/`lastRunsBySchedule` (both
+   * keyed on that payload field, not on type+project) can't see the nudge's job at all, even though
+   * `runScheduleNow`'s own type+project "already-running" check still refuses a Run now click
+   * against it — leaving the Automation table's button enabled through a 409 the nudge itself was
+   * causing. Pins that this suite's own `enqueue` stub, called the way `getPickerNudge()` calls it,
+   * receives a resolvable schedule id and the job it inserts carries it in the payload.
+   */
+  it("passes its schedule id through to the job it enqueues", async () => {
+    // The outer `beforeEach`'s `nudge` is already started and subscribed to the same board-changed
+    // broadcast — left running, it would race this test's own nudge to `enqueueJob` and, having
+    // inserted first, make `queuedJobId` short-circuit this one before its `enqueue` stub ever runs.
+    nudge.stop();
+    await createSchedule(t.db, clock, { projectId: "p1", type: "board-picker", cron: "*/10 * * * *" });
+    let seenScheduleId: string | undefined;
+    const scheduledNudge = new BoardPickerNudge({
+      db: t.db,
+      enqueue: (projectId, scheduleId) => {
+        seenScheduleId = scheduleId;
+        return Promise.resolve(
+          enqueueScheduledTypeIfAbsent(
+            t.db,
+            clock,
+            "board-picker",
+            projectId,
+            scheduleId ? { projectId, scheduleId } : { projectId },
+            { coveredBy: ["queued"] },
+          ),
+        );
+      },
+    });
+    scheduledNudge.start();
+    try {
+      await read("/tmp/p1", []);
+      await read("/tmp/p1", [bead("t1")]);
+      await vi.advanceTimersByTimeAsync(PICKER_NUDGE_WINDOW_MS);
+    } finally {
+      scheduledNudge.stop();
+    }
+
+    expect(seenScheduleId).toBeDefined();
+    const job = t.db
+      .select()
+      .from(schema.jobs)
+      .all()
+      .find((j) => j.type === "board-picker");
+    expect(JSON.parse(job!.payloadJson as string)).toEqual({
+      projectId: "p1",
+      scheduleId: seenScheduleId,
+    });
+  });
+});

@@ -1,0 +1,7 @@
+# Fingerprints gitleaks must not re-report. One entry per line, `<commit>:<file>:<rule>:<line>`.
+#
+# The PR's own scan gate flags the generated-looking blob in stringer.test.ts, which is the fixture
+# proving `filterSecretSignals` never clears a real key from a test file. The current line carries
+# an inline `gitleaks:allow`; this entry covers the commit that introduced it, since a PR scan
+# re-reads every commit in the range and history is not rewritten.
+f4490ebaf26082050b671e8b3a2a2071a6c91a70:src/lib/stringer.test.ts:generic-api-key:784

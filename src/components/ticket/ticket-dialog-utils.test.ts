@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   composeDescription,
+  canRunTicket,
   detailsSummary,
   diffTicketPatch,
   draftFromDetail,
   hasTicketChanges,
+  isStandaloneRunTarget,
   resolutionOf,
+  runToastMessage,
   stripContractSections,
   type TicketDraft,
 } from "@/components/ticket/ticket-dialog-utils";
@@ -95,13 +98,32 @@ describe("draftFromDetail", () => {
 });
 
 describe("stripContractSections", () => {
-  it("removes the Goal and Acceptance blocks and trims the remainder", () => {
-    const desc = "## Goal\n\ng\n\n## Acceptance\n\na\n\n## Out of scope\n\nnothing";
-    expect(stripContractSections(desc)).toBe("## Out of scope\n\nnothing");
-  });
+  // Both spellings, because the board holds beads written before anton-dji7 renamed the heading:
+  // strip has to claim either or an old bead's criteria would survive into `body` and be written
+  // twice on the next save.
+  it.each(["Acceptance", "Acceptance Criteria"])(
+    "removes the Goal and `## %s` blocks and trims the remainder",
+    (heading) => {
+      const desc = `## Goal\n\ng\n\n## ${heading}\n\na\n\n## Out of scope\n\nnothing`;
+      expect(stripContractSections(desc)).toBe("## Out of scope\n\nnothing");
+    },
+  );
 
-  it("returns '' when the description is only Goal + Acceptance", () => {
-    expect(stripContractSections("## Goal\n\ng\n\n## Acceptance\n\na")).toBe("");
+  it.each(["Acceptance", "Acceptance Criteria"])(
+    "returns '' when the description is only Goal + `## %s`",
+    (heading) => {
+      expect(stripContractSections(`## Goal\n\ng\n\n## ${heading}\n\na`)).toBe("");
+    },
+  );
+
+  // The trap anton-dji7 exists to close: composing under the canonical heading and stripping it
+  // again must be a fixed point, or every dialog save would rename the section back or duplicate it.
+  it("is stable across a compose → strip → compose round trip", () => {
+    const draft: TicketDraft = { ...base, goal: "g", acceptance: "- [ ] a", body: "## Verify\n\ntests" };
+    const composed = composeDescription(draft);
+    expect(composed).toContain("## Acceptance Criteria\n\n- [ ] a");
+    expect(stripContractSections(composed)).toBe(draft.body);
+    expect(composeDescription({ ...draft, body: stripContractSections(composed) })).toBe(composed);
   });
 });
 
@@ -165,7 +187,7 @@ describe("contract editing", () => {
   it("emits both description and acceptance when the contract changes", () => {
     const patch = diffTicketPatch(original, { ...original, acceptance: "- [ ] new item" });
     expect(patch.acceptance).toBe("- [ ] new item");
-    expect(patch.description).toContain("## Acceptance\n\n- [ ] new item");
+    expect(patch.description).toContain("## Acceptance Criteria\n\n- [ ] new item");
   });
 
   it("does not touch the contract when only a label changes", () => {
@@ -188,7 +210,7 @@ describe("contract editing", () => {
     expect(patch.acceptance).toBe("- [ ] A\n- [ ] B");
   });
 
-  it("promotes a legacy field-only acceptance into a ## Acceptance section on first edit", () => {
+  it("promotes a legacy field-only acceptance into a ## Acceptance Criteria section on first edit", () => {
     const legacy = draftFromDetail({
       id: "x",
       title: "t",
@@ -204,7 +226,7 @@ describe("contract editing", () => {
     const patch = diffTicketPatch(legacy, { ...legacy, goal: "Do it better" });
     const bead = asBead({ description: patch.description, acceptance: legacy.acceptance });
     expect(parseAcceptance(bead)).toBe("field-only criteria");
-    expect(patch.description).toContain("## Acceptance\n\nfield-only criteria");
+    expect(patch.description).toContain("## Acceptance Criteria\n\nfield-only criteria");
   });
 
   it("composeDescription omits empty sections", () => {
@@ -246,5 +268,55 @@ describe("detailsSummary", () => {
 
   it("shows Snoozed as the status when deferred, regardless of the draft's raw status", () => {
     expect(detailsSummary(base, true)).toBe("Snoozed · P2 · nextjs · risk:low · size:M");
+  });
+});
+
+describe("isStandaloneRunTarget", () => {
+  it("admits a parentless task or bug — the shapes anton runs on their own", () => {
+    expect(isStandaloneRunTarget({ type: "task" })).toBe(true);
+    expect(isStandaloneRunTarget({ type: "bug" })).toBe(true);
+  });
+
+  it("refuses a child ticket, which runs via its epic's PR", () => {
+    expect(isStandaloneRunTarget({ type: "task", epicId: "ep-1" })).toBe(false);
+  });
+
+  it("refuses a parentless non-work type the approve/claim routes would 422", () => {
+    expect(isStandaloneRunTarget({ type: "learning" })).toBe(false);
+    expect(isStandaloneRunTarget({ type: "chore" })).toBe(false);
+  });
+});
+
+describe("canRunTicket", () => {
+  const target = { type: "task", stage: "backlog" as const, deferred: false };
+
+  it("offers the run on a still-runnable standalone target", () => {
+    expect(canRunTicket(target)).toBe(true);
+    expect(canRunTicket({ ...target, stage: "implementing" })).toBe(true);
+  });
+
+  it("withholds it once the target is done — its run already produced a PR", () => {
+    expect(canRunTicket({ ...target, stage: "done" })).toBe(false);
+  });
+
+  it("withholds it while snoozed — starting it now contradicts the snooze", () => {
+    expect(canRunTicket({ ...target, deferred: true })).toBe(false);
+  });
+
+  it("withholds it from anything that isn't a run target of its own", () => {
+    expect(canRunTicket({ ...target, epicId: "ep-1" })).toBe(false);
+  });
+});
+
+describe("runToastMessage", () => {
+  it("reports the board move when the approve applied a gardener proposal", () => {
+    expect(runToastMessage("Do the thing", false, "closed bd-9 as duplicate")).toBe(
+      "Applied — closed bd-9 as duplicate",
+    );
+  });
+
+  it("distinguishes a first approval from a force run", () => {
+    expect(runToastMessage("Do the thing", false, undefined)).toBe('Approved & running "Do the thing"');
+    expect(runToastMessage("Do the thing", true, undefined)).toBe('Re-running "Do the thing"');
   });
 });

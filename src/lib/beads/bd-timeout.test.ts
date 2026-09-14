@@ -156,6 +156,36 @@ describe("bd timeout reaps the whole process group (anton-jfjw.1)", () => {
     expect(await waitForDeath(bdPid)).toBe(true);
   });
 
+  it("still escalates for a descendant that outlived a bd which exited on the SIGTERM", async () => {
+    // The other escalation test keeps bd alive (it traps SIGTERM), so it never exercises the
+    // `exit` handler. This is the field shape that does: SIGTERM ends bd itself, while its wedged
+    // `git fetch` ignores the signal and keeps the exclusive Dolt lock. Cancelling the pending
+    // SIGKILL just because the group leader exited leaves that survivor running forever.
+    process.env[BD_KILL_GRACE_ENV] = String(GRACE_MS);
+    const bdPidFile = join(dir, "survivor-bd.pid");
+    const kidPidFile = join(dir, "survivor-kid.pid");
+    fakeBd("bd-exits-leaving-survivor", [
+      "#!/bin/sh",
+      `sh -c 'trap "" TERM; echo $$ > ${kidPidFile}; while true; do sleep 0.1; done' &`,
+      `echo $$ > ${bdPidFile}`,
+      "sleep 30",
+    ]);
+
+    const promise = runBd(dir, ["dolt", "pull"]);
+    const bdPid = await readPid(bdPidFile);
+    const kidPid = await readPid(kidPidFile);
+    strays.push(bdPid, kidPid);
+
+    await expect(promise).rejects.toThrow(/exceeded its \d+ms budget/);
+    // bd takes the SIGTERM and goes — the exit that used to disarm the escalation...
+    expect(await waitForDeath(bdPid), "bd itself exits on the SIGTERM").toBe(true);
+    // ...while only the escalation can reach the descendant that ignored it.
+    expect(
+      await waitForDeath(kidPid),
+      "the SIGTERM-immune descendant must still be SIGKILLed after bd exits",
+    ).toBe(true);
+  });
+
   it("names the cwd, the argv and the budget in the timeout error", async () => {
     fakeBd("bd-hangs", ["#!/bin/sh", "sleep 30"]);
     const err: Error = await runBd(dir, ["dolt", "pull"]).then(

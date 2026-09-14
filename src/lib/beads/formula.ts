@@ -231,8 +231,8 @@ export function renderBeadSkeleton(
     );
   }
   // Only OUTPUT-BEARING description text counts as consumption: the description is the sole
-  // templated field the skeleton emits (`step.title` is never rendered — `createDraftEpic` uses the
-  // draft's own title), and within it a placeholder hidden in an HTML comment interpolates into
+  // templated field the skeleton emits (`step.title` is never rendered — the Add-work commit uses
+  // the draft's own title), and within it a placeholder hidden in an HTML comment interpolates into
   // markup the render never shows — the raw-template scan read `<!-- {{outcome}} -->` as consumed
   // while the founder's value landed invisibly and a static section shadowed it.
   const referenced = new Set([...renderedText(step.description).matchAll(VAR_TOKEN)].map((m) => m[1]));

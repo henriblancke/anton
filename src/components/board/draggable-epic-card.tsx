@@ -4,22 +4,11 @@ import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
 import { GripVerticalIcon } from "lucide-react";
 
-import type { Epic, Stage } from "@/lib/types";
+import type { Stage } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { EpicCard } from "@/components/board/epic-card";
+import { EpicCard, type EpicCardProps } from "@/components/board/epic-card";
 
-export function DraggableEpicCard({
-  slug,
-  epic,
-  budgetAware = false,
-  onDeleted,
-}: {
-  slug: string;
-  epic: Epic;
-  /** Project budget-aware flag (anton-y2ue): forwarded to the card for the Approve/Queue split. */
-  budgetAware?: boolean;
-  onDeleted?: (epicId: string) => void;
-}) {
+export function DraggableEpicCard({ slug, epic, budgetAware = false, onDeleted }: EpicCardProps) {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, isDragging } =
     useDraggable({
       id: epic.id,

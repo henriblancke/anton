@@ -1,0 +1,1 @@
+ALTER TABLE `scan_summaries` ADD `scanned_sha` text;

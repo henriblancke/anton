@@ -1,7 +1,14 @@
 import { randomUUID } from "node:crypto";
 
+import {
+  claudeRouting,
+  routingEnvDelta,
+  type ClaudeRouting,
+  type RoutingEnvDelta,
+} from "@/lib/claude/driver-routing";
 import { getDb } from "@/lib/db";
 import { systemClock } from "@/lib/jobs/queue";
+import { getProjectSettings } from "@/lib/projects";
 import { createSession, endSession } from "@/lib/sessions";
 import type { Project } from "@/lib/types";
 
@@ -21,6 +28,29 @@ export interface StartInteractiveInput {
    * client input directly.
    */
   cwd?: string;
+  /**
+   * Routing to pin the pty to, resolved from a LIVE run's captured settings snapshot (anton-7poz).
+   * A headless run pins its routing at run start, so current project settings can drift mid-run; the
+   * investigate flow passes the run's captured routing here so the terminal hits the SAME endpoint as
+   * the headless session it debugs. Server-resolved from the live job handle — never client input.
+   * Absent (generic / `/shape` spawns), the pty routes on the project's CURRENT settings.
+   */
+  routing?: ClaudeRouting;
+}
+
+/**
+ * Fold a routing delta into a pty env: a string SETS the var, `undefined` DELETES it. The headless
+ * driver hands the delta straight to `child_process.spawn`, which drops undefined-valued keys — but
+ * node-pty's `_parseEnv` stringifies every own key, so a lingering `undefined` would reach the child
+ * as the literal `ANTHROPIC_BASE_URL=undefined`. Deleting the key is what actually keeps an unrouted
+ * project's terminal off anton's ambient gateway (anton-7poz).
+ */
+function applyRoutingDelta(env: NodeJS.ProcessEnv, delta: RoutingEnvDelta): NodeJS.ProcessEnv {
+  for (const [key, value] of Object.entries(delta)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+  return env;
 }
 
 /**
@@ -48,12 +78,22 @@ export async function startInteractiveSession(
 
   const bin = process.env[CLAUDE_BIN_ENV] ?? "claude";
   try {
+    // Route the terminal exactly like the run it belongs to (anton-7poz). An investigate terminal
+    // carries the live job's OWN captured routing, so it hits the run's endpoint even if project
+    // settings changed since the run began. Absent one (generic / `/shape` spawns), resolve the
+    // project's CURRENT settings through the SAME resolver, applied OVER anton's env — so an unrouted
+    // project's pty never inherits a stray ambient ANTHROPIC_BASE_URL. Kept inside the guard so a
+    // failed settings read marks the row failed rather than leaving it stuck `running`.
+    const routing = input.routing ?? claudeRouting(await getProjectSettings(db, project.id));
     getPtyManager().spawn({
       sessionId,
       file: bin,
       args: input.args ?? [],
       cwd: input.cwd ?? project.repoPath,
-      env: { ...process.env, TERM: "xterm-256color" },
+      env: applyRoutingDelta(
+        { ...process.env, TERM: "xterm-256color" },
+        routingEnvDelta(routing),
+      ),
       cols: input.cols ?? 80,
       rows: input.rows ?? 24,
     });

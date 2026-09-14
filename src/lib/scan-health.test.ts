@@ -425,6 +425,63 @@ describe("the persisted series", () => {
     expect(next.delta?.total).toBe(-2);
   });
 
+  it("names the tree it measured, and re-names it when a replay measures a newer one (anton-qor2)", async () => {
+    // A point that doesn't name its tree can't be told apart from one measuring a checkout six
+    // commits behind — which is how 87% of the 2026-08-06 scan described code already merged away.
+    const first = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 5 }),
+      deltaState: since("b0", "b1"),
+      scannedSha: "a338176aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    expect(first.scannedSha).toBe("a338176aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(summarizeScanLine(first)).toContain("at a338176a");
+
+    // The retry replayed the window against a checkout that had since been brought forward, so the
+    // point holds ITS measurement — and must hold its tree, not the one that measurement replaced.
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 6 }),
+      deltaState: since("b0", "b2"),
+      scannedSha: "8283608bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    });
+    expect(retry.scannedSha).toBe("8283608bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    // Read back, and rendered onto the point the chart draws.
+    const [row] = await listScanSummaries(tdb.db, projectId);
+    expect(row.scannedSha).toBe("8283608bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    expect(scanHealth([row])?.latest.sha).toBe("8283608bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    // The board polls on a token — a re-measurement against another tree has to move it.
+    expect(scanHealthVersion(scanHealth([row]))).toContain("8283608b");
+  });
+
+  it("keeps the tree of the measurement it kept when a retry's window is dropped", async () => {
+    // The retry scanned a window this point counts nothing of (no replay, no abutment), so its
+    // signals are dropped — and with them its tree. Re-naming would put a commit on counts nobody
+    // measured against it.
+    await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 4 }),
+      deltaState: since("b0", "b1"),
+      scannedSha: "a338176aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    const retry = await saveScanSummary(tdb.db, clock, {
+      projectId,
+      jobId: "job-1",
+      counts: counts({ low: 9 }),
+      deltaState: since("elsewhere", "b9"),
+      scannedSha: "8283608bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    });
+
+    expect(retry.counts.total).toBe(4);
+    expect(retry.scannedSha).toBe("a338176aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const [row] = await listScanSummaries(tdb.db, projectId);
+    expect(row.scannedSha).toBe("a338176aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  });
+
   it("lands the triage report of a replay that found exactly what the first attempt did", async () => {
     // The common shape of a quota retry: nothing arrived during the backoff, so the rescan re-reports
     // the same 7 signals and triages them. Only the report is new — and refusing it (as a retry that

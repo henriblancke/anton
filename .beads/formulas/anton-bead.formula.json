@@ -49,14 +49,14 @@
       "type": "feature",
       "needs": ["epic"],
       "title": "{{title}}",
-      "description": "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}\n\n## Context\n\n{{context}}\n\n## Out of scope\n\n{{out_of_scope}}\n\n## Verify\n\n{{verify}}"
+      "description": "## Goal\n\n{{goal}}\n\n## Acceptance Criteria\n\n{{acceptance}}\n\n## Context\n\n{{context}}\n\n## Out of scope\n\n{{out_of_scope}}\n\n## Verify\n\n{{verify}}"
     },
     {
       "id": "ticket",
       "type": "task",
       "needs": ["feature"],
       "title": "{{title}}",
-      "description": "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}\n\n## Context\n\n{{context}}\n\n## Out of scope\n\n{{out_of_scope}}\n\n## Verify\n\n{{verify}}"
+      "description": "## Goal\n\n{{goal}}\n\n## Acceptance Criteria\n\n{{acceptance}}\n\n## Context\n\n{{context}}\n\n## Out of scope\n\n{{out_of_scope}}\n\n## Verify\n\n{{verify}}"
     }
   ]
 }

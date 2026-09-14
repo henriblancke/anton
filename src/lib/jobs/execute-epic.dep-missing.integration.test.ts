@@ -1,0 +1,404 @@
+/**
+ * The `dep-missing` repair, end to end (anton-qg4h / R5.4) — REAL execute-epic handler, REAL job
+ * runner, REAL bd and git, a fake claude that delivers nothing and reports the class.
+ *
+ * Four claims:
+ *   • a block whose reason names a bead ON THE BOARD draws the `blocks` edge nobody drew, stamps the
+ *     repair with the agent's own reason, and PARKS the target — no retry, because the work cannot
+ *     start until the blocker lands;
+ *   • the blocker becomes SELECTABLE and the blocked target does not — the whole point of drawing the
+ *     edge is that the queue moves on to the thing that was in the way;
+ *   • a prerequisite that is a ticket of THIS RUN is a scheduling correction, not a wait (anton-0gm2):
+ *     the same edge is drawn, then the run re-orders itself, dispatches the prerequisite, comes back
+ *     to the blocked ticket and finishes — no park, no failure, and an account on the bead. A
+ *     prerequisite the run CARRIES but is holding behind a blocker outside it is not that case: this
+ *     attempt will never land it, so it parks exactly as an outside prerequisite does;
+ *   • a prerequisite that resolves to NOTHING escalates: no edge, no stamp, today's poison park, and
+ *     an account on the bead of why anton refused. The repair records ordering; it never files work.
+ *
+ * The target is a STANDALONE (parentless) task rather than an epic child, because that is the shape
+ * the claimable set answers directly: both ends of the new edge are run targets, so "the blocker is
+ * selectable and the target is not" is one `beads.claimableTargets` read rather than an inference.
+ * The sibling case is the exception and has to be — a prerequisite the run holds itself only exists
+ * inside a target with more than one ticket.
+ */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { beads } from "../beads/bd";
+import { parseTicketNotes } from "../beads/notes";
+import { indexBoard } from "../gardener/board-index";
+import { repairFingerprint } from "../gardener/repair";
+import { revertPrereqEdge } from "../gardener/repair-dep-missing";
+import * as schema from "../db/schema";
+import { getJob } from "./queue";
+import { resetOperatorCache } from "../operator";
+import { describeBd } from "@/lib/testing/integration";
+import {
+  BASE_TIME_MS,
+  resetPerCaseState,
+  FakeClock,
+  writeBin,
+  fakeClaudeReadingStdin,
+  createExecuteEpicSandbox,
+  createTicket,
+  makeEpicRunner,
+  enqueueEpicJob,
+  tickToIdle,
+  type ExecuteEpicSandbox,
+} from "./execute-epic.fixture";
+import { insertProject } from "@/lib/testing/project";
+
+describeBd("execute-epic e2e — the dep-missing repair (real handler · real bd/git · fake claude)", () => {
+  let repo: string;
+  let binDir: string;
+  let tdb: ExecuteEpicSandbox["tdb"];
+  let clock: FakeClock;
+  let ctx: ExecuteEpicSandbox;
+  let projectId: string;
+  let shadowProjectId: string;
+
+  beforeAll(async () => {
+    ctx = await createExecuteEpicSandbox();
+    ({ repo, binDir, tdb, clock } = ctx);
+    // No verify gates, so what the run stops on is the zero-diff delivery gate and nothing else.
+    // ARMED at `apply`: drawing an edge is board state other runs read, and the shipped policy is
+    // `shadow`, so a project that wants the edge drawn has to say so (R5.3).
+    projectId = insertProject(tdb.db, {
+      slug: "sandbox-depmissing",
+      name: "sandbox-depmissing",
+      repoPath: repo,
+      settingsJson: JSON.stringify({
+        reviewEnabled: false,
+        repairAutonomy: { "dep-missing": "apply" },
+      }),
+    });
+
+    // The same repo through a project that armed NOTHING — what every project gets on upgrade.
+    shadowProjectId = insertProject(tdb.db, {
+      slug: "sandbox-depmissing-shadow",
+      name: "sandbox-depmissing-shadow",
+      repoPath: repo,
+      settingsJson: JSON.stringify({ reviewEnabled: false }),
+    });
+  });
+
+  afterAll(() => {
+    ctx?.restoreEnv();
+    resetOperatorCache();
+    ctx?.cleanup();
+  });
+
+  beforeEach(async () => {
+    clock.set(BASE_TIME_MS);
+    await resetPerCaseState(tdb);
+  });
+
+  /** An approved, parentless run target — one end of the ordering, whichever end. */
+  async function seedTarget(title: string): Promise<string> {
+    const id = await beads.create(repo, {
+      title,
+      type: "task",
+      acceptance: "the work lands",
+      description: `## Goal\n${title}.\n\n## Context\nnothing moved here.`,
+    });
+    await beads.approve(repo, id);
+    return id;
+  }
+
+  /**
+   * A claude that changes nothing and reports the classified block, naming `prereq` in its reason —
+   * exactly the wire format `ANTON-RESULT: blocked — <class> — <reason>` (anton-ie05).
+   */
+  function blockedOnClaude(name: string, prereq: string): string {
+    const reason = `dep-missing — the schema ${prereq} adds has to land before this can be wired up`;
+    return writeBin(
+      binDir,
+      name,
+      fakeClaudeReadingStdin(`const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'sdm'});
+e({type:'assistant',message:{content:[{type:'text',text:'nothing I can do until that lands'}]}});
+e({type:'result',subtype:'success',result:'ANTON-RESULT: blocked — ${reason}',session_id:'sdm',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+  }
+
+  /** Does the board record `blocker` as a direct blocker of `target`? */
+  async function edgeExists(target: string, blocker: string): Promise<boolean> {
+    const board = await beads.list(repo, ["--status", "all"]);
+    return indexBoard(board).recordsBlocker(target, blocker);
+  }
+
+  const claimableIds = async (): Promise<string[]> =>
+    (await beads.claimableTargets(repo)).map((t) => t.bead.id);
+
+  it("draws the edge, parks the target, and leaves the blocker selectable", async () => {
+    const prereq = await seedTarget("The schema migration");
+    const target = await seedTarget("Wire the reports page up");
+    const runner = makeEpicRunner(ctx);
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    process.env.ANTON_CLAUDE_BIN = blockedOnClaude("claude-depmissing", prereq);
+    try {
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: target });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      // PARKED, not retried: the ordering anton just recorded is a wait, and no attempt against
+      // this bead can shorten it. The park names the blocker, so run-health reads it as a
+      // blocked-by stall rather than a permanent failure.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain(`is blocked by ${prereq}`);
+      expect(job?.lastError).toContain("anton drew that edge itself");
+
+      // The run row parks too — the resume after the blocker lands continues in this same row.
+      const runRow = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === target)!;
+      expect(runRow.status).toBe("parked");
+
+      // The edge itself, in the direction bd reads as "the prerequisite blocks the target".
+      expect(await edgeExists(target, prereq)).toBe(true);
+
+      // Recorded as a repair: the stamp is the loop guard, the note carries the agent's reason.
+      const parked = await beads.show(repo, target);
+      const stamp = (parked.labels ?? []).find((l) => l.startsWith("repair:dep-missing:"));
+      expect(stamp).toContain(repairFingerprint(target, "dep-missing"));
+      const notes = parseTicketNotes(parked.notes)
+        .filter((n) => n.source === "system")
+        .map((n) => n.text);
+      const record = notes.find((t) => t.includes("anton: repaired"))!;
+      expect(record).toContain("the schema");
+      expect(record).toContain(prereq);
+
+      // Left claimable in STATUS — the edge is what holds it, and a `blocked` bead could never be
+      // re-claimed by the resume that follows the blocker landing.
+      expect(parked.status).toBe("open");
+      expect(parked.assignee ?? null).toBeNull();
+      expect(parked.labels ?? []).not.toContain("stage:implementing");
+
+      // …and the queue has moved on to the thing that was in the way: the blocker is selectable,
+      // the blocked target is not.
+      const claimable = await claimableIds();
+      expect(claimable).toContain(prereq);
+      expect(claimable).not.toContain(target);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("RE-ORDERS and carries on when the prerequisite is a ticket of this same run (anton-0gm2)", async () => {
+    const epic = await beads.create(repo, {
+      title: "The reports feature",
+      type: "epic",
+      description: "## Goal\nShip reports.\n\n## Acceptance\nIt renders.",
+    });
+    await beads.approve(repo, epic);
+    // Two tickets with no edge between them — the incident's shape: whichever the run dispatches
+    // first reports that the other one has to land before it can, and nothing on the board says so.
+    const one = createTicket(repo, { title: "Wire the reports page up", parent: epic });
+    const two = createTicket(repo, { title: "Add the reports schema", parent: epic });
+
+    // Blocks ONCE, on whichever ticket the run reaches first, naming its sibling — so the case does
+    // not depend on the order bd hands the children back in. Every dispatch after that delivers,
+    // which is what makes the run's second pass at the blocked ticket a real attempt.
+    const sentinel = join(ctx.sandbox, "reorder-blocked-once");
+    const claude = writeBin(
+      binDir,
+      "claude-reorder",
+      fakeClaudeReadingStdin(`const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'sro'});
+const mine=prompt.includes('Ticket: ${one} ')?'${one}':'${two}';
+if(!fs.existsSync('${sentinel}')){
+  fs.writeFileSync('${sentinel}',mine);
+  const other=mine==='${one}'?'${two}':'${one}';
+  e({type:'result',subtype:'success',result:'ANTON-RESULT: blocked — dep-missing — the schema '+other+' adds has to land before this can be wired up',session_id:'sro',num_turns:1,is_error:false});
+  process.exit(0);
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+' '+Math.random()+'\\n');
+e({type:'result',subtype:'success',result:'done',session_id:'sro',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const runner = makeEpicRunner(ctx);
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    process.env.ANTON_CLAUDE_BIN = claude;
+    try {
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epic });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      const blocked = readFileSync(sentinel, "utf8");
+      const prereq = blocked === one ? two : one;
+
+      // NO park and NO failure — the run finished the feature it was given. That is the whole
+      // change: the same block used to raise `ParkedOnPrereqError`, which is poison, and three real
+      // runs disarmed autopilot that way in one incident.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      const runRow = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic)!;
+      expect(runRow.status).toBe("done");
+
+      // Both tickets shipped, and the ordering anton drew is on the board exactly as the park would
+      // have recorded it — only what the run then DID about it changed.
+      expect((await beads.show(repo, blocked)).status).toBe("closed");
+      expect((await beads.show(repo, prereq)).status).toBe("closed");
+      expect(await edgeExists(blocked, prereq)).toBe(true);
+
+      // …and the bead says what was re-ordered and why, so the correction is as legible as a park.
+      const notes = parseTicketNotes((await beads.show(repo, blocked)).notes)
+        .filter((n) => n.source === "system")
+        .map((n) => n.text);
+      const account = notes.find((t) => t.includes("re-ordered, not parked"))!;
+      expect(account).toBeDefined();
+      expect(account).toContain(prereq);
+      expect(account).toContain("dispatches it next");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("PARKS when the prerequisite is a ticket this run is HOLDING behind an outside blocker", async () => {
+    // The run CARRIES the prerequisite but cannot land it: a bead outside the run blocks it, so the
+    // dispatch loop holds it and this attempt will never run it. That is a genuine wait, not a
+    // scheduling correction — re-ordering around it would schedule nothing, re-dispatch the blocked
+    // ticket into the identical failure, and park the run on generic no-delivery poison instead of
+    // the blocked-by park the run-health sweep reads the blocker id back out of.
+    const outside = await seedTarget("The upstream schema nobody has landed yet");
+    const epic = await beads.create(repo, {
+      title: "The exports feature",
+      type: "epic",
+      description: "## Goal\nShip exports.\n\n## Acceptance\nIt exports.",
+    });
+    await beads.approve(repo, epic);
+    const wiring = createTicket(repo, { title: "Wire the exports page up", parent: epic });
+    const held = createTicket(repo, { title: "Add the exports schema", parent: epic });
+    await beads.link(repo, held, outside, "blocks");
+
+    // One dispatch mark per agent run — a re-order would cost a second one on the same ticket.
+    const dispatches = join(ctx.sandbox, "held-prereq-dispatches");
+    const claude = writeBin(
+      binDir,
+      "claude-heldprereq",
+      fakeClaudeReadingStdin(`const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'shp'});
+fs.appendFileSync('${dispatches}','x');
+e({type:'result',subtype:'success',result:'ANTON-RESULT: blocked — dep-missing — the schema ${held} adds has to land before this can be wired up',session_id:'shp',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const runner = makeEpicRunner(ctx);
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    process.env.ANTON_CLAUDE_BIN = claude;
+    try {
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epic });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      // The unchanged outside-park path, blocker id and all.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain(`is blocked by ${held}`);
+      expect(job?.lastError).toContain("anton drew that edge itself");
+      expect(await edgeExists(wiring, held)).toBe(true);
+
+      // …and it cost exactly one dispatch: nothing was re-ordered, so nothing was re-run.
+      expect(readFileSync(dispatches, "utf8")).toBe("x");
+      const parked = await beads.show(repo, wiring);
+      expect(parked.status).toBe("open");
+      const notes = parseTicketNotes(parked.notes)
+        .filter((n) => n.source === "system")
+        .map((n) => n.text);
+      expect(notes.some((t) => t.includes("re-ordered, not parked"))).toBe(false);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("refuses a prerequisite that resolves to no bead: it escalates, on the record", async () => {
+    const target = await seedTarget("Wire the exports page up");
+    const runner = makeEpicRunner(ctx);
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    // A bead id nobody filed, minted with THIS board's prefix so it reads as a prerequisite that
+    // missed rather than as prose. The repair records ordering between beads that exist; it never
+    // creates the missing work, so there is nothing here for it to point at.
+    const ghost = `${target.split("-")[0]}-ghost`;
+    process.env.ANTON_CLAUDE_BIN = blockedOnClaude("claude-depghost", ghost);
+    try {
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: target });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      // Today's behaviour, untouched: poison park on the block's own reason, blocked bead, no edge,
+      // no stamp. The one thing that is new is the account of WHY anton did not repair it.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      const blocked = await beads.show(repo, target);
+      expect(blocked.status).toBe("blocked");
+      expect((blocked.labels ?? []).some((l) => l.startsWith("repair:"))).toBe(false);
+      expect(await edgeExists(target, ghost)).toBe(false);
+      expect((await beads.list(repo, ["--status", "all"])).some((b) => b.id === ghost)).toBe(false);
+
+      const notes = parseTicketNotes(blocked.notes)
+        .filter((n) => n.source === "system")
+        .map((n) => n.text);
+      const refusal = notes.find((t) => t.includes("did not repair this as `dep-missing`"))!;
+      expect(refusal).toBeDefined();
+      expect(refusal).toContain("holds no such bead");
+      expect(refusal.split("\n")).toHaveLength(1);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("draws NO edge on a project that armed nothing — the shipped `shadow` default (R5.3)", async () => {
+    const prereq = await seedTarget("The unarmed schema migration");
+    const target = await seedTarget("Wire the unarmed page up");
+    const runner = makeEpicRunner(ctx);
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    process.env.ANTON_CLAUDE_BIN = blockedOnClaude("claude-depshadow", prereq);
+    try {
+      const jobId = await enqueueEpicJob(runner, {
+        projectId: shadowProjectId,
+        epicBeadId: target,
+      });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      // The block settles exactly as it did before auto-repair existed: poison park, blocked bead.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      const blocked = await beads.show(repo, target);
+      expect(blocked.status).toBe("blocked");
+
+      // No edge and no stamp — the board is as the run found it, and the target is held back by
+      // nothing anton wrote.
+      expect(await edgeExists(target, prereq)).toBe(false);
+      expect((blocked.labels ?? []).some((l) => l.startsWith("repair:"))).toBe(false);
+
+      // But the record IS there: the prerequisite anton resolved, and the edge it withheld.
+      const notes = parseTicketNotes(blocked.notes)
+        .filter((n) => n.source === "system")
+        .map((n) => n.text);
+      const shadow = notes.find((t) => t.includes("did not repair this as `dep-missing`"))!;
+      expect(shadow).toBeDefined();
+      expect(shadow).toContain("`shadow`");
+      expect(shadow).toContain(prereq);
+      expect(shadow.split("\n")).toHaveLength(1);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("the edge is reversible — bd takes it back and the target is selectable again", async () => {
+    const prereq = await seedTarget("The other schema migration");
+    const target = await seedTarget("Wire the settings page up");
+
+    // The edge exactly as the repair writes it, then bd's own undo of that write.
+    await beads.link(repo, target, prereq, "blocks");
+    expect(await edgeExists(target, prereq)).toBe(true);
+    expect(await claimableIds()).not.toContain(target);
+
+    await revertPrereqEdge(repo, target, prereq, "the operator says the ordering is wrong");
+
+    expect(await edgeExists(target, prereq)).toBe(false);
+    expect(await claimableIds()).toContain(target);
+    const reversed = await beads.show(repo, target);
+    const notes = parseTicketNotes(reversed.notes)
+      .filter((n) => n.source === "system")
+      .map((n) => n.text);
+    expect(notes.some((t) => t.includes("removed the `dep-missing` repair's blocks edge"))).toBe(
+      true,
+    );
+  });
+});

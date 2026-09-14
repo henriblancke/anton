@@ -24,9 +24,9 @@
  *      pass closed something.)
  *   4. APPLY ({@link dispatchUngated} / {@link dispatchReleased} / {@link dispatchMerged}) — the
  *      plan's three paths, in order: re-dispatch released work, mark the ad-hoc gates it came from,
- *      and hand every merged run target to review-fix, which closes it out exactly as it always has
- *      (anton-k0kj). That last move is what turns "waiting for merge" from a sweep that re-reads
- *      every open PR into one bd call per slot.
+ *      and hand every merged run target to a per-PR review-fix job, which closes it out exactly as
+ *      it always has (anton-k0kj). That last move is what turns "waiting for merge" from a sweep
+ *      that re-reads every open PR into one bd call per slot.
  *
  * IDEMPOTENCE is the property to preserve. `bd ready --gated` keeps reporting an entry for as long
  * as its step is ready — it is a view of the board, not a queue of events — so this pass must never
@@ -54,8 +54,8 @@ import {
   type PlainGateResume,
   type ResumePlan,
 } from "./gate-targets";
-import { enqueueReviewFixIfAbsent, systemClock, type AntonDb, type Clock } from "./queue";
-import type { JobContext, JobHandler } from "./runner";
+import { systemClock, type AntonDb, type Clock } from "./queue";
+import type { JobContext, JobEffect, JobHandler } from "./runner";
 import { resumeEpic } from "./unstick";
 
 /**
@@ -171,6 +171,12 @@ export interface PassContext {
   clock: Clock;
   projectId: string;
   repo: string;
+  /**
+   * The runner's guarded per-PR dispatch for THIS project (`JobContext.enqueueReviewFixPr`, bound
+   * to `projectId`). The pass fans out through it rather than the queue helper so a project delete
+   * that lands mid-pass refuses the insert instead of failing over the fresh row (PR #250 review).
+   */
+  enqueueReviewFixPr: (epicBeadId: string) => string | undefined;
 }
 
 /** What phase 1 learned about the project's gates — the input every later phase is scoped by. */
@@ -260,15 +266,25 @@ export async function surfaceStalls(
 /**
  * 4a. APPLY — re-dispatch the work whose gated step is ready again. `resumeEpic` decides the verb
  * (resume a parked job, or enqueue a fresh one) and refuses anything an active job already covers,
- * which is what makes an overlapping pass a no-op instead of a second run.
+ * which is what makes an overlapping pass a no-op instead of a second run. Returns how many runs it
+ * actually put back in flight — a refusal is not work, and must not be counted as any.
  */
-export async function dispatchUngated(pass: PassContext, targets: Bead[]): Promise<void> {
+export async function dispatchUngated(pass: PassContext, targets: Bead[]): Promise<number> {
+  let resumed = 0;
   for (const target of targets) {
     const outcome = await resumeEpic(pass.db, pass.clock, pass.projectId, target.id);
     if (outcome === "resumed-job" || outcome === "enqueued") {
+      resumed += 1;
       console.log(`[gate-check] ${pass.projectId}: ${target.id} ungated — ${outcome}`);
     }
   }
+  return resumed;
+}
+
+/** What phase 4b did: gates marked handed back, and runs actually put back in flight. */
+export interface ReleasedDispatch {
+  handedBack: number;
+  resumed: number;
 }
 
 /**
@@ -276,16 +292,22 @@ export async function dispatchUngated(pass: PassContext, targets: Bead[]): Promi
  * gate itself because a resolved gate stays on its bead forever. The mark lands AFTER the dispatch
  * decision, so a failed resume is retried next pass rather than being silently recorded as handled —
  * and every outcome is marked, including `already-active`/`job-cancelled`: the gate has done its job
- * in all four cases. Returns how many marks landed — the count that decides the dolt push, because
- * the marker is what keeps a SECOND anton sharing this board from re-dispatching the same target.
+ * in all four cases.
+ *
+ * The two counts are independent on purpose: `handedBack` (marks that landed) decides the dolt push,
+ * because the marker is what keeps a SECOND anton sharing this board from re-dispatching the same
+ * target, while `resumed` records the queue write. A resume that lands and a mark that then fails is
+ * still a pass that put a run back in flight, and must not report "nothing to do".
  */
 export async function dispatchReleased(
   pass: PassContext,
   released: PlainGateResume[],
-): Promise<number> {
+): Promise<ReleasedDispatch> {
   let handedBack = 0;
+  let resumed = 0;
   for (const { gate, target } of released) {
     const outcome = await resumeEpic(pass.db, pass.clock, pass.projectId, target.id);
+    if (outcome === "resumed-job" || outcome === "enqueued") resumed += 1;
     console.log(
       `[gate-check] ${pass.projectId}: ${target.id} released by gate ${gate.id} — ${outcome}`,
     );
@@ -296,21 +318,31 @@ export async function dispatchReleased(
       console.error(`[gate-check] failed to mark gate ${gate.id} as handed back:`, e);
     }
   }
-  return handedBack;
+  return { handedBack, resumed };
 }
 
 /**
- * 4c. APPLY — hand every MERGED run target to review-fix (anton-k0kj), which finalizes it exactly as
- * it always has; only its trigger moved. Deduped against a live job for the same target, and
- * re-dispatched every pass until the finalize actually lands, so a half-done finalize heals itself.
+ * 4c. APPLY — hand every MERGED run target to the PER-PR fix job (anton-k0kj / anton-5mjt), which
+ * finalizes it exactly as it always has; only its trigger moved. Dispatching onto `review-fix-pr`
+ * rather than the dispatcher's own type is what keeps a merged target off the scheduled poll's
+ * coalescing key: a finalize in flight here used to suppress the next due `review-fix` slot, so a
+ * merge would silently cost the other PRs their review-event poll.
+ *
+ * Deduped against a live job for the same target, and re-dispatched every pass until the finalize
+ * actually lands (the target closes and loses `stage:in-review`), so a half-done finalize heals
+ * itself. Returns how many jobs were ENQUEUED, not how many targets were finalized — that job has
+ * not run yet, and may still be held, fail, or park.
  */
-export async function dispatchMerged(pass: PassContext, merged: Bead[]): Promise<void> {
+export async function dispatchMerged(pass: PassContext, merged: Bead[]): Promise<number> {
+  let dispatched = 0;
   for (const target of merged) {
-    const jobId = enqueueReviewFixIfAbsent(pass.db, pass.clock, pass.projectId, target.id);
+    const jobId = pass.enqueueReviewFixPr(target.id);
     if (jobId) {
-      console.log(`[gate-check] ${pass.projectId}: ${target.id} merged — dispatched review-fix`);
+      dispatched += 1;
+      console.log(`[gate-check] ${pass.projectId}: ${target.id} merged — dispatched review-fix-pr`);
     }
   }
+  return dispatched;
 }
 
 /**
@@ -333,6 +365,35 @@ export function wroteToBoard(resolved: number, surfaced: number, handedBack: num
   return resolved > 0 || surfaced > 0 || handedBack > 0;
 }
 
+/** Everything one pass can have done, counted per phase. */
+export interface GatePassCounts {
+  resolved: number;
+  surfaced: number;
+  handedBack: number;
+  resumed: number;
+  dispatched: number;
+}
+
+/**
+ * What the pass DID, named action by action. Every count earns a clause, because the board write and
+ * the queue write are different work and either alone is a pass that changed something: a gate
+ * resolved on another machine leaves this pass resuming runs with nothing of its own to push, and
+ * reporting that as "nothing to do" hides the one slot where the queue moved.
+ */
+export function gatePassEffect(counts: GatePassCounts): JobEffect {
+  const did = [
+    counts.resolved > 0 && `closed ${counts.resolved} gate(s)`,
+    counts.surfaced > 0 && `surfaced ${counts.surfaced} stall(s)`,
+    counts.handedBack > 0 && `handed back ${counts.handedBack} gate(s)`,
+    counts.resumed > 0 && `resumed ${counts.resumed} run(s)`,
+    counts.dispatched > 0 && `dispatched ${counts.dispatched} merged run(s) to review-fix-pr`,
+  ].filter((clause): clause is string => clause !== false);
+
+  return did.length > 0
+    ? { changed: true, note: did.join(", ") }
+    : { changed: false, note: "no gate closed" };
+}
+
 /**
  * A gate bd could not evaluate is UNKNOWN, not unresolved — reading it as "still waiting" is how a
  * wait becomes permanent. Thrown last so the pass's real work still lands: the runner retries, and a
@@ -351,11 +412,17 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
   const db = deps.db;
   const clock = deps.clock ?? systemClock;
 
-  return async function gateCheck(ctx: JobContext): Promise<void> {
+  return async function gateCheck(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as GateCheckPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
-    const pass: PassContext = { db, clock, projectId, repo: project.repoPath };
+    const pass: PassContext = {
+      db,
+      clock,
+      projectId,
+      repo: project.repoPath,
+      enqueueReviewFixPr: (epicBeadId) => ctx.enqueueReviewFixPr(projectId, epicBeadId),
+    };
 
     const evaluation = await evaluateGates(pass, ctx);
 
@@ -377,9 +444,9 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     // is machine-local, and `resumeEpic`'s dedupe only sees the local job table (anton-zoh).
     const operator = await resolveOperator();
     const plan = planResumes(board, await beads.readyGated(pass.repo), nowMs, operator);
-    await dispatchUngated(pass, plan.targets);
-    const handedBack = await dispatchReleased(pass, plan.released);
-    await dispatchMerged(pass, plan.merged);
+    const ungated = await dispatchUngated(pass, plan.targets);
+    const { handedBack, resumed: releasedResumes } = await dispatchReleased(pass, plan.released);
+    const dispatched = await dispatchMerged(pass, plan.merged);
 
     const unmatched = unmatchedGatedReport(plan);
     if (unmatched) console.log(`[gate-check] ${projectId}: ${unmatched}`);
@@ -389,5 +456,16 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     }
 
     assertGatesEvaluated(pass.repo, evaluation.errors);
+
+    // A slot where every gate is still open is the NORMAL case for a job that runs every ten
+    // minutes; it has to read as "nothing to do", or the column is a wall of green that means
+    // nothing.
+    return gatePassEffect({
+      resolved: evaluation.resolved,
+      surfaced,
+      handedBack,
+      resumed: ungated + releasedResumes,
+      dispatched,
+    });
   };
 }

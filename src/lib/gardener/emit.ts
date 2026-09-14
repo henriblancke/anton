@@ -19,7 +19,10 @@
  *     proposal — anton's won't-do outcome (LABELS.abandoned) — suppresses forever, which is what
  *     makes declining meaningful. A PLAINLY closed proposal (one that was applied, anton-1t3n) does
  *     NOT suppress: the move landed, so the detector has nothing left to find, and if it somehow
- *     does the board really did regress.
+ *     does the board really did regress. The one exception is a kind whose decline is an answer
+ *     about a MOMENT rather than about the board — the re-judgement of parked work — which states a
+ *     window and expires with it ({@link declineExpired}). The window is written on the proposal
+ *     itself, so a founder learns it when they decide rather than when the ask comes back.
  *   • EVIDENCE TRAVELS WITH THE ASK. The detection's evidence lines and `discovered-from` edges to
  *     every bead the move concerns land on the proposal, so an approver can check the reasoning from
  *     the bead itself instead of re-deriving it from the board.
@@ -29,17 +32,22 @@
 import { beads, CLAIM_SETTLE_MS, LABELS, type Bead, type SyncOutcome } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
-import { isClaimed, isOpenWork } from "./board-index";
+import { errorText, sleepMs } from "../retry-helpers";
+import { ageInDays, isClaimed, isOpenWork } from "./board-index";
 import {
+  canonicalFingerprintOf,
   concernedBeads,
   fingerprintLabelOf,
   GARDENER_OBSERVED_AT_KEY,
   GARDENER_PLAN_KEY,
   isManualProposal,
   isProposalBead,
+  kindOfFingerprint,
+  KINDS,
   namespaceOf,
   planOf,
   type GardenerDetection,
+  type GardenerDetectionKind,
   type GardenerPlan,
   type ProposalNamespace,
 } from "./detections";
@@ -73,17 +81,70 @@ const PRODUCER: Record<ProposalNamespace, { title: string; filedBy: string }> = 
 export const MAX_PROPOSALS_PER_PASS = 10;
 
 /**
- * Fingerprints the board says NOT to propose again: every proposal still open, plus every one
- * declined (abandoned). A plainly-closed proposal is absent deliberately — see the module header.
+ * How many proposals ONE pass may APPLY unattended (anton-4ab3) — a different budget from
+ * {@link MAX_PROPOSALS_PER_PASS}, and deliberately smaller.
+ *
+ * That cap bounds a founder's ATTENTION: ten asks is a readable morning, and being wrong costs a
+ * longer list. This one bounds unattended WRITES to the board, where being wrong costs board state
+ * nobody chose — a different question, which deserves a smaller answer. Three is a night's tidying;
+ * a board that wants more than that in one pass is a board an operator should be looking at.
+ *
+ * The overflow is not lost and not applied later by stealth: it stays open as an ordinary ask that
+ * a human approves or declines. No later pass re-decides it — suppression keys on the fingerprint
+ * an open proposal already carries, so the ask standing on the board is what keeps it from being
+ * re-filed, and the armed walk only ever visits the proposals its own pass just created.
  */
-export function suppressedFingerprints(board: Bead[]): Set<string> {
+export const MAX_APPLIES_PER_PASS = 3;
+
+/**
+ * Fingerprints the board says NOT to propose again: every proposal still open, plus every one
+ * declined (abandoned) whose decline still holds. A plainly-closed proposal is absent deliberately —
+ * see the module header.
+ *
+ * A proposal answers for the claim its own PLAN makes as well as for the label it carries. The two
+ * are the same string for everything this emitter filed; they differ for a `parentless-cluster`
+ * filed before the claim moved to its target (anton-9hpp), and folding it onto the identity the
+ * detector now derives is what keeps the rollout from filing a fresh-format twin of an ask the
+ * board already carries.
+ *
+ * `nowMs` is only read for the kinds whose decline EXPIRES ({@link declineExpired}); every other
+ * fingerprint is suppressed on the label alone, whatever the clock says.
+ */
+export function suppressedFingerprints(board: Bead[], nowMs: number = Date.now()): Set<string> {
   const out = new Set<string>();
   for (const bead of board) {
     const fingerprint = fingerprintLabelOf(bead);
     if (!fingerprint) continue;
-    if (isOpenWork(bead) || beads.isAbandoned(bead)) out.add(fingerprint);
+    if (!isOpenWork(bead)) {
+      if (!beads.isAbandoned(bead)) continue;
+      if (declineExpired(fingerprint, bead, nowMs)) continue;
+    }
+    out.add(fingerprint);
+    const canonical = canonicalFingerprintOf(bead);
+    if (canonical) out.add(canonical);
   }
   return out;
+}
+
+/**
+ * Has this DECLINE run out — the stated window for a kind that has one, elapsed since the proposal
+ * was settled?
+ *
+ * Only ever true for a kind {@link KINDS} gives a `reask` window (detections.ts
+ * `REASK_AFTER_DAYS`): declined stays declined everywhere else, and that is what makes declining
+ * mean anything. The one exception is the re-judgement of parked work, whose decline says "still
+ * parked" — an answer about a moment, which a quarter later is worth asking again.
+ *
+ * Fails CLOSED, twice over: an unreadable kind or an undated proposal keeps suppressing. The cost of
+ * a decline that never expires is a question nobody is asked; the cost of one that expires on a
+ * stamp we could not read is the founder answering the same question every night.
+ */
+function declineExpired(fingerprint: string, proposal: Bead, nowMs: number): boolean {
+  const kind = kindOfFingerprint(fingerprint);
+  const window = kind ? KINDS[kind].reask : undefined;
+  if (window === undefined) return false;
+  const since = ageInDays(proposal, nowMs);
+  return since !== undefined && since >= window;
 }
 
 export interface EmissionPlan {
@@ -121,7 +182,10 @@ export interface EmissionInput {
  */
 export function planEmission(input: EmissionInput): EmissionPlan {
   const limit = input.limit ?? MAX_PROPOSALS_PER_PASS;
-  const blocked = suppressedFingerprints(input.board);
+  // Judged against the moment the board was READ, not against wall-clock now: it is the same
+  // snapshot every proposal's evidence describes, so a pass decides suppression and files its asks
+  // off one clock. A caller with no snapshot to name falls back to now.
+  const blocked = suppressedFingerprints(input.board, input.observedAtMs ?? Date.now());
   const seen = new Set<string>();
   const fresh: GardenerDetection[] = [];
   const suppressed: GardenerDetection[] = [];
@@ -281,13 +345,29 @@ function survivorFirst(a: Bead, b: Bead): number {
   return Number(unclaimedTwin(a)) - Number(unclaimedTwin(b)) || a.id.localeCompare(b.id);
 }
 
-/** One fingerprint the board carries more than once: the proposal that stands, and its twins. */
+/**
+ * One proposal standing for a claim, with the fingerprint label it carried on the snapshot.
+ *
+ * The label is kept BESIDE the claim rather than assumed equal to it: twins grouped by their
+ * canonical claim need not carry the same label (see {@link planReconciliation}), and the locked
+ * re-read every fold takes has to check the bead's ACTUAL label — the record of "this is still the
+ * bead the snapshot judged" — not the claim it was grouped under.
+ */
+export interface ProposalTwin {
+  id: string;
+  label: string;
+}
+
+/** One claim the board carries more than once: the proposal that stands, and its twins. */
 export interface DuplicateProposals {
+  /** The canonical claim the group shares — equal to every twin's label except a legacy one's. */
   fingerprint: string;
   /** The twin that keeps the ask — approved or claimed if any is, else the first filed. */
   keep: string;
+  /** The label the survivor carried, re-checked under the lock before any twin is folded into it. */
+  keepLabel: string;
   /** Twins to fold into `keep`: same claim, nobody acting on them. */
-  fold: string[];
+  fold: ProposalTwin[];
   /** Twins left standing because an approval or a run holds them. Named, never quietly folded. */
   held: string[];
 }
@@ -309,6 +389,14 @@ export interface DuplicateProposals {
  * The survivor is picked by a TOTAL order both machines compute alike, so two patrols reconciling
  * the same board concurrently converge on the same bead rather than folding each other away.
  *
+ * Grouped by the CANONICAL CLAIM each proposal's own plan hashes to, not by the label it happens to
+ * carry (anton-9hpp). The two are the same string for everything the current emitter filed; they
+ * differ for a `parentless-cluster` filed before the claim moved to its target, whose label hashes
+ * the membership it was found with. Label-grouping would leave those pre-rollout siblings — several
+ * open asks for ONE target, each with a different label — unrecognised and standing forever, which
+ * is the exact duplication target identity exists to remove. Each bead's real label rides along in
+ * {@link ProposalTwin} so the locked re-read still validates the bead itself before closing it.
+ *
  * `only` narrows the fold to named claims — what {@link arbitrateEmission} passes so a pass's own
  * arbitration answers for the proposals it just filed and nothing else.
  */
@@ -316,27 +404,30 @@ export function planReconciliation(
   board: Bead[],
   only?: ReadonlySet<string>,
 ): DuplicateProposals[] {
-  const groups = new Map<string, Bead[]>();
+  const groups = new Map<string, Array<{ bead: Bead; twin: ProposalTwin }>>();
   for (const bead of board) {
-    const fingerprint = fingerprintLabelOf(bead);
+    const label = fingerprintLabelOf(bead);
     // Open only: a declined twin is a recorded answer and a plainly-closed one is already folded or
     // applied — neither is a second ask standing on the board.
-    if (!fingerprint || !isProposalBead(bead) || !isOpenWork(bead)) continue;
-    if (only && !only.has(fingerprint)) continue;
-    const group = groups.get(fingerprint);
-    if (group) group.push(bead);
-    else groups.set(fingerprint, [bead]);
+    if (!label || !isProposalBead(bead) || !isOpenWork(bead)) continue;
+    const claim = canonicalFingerprintOf(bead) ?? label;
+    if (only && !only.has(claim)) continue;
+    const entry = { bead, twin: { id: bead.id, label } };
+    const group = groups.get(claim);
+    if (group) group.push(entry);
+    else groups.set(claim, [entry]);
   }
 
   const duplicates: DuplicateProposals[] = [];
   for (const [fingerprint, group] of groups) {
     if (group.length < 2) continue;
-    const [keep, ...twins] = [...group].sort(survivorFirst);
+    const [keep, ...twins] = [...group].sort((a, b) => survivorFirst(a.bead, b.bead));
     duplicates.push({
       fingerprint,
-      keep: keep.id,
-      fold: twins.filter(unclaimedTwin).map((b) => b.id),
-      held: twins.filter((b) => !unclaimedTwin(b)).map((b) => b.id),
+      keep: keep.twin.id,
+      keepLabel: keep.twin.label,
+      fold: twins.filter((t) => unclaimedTwin(t.bead)).map((t) => t.twin),
+      held: twins.filter((t) => !unclaimedTwin(t.bead)).map((t) => t.twin.id),
     });
   }
   return duplicates.sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
@@ -348,13 +439,15 @@ export function planReconciliation(
  * silent retraction of the last standing ask.
  *
  * Fails CLOSED — an unreadable survivor answers "no", so the twin is left standing and the next
- * patrol re-asks. Judged on the fingerprint alone, not on openness: a survivor closed since the
- * snapshot was answered (applied, or declined and now suppressed), which is a legitimate end for the
- * ask, while requiring it open would strand duplicate noise whenever an apply settles it mid-fold.
+ * patrol re-asks. Judged on its own LABEL, not on the claim it was grouped under: a legacy survivor
+ * legitimately carries a label the claim does not equal, while a relabelled one is no longer the
+ * bead the snapshot chose. Not judged on openness: a survivor closed since the snapshot was answered
+ * (applied, or declined and now suppressed), which is a legitimate end for the ask, while requiring
+ * it open would strand duplicate noise whenever an apply settles it mid-fold.
  */
 async function survivorHolds(repo: string, duplicate: DuplicateProposals): Promise<boolean> {
   try {
-    return fingerprintLabelOf(await beads.show(repo, duplicate.keep)) === duplicate.fingerprint;
+    return fingerprintLabelOf(await beads.show(repo, duplicate.keep)) === duplicate.keepLabel;
   } catch {
     return false;
   }
@@ -366,6 +459,32 @@ export interface ReconcileResult {
   held: string[];
   /** Folds whose close failed. Reported, not thrown: the next patrol sees the twin and retries. */
   failed: string[];
+}
+
+/** The one phrase that marks a close as a fold. Written by {@link foldReason}, read by nothing else. */
+const FOLD_REASON_PREFIX = "duplicate of ";
+
+/**
+ * Why a folded duplicate was closed — built here rather than inline, because TWO readers depend on
+ * telling this close from an apply's.
+ *
+ * A fold is a PLAIN close on purpose (see {@link reconcileDuplicateProposals}), so nothing about the
+ * bead's status distinguishes "the founder accepted this ask" from "overlapping patrols filed it
+ * twice and we kept the other one". The settled-proposal record (track-record.ts) counts the first as
+ * evidence a kind can be armed on, and counting the second would score every fold as a success —
+ * inflating precision exactly when a detector is at its noisiest, which is the failure mode
+ * inverted. One builder, one predicate, so the writer and the reader cannot drift.
+ */
+export function foldReason(keep: string, fingerprint: string): string {
+  return (
+    `${FOLD_REASON_PREFIX}${keep}: overlapping patrols filed the same claim ` +
+    `(${fingerprint}) twice — ${keep} carries the ask`
+  );
+}
+
+/** Was this close a {@link foldReason} — a duplicate withdrawn — rather than an apply or a decline? */
+export function isFoldReason(reason: unknown): boolean {
+  return typeof reason === "string" && reason.trimStart().startsWith(FOLD_REASON_PREFIX);
 }
 
 export interface ReconcileOptions {
@@ -407,7 +526,7 @@ export async function reconcileDuplicateProposals(
 
   for (const duplicate of planReconciliation(board, fingerprints)) {
     result.held.push(...duplicate.held);
-    for (const id of duplicate.fold) {
+    for (const { id, label } of duplicate.fold) {
       // Between every close, like the emission loop: a cancelled patrol must stop writing, and what
       // already landed is board state the caller still has to propagate.
       if (signal?.aborted) return result;
@@ -415,17 +534,12 @@ export async function reconcileDuplicateProposals(
         const folded = await withBeadWriteLocks(repo, [duplicate.keep, id], async () => {
           if (!(await survivorHolds(repo, duplicate))) return false;
           const live = await beads.show(repo, id);
+          // Against the twin's OWN label, which is what the snapshot judged — a bead grouped by its
+          // canonical claim need not carry that claim as its label.
           const stale =
-            fingerprintLabelOf(live) !== duplicate.fingerprint ||
-            !isOpenWork(live) ||
-            !unclaimedTwin(live);
+            fingerprintLabelOf(live) !== label || !isOpenWork(live) || !unclaimedTwin(live);
           if (stale) return false;
-          await beads.close(
-            repo,
-            id,
-            `duplicate of ${duplicate.keep}: overlapping patrols filed the same claim ` +
-              `(${duplicate.fingerprint}) twice — ${duplicate.keep} carries the ask`,
-          );
+          await beads.close(repo, id, foldReason(duplicate.keep, duplicate.fingerprint));
           return true;
         });
         if (folded) result.folded.push({ id, into: duplicate.keep });
@@ -482,14 +596,6 @@ export interface ArbitrationResult extends ReconcileResult {
    */
   skipped?: string;
 }
-
-const sleepMs = (ms: number): Promise<void> =>
-  new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    if (typeof t.unref === "function") t.unref();
-  });
-
-const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /**
  * Converge the claims THIS pass filed down to one proposal each — the run-lease arbitration pattern
@@ -592,7 +698,16 @@ function moveClause(detection: GardenerDetection): string {
       return `split ${subjects} into separate tickets`;
     case "unapprove":
       return `fix ${subjects} or withdraw its approval`;
+    case "approve":
+      return `approve ${subjects} so a run can start on ${pronoun(detection)}`;
+    case "undefer":
+      return `return ${subjects} to the board, or leave ${pronoun(detection)} parked`;
   }
+}
+
+/** How the subjects read once named — one bead is an "it", several are a "them". */
+function pronoun(detection: GardenerDetection): string {
+  return detection.subjects.length === 1 ? "it" : "them";
 }
 
 /** Ids up to a pair; past that a count, so a cluster's title stays a title. */
@@ -632,6 +747,20 @@ function appliedState(detection: GardenerDetection): string {
       // answer, and approving after a repair records that rather than stripping the label off work
       // that is sound again (see apply.ts `planUnapprove`).
       return `${subjects} either meets the approve gate again, or no longer carries \`approved\` — with a note on the bead naming the gaps that withdrew it`;
+    case "undefer":
+      // The move is the whole assertion: `open` again, contract untouched. Not "a run has started on
+      // it" — nothing here enqueues one, and whether the board reaches this bead is the picker's
+      // ranking to decide. What the approver IS being told rides in the evidence instead: an
+      // approved bead re-enters the claimable pool the moment it leaves `deferred` (rejudge.ts).
+      return `${subjects} ${is} open again rather than deferred, with ${detection.subjects.length === 1 ? "its" : "their"} contract, notes and edges exactly as parked`;
+    case "approve":
+      // What the move WRITES, not what a later feature will do with it: the gate, and nothing here
+      // enqueues a run (anton-qlci). An acceptance box promising a started run is one the approver
+      // cannot check off — and so is one promising the RESERVATION anton's own grant takes with it,
+      // because a human (or a concurrent pass) granting the label first settles this ask without
+      // one, and no claim is written over their write (apply-plan.ts `planApprove`). The gate alone
+      // is what every applied outcome guarantees, so the gate alone is what the box asserts.
+      return `${subjects} ${is} approved — the gate is granted, which is the state a run starts from`;
   }
 }
 
@@ -654,11 +783,68 @@ const MANUAL_INSTRUCTIONS: Partial<Record<GardenerDetection["move"], string[]>> 
 function acceptanceOf(detection: GardenerDetection): string {
   return [
     `- [ ] ${appliedState(detection)}`,
-    "- [ ] no other bead is re-parented, linked, reprioritized, retired or unapproved — the move above is the whole change",
+    "- [ ] no other bead is re-parented, linked, reprioritized, retired, returned to the board, approved or unapproved — the move above is the whole change",
     isManualProposal(detection)
       ? "- [ ] this proposal is DECLINED once the move is made by hand — approving it is refused, so declining is what settles it"
       : "- [ ] this proposal is closed with a note naming what changed",
   ].join("\n");
+}
+
+/**
+ * How a kind whose DECLINE is itself an answer tells its reader to settle it — the shape a
+ * re-judgement needs and no other proposal does.
+ *
+ * Every other proposal declines to "no, leave the board alone", so the standard two lines say all
+ * there is to say. A re-judgement is asked the other way round: both answers are decisions about the
+ * subject, and the third one — that the work is genuinely dead — is a move anton will not make at
+ * all. Spelling that out is the difference between a founder recording a permanent won't-do and a
+ * founder assuming a decline did it for them.
+ */
+const REJUDGE_INSTRUCTIONS: Partial<Record<GardenerDetectionKind, string[]>> = {
+  "aged-defer": [
+    "This bead is a DECISION, not implementation work, and BOTH answers settle it. APPROVE returns",
+    "the parked bead to the board through the beads seam (`bd undefer`), with its contract intact.",
+    "DECLINE leaves it exactly where it is — parked, still reversible, and not re-asked for the",
+    "window below. If it is genuinely dead, that is the third answer and it is yours alone: record",
+    "the won't-do by hand (`bd close --reason abandoned`) and decline this proposal. anton proposes a",
+    "permanent retirement and never applies one, however far its autonomy is armed.",
+  ],
+};
+
+/** The settlement paragraph for this ask — manual, re-judged, or the ordinary approve/decline. */
+function settlementLines(detection: GardenerDetection): string[] {
+  if (isManualProposal(detection)) return MANUAL_INSTRUCTIONS[detection.move] ?? [];
+  return (
+    REJUDGE_INSTRUCTIONS[detection.kind] ?? [
+      "This bead is a DECISION, not implementation work: approving it applies the move through the",
+      "beads seam, declining it records the reason.",
+    ]
+  );
+}
+
+/**
+ * What the fingerprint BUYS the reader: how long this claim stays unasked, stated in days wherever
+ * the decline expires (detections.ts `REASK_AFTER_DAYS`). A proposal that promised silence forever
+ * and then re-appeared would teach a founder to distrust every other one.
+ */
+function suppressionLines(detection: GardenerDetection): string[] {
+  const window = KINDS[detection.kind].reask;
+  return window === undefined
+    ? [
+        `- fingerprint: \`${detection.fingerprint}\` — while this bead is open, or once it is declined,`,
+        "  the patrol makes this claim no second time",
+      ]
+    : [
+        `- fingerprint: \`${detection.fingerprint}\` — while this bead is open, and for ${window} days after`,
+        "  it is declined, the patrol makes this claim no second time; past that window it asks once more,",
+        "  because a decline here says \"still parked\", which is an answer about today",
+      ];
+}
+
+/** How long "the next patrol files nothing new" is true for — everything, unless the decline expires. */
+function reaskSuffix(detection: GardenerDetection): string {
+  const window = KINDS[detection.kind].reask;
+  return window === undefined ? "" : ` for the ${window} days this ask holds`;
 }
 
 function descriptionOf(detection: GardenerDetection): string {
@@ -671,19 +857,13 @@ function descriptionOf(detection: GardenerDetection): string {
     "",
     "## Context",
     `Filed by ${PRODUCER[namespaceOf(detection.kind)].filedBy.replace("%kind%", detection.kind)}.`,
-    ...(isManualProposal(detection)
-      ? (MANUAL_INSTRUCTIONS[detection.move] ?? [])
-      : [
-          "This bead is a DECISION, not implementation work: approving it applies the move through the",
-          "beads seam, declining it records the reason.",
-        ]),
+    ...settlementLines(detection),
     "",
     `- move: \`${detection.move}\`${detection.retireAs ? ` (\`${detection.retireAs}\`)` : ""}`,
     `- subjects: ${detection.subjects.join(", ")}`,
     ...(detection.target ? [`- target: ${detection.target}`] : []),
     ...(detection.detail ? [`- to: ${detection.detail}`] : []),
-    `- fingerprint: \`${detection.fingerprint}\` — while this bead is open, or once it is declined,`,
-    "  the patrol makes this claim no second time",
+    ...suppressionLines(detection),
     "",
     "## Out of scope",
     "- any board change beyond the move above",
@@ -692,6 +872,6 @@ function descriptionOf(detection: GardenerDetection): string {
     "",
     "## Verify",
     `- after the move, the board shows that ${appliedState(detection)}`,
-    `- the next patrol files nothing new for \`${detection.fingerprint}\``,
+    `- the next patrol files nothing new for \`${detection.fingerprint}\`${reaskSuffix(detection)}`,
   ].join("\n");
 }

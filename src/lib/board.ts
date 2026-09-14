@@ -14,7 +14,32 @@ import {
   type HygieneReport,
 } from "./hygiene";
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
+import { operatorQueue } from "./operator-queue";
+import {
+  agedOutPicks,
+  isPlanStale,
+  latestBoardPickerPlan,
+  recordBoardPickerPlan,
+  stampBoard,
+  type BoardPickerPlan,
+} from "./board-picker-plan";
+import { boardProvenance, provenanceVersion } from "./board-provenance";
+import { getDb } from "./db";
+import {
+  ADMIT_ALL_POLICY,
+  decideBoardPickerPlan,
+  type BoardPickerDecision,
+} from "./jobs/picker-decision";
+import { armedPickerPolicy } from "./jobs/picker-policy";
+import {
+  deferralVersion,
+  latestDeclinedPicks,
+  latestPickerDeferrals,
+  pickerTrackRecord,
+} from "./picker-veto";
 import { reviewTrajectory } from "./review-trajectory";
+import { isScheduleEnabled } from "./schedules";
+import { upNextAbsence, upNextEntries, upNextVersion, type UpNextStance } from "./up-next";
 import {
   latestScanHealth,
   latestScanHealthVersion,
@@ -23,6 +48,8 @@ import {
   type ScanHealth,
 } from "./scan-health";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
+import type { Policy } from "./policy/types";
+import { getProjectSettings, resolvePickerAutonomy, resolvePickerPolicy } from "./projects";
 import {
   boardCards,
   isRunTicket,
@@ -35,6 +62,7 @@ import {
 } from "./ticket-view";
 import {
   STAGES,
+  type BeadProvenance,
   type Board,
   type Epic,
   type Project,
@@ -55,17 +83,54 @@ function boardVersion(
   snapshotVersion: number,
   hygiene: string,
   scan: string,
+  vetoes: string,
+  provenance: string,
+  upNext: string,
   repoPath: string,
 ): string {
-  return `${snapshotVersion}:${hygiene}:${scan}:${getSyncStatusToken(repoPath)}`;
+  return `${snapshotVersion}:${hygiene}:${scan}:${vetoes}:${provenance}:${upNext}:${getSyncStatusToken(repoPath)}`;
 }
 
+/**
+ * The poll's half of the freshness token: the same string {@link getBoard} stamps its payload with,
+ * assembled without building a board.
+ *
+ * It READS the plan row and never writes one — the ranking is not derived here, so there is no
+ * decision to record, and a poll that wrote would have to re-read the board to decide what. That is
+ * what keeps the 304 path cheap, and it is only sound because the write on the build path is
+ * idempotent per decision: a poll and a build over an unchanged board name the same generation.
+ */
 export async function getBoardVersion(project: Project): Promise<string> {
-  const [hygiene, scan] = await Promise.all([
+  // The policy joins the plan on the poll path (not just the build): it is half the plan's freshness
+  // fence, so saving a narrower one turns every live pick into history — the lane goes and
+  // `[Release]` with it — while the bead snapshot, the plan row and the schedule all sit still. A
+  // token blind to it would 304 the operator back onto the board they just invalidated.
+  const [hygiene, scan, deferrals, plan, picker] = await Promise.all([
     readHygieneVersion(project),
     readScanHealthVersion(project),
+    readDeferrals(project),
+    readPickerPlan(project),
+    readPickerStance(project),
   ]);
-  return boardVersion(issueSnapshotVersion(project.repoPath), hygiene, scan, project.repoPath);
+  return boardVersion(
+    issueSnapshotVersion(project.repoPath),
+    hygiene,
+    scan,
+    deferralVersion(deferrals),
+    // Gated exactly as the served board gates the marks themselves (`armedPlan` in getBoard) — on
+    // OFFERING, and on the policy being known: a picker that is switched off, running below the
+    // level that offers its picks, or whose policy anton could not read carries no provenance, so
+    // letting a plan row move the token would break a 304 and serve back data the client already
+    // holds. The two gates must stay identical or the poll's token and the served board's disagree
+    // and every poll re-reads. The stance itself is covered separately by upNextVersion, which is
+    // what makes a level change land on the next poll: moving between `propose` and `shadow`
+    // touches neither a bead, nor the plan row, nor the policy. The clock rides there too, for the
+    // one input of the derived ranking that moves on its own — an age criterion's whole-day boundary
+    // (PR #226 review).
+    provenanceVersion(picker.offers && picker.policyKnown ? plan : undefined, picker.policy),
+    upNextVersion(picker, picker.policy, Date.now()),
+    project.repoPath,
+  );
 }
 
 /**
@@ -101,6 +166,163 @@ async function readScanHealth(project: Project): Promise<ScanHealth | undefined>
   }
 }
 
+/**
+ * The picker vetoes in force (anton-jqvy), bead id → expiry. Degrades to "nothing deferred" on an
+ * anton.db failure for the same reason the reads above do: a veto is pacing, and losing it must
+ * never take the board — where every run is approved — down with it.
+ *
+ * Fed into the freshness token as the ACTIVE set rather than as a write stamp, so a window closing
+ * moves the token on its own: an expiry is not a write, and a card left drawn as deferred after its
+ * hold ran out is a card the operator would think anton had forgotten.
+ */
+async function readDeferrals(project: Project): Promise<Map<string, number>> {
+  try {
+    return await latestPickerDeferrals(project.id);
+  } catch (err) {
+    console.error(`[board] picker deferral read failed for ${project.slug}`, err);
+    return new Map();
+  }
+}
+
+/**
+ * The picks of the recorded plan the operator has already vetoed — what retires a generation the
+ * picker never got to rewrite (`isPlanStale`). Degrades to "none declined" like the reads above: the
+ * worst a lost read costs is a plan that reads current for one more pass.
+ */
+async function readDeclinedPicks(project: Project, planId: string): Promise<Set<string>> {
+  try {
+    return await latestDeclinedPicks(project.id, planId);
+  } catch (err) {
+    console.error(`[board] picker decline read failed for ${project.slug}`, err);
+    return new Set();
+  }
+}
+
+/**
+ * The picker's latest recorded plan — where a card's `◈ policy` provenance comes from (anton-cqxd).
+ * Degrades to "the picker has never run here" on an anton.db failure, exactly as the reads above do:
+ * a missing badge is a board with less explanation on it, a throw is no board at all.
+ */
+async function readPickerPlan(project: Project): Promise<BoardPickerPlan | undefined> {
+  try {
+    return await latestBoardPickerPlan(project.id);
+  } catch (err) {
+    console.error(`[board] picker plan read failed for ${project.slug}`, err);
+    return undefined;
+  }
+}
+
+/**
+ * What the picker is doing on this project, as the board projects it: the policy `◈ policy` anchors
+ * at, and whether the pass is OFFERING its picks at all.
+ *
+ * Two facts make one answer because the board asks one question. The schedule is the first half — a
+ * ranking left on screen by a pass that stopped running is the one thing a shadow-mode lane must not
+ * be. The resolved AUTONOMY is the second (PR #218 review): `propose` promises "ranks what could run
+ * next · nothing is offered" in settings, and it is also where every unarmed project sits by default,
+ * so a lane drawn from it would offer ranked cards, `[Release]` and vetoes — and RECORD those answers
+ * into the track record `apply` is earned on — against a level that promised none of it. Only
+ * `shadow` (offer and answer) and `apply` (offer and start) put picks on the board.
+ *
+ * Fail-soft to "offering" on each half independently — losing a read must not silently hide a lane
+ * that is running, and the plan's own freshness fence still governs what it may claim. The POLICY is
+ * the exception: it decides what the lane admits, so a read that failed is carried as unknown rather
+ * than folded into "none armed" (`policyKnown`, PR #226 review).
+ */
+interface PickerStance extends UpNextStance {
+  /** The policy armed on this machine, or undefined when the project has armed none. */
+  policy?: Policy;
+  /** The pass is running AND its level puts picks in front of the operator. */
+  offers: boolean;
+}
+
+async function readPickerStance(project: Project): Promise<PickerStance> {
+  const [scheduled, level] = await Promise.all([
+    isScheduleEnabled(project.id, "board-picker").catch((err) => {
+      console.error(`[board] picker schedule read failed for ${project.slug}`, err);
+      return true;
+    }),
+    readPickerLevel(project),
+  ]);
+  // The two halves are kept apart, not collapsed into `offers`: a withheld lane has to say WHICH
+  // absence it is (anton-w579), and "the schedule is off" and "the level only proposes" are cleared
+  // in two different places.
+  const { offers: levelOffers, known: policyKnown, ...rest } = level;
+  return { ...rest, scheduled, levelOffers, policyKnown, offers: scheduled && levelOffers };
+}
+
+/** What settings alone say: the armed policy, and whether the resolved autonomy offers its picks. */
+interface PickerLevel {
+  policy?: Policy;
+  offers: boolean;
+  /** The read succeeded — so an absent `policy` means "none armed" rather than "unknown". */
+  known: boolean;
+}
+
+/**
+ * The Up Next ranking, or nothing if deriving it throws (PR #226 review).
+ *
+ * Deriving the lane per read (anton-r0ew) put the picker's whole decision — `policyCandidates`,
+ * `rankTargets` — inside the board read, where projecting a recorded plan was a map that could not
+ * fail. So it degrades like every other picker-derived read here: a bug in the decision costs the
+ * LANE, which then says it has nothing to show, not the surface every run is approved from.
+ */
+function deriveRanking(
+  project: Project,
+  derive: () => BoardPickerDecision,
+): BoardPickerDecision | undefined {
+  try {
+    return derive();
+  } catch (err) {
+    console.error(`[board] up-next ranking failed for ${project.slug}`, err);
+    return undefined;
+  }
+}
+
+/**
+ * Write the ranking this read derived down as the project's plan generation, or nothing if the write
+ * throws (anton-f12y).
+ *
+ * Fail-soft like every other anton.db read on this path, and for the sharper reason: this is the one
+ * WRITE the board makes, on the surface every run is approved from. A locked database costs the
+ * generation — the lane still ranks, and the badge falls back to the plan the last pass recorded —
+ * where a throw would cost the board.
+ */
+async function recordRanking(
+  project: Project,
+  decision: BoardPickerDecision,
+): Promise<BoardPickerPlan | undefined> {
+  try {
+    return await recordBoardPickerPlan({ projectId: project.id, ...decision });
+  } catch (err) {
+    console.error(`[board] up-next plan write failed for ${project.slug}`, err);
+    return undefined;
+  }
+}
+
+/** The settings half of {@link readPickerStance} — the armed policy and the resolved autonomy. */
+async function readPickerLevel(project: Project): Promise<PickerLevel> {
+  try {
+    const db = getDb();
+    // Two independent reads, so one round trip rather than two on every board view.
+    const [settings, record] = await Promise.all([
+      getProjectSettings(db, project.id),
+      pickerTrackRecord(db, project.id),
+    ]);
+    // The EARNED floor rides along (`resolvePickerAutonomy`): a project demoted off `apply` lands on
+    // `shadow`, which still offers — the lane is where the record that lifts it back is made.
+    const autonomy = resolvePickerAutonomy(settings, record);
+    const armed = resolvePickerPolicy(settings);
+    return { ...(armed ? { policy: armed } : {}), offers: autonomy !== "propose", known: true };
+  } catch (err) {
+    console.error(`[board] picker settings read failed for ${project.slug}`, err);
+    // Fail-soft on the LEVEL, fail-closed on the POLICY (PR #226 review). An unreadable policy is not
+    // an unarmed one: ranking with `ADMIT_ALL_POLICY` here would present every structurally eligible
+    // target as what anton would start next, including the ones the configured policy rejects.
+    return { offers: true, known: false };
+  }
+}
+
 async function readScanHealthVersion(project: Project): Promise<string> {
   try {
     return await latestScanHealthVersion(project.id);
@@ -127,12 +349,23 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Read beads and their snapshot version together: a background refresh can land mid-build, so
   // stamping the response with a separately-read version would let it advance past the data served
   // here — the client would then poll that version, 304, and never see this board's data refreshed.
-  // The bead read (bd) and the anton.db reads (hygiene, scan health) are independent — run them
-  // concurrently so the slowest sets the board's latency instead of their sum.
-  const [{ beads: allBeads, version: snapshotVersion }, hygiene, scan] = await Promise.all([
+  // The bead read (bd) and the anton.db reads (hygiene, scan health, picker vetoes, the picker's
+  // plan and policy) are independent — run them concurrently so the slowest sets the board's latency
+  // instead of their sum.
+  const [
+    { beads: allBeads, version: snapshotVersion },
+    hygiene,
+    scan,
+    deferrals,
+    recordedPlan,
+    picker,
+  ] = await Promise.all([
     readAllIssues(project.repoPath, opts),
     readHygiene(project),
     readScanHealth(project),
+    readDeferrals(project),
+    readPickerPlan(project),
+    readPickerStance(project),
   ]);
 
   // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
@@ -179,7 +412,14 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
 
   // Derive epic→epic dependency rollup once (blockedBy/ready/rank), so the board reflects the
   // readiness the runtime's bd-ready enforces. Degrades to a stable order on a cycle (epic-graph.ts).
-  const graphNodes = new Map(computeEpicGraph(workBeads).epics.map((n) => [n.id, n]));
+  //
+  // Over `allBeads`, not the pipeline-stripped `workBeads`: the rollup's per-child readiness reads a
+  // blocker missing from the list as still open (fail-safe), so stripping the gate beads would make
+  // every RESOLVED gate — and every in-review target's own `gh:pr` merge gate, which `isOwnMergeWait`
+  // can only recognise from the bead — read as a permanent open blocker, exactly the state
+  // loadAllIssues reads gates to prevent. It adds no node and no edge: `isUnit` rejects gate/molecule
+  // and the rollup attributes pipeline artifacts to no unit.
+  const graphNodes = new Map(computeEpicGraph(allBeads).epics.map((n) => [n.id, n]));
 
   for (const card of cardBeads) {
     const children = childrenByCard.get(card.id) ?? [];
@@ -201,6 +441,13 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       children,
       blockedBy,
       ready: blockedBy.length === 0,
+      // The finer verdict beside that coarse flag (anton-nywj): which of the run's tickets are
+      // actually held. It needs no standalone fold-back — the rollup gates an unattributable blocker
+      // on the blocker itself, exactly as epicStandaloneBlockers does — so it already answers for
+      // every blocker `blockedBy` above collects, one ticket at a time.
+      childReadiness: node?.childReadiness,
+      readyChildren: node?.readyChildren,
+      blockedChildren: node?.blockedChildren,
       rank: node?.rank ?? 0,
       // The product epic above this card — the key the board's epic swimlanes group on.
       epic: parentEpicOf(card, workBeads),
@@ -230,6 +477,11 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     if (!standalone[stage]) standalone[stage] = [];
   }
 
+  // The operator's own queue (anton-qfso.1): the approved `agent:human` beads anton refuses to
+  // dispatch. Derived from the SAME snapshot as the cards — excluding this work from the agent queue
+  // must not cost a read to find it again.
+  const humanWork = operatorQueue(workBeads);
+
   // Every run target the board holds — cards and standalone chips alike — rolled up into the
   // project's score trend (anton-tprv). Off the labels already in this snapshot: no per-card read.
   const trajectory = reviewTrajectory([...cardBeads, ...orphanTasks]);
@@ -240,14 +492,140 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Chips read the same way in every column (unread-first, then newest), independent of epic order.
   for (const stage of STAGES) standalone[stage].sort(compareStandalone);
 
+  // The plan, only while a pass is actually keeping it AND offering it (`readPickerStance`): a
+  // project whose `board-picker` schedule was switched off — or whose level is `propose`, which
+  // promises a ranking and nothing else — keeps its last recorded plan in the db, and reading it here
+  // would badge every old entry `◈ policy`. That badge is what `[Release]` is derived from
+  // (isPickerPick), so ordinary Backlog cards would go on offering to record accepts against a pass
+  // that no longer runs, or a level that never asked.
+  //
+  // And only while the armed policy is KNOWN (PR #226 review). A failed settings read fails soft to
+  // "offering" with no policy, which would leave the recorded plan reading as current — its digest
+  // compared against a stamp taken with no policy, so an admit-all plan armed under a since-narrowed
+  // one never falls stale. Its entries would keep their `◈ policy` badge and the `[Release]` derived
+  // from it, offering a start beside the very `policy-unreadable` absence that says anton will not
+  // guess. Withheld here, the plan retires with the ranking rather than outliving it.
+  const armedPlan = picker.offers && picker.policyKnown ? recordedPlan : undefined;
+  // One clock read for both questions the picker is asked below — what would anton start now, and is
+  // the recorded plan still that — so the lane and the badge can never be answering about different
+  // moments.
+  const observedAtMs = Date.now();
+  // The Up Next lane's input (anton-r0ew): the ranking DERIVED here, not the one a pass wrote down.
+  // The lane claims this is the order anton would start work in NOW, and that claim is cheap to make
+  // true — `decideBoardPickerPlan` is the pure decision the pass itself makes, and this read already
+  // holds every input it takes. So a claim, a new bead or a lapsed hold re-ranks the lane on the next
+  // read, where projecting a recorded plan could only blank it until the next pass ran.
+  //
+  // "Cheap" measured, on this repo's own 781-bead board (PR #226 review): ~35ms of CPU per read for
+  // the whole derivation, against ~1.2s for the `bd list` snapshot the read already spends. Most of
+  // it is duplicated — `eligibleTargets` walks the board three times (here, `armedPickerPolicy`,
+  // `boardProvenance`) and it is stamped twice — but ~3% of a read is not worth memoizing across
+  // these call sites, and the poll's 304 path (`getBoardVersion`) derives nothing at all.
+  //
+  // Gated on OFFERING, unchanged: a disarmed pass — or one at `propose` — puts no picks in front of
+  // the operator, and a ranking computed anyway would draw the lane the level promised not to.
+  //
+  // And on the policy being KNOWN (PR #226 review). `readPickerLevel` fails soft, so a settings read
+  // that threw reports "offering" with no policy — and ranking that as if none were armed would put
+  // every structurally eligible target in the lane as what anton would start, including the ones the
+  // armed policy rejects. An unknown policy is not an absent one, so the lane says so instead
+  // (`policy-unreadable`) rather than showing a ranking anton would not act on.
+  const ranking = picker.offers && picker.policyKnown
+    ? deriveRanking(project, () =>
+        decideBoardPickerPlan({
+          board: allBeads,
+          policy: picker.policy
+            ? armedPickerPolicy(picker.policy, allBeads, new Date(observedAtMs))
+            : ADMIT_ALL_POLICY,
+          ...(picker.policy ? { armedPolicy: picker.policy } : {}),
+          runtime: { observedAtMs, deferrals },
+        }),
+      )
+    : undefined;
+  // And WRITTEN DOWN (anton-f12y). The ranking is derived per read, but a verdict is recorded against
+  // a GENERATION — so a pick the lane draws under no recorded plan offers a start the approve route
+  // then refuses, and the operator's answer is lost. Deriving already re-decides the plan the pass
+  // would; recording it is what makes that decision nameable, and on an active board this read is the
+  // fresher of the two writers.
+  //
+  // Idempotent per DECISION (`saveBoardPickerPlan`): a read that restates the standing plan mints no
+  // generation and moves no timestamp, so the freshness token below holds still and the poll goes on
+  // 304ing. The poll path itself never reaches here — it derives nothing, so it writes nothing.
+  //
+  // What the board then answers with is the row: the generation just recorded, or — when the
+  // derivation or the write failed, both fail-soft — the last one a pass left behind, judged by the
+  // staleness fence exactly as before.
+  const plan = (ranking ? await recordRanking(project, ranking) : undefined) ?? armedPlan;
+  // Does the plan still describe the decision anton would make NOW? Asked ONCE, over every input to
+  // that decision — the beads and the armed policy, which stampBoard folds in together, plus the two
+  // the digest structurally cannot hold (isPlanStale): the deferrals, whose expiry it cannot see, and
+  // the age bounds, which move with the clock (agedOutPicks). So an operator narrowing `pickerPolicy`
+  // without touching a bead invalidates the plan, and so does a hold running out on a target the pass
+  // set aside — or on one it picked, when no pass ran to record the exclusion — or a pick simply
+  // growing older than the policy admits, which the derived lane has already dropped.
+  //
+  // A generation this read just recorded clears that fence by construction — it was decided from
+  // these very beads, this policy and these deferrals. What the fence still governs is HISTORY's
+  // claim on the present: the plan left standing when the write or the derivation failed, and the
+  // generation a decline has retired, which restating the same decision never re-mints.
+  //
+  // The declines are read here rather than beside the deferrals above because the question is about
+  // ONE generation — it needs the plan id the write above returns.
+  const declined = plan ? await readDeclinedPicks(project, plan.planId) : undefined;
+  const planIsStale =
+    plan !== undefined &&
+    isPlanStale(
+      plan,
+      stampBoard(allBeads, observedAtMs, picker.policy),
+      deferrals,
+      declined,
+      agedOutPicks(plan, allBeads, picker.policy, observedAtMs),
+    );
+  // Who touched each bead and why (anton-cqxd), joined once over the whole board: the picker's
+  // recorded plan and the product master's own proposals, which are ordinary beads in this snapshot.
+  // A stale plan still badges — the rule a target WAS picked under does not stop being true — but
+  // the mark carries `stale`, so what survives staleness is the badge and not the button.
+  const provenance = boardProvenance({
+    board: allBeads,
+    plan,
+    policy: picker.policy,
+    planIsStale,
+  });
+  const upNext = upNextEntries(allBeads, ranking);
+  // The generation a verdict on those picks is RECORDED against — the plan row, and still only while
+  // anton stands behind it. The row now names this read's own ranking, so a drawn pick carries the
+  // generation it was drawn under; a plan the write could not refresh still falls away rather than
+  // lending its name to a decision it no longer describes (anton-5axf binds the button to it and says
+  // so on the card).
+  const currentPlan = planIsStale ? undefined : plan;
+  // Which nothing this is (anton-w579). A withheld lane that simply vanishes reads as "anton has
+  // nothing to start" on a board where the pass is switched off, only proposing, or looking at
+  // nothing it may claim — three states with three different clearing conditions.
+  const absence = upNextAbsence(picker, upNext);
+  // A DONE target is never badged: provenance answers "should this run?", and a shipped run has
+  // stopped asking. Off the stage rather than the card, so the rule holds for chips too.
+  const marksFor = (stage: Stage, id: string): BeadProvenance[] | undefined =>
+    stage === "done" ? undefined : provenance.get(id);
+
   // Resolve PR links from the repo's origin remote (once) so `gh-<n>` refs become clickable.
   const base = await githubBaseUrl(project.repoPath);
   for (const stage of STAGES) {
     for (const epic of columns[stage]) {
       attachPrUrl(epic, base);
+      // A vetoed target reads as SET ASIDE on the board, never as silently missing (anton-jqvy).
+      const held = deferrals.get(epic.id);
+      if (held !== undefined) epic.notNowUntil = held;
+      const marks = marksFor(stage, epic.id);
+      if (marks?.length) epic.provenance = marks;
       for (const ticket of epic.tickets) attachPrUrl(ticket, base);
     }
-    for (const item of standalone[stage]) attachPrUrl(item, base);
+    for (const item of standalone[stage]) {
+      attachPrUrl(item, base);
+      const held = deferrals.get(item.id);
+      if (held !== undefined) item.notNowUntil = held;
+      const marks = marksFor(stage, item.id);
+      if (marks?.length) item.provenance = marks;
+    }
   }
 
   return {
@@ -260,10 +638,28 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       snapshotVersion,
       hygieneVersion(hygiene),
       scanHealthVersion(scan),
+      deferralVersion(deferrals),
+      provenanceVersion(plan, picker.policy),
+      // The instant the lane below was derived at, not a second clock read: the token must name the
+      // age bucket this board's ranking was decided in, or the poll that follows re-fetches a board
+      // the client already holds.
+      upNextVersion(picker, picker.policy, observedAtMs),
       project.repoPath,
     ),
     columns,
     standalone,
+    operatorQueue: humanWork,
+    // Length, not existence: a ranking that admits nothing is an EMPTY lane, and `Board.upNext`
+    // promises absent-never-empty — an "Up Next" heading over nothing reads as "anton has nothing to
+    // start", which is what `upNextAbsence` says in words instead.
+    // The generation rides along only when there is one to stand behind: a card's veto names the
+    // decision it can be recorded against, so a tab a later pass has overtaken — or a lane that has
+    // outrun the plan row entirely — records no pick rather than a stranger's.
+    ...(upNext?.length
+      ? { upNext, ...(currentPlan ? { upNextPlanId: currentPlan.planId } : {}) }
+      : {}),
+    // Rides beside the lane it replaces, never with it: named only while there is no ranking drawn.
+    ...(upNext?.length ? {} : absence ? { upNextAbsence: absence } : {}),
     hygiene,
     ...(trajectory ? { reviewTrajectory: trajectory } : {}),
     ...(scan ? { scanHealth: scan } : {}),

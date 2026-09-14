@@ -15,7 +15,7 @@
  * review can switch the reviewer's sandbox back off.
  */
 import { realpath } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import { PoisonError } from "./errors";
 
@@ -117,6 +117,31 @@ async function withRealPaths(paths: string[]): Promise<string[]> {
 }
 
 /**
+ * The ref store's path must be ABSOLUTE, or the deny rule silently stops denying.
+ *
+ * `git rev-parse --path-format=absolute` predates nothing anton supports on paper, but an older git
+ * (< 2.31) does not reject the flag — it IGNORES it and answers relative to the worktree. That
+ * relative answer then resolves against the node process's cwd, which is not the worktree: it
+ * yields a path that usually does not exist, `withRealPaths` keeps the literal form, and the
+ * sandbox is handed a deny rule matching nothing. The hole is invisible — the review runs, the
+ * settings look populated, and the ref store is writable.
+ *
+ * So the shape of the answer is checked rather than the version of the binary: this catches the old
+ * git, a future flag rename, and any other way the answer stops being what the sandbox needs.
+ * PoisonError because it is not retryable — the host's git is what it is until someone changes it.
+ */
+function assertAbsoluteCommonDir(commonDir: string): string {
+  if (!isAbsolute(commonDir)) {
+    throw new PoisonError(
+      `git reported a relative git-common-dir (${commonDir || "<empty>"}), so the review sandbox cannot ` +
+        `pin the ref store shut. This host's git ignores \`--path-format=absolute\` (added in git 2.31); ` +
+        `upgrade git on this host, because a sandbox scoped to an unresolvable path is a guard with a hole in it.`,
+    );
+  }
+  return commonDir;
+}
+
+/**
  * Everything a review dispatch needs to run contained: fail loud on a platform that cannot be
  * sandboxed, then pin the repository's ref store shut for the session.
  *
@@ -130,6 +155,6 @@ export async function resolveReviewSandbox(args: {
   platform?: NodeJS.Platform;
 }): Promise<ReviewSandboxSettings> {
   assertReviewSandboxSupported(args.platform);
-  const commonDir = await args.readGitCommonDir(args.worktreePath);
+  const commonDir = assertAbsoluteCommonDir(await args.readGitCommonDir(args.worktreePath));
   return reviewSandboxSettings(await withRealPaths(reviewSandboxDenyWrite(args.worktreePath, commonDir)));
 }

@@ -1,0 +1,174 @@
+import type {
+  ScheduleLastRun,
+  SchedulePendingStatus,
+} from "@/components/settings/automation-table";
+import type { Policy } from "@/components/settings/policy-draft-section";
+import type { PickerAutonomy } from "@/lib/policy/types";
+
+/**
+ * The shapes the settings form works in. Every one of them is MIRRORED from a server type rather
+ * than imported: this whole module tree is client-side, and importing the server's settings code to
+ * get a type would drag its runtime into the bundle. Keep in sync with src/lib/projects.ts.
+ */
+
+/** One label→formula mapping (anton-aa3m), mirrored from the server's FormulaVariant. */
+export interface FormulaVariant {
+  label: string;
+  formula: string;
+}
+
+/** A variant row being edited: the mapping plus a stable local id used only as the React key. */
+export interface VariantRow extends FormulaVariant {
+  id: string;
+}
+
+/**
+ * One model routing rule (anton-uu7r), mirrored from the server's ModelRoute. Every matcher is
+ * optional and they AND together; `""` is how the form spells "this rule does not ask".
+ */
+export interface ModelRoute {
+  jobType?: string;
+  step?: string;
+  label?: string;
+  model: string;
+}
+
+/** A routing rule being edited. Matchers are held as `""` rather than absent — a select has a
+ *  value — and the save drops the empty ones. */
+export interface ModelRouteRow {
+  id: string;
+  jobType: string;
+  step: string;
+  label: string;
+  model: string;
+}
+
+/**
+ * A `ns:` group of the labels this project's board actually uses (anton-prng), mirrored from the
+ * server's LabelNamespace. `namespace` is `""` for bare labels like `approved`.
+ */
+export interface LabelNamespace {
+  namespace: string;
+  labels: { label: string; count: number }[];
+}
+
+/** One nominated value label, with a stable local id so reordering never moves the operator's cursor. */
+export interface ValueLabelRow {
+  id: string;
+  label: string;
+}
+
+/** Settings the UI can edit today. */
+export interface EditableSettings {
+  model?: string;
+  /** Gateway routing (anton-n16m): the base URL to drive instead of the Claude API; absent = the API. */
+  claudeBaseUrl?: string;
+  /** The NAME of the env var anton reads the gateway token from at spawn time — never the token. */
+  claudeAuthTokenEnv?: string;
+  /** Whether anton asks the gateway which models it serves (anton-n16m); absent = off. */
+  claudeGatewayModelDiscovery?: boolean;
+  seedPrompt?: string;
+  reviewFixPrompt?: string;
+  productMasterPrompt?: string;
+  /** Pre-PR self-review gate (anton-3apm); absent = ON. The knobs below only apply when on. */
+  reviewEnabled?: boolean;
+  reviewAgent?: string;
+  reviewPrompt?: string;
+  reviewMaxRounds?: number;
+  /** Score-regression alarm (anton-i98r): park after `reviewLowScoreRounds` rounds below this. */
+  reviewMinScore?: number;
+  reviewLowScoreRounds?: number;
+  testCommand?: string;
+  lintCommand?: string;
+  typecheckCommand?: string;
+  buildCommand?: string;
+  /** Per-label pipeline variants (anton-aa3m), in precedence order — first matching label wins. */
+  formulaVariants?: FormulaVariant[];
+  /** The model routing table (anton-uu7r), in evaluation order — first match wins, `model` is the
+   *  fallback. Absent/empty = every job runs on `model`. */
+  modelRoutes?: ModelRoute[];
+  concurrency?: number;
+  /** Max concurrent per-PR review fixes (anton-kwi6); absent = DEFAULT_REVIEW_FIX_CONCURRENCY. */
+  reviewFixConcurrency?: number;
+  jobTimeoutMinutes?: number;
+  ticketTimeoutMinutes?: number;
+  /** Pre-commit hooks' own cap (anton-n5e7); absent = DEFAULT_COMMIT_TIMEOUT_MINUTES (2 min). */
+  commitTimeoutMinutes?: number;
+  maxRetries?: number;
+  agents?: string[];
+  autonomy?: boolean;
+  conventionalCommits?: boolean;
+  /**
+   * How far a pass may go with the proposals it files, per detection kind (anton-nbyy). Only the
+   * kinds moved off `propose` are stored. Typed loosely on purpose: this mirror must survive a blob
+   * a human hand-edited or an older anton wrote, and `resolveProposalAutonomy` floors anything it
+   * can't read back to `propose` rather than rendering it.
+   */
+  proposalAutonomy?: Record<string, string>;
+  /**
+   * How far anton may go REPAIRING a block a run declared, per class (R5.3). Only the classes moved
+   * off their shipped level are stored. Typed loosely for the same reason the line above is, and
+   * floored the same way: `resolveRepairAutonomy` reads anything it cannot parse back to the class's
+   * shipped level rather than rendering it.
+   */
+  repairAutonomy?: Record<string, string>;
+  /** Budget-aware execution master-switch (anton-7mpv.1); off by default. Gates the knobs below. */
+  budgetAware?: boolean;
+  /**
+   * This project's declared cut of the shared weekly quota (R6.1). Absent = never declared, which
+   * the panel renders as the equal split across paced projects rather than as a number nobody chose.
+   */
+  quotaSharePct?: number;
+  /** `reserve my share` (R6.5): keep the allocation even while this project sits idle. */
+  reserveQuotaShare?: boolean;
+  /** Operator budget policy (anton-egrg); only the two exposed knobs round-trip through this form. */
+  budgetPolicy?: {
+    daytimeReservePct?: number;
+    weeklyTargetPct?: number;
+  };
+  /** Nominated value labels (anton-prng), highest tier first. Absent/empty = rank on age alone. */
+  valueLabels?: string[];
+  /** The armed work policy (anton-c7iv). Absent = never armed, which is what makes the panel
+   *  propose a calibrated draft instead of an empty form. */
+  pickerPolicy?: Policy;
+  /**
+   * How far the picker may go with the plan it decides (anton-vkp9). Absent = never chosen, which an
+   * armed project reads back as `shadow`. What is STORED, not what the pass resolves: both floors —
+   * an armed policy, and a record that has earned it — are re-applied where it is rendered, so a
+   * level the pass would refuse is never drawn as the one in force.
+   */
+  pickerAutonomy?: PickerAutonomy;
+  /** The operator declined the daily product-master offer (anton-3xa9); absent = not yet asked. */
+  keepProductMasterWeekly?: boolean;
+  /**
+   * The autopilot brakes (anton-nmy7): when anton stops STARTING work. `autopilotWipLimit` is a
+   * self-clearing hold; the other three latch a disarm only a human re-arms. Each absent value
+   * falls back to its shipped default.
+   */
+  autopilotWipLimit?: number;
+  autopilotFailureStreak?: number;
+  autopilotScoreFloor?: number;
+  autopilotScoreWindow?: number;
+}
+
+/** Per-automation schedule state from the server; a missing row means "not scheduled yet". */
+export interface AutomationSchedule {
+  type: string;
+  enabled: boolean;
+  cron: string;
+  /** Epoch SECONDS; absent while the schedule is disabled. */
+  nextRunAt?: number;
+  /** Epoch SECONDS of the last fire; absent until it has run once. */
+  lastRunAt?: number;
+  /** How that fire ended (anton-znoz); absent until a fired job has settled. */
+  lastRun?: ScheduleLastRun;
+  /** Where an unsettled fire sits (anton-znoz); absent when nothing is in flight. */
+  pendingRun?: SchedulePendingStatus;
+}
+
+/** One discoverable agent (anton-dvo.1), mirrored from the server's DiscoveredAgent. */
+export interface DiscoveredAgent {
+  id: string;
+  source: "project" | "global" | "bundled" | "plugin";
+  description?: string;
+}

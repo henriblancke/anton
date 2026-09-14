@@ -114,15 +114,87 @@ ANTON-RESULT: delivered
 when you implemented the ticket and left the checks green, **or**
 
 ```
-ANTON-RESULT: blocked — <one-line reason>
+ANTON-RESULT: blocked — <class> — <one-line reason>
 ```
 
 when you could not deliver (a blocker from "Fail loud", a contradiction in the acceptance
 criteria, a missing dependency, or a pre-existing failure that isn't yours to fix). State the
 reason in one line so a human knows what to decide.
 
+`<class>` says WHY in a form anton can act on. Use **exactly one** of these words, spelled
+exactly as written, followed by ` — ` and your one-line reason:
+
+- `ref-stale` — the ticket points at a file, path, or symbol that has moved or no longer exists.
+  Name the pointer as the ticket writes it.
+- `dep-missing` — the work needs something another ticket has to land first, and no edge says so.
+  Name the **bead id** you are waiting on (`anton-abcd`) — anton draws the ordering edge from the id
+  and can draw nothing from a description. Name exactly one: it records the ordering you state, it
+  never files the missing work, so a reason that names no id, or several, goes to a human instead.
+- `acceptance-missing` — the acceptance criteria are absent, contradictory, or not verifiable as
+  written.
+- `oversized` — the ticket is too large to land as one coherent change.
+- `already-shipped` — the ticket's work is already in the tree, so there is nothing left to change.
+  Name the **bead id** that shipped it (`anton-abcd`) — required, and exactly one: the retirement
+  closes this ticket as superseded by that bead, so anton will not pick between two ids or close a
+  ticket against prose. A **commit** sha or **PR** number strengthens the claim but cannot stand in
+  for the id. anton VERIFIES what you name against the board and the repository, so a claim naming
+  no resolvable bead reaches a human instead. Use it only when the acceptance criteria are already
+  satisfied as written, not when the work merely looks similar.
+- `env` — the toolchain or environment is broken in a way this ticket cannot fix: a missing
+  dependency, a red build that isn't yours, a service that will not start.
+- `other` — anything else. **Use it whenever none of the above fits exactly.**
+
+Do not invent a class or bend one to fit: anton reads the class as an exact word, so an
+unrecognised one is read as plain prose and the run escalates to a human — the same as `other`.
+A missing class is fine too; the reason still reaches a person.
+
+Emit this instead:
+
+```
+ANTON-RESULT: needs-human — <one-line ask>
+```
+
+when the next step is one **only a person can take**: a credential or secret you cannot mint, an
+account or subscription someone must create, a click in a third-party dashboard, an approval, or a
+judgement call that is the founder's to make. State the ask concretely — what a person must do —
+so it can be handed to them and the work resumed.
+
+`needs-human` is **not** "this is hard", "I am unsure", or "this would take a while" — those are
+your job. Use it only when no amount of further work inside this worktree can reach the next step.
+
+Emit this when the step's work is **already on this branch**:
+
+```
+ANTON-RESULT: satisfied — <commit sha> — <one-line note on how that commit covers this ticket>
+```
+
+Tickets in a run are steps of one change in one worktree, and one coherent commit from an earlier
+step can already meet a later ticket's acceptance criteria. When you have checked the branch and
+every criterion is met by work an earlier step committed, `satisfied` is the honest answer — not
+`delivered` (you delivered nothing new) and not `blocked` (nothing is wrong). Name the commit that
+did the work, abbreviated or full: anton verifies that sha is on the run's branch before it settles
+the step, so a `satisfied` that names no commit does not parse at all and a sha the branch does not
+carry parks the run as no-delivery. It is never a way to skip work that is merely similar, partial,
+or elsewhere on the board — if any criterion is still unmet, do the work and report `delivered`.
+
+When the ask is a **decision** rather than an action — which option, which value, which trade-off —
+state the choices, not just the question. The answer comes back to the resumed session as a **human
+note on the ticket** (anton inlines those notes into the task as binding steering); closing the gate
+carries nothing on its own. So before you ask again, read the ticket's notes: an ask already answered
+there is not an ask, and re-emitting it parks the run on a question that has been decided.
+
 Rules:
 - Emit it **once**, as the final line. anton reads the last `ANTON-RESULT:` line from your output.
-- **Never report `delivered` on an unchanged tree.** If you made no code changes, you delivered
-  nothing — report `blocked` with the reason. anton cross-checks this line against what actually
-  got committed; a `delivered` claim with an empty diff is a false success and is blocked for a human.
+- **Never report `delivered` on an unchanged tree — with one exception, a CONTINUATION of this
+  ticket.** If you made no code changes, you normally delivered nothing —
+  report `satisfied` with the commit that already did the work, or `blocked` (or `needs-human`) with the reason. anton
+  cross-checks this line against what actually got committed; a `delivered` claim with an empty diff
+  is normally a false success and is blocked for a human. The exception: when the task tells you a
+  **previous attempt at THIS ticket** ran out of time and left its incomplete work already committed
+  on this branch, read that work first, and if — after reading it — every acceptance criterion is
+  genuinely already met, report `delivered` without manufacturing a change to prove it. That
+  preserved commit is this ticket's own delivery, and reporting `delivered` is what tells anton to
+  adopt it. This is not `satisfied`: `satisfied` names a *different* step's commit that happens to
+  cover this ticket, whereas here the branch already carries THIS ticket's own work. Take this
+  exception only when the task explicitly presents such a continuation — absent that, the rule above
+  stands.

@@ -3,7 +3,7 @@ import { beads, type Bead } from "@/lib/beads/bd";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { githubBaseUrl } from "@/lib/git/remote";
 import { linkPr, normalizePrRef } from "@/lib/pr-link";
-import { resolveProject } from "../../../resolve-project";
+import { parseJsonBody, resolveProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -40,12 +40,8 @@ export async function POST(
   const { project, response } = await resolveProject(slug);
   if (!project) return response;
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-  }
+  const { body, response: badBody } = await parseJsonBody(request);
+  if (badBody) return badBody;
   const rawRef = (body as { ref?: unknown })?.ref;
   if (typeof rawRef !== "string") {
     return NextResponse.json({ error: "ref must be a string" }, { status: 400 });

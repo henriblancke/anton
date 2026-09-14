@@ -10,13 +10,27 @@ import * as schema from "@/lib/db/schema";
 
 let tdb: TestDb;
 
+const gitOps = vi.hoisted(() => ({
+  commitAll: vi.fn(),
+  commitMarker: vi.fn(),
+  isAncestor: vi.fn(),
+  openPullRequest: vi.fn(),
+  readWorktreeState: vi.fn(),
+  resolveHooksPathOverride: vi.fn(),
+  stageAll: vi.fn(),
+  worktreeHasCommitFor: vi.fn(),
+  worktreeHasPreservedCommitFor: vi.fn(),
+}));
+
 // Point the shared getDb() (used by projects.ts under the route) at the test db.
 vi.mock("@/lib/db", () => ({
   getDb: () => tdb.db,
   schema,
 }));
+vi.mock("@/lib/git/ops", () => gitOps);
 
 const { GET, PATCH } = await import("./route");
+const { commitStep } = await import("@/lib/jobs/steps/git");
 
 const ctx = (slug: string) => ({ params: Promise.resolve({ slug }) });
 
@@ -175,6 +189,31 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
     expect("budgetAware" in persisted()).toBe(false);
   });
 
+  it("PATCH persists the keep-weekly answer, and GET restores it (anton-3xa9)", async () => {
+    // The opt-out only works if it survives the session that gave it — otherwise arming the picker
+    // asks the same question forever.
+    const res = await PATCH(patchReq({ keepProductMasterWeekly: true }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.keepProductMasterWeekly).toBe(true);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.keepProductMasterWeekly).toBe(true);
+  });
+
+  it("PATCH rejects a non-boolean keepProductMasterWeekly (anton-3xa9)", async () => {
+    for (const bad of ["yes", 1, {}]) {
+      const res = await PATCH(patchReq({ keepProductMasterWeekly: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+  });
+
+  it('PATCH "" / null clears keepProductMasterWeekly back to unasked (anton-3xa9)', async () => {
+    await PATCH(patchReq({ keepProductMasterWeekly: true }), ctx("tmp"));
+    const res = await PATCH(patchReq({ keepProductMasterWeekly: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect("keepProductMasterWeekly" in persisted()).toBe(false);
+  });
+
   it("PATCH persists a budgetPolicy, and GET restores it (anton-egrg)", async () => {
     const budgetPolicy = { daytimeReservePct: 25, weeklyTargetPct: 80 };
     const res = await PATCH(patchReq({ budgetPolicy }), ctx("tmp"));
@@ -251,6 +290,233 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
     expect(res.status).toBe(200);
     expect((await res.json()).settings.scanSeverity).toBeUndefined();
     expect("scanSeverity" in persisted()).toBe(false);
+  });
+});
+
+/**
+ * Claude gateway routing (anton-n16m): a project points at a gateway from settings without touching
+ * the shell that launched anton and without handing anton a secret. The base URL is validated as
+ * http(s), the token field takes an env var NAME (not a value), discovery is a boolean, each clears
+ * to its default, and a base URL saved with no token env var name is refused.
+ */
+describe("settings route — Claude gateway routing (anton-n16m)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("defaults by absence: a fresh project persists none of the three keys", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    const { settings } = await get.json();
+    expect(settings.claudeBaseUrl).toBeUndefined();
+    expect(settings.claudeAuthTokenEnv).toBeUndefined();
+    expect(settings.claudeGatewayModelDiscovery).toBeUndefined();
+  });
+
+  it("PATCH persists a base URL with its token env var and discovery, and GET restores them", async () => {
+    const res = await PATCH(
+      patchReq({
+        claudeBaseUrl: "http://localhost:20128",
+        claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+        claudeGatewayModelDiscovery: true,
+      }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings).toMatchObject({
+      claudeBaseUrl: "http://localhost:20128",
+      claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+      claudeGatewayModelDiscovery: true,
+    });
+    expect(persisted()).toMatchObject({
+      claudeBaseUrl: "http://localhost:20128",
+      claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+      claudeGatewayModelDiscovery: true,
+    });
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings).toMatchObject({
+      claudeBaseUrl: "http://localhost:20128",
+      claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+      claudeGatewayModelDiscovery: true,
+    });
+  });
+
+  it('PATCH "" / null clears each field back to the default (keys removed)', async () => {
+    await PATCH(
+      patchReq({
+        claudeBaseUrl: "https://gateway.example.dev/v1",
+        claudeAuthTokenEnv: "GATEWAY_TOKEN",
+        claudeGatewayModelDiscovery: true,
+      }),
+      ctx("tmp"),
+    );
+    // Clearing the base URL first: an empty base URL removes the credential requirement, so the
+    // token env var can clear in the same patch without tripping the cross-check.
+    const res = await PATCH(
+      patchReq({ claudeBaseUrl: "", claudeAuthTokenEnv: null, claudeGatewayModelDiscovery: null }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    const { settings } = await res.json();
+    expect(settings.claudeBaseUrl).toBeUndefined();
+    expect(settings.claudeAuthTokenEnv).toBeUndefined();
+    expect(settings.claudeGatewayModelDiscovery).toBeUndefined();
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+    expect("claudeAuthTokenEnv" in persisted()).toBe(false);
+    expect("claudeGatewayModelDiscovery" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL that isn't an http(s) URL, leaving settings untouched", async () => {
+    for (const bad of ["not a url", "ftp://gateway.dev", "localhost:20128", 42]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL carrying credentials — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://user:sk-secret@gateway.example/v1",
+      "https://sk-secret@gateway.example/v1",
+      "http://user:pass@localhost:20128",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL with a query or fragment — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://gateway.example/v1?api_key=sk-secret",
+      "https://gateway.example/v1#token=sk-secret",
+      "https://gateway.example/v1?foo=bar",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL embedding a credential in its path — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://gateway.example/api/sk-secret/v1",
+      "https://gateway.example/sk-ant-abc123",
+      "https://gateway.example/ghp_0123456789abcdef/v1",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL embedding a credential in its hostname — a secret must not land in settings_json", async () => {
+    for (const bad of [
+      "https://sk-secret.gateway.example/v1",
+      "https://ghp_0123456789abcdef.gateway.example/v1",
+      // Case-sensitive markers: new URL() lowercases the label, but the raw string is what gets
+      // persisted, so the check must scan the original case (anton-pv2p review, thread PRRT_…gdFZR).
+      "https://AKIAIOSFODNN7EXAMPLE.gateway.example/v1",
+      "https://AIzaSyD0123456789abcdef.gateway.example/v1",
+      // Percent-encoded: new URL() decodes the label, so the marker is absent from the raw string
+      // but present in what a reader resolves (anton-pv2p review, thread PRRT_…dZEo).
+      "https://%41KIAIOSFODNN7EXAMPLE.gateway.example/v1",
+      "https://%67hp_0123456789abcdef.gateway.example/v1",
+      // A malformed escape in the PATH must not abort the host decode.
+      "https://%41KIAIOSFODNN7EXAMPLE.gateway.example/%zz",
+    ]) {
+      const res = await PATCH(
+        patchReq({ claudeBaseUrl: bad, claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }),
+        ctx("tmp"),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeBaseUrl/);
+    }
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("PATCH accepts a versioned base-URL path — a token-free path is not a credential", async () => {
+    const res = await PATCH(
+      patchReq({
+        claudeBaseUrl: "https://gateway.example/v1/openai",
+        claudeAuthTokenEnv: "GATEWAY_TOKEN",
+      }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    expect(persisted().claudeBaseUrl).toBe("https://gateway.example/v1/openai");
+  });
+
+  it("PATCH rejects a token VALUE in the env-var-name field — a secret must not be stored", async () => {
+    // "AKIAIOSFODNN7EXAMPLE" is all-uppercase, so it satisfies the identifier pattern; the
+    // credential detector still rejects it, keeping a pasted AWS key out of settings_json.
+    for (const bad of [
+      "sk-ant-abc123",
+      "anthropic-auth-token",
+      "MY TOKEN",
+      "1TOKEN",
+      "AKIAIOSFODNN7EXAMPLE",
+      42,
+    ]) {
+      const res = await PATCH(patchReq({ claudeAuthTokenEnv: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/claudeAuthTokenEnv/);
+    }
+    expect("claudeAuthTokenEnv" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a non-boolean claudeGatewayModelDiscovery", async () => {
+    for (const bad of ["yes", 1, {}]) {
+      const res = await PATCH(patchReq({ claudeGatewayModelDiscovery: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+    expect("claudeGatewayModelDiscovery" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a base URL saved with no token env var name, and names the fix", async () => {
+    const res = await PATCH(patchReq({ claudeBaseUrl: "http://localhost:20128" }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/claudeAuthTokenEnv/);
+    expect("claudeBaseUrl" in persisted()).toBe(false);
+  });
+
+  it("cross-checks the base URL against the STORED token env var, not just the patched fields", async () => {
+    // The token env var is already stored; a later patch may set the base URL alone.
+    await PATCH(patchReq({ claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN" }), ctx("tmp"));
+    const res = await PATCH(patchReq({ claudeBaseUrl: "http://localhost:20128" }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted()).toMatchObject({
+      claudeBaseUrl: "http://localhost:20128",
+      claudeAuthTokenEnv: "ANTHROPIC_AUTH_TOKEN",
+    });
+
+    // Clearing the stored token env var while a base URL stands is the same contradiction, refused.
+    const orphaned = await PATCH(patchReq({ claudeAuthTokenEnv: null }), ctx("tmp"));
+    expect(orphaned.status).toBe(400);
+    expect((await orphaned.json()).error).toMatch(/claudeAuthTokenEnv/);
+    expect(persisted().claudeAuthTokenEnv).toBe("ANTHROPIC_AUTH_TOKEN");
   });
 });
 
@@ -424,6 +690,71 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect("reviewMaxRounds" in persisted()).toBe(false);
   });
 
+  it("PATCH persists an in-range commitTimeoutMinutes, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ commitTimeoutMinutes: 5 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.commitTimeoutMinutes).toBe(5);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.commitTimeoutMinutes).toBe(5);
+  });
+
+  it("PATCH rejects an out-of-range or non-integer commitTimeoutMinutes", async () => {
+    for (const bad of [0, 61, 2.5, "long"]) {
+      const res = await PATCH(patchReq({ commitTimeoutMinutes: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/commitTimeoutMinutes/);
+    }
+    expect("commitTimeoutMinutes" in persisted()).toBe(false);
+  });
+
+  it('PATCH "" / null clears commitTimeoutMinutes back to the default (key removed)', async () => {
+    await PATCH(patchReq({ commitTimeoutMinutes: 10 }), ctx("tmp"));
+    const res = await PATCH(patchReq({ commitTimeoutMinutes: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.commitTimeoutMinutes).toBeUndefined();
+    expect("commitTimeoutMinutes" in persisted()).toBe(false);
+  });
+
+  it("saves, reads, then gives commitAll the project's configured commit budget", async () => {
+    const saved = await PATCH(patchReq({ commitTimeoutMinutes: 5 }), ctx("tmp"));
+    expect(saved.status).toBe(200);
+
+    const { settings } = await (await GET(new Request("http://t/"), ctx("tmp"))).json();
+    gitOps.commitAll.mockResolvedValue({ committed: true });
+    gitOps.resolveHooksPathOverride.mockResolvedValue(undefined);
+
+    await commitStep({
+      db: tdb.db,
+      clock: { now: () => 0 },
+      ctx: {
+        signal: new AbortController().signal,
+        heartbeat: async () => {},
+        report: () => {},
+        claudeReached: async () => {},
+        jobId: "job-test",
+        type: "execute-epic",
+      },
+      projectId: "p1",
+      runId: "run-test",
+      repoPath: "/tmp/p1",
+      worktreePath: "/tmp/p1",
+      branch: "anton/settings-round-trip",
+      baseBranch: "main",
+      baseRef: "origin/main",
+      baseForkSha: "f0f0f0forkcommit",
+      target: { id: "anton-settings", title: "Settings round trip", status: "in_progress", issue_type: "feature" },
+      tickets: [{ id: "anton-settings", title: "Settings round trip", status: "in_progress", issue_type: "feature" }],
+      settings,
+    });
+
+    expect(gitOps.commitAll).toHaveBeenCalledWith(
+      "/tmp/p1",
+      "anton-settings: Settings round trip",
+      expect.objectContaining({ timeoutMs: 5 * 60_000 }),
+    );
+  });
+
   it("PATCH persists the score-alarm thresholds, including 0 as the off switch (anton-i98r)", async () => {
     // The cap rides along: a 3-round streak under the default cap of 2 could never trip, and is
     // rejected by the cross-check below.
@@ -443,8 +774,66 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect((await get.json()).settings).toMatchObject({ reviewMinScore: 0, reviewLowScoreRounds: 3 });
   });
 
+  it("PATCH persists the consecutive-failure streak, including 0 as the off switch (anton-rgso)", async () => {
+    const res = await PATCH(patchReq({ autopilotFailureStreak: 5 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().autopilotFailureStreak).toBe(5);
+
+    // 0 is a VALUE here, not a clear: it is how the operator turns the breaker off.
+    const off = await PATCH(patchReq({ autopilotFailureStreak: 0 }), ctx("tmp"));
+    expect((await off.json()).settings.autopilotFailureStreak).toBe(0);
+
+    for (const bad of [11, -1, 2.5, "three"]) {
+      const rejected = await PATCH(patchReq({ autopilotFailureStreak: bad }), ctx("tmp"));
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error).toMatch(/autopilotFailureStreak/);
+    }
+    expect(persisted().autopilotFailureStreak).toBe(0);
+  });
+
+  it("PATCH persists the score floor and window, including 0 as the off switch (anton-cekf)", async () => {
+    const res = await PATCH(patchReq({ autopilotScoreFloor: 8, autopilotScoreWindow: 4 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted()).toMatchObject({ autopilotScoreFloor: 8, autopilotScoreWindow: 4 });
+
+    // 0 is a VALUE for the floor — the operator's opt-out — and out of range for the window, which
+    // has no meaning at zero runs.
+    const off = await PATCH(patchReq({ autopilotScoreFloor: 0 }), ctx("tmp"));
+    expect((await off.json()).settings.autopilotScoreFloor).toBe(0);
+
+    for (const bad of [11, -1, 2.5, "seven"]) {
+      const rejected = await PATCH(patchReq({ autopilotScoreFloor: bad }), ctx("tmp"));
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error).toMatch(/autopilotScoreFloor/);
+    }
+    for (const bad of [0, 11, 1.5]) {
+      const rejected = await PATCH(patchReq({ autopilotScoreWindow: bad }), ctx("tmp"));
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error).toMatch(/autopilotScoreWindow/);
+    }
+    expect(persisted()).toMatchObject({ autopilotScoreFloor: 0, autopilotScoreWindow: 4 });
+  });
+
+  it("PATCH persists the WIP limit, including 0 as the off switch (anton-wy9y)", async () => {
+    const res = await PATCH(patchReq({ autopilotWipLimit: 5 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().autopilotWipLimit).toBe(5);
+
+    // 0 is a VALUE here, not a clear: it is how an operator who reviews faster than anton ships
+    // turns the hold off.
+    const off = await PATCH(patchReq({ autopilotWipLimit: 0 }), ctx("tmp"));
+    expect((await off.json()).settings.autopilotWipLimit).toBe(0);
+
+    for (const bad of [21, -1, 1.5, "three"]) {
+      const rejected = await PATCH(patchReq({ autopilotWipLimit: bad }), ctx("tmp"));
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error).toMatch(/autopilotWipLimit/);
+    }
+    expect(persisted().autopilotWipLimit).toBe(0);
+  });
+
   it("PATCH rejects out-of-range score-alarm thresholds", async () => {
-    for (const bad of [11, -1, 4.5, "low"]) {
+    for (const bad of [11, -1, 4.5, "low", "7", true]) {
       const res = await PATCH(patchReq({ reviewMinScore: bad }), ctx("tmp"));
       expect(res.status).toBe(400);
       expect((await res.json()).error).toMatch(/reviewMinScore/);
@@ -537,6 +926,54 @@ describe("settings route — self-review settings (anton-of1m)", () => {
   });
 });
 
+/**
+ * The per-PR fix cap (anton-kwi6). It rides the settings JSON blob like every other numeric policy
+ * knob, and is bounded at the API boundary so a value the runner would misbehave on never persists.
+ */
+describe("settings route — reviewFixConcurrency (anton-kwi6)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("defaults by absence: a fresh project persists no key", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.reviewFixConcurrency).toBeUndefined();
+    expect("reviewFixConcurrency" in persisted()).toBe(false);
+  });
+
+  it("round-trips a value in range", async () => {
+    const res = await PATCH(patchReq({ reviewFixConcurrency: 4 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewFixConcurrency).toBe(4);
+    expect(persisted().reviewFixConcurrency).toBe(4);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.reviewFixConcurrency).toBe(4);
+  });
+
+  it("rejects out-of-range and non-integer values, leaving the stored value untouched", async () => {
+    await PATCH(patchReq({ reviewFixConcurrency: 2 }), ctx("tmp"));
+    for (const bad of [0, 7, -1, 2.5, "3", []]) {
+      expect((await PATCH(patchReq({ reviewFixConcurrency: bad }), ctx("tmp"))).status).toBe(400);
+    }
+    expect(persisted().reviewFixConcurrency).toBe(2);
+  });
+
+  it('"" / null clears it back to the shipped default', async () => {
+    await PATCH(patchReq({ reviewFixConcurrency: 5 }), ctx("tmp"));
+    const res = await PATCH(patchReq({ reviewFixConcurrency: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.reviewFixConcurrency).toBeUndefined();
+    expect("reviewFixConcurrency" in persisted()).toBe(false);
+  });
+});
+
 describe("settings route — per-label pipeline variants (anton-aa3m)", () => {
   beforeEach(async () => {
     tdb = makeTestDb();
@@ -613,5 +1050,496 @@ describe("settings route — per-label pipeline variants (anton-aa3m)", () => {
       const res = await PATCH(patchReq({ formulaVariants: value }), ctx("tmp"));
       expect(res.status).toBe(400);
     }
+  });
+});
+
+/**
+ * Nominated value labels (anton-prng): the nominations round-trip IN ORDER (the order is the value
+ * band order), nominating none is stored as absent, and a repeat 400s rather than persisting a tier
+ * that can never be reached.
+ */
+describe("settings route — nominated value labels (anton-prng)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("persists no key for a zero-config project — anton nominates nothing", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.valueLabels).toBeUndefined();
+    expect("valueLabels" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists the nominations IN ORDER, and GET restores them", async () => {
+    const valueLabels = ["risk:high", "blocking-PR"];
+    const res = await PATCH(patchReq({ valueLabels }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.valueLabels).toEqual(valueLabels);
+    expect(persisted().valueLabels).toEqual(valueLabels);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.valueLabels).toEqual(valueLabels);
+  });
+
+  it("replaces rather than merges — re-ranking must be able to drop a nomination", async () => {
+    await PATCH(patchReq({ valueLabels: ["risk:high", "blocking-PR"] }), ctx("tmp"));
+    await PATCH(patchReq({ valueLabels: ["blocking-PR"] }), ctx("tmp"));
+    expect(persisted().valueLabels).toEqual(["blocking-PR"]);
+  });
+
+  it("clears on [] / null — back to ranking on native fields alone", async () => {
+    await PATCH(patchReq({ valueLabels: ["risk:high"] }), ctx("tmp"));
+    await PATCH(patchReq({ valueLabels: [] }), ctx("tmp"));
+    expect("valueLabels" in persisted()).toBe(false);
+
+    await PATCH(patchReq({ valueLabels: ["risk:high"] }), ctx("tmp"));
+    await PATCH(patchReq({ valueLabels: null }), ctx("tmp"));
+    expect("valueLabels" in persisted()).toBe(false);
+  });
+
+  it("rejects a repeat or malformed nomination without disturbing what is stored", async () => {
+    await PATCH(patchReq({ valueLabels: ["risk:high"] }), ctx("tmp"));
+    for (const value of [
+      ["risk:high", "risk:high"],
+      ["  "],
+      [42],
+      "risk:high",
+      Array.from({ length: 9 }, (_, i) => `l${i}`),
+    ]) {
+      const res = await PATCH(patchReq({ valueLabels: value }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/valueLabels/);
+    }
+    expect(persisted().valueLabels).toEqual(["risk:high"]);
+  });
+});
+
+/**
+ * Per-kind proposal autonomy (anton-nbyy): the policy round-trips, merges per kind, and a submission
+ * naming a kind or a level anton doesn't know 400s rather than persisting an entry that would
+ * silently resolve back to `propose`.
+ */
+describe("settings route — proposal autonomy policy (anton-nbyy)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("persists no key for a zero-config project — propose everywhere is an absence", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.proposalAutonomy).toBeUndefined();
+    expect("proposalAutonomy" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists a policy, and GET restores it after a reload", async () => {
+    const proposalAutonomy = { stale: "shadow", "shipped-orphan": "apply" };
+    const res = await PATCH(patchReq({ proposalAutonomy }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.proposalAutonomy).toEqual(proposalAutonomy);
+    expect(persisted().proposalAutonomy).toEqual(proposalAutonomy);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.proposalAutonomy).toEqual(proposalAutonomy);
+  });
+
+  it("merges per kind, so a client that sends one kind can't disarm the others", async () => {
+    await PATCH(patchReq({ proposalAutonomy: { stale: "shadow" } }), ctx("tmp"));
+    const res = await PATCH(patchReq({ proposalAutonomy: { "low-value": "shadow" } }), ctx("tmp"));
+    expect((await res.json()).settings.proposalAutonomy).toEqual({
+      stale: "shadow",
+      "low-value": "shadow",
+    });
+  });
+
+  it("rejects an unknown kind or an unknown level, without persisting", async () => {
+    await PATCH(patchReq({ proposalAutonomy: { stale: "shadow" } }), ctx("tmp"));
+    for (const bad of [
+      { "kind-from-the-future": "shadow" }, // not a detection kind
+      { stale: "armed" }, // not one of the three levels
+      { stale: true },
+      ["stale"],
+      "shadow",
+    ]) {
+      const res = await PATCH(patchReq({ proposalAutonomy: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/proposalAutonomy/);
+    }
+    expect(persisted().proposalAutonomy).toEqual({ stale: "shadow" });
+  });
+
+  it('"" / null clears the policy back to propose everywhere (key removed)', async () => {
+    await PATCH(patchReq({ proposalAutonomy: { stale: "shadow" } }), ctx("tmp"));
+    const res = await PATCH(patchReq({ proposalAutonomy: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.proposalAutonomy).toBeUndefined();
+    expect("proposalAutonomy" in persisted()).toBe(false);
+  });
+
+  /**
+   * The REPAIR dial (R5.3) — the same boundary over the block classes. Its own key rather than an
+   * entry in `proposalAutonomy`, because a repair files no proposal and so can never build the
+   * settled-proposal record the earned floor weighs (gardener/repair-autonomy.ts).
+   */
+  it("takes a repair policy per class, merges it, and rejects what it cannot read", async () => {
+    const res = await PATCH(patchReq({ repairAutonomy: { "ref-stale": "apply" } }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.repairAutonomy).toEqual({ "ref-stale": "apply" });
+
+    const merged = await PATCH(patchReq({ repairAutonomy: { "dep-missing": "propose" } }), ctx("tmp"));
+    expect((await merged.json()).settings.repairAutonomy).toEqual({
+      "ref-stale": "apply",
+      "dep-missing": "propose",
+    });
+
+    for (const bad of [
+      { "class-from-the-future": "apply" }, // not a repair class
+      { "ref-stale": "armed" }, // not one of the three levels
+      { "ref-stale": true },
+      "apply",
+    ]) {
+      const bogus = await PATCH(patchReq({ repairAutonomy: bad }), ctx("tmp"));
+      expect(bogus.status).toBe(400);
+      expect((await bogus.json()).error).toMatch(/repairAutonomy/);
+    }
+    expect(persisted().repairAutonomy).toEqual({ "ref-stale": "apply", "dep-missing": "propose" });
+  });
+
+  /**
+   * A class with no repair behind it cannot be armed. `repairBlockedTicket` dispatches only the
+   * factual pair, so a stored `acceptance-missing: "apply"` would 200, be ignored by every run, and
+   * render back as `propose` — the one silence this boundary exists to refuse (PR #223 review).
+   */
+  it("refuses arming a class anton has no repair for, but still takes `propose`", async () => {
+    for (const klass of ["acceptance-missing", "oversized"]) {
+      for (const level of ["apply", "shadow"]) {
+        const armed = await PATCH(patchReq({ repairAutonomy: { [klass]: level } }), ctx("tmp"));
+        expect(armed.status).toBe(400);
+        expect((await armed.json()).error).toMatch(new RegExp(`repairAutonomy.*${klass}`));
+      }
+      const pinned = await PATCH(patchReq({ repairAutonomy: { [klass]: "propose" } }), ctx("tmp"));
+      expect(pinned.status).toBe(200);
+    }
+    expect(persisted().repairAutonomy).toEqual({
+      "acceptance-missing": "propose",
+      oversized: "propose",
+    });
+  });
+});
+
+/**
+ * The standing work policy (anton-c7iv). Absent is the load-bearing state — it means the project was
+ * never armed, which is what makes first arm propose a calibrated draft — so the round trip has to
+ * keep "no key" and "no key" distinguishable from an empty policy, and a criterion the operator drops
+ * has to actually leave the store.
+ */
+describe("settings route — work policy (anton-c7iv)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  const policy = {
+    types: ["bug", "feature"],
+    maxPriority: 2,
+    labels: [{ namespace: "severity", values: ["critical", "major"] }],
+    requireUnblocked: true,
+  };
+
+  it("persists no key for a project nobody has armed", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pickerPolicy).toBeUndefined();
+    expect("pickerPolicy" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists an accepted policy, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.pickerPolicy).toEqual(policy);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pickerPolicy).toEqual(policy);
+  });
+
+  it("replaces rather than merges — widening a policy means dropping a criterion", async () => {
+    await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    await PATCH(patchReq({ pickerPolicy: { types: ["bug"] } }), ctx("tmp"));
+    expect(persisted().pickerPolicy).toEqual({ types: ["bug"] });
+  });
+
+  it("clears on null — the project is unarmed again, not armed with nothing", async () => {
+    await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    await PATCH(patchReq({ pickerPolicy: null }), ctx("tmp"));
+    expect("pickerPolicy" in persisted()).toBe(false);
+  });
+
+  it("round-trips a hand-ranked namespace in the operator's order (anton-qsr1)", async () => {
+    // The ORDER is the ranking (R2.3), so it must survive the write and the read back unsorted —
+    // a policy that re-alphabetised on save would silently discard what the operator dragged.
+    const ranked = {
+      labels: [{ namespace: "severity", values: ["major", "critical", "minor"], ranked: true }],
+    };
+    const res = await PATCH(patchReq({ pickerPolicy: ranked }), ctx("tmp"));
+    expect(res.status).toBe(200);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pickerPolicy).toEqual(ranked);
+    expect(persisted().pickerPolicy).toEqual(ranked);
+  });
+
+  it("round-trips the ordered native bounds and a ranked comparison (anton-hmyo)", async () => {
+    // Both ends of every ordered field, plus the one ordering a discovered namespace ever gets —
+    // the operator's own ranking, with the bound they set against it.
+    const ordered = {
+      minPriority: 1,
+      maxPriority: 3,
+      minParentDepth: 0,
+      maxParentDepth: 1,
+      minAgeDays: 1,
+      maxAgeDays: 180,
+      labels: [
+        {
+          namespace: "severity",
+          values: ["critical", "major", "minor"],
+          ranked: true,
+          compare: { op: "lte", value: "major" },
+        },
+      ],
+    };
+    const res = await PATCH(patchReq({ pickerPolicy: ordered }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().pickerPolicy).toEqual(ordered);
+  });
+
+  it("rejects a malformed policy without disturbing what is stored", async () => {
+    await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    for (const value of [
+      // An empty membership set fails closed against every bead — never what an operator meant.
+      { types: [] },
+      { labels: [{ namespace: "severity", values: [] }] },
+      // One namespace, one criterion: a second entry could never be reached.
+      {
+        labels: [
+          { namespace: "severity", values: ["major"] },
+          { namespace: "severity", values: ["minor"] },
+        ],
+      },
+      // A value listed twice is one membership test twice over, and under a ranking it is a value
+      // at two positions — a bound could then admit a slice the stored order does not show.
+      { labels: [{ namespace: "severity", values: ["major", "major"] }] },
+      {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major", "critical"],
+            ranked: true,
+            compare: { op: "lte", value: "critical" },
+          },
+        ],
+      },
+      { maxPriority: -1 },
+      { maxPriority: "P2" },
+      { requireUnblocked: "yes" },
+      { labels: [{ namespace: "severity", values: ["major"], ranked: "yes" }] },
+      // A comparison the predicate could only ever fail closed on is a policy that admits nothing
+      // and says so one bead at a time — rejected here instead, where the operator can see it.
+      {
+        labels: [
+          { namespace: "severity", values: ["critical", "major"], compare: { op: "lte", value: "major" } },
+        ],
+      },
+      {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major"],
+            ranked: true,
+            compare: { op: "lte", value: "blocker" },
+          },
+        ],
+      },
+      {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major"],
+            ranked: true,
+            compare: { op: "under", value: "major" },
+          },
+        ],
+      },
+      { minPriority: 5 },
+      { maxParentDepth: -1 },
+      { minAgeDays: "a week" },
+      { unknownCriterion: true },
+      ["bug"],
+    ]) {
+      const res = await PATCH(patchReq({ pickerPolicy: value }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/pickerPolicy/);
+    }
+    expect(persisted().pickerPolicy).toEqual(policy);
+  });
+});
+
+describe("settings route — model routing table (anton-uu7r)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("persists no key for a zero-config project — an empty table is the default, not a setting", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.modelRoutes).toBeUndefined();
+    expect("modelRoutes" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists a valid table IN ORDER — that order is the evaluation precedence", async () => {
+    const modelRoutes = [
+      { jobType: "execute-epic", step: "review", model: "claude-opus-5" },
+      { jobType: "execute-epic", label: "risk:high", model: "claude-opus-5" },
+      { jobType: "nightly-stringer", model: "claude-haiku-4-5" },
+      { model: "claude-sonnet-5" },
+    ];
+    const res = await PATCH(patchReq({ modelRoutes }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.modelRoutes).toEqual(modelRoutes);
+    expect(persisted().modelRoutes).toEqual(modelRoutes);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.modelRoutes).toEqual(modelRoutes);
+  });
+
+  it("accepts a gateway combo name — anton cannot know a gateway's catalogue", async () => {
+    for (const model of ["cc/claude-opus-5[1m]", "bedrock/us.anthropic.claude-sonnet-5", "gpt-5"]) {
+      const res = await PATCH(patchReq({ modelRoutes: [{ model }] }), ctx("tmp"));
+      expect(res.status).toBe(200);
+      expect(persisted().modelRoutes).toEqual([{ model }]);
+    }
+  });
+
+  it("clears the table on [] / null — every job back to settings.model", async () => {
+    await PATCH(patchReq({ modelRoutes: [{ model: "claude-opus-5" }] }), ctx("tmp"));
+    await PATCH(patchReq({ modelRoutes: [] }), ctx("tmp"));
+    expect("modelRoutes" in persisted()).toBe(false);
+
+    await PATCH(patchReq({ modelRoutes: [{ model: "claude-opus-5" }] }), ctx("tmp"));
+    await PATCH(patchReq({ modelRoutes: null }), ctx("tmp"));
+    expect("modelRoutes" in persisted()).toBe(false);
+  });
+
+  it("rejects an unknown job type — anton knows its own types", async () => {
+    const res = await PATCH(
+      patchReq({ modelRoutes: [{ jobType: "execute-feature", model: "claude-opus-5" }] }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/job type must be one of/);
+  });
+
+  it("rejects an unknown step id — anton knows its own steps", async () => {
+    const res = await PATCH(
+      patchReq({ modelRoutes: [{ step: "deploy", model: "claude-opus-5" }] }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/step must be one of/);
+  });
+
+  it("rejects an empty model — a rule that names no model routes nowhere", async () => {
+    for (const model of ["", "   ", 7, null]) {
+      const res = await PATCH(patchReq({ modelRoutes: [{ model }] }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/modelRoutes/);
+    }
+  });
+
+  it("rejects more rules than the bound allows", async () => {
+    const tooMany = Array.from({ length: 21 }, (_, i) => ({
+      label: `tier:${i}`,
+      model: "claude-opus-5",
+    }));
+    const res = await PATCH(patchReq({ modelRoutes: tooMany }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/modelRoutes/);
+  });
+
+  it("rejects a step named on a job type that walks no pipeline — it can match nothing", async () => {
+    const res = await PATCH(
+      patchReq({ modelRoutes: [{ jobType: "review-fix-pr", step: "review", model: "claude-opus-5" }] }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/can never match/);
+  });
+
+  it("rejects a rule an earlier rule already shadows — first match wins, so it never fires", async () => {
+    const shadowed = [
+      // A bare catch-all above anything at all.
+      [{ model: "claude-sonnet-5" }, { jobType: "execute-epic", model: "claude-opus-5" }],
+      // A whole job type above one of its steps.
+      [
+        { jobType: "execute-epic", model: "claude-sonnet-5" },
+        { jobType: "execute-epic", step: "review", model: "claude-opus-5" },
+      ],
+      // The same rule twice.
+      [
+        { label: "risk:high", model: "claude-opus-5" },
+        { label: "risk:high", model: "claude-sonnet-5" },
+      ],
+    ];
+    for (const modelRoutes of shadowed) {
+      const res = await PATCH(patchReq({ modelRoutes }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/can never match/);
+    }
+    expect("modelRoutes" in persisted()).toBe(false);
+  });
+
+  it("accepts sibling rules that overlap in neither direction, and the narrower-first ordering", async () => {
+    const modelRoutes = [
+      { jobType: "execute-epic", step: "review", model: "claude-opus-5" },
+      { jobType: "execute-epic", model: "claude-sonnet-5" },
+      { label: "risk:high", model: "claude-opus-5" },
+      { label: "size:S", model: "claude-haiku-4-5" },
+    ];
+    const res = await PATCH(patchReq({ modelRoutes }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().modelRoutes).toEqual(modelRoutes);
+  });
+
+  it("rejects an unknown key on a rule and leaves the stored table untouched", async () => {
+    const stored = [{ jobType: "execute-epic", model: "claude-opus-5" }];
+    await PATCH(patchReq({ modelRoutes: stored }), ctx("tmp"));
+    for (const value of [
+      [{ model: "claude-opus-5", agent: "nextjs" }],
+      [{ model: "claude-opus-5", label: "" }],
+      "claude-opus-5",
+      [{ jobType: "execute-epic" }],
+    ]) {
+      const res = await PATCH(patchReq({ modelRoutes: value }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/modelRoutes/);
+    }
+    expect(persisted().modelRoutes).toEqual(stored);
   });
 });

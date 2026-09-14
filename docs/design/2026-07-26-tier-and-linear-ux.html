@@ -514,6 +514,7 @@
     color: var(--fg);
     width: 100%;
   }
+  input[type="text"]::placeholder { color: var(--muted-fg); }
   input[type="text"]:focus-visible { outline: 2px solid var(--primary); outline-offset: -1px; }
 
   .status {
@@ -542,6 +543,23 @@
     line-height: 1.6;
   }
   .preview .cmd .flag { color: var(--primary); }
+  .preview .cmd + .cmd { margin-top: 0.5rem; }
+  .preview .cmd .pass {
+    display: block;
+    font-family: var(--font-sans);
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+    color: var(--muted-fg);
+  }
+  /* Overflow ids stay in the DOM so the command copies whole; only the emphasis
+     is folded away, and the count rides on ::after so it never enters a copy. */
+  .preview .cmd .fold { color: var(--muted-fg); }
+  .preview .cmd .fold::after {
+    content: " (+" attr(data-more) " more)";
+    font-family: var(--font-sans);
+    font-size: 0.72rem;
+    color: var(--muted-fg);
+  }
   .preview .out { font-size: 0.8rem; color: var(--muted-fg); margin: 0; }
   .preview .out strong { color: var(--fg); font-variant-numeric: tabular-nums; }
 
@@ -641,7 +659,7 @@
           <span class="body">
             <span class="name">epic</span>
             <span class="what">A product outcome. Spans several features, carries one <code>area:</code> label.</span>
-            <span class="who">Read by people who don't read code. Lives in Linear as a top-level issue.</span>
+            <span class="who">Read by people who don't read code. Lives in Linear as a top-level issue, indistinguishable from a synced feature — push carries neither hierarchy nor tier.</span>
           </span>
         </div>
         <div class="tier" data-tier="feature">
@@ -1064,7 +1082,9 @@
             <p class="help">
               Push-triggered syncs are debounced to one every 5 minutes — a single run writes to a bead
               dozens of times, and each write nudges a push. The schedule is the backstop for when a
-              push-triggered sync fails.
+              push-triggered sync fails. Both triggers can be on, but only one sync runs at a time:
+              routing mutates a single global project id, so an overlapping sync is skipped and
+              reported rather than interleaved.
             </p>
           </div>
 
@@ -1089,7 +1109,7 @@
               <button class="tchip" type="button" aria-pressed="false" data-type="bug" data-count="2"><span class="mk" aria-hidden="true">✓</span>bug</button>
               <button class="tchip" type="button" aria-pressed="false" data-type="chore" data-count="5"><span class="mk" aria-hidden="true">✓</span>chore</button>
             </div>
-            <p class="help">Epics land as top-level issues; features as sub-issues of their epic. Anything you leave off stays local.</p>
+            <p class="help">The push is flat: every tier you pick lands as a top-level issue, because bd sends no parent. <code>--type</code> only chooses what gets pushed — it does not travel with the issue, so Linear cannot tell an epic from a feature. Grouping is the Linear project the <code>area:</code> routing sets <em>when the issue is created</em>. Anything you leave off stays local.</p>
           </div>
 
           <div class="field">
@@ -1125,14 +1145,20 @@
             </div>
             <p class="help">
               bd holds one project id at a time, so anton runs one pass per area and restores the
-              setting afterwards. Unmapped areas are skipped and reported, never guessed.
+              setting afterwards. That project id is global, so the whole run — capture, every pass,
+              restore — is held under one sync lock; two routed syncs at once would push one area's
+              beads under the other's project. Unmapped areas are skipped and reported, never guessed.
+              <strong>Routing applies at creation.</strong> bd sends the project only when it creates
+              an issue — never on an update — so editing this table moves beads that have not been
+              pushed yet and leaves already-linked issues in the project they were created in. Move
+              those in Linear.
             </p>
           </div>
 
           <div class="field">
             <label for="extra-args">Extra arguments</label>
-            <input id="extra-args" type="text" value="--create-only" />
-            <p class="help">Passed through to <code>bd linear sync</code> verbatim. Anything the panel doesn't cover, you can still reach.</p>
+            <input id="extra-args" type="text" value="" placeholder="--flag value" />
+            <p class="help">Passed through to <code>bd linear sync</code> verbatim. Anything the panel doesn't cover, you can still reach. Empty by default: the sync updates the issues it has already linked, which is how status and completion travel back.</p>
           </div>
 
           <hr class="divider" />
@@ -1140,8 +1166,16 @@
           <div class="field">
             <span class="lab">Preview</span>
             <div class="preview">
-              <div class="cmd" id="cmd">bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> epic,feature <span class="flag">--state</span> all <span class="flag">--create-only</span></div>
-              <p class="out" id="dry">Would push <strong>3 epics</strong> and <strong>6 features</strong> across 3 projects. <strong>48</strong> beads excluded by the tier filter.</p>
+              <div id="cmd"></div>
+              <p class="out" id="dry"></p>
+              <p class="out">Each pass carries its own <code>--issues</code> list — in full, every id,
+                because a trimmed list copies as a command that pushes the wrong beads. With
+                <code>linear.project_id</code> set, bd skips creating any bead that has no Linear
+                issue yet, so one unscoped command would report success and create nothing. The
+                prior <code>linear.project_id</code> is captured before the first pass and put back
+                after the last by the <code>restore</code> helper, which the <code>trap</code> also
+                runs if a pass fails. Where there was no prior value, it calls
+                <code>bd config unset linear.project_id</code> rather than writing an empty one.</p>
             </div>
             <div class="row between">
               <div class="row">
@@ -1167,7 +1201,10 @@
         <div class="note">
           <span class="note-label">Preview before push</span>
           <p>Every setting is reversible except a bad first push, which creates issues in someone
-             else's Linear. Dry-run is one click and reports counts, not a spinner.</p>
+             else's Linear — and except the project each issue was created in, which no later change
+             to the routing table can move. Dry-run is one click and reports counts, not a spinner —
+             but it needs a credential (bd reaches the live API before it previews) and reports one
+             line per bead, so anton derives the counts.</p>
         </div>
         <div class="note">
           <span class="note-label" data-kind="risk">Before the first push</span>
@@ -1176,10 +1213,21 @@
              the pr-ref migration has run.</p>
         </div>
         <div class="note">
-          <span class="note-label" data-kind="risk">Label churn</span>
-          <p>The run-lease is a label rewritten every 5 minutes on the run target — now a synced
-             feature. Either move it to metadata or confirm push ignores labels, or Linear gets an
-             activity feed of nothing.</p>
+          <span class="note-label" data-kind="risk">Lease churn</span>
+          <p>Settled 2026-09-05: push never sends labels, so the run-lease stays a label and nothing
+             moves to metadata. What it costs is API calls — one read per linked bead every push,
+             plus a write for every bead carrying a structured <code>acceptance_criteria</code>,
+             <code>design</code> or <code>notes</code> field. Size it against what per-area routing
+             selects, not the 197 epics+features the tier chips match: on this panel's
+             <code>--state all</code> default that was <strong>122 writes against N=194</strong> on
+             2026-09-05 if a feature inherits its parent epic's <code>area:</code>, and
+             <strong>10 against N=11</strong> if it does not — an open routing question that swings
+             the budget 18×. <em>Open only</em> moves it again (N=44, 17 writes on the inherited
+             reading). A <em>partial</em> routing table is budgeted from its own areas' rows — the
+             per-area write share runs 18–100% — not by scaling that aggregate. It does not decay —
+             closed beads never leave an <em>Open and closed</em> population and anton keeps writing
+             <code>notes</code>.
+             That is what the debounce caps.</p>
         </div>
         <div class="note">
           <span class="note-label">Credentials</span>
@@ -1214,26 +1262,77 @@
   var dryEl = document.getElementById('dry');
   var plural = function (n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); };
 
+  // The routing table above, with the beads each area selects. bd holds one
+  // project id at a time, so the preview has to show the passes, not a single
+  // command — and each pass must name its ids or the creates are dropped.
+  var ROUTES = [
+    { area: 'ontology', project: 'Ontology',      projectId: 'prj_ontology',
+      counts: { epic: 1, feature: 3, task: 14, bug: 1, chore: 2 } },
+    { area: 'knowledge', project: 'Knowledge',    projectId: 'prj_knowledge',
+      counts: { epic: 1, feature: 2, task: 16, bug: 1, chore: 2 } },
+    { area: 'ingest', project: 'Ingest Engine',   projectId: 'prj_ingest',
+      counts: { epic: 1, feature: 1, task: 11, bug: 0, chore: 1 } }
+  ];
+
+  function beadIds(route, type, n) {
+    var out = [];
+    for (var i = 1; i <= n; i++) { out.push('lib-' + route.area[0] + type[0] + i); }
+    return out;
+  }
+
+  // Every id renders. Trimming the list would put a truncation marker inside a
+  // command the panel invites you to copy, silently dropping most of the pass.
+  function idList(ids) {
+    if (ids.length <= 6) return ids.join(',');
+    return ids.slice(0, 6).join(',') +
+      '<span class="fold" data-more="' + (ids.length - 6) + '">,' + ids.slice(6).join(',') + '</span>';
+  }
+
   function refresh() {
     var on = chips.filter(function (c) { return c.getAttribute('aria-pressed') === 'true'; });
     var off = chips.filter(function (c) { return c.getAttribute('aria-pressed') !== 'true'; });
     var types = on.map(function (c) { return c.dataset.type; });
 
-    cmdEl.innerHTML = types.length
-      ? 'bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> ' +
-        types.join(',') + ' <span class="flag">--state</span> all <span class="flag">--create-only</span>'
-      : 'bd linear sync <span class="flag">--push</span> — no tiers selected';
-
     if (!types.length) {
+      cmdEl.innerHTML = '<div class="cmd">bd linear sync <span class="flag">--push</span> — no tiers selected</div>';
       dryEl.innerHTML = 'Nothing would sync. Pick at least one tier.';
       return;
     }
+
+    var passes = ROUTES.map(function (route) {
+      var ids = types.reduce(function (acc, t) { return acc.concat(beadIds(route, t, route.counts[t] || 0)); }, []);
+      return { route: route, ids: ids };
+    }).filter(function (p) { return p.ids.length; });
+
+    // linear.project_id is one global setting: capture it before the first pass,
+    // put it back after the last, and trap so a failed pass restores it too —
+    // otherwise the next unscoped sync routes creates into the last area's project.
+    var preamble = '<div class="cmd"><span class="pass">under the sync lock · before the first pass</span>' +
+      'set -euo pipefail<br />' +
+      'prior=$(bd config get linear.project_id 2&gt;/dev/null || true)<br />' +
+      'restore() { if [ -n "$prior" ]; then bd config set linear.project_id "$prior"; ' +
+      'else bd config unset linear.project_id; fi; }<br />' +
+      'trap restore EXIT</div>';
+    var epilogue = '<div class="cmd"><span class="pass">after the last pass · restore</span>' +
+      'restore<br />' +
+      'trap - EXIT</div>';
+
+    cmdEl.innerHTML = preamble + passes.map(function (p) {
+      return '<div class="cmd"><span class="pass">area:' + p.route.area + ' → ' + p.route.project +
+             ' · ' + plural(p.ids.length, 'bead') + '</span>' +
+             'bd config set linear.project_id ' + p.route.projectId + '<br />' +
+             'bd linear sync <span class="flag">--push</span> <span class="flag">--type</span> ' +
+             types.join(',') + ' <span class="flag">--state</span> all ' +
+             '<span class="flag">--issues</span> ' + idList(p.ids) + '</div>';
+    }).join('') + epilogue;
+
     var parts = on.map(function (c) { return '<strong>' + plural(Number(c.dataset.count), c.dataset.type) + '</strong>'; });
     var excluded = off.reduce(function (sum, c) { return sum + Number(c.dataset.count); }, 0);
     var list = parts.length > 1
       ? parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1]
       : parts[0];
-    dryEl.innerHTML = 'Would push ' + list + ' across 3 projects.' +
+    dryEl.innerHTML = 'Would push ' + list + ' in <strong>' + plural(passes.length, 'pass') +
+      '</strong>, one per mapped area.' +
       (excluded ? ' <strong>' + excluded + '</strong> beads excluded by the tier filter.' : '');
   }
 

@@ -60,25 +60,9 @@ export async function discoverAgents(
 
   const byId = new Map<string, DiscoveredAgent>();
   for (const { source, dir } of sources) {
-    let entries: string[];
-    try {
-      entries = await readdir(dir);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException)?.code;
-      if (code === "ENOENT" || code === "ENOTDIR") continue; // no such source dir → nothing to add
-      throw err;
-    }
-    for (const entry of entries) {
-      if (!entry.endsWith(".md")) continue;
-      const id = entry.slice(0, -3);
-      if (!id || byId.has(id)) continue; // earlier (higher-precedence) source already claimed this id
-      let description: string | undefined;
-      try {
-        description = parseFrontmatter(await readFile(join(dir, entry), "utf8")).description;
-      } catch {
-        // unreadable prompt → still list it by id, just without a description
-      }
-      byId.set(id, { id, source, description });
+    for (const id of await agentIdsIn(dir)) {
+      if (byId.has(id)) continue; // an earlier (higher-precedence) source already claimed this id
+      byId.set(id, { id, source, description: await readDescription(join(dir, `${id}.md`)) });
     }
   }
 
@@ -97,16 +81,31 @@ export async function discoverAgents(
  * Missing bundled dir → empty. Sorted.
  */
 export async function bundledAgentIds(bundledRoot?: string): Promise<string[]> {
-  const dir = join(bundledRoot ?? process.cwd(), AGENT_PROMPTS_DIR);
+  return (await agentIdsIn(join(bundledRoot ?? process.cwd(), AGENT_PROMPTS_DIR))).sort();
+}
+
+/**
+ * The agent ids (`.md` filename stems) a source dir defines, unsorted and in readdir order. A
+ * missing source dir is not an error — it just defines no agents.
+ */
+async function agentIdsIn(dir: string): Promise<string[]> {
+  let entries: string[];
   try {
-    return (await readdir(dir))
-      .filter((e) => e.endsWith(".md"))
-      .map((e) => e.slice(0, -3))
-      .sort();
+    entries = await readdir(dir);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code === "ENOENT" || code === "ENOTDIR") return [];
     throw err;
+  }
+  return entries.filter((e) => e.endsWith(".md") && e !== ".md").map((e) => e.slice(0, -3));
+}
+
+/** An unreadable prompt is still a listable agent — it just has no description to show. */
+async function readDescription(file: string): Promise<string | undefined> {
+  try {
+    return parseFrontmatter(await readFile(file, "utf8")).description;
+  } catch {
+    return undefined;
   }
 }
 
@@ -117,47 +116,55 @@ export async function bundledAgentIds(bundledRoot?: string): Promise<string[]> {
  * a general YAML parser; nested maps and lists are ignored.
  */
 export function parseFrontmatter(md: string): { name?: string; description?: string } {
-  if (!md.startsWith("---\n")) return {};
-  const lines = md.split("\n");
-  let end = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === "---") {
-      end = i;
-      break;
-    }
-  }
-  if (end === -1) return {};
+  const body = frontmatterBody(md);
+  if (!body) return {};
 
-  const body = lines.slice(1, end);
   const out: Record<string, string> = {};
   for (let i = 0; i < body.length; i++) {
-    const m = /^([A-Za-z_][\w-]*):\s?(.*)$/.exec(body[i]);
-    if (!m) continue; // indented continuation / list item / blank — handled by the block collector
-    const key = m[1];
-    const rest = m[2].trim();
-    const isBlock = /^[|>][+-]?$/.test(rest); // folded (>) or literal (|) block scalar indicator
-    if (isBlock || rest === "") {
-      // Collect the indented continuation lines that make up this key's value.
-      const collected: string[] = [];
-      let j = i + 1;
-      for (; j < body.length; j++) {
-        if (body[j].trim() === "") {
-          collected.push("");
-          continue;
-        }
-        if (/^\s/.test(body[j])) collected.push(body[j].trim());
-        else break; // a new top-level key ends the block
-      }
-      i = j - 1;
-      // Literal (|) keeps line breaks; folded (>) joins lines with spaces, dropping blank markers.
-      out[key] = rest.startsWith("|")
-        ? collected.join("\n").trim()
-        : collected.filter((l) => l !== "").join(" ").trim();
-    } else {
+    const m = KEY_LINE.exec(body[i]);
+    if (!m) continue; // indented continuation / list item / blank — consumed by collectContinuation
+    const [, key, value] = m;
+    const rest = value.trim();
+    if (rest !== "" && !BLOCK_INDICATOR.test(rest)) {
       out[key] = stripQuotes(rest);
+      continue;
     }
+    const collected = collectContinuation(body, i + 1);
+    out[key] = joinContinuation(rest, collected);
+    i += collected.length;
   }
   return { name: out.name, description: out.description };
+}
+
+const KEY_LINE = /^([A-Za-z_][\w-]*):\s?(.*)$/;
+/** Folded (>) or literal (|) block scalar indicator, optionally chomped (`-`/`+`). */
+const BLOCK_INDICATOR = /^[|>][+-]?$/;
+
+/** The lines between the leading `---` fences, or null when absent or unterminated. */
+function frontmatterBody(md: string): string[] | null {
+  if (!md.startsWith("---\n")) return null;
+  const lines = md.split("\n");
+  const end = lines.indexOf("---", 1);
+  return end === -1 ? null : lines.slice(1, end);
+}
+
+/** The indented (or blank) lines making up a multi-line value, up to the next top-level key. */
+function collectContinuation(body: string[], start: number): string[] {
+  const collected: string[] = [];
+  for (let i = start; i < body.length; i++) {
+    const line = body[i];
+    if (line.trim() === "") collected.push("");
+    else if (/^\s/.test(line)) collected.push(line.trim());
+    else break;
+  }
+  return collected;
+}
+
+/** Literal (|) keeps line breaks; folded (>) joins lines with spaces, dropping blank markers. */
+function joinContinuation(indicator: string, collected: string[]): string {
+  return indicator.startsWith("|")
+    ? collected.join("\n").trim()
+    : collected.filter((l) => l !== "").join(" ").trim();
 }
 
 function stripQuotes(s: string): string {

@@ -12,7 +12,15 @@ import { describe, expect, it } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
 import type { RunHealthFinding } from "../run-health";
 import type { RunRow } from "../runs";
-import { classifyFinding, escalationNote, usageWindowEnd, type UnstickContext } from "./unstick";
+import type { EscalationRow } from "../escalations";
+import { blockedByPoison, parkedOnGateClause } from "./errors";
+import {
+  classifyFinding,
+  escalationNote,
+  partitionOpenEscalations,
+  usageWindowEnd,
+  type UnstickContext,
+} from "./unstick";
 
 const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
@@ -29,17 +37,23 @@ function run(o: Partial<RunRow> = {}): RunRow {
     projectId: "p1",
     epicBeadId: "e-1",
     ticketBeadId: null,
+    jobId: null,
+    writeSeq: null,
     worktreePath: null,
     branch: null,
     model: null,
     agentTag: null,
+    endpointHost: null,
     formula: null,
     formulaVariant: null,
+    baseForkSha: null,
     status: "parked",
+    reviewScore: null,
     attempts: 1,
     leaseExpiresAt: null,
     error: "usage-limit",
     startedAt: secDate(NOW - 4 * HOUR),
+    attemptStartedAt: secDate(NOW - 4 * HOUR),
     endedAt: null,
     updatedAt: secDate(NOW - 4 * HOUR),
     ...o,
@@ -108,6 +122,21 @@ describe("classifyFinding — parked runs", () => {
     const verdict = classifyFinding(
       finding(),
       ctx({ usageWindowEndsAt: () => NOW - HOUR, epicCancelled: () => true }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("cancelled");
+  });
+
+  it("HOLDS a non-quota park whose epic an operator cancelled — a stop is not a judgment call", () => {
+    // The cancel settles the JOB; the run row stays parked with whatever error stopped it, so this
+    // finding comes back every sweep. Escalating it asks the founder to re-decide a stop they
+    // already made — and its Abandon would close a bead they may have left open on purpose.
+    const verdict = classifyFinding(
+      finding({ reason: "parked 4h ago: agent exited 1" }),
+      ctx({
+        parkedRuns: new Map([["r-1", run({ error: "agent exited 1" })]]),
+        epicCancelled: () => true,
+      }),
     );
     expect(verdict.disposition).toBe("hold");
     expect(verdict.why).toContain("cancelled");
@@ -352,6 +381,25 @@ describe("classifyFinding — an untrusted board fails CLOSED", () => {
 });
 
 describe("classifyFinding — the never-automatic kinds", () => {
+  it("escalates an open human gate — a wait by design still needs the person told", () => {
+    const verdict = classifyFinding(
+      finding({ kind: "needs-human", key: "needs-human:g-1", gateId: "g-1", beadId: "t-1" }),
+      ctx(),
+    );
+    expect(verdict.disposition).toBe("escalate");
+  });
+
+  it("holds a human gate resolved between the sweep and now — the wait already ended", () => {
+    // The escalation this would raise is unretirable: later reports simply omit the finding, so the
+    // false "Waiting on you" sits on the board until a human answers a question nobody is asking.
+    const verdict = classifyFinding(
+      finding({ kind: "needs-human", key: "needs-human:g-1", gateId: "g-1", beadId: "t-1" }),
+      ctx({ stillStuck: () => false }),
+    );
+    expect(verdict.disposition).toBe("hold");
+    expect(verdict.why).toContain("resolved");
+  });
+
   it.each(["stale-pr", "exhausted-job"] as const)(
     "escalates %s rather than retrying it",
     (kind) => {
@@ -470,9 +518,97 @@ describe("escalationNote", () => {
     expect(escalationNote(finding(), ESC_ID)).toContain("3f2a1b9c");
   });
 
+  it("names the ticket an ask is answered on, since the note lands on the run target", () => {
+    const note = escalationNote(
+      finding({ kind: "needs-human", reason: "waiting on a human 3h: A or B?", askBeadId: "t-9" }),
+      ESC_ID,
+    );
+    expect(note).toContain("Answer on t-9");
+    // Nothing to answer on the four accidental stalls — they name no asking ticket.
+    expect(escalationNote(finding(), ESC_ID)).not.toContain("Answer on");
+  });
+
   it("stays on ONE line — beads splits a note blob on newlines into separate entries", () => {
     const note = escalationNote(finding({ reason: "parked:\n  agent exited 1\n" }), ESC_ID);
     expect(note).not.toContain("\n");
     expect(note).toContain("parked: agent exited 1");
+  });
+});
+
+/**
+ * Which open escalations a pass re-checks. The split is where "the report stopped carrying it"
+ * becomes a CANDIDATE for retirement rather than a verdict — get it wrong in either direction and
+ * the panel either nags about stalls that ended or silently dismisses ones that haven't.
+ */
+describe("partitionOpenEscalations", () => {
+  function row(kind: string, findingKey: string, reason = ""): EscalationRow {
+    return {
+      id: `esc-${findingKey}`,
+      projectId: "p1",
+      findingKey,
+      kind,
+      reason,
+      beadId: null,
+      epicBeadId: null,
+      runId: null,
+      jobId: null,
+      since: null,
+      evidenceJson: "{}",
+      status: "open",
+      resolution: null,
+      notedAt: null,
+      dismissedAt: null,
+      signature: null,
+      raisedAt: secDate(NOW),
+      updatedAt: secDate(NOW),
+    };
+  }
+
+  const reported = [finding({ key: "parked-run:r-1" })];
+  const ids = (rows: EscalationRow[]) => rows.map((r) => r.findingKey);
+
+  it("leaves a row the current report still carries to the finding loop", () => {
+    // Retiring it here would churn it settle-raise every pass: the loop re-raises it anyway.
+    const pending = partitionOpenEscalations([row("parked-run", "parked-run:r-1")], reported);
+    expect(ids(pending.endedStalls)).toEqual([]);
+    expect(ids(pending.blockedJobWaits)).toEqual([]);
+  });
+
+  it("makes a row the report dropped a candidate for the live re-check", () => {
+    const pending = partitionOpenEscalations([row("parked-run", "parked-run:r-2")], reported);
+    expect(ids(pending.endedStalls)).toEqual(["parked-run:r-2"]);
+  });
+
+  it("reconciles every gate wait, reported or not — nothing else can retire one", () => {
+    const wait = row("needs-human", "needs-human:g-1");
+    const stillReported = partitionOpenEscalations([wait], [finding({ key: "needs-human:g-1" })]);
+    expect(ids(stillReported.gateWaits)).toEqual(["needs-human:g-1"]);
+    const orphaned = partitionOpenEscalations([wait], reported);
+    expect(ids(orphaned.gateWaits)).toEqual(["needs-human:g-1"]);
+    // A gate wait is never an ended stall: the gate list, not a job read, is what retires it.
+    expect(ids(orphaned.endedStalls)).toEqual([]);
+  });
+
+  it.each([
+    ["a run that armed its own ask", parkedOnGateClause("g-1")],
+    ["a job refused behind someone else's gate", blockedByPoison("t-1", ["g-1"]).message],
+  ])("spots the exhausted-job row that is a gate's wait wearing a second face: %s", (_, reason) => {
+    const pending = partitionOpenEscalations(
+      [row("exhausted-job", "exhausted-job:j-1", reason)],
+      reported,
+    );
+    expect(ids(pending.blockedJobWaits)).toEqual(["exhausted-job:j-1"]);
+    // Kept in the general set too: once the gate is answered, only the job's own re-check can
+    // retire the row.
+    expect(ids(pending.endedStalls)).toEqual(["exhausted-job:j-1"]);
+  });
+
+  it("leaves an ordinary exhausted-job row to its own live re-check", () => {
+    const pending = partitionOpenEscalations(
+      [row("exhausted-job", "exhausted-job:j-2", "retries spent: agent exited 1")],
+      reported,
+    );
+    expect(ids(pending.blockedJobWaits)).toEqual([]);
+    expect(ids(pending.endedStalls)).toEqual(["exhausted-job:j-2"]);
   });
 });

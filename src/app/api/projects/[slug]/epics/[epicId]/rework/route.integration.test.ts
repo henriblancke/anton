@@ -46,7 +46,7 @@ const CONTRACT = (goal: string) =>
     `## Goal`,
     goal,
     ``,
-    `## Acceptance`,
+    `## Acceptance Criteria`,
     `- [ ] ${goal}`,
     ``,
     `## Context`,

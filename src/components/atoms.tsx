@@ -1,17 +1,19 @@
 import type { ReactNode } from "react";
-import { CircleSlashIcon, LockIcon, MoonIcon } from "lucide-react";
+import { CircleSlashIcon, GitPullRequestIcon, LockIcon, LockOpenIcon, MoonIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
 import { formatExactTime, formatRelativeTime } from "@/lib/time";
 import { STAGE_ACCENT_DOT, STAGE_LABELS } from "@/components/board/board-utils";
 
-type ChipTone = "neutral" | "risk-high" | "risk-med" | "blocked" | "pr" | "done";
+type ChipTone = "neutral" | "risk-high" | "risk-med" | "partial" | "blocked" | "pr" | "done";
 
 const CHIP_TONE: Record<ChipTone, string> = {
   neutral: "border-border bg-secondary text-muted-foreground",
   "risk-high": "border-risk-high/30 bg-risk-high/10 text-risk-high",
   "risk-med": "border-risk-med/28 bg-risk-med/10 text-risk-med",
+  // Amber, deliberately not the blocked rose: a partially-gated run still starts.
+  partial: "border-risk-med/30 bg-risk-med/10 text-risk-med",
   blocked: "border-blocked/30 bg-blocked/10 text-blocked",
   pr: "border-stage-in-review/30 bg-stage-in-review/10 text-stage-in-review",
   done: "border-stage-done/30 bg-stage-done/10 text-stage-done",
@@ -52,6 +54,15 @@ export function MetaChip({
 }
 
 /**
+ * The shape every wrapper around a meta chip wears. A wrapper left at its inherited metrics
+ * blockifies as a flex item and establishes a 24px text line box (16px/1.5) around a 16px chip; in a
+ * stretching row that sets the flex line's cross size and grows every chip beside it, so a card
+ * wears taller chips for no reason but having been linked (anton-ssks). One exported shape rather
+ * than a class string per wrapper, so the next wrapper cannot reintroduce the gap.
+ */
+export const CHIP_WRAPPER = "inline-flex leading-none";
+
+/**
  * Wraps a PR chip in a new-tab link when a URL is known, otherwise renders the chip inert. Safe
  * inside clickable cards/rows: `pointer-events-auto` + `stopPropagation` keep the click on the link
  * (opening the PR) instead of bubbling to a parent card link. `href` comes from an entity's `prUrl`.
@@ -66,7 +77,13 @@ export function PrLink({
   children: ReactNode;
 }) {
   if (!href) {
-    return className ? <span className={className}>{children}</span> : <>{children}</>;
+    // The inert wrapper collapses for the same reason the anchor does — a PR with a ref but no url
+    // still shows its chip, and it must measure what the linked one measures.
+    return className ? (
+      <span className={cn(CHIP_WRAPPER, className)}>{children}</span>
+    ) : (
+      <>{children}</>
+    );
   }
   return (
     <a
@@ -74,11 +91,66 @@ export function PrLink({
       target="_blank"
       rel="noopener noreferrer"
       onClick={(e) => e.stopPropagation()}
-      className={cn("pointer-events-auto focus-visible:outline-none", className)}
+      className={cn("pointer-events-auto focus-visible:outline-none", CHIP_WRAPPER, className)}
       title="Open pull request"
     >
       {children}
     </a>
+  );
+}
+
+/** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
+export function prLabel(ref: string): string {
+  const m = /(\d+)\s*$/.exec(ref);
+  return m ? `#${m[1]}` : ref;
+}
+
+/**
+ * The linked-PR chip every run-target surface shows — feature card, standalone chip, ticket header,
+ * PR link control. One shape so a PR reads the same wherever it appears: a new-tab link (inert
+ * without a url) around a tinted meta chip. `tone` follows what the PR now means — `pr` while it is
+ * under review, `done` once merged — and `icon` drops the glyph where the label already carries the
+ * meaning (the done card's "merged #218").
+ */
+export function PrChip({
+  href,
+  tone = "pr",
+  icon = true,
+  className,
+  children,
+}: {
+  href?: string;
+  tone?: "pr" | "done";
+  icon?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <PrLink href={href} className={className}>
+      <MetaChip tone={tone}>
+        {icon && <GitPullRequestIcon className="size-2.5" aria-hidden="true" />}
+        {children}
+      </MetaChip>
+    </PrLink>
+  );
+}
+
+/**
+ * The live "working" marker a run target shows while it is implementing and has no PR yet — the one
+ * place on a card that says a run is moving right now. Pulsing dot plus the word, never a chip: it
+ * is a state, not metadata.
+ */
+export function WorkingPulse({ className }: { className?: string }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 text-[10px] text-stage-implementing",
+        className,
+      )}
+    >
+      <span className="size-1.5 rounded-full bg-stage-implementing anton-pulse" aria-hidden="true" />
+      working
+    </span>
   );
 }
 
@@ -93,6 +165,32 @@ export function BlockedChip({ blockedBy }: { blockedBy: string[] }) {
     <MetaChip tone="blocked">
       <LockIcon className="size-2.5" aria-hidden="true" />
       <span title={`blocked by ${blockedBy.join(", ")}`}>{label}</span>
+    </MetaChip>
+  );
+}
+
+/**
+ * "partially blocked · N/M ready" chip — a run target whose work is only part-held (anton-zztt). The
+ * run starts on the M−N tickets nothing holds and parks the rest, so this is a progress signal, not
+ * a stop: an open padlock in amber, never the blocked rose, and the card it sits on stays lit and
+ * approvable. The held ticket ids ride in the title. Renders nothing once nothing is held.
+ */
+export function PartiallyBlockedChip({
+  ready,
+  total,
+  held,
+}: {
+  ready: number;
+  total: number;
+  held: string[];
+}) {
+  if (held.length === 0) return null;
+  return (
+    <MetaChip tone="partial">
+      <LockOpenIcon className="size-2.5" aria-hidden="true" />
+      <span title={`held by a blocker outside this run: ${held.join(", ")}`}>
+        {`partially blocked · ${ready}/${total} ready`}
+      </span>
     </MetaChip>
   );
 }
@@ -204,5 +302,31 @@ export function RelativeTime({ iso, className }: { iso: string | null | undefine
     <time dateTime={iso ?? undefined} title={exact ?? undefined} className={className}>
       {relative}
     </time>
+  );
+}
+
+/**
+ * The project breadcrumb bar every project section renders above its tabs — `<project> / <section>`.
+ * `children` is an optional trailing slot (settings hangs its unsaved-count and Save button there),
+ * so a section with extra header controls no longer has to re-copy the bar and drift from the rest.
+ */
+export function PageHeader({
+  project,
+  section,
+  children,
+}: {
+  project: string;
+  section: string;
+  children?: ReactNode;
+}) {
+  return (
+    <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-6">
+      <div className="flex items-center gap-2 text-[13px]">
+        <span className="text-muted-foreground">{project}</span>
+        <span className="text-subtle">/</span>
+        <span className="font-medium text-foreground">{section}</span>
+      </div>
+      {children}
+    </header>
   );
 }

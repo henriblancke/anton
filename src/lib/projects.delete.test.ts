@@ -118,6 +118,36 @@ async function seedProject(slug: string) {
     cron: "0 3 * * *",
   });
 
+  // The disarm history, latched and lifted. Both rows reference the project, so leaving them
+  // behind fails the project DELETE on the foreign key and rolls the whole teardown back.
+  await db.insert(schema.autopilotDisarms).values({
+    id: randomUUID(),
+    projectId,
+    reason: "score-regression",
+    detail: "The rolling review score fell below the floor of 7.",
+    evidenceJson: JSON.stringify(["anton-a · 5.5"]),
+    rearmedAt: nowSec,
+    rearmedBy: "anton-test",
+  });
+  await db.insert(schema.autopilotDisarms).values({
+    id: randomUUID(),
+    projectId,
+    reason: "consecutive-failures",
+    detail: "3 runs in a row ended without delivering.",
+    evidenceJson: JSON.stringify(["r-1 · anton-a · failed"]),
+  });
+
+  // A budget-aware project has burn samples pointing at it. The foreign key means teardown must
+  // deal with them or the project DELETE rolls the whole thing back (see deleteProjectRows).
+  const burnSampleId = randomUUID();
+  await db.insert(schema.burnSamples).values({
+    id: burnSampleId,
+    jobType: "execute-epic",
+    projectId,
+    sessionDelta: 21,
+    weeklyDelta: 3,
+  });
+
   const logPath = join(workDir, `${slug}-session.log`);
   writeFileSync(logPath, "session output\n");
   await db.insert(schema.sessions).values({
@@ -128,7 +158,7 @@ async function seedProject(slug: string) {
     logPath,
   });
 
-  return { projectId, wt, branch, logPath };
+  return { projectId, burnSampleId, wt, branch, logPath };
 }
 
 async function projectRowCounts(projectId: string) {
@@ -144,6 +174,15 @@ async function projectRowCounts(projectId: string) {
     ).length,
     sessions: (
       await db.select().from(schema.sessions).where(eq(schema.sessions.projectId, projectId))
+    ).length,
+    autopilotDisarms: (
+      await db
+        .select()
+        .from(schema.autopilotDisarms)
+        .where(eq(schema.autopilotDisarms.projectId, projectId))
+    ).length,
+    burnSamples: (
+      await db.select().from(schema.burnSamples).where(eq(schema.burnSamples.projectId, projectId))
     ).length,
   };
 }
@@ -166,6 +205,8 @@ suite("deleteProject (real git + temp anton.db)", () => {
       jobs: 0,
       schedules: 0,
       sessions: 0,
+      autopilotDisarms: 0,
+      burnSamples: 0,
     });
 
     // Worktree dir + branch removed; session log deleted.
@@ -177,6 +218,26 @@ suite("deleteProject (real git + temp anton.db)", () => {
     expect(gitIn(repo, ["status", "--porcelain"])).toBe(statusBefore);
     expect(gitIn(repo, ["rev-parse", "HEAD"])).toBe(headBefore);
     expect(readFileSync(join(repo, ".beads", "issues.jsonl"))).toEqual(beadsBefore);
+  });
+
+  it("keeps a deregistered project's burn samples as machine-wide cost, unattributed", async () => {
+    // The sample outlives its project deliberately: the per-type average pacing reads is a property
+    // of this machine, so deregistering a repo must not reset what an execute-epic costs here. Only
+    // the attribution — meaningless once the project is gone — is dropped.
+    const db = getDb();
+    const { projectId, burnSampleId } = await seedProject("detached");
+    const before = await db.select().from(schema.burnSamples);
+
+    await deleteProject("detached");
+
+    const after = await db.select().from(schema.burnSamples);
+    expect(after).toHaveLength(before.length);
+    const detached = after.find((row) => row.id === burnSampleId);
+    expect(detached?.projectId).toBeNull();
+    expect(detached?.sessionDelta).toBe(21);
+    expect(
+      (await db.select().from(schema.projects).where(eq(schema.projects.id, projectId))).length,
+    ).toBe(0);
   });
 
   it("throws a clear not-found error for an unknown slug", async () => {
@@ -204,6 +265,8 @@ suite("deleteProject (real git + temp anton.db)", () => {
       jobs: 2,
       schedules: 1,
       sessions: 1,
+      autopilotDisarms: 2,
+      burnSamples: 1,
     });
   });
 });

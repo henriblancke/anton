@@ -10,7 +10,9 @@ const project = { id: "p-1", slug: "known", name: "Known", repoPath: "/tmp/known
 const getProjectBySlug = vi.fn(async (slug: string) => (slug === "known" ? project : null));
 vi.mock("@/lib/projects", () => ({ getProjectBySlug: (slug: string) => getProjectBySlug(slug) }));
 
-const { notFoundResponse, resolveProject, withProject } = await import("./resolve-project");
+const { notFoundResponse, parseJsonBody, resolveProject, withProject } = await import(
+  "./resolve-project",
+);
 
 afterEach(() => vi.clearAllMocks());
 
@@ -58,5 +60,30 @@ describe("notFoundResponse", () => {
     const res = notFoundResponse("Epic not found");
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: "Epic not found" });
+  });
+});
+
+describe("parseJsonBody", () => {
+  const post = (body: string) => new Request("http://t/x", { method: "POST", body });
+
+  it("hands back the parsed body and no response", async () => {
+    const { body, response } = await parseJsonBody(post('{"reason":"done"}'));
+    expect(response).toBeUndefined();
+    expect(body).toEqual({ reason: "done" });
+  });
+
+  it("400s on a malformed payload", async () => {
+    const { body, response } = await parseJsonBody(post("{not json"));
+    expect(body).toBeUndefined();
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({ error: "Invalid JSON body" });
+  });
+
+  it("accepts a falsy body — the guard is malformed JSON, not an empty payload", async () => {
+    // Discriminating on `body` instead of `response` would reject `null`/`0` as unparseable and
+    // hide them from the route's own validator, which reports them with its own message.
+    const { body, response } = await parseJsonBody(post("null"));
+    expect(response).toBeUndefined();
+    expect(body).toBeNull();
   });
 });

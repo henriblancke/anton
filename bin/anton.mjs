@@ -8,6 +8,9 @@
  *                  install required skills + selected agents into global ~/.claude (interactive;
  *                  `--agents <a,b,c>` / `--agents all` / `--no-agents` for non-interactive/CI) →
  *                  wire beads Dolt sync (git origin as Dolt remote + initial refs/dolt push)
+ *   anton server-mode  point ONE project's board at a shared Dolt server: back up → write
+ *                  .beads/metadata.json → bd dolt test → read the board back → publish the
+ *                  connection as the team default (reverts the write on any failure)
  *   anton doctor   prereq checks only (non-destructive)
  *   anton dev      next dev  (runner + scheduler auto-start via src/instrumentation.ts)
  *   anton start    next build (if stale) → next start
@@ -36,21 +39,44 @@ import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
-  beadsPrereqs,
   bdVersion,
   bdVersionAtLeast,
+  budgetMs,
+  checkSharedServer,
   configureBeadsDoltSync,
   configureBeadsForRepo,
   ensureBeadFormula,
   ensureBeadsGitignore,
   ensureRunFormula,
+  formatServerTarget,
   hasBeadsDir,
+  passwordVarHint,
+  readDoltMetadata,
+  scopedBdRunner,
+  SERVER_MIGRATION_RUNBOOK,
   BEAD_FORMULA_FILENAME,
   RUN_FORMULA_FILENAME,
   MIN_BD_VERSION,
 } from "../src/lib/beads/config.mjs";
+import { configureServerMode } from "../src/lib/beads/server-mode.mjs";
 import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
 import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
+import {
+  buildDrift,
+  buildMatchesCheckout,
+  describeBuildIdentity,
+  liveBuildRecords,
+  readBuildIdentity,
+  processStartedAt,
+  sameCheckout,
+  writeBuildStamp,
+} from "../src/lib/build/identity.mjs";
+import {
+  antonPidFile,
+  pidFileVerdict,
+  procfsListeningEndpoints,
+  unstampedServers,
+} from "../src/lib/build/servers.mjs";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -71,7 +97,7 @@ const IS_BUNDLE = existsSync(RELEASE_VERSION_FILE);
 const INSTALL_ROOT = process.env.ANTON_HOME ?? join(homedir(), ".local", "share", "anton");
 const STATE_DIR = process.env.ANTON_STATE_DIR ?? join(homedir(), ".local", "state", "anton");
 const LOG_DIR = join(STATE_DIR, "logs");
-const PID_FILE = join(STATE_DIR, "anton.pid");
+const PID_FILE = antonPidFile(STATE_DIR);
 const BIN_LINK = process.env.ANTON_BIN_LINK ?? join(homedir(), ".local", "bin", "anton");
 const RELEASE_OWNER = process.env.ANTON_RELEASE_OWNER ?? "henriblancke";
 const RELEASE_REPO = process.env.ANTON_RELEASE_REPO ?? "anton";
@@ -92,10 +118,23 @@ function bundleVersion() {
   }
 }
 
+/**
+ * The `ANTON_DB` override as an ABSOLUTE path, or null when it is unset.
+ *
+ * The override is documented as a path, and a RELATIVE one names a different file for every reader:
+ * the server resolves it from APP_ROOT (both `runLocal` and the daemon spawn with that cwd) and
+ * writes its build record beside THAT database, while `anton doctor` run from anywhere else would
+ * scan beside a database in the caller's directory — and report "no running server recorded" over a
+ * live, stale one (PR #217 review). Resolved once, here, so every reader names the same file.
+ */
+function antonDbOverride() {
+  return process.env.ANTON_DB ? resolve(APP_ROOT, process.env.ANTON_DB) : null;
+}
+
 /** Env that redirects anton's writable state OUT of the (replaceable) runtime dir in bundle mode. */
 function bundleStateEnv() {
   return {
-    ANTON_DB: process.env.ANTON_DB ?? join(STATE_DIR, "anton.db"),
+    ANTON_DB: antonDbOverride() ?? join(STATE_DIR, "anton.db"),
     ANTON_SESSIONS_ROOT: process.env.ANTON_SESSIONS_ROOT ?? join(STATE_DIR, "sessions"),
     ANTON_SCANS_ROOT: process.env.ANTON_SCANS_ROOT ?? join(STATE_DIR, "scans"),
   };
@@ -112,22 +151,124 @@ function compareVersions(a, b) {
   return 0;
 }
 
-/** Read the daemon PID if the process is actually alive; clears a stale pidfile otherwise. */
-function runningPid() {
-  let pid;
-  try {
-    pid = parseInt(readFileSync(PID_FILE, "utf8").trim(), 10);
-  } catch {
-    return null;
+/**
+ * Write the daemon pidfile: the pid on the first line, the pid's birth stamp on the second, and the
+ * port that daemon listens on — when the caller knows it — on the third.
+ *
+ * The stamp is what `runningPid` needs to tell THIS daemon from whatever the OS later hands the
+ * same number — the same protection build records already carry (see `recordAlive`). Lines rather
+ * than JSON because every reader of a pidfile, anton's or an operator's, expects to find a pid on
+ * line one; a machine that cannot say when a process was born writes an empty second line, so the
+ * port keeps its place.
+ *
+ * The port lives HERE, in the daemon's own record, rather than in a file one per install (PR #217
+ * review). A shared note is written by whatever started last: `anton start --foreground --port 4100`
+ * beside a running daemon overwrote it, and `anton status` — which takes its pid from this file —
+ * then printed the daemon's pid against the foreground server's URL, and went on printing it after
+ * that process exited. Recorded with the pid, the port is the port of the process being reported,
+ * and it is deleted with the pidfile when the daemon stops.
+ *
+ * `pidFileVerdict` reads the first two lines only, so a third costs its readers nothing.
+ *
+ * @param {number} pid
+ * @param {string} [pidFile]
+ * @param {string|number|null} [port] the port that daemon listens on, where the caller knows it
+ */
+function writePidFile(pid, pidFile = PID_FILE, port = null) {
+  mkdirSync(dirname(pidFile), { recursive: true });
+  const startedAt = processStartedAt(pid) ?? "";
+  writeFileSync(pidFile, port === null ? `${pid}\n${startedAt}\n` : `${pid}\n${startedAt}\n${port}\n`);
+}
+
+/**
+ * Read the daemon PID if the daemon is actually alive; clears a stale pidfile otherwise.
+ *
+ * `pidFileVerdict` is the read — shared with the server, which asks the same file who else of this
+ * install is up — and it answers only for the process that actually wrote the file: a daemon that
+ * crashed without clearing its pidfile leaves a pid the OS reuses, and signal 0 alone would then
+ * report an unrelated process as anton's server (PR #217).
+ *
+ * Only the pid half of the verdict, for readers that have nothing irreversible to do with the
+ * answer (`status` lines, doctor's server sweep). A command that ACTS on the daemon takes the whole
+ * snapshot from `lifecycleVerdict` instead — silence here is not proof that nothing is running.
+ *
+ * The path is injectable so the reuse case can be exercised over a fixture, matching the other
+ * seams here (`staleSkills`, `unstampedServers`); every caller passes nothing and gets the real one.
+ */
+function runningPid(pidFile = PID_FILE) {
+  return lifecycleVerdict(pidFile).pid;
+}
+
+/**
+ * One pidfile read for one lifecycle decision: `pid` while the recorded daemon is provably the one
+ * running, and `unverifiable` naming the pid this machine cannot prove either way — the daemon, or
+ * the stranger the OS handed its number to.
+ *
+ * `pid` alone answers null in both the stopped case and the unverifiable one, which every lifecycle
+ * command would otherwise read as proof that nothing is running: `start` spawns a duplicate and
+ * overwrites the live daemon's pidfile (leaving the original unmanageable, while the duplicate dies
+ * on the occupied port), `update` swaps the runtime out from under it and `uninstall` deletes it.
+ * None of those are recoverable by the next read that works, so they refuse to act rather than
+ * guess.
+ *
+ * Both fields come off ONE snapshot for the same reason (PR #217 review). Asking for the
+ * unverifiable pid and then for the running one reads the process table twice, and a birth time
+ * that resolves on the first read and fails on the second clears the pre-flight and then answers
+ * null — landing on exactly the destructive branch the pre-flight exists to prevent.
+ *
+ * Only a file the read PROVES stale is cleared. A stamped pid whose birth time cannot be reread
+ * names nobody either, but deleting it would strand a daemon that is merely unverifiable this
+ * second — `anton stop` could then never find it again. And the clearing belongs here rather than
+ * in the shared reader: this is the process that owns the daemon's lifecycle, while a request path
+ * asking the same question must not delete state under it.
+ *
+ * Both seams are injectable for the reason `daemonState`'s are: an unverifiable birth time cannot
+ * be staged over a real process.
+ */
+function lifecycleVerdict(pidFile = PID_FILE, startedAtNow = processStartedAt) {
+  const { pid, stale, unverifiable } = pidFileVerdict(pidFile, startedAtNow);
+  if (stale) {
+    try { unlinkSync(pidFile); } catch {}
   }
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    process.kill(pid, 0); // signal 0 = existence check
-    return pid;
-  } catch {
-    try { unlinkSync(PID_FILE); } catch {}
-    return null;
-  }
+  return { pid, unverifiable };
+}
+
+/**
+ * What one read PROVES about the daemon `anton stop` is signalling — the two proofs that gate its
+ * wait, off a single snapshot:
+ *
+ *   "running"  — the pidfile still names THIS pid and its birth stamp matches. The only state in
+ *                which escalating to SIGKILL signals the daemon and not a stranger.
+ *   "exited"   — the file is stale (the recorded process is dead, or the pid now names something
+ *                born after it) or no longer there at all. The only state in which stop may drop
+ *                the pidfile and report success.
+ *   "unproven" — alive but unverifiable, or a file that now names a different daemon. Neither
+ *                proof holds, so nothing is signalled and nothing is deleted.
+ *
+ * Both halves are asserted, never inferred from the other's silence (PR #217 review). A stamped pid
+ * whose birth time cannot be reread names nobody: reading that as death would skip the rest of the
+ * wait, drop the SIGKILL and delete the pidfile, leaving a live daemon no later `anton stop` can
+ * find — and reading it as life would send SIGKILL to whatever process now holds the number.
+ *
+ * Both seams are injectable for the reason `runningPid`'s path is: an unverifiable birth time
+ * cannot be staged over a real process.
+ *
+ * @param {number} pid the pid stop is acting on, as the opening read named it
+ * @returns {"running"|"exited"|"unproven"}
+ */
+function daemonState(pid, pidFile = PID_FILE, startedAtNow = processStartedAt) {
+  const { pid: live, stale } = pidFileVerdict(pidFile, startedAtNow);
+  if (live === pid) return "running";
+  if (live === null && (stale || !existsSync(pidFile))) return "exited";
+  return "unproven";
+}
+
+/** Say why a lifecycle command refused to act, and what makes it safe to retry. */
+function reportUnverifiableDaemon(pid, action, pidFile = PID_FILE) {
+  console.log(c.yellow(`cannot ${action}: a daemon may still be running (pid ${pid}).`));
+  console.log(c.dim(`  ${pidFile} names it, but its birth time could not be reread, so anton cannot tell`));
+  console.log(c.dim("  a live server from a reused pid — acting would strand the one, or signal the other."));
+  console.log(c.dim(`  Re-run once the process table is readable, or stop that process yourself and delete ${pidFile}.`));
 }
 
 /** Poll until the server answers on the port, or timeout. Best-effort (uses global fetch). */
@@ -143,6 +284,38 @@ async function waitForReady(port, timeoutMs = 30000) {
     }
   }
   return false;
+}
+
+
+/**
+ * The port the daemon named in `pidFile` was started on, or null where that record names none — a
+ * pidfile written before the port was recorded there, or one written by a start that never knew it.
+ *
+ * Only `startDaemon` records a port, and only for the process this file names: a foreground `anton
+ * start` or `anton dev` writes no pidfile, so it cannot overwrite the daemon's URL with its own.
+ */
+function daemonPort(pidFile = PID_FILE) {
+  try {
+    const port = (readFileSync(pidFile, "utf8").split("\n")[2] ?? "").trim();
+    return /^\d+$/.test(port) ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Where the daemon is: the port it recorded when it started, else this invocation's own flag/`PORT`,
+ * else Next's default.
+ *
+ * The RECORD outranks the caller's environment (PR #217 review). `resolvePort` answers for the
+ * process it is about to spawn, and it falls back to an ambient `PORT` — so consulting it first made
+ * `PORT=4200 anton status` print a validated daemon pid against `http://localhost:4200`, a URL
+ * nothing is listening on. That is the same wrong line the pid-scoped port record was added to
+ * prevent; status describes a process that is already running, and only its own record says where.
+ * The fallback is for a pidfile written before the port was recorded there, which names none.
+ */
+function serverPort(args, pidFile = PID_FILE) {
+  return daemonPort(pidFile) ?? resolvePort(args) ?? "3000";
 }
 
 const c = {
@@ -201,9 +374,25 @@ function runLocal(bin, args, env = {}) {
   const r = spawnSync(target, args, {
     cwd: APP_ROOT,
     stdio: "inherit",
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...serverRootEnv(), ...env },
   });
   return r.status ?? 1;
+}
+
+/**
+ * The runtime dir, handed to the server as an env var rather than left as its cwd (anton-pzfb).
+ *
+ * `anton update` deletes the directory the running server booted from, and from then on
+ * `process.cwd()` throws ENOENT inside it — so a module registry that first loads AFTER the upgrade
+ * (Next bundles instrumentation separately from the request graph) has nothing to resolve its paths
+ * from and reports no drift on the one upgrade drift exists to name. The launcher knows the
+ * pathname from `import.meta.url`, which no deletion touches; `src/lib/build/drift.ts` reads it.
+ */
+function serverRootEnv() {
+  const db = antonDbOverride();
+  // Handed down absolute so the server's own readers (getDb, src/lib/build/drift.ts) resolve the
+  // override identically to the CLI, whatever directory the operator invoked anton from.
+  return { ANTON_APP_ROOT: process.env.ANTON_APP_ROOT ?? APP_ROOT, ...(db ? { ANTON_DB: db } : {}) };
 }
 
 // ── Agents & skills provisioning (anton setup + anton init) ─────────────────────────────────
@@ -599,10 +788,15 @@ function ensureMigrated(opts = {}) {
 
 /** Daemonize `next start` from the bundle, redirecting output to the persistent state log dir. */
 async function startDaemon(args) {
-  const running = runningPid();
+  const { pid: running, unverifiable } = lifecycleVerdict();
+  if (unverifiable) {
+    reportUnverifiableDaemon(unverifiable, "start");
+    return 1;
+  }
   const port = resolvePort(args) ?? "3000";
   if (running) {
-    console.log(c.yellow("anton is already running") + c.dim(` (pid ${running}) → http://localhost:${port}`));
+    // The daemon's own port, not the one this invocation asked for: it is already up somewhere else.
+    console.log(c.yellow("anton is already running") + c.dim(` (pid ${running}) → http://localhost:${daemonPort() ?? port}`));
     return 0;
   }
 
@@ -641,12 +835,12 @@ async function startDaemon(args) {
       NODE_ENV: "production",
       PORT: String(port),
       HOSTNAME: process.env.ANTON_HOST ?? "127.0.0.1",
+      ...serverRootEnv(),
       ...stateEnv,
     },
   });
   child.unref();
-  mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(PID_FILE, String(child.pid));
+  writePidFile(child.pid, PID_FILE, port);
   console.log(c.dim(`anton starting (pid ${child.pid})…`));
 
   const ready = await waitForReady(port);
@@ -658,32 +852,98 @@ async function startDaemon(args) {
   return 0;
 }
 
-/** Stop the running daemon (SIGTERM, then SIGKILL if it lingers). */
-async function cmdStop() {
-  const pid = runningPid();
+/**
+ * Stop the running daemon (SIGTERM, then SIGKILL if it lingers).
+ *
+ * The opening read consumes the tri-state verdict rather than `runningPid`'s pid alone (PR #217
+ * review): a daemon whose birth time cannot be reread answers null there, and reporting that as
+ * "not running" with rc 0 is a stop that never sent a signal — the lifecycle commands downstream
+ * then take that success as proof the port is free. An unverifiable daemon is a retryable failure.
+ *
+ * Every step after it reads the same tri-state verdict, and the pidfile is deleted only once one of
+ * them proves the daemon dead (PR #217 review). Death is never inferred from silence: a birth-time
+ * read that fails mid-wait makes a live daemon unnameable, and treating that as its exit would drop
+ * the SIGKILL and then remove the one record of the process still holding the port.
+ *
+ * The ESCALATION is gated on the opposite proof (PR #217 review). "Not proven gone" is not proof
+ * the pid is still anton's: a daemon that exits during the grace period frees its number, and if
+ * the OS hands it to something else while the birth-time reader is unavailable — or answers in a
+ * spelling this stamp cannot be compared against — the verdict goes unverifiable, and a SIGKILL on
+ * "not exited" would land on that stranger. So the kill is sent only while the recorded birth stamp
+ * still PROVES the pid is the daemon; anything else is reported and left alone, which is the same
+ * trade every other lifecycle command here makes.
+ *
+ * Both seams are injectable so the unverifiable branch can be exercised over a fixture — it returns
+ * before any signal — matching the other pidfile readers here.
+ */
+async function cmdStop(pidFile = PID_FILE, startedAtNow = processStartedAt) {
+  const { pid, stale, unverifiable } = pidFileVerdict(pidFile, startedAtNow);
+  if (stale) {
+    try { unlinkSync(pidFile); } catch {}
+  }
+  if (unverifiable) {
+    reportUnverifiableDaemon(unverifiable, "stop", pidFile);
+    return 1;
+  }
   if (!pid) {
     console.log(c.dim("anton is not running."));
     return 0;
   }
   try { process.kill(pid, "SIGTERM"); } catch {}
-  for (let i = 0; i < 20 && runningPid(); i++) await sleep(150); // up to ~3s grace
-  if (runningPid()) {
-    try { process.kill(pid, "SIGKILL"); } catch {}
+  // One read per poll, so the proof that gates the signal and the proof that ends the wait cannot
+  // disagree about a process table that moved between them.
+  let state = daemonState(pid, pidFile, startedAtNow);
+  for (let i = 0; i < 20 && state !== "exited"; i++) {
+    await sleep(150); // up to ~3s grace
+    state = daemonState(pid, pidFile, startedAtNow);
   }
-  try { unlinkSync(PID_FILE); } catch {}
+  if (state === "running") {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+    for (let i = 0; i < 10 && state !== "exited"; i++) {
+      await sleep(100); // let the kill land
+      state = daemonState(pid, pidFile, startedAtNow);
+    }
+  }
+  if (state !== "exited") {
+    console.log(c.yellow(`could not confirm anton stopped (pid ${pid})`) + c.dim(` — keeping ${pidFile}`));
+    console.log(c.dim("  Its birth time could not be reread, so the pid may not be anton's — anton will not"));
+    console.log(c.dim("  SIGKILL a process it cannot prove is its own. Re-run `anton stop`."));
+    return 1;
+  }
+  try { unlinkSync(pidFile); } catch {}
   console.log(c.green("✓ anton stopped") + c.dim(` (pid ${pid})`));
   return 0;
 }
 
+/**
+ * Stop the daemon ahead of a step that destroys what it is running on, and say whether that step may
+ * proceed (PR #217 review).
+ *
+ * `update` and `uninstall` used to discard `cmdStop`'s result: a stop that could NOT confirm the
+ * daemon dead returns 1 and deliberately keeps the pidfile, and running on past that swaps the
+ * runtime out from under a live server, or deletes it (with `--purge`, its state too). The
+ * pre-flight `lifecycleVerdict` check both commands make cannot cover this — the failure happens
+ * later, in stop's own polling loop.
+ */
+async function stoppedFor(action, pidFile = PID_FILE, startedAtNow = processStartedAt) {
+  if ((await cmdStop(pidFile, startedAtNow)) === 0) return true;
+  console.log(c.red(`cannot ${action}: anton could not be confirmed stopped.`));
+  console.log(c.dim("  Nothing was changed. Re-run once `anton stop` succeeds."));
+  return false;
+}
+
 /** Print install/runtime/state paths and whether the daemon is running. */
 function cmdStatus(args) {
-  const pid = runningPid();
-  const port = resolvePort(args) ?? "3000";
+  const { pid, unverifiable } = lifecycleVerdict();
+  const port = serverPort(args);
   console.log(c.bold("anton status"));
   console.log(`  version   ${bundleVersion() ?? c.dim("(source checkout)")}`);
   console.log(`  runtime   ${APP_ROOT}`);
   console.log(`  state     ${STATE_DIR}`);
   if (pid) console.log(`  server    ${c.green("running")}${c.dim(` (pid ${pid}) → http://localhost:${port}`)}`);
+  // "stopped" would be a claim this read cannot make: the pidfile names a live pid whose identity
+  // could not be rechecked, and the lifecycle commands refuse to act on it for the same reason.
+  else if (unverifiable) console.log(`  server    ${c.yellow("unknown")}${c.dim(` (pid ${unverifiable} — birth time unreadable)`)}`);
   else console.log(`  server    ${c.dim("stopped")}`);
   return 0;
 }
@@ -803,8 +1063,17 @@ async function cmdUpdate() {
     return 1;
   }
 
-  const wasRunning = !!runningPid();
-  if (wasRunning) await cmdStop();
+  const { pid: livePid, unverifiable } = lifecycleVerdict();
+  if (unverifiable) {
+    reportUnverifiableDaemon(unverifiable, "update");
+    rmSync(tmp, { recursive: true, force: true });
+    return 1;
+  }
+  const wasRunning = !!livePid;
+  if (wasRunning && !(await stoppedFor("update"))) {
+    rmSync(tmp, { recursive: true, force: true });
+    return 1;
+  }
 
   const runtime = join(INSTALL_ROOT, "runtime");
   const backup = join(INSTALL_ROOT, "runtime.old");
@@ -829,7 +1098,12 @@ async function cmdUninstall(args = []) {
     console.log(c.yellow("`anton uninstall` applies to an installed bundle only."));
     return 1;
   }
-  if (runningPid()) await cmdStop();
+  const { pid: livePid, unverifiable } = lifecycleVerdict();
+  if (unverifiable) {
+    reportUnverifiableDaemon(unverifiable, "uninstall");
+    return 1;
+  }
+  if (livePid && !(await stoppedFor("uninstall"))) return 1;
   rmSync(INSTALL_ROOT, { recursive: true, force: true });
   try { unlinkSync(BIN_LINK); } catch {}
   if (args.includes("--purge")) {
@@ -870,12 +1144,69 @@ function checkPrereqs() {
   return ok && nodeOk;
 }
 
-/** One `bd list` in `repo`, always JSON and never truncated (bd caps at 50 by default). */
+/**
+ * Is the board this command runs against actually usable? Reported alongside the tool prereqs, and
+ * only meaningful in SERVER mode: an embedded board is a local Dolt directory, so there is nothing
+ * to reach and nothing to say. A shared-server board keeps no local copy, which makes a board this
+ * machine cannot read an outage rather than stalled sync (DESIGN.md §3a) — so it is probed with
+ * `bd dolt test` AND a board read, and the failure names the configured target and the ways out.
+ *
+ * The read is not belt-and-braces: a connection test passes over a database that does not exist on
+ * the server and over one belonging to another project, so stopping there would exit this command
+ * clean on a board where nothing works (PR #174 review, {@link checkSharedServer}).
+ *
+ * Returns true when the board is fine OR the question does not apply (no `.beads/`, embedded mode),
+ * so only a genuinely unusable board fails the caller.
+ */
+function checkBoard(dir = process.cwd()) {
+  if (!hasBeadsDir(dir)) return true;
+  const board = readDoltMetadata(dir);
+  if (board.mode !== "server") return true;
+
+  const target = formatServerTarget(board);
+  const probe = checkSharedServer(dir, board);
+  const probes = c.dim("bd dolt test + board read");
+  if (probe.ok) {
+    console.log(`  ${c.green("✓")} ${"board".padEnd(9)} ${c.green(`shared Dolt server ${target} serving this board`)}  ${probes}`);
+    return true;
+  }
+  const headline =
+    probe.stage === "read"
+      ? `shared Dolt server ${target} answered but WILL NOT SERVE this board`
+      : `shared Dolt server ${target} UNREACHABLE`;
+  console.log(`  ${c.red("✗")} ${"board".padEnd(9)} ${c.red(headline)}  ${probes}`);
+  // bd's own failure is often several lines (its config warnings ride along); indent every one, so
+  // the cause reads as part of this report rather than as stray output.
+  for (const line of probe.detail.split("\n")) console.log(c.dim(`    ${line}`));
+  if (probe.stage === "read") {
+    // Host, port, account and transport are already proven by the probe that passed — pointing the
+    // reader back at them is what wastes the hour. What is left is the database itself.
+    console.log(c.dim(`    Check .beads/metadata.json names the database this board lives in (now "${board.database ?? "?"}"),`));
+    console.log(c.dim(`    that the "${board.user ?? "configured"}" account may read it, and that the board was copied onto the server:`));
+    console.log(c.dim(`    ${SERVER_MIGRATION_RUNBOOK}`));
+  } else {
+    console.log(c.dim(`    Start the server (or restore the route to ${target}), check .beads/metadata.json`));
+    console.log(c.dim(`    names the right host/port/user, and set ${passwordVarHint(board.user)} in this shell.`));
+  }
+  console.log(c.dim('    Or set "dolt_mode": "embedded" there to work from this machine\'s local copy meanwhile.'));
+  return false;
+}
+
+/**
+ * One `bd list` in `repo`, always JSON and never truncated (bd caps at 50 by default).
+ *
+ * Spawned through the project-scoped runner, not a bare `spawnSync` (anton-ffmw.1): `board-check`
+ * takes MANY repos in one invocation, so an ambient `BEADS_DOLT_*` inherited from the launch
+ * directory would have every one of them listed out of whichever database that names, and a project
+ * whose account has its own `BEADS_DOLT_PASSWORD_<USER>` would never receive it and fail to
+ * authenticate. The runner resolves both from the target repo's own metadata.json.
+ *
+ * The network budget, because in server mode this read crosses the wire — and an unbounded spawn is
+ * how a hung server turns a board audit into a hang.
+ */
 function bdList(repo, extra) {
-  return spawnSync("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], {
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  const exec = scopedBdRunner(repo, readDoltMetadata(repo));
+  return exec("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], budgetMs("network"));
 }
 
 /** bd's listing as an array, or null when this build's output can't be parsed. */
@@ -1020,7 +1351,75 @@ function staleSkills(skillsSrc = SKILLS_SRC, { claudeRoot = CLAUDE_ROOT, project
   return out;
 }
 
-function cmdDoctor() {
+
+/**
+ * Report the build the RUNNING server is serving against the one on disk (anton-pzfb) — the same
+ * verdict the health page shows, from the shared comparison in src/lib/build/identity.mjs.
+ *
+ * Read-only, like the skill-drift check above it: a restart can kill an in-flight run, so anton
+ * names the action and leaves it to the operator. The restart itself differs by install — a bundle
+ * has a daemon to stop and start, a source checkout has whatever terminal `anton dev` is in.
+ */
+async function reportServerBuild(dbPath) {
+  // Every record still backed by a running process, and left by THIS install: one install can hold
+  // several servers — a UI-only one beside the runner, or two ports mid-hand-over — and each is its
+  // own answer, while a neighbouring checkout sharing this database (`ANTON_DB`) is not this
+  // checkout's answer at all.
+  const live = liveBuildRecords(dbPath, APP_ROOT);
+  // The servers no record above can see: one too old to have written one, which is the state that
+  // hid a stale process for three nights.
+  const unstamped = await unstampedServers({
+    isBundle: IS_BUNDLE,
+    appRoot: APP_ROOT,
+    pid: runningPid,
+    livePids: new Set(live.map(({ record }) => record.pid)),
+  });
+  // One read of the code on disk for all of them: they are compared against the same checkout, and
+  // `readBuildIdentity` spawns git.
+  const onDisk = live.length || unstamped.length ? readBuildIdentity(APP_ROOT) : undefined;
+  const seen = [
+    ...live.map(({ record }) => ({
+      pid: record.pid,
+      record,
+      // Already proved live above; re-checking would spawn `ps` again per record.
+      drift: buildDrift({ appRoot: APP_ROOT, record, onDisk, isAlive: () => true }),
+    })),
+    ...unstamped.map((pid) => ({
+      pid,
+      record: null,
+      drift: buildDrift({ appRoot: APP_ROOT, record: null, serverRunning: true, onDisk }),
+    })),
+  ];
+  if (!seen.length) {
+    // Not "stopped": this install's own liveness evidence came back empty too, so all anton can
+    // honestly claim here is that nothing recorded a boot against it.
+    console.log(`  ${c.dim("·")} ${"server".padEnd(9)} ${c.dim("no running server recorded")}`);
+    return;
+  }
+  // Which process a line is about only needs saying when there is more than one to confuse it with.
+  const which = (pid) => (seen.length > 1 ? `pid ${pid} ` : "");
+  for (const { pid, record, drift } of seen) {
+    if (!drift) {
+      console.log(
+        `  ${c.green("✓")} ${"server".padEnd(9)} ${c.green(`${which(pid)}running the build on disk (${describeBuildIdentity(record)})`)}`,
+      );
+      continue;
+    }
+    const why =
+      drift.state === "unstamped"
+        ? "is running but recorded no build identity — what it is serving cannot be established"
+        : `is running ${describeBuildIdentity(drift.running)} but the ${drift.state === "outdated" ? "runtime" : "checkout"} on disk is ${describeBuildIdentity(drift.onDisk)}`;
+    console.log(`  ${c.yellow("!")} ${"server".padEnd(9)} ${c.yellow(`${which(pid)}${why}`)}`);
+  }
+  if (!seen.some(({ drift }) => drift)) return;
+  console.log(
+    c.dim("    Restart it to run the build on disk — ") +
+      c.dim(IS_BUNDLE ? "`anton stop && anton start`." : "stop the server and re-run `anton dev` / `anton start`.") +
+      c.dim("\n    Nothing else clears it, and anton will not restart itself: a live process may be mid-run."),
+  );
+}
+
+async function cmdDoctor() {
   const ok = checkPrereqs();
   const stale = staleSkills();
   if (stale.length === 0) {
@@ -1052,12 +1451,20 @@ function cmdDoctor() {
   }
   // Resolve the DB the same way the server does: in a bundle it lives in the persistent state dir
   // (where `anton setup` creates it), NOT under the runtime dir — so doctor must check there too.
-  const dbPath = IS_BUNDLE ? bundleStateEnv().ANTON_DB : (process.env.ANTON_DB ?? join(APP_ROOT, "anton.db"));
+  const dbPath = IS_BUNDLE ? bundleStateEnv().ANTON_DB : (antonDbOverride() ?? join(APP_ROOT, "anton.db"));
   console.log(
     `  ${existsSync(dbPath) ? "✓" : c.yellow("·")} ${"anton.db".padEnd(9)} ${existsSync(dbPath) ? c.green(dbPath) : c.yellow("not created — run `anton setup`")}`,
   );
-  console.log(ok ? c.green("\nAll required tools present.\n") : c.red("\nMissing required tools — install them, then re-run.\n"));
-  return ok ? 0 : 1;
+  await reportServerBuild(dbPath);
+  // Last, because it is the only check that leaves the machine: a board on a shared server that
+  // nothing here can reach is as fatal as a missing tool, and doctor is where an operator looks first.
+  // Gated on the tool check: probing a board with no usable bd would report an "unreachable server"
+  // whose real cause is the missing tool named two lines above.
+  const boardOk = ok ? checkBoard() : true;
+  if (!ok) console.log(c.red("\nMissing required tools — install them, then re-run.\n"));
+  else if (!boardOk) console.log(c.red("\nThis repo's board is on a shared Dolt server this machine can't reach — see above.\n"));
+  else console.log(c.green("\nAll required tools present.\n"));
+  return ok && boardOk ? 0 : 1;
 }
 
 /**
@@ -1071,6 +1478,10 @@ function renderDoltSyncOutcome(dolt) {
   switch (dolt.status) {
     case "no-workspace":
       console.log(c.dim("  no .beads workspace at the package root — skipping."));
+      return true;
+    case "server-mode":
+      // Not a degradation: a shared-server board has no refs/dolt/data to wire (anton-4gd2).
+      console.log(c.dim("  board is on a shared Dolt server — no refs/dolt/data remote to wire."));
       return true;
     case "no-remote":
       console.log(c.red("  ✗ .beads exists but git has no `origin` remote — Dolt sync has nowhere to push."));
@@ -1223,8 +1634,7 @@ function parseInitArgs(args) {
 
 /** The anton.db the server reads — env override, else the persistent state dir (bundle) / APP_ROOT. */
 function resolveAntonDb() {
-  if (process.env.ANTON_DB) return process.env.ANTON_DB;
-  return IS_BUNDLE ? join(STATE_DIR, "anton.db") : join(APP_ROOT, "anton.db");
+  return antonDbOverride() ?? (IS_BUNDLE ? join(STATE_DIR, "anton.db") : join(APP_ROOT, "anton.db"));
 }
 
 /** The repo's current branch, defaulting to "main" (mirrors detectDefaultBranch in projects.ts). */
@@ -1357,6 +1767,9 @@ function renderDoltSync(sync) {
     case "no-workspace":
       console.log(c.yellow("! no .beads/ workspace — skipped Dolt remote wiring."));
       break;
+    case "server-mode":
+      console.log(c.dim("• board is on a shared Dolt server — no refs/dolt/data remote to wire."));
+      break;
     case "error":
       console.log(c.yellow(`! Dolt remote wiring failed: ${sync.detail}`));
       console.log(c.dim("  beads is configured; retry with `bd dolt remote add origin <url>` then `bd dolt push`."));
@@ -1414,22 +1827,27 @@ async function cmdInit(args = []) {
   const dir = resolve(rawPath ?? process.cwd());
   console.log(c.bold("anton init") + c.dim(` ${dir}`));
 
-  // Prereqs — fail loud, each with the fix (shared with addProject's self-heal gate).
-  const pre = beadsPrereqs(dir);
-  if (!pre.ok) {
-    console.log(c.red(`\n✗ ${pre.error.message}`));
-    if (pre.error.fix) console.log(c.dim(`  ${pre.error.fix}`));
-    return 1;
-  }
-
   // Enforce beads team-config via the shared config path (bd init when absent → config.yaml → .gitignore).
+  // It runs the prereq preflight ITSELF, and no gate may run ahead of it: on a server board the
+  // config path first retracts a stale `dolt.user` published in config.yaml, and a preflight before
+  // that retraction probes as the very account being retracted — so `anton init` would refuse the
+  // project over the exact fault it came to repair (PR #174 review). Prereq failures come back as
+  // `skipped` with the same message + fix this used to print.
   const beads = configureBeadsForRepo(dir, { prefix, log: (m) => console.log(c.dim(`  ${m}`)) });
   if (!beads.configured) {
-    console.log(c.red("\n✗ beads config failed — see output above."));
+    if (beads.skipped) {
+      console.log(c.red(`\n✗ ${beads.reason}`));
+      if (beads.fix) console.log(c.dim(`  ${beads.fix}`));
+    } else {
+      console.log(c.red("\n✗ beads config failed — see output above."));
+    }
     return 1;
   }
   for (const e of beads.errors) console.log(c.yellow(`  ${e}`));
-  console.log(c.green("\n✓ beads team-config enforced.") + c.dim(` (${dir})`));
+  // Naming the profile makes the board's mode visible where it was applied — a server-mode repo
+  // enforces a connection, not the refs/dolt/data knobs, and the two shouldn't look alike.
+  const profile = beads.mode === "server" ? "shared Dolt server board" : "embedded board";
+  console.log(c.green("\n✓ beads team-config enforced.") + c.dim(` (${dir} — ${profile})`));
 
   // Dolt remote wiring outcome — render every status branch, matching cmdSetup (anton-43b).
   renderDoltSync(beads.doltSync);
@@ -1483,9 +1901,309 @@ async function cmdInit(args = []) {
   return 0;
 }
 
+// ── Per-project server mode (anton server-mode — anton-yvjd) ─────────────────────────────────
+// Points ONE project's board at a shared `dolt sql-server` and proves the switch: back up, write
+// `.beads/metadata.json`, `bd dolt test`, confirm the board reads back whole, publish the connection
+// as the team default. The judgement lives in src/lib/beads/server-mode.mjs; this is its terminal.
+//
+// It configures the connection — it does NOT move the data. Copying an existing board's Dolt
+// history onto the server is docs/runbooks/embedded-board-to-shared-dolt-server.md, which a human
+// runs; this command is what makes that copy safe to point at (and refuses when it hasn't happened).
+
+/** The flags `server-mode` accepts — one source for `--help` and for the unknown-flag refusal. */
+const SERVER_MODE_FLAGS =
+  "[path] --host <h> [--port <n>] [--user <u>] --database <db> [--tls|--no-tls] [--no-backup] [--force]";
+
+/**
+ * Parse `anton server-mode` args: the first bare token is the target repo (default: cwd), the rest
+ * name the connection. `--flag <v>` and `--flag=<v>` both work, matching parseInitArgs. Anything
+ * else lands in `unknown`, a value flag left without a value lands in `missing`, and a second bare
+ * token lands in `extra` — the command refuses on any of the three rather than running a half-read
+ * connection or an ambiguous target.
+ */
+function parseServerModeArgs(args) {
+  const VALUE_FLAGS = {
+    "--host": "host",
+    "--port": "port",
+    "--user": "user",
+    "--database": "database",
+    "--db": "database",
+  };
+  const out = {
+    path: null,
+    host: null,
+    port: null,
+    user: null,
+    database: null,
+    // Undefined, not false: only a project that DECLARES a transport gets one written, so a repo
+    // configured before `--tls` existed keeps inheriting the ambient BEADS_DOLT_SERVER_TLS.
+    tls: undefined,
+    backup: true,
+    force: false,
+    unknown: [],
+    missing: [],
+    extra: [],
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--no-backup") {
+      out.backup = false;
+      continue;
+    }
+    if (a === "--force") {
+      out.force = true;
+      continue;
+    }
+    if (a === "--tls" || a === "--no-tls") {
+      out.tls = a === "--tls";
+      continue;
+    }
+    const eq = a.match(/^(--[a-z-]+)=(.*)$/);
+    const flag = eq ? eq[1] : a;
+    const key = VALUE_FLAGS[flag];
+    if (key) {
+      const value = eq ? eq[2] : args[i + 1];
+      // A value flag with nothing usable behind it is a typo, not an omission — and it must not read
+      // as one: resolveServerConnection falls back to the repo's existing metadata for every field
+      // left null, so a trailing `--database` would verify and publish the OLD database and still
+      // exit 0 (PR #174 review). The next token is left unconsumed when it is itself a flag, so it
+      // still gets parsed on its own terms.
+      if (value === undefined || value === "" || (!eq && value.startsWith("-"))) {
+        out.missing.push(flag);
+        continue;
+      }
+      out[key] = value;
+      if (!eq) i++;
+      continue;
+    }
+    // A typo is collected, never ignored: on a repo that already carries a connection, ignoring
+    // `--hots new-host` would verify and publish the OLD host and still exit 0 (PR #174 review).
+    if (a.startsWith("-")) {
+      out.unknown.push(flag);
+      continue;
+    }
+    // A second bare token is an ambiguous target, not a spare word. Keeping the first would rewrite
+    // and verify ONE repo's board connection while the operator named two, and still exit 0
+    // (PR #174 review) — so every extra positional is collected and the command refuses.
+    if (out.path === null) out.path = a;
+    else out.extra.push(a);
+  }
+  return out;
+}
+
+/** Keep a multi-line tool message inside the report's left margin instead of breaking out of it. */
+const indent = (text) => String(text).split("\n").join("\n  ");
+
+/** How each step status prints. Anything unrecognised prints plainly rather than being swallowed. */
+const SERVER_MODE_MARKS = {
+  ok: () => c.green("✓"),
+  set: () => c.green("✓"),
+  written: () => c.green("✓"),
+  already: () => c.dim("·"),
+  unset: () => c.dim("·"),
+  skipped: () => c.dim("·"),
+  reverted: () => c.yellow("↩"),
+  // A revert that declined to overwrite an edit someone else made after the flip — the file is
+  // theirs now, and the warning below says what is left pointing where.
+  kept: () => c.yellow("⚠"),
+  unchanged: () => c.dim("·"),
+  failed: () => c.red("✗"),
+  missing: () => c.red("✗"),
+  unreadable: () => c.red("✗"),
+};
+
+async function cmdServerMode(args = []) {
+  const parsed = parseServerModeArgs(args);
+  const malformed = [
+    parsed.unknown.length ? `unknown flag${parsed.unknown.length === 1 ? "" : "s"} ${parsed.unknown.join(", ")}` : null,
+    parsed.missing.length ? `missing value for ${parsed.missing.join(", ")}` : null,
+    parsed.extra.length
+      ? `unexpected argument${parsed.extra.length === 1 ? "" : "s"} ${parsed.extra.join(", ")} (one repo path at a time)`
+      : null,
+  ].filter(Boolean);
+  if (malformed.length) {
+    for (const m of malformed) console.log(c.red(`anton server-mode: ${m}`));
+    console.log(c.dim(`  usage: anton server-mode ${SERVER_MODE_FLAGS}\n`));
+    return 1;
+  }
+  const dir = resolve(parsed.path ?? process.cwd());
+  console.log(c.bold("anton server-mode") + c.dim(` ${dir}`));
+
+  // Steps print as they happen: an export plus two round trips to the server is long enough that a
+  // batched render reads as a hang. bd's own output is multi-line — its first line is the headline,
+  // the rest is repeated in full under the error below, where the reader is actually looking.
+  const renderStep = (s) => {
+    const mark = (SERVER_MODE_MARKS[s.status] ?? (() => c.dim("·")))();
+    const lines = String(s.detail ?? "").split("\n").filter(Boolean);
+    const detail = lines.length ? `${lines[0]}${lines.length > 1 ? " …" : ""}` : "";
+    console.log(`  ${mark} ${s.name}${detail ? c.dim(` — ${detail}`) : c.dim(` (${s.status})`)}`);
+  };
+
+  const result = configureServerMode(dir, parsed, {
+    log: (m) => console.log(c.dim(`    ${m}`)),
+    onStep: renderStep,
+  });
+
+  // What the run could not verify, on either exit. Printed in full and never dimmed: a warning here
+  // is the only notice an operator gets that a board on this machine went unchecked (PR #174 review).
+  const renderWarnings = () => {
+    for (const w of result.warnings ?? []) console.log(c.yellow(`\n!  ${indent(w)}`));
+  };
+
+  if (!result.ok) {
+    // The headline is the mode the run LEFT, not the one it intended: when the rollback cannot put
+    // metadata.json back, or declines because someone else edited it, the project is still reading
+    // the server — and "not switched" would send an operator back to a board nothing is reading
+    // (PR #174 review). `result.after` is the file itself, read on the way out.
+    const left = result.after;
+    if (left?.mode === "server") {
+      const where = `${left.user ? `${left.user}@` : ""}${left.host ?? "?"}:${left.port ?? "?"}/${left.database ?? "?"}`;
+      console.log(
+        c.red(
+          result.switchStillWritten
+            ? `\n✗ server mode was NOT verified — and this project is STILL pointed at ${where}: the switch could not be taken back out of .beads/metadata.json.`
+            : `\n✗ this project was NOT switched — it was ALREADY pointed at ${where}, and still is.`,
+        ),
+      );
+    } else {
+      console.log(c.red("\n✗ this project was NOT switched to server mode."));
+    }
+    for (const e of result.errors) console.log(c.red(`  ${indent(e)}`));
+    for (const h of result.hints ?? []) console.log(c.dim(`  → ${h}`));
+    renderWarnings();
+    // The two arrived-whole guards are the failures with a runbook behind them: the server is fine,
+    // the data simply is not on it yet — or the copy that is on it and this board were edited apart.
+    if (result.missing?.length || result.diverged?.length) {
+      console.log(c.dim("  → copy the board's Dolt history onto the server first:"));
+      console.log(c.dim(`    ${SERVER_MIGRATION_RUNBOOK}`));
+    }
+    console.log("");
+    return 1;
+  }
+
+  const { host, port, user, database, tls } = result.connection;
+  const transport = tls === undefined ? "" : tls ? " over TLS" : " without TLS";
+  console.log(
+    c.green("\n✓ server mode configured.") +
+      c.dim(` ${user ? `${user}@` : ""}${host}:${port}/${database}${transport}`),
+  );
+  // Records, not issues: the check reads `bd export --all`, so the count covers comment threads and
+  // persistent memories as well as beads (readBoardRecords).
+  if (result.counts?.after !== undefined) console.log(c.dim(`  board reads ${result.counts.after} records from the server.`));
+  if (result.backup?.path) console.log(c.dim(`  pre-switch backup: ${result.backup.path}`));
+  renderWarnings();
+  console.log(
+    c.dim("  Next: run the same command on every other machine (the connection travels in config.yaml,\n" +
+      "        the password does not — set it in each shell), then `anton start`.\n"),
+  );
+  return 0;
+}
+
 function cmdDev(args) {
   console.log(c.dim("anton dev — starting Next.js dev server (runner + scheduler auto-start)…"));
   return runLocal("next", nextArgs("dev", args));
+}
+
+/**
+ * How many builds `anton start` will spend on a checkout that keeps moving. Two rebuilds past the
+ * first is already a person editing through a compile; a fourth would just keep the terminal busy.
+ */
+const MAX_BUILD_ATTEMPTS = 3;
+
+/**
+ * Leave `.next` provably compiled from the checkout on disk, or refuse to start. Returns an exit
+ * code: 0 to go on, non-zero to stop.
+ *
+ * `next start` serves whatever `.next` holds, whichever code produced it — so a checkout that moved
+ * since its last build (a pull, an edit nobody committed, or a different `NEXT_PUBLIC_*` value in
+ * this shell, which Next inlines at compile time) would boot stamping the NEW code while serving
+ * the old one, and every drift surface would then call a stale server current (anton-pzfb).
+ * Rebuilding instead is what makes "restart to run the build on disk" true advice for a source
+ * install. A bundle is exempt: it ships its own prebuilt `.next` and no toolchain to rebuild with.
+ *
+ * The identity is read BEFORE compiling and RE-READ after: an edit saved mid-build lands in the
+ * artifact only if Next had not already read that file, so the tree the build started from is the
+ * most it can honestly claim — and if the tree moved meanwhile, that claim is false and the build
+ * runs again rather than being stamped with a checkout it never saw. A re-read that comes back
+ * unable to name the tree counts as moved, not as agreement (`sameCheckout`): a git call that timed
+ * out or overran its buffer is the check failing open, and stamping through it is the same false
+ * "current" by another route.
+ *
+ * The rebuild passes `--webpack` because that is what `package.json`'s `build` script — the one CI
+ * and the release bundle compile with — uses; Next 16 defaults bare `next build` to Turbopack, so
+ * omitting it would leave the server running an artifact no gate ever built (PR #217 review).
+ *
+ * A rebuild is REFUSED while a server from this install is still serving out of the same `.next`
+ * (PR #217 review). `next build` rewrites that directory in place, and a running `next start` loads
+ * route chunks from it lazily and by content hash — so compiling underneath one breaks or mixes the
+ * responses it is in the middle of serving, and the second process then fails to bind the occupied
+ * port anyway. Two servers from one install are otherwise supported (a UI-only `ANTON_RUNNER=off`
+ * one beside the runner), and they stay supported: this refuses only the REBUILD, so a second start
+ * against a `.next` that already matches the checkout returns above without ever reaching here.
+ *
+ * Named and left to the operator, like every other restart this CLI reports: stopping a server can
+ * kill an in-flight run, which is not anton's call to make. Liveness is `liveBuildRecords`, so a
+ * record whose birth time cannot be rechecked does not count as live and does not block the build —
+ * the same "unproven is not alive" this reads everywhere else, though it errs toward rebuilding
+ * here rather than away from it.
+ *
+ * `build`, `readIdentity` and `liveServers` are injected so the loop is testable without spawning a
+ * real compile or a real server.
+ */
+function ensureFreshBuild({
+  appRoot,
+  isBundle,
+  build = () => runLocal("next", ["build", "--webpack"]),
+  readIdentity = readBuildIdentity,
+  liveServers = () => liveBuildRecords(resolveAntonDb(), appRoot),
+}) {
+  let compiledFrom = isBundle ? null : readIdentity(appRoot);
+  const built = existsSync(join(appRoot, ".next"));
+  if (built && (compiledFrom === null || buildMatchesCheckout(appRoot, compiledFrom))) return 0;
+
+  const serving = built ? liveServers() : [];
+  if (serving.length) {
+    const pids = serving.map(({ record }) => record.pid);
+    console.log(c.red(`\n✗ .next needs rebuilding, but ${pids.length === 1 ? "a server is" : "servers are"} serving from it (pid ${pids.join(", ")}).`));
+    console.log(c.dim("  `next build` rewrites .next in place, and a running server loads its route chunks from"));
+    console.log(c.dim("  there as requests come in — rebuilding now would break the responses it is serving, and"));
+    console.log(c.dim("  this process could not take the port afterwards either."));
+    console.log(c.dim("  Stop that server, then re-run `anton start`. anton will not do it for you: a running"));
+    console.log(c.dim("  process may be mid-run."));
+    return 1;
+  }
+
+  let why = built
+    ? "the build in .next is not provably this checkout — rebuilding so the server runs what is here…"
+    : "no build found — running `next build` first…";
+  for (let attempt = 1; attempt <= MAX_BUILD_ATTEMPTS; attempt++) {
+    console.log(c.dim(why));
+    const code = build();
+    if (code !== 0) return code;
+    if (!compiledFrom) return 0;
+    const now = readIdentity(appRoot);
+    if (sameCheckout(compiledFrom, now)) {
+      // A stamp anton could not write leaves the server running exactly this checkout and unable to
+      // prove it: every drift surface reads the unstamped `.next` as a build nothing can name and
+      // reports the freshly-started server as stale until the next restart. Saying so here is what
+      // tells that false alarm from a real one — the build is fine, the disk is not (PR #217 review).
+      if (!writeBuildStamp(appRoot, compiledFrom)) {
+        console.log(c.yellow("  ! could not write .next/anton-build.json — starting anyway, but nothing can name this build."));
+        console.log(c.dim("    Health and `anton doctor` will call this server unstamped until a restart with a writable .next/"));
+      }
+      return 0;
+    }
+    compiledFrom = now;
+    why = "the build could not be tied to the checkout on disk — rebuilding so .next is the code here…";
+  }
+  console.log(
+    c.red(`\n✗ ${MAX_BUILD_ATTEMPTS} builds later, .next still cannot be tied to this checkout — the server was NOT started.`),
+  );
+  console.log(
+    c.dim("  (either the tree kept changing mid-compile, or git could not read it — nothing here can say\n" +
+      "   what .next holds. Re-run `anton start` once the tree is still and `git status` answers.)"),
+  );
+  return 1;
 }
 
 async function cmdStart(args) {
@@ -1506,12 +2224,9 @@ async function cmdStart(args) {
     return 1;
   }
 
-  const built = existsSync(join(APP_ROOT, ".next"));
-  if (!built) {
-    console.log(c.dim("no build found — running `next build` first…"));
-    const b = runLocal("next", ["build"]);
-    if (b !== 0) return b;
-  }
+  const fresh = ensureFreshBuild({ appRoot: APP_ROOT, isBundle: IS_BUNDLE });
+  if (fresh !== 0) return fresh;
+
   console.log(c.dim("anton start — starting Next.js server (runner + scheduler auto-start)…"));
   // In bundle mode the server's writable state — including the DB getDb() opens — must point at
   // STATE_DIR (the same env startDaemon passes), so it opens the DB ensureMigrated() just migrated
@@ -1526,7 +2241,8 @@ ${c.bold("Usage:")} anton <command>
 
   ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install/refresh agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
   ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
-  ${c.bold("doctor")}   check prereqs + anton.db + stale skills (non-destructive)
+  ${c.bold("server-mode")} point ONE project's board at a shared Dolt server + verify it  ${c.dim(SERVER_MODE_FLAGS)}
+  ${c.bold("doctor")}   check prereqs + anton.db + stale skills + a stale running server (non-destructive)
   ${c.bold("board-check")} report beads that break epic → feature → ticket  ${c.dim("[path...] (default: cwd)")}
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
   ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}
@@ -1538,6 +2254,7 @@ ${c.bold("Usage:")} anton <command>
   ${c.bold("--help")}   show this help
 
 ${c.dim("Port: dev/start default to 3000; override with --port <n> (alias -p) or PORT=<n>.")}
+${c.dim("      doctor takes no port — it finds every server running from this install, on any port.")}
 The runner + scheduler start automatically with the server (set ANTON_RUNNER=off to disable).
 `;
 
@@ -1553,6 +2270,8 @@ function main(argv) {
       return cmdDoctor();
     case "board-check":
       return cmdBoardCheck(rest);
+    case "server-mode":
+      return cmdServerMode(rest);
     case "dev":
       return cmdDev(rest);
     case "start":
@@ -1592,8 +2311,10 @@ if (invokedDirectly) Promise.resolve(main(process.argv)).then((code) => process.
 export {
   resolvePort,
   nextArgs,
+  ensureFreshBuild,
   main,
   parseInitArgs,
+  parseServerModeArgs,
   ensureBeadsGitignore,
   registerProject,
   resolveAntonDb,
@@ -1601,6 +2322,15 @@ export {
   provisionAgentsSkills,
   installSkillDir,
   staleSkills,
+  unstampedServers,
+  procfsListeningEndpoints,
+  runningPid,
+  daemonState,
+  lifecycleVerdict,
+  cmdStop,
+  stoppedFor,
+  writePidFile,
+  serverPort,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
   compareVersions,

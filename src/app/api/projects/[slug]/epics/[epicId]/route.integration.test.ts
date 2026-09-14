@@ -10,7 +10,7 @@ import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
 import * as epicDetail from "@/lib/epic-detail";
 import { resetIssueSnapshots } from "@/lib/beads/snapshot";
-import { describeBd, jsonRequest, makeBdRepo, paramsCtx, type BdRepo } from "@/lib/testing/integration";
+import { describeBd, jsonRequest, makeBdRepo, paramsCtx, tmpProject, type BdRepo } from "@/lib/testing/integration";
 import type { Project } from "@/lib/types";
 
 let project: Project | null = null;
@@ -31,15 +31,7 @@ describeBd("epic route (real bd)", () => {
   beforeAll(async () => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
-    project = {
-      id: "x",
-      slug: "tmp",
-      name: "tmp",
-      repoPath: repo,
-      defaultBranch: "main",
-      hasBeads: true,
-      createdAt: 0,
-    };
+    project = tmpProject(repo);
     epicId = await beads.create(repo, {
       title: "Prioritizable epic",
       type: "epic",

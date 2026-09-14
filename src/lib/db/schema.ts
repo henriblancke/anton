@@ -26,25 +26,75 @@ export const runs = sqliteTable("runs", {
   projectId: text("project_id").notNull().references(() => projects.id),
   epicBeadId: text("epic_bead_id").notNull(),
   ticketBeadId: text("ticket_bead_id"),
+  // The execute-epic job currently behind this run (anton-rgso), rewritten when a resume picks the
+  // parked row back up. The durable half of "did an operator stop this attempt": a cancel is
+  // recorded on the JOB and never on the run, and the two stamps can be days apart — a job parked on
+  // a usage limit is cancelled whenever the operator gets to it — so a timestamp match cannot tell
+  // that cancel from a genuine failure. Null on rows written before this column existed.
+  jobId: text("job_id"),
   worktreePath: text("worktree_path"),
   branch: text("branch"),
   model: text("model"),
   agentTag: text("agent_tag"),
+  // The endpoint host this run drove (anton-oom5): the gateway's host when a project is routed,
+  // else the Anthropic default `api.anthropic.com`, so a bad run can be attributed to the gateway or
+  // cleared of it without re-running it. The HOST only — never the token, never a URL carrying
+  // userinfo (see `endpointHostFromBaseUrl`). NULL only on rows written before this column existed:
+  // an unrouted run records the default explicitly, so an old row and an unrouted new row are not
+  // confusable. Not backfilled.
+  endpointHost: text("endpoint_host"),
   // The pipeline this run walked (anton-aa3m): the formula file's absolute path, and the bead label
   // that selected it when a per-label variant applied (null = the project/bundled default). Recorded
   // rather than inferred — per-project pipelines make "why did this run do that" project-specific,
   // and settings or the target's labels may have changed by the time anyone asks.
   formula: text("formula"),
   formulaVariant: text("formula_variant"),
+  // The commit this run's branch forked from its base, pinned at worktree CREATION (PR #238 review).
+  // Dispatch partitions the run's tickets against `base_fork_sha..HEAD`; recomputing the fork with
+  // `merge-base <base> HEAD` at dispatch reads the base REF, which a sibling run's fetch can rewind
+  // behind the true fork point — widening the delta into pre-fork history, where an old `<id>:`
+  // commit reads as this run's delivery and keeps a superseded ticket live for a PR carrying none of
+  // its work. Resolved once when origin/<base> is fresh and HEAD still sits at it, then reused across
+  // resumes (a reused worktree's HEAD has moved on, so recomputing then is wrong). Null on rows
+  // written before this column existed, which fall back to recomputing.
+  baseForkSha: text("base_fork_sha"),
   // queued | running | parked | done | failed
   status: text("status").notNull().default("queued"),
+  // The self-review score THIS attempt earned (anton-cekf), 0-10, null until its review gate reports
+  // one. The board carries the same number as a `review-score:<n>` label, but that label is the
+  // TARGET's latest score, not any one attempt's: a rerun that settles without being reviewed would
+  // lend its target's old score to a new run row, and the score-regression breaker would judge — and
+  // freeze — a project on reviews that happened before those runs, or before the operator's last
+  // re-arm. Recorded per attempt so the join cannot lie.
+  reviewScore: integer("review_score"),
   attempts: integer("attempts").notNull().default(0),
   leaseExpiresAt: ts("lease_expires_at"),
   error: text("error"),
   startedAt: ts("started_at"),
+  // When the CURRENT attempt on this row began (anton-tebf) — equal to `started_at` on a fresh run,
+  // rewritten every time a resume picks a parked row back up. A row is not one attempt: a parked run
+  // resumes in place (`findOpenRunForEpic`), so `started_at` answers "when did this work first
+  // start", not "when did the attempt that failed start". The repair weigher needs the second — a
+  // `dep-missing` repair parks the run it repaired, and its failure after the resume must still be
+  // ordered AFTER the repair stamp to count double (gardener/repair.ts). Null on rows written
+  // before this column existed, which fall back to `started_at`.
+  attemptStartedAt: ts("attempt_started_at"),
   endedAt: ts("ended_at"),
   updatedAt: ts("updated_at").notNull().default(now),
-});
+  // A global counter stamped on every write to this row (anton-rgso), so the rows carry the one
+  // thing no timestamp here can: SETTLEMENT ORDER. Every `ts` column is whole-second, and with
+  // per-project concurrency two runs settling in the same second is ordinary — but the autopilot
+  // breakers read the run list as a sequence, where a delivery placed before rather than after a
+  // failure resets a streak instead of latching it. Start order is only a proxy for settlement
+  // order and inverts precisely when the runs overlap; a run's LAST write is its settlement, so
+  // descending `writeSeq` is settlement order by construction. Null on rows written before this
+  // column existed, which fall back to that proxy.
+  writeSeq: integer("write_seq"),
+}, (table) => [
+  // Serves the tie-break's ordering and, more to the point, makes the MAX+1 stamp on every run
+  // write an index lookup instead of a table scan.
+  index("runs_write_seq_idx").on(table.writeSeq),
+]);
 
 /** Durable job queue. Idempotent; resumable via leases + backoff. See DESIGN.md §4. */
 export const jobs = sqliteTable(
@@ -52,7 +102,7 @@ export const jobs = sqliteTable(
   {
     id: text("id").primaryKey(),
     // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push | run-health |
-    // unstick | gate-check | gardener
+    // unstick | gate-check | gardener | product-master | board-picker | worktree-reaper
     type: text("type").notNull(),
     projectId: text("project_id").references(() => projects.id),
     payloadJson: text("payload_json").notNull().default("{}"),
@@ -61,7 +111,24 @@ export const jobs = sqliteTable(
     runAt: ts("run_at").notNull().default(now),
     leaseExpiresAt: ts("lease_expires_at"),
     attempts: integer("attempts").notNull().default(0),
+    // Attempts that ran Claude on this row, for the quota-share spend estimate (R6.3, ./quota-spend).
+    // `attempts` is the RETRY budget and is rewound on purpose — `resumeJob` zeroes it so an un-parked
+    // job gets a fresh run at `maxAttempts` — so a meter summing it lost every attempt the job had
+    // already burned the moment an operator or the picker resumed it, and the governor granted that
+    // quota again (PR #248 review). This counter is charged when the handler reaches Claude
+    // (`chargeSpentAttempt`), never at the lease — an attempt that exits in preflight is not spend —
+    // and is never rewound or refunded: nothing else touches it.
+    spentAttempts: integer("spent_attempts").notNull().default(0),
     lastError: text("last_error"),
+    // What the handler reported it actually DID, written when the job completes (anton-znoz).
+    // `ok` = it changed something, `noop` = it ran and found nothing to do. A completed job with a
+    // NULL outcome is one whose handler reports nothing, and reads as `ok` — "it ran and did not
+    // fail" is all the system knows about it, and the one claim it is entitled to make. Only an
+    // explicit `noop` earns the stronger "there was nothing to do".
+    // effect | note: the schedule's last-run outcome is derived from these plus `status`, so a
+    // failure needs no outcome of its own (it is `status` + `lastError`).
+    outcome: text("outcome"),
+    outcomeNote: text("outcome_note"),
     createdAt: ts("created_at").notNull().default(now),
     updatedAt: ts("updated_at").notNull().default(now),
   },
@@ -92,6 +159,21 @@ export const jobs = sqliteTable(
     uniqueIndex("jobs_active_sync_push_unique")
       .on(table.projectId)
       .where(sql`${table.type} = 'sync-push' and ${table.status} = 'queued'`),
+    // Serves the unwatched-park read (anton-kh98), which runs on every board render of a project
+    // whose stall watcher is disarmed — the shipped default. Partial on 'parked' so it stays tiny
+    // next to a jobs table that keeps every finished job for the life of the project, and carries
+    // updated_at so the count and the MIN age are both answered from the index alone.
+    index("jobs_project_parked_idx")
+      .on(table.projectId, table.updatedAt)
+      .where(sql`${table.status} = 'parked'`),
+    // Serves the quota-share spend estimate (R6.3, ./quota-spend), which sums spent attempts over the
+    // current quota week: once per governor tick for one project, and once per settings render for
+    // every project. `updated_at` leads because the week window is the predicate BOTH readers share
+    // — the all-project read has no project to seek on, so a (project_id, updated_at) index would
+    // leave it scanning a jobs table that keeps every finished job for the life of the project.
+    // Seeking the week first bounds both to the same small slice, and the per-project read narrows
+    // inside it without a second index to maintain on every job write.
+    index("jobs_updated_project_idx").on(table.updatedAt, table.projectId),
   ],
 );
 
@@ -107,7 +189,8 @@ export const schedules = sqliteTable("schedules", {
 
 /**
  * Per-job Claude burn samples (anton-w8ny). One row per completed job attempt: the session%/weekly%
- * that moved across the job, attributed to its TYPE. Attribution is clean only for solo windows:
+ * that moved across the job, attributed to its TYPE and to the PROJECT that spent it (anton-wj3d,
+ * nullable — see `project_id`). Attribution is clean only for solo windows:
  * the runner opens a burn window only when this job runs alone (nothing else in flight), and
  * discards the window if a sibling is dispatched before it closes — so every recorded delta is
  * unambiguously one job's cost. A rolling per-type
@@ -120,13 +203,28 @@ export const burnSamples = sqliteTable(
     id: text("id").primaryKey(),
     // execute-epic | review-fix | nightly-stringer | orphan-grooming
     jobType: text("job_type").notNull(),
+    // Whose quota the job spent (anton-wj3d). Nullable, and NOT backfilled: rows written before this
+    // column genuinely do not know their project, and inventing one would poison the very per-project
+    // averages the quota shares are enforced from. Null also covers anton's own plumbing jobs, which
+    // belong to no project's share. Per-project reads match on equality, so unattributed rows are
+    // excluded by construction rather than misattributed.
+    projectId: text("project_id").references(() => projects.id),
     // session/weekly utilization delta (0–100 percentage points) burned across the job.
     sessionDelta: real("session_delta").notNull(),
     weeklyDelta: real("weekly_delta").notNull(),
     createdAt: ts("created_at").notNull().default(now),
   },
-  // Serve the "most recent N samples for this type" query without a full scan.
-  (table) => [index("burn_samples_type_created_idx").on(table.jobType, table.createdAt)],
+  (table) => [
+    // Serve the "most recent N samples for this type" query without a full scan. Kept alongside the
+    // per-project index: the per-type average is still read globally for cost estimates.
+    index("burn_samples_type_created_idx").on(table.jobType, table.createdAt),
+    // Serve "most recent N samples for this project and type" — the per-project spend read.
+    index("burn_samples_project_type_created_idx").on(
+      table.projectId,
+      table.jobType,
+      table.createdAt,
+    ),
+  ],
 );
 
 /**
@@ -147,6 +245,226 @@ export const runHealthReports = sqliteTable("run_health_reports", {
   /** Denormalized so a board badge / refresh token needn't parse the blob. */
   findingCount: integer("finding_count").notNull().default(0),
 });
+
+/**
+ * The board-picker's latest ranked plan per project (anton-it5i) — what anton would start next, in
+ * order, and why every other candidate is not on the list. The pass is read-only over the board, so
+ * this row IS its whole output, and it follows `run_health_reports` exactly: ONE row per project,
+ * each pass replacing the last. Appending would grow a log of ten-minute ticks nobody reads while
+ * the three surfaces that need the answer — the Up Next lane, the decision log, and arming — each
+ * went on re-deriving it, which is the disagreement this row exists to prevent.
+ *
+ * Machine-local by construction, like the policy it derives from: two machines on one repo may hold
+ * different policies and so different plans, and bd's claim protocol — never this table — settles
+ * the race between them.
+ */
+export const boardPickerPlans = sqliteTable("board_picker_plans", {
+  projectId: text("project_id")
+    .primaryKey()
+    .references(() => projects.id),
+  /** The picker job that produced this plan, so an entry traces back to its job row. */
+  jobId: text("job_id"),
+  /**
+   * Identity of this GENERATION of the plan — what a verdict names when it answers one of its picks
+   * (`picker_verdicts.plan_id`).
+   *
+   * Distinct from `board_digest`, and that distinction is the point: the digest describes the INPUTS
+   * (board + policy) and is legitimately reusable, so a pass that re-admits a target once its veto
+   * expires stamps the very digest the decline was filed against. Keyed on that, the new pick would
+   * inherit the old answer. Minted fresh whenever the pass decides anything different, and carried
+   * over when it re-decides the same plan.
+   */
+  planId: text("plan_id").notNull().default(""),
+  generatedAt: ts("generated_at").notNull().default(now),
+  /**
+   * Digest of the board snapshot the plan was ranked against. A surface compares it with a digest of
+   * the board as it now reads: unequal means the board MOVED, and a plan ranked against a board that
+   * has since moved must never be presented as the current answer — the gardener's premise fence,
+   * asked of a whole snapshot rather than one bead.
+   */
+  boardDigest: text("board_digest").notNull(),
+  /**
+   * When the pass read the board, in epoch MILLISECONDS rather than the `ts()` seconds every other
+   * stamp here uses. It dates against bd's per-bead write stamps exactly as the gardener's
+   * `observedAtMs` does, and truncating to the second would let a write landing inside that same
+   * second read as having happened before the snapshot.
+   */
+  boardObservedAtMs: integer("board_observed_at_ms").notNull(),
+  /** How many beads the digest covers — the snapshot's size, without parsing anything. */
+  boardBeadCount: integer("board_bead_count").notNull().default(0),
+  /** `PickerPlanEntry[]` (src/lib/board-picker-plan.ts), serialized, in rank order. */
+  entriesJson: text("entries_json").notNull().default("[]"),
+  /** `PickerExclusion[]`, serialized — the machine-readable "why not this one?" for the rest. */
+  exclusionsJson: text("exclusions_json").notNull().default("[]"),
+  /** Denormalized so a lane badge / refresh token needn't parse the blob. */
+  targetCount: integer("target_count").notNull().default(0),
+});
+
+/**
+ * What the operator ANSWERED the picker (anton-jqvy) — one row per verdict on one of its picks.
+ *
+ * The counterpart to the plan above: that row is what anton decided, this table is what a human said
+ * back. `✕ not now` and `Never` both record a DECLINE (release records the accept), so the pair is a
+ * track record — the same evidence base earned autonomy reads for the gardener's kinds
+ * (`gardener/track-record.ts`), for a surface that has no board fingerprint to count off.
+ *
+ * The two vetoes are one VERDICT and two MEANINGS (anton-gtcd): both defer the target and both are
+ * declines, but `✕ not now` is pacing — "not this hour" — while `Never` is judgment about the rule
+ * that admitted the pick. `veto_kind` is what tells them apart on the row, so the record can weigh
+ * genuine disagreement without counting the operator's scheduling against the ranking.
+ *
+ * One row per (verdict, pick) — a repeat veto extends its standing decline rather than filing a
+ * second one, so the counts stay a record of DECISIONS and not of clicks. A decline carries its own
+ * expiry rather than a flag somebody has to clear: a veto defers the target for a bounded window
+ * ({@link PICKER_DEFER_WINDOW_MS}), so the next pass skips it and the pass after the window lets it
+ * back in. That bound is what keeps this from being the per-bead blocklist the design refuses —
+ * nothing here can silence a target permanently.
+ *
+ * Machine-local, like the plan and the policy it answers: a veto is one operator's pacing decision
+ * on one machine, not shared board state.
+ */
+export const pickerVerdicts = sqliteTable(
+  "picker_verdicts",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The target the verdict is about. Not an FK — beads live on the board, not in anton.db. */
+    beadId: text("bead_id").notNull(),
+    /** `accepted` | `declined` — the two halves of the record earned autonomy counts. */
+    verdict: text("verdict").notNull(),
+    /** `PickerVerdictAction`: which affordance produced it (`not-now`, `never`, `release`). */
+    action: text("action").notNull(),
+    /**
+     * `PickerVetoKind`: what a decline MEANT — `pacing` (`not-now`) or `disagreement` (`never`).
+     * Null on an accept, which vetoes nothing.
+     *
+     * Kept beside `action` rather than derived from it because the two answer different questions
+     * and drift apart on purpose (anton-gtcd). `action` is the LAST affordance that touched the row,
+     * and a repeat veto overwrites it; this is the strongest thing the operator ever said about the
+     * pick, and a later `not-now` never erases a `never`. Only the meaning is evidence about the
+     * ranking, so only the meaning may be counted.
+     */
+    vetoKind: text("veto_kind"),
+    /** The admitting rule the plan recorded, frozen at the moment of the verdict. */
+    rule: text("rule"),
+    /**
+     * The `PolicyCriterionKey` a `Never` opened the policy editor at, when the armed policy had one
+     * to name. Null for a `not-now`, and for a project whose policy narrows nothing.
+     */
+    criterion: text("criterion"),
+    /** The rank the target held in the plan being answered — the pick, not just the bead. */
+    rank: integer("rank"),
+    /**
+     * The answered plan's generation id (`board_picker_plans.plan_id`), so a verdict names the
+     * DECISION and not only its subject. Null when no recorded plan carried the target.
+     */
+    planId: text("plan_id"),
+    /** When this target becomes pickable again. Null on an accept — only a decline defers. */
+    deferredUntil: ts("deferred_until"),
+    decidedAt: ts("decided_at").notNull().default(now),
+  },
+  (table) => [
+    // Serves the track-record read ("this project's last N verdicts, newest first").
+    index("picker_verdicts_project_idx").on(table.projectId, table.decidedAt),
+    // Serves the pass's and the board's "which targets are deferred right now" read.
+    index("picker_verdicts_deferred_idx").on(table.projectId, table.deferredUntil),
+    // At most one ACCEPT per (project, bead, plan) — the DB backstop behind recordPickerAccept's
+    // conflict-ignoring insert. Two concurrent releases of one pick (a double-click, a retry) start
+    // a single run through the enqueue dedupe, so they must not leave two accepts inflating the
+    // track record earned autonomy reads. Partial on the accepted verdict because the DECLINE side
+    // is deduped by `recordPickerVeto` itself, under the same write lock: a second veto updates the
+    // standing row's expiry, so there is no conflicting insert for an index to catch. A plan-less
+    // accept answers no recorded pick and stays unconstrained: SQLite treats NULLs as distinct.
+    uniqueIndex("picker_verdicts_accept_unique")
+      .on(table.projectId, table.beadId, table.planId)
+      .where(sql`${table.verdict} = 'accepted'`),
+  ],
+);
+
+/**
+ * What the picker STARTED with nobody watching (anton-vfvg / R1.5) — one row per unattended start.
+ *
+ * The mirror of `picker_verdicts` above: that table is what a human said back, this one is what anton
+ * did on its own authority. Both feed the Health page's decision log, which is the operator's
+ * standing answer to "what happened while I was not looking" — a start recorded only in a bead note
+ * and a job log would make them open a run to find out.
+ *
+ * A LOG, not a projection of live state: the plan is one replaced row per project, so a start it
+ * decided is gone the moment the next pass runs. The record has to outlive the decision that made it.
+ *
+ * Bounded to {@link PICKER_START_RETENTION} rows per project, pruned on write like the scan
+ * summaries: the log answers "recently", and an unbounded table would grow a row every cadence
+ * forever for a page that shows the newest handful.
+ */
+export const pickerStarts = sqliteTable(
+  "picker_starts",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The target that was started. Not an FK — beads live on the board, not in anton.db. */
+    beadId: text("bead_id").notNull(),
+    /** Where it stood in the plan that started it, and how many targets that plan ranked. */
+    rank: integer("rank").notNull(),
+    ranked: integer("ranked").notNull(),
+    /** The admitting rule, frozen at the moment of the start — the same words the bead note carries. */
+    rule: text("rule").notNull(),
+    /** The run this start enqueued, so the log can point at the job that answers "what happened". */
+    jobId: text("job_id"),
+    startedAt: ts("started_at").notNull().default(now),
+  },
+  // Serves the log read ("this project's last N starts, newest first") and the prune behind it.
+  (table) => [index("picker_starts_project_idx").on(table.projectId, table.startedAt)],
+);
+
+/**
+ * The autopilot's DISARM latch, per project (anton-5c8h / R4.6). A disarm is the half of the brake
+ * that does not clear itself: a score regression or a run of failures freezes the picker until a
+ * human looks at the evidence and re-arms it, and this row is both the freeze and the audit trail of
+ * who lifted it.
+ *
+ * Only the disarm is stored. A HOLD (the WIP limit) is derived from live run/PR state on every pass
+ * and clears the moment that state changes — persisting it would create a second, staler answer to a
+ * question the board can already answer, and a stale hold is a stopped autopilot nobody can explain.
+ *
+ * Append-only rather than one row per project: `rearmed_at` closes a disarm instead of deleting it,
+ * so "this project was disarmed for score regression twice last week, and Henri re-armed it both
+ * times" survives. The partial unique index is what keeps at most ONE latched at a time, the same
+ * shape `escalations_open_unique` uses for the same reason.
+ */
+export const autopilotDisarms = sqliteTable(
+  "autopilot_disarms",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** `DisarmReason` (src/lib/autopilot-breaker.ts): score-regression | consecutive-failures. */
+    reason: text("reason").notNull(),
+    /** Why, in the detector's own words — the sentence the lane header prints under the heading. */
+    detail: text("detail").notNull(),
+    /** `string[]`: the score series or the failed runs. The operator's whole case for re-arming. */
+    evidenceJson: text("evidence_json").notNull().default("[]"),
+    /** The escalation this disarm raised (R4.6), so the header's `Investigate` lands on it. */
+    escalationId: text("escalation_id"),
+    disarmedAt: ts("disarmed_at").notNull().default(now),
+    /** Null while the breaker is latched. Set by an explicit human re-arm, never by a pass. */
+    rearmedAt: ts("rearmed_at"),
+    /** WHO re-armed it (`resolveOperator`) — a re-arm is a decision, and decisions have an author. */
+    rearmedBy: text("rearmed_by"),
+  },
+  (table) => [
+    // At most one LATCHED disarm per project: a second detector tripping while the first is unlifted
+    // must not stack a second freeze the operator has to clear twice.
+    uniqueIndex("autopilot_disarms_latched_unique")
+      .on(table.projectId)
+      .where(sql`${table.rearmedAt} is null`),
+    index("autopilot_disarms_project_idx").on(table.projectId, table.disarmedAt),
+  ],
+);
 
 /**
  * One gardener patrol's hygiene report (anton-3nv7). Unlike `run_health_reports` this is one row PER
@@ -245,7 +563,7 @@ export const scanSummaries = sqliteTable(
      * when there was none anton could read (a whole-repo pass, or a state it could not identify).
      *
      * Kept beside the one it left because a retried job's rescan is only legible against both. When
-     * a pass dies before triage the handler puts the baseline BACK (src/lib/jobs/nightly-stringer.ts),
+     * a pass dies before triage the handler puts the baseline BACK (src/lib/jobs/nightly-stringer-scan.ts),
      * so the retry measures from this value again: it REPLAYED the row's own window rather than
      * continuing past it, and its counts supersede rather than fold. A retry measuring from
      * `delta_state` instead scanned the next window along, and folds in. Written once, at insert —
@@ -272,6 +590,16 @@ export const scanSummaries = sqliteTable(
     beadsDeduped: integer("beads_deduped"),
     /** Collectors that died mid-scan: every one is a hole in the counts above. */
     collectorFailures: integer("collector_failures").notNull().default(0),
+    /**
+     * The commit the scanned working tree held (anton-qor2). NULL for rows written before it was
+     * tracked, or when git could not name one.
+     *
+     * A point on the trend is a measurement of a TREE, and until this was recorded nothing said
+     * which: the 2026-08-06 nightly measured a checkout 6 commits behind origin/main and the column
+     * it charted was indistinguishable from one measuring the shipped code. Stale is now visible on
+     * the point rather than inferred from a diff hours later.
+     */
+    scannedSha: text("scanned_sha"),
   },
   (table) => [
     // Serves "this project's last N scans" (and the prune) without a full scan.
@@ -323,6 +651,29 @@ export const escalations = sqliteTable(
     /** When the board-native `bd note` landed. Null with a `beadId` set means the write failed and
      *  the next pass retries it — the note is what makes the escalation visible off the anton UI. */
     notedAt: ts("noted_at"),
+    /**
+     * When a HUMAN put this alert down (anton-7gxs), and the reason it stays down: a dismissed row
+     * suppresses the next raise of the same stall (see {@link escalationSignature}).
+     *
+     * Deliberately NOT `resolution = 'dismissed'`, which the sweep itself writes whenever it retires
+     * an ended stall (`settleEndedStalls` in jobs/unstick.ts). Keying suppression off the resolution
+     * would make every auto-retirement silence its own finding forever — the exact opposite of what
+     * that path means, which is "this stall is over, so stop showing it". Only a click sets this.
+     */
+    dismissedAt: ts("dismissed_at"),
+    /**
+     * The stall's identity BEYOND its finding key — what "until it changes" is measured against.
+     *
+     * `findingKey` alone is too coarse to gate a dismissal on: an `exhausted-job` key is the job id,
+     * and that job's error text is exactly what changes when the failure changes. The signature
+     * folds in the reason and the stall's start, so a dismissed 503 storm stays down while the same
+     * job failing a NEW way comes straight back.
+     *
+     * Null on rows written before this column existed, and null rows never suppress: an old
+     * dismissal has nothing to compare against, and silencing a live stall on a guess is the one
+     * mistake this table must not make.
+     */
+    signature: text("signature"),
     raisedAt: ts("raised_at").notNull().default(now),
     updatedAt: ts("updated_at").notNull().default(now),
   },
@@ -336,22 +687,124 @@ export const escalations = sqliteTable(
       .where(sql`${table.status} = 'open'`),
     // Serves the board panel's "this project's open escalations" read without a full scan.
     index("escalations_project_status_idx").on(table.projectId, table.status),
+    // Serves the suppression read on the raise path — one lookup per finding per sweep, so it must
+    // not scan the table's whole history. Partial on dismissed rows for the same reason the open
+    // index above is partial: only they can ever match.
+    index("escalations_dismissed_idx")
+      .on(table.projectId, table.findingKey)
+      .where(sql`${table.dismissedAt} is not null`),
   ],
 );
 
 /** Claude sessions — for history, diagnostics, and xterm attach. */
-export const sessions = sqliteTable("sessions", {
-  id: text("id").primaryKey(),
-  projectId: text("project_id").notNull().references(() => projects.id),
-  runId: text("run_id").references(() => runs.id),
-  // shape | execute | review-fix | interactive
-  kind: text("kind").notNull(),
-  beadId: text("bead_id"),
-  status: text("status").notNull().default("running"),
-  logPath: text("log_path"),
-  // Claude's own session id (from the stream-json result / system-init event), persisted so a
-  // transient mid-stream death can be retried with `claude --resume <id>` (anton-juar).
-  claudeSessionId: text("claude_session_id"),
-  startedAt: ts("started_at").notNull().default(now),
-  endedAt: ts("ended_at"),
-});
+export const sessions = sqliteTable(
+  "sessions",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id").notNull().references(() => projects.id),
+    runId: text("run_id").references(() => runs.id),
+    // The queue job that opened this session (anton-lmps). The runner's in-memory live handle only
+    // answers for a job running on THIS instance, so without this column a settled job's output is
+    // unreachable — a nightly gardener/product-master pass writes no run row, and its log would exist
+    // only as a file on disk. Project deletion clears sessions before jobs, so the FK never blocks it.
+    jobId: text("job_id").references(() => jobs.id),
+    // shape | execute | review-fix | interactive
+    kind: text("kind").notNull(),
+    beadId: text("bead_id"),
+    status: text("status").notNull().default("running"),
+    logPath: text("log_path"),
+    // Claude's own session id (from the stream-json result / system-init event), persisted so a
+    // transient mid-stream death can be retried with `claude --resume <id>` (anton-juar).
+    claudeSessionId: text("claude_session_id"),
+    startedAt: ts("started_at").notNull().default(now),
+    endedAt: ts("ended_at"),
+  },
+  (table) => [
+    // Serves the jobs page's "which session did each of these rows open" read (one IN per page).
+    index("sessions_job_idx").on(table.jobId),
+  ],
+);
+
+/**
+ * One row per `claude` invocation and model (anton-77l9) — the fact table every question about what
+ * a task SPENT is answered from.
+ *
+ * Recorded from the result event at the moment the invocation ends, with the dimensions as they
+ * stood then: the project, the job type and pipeline step that dispatched it, the run and bead it
+ * was for, the model anton REQUESTED next to the one the result reported, and the endpoint host it
+ * went to. None of that is reconstructible later — settings change, a formula is edited, a bead is
+ * relabelled, a gateway is pointed elsewhere — which is the same reason `runs` records `model`,
+ * `agent_tag`, `formula` and `formula_variant` rather than deriving them. Cost is NOT derived here;
+ * a sibling ticket owns the price table.
+ *
+ * Grain: one row per (invocation, model). A session that used a subagent reports usage under both
+ * models, and one row per model is what lets a later reader attribute the haiku tokens and the opus
+ * tokens separately rather than summing them into a figure that prices as neither. An invocation
+ * whose `modelUsage` was absent, empty or unreadable still gets exactly ONE row — `model_reported`
+ * null, the counts null — because the fact that the invocation happened is what the table is for,
+ * and a dropped row understates spend silently.
+ *
+ * `modelUsage` is cumulative per session, so these counts are the LATEST result's, never a sum
+ * across the results of one session (see claude/model-usage.ts).
+ */
+export const claudeInvocations = sqliteTable(
+  "claude_invocations",
+  {
+    id: text("id").primaryKey(),
+    /** One id per driver call, shared by every model-usage row it produced. */
+    invocationId: text("invocation_id"),
+    projectId: text("project_id").references(() => projects.id),
+    /** The queue job type that dispatched this invocation (`execute-epic`, `review-fix-pr`, …). */
+    jobType: text("job_type"),
+    jobId: text("job_id"),
+    /**
+     * The formula step that dispatched it (`implement`, `review`, a project's own `step:claude` id),
+     * or the pass's own name for an invocation outside the ticket pipeline. What separates two
+     * invocations of one run that spent very differently.
+     */
+    step: text("step"),
+    runId: text("run_id"),
+    /** The bead the invocation was for — the ticket, or the run target for a run-phase step. */
+    beadId: text("bead_id"),
+    /** Claude's own session id, so a row joins to its session log and its sibling invocations. */
+    claudeSessionId: text("claude_session_id"),
+    /** The model anton ASKED for (`--model`), null when the run took claude's default. */
+    modelRequested: text("model_requested"),
+    /**
+     * The model id the result reported the usage UNDER. A gateway spells ids its own way and may
+     * serve a different model than was requested, so the two are recorded separately rather than
+     * assumed equal — the divergence is a sibling ticket's question, and it can only be asked if
+     * both are stored. Null on an invocation with unknown usage.
+     */
+    modelReported: text("model_reported"),
+    /**
+     * The HOST the invocation's traffic went to — a gateway's, or null for the Claude API. The host
+     * only: a base URL can carry a path and a query, and neither is a dimension worth keeping next
+     * to the risk of a credential landing in one.
+     */
+    endpointHost: text("endpoint_host"),
+    inputTokens: integer("input_tokens"),
+    outputTokens: integer("output_tokens"),
+    thinkingTokens: integer("thinking_tokens"),
+    cacheReadInputTokens: integer("cache_read_input_tokens"),
+    cacheCreationInputTokens: integer("cache_creation_input_tokens"),
+    webSearchRequests: integer("web_search_requests"),
+    numTurns: integer("num_turns"),
+    /** What claude itself reported the session cost. Kept as REPORTED, not as anton's own derivation. */
+    costUsd: real("cost_usd"),
+    durationMs: integer("duration_ms"),
+    durationApiMs: integer("duration_api_ms"),
+    /** ok | error — whether claude reported the invocation itself as failed. */
+    outcome: text("outcome").notNull(),
+    recordedAt: ts("recorded_at").notNull().default(now),
+  },
+  (table) => [
+    // The read every later question starts from: one project's spend over a window. `recorded_at`
+    // trails the project id because the project is always known and always an equality predicate,
+    // while the window is a range — the reverse order would leave the seek to the range.
+    index("claude_invocations_project_idx").on(table.projectId, table.recordedAt),
+    // Serves "what did this run spend", which is a run detail read and not a scan of the table.
+    index("claude_invocations_run_idx").on(table.runId),
+    index("claude_invocations_invocation_idx").on(table.invocationId),
+  ],
+);

@@ -19,6 +19,12 @@ export interface BoardIndex {
   /** Direct children of a bead, in board order. */
   childrenOf(id: string): Bead[];
   /**
+   * Every bead beneath this one, at any depth, whatever its status — the subtree a retirement has to
+   * LOCK, not just judge (PR #238 review): a re-parent onto a closed descendant contends on that
+   * descendant alone, so a settlement that held only the parent could not order itself against it.
+   */
+  descendantsOf(id: string): Bead[];
+  /**
    * Every still-open bead beneath this one, at any depth. Retirement asks this before it settles a
    * bead: closing a parent with open children leaves them hanging off a card nothing will ever run,
    * which is the same unreachable state `detectContainerOrphans` exists to flag.
@@ -39,11 +45,17 @@ export interface BoardIndex {
    */
   recordsBlocker(id: string, blockerId: string): boolean;
   /**
-   * Is `id` already blocked by `blockerId`, directly or through any chain of `blocks` edges?
+   * Is `id` already blocked by `blockerId`, directly or through any chain of BLOCKING edges?
    * DIRECTED, unlike {@link hasBlocksEdge}, and asked in the one place direction decides safety:
    * recording "X blocks Y" when X is itself already waiting on Y closes a dependency cycle, and bd
    * rejects cycles at every write path (bd-hygiene.integration.test.ts) — so a proposal that only
    * looked at the direct pair could be approved into a 500 and never apply.
+   *
+   * The walk follows `conditional-blocks` as well as `blocks` (PR #223 review): the question is
+   * whether work is HELD BACK, and the measured CLI matrix
+   * (docs/spikes/2026-07-28-bd-workflow-primitives.md) says both types block identically. Indexing
+   * the exact type alone would read a path that reaches the target through one conditional edge as
+   * safe, and the repair promising a park behind a prerequisite would close a real cycle instead.
    */
   isBlockedBy(id: string, blockerId: string): boolean;
   /**
@@ -61,6 +73,14 @@ export interface BoardIndex {
    * it, so a pair already carrying provenance can never also carry ordering.
    */
   recordsDiscovery(discoveredId: string, sourceId: string): boolean;
+  /**
+   * The type of the edge the board records FROM `fromId` TO `toId`, if the directed pair carries one
+   * at all. The catch-all behind {@link recordsBlocker} and {@link recordsDiscovery}: bd's one-edge-
+   * per-directed-pair rule applies to EVERY type it accepts, not just the three indexed by name, so
+   * a pair already carrying `conditional-blocks` or `related` refuses a `blocks` write exactly as a
+   * provenance pair does (PR #223 review). Asked last, so the named types keep their own refusals.
+   */
+  recordsEdge(fromId: string, toId: string): string | undefined;
   /** Is `ancestorId` this bead, or anywhere on its parent chain? Cycle-guarded. */
   isAncestor(ancestorId: string, id: string): boolean;
   /** An epic that groups run targets rather than being one (`beads.isContainer`, board-wide). */
@@ -81,21 +101,28 @@ export function indexBoard(all: Bead[]): BoardIndex {
 
   const blocks = new Set<string>();
   // The same edges, kept DIRECTED: `from` depends on `to` (bd's `blocks` edge points at the blocker,
-  // matching beads.unblocksCount), which is what makes reachability — and so cycle detection —
-  // answerable at all. A Set per bead so a direct-blocker lookup costs the same as every other edge
-  // question here.
+  // matching beads.unblocksCount). EXACTLY `blocks`, because this answers whether the board already
+  // records the very edge a write asks for. A Set per bead so a direct-blocker lookup costs what
+  // every other edge question here costs.
   const blockers = new Map<string, Set<string>>();
+  // Everything that actually HOLDS WORK BACK, which is what reachability — and so cycle detection —
+  // has to walk. A superset of `blockers` by one type; see {@link BoardIndex.isBlockedBy}.
+  const blocking = new Map<string, Set<string>>();
   // `bd supersede <id> --with <replacement>` writes (from = the superseded bead, to = the survivor).
   const supersedes = new Set<string>();
   // `bd link <discovered> <source> --type discovered-from` writes (from = the bead that was found,
   // to = the work it was found while doing).
   const discoveries = new Set<string>();
+  // Every directed pair the board has spent, whatever the type — the question a write has to ask
+  // before it draws a new edge over one.
+  const edgeTypes = new Map<string, string>();
   for (const edge of beads.edgesOf(all)) {
+    const pair = directedKey(edge.from, edge.to);
+    if (!edgeTypes.has(pair)) edgeTypes.set(pair, edge.type);
+    if (BLOCKING_EDGE_TYPES.has(edge.type)) addBlocker(blocking, edge.from, edge.to);
     if (edge.type === "blocks") {
       blocks.add(pairKey(edge.from, edge.to));
-      const known = blockers.get(edge.from);
-      if (known) known.add(edge.to);
-      else blockers.set(edge.from, new Set([edge.to]));
+      addBlocker(blockers, edge.from, edge.to);
     } else if (edge.type === "supersedes") {
       supersedes.add(directedKey(edge.from, edge.to));
     } else if (edge.type === "discovered-from") {
@@ -104,44 +131,47 @@ export function indexBoard(all: Bead[]): BoardIndex {
   }
 
   const childrenOf = (id: string): Bead[] => children.get(id) ?? [];
+  const descendantsOf = (id: string): Bead[] => {
+    const found: Bead[] = [];
+    const seen = new Set<string>([id]);
+    const queue = [...childrenOf(id)];
+    while (queue.length > 0) {
+      const bead = queue.shift() as Bead;
+      if (seen.has(bead.id)) continue; // a parent cycle must not spin this walk forever
+      seen.add(bead.id);
+      found.push(bead);
+      queue.push(...childrenOf(bead.id));
+    }
+    return found;
+  };
 
   return {
     all,
     byId,
     cards: boardCards(all),
     childrenOf,
-    openDescendants: (id) => {
-      const found: Bead[] = [];
-      const seen = new Set<string>([id]);
-      const queue = [...childrenOf(id)];
-      while (queue.length > 0) {
-        const bead = queue.shift() as Bead;
-        if (seen.has(bead.id)) continue; // a parent cycle must not spin this walk forever
-        seen.add(bead.id);
-        if (isOpenWork(bead)) found.push(bead);
-        queue.push(...childrenOf(bead.id));
-      }
-      return found;
-    },
+    descendantsOf,
+    openDescendants: (id) => descendantsOf(id).filter(isOpenWork),
     hasBlocksEdge: (a, b) => blocks.has(pairKey(a, b)),
     recordsBlocker: (id, blockerId) => blockers.get(id)?.has(blockerId) ?? false,
     isBlockedBy: (id, blockerId) => {
       // Walks blocker-ward from `id`; `seen` also guards a graph that ALREADY holds a cycle (a merge
       // can leave one, see beads.depCycles), which must not spin this walk forever.
       const seen = new Set<string>([id]);
-      const queue = [...(blockers.get(id) ?? [])];
+      const queue = [...(blocking.get(id) ?? [])];
       while (queue.length > 0) {
         const next = queue.shift() as string;
         if (next === blockerId) return true;
         if (seen.has(next)) continue;
         seen.add(next);
-        queue.push(...(blockers.get(next) ?? []));
+        queue.push(...(blocking.get(next) ?? []));
       }
       return false;
     },
     recordsSupersedes: (id, replacementId) => supersedes.has(directedKey(id, replacementId)),
     recordsDiscovery: (discoveredId, sourceId) =>
       discoveries.has(directedKey(discoveredId, sourceId)),
+    recordsEdge: (fromId, toId) => edgeTypes.get(directedKey(fromId, toId)),
     isAncestor: (ancestorId, id) => {
       const seen = new Set<string>();
       let current: string | undefined = id;
@@ -155,6 +185,20 @@ export function indexBoard(all: Bead[]): BoardIndex {
     },
     isContainer: (bead) => beads.isContainer(bead, all),
   };
+}
+
+/**
+ * The bd edge types that HOLD WORK BACK — measured, not assumed
+ * (docs/spikes/2026-07-28-bd-workflow-primitives.md): a bead on the `from` side of either shows up
+ * in `bd blocked`. Every other type bd accepts is a no-op for scheduling.
+ */
+const BLOCKING_EDGE_TYPES = new Set(["blocks", "conditional-blocks"]);
+
+/** Record `to` as something `from` waits on, in one of the directed blocker adjacency maps. */
+function addBlocker(map: Map<string, Set<string>>, from: string, to: string): void {
+  const known = map.get(from);
+  if (known) known.add(to);
+  else map.set(from, new Set([to]));
 }
 
 /** Undirected edge key — `a|b` and `b|a` are the same edge to every question asked here. */
@@ -232,17 +276,40 @@ export function isClaimed(bead: Bead): boolean {
  * without ever being a board card.
  */
 export function ticketOwnerOf(index: BoardIndex, bead: Bead): Bead | undefined {
+  return ticketAncestry(index, bead).owner;
+}
+
+/**
+ * The ancestors this bead reaches its run target THROUGH — every strict ancestor the walk passes
+ * before it lands on one, or, when nothing above the bead runs, the whole chain it climbed. Empty
+ * when the bead hangs directly off its run target or is one itself.
+ *
+ * bd nesting runs to any depth, so a `feature → task → subtask` subtask reaches its card through the
+ * task. Those in-between beads are where ownership can change WITHOUT the bead itself being written
+ * to — re-homing one hands the whole subtree to another card — which is the one thing a fence read
+ * off the bead's own stamp cannot see (see apply-plan.ts `carrierMoved`).
+ */
+export function ticketPathOf(index: BoardIndex, bead: Bead): Bead[] {
+  return ticketAncestry(index, bead).through;
+}
+
+/** The walk both readings share: what the bead climbs through, and the run target it lands on. */
+function ticketAncestry(index: BoardIndex, bead: Bead): { through: Bead[]; owner?: Bead } {
+  const through: Bead[] = [];
   const seen = new Set<string>();
   let current: Bead | undefined = bead;
   while (current && !seen.has(current.id)) {
     // Plumbing coordinates work rather than running it, and nothing above it runs this bead either.
-    if (isPipelineArtifact(current)) return undefined;
-    if (beads.isRunTarget(current, index.all)) return current.id === bead.id ? undefined : current;
+    if (isPipelineArtifact(current)) return { through };
+    if (beads.isRunTarget(current, index.all)) {
+      return current.id === bead.id ? { through } : { through, owner: current };
+    }
+    if (current.id !== bead.id) through.push(current);
     seen.add(current.id);
     const parent = beads.parentOf(current);
     current = parent ? index.byId.get(parent) : undefined;
   }
-  return undefined;
+  return { through };
 }
 
 /** bd's last-write stamp, falling back to creation — a bead carrying neither is simply undated. */
@@ -274,4 +341,68 @@ const DAY_MS = 86_400_000;
 export function ageInDays(bead: Bead, nowMs: number): number | undefined {
   const at = stampMsOf(bead);
   return at === undefined ? undefined : Math.floor((nowMs - at) / DAY_MS);
+}
+
+/**
+ * bd ids as they appear in PROSE (`anton-qg4h`, `anton-287p.1`) — deliberately loose, because
+ * membership in a board is what decides which of these is real ({@link beadIdsNamedIn}) and the
+ * pattern only has to be wide enough not to miss one. The dotted suffix is part of the id: bd mints
+ * child ids that carry it, and a pattern that stopped at the dot would resolve `anton-287p.1` to its
+ * parent.
+ */
+const ID_PATTERN = /\b[a-z][a-z0-9]*-[a-z0-9]{2,12}(?:\.[a-z0-9]+)*\b/gi;
+
+/**
+ * A url taken whole, so no segment of it is read as a bead id (PR #238 review): the owner or
+ * repository in `https://github.com/anton-abcd/widgets/pull/85` stands alone between slashes and,
+ * shaped exactly like a bead id, would otherwise be read as one — retiring a target as superseded
+ * by a bead the reason only names accidentally inside a link. The same span the commit-citation
+ * parser strips (repair-already-shipped.ts's `URL_PATTERN`), ended at the punctuation that
+ * separates one citation from the next without whitespace.
+ */
+const URL_PATTERN = /\bhttps?:\/\/[^\s,;()[\]<>"'`|]+/g;
+
+/** A url or a bead id, whichever comes first — one pass, so url spans are consumed before the id
+ * pattern can read a segment of them, and real ids keep the order written. */
+const ID_OR_URL = new RegExp(`${URL_PATTERN.source}|${ID_PATTERN.source}`, "gi");
+
+/**
+ * Every bead id `text` mentions, lower-cased and de-duplicated in the order written. Ids inside a
+ * url are skipped, not extracted — a link's owner or repository is not a bead the reason names.
+ *
+ * Order is how a caller REPORTS what it found; which id means what is never decided by position.
+ */
+export function namedBeadIds(text: string | undefined): string[] {
+  if (!text) return [];
+  const seen = new Set<string>();
+  for (const [token] of text.matchAll(ID_OR_URL)) {
+    if (/^https?:/i.test(token)) continue; // a url span, matched only to swallow its segments
+    seen.add(token.toLowerCase());
+  }
+  return [...seen];
+}
+
+/** The bit before the dash — `anton` in `anton-qg4h`; empty for a token shaped like neither. */
+function idPrefix(id: string): string {
+  const dash = id.indexOf("-");
+  return dash > 0 ? id.slice(0, dash) : "";
+}
+
+/**
+ * The ids in `text` that could be beads of THIS board — the ones whose prefix it actually mints,
+ * read off the snapshot rather than configured.
+ *
+ * Narrowed by prefix rather than by membership, because the two answers differ and both callers need
+ * the difference: {@link ID_PATTERN} is loose enough that ordinary hyphenated prose ("pre-existing",
+ * "zero-diff") reads as an id, and dropping every id the board does not hold would silently discard a
+ * MISTYPED one — the very reading a checker must refuse. The prefix is the cheapest line between the
+ * two: `anton-zzzz` is a bead id that missed, `pre-existing` was never one.
+ */
+export function beadIdsNamedIn(index: BoardIndex, text: string | undefined): string[] {
+  const prefixes = new Set<string>();
+  for (const id of index.byId.keys()) {
+    const prefix = idPrefix(id);
+    if (prefix) prefixes.add(prefix);
+  }
+  return namedBeadIds(text).filter((id) => prefixes.has(idPrefix(id)));
 }

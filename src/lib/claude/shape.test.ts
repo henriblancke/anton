@@ -15,6 +15,29 @@ describe("buildShapeSystemPrompt", () => {
   });
 });
 
+describe("SHAPE_UI_FRAMING", () => {
+  // The framing leads the prompt, so it outranks the skill body: while it described the panel as
+  // committing an epic, the UI producer and the /shape CLI producer disagreed about what a run
+  // target is (anton-h1ds).
+  it("frames the draft as a feature under an epic, the tier anton runs", () => {
+    expect(SHAPE_UI_FRAMING).toContain("**feature**");
+    expect(SHAPE_UI_FRAMING).toContain("**epic**");
+    expect(SHAPE_UI_FRAMING).toContain("one reviewable PR");
+    expect(SHAPE_UI_FRAMING).not.toMatch(/draft epic|single-PR-scoped epic/i);
+  });
+
+  it("names every section the panel commits, so the assistant proposes text for each", () => {
+    for (const field of ["Goal", "Acceptance criteria", "Context", "Out of scope", "Verify"]) {
+      expect(SHAPE_UI_FRAMING).toContain(`**${field}**`);
+    }
+  });
+
+  it("refuses a parentless feature rather than inventing an epic to silence the question", () => {
+    expect(SHAPE_UI_FRAMING).toContain("Never leave the feature without an epic");
+    expect(SHAPE_UI_FRAMING).toContain("one-feature epic");
+  });
+});
+
 describe("buildShapeArgs", () => {
   it("seeds the skill via --append-system-prompt", () => {
     const args = buildShapeArgs("SKILL BODY");

@@ -11,6 +11,20 @@
  *    board all judge beads read from `bd list --json`, on the strength of it carrying every home
  *    the contract lives in — description and `acceptance_criteria` — whenever they are non-empty
  *    (ticket-view.ts). That is a property of bd's output, so only a real bd can pin it.
+ * 4. **bd's own validator agrees.** anton reads either spelling of the rubric heading; bd does not
+ *    (`bd create --validate` demands `## Acceptance Criteria` on a task/feature, `## Success
+ *    Criteria` on an epic), so which spelling the formula cooks is a fact only bd can settle. Every
+ *    tier is cooked by bd, created with `--validate`, and then linted — together the forcing
+ *    function that makes the heading un-revertable (anton-szul). `--validate` is the sharper of the
+ *    two: it refuses the create outright, judging the very description the formula ships. `bd lint`
+ *    rejects the bare spelling too (measured on bd 1.1.2, which exits 1 with "Missing: ## Acceptance
+ *    Criteria"), and is pinned alongside it because it is the only rubric check that reaches beads
+ *    made the `--graph` way, which `--validate` skips entirely (skills/bd/SKILL.md).
+ * 5. **…and what bd's validator does NOT agree to.** Its scope is that one heading, nothing more: a
+ *    body of only the rubric passes, and so does a skeleton whose every var is still the formula's
+ *    TODO prompt. skills/bd/SKILL.md is loaded verbatim into /shape and /scan-triage, so selling
+ *    `--validate` as a contract check ships TODO-stub beads; these two tests keep the sentence
+ *    honest, and name anton's own gate as the thing that actually refuses them.
  */
 import { execFileSync } from "node:child_process";
 import { afterAll, beforeAll, expect, it } from "vitest";
@@ -41,7 +55,13 @@ describeBd("bead formula (real bd · cook + create)", () => {
     success_criteria: "- [ ] every report view exports",
   };
 
-  const cook = (): { steps: Array<{ id: string; description: string }> } => {
+  interface CookedStep {
+    id: string;
+    type: string;
+    description: string;
+  }
+
+  const cook = (): { steps: CookedStep[] } => {
     const args = [
       "cook",
       BEAD_FORMULA_NAME,
@@ -51,12 +71,39 @@ describeBd("bead formula (real bd · cook + create)", () => {
     return JSON.parse(execFileSync("bd", args, { cwd: repo, encoding: "utf8" }));
   };
 
+  /** `bd create --validate` — bd judging the cooked description by its OWN required section: the
+   * rubric heading, and (per the two tests at the end) nothing else. */
+  const createValidated = (type: string, description: string): string =>
+    JSON.parse(
+      execFileSync(
+        "bd",
+        ["create", VARS.title, "--type", type, "--description", description, "--validate", "--json"],
+        { cwd: repo, encoding: "utf8", stdio: "pipe" },
+      ),
+    ).id;
+
+  /** `bd lint` — the same rubric judged after the fact. Exits non-zero on a finding, so a passing
+   * lint is simply "does not throw". */
+  const lint = (id: string): string =>
+    execFileSync("bd", ["lint", id], { cwd: repo, encoding: "utf8", stdio: "pipe" });
+
+  /** What bd itself cooked, per tier — the description AND the bd type each tier materialises as. */
+  let cooked: Map<string, CookedStep>;
+
   beforeAll(() => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
     // The install step `anton init` / addProject runs — proving bd itself discovers what we ship.
     expect(ensureBeadFormula(`${repo}/.beads`).status).toBe("installed");
+    cooked = new Map(cook().steps.map((s) => [s.id, { ...s, description: s.description.trim() }]));
   });
+
+  /** The cooked step for `tier`, failing loud rather than validating an `undefined` description. */
+  const cookedTier = (tier: BeadTier): CookedStep => {
+    const step = cooked.get(tier);
+    expect(step, `bd cook emitted no \`${tier}\` step`).toBeDefined();
+    return step!;
+  };
 
   afterAll(() => bdRepo.cleanup());
 
@@ -67,11 +114,86 @@ describeBd("bead formula (real bd · cook + create)", () => {
 
   it("renders byte-identically to `bd cook --mode=runtime`", async () => {
     const formula = await loadBeadFormula(repo);
-    const cooked = new Map(cook().steps.map((s) => [s.id, s.description]));
 
     for (const tier of ["epic", "feature", "ticket"] as BeadTier[]) {
-      expect(cooked.get(tier)?.trim(), tier).toBe(renderBeadSkeleton(formula, tier, VARS).description);
+      expect(cookedTier(tier).description, tier).toBe(
+        renderBeadSkeleton(formula, tier, VARS).description,
+      );
     }
+  });
+
+  // Why the rubric heading is spelled bd's way (anton-dji7, pinned by anton-szul). anton's own
+  // reader takes either spelling, so only bd can say which one bd wants. Driven off bd's OWN cooked
+  // output rather than anton's renderer: what ships is the formula, so the thing that must satisfy
+  // `--validate` is what bd cooks from it — respelling the heading back reddens all three tiers.
+  it.each(["epic", "feature", "ticket"] as BeadTier[])(
+    "cooks a %s that bd's own `--validate` and `bd lint` both accept onto the board",
+    (tier) => {
+      const { type, description } = cookedTier(tier);
+      const id = createValidated(type, description);
+      expect(id).toMatch(/\S/);
+      // Both of bd's rubric checks, not just the one on the create path: `--validate` never runs on
+      // the `--graph` path the skill prescribes, so lint is what guards a bead created that way.
+      expect(() => lint(id)).not.toThrow();
+    },
+  );
+
+  // …and the negative cases pin that both checks actually judge rather than pass everything.
+  it("proves `--validate` refuses the heading anton used to cook", () => {
+    const { type, description } = cookedTier("ticket");
+    expect(() =>
+      createValidated(type, description.replace("## Acceptance Criteria", "## Acceptance")),
+    ).toThrow(/Acceptance Criteria/);
+  });
+
+  it("proves `bd lint` refuses that heading too — the check the `--graph` path leans on", () => {
+    const { type, description } = cookedTier("ticket");
+    const bare = description.replace("## Acceptance Criteria", "## Acceptance");
+    // Created WITHOUT `--validate`, standing in for the bead a `--graph` plan lands: that path skips
+    // validation entirely, so lint is the only thing between it and a rubric-less bead.
+    const id = JSON.parse(
+      execFileSync("bd", ["create", VARS.title, "--type", type, "--description", bare, "--json"], {
+        cwd: repo,
+        encoding: "utf8",
+        stdio: "pipe",
+      }),
+    ).id as string;
+
+    // bd signals a finding only through the exit code and prints the reason on stdout, so assert on
+    // both — a bare `.toThrow()` would pass for any failure, including a mistyped id.
+    const findings = (() => {
+      try {
+        lint(id);
+        return null;
+      } catch (e) {
+        return (e as { stdout?: string }).stdout ?? "";
+      }
+    })();
+
+    expect(findings, "bd lint accepted the bare heading").not.toBeNull();
+    expect(findings).toContain("Missing: ## Acceptance Criteria");
+  });
+
+  // What `--validate` does NOT check. skills/bd/SKILL.md is instruction text anton loads verbatim
+  // into /shape and /scan-triage, and it once told an agent the flag "refuses a body missing the
+  // sections that type requires" — so a green `--validate` read as a complete contract and TODO-stub
+  // beads shipped to the board, to be caught only at the approve gate. bd's real scope is the ONE
+  // rubric heading: everything else is anton's own gate, below.
+  it("accepts a body that is nothing BUT the rubric heading", () => {
+    expect(createValidated("task", "## Acceptance Criteria\n- [ ] the rubric is the whole body")).toMatch(
+      /\S/,
+    );
+  });
+
+  it("accepts a cooked-but-unfilled skeleton that anton's contract gate refuses", async () => {
+    // Every var left at its `TODO —` default: the exact bead the skill elsewhere calls worse than an
+    // absent rubric. bd creates it; validateBeadContract blocks it.
+    const skeleton = renderBeadSkeleton(await loadBeadFormula(repo), "ticket", {});
+    expect(skeleton.description).toContain("TODO —");
+
+    const id = createValidated(skeleton.type, skeleton.description);
+    const bead = await beads.show(repo, id);
+    expect(validateBeadContract(bead).filter((v) => v.severity === "blocking")).not.toEqual([]);
   });
 
   it("materialises a ticket that reads back contract-conformant", async () => {

@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, desc, eq, gt, inArray, isNull, like, lt, lte, not, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, like, lt, lte, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -17,6 +17,7 @@ export type AntonDb = BetterSQLite3Database<typeof schema>;
 export type JobType =
   | "execute-epic"
   | "review-fix"
+  | "review-fix-pr"
   | "nightly-stringer"
   | "orphan-grooming"
   | "sync-push"
@@ -24,7 +25,9 @@ export type JobType =
   | "unstick"
   | "gate-check"
   | "gardener"
-  | "product-master";
+  | "product-master"
+  | "board-picker"
+  | "worktree-reaper";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).
@@ -68,21 +71,23 @@ function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
 }
 
-export async function enqueue(
-  db: AntonDb,
-  clock: Clock,
-  input: {
-    type: JobType;
-    projectId?: string;
-    payload?: unknown;
-    /** ms epoch; default = now (immediately due). */
-    runAt?: number;
-  },
-): Promise<string> {
-  const id = randomUUID();
-  const nowMs = clock.now();
-  await db.insert(schema.jobs).values({
-    id,
+export interface EnqueueInput {
+  type: JobType;
+  projectId?: string;
+  payload?: unknown;
+  /** ms epoch; default = now (immediately due). */
+  runAt?: number;
+}
+
+/**
+ * The insert values for a fresh `queued` job, as a value — so a caller that must write the row
+ * inside its OWN synchronous transaction can, instead of restating the row shape. The scheduler does
+ * exactly that: it stamps `schedules.lastRunAt` from this row's `createdAt` in the same transaction,
+ * which is what lets the Automation table tell a fire's own outcome from an earlier one's.
+ */
+export function newJobRow(input: EnqueueInput, nowMs: number): typeof schema.jobs.$inferInsert {
+  return {
+    id: randomUUID(),
     type: input.type,
     projectId: input.projectId,
     payloadJson: JSON.stringify(input.payload ?? {}),
@@ -91,8 +96,13 @@ export async function enqueue(
     attempts: 0,
     createdAt: secDate(nowMs),
     updatedAt: secDate(nowMs),
-  });
-  return id;
+  };
+}
+
+export async function enqueue(db: AntonDb, clock: Clock, input: EnqueueInput): Promise<string> {
+  const row = newJobRow(input, clock.now());
+  await db.insert(schema.jobs).values(row);
+  return row.id;
 }
 
 /** The active statuses that must hold at most one execute-epic job per (project, epic). */
@@ -124,7 +134,7 @@ const RESTRICTED_CANCELLABLE_STATUSES = [...CANCELLABLE_STATUSES, "failed"] as c
 const COVERING_STATUSES = ["queued", "running", "parked", "failed"] as const;
 
 /** Is `e` a SQLite UNIQUE-constraint violation (the partial-index backstop firing)? */
-function isUniqueViolation(e: unknown): boolean {
+export function isUniqueViolation(e: unknown): boolean {
   const code = (e as { code?: string })?.code;
   return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT";
 }
@@ -138,6 +148,87 @@ function executeEpicPayload(projectId: string, epicBeadId: string, bypassBudget?
   return bypassBudget
     ? { projectId, epicBeadId, bypassBudget: true }
     : { projectId, epicBeadId };
+}
+
+/**
+ * Id of the first job matching `where`, or undefined. The shared preamble of every dedupe lookup
+ * below: they differ only in their predicate, and all run synchronously so a caller can use them as
+ * the read half of a better-sqlite3 read→write transaction (see `enqueueExecuteEpicDeduped`).
+ */
+function firstJobId(tx: Pick<AntonDb, "select">, where: SQL | undefined): string | undefined {
+  const rows = tx
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(where)
+    .limit(1)
+    .all();
+  return rows[0]?.id;
+}
+
+/** Id of an execute-epic job for this project + epic in any of `statuses`, if one exists. */
+function executeEpicIdInStatuses(
+  tx: Pick<AntonDb, "select">,
+  projectId: string,
+  epicBeadId: string,
+  statuses: readonly JobStatus[],
+): string | undefined {
+  return firstJobId(
+    tx,
+    and(
+      eq(schema.jobs.type, "execute-epic"),
+      eq(schema.jobs.projectId, projectId),
+      inArray(schema.jobs.status, [...statuses]),
+      eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+    ),
+  );
+}
+
+/**
+ * The insert values for a fresh `queued` execute-epic job. Both enqueue paths
+ * (`enqueueExecuteEpicIfAbsent`, `enqueueExecuteEpicDeduped`) build their row here so a payload-shape
+ * or column-default change is a single edit and can't drift between them.
+ */
+function newExecuteEpicJobRow(
+  projectId: string,
+  epicBeadId: string,
+  nowMs: number,
+  bypassBudget?: boolean,
+): typeof schema.jobs.$inferInsert {
+  return {
+    id: randomUUID(),
+    type: "execute-epic",
+    projectId,
+    payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, bypassBudget)),
+    status: "queued",
+    runAt: secDate(nowMs),
+    attempts: 0,
+    createdAt: secDate(nowMs),
+    updatedAt: secDate(nowMs),
+  };
+}
+
+/**
+ * Promote a covering QUEUED execute-epic job to "run now": set the bypass flag and pull `runAt` due,
+ * clearing any budget defer that had pushed it into the future. Guarded to `queued` — a `running` job
+ * is already executing (its payload is re-read only on the next attempt) and a parked/failed one is
+ * left for its own resume path.
+ */
+function promoteToBypass(
+  tx: Pick<AntonDb, "update">,
+  jobId: string,
+  projectId: string,
+  epicBeadId: string,
+  nowMs: number,
+): void {
+  tx.update(schema.jobs)
+    .set({
+      payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, true)),
+      runAt: secDate(nowMs),
+      lastError: null,
+      updatedAt: secDate(nowMs),
+    })
+    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "queued")))
+    .run();
 }
 
 /** The `epicBeadId` carried in a job's payload, or undefined if absent/malformed. */
@@ -156,20 +247,7 @@ export function activeExecuteEpicId(
   projectId: string,
   epicBeadId: string,
 ): string | undefined {
-  const rows = tx
-    .select({ id: schema.jobs.id })
-    .from(schema.jobs)
-    .where(
-      and(
-        eq(schema.jobs.type, "execute-epic"),
-        eq(schema.jobs.projectId, projectId),
-        inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
-        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-      ),
-    )
-    .limit(1)
-    .all();
-  return rows[0]?.id;
+  return executeEpicIdInStatuses(tx, projectId, epicBeadId, ACTIVE_STATUSES);
 }
 
 /**
@@ -185,20 +263,7 @@ function coveringExecuteEpicId(
   projectId: string,
   epicBeadId: string,
 ): string | undefined {
-  const rows = tx
-    .select({ id: schema.jobs.id })
-    .from(schema.jobs)
-    .where(
-      and(
-        eq(schema.jobs.type, "execute-epic"),
-        eq(schema.jobs.projectId, projectId),
-        inArray(schema.jobs.status, [...COVERING_STATUSES]),
-        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-      ),
-    )
-    .limit(1)
-    .all();
-  return rows[0]?.id;
+  return executeEpicIdInStatuses(tx, projectId, epicBeadId, COVERING_STATUSES);
 }
 
 /** The statuses a settled execute-epic job can be un-parked from — exactly what `resumeJob` accepts. */
@@ -246,6 +311,55 @@ export async function resumableExecuteEpicId(
     .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
     .limit(1);
   return rows[0]?.id;
+}
+
+/** One operator cancel: which job was stopped, and when (anton-rgso). */
+export interface CancelledJob {
+  id: string;
+  /** `updatedAt` on the cancelled row — when the operator pressed stop. */
+  at: number;
+}
+
+/**
+ * The execute-epic jobs an operator CANCELLED in this project, keyed by epic (anton-rgso).
+ *
+ * `cancelled` is the one terminal status that is a DECISION rather than an outcome — a person saying
+ * stop — so the consecutive-failure breaker has to be able to subtract it from what it counts. The
+ * job ID is what a run matches on (`runs.job_id`); the instant is the fallback join for run rows
+ * written before that column existed.
+ *
+ * Every cancel is returned rather than only the latest: an epic an operator stopped twice would
+ * otherwise leave the earlier run counted as a failure by the very reading that exists to excuse it.
+ * Rows whose payload names no epic are dropped — nothing can be matched to them.
+ */
+export async function cancelledExecuteEpicJobs(
+  db: AntonDb,
+  projectId: string,
+): Promise<Map<string, CancelledJob[]>> {
+  const rows = await db
+    .select({
+      id: schema.jobs.id,
+      epicBeadId: sql<string | null>`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`,
+      updatedAt: schema.jobs.updatedAt,
+    })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "execute-epic"),
+        eq(schema.jobs.projectId, projectId),
+        eq(schema.jobs.status, "cancelled"),
+      ),
+    );
+  const byEpic = new Map<string, CancelledJob[]>();
+  for (const row of rows) {
+    const at = toMs(row.updatedAt);
+    if (!row.epicBeadId || at === undefined) continue;
+    const cancel = { id: row.id, at };
+    const seen = byEpic.get(row.epicBeadId);
+    if (seen) seen.push(cancel);
+    else byEpic.set(row.epicBeadId, [cancel]);
+  }
+  return byEpic;
 }
 
 /**
@@ -311,31 +425,79 @@ export function enqueueExecuteEpicIfAbsent(
       if (covering) {
         // A take-over with "run now" intent (`bypassBudget`) onto a covering QUEUED job — e.g. a
         // paced "Queue for optimal usage" row, possibly budget-deferred to a future runAt — must
-        // promote it, mirroring `enqueueExecuteEpicDeduped`: set the bypass flag and pull it due
-        // now, or the governor keeps holding the reused job to the pace boundary and the "run now"
-        // intent is silently dropped. Guarded to `queued`: a running job is already executing, and
-        // a parked/failed one is left for its own resume path.
-        if (opts?.bypassBudget) {
-          tx.update(schema.jobs)
-            .set({
-              payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, true)),
-              runAt: secDate(nowMs),
-              lastError: null,
-              updatedAt: secDate(nowMs),
-            })
-            .where(and(eq(schema.jobs.id, covering), eq(schema.jobs.status, "queued")))
-            .run();
-        }
+        // promote it, mirroring `enqueueExecuteEpicDeduped`, or the governor keeps holding the
+        // reused job to the pace boundary and the "run now" intent is silently dropped.
+        if (opts?.bypassBudget) promoteToBypass(tx, covering, projectId, epicBeadId, nowMs);
         return undefined;
       }
+
+      const row = newExecuteEpicJobRow(projectId, epicBeadId, nowMs, opts?.bypassBudget);
+      tx.insert(schema.jobs).values(row).run();
+      return row.id;
+    });
+  } catch (e) {
+    // Backstop: the index rejected a concurrent insert. The winning job now covers the epic locally.
+    if (isUniqueViolation(e)) return undefined;
+    throw e;
+  }
+}
+
+/**
+ * Enqueue the per-PR fix job for ONE run target (anton-f01t) — the unit the scheduled `review-fix`
+ * poll fans out to, and the one a closed merge gate dispatches onto (anton-5mjt).
+ *
+ * Deduped on (project, epicBeadId) over queued/running `review-fix-pr` rows only. A settled row —
+ * done, parked, failed — must NOT hold a target back: gate-check re-dispatches every pass until the
+ * finalize actually lands (the target closes and loses `stage:in-review`), which is what makes a
+ * failed finalize self-healing rather than a one-shot that silently lost. The dispatcher is not
+ * counted as covering either; it is a different type that only triages, so treating its in-flight
+ * poll as coverage would strand this target until the next slot.
+ *
+ * Synchronous transaction with no awaits inside, like the execute-epic helpers above: better-sqlite3
+ * runs one connection, so the read→write pair cannot interleave and two overlapping passes yield
+ * exactly one job — don't make this async. `jobs_active_epic_unique` keys on
+ * (type, project_id, $.epicBeadId) WHERE queued/running, so it backstops this type unchanged; a
+ * concurrent insert that wins the race raises UNIQUE, which we absorb as "already covered".
+ *
+ * `refuseProject` is the runner's project-teardown veto, asked INSIDE the transaction exactly as
+ * `resumeJob` asks it (PR #250 review): the barrier lives in memory, so a caller that checked it
+ * before this call would still race `quiesceProject` — it raises the flag and sweeps the project's
+ * active rows between that check and this insert, and the fresh `queued` row then trips teardown's
+ * leftover guard and fails the delete. Crossed in the same synchronous step as the write there is
+ * no window. A refusal reads as "not dispatched" (undefined) — the project is going away, and no
+ * row is the correct outcome. Handlers reach this through `JobContext.enqueueReviewFixPr`, never
+ * this function bare; the runner is the only caller that can supply the veto.
+ */
+export function enqueueReviewFixPrIfAbsent(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+  epicBeadId: string,
+  opts?: { refuseProject?: (projectId: string) => boolean },
+): string | undefined {
+  const nowMs = clock.now();
+  try {
+    return db.transaction((tx) => {
+      if (opts?.refuseProject?.(projectId)) return undefined;
+
+      const existing = firstJobId(
+        tx,
+        and(
+          eq(schema.jobs.type, "review-fix-pr"),
+          eq(schema.jobs.projectId, projectId),
+          inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
+          eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+        ),
+      );
+      if (existing) return undefined;
 
       const id = randomUUID();
       tx.insert(schema.jobs)
         .values({
           id,
-          type: "execute-epic",
+          type: "review-fix-pr",
           projectId,
-          payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, opts?.bypassBudget)),
+          payloadJson: JSON.stringify({ projectId, epicBeadId }),
           status: "queued",
           runAt: secDate(nowMs),
           attempts: 0,
@@ -346,67 +508,80 @@ export function enqueueExecuteEpicIfAbsent(
       return id;
     });
   } catch (e) {
-    // Backstop: the index rejected a concurrent insert. The winning job now covers the epic locally.
     if (isUniqueViolation(e)) return undefined;
     throw e;
   }
 }
 
 /**
- * Enqueue a review-fix job SCOPED TO ONE run target, unless an identical one is already live. This
- * is how a closed merge gate reaches review-fix (anton-k0kj): gate-check learns the PR merged from
- * the board and hands that one target to the sweep, which finalizes it exactly as it always has.
+ * Enqueue one of the SCHEDULED job types (board-picker, nightly-stringer, …) for a project unless a
+ * job of that type is already COVERING it under `coveredBy` — the same one-active-per-(type,
+ * project) coalescing `Scheduler.tickOnce` and `runScheduleNow` (schedules.ts) already apply,
+ * available to every OTHER producer of these types (PR #264 review).
  *
- * Deduped on (project, epicBeadId) over queued/running rows only. A settled row — done, parked,
- * failed — must NOT hold a target back: gate-check re-dispatches every pass until the finalize
- * actually lands (the target closes and loses `stage:in-review`), which is what makes a failed
- * finalize self-healing rather than a one-shot that silently lost. The project-wide sweep is not
- * counted as covering either; it is a different job (no `epicBeadId`) and may skip this target on
- * ownership, so treating it as coverage could strand the finalize until the next slot.
+ * The board-change nudge (picker-nudge.ts) is the motivating caller: it checks `queuedJobId` before
+ * calling its injected `enqueue`, but that check and the insert it guards are two separate
+ * operations with an `await` between them — a scheduler tick or a manual "Run now" fire landing in
+ * that window is invisible to it and could double-fire the pass. Wrapping the check and insert in
+ * ONE synchronous transaction closes that window the same way `enqueueReviewFixPrIfAbsent` closes
+ * its own: better-sqlite3 runs one connection, so nothing can interleave between the read and the
+ * write here.
  *
- * Synchronous transaction with no awaits inside, like the execute-epic helpers above: better-sqlite3
- * runs one connection, so the read→write pair cannot interleave and two overlapping gate-check
- * passes yield exactly one job. There is no partial-unique backstop for review-fix rows, so the
- * transaction IS the guarantee — don't make this async.
+ * `coveredBy` defaults to `ACTIVE_STATUSES` (queued+running), matching the scheduler's own
+ * coalescing — but the nudge deliberately dedupes on `queued` ONLY (a `running` pass may have read
+ * the board before the change that triggered this nudge, so it does not cover it); pass
+ * `["queued"]` to preserve that semantic exactly rather than silently widening it.
+ *
+ * `refuseProject` is the runner's project-teardown veto, asked inside the transaction for the same
+ * reason `enqueueReviewFixPrIfAbsent` asks it — a check made before this call would still race
+ * `quiesceProject`. Returns the existing job's id when one already covers this project (inserting no
+ * new row), otherwise a freshly-created `queued` job's id.
+ *
+ * `scheduleId`, when passed, stamps `schedules.lastRunAt` in the SAME transaction as the insert —
+ * mirroring `runScheduleNow` and `Scheduler.tickOnce` (PR #264 review). Without it, a caller whose
+ * payload names a `scheduleId` (the board-picker nudge) would make its jobs visible to
+ * `pendingRunsBySchedule`/`lastRunsBySchedule` — both keyed on that payload field — while leaving
+ * `lastRunAt` unmoved: a first-ever fire would still read "never" (`LastRunCell` returns early with
+ * no `lastRunAt` to compare against), and a later one would date itself against a stale stamp,
+ * showing its outcome beside the PREVIOUS fire's timestamp.
  */
-export function enqueueReviewFixIfAbsent(
+export function enqueueScheduledTypeIfAbsent(
   db: AntonDb,
   clock: Clock,
+  type: JobType,
   projectId: string,
-  epicBeadId: string,
-): string | undefined {
+  payload: unknown,
+  opts?: {
+    refuseProject?: (projectId: string) => boolean;
+    coveredBy?: readonly string[];
+    scheduleId?: string;
+  },
+): string {
   const nowMs = clock.now();
   return db.transaction((tx) => {
-    const existing = tx
-      .select({ id: schema.jobs.id })
-      .from(schema.jobs)
-      .where(
-        and(
-          eq(schema.jobs.type, "review-fix"),
-          eq(schema.jobs.projectId, projectId),
-          inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
-          eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-        ),
-      )
-      .limit(1)
-      .all();
-    if (existing[0]) return undefined;
+    if (opts?.refuseProject?.(projectId)) {
+      throw new Error(`Project is being deleted: ${projectId}`);
+    }
 
-    const id = randomUUID();
-    tx.insert(schema.jobs)
-      .values({
-        id,
-        type: "review-fix",
-        projectId,
-        payloadJson: JSON.stringify({ projectId, epicBeadId }),
-        status: "queued",
-        runAt: secDate(nowMs),
-        attempts: 0,
-        createdAt: secDate(nowMs),
-        updatedAt: secDate(nowMs),
-      })
-      .run();
-    return id;
+    const existing = firstJobId(
+      tx,
+      and(
+        eq(schema.jobs.type, type),
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, opts?.coveredBy ? [...opts.coveredBy] : [...ACTIVE_STATUSES]),
+      ),
+    );
+    if (existing) return existing;
+
+    const row = newJobRow({ type, projectId, payload }, nowMs);
+    tx.insert(schema.jobs).values(row).run();
+    if (opts?.scheduleId) {
+      tx.update(schema.schedules)
+        .set({ lastRunAt: row.createdAt })
+        .where(eq(schema.schedules.id, opts.scheduleId))
+        .run();
+    }
+    return row.id;
   });
 }
 
@@ -436,39 +611,15 @@ export function enqueueExecuteEpicDeduped(
       const existing = activeExecuteEpicId(tx, projectId, epicBeadId);
       if (existing) {
         // "Approve" (immediate) on an epic that already has a queued run: promote it so the budget
-        // governor stops pacing it — set the bypass flag AND pull it due now, clearing any budget
-        // defer that had pushed its runAt into the future. Guarded to `queued` (a `running` job is
-        // already executing, and its payload is re-read only on the next attempt). A queue-mode
-        // (non-bypass) re-approve leaves the existing job exactly as it is (anton-d8i4).
-        if (bypassBudget) {
-          tx.update(schema.jobs)
-            .set({
-              payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, true)),
-              runAt: secDate(nowMs),
-              lastError: null,
-              updatedAt: secDate(nowMs),
-            })
-            .where(and(eq(schema.jobs.id, existing), eq(schema.jobs.status, "queued")))
-            .run();
-        }
+        // governor stops pacing it. A queue-mode (non-bypass) re-approve leaves the existing job
+        // exactly as it is (anton-d8i4).
+        if (bypassBudget) promoteToBypass(tx, existing, projectId, epicBeadId, nowMs);
         return existing;
       }
 
-      const id = randomUUID();
-      tx.insert(schema.jobs)
-        .values({
-          id,
-          type: "execute-epic",
-          projectId,
-          payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, bypassBudget)),
-          status: "queued",
-          runAt: secDate(nowMs),
-          attempts: 0,
-          createdAt: secDate(nowMs),
-          updatedAt: secDate(nowMs),
-        })
-        .run();
-      return id;
+      const row = newExecuteEpicJobRow(projectId, epicBeadId, nowMs, bypassBudget);
+      tx.insert(schema.jobs).values(row).run();
+      return row.id;
     });
   } catch (e) {
     // Backstop: the index rejected a concurrent insert. Return the job that won the race.
@@ -491,19 +642,37 @@ function queuedSyncPushId(
   tx: Pick<AntonDb, "select">,
   projectId: string,
 ): string | undefined {
-  const rows = tx
-    .select({ id: schema.jobs.id })
-    .from(schema.jobs)
-    .where(
-      and(
-        eq(schema.jobs.type, "sync-push"),
-        eq(schema.jobs.projectId, projectId),
-        eq(schema.jobs.status, "queued"),
-      ),
-    )
-    .limit(1)
-    .all();
-  return rows[0]?.id;
+  return firstJobId(
+    tx,
+    and(
+      eq(schema.jobs.type, "sync-push"),
+      eq(schema.jobs.projectId, projectId),
+      eq(schema.jobs.status, "queued"),
+    ),
+  );
+}
+
+/**
+ * Id of the `queued` job of `type` for this project, if one exists — "a pass is already owed".
+ *
+ * The read the picker's board-change nudge folds onto (anton-h32k), so a board that keeps moving
+ * cannot pile queued passes behind a busy runner. `running` is excluded for
+ * {@link enqueueSyncPushDeduped}'s reason: a pass in flight may have read the board BEFORE the
+ * change that nudged this one, so a follow-up must still be schedulable.
+ */
+export function queuedJobId(
+  db: Pick<AntonDb, "select">,
+  type: JobType,
+  projectId: string,
+): string | undefined {
+  return firstJobId(
+    db,
+    and(
+      eq(schema.jobs.type, type),
+      eq(schema.jobs.projectId, projectId),
+      eq(schema.jobs.status, "queued"),
+    ),
+  );
 }
 
 /**
@@ -574,7 +743,9 @@ export function enqueueSyncPushDeduped(
  * Atomically lease up to `limit` runnable jobs and return them. Runnable =
  *   • `queued` and due (runAt ≤ now), OR
  *   • `running` but the lease expired (crashed worker → reclaim).
- * Leasing sets status=`running`, a fresh lease, and increments `attempts`.
+ * Leasing sets status=`running`, a fresh lease, and increments `attempts`. It does NOT touch the
+ * spend meter (`spentAttempts`): that charge lands when the handler reaches Claude
+ * ({@link chargeSpentAttempt}), never at lease time — see there for why.
  *
  * The runner is single-process, so a read-then-write inside one better-sqlite3 transaction is
  * sufficient mutual exclusion.
@@ -583,6 +754,12 @@ export function enqueueSyncPushDeduped(
  * in flight in that candidate's bucket (keyed by projectId). `Infinity` means ungated (only the
  * global `limit` applies). Jobs whose bucket is already at capacity are skipped in favor of the
  * next-due job for a different bucket. Currently the runner gates execute-epic per project.
+ *
+ * `typeCapOf` is the second, coarser dimension: the max jobs of a candidate's TYPE in flight across
+ * every project at once. A per-project cap bounds one project's fan-out but not the sum over
+ * projects (PR #250 review) — four projects each at a per-project cap of two are eight `review-fix-pr`
+ * jobs, the whole default pool, and every other type waits behind them. A candidate must clear both
+ * caps to lease; `Infinity` means no per-type ceiling.
  *
  * `exclude` drops job ids that are already dispatched in-process (rolling dispatch keeps them in the
  * runner's `inFlight` set while their handler runs). Without it, a still-running job whose lease
@@ -596,6 +773,12 @@ export function enqueueSyncPushDeduped(
  * fill the earliest-by-`runAt` scan window and be skipped, so every tick keeps re-scanning the same
  * gated prefix and never reaches leasable work for other schedules/projects (anton-7l7). Excluding
  * them in the query paginates past them instead. `capOf` still enforces the cap as a backstop.
+ *
+ * A cap that fills up DURING the scan gets the same treatment (PR #250 review): once a type or a
+ * bucket is found saturated, its rows are excluded from the next page and the scan continues, so a
+ * backlog of due PR fixes wider than one window — every one skipped by a full `typeCapOf` — cannot
+ * hide an execute-epic, gate-check or sync-push queued behind it. The reserve those caps exist for
+ * is only real if the scan can reach past the capped rows to the work it was reserved for.
  */
 export async function leaseDue(
   db: AntonDb,
@@ -604,6 +787,7 @@ export async function leaseDue(
     leaseMs: number;
     limit: number;
     capOf?: (job: JobRow) => number;
+    typeCapOf?: (job: JobRow) => number;
     exclude?: Iterable<string>;
     excludeBucketKeys?: Iterable<string>;
   },
@@ -614,46 +798,60 @@ export async function leaseDue(
   const excludeIds = opts.exclude ? [...opts.exclude] : [];
   const excludeBuckets = opts.excludeBucketKeys ? [...opts.excludeBucketKeys] : [];
 
-  // Without per-bucket caps, the DB `limit` alone bounds the result. With caps we must scan more
-  // candidates than `limit` (some get skipped for being at capacity), so widen the fetch.
-  const scanLimit = opts.capOf ? Math.max(opts.limit * 8, 200) : opts.limit;
+  // Without caps, the DB `limit` alone bounds the result. With caps we must scan more candidates
+  // than `limit` (some get skipped for being at capacity), so widen the fetch — and page past a
+  // window that a saturated cap filled entirely (see below).
+  const capped = opts.capOf !== undefined || opts.typeCapOf !== undefined;
+  const scanLimit = capped ? Math.max(opts.limit * 8, 200) : opts.limit;
   const runnable = or(
     and(eq(schema.jobs.status, "queued"), lte(schema.jobs.runAt, nowDate)),
     and(eq(schema.jobs.status, "running"), lte(schema.jobs.leaseExpiresAt, nowDate)),
   );
-  // Drop hard-held buckets before the scan window so they can't crowd out leasable work. Each key is
+  // Rows in any of these `(type, projectId)` buckets are dropped from the scan window. Each key is
   // `scheduleGateKey(type, projectId)`; an empty projectId segment means the null-project bucket.
-  const heldBucketFilter =
-    excludeBuckets.length > 0
-      ? not(
-          or(
-            ...excludeBuckets.map((key) => {
-              const [type, projectId] = key.split("\0");
-              return and(
-                eq(schema.jobs.type, type),
-                projectId === "" ? isNull(schema.jobs.projectId) : eq(schema.jobs.projectId, projectId),
-              );
-            }),
-          )!,
-        )
-      : undefined;
-  const where = and(
-    runnable,
-    excludeIds.length > 0 ? notInArray(schema.jobs.id, excludeIds) : undefined,
-    heldBucketFilter,
-  );
-  const candidates = await db
-    .select()
-    .from(schema.jobs)
-    .where(where)
-    .orderBy(schema.jobs.runAt)
-    .limit(scanLimit);
+  const outsideBuckets = (keys: Iterable<string>): SQL | undefined => {
+    const clauses = [...keys].map((key) => {
+      const [type, projectId] = key.split("\0");
+      return and(
+        eq(schema.jobs.type, type),
+        projectId === "" ? isNull(schema.jobs.projectId) : eq(schema.jobs.projectId, projectId),
+      );
+    });
+    return clauses.length > 0 ? not(or(...clauses)!) : undefined;
+  };
+  // One page of the earliest-due candidates, minus the hard-held buckets, whatever the scan has
+  // already found saturated, and the rows it already picked. A picked row's bucket is usually still
+  // under its cap, so nothing else drops it from the next page: without `skipIds` it is fetched and
+  // appended again, and its duplicates can meet `limit` while distinct leasable jobs sit behind it.
+  const fetchCandidates = (
+    skipTypes: Iterable<string>,
+    skipBuckets: Iterable<string>,
+    skipIds: Iterable<string> = [],
+  ) => {
+    const types = [...skipTypes];
+    const ids = [...excludeIds, ...skipIds];
+    return db
+      .select()
+      .from(schema.jobs)
+      .where(
+        and(
+          runnable,
+          ids.length > 0 ? notInArray(schema.jobs.id, ids) : undefined,
+          outsideBuckets(excludeBuckets),
+          types.length > 0 ? notInArray(schema.jobs.type, types) : undefined,
+          outsideBuckets(skipBuckets),
+        ),
+      )
+      .orderBy(schema.jobs.runAt)
+      .limit(scanLimit);
+  };
 
-  if (candidates.length === 0) return [];
-
-  let due = candidates;
-  if (opts.capOf) {
-    const capOf = opts.capOf;
+  let due: JobRow[];
+  if (!capped) {
+    due = await fetchCandidates([], []);
+  } else {
+    const capOf = opts.capOf ?? (() => Infinity);
+    const typeCapOf = opts.typeCapOf ?? (() => Infinity);
     // Count the live load a new lease competes with, per bucket. A `running` job counts if its lease
     // hasn't expired OR it's still dispatched in-process (in `exclude`): an in-flight handler whose
     // DB lease lapsed (missed heartbeat) is filtered out of the lease candidates above but is still
@@ -664,34 +862,60 @@ export async function leaseDue(
     // so a cap on one job type — execute-epic concurrency, or a disabled schedule's cap-0 — never
     // counts against a different type sharing the same project (anton-7l7).
     const bucketKey = (type: string, projectId: string | null) => `${type}\0${projectId ?? ""}`;
-    const liveLoad =
-      excludeIds.length > 0
-        ? or(gt(schema.jobs.leaseExpiresAt, nowDate), inArray(schema.jobs.id, excludeIds))
-        : gt(schema.jobs.leaseExpiresAt, nowDate);
     const active = await db
       .select({ projectId: schema.jobs.projectId, type: schema.jobs.type })
       .from(schema.jobs)
-      .where(and(eq(schema.jobs.status, "running"), liveLoad));
+      .where(liveRunning(nowDate, excludeIds));
     const usedByBucket = new Map<string, number>();
+    // The per-type load is tallied separately from the buckets: it spans every project, so it
+    // cannot ride the (type, project) key.
+    const usedByType = new Map<string, number>();
     for (const row of active) {
+      if (typeCapOf(row as JobRow) !== Infinity) {
+        usedByType.set(row.type, (usedByType.get(row.type) ?? 0) + 1);
+      }
       if (capOf(row as JobRow) === Infinity) continue;
       const key = bucketKey(row.type, row.projectId);
       usedByBucket.set(key, (usedByBucket.get(key) ?? 0) + 1);
     }
 
+    // A type or bucket found at capacity is excluded from every later page: a skipped candidate
+    // would only be skipped again, and a full window of them is how leasable work got hidden.
+    const saturatedTypes = new Set<string>();
+    const saturatedBuckets = new Set<string>();
     const picked: JobRow[] = [];
-    for (const job of candidates) {
-      if (picked.length >= opts.limit) break;
-      const cap = capOf(job);
-      if (cap === Infinity) {
+    for (;;) {
+      const candidates = await fetchCandidates(
+        saturatedTypes,
+        saturatedBuckets,
+        picked.map((job) => job.id),
+      );
+      let skipped = false;
+      for (const job of candidates) {
+        if (picked.length >= opts.limit) break;
+        const typeCap = typeCapOf(job);
+        const usedOfType = usedByType.get(job.type) ?? 0;
+        if (usedOfType >= typeCap) {
+          saturatedTypes.add(job.type); // type at its runner-wide ceiling — leave queued
+          skipped = true;
+          continue;
+        }
+        const cap = capOf(job);
+        const key = bucketKey(job.type, job.projectId);
+        const used = usedByBucket.get(key) ?? 0;
+        if (used >= cap) {
+          saturatedBuckets.add(key); // bucket at capacity — leave queued, try the next candidate
+          skipped = true;
+          continue;
+        }
+        if (typeCap !== Infinity) usedByType.set(job.type, usedOfType + 1);
+        if (cap !== Infinity) usedByBucket.set(key, used + 1);
         picked.push(job);
-        continue;
       }
-      const key = bucketKey(job.type, job.projectId);
-      const used = usedByBucket.get(key) ?? 0;
-      if (used >= cap) continue; // bucket at capacity — leave queued, try the next candidate
-      usedByBucket.set(key, used + 1);
-      picked.push(job);
+      // Another page is worth reading only when this one was full (more rows may follow) and a
+      // skip just widened the exclusion, so the next query reaches rows this one could not. Each
+      // extra page excludes at least one new key, which is what bounds the loop.
+      if (picked.length >= opts.limit || candidates.length < scanLimit || !skipped) break;
     }
     due = picked;
   }
@@ -713,6 +937,45 @@ export async function leaseDue(
     .returning();
 
   return leased;
+}
+
+/**
+ * The rows occupying a concurrency slot right now: `running` with a lease still in force, or still
+ * dispatched in-process (`inFlightIds`) whatever its DB lease says. One definition, shared by
+ * `leaseDue`'s per-bucket cap and {@link bucketLiveLoad}, so the governor's slot count can never
+ * disagree with the lease that follows it.
+ */
+function liveRunning(nowDate: Date, inFlightIds: readonly string[]): SQL | undefined {
+  const live =
+    inFlightIds.length > 0
+      ? or(gt(schema.jobs.leaseExpiresAt, nowDate), inArray(schema.jobs.id, inFlightIds))
+      : gt(schema.jobs.leaseExpiresAt, nowDate);
+  return and(eq(schema.jobs.status, "running"), live);
+}
+
+/**
+ * How many jobs one `(type, projectId)` bucket has live, by `leaseDue`'s own definition — what a
+ * new lease in that bucket competes with under `capOf`. The runner's value gate reads it so a
+ * candidate the bucket cannot admit this tick reserves no quota share (PR #248 review).
+ */
+export async function bucketLiveLoad(
+  db: AntonDb,
+  clock: Clock,
+  opts: { type: JobType; projectId: string | null; inFlightIds: Iterable<string> },
+): Promise<number> {
+  const rows = await db
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(
+      and(
+        liveRunning(secDate(clock.now()), [...opts.inFlightIds]),
+        eq(schema.jobs.type, opts.type),
+        opts.projectId === null
+          ? isNull(schema.jobs.projectId)
+          : eq(schema.jobs.projectId, opts.projectId),
+      ),
+    );
+  return rows.length;
 }
 
 /**
@@ -786,18 +1049,110 @@ export async function renewLease(
     .where(eq(schema.jobs.id, jobId));
 }
 
-export async function complete(db: AntonDb, clock: Clock, jobId: string): Promise<void> {
+/**
+ * What a handler reports it actually DID (anton-znoz). A job's `status` says whether it finished;
+ * this says whether finishing meant anything — the difference between a nightly scan that filed
+ * three beads and one that found nothing, which the Automation table reads as "worked" vs "nothing
+ * to do". Handlers that report nothing settle with a NULL outcome, which is a third claim again
+ * ("ran, effect unknown") and is never dressed up as either.
+ */
+export interface JobEffect {
+  /** Did this run change anything — the board, the queue, a report row? */
+  changed: boolean;
+  /** One short line naming what it did, or why there was nothing to do. */
+  note?: string;
+}
+
+/** How a `JobEffect` is stored on the row: the two values `jobs.outcome` ever holds. */
+export type JobOutcome = "ok" | "noop";
+
+/** How a withheld no-op explains itself on the row (see `toJobOutcome`). */
+const PRIOR_ATTEMPT_NOTE = "an earlier attempt may have changed state";
+
+/**
+ * Persisted shape of an effect — kept next to `complete` so writer and reader agree.
+ *
+ * `retried` says an earlier attempt of this job ran and did not complete. The effect is
+ * attempt-local, so a no-op reported by a retry is not a claim the JOB did nothing: an attempt that
+ * performed durable work and then threw (gate-check closes gates, then fails its own assertion)
+ * leaves the retry nothing left to find. Withhold the no-op there and settle as NULL — "ran, effect
+ * unknown" — rather than report work that happened as work that didn't. A `changed` claim stands
+ * either way: this attempt changed something regardless of what came before.
+ */
+export function toJobOutcome(
+  effect: JobEffect | undefined,
+  opts?: { retried?: boolean },
+): {
+  outcome: JobOutcome | null;
+  outcomeNote: string | null;
+} {
+  if (!effect) return { outcome: null, outcomeNote: null };
+  if (!effect.changed && opts?.retried) {
+    return {
+      outcome: null,
+      outcomeNote: effect.note ? `${effect.note} — ${PRIOR_ATTEMPT_NOTE}` : PRIOR_ATTEMPT_NOTE,
+    };
+  }
+  return { outcome: effect.changed ? "ok" : "noop", outcomeNote: effect.note ?? null };
+}
+
+/**
+ * Charge one attempt to the project's spend meter (`spentAttempts`) — the runner writes it the
+ * moment the handler reports it is about to spawn Claude, once per attempt (PR #248 review).
+ *
+ * Charged at the spawn rather than at the lease because the lease is not evidence of spend: an
+ * attempt can exit in preflight without ever invoking Claude (an abandoned target, a lease held
+ * elsewhere, a run already carried to a PR), and a charge taken up front had to be handed back on
+ * every such exit. That refund needed the runner to settle — a process that dies after the lease
+ * and before the spawn left the charge on the row for good, and the reclaim leased (and charged) it
+ * again, so a preflight that crashed repeatedly could spend a project's whole share on nothing.
+ * Writing the charge only when Claude is reached leaves nothing to reconcile: a crash before the
+ * write spent nothing and is charged nothing; a crash after it burned quota and keeps the charge.
+ *
+ * Not guarded on status: the handler is about to spawn whatever the row says, and quota accounting
+ * sums every status. `updatedAt` is left alone — it is the lease's timestamp, and on a cancelled
+ * row the cancel's, which `resumeEpic` reads as evidence.
+ */
+export async function chargeSpentAttempt(db: AntonDb, jobId: string): Promise<void> {
+  await db
+    .update(schema.jobs)
+    .set({ spentAttempts: sql`${schema.jobs.spentAttempts} + 1` })
+    .where(eq(schema.jobs.id, jobId));
+}
+
+/**
+ * Settle a running job as `done`. The spend meter is untouched here: the charge, if any, landed when
+ * the handler reached Claude ({@link chargeSpentAttempt}), so a job that finished without ever
+ * invoking it — a run resumed onto a PR it had already opened, an abandoned target — was never
+ * charged and has nothing to hand back.
+ */
+export async function complete(
+  db: AntonDb,
+  clock: Clock,
+  jobId: string,
+  effect?: JobEffect,
+  opts?: { retried?: boolean },
+): Promise<void> {
   const nowMs = clock.now();
   await db
     .update(schema.jobs)
-    .set({ status: "done", leaseExpiresAt: null, lastError: null, updatedAt: secDate(nowMs) })
+    .set({
+      status: "done",
+      leaseExpiresAt: null,
+      lastError: null,
+      ...toJobOutcome(effect, opts),
+      updatedAt: secDate(nowMs),
+    })
     .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
 }
 
 /**
  * Reschedule a job to run again at `runAtMs` (used for both quota backoff and retry). Returns it
  * to `queued` and clears the lease so it is picked up when due. Optionally rewinds `attempts`
- * (quota isn't the job's fault, so it shouldn't burn the poison budget).
+ * (quota isn't the job's fault, so it shouldn't burn the poison budget). `spentAttempts` is never
+ * rewound: it counts spawns, not leases (see {@link chargeSpentAttempt}), so a quota hit keeps its
+ * charge — the limit is Claude's own answer, and a multi-call handler may have finished real work
+ * before it — while a preflight exit was never charged (PR #248 review).
  *
  * One collision is possible for sync-push (anton-x7la): its dedup index is queued-only, so while
  * this job was `running` a board write may have enqueued a fresh queued follow-up into the project's
@@ -873,6 +1228,38 @@ export async function reschedule(
 }
 
 /**
+ * Marker `deferQueuedJobs` stamps on the rows the budget governor holds. On its own it is a pacing
+ * note — not evidence of an attempt (see `hasPriorAttempt`).
+ */
+export const BUDGET_DEFER_PREFIX = "budget: ";
+
+/**
+ * Separator carrying a row's pre-existing `lastError` through a governor deferral. A governed row is
+ * not always virgin: a refunded attempt (quota, lease-held, not-wired) rewinds `attempts` and leaves
+ * its error as the ONLY trace that the job already ran. Overwriting that with a bare pacing note
+ * would publish the next attempt's "nothing to do" as the whole job's no-op even though the refunded
+ * attempt did durable work, so the marker carries the prior error instead of replacing it.
+ */
+export const BUDGET_DEFER_PRIOR_SEP = " | prior: ";
+
+/**
+ * The attempt evidence a row's `lastError` holds, as SQL: the text carried after the separator when
+ * it is already a governor marker, the whole error when it is not a marker at all, and null when the
+ * row holds nothing but a pacing note. Shared by defer (which re-carries it) and resume (which
+ * restores it), so a marker never accumulates and never swallows the evidence underneath it.
+ */
+function priorErrorSql(): SQL {
+  const col = schema.jobs.lastError;
+  const sep = BUDGET_DEFER_PRIOR_SEP;
+  return sql`case
+    when ${col} is null then null
+    when instr(${col}, ${sep}) > 0 then substr(${col}, instr(${col}, ${sep}) + ${sep.length})
+    when ${col} like ${`${BUDGET_DEFER_PREFIX}%`} then null
+    else ${col}
+  end`;
+}
+
+/**
  * Budget-defer (anton-szld): push the `queued` jobs of `types` for a project out to `retryAtMs`, so
  * the proactive budget governor backs autonomous work off past the reset/night boundary instead of
  * only catching a `UsageLimitError` after hitting the wall. Mirrors a quota backoff's reschedule but
@@ -880,11 +1267,25 @@ export async function reschedule(
  * its own), never burns an attempt, and only ever moves a job *later* — a job already scheduled past
  * `retryAtMs` (e.g. a longer quota backoff) is left where it is. Returns how many rows it deferred.
  *
+ * Only DUE rows — and rows the governor itself already holds — are deferred (PR #248 review). A row
+ * still inside a retry or usage-limit backoff cannot start before that backoff elapses whatever the
+ * governor decides, and the governor's marker is read as demand by the quota split
+ * (`observedWorkEligibility`): stamping it on a backed-off row would keep a project that cannot
+ * spend in the divisor for the length of a backoff it was already idle through. Leaving the row
+ * alone loses nothing — the governor holds the bucket every tick it pays, and defers the row the
+ * tick it comes due if the budget still says so. A row already carrying the marker was due when it
+ * was first held, so a later, longer boundary may move it again and keep its note current.
+ *
  * `bypass` filters execute-epic rows by the `bypassBudget` payload flag (anton-d8i4), so the governor
  * can hold the paced ("Queue") jobs and the immediate-approved ("Approve"/run-directly) ones on
  * different boundaries: `"exclude"` matches only the paced rows (flag unset), `"only"` matches only
  * the immediate ones (flag set). Absent → no payload filter (defer every matching row). SQLite maps
  * a JSON `true` to the integer 1 via `json_extract`, so an absent/`false` flag is `IS NOT 1`.
+ *
+ * The pacing note never destroys attempt evidence: any non-marker `lastError` already on the row is
+ * appended to it via {@link BUDGET_DEFER_PRIOR_SEP} rather than overwritten. Omitting `lastError`
+ * does NOT clear the column — it writes the same prior-attempt evidence back (an unmarked deferral),
+ * because erasing a refunded attempt's only trace is never what a caller that stays silent wants.
  */
 export async function deferQueuedJobs(
   db: AntonDb,
@@ -907,9 +1308,13 @@ export async function deferQueuedJobs(
       : opts.bypass === "exclude"
         ? sql`${bypassExtract} is not 1`
         : undefined;
+  const prior = priorErrorSql();
+  const lastError = opts.lastError
+    ? sql`${opts.lastError} || coalesce(${BUDGET_DEFER_PRIOR_SEP} || (${prior}), '')`
+    : prior; // no marker supplied → strip any prior marker, keep the attempt evidence under it
   const rows = await db
     .update(schema.jobs)
-    .set({ runAt: retryDate, lastError: opts.lastError ?? null, updatedAt: secDate(nowMs) })
+    .set({ runAt: retryDate, lastError, updatedAt: secDate(nowMs) })
     .where(
       and(
         eq(schema.jobs.status, "queued"),
@@ -917,6 +1322,10 @@ export async function deferQueuedJobs(
         opts.projectId == null
           ? isNull(schema.jobs.projectId)
           : eq(schema.jobs.projectId, opts.projectId),
+        or(
+          lte(schema.jobs.runAt, secDate(nowMs)),
+          like(schema.jobs.lastError, `${BUDGET_DEFER_PREFIX}%`),
+        ),
         lt(schema.jobs.runAt, retryDate),
         bypassFilter,
       ),
@@ -931,7 +1340,8 @@ export async function deferQueuedJobs(
  * only scans due rows, so disabling pacing wouldn't actually resume them. Pull the governor's own
  * deferrals back to due-now. Scoped by the `budget: ` lastError marker `deferQueuedJobs` writes:
  * quota backoffs and retry reschedules carry different lastError text and are left where they are.
- * Returns how many rows it resumed.
+ * Clearing the marker restores whatever prior error it was carrying, so undoing a hold cannot erase
+ * a refunded attempt's evidence either. Returns how many rows it resumed.
  */
 export async function resumeBudgetDeferredJobs(
   db: AntonDb,
@@ -942,7 +1352,7 @@ export async function resumeBudgetDeferredJobs(
   const nowDate = secDate(clock.now());
   const rows = await db
     .update(schema.jobs)
-    .set({ runAt: nowDate, lastError: null, updatedAt: nowDate })
+    .set({ runAt: nowDate, lastError: priorErrorSql(), updatedAt: nowDate })
     .where(
       and(
         eq(schema.jobs.status, "queued"),
@@ -951,7 +1361,7 @@ export async function resumeBudgetDeferredJobs(
           ? isNull(schema.jobs.projectId)
           : eq(schema.jobs.projectId, opts.projectId),
         gt(schema.jobs.runAt, nowDate),
-        like(schema.jobs.lastError, "budget: %"),
+        like(schema.jobs.lastError, `${BUDGET_DEFER_PREFIX}%`),
       ),
     )
     .returning({ id: schema.jobs.id });
@@ -981,7 +1391,12 @@ export async function park(
   const nowMs = clock.now();
   const rows = await db
     .update(schema.jobs)
-    .set({ status: "parked", leaseExpiresAt: null, lastError, updatedAt: secDate(nowMs) })
+    .set({
+      status: "parked",
+      leaseExpiresAt: null,
+      lastError,
+      updatedAt: secDate(nowMs),
+    })
     .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...ACTIVE_STATUSES])))
     .returning({ id: schema.jobs.id });
   return rows.length > 0;
@@ -992,51 +1407,84 @@ export async function park(
  * ticket) triggers. Returns a `parked` job to `queued`, due now, with `attempts` reset to 0 so it
  * gets a fresh retry budget rather than parking again on the next failure. This is what stops a
  * transient error that exhausted maxAttempts from being a permanent dead end (anton-ner.2).
+ * `spentAttempts` is left alone: the retry budget is renewed, the quota those attempts burned is not.
  *
  * Un-parks a `parked` job or a `failed` (reserved terminal) one; a no-op for anything else (returns
  * false) — resuming a running/done/queued job would corrupt its lifecycle. The status guard is
  * applied in the UPDATE's WHERE so a concurrent settle can't race it between the read and the write,
  * and the return value is that CAS's affected-row count: `true` means this call un-parked the job,
  * never merely that it looked resumable a moment earlier.
+ *
+ * `refuseProject` is a caller-owned veto on the row's project, asked INSIDE the transaction (PR #218
+ * review). The runner's project-teardown barrier lives in memory, so a caller that checked it before
+ * this call would still be racing: `quiesceProject` can raise it and sweep the project's active rows
+ * between that check and this write, and the revived `queued` row then trips teardown's leftover
+ * guard and fails the delete. Handed down instead, it is crossed in the same synchronous step as the
+ * status flip — the whole body runs without an await, on better-sqlite3's single connection, exactly
+ * like the enqueue helpers above. Don't reintroduce one.
+ *
+ * `stripBypassBudget` un-parks the job as a POLICY start: the operator's "run now" flag comes off in
+ * the SAME guarded UPDATE as the status flip (PR #218 review). A settled job can carry `bypassBudget`
+ * from the immediate "Approve & run" that created it, and the picker resumes whatever job covers its
+ * target rather than enqueueing a fresh one — riding that flag into an UNATTENDED start would skip
+ * the budget and value gates the governor holds every policy start to. Stripping it as a separate
+ * statement would be worse than not stripping it: an operator's manual resume landing in between
+ * wins the row and then runs WITHOUT the bypass they asked for. Sharing the CAS makes the two
+ * outcomes the only ones — this resume takes the row and pays the pacing, or it loses and the flag
+ * stands. `json_remove` rather than a rewritten payload so nothing else the row carries is dropped.
  */
-export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promise<boolean> {
+export async function resumeJob(
+  db: AntonDb,
+  clock: Clock,
+  jobId: string,
+  opts?: { refuseProject?: (projectId: string) => boolean; stripBypassBudget?: boolean },
+): Promise<boolean> {
   const nowMs = clock.now();
-  const job = await getJob(db, jobId);
-  // Only a settled-but-recoverable job un-parks: `parked` (retry budget exhausted / permanent error
-  // a human resolved) or `failed` (reserved terminal). A running/queued/done job must not be reset —
-  // that would corrupt its lifecycle or duplicate work.
-  if (!job || (job.status !== "parked" && job.status !== "failed")) return false;
-
-  // Un-parking returns the job to `queued` — an active status. For execute-epic that competes with
-  // `jobs_active_epic_unique`: after this job parked/failed, the dedupe path (which ignores
-  // parked/failed) may have already spawned a fresh queued/running job for the same project + epic.
-  // Reviving this stale row would then be a *second* active job for that epic and raise UNIQUE. So
-  // no-op instead of surfacing a 500 — the fresh job already covers the work (anton-ner).
-  if (job.type === "execute-epic" && job.projectId) {
-    const epicBeadId = epicBeadIdOf(job.payloadJson);
-    if (epicBeadId && activeExecuteEpicId(db, job.projectId, epicBeadId)) return false;
-  }
-
   try {
-    const updated = await db
-      .update(schema.jobs)
-      .set({
-        status: "queued",
-        runAt: secDate(nowMs),
-        leaseExpiresAt: null,
-        attempts: 0,
-        lastError: null,
-        updatedAt: secDate(nowMs),
-      })
-      // Re-assert the resumable status in the WHERE so a concurrent settle can't race it between the
-      // read above and this write.
-      .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, ["parked", "failed"])))
-      .returning({ id: schema.jobs.id });
-    // The WHERE is the CAS, so the affected-row count is the only truthful answer: zero means a
-    // concurrent settle (an operator's cancel, most of all) took the row after the read above and
-    // this resume did NOT happen. Reporting `true` there would let `resumeEpic` claim `resumed-job`
-    // and skip its cancellation re-read, so the UI would call a still-cancelled job restarted.
-    return updated.length > 0;
+    return db.transaction((tx) => {
+      const job = tx.select().from(schema.jobs).where(eq(schema.jobs.id, jobId)).limit(1).all()[0];
+      // Only a settled-but-recoverable job un-parks: `parked` (retry budget exhausted / permanent
+      // error a human resolved) or `failed` (reserved terminal). A running/queued/done job must not
+      // be reset — that would corrupt its lifecycle or duplicate work.
+      if (!job || (job.status !== "parked" && job.status !== "failed")) return false;
+
+      if (job.projectId && opts?.refuseProject?.(job.projectId)) return false;
+
+      // Un-parking returns the job to `queued` — an active status. For execute-epic that competes
+      // with `jobs_active_epic_unique`: after this job parked/failed, the dedupe path (which ignores
+      // parked/failed) may have already spawned a fresh queued/running job for the same project +
+      // epic. Reviving this stale row would then be a *second* active job for that epic and raise
+      // UNIQUE. So no-op instead of surfacing a 500 — the fresh job already covers the work
+      // (anton-ner).
+      if (job.type === "execute-epic" && job.projectId) {
+        const epicBeadId = epicBeadIdOf(job.payloadJson);
+        if (epicBeadId && activeExecuteEpicId(tx, job.projectId, epicBeadId)) return false;
+      }
+
+      const updated = tx
+        .update(schema.jobs)
+        .set({
+          status: "queued",
+          runAt: secDate(nowMs),
+          leaseExpiresAt: null,
+          attempts: 0,
+          lastError: null,
+          updatedAt: secDate(nowMs),
+          ...(opts?.stripBypassBudget
+            ? { payloadJson: sql`json_remove(${schema.jobs.payloadJson}, '$.bypassBudget')` }
+            : {}),
+        })
+        // Re-assert the resumable status in the WHERE so a concurrent settle — one that landed
+        // before this transaction opened — can't be overwritten by a read taken before it.
+        .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, ["parked", "failed"])))
+        .returning({ id: schema.jobs.id })
+        .all();
+      // The WHERE is the CAS, so the affected-row count is the only truthful answer: zero means a
+      // concurrent settle (an operator's cancel, most of all) took the row and this resume did NOT
+      // happen. Reporting `true` there would let `resumeEpic` claim `resumed-job` and skip its
+      // cancellation re-read, so the UI would call a still-cancelled job restarted.
+      return updated.length > 0;
+    });
   } catch (e) {
     // Backstop for the race the check above can't fully close: a concurrent enqueue could win the
     // active slot between the check and this write. Absorb the index violation as a clean no-op.

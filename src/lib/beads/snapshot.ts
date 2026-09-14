@@ -33,6 +33,7 @@ export interface SnapshotRead {
 
 const SNAPSHOTS_KEY = Symbol.for("anton.beads.issueSnapshots");
 const DESCRIPTIONS_KEY = Symbol.for("anton.beads.beadDescriptions");
+const LISTENERS_KEY = Symbol.for("anton.beads.boardChangeListeners");
 
 function snapshots(): Map<string, SnapshotEntry> {
   const global = globalThis as unknown as Record<
@@ -40,6 +41,51 @@ function snapshots(): Map<string, SnapshotEntry> {
     Map<string, SnapshotEntry> | undefined
   >;
   return (global[SNAPSHOTS_KEY] ??= new Map());
+}
+
+/** Told, with the repo path, whenever that repo's board moved. Never awaited, never throws. */
+export type BoardChangeListener = (cwd: string) => void;
+
+function boardChangeListeners(): Set<BoardChangeListener> {
+  const global = globalThis as unknown as Record<symbol, Set<BoardChangeListener> | undefined>;
+  return (global[LISTENERS_KEY] ??= new Set());
+}
+
+/**
+ * Subscribe to "this repo's board moved", and get back the unsubscribe (anton-h32k).
+ *
+ * The signal is a completed board read whose CONTENT differs from the last one — announced from
+ * {@link refreshIssueSnapshot}, never from an invalidation. That distinction is the whole contract:
+ * an invalidation says a fresh read is needed, not that anything changed, and the sync coalescer
+ * invalidates on every pass that reaches `synced` whether or not the pull landed a single commit.
+ * A listener wired to that would fire every 30s on any wired board — a heartbeat wearing a change
+ * feed's name. Every mover still reaches subscribers, because every local write (`bdWrite`,
+ * `bdGateWrite`) and every remote pull forces the read that detects it.
+ *
+ * Global-keyed for the same reason the snapshots themselves are: Next compiles instrumentation and
+ * the app layer into separate module registries, so a module-scoped set would leave a listener
+ * registered at boot deaf to every board read a route handler makes.
+ */
+export function onBoardChanged(listener: BoardChangeListener): () => void {
+  const registered = boardChangeListeners();
+  registered.add(listener);
+  return () => {
+    registered.delete(listener);
+  };
+}
+
+/**
+ * Tell every subscriber this repo's board moved. A listener is a side channel and must never break
+ * the read the caller actually asked for — its throw is logged and swallowed.
+ */
+function announceBoardChange(cwd: string): void {
+  for (const listener of boardChangeListeners()) {
+    try {
+      listener(cwd);
+    } catch (e) {
+      console.error(`[snapshot] board-change listener failed for ${cwd}`, e);
+    }
+  }
 }
 
 /** Per-repo memo of the one field `bd list` can drop — a bead's description — keyed by bead id. */
@@ -126,6 +172,10 @@ export function invalidateIssueSnapshot(cwd: string, localWrite = false): void {
 /**
  * Refresh a repository once. Concurrent callers share the same loader invocation. A failed
  * refresh never discards the last good snapshot.
+ *
+ * This is also where "the board moved" is ANNOUNCED ({@link onBoardChanged}), because a completed
+ * read is the only place the app can tell a move from a poll: it compares the board it just loaded
+ * against the one it held.
  */
 export function refreshIssueSnapshot(
   cwd: string,
@@ -142,6 +192,9 @@ export function refreshIssueSnapshot(
       // boundary and must never repopulate the current snapshot.
       if (entry.generation !== generation) return entry.beads ?? beads;
       const serialized = JSON.stringify(beads);
+      // A cold entry has no board to differ FROM, so the first read of a repo sets the baseline
+      // rather than announcing a move nobody made.
+      const moved = entry.serialized !== null && entry.serialized !== serialized;
       if (entry.serialized !== serialized) entry.version += 1;
       entry.beads = beads;
       entry.serialized = serialized;
@@ -149,6 +202,8 @@ export function refreshIssueSnapshot(
       // This read started after (and its generation matches) the write, so it reflects it — the
       // retained board is no longer the only post-write data and reads can serve warm again.
       entry.pendingWrite = false;
+      // Announced AFTER the entry has taken the new board, so a listener that reads back sees it.
+      if (moved) announceBoardChange(cwd);
       return beads;
     })
     .finally(() => {
@@ -156,6 +211,20 @@ export function refreshIssueSnapshot(
     });
   entry.refresh = refresh;
   return refresh;
+}
+
+/**
+ * The background board read currently in flight for `cwd`, or null when none is (anton-3dpp).
+ *
+ * The refreshes above are deliberately un-awaited — that is what keeps a read from waiting behind
+ * embedded Dolt — so the `bd list` they spawn outlives the call that started it. On an EMBEDDED
+ * board that matters to exactly one other caller: a Dolt pass takes the repo's exclusive lock, and
+ * bd fails (it does not queue) when a read still holds it. The sync coalescer awaits this before
+ * starting a pass so the two never collide. Returned as an opaque promise: callers wait for the
+ * read to be over, never for its beads.
+ */
+export function issueSnapshotRefreshInFlight(cwd: string): Promise<unknown> | null {
+  return entryFor(cwd).refresh;
 }
 
 /**
@@ -206,8 +275,11 @@ export async function readIssueSnapshot(
     }
     return { beads: retained, version: entry.version };
   }
-  await refreshIssueSnapshot(cwd, loader, now);
-  return { beads: entry.beads ?? [], version: entry.version };
+  // Take the loader's own result, not just the cache: when a write invalidates mid-flight the
+  // generation guard refuses to repopulate the cache but still hands the loaded board back here —
+  // reading `entry.beads` alone would serve a successful load as an empty board.
+  const loaded = await refreshIssueSnapshot(cwd, loader, now);
+  return { beads: entry.beads ?? loaded, version: entry.version };
 }
 
 /** Start a freshness probe without making the caller wait for embedded Dolt. */
@@ -224,8 +296,13 @@ export function probeIssueSnapshot(
   }
 }
 
-/** Test-only reset; repository runtime code should invalidate instead. */
+/**
+ * Test-only reset; repository runtime code should invalidate instead. Drops the board-change
+ * subscribers too: the registry is process-global, so a suite that forgot to unsubscribe would
+ * otherwise leak a listener into the next one and have it fire on a board it knows nothing about.
+ */
 export function resetIssueSnapshots(): void {
   snapshots().clear();
   descriptionCaches().clear();
+  boardChangeListeners().clear();
 }

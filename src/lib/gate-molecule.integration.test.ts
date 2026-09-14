@@ -23,7 +23,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { describeBd, makeBdRepo, makeFileDb, type BdRepo, type FileDb } from "@/lib/testing/integration";
+import { describeBd, makeBdRepo, makeFileDb, tmpProject, type BdRepo, type FileDb } from "@/lib/testing/integration";
 import { beads, type Bead } from "./beads/bd";
 import { loadAllIssues } from "./beads/issues";
 import { resetIssueSnapshots } from "./beads/snapshot";
@@ -95,10 +95,7 @@ describeBd("gate + molecule beads are never work (real pour)", () => {
     fileDb = makeFileDb();
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
-    project = {
-      id: "x", slug: "tmp", name: "tmp", repoPath: repo,
-      defaultBranch: "main", hasBeads: true, createdAt: 0,
-    };
+    project = tmpProject(repo);
 
     mkdirSync(join(repo, ".beads", "formulas"), { recursive: true });
     writeFileSync(

@@ -154,13 +154,14 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     await beads.approve(repo, epic); // approved + backlog, owned by a teammate
 
     const realShow = beads.show.bind(beads);
-    let raced = false;
-    const spy = vi.spyOn(beads, "show").mockImplementation(async (cwd, id) => {
-      if (id === epic && !raced) {
-        raced = true; // the owner's runner "starts" between the pre-lock gate and this read
-        await beads.tag(repo, epic, ["stage:implementing"]);
-      }
-      return realShow(cwd, id);
+    const realList = beads.list.bind(beads);
+    // The route reads the board twice: once up front for the gates, once under the claim lock. Race
+    // the SECOND one — tagging the bead implementing just before the under-lock read lands is the
+    // owner's runner starting inside the window the lock exists to close.
+    let reads = 0;
+    const spy = vi.spyOn(beads, "list").mockImplementation(async (cwd, args) => {
+      if (++reads === 2) await beads.tag(repo, epic, ["stage:implementing"]);
+      return realList(cwd, args);
     });
 
     actAs("anton-test");

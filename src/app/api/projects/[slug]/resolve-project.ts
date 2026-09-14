@@ -33,6 +33,32 @@ export function notFoundResponse(message: string): NextResponse {
   return NextResponse.json({ error: message }, { status: 404 });
 }
 
+type JsonBodyResult =
+  | { body: unknown; response?: undefined }
+  | { body?: undefined; response: NextResponse };
+
+/**
+ * Shared malformed-body guard for the `[slug]` API routes: the parsed request body, or a
+ * ready-to-return 400 when the payload isn't JSON. Same shape as resolveProject, so a route reads:
+ *
+ *   const { body, response } = await parseJsonBody(request);
+ *   if (response) return response;
+ *
+ * Discriminated on `response` rather than on `body`, because a well-formed body is legitimately
+ * allowed to be `null` or `0` — truthiness would reject payloads the routes' own validators accept.
+ *
+ * Only for routes that hand the raw body to their own validator. A route parsing straight into a
+ * schema (`schema.parse(await request.json())`) keeps its own try/catch: it has to tell a ZodError
+ * apart from malformed JSON, and that split is what its 400 body reports.
+ */
+export async function parseJsonBody(request: Request): Promise<JsonBodyResult> {
+  try {
+    return { body: await request.json() };
+  } catch {
+    return { response: NextResponse.json({ error: "Invalid JSON body" }, { status: 400 }) };
+  }
+}
+
 /**
  * Wrap a `[slug]`-scoped route handler with the shared prelude: await `params`, resolve the
  * project, and short-circuit with resolveProject's 404 when the slug matches nothing. The handler

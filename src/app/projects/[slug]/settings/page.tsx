@@ -1,10 +1,30 @@
 import { notFound } from "next/navigation";
 
-import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
+import {
+  getProjectBySlug,
+  getProjectSettingsBySlug,
+  resolvePickerApplyOverride,
+} from "@/lib/projects";
+import { allIssues } from "@/lib/beads/issues";
+import { boardLabelVocabulary } from "@/lib/beads/labels";
+import { discoverVocabulary } from "@/lib/policy/vocabulary";
+import { boardIssueTypes, calibratePolicy } from "@/lib/policy/calibrate";
+import { policyCandidates } from "@/lib/policy/candidates";
+import {
+  earnedAutonomyOfKind,
+  emptyTrackRecord,
+  pickerApplyVerdict,
+} from "@/lib/gardener/autonomy";
+import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
+import { proposalTrackRecord } from "@/lib/gardener/track-record";
+import { latestPickerTrackRecord } from "@/lib/picker-veto";
 import { bundledAgentIds, discoverAgents } from "@/lib/agents-discovery";
 import { DEFAULT_SCHEDULES, listSchedules } from "@/lib/schedules";
 import { loadBaseSystemPrompt } from "@/lib/claude/system-prompt";
+import { quotaShareProjects } from "@/lib/quota-spend";
+import type { QuotaShareProject } from "@/lib/quota-share";
 import { SettingsView } from "@/components/settings/settings-view";
+import type { EarnedPicker } from "@/components/settings/sections/picker-autonomy-section";
 
 export const dynamic = "force-dynamic";
 
@@ -29,6 +49,8 @@ export default async function ProjectSettingsPage({
     cron: s.cron,
     nextRunAt: s.nextRunAt,
     lastRunAt: s.lastRunAt,
+    lastRun: s.lastRun,
+    pendingRun: s.pendingRun,
   }));
   // The cadence each automation ships with, so "Reset to default" has one source of truth.
   const defaultCrons = Object.fromEntries(DEFAULT_SCHEDULES.map((d) => [d.type, d.cron]));
@@ -37,9 +59,101 @@ export default async function ProjectSettingsPage({
   // .claude/agents (ids anton doesn't ship) are shown as always-active, never gated (anton-dvo.1
   // reversal). We partition by bundled-id membership, not by DiscoveredAgent.source — a user
   // override of a bundled name reports source "global"/"project" but still lives in anton's slot.
-  const [agents, bundledIds] = await Promise.all([
+  // Plus the label vocabulary the board actually uses (anton-prng), so value nominations are picked
+  // from this project's own namespaces rather than from labels anton assumed. Read alongside the
+  // agents (the snapshot is usually warm from the board) and fail-soft: a board anton can't read
+  // leaves the picker empty, where the editor still takes a typed label.
+  const [agents, bundledIds, board] = await Promise.all([
     discoverAgents(project.repoPath).catch(() => []),
     bundledAgentIds().catch(() => []),
+    // The failure is CARRIED, not swallowed into an empty board: an unreadable board and a board with
+    // no work look identical downstream, and the work policy panel must not let an operator arm a
+    // fallback policy fitted to a read failure.
+    allIssues(project.repoPath, { blockOnPendingWrite: false }).then(
+      (issues) => ({ issues, ok: true }),
+      () => ({ issues: [] as Awaited<ReturnType<typeof allIssues>>, ok: false }),
+    ),
+  ]);
+  const beads = board.issues;
+  const labelVocabulary = boardLabelVocabulary(beads);
+  // Which of those namespaces read as a SCALE (anton-g631) — the only ones the policy editor offers a
+  // hand-ranking on, since "rank these" means nothing on a `team:` or `component:`.
+  const rankingCandidates = discoverVocabulary(beads)
+    .namespaces.filter((n) => n.rankingCandidate)
+    .map((n) => n.namespace);
+  // What first arm proposes (anton-c7iv): the policy this project's OWN approvals would have
+  // matched, so the panel is never a blank form and never speaks a vocabulary this board doesn't.
+  // Pure over the snapshot already read above — no extra board call — and inert: the draft is only
+  // rendered, never stored, until the operator accepts it.
+  const policyDraft = calibratePolicy(beads);
+  const issueTypes = boardIssueTypes(beads);
+  // Every STARTABLE run target, flattened to what the predicate reads, so the editor's match count
+  // and its per-bead "why not?" answer in the browser as the operator edits (anton-qsr1). Startable
+  // is the picker's own gate, so the panel counts the set a policy actually chooses from; the rest
+  // of the open run targets arrive as a count the panel explains. Off the same snapshot — no extra
+  // board call.
+  const { candidates, notStartable } = policyCandidates(beads);
+
+  // What this board's own settled proposals say about each kind (anton-m29g) — the second gate
+  // arming needs, and the one no setting lifts. Derived here rather than in the form because the
+  // form is a client module and the verdict is a fact about the board; it arrives as plain counts
+  // and a reason, so a locked control is never an unexplained disabled control. A board anton cannot
+  // read yields an empty record, which locks everything — the safe direction.
+  const record = await allIssues(project.repoPath)
+    .then(proposalTrackRecord)
+    .catch(() => emptyTrackRecord());
+  const earned = Object.fromEntries(
+    GARDENER_DETECTION_KINDS.map((kind) => {
+      const { applied, settled, eligible, reason } = earnedAutonomyOfKind(kind, record);
+      return [kind, { applied, settled, eligible, ...(reason ? { reason } : {}) }];
+    }),
+  );
+
+  // And what this project's own picks have earned the PICKER (anton-vkp9) — the same floor, over the
+  // operator's releases and vetoes instead of over a kind's proposals. Read from anton.db rather than
+  // the board, and handed down as plain counts for the same reason: the control must reach the pass's
+  // verdict from the pass's numbers, and a store that will not answer locks `apply` rather than
+  // opening it.
+  const pickerRecord = await latestPickerTrackRecord(project.id).catch(() => ({
+    accepted: 0,
+    declined: 0,
+    settled: 0,
+  }));
+  // The earned floor and the operator's own override of it, weighed ONCE (anton-d1lk) so the control
+  // and the pass can never disagree about which of the two is holding `apply` up. The record's own
+  // reason travels even while a signature stands in for it — an operator has to be able to see what
+  // they are standing in for.
+  const picker = pickerApplyVerdict(pickerRecord, resolvePickerApplyOverride(settings));
+  const pickerEarned: EarnedPicker = {
+    accepted: picker.earned.accepted,
+    settled: picker.earned.settled,
+    bar: picker.earned.bar,
+    ...(picker.arming ? { arming: picker.arming } : {}),
+    ...(picker.deliberate ? { deliberate: picker.deliberate } : {}),
+    ...(picker.earned.reason ? { reason: picker.earned.reason } : {}),
+  };
+
+  // Every project's position in the quota split (R6) — declared share, live eligibility and what
+  // this week attributed to it. Cross-project because a share only reads against the others.
+  // Fail-soft to THIS project's own row rather than to nothing: an empty list would take the share
+  // and reserve controls off the page entirely, so a failed read of everyone else's position would
+  // cost the operator the one position they came here to set.
+  const quotaProjects = await quotaShareProjects().catch<QuotaShareProject[]>(() => [
+    {
+      id: project.id,
+      slug: project.slug,
+      name: project.name,
+      sharePct: settings.quotaSharePct ?? 100,
+      declared: settings.quotaSharePct !== undefined,
+      governed: settings.budgetAware === true,
+      reserved: settings.reserveQuotaShare === true,
+      // The read failed, so eligibility is unknown — which is not idle. Reading it as idle would
+      // tell the operator their share is in use elsewhere, naming a beneficiary we did not manage
+      // to look up.
+      eligible: null,
+      spentWeeklyPct: null,
+      seeded: false,
+    },
   ]);
 
   return (
@@ -51,6 +165,16 @@ export default async function ProjectSettingsPage({
       defaultCrons={defaultCrons}
       agents={agents}
       bundledIds={bundledIds}
+      labelVocabulary={labelVocabulary}
+      rankingCandidates={rankingCandidates}
+      issueTypes={issueTypes}
+      policyDraft={policyDraft}
+      policyCandidates={candidates}
+      policyNotStartable={notStartable}
+      boardUnavailable={!board.ok}
+      earned={earned}
+      pickerEarned={pickerEarned}
+      quotaProjects={quotaProjects}
     />
   );
 }

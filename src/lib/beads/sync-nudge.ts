@@ -13,6 +13,7 @@
  * schedules propagation. Enqueue failures are swallowed (logged), never surfaced into the request.
  */
 import { beads } from "./bd";
+import { isServerMode } from "./board-mode";
 import { getDb } from "../db";
 import { enqueueSyncPushDeduped, systemClock } from "../jobs/queue";
 
@@ -22,6 +23,12 @@ export interface NudgeTarget {
 }
 
 export function nudgeSync(project: NudgeTarget, label = "sync"): void {
+  // Server mode: the write is already on the shared database the moment it commits, so there is
+  // nothing to propagate — skip BOTH paths (anton-0tul). Enqueuing the durable job anyway would
+  // schedule a retry-with-backoff-then-PARK cycle around a push that can never succeed, turning a
+  // healthy board into parked work for a human.
+  if (isServerMode(project.repoPath)) return;
+
   // Immediate best-effort push; a failure is recorded as unpushed in the sync-status registry and
   // retried by the durable job below (and the E1 heartbeat) — this catch only keeps it from floating.
   void beads

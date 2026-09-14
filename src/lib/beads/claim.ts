@@ -32,6 +32,8 @@
  * read-decide-write sequence on the bead's chain; `setAssigneeIfOwner` is the one-shot swap built
  * on it.
  */
+import { NextResponse } from "next/server";
+
 import { beads, ownerOf, type Bead } from "./bd";
 import { withBeadWriteLock } from "./claim-lock";
 
@@ -46,8 +48,15 @@ export { ownerOf };
  * The outcome of a swap: `ok` when the assignee is now `next`, else the owner that beat us. A
  * successful swap carries the bead it verified — the post-write read on a real write, the read it
  * short-circuited on a no-op — so callers can answer with it instead of spawning `bd show` again.
+ *
+ * `wrote` separates the two ways a swap succeeds: it MOVED the assignee, or it found the end state
+ * already standing and skipped bd. A caller that unwinds its own claim when a later write fails must
+ * check it — the no-op's reservation was taken by somebody else's write (another process resolving
+ * to the same operator), and releasing it would cancel a claim this caller never made.
  */
-export type SwapResult = { ok: true; bead: Bead } | { ok: false; owner: string | undefined };
+export type SwapResult =
+  | { ok: true; bead: Bead; wrote: boolean }
+  | { ok: false; owner: string | undefined };
 
 /** The bd surface a swap needs, injectable so tests can drive it without a real board. */
 export interface AssigneeStore {
@@ -64,6 +73,30 @@ export function conflictBody(id: string, owner: string | undefined): { error: st
   return owner
     ? { error: `${id} was claimed by ${owner} while this request was in flight — reload and retry`, owner }
     : { error: `${id}'s claim changed while this request was in flight — reload and retry` };
+}
+
+/**
+ * The 409 for a take-over this route REFUSED outright — no `{ steal: true }` to authorize it, no
+ * operator identity to attribute it to, or a target whose run has already left backlog. Approve
+ * and claim both answer through here so a blocked steal always carries the same envelope: the
+ * reason, the `owner` the UI names, and the `stage` when a live run is what makes it untakeable.
+ *
+ * It TAKES the message rather than deciding it. The wording is per-route authorization policy —
+ * approve takes a reservation over, claim also releases someone else's — and collapsing those into
+ * one sentence would tell the operator to do something this route does not offer. Only the
+ * envelope and the status are shared.
+ *
+ * Unlike {@link conflictBody} this returns the response, not the body: the status is half of what
+ * the gates were duplicating, so leaving it at the call sites would leave the clone half-standing.
+ */
+export function stealRefused(
+  message: string,
+  owner: string | undefined,
+  stage?: string,
+): NextResponse {
+  // Undefined fields serialize away, so a refusal that names no stage — or, like conflictBody, no
+  // owner — answers byte-identically to the hand-written body it replaces.
+  return NextResponse.json({ error: message, owner, stage }, { status: 409 });
 }
 
 /**
@@ -87,6 +120,17 @@ export interface ClaimGuard {
    * the very lock `fn` is holding and deadlock.
    */
   withClaimLock<T>(repoPath: string, id: string, fn: (swap: LockedSwap) => Promise<T>): Promise<T>;
+  /**
+   * The CAS ALONE, for a caller that already holds this bead's write lock through
+   * {@link withBeadWriteLock} rather than through {@link withClaimLock} — gardener/apply-steps.ts
+   * takes it for a whole re-read-and-write sequence spanning several beads. Both spellings queue on
+   * the one chain map, so calling `withClaimLock` from inside one waits on the lock the caller is
+   * holding and deadlocks; this is the same swap without that second acquisition.
+   *
+   * Never call it outside such a lock: unserialized, it is exactly the lost-update race this module
+   * exists to close.
+   */
+  swapUnderLock(repoPath: string, id: string): LockedSwap;
   /** Set `id`'s assignee to `next` (undefined releases it) only if it still reads as `expectedOwner`. */
   setAssigneeIfOwner(
     repoPath: string,
@@ -117,7 +161,7 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
       // winner sets the owner to exactly what the loser also wanted, so `before !== expectedOwner`
       // would otherwise turn the loser into a spurious 409 even though the end state it asked for
       // already holds.
-      if (before === next) return { ok: true, bead };
+      if (before === next) return { ok: true, bead, wrote: false };
       // A different owner landed in the window (a real steal by someone else) — lose here rather
       // than overwrite it, and name who holds the claim now.
       if (before !== expectedOwner) return { ok: false, owner: before };
@@ -127,7 +171,7 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
 
       const written = await store.show(repoPath, id);
       const after = ownerOf(written);
-      return after === next ? { ok: true, bead: written } : { ok: false, owner: after };
+      return after === next ? { ok: true, bead: written, wrote: true } : { ok: false, owner: after };
     };
 
   // The lock itself lives in ./claim-lock, shared with beads.claimVerified: a worker's claim
@@ -142,6 +186,7 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
 
   return {
     withClaimLock,
+    swapUnderLock: swapUnlocked,
     setAssigneeIfOwner: (repoPath, id, expectedOwner, next) =>
       withClaimLock(repoPath, id, (swap) => swap(expectedOwner, next)),
   };
@@ -160,6 +205,10 @@ const CLAIM_GUARD_KEY = Symbol.for("anton.beads.claimGuard");
 export const claimGuard = ((globalThis as unknown as Record<symbol, ClaimGuard>)[
   CLAIM_GUARD_KEY
 ] ??= createClaimGuard());
+
+/** The CAS for a caller already holding `id`'s write lock. See {@link ClaimGuard.swapUnderLock}. */
+export const swapUnderLock: ClaimGuard["swapUnderLock"] = (repoPath, id) =>
+  claimGuard.swapUnderLock(repoPath, id);
 
 /** Run `fn` under `id`'s claim-write lock. See {@link ClaimGuard.withClaimLock}. */
 export const withClaimLock: ClaimGuard["withClaimLock"] = (repoPath, id, fn) =>

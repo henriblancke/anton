@@ -1,7 +1,8 @@
 "use client";
 
-import { CloudOffIcon, LoaderIcon, TriangleAlertIcon, UploadIcon } from "lucide-react";
-import { useSyncExternalStore } from "react";
+import { CloudIcon,
+  CloudOffIcon, LoaderIcon, TriangleAlertIcon, UploadIcon } from "lucide-react";
+import { useLiveNow } from "@/components/live-clock";
 import { deriveSyncBadge } from "@/lib/sync-status";
 import type { SyncStatusView } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -19,41 +20,9 @@ function ago(msEpoch: number, now: number): string {
   return `${duration(now - msEpoch)} ago`;
 }
 
-// A shared 1-second wall-clock exposed through useSyncExternalStore. The server snapshot is `null`,
-// so SSR and the first client render agree (no relative text) — computing a relative label during
-// render otherwise made them disagree by ~1s → a hydration mismatch (anton). After hydration the
-// client reads the live time and re-renders each tick. getSnapshot returns the cached tick value
-// (not a fresh Date.now()) so it stays stable between ticks, as useSyncExternalStore requires.
-let clockValue: number | null = null;
-const clockListeners = new Set<() => void>();
-let clockTimer: ReturnType<typeof setInterval> | null = null;
-
-function subscribeClock(onChange: () => void): () => void {
-  clockListeners.add(onChange);
-  if (clockTimer === null) {
-    clockValue = Date.now();
-    clockTimer = setInterval(() => {
-      clockValue = Date.now();
-      for (const l of clockListeners) l();
-    }, 1_000);
-  }
-  return () => {
-    clockListeners.delete(onChange);
-    if (clockListeners.size === 0 && clockTimer !== null) {
-      clearInterval(clockTimer);
-      clockTimer = null;
-    }
-  };
-}
-
-/** Live wall-clock: `null` until mount (SSR-safe), then the current epoch-ms, ticking each second. */
-function useLiveNow(): number | null {
-  return useSyncExternalStore(
-    subscribeClock,
-    () => clockValue,
-    () => null,
-  );
-}
+/** How often the relative labels below are re-read. Seconds matter here: this badge is how an
+ *  operator sees a sync wedge, and "12s ago" going stale is the first thing that would hide one. */
+const CLOCK_TICK_MS = 1_000;
 
 /** "1 unpushed" / "3 unpushed" — the operator-visible backlog count. */
 function unpushedLabel(n: number): string {
@@ -72,7 +41,7 @@ const base =
  * anton-jfjw.3).
  */
 export function SyncStatusBadge({ sync }: { sync: SyncStatusView }) {
-  const now = useLiveNow();
+  const now = useLiveNow(CLOCK_TICK_MS);
   switch (deriveSyncBadge(sync)) {
     case "synced":
       return (
@@ -140,6 +109,16 @@ export function SyncStatusBadge({ sync }: { sync: SyncStatusView }) {
         >
           <CloudOffIcon className="size-3" aria-hidden="true" />
           Not wired to shared remote
+        </span>
+      );
+    case "shared-server":
+      return (
+        <span
+          className={cn(base, "border-sky-500/40 text-sky-600 dark:text-sky-400")}
+          title="This board is served by a shared Dolt sql-server — every machine reads and writes the same database, so there is no push/pull to run."
+        >
+          <CloudIcon className="size-3" aria-hidden="true" />
+          Shared server
         </span>
       );
     default:

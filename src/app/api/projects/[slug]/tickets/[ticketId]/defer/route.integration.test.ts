@@ -7,7 +7,7 @@
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
 import { resetIssueSnapshots } from "@/lib/beads/snapshot";
-import { describeBd, makeBdRepo, paramsCtx, type BdRepo } from "@/lib/testing/integration";
+import { describeBd, makeBdRepo, paramsCtx, tmpProject, type BdRepo } from "@/lib/testing/integration";
 import type { Project, TicketDetail } from "@/lib/types";
 
 let project: Project | null = null;
@@ -31,15 +31,7 @@ describeBd("ticket defer route (real bd)", () => {
   beforeAll(async () => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
-    project = {
-      id: "x",
-      slug: "tmp",
-      name: "tmp",
-      repoPath: repo,
-      defaultBranch: "main",
-      hasBeads: true,
-      createdAt: 0,
-    };
+    project = tmpProject(repo);
     taskId = await beads.create(repo, { title: "Not now, not dead", type: "task" });
   });
 

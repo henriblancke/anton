@@ -41,6 +41,16 @@ const DEFAULT_MAX_OUTPUT = 32 * 1024 * 1024;
  */
 const DRAIN_AFTER_EXIT_MS = 2_000;
 
+/** How often a kill path re-asks whether the gate's process group still has members. */
+const REAP_POLL_MS = 25;
+
+/**
+ * Ceiling on waiting for a SIGKILLed group to disappear. SIGKILL is uncatchable, so anything still
+ * standing past this is wedged in the kernel (uninterruptible I/O) or has left the group by setsid —
+ * neither of which more waiting fixes, and a job run must never hang on it.
+ */
+const REAP_CEILING_MS = 2_000;
+
 function killGraceMs(): number {
   const raw = Number(process.env[KILL_GRACE_ENV]);
   return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_KILL_GRACE_MS;
@@ -73,8 +83,10 @@ export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promis
     let out = "";
     let exited = false;
     let settled = false;
+    let killing = false;
     let drainTimer: NodeJS.Timeout | undefined;
     let escalateTimer: NodeJS.Timeout | undefined;
+    let reapTimer: NodeJS.Timeout | undefined;
 
     const killGroup = (sig: NodeJS.Signals) => {
       if (process.platform !== "win32" && child.pid) {
@@ -88,41 +100,93 @@ export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promis
       child.kill(sig);
     };
 
+    /**
+     * Whether the gate's process GROUP still has members — the direct shell OR any descendant it
+     * forked. Signal 0 checks existence without delivering anything, and `ESRCH` on the group is the
+     * only proof that every member is gone; `EPERM` means members we cannot signal still exist.
+     */
+    const groupGone = (): boolean => {
+      if (!child.pid) return true; // spawn failed — there is no group to wait on
+      if (process.platform === "win32") return exited; // no process groups; the child is all there is
+      try {
+        process.kill(-child.pid, 0);
+        return false;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    };
+
     const settle = (emit: () => void) => {
       if (settled) return;
       settled = true;
       signal?.removeEventListener("abort", onAbort);
       if (drainTimer) clearTimeout(drainTimer);
+      if (escalateTimer) clearTimeout(escalateTimer);
+      if (reapTimer) clearTimeout(reapTimer);
       emit();
     };
 
-    // Node's built-in `signal` support only ever SIGTERMs the direct child, once. Cancellation is
-    // owned here instead: signal the whole group, then escalate for a command that traps SIGTERM.
-    // The escalation deliberately outlives the promise — the run unwinds immediately, while the
-    // group still gets killed — and is cleared as soon as the child actually exits.
-    const onAbort = () => {
-      if (!exited) {
-        killGroup("SIGTERM");
-        escalateTimer = setTimeout(() => killGroup("SIGKILL"), killGraceMs());
+    /**
+     * Kill the gate and settle only once its process tree is actually GONE (PR #228 review).
+     *
+     * Settling at SIGTERM would hand the caller a rejection while the group is still running: the
+     * timeout-preservation path reads that as a failed gate and hard-resets the worktree, so a write
+     * still in flight lands after the cleanliness check and is swept into the next ticket's commit.
+     * A kill is not a fact until the group is empty, so the promise waits for that — SIGTERM, then
+     * SIGKILL after the grace, then poll until the group reports ESRCH.
+     *
+     * The escalation no longer stops at the direct child's exit either: `sh -c` can fork, so the
+     * wrapper exiting says nothing about the workers it left behind. It is guarded by a liveness
+     * check instead, so a group that is already gone is never signalled through a recycled pid.
+     */
+    const killTree = (first: NodeJS.Signals, emit: () => void) => {
+      if (settled || killing) return;
+      killing = true;
+      // A drain already counting down would resolve the promise out from under the kill.
+      if (drainTimer) clearTimeout(drainTimer);
+      // Drop the pipes: nothing will read them again, and the overflow path must stop accumulating
+      // output while the group takes its grace to die.
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      killGroup(first);
+      const grace = first === "SIGKILL" ? 0 : killGraceMs();
+      if (first !== "SIGKILL") {
+        escalateTimer = setTimeout(() => {
+          if (!groupGone()) killGroup("SIGKILL");
+        }, grace);
       }
-      settle(() => reject(abortError()));
+      const deadline = Date.now() + grace + REAP_CEILING_MS;
+      const waitForGroup = () => {
+        if (groupGone() || Date.now() >= deadline) {
+          settle(emit);
+          return;
+        }
+        reapTimer = setTimeout(waitForGroup, REAP_POLL_MS);
+      };
+      waitForGroup();
+    };
+
+    // Node's built-in `signal` support only ever SIGTERMs the direct child, once. Cancellation is
+    // owned here instead: signal the whole group, and settle when it is gone (see killTree).
+    const onAbort = () => {
+      if (exited && groupGone()) {
+        settle(() => reject(abortError()));
+        return;
+      }
+      killTree("SIGTERM", () => reject(abortError()));
     };
 
     /** maxBuffer parity with bd.ts: kill the group and reject rather than buffer without bound. */
     const limit = maxOutput();
     const overflow = () => {
-      killGroup("SIGKILL");
-      settle(() => {
-        // Drop the pipes a leaked descendant is still holding — nothing will read them again.
-        child.stdout?.destroy();
-        child.stderr?.destroy();
+      killTree("SIGKILL", () =>
         reject(
           Object.assign(new Error(`gate output exceeded ${limit} bytes: ${cmd}`), {
             code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
             killed: true,
           }),
-        );
-      });
+        ),
+      );
     };
 
     const capture = (c: Buffer) => {
@@ -132,11 +196,13 @@ export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promis
     child.stdout?.on("data", capture);
     child.stderr?.on("data", capture);
     child.on("error", (err) => settle(() => reject(err)));
-    child.on("close", (code) => settle(() => resolve({ ok: code === 0, code, output: out })));
+    child.on("close", (code) => {
+      if (!killing) settle(() => resolve({ ok: code === 0, code, output: out }));
+    });
     child.on("exit", (code) => {
       exited = true;
-      if (escalateTimer) clearTimeout(escalateTimer);
-      if (settled) return;
+      // A kill in flight owns the settle, and its escalation still has descendants to reach.
+      if (killing || settled) return;
       drainTimer = setTimeout(() => {
         settle(() => {
           // Drop the pipes a leaked descendant is still holding — nothing will read them again.
@@ -153,32 +219,54 @@ export function runShell(cmd: string, cwd: string, signal?: AbortSignal): Promis
   });
 }
 
+/** One verify gate as it actually ran — the evidence {@link captureVerifyGates} hands its caller. */
+export interface VerifyGateOutcome extends VerifyGate {
+  ok: boolean;
+  code: number | null;
+  /** Combined stdout+stderr, verbatim. A caller that puts this in a prompt truncates it itself. */
+  output: string;
+}
+
 /**
- * Run the operator's verify gates in order (anton-3oh8), logging each to the session and throwing
- * on the first non-zero exit — the same fail path as the historical single test gate. `onFail`
- * builds the caller-specific error message (execute-epic names the ticket; review-fix names the
- * PR). An empty gate list is a no-op, preserving unchanged behavior when nothing is configured.
+ * Run the operator's verify gates in order (anton-3oh8) and REPORT what each did. The reporting
+ * half of {@link runVerifyGates}, which is the throwing half.
+ *
+ * `stopOnFail` (the default) stops at the first red, where the throwing half stops: for ENFORCEMENT
+ * the first failure is the whole answer and the gates after it would judge a tree already known to
+ * be broken. Pass `false` when the outcomes are EVIDENCE someone will reason from (PR #254 review):
+ * a caller that stops early knows only that one gate failed, while a reader told "the checks were
+ * run for you" would take the silence of lint, typecheck and build for their success.
  *
  * The whole sequence runs under a host-wide lock (anton-0oi): concurrent runs each starting a full
  * suite starve each other into timeout failures that belong to neither change. The lock is advisory
  * — if a peer holds it too long we run anyway, because a slow gate beats a wedged queue.
+ *
+ * Separated out for the review gate (anton-3jwh's fallout): the reviewer used to run the suite
+ * ITSELF, from inside its agent session, which is the one suite run on this machine that took no
+ * lock — so it neither waited for the runs anton was serializing nor made them wait for it. Handing
+ * it these outcomes instead puts the last suite run in the pipeline back under the same lock as
+ * every other. A red gate is returned, not thrown: at review time that is a finding for the reviewer
+ * to report and the fix session to repair, which is the loop that already exists.
  */
-export async function runVerifyGates(
+export async function captureVerifyGates(
   gates: VerifyGate[],
   cwd: string,
   signal: AbortSignal | undefined,
   logPath: string,
-  onFail: (gate: VerifyGate, code: number | null) => string,
-): Promise<void> {
-  if (gates.length === 0) return; // no gates: never take the lock
+  options: { stopOnFail?: boolean } = {},
+): Promise<VerifyGateOutcome[]> {
+  if (gates.length === 0) return []; // no gates: never take the lock
+  const stopOnFail = options.stopOnFail ?? true;
 
+  const outcomes: VerifyGateOutcome[] = [];
   await withHostLock(
     VERIFY_GATE_LOCK,
     async () => {
       for (const gate of gates) {
         const res = await runShell(gate.command, cwd, signal);
         await appendSessionLog(logPath, `\n[${gate.label}] ${gate.command}\n${res.output}\n`);
-        if (!res.ok) throw new Error(onFail(gate, res.code));
+        outcomes.push({ ...gate, ok: res.ok, code: res.code, output: res.output });
+        if (!res.ok && stopOnFail) return;
       }
     },
     {
@@ -192,4 +280,22 @@ export async function runVerifyGates(
       },
     },
   );
+  return outcomes;
+}
+
+/**
+ * Run the operator's verify gates in order, logging each to the session and throwing on the first
+ * non-zero exit — the same fail path as the historical single test gate. `onFail` builds the
+ * caller-specific error message (execute-epic names the ticket; review-fix names the PR). An empty
+ * gate list is a no-op, preserving unchanged behavior when nothing is configured.
+ */
+export async function runVerifyGates(
+  gates: VerifyGate[],
+  cwd: string,
+  signal: AbortSignal | undefined,
+  logPath: string,
+  onFail: (gate: VerifyGate, code: number | null) => string,
+): Promise<void> {
+  const red = (await captureVerifyGates(gates, cwd, signal, logPath)).find((o) => !o.ok);
+  if (red) throw new Error(onFail(red, red.code));
 }

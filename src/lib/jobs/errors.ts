@@ -41,6 +41,145 @@ export class PoisonError extends Error {
  */
 export class PoisonEpic extends PoisonError {}
 
+/** How a blocked-run park lists the beads holding the run back — and how it is read back. */
+const BLOCKED_BY = / is blocked by ([^—]+) — refusing to execute/;
+
+/** The clause {@link BLOCKED_BY} parses. Every blocked park is phrased through it, or the ids stop
+ * being readable back. */
+function blockedByClause(beadId: string, blockers: string[]): string {
+  return `${beadId} is blocked by ${blockers.join(", ")} — refusing to execute`;
+}
+
+/**
+ * The poison a run parks on when a prerequisite is still open. Built here, next to its parser,
+ * because that message is the ONLY durable record of WHICH beads held the run back: the run-health
+ * sweep reads the ids back out to tell a job stalled behind an open human gate — already reported as
+ * that gate's own wait — from one stalled on anything else. Reworded in one place only, the two
+ * would drift silently and the double escalation would come back.
+ */
+export function blockedByPoison(beadId: string, blockers: string[]): PoisonEpic {
+  return new PoisonEpic(
+    `${blockedByClause(beadId, blockers)}; resume the run once the blocker(s) complete`,
+  );
+}
+
+/**
+ * The reason a run parks once it has run every ticket it could and the REST are held by a
+ * prerequisite outside this run (anton-1two). Lives beside {@link blockedByPoison} for the same
+ * reason and shares its clause: run-health must read the blocker ids back out of a partially-gated
+ * park exactly as it does an all-or-nothing one. Returns the text rather than an error so the caller
+ * can classify the park itself — this one stops a run whose earlier tickets already committed.
+ */
+export function blockedTailReason(
+  beadId: string,
+  args: { blockers: string[]; held: string[]; ran: string[] },
+): string {
+  const ran =
+    args.ran.length > 0
+      ? `${args.ran.length} ticket(s) that could run did (${args.ran.join(", ")}) and their commits ` +
+        `are on the branch, but no pull request opens until the whole run target is complete. `
+      : "";
+  return (
+    `${blockedByClause(beadId, args.blockers)} ${args.held.join(", ")} — ` +
+    `${ran}Resume the run once the blocker(s) complete and the held ticket(s) will run into this ` +
+    `same branch and its one pull request`
+  );
+}
+
+/**
+ * The blocker ids a {@link blockedByPoison} park names, or undefined when the message is some other
+ * poison. Matched anywhere in the text so a caller can pass the park reason with the runner's
+ * `poison:` prefix — or a report finding's prose — still attached.
+ */
+export function poisonBlockerIds(parkMessage: string): string[] | undefined {
+  const match = BLOCKED_BY.exec(parkMessage);
+  if (!match) return undefined;
+  const ids = match[1]!
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return ids.length > 0 ? ids : undefined;
+}
+
+/**
+ * How a needs-human park names the gate holding the run — and how it is read back. Global, because
+ * the clause is read from the TAIL: the agent's ask sits in front of it verbatim, and an ask that
+ * quotes this very sentence (asking a person to resolve a gate, say) would win a first-match parse
+ * and hand the sweeps a gate that was never armed for this run (PR #205 review).
+ */
+const PARKED_ON_GATE = /parked on human gate (\S+) until someone answers it/g;
+
+/**
+ * The LAST match of a global pattern, or undefined. `matchAll` iterates a clone, so the shared
+ * pattern's `lastIndex` never carries between calls.
+ */
+function lastMatch(pattern: RegExp, text: string): RegExpExecArray | undefined {
+  let last: RegExpExecArray | undefined;
+  for (const match of text.matchAll(pattern)) last = match as RegExpExecArray;
+  return last;
+}
+
+/**
+ * How that park names the OTHER open human gates on the target, when there are any. The ids are
+ * comma-separated and the sentence's period is a LOOKAHEAD, not part of the capture: bd ids may
+ * contain a period themselves (`anton-287p.1`), and a period-terminated capture would truncate every
+ * one of them — silently returning the wrong gate id to the sweeps that suppress on it.
+ */
+const PARKED_ALSO_HELD =
+  /it is also held by human gate\(s\) ([^\s,]+(?:,\s*[^\s,]+)*)(?=\.(?:\s|$))/;
+
+/**
+ * The clause a run's poison park uses to name the human gate it is waiting behind. Lives beside its
+ * parser for the same reason {@link blockedByPoison} does: that sentence is the ONLY durable record
+ * of WHICH gate a parked ask reached, and reworded in two places the two would drift silently.
+ *
+ * `held` — the open human gates on the target that anton did NOT arm — is named too, because
+ * answering anton's gate alone does not release the run (PR #205 review): the target stays blocked
+ * behind the person's own hold, and a park naming only the gate that just closed reads to the
+ * run-health sweep as a permanent failure the moment it is answered.
+ */
+export function parkedOnGateClause(gateId: string, held: string[] = []): string {
+  const base = `The run is parked on human gate ${gateId} until someone answers it.`;
+  return held.length > 0
+    ? `${base} Even then it is also held by human gate(s) ${held.join(", ")}.`
+    : base;
+}
+
+/**
+ * The human gate a needs-human park is waiting behind, or undefined when the message is some other
+ * poison. Matched anywhere in the text so a caller can pass the park reason with the runner's
+ * `poison:` prefix — or a report finding's prose — still attached.
+ *
+ * The run-health sweep reads it back to tell this stall from a permanent failure: a parked ask is
+ * ALREADY reported as its gate's own wait, so reporting the job too would raise a second escalation
+ * — calling a wait on a person an exhausted job — for the same pause.
+ */
+export function parkedAskGateId(parkMessage: string): string | undefined {
+  return lastMatch(PARKED_ON_GATE, parkMessage)?.[1];
+}
+
+/**
+ * EVERY human gate a needs-human park names — the one it armed, then the holds that keep the target
+ * blocked after that one is answered — or undefined when the message is some other poison.
+ *
+ * The list is what the sweep needs, not just the armed gate: while ANY of them is open the job is
+ * still one wait with the gate that reports it, and suppressing on the armed gate alone would
+ * re-raise the park as a permanent failure the moment anton's own gate is resolved ahead of the
+ * person's hold.
+ */
+export function parkedAskGateIds(parkMessage: string): string[] | undefined {
+  const armed = lastMatch(PARKED_ON_GATE, parkMessage);
+  if (!armed) return undefined;
+  // Only the text AFTER the armed clause: the holds are appended right behind it, so an ask that
+  // quotes a hold sentence of its own can't be read as this park's.
+  const tail = parkMessage.slice(armed.index + armed[0].length);
+  const held = (PARKED_ALSO_HELD.exec(tail)?.[1] ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return [armed[1]!, ...held];
+}
+
 /**
  * This run cannot safely proceed because it can't prove it exclusively holds the epic's live
  * run-lease (anton-jz1). Two triggers, same recovery:
@@ -120,6 +259,26 @@ export class SyncNotWiredError extends Error {
   }
 }
 
+/**
+ * A new run can't START because the anton PROCESS is behind its own latest code (anton-mh3c) — its
+ * checkout is behind upstream, or its installed packages no longer match the lockfile. Like
+ * {@link SyncNotWiredError}, this is neither a completion nor the job's own failure, and it is NOT a
+ * poison: parking would strand every job that hit it in `parked` until a human resumed each by hand,
+ * even after the fix (pull/reinstall, restart anton) cleared the condition process-wide. So the
+ * runner RESCHEDULES on a slow cadence with the attempt refunded — the stale process keeps deferring
+ * new starts, and the moment it is restarted on fresh code the next attempt passes and runs itself.
+ *
+ * The stopped state stays loudly visible independent of this reschedule: `staleBreaker`
+ * (autopilot-breaker.ts) computes the stale band live from the same self-freshness verdict, so the
+ * app shows "Anton is running old code" whether or not any job is currently deferred on it.
+ */
+export class StaleCheckoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StaleCheckoutError";
+  }
+}
+
 export function isUsageLimitError(e: unknown): e is UsageLimitError {
   return e instanceof UsageLimitError || (e as { name?: string })?.name === "UsageLimitError";
 }
@@ -141,6 +300,41 @@ export function isRunAlreadyLiveError(e: unknown): e is RunAlreadyLiveError {
   );
 }
 
+/**
+ * Whether the failure PROVES another machine owns this epic's branch — the only basis on which a
+ * caller may hand the branch over to someone else (leave the orphan PR ready, skip the worktree
+ * teardown). An `unproven` lease conflict is this run losing track of its OWN lease and says nothing
+ * about a second owner, so it must not read as one: treated as foreign, it strands resources nobody
+ * else claims. Shared so every such caller applies the same rule.
+ */
+export function isForeignRunOwner(e: unknown): boolean {
+  return isRunAlreadyLiveError(e) && e.conflict === "foreign";
+}
+
 export function isSyncNotWiredError(e: unknown): e is SyncNotWiredError {
   return e instanceof SyncNotWiredError || (e as { name?: string })?.name === "SyncNotWiredError";
+}
+
+export function isStaleCheckoutError(e: unknown): e is StaleCheckoutError {
+  return e instanceof StaleCheckoutError || (e as { name?: string })?.name === "StaleCheckoutError";
+}
+
+/**
+ * The stable opening of a stale-checkout deferral's message ({@link StaleCheckoutError}, built by
+ * execute-epic-freshness.ts `staleCheckoutRefusal`). Shared so the message and the settled-row
+ * predicate below cannot drift apart.
+ */
+export const STALE_CHECKOUT_REFUSAL_PREFIX =
+  "anton is running behind its own latest code, so it will not start new work:";
+
+/**
+ * Whether a SETTLED run row's error is the stale-checkout deferral — a refunded, rescheduled
+ * non-start on which no work was attempted (no lease, worktree or claim). The error is stored as a
+ * string, and the message leads the row (settleRunRow writes `${message}${orphanNotice}`), so the
+ * stable prefix identifies it. Used by the failure-streak verdict, which keeps this out of the
+ * per-project failure evidence: a machine-wide staleness that self-clears on restart must not latch
+ * a project disarm (PR #257 review).
+ */
+export function isStaleCheckoutDeferral(error: string | undefined): boolean {
+  return error !== undefined && error.startsWith(STALE_CHECKOUT_REFUSAL_PREFIX);
 }

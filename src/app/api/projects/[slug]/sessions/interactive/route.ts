@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import type { ClaudeRouting } from "@/lib/claude/driver-routing";
 import { getRunningJobInfo } from "@/lib/jobs/service";
 import { startInteractiveSession } from "@/lib/pty/interactive";
 import { resolveProject } from "../../resolve-project";
@@ -54,6 +55,7 @@ export async function POST(
   // settled (or other-machine) job has no live directory to drop into, so fail loud with 409
   // rather than silently opening a terminal in the wrong place.
   let cwd: string | undefined;
+  let routing: ClaudeRouting | undefined;
   if (body.jobId) {
     const info = await getRunningJobInfo(project.id, body.jobId);
     if (!info?.cwd) {
@@ -63,6 +65,9 @@ export async function POST(
       );
     }
     cwd = info.cwd;
+    // Pin the terminal to the live job's captured endpoint, so a mid-run settings change can't route
+    // this debugging session to a different gateway than the job it inspects (anton-7poz).
+    routing = info.routing;
   }
 
   try {
@@ -73,6 +78,7 @@ export async function POST(
       beadId: body.beadId,
       runId: body.runId,
       cwd,
+      routing,
     });
     return Response.json({ sessionId }, { status: 201 });
   } catch (err) {

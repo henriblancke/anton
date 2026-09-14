@@ -3,36 +3,41 @@ import { NextResponse } from "next/server";
 import { actOnEscalation, isEscalationAction } from "@/lib/escalation-actions";
 import { NotAbandonableError } from "@/lib/abandon";
 import { openEscalations } from "@/lib/escalations";
-import { withProject } from "../../resolve-project";
+import { parseJsonBody, withProject } from "../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Settle one escalation (anton-wvcy): `{ action: "resume" | "abandon" | "dismiss" }`.
+ * Settle one escalation (anton-wvcy): `{ action: "resume" | "abandon" | "dismiss" | "restore" }`.
+ *
+ * `restore` (anton-7gxs) is the one verb that acts on a row that is not open: it lifts a dismissal,
+ * which is what makes dismissing safe to be durable in the first place.
  *
  * A POST on the escalation itself rather than sub-resources — every verb is the SAME decision
  * ("how does this stall end?"), and modelling them as one action field keeps the panel's buttons
  * on one code path. Returns the remaining open escalations so the board panel re-renders from the
  * response instead of racing a refetch against the write.
  *
+ * The verb set does not grow with the stall class: `resume` on a wait for a PERSON is
+ * resolve-and-resume — it closes the gate and then re-enqueues the run target — because that is one
+ * decision ("I did it, carry on") and splitting it into two requests would leave the founder able to
+ * settle half of it. See escalation-actions.ts for the ordering that makes it safe.
+ *
  * 409 covers "already settled" (someone else clicked first), "nothing to act on" (a finding that
- * names neither a bead nor a job), "contested" (another machine is running the work now), and
- * "unverified" (bd couldn't confirm whether one is) — in each case the request was valid but the
- * state refuses it.
+ * names neither a bead nor a job), "contested" (another machine is running the work now),
+ * "unverified" (bd couldn't confirm whether one is), and a `dismiss` on a wait for a person (which
+ * would settle the row over a still-open gate) — in each case the request was valid but the state
+ * refuses it.
  */
 export const POST = withProject<{ slug: string; escalationId: string }>(
   async (request, { project, params }) => {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-    }
+    const { body, response: badBody } = await parseJsonBody(request);
+    if (badBody) return badBody;
 
     const action = (body as { action?: unknown })?.action;
     if (!isEscalationAction(action)) {
       return NextResponse.json(
-        { error: 'action must be "resume", "abandon", or "dismiss"' },
+        { error: 'action must be "resume", "abandon", "dismiss", or "restore"' },
         { status: 400 },
       );
     }
@@ -41,11 +46,17 @@ export const POST = withProject<{ slug: string; escalationId: string }>(
       const result = await actOnEscalation(project, params.escalationId, action);
       if (!result.ok) {
         const status = result.reason === "not-found" ? 404 : 409;
-        return NextResponse.json({ error: FAILURE_MESSAGES[result.reason] }, { status });
+        return NextResponse.json(
+          { error: FAILURE_MESSAGES[result.reason], reason: result.reason },
+          { status },
+        );
       }
       return NextResponse.json({
         action: result.action,
         detail: result.detail,
+        // Sent only where the detail alone would mislead — today the gate hold, whose reason is the
+        // difference between "wait, it starts itself" and "approve it or nothing happens".
+        note: result.note,
         escalations: await openEscalations(project.id),
       });
     } catch (err) {
@@ -62,6 +73,12 @@ const FAILURE_MESSAGES = {
   "not-found": "Escalation not found",
   "not-open": "This escalation has already been settled",
   "no-target": "This escalation names no ticket or job to act on",
+  "not-dismissable":
+    "This alert can't be dismissed — a wait on a person leaves its gate open, and a disarm keeps every card stopped. Answer it, or re-arm anton",
+  "not-dismissed":
+    "There is nothing to restore — this alert was never dismissed, or it was already restored",
+  "restore-conflicted":
+    "This alert is already open elsewhere; its dismissal remains available to restore after that alert is settled",
   contested: "Another machine has picked this work back up — it is running again, so nothing was changed",
   unverified:
     "anton could not read the shared board, so it can't rule out another machine running this work — nothing was changed. Try again once bd can reach the remote",

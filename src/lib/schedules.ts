@@ -7,11 +7,18 @@
  * path uses the shared anton.db.
  */
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { getDb, schema } from "./db";
-import type { AntonDb, Clock } from "./jobs/queue";
+import { toEpoch } from "./db/epoch";
+import { newJobRow, systemClock, type AntonDb, type Clock } from "./jobs/queue";
 import type { JobType } from "./jobs/queue";
 import { isValidCron, nextRun } from "./jobs/cron";
+import {
+  lastRunsBySchedule,
+  pendingRunsBySchedule,
+  type ScheduleLastRun,
+  type SchedulePendingStatus,
+} from "./schedule-runs";
 
 /** Job types that run on a schedule (execute-epic is enqueued on approval, never on cron). */
 export type ScheduledJobType = Extract<
@@ -24,6 +31,8 @@ export type ScheduledJobType = Extract<
   | "gate-check"
   | "gardener"
   | "product-master"
+  | "board-picker"
+  | "worktree-reaper"
 >;
 
 export type ScheduleRow = typeof schema.schedules.$inferSelect;
@@ -36,16 +45,21 @@ export interface ScheduleSummary {
   enabled: boolean;
   lastRunAt?: number;
   nextRunAt?: number;
+  /**
+   * How the last fire ENDED (anton-znoz) — absent until this schedule has settled a job, and absent
+   * from every write path that only touches the row itself. `lastRunAt` says when; this says what.
+   */
+  lastRun?: ScheduleLastRun;
+  /**
+   * Where this schedule's still-unsettled fire is (anton-znoz) — absent when nothing is in flight.
+   * The switch cannot answer that: the runner gates only the claim, so a disabled schedule can hold
+   * a queued job AND a leased one that is still executing.
+   */
+  pendingRun?: SchedulePendingStatus;
 }
 
 function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
-}
-
-function toEpoch(value: unknown): number | undefined {
-  if (value == null) return undefined;
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value);
 }
 
 export function toScheduleSummary(row: ScheduleRow): ScheduleSummary {
@@ -110,8 +124,22 @@ export interface UpdateSchedulePatch {
 }
 
 /**
+ * `immediate` takes the write lock at BEGIN rather than upgrading to it after the read: anton.db is
+ * shared with the scheduler process, and a deferred transaction that upgrades mid-way fails the
+ * write outright instead of waiting out `busy_timeout`.
+ */
+const TAKE_WRITE_LOCK = { behavior: "immediate" } as const;
+
+/**
  * Patch a schedule's cron/enabled. Recomputes `nextRunAt` whenever the cron changes or a disabled
  * schedule is (re-)enabled; disabling clears `nextRunAt` so the loop skips it.
+ *
+ * The read and the write are ONE synchronous transaction, because this is a read-modify-write over a
+ * row two callers reach at once: the settings panel patches `enabled` on the same row a cadence
+ * accept is patching `cron` (settings-view.tsx), and each write carries the field it did NOT send at
+ * the value it read. Awaiting between the read and the update let both patches read the same row and
+ * the loser's intent vanish — the weekly cron restored, or a disabled job switched back on — with a
+ * success response for both. Serialized, the second patch reads what the first committed.
  */
 export async function updateSchedule(
   db: AntonDb,
@@ -119,32 +147,129 @@ export async function updateSchedule(
   id: string,
   patch: UpdateSchedulePatch,
 ): Promise<void> {
-  const rows = await db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).limit(1);
-  const current = rows[0];
-  if (!current) throw new Error(`schedule not found: ${id}`);
-
-  const cron = patch.cron ?? current.cron;
   if (patch.cron !== undefined && !isValidCron(patch.cron)) {
     throw new Error(`invalid cron expression: "${patch.cron}"`);
   }
-  const enabled = patch.enabled ?? current.enabled;
+  return db.transaction((tx) => {
+    const current = tx
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, id))
+      .limit(1)
+      .get();
+    if (!current) throw new Error(`schedule not found: ${id}`);
 
-  const set: Partial<ScheduleRow> = { cron, enabled };
-  if (!enabled) {
-    set.nextRunAt = null;
-  } else if (patch.cron !== undefined || (patch.enabled === true && !current.enabled)) {
-    set.nextRunAt = secDate(nextRun(cron, clock.now()));
-  }
-  await db.update(schema.schedules).set(set).where(eq(schema.schedules.id, id));
+    const cron = patch.cron ?? current.cron;
+    const enabled = patch.enabled ?? current.enabled;
+
+    const set: Partial<ScheduleRow> = { cron, enabled };
+    if (!enabled) {
+      set.nextRunAt = null;
+    } else if (patch.cron !== undefined || (patch.enabled === true && !current.enabled)) {
+      set.nextRunAt = secDate(nextRun(cron, clock.now()));
+    }
+    tx.update(schema.schedules).set(set).where(eq(schema.schedules.id, id)).run();
+  }, TAKE_WRITE_LOCK);
 }
 
-/** All schedules for a project (UI read path via shared anton.db). */
-export async function listSchedules(projectId: string): Promise<ScheduleSummary[]> {
-  const rows = await getDb()
-    .select()
-    .from(schema.schedules)
-    .where(eq(schema.schedules.projectId, projectId));
-  return rows.map(toScheduleSummary);
+/** Why a manual fire was refused — the route maps each to its own status code. */
+export type RunNowRefusal = "not-found" | "disabled" | "already-running" | "project-refused";
+
+export type RunNowResult = { ok: true; jobId: string } | { ok: false; reason: RunNowRefusal };
+
+/**
+ * Fire one automation's job right now, outside its cron (Settings → Automation's "Run now"). Builds and
+ * inserts the row exactly as the scheduler's own tick does (jobs/scheduler.ts) — same payload shape
+ * (`{ projectId, scheduleId }`), same `lastRunAt` stamp in the same transaction — so a manual fire
+ * is indistinguishable from a cron fire to every reader downstream (schedule-runs.ts's outcome
+ * pairing, the Automation table's Last-run cell). `nextRunAt` is left untouched: a manual fire does
+ * not reschedule the automation's own cadence.
+ *
+ * Refused when the automation is off (an operator must arm it first — the switch is the one place
+ * that decides whether this type may run at all) or when a job of this type is already active
+ * (`queued`/`running`) for the project, mirroring the scheduler's own inflight coalescing so a click
+ * can never double-fire a pass that is already running. `refuseProject` is the runner's
+ * project-teardown veto, asked inside the same transaction as the insert for the same reason
+ * `enqueueReviewFixPrIfAbsent` asks it (queue.ts) — a check made before this call would still race
+ * `quiesceProject`.
+ */
+export async function runScheduleNow(
+  db: AntonDb,
+  clock: Clock,
+  id: string,
+  opts?: { refuseProject?: (projectId: string) => boolean },
+): Promise<RunNowResult> {
+  const nowMs = clock.now();
+  return db.transaction((tx) => {
+    const row = tx
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, id))
+      .limit(1)
+      .get();
+    if (!row) return { ok: false, reason: "not-found" };
+    if (!row.enabled) return { ok: false, reason: "disabled" };
+    if (opts?.refuseProject?.(row.projectId)) return { ok: false, reason: "project-refused" };
+
+    const active = tx
+      .select({ id: schema.jobs.id })
+      .from(schema.jobs)
+      .where(
+        and(
+          eq(schema.jobs.type, row.type),
+          eq(schema.jobs.projectId, row.projectId),
+          inArray(schema.jobs.status, ["queued", "running"]),
+        ),
+      )
+      .limit(1)
+      .get();
+    if (active) return { ok: false, reason: "already-running" };
+
+    const job = newJobRow(
+      {
+        type: row.type as JobType,
+        projectId: row.projectId,
+        payload: { projectId: row.projectId, scheduleId: row.id },
+      },
+      nowMs,
+    );
+    tx.insert(schema.jobs).values(job).run();
+    tx.update(schema.schedules)
+      .set({ lastRunAt: job.createdAt })
+      .where(eq(schema.schedules.id, row.id))
+      .run();
+    return { ok: true, jobId: job.id };
+  }, TAKE_WRITE_LOCK);
+}
+
+/**
+ * All schedules for a project (UI read path via shared anton.db), each carrying how its last fire
+ * ended and where an unsettled one currently sits. Both are joined here rather than left to the
+ * caller so every path that renders a schedule — the settings page's server render, the panel's
+ * poll, a PATCH response — shows the same row; a patch that answered without them would blank the
+ * outcome column on every toggle, and a toggle is exactly when the pending fire's status decides
+ * whether the row reads as running or held.
+ */
+export async function listSchedules(
+  projectId: string,
+  clock: Clock = systemClock,
+): Promise<ScheduleSummary[]> {
+  const [rows, lastRuns, pendingRuns] = await Promise.all([
+    getDb().select().from(schema.schedules).where(eq(schema.schedules.projectId, projectId)),
+    lastRunsBySchedule(projectId),
+    // Clock-dependent: an in-flight fire only counts as running while its lease is fresh.
+    pendingRunsBySchedule(projectId, clock),
+  ]);
+  return rows.map((row) => {
+    const summary = toScheduleSummary(row);
+    const lastRun = lastRuns[row.id];
+    const pendingRun = pendingRuns[row.id];
+    return {
+      ...summary,
+      ...(lastRun ? { lastRun } : {}),
+      ...(pendingRun ? { pendingRun } : {}),
+    };
+  });
 }
 
 /**
@@ -169,12 +294,33 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
  * job that WRITES to the board unprompted (it closes epics bd judges done and repairs the blocked
  * flag). An operator who never asked for a patrol should not find work closed on their board — so
  * arming it is a deliberate act, and the report it produces is what earns the trust to leave it on.
+ * Its judgment tier also carries the re-judgement of parked work (anton-dsnr): daily is a fine
+ * cadence for a 90-day silence, and it needs no switch of its own because it costs no session and
+ * files nothing a founder has not already left parked for a quarter.
  *
  * product-master (anton-d2sx) ships disabled for both of the gardener's reasons and a third: it is
  * the only schedule that spends a claude session on judgment rather than on mechanism, and every
  * proposal it files spends a founder's attention. It runs WEEKLY rather than nightly because that is
  * the natural cadence of the question — "what matters next" does not change between two Tuesdays on
  * a board a nightly pass would find identical, and re-asking it daily is how the pass becomes noise.
+ * Weekly is only the DEFAULT, not a rule: arming board-picker makes these priorities the input to a
+ * ranking recomputed every few minutes, so the settings panel then offers to raise it to daily
+ * (anton-3xa9) — on that ranking's freshness, not on execution the picker does not do yet. The offer
+ * is an offer — nothing here moves a cadence an operator did not accept.
+ *
+ * board-picker (anton-albm) ships disabled for the gardener's reasons: an operator who never asked
+ * for a pass should not find one running. Today it DECIDES ONLY — it ranks the claimable set and
+ * records the plan, writing nothing to the board and starting nothing — so arming it buys the
+ * ranking, kept fresh, and nothing else. Starting a target off that plan is the arming feature's job
+ * and lands behind its own switch. Ten minutes because the pass is mechanical — a board read and a
+ * ranking, no Claude session — so the cadence is only how stale the recorded plan may get.
+ *
+ * worktree-reaper (anton-hrun.1) is armed by default despite deleting things, because what it
+ * deletes is anton's OWN residue and nobody else's: a checkout under `.anton-worktrees/` whose bead
+ * is closed, and the run branch beside it once no open PR needs it. It writes nothing to the board,
+ * never touches a locked checkout or an in-flight run, and an operator who never asked for it is the
+ * one most likely to end up with dozens of stale run branches. Daily, off-peak: residue accrues one
+ * run at a time, so a nightly pass is as timely as the problem is.
  *
  * gate-check (anton-286r) is armed by default and runs often, because it is the ONLY thing that
  * resumes a run parked on a gate: shipping it off would strand gated work indefinitely, and its
@@ -194,6 +340,8 @@ export const DEFAULT_SCHEDULES: Array<{
   { type: "gate-check", cron: "*/10 * * * *" }, // close satisfied gates + resume their work
   { type: "gardener", cron: "0 5 * * *", enabled: false }, // board hygiene patrol daily 05:00; opt-in
   { type: "product-master", cron: "0 6 * * 1", enabled: false }, // product judgment weekly, Mon 06:00; opt-in
+  { type: "board-picker", cron: "*/10 * * * *", enabled: false }, // rank the board, record a plan; opt-in
+  { type: "worktree-reaper", cron: "30 4 * * *" }, // reclaim finished runs' worktrees + branches, daily 04:30
 ];
 
 /**
@@ -282,4 +430,55 @@ export async function ensureSchedule(
     .limit(1);
   if (existing[0]) return existing[0].id;
   return createSchedule(db, clock, input);
+}
+
+/**
+ * Is one of a project's schedules armed? The db-injectable half, for the runtime paths that already
+ * hold a connection (the scheduler's own db, a test's).
+ *
+ * A type with no row reads as ENABLED: absence means the seed has never run for this project, which
+ * is not the operator switching the automation off, and a surface that treated it as a disable would
+ * hide itself on an installation that simply predates the type.
+ */
+export async function scheduleEnabled(
+  db: AntonDb,
+  projectId: string,
+  type: ScheduledJobType,
+): Promise<boolean> {
+  const rows = await db
+    .select({ enabled: schema.schedules.enabled })
+    .from(schema.schedules)
+    .where(and(eq(schema.schedules.projectId, projectId), eq(schema.schedules.type, type)))
+    .limit(1);
+  return rows[0]?.enabled ?? true;
+}
+
+/**
+ * This project's schedule id for `type`, if the row exists (PR #264 review). A caller that enqueues
+ * OUTSIDE the scheduler's own tick — the board-picker nudge is the one caller today — needs this to
+ * stamp the same `{ scheduleId }` payload shape `runScheduleNow` and the scheduler both use, so its
+ * jobs are visible to `pendingRunsBySchedule`/`lastRunsBySchedule` (both keyed on that payload field,
+ * not on type+project) instead of being invisible to every schedule-keyed read while still counting
+ * against `runScheduleNow`'s own type+project "already-running" check — the split that let the Run
+ * now button stay enabled through a 409 a nudge job was already causing.
+ */
+export async function scheduleIdFor(
+  db: AntonDb,
+  projectId: string,
+  type: ScheduledJobType,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({ id: schema.schedules.id })
+    .from(schema.schedules)
+    .where(and(eq(schema.schedules.projectId, projectId), eq(schema.schedules.type, type)))
+    .limit(1);
+  return rows[0]?.id;
+}
+
+/** {@link scheduleEnabled} over the shared anton.db — the UI read path. */
+export async function isScheduleEnabled(
+  projectId: string,
+  type: ScheduledJobType,
+): Promise<boolean> {
+  return scheduleEnabled(getDb(), projectId, type);
 }
