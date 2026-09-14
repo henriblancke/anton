@@ -1,6 +1,6 @@
 /**
- * Meter-attribution migration (drizzle/0038) preserves safely known Anthropic samples while
- * quarantining legacy gateway samples, and its follow-up index (0039) bounds routed-meter reads.
+ * Meter-attribution migration (drizzle/0039) preserves safely known Anthropic samples while
+ * quarantining legacy gateway samples, and its follow-up index (0040) bounds routed-meter reads.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
@@ -8,9 +8,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { applyMigrationFile, applyMigrationsTo } from "./testing";
 
-const MIGRATION = "0038_quota_meter_history.sql";
-const INDEX_MIGRATION = "0039_common_scarlet_spider.sql";
-const BACKFILL_MIGRATION = "0040_legacy-quota-attempt-backfill.sql";
+const MIGRATION = "0039_quota_meter_history.sql";
+const INDEX_MIGRATION = "0040_common_scarlet_spider.sql";
+const BACKFILL_MIGRATION = "0041_legacy-quota-attempt-backfill.sql";
 
 /** Read a migration's documented reverse recipe so its executable steps cannot drift from the header. */
 function reverseStatements(migration: string = MIGRATION): string[] {
@@ -46,7 +46,7 @@ beforeEach(() => {
 
 afterEach(() => sqlite.close());
 
-describe("drizzle/0038 — quota meter history", () => {
+describe("drizzle/0039 — quota meter history", () => {
   it("carries legacy unrouted history forward on the prior Anthropic approximation", () => {
     applyMigrationFile(sqlite, MIGRATION);
     applyMigrationFile(sqlite, BACKFILL_MIGRATION);

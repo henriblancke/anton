@@ -7,6 +7,7 @@
  * The job runner + execute-epic job depend on exactly these exports.
  */
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { hostname } from "node:os";
@@ -32,6 +33,10 @@ export interface Worktree {
   branch: string;
   /** Branch the worktree was created from. */
   baseBranch: string;
+  /** The commit the checkout forked from, captured at creation — see {@link readForkAtCreation}. */
+  forkSha?: string;
+  /** Whether this call created the branch under its branch lock, rather than reusing it. */
+  createdBranch: boolean;
   /** The main repo the worktree belongs to. */
   repoPath: string;
 }
@@ -403,6 +408,20 @@ function conflictingClaim(
  * edits. The claim holder itself says so with `claimedBy` — it materializes its own checkout under
  * its claim, and refusing that would deadlock the very job the claim is for.
  */
+/**
+ * The commit a freshly-created checkout forked from, resolved before any slow step can rewind the
+ * base ref (PR #238 review). {@link createWorktree} branches off `baseBranch` — a mutable
+ * remote-tracking ref such as `origin/main` — inside a lock that holds minutes, and the warm that
+ * follows runs minutes more. Reading the fork point from inside that window (or after it) against
+ * the still-mutable ref lets a sibling run's fetch rewind it behind the commit this branch was
+ * actually cut from. So `createWorktree` records the fork by reading the new checkout's own HEAD —
+ * the commit the branch was literally created at — and returns it; the caller pins HEAD here instead
+ * of re-deriving later.
+ */
+async function readForkAtCreation(worktreePath: string): Promise<string> {
+  return git(worktreePath, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+}
+
 export async function createWorktree(opts: {
   repoPath: string;
   branch: string;
@@ -435,7 +454,7 @@ export async function createWorktree(opts: {
     }
     const claimed = holders[0];
     const existing: Worktree | null = record
-      ? { path: record.path, branch, baseBranch: branch, repoPath }
+      ? { path: record.path, branch, baseBranch: branch, createdBranch: false, repoPath }
       : null;
     // A registration can outlive its checkout: `git worktree list` reports an administrative record,
     // and the directory may already be gone (anton-2wvb). Reusing such a path hands a non-existent
@@ -452,22 +471,88 @@ export async function createWorktree(opts: {
     const path = worktreePathFor(repoPath, branch);
     await mkdir(dirname(path), { recursive: true });
 
+    const exists = await branchExists(repoPath, branch);
+    if (await unsafeForkBranch(repoPath, branch)) {
+      if (exists) {
+        throw new Error(
+          `[worktree] refusing to reuse ${branch}: fork capture failed after creating it, so its ` +
+            `history is unpinned; delete the branch before retrying`,
+        );
+      }
+      await clearUnsafeForkBranch(repoPath, branch);
+    }
+
     // `--lock` as part of the ADD, never a `worktree lock` after it: git documents the two-step form
     // as racy, and this is the race that matters — between the two commands a concurrent anton's
     // teardown reads a fresh, unlocked checkout on the expected branch and force-removes it.
     const lockArgs = claimed ? ["--lock", "--reason", claimLockReason(claimed)] : [];
-    if (await branchExists(repoPath, branch)) {
-      await git(repoPath, ["worktree", "add", ...lockArgs, path, branch]);
-    } else {
+    const createdBranch = !exists;
+    if (createdBranch) {
       await git(repoPath, ["worktree", "add", ...lockArgs, path, "-b", branch, baseBranch]);
+    } else {
+      await git(repoPath, ["worktree", "add", ...lockArgs, path, branch]);
     }
 
-    // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
-    // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
-    return { path: await realpath(path), branch, baseBranch, repoPath };
+    try {
+      // Read the new checkout's HEAD *before* warming: the branch was just cut from `baseBranch`, and
+      // warming (or any later fetch) can rewind that ref behind the commit the checkout records. HEAD
+      // is fixed to the creation commit regardless — only read here, not after the warm below.
+      const forkSha = await readForkAtCreation(path);
+
+      // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
+      // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
+      const resolved = await realpath(path);
+      return { path: resolved, branch, baseBranch, forkSha, createdBranch, repoPath };
+    } catch (error) {
+      // Returning an unpinned checkout lets a retry classify its branch as reused and derive a fork
+      // against a base ref that may have moved. This checkout did not exist before this call, so tear
+      // it down before exposing that state; retain a pre-existing branch for the run that owns it.
+      await git(repoPath, ["worktree", "unlock", path]).catch(() => undefined);
+      try {
+        await git(repoPath, ["worktree", "remove", "--force", path]);
+      } catch (cleanupError) {
+        throw new Error(
+          `[worktree] could not capture ${branch}'s creation fork and could not remove the unpinned ` +
+            `checkout: ${gitError(cleanupError)} (original error: ${gitError(error)})`,
+        );
+      }
+
+      if (createdBranch) {
+        try {
+          await git(repoPath, ["branch", "-D", branch]);
+        } catch (cleanupError) {
+          try {
+            await markUnsafeForkBranch(repoPath, branch);
+          } catch (markError) {
+            throw new Error(
+              `[worktree] could not capture ${branch}'s creation fork, removed its checkout, but ` +
+                `could neither delete nor mark the branch unsafe: ${gitError(markError)} ` +
+                `(branch deletion: ${gitError(cleanupError)}; original error: ${gitError(error)})`,
+            );
+          }
+          throw new Error(
+            `[worktree] could not capture ${branch}'s creation fork and deleted its checkout, but ` +
+              `the branch remains unsafe to reuse: ${gitError(cleanupError)} ` +
+              `(original error: ${gitError(error)})`,
+          );
+        }
+      }
+      throw error;
+    }
   });
 
-  if (warm) await warmWorktree(wt, signal);
+  if (warm) {
+    try {
+      await warmWorktree(wt, signal);
+    } catch (err) {
+      // The fork was captured before warming; an unexpected setup failure must not discard it before
+      // the run row can persist it for a later resume.
+      console.warn(
+        `[worktree] warming ${wt.path} failed unexpectedly — continuing without it: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
   // No hooks bridge to materialize here: every git command anton runs against this worktree passes
   // `-c core.hooksPath=<resolved from repoPath>` itself (see resolveHooksPathOverride in ops.ts) —
   // hooks fire from the base repo's own directory with no symlink, no info/exclude entry, and no
@@ -520,12 +605,49 @@ export async function listBranches(repoPath: string, prefix: string): Promise<st
   return out.split("\n").filter(Boolean);
 }
 
-async function branchExists(repoPath: string, branch: string): Promise<boolean> {
+/** A durable local ref for a branch whose fresh fork could not be captured or cleaned up. */
+function unsafeForkRef(branch: string): string {
+  return `refs/anton/unsafe-fork/${createHash("sha256").update(branch).digest("hex")}`;
+}
+
+/** Whether a prior failed fork capture left this branch unsafe to reuse. */
+async function unsafeForkBranch(repoPath: string, branch: string): Promise<boolean> {
+  try {
+    await git(repoPath, ["show-ref", "--verify", "--quiet", unsafeForkRef(branch)]);
+    return true;
+  } catch (err) {
+    if ((err as { code?: number }).code === 1) return false;
+    throw err;
+  }
+}
+
+/** Mark the surviving branch before returning a failed fork capture to a future retry. */
+async function markUnsafeForkBranch(repoPath: string, branch: string): Promise<void> {
+  await git(repoPath, ["update-ref", unsafeForkRef(branch), "HEAD"]);
+}
+
+/** A branch an operator removed is safe to create again; its stale marker must not block it. */
+async function clearUnsafeForkBranch(repoPath: string, branch: string): Promise<void> {
+  await git(repoPath, ["update-ref", "-d", unsafeForkRef(branch)]);
+}
+
+/**
+ * Whether `branch` already exists locally. {@link createWorktree} asks this under its branch lock
+ * and returns whether it actually created the branch; callers must use that result instead of
+ * observing this mutable ref before creation.
+ *
+ * A missing ref is the one expected false result. Operational failures must propagate: treating an
+ * unreadable ref store as a new branch lets creation misclassify a reused checkout as fresh.
+ */
+export async function branchExists(repoPath: string, branch: string): Promise<boolean> {
   try {
     await git(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    // `show-ref --verify` reserves exit 1 for a ref that does not exist; every other failure means
+    // git could not establish whether this checkout is reused.
+    if ((err as { code?: number }).code === 1) return false;
+    throw err;
   }
 }
 
@@ -711,7 +833,7 @@ export async function listWorktrees(repoPath: string): Promise<WorktreeRecord[]>
 /** Return the existing worktree for `branch`, or null. */
 export async function findWorktree(repoPath: string, branch: string): Promise<Worktree | null> {
   const record = (await listWorktrees(repoPath)).find((w) => w.branch === branch);
-  return record ? { path: record.path, branch, baseBranch: branch, repoPath } : null;
+  return record ? { path: record.path, branch, baseBranch: branch, createdBranch: false, repoPath } : null;
 }
 
 /** What {@link removeWorktree} actually did — the evidence a reaper's log is written from. */

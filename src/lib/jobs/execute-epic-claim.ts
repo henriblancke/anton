@@ -9,10 +9,16 @@
 import { beads, LABELS, unclaimableStatus } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { assignChildren, formatReservedChildren } from "../beads/child-assign";
-import { resolveFreshBase } from "../git/ops";
-import { acquireWorktreeClaim, createWorktree, type Worktree } from "../git/worktree";
+import { resolveForkPoint, resolveFreshBase } from "../git/ops";
+import {
+  acquireWorktreeClaim,
+  createWorktree,
+  releaseWorktreeClaim,
+  removeWorktree,
+  type Worktree,
+} from "../git/worktree";
 import { resolveOperator } from "../operator";
-import { updateRun } from "../runs";
+import { findRunBaseForkShaForBranch, getRunBaseForkSha, updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
 import { safe } from "./execute-epic-persist";
 import type { EpicRun } from "./execute-epic-run";
@@ -61,11 +67,93 @@ export async function warmRunWorktree(
     signal: ctx.signal,
   });
   run.worktree = worktree;
-  await updateRun(db, clock, runId, {
-    worktreePath: worktree.path,
-    branch: worktree.branch,
-    attempts: ctx.attempt,
-  });
+  // `createWorktree` made this decision under its branch lock; a caller-side ref probe could go
+  // stale while the checkout is created and misclassify the fork provenance.
+  const reusedCheckout = !worktree.createdBranch;
+  // Pin the fork COMMIT now, while origin/<base> is freshly fetched and — on a FIRST creation — HEAD
+  // still sits at it (PR #238 review). A fresh creation's fork is already fixed at the instant
+  // `createWorktree` cut the branch (before warming could rewind the base); only a legacy row or a
+  // reused checkout without a recorded fork re-derives it, and the derived value is persisted so
+  // dispatch partitions against the commit the branch was cut from — never re-derived against
+  // `baseRef` a sibling run's fetch can rewind mid-run. A resume READS the stored value rather than
+  // recomputing: its worktree already carries this run's commits, so `merge-base <base> HEAD` then
+  // would answer far behind the true fork.
+  //
+  // The pin follows the CHECKOUT, not this run row alone (PR #238 review). Attempts do not all share
+  // a row: an ordinary handler failure settles it `failed`, so the runner's retry opens a FRESH row
+  // while deliberately reusing this branch and worktree (execute-epic-prepare's branch-scoped
+  // retry). Keyed by `runId` only, that retry finds nothing pinned and recomputes against a base a
+  // sibling run's fetch may have rewound since — the exact widening the pin exists to prevent. So a
+  // run that INHERITED its branch recovers what the attempt that cut it recorded, and only one
+  // standing on a branch it just created resolves a fork point of its own. A pre-column branch has
+  // neither, and recomputes once — no worse than the old behaviour — storing the answer on its row.
+  let storedFork: string | undefined;
+  let baseForkSha: string;
+  try {
+    // Pin reads are part of the same atomic setup as the pin write: a fresh checkout with neither
+    // must be removed, or a retry could reuse its branch and derive a fork from a moved base.
+    storedFork = await getRunBaseForkSha(db, runId);
+    const reusedFork =
+      storedFork ??
+      (reusedCheckout
+        ? await findRunBaseForkShaForBranch(db, projectId, run.targetId, branch)
+        : undefined);
+    try {
+      // The creation-captured fork is FROZEN only on a first creation (PR #238 review): there
+      // `readForkAtCreation` reads the checkout's HEAD in the instant `worktree add -b` cut it, so the
+      // base cannot since have rewound it. A reused checkout's `forkSha` is read off the SAME call
+      // checking the existing branch out, so it returns the branch's current HEAD — already carrying
+      // this run's prior-attempt commits — not the fork point. Preferring it would partition against
+      // `<HEAD>..HEAD>` and read a ticket already closed on a prior attempt as a pre-existing
+      // retirement. Only a checkout this call just created takes `worktree.forkSha`; a reused one asks
+      // `reusedFork` first, the row and the attempt that cut the branch.
+      baseForkSha = reusedCheckout
+        ? reusedFork ?? (await resolveForkPoint(worktree.path, freshBase))
+        : worktree.forkSha ?? reusedFork ?? (await resolveForkPoint(worktree.path, freshBase));
+    } catch (e) {
+      // Only reachable when a legacy row (no pinned fork) resumes over a worktree whose base was
+      // rewritten to an unrelated history — a fresh creation forks off `freshBase` and always shares
+      // it. Partitioning the run's tickets against a moving ref instead could read work this checkout
+      // never forked from as its own delivery, so stop rather than guess a fork point.
+      throw new PoisonEpic(
+        `anton could not resolve the commit \`${worktree.branch}\` forked from ${freshBase} in ` +
+          `${worktree.path} (${e instanceof Error ? e.message : String(e)}) — refusing to partition ` +
+          `the run's tickets against a moving base. Repair the worktree, then resume the run`,
+      );
+    }
+    await updateRun(db, clock, runId, {
+      worktreePath: worktree.path,
+      branch: worktree.branch,
+      attempts: ctx.attempt,
+      // Persist the creation-captured fork (and a recovered sibling's pin) onto this row. A reused
+      // checkout retains its own pin, but a recreated branch must replace a stale row pin: that old
+      // value describes the deleted checkout and could widen delivery evidence on a later retry.
+      ...(!reusedCheckout || !storedFork ? { baseForkSha } : {}),
+    });
+  } catch (error) {
+    // A newly-created checkout without a pinned fork is unsafe to reuse: any setup failure before
+    // persistence would otherwise leave a retry free to derive against a base another run has moved.
+    // A reused checkout belongs to its prior attempt and is already pinned, so this attempt leaves it
+    // intact.
+    if (!reusedCheckout) {
+      await releaseWorktreeClaim(repo, branch, worktreeClaim).catch((cleanupError) => {
+        console.error(`[execute-epic] could not release the failed worktree claim for ${branch}`, cleanupError);
+      });
+      const removal = await removeWorktree(worktree, { deleteBranch: true }).catch((cleanupError) => {
+        console.error(`[execute-epic] could not remove the unpinned worktree for ${branch}`, cleanupError);
+        return undefined;
+      });
+      if (!removal?.removed || !removal.branchDeleted) {
+        throw new PoisonEpic(
+          `anton could not persist ${branch}'s fork pin, and its newly-created checkout could not be ` +
+            `fully removed${removal?.skipped ? ` (${removal.skipped})` : ""}${removal?.branchSkipped ? ` (${removal.branchSkipped})` : ""} — ` +
+            `leaving it reusable would let a retry recompute against a moved base. Remove the checkout ` +
+            `and branch, then resume (${error instanceof Error ? error.message : String(error)})`,
+        );
+      }
+    }
+    throw error;
+  }
   await ctx.heartbeat();
 
   // Every step of the walk runs through the step registry (anton-4npr) — one entry point per step,
@@ -83,6 +171,7 @@ export async function warmRunWorktree(
     branch: worktree.branch,
     baseBranch,
     baseRef: freshBase,
+    baseForkSha,
     target,
     settings,
     assertLeaseHeld: lease.assertHeld,

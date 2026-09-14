@@ -4,7 +4,7 @@
 -- deliberately approximate weekly boundary. A current router configuration cannot identify the
 -- historical meter, so only projects with no legacy gateway URL are carried forward. A connection id
 -- was introduced after gateway routing, so it cannot identify routed history on upgrade. Already recorded
--- ledger rows are subtracted, making this safe if a machine had applied 0038 before 0040.
+-- ledger rows are subtracted, making this safe if a machine had applied 0039 before 0041.
 --
 -- Reverse:
 --   DELETE FROM `quota_attempts` WHERE `id` LIKE 'legacy:%';

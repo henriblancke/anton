@@ -18,6 +18,7 @@ import {
   type WorktreeState,
 } from "../../git/ops";
 import { PoisonEpic } from "../errors";
+import { resolveCommitTimeoutMs } from "../../projects";
 import { buildPrTitle } from "../pr-title";
 import { stepSubject, type StepContext } from "./context";
 import { prBody } from "./prompts";
@@ -64,7 +65,32 @@ export async function commitStep(ctx: StepContext): Promise<StepResultWith<"comm
   // a no-op now that this has already staged everything.
   await stageAll(ctx.worktreePath);
   const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
-  const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx), { hooksPath });
+  // A post-commit hook runs after Git advances HEAD, but the ticket deadline can still reap that
+  // hook and reject the commit call. Capture the tip immediately before our attempt so a prior
+  // agent self-commit is never mistaken for this commit landing after a rejection.
+  const before = ctx.ticketStartHead ? await readWorktreeState(ctx.worktreePath) : undefined;
+  let committed: boolean;
+  try {
+    ({ committed } = await commitAll(ctx.worktreePath, commitMessage(ctx), {
+      hooksPath,
+      timeoutMs: resolveCommitTimeoutMs(ctx.settings),
+      signal: ctx.ctx.signal,
+    }));
+  } catch (error) {
+    // A ticket deadline may stop a post-commit hook after HEAD advanced; an operator stopping the
+    // whole job must still reach the aborted-ticket path, which deliberately writes nothing to bd.
+    if (ctx.ctx.jobSignal?.aborted || !before || !ctx.ticketStartHead) throw error;
+    const after = await readWorktreeState(ctx.worktreePath);
+    if (after.head === before.head) throw error;
+
+    assertHeadOnRunBranch(ctx, after);
+    await assertTicketStartReachable(ctx, after, ctx.ticketStartHead);
+    return {
+      ok: true,
+      detail: "commit landed before its post-commit hook was stopped",
+      facts: { committed: true },
+    };
+  }
   if (committed) return { ok: true, detail: "committed", facts: { committed: true } };
 
   // No anchor to compare against: fall back to the index alone. The pre-anton-8t1f behaviour, kept
@@ -205,7 +231,11 @@ async function recordAttribution(ctx: StepContext, why: string): Promise<boolean
   // `resolveHooksPathOverride` here reads a submodule gitlink that is already committed, not merely
   // staged — the round-36/37 index-vs-HEAD gap this file's other call site closes does not apply.
   const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
-  await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`, { hooksPath });
+  await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`, {
+    hooksPath,
+    timeoutMs: resolveCommitTimeoutMs(ctx.settings),
+    signal: ctx.ctx.signal,
+  });
   return true;
 }
 

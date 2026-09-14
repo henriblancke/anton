@@ -12,6 +12,8 @@ let addProject: typeof import("./projects").addProject;
 let listProjects: typeof import("./projects").listProjects;
 let getProjectBySlug: typeof import("./projects").getProjectBySlug;
 let resolveVerifyGates: typeof import("./projects").resolveVerifyGates;
+let resolveCommitTimeoutMs: typeof import("./projects").resolveCommitTimeoutMs;
+let DEFAULT_COMMIT_TIMEOUT_MINUTES: typeof import("./projects").DEFAULT_COMMIT_TIMEOUT_MINUTES;
 let resolveReviewConfig: typeof import("./projects").resolveReviewConfig;
 let DEFAULT_REVIEW_MAX_ROUNDS: typeof import("./projects").DEFAULT_REVIEW_MAX_ROUNDS;
 let DEFAULT_REVIEW_MIN_SCORE: typeof import("./projects").DEFAULT_REVIEW_MIN_SCORE;
@@ -48,6 +50,8 @@ beforeAll(async () => {
   listProjects = mod.listProjects;
   getProjectBySlug = mod.getProjectBySlug;
   resolveVerifyGates = mod.resolveVerifyGates;
+  resolveCommitTimeoutMs = mod.resolveCommitTimeoutMs;
+  DEFAULT_COMMIT_TIMEOUT_MINUTES = mod.DEFAULT_COMMIT_TIMEOUT_MINUTES;
   resolveReviewConfig = mod.resolveReviewConfig;
   DEFAULT_REVIEW_MAX_ROUNDS = mod.DEFAULT_REVIEW_MAX_ROUNDS;
   DEFAULT_REVIEW_MIN_SCORE = mod.DEFAULT_REVIEW_MIN_SCORE;
@@ -179,6 +183,16 @@ describe("resolveVerifyGates (anton-3oh8)", () => {
       { label: "tests", command: "t" },
       { label: "build", command: "b" },
     ]);
+  });
+});
+
+describe("resolveCommitTimeoutMs (anton-zse2)", () => {
+  it("resolves an unset project to the 2-minute default (byte-identical to before the setting existed)", () => {
+    expect(resolveCommitTimeoutMs({})).toBe(DEFAULT_COMMIT_TIMEOUT_MINUTES * 60_000);
+  });
+
+  it("converts a configured commitTimeoutMinutes to milliseconds", () => {
+    expect(resolveCommitTimeoutMs({ commitTimeoutMinutes: 5 })).toBe(5 * 60_000);
   });
 });
 

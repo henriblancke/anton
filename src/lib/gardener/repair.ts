@@ -36,8 +36,9 @@
  * board rather than part of it. The convention is reused; the namespace must not be.
  *
  * Pure values plus one write. Nothing here decides WHETHER a class is repairable in a given
- * situation or performs a repair — the factual repairs are anton-fzas (`ref-stale`) and anton-qg4h
- * (`dep-missing`), and both pass through {@link decideRepair} before they touch anything.
+ * situation or performs a repair — the factual repairs are anton-fzas (`ref-stale`), anton-qg4h
+ * (`dep-missing`) and anton-5bpd (`already-shipped`), and all three pass through
+ * {@link decideRepair} before they touch anything.
  */
 import { createHash } from "node:crypto";
 import { beads } from "../beads/bd";
@@ -47,9 +48,9 @@ import type { ProposalAutonomy } from "./autonomy";
 import { FINGERPRINT_HASH_LENGTH } from "./detections";
 
 /**
- * The block classes anton will attempt a repair for — the factual pair (R5.4) and the inventive pair
- * (R5.5). `env` and `other` are deliberately absent: nothing anton can check makes them actionable,
- * so they escalate on their first appearance, not their second.
+ * The block classes anton will attempt a repair for — the factual ones (R5.4, anton-5bpd) and the
+ * inventive pair (R5.5). `env` and `other` are deliberately absent: nothing anton can check makes
+ * them actionable, so they escalate on their first appearance, not their second.
  *
  * A closed set, and {@link isRepairClass} is an EXACT membership test, because the guard is the last
  * thing standing between an unrecognised class and a confident repair. Anything the result parser
@@ -58,6 +59,7 @@ import { FINGERPRINT_HASH_LENGTH } from "./detections";
 export const REPAIR_CLASSES = [
   "ref-stale",
   "dep-missing",
+  "already-shipped",
   "acceptance-missing",
   "oversized",
 ] as const;
@@ -87,20 +89,28 @@ export function repairFingerprint(beadId: string, klass: RepairClass): string {
 }
 
 /**
- * The label as it is written: the fingerprint plus WHEN the repair was made.
+ * The label as it is written: the fingerprint plus WHEN the repair was made. A verified retirement
+ * also carries its closure version and survivor, so recovery can prove it is settling the exact close
+ * anton verified rather than a later decision on the same bead.
  *
  * The timestamp is not decoration. The breaker weighs a failed run double only when the repair
  * PRECEDED it ({@link repairedFailureWeight}) — without an instant to order against, the block that
  * triggered the repair would count double too, and a threshold of 3 would trip on one honest park
  * plus one failed repair. Multi-segment by the same precedent `run-lease:<expiry>[:<owner>]` sets.
  */
-export function repairLabel(beadId: string, klass: RepairClass, atMs: number): string {
-  return `${repairFingerprint(beadId, klass)}:${Math.floor(atMs)}`;
+export function repairLabel(
+  beadId: string,
+  klass: RepairClass,
+  atMs: number,
+  closure?: string,
+  survivor?: string,
+): string {
+  return `${repairFingerprint(beadId, klass)}:${Math.floor(atMs)}${closure ? `:${closure}` : ""}${survivor ? `:${survivor}` : ""}`;
 }
 
 /** A repair stamp's exact shape, so no unrelated `repair`-ish label is ever read as one. */
 const REPAIR_LABEL = new RegExp(
-  `^${REPAIR_NAMESPACE}:([a-z-]+):([0-9a-f]{${FINGERPRINT_HASH_LENGTH}}):(\\d+)$`,
+  `^${REPAIR_NAMESPACE}:([a-z-]+):([0-9a-f]{${FINGERPRINT_HASH_LENGTH}}):(\\d+)(?::([A-Za-z0-9._-]+)(?::([A-Za-z0-9._-]+))?)?$`,
 );
 
 /** One repair anton already made on a bead, as the board remembers it. */
@@ -110,6 +120,10 @@ export interface RepairAttempt {
   fingerprint: string;
   /** Unix MILLISECONDS the repair was stamped. */
   at: number;
+  /** The durable board version that began the closure this repair retired. */
+  closure?: string;
+  /** The survivor the verified retirement superseded this bead in favour of. */
+  survivor?: string;
   /**
    * What the repair actually did, recovered from the bead's note. Undefined when the note was
    * edited away or predates the note format — the stamp still counts, because the LABEL is the
@@ -236,6 +250,8 @@ export function repairAttemptsOf(bead: RepairedBead): RepairAttempt[] {
       klass,
       fingerprint,
       at: Number(m[3]!),
+      ...(m[4] ? { closure: m[4] } : {}),
+      ...(m[5] ? { survivor: m[5] } : {}),
       ...(prose ? { attempted: prose } : {}),
     });
   }
@@ -363,8 +379,10 @@ export async function recordRepair(
   klass: RepairClass,
   attempted: string,
   atMs: number,
+  closure?: string,
+  survivor?: string,
 ): Promise<string> {
-  const label = repairLabel(bead.id, klass, atMs);
+  const label = repairLabel(bead.id, klass, atMs, closure, survivor);
   await beads.tag(repoPath, bead.id, [label]);
   try {
     await beads.note(repoPath, bead.id, repairNote(repairFingerprint(bead.id, klass), attempted));

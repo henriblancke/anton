@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "4518b160-4a11-4ed2-993c-8afdb1b9c7fe",
-  "prevId": "fdcc5f81-566c-49ab-82bb-782609622a3a",
+  "id": "61774828-f7cc-4013-baa2-e67ff3961d8e",
+  "prevId": "e18155e4-d177-4988-81d9-d0101aadc51f",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -270,15 +270,6 @@
           "name": "burn_samples_type_created_idx",
           "columns": [
             "job_type",
-            "created_at"
-          ],
-          "isUnique": false
-        },
-        "burn_samples_type_meter_created_idx": {
-          "name": "burn_samples_type_meter_created_idx",
-          "columns": [
-            "job_type",
-            "meter_key",
             "created_at"
           ],
           "isUnique": false
@@ -1554,6 +1545,13 @@
         "write_seq": {
           "name": "write_seq",
           "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "base_fork_sha": {
+          "name": "base_fork_sha",
+          "type": "text",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
