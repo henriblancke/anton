@@ -262,11 +262,16 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     expect(unlinkMock).not.toHaveBeenCalled();
   });
 
-  it("parks — restoring the claim — when the authoritative read fails (PR #238 review)", async () => {
+  it("parks — restoring only its own still-current claim — when the authoritative read fails (PR #238 review)", async () => {
     // A transient `bd show` failure tells us NOTHING about the edge; treating the unreadable bead
     // as edge-free would run the ticket and let a surviving `supersedes` reach the close/resume
     // that drops the rerun's work. So fail closed rather than proceed on an unverified read.
-    showMock.mockRejectedValue(new Error("database is locked"));
+    // The locked release re-reads before writing and after its status write: it may release only
+    // the exact claim this run still holds.
+    showMock
+      .mockRejectedValueOnce(new Error("database is locked"))
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValue({ ...claimed, status: "open" });
 
     const err = await claimTicket(run(), reopened, "op").then(
       () => undefined,
@@ -275,7 +280,52 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     expect(err).toBeInstanceOf(PoisonEpic);
     expect((err as Error).message).toMatch(/could not be re-read after claiming/);
     expect(unlinkMock).not.toHaveBeenCalled();
-    // The claim the gate took is handed back so the resume's own claim gate can re-take it.
+    expect(setStatusMock).toHaveBeenCalledWith(REPO, reopened.id, "open");
+    expect(unassignMock).toHaveBeenCalledWith(REPO, reopened.id);
+  });
+
+  it("does not reopen or unassign a settlement that superseded the failed claim read (PR #238 review)", async () => {
+    // The cleanup starts only after the failed read. A remote writer can settle the bead before its
+    // release re-read; its closed state and assignee must remain theirs rather than be reset to open.
+    showMock
+      .mockRejectedValueOnce(new Error("database is locked"))
+      .mockResolvedValue({ ...claimed, status: "closed", assignee: "other-op" });
+
+    const err = await claimTicket(run(), reopened, "op").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(PoisonEpic);
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("does not unassign a claim another operator took after the failed read (PR #238 review)", async () => {
+    // The pre-write read still finds the original claim; the read after status restoration sees the
+    // other operator, so the cleanup must leave their assignee and stage untouched.
+    showMock
+      .mockRejectedValueOnce(new Error("database is locked"))
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValue({ ...claimed, status: "open", assignee: "other-op" });
+
+    await expect(claimTicket(run(), reopened, "op")).rejects.toBeInstanceOf(PoisonEpic);
+
+    expect(setStatusMock).toHaveBeenCalledWith(REPO, reopened.id, "open");
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("releases a verified current claim on a shared board (PR #238 review)", async () => {
+    pinBoardMode(REPO, { mode: "server" });
+    showMock
+      .mockRejectedValueOnce(new Error("database is locked"))
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValue({ ...claimed, status: "open" });
+
+    await expect(claimTicket(run(), reopened, "op")).rejects.toBeInstanceOf(PoisonEpic);
+
     expect(setStatusMock).toHaveBeenCalledWith(REPO, reopened.id, "open");
     expect(unassignMock).toHaveBeenCalledWith(REPO, reopened.id);
   });
@@ -313,6 +363,10 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
   });
 
   it("parks — restoring the claim — when bd refuses to remove the edge", async () => {
+    showMock
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValueOnce(claimed)
+      .mockResolvedValue({ ...claimed, status: "open" });
     unlinkMock.mockRejectedValue(new Error("Command failed: bd dep remove\ndatabase is locked"));
 
     const err = await claimTicket(run(), reopened, "op").then(

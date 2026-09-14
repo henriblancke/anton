@@ -44,17 +44,29 @@ export interface TicketBudget {
 }
 
 /**
- * Undo the claim before a gate parks the run: hand the status back to `open` and drop the assignee
- * and the stage label the claim wrote. The claim moved the ticket to `in_progress`, and the
- * epic-level cleanup hands the assignee back but NOT the status — leaving `in_progress` with no
- * owner, which `bd update --claim` refuses outright, so the resume the park tells the operator to
- * run would never get past its own claim gate. Best-effort throughout: this runs on the way to a
- * throw, and a write that also fails changes nothing the operator cannot fix by hand.
+ * Undo a claim before a gate parks the run, but only while the board still says it belongs to this
+ * run. A failed post-claim read is not evidence that nothing else settled the ticket in the meantime:
+ * reopening or unassigning a newer settlement would undo that decision.
+ *
+ * The process-wide bead lock keeps local writers from interleaving the re-read and rollback. On a
+ * shared board, the re-read still fences this writer from blindly reopening a settlement that has
+ * already arrived; a later remote writer remains the board's newer decision.
  */
-async function unclaimAndPark(repo: string, ticketId: string): Promise<void> {
-  await safe(() => beads.setStatus(repo, ticketId, "open"));
-  await safe(() => beads.unassign(repo, ticketId));
-  await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
+async function unclaimAndPark(repo: string, ticketId: string, operator: string | undefined): Promise<void> {
+  await withBeadWriteLock(repo, ticketId, async () => {
+    const fresh = await beads.show(repo, ticketId).catch(() => undefined);
+    if (!fresh || fresh.status !== "in_progress" || !operator || ownerOf(fresh) !== operator) {
+      return;
+    }
+    await safe(() => beads.setStatus(repo, ticketId, "open"));
+    // `bd update --status open` preserves the assignee, so another writer cannot land between the
+    // status rollback and a later unassign and have their claim stripped. The order deliberately
+    // leaves an owner on a failed status write rather than producing an unclaimable in-progress bead.
+    const afterStatus = await beads.show(repo, ticketId).catch(() => undefined);
+    if (!afterStatus || afterStatus.status !== "open" || ownerOf(afterStatus) !== operator) return;
+    await safe(() => beads.unassign(repo, ticketId));
+    await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
+  });
 }
 
 /**
@@ -93,12 +105,9 @@ export async function claimTicket(
   // and a run that cannot clear it parks before it can open that PR.
   if (beads.isNotDelivered(ticket)) {
     if (!(await mustPersist(() => beads.untag(repo, ticket.id, [LABELS.notDelivered])))) {
-      // Put the ticket back the way the claim above found it before halting. The claim already
-      // moved it to `in_progress`, and the epic-level cleanup hands the assignee back but not the
-      // status — leaving `in_progress` with no owner, which `bd update --claim` refuses outright.
-      // The resume this park tells the operator to run would then never get past its claim gate.
-      // Same restore the retryable-failure path performs, for the same reason.
-      await unclaimAndPark(repo, ticket.id);
+      // Hand the claim back only if a locked re-read still proves it is this run's `in_progress`
+      // claim. A later settlement or unreadable board is left untouched rather than reopened.
+      await unclaimAndPark(repo, ticket.id, operator);
       throw new PoisonEpic(
         `${ticket.id} carries \`${LABELS.notDelivered}\` from a previous run but bd would not ` +
           `clear it — running this ticket and opening a pull request would make merge ` +
@@ -123,7 +132,7 @@ export async function claimTicket(
   // and restore the claim exactly as the unlink-refusal path below does — rather than proceed on
   // an unverified read.
   if (!claimed) {
-    await unclaimAndPark(repo, ticket.id);
+    await unclaimAndPark(repo, ticket.id, operator);
     throw new PoisonEpic(
       `${ticket.id} could not be re-read after claiming, so a stale \`supersedes\` edge from a ` +
         `previous retirement cannot be ruled out — running this ticket and opening a pull request ` +
@@ -153,7 +162,7 @@ export async function claimTicket(
       );
     }
     if (!(await mustPersist(() => beads.unlink(repo, ticket.id, survivor)))) {
-      await unclaimAndPark(repo, ticket.id);
+      await unclaimAndPark(repo, ticket.id, operator);
       throw new PoisonEpic(
         `${ticket.id} carries a stale \`supersedes\` edge to ${survivor} from a previous ` +
           `retirement but bd would not remove it — running this ticket and opening a pull request ` +
