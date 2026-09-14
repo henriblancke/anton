@@ -196,6 +196,11 @@ describe("required skill assets", () => {
       expect(shape).toMatch(/Audit the ordering\. This step is not optional either/);
       expect(shape).toMatch(/topological order over `blocks`\s+edges/);
       expect(shape).toMatch(/not\*\* board order, not creation order/);
+      expect(shape).toMatch(/nearest-card\s+membership/);
+      expect(shape).toMatch(/arbitrary working-layer nesting/);
+      expect(shape).toMatch(/pipeline exclusion/);
+      expect(shape).toMatch(/Kahn ordering/);
+      expect(shape).toMatch(/matches the intended build order because/);
       expect(shape).toMatch(/naming the tickets/);
     });
 

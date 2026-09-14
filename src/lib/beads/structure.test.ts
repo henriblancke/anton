@@ -7,6 +7,7 @@ import {
   formatStructureViolations,
   structureGaps,
   validateBoardStructure,
+  type StructureOptions,
   type StructureRule,
 } from "./structure";
 
@@ -32,8 +33,8 @@ const blocks = (blockedId: string, blockerId: string) => ({
 });
 
 /** Rules broken by `id`, so an assertion names the rule rather than matching prose. */
-const rulesFor = (board: Bead[], id: string): StructureRule[] =>
-  validateBoardStructure(board)
+const rulesFor = (board: Bead[], id: string, options?: StructureOptions): StructureRule[] =>
+  validateBoardStructure(board, options)
     .filter((v) => v.id === id)
     .map((v) => v.rule);
 
@@ -139,15 +140,44 @@ describe("validateBoardStructure", () => {
       expect(rulesFor(board, "second")).toEqual([]);
     });
 
-    it("faults every bead on a blocks cycle", () => {
+    it("faults every bead bd reports on a blocks cycle", () => {
       const board = [
         task("a", undefined, { dependencies: [blocks("a", "b")] }),
         task("b", undefined, { dependencies: [blocks("b", "c")] }),
         task("c", undefined, { dependencies: [blocks("c", "a")] }),
       ];
-      expect(rulesFor(board, "a")).toEqual(["blocks-cycle"]);
-      expect(rulesFor(board, "b")).toEqual(["blocks-cycle"]);
-      expect(rulesFor(board, "c")).toEqual(["blocks-cycle"]);
+      const cycles = [{ ids: ["a", "b", "c"], raw: { cycle: ["a", "b", "c"] } }];
+      expect(rulesFor(board, "a", { cycles })).toEqual(["blocks-cycle"]);
+      expect(rulesFor(board, "b", { cycles })).toEqual(["blocks-cycle"]);
+      expect(rulesFor(board, "c", { cycles })).toEqual(["blocks-cycle"]);
+    });
+
+    it("does not infer cycles when bd supplies no cycle evidence", () => {
+      const board = [
+        task("a", undefined, { dependencies: [blocks("a", "b")] }),
+        task("b", undefined, { dependencies: [blocks("b", "a")] }),
+      ];
+      expect(validateBoardStructure(board, { cycles: [] })).toEqual([]);
+    });
+
+    it("blocks on an unreadable bd cycle record rather than treating it as clean", () => {
+      const violations = validateBoardStructure(HEALTHY, { cycles: [{ ids: [], raw: { unexpected: true } }] });
+      expect(violations).toEqual([
+        expect.objectContaining({ id: "board", rule: "blocks-cycle", severity: "blocking" }),
+      ]);
+      expect(violations[0].message).toContain("bd dep cycles");
+      expect(violations[0].message).toContain("bd dep remove");
+      expect(violations[0].message).toContain("bd dep add");
+    });
+
+    it("keeps partially parseable bd cycle evidence blocking at board scope", () => {
+      const violations = validateBoardStructure(HEALTHY, {
+        cycles: [{ ids: ["t1", "unknown"], raw: { ids: ["t1", "unknown"] } }],
+      });
+      expect(violations.map((v) => [v.id, v.rule])).toEqual([
+        ["t1", "blocks-cycle"],
+        ["board", "blocks-cycle"],
+      ]);
     });
 
     it("does not fault a plain chain that merely converges, with no loop", () => {

@@ -134,11 +134,25 @@ describe("anton board-check (bd stubbed on PATH)", () => {
   const dirs = tempDirs();
   let repo: string;
 
-  /** A `bd` whose `list` serves BOARD, optionally refusing `--status all` the way lean builds do. */
-  async function fakeBd(board: unknown[], { rejectsStatusAll = false } = {}): Promise<string> {
+  /** A `bd` whose list and dependency-cycle output are configurable at the CLI boundary. */
+  async function fakeBd(
+    board: unknown[],
+    {
+      rejectsStatusAll = false,
+      cycles = [],
+      cycleExit = 0,
+      cycleOutput = JSON.stringify(cycles),
+    }: {
+      rejectsStatusAll?: boolean;
+      cycles?: unknown[];
+      cycleExit?: number;
+      cycleOutput?: string;
+    } = {},
+  ): Promise<string> {
     const bin = await dirs.make("anton-bdbin-");
     const open = board.filter((b) => (b as { status?: string }).status !== "closed");
     const closed = board.filter((b) => (b as { status?: string }).status === "closed");
+    const gates = board.filter((b) => (b as { issue_type?: string }).issue_type === "gate");
     writeFakeBd(
       bin,
       [
@@ -146,9 +160,20 @@ describe("anton board-check (bd stubbed on PATH)", () => {
         "const a = process.argv.slice(2);",
         `const open = ${JSON.stringify(JSON.stringify(open))};`,
         `const closed = ${JSON.stringify(JSON.stringify(closed))};`,
-        `const all = ${JSON.stringify(JSON.stringify(board))};`,
+        `const all = ${JSON.stringify(JSON.stringify(board.filter((b) => (b as { issue_type?: string }).issue_type !== "gate")))};`,
+        `const gates = ${JSON.stringify(JSON.stringify(gates))};`,
+        `const cycleOutput = ${JSON.stringify(cycleOutput)};`,
+        `const cycleExit = ${cycleExit};`,
+        'if (a.includes("dep") && a.includes("cycles")) {',
+        '  if (cycleExit !== 0) console.error(cycleOutput); else console.log(cycleOutput);',
+        "  process.exit(cycleExit);",
+        "}",
         'const i = a.indexOf("--status");',
         'const status = i >= 0 ? a[i + 1] : "";',
+        'if (a.includes("--type") && a[a.indexOf("--type") + 1] === "gate") {',
+        "  console.log(gates);",
+        "  process.exit(0);",
+        "}",
         `if (status === "all" && ${rejectsStatusAll}) {`,
         '  console.error("unknown value for --status: all");',
         "  process.exit(2);",
@@ -238,14 +263,44 @@ describe("anton board-check (bd stubbed on PATH)", () => {
       expect(r.status).toBe(1);
     });
 
-    it("counts a blocks cycle as blocking and exits non-zero", async () => {
+    it("counts a cycle bd reports as blocking and exits non-zero", async () => {
       const board = [
         ...HEALTHY,
         { id: "a", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("a", "b")] },
         { id: "b", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("b", "a")] },
       ];
-      const r = runCheck(await fakeBd(board));
+      const r = runCheck(await fakeBd(board, { cycles: [{ cycle: ["a", "b"] }] }));
       expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.status).toBe(1);
+    });
+
+    it("refuses an unreadable populated cycle report rather than calling the board clean", async () => {
+      const r = runCheck(await fakeBd(HEALTHY, { cycles: [{ unfamiliar: true }] }));
+      expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.stdout).toContain("bd dep cycles");
+      expect(r.status).toBe(1);
+    });
+
+    it("hydrates gate records before judging a blocks target", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "gate1", issue_type: "gate", status: "open" },
+        { id: "waiter", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("waiter", "gate1")] },
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).not.toContain("[blocks-edge-dangling]");
+      expect(r.status).toBe(0);
+    });
+
+    it("fails loud when bd's authoritative cycle output is malformed", async () => {
+      const r = runCheck(await fakeBd(HEALTHY, { cycleOutput: "not json" }));
+      expect(r.stderr).toContain("cycle output this build can't parse");
+      expect(r.status).toBe(1);
+    });
+
+    it("reports a non-zero cycle command with a usable fallback detail", async () => {
+      const r = runCheck(await fakeBd(HEALTHY, { cycleExit: 2, cycleOutput: "" }));
+      expect(r.stderr).toContain("bd dep cycles exited 2");
       expect(r.status).toBe(1);
     });
 

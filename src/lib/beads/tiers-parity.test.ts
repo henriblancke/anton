@@ -93,4 +93,14 @@ describe("tiers.mjs agrees with the app's TypeScript predicates", () => {
     const board = [gate, waiter];
     expect(validateBoardStructure(board).some((v) => v.rule === "blocks-edge-dangling")).toBe(false);
   });
+
+  it("forwards bd cycle evidence through the typed facade", () => {
+    const board = [bead("a", "task"), bead("b", "task")];
+    const cycles = [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }];
+
+    expect(validateBoardStructure(board, { cycles }).map((v) => [v.id, v.rule])).toEqual([
+      ["a", "blocks-cycle"],
+      ["b", "blocks-cycle"],
+    ]);
+  });
 });

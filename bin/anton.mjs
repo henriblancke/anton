@@ -1209,6 +1209,33 @@ function bdList(repo, extra) {
   return exec("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], budgetMs("network"));
 }
 
+/** The authoritative cycle query, through the same project-scoped runner as the board listing. */
+function bdDepCycles(repo) {
+  const exec = scopedBdRunner(repo, readDoltMetadata(repo));
+  return exec("bd", ["-C", repo, "dep", "cycles", "--json"], budgetMs("network"));
+}
+
+/** Parse bd's cycle records best-effort, retaining every raw entry if its shape evolves. */
+function parseDepCycles(stdout) {
+  let parsed;
+  try {
+    parsed = JSON.parse((stdout ?? "").trim() || "null");
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const idsOf = (node) => {
+    if (typeof node === "string") return [node];
+    if (Array.isArray(node)) return node.flatMap(idsOf);
+    if (!node || typeof node !== "object") return [];
+    const named = node.cycle ?? node.path ?? node.ids ?? node.issue_ids ?? node.issues ?? node.nodes;
+    if (named !== undefined) return idsOf(named);
+    const id = typeof node.id === "string" ? node.id : typeof node.issue_id === "string" ? node.issue_id : undefined;
+    return id ? [id] : [];
+  };
+  return parsed.map((raw) => ({ ids: idsOf(raw), raw }));
+}
+
 /** bd's listing as an array, or null when this build's output can't be parsed. */
 function parseBoard(stdout) {
   try {
@@ -1244,21 +1271,41 @@ function readBoard(repo) {
           : all.error.message,
     };
   }
+
+  let work;
   if (all.status === 0) {
-    const board = parseBoard(all.stdout);
-    return board ? { board } : { error: "bd returned output this build can't parse." };
+    work = parseBoard(all.stdout);
+    if (!work) return { error: "bd returned output this build can't parse." };
+  } else {
+    const [open, closed] = [bdList(repo, []), bdList(repo, ["--status", "closed"])];
+    const failed = [open, closed].some((r) => r.error || r.status !== 0);
+    // Report the ORIGINAL failure: the fallback is a guess about which bd this is, and if it fails too
+    // the useful message is why `--status all` was refused, not why the second guess was.
+    if (failed) return { error: (all.stderr ?? "").trim() || `bd list exited ${all.status}` };
+
+    const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
+    if (listings.some((l) => l === null)) return { error: "bd returned output this build can't parse." };
+    const byId = new Map();
+    for (const bead of listings.flat()) if (!byId.has(bead.id)) byId.set(bead.id, bead);
+    work = [...byId.values()];
   }
 
-  const [open, closed] = [bdList(repo, []), bdList(repo, ["--status", "closed"])];
-  const failed = [open, closed].some((r) => r.error || r.status !== 0);
-  // Report the ORIGINAL failure: the fallback is a guess about which bd this is, and if it fails too
-  // the useful message is why `--status all` was refused, not why the second guess was.
-  if (failed) return { error: (all.stderr ?? "").trim() || `bd list exited ${all.status}` };
+  // bd omits pipeline gates from ordinary listings while retaining blocks edges that point to them.
+  // The structural rule needs the target record to distinguish a real gate from a dangling blocker.
+  const known = new Set(work.map((bead) => bead.id));
+  const needsGates = work.some((bead) =>
+    (bead.dependencies ?? []).some((dep) => dep?.type === "blocks" && !known.has(dep.depends_on_id)),
+  );
+  if (!needsGates) return { board: work };
 
-  const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
-  if (listings.some((l) => l === null)) return { error: "bd returned output this build can't parse." };
-  const byId = new Map();
-  for (const bead of listings.flat()) if (!byId.has(bead.id)) byId.set(bead.id, bead);
+  const gates = bdList(repo, ["--status", "all", "--type", "gate"]);
+  if (gates.error || gates.status !== 0) {
+    return { error: gates.error?.message || (gates.stderr ?? "").trim() || `bd list --type gate exited ${gates.status}` };
+  }
+  const parsedGates = parseBoard(gates.stdout);
+  if (!parsedGates) return { error: "bd returned output this build can't parse." };
+  const byId = new Map(work.map((bead) => [bead.id, bead]));
+  for (const gate of parsedGates) if (!byId.has(gate.id)) byId.set(gate.id, gate);
   return { board: [...byId.values()] };
 }
 
@@ -1294,8 +1341,21 @@ function cmdBoardCheck(args) {
       console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${error}`));
       return 1;
     }
+    const cycleResult = bdDepCycles(repo);
+    if (cycleResult.error || cycleResult.status !== 0) {
+      const detail = cycleResult.error?.code === "ENOENT"
+        ? "bd not found on PATH — install it with `brew install gastownhall/tap/bd`"
+        : cycleResult.error?.message || (cycleResult.stderr ?? "").trim() || `bd dep cycles exited ${cycleResult.status}`;
+      console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim(`\n${detail}`));
+      return 1;
+    }
+    const cycles = parseDepCycles(cycleResult.stdout);
+    if (cycles === null) {
+      console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim("\nbd returned cycle output this build can't parse."));
+      return 1;
+    }
 
-    const report = buildStructureReport(board);
+    const report = buildStructureReport(board, { cycles });
     blocking += report.blocking;
     console.log(formatStructureReport(report, repos.length > 1 ? repo : ""));
     console.log("");

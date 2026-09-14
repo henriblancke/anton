@@ -161,7 +161,7 @@ async function applyProposalResponse(
 }
 
 export const POST = withProject<{ slug: string; epicId: string }>(async (request, { project, params }) => {
-  const { epicId } = params;
+  const { epicId } = await params;
 
   // Gate approval on readiness: approving enqueues execute-epic immediately, so an epic with open
   // blockers must not be startable before its blocker completes. Locate it across stages first.
@@ -173,6 +173,9 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // falls back to separate open/closed reads where `--status all` fails; calling `beads.list` directly
   // here would skip that fallback and 500 the whole approval in exactly the scenario the board handles.
   const allBeads = await refreshAllIssues(project.repoPath);
+  // bd reads share the board's Dolt connection. Keep the authoritative cycle read behind the full
+  // snapshot so approval does not contend with itself before it can decide whether to enqueue.
+  const cycles = await beads.depCycles(project.repoPath);
 
   // Validate the target is actually runnable *before* touching labels or enqueuing. Approval is the
   // run trigger, so labeling-and-enqueuing a bead that execute-epic will only poison-park is a false
@@ -336,7 +339,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // One call, both severities: the refusal below and the advisory further down are the same subtree
   // read, and asking twice would walk the whole board twice.
   const structural = willEnqueue
-    ? structureGaps(epicId, allBeads)
+    ? structureGaps(epicId, allBeads, { cycles })
     : { blocking: [], advisory: [] };
   if (structural.blocking.length > 0) {
     return NextResponse.json(

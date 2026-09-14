@@ -87,10 +87,10 @@ function isJudged(bead) {
  * epic whose only feature child is closed is still a container, so its loose tickets are still dead.
  * Only the *offender* has to be live ({@link isJudged}); its context does not.
  */
-export function validateBoardStructure(board) {
+export function validateBoardStructure(board, { cycles } = {}) {
   const byId = new Map(board.map((b) => [b.id, b]));
   const childrenOf = childIndex(board);
-  const onBlocksCycle = blocksCycleMembers(board, byId);
+  const { members: onBlocksCycle, unmapped: unmappedCycles } = cycleMembers(board, byId, cycles);
 
   const violations = [];
   const fault = (id, rule, severity, message) => violations.push({ id, rule, severity, message });
@@ -269,6 +269,21 @@ export function validateBoardStructure(board) {
     }
   }
 
+  // `bd dep cycles` may report a real graph cycle in an encoding whose bead ids this version of
+  // anton cannot read. That is still blocking evidence, not an empty answer: put it on a stable
+  // board-level id so the CLI refuses instead of silently calling the board healthy.
+  for (const cycle of unmappedCycles) {
+    fault(
+      "board",
+      "blocks-cycle",
+      "blocking",
+      `bd dep cycles reported a blocks cycle whose bead ids anton could not map: ${cycleMetadata(cycle)}. ` +
+        "The graph is unsafe to dispatch until you inspect bd's cycle report and break one edge " +
+        "(`bd dep remove <blocked> <blocker>`), then restore the intended order " +
+        "(`bd dep add <blocked> <blocker>`).",
+    );
+  }
+
   return violations;
 }
 
@@ -284,9 +299,9 @@ export function validateBoardStructure(board) {
  * {@link validateBoardStructure} sweeps over the whole board — a quadratic walk each, since
  * container-ness is read per bead. Returning the split removes the choice rather than documenting it.
  */
-export function structureGaps(targetId, board) {
+export function structureGaps(targetId, board, options) {
   const subtree = descendantsOf(targetId, board);
-  const owned = validateBoardStructure(board).filter((v) => subtree.has(v.id));
+  const owned = validateBoardStructure(board, options).filter((v) => v.id === "board" || subtree.has(v.id));
   return {
     blocking: owned.filter((v) => v.severity === "blocking"),
     advisory: owned.filter((v) => v.severity === "advisory"),
@@ -294,47 +309,31 @@ export function structureGaps(targetId, board) {
 }
 
 /**
- * Every bead id sitting on a `blocks` cycle, by plain DFS over the edges {@link validateBoardStructure}
- * hasn't already faulted (a self-edge and a dangling one are reported once each, on their own rule,
- * not folded into a cycle of one). Belt-and-braces, not the check: `bd dep add` refuses to CREATE a
- * cycle at every write path (hygiene.ts documents the measurement against 1.1.0 and 1.1.2), so this
- * exists for whatever gets a cycle onto the board some other way — a hand-edited import, a restore
- * from an older export. Cheap on purpose: a coloured DFS marking exactly the beads ON a loop, not
- * `bd dep cycles`'s richer per-cycle path — that answer already exists for a human to read; this only
- * needs the boolean.
+ * The cycle answer belongs to bd, not a local traversal: its graph includes every dependency source
+ * and it owns the definition of a cycle. `cycles` is the parsed `bd dep cycles --json` result; raw
+ * entries are deliberately retained so a format bd adds later cannot turn into a clean report.
  */
-function blocksCycleMembers(board, byId) {
-  const adj = new Map();
-  for (const bead of board) {
-    for (const dep of bead.dependencies ?? []) {
-      if (dep?.type !== "blocks" || !dep.issue_id || !dep.depends_on_id) continue;
-      if (dep.issue_id === dep.depends_on_id) continue; // blocks-edge-self's fault, not a cycle
-      if (!byId.has(dep.depends_on_id)) continue; // blocks-edge-dangling's fault, not a cycle
-      const edges = adj.get(dep.issue_id);
-      if (edges) edges.push(dep.depends_on_id);
-      else adj.set(dep.issue_id, [dep.depends_on_id]);
-    }
+function cycleMembers(board, byId, cycles) {
+  const members = new Set();
+  const unmapped = [];
+  for (const cycle of cycles ?? []) {
+    const ids = Array.isArray(cycle?.ids) ? cycle.ids.filter((id) => typeof id === "string") : [];
+    const mapped = ids.filter((id) => byId.has(id));
+    for (const id of mapped) members.add(id);
+    // A partially readable record still leaves a cycle member unnamed. Preserve it as a board-level
+    // fault rather than letting the unrecognised part of bd's authoritative evidence disappear.
+    if (ids.length === 0 || mapped.length !== ids.length) unmapped.push(cycle?.raw ?? cycle);
   }
+  return { members, unmapped };
+}
 
-  const onCycle = new Set();
-  const color = new Map(); // 0 unset · 1 on the current DFS stack · 2 finished
-  const stack = [];
-  const visit = (id) => {
-    color.set(id, 1);
-    stack.push(id);
-    for (const next of adj.get(id) ?? []) {
-      const state = color.get(next) ?? 0;
-      if (state === 0) visit(next);
-      else if (state === 1) {
-        for (let i = stack.length - 1; i >= 0 && stack[i] !== next; i--) onCycle.add(stack[i]);
-        onCycle.add(next);
-      }
-    }
-    stack.pop();
-    color.set(id, 2);
-  };
-  for (const id of adj.keys()) if (!color.has(id)) visit(id);
-  return onCycle;
+/** Keep unfamiliar authoritative metadata diagnosable without letting an unexpected value throw. */
+function cycleMetadata(raw) {
+  try {
+    return JSON.stringify(raw);
+  } catch {
+    return String(raw);
+  }
 }
 
 /** Children by parent id, in board order — the parent graph both walks below read. */
@@ -416,8 +415,8 @@ const ORDERING_RULES = new Set([
 ]);
 
 /** The board's tier conformance, for `anton board-check` and `/shape`'s Phase 5 audit. */
-export function buildStructureReport(board) {
-  const violations = validateBoardStructure(board);
+export function buildStructureReport(board, options) {
+  const violations = validateBoardStructure(board, options);
   return {
     judged: board.filter(isJudged).length,
     blocking: violations.filter((v) => v.severity === "blocking").length,

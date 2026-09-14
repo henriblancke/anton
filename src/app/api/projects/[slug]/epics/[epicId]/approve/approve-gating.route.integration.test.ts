@@ -260,6 +260,26 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(await executeEpicJobs(outer)).toHaveLength(0);
   });
 
+  it("refuses a target bd reports on an authoritative blocks cycle before approving it", async () => {
+    const target = await beads.create(repo, {
+      title: "Cycle evidence target",
+      type: "task",
+      acceptance: "- [ ] it works",
+    });
+    const cyclesSpy = vi.spyOn(beads, "depCycles").mockResolvedValue([{ ids: [target], raw: { cycle: [target] } }]);
+    try {
+      const res = await approve(target);
+      expect(res.status).toBe(422);
+      const body = await res.json();
+      expect(body.rules).toEqual(["blocks-cycle"]);
+      expect(body.error).toContain(target);
+      expect(beads.isApproved(await beads.show(repo, target))).toBe(false);
+      expect(await executeEpicJobs(target)).toHaveLength(0);
+    } finally {
+      cyclesSpy.mockRestore();
+    }
+  });
+
   it("approves a childless, parentless feature and reports both shapes as advisory", async () => {
     // A feature with no tickets is a legitimate single-ticket run (beads.groupsChildren), and a
     // parentless one runs fine — it just shows on no roadmap. Refusing either would strand honest

@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 7b9fa35ca66b
+version: 9f5ff9696ad6
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -197,9 +197,56 @@ tickets in the order the executor will actually dispatch them (the topological o
 edges — **not** board order, not creation order):
 
 ```bash
-bd list --status all --json --limit 0 \
-  | jq -r --arg f "<feature-id>" '[.[] | select(.parent == $f)] | .[] | "\(.id)\t\(.title)"'
-bd dep tree <feature-id>       # or: bd show <ticket-id> to read its blocked-on edges directly
+# Prints every feature's actual executor dispatch order. It mirrors runTickets: nearest-card membership,
+# arbitrary working-layer nesting, pipeline exclusion, and Kahn ordering with source-list ties.
+bd list --status all --json --limit 0 | node -e '
+const all = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const parentOf = (b) => b.parent ?? b.parent_id;
+const pipeline = new Set(["molecule", "gate"]);
+const ticketTypes = new Set(["task", "bug", "chore", "feature"]);
+const byId = new Map(all.map((b) => [b.id, b]));
+const cardIds = new Set(all.filter((b) =>
+  b.issue_type === "feature" ||
+  (b.issue_type === "epic" && !all.some((c) => c.issue_type === "feature" && parentOf(c) === b.id)),
+).map((b) => b.id));
+const cardOf = (b) => {
+  const seen = new Set([b.id]); let parent = parentOf(b);
+  while (parent && !seen.has(parent)) {
+    if (cardIds.has(parent)) return parent;
+    seen.add(parent); const ancestor = byId.get(parent);
+    if (ancestor && pipeline.has(ancestor.issue_type)) return undefined;
+    parent = ancestor && parentOf(ancestor);
+  }
+};
+const runTickets = (featureId) => all.filter((b) =>
+  !cardIds.has(b.id) && !pipeline.has(b.issue_type) && ticketTypes.has(b.issue_type) && cardOf(b) === featureId,
+);
+const orderTickets = (tickets) => {
+  const ids = new Set(tickets.map((t) => t.id));
+  const adj = new Map(tickets.map((t) => [t.id, []]));
+  for (const bead of all) for (const edge of bead.dependencies ?? []) {
+    if (edge.type === "blocks" && ids.has(edge.issue_id) && ids.has(edge.depends_on_id))
+      adj.get(edge.depends_on_id).push(edge.issue_id); // blocker → dependent
+  }
+  const indegree = new Map(tickets.map((t) => [t.id, 0]));
+  for (const dependents of adj.values()) for (const id of dependents) indegree.set(id, indegree.get(id) + 1);
+  const queue = tickets.filter((t) => indegree.get(t.id) === 0).map((t) => t.id);
+  const order = [];
+  while (queue.length) {
+    const id = queue.shift(); order.push(id);
+    for (const dependent of adj.get(id)) {
+      indegree.set(dependent, indegree.get(dependent) - 1);
+      if (indegree.get(dependent) === 0) queue.push(dependent);
+    }
+  }
+  return order.length === tickets.length ? order.map((id) => tickets.find((t) => t.id === id)) : tickets;
+};
+for (const feature of all.filter((b) => b.issue_type === "feature")) {
+  console.log(`feature ${feature.id}:`);
+  for (const [index, ticket] of orderTickets(runTickets(feature.id)).entries())
+    console.log(`  ${index + 1}. ${ticket.id}\t${ticket.title}`);
+}
+'
 ```
 
 Then assert out loud, naming the tickets: "feature `<id>` dispatches `t1` → `t2` → `t3`; that
