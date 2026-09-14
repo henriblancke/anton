@@ -539,6 +539,8 @@ async function commitPreservedTree(args: {
   const first = await commitAll(worktreePath, message, { hooksPath, timeoutMs, signal }).catch(rejected);
   // Accepted by this project's hooks — the same proof an ordinary commit ships on, so `verified` is
   // not re-compared here; it exists for the bypass below, where no hook is left to say yes.
+  // A job abort intentionally leaves either outcome to the stopping actor, so HEAD recovery here
+  // would only make the operator-facing log more specific; it must not adopt or roll back anything.
   if (!("error" in first) || signal.aborted) return first;
   const after = await readWorktreeState(worktreePath).catch(() => null);
   if (!after || after.head !== before.head) return first;

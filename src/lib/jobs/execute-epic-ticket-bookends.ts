@@ -289,7 +289,9 @@ export function narrowToTicket(
 ): StepContext {
   return {
     ...run,
-    ctx: { ...run.ctx, signal: budget.signal },
+    // Keep the run-level signal available alongside the ticket deadline so a step can preserve a
+    // landed commit for a ticket timeout without swallowing an operator's whole-job cancellation.
+    ctx: { ...run.ctx, signal: budget.signal, jobSignal: run.ctx.signal },
     tickets: [ticket],
     session,
     ...(baseline ? { ticketStartHead: baseline.head } : {}),

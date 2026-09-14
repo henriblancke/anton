@@ -253,6 +253,35 @@ process.exit(0);`,
     expect(sessions[0].beadId).toBe(epicId);
   });
 
+  it.runIf(process.platform !== "win32")(
+    "pushes a fix that landed before its post-commit hook exceeded the commit budget",
+    async () => {
+      const hookStarted = join(sandbox, "review-fix-post-commit-started");
+      const postCommit = join(repo, ".git", "hooks", "post-commit");
+      writeFileSync(
+        postCommit,
+        `#!/usr/bin/env sh\ntouch ${JSON.stringify(hookStarted)}\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n`,
+      );
+      chmodSync(postCommit, 0o755);
+      const restore = saveEnv(["ANTON_GIT_COMMIT_TIMEOUT_MS"]);
+      process.env.ANTON_GIT_COMMIT_TIMEOUT_MS = "1000";
+      try {
+        await expectOneFix(await runSweep());
+
+        expect(readFileSync(hookStarted, "utf8")).toBe("");
+        const remoteLog = execFileSync("git", ["-C", repo, "log", "--oneline", `origin/${branch}`], {
+          encoding: "utf8",
+        });
+        expect(remoteLog).toContain("address review feedback");
+        expect((await tdb.db.select().from(schema.sessions)).at(-1)?.status).toBe("done");
+      } finally {
+        restore();
+        writeFileSync(postCommit, "#!/usr/bin/env sh\n");
+        chmodSync(postCommit, 0o755);
+      }
+    },
+  );
+
   it("uses the per-project reviewFixPrompt override when set (else the default file)", async () => {
     const marker = "RF_OVERRIDE_MARKER_QZX9";
     await tdb.db

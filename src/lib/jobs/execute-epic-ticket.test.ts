@@ -131,6 +131,41 @@ describe("runTicket — the deadline is honoured through the gate's branch read 
     expect((settled.e as Error).message).toMatch(/ran out of its ticket budget/);
   });
 
+  it("settles as an abort, not a close, when a recovered commit's job is cancelled", async () => {
+    branchAddedCommitMock.mockResolvedValue(true);
+    const ticketRun = run();
+    const job = new AbortController();
+    ticketRun.ctx.signal = job.signal;
+    const recoveredCommit: ResolvedStep = {
+      step: { id: "commit" },
+      definition: {
+        name: "commit",
+        class: "git",
+        summary: "a commit recovered after its post-commit hook stopped",
+        producesDiff: true,
+        handler: async () => {
+          job.abort(new Error("operator cancelled the job"));
+          return { ok: true, facts: { committed: true } };
+        },
+      },
+    } as unknown as ResolvedStep;
+
+    await expect(
+      runTicket({ run: ticketRun, steps: [recoveredCommit], ticket, runTicketIds: [ticket.id], timeoutMs: 5_000 }),
+    ).rejects.toThrow("settled as a failure");
+
+    expect(finishTicketMock).not.toHaveBeenCalled();
+    expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
+    const settled = settleFailedTicketMock.mock.calls[0]![0] as {
+      ranOutOfTime: boolean;
+      progress: { committed: boolean; delivered: boolean };
+      e: unknown;
+    };
+    expect(settled.ranOutOfTime).toBe(false);
+    expect(settled.progress).toMatchObject({ committed: true, delivered: true });
+    expect((settled.e as Error).message).toContain("run was aborted");
+  });
+
   it("closes as satisfied when the read answers inside the budget", async () => {
     branchAddedCommitMock.mockResolvedValue(true);
 

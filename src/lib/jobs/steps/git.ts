@@ -77,7 +77,9 @@ export async function commitStep(ctx: StepContext): Promise<StepResultWith<"comm
       signal: ctx.ctx.signal,
     }));
   } catch (error) {
-    if (!before || !ctx.ticketStartHead) throw error;
+    // A ticket deadline may stop a post-commit hook after HEAD advanced; an operator stopping the
+    // whole job must still reach the aborted-ticket path, which deliberately writes nothing to bd.
+    if (ctx.ctx.jobSignal?.aborted || !before || !ctx.ticketStartHead) throw error;
     const after = await readWorktreeState(ctx.worktreePath);
     if (after.head === before.head) throw error;
 

@@ -121,7 +121,7 @@ suite("commitStep (real git)", () => {
   });
 
   it.runIf(process.platform !== "win32")(
-    "keeps a commit that landed before cancelling its post-commit hook",
+    "keeps a commit that landed before cancelling its post-commit hook for a ticket deadline",
     async () => {
       const started = head();
       const hookStarted = join(sandbox, "post-commit-started");
@@ -147,6 +147,41 @@ suite("commitStep (real git)", () => {
       const result = await pending;
       expect(result.ok).toBe(true);
       expect(result.facts.committed).toBe(true);
+      expect(head()).not.toBe(started);
+      expect(subjects()[0]).toBe(`${ticket.id}: ${ticket.title}`);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "propagates a job cancellation even when its post-commit hook was stopped after HEAD advanced",
+    async () => {
+      const started = head();
+      const hookStarted = join(sandbox, "post-commit-started");
+      const hook = join(repo, ".git", "hooks", "post-commit");
+      writeFileSync(
+        hook,
+        `#!/bin/sh\ntouch ${JSON.stringify(hookStarted)}\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n`,
+      );
+      chmodSync(hook, 0o755);
+      write("cadence-editor.tsx", "export const CadenceEditor = () => null;\n");
+      const job = new AbortController();
+      const ticketDeadline = new AbortController();
+      job.signal.addEventListener("abort", () => ticketDeadline.abort(), { once: true });
+      const stepContext = context();
+      const pending = commitStep({
+        ...stepContext,
+        ticketStartHead: started,
+        ctx: {
+          ...stepContext.ctx,
+          signal: ticketDeadline.signal,
+          jobSignal: job.signal,
+        },
+      });
+
+      await waitForPath(hookStarted);
+      job.abort(new Error("operator cancelled the job"));
+
+      await expect(pending).rejects.toThrow(/aborted/i);
       expect(head()).not.toBe(started);
       expect(subjects()[0]).toBe(`${ticket.id}: ${ticket.title}`);
     },
