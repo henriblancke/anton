@@ -8,7 +8,9 @@
  * step across that line changes what a park leaves behind, so each one says where it sits and why.
  */
 import { beads, type Bead } from "../beads/bd";
+import { cycleEvidenceFor } from "../beads/cycle-evidence";
 import { loadAllIssues } from "../beads/issues";
+import { formatStructureViolations, structureGaps } from "../beads/structure";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
 import {
   branchContainsCommit,
@@ -133,14 +135,33 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
 }
 
 /**
- * Steps 0a-bis and 0a-ter. Re-run the readiness gate and re-derive the target's SHAPE against the
- * freshly-pulled board, then take the lease's leftovers. Both properties belong to the whole BOARD,
- * not to the bead, so a pull that changed either must be judged before anything is held.
+ * Steps 0a-pre, 0a-bis and 0a-ter. Re-run the structure/cycle gate, the readiness gate, and re-derive
+ * the target's SHAPE — all against the freshly-pulled board — then take the lease's leftovers. Every
+ * one of these properties belongs to the whole BOARD, not to the bead, so a pull that changed any of
+ * them must be judged before anything is held.
  */
 function regateRefreshedBoard(run: EpicRun, leaseTarget: Bead): RunGates {
   const { targetId: epicBeadId, lease } = run;
   const { all } = run;
   let target = run.target;
+  // 0a-pre. Re-run the authoritative structure/cycle gate against the freshly-pulled board too
+  //     (PR #274 review). The top-of-handler check (execute-epic-start.ts) ran on the PRE-pull
+  //     snapshot; `refreshRunBoard`'s pull, just above, can itself land an internal `blocks` cycle
+  //     among this run's OWN tickets that check never saw — a cross-machine Dolt merge lands on its
+  //     own schedule, not this job's. `runReadiness` below treats an internal edge as ORDERING, not
+  //     a blocker, so it would never notice the cycle, and `orderTickets` (execute-epic-board.ts)
+  //     falls back to input order the moment its topological sort can't place every ticket — which
+  //     would dispatch a dependent ticket ahead of the prerequisite the very edges say it must
+  //     follow. Poison before anything is held, exactly like the top-of-handler check; the fix is on
+  //     the board, not a retry. Reads `all` (the board `refreshRunBoard` just adopted into `run.all`,
+  //     or the pre-pull snapshot if that adoption failed) with `cycleEvidenceFor`, which is populated
+  //     only when the read that produced `all` asked for cycles — `refreshRunBoard`'s re-list does.
+  const structural = structureGaps(epicBeadId, all, { cycles: cycleEvidenceFor(all) });
+  if (structural.blocking.length > 0) {
+    throw new PoisonEpic(
+      `${epicBeadId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
+    );
+  }
   // 0a-bis. Re-run the job-start readiness gate against the freshly-pulled board (anton-jz1).
   //     The top-of-handler `blockers` check ran on the PRE-pull `all`, so a `blocks` edge
   //     another machine pushed before this pull is invisible there — and the `fresh` adoption

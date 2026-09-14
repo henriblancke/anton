@@ -73,8 +73,13 @@ export async function refreshRunBoard(
   try {
     // Strict for the same reason as the read up top — and here the catch already does the right
     // thing with a rejection: keep the gate-complete pre-pull snapshot rather than adopting a
-    // fresh board whose gates are missing.
-    const fresh = await loadAllIssues(repo, { strictGates: true });
+    // fresh board whose gates are missing. `withCycles` too (PR #274 review): this pull is the one
+    // that can land a `blocks` cycle among the run's OWN tickets that the top-of-handler structure
+    // check (execute-epic-start.ts) never saw — the structure/cycle re-check `regateRefreshedBoard`
+    // runs against the board THIS call adopts needs its own authoritative `bd dep cycles` evidence,
+    // or it would silently find no cycle at all (cycleMembers treats a missing `cycles` option as
+    // "none reported", not "unknown").
+    const fresh = await loadAllIssues(repo, { strictGates: true, withCycles: true });
     const freshTarget = fresh.find((b) => b.id === epicBeadId);
     if (freshTarget) {
       run.all = fresh;

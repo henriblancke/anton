@@ -15,6 +15,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "../beads/bd";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 
 const refreshRunBoardMock = vi.fn();
 const settleCompletedRunMock = vi.fn();
@@ -359,6 +360,55 @@ describe("prepareEpicRun — a held child is caught on every board the run adopt
     expect(prep.done).toBe(false);
     expect(warmRunWorktreeMock).toHaveBeenCalled();
     expect(claimRunTargetMock).toHaveBeenCalled();
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+});
+
+describe("prepareEpicRun — the structure/cycle gate re-runs on the board the refresh adopted (PR #274 review)", () => {
+  // execute-epic-start.ts's top-of-handler structure/cycle check (added for this same PR) only ever
+  // sees the PRE-pull snapshot. `refreshRunBoard`'s pull, mocked away here exactly as it is in every
+  // other test in this file, is what can land a `blocks` cycle among this run's own tickets AFTER
+  // that check ran — this gate is what catches it on the board `regateRefreshedBoard` reads (`run.all`),
+  // rather than letting `runReadiness` wave it through as mere ordering.
+  it("poisons a run whose freshly-pulled board carries a blocks cycle among its own tickets", async () => {
+    const t1: Bead = {
+      ...ticket("t-1"),
+      dependencies: [{ type: "blocks", issue_id: "t-1", depends_on_id: "t-2" }],
+    } as Bead;
+    const t2: Bead = {
+      ...ticket("t-2"),
+      dependencies: [{ type: "blocks", issue_id: "t-2", depends_on_id: "t-1" }],
+    } as Bead;
+    const all = board(t1, t2);
+    attachCycleEvidence(all, [{ ids: ["t-1", "t-2"], raw: {} }]);
+    loadAllIssuesMock.mockResolvedValue(all);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(all));
+
+    const error = await refusalFrom(all);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain(TARGET);
+    expect(error.message).toContain("breaks the tier structure");
+    expect(error.message).toContain("sits in a blocks cycle");
+    // Nothing held: no worktree or claim over a graph the run cannot dispatch.
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+    expect(claimRunTargetMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves a cycle-free freshly-pulled board alone — bd's own evidence says the graph is safe", async () => {
+    const t1 = ticket("t-1");
+    const t2: Bead = {
+      ...ticket("t-2"),
+      dependencies: [{ type: "blocks", issue_id: "t-2", depends_on_id: "t-1" }],
+    } as Bead;
+    const all = board(t1, t2);
+    attachCycleEvidence(all, []);
+    loadAllIssuesMock.mockResolvedValue(all);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(all));
+
+    const prep = await prepareEpicRun(run(all));
+
+    expect(prep.done).toBe(false);
     expect(publishRunClaimMock).toHaveBeenCalled();
   });
 });
