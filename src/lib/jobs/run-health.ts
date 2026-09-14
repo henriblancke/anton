@@ -15,7 +15,15 @@
  *
  * Off by default: the schedule is seeded disabled (schedules.ts), so a project opts in.
  */
-import { beads, gateReason as bdGateReason, LABELS, type Bead, type Gate } from "../beads/bd";
+import {
+  beads,
+  boardUnreachableCause,
+  gateReason as bdGateReason,
+  LABELS,
+  type Bead,
+  type BoardUnreachableCause,
+  type Gate,
+} from "../beads/bd";
 import { getPrActivity, prNumberFromRef, type PrActivity } from "../git/pr";
 import {
   DEFAULT_MAX_RETRIES,
@@ -210,6 +218,50 @@ export function detectDeadLeases(
   return findings;
 }
 
+/** The runner's own `failed N×:` park marker, stripped so what's left is the underlying cause. */
+const EXHAUSTED_PARK_MARKER = /^failed \d+×:\s*/;
+
+/**
+ * What a park's lastError is actually complaining about, with the runner's own wrapping (the
+ * poison prefix or the `failed N×:` marker) peeled off. Two jobs hit by the identical board outage
+ * carry different job types and attempt counts in their full `lastError`, so grouping has to compare
+ * the CAUSE underneath that wrapping, not the wrapped text.
+ */
+function underlyingCause(lastError: string, poisoned: boolean): string {
+  return poisoned
+    ? lastError.slice(POISON_PARK_PREFIX.length).trim()
+    : lastError.replace(EXHAUSTED_PARK_MARKER, "");
+}
+
+/** What a human does about each board-unreachable cause — the escalation's whole reason is this. */
+const BOARD_OUTAGE_REMEDY: Record<BoardUnreachableCause, { target: string; remedy: string }> = {
+  "identity-mismatch": {
+    target: "this project's Dolt database",
+    remedy: "check .beads/metadata.json names the right host/port/database for this project",
+  },
+  "server-unreachable": {
+    target: "the shared Dolt server",
+    remedy: "check the server is up and reachable",
+  },
+  "dolt-missing": {
+    target: "the dolt binary on this machine",
+    remedy: "install dolt, or restore it to PATH",
+  },
+  "disk-full": {
+    target: "the host's disk",
+    remedy: "free up disk space",
+  },
+};
+
+/** One board-wide outage's still-growing tally, kept while the job loop finds more of its jobs. */
+interface OutageGroup {
+  cause: BoardUnreachableCause;
+  /** The earliest-parked job in the group — its `since` is the outage's own start. */
+  representative: JobRow;
+  since: number;
+  count: number;
+}
+
 /**
  * Jobs the runner has stopped retrying — recoverable only by a human, so they sit forever unless
  * something surfaces them. Three shapes qualify:
@@ -229,6 +281,15 @@ export function detectDeadLeases(
  *
  * A job parked with attempts still on the clock for any OTHER reason (quota backoff, a held lease)
  * is excluded: those refund the attempt and come back by themselves.
+ *
+ * Jobs parked on a BOARD-WIDE cause (anton-ifz2) — the board itself unreachable, or one project's
+ * identity mismatch — collapse onto ONE finding per project per cause instead of one per job: an
+ * hour-long outage stops every job that touches the board at once, and reporting each independently
+ * is what turned one outage into 1,183 rows and buried the handful of genuinely different failures
+ * in the noise. Keyed on the project AND the cause, so two projects hit by the same outage still
+ * raise their own — the claim is "one escalation per outage IN ONE PROJECT" — and a different cause
+ * (an identity mismatch is one project's own misconfiguration, not the shared server being down)
+ * always raises its own row rather than being folded into an unrelated outage's.
  */
 export function detectExhaustedJobs(
   jobs: JobRow[],
@@ -236,6 +297,8 @@ export function detectExhaustedJobs(
   nowMs: number,
 ): RunHealthFinding[] {
   const findings: RunHealthFinding[] = [];
+  const outages = new Map<string, OutageGroup>();
+
   for (const job of jobs) {
     if (job.status !== "parked" && job.status !== "failed") continue;
     const lastError = job.lastError?.trim() || "no error recorded";
@@ -247,6 +310,19 @@ export function detectExhaustedJobs(
     const budget = spentBudget ?? maxAttempts;
     if (!poisoned && spentBudget === undefined && job.attempts < maxAttempts) continue;
     const since = toMs(job.updatedAt) ?? nowMs;
+
+    const cause = boardUnreachableCause(underlyingCause(lastError, poisoned));
+    if (cause) {
+      const key = `${job.projectId ?? ""}::${cause}`;
+      const outage = outages.get(key);
+      if (!outage || since < outage.since) {
+        outages.set(key, { cause, representative: job, since, count: (outage?.count ?? 0) + 1 });
+      } else {
+        outage.count += 1;
+      }
+      continue;
+    }
+
     findings.push({
       kind: "exhausted-job",
       key: `exhausted-job:${job.id}`,
@@ -259,6 +335,23 @@ export function detectExhaustedJobs(
       beadId: epicBeadIdOf(job.payloadJson),
     });
   }
+
+  for (const outage of outages.values()) {
+    const { target, remedy } = BOARD_OUTAGE_REMEDY[outage.cause];
+    const { representative, since, count } = outage;
+    findings.push({
+      kind: "exhausted-job",
+      key: `exhausted-job:board-unreachable:${representative.projectId ?? "?"}:${outage.cause}`,
+      reason:
+        `${target} is unreachable — ${count} job${count === 1 ? "" : "s"} parked on the same ` +
+        `outage. ${remedy}.`,
+      since,
+      ageMs: Math.max(0, nowMs - since),
+      jobId: representative.id,
+      beadId: epicBeadIdOf(representative.payloadJson),
+    });
+  }
+
   return findings;
 }
 

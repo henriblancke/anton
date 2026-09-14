@@ -69,26 +69,36 @@ export function isFirstPublishPullOutput(output: string): boolean {
 }
 
 /**
- * bd/dolt failure text meaning the BOARD is unreachable, not just this one job (anton-ej1l) — every
- * job that touches this board fails the same way, so a caller that only counts failures reads one
- * outage as N independent ones. Four causes, matched on bd's own wording so classification stays
- * accurate however anton's message around it is worded:
- *   - bd's project-identity guard refusing a mismatched database ({@link IDENTITY_MISMATCH_TEXT}).
- *   - the shared Dolt server refusing the connection outright.
- *   - the embedded dolt binary missing, so bd's own auto-start can't recover.
- *   - the host out of disk, so neither embedded nor server dolt can write.
- * An ordinary bd error — a refused claim, an unknown bead id — matches none of these.
+ * Which board-unreachable cause bd/dolt's failure text names, or undefined for an ordinary bd error
+ * (a refused claim, an unknown bead id) — matched on bd's own wording so classification stays
+ * accurate however anton's message around it is worded. Named rather than a single yes/no flag
+ * (anton-ej1l) because a caller grouping escalations by cause (anton-ifz2) must NOT fold the
+ * project-identity guard in with the other three: that one is a single project's own database
+ * misconfiguration, not the shared board being down, and the two need different remedies even
+ * though every one of them fails every job that touches the board the same way.
  */
-const BOARD_UNREACHABLE_OUTPUT = [
-  /Dolt server unreachable/i,
-  /dolt is not installed|not found in PATH/i,
-  /no space left|ENOSPC/i,
+export type BoardUnreachableCause =
+  | "identity-mismatch"
+  | "server-unreachable"
+  | "dolt-missing"
+  | "disk-full";
+
+const BOARD_UNREACHABLE_CAUSES: ReadonlyArray<{
+  cause: Exclude<BoardUnreachableCause, "identity-mismatch">;
+  pattern: RegExp;
+}> = [
+  { cause: "server-unreachable", pattern: /Dolt server unreachable/i },
+  { cause: "dolt-missing", pattern: /dolt is not installed|not found in PATH/i },
+  { cause: "disk-full", pattern: /no space left|ENOSPC/i },
 ];
 
+export function boardUnreachableCause(output: string): BoardUnreachableCause | undefined {
+  if (output.includes(IDENTITY_MISMATCH_TEXT)) return "identity-mismatch";
+  return BOARD_UNREACHABLE_CAUSES.find(({ pattern }) => pattern.test(output))?.cause;
+}
+
 export function isBoardUnreachableOutput(output: string): boolean {
-  return (
-    output.includes(IDENTITY_MISMATCH_TEXT) || BOARD_UNREACHABLE_OUTPUT.some((re) => re.test(output))
-  );
+  return boardUnreachableCause(output) !== undefined;
 }
 
 /** Wraps `message` in {@link BoardUnreachableError} when `output` matches {@link isBoardUnreachableOutput},

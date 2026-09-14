@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { isBoardUnreachableError } from "../jobs/errors";
 import {
   beads,
+  boardUnreachableCause,
   buildCookArgs,
   buildPruneArgs,
   buildUpdateArgs,
@@ -527,6 +528,23 @@ describe("isBoardUnreachableOutput", () => {
   it("does not match an ordinary bd error (a refused claim, a bad id)", () => {
     expect(isBoardUnreachableOutput("issue not claimable: status blocked")).toBe(false);
     expect(isBoardUnreachableOutput("bd: issue anton-e1 not found")).toBe(false);
+  });
+});
+
+describe("boardUnreachableCause", () => {
+  it("names which of the four causes matched, not just that one did", () => {
+    expect(boardUnreachableCause("PROJECT IDENTITY MISMATCH — refusing to connect")).toBe(
+      "identity-mismatch",
+    );
+    expect(boardUnreachableCause("Dolt server unreachable at 127.0.0.1:0")).toBe(
+      "server-unreachable",
+    );
+    expect(boardUnreachableCause("dolt is not installed (not found in PATH)")).toBe("dolt-missing");
+    expect(boardUnreachableCause("ENOSPC: no space left on device")).toBe("disk-full");
+  });
+
+  it("returns undefined for an ordinary bd error", () => {
+    expect(boardUnreachableCause("issue not claimable: status blocked")).toBeUndefined();
   });
 });
 
