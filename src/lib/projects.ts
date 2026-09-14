@@ -1309,12 +1309,12 @@ async function governedQuotaBoard(
  * The nudge passes no per-project spend to `budgetGate`, so the share ceiling each policy carries is
  * checked against a spend of 0 there: it binds only for a 0% share — a parked repo defers, as it
  * should, since its governor would never burn the quota being nudged about — and for any positive
- * share it is the whole weekly target on the account meter that answers. Deliberate: the nudge asks
- * whether the MACHINE has idle weekly quota worth shaping work for; which repo gets to spend it, and
- * how much of its share is already gone, is the governor's decision at lease time, not the nudge's.
+ * share it is the whole weekly target on the account meter that answers. Routed projects are excluded:
+ * this nudge reads the Anthropic meter and must never shape work that spends a router's independent
+ * pool.
  */
 export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
-  const governed = await governedProjects();
+  const governed = (await governedProjects()).filter(({ settings }) => quotaMeterKey(settings) === "anthropic");
   const board = await governedQuotaBoard(governed);
   return governed.map(({ projectId, settings }) =>
     withQuotaShare(resolveBudgetPolicy(settings), resolveGovernedShare(projectId, board).sharePct),

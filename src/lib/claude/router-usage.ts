@@ -105,10 +105,11 @@ export function parseRouterUsage(body: unknown, plan: string | null = null): Rou
 
 export { routerUsageUrl } from "./router-endpoint";
 
-/** The canonical management endpoint makes equivalent configured gateway URLs share one read. */
-const key = (url: string, connectionId: string): string => `${url}::${connectionId}`;
+/** The canonical endpoint and configured credential source identify one router meter read. */
+const key = (url: string, connectionId: string, tokenEnv: string): string =>
+  `${url}::${connectionId}::${tokenEnv}`;
 
-/** Cool-off armed on a 429, shared by every reader of one (baseUrl, connectionId) pair. */
+/** Cool-off armed on a 429, shared only by readers using the same router credentials. */
 const backoffUntil = new Map<string, number>();
 
 type RouterSettings = Pick<ProjectSettings, "claudeBaseUrl" | "claudeAuthTokenEnv" | "routerConnectionId">;
@@ -145,7 +146,7 @@ export async function fetchRouterUsage(
     });
     if (res.status === 429) {
       const waitMs = backoffMsFor(res.headers.get("retry-after"));
-      backoffUntil.set(key(url, connectionId), Date.now() + waitMs);
+      backoffUntil.set(key(url, connectionId, tokenEnv), Date.now() + waitMs);
       console.warn(`[router-usage] ${baseUrl} 429 — backing off ${Math.round(waitMs / 1000)}s`);
       return null;
     }
@@ -179,7 +180,8 @@ export async function getRouterUsageFresh(
 ): Promise<RouterUsage | null> {
   const baseUrl = settings.claudeBaseUrl?.trim();
   const connectionId = settings.routerConnectionId?.trim();
-  if (!baseUrl || !connectionId) return null;
+  const tokenEnv = settings.claudeAuthTokenEnv?.trim();
+  if (!baseUrl || !connectionId || !tokenEnv) return null;
 
   let url: string;
   try {
@@ -188,7 +190,7 @@ export async function getRouterUsageFresh(
     return null;
   }
 
-  const k = key(url, connectionId);
+  const k = key(url, connectionId, tokenEnv);
   const ts = now();
   if (ts < (backoffUntil.get(k) ?? 0)) return null;
 
@@ -211,7 +213,8 @@ export async function getRouterUsageCached(
 ): Promise<RouterUsage | null> {
   const baseUrl = settings.claudeBaseUrl?.trim();
   const connectionId = settings.routerConnectionId?.trim();
-  if (!baseUrl || !connectionId) return null;
+  const tokenEnv = settings.claudeAuthTokenEnv?.trim();
+  if (!baseUrl || !connectionId || !tokenEnv) return null;
 
   let url: string;
   try {
@@ -220,7 +223,7 @@ export async function getRouterUsageCached(
     return null;
   }
 
-  const k = key(url, connectionId);
+  const k = key(url, connectionId, tokenEnv);
   const ts = now();
 
   const until = backoffUntil.get(k) ?? 0;
@@ -252,7 +255,12 @@ export function resetRouterUsageCache(): void {
   backoffUntil.clear();
 }
 
-/** Arm the 429 backoff for one canonical management endpoint and connection pair. Test-only. */
-export function armRouterBackoffForTest(baseUrl: string, connectionId: string, until: number): void {
-  backoffUntil.set(key(routerUsageUrl(baseUrl, connectionId), connectionId), until);
+/** Arm the 429 backoff for one canonical management endpoint, connection, and credential source. Test-only. */
+export function armRouterBackoffForTest(
+  baseUrl: string,
+  connectionId: string,
+  tokenEnv: string,
+  until: number,
+): void {
+  backoffUntil.set(key(routerUsageUrl(baseUrl, connectionId), connectionId, tokenEnv), until);
 }

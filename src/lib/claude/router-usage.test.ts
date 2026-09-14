@@ -296,7 +296,12 @@ describe("getRouterUsageFresh", () => {
     const now = () => clock;
     const cached = async () => withResponse(200, true, ROUTER_FIXTURE);
     await getRouterUsageCached(SETTINGS, cached, now);
-    armRouterBackoffForTest(SETTINGS.claudeBaseUrl, SETTINGS.routerConnectionId, clock + 5 * 60_000);
+    armRouterBackoffForTest(
+      SETTINGS.claudeBaseUrl,
+      SETTINGS.routerConnectionId,
+      SETTINGS.claudeAuthTokenEnv,
+      clock + 5 * 60_000,
+    );
 
     let calls = 0;
     const result = await getRouterUsageFresh(
@@ -398,7 +403,12 @@ describe("getRouterUsageCached (mirrors usage.ts's TTL, single-flight, and 429 b
     };
 
     await getRouterUsageCached(SETTINGS, live, now); // warm the cache
-    armRouterBackoffForTest(SETTINGS.claudeBaseUrl, SETTINGS.routerConnectionId, clock + 5 * 60_000);
+    armRouterBackoffForTest(
+      SETTINGS.claudeBaseUrl,
+      SETTINGS.routerConnectionId,
+      SETTINGS.claudeAuthTokenEnv,
+      clock + 5 * 60_000,
+    );
     clock += 60_001; // TTL elapsed, but backoff still active
     const result = await getRouterUsageCached(SETTINGS, live, now);
     expect(result).not.toBeNull();
@@ -475,6 +485,24 @@ describe("getRouterUsageCached (mirrors usage.ts's TTL, single-flight, and 429 b
 
     expect(result).toBeNull();
     expect(calls).toBe(0);
+  });
+
+  it("isolates cached failures between distinct credential environment variables", async () => {
+    const valid = { ...SETTINGS, claudeAuthTokenEnv: "ROUTER_TOKEN_VALID" };
+    const missing = { ...SETTINGS, claudeAuthTokenEnv: "ROUTER_TOKEN_MISSING" };
+    process.env.ROUTER_TOKEN_VALID = "secret";
+    delete process.env.ROUTER_TOKEN_MISSING;
+    let calls = 0;
+
+    expect(await getRouterUsageCached(missing, async () => {
+      calls += 1;
+      return withResponse(200, true, ROUTER_FIXTURE);
+    }, () => 1_000)).toBeNull();
+    expect(await getRouterUsageCached(valid, async () => {
+      calls += 1;
+      return withResponse(200, true, ROUTER_FIXTURE);
+    }, () => 1_000)).toEqual(expect.objectContaining({ weeklyPct: 37 }));
+    expect(calls).toBe(1);
   });
 
   it("returns null without a fetch when the project isn't routed at all", async () => {

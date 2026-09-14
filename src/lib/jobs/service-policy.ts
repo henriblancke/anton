@@ -67,7 +67,7 @@ export async function resolveBudgetPolicy(projectId: string | undefined) {
   // subject is absent and so ungoverned — the full weekly target for one tick — rather than a
   // rejection shared by every policy the coalesced read served, which would error the whole tick.
   const share = resolveGovernedShare(projectId, meterShareBoard(await quotaShareBoard().catch(() => []), settings));
-  announceImbalance(share);
+  announceImbalance(quotaMeterKey(settings), share);
   return withQuotaShare(resolveBudgetPolicyFromSettings(settings), share.sharePct);
 }
 
@@ -163,8 +163,8 @@ async function resolveProjectMeter(
   return readRouter(settings).catch(() => null);
 }
 
-/** The last imbalance announced, so a per-tick resolve reports a change rather than a stream. */
-let lastImbalanceAnnounced = "";
+/** The last imbalance announced for each independent quota meter. */
+const lastImbalanceAnnounced = new Map<string, string>();
 
 /**
  * Say out loud when the declared shares don't sum to 100. The governor proportions them anyway — an
@@ -173,13 +173,13 @@ let lastImbalanceAnnounced = "";
  * silently changed under them. The settings panel carries the same fact; this is for the operator
  * watching the runner rather than the panel.
  */
-function announceImbalance(share: ResolvedQuotaShare): void {
-  const key = share.imbalanced ? String(Math.round(share.declaredTotalPct)) : "";
-  if (key === lastImbalanceAnnounced) return;
-  lastImbalanceAnnounced = key;
-  if (!key) return;
+function announceImbalance(meterKey: string, share: ResolvedQuotaShare): void {
+  const imbalance = share.imbalanced ? String(Math.round(share.declaredTotalPct)) : "";
+  if (imbalance === lastImbalanceAnnounced.get(meterKey)) return;
+  lastImbalanceAnnounced.set(meterKey, imbalance);
+  if (!imbalance) return;
   console.warn(
-    `[jobs] quota shares across budget-aware projects total ${key}%, not 100% — each project's weekly ceiling is its declared share in proportion (Settings → Quota shares)`,
+    `[jobs] quota shares across budget-aware projects total ${imbalance}%, not 100% — each project's weekly ceiling is its declared share in proportion (Settings → Quota shares)`,
   );
 }
 

@@ -311,6 +311,30 @@ describe("resolveBudgetPolicy (quota share)", () => {
 
     expect(warn).not.toHaveBeenCalled();
   });
+
+  it("keeps imbalance announcement suppression separate for independent meters", async () => {
+    const router = {
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: "ROUTER_TOKEN",
+      routerConnectionId: "conn_1",
+    };
+    project("account-a", armed({ quotaSharePct: 44 }));
+    project("account-b", armed({ quotaSharePct: 44 }));
+    project("router-a", armed({ ...router, quotaSharePct: 55 }));
+    project("router-b", armed({ ...router, quotaSharePct: 55 }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await resolveBudgetPolicy("account-a");
+    await resolveBudgetPolicy("router-a");
+    await resolveBudgetPolicy("account-b");
+    await resolveBudgetPolicy("router-b");
+
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls.map(([message]) => message)).toEqual([
+      expect.stringContaining("total 88%, not 100%"),
+      expect.stringContaining("total 110%, not 100%"),
+    ]);
+  });
 });
 
 /**
