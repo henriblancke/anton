@@ -199,6 +199,7 @@ describe("required skill assets", () => {
       expect(shape).toMatch(/nearest-card\s+membership/);
       expect(shape).toMatch(/arbitrary working-layer nesting/);
       expect(shape).toMatch(/pipeline exclusion/);
+      expect(shape).toMatch(/open and closed reads/);
       expect(shape).toMatch(/Kahn ordering/);
       expect(shape).toMatch(/matches the intended build order because/);
       expect(shape).toMatch(/naming the tickets/);

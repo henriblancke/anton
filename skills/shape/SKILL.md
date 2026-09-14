@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 9f5ff9696ad6
+version: 3a90e2c6c7e3
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -199,8 +199,18 @@ edges — **not** board order, not creation order):
 ```bash
 # Prints every feature's actual executor dispatch order. It mirrors runTickets: nearest-card membership,
 # arbitrary working-layer nesting, pipeline exclusion, and Kahn ordering with source-list ties.
-bd list --status all --json --limit 0 | node -e '
-const all = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+# Some supported bd builds reject --status all, so merge their open and closed reads before sorting.
+node -e '
+const { execFileSync } = require("node:child_process");
+const list = (args = []) => JSON.parse(execFileSync("bd", ["list", ...args, "--json", "--limit", "0"], { encoding: "utf8" }));
+let all;
+try {
+  all = list(["--status", "all"]);
+} catch {
+  const byId = new Map();
+  for (const bead of [...list(), ...list(["--status", "closed"])]) if (!byId.has(bead.id)) byId.set(bead.id, bead);
+  all = [...byId.values()];
+}
 const parentOf = (b) => b.parent ?? b.parent_id;
 const pipeline = new Set(["molecule", "gate"]);
 const ticketTypes = new Set(["task", "bug", "chore", "feature"]);
