@@ -1,5 +1,5 @@
 import { beads, type Bead } from "./bd";
-import { attachCycleEvidence } from "./cycle-evidence";
+import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import {
   getBeadDescription,
   getIssueSnapshot,
@@ -123,11 +123,18 @@ export async function loadAllIssues(
 }
 
 
-export function allIssues(
+export async function allIssues(
   cwd: string,
-  opts?: SnapshotReadOptions,
+  opts?: SnapshotReadOptions & { withCycles?: boolean },
 ): Promise<Bead[]> {
-  return getIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
+  const board = await getIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
+  // The snapshot key is the repository, not every reader's projection needs. A warm page snapshot
+  // may therefore predate an approval reader: enrich that exact array rather than treating absent
+  // evidence as an authoritative empty result.
+  if (opts?.withCycles && cycleEvidenceFor(board) === undefined) {
+    attachCycleEvidence(board, await beads.depCycles(cwd));
+  }
+  return board;
 }
 
 /** Beads plus the snapshot version they carry, read atomically — for callers that stamp a response

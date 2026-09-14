@@ -706,9 +706,9 @@ describe("gardener patrol · shadow mode", () => {
     expect(await sessionLog()).toContain(
       "[gardener] SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD APPLY: closed t-4 as shipped\n",
     );
-    // One create (the proposal) and one extra read (the fresh board the shadow decided against).
+    // One create (the proposal), then a fresh board and authoritative cycle read for the shadow.
     // Nothing else: t-4 is never closed, deferred or updated by a pass that only says what it would do.
-    expect(calls).toEqual([...READS, "create", "list"]);
+    expect(calls).toEqual([...READS, "create", "list", "depCycles"]);
     expect(closeMock).not.toHaveBeenCalled();
   });
 
@@ -778,7 +778,7 @@ describe("gardener patrol · shadow mode", () => {
       `SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD REFUSE: ` +
         `${decision.status === "refuse" ? decision.reason : ""}\n`,
     );
-    expect(calls).toEqual([...READS, "create", "list"]);
+    expect(calls).toEqual([...READS, "create", "list", "depCycles"]);
   });
 
   it("dates the fence on bd's one-second grid, so a same-second write reads as the tie apply refuses", async () => {

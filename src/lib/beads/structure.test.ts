@@ -131,6 +131,16 @@ describe("validateBoardStructure", () => {
       expect(rulesFor(board, "f1")).toContain("blocks-duplicates-parent");
     });
 
+    it("allows a nested working ticket to wait on its parent ticket", () => {
+      const board = [
+        epic("e1"),
+        feature("f1", "e1"),
+        task("parent", "f1"),
+        task("subtask", "parent", { dependencies: [blocks("subtask", "parent")] }),
+      ];
+      expect(rulesFor(board, "subtask")).toEqual([]);
+    });
+
     it("does not fault an ordinary blocks edge between unrelated beads", () => {
       const board = [
         ...HEALTHY,

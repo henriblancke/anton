@@ -116,7 +116,7 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
 
   let board: Bead[];
   try {
-    board = await loadAllIssues(input.repo);
+    board = await loadAllIssues(input.repo, { withCycles: true });
   } catch (e) {
     // The read is the shadow's whole input, so losing it loses every record — but it costs the pass
     // nothing else, because a shadow has nothing to leave half-done.

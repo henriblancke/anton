@@ -137,7 +137,10 @@ export function validateBoardStructure(board, { cycles } = {}) {
       }
 
       const partnerOfParent = parentOf(bead) === blockerId ? "parent" : parentOf(blocker) === bead.id ? "child" : null;
-      if (partnerOfParent) {
+      // Ticket nesting assigns ownership, not dispatch order: a feature run dispatches both a task and
+      // its subtask, so their explicit `blocks` edge is the only order the executor can observe.
+      const bothDispatchedTickets = isTicketType(bead) && isTicketType(blocker);
+      if (partnerOfParent && !bothDispatchedTickets) {
         fault(
           bead.id,
           "blocks-duplicates-parent",

@@ -12,21 +12,31 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./bd";
 
 const listMock = vi.fn();
+const cyclesMock = vi.fn();
 
 vi.mock("./bd", async () => {
   const actual = await vi.importActual<typeof import("./bd")>("./bd");
   return {
     ...actual,
-    beads: { ...actual.beads, list: (...args: unknown[]) => listMock(...args) },
+    beads: {
+      ...actual.beads,
+      list: (...args: unknown[]) => listMock(...args),
+      depCycles: (...args: unknown[]) => cyclesMock(...args),
+    },
   };
 });
 
-const { loadAllIssues } = await import("./issues");
+const { allIssues, loadAllIssues } = await import("./issues");
+const { cycleEvidenceFor } = await import("./cycle-evidence");
+const { resetIssueSnapshots } = await import("./snapshot");
 
 const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
 beforeEach(() => {
+  resetIssueSnapshots();
   listMock.mockReset();
+  cyclesMock.mockReset();
+  cyclesMock.mockResolvedValue([]);
   warn.mockClear();
 });
 
@@ -110,6 +120,28 @@ describe("loadAllIssues", () => {
 
     expect((await loadAllIssues(REPO, { strictGates: true })).map((b) => b.id)).toEqual(["t-1"]);
     expect(listMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("attaches cycle evidence to the cached board, so approval projections cannot read it cycle-free", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const board = await allIssues(REPO, { withCycles: true });
+
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cyclesMock).toHaveBeenCalledWith(REPO);
+  });
+
+  it("enriches a warm ordinary snapshot when an approval projection needs cycle evidence", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const ordinary = await allIssues(REPO);
+    const approval = await allIssues(REPO, { withCycles: true });
+
+    expect(approval).toBe(ordinary);
+    expect(cycleEvidenceFor(approval)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
   });
 
   it("dedupes, so a bd that starts carrying gates in the ordinary listing doesn't double them", async () => {

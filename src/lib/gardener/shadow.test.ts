@@ -52,10 +52,13 @@ vi.mock("../beads/bd", async () => {
   return { ...actual, beads };
 });
 
-const loadMock = vi.fn<(cwd: string) => Promise<Bead[]>>();
+const loadMock = vi.fn<(cwd: string, opts?: { withCycles?: boolean }) => Promise<Bead[]>>();
 vi.mock("../beads/issues", async () => {
   const actual = await vi.importActual<typeof import("../beads/issues")>("../beads/issues");
-  return { ...actual, loadAllIssues: (...a: [string]) => loadMock(...a) };
+  return {
+    ...actual,
+    loadAllIssues: (...a: Parameters<typeof actual.loadAllIssues>) => loadMock(...a),
+  };
 });
 
 /** The decision seam, delegating to the real planner — primed to throw only by the `error` case. */
@@ -320,6 +323,7 @@ describe("which proposals a pass shadows", () => {
 
     expect(records.map((r) => r.proposal)).toEqual(["anton-p1", "anton-p3"]);
     expect(loadMock).toHaveBeenCalledTimes(1);
+    expect(loadMock).toHaveBeenCalledWith(REPO, { withCycles: true });
   });
 });
 

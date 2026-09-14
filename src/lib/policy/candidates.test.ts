@@ -8,6 +8,7 @@
  * disagreed with it would claim available work where the picker has none.
  */
 import { describe, expect, it } from "vitest";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import type { Bead } from "../beads/types";
 import { policyCandidates } from "./candidates";
 
@@ -112,6 +113,18 @@ describe("policyCandidates", () => {
       bead({ id: "gate", status: "open" }),
     ];
     expect(ids(board)).toContain("feature");
+  });
+
+  it("withholds a feature when authoritative cycle evidence names its ready children", () => {
+    const board = attachCycleEvidence([
+      bead({ id: "feature", issue_type: "feature" }),
+      bead({ id: "free", parent: "feature" }),
+      bead({ id: "a", parent: "feature", dependencies: [{ issue_id: "a", depends_on_id: "b", type: "blocks" }] }),
+      bead({ id: "b", parent: "feature", dependencies: [{ issue_id: "b", depends_on_id: "a", type: "blocks" }] }),
+    ], [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }]);
+
+    expect(ids(board)).toEqual([]);
+    expect(policyCandidates(board).notStartable).toBe(1);
   });
 
   it("counts parent hops, so a policy can say `parentless work only` (anton-hmyo)", () => {
