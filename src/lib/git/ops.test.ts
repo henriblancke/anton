@@ -68,8 +68,8 @@ import {
   satisfiedMarkerTarget,
   SATISFIES_TRAILER,
 } from "./ops";
-import { DEFAULT_COMMIT_TIMEOUT_MS, GH_BIN_ENV, PUSH_TIMEOUT_ENV } from "./ops";
-import { DEFAULT_COMMIT_TIMEOUT_MINUTES } from "@/lib/projects";
+import { DEFAULT_COMMIT_TIMEOUT_MS, DEFAULT_PUSH_TIMEOUT_MS, GH_BIN_ENV, PUSH_TIMEOUT_ENV } from "./ops";
+import { DEFAULT_COMMIT_TIMEOUT_MINUTES, DEFAULT_PUSH_TIMEOUT_MINUTES } from "@/lib/projects";
 
 function has(cmd: string): boolean {
   try {
@@ -3767,6 +3767,12 @@ suite("sibling attribution trailers (real git)", () => {
 describe("commit timeout default", () => {
   it("agrees with the project setting's default (anton-wq0k) — the two must never drift apart", () => {
     expect(DEFAULT_COMMIT_TIMEOUT_MINUTES * 60_000).toBe(DEFAULT_COMMIT_TIMEOUT_MS);
+  });
+});
+
+describe("push timeout default", () => {
+  it("agrees with the project setting's default (anton-i5wkg) — the two must never drift apart", () => {
+    expect(DEFAULT_PUSH_TIMEOUT_MINUTES * 60_000).toBe(DEFAULT_PUSH_TIMEOUT_MS);
   });
 });
 

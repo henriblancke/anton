@@ -300,6 +300,13 @@ export interface ProjectSettings {
    */
   commitTimeoutMinutes?: number;
   /**
+   * How long a single `git push` (and the `pre-push` hook chain it triggers) may run before anton
+   * kills it, in minutes. Mirrors {@link commitTimeoutMinutes}'s reasoning: a `pre-push` hook chain
+   * can legitimately run for a while, so the range floor is 1, not 0. Absent →
+   * DEFAULT_PUSH_TIMEOUT_MINUTES (2 min).
+   */
+  pushTimeoutMinutes?: number;
+  /**
    * Max attempts for a job before it is parked for a human (anton-xbk). A failed ticket fails the
    * execute-epic job, which retries and resumes past already-closed tickets — so this is the
    * effective per-task retry budget. Absent → DEFAULT_MAX_RETRIES.
@@ -522,6 +529,10 @@ export const DEFAULT_TICKET_TIMEOUT_MINUTES = 45;
 /** Kept in minutes for consistency with the other two timeouts; ops.ts's git-commit default is
  *  {@link DEFAULT_COMMIT_TIMEOUT_MINUTES} * 60_000 ms — asserted equal in ops.test.ts. */
 export const DEFAULT_COMMIT_TIMEOUT_MINUTES = 2;
+/** Kept in minutes for the same reason as {@link DEFAULT_COMMIT_TIMEOUT_MINUTES}; ops.ts's
+ *  git-push default is {@link DEFAULT_PUSH_TIMEOUT_MINUTES} * 60_000 ms — asserted equal in
+ *  ops.test.ts. */
+export const DEFAULT_PUSH_TIMEOUT_MINUTES = 2;
 export const DEFAULT_MAX_RETRIES = 3;
 /** Two rounds: the reviewer's first pass plus one chance to confirm the fixes landed. */
 export const DEFAULT_REVIEW_MAX_ROUNDS = 2;
@@ -584,6 +595,12 @@ export const TICKET_TIMEOUT_MINUTES_RANGE = { min: 5, max: 240 } as const; // 5 
  * the thing that should be bounding the run.
  */
 export const COMMIT_TIMEOUT_MINUTES_RANGE = { min: 1, max: 60 } as const;
+/**
+ * 1 min … 60 min, for the same reason as {@link COMMIT_TIMEOUT_MINUTES_RANGE}: the floor keeps a
+ * `pre-push` hook chain from being killed before it finishes, and the ceiling defers to
+ * {@link JOB_TIMEOUT_MINUTES_RANGE}'s job timeout past an hour.
+ */
+export const PUSH_TIMEOUT_MINUTES_RANGE = { min: 1, max: 60 } as const;
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
 export const REVIEW_MAX_ROUNDS_RANGE = { min: 1, max: 5 } as const;
 /** `0` is in range on purpose: it is how the operator turns the score-regression alarm off. */

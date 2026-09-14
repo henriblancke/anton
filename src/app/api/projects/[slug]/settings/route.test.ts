@@ -716,6 +716,32 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect("commitTimeoutMinutes" in persisted()).toBe(false);
   });
 
+  it("PATCH persists an in-range pushTimeoutMinutes, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ pushTimeoutMinutes: 5 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.pushTimeoutMinutes).toBe(5);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pushTimeoutMinutes).toBe(5);
+  });
+
+  it("PATCH rejects an out-of-range or non-integer pushTimeoutMinutes", async () => {
+    for (const bad of [0, 61, 2.5, "long"]) {
+      const res = await PATCH(patchReq({ pushTimeoutMinutes: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/pushTimeoutMinutes/);
+    }
+    expect("pushTimeoutMinutes" in persisted()).toBe(false);
+  });
+
+  it('PATCH "" / null clears pushTimeoutMinutes back to the default (key removed)', async () => {
+    await PATCH(patchReq({ pushTimeoutMinutes: 10 }), ctx("tmp"));
+    const res = await PATCH(patchReq({ pushTimeoutMinutes: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.pushTimeoutMinutes).toBeUndefined();
+    expect("pushTimeoutMinutes" in persisted()).toBe(false);
+  });
+
   it("saves, reads, then gives commitAll the project's configured commit budget", async () => {
     const saved = await PATCH(patchReq({ commitTimeoutMinutes: 5 }), ctx("tmp"));
     expect(saved.status).toBe(200);
