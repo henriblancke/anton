@@ -234,6 +234,7 @@ function gate(
   result: Promise<ReviewGateResult>;
   calls: RunClaudeOptions[];
   commitMessages: string[];
+  commitOptions: Array<{ timeoutMs?: number }>;
   restores: string[];
   /** The worktree's dirt as each round's diff was read — the review must see a settled tree. */
   diffStates: string[];
@@ -242,6 +243,7 @@ function gate(
 } {
   const { run, calls } = fakeClaude(replies);
   const commitMessages: string[] = [];
+  const commitOptions: Array<{ timeoutMs?: number }> = [];
   const diffStates: string[] = [];
   const rounds: ReviewRound[] = [];
   const result = runReviewGate({
@@ -266,8 +268,9 @@ function gate(
         diffStates.push((await worktree.readState()).status);
         return diff;
       },
-      commit: async (_path, message) => {
+      commit: async (_path, message, options) => {
         commitMessages.push(message);
+        commitOptions.push(options ?? {});
         const committed = commits[commitMessages.length - 1] ?? true;
         if (committed) worktree.onCommit();
         return { committed };
@@ -277,7 +280,7 @@ function gate(
       ...(hashTree ? { hashTree } : {}),
     },
   });
-  return { result, calls, commitMessages, restores: worktree.restores, diffStates, rounds };
+  return { result, calls, commitMessages, commitOptions, restores: worktree.restores, diffStates, rounds };
 }
 
 /** The recorded sessions in start order — the UI's view of the gate. */
@@ -325,6 +328,16 @@ describe("runReviewGate — convergence", () => {
     expect(blockingFindings(out.unresolved)).toEqual([]);
     expect(calls).toHaveLength(3); // review → fix → review
     expect(commitMessages).toEqual(["anton-gate1: address self-review findings (round 1)"]);
+  });
+
+  it("gives the self-review fix commit the project's configured budget", async () => {
+    const { result, commitOptions } = gate([report(4, [BLOCKING]), "fixed", report(9, [])], {
+      commitTimeoutMinutes: 10,
+    });
+
+    await result;
+
+    expect(commitOptions).toEqual([{ timeoutMs: 10 * 60_000 }]);
   });
 
   it("keeps child-ticket label routing through review fixes", async () => {

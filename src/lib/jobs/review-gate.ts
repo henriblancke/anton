@@ -28,7 +28,7 @@ import {
   type BranchDiff,
   type WorktreeState,
 } from "../git/ops";
-import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings } from "../projects";
+import { resolveCommitTimeoutMs, resolveReviewConfig, resolveVerifyGates, type ProjectSettings } from "../projects";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
@@ -117,7 +117,11 @@ export interface ReviewGateDeps {
   diff?: (worktreePath: string, base: string) => Promise<BranchDiff>;
   /** Pin the movable base branch to the fork-point commit every round is judged against. */
   mergeBase?: (worktreePath: string, base: string) => Promise<string>;
-  commit?: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
+  commit?: (
+    worktreePath: string,
+    message: string,
+    options: { timeoutMs?: number },
+  ) => Promise<{ committed: boolean }>;
   /** Fingerprint the worktree around a review — the read-only guard's before/after. */
   readState?: (worktreePath: string) => Promise<WorktreeState>;
   /** Undo whatever a review wrote, back to the fingerprint taken before it ran. */
@@ -284,7 +288,10 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const fixClaude = meter("review-fix");
   const readDiff = args.deps?.diff ?? diffAgainstBase;
   const mergeBase = args.deps?.mergeBase ?? resolveMergeBase;
-  const commit = args.deps?.commit ?? commitAll;
+  const commit =
+    args.deps?.commit ??
+    ((commitWorktreePath: string, message: string, _options: { timeoutMs?: number }) =>
+      commitAll(commitWorktreePath, message, { timeoutMs: resolveCommitTimeoutMs(settings) }));
   const readState = args.deps?.readState ?? readWorktreeState;
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
   const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
@@ -877,7 +884,11 @@ async function runGateFixSession(args: {
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
-  commit: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
+  commit: (
+    worktreePath: string,
+    message: string,
+    options: { timeoutMs?: number },
+  ) => Promise<{ committed: boolean }>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
   /** Hash the tree a commit would write — how the gate proves the committed tree is the tested one. */
@@ -965,7 +976,9 @@ async function runGateFixSession(args: {
       // Hashing either side of the commit is how the evidence proves it describes the committed
       // tree; when it does not, it is dropped and the next round runs the gates itself.
       const testedTree = await hashTreeOrUnknown(args.hashTree, worktreePath);
-      const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`);
+      const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`, {
+        timeoutMs: resolveCommitTimeoutMs(settings),
+      });
       // Set the instant the commit lands, BEFORE the second hash: past here the round's work is
       // verified and committed, and the rollback below must not touch it however this session ends.
       // Hashing after it would otherwise put a good, gate-passing fix behind `discardSessionWrites`.
