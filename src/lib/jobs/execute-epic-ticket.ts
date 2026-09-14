@@ -105,7 +105,7 @@ export async function runTicket(args: {
         `${ticket.id} ran out of its ticket budget while the delivery gate was reading the branch`,
       );
     }
-    const { closed } = await finishTicket(run, ticket, session.sessionId, closeOnDone, settlement);
+    const { closed } = await finishTicket(ticketCtx, ticket, session.sessionId, closeOnDone, settlement);
     return { ...settlement, closed };
   } catch (e) {
     // Always throws; returned so the signature carries the `never` and the walk's answer is typed.

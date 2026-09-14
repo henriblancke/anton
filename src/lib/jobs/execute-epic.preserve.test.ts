@@ -741,6 +741,39 @@ suite("preserveTimedOutWork (real git)", () => {
   // The abort's other landing spot: a pre-commit hook can hold the commit open. The signal now
   // reaches `commitAll`, which reaps that hook group before this preserve returns, so an abort that
   // lands before git creates its commit leaves neither a WIP commit nor a later hook writing here.
+  it("stops a rejected preserved commit before retrying once the job aborts", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("HALF_WRITTEN.md", "finished work the kill must not retry\n");
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    const committing = join(sandbox, "committing");
+    const reaped = join(sandbox, "hook-reaped");
+    writeFileSync(
+      join(hooks, "pre-commit"),
+      `#!/bin/sh\ntouch "${committing}"\ntrap 'touch "${reaped}"; exit 1' TERM\nsleep 120 &\nwait\n`,
+      { mode: 0o755 },
+    );
+    const abort = new AbortController();
+    const watch = setInterval(() => {
+      if (existsSync(committing)) abort.abort();
+    }, 10);
+
+    const kept = await preserveTimedOutWork({
+      run: run(abort.signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    }).finally(() => clearInterval(watch));
+
+    expect(kept).toEqual({ jobAborted: true });
+    expect(existsSync(reaped)).toBe(true);
+    expect(subjects()).not.toContain(`WIP ${ticket.id}: ${ticket.title}`);
+    expect(head()).toBe(baseline.head);
+  });
+
   it("reports the JOB's abort that lands while the preserved commit is being made", async () => {
     const baseline = await readWorktreeState(repo);
     write("HALF_WRITTEN.md", "finished work the kill must not delete\n");

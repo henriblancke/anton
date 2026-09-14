@@ -348,6 +348,11 @@ export async function finishTicket(
     // re-verifies the same claim and writes it then. Recorded once the gate has accepted the claim,
     // never on the agent's word alone — this is the same settlement the note cites.
     await recordSatisfiedOnBranch(run, ticket, settlement.by);
+    // The marker's commit observes this ticket's deadline, but it can settle immediately before that
+    // deadline fires. Do not let that narrow window close the bead after its budget has expired.
+    if (run.ctx.signal.aborted) {
+      throw new Error(`${ticket.id} was aborted while recording its satisfied-ticket attribution`);
+    }
   }
   // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
   // → done). A standalone target isn't closed until its PR merges, so instead move it to

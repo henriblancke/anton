@@ -78,6 +78,7 @@ function run(): Omit<StepContext, "tickets"> {
     db: {},
     clock: { now: () => 0 },
     settings: {},
+    ctx: { signal: new AbortController().signal },
   } as unknown as Omit<StepContext, "tickets">;
 }
 
@@ -153,7 +154,12 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
     expect(commitMarkerMock).toHaveBeenCalledWith(
       WORKTREE,
       expect.stringContaining(`anton: ${ticket.id} satisfied by 0123456`),
-      { satisfies: [ticket.id], hooksPath: undefined, timeoutMs: 120_000 },
+      {
+        satisfies: [ticket.id],
+        hooksPath: undefined,
+        timeoutMs: 120_000,
+        signal: expect.any(AbortSignal),
+      },
     );
     const [, message] = commitMarkerMock.mock.calls[0] as [string, string];
     expect(message).toContain('"anton-t1: Add the schema"');
@@ -161,6 +167,29 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
     // ticket's own, which a satisfied step never produced.
     expect(message.startsWith(ticket.id)).toBe(false);
     expect(message.startsWith(`WIP ${ticket.id}`)).toBe(false);
+  });
+
+  it("does NOT close a satisfied step after its ticket signal aborts during attribution", async () => {
+    const abort = new AbortController();
+    commitMarkerMock.mockImplementation(async () => {
+      abort.abort();
+    });
+
+    const err = await finishTicket(
+      { ...run(), ctx: { signal: abort.signal } } as Omit<StepContext, "tickets">,
+      ticket,
+      "s1",
+      true,
+      satisfied,
+    ).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("aborted while recording");
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(endSessionMock).not.toHaveBeenCalled();
   });
 
   it("does NOT close a satisfied step whose branch attribution git refused (PR #258 review)", async () => {

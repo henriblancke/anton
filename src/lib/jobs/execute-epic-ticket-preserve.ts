@@ -539,7 +539,7 @@ async function commitPreservedTree(args: {
   const first = await commitAll(worktreePath, message, { hooksPath, timeoutMs, signal }).catch(rejected);
   // Accepted by this project's hooks — the same proof an ordinary commit ships on, so `verified` is
   // not re-compared here; it exists for the bypass below, where no hook is left to say yes.
-  if (!("error" in first)) return first;
+  if (!("error" in first) || signal.aborted) return first;
   const after = await readWorktreeState(worktreePath).catch(() => null);
   if (!after || after.head !== before.head) return first;
   const retried = await stageAllAndHashTree(worktreePath).catch(() => null);
