@@ -126,6 +126,7 @@ export async function createSchedule(
 export interface UpdateSchedulePatch {
   cron?: string;
   enabled?: boolean;
+  autoArmed?: boolean;
 }
 
 /**
@@ -136,8 +137,10 @@ export interface UpdateSchedulePatch {
 const TAKE_WRITE_LOCK = { behavior: "immediate" } as const;
 
 /**
- * Patch a schedule's cron/enabled. Recomputes `nextRunAt` whenever the cron changes or a disabled
- * schedule is (re-)enabled; disabling clears `nextRunAt` so the loop skips it.
+ * Patch a schedule's cron/enabled/autoArmed. Recomputes `nextRunAt` whenever the cron changes or a
+ * disabled schedule is (re-)enabled; disabling clears `nextRunAt` so the loop skips it. `autoArmed`
+ * is set in this same transaction so a one-time migration arm (see {@link backfillDefaultSchedules})
+ * can never commit `enabled` without its durable marker landing atomically alongside it.
  *
  * The read and the write are ONE synchronous transaction, because this is a read-modify-write over a
  * row two callers reach at once: the settings panel patches `enabled` on the same row a cadence
@@ -168,6 +171,7 @@ export async function updateSchedule(
     const enabled = patch.enabled ?? current.enabled;
 
     const set: Partial<ScheduleRow> = { cron, enabled };
+    if (patch.autoArmed !== undefined) set.autoArmed = patch.autoArmed;
     if (!enabled) {
       set.nextRunAt = null;
     } else if (patch.cron !== undefined || (patch.enabled === true && !current.enabled)) {
@@ -437,11 +441,11 @@ export async function backfillDefaultSchedules(
       .limit(1);
     const armedRunHealth = runHealth[0]?.enabled === false && runHealth[0]?.autoArmed === false;
     if (armedRunHealth) {
-      await updateSchedule(db, clock, runHealth[0].id, { enabled: true });
-      await db
-        .update(schema.schedules)
-        .set({ autoArmed: true })
-        .where(eq(schema.schedules.id, runHealth[0].id));
+      // enabled and autoArmed land in the SAME transaction (updateSchedule): if only `enabled`
+      // committed and the process died (or a second write failed) before `autoArmed` did, the row
+      // would read exactly like the pre-migration default this backfill targets, and the next boot
+      // would re-arm it even after an operator deliberately disabled it again.
+      await updateSchedule(db, clock, runHealth[0].id, { enabled: true, autoArmed: true });
     }
     if (created.length > 0 || armedRunHealth) {
       backfills.push({ projectId: project.id, created, armedRunHealth });

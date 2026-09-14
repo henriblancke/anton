@@ -210,7 +210,17 @@ export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Pro
     } catch (e) {
       const err = e as Error & { stdout?: string; stderr?: string };
       const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
-      throw doltSyncFailure(`${probe.message(cwd, target)} Underlying error: ${output}`, output, e);
+      // Unlike the generic bd-failure boundary below (and in dolt-exec.ts), this one does not need
+      // to pattern-match bd's raw text to know the board is unreachable: both PREFLIGHT_PROBES exist
+      // solely to test that reachability, so ANY failure here — "connection refused", a timeout, an
+      // identity mismatch, whatever bd's transport happens to print — IS a board outage by context.
+      // Classifying from output text (as `doltSyncFailure` does) would miss diagnostics that never
+      // matched `isBoardUnreachableOutput`'s patterns, e.g. dial tcp: connect: connection refused,
+      // and let a preflight failure fall into ordinary job retry/parking instead of the refunded
+      // board-outage backoff that de-duplicates parks across every job during an outage.
+      throw new BoardUnreachableError(`${probe.message(cwd, target)} Underlying error: ${output}`, {
+        cause: e,
+      });
     }
   }
   // Stamped only after BOTH probes pass, so a server that was down — or a board it would not serve —
