@@ -2,10 +2,26 @@
  * Unit tests for the pure PR-link helpers: ref normalization and the write plan. No bd — these are
  * the decision functions the /epics/<id>/pr route relies on. Mirrors board-move.test.ts.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
-import { LABELS } from "./beads/bd";
-import { normalizePrRef, planPrLink } from "./pr-link";
+import type { Project } from "./types";
+
+const setPrRefMock = vi.fn(async () => "");
+const tagMock = vi.fn(async () => "");
+const untagMock = vi.fn(async () => "");
+
+vi.mock("./beads/bd", async () => {
+  const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
+  return {
+    ...actual,
+    beads: { ...actual.beads, setPrRef: setPrRefMock, tag: tagMock, untag: untagMock },
+  };
+});
+vi.mock("./beads/sync-nudge", () => ({ nudgeSync: () => {} }));
+
+const { LABELS } = await import("./beads/bd");
+const { withBeadWriteLock } = await import("./beads/claim-lock");
+const { linkPr, normalizePrRef, planPrLink } = await import("./pr-link");
 
 function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
   return {
@@ -124,5 +140,34 @@ describe("planPrLink", () => {
   it("does NOT flip a non-runnable parentless type (learning/chore/etc.)", () => {
     const learning = makeBead({ id: "l-1", issue_type: "learning" });
     expect(planPrLink(learning, "gh-1", [learning]).stageOps).toEqual([]);
+  });
+});
+
+// The `already-shipped` retirement verifies a survivor through its PR pointer and re-reads it under
+// the bead's write lock before it writes (gardener/repair-already-shipped.ts). A link written
+// outside that lock could swap a verified merged PR for an unmerged one in the window; under it,
+// the swap either precedes the reread — and is refused — or waits behind the supersede.
+describe("linkPr", () => {
+  it("writes the ref and stage ops under the target's bead write lock", async () => {
+    const project = { repoPath: "/tmp/anton-pr-link" } as Project;
+    const target = makeBead({ id: "anton-1", issue_type: "epic", labels: [LABELS.stage("implementing")] });
+    let releasedAt = 0;
+    const holding = withBeadWriteLock(project.repoPath, target.id, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      releasedAt = Date.now();
+    });
+    let wroteAt = 0;
+    setPrRefMock.mockImplementationOnce(async () => {
+      wroteAt = Date.now();
+      return "";
+    });
+
+    await linkPr(project, target, "gh-44", [target]);
+    await holding;
+
+    expect(wroteAt).toBeGreaterThanOrEqual(releasedAt);
+    expect(setPrRefMock).toHaveBeenCalledWith(project.repoPath, target.id, "gh-44");
+    expect(tagMock).toHaveBeenCalledWith(project.repoPath, target.id, [LABELS.stage("in-review")]);
+    expect(untagMock).toHaveBeenCalledWith(project.repoPath, target.id, [LABELS.stage("implementing")]);
   });
 });

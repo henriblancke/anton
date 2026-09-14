@@ -87,8 +87,8 @@ interface RunGates {
  * claim. Answers `{ done: true }` when the target needs nothing more from this attempt.
  */
 export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
-  const { preCheckTrusted, leaseTarget } = await refreshRunBoard(run);
-  if (await settleCompletedRun(run, leaseTarget)) return { done: true };
+  const { preCheckTrusted, currentBoardTrusted, leaseTarget } = await refreshRunBoard(run);
+  if (await settleCompletedRun(run, leaseTarget, currentBoardTrusted)) return { done: true };
   // Step 0-pre. Refuse to start a new run on a stale checkout (anton-mh3c). Placed AFTER the
   // completion short-circuit so a target already carried to its pull request still settles
   // idempotently rather than being grounded by a staleness with nothing left to run. The gate lives
@@ -608,4 +608,3 @@ async function armHumanTicketWaits(run: EpicRun, gates: RunGates): Promise<void>
   gates.readiness = freshReadiness;
   gates.children = freshChildren;
 }
-

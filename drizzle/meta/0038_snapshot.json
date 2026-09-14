@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "f1c9a001-b1ed-4a28-b8b2-667c6ac0a742",
+  "id": "e18155e4-d177-4988-81d9-d0101aadc51f",
   "prevId": "b6c8ca91-3a52-4a80-97ed-e937345c4edd",
   "tables": {
     "autopilot_disarms": {
@@ -1411,6 +1411,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "base_fork_sha": {
+          "name": "base_fork_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "status": {
           "name": "status",
           "type": "text",
@@ -1722,14 +1729,6 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
-        },
-        "auto_armed": {
-          "name": "auto_armed",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
         }
       },
       "indexes": {},

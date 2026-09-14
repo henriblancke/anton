@@ -32,6 +32,9 @@ const EXPRESSIONS: Record<string, string> = {
   "github.repository_owner": "owner",
   "github.event.repository.name": "repo",
   "github.event.pull_request.number": "42",
+  // The pinned install step hands its output to the action; the path itself never reaches
+  // the prompt, so any value works here — the test only needs the expression to resolve.
+  "steps.claude-install.outputs.exe": "/tmp/claude-install/claude",
   "env.REVIEW_BOT_LOGIN": "claude[bot]",
   "env.REVIEW_FILE": ".github/CODE_REVIEW.md",
   "env.REVIEW_LABEL": "claude-approved",

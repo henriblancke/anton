@@ -3,6 +3,21 @@
  * temp repo. Skipped when `git` isn't installed.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+const warmResolutionFailure = vi.hoisted(() => ({ enabled: false }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    existsSync(path: Parameters<typeof actual.existsSync>[0]) {
+      if (warmResolutionFailure.enabled && String(path).endsWith("bun.lock")) {
+        throw new Error("temporary filesystem failure");
+      }
+      return actual.existsSync(path);
+    },
+  };
+});
+
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -18,6 +33,7 @@ import { hostname, tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
   acquireWorktreeClaim,
+  branchExists,
   createWorktree,
   findWorktree,
   listWorktrees,
@@ -110,6 +126,7 @@ suite("worktree manager (real git)", () => {
 
     expect(wt.repoPath).toBe(repo);
     expect(wt.branch).toBe(branch);
+    expect(wt.createdBranch).toBe(true);
     expect(existsSync(wt.path)).toBe(true);
     expect(realpathSync(wt.path)).toBe(realpathSync(worktreePathFor(repo, branch)));
 
@@ -126,8 +143,29 @@ suite("worktree manager (real git)", () => {
     const first = await createWorktree({ repoPath: repo, branch });
     const second = await createWorktree({ repoPath: repo, branch });
 
+    expect(first.createdBranch).toBe(true);
     expect(second.path).toBe(first.path);
+    expect(second.createdBranch).toBe(false);
     expect(existsSync(second.path)).toBe(true);
+  });
+
+  it("returns false only when the local branch is missing", async () => {
+    expect(await branchExists(repo, "anton/does-not-exist")).toBe(false);
+  });
+
+  it("propagates operational show-ref failures instead of claiming the branch is new", async () => {
+    const shim = gitShim([
+      'if [ "$3" = "show-ref" ]; then',
+      '  echo "fatal: ref database unavailable" >&2',
+      "  exit 128",
+      "fi",
+    ]);
+
+    try {
+      await expect(branchExists(repo, "anton/anything")).rejects.toThrow("ref database unavailable");
+    } finally {
+      shim.restore();
+    }
   });
 
   // anton-2wvb: `git worktree list` reports an administrative record, which outlives a checkout
@@ -142,6 +180,7 @@ suite("worktree manager (real git)", () => {
     const second = await createWorktree({ repoPath: repo, branch });
 
     expect(second.path).toBe(first.path);
+    expect(second.createdBranch).toBe(false);
     expect(existsSync(second.path)).toBe(true);
   });
 
@@ -157,6 +196,7 @@ suite("worktree manager (real git)", () => {
     const second = await createWorktree({ repoPath: repo, branch });
 
     expect(second.path).toBe(first.path);
+    expect(second.createdBranch).toBe(false);
     expect(existsSync(second.path)).toBe(true);
   });
 
@@ -229,6 +269,83 @@ suite("worktree manager (real git)", () => {
     } finally {
       warn.mockRestore();
       delete process.env[WARM_COMMAND_ENV];
+    }
+  });
+
+  it("fails creation before warming when it cannot read the new checkout's fork", async () => {
+    const branch = "anton/run-fork-read-fails";
+    const shim = gitShim([
+      'if [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then',
+      '  echo "fatal: object database unavailable" >&2',
+      "  exit 128",
+      "fi",
+    ]);
+    process.env[WARM_COMMAND_ENV] = "mkdir -p node_modules && echo warmed > node_modules/.warm";
+
+    try {
+      await expect(createWorktree({ repoPath: repo, branch, warm: true })).rejects.toThrow(
+        "object database unavailable",
+      );
+      expect(existsSync(worktreePathFor(repo, branch))).toBe(false);
+      expect(await branchExists(repo, branch)).toBe(false);
+    } finally {
+      shim.restore();
+      delete process.env[WARM_COMMAND_ENV];
+      await removeWorktree({
+        path: worktreePathFor(repo, branch),
+        branch,
+        baseBranch: "master",
+        createdBranch: false,
+        repoPath: repo,
+      }, { deleteBranch: true });
+    }
+  });
+
+  it("marks a branch unsafe when fork cleanup removes its checkout but cannot delete its branch", async () => {
+    const branch = "anton/run-fork-cleanup-branch-fails";
+    const shim = gitShim([
+      'if [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then',
+      '  echo "fatal: object database unavailable" >&2',
+      "  exit 128",
+      "fi",
+      'if [ "$3" = "branch" ] && [ "$4" = "-D" ]; then',
+      '  echo "fatal: cannot lock ref" >&2',
+      "  exit 1",
+      "fi",
+    ]);
+
+    try {
+      await expect(createWorktree({ repoPath: repo, branch })).rejects.toThrow(
+        /branch remains unsafe to reuse/,
+      );
+      expect(existsSync(worktreePathFor(repo, branch))).toBe(false);
+      expect(await branchExists(repo, branch)).toBe(true);
+    } finally {
+      shim.restore();
+    }
+
+    await expect(createWorktree({ repoPath: repo, branch })).rejects.toThrow(/refusing to reuse/);
+
+    execFileSync("git", ["-C", repo, "branch", "-D", branch]);
+    const recreated = await createWorktree({ repoPath: repo, branch });
+    expect(recreated.forkSha).toMatch(/^[0-9a-f]{40}$/);
+    await removeWorktree(recreated, { deleteBranch: true });
+  });
+
+  it("returns the creation fork when warm-command resolution throws", async () => {
+    const priorVitest = process.env.VITEST;
+    delete process.env.VITEST;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    warmResolutionFailure.enabled = true;
+    try {
+      const wt = await createWorktree({ repoPath: repo, branch: "anton/run-warm-resolution-fails", warm: true });
+      expect(wt.forkSha).toMatch(/^[0-9a-f]{40}$/);
+      expect(warn.mock.calls.flat().join(" ")).toContain("failed unexpectedly");
+    } finally {
+      warmResolutionFailure.enabled = false;
+      warn.mockRestore();
+      if (priorVitest === undefined) delete process.env.VITEST;
+      else process.env.VITEST = priorVitest;
     }
   });
 
@@ -416,7 +533,7 @@ suite("worktree manager (real git)", () => {
 
     try {
       const removal = await removeWorktree(
-        { path: wt.path, branch: stale, baseBranch: stale, repoPath: repo },
+        { path: wt.path, branch: stale, baseBranch: stale, createdBranch: false, repoPath: repo },
         { deleteBranch: true },
       );
 
@@ -443,7 +560,13 @@ suite("worktree manager (real git)", () => {
     );
     rmSync(orphanRepo, { recursive: true, force: true });
 
-    await removeWorktree({ path: orphanPath, branch, baseBranch: branch, repoPath: orphanRepo });
+    await removeWorktree({
+      path: orphanPath,
+      branch,
+      baseBranch: branch,
+      createdBranch: false,
+      repoPath: orphanRepo,
+    });
 
     expect(existsSync(orphanPath)).toBe(false);
   });
@@ -461,6 +584,7 @@ suite("worktree manager (real git)", () => {
       path: orphanPath,
       branch: "anton/relative",
       baseBranch: "anton/relative",
+      createdBranch: false,
       repoPath: orphanRepo,
     });
 
@@ -497,7 +621,7 @@ suite("worktree manager (real git)", () => {
 
     try {
       const removal = await removeWorktree(
-        { path: wt.path, branch: gone, baseBranch: gone, repoPath: repo },
+        { path: wt.path, branch: gone, baseBranch: gone, createdBranch: false, repoPath: repo },
         { deleteBranch: true },
       );
 
@@ -868,6 +992,7 @@ suite("worktree manager (real git)", () => {
       path: arbitraryPath,
       branch: "anton/unverified",
       baseBranch: "anton/unverified",
+      createdBranch: false,
       repoPath: join(arbitraryPath, "missing-repo"),
     });
 

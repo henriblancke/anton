@@ -14,7 +14,7 @@
  * repair files no bead and that note is the only record a founder can read (see the legend below).
  *
  * Mirrored from src/lib/gardener/repair-autonomy.ts rather than imported: this module tree is
- * client-side, and importing the pass's code to get four strings would drag the board reader,
+ * client-side, and importing the pass's code to get a handful of strings would drag the board reader,
  * `bd` and node's `crypto` into the bundle. Keep in sync with REPAIR_CLASSES and
  * DEFAULT_REPAIR_AUTONOMY_POLICY.
  */
@@ -44,10 +44,11 @@ export interface RepairClassSpec {
 /**
  * The block classes, cheapest mistake first.
  *
- * The FACTUAL pair invent nothing — one rewrites a pointer to what it already meant, the other
- * records an ordering that already exists — which is why they are armable at all. The INVENTIVE
- * pair have no repair behind them: arming them would be a setting the run silently ignores, so they
- * are pinned and say so rather than being left off the page.
+ * The FACTUAL ones invent nothing — one rewrites a pointer to what it already meant, one records an
+ * ordering that already exists, one retires a ticket against work git and the board already hold —
+ * which is why they are armable at all. The INVENTIVE pair have no repair behind them: arming them
+ * would be a setting the run silently ignores, so they are pinned and say so rather than being left
+ * off the page.
  */
 export const REPAIR_CLASSES: RepairClassSpec[] = [
   {
@@ -59,6 +60,13 @@ export const REPAIR_CLASSES: RepairClassSpec[] = [
     id: "dep-missing",
     block: "the agent needs work that has to land first, and no edge said so",
     does: "draws the `blocks` edge and parks the bead behind the prerequisite",
+  },
+  {
+    id: "already-shipped",
+    block: "the agent found the ticket's work already in the tree, and named what shipped it",
+    does:
+      "verifies the claim against git and the board, then closes the bead as superseded by what " +
+      "shipped it — the run carries on with the rest of the feature",
   },
   {
     id: "acceptance-missing",
@@ -75,13 +83,14 @@ export const REPAIR_CLASSES: RepairClassSpec[] = [
 ];
 
 /**
- * The shipped level per class, mirrored from DEFAULT_REPAIR_AUTONOMY_POLICY. The factual pair ship
+ * The shipped level per class, mirrored from DEFAULT_REPAIR_AUTONOMY_POLICY. The factual ones ship
  * at `shadow`: they are safe to COMPUTE, which is not the same as armed to write, and a week of
  * shadow notes is what makes arming them an informed act.
  */
 const SHIPPED: Record<string, RepairAutonomy> = {
   "ref-stale": "shadow",
   "dep-missing": "shadow",
+  "already-shipped": "shadow",
   "acceptance-missing": "propose",
   oversized: "propose",
 };
@@ -98,7 +107,7 @@ export function shippedRepairLevel(classId: string): RepairAutonomy {
  *
  * The one floor is re-applied here, because the lie this control cannot tell is showing a level the
  * run would ignore: an unreadable entry falls back to the class's SHIPPED level (not to `propose` —
- * that would draw the factual pair as disarmed when they are not), and a class with no repair behind
+ * that would draw the factual classes as disarmed when they are not), and a class with no repair behind
  * it ({@link RepairClassSpec.blocked}) reads back pinned.
  */
 export function resolveRepairAutonomy(

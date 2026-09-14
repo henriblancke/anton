@@ -8,9 +8,9 @@
  * ticket whose timed-out work is already preserved on the branch (anton-d967 — an empty index AND a
  * still HEAD), and the agent that committed somewhere the PR push will never look.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -60,6 +60,8 @@ suite("commitStep (real git)", () => {
     execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
   const head = () => out(["rev-parse", "HEAD"]);
   const subjects = () => out(["log", "--format=%s"]).split("\n");
+  const waitForPath = async (path: string) =>
+    vi.waitFor(() => expect(existsSync(path)).toBe(true), { timeout: 10_000 });
 
   /** Stand in for the agent editing the worktree. */
   const write = (name: string, body: string) => writeFileSync(join(repo, name), body);
@@ -81,6 +83,7 @@ suite("commitStep (real git)", () => {
       branch: BRANCH,
       baseBranch: "main",
       baseRef: "origin/main",
+      baseForkSha: "f0f0f0forkcommit",
       target: ticket,
       tickets: [ticket],
       settings: {} satisfies ProjectSettings,
@@ -117,6 +120,73 @@ suite("commitStep (real git)", () => {
     expect(result.facts.committed).toBe(true);
     expect(subjects()[0]).toBe(`${ticket.id}: ${ticket.title}`);
   });
+
+  it.runIf(process.platform !== "win32")(
+    "keeps a commit that landed before cancelling its post-commit hook for a ticket deadline",
+    async () => {
+      const started = head();
+      const hookStarted = join(sandbox, "post-commit-started");
+      const hooksDir = join(repo, ".git", "hooks");
+      const hook = join(hooksDir, "post-commit");
+      writeFileSync(
+        hook,
+        `#!/bin/sh\ntouch ${JSON.stringify(hookStarted)}\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n`,
+      );
+      chmodSync(hook, 0o755);
+      write("cadence-editor.tsx", "export const CadenceEditor = () => null;\n");
+      const controller = new AbortController();
+      const stepContext = context();
+      const pending = commitStep({
+        ...stepContext,
+        ticketStartHead: started,
+        ctx: { ...stepContext.ctx, signal: controller.signal },
+      });
+
+      await waitForPath(hookStarted);
+      controller.abort(new Error("ticket deadline elapsed"));
+
+      const result = await pending;
+      expect(result.ok).toBe(true);
+      expect(result.facts.committed).toBe(true);
+      expect(head()).not.toBe(started);
+      expect(subjects()[0]).toBe(`${ticket.id}: ${ticket.title}`);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "propagates a job cancellation even when its post-commit hook was stopped after HEAD advanced",
+    async () => {
+      const started = head();
+      const hookStarted = join(sandbox, "post-commit-started");
+      const hook = join(repo, ".git", "hooks", "post-commit");
+      writeFileSync(
+        hook,
+        `#!/bin/sh\ntouch ${JSON.stringify(hookStarted)}\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n`,
+      );
+      chmodSync(hook, 0o755);
+      write("cadence-editor.tsx", "export const CadenceEditor = () => null;\n");
+      const job = new AbortController();
+      const ticketDeadline = new AbortController();
+      job.signal.addEventListener("abort", () => ticketDeadline.abort(), { once: true });
+      const stepContext = context();
+      const pending = commitStep({
+        ...stepContext,
+        ticketStartHead: started,
+        ctx: {
+          ...stepContext.ctx,
+          signal: ticketDeadline.signal,
+          jobSignal: job.signal,
+        },
+      });
+
+      await waitForPath(hookStarted);
+      job.abort(new Error("operator cancelled the job"));
+
+      await expect(pending).rejects.toThrow(/aborted/i);
+      expect(head()).not.toBe(started);
+      expect(subjects()[0]).toBe(`${ticket.id}: ${ticket.title}`);
+    },
+  );
 
   // The gate's whole reason for existing: a clean agent exit that changed nothing delivered nothing,
   // and closing the ticket on it would be a false success.

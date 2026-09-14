@@ -6,7 +6,10 @@
  * Everything here is bookkeeping the walk needs done but does not itself decide. What happens when a
  * ticket stops short is the settlement's (execute-epic-ticket-settle.ts).
  */
-import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
+import { beads, labelValueOf, LABELS, ownerOf, unclaimableStatus, type Bead } from "../beads/bd";
+import { readCurrentClosureVersion } from "../beads/closure-cycle";
+import { isServerMode } from "../beads/board-mode";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { claudeRouting } from "../claude/driver-routing";
 import { formatSatisfiedNote, shortSha } from "../beads/satisfied-note";
 import type { SatisfiedBy } from "../beads/satisfied-note";
@@ -17,10 +20,12 @@ import {
   satisfiedMarkerSubject,
   type WorktreeState,
 } from "../git/ops";
+import { resolveCommitTimeoutMs } from "../projects";
 import { updateRun } from "../runs";
 import { appendSessionLog, endSession, startJobSession, type JobSession } from "../sessions";
 import { PoisonEpic } from "./errors";
-import { mustPersist, safe } from "./execute-epic-persist";
+import { errorText, sleepMs } from "../retry-helpers";
+import { mustPersist, PERSIST_RETRY_MS, safe } from "./execute-epic-persist";
 import type { TicketSettlement } from "./execute-epic-ticket-settle";
 import type { JobContext } from "./runner";
 import type { StepContext } from "./step-registry";
@@ -40,6 +45,33 @@ export interface TicketBudget {
 }
 
 /**
+ * Undo a claim before a gate parks the run, but only while the board still says it belongs to this
+ * run. A failed post-claim read is not evidence that nothing else settled the ticket in the meantime:
+ * reopening or unassigning a newer settlement would undo that decision.
+ *
+ * The process-wide bead lock keeps local writers from interleaving the re-read and rollback. On a
+ * shared board, the re-read still fences this writer from blindly reopening a settlement that has
+ * already arrived; a later remote writer remains the board's newer decision.
+ */
+async function unclaimAndPark(repo: string, ticketId: string, operator: string | undefined): Promise<void> {
+  await withBeadWriteLock(repo, ticketId, async () => {
+    const fresh = await beads.show(repo, ticketId).catch(() => undefined);
+    // `bd update --claim` can resolve its actor independently when anton could not name one. The
+    // post-claim read is then the only authoritative holder to compare-and-swap back to open.
+    const holder = operator ?? (fresh ? ownerOf(fresh) : undefined);
+    if (!fresh || fresh.status !== "in_progress" || !holder || ownerOf(fresh) !== holder) return;
+    await safe(() => beads.setStatus(repo, ticketId, "open"));
+    // `bd update --status open` preserves the assignee, so another writer cannot land between the
+    // status rollback and a later unassign and have their claim stripped. The order deliberately
+    // leaves an owner on a failed status write rather than producing an unclaimable in-progress bead.
+    const afterStatus = await beads.show(repo, ticketId).catch(() => undefined);
+    if (!afterStatus || afterStatus.status !== "open" || ownerOf(afterStatus) !== holder) return;
+    await safe(() => beads.unassign(repo, ticketId));
+    await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
+  });
+}
+
+/**
  * Claim the ticket for the operator as a HARD GATE before doing any work, and clear any verdict a
  * previous run left on it.
  */
@@ -47,7 +79,7 @@ export async function claimTicket(
   run: Omit<StepContext, "tickets">,
   ticket: Bead,
   operator: string | undefined,
-): Promise<void> {
+): Promise<string | undefined> {
   const repo = run.repoPath;
   // Claim the ticket for the operator as a HARD GATE before doing any work. On a shared board
   // the claim is the cross-operator coordination primitive (anton-live-sync R6): a failure here
@@ -75,14 +107,9 @@ export async function claimTicket(
   // and a run that cannot clear it parks before it can open that PR.
   if (beads.isNotDelivered(ticket)) {
     if (!(await mustPersist(() => beads.untag(repo, ticket.id, [LABELS.notDelivered])))) {
-      // Put the ticket back the way the claim above found it before halting. The claim already
-      // moved it to `in_progress`, and the epic-level cleanup hands the assignee back but not the
-      // status — leaving `in_progress` with no owner, which `bd update --claim` refuses outright.
-      // The resume this park tells the operator to run would then never get past its claim gate.
-      // Same restore the retryable-failure path performs, for the same reason.
-      await safe(() => beads.setStatus(repo, ticket.id, "open"));
-      await safe(() => beads.unassign(repo, ticket.id));
-      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+      // Hand the claim back only if a locked re-read still proves it is this run's `in_progress`
+      // claim. A later settlement or unreadable board is left untouched rather than reopened.
+      await unclaimAndPark(repo, ticket.id, operator);
       throw new PoisonEpic(
         `${ticket.id} carries \`${LABELS.notDelivered}\` from a previous run but bd would not ` +
           `clear it — running this ticket and opening a pull request would make merge ` +
@@ -90,9 +117,329 @@ export async function claimTicket(
       );
     }
   }
+  // A ticket an earlier attempt RETIRED (`bd supersede`) and an operator then reopened to re-run
+  // still carries the stale `supersedes` edge that close wrote — reopen leaves it (anton-5bpd,
+  // PR #238 review). We are about to run the ticket, so that edge is a lie: left in place, this
+  // run's honest close reads as superseded again ({@link beads.supersededBy}), and a cross-machine
+  // resume between that close and its push drops the ticket as a pre-existing retirement
+  // (execute-epic-dispatch `partitionTickets`) instead of regenerating its commit — the PR then
+  // omits the rerun's work. So the edge is cleared here, on the authoritative read the claim just
+  // earned; and — like the marker above — a run that cannot clear it parks before it can open that
+  // PR. Only an edge that PREDATES the claim is cleared: the same read sees a retirement another
+  // process landed in the window, and that one is settled work (see {@link retirementSettledSinceClaim}).
+  const claimed = await beads.show(repo, ticket.id).catch(() => undefined);
+  // The read is authoritative or nothing: a transient failure here tells us NOTHING about the
+  // edge, and treating an unreadable bead as edge-free would run the ticket and let a surviving
+  // `supersedes` reach the same close/resume that omits the rerun's work. So fail closed — park
+  // and restore the claim exactly as the unlink-refusal path below does — rather than proceed on
+  // an unverified read.
+  if (!claimed) {
+    await unclaimAndPark(repo, ticket.id, operator);
+    throw new PoisonEpic(
+      `${ticket.id} could not be re-read after claiming, so a stale \`supersedes\` edge from a ` +
+        `previous retirement cannot be ruled out — running this ticket and opening a pull request ` +
+        `would risk its own honest close reading as superseded again, and a cross-machine resume ` +
+        `dropping the rerun's work from the PR. Check the beads DB, then resume the run`,
+    );
+  }
+  const survivor = beads.supersedesTarget(claimed);
+  if (survivor) {
+    // …but only an edge this run's own claim proves is STALE (PR #238 review). A supersede another
+    // process wrote in the window between the claim above and this read is a valid retirement, and
+    // removing it would run the ticket that hand just settled and record its close as an ordinary
+    // delivery. What tells the two apart is the claim itself ({@link retirementSettledSinceClaim}).
+    const settled = retirementSettledSinceClaim(claimed, operator);
+    if (settled) {
+      // RETRYABLE, not a park: the next attempt re-reads the board, and dispatch drops a ticket
+      // closed as superseded with no commit under its own id exactly as it drops any retirement it
+      // finds (execute-epic-dispatch `partitionTickets`) — recording it on the run's retired ledger
+      // so the pull request says what it does not carry. Nothing is written here and the claim is
+      // NOT handed back: the bead belongs to whoever settled it, and `unclaimAndPark` would reopen
+      // a closed retirement.
+      throw new Error(
+        `refusing to execute ${ticket.id}: it was retired as superseded by ${survivor} after this ` +
+          `run claimed it (${settled}) — retrying so the next attempt re-reads the board and drops ` +
+          `the ticket as the settled retirement it is, rather than re-running work another hand ` +
+          `has already closed`,
+      );
+    }
+    if (!(await mustPersist(() => beads.unlink(repo, ticket.id, survivor)))) {
+      await unclaimAndPark(repo, ticket.id, operator);
+      throw new PoisonEpic(
+        `${ticket.id} carries a stale \`supersedes\` edge to ${survivor} from a previous ` +
+          `retirement but bd would not remove it — running this ticket and opening a pull request ` +
+          `would make its own honest close read as superseded again, and a cross-machine resume ` +
+          `drop the rerun's work from the PR. Check the beads DB, then resume the run`,
+      );
+    }
+    await assertUnlinkedOurStaleEdge(repo, ticket.id, survivor, operator);
+  }
   void beads
     .sync(repo)
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
+  // `bd update --claim` may resolve its configured actor when anton could not. Carry the
+  // authoritative post-claim assignee into settlement so the repair can detect a later reassignment.
+  return ownerOf(claimed);
+}
+
+/**
+ * The fence after the stale-edge unlink: prove the edge it removed was the STALE one the pre-unlink
+ * read saw, and not a retirement another process landed in between (PR #238 review).
+ *
+ * The bead lock orders this process only. On a shared-server board another hand can `bd supersede`
+ * the ticket against the SAME survivor between {@link retirementSettledSinceClaim}'s read and the
+ * unlink — and because the survivor matches, the unlink strips the NEW retirement's edge rather than
+ * the reopened one's. Nothing downstream can tell: `claimTicket` returns, the agent runs a ticket
+ * that hand has already closed, and the run's own close records it as an ordinary delivery, losing
+ * the survivor the other process recorded. `mustPersist`'s retries widen the same window — each
+ * attempt is a fresh write against a board that may have moved since the last.
+ *
+ * So the same questions are asked once more with the unlink ON the board, exactly as the retirement
+ * fences do (execute-epic-dispatch `retireFound`, gardener/repair-already-shipped.ts
+ * `retirementHeld`): only a read taken after the write can have seen such a writer. The claim is
+ * still what separates the two cases, so the check is `retirementSettledSinceClaim` again — a ticket
+ * still `in_progress` under this run's own claim is one nothing has settled, and the edge that just
+ * came off can only have been the stale one.
+ *
+ * A detected race PUTS THE EDGE BACK before it retries (PR #238 review). The unlink has already
+ * happened, so the settlement this fence just found is on the board as a close with NO survivor —
+ * and that is not a state the next attempt drops. Dispatch reads a closed ticket with no
+ * `supersedes` edge and no commit under its own id on this branch as a cross-machine resume, reopens
+ * it and re-runs work the other hand settled (execute-epic-dispatch `reopenForRegeneration`), which
+ * is the very outcome the retry was supposed to avoid. So the edge the unlink removed is written
+ * again — through `bd supersede`, the only door that writes that type, idempotent on a bead already
+ * closed against the same survivor — restoring exactly the state the pre-unlink read observed.
+ *
+ * Only when the ticket reads CLOSED. That is the shape a retirement leaves, and it is the shape the
+ * regeneration path misreads. A race that shows up as a MOVED CLAIM on a ticket still open or
+ * in_progress is the other case: nothing was superseded, the edge this run removed was the stale one
+ * it came for, and re-closing the bead as superseded would destroy a live claim another hand holds.
+ * An ABANDONED bead needs no restore either — dispatch drops it as abandoned with or without the
+ * edge.
+ *
+ * The restore re-proves the retirement on its OWN read before each write (PR #238 review): this
+ * fence's `after` is history by then, and another hand can reopen or re-settle the ticket in
+ * between — see {@link restoreRetirementEdge}.
+ *
+ * A restore anton cannot land PARKS instead of retrying, because the retry is the dangerous path:
+ * the run cannot leave a settled retirement stripped of its survivor and then hand the next attempt a
+ * ticket it will reopen and re-run. The claim is NOT handed back on either exit — the bead belongs
+ * to whoever settled it, and `unclaimAndPark` would reopen a closed retirement.
+ *
+ * An unreadable bead fails closed for the reason the pre-unlink read does: "could not check" is not
+ * "nothing landed", and proceeding would run the ticket on exactly the race this fence exists to
+ * catch.
+ */
+async function assertUnlinkedOurStaleEdge(
+  repo: string,
+  ticketId: string,
+  survivor: string,
+  operator: string | undefined,
+): Promise<void> {
+  const after = await beads.show(repo, ticketId).catch(() => undefined);
+  if (!after) {
+    throw new Error(
+      `refusing to execute ${ticketId}: anton removed the \`supersedes\` edge to ${survivor} that ` +
+        `a previous retirement left on it, but bd would not read the ticket back, so anton cannot ` +
+        `tell whether the edge it removed was that stale one or a retirement another process wrote ` +
+        `while it was removing it — retrying so the next attempt decides on a board it can read`,
+    );
+  }
+  const settled = retirementSettledSinceClaim(after, operator);
+  if (settled) {
+    const closure = await readCurrentClosureVersion(repo, ticketId).catch(() => undefined);
+    await restoreRetirementEdge(repo, ticketId, survivor, closure);
+    throw new Error(
+      `refusing to execute ${ticketId}: it was retired as superseded by ${survivor} while anton ` +
+        `was removing the stale \`supersedes\` edge a previous retirement left on it (${settled}) — ` +
+        `the edge anton removed was that new retirement's, so retrying lets the next attempt ` +
+        `re-read the board and drop the ticket as the settled retirement it is, rather than ` +
+        `running work another hand has already closed`,
+    );
+  }
+}
+
+/**
+ * Write back the `supersedes` edge {@link claimTicket}'s unlink removed from a retirement another
+ * process landed in the window — see {@link assertUnlinkedOurStaleEdge} for why the retry needs it
+ * there and why only a CLOSED ticket gets it.
+ *
+ * `bd supersede` is the only seam that writes the type (beads/link-types.ts refuses it through
+ * `link`), and it is idempotent against the same survivor on an already-closed bead: it re-draws the
+ * edge and leaves the close standing.
+ *
+ * Every attempt re-reads the ticket and re-proves the retirement immediately before it writes
+ * (PR #238 review). The fence's own read is already history by the time the restore runs, and on a
+ * shared-server board the same hands that raced the unlink can reopen, reclaim, abandon or
+ * re-supersede the ticket again in between — a retry loop widens that window rather than narrowing
+ * it. Written unconditionally off the stale read, the restore would close a bead a reopen had just
+ * made live again and stamp the old survivor over a newer decision: the exact overwrite this whole
+ * path exists to prevent, in the other direction. So the precondition is asked of a read taken
+ * inside the same attempt as the write, under the ticket's write lock so no writer in THIS process
+ * can land between the two, and anything the read no longer recognises as the retirement anton
+ * unlinked is left alone.
+ */
+async function restoreRetirementEdge(
+  repo: string,
+  ticketId: string,
+  survivor: string,
+  closure: string | undefined,
+): Promise<void> {
+  // `bd supersede` has no compare-and-swap form. An embedded board's local write lock lets this
+  // process make the re-read/write sequence coherent; a shared server can accept another writer
+  // between those operations, so restoring there could overwrite live work before the read-back
+  // detects it. Leave the overtaking state untouched and park instead.
+  if (isServerMode(repo)) {
+    throw new PoisonEpic(
+      `${ticketId} was retired as superseded by ${survivor} while anton was removing the stale ` +
+        `\`supersedes\` edge a previous retirement left on it, but the shared board exposes no ` +
+        `conditional restore — anton stopped before writing so it could not overwrite the newer ` +
+        `decision. Re-read the ticket and restore its survivor manually if it is still the intended ` +
+        `retirement, then resume the run`,
+    );
+  }
+  if (!closure) {
+    throw new PoisonEpic(
+      `${ticketId} was retired as superseded by ${survivor} while anton was removing the stale ` +
+        `\`supersedes\` edge, but bd history could not identify that closure — anton stopped before ` +
+        `writing so it could not restore an edge over a newer same-second decision`,
+    );
+  }
+  const failure = await withBeadWriteLock(repo, ticketId, () =>
+    persistRetirementEdge(repo, ticketId, survivor, closure),
+  );
+  if (!failure) return;
+  throw new PoisonEpic(
+    `${ticketId} was retired as superseded by ${survivor} while anton was removing the stale ` +
+      `\`supersedes\` edge a previous retirement left on it, and anton could not write that ` +
+      `retirement's edge back (${failure}) — the ticket is now closed with no survivor recorded, ` +
+      `which the next attempt would read as a cross-machine resume and re-run. The run stopped ` +
+      `rather than regenerate work another hand has already settled. Re-run ` +
+      `\`bd supersede ${ticketId} --with ${survivor}\`, then resume the run`,
+  );
+}
+
+/** How many read-then-write attempts {@link restoreRetirementEdge} gets — `mustPersist`'s budget. */
+const RESTORE_ATTEMPTS = 3;
+
+/**
+ * One read-and-conditionally-write pass per attempt, answering why the edge is still off the board
+ * — or `undefined` once it is back, or once the ticket is no longer one this restore may touch.
+ *
+ * The read is what makes the write conditional, so it is taken fresh on every attempt rather than
+ * hoisted: a retry decided on the first attempt's read is the unconditional write again, just later.
+ */
+async function persistRetirementEdge(
+  repo: string,
+  ticketId: string,
+  survivor: string,
+  closure: string,
+): Promise<string | undefined> {
+  let why = "bd would not read the ticket back";
+  for (let attempt = 1; attempt <= RESTORE_ATTEMPTS; attempt += 1) {
+    if (attempt > 1) await sleepMs(PERSIST_RETRY_MS);
+    const fresh = await beads.show(repo, ticketId).catch((e: unknown) => {
+      console.error(`[execute-epic] bd read failed (attempt ${attempt}/${RESTORE_ATTEMPTS}):`, e);
+      why = `bd would not read the ticket back: ${errorText(e)}`;
+      return undefined;
+    });
+    if (!fresh) continue;
+    if (!(await restorableRetirement(repo, fresh, closure))) return undefined;
+    try {
+      await beads.supersede(repo, ticketId, survivor);
+    } catch (e) {
+      console.error(`[execute-epic] bd write failed (attempt ${attempt}/${RESTORE_ATTEMPTS}):`, e);
+      why = `bd refused the write: ${errorText(e)}`;
+      continue;
+    }
+    // The write's success is not proof the checked closure was restored (PR #238 review). On a
+    // shared-server board `withBeadWriteLock` orders only THIS process: a reopen, abandon, or
+    // re-supersede by another machine can land between the conditional read and the write, and
+    // `bd supersede` would then have closed the newer live state or overwritten its survivor. Re-read
+    // with the write ON the board and accept only the exact retirement this pass set out to re-draw.
+    const after = await beads.show(repo, ticketId).catch((e: unknown) => {
+      console.error(`[execute-epic] bd read-back failed (attempt ${attempt}/${RESTORE_ATTEMPTS}):`, e);
+      why = `bd would not read the ticket back to confirm the restore: ${errorText(e)}`;
+      return undefined;
+    });
+    if (!after) continue;
+    if (await restoreHeld(repo, after, closure, survivor)) return undefined;
+    // The write landed on a board that had moved since the read. Retrying would overwrite whatever
+    // decision overtook the restore a second time, so stop writing and park: the overtaking decision
+    // is preserved by surfacing it, never by treating this close as the one the fence checked.
+    return (
+      `the edge was written back, but ${ticketId} no longer reads as the retirement it restores — ` +
+      `another hand decided it between the check and the write, and anton does not rewrite that`
+    );
+  }
+  return why;
+}
+
+/**
+ * Whether this read is still the retirement {@link restoreRetirementEdge} unlinked, and therefore
+ * one anton may re-draw the edge on.
+ *
+ * CLOSED and not abandoned is the shape {@link assertUnlinkedOurStaleEdge} explains: a bead back at
+ * `open` or `in_progress` is a live claim the supersede would destroy, and an abandoned one is a
+ * person's recorded won't-do that dispatch drops with or without the edge. The SURVIVOR half is what
+ * the fresh read adds: an edge already naming this survivor means another hand restored it and the
+ * write has nothing to add, and one naming a DIFFERENT survivor is a newer retirement decision that
+ * re-superseding would overwrite. Either way the run still retries — the ticket is settled, which is
+ * all the caller's error claims.
+ */
+async function restorableRetirement(repo: string, fresh: Bead, closure: string): Promise<boolean> {
+  if (fresh.status !== "closed" || beads.isAbandoned(fresh)) return false;
+  // Beads timestamps are second-granular: only the immutable history version distinguishes a same-second reclose.
+  if ((await readCurrentClosureVersion(repo, fresh.id).catch(() => undefined)) !== closure) return false;
+  return beads.supersedesTarget(fresh) === undefined;
+}
+
+/**
+ * Whether a read taken AFTER the restore wrote still reads as the retirement this pass set out to
+ * re-draw — the post-write fence {@link persistRetirementEdge} lands. Anything else means another
+ * hand decided the ticket in the window: a reopen/re-claim, an abandon, a close in another cycle
+ * (with a different history identity), or a re-supersede against a different survivor. The write's own success
+ * proved nothing, because `bd supersede` shuts the board-dangerous race (a live ticket it re-closes,
+ * or a survivor it overwrites) before any later reader can see it — only a fresh read can.
+ */
+async function restoreHeld(repo: string, after: Bead, closure: string, survivor: string): Promise<boolean> {
+  if (after.status !== "closed" || beads.isAbandoned(after)) return false;
+  if ((await readCurrentClosureVersion(repo, after.id).catch(() => undefined)) !== closure) return false;
+  // The edge is asserted (not just the status): a survivor STRIPPED in the same window leaves a
+  // valid close with no survivor recorded, the state the next attempt misreads as a cross-machine
+  // resume, so a close without this survivor on the board is still "not restored".
+  return beads.supersedesTarget(after) === survivor;
+}
+
+/**
+ * Why the `supersedes` edge on the post-claim read is a retirement that landed AFTER this run took
+ * the ticket — or undefined while it is the stale pointer a reopened retirement kept (PR #238
+ * review).
+ *
+ * `bd reopen` returns a retired bead to `open` and leaves its `supersedes` edge behind, which is
+ * the edge {@link claimTicket} exists to clear. But the read that finds it is taken after the claim,
+ * so it also sees a supersede another process wrote in between — and that one is VALID: the ticket
+ * is settled, and clearing the edge would run it anyway and record its close as ordinary delivery.
+ *
+ * The claim is what separates them, because `bd supersede` closes the bead as it writes the edge. A
+ * ticket still `in_progress` under this run's own assignee is one nothing has settled since the
+ * claim, so its edge can only predate it. Any other reading — closed, returned to `open`, blocked,
+ * deferred, or held by another name — is a board decision made after the claim, and the edge goes
+ * with it. The ASSIGNEE half is asked only when the run resolved an operator identity: without one
+ * bd claims under its own actor resolution, and there is no name to hold the read to.
+ */
+export function retirementSettledSinceClaim(
+  claimed: Bead,
+  operator: string | undefined,
+): string | undefined {
+  if (claimed.status !== "in_progress") {
+    return `the ticket reads ${claimed.status} now, not the in_progress this run's claim left it`;
+  }
+  const holder = ownerOf(claimed);
+  if (operator && holder !== operator) {
+    return `the ticket is ${holder ? `claimed by \`${holder}\`` : "unclaimed"} now, not held for \`${operator}\` as this run's claim left it`;
+  }
+  return undefined;
 }
 
 /** The statuses bd refuses a claim on that a LATER attempt can still find changed — see below. */
@@ -288,7 +635,9 @@ export function narrowToTicket(
 ): StepContext {
   return {
     ...run,
-    ctx: { ...run.ctx, signal: budget.signal },
+    // Keep the run-level signal available alongside the ticket deadline so a step can preserve a
+    // landed commit for a ticket timeout without swallowing an operator's whole-job cancellation.
+    ctx: { ...run.ctx, signal: budget.signal, jobSignal: run.ctx.signal },
     tickets: [ticket],
     session,
     ...(baseline ? { ticketStartHead: baseline.head } : {}),
@@ -347,6 +696,11 @@ export async function finishTicket(
     // re-verifies the same claim and writes it then. Recorded once the gate has accepted the claim,
     // never on the agent's word alone — this is the same settlement the note cites.
     await recordSatisfiedOnBranch(run, ticket, settlement.by);
+    // The marker's commit observes this ticket's deadline, but it can settle immediately before that
+    // deadline fires. Do not let that narrow window close the bead after its budget has expired.
+    if (run.ctx.signal.aborted) {
+      throw new Error(`${ticket.id} was aborted while recording its satisfied-ticket attribution`);
+    }
   }
   // Persist this ticket's "code done" state the moment it commits. An epic child closes (stage
   // → done). A standalone target isn't closed until its PR merges, so instead move it to
@@ -401,7 +755,12 @@ async function recordSatisfiedOnBranch(
         `own. This empty commit records the attribution no subject on this branch carries — it is ` +
         `what a later attempt reads to see the ticket as delivered instead of dispatching it into ` +
         `a zero diff.`,
-      { satisfies: [ticket.id], hooksPath },
+      {
+        satisfies: [ticket.id],
+        hooksPath,
+        timeoutMs: resolveCommitTimeoutMs(run.settings),
+        signal: run.ctx.signal,
+      },
     );
   } catch (e) {
     throw new PoisonEpic(

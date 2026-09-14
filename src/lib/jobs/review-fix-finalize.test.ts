@@ -220,6 +220,39 @@ describe("finalizeMergedEpic", () => {
     expect(noteMock.mock.calls[0][2]).toContain("merged WITHOUT this ticket");
   });
 
+  it("holds the close open when a snapshot-closed child was reopened in the window (PR #238 review)", async () => {
+    // The run delivered t1 and retired t2 (closed as superseded). Between the sweep's snapshot and
+    // this close, an operator reopens t2 to re-run it. The snapshot still says closed, so t2 is
+    // neither preserved nor in the close batch — closing the target now would strand it open beneath
+    // a merged, undiscoverable epic. The fresh read immediately before the close catches the reopen
+    // and holds finalization open (leaving `stage:in-review`) for the next sweep to redo from a
+    // fresh snapshot that preserves and rehomes it.
+    const reopenedRetirement = { id: "t2", title: "t2", status: "closed", labels: [] } as Bead;
+    statuses.set("t2", "open"); // the LIVE board — reopened since the snapshot
+    boardLabels.set("t2", []);
+
+    await finalize(bead("epic-1"), [bead("t1"), reopenedRetirement]);
+
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("holds the close open when a snapshot-closed child cannot be re-read (PR #238 review)", async () => {
+    // An unreadable bead proves nothing either way — this seam never closes a merged target over
+    // work that may still be somebody's, so a read it cannot make holds finalization open too.
+    const t2 = { id: "t2", title: "t2", status: "closed", labels: [] } as Bead;
+    statuses.set("t2", "closed");
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t2") throw new Error("database is locked");
+      return { id, title: id, status: statuses.get(id) ?? "open", labels: boardLabels.get(id) ?? [] } as Bead;
+    });
+
+    await finalize(bead("epic-1"), [bead("t1"), t2]);
+
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
   it("rehomes the preserved tickets under a new run target", async () => {
     // A ticket parented to the merged (now closed) target is not a run target, and the target
     // itself short-circuits on its merged PR ref — so without a new home the note telling the
@@ -1507,6 +1540,40 @@ describe("finalizeMergedEpic", () => {
     expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-2");
   });
 
+  // Both re-parents hold the moved bead's lock and its new home's, like every other re-parent
+  // writer (PR #238 review): the already-shipped retirement re-reads the board under the ticket's
+  // lock and its ancestors' to see that it still hangs where it was checked, and an unlocked move
+  // could land between that read and the supersede — closing the ticket inside a run it just
+  // joined. The HOME's lock is the one nothing else in finalization takes, so it is the one held.
+  it("re-parents only under the moved bead's lock and its new home's (PR #238)", async () => {
+    const movedAt: Record<string, number> = {};
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      movedAt[id] = Date.now();
+    });
+    const releasedAt: Record<string, number> = {};
+    const holding = Promise.all(
+      ["epic-1", "epic-2"].map((id) =>
+        withBeadWriteLock("/repo", id, async () => {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          releasedAt[id] = Date.now();
+        }),
+      ),
+    );
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3")),
+    ]);
+    await holding;
+
+    expect(reparentMock.mock.calls).toEqual([
+      ["/repo", "t3", "epic-1"],
+      ["/repo", "t2", "epic-2"],
+    ]);
+    expect(movedAt.t3).toBeGreaterThanOrEqual(releasedAt["epic-1"]!); // the detach, onto the merged target
+    expect(movedAt.t2).toBeGreaterThanOrEqual(releasedAt["epic-2"]!); // the move, onto the follow-up
+  });
+
   it("pins the ancestor when a delivered descendant was reopened since the sweep (PR #199)", async () => {
     // The closing batch is built from the same snapshot that called t3 delivered, so a t3 reopened
     // while the PR was being finalized is left out of it. Detaching it onto the merged target would
@@ -2187,6 +2254,19 @@ describe("undeliveredAtMerge", () => {
     ];
 
     expect(undeliveredAtMerge(children)).toEqual(new Set(["t1", "t2"]));
+  });
+
+  it("holds back a retired ticket an operator reopened while the PR sat in review", () => {
+    // Retired as already shipped (anton-5bpd): closed as superseded, its work in the run's base and
+    // in none of its diff, and marked `not-delivered` by the run for exactly this moment. Reopened,
+    // it is an open child the merge would otherwise close as shipped — and the `supersedes` edge
+    // alone says nothing to the merge, so the marker is what keeps it open (PR #238 review).
+    const reopened = {
+      ...bead("t2", "open", [LABELS.notDelivered]),
+      dependencies: [{ issue_id: "t2", depends_on_id: "shipper", type: "supersedes" }],
+    } as Bead;
+
+    expect(undeliveredAtMerge([bead("t1"), reopened])).toEqual(new Set(["t2"]));
   });
 
   it("walks through a dependent that is closed but marked not-delivered", () => {

@@ -271,8 +271,15 @@
     {
       "idx": 38,
       "version": "6",
+      "when": 1789085199274,
+      "tag": "0038_big_rawhide_kid",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "6",
       "when": 1789411097199,
-      "tag": "0038_schedules_auto_armed",
+      "tag": "0039_schedules_auto_armed",
       "breakpoints": true
     }
   ]
