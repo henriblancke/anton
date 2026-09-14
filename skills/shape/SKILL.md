@@ -198,7 +198,11 @@ edges — **not** board order, not creation order):
 
 ```bash
 # Prints every feature's actual executor dispatch order. It mirrors runTickets: nearest-card membership,
-# arbitrary working-layer nesting, pipeline exclusion, and Kahn ordering with source-list ties.
+# arbitrary working-layer nesting, pipeline exclusion, and Kahn ordering with source-list ties. A
+# ticket held by a blocker OUTSIDE this feature (work in another run) is excluded from the numbered
+# order and listed separately, mirroring runReadiness's gated partition (execute-epic-board.ts) that
+# partitionTickets (execute-epic-dispatch.ts) applies before dispatch — the executor never runs a held
+# ticket in this pass, so numbering it alongside the rest would claim an order nobody will observe.
 # Some supported bd builds reject --status all, so merge their open and closed reads before sorting.
 node -e '
 const { execFileSync } = require("node:child_process");
@@ -231,6 +235,34 @@ const cardOf = (b) => {
 const runTickets = (featureId) => all.filter((b) =>
   !cardIds.has(b.id) && !pipeline.has(b.issue_type) && ticketTypes.has(b.issue_type) && cardOf(b) === featureId,
 );
+const blockersOf = new Map();
+for (const bead of all) for (const edge of bead.dependencies ?? []) {
+  if (edge.type !== "blocks") continue;
+  const prereqs = blockersOf.get(edge.issue_id) ?? [];
+  prereqs.push(edge.depends_on_id);
+  blockersOf.set(edge.issue_id, prereqs);
+}
+// Tickets gated by a blocker outside this feature's own set, propagated to anything inside the
+// feature that depends on one of them — same shape as computeEpicGraph's blocked-children rollup
+// (epic-graph.ts), simplified to "closed" for done (this audit runs on freshly shaped work, so a
+// merged-but-not-closed distinction does not arise).
+const heldIds = (tickets) => {
+  const ids = new Set(tickets.map((t) => t.id));
+  const heldByExternal = (id) => (blockersOf.get(id) ?? []).some((blockerId) => {
+    if (ids.has(blockerId)) return false; // inside this feature — ordering, not a gate
+    const blocker = byId.get(blockerId);
+    return !blocker || blocker.status !== "closed"; // unknown or open blocker reads as held (fail-safe)
+  });
+  const held = new Set(tickets.filter((t) => heldByExternal(t.id)).map((t) => t.id));
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const t of tickets) {
+      if (held.has(t.id)) continue;
+      if ((blockersOf.get(t.id) ?? []).some((id) => ids.has(id) && held.has(id))) { held.add(t.id); grew = true; }
+    }
+  }
+  return held;
+};
 const orderTickets = (tickets) => {
   const ids = new Set(tickets.map((t) => t.id));
   const adj = new Map(tickets.map((t) => [t.id, []]));
@@ -253,8 +285,13 @@ const orderTickets = (tickets) => {
 };
 for (const feature of all.filter((b) => b.issue_type === "feature")) {
   console.log(`feature ${feature.id}:`);
-  for (const [index, ticket] of orderTickets(runTickets(feature.id)).entries())
+  const tickets = runTickets(feature.id);
+  const held = heldIds(tickets);
+  const dispatchable = tickets.filter((t) => !held.has(t.id));
+  for (const [index, ticket] of orderTickets(dispatchable).entries())
     console.log(`  ${index + 1}. ${ticket.id}\t${ticket.title}`);
+  for (const ticket of tickets.filter((t) => held.has(t.id)))
+    console.log(`  held (external blocker, not dispatched this pass): ${ticket.id}\t${ticket.title}`);
 }
 '
 ```
