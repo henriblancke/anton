@@ -3109,13 +3109,13 @@ suite("commitAll (real git · a hook that outlives the kill)", () => {
   );
 
   it.runIf(process.platform !== "win32")(
-    "names the effective budget in minutes and points at the project's Commit timeout setting",
+    "names the effective sub-minute budget and points at the project's Commit timeout setting",
     async () => {
       delete process.env[COMMIT_TIMEOUT_ENV];
 
       await expect(
         commitAll(repo, "t1: work the hook is sitting on", { timeoutMs: 2_000 }),
-      ).rejects.toThrow(/timed out after 0\.0 minute\(s\).*Commit timeout/);
+      ).rejects.toThrow(/timed out after 2,000 ms \(0\.033 minute\(s\)\).*Commit timeout/);
     },
   );
 

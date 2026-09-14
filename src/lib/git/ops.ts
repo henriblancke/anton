@@ -816,11 +816,16 @@ function reapCommitGroup(child: ChildProcess): Promise<void> {
  * The rejection a commit killed by its own budget carries. `killed: true` is load-bearing: callers
  * tell a timeout from git's own non-zero exit by it (see {@link exitedWith}).
  */
+function formatCommitBudget(timeoutMs: number): string {
+  if (timeoutMs % 60_000 === 0) return `${timeoutMs / 60_000} minute(s)`;
+  const minutes = (timeoutMs / 60_000).toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+  return `${timeoutMs.toLocaleString("en-US")} ms (${minutes} minute(s))`;
+}
+
 function commitTimedOut(args: string[], timeoutMs: number, stderr: string): Error {
-  const minutes = (timeoutMs / 60_000).toFixed(1);
   return Object.assign(
     new Error(
-      `git ${args[0]} timed out after ${minutes} minute(s) (this project's "Commit timeout" ` +
+      `git ${args[0]} timed out after ${formatCommitBudget(timeoutMs)} (this project's "Commit timeout" ` +
         `setting) and was killed with everything it spawned: ${stderr}`,
     ),
     { killed: true },

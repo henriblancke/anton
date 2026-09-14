@@ -336,6 +336,41 @@ suite("preserveTimedOutWork (real git)", () => {
     );
   });
 
+  it(
+    "kills a preserved-work commit at the project's configured Commit timeout",
+    async () => {
+      const baseline = await readWorktreeState(repo);
+      write("FINISHED.md", "gate-passing work the slow hook must not outlive\n");
+      const hooks = join(repo, ".git", "hooks");
+      const killed = join(sandbox, "hook-killed");
+      mkdirSync(hooks, { recursive: true });
+      writeFileSync(
+        join(hooks, "pre-commit"),
+        `#!/bin/sh\ntrap 'touch "${killed}"; exit 1' TERM\nsleep 120 &\nwait\n`,
+        { mode: 0o755 },
+      );
+      const started = Date.now();
+
+      const kept = await preserveTimedOutWork({
+        run: run(new AbortController().signal, { testCommand: "true", commitTimeoutMinutes: 1 }),
+        ticket,
+        logPath,
+        baseline,
+        committed: false,
+        timeoutMs: 60_000,
+        standalone: true,
+      });
+
+      // The preserve retries its already-verified tree with hooks bypassed, so the final commit lands;
+      // the hook's TERM trap is the evidence that the first real commit died at the project's setting.
+      expect(kept).toEqual({ branch: BRANCH, retained: false });
+      expect(existsSync(killed)).toBe(true);
+      expect(Date.now() - started).toBeLessThan(90_000);
+      expect(head()).not.toBe(baseline.head);
+    },
+    120_000,
+  );
+
   // The marker is the ONLY way either reader finds self-committed work, and a project whose
   // `commit-msg` hook enforces its own subject convention refuses anton's `WIP` one (PR #228
   // review). Losing the marker to a message check costs the ticket its whole path back to a pull
