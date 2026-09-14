@@ -290,7 +290,7 @@ describe("getRouterUsageFresh", () => {
     expect(calls).toBe(2);
   });
 
-  it("joins an overlapping cached read instead of double-hitting the router", async () => {
+  it("waits for an older cached flight, then fetches a post-job snapshot", async () => {
     process.env.ROUTER_TOKEN_TEST = "secret";
     let calls = 0;
     let release!: () => void;
@@ -299,20 +299,28 @@ describe("getRouterUsageFresh", () => {
     });
     const fetcher = async () => {
       calls += 1;
-      await gate;
-      return withResponse(200, true, ROUTER_FIXTURE);
+      if (calls === 1) await gate;
+      return withResponse(200, true, {
+        ...ROUTER_FIXTURE,
+        quotas: {
+          ...ROUTER_FIXTURE.quotas,
+          "session (5h)": { ...ROUTER_FIXTURE.quotas["session (5h)"], used: calls === 1 ? 10 : 20 },
+        },
+      });
     };
     const now = () => 1_000;
 
     const cached = getRouterUsageCached(SETTINGS, fetcher, now);
-    const fresh = getRouterUsageFresh(SETTINGS, fetcher, now);
+    const firstFresh = getRouterUsageFresh(SETTINGS, fetcher, now);
+    const secondFresh = getRouterUsageFresh(SETTINGS, fetcher, now);
     release();
 
-    await expect(Promise.all([cached, fresh])).resolves.toEqual([
-      expect.objectContaining({ weeklyPct: 37 }),
-      expect.objectContaining({ weeklyPct: 37 }),
+    await expect(cached).resolves.toEqual(expect.objectContaining({ sessionPct: 10 }));
+    await expect(Promise.all([firstFresh, secondFresh])).resolves.toEqual([
+      expect.objectContaining({ sessionPct: 20 }),
+      expect.objectContaining({ sessionPct: 20 }),
     ]);
-    expect(calls).toBe(1);
+    expect(calls).toBe(2);
   });
 
   it("returns null during shared 429 backoff so a burn window cannot sample stale usage", async () => {

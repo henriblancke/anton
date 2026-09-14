@@ -193,10 +193,16 @@ export async function getRouterUsageFresh(
   const k = key(url, connectionId, tokenEnv);
   if (now() < (backoffUntil.get(k) ?? 0)) return null;
 
-  // A fresh sampling edge cannot reuse a settled cache entry, but it joins an overlapping read:
-  // otherwise a governor read and this edge double-hit the same router at the same instant.
+  // A sampling edge cannot reuse a pre-existing flight: it may have begun before the job and
+  // therefore cannot be the post-job side of the burn window. Wait for it to settle, then start
+  // fresh evidence (or join a post-wait caller that already did), preserving single-flight.
   const stale = inFlight.get(k);
-  if (stale) return stale;
+  if (stale) {
+    await stale.catch(() => null);
+    if (now() < (backoffUntil.get(k) ?? 0)) return null;
+    const current = inFlight.get(k);
+    if (current) return current;
+  }
 
   const ts = now();
   const promise = (async () => {
