@@ -124,6 +124,17 @@ function meterShareBoard(
 }
 
 /**
+ * The meter key a project's share is attributed to. No fail-soft here — a settings-read error
+ * propagates to the caller; `resolveProjectMeterKeySafe` in runner.ts is the fail-soft wrapper
+ * that falls back to `"anthropic"`.
+ */
+export async function resolveProjectMeterKey(projectId: string | null): Promise<string> {
+  if (!projectId) return "anthropic";
+  const settings = await getProjectSettings(getDb(), projectId);
+  return quotaMeterKey(settings);
+}
+
+/**
  * What the governor measures a project's share ceiling against (R6.1): this project's OWN attributed
  * weekly spend. The share cannot be enforced on the account meter `budgetGate` reads — that number
  * is moved by every repo on the machine, so gating it per-share would stop them all at one repo's
@@ -134,12 +145,6 @@ function meterShareBoard(
  * Fails soft to `null` — unattributed, never zero — so a db hiccup relaxes the share rather than
  * parking the project.
  */
-export async function resolveProjectMeterKey(projectId: string | null): Promise<string> {
-  if (!projectId) return "anthropic";
-  const settings = await getProjectSettings(getDb(), projectId);
-  return quotaMeterKey(settings);
-}
-
 export async function resolveProjectSpend(
   projectId: string | null,
   snapshot: ProjectMeterSnapshot,
