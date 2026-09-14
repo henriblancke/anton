@@ -33,7 +33,11 @@ export type StructureRule =
   | "feature-without-epic"
   | "feature-without-tickets"
   | "feature-under-ticket-budget"
-  | "feature-over-ticket-budget";
+  | "feature-over-ticket-budget"
+  | "blocks-edge-dangling"
+  | "blocks-edge-self"
+  | "blocks-duplicates-parent"
+  | "blocks-cycle";
 
 export interface StructureViolation {
   /** The offending bead — the one an author has to move or re-type. */

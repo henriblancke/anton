@@ -90,6 +90,7 @@ function isJudged(bead) {
 export function validateBoardStructure(board) {
   const byId = new Map(board.map((b) => [b.id, b]));
   const childrenOf = childIndex(board);
+  const onBlocksCycle = blocksCycleMembers(board, byId);
 
   const violations = [];
   const fault = (id, rule, severity, message) => violations.push({ id, rule, severity, message });
@@ -98,6 +99,71 @@ export function validateBoardStructure(board) {
     if (!isJudged(bead)) continue;
     const parentId = parentOf(bead);
     const parent = parentId ? byId.get(parentId) : undefined;
+
+    // The `blocks` edges THIS bead owns (bd inlines only the issue_id === bead.id side — see
+    // beads.edgesOf). Every one of these is checked against the same three mechanical faults a
+    // human would catch by eye: waiting on itself, waiting on nothing that exists, and waiting on
+    // a bead the parent-child edge already orders. `byId` here is the WHOLE board, unfiltered —
+    // a target that resolves to a `gate` or any other pipeline bead is still FOUND, so it is never
+    // "dangling"; only an id this board carries nowhere at all is.
+    for (const dep of bead.dependencies ?? []) {
+      if (dep?.type !== "blocks" || !dep.issue_id || !dep.depends_on_id) continue;
+      const blockerId = dep.depends_on_id;
+
+      if (blockerId === bead.id) {
+        fault(
+          bead.id,
+          "blocks-edge-self",
+          "blocking",
+          `blocks-depends on itself — a bead can never wait on its own close, so this edge can ` +
+            `never resolve and the run stalls on it forever. Drop it ` +
+            `(\`bd dep remove ${bead.id} ${bead.id}\`).`,
+        );
+        continue;
+      }
+
+      const blocker = byId.get(blockerId);
+      if (!blocker) {
+        fault(
+          bead.id,
+          "blocks-edge-dangling",
+          "blocking",
+          `blocks-depends on ${blockerId}, which is not on this board — bd can never resolve a ` +
+            `blocker that does not exist, so this edge holds the run back forever. Remove the ` +
+            `stale edge (\`bd dep remove ${bead.id} ${blockerId}\`), then add the real one if a ` +
+            `live prerequisite exists (\`bd dep add ${bead.id} <blocker-id>\`).`,
+        );
+        continue;
+      }
+
+      const partnerOfParent = parentOf(bead) === blockerId ? "parent" : parentOf(blocker) === bead.id ? "child" : null;
+      if (partnerOfParent) {
+        fault(
+          bead.id,
+          "blocks-duplicates-parent",
+          "blocking",
+          `blocks-depends on ${blockerId}, already its ${partnerOfParent} — a parent never waits ` +
+            `on its own child, and the tier already orders the two, so the edge is redundant and ` +
+            `only doubles the wait. Drop it (\`bd dep remove ${bead.id} ${blockerId}\`).`,
+        );
+      }
+    }
+
+    if (onBlocksCycle.has(bead.id)) {
+      const partner = (bead.dependencies ?? []).find(
+        (d) => d?.type === "blocks" && onBlocksCycle.has(d.depends_on_id),
+      )?.depends_on_id;
+      fault(
+        bead.id,
+        "blocks-cycle",
+        "blocking",
+        `sits in a blocks cycle${partner ? ` with ${partner}` : ""} — each bead on the loop waits ` +
+          `(directly or transitively) on the next, so none of them can ever become ready and the ` +
+          `run deadlocks. Break the loop by dropping one edge on it ` +
+          `(\`bd dep remove ${bead.id} ${partner ?? "<blocker-id>"}\`), then re-add whichever order ` +
+          `is actually correct (\`bd dep add <blocked> <blocker>\`).`,
+      );
+    }
 
     // A parent id pointing at a bead this board doesn't contain — a bd-level inconsistency, not a
     // shape one (a re-parent that lost its target, a hand-edited export). The one rule here that
@@ -225,6 +291,50 @@ export function structureGaps(targetId, board) {
     blocking: owned.filter((v) => v.severity === "blocking"),
     advisory: owned.filter((v) => v.severity === "advisory"),
   };
+}
+
+/**
+ * Every bead id sitting on a `blocks` cycle, by plain DFS over the edges {@link validateBoardStructure}
+ * hasn't already faulted (a self-edge and a dangling one are reported once each, on their own rule,
+ * not folded into a cycle of one). Belt-and-braces, not the check: `bd dep add` refuses to CREATE a
+ * cycle at every write path (hygiene.ts documents the measurement against 1.1.0 and 1.1.2), so this
+ * exists for whatever gets a cycle onto the board some other way — a hand-edited import, a restore
+ * from an older export. Cheap on purpose: a coloured DFS marking exactly the beads ON a loop, not
+ * `bd dep cycles`'s richer per-cycle path — that answer already exists for a human to read; this only
+ * needs the boolean.
+ */
+function blocksCycleMembers(board, byId) {
+  const adj = new Map();
+  for (const bead of board) {
+    for (const dep of bead.dependencies ?? []) {
+      if (dep?.type !== "blocks" || !dep.issue_id || !dep.depends_on_id) continue;
+      if (dep.issue_id === dep.depends_on_id) continue; // blocks-edge-self's fault, not a cycle
+      if (!byId.has(dep.depends_on_id)) continue; // blocks-edge-dangling's fault, not a cycle
+      const edges = adj.get(dep.issue_id);
+      if (edges) edges.push(dep.depends_on_id);
+      else adj.set(dep.issue_id, [dep.depends_on_id]);
+    }
+  }
+
+  const onCycle = new Set();
+  const color = new Map(); // 0 unset · 1 on the current DFS stack · 2 finished
+  const stack = [];
+  const visit = (id) => {
+    color.set(id, 1);
+    stack.push(id);
+    for (const next of adj.get(id) ?? []) {
+      const state = color.get(next) ?? 0;
+      if (state === 0) visit(next);
+      else if (state === 1) {
+        for (let i = stack.length - 1; i >= 0 && stack[i] !== next; i--) onCycle.add(stack[i]);
+        onCycle.add(next);
+      }
+    }
+    stack.pop();
+    color.set(id, 2);
+  };
+  for (const id of adj.keys()) if (!color.has(id)) visit(id);
+  return onCycle;
 }
 
 /** Children by parent id, in board order — the parent graph both walks below read. */

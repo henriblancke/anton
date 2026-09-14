@@ -24,6 +24,13 @@ const feature = (id: string, parent?: string, over: Partial<Bead> = {}) =>
 const task = (id: string, parent?: string, over: Partial<Bead> = {}) =>
   bead(id, "task", { ...(parent ? { parent } : {}), ...over });
 
+/** A `blocks` edge, inlined the way `bd list --json` carries it: on the DEPENDENT's own record. */
+const blocks = (blockedId: string, blockerId: string) => ({
+  issue_id: blockedId,
+  depends_on_id: blockerId,
+  type: "blocks",
+});
+
 /** Rules broken by `id`, so an assertion names the rule rather than matching prose. */
 const rulesFor = (board: Bead[], id: string): StructureRule[] =>
   validateBoardStructure(board)
@@ -73,6 +80,92 @@ describe("validateBoardStructure", () => {
       expect(rulesFor(board, "c1")).toEqual(["parentless-chore"]);
       expect(rulesFor(board, "t1")).toEqual([]);
       expect(rulesFor(board, "b1")).toEqual([]);
+    });
+  });
+
+  describe("blocks edges — the four mechanical ordering faults", () => {
+    it("faults a bead that blocks-depends on itself", () => {
+      const board = [...HEALTHY, task("stuck", "f1", { dependencies: [blocks("stuck", "stuck")] })];
+      expect(rulesFor(board, "stuck")).toEqual(["blocks-edge-self"]);
+      expect(validateBoardStructure(board).find((v) => v.id === "stuck")?.severity).toBe("blocking");
+    });
+
+    it("faults a blocks edge whose target is not on the board", () => {
+      const board = [...HEALTHY, task("stuck", "f1", { dependencies: [blocks("stuck", "ghost")] })];
+      expect(rulesFor(board, "stuck")).toEqual(["blocks-edge-dangling"]);
+      const [violation] = validateBoardStructure(board).filter((v) => v.id === "stuck");
+      expect(violation.message).toContain("ghost");
+      expect(violation.message).toContain("bd dep remove stuck ghost");
+    });
+
+    it("does not fault a blocks edge whose target is a CLOSED bead still on the board", () => {
+      // Closed is a resolved blocker, not a missing one — bd list --status all still carries it.
+      const board = [
+        ...HEALTHY,
+        task("done", "f1", { status: "closed" }),
+        task("waiter", "f1", { dependencies: [blocks("waiter", "done")] }),
+      ];
+      expect(rulesFor(board, "waiter")).toEqual([]);
+    });
+
+    it("does not fault a blocks edge whose target is a `gate` bead — the legitimate case", () => {
+      // Ad-hoc merge gates are a real `blocks` target (121 of them on this project's own board) —
+      // present in the board, just of pipeline type. Presence is all that matters here; type must
+      // never be used to treat a found bead as though it were missing.
+      const board = [
+        ...HEALTHY,
+        bead("gate1", "gate"),
+        task("waiter", "f1", { dependencies: [blocks("waiter", "gate1")] }),
+      ];
+      expect(rulesFor(board, "waiter")).toEqual([]);
+    });
+
+    it("faults a blocks edge on a pair already linked parent-child (parent waiting on its child)", () => {
+      const board = [epic("e1", { dependencies: [blocks("e1", "f1")] }), feature("f1", "e1")];
+      expect(rulesFor(board, "e1")).toEqual(["blocks-duplicates-parent"]);
+    });
+
+    it("faults the same duplicate in the other direction (child waiting on its parent)", () => {
+      const board = [epic("e1"), feature("f1", "e1", { dependencies: [blocks("f1", "e1")] })];
+      expect(rulesFor(board, "f1")).toContain("blocks-duplicates-parent");
+    });
+
+    it("does not fault an ordinary blocks edge between unrelated beads", () => {
+      const board = [
+        ...HEALTHY,
+        task("first", "f1"),
+        task("second", "f1", { dependencies: [blocks("second", "first")] }),
+      ];
+      expect(rulesFor(board, "second")).toEqual([]);
+    });
+
+    it("faults every bead on a blocks cycle", () => {
+      const board = [
+        task("a", undefined, { dependencies: [blocks("a", "b")] }),
+        task("b", undefined, { dependencies: [blocks("b", "c")] }),
+        task("c", undefined, { dependencies: [blocks("c", "a")] }),
+      ];
+      expect(rulesFor(board, "a")).toEqual(["blocks-cycle"]);
+      expect(rulesFor(board, "b")).toEqual(["blocks-cycle"]);
+      expect(rulesFor(board, "c")).toEqual(["blocks-cycle"]);
+    });
+
+    it("does not fault a plain chain that merely converges, with no loop", () => {
+      const board = [
+        task("a", undefined, { dependencies: [blocks("a", "c")] }),
+        task("b", undefined, { dependencies: [blocks("b", "c")] }),
+        task("c"),
+      ];
+      expect(validateBoardStructure(board)).toEqual([]);
+    });
+
+    it("does not double-count a self-edge or a dangling edge as a cycle", () => {
+      const board = [
+        task("self", undefined, { dependencies: [blocks("self", "self")] }),
+        task("dangling", undefined, { dependencies: [blocks("dangling", "ghost")] }),
+      ];
+      expect(rulesFor(board, "self")).toEqual(["blocks-edge-self"]);
+      expect(rulesFor(board, "dangling")).toEqual(["blocks-edge-dangling"]);
     });
   });
 

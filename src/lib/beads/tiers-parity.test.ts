@@ -66,4 +66,31 @@ describe("tiers.mjs agrees with the app's TypeScript predicates", () => {
     const board = [bead("e", "epic"), bead("f", "feature", { parent: "e" }), dropped];
     expect(validateBoardStructure(board).some((v) => v.id === "stray")).toBe(false);
   });
+
+  it("reads a `blocks` edge in the same direction beads.edgesOf does — issue_id is the DEPENDENT", () => {
+    // bd stores `blocks` as (issue_id = dependent, depends_on_id = blocker). A copy that read the
+    // pair backwards would fault the blocker for waiting on its own dependent instead of the other
+    // way round, so pin the direction against the app's own edge reader.
+    const blocker = bead("blocker", "task");
+    const dependent = bead(
+      "dependent",
+      "task",
+      { dependencies: [{ issue_id: "dependent", depends_on_id: "blocker", type: "blocks" }] },
+    );
+    const board = [blocker, dependent];
+    const [edge] = beads.edgesOf(board);
+    expect(edge).toEqual({ from: "dependent", to: "blocker", type: "blocks" });
+    expect(validateBoardStructure(board).some((v) => v.id === edge.from)).toBe(false);
+  });
+
+  it("does not fire blocks-edge-dangling on a `blocks` edge whose target is a `gate` bead", () => {
+    // 121 of this project's own live edges are exactly this shape — a ticket waiting on an ad-hoc
+    // merge gate. A gate found in the board is FOUND, never treated as though it were missing.
+    const gate = bead("gate1", "gate");
+    const waiter = bead("waiter", "task", {
+      dependencies: [{ issue_id: "waiter", depends_on_id: "gate1", type: "blocks" }],
+    });
+    const board = [gate, waiter];
+    expect(validateBoardStructure(board).some((v) => v.rule === "blocks-edge-dangling")).toBe(false);
+  });
 });
