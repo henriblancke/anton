@@ -55,15 +55,16 @@ export interface TicketBudget {
 async function unclaimAndPark(repo: string, ticketId: string, operator: string | undefined): Promise<void> {
   await withBeadWriteLock(repo, ticketId, async () => {
     const fresh = await beads.show(repo, ticketId).catch(() => undefined);
-    if (!fresh || fresh.status !== "in_progress" || !operator || ownerOf(fresh) !== operator) {
-      return;
-    }
+    // `bd update --claim` can resolve its actor independently when anton could not name one. The
+    // post-claim read is then the only authoritative holder to compare-and-swap back to open.
+    const holder = operator ?? (fresh ? ownerOf(fresh) : undefined);
+    if (!fresh || fresh.status !== "in_progress" || !holder || ownerOf(fresh) !== holder) return;
     await safe(() => beads.setStatus(repo, ticketId, "open"));
     // `bd update --status open` preserves the assignee, so another writer cannot land between the
     // status rollback and a later unassign and have their claim stripped. The order deliberately
     // leaves an owner on a failed status write rather than producing an unclaimable in-progress bead.
     const afterStatus = await beads.show(repo, ticketId).catch(() => undefined);
-    if (!afterStatus || afterStatus.status !== "open" || ownerOf(afterStatus) !== operator) return;
+    if (!afterStatus || afterStatus.status !== "open" || ownerOf(afterStatus) !== holder) return;
     await safe(() => beads.unassign(repo, ticketId));
     await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
   });

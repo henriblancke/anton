@@ -284,6 +284,22 @@ describe("claimTicket — clears a stale supersedes edge before running (PR #238
     expect(unassignMock).toHaveBeenCalledWith(REPO, reopened.id);
   });
 
+  it("releases the configured claim when anton could not resolve an operator (PR #238 review)", async () => {
+    // `bd update --claim` resolves its own configured actor even when anton cannot. The post-claim
+    // read is therefore the compare-and-swap baseline the rollback must use.
+    const configuredClaim = { ...claimed, assignee: "bd-configured-op" } as Bead;
+    showMock
+      .mockRejectedValueOnce(new Error("database is locked"))
+      .mockResolvedValueOnce(configuredClaim)
+      .mockResolvedValue({ ...configuredClaim, status: "open" });
+
+    await expect(claimTicket(run(), reopened, undefined)).rejects.toBeInstanceOf(PoisonEpic);
+
+    expect(setStatusMock).toHaveBeenCalledWith(REPO, reopened.id, "open");
+    expect(unassignMock).toHaveBeenCalledWith(REPO, reopened.id);
+    expect(untagMock).toHaveBeenCalledWith(REPO, reopened.id, ["stage:implementing"]);
+  });
+
   it("does not reopen or unassign a settlement that superseded the failed claim read (PR #238 review)", async () => {
     // The cleanup starts only after the failed read. A remote writer can settle the bead before its
     // release re-read; its closed state and assignee must remain theirs rather than be reset to open.

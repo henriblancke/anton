@@ -132,7 +132,7 @@ export async function dispatchRunTickets(
   // THIS branch delivers, not what a later base merge introduced.
   const forkPoint = prep.runStep.baseForkSha;
   const baseRef = prep.runStep.baseRef;
-  const { live, held, dispatchable } = await partitionTickets(run, prep.gated, async (id) => {
+  const { live, held, dispatchable } = await partitionTickets(run, prep, prep.gated, async (id) => {
     try {
       return await worktreeHasCommitFor(prep.worktree.path, id, {
         base: forkPoint,
@@ -266,6 +266,7 @@ function retirementClauses(rs: readonly RetiredTicketOutcome[]): string[] {
 /** The run's tickets, split into what it may dispatch now and what a blocker outside it holds. */
 async function partitionTickets(
   run: EpicRun,
+  prep: Extract<RunPreparation, { done: false }>,
   gated: Set<string>,
   /** Whether THIS branch carries a commit under the ticket's id — the branch's own evidence. */
   hasCommitFor: (ticketId: string) => Promise<boolean>,
@@ -319,11 +320,23 @@ async function partitionTickets(
       live.push(ticket);
       continue;
     }
-    if (await hasCommitFor(ticket.id)) {
-      // A commit proves this branch carries the snapshot's work, not that an operator has not since
+    // A sibling's `Anton-Satisfies` trailer or a verified satisfaction note can account for this
+    // ticket without a `<ticketId>:` subject. Ask the same delivery predicate the dispatch loop
+    // uses before retiring it, or a supersede would erase the PR attribution for work this branch has.
+    const delivery = await branchDelivery(
+      {
+        hasCommitFor,
+        satisfiedBy: (id) => branchSatisfiesTicket(prep.worktree.path, id),
+        notedSatisfiedBy: (candidate) => notedSatisfaction(prep.runStep, candidate),
+        branchAdded: (sha) => branchAddedCommit(run.repo, run.branch, prep.runStep.baseRef, sha),
+      },
+      ticket,
+    );
+    if (delivery) {
+      // A delivery proves this branch carries the snapshot's work, not that an operator has not since
       // reopened or rewritten the ticket (PR #238 review). Read its lifecycle under the same lock as
-      // a no-commit retirement before accepting that commit as delivery: a fresh open bead must run
-      // its current contract, while one still superseded remains a closed delivery in this diff.
+      // a no-commit retirement before accepting that delivery: a fresh open bead must run its current
+      // contract, while one still superseded remains a closed delivery in this diff.
       const fresh = await rereadSupersededTicket(run, ticket);
       // `bd abandon` closes and labels a ticket but does not remove its old `supersedes` edge. A
       // fresh read can therefore still look superseded while recording an operator's later won't-do;

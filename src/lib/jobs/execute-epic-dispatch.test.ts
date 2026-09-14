@@ -34,12 +34,16 @@ vi.mock("./execute-epic-ticket", () => ({
 
 type HasCommitOptions = { base?: string; excludeBase?: string; strict?: boolean };
 const hasCommitMock = vi.fn<(worktree: string, id: string, options?: HasCommitOptions) => Promise<boolean>>();
+const satisfiedByMock = vi.fn();
+const branchAddedMock = vi.fn();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
     ...actual,
     worktreeHasCommitFor: (worktree: string, id: string, options?: HasCommitOptions) =>
       hasCommitMock(worktree, id, options),
+    branchSatisfiesTicket: (...args: unknown[]) => satisfiedByMock(...args),
+    branchAddedCommit: (...args: unknown[]) => branchAddedMock(...args),
   };
 });
 
@@ -161,6 +165,8 @@ beforeEach(() => {
   board = [];
   runTicketMock.mockReset().mockResolvedValue(COMMITTED);
   hasCommitMock.mockReset().mockResolvedValue(false);
+  satisfiedByMock.mockReset().mockResolvedValue(undefined);
+  branchAddedMock.mockReset().mockResolvedValue(true);
   reopenMock.mockReset().mockResolvedValue("");
   // Faithful default: a tag/untag the subsequent `show` reads back on the board bead, so the
   // post-write reread in retireFound sees the marker it just wrote (PR #238 review).
@@ -199,6 +205,22 @@ describe("a ticket the board already holds as superseded", () => {
     // review, it is an open child with nothing in that diff, and the marker is the only thing that
     // keeps merge finalization from closing it as shipped.
     expect(markedNotDelivered()).toEqual(["anton-a"]);
+  });
+
+  it("keeps a superseded ticket whose sibling marker satisfies it in this branch's delta", async () => {
+    satisfiedByMock.mockImplementation(async (_worktree: string, id: string) =>
+      id === "anton-a"
+        ? { sha: "0123456789abcdef0123456789abcdef01234567", subject: "anton-b: cover both", ticketIds: [id] }
+        : undefined,
+    );
+    const run = makeRun([superseded("anton-a", SHIPPER), bead("anton-b")], new AbortController().signal);
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(dispatchedIds()).toEqual(["anton-b"]);
+    expect(outcome.delivered.map((t) => t.id)).toEqual(["anton-a", "anton-b"]);
+    expect(run.retired).toEqual([]);
+    expect(markedNotDelivered()).toEqual([]);
   });
 
   // The snapshot says superseded; the board, read under the ticket's lock, says an operator has
