@@ -164,7 +164,7 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
     loadAllIssuesMock.mockResolvedValue([target, child()]);
 
     await expect(settleCompletedRun(run([target], target), target)).rejects.toThrow(
-      "gained child tickets before anton could settle",
+      "changed after anton verified its already-shipped retirement",
     );
     expect(updateRunMock).not.toHaveBeenCalled();
   });
@@ -176,7 +176,7 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
       .mockResolvedValueOnce([target, child()]);
 
     await expect(settleCompletedRun(run([target], target), target)).rejects.toThrow(
-      "gained child tickets while anton recorded",
+      "changed while anton recorded its already-shipped retirement",
     );
     expect(updateRunMock).toHaveBeenCalledTimes(1);
     expect(updateRunMock).toHaveBeenCalledWith(
@@ -200,7 +200,7 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
     pullMock.mockRejectedValue(new Error("dolt pull: remote unavailable"));
 
     await expect(settleCompletedRun(run([target], target), target)).rejects.toThrow(
-      "gained child tickets before anton could settle",
+      "changed after anton verified its already-shipped retirement",
     );
     expect(loadAllIssuesMock).not.toHaveBeenCalled();
     expect(updateRunMock).not.toHaveBeenCalled();
@@ -213,6 +213,37 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
     expect(await settleCompletedRun(run([target], target), target)).toBe(true);
     expect(pullMock).not.toHaveBeenCalled();
     expect(loadAllIssuesMock).toHaveBeenCalledWith(REPO, { strictGates: true });
+  });
+
+  it("poisons the run when the retirement is reopened while the terminal row is written", async () => {
+    const target = retiredTarget();
+    loadAllIssuesMock
+      .mockResolvedValueOnce([target])
+      .mockResolvedValueOnce([{ ...target, status: "open", dependencies: [] }]);
+
+    await expect(settleCompletedRun(run([target], target), target)).rejects.toThrow(
+      "changed while anton recorded its already-shipped retirement",
+    );
+    expect(updateRunMock).toHaveBeenCalledTimes(1);
+    expect(releaseRunResourcesMock).not.toHaveBeenCalled();
+  });
+
+  it("poisons the run when the retirement gets a different survivor while the terminal row is written", async () => {
+    const target = retiredTarget();
+    loadAllIssuesMock
+      .mockResolvedValueOnce([target])
+      .mockResolvedValueOnce([
+        {
+          ...target,
+          dependencies: [{ type: "supersedes", issue_id: TARGET, depends_on_id: "anton-new-survivor" }],
+        },
+      ]);
+
+    await expect(settleCompletedRun(run([target], target), target)).rejects.toThrow(
+      "changed while anton recorded its already-shipped retirement",
+    );
+    expect(updateRunMock).toHaveBeenCalledTimes(1);
+    expect(releaseRunResourcesMock).not.toHaveBeenCalled();
   });
 
   it("rejects a stamp left by a same-second retirement cycle before the current closure", async () => {

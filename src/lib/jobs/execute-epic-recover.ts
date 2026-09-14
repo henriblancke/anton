@@ -361,9 +361,10 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
   if (closure !== repair.closure) return false;
 
   // The refresh that admitted this settlement and its terminal row write are unordered with other
-  // board writers. Pull before each fence on embedded boards: another machine can publish a child
-  // after the startup refresh, and a local list alone would preserve that stale childless snapshot.
-  const childlessNow = async (): Promise<boolean> => {
+  // board writers. Pull before each fence on embedded boards: another machine can publish a child,
+  // reopen the target, or replace its survivor after the startup refresh. A local list alone would
+  // preserve that stale childless snapshot and let a terminal row claim an obsolete retirement.
+  const retirementStillHeld = async (): Promise<boolean> => {
     if (!isServerMode(repo)) {
       try {
         await beads.pull(repo);
@@ -373,13 +374,16 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
     }
     const current = await mustReadBoard(repo);
     const currentTarget = current?.find((bead) => bead.id === targetId);
-    return Boolean(currentTarget) && !beads.groupsChildren(currentTarget!, runTickets(current!, targetId));
+    if (!current || !currentTarget || beads.groupsChildren(currentTarget, runTickets(current, targetId))) return false;
+    if (currentTarget.status !== "closed" || beads.supersededBy(currentTarget) !== survivor) return false;
+    return (await readCurrentClosureVersion(repo, targetId).catch(() => undefined)) === repair.closure;
   };
-  if (!(await childlessNow())) {
+  if (!(await retirementStillHeld())) {
     throw new PoisonEpic(
-      `${targetId} gained child tickets before anton could settle its already-shipped retirement — ` +
-        `the target is closed and cannot safely switch from a standalone run to a grouped run. ` +
-        `Resolve the board topology before resuming.`,
+      `${targetId} changed after anton verified its already-shipped retirement — it may have gained ` +
+        `child tickets, reopened, or been superseded differently. Anton will not settle a terminal row ` +
+        `for a retirement the board no longer proves. Re-read the target and resolve its current state ` +
+        `before resuming.`,
     );
   }
 
@@ -407,11 +411,11 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
   // safely enter grouped preparation — its claim gate accepts only open targets — and returning false
   // would both continue through that invalid path and leave a terminal row behind. Poison so the
   // attempt's normal settlement records the topology conflict as failed instead of as a false success.
-  if (!(await childlessNow())) {
+  if (!(await retirementStillHeld())) {
     throw new PoisonEpic(
-      `${targetId} gained child tickets while anton recorded its already-shipped retirement — the ` +
-        `target is closed and cannot safely switch from a standalone run to a grouped run. Resolve ` +
-        `the board topology before resuming; anton will not report the retirement as settled.`,
+      `${targetId} changed while anton recorded its already-shipped retirement — it may have gained ` +
+        `child tickets, reopened, or been superseded differently. Anton will not report that earlier ` +
+        `retirement as settled; re-read the target and resolve its current state before resuming.`,
     );
   }
   // Nothing was committed, so the checkout is pure residue and the branch goes with it: the target

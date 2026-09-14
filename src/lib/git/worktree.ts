@@ -472,21 +472,43 @@ export async function createWorktree(opts: {
     // as racy, and this is the race that matters — between the two commands a concurrent anton's
     // teardown reads a fresh, unlocked checkout on the expected branch and force-removes it.
     const lockArgs = claimed ? ["--lock", "--reason", claimLockReason(claimed)] : [];
-    if (await branchExists(repoPath, branch)) {
-      await git(repoPath, ["worktree", "add", ...lockArgs, path, branch]);
-    } else {
+    const createdBranch = !(await branchExists(repoPath, branch));
+    if (createdBranch) {
       await git(repoPath, ["worktree", "add", ...lockArgs, path, "-b", branch, baseBranch]);
+    } else {
+      await git(repoPath, ["worktree", "add", ...lockArgs, path, branch]);
     }
 
-    // Read the new checkout's HEAD *before* warming: the branch was just cut from `baseBranch`, and
-    // warming (or any later fetch) can rewind that ref behind the commit the checkout records. HEAD
-    // is fixed to the creation commit regardless — only read here, not after the warm below.
-    const forkSha = await readForkAtCreation(path);
+    try {
+      // Read the new checkout's HEAD *before* warming: the branch was just cut from `baseBranch`, and
+      // warming (or any later fetch) can rewind that ref behind the commit the checkout records. HEAD
+      // is fixed to the creation commit regardless — only read here, not after the warm below.
+      const forkSha = await readForkAtCreation(path);
 
-    // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
-    // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
-    const resolved = await realpath(path);
-    return { path: resolved, branch, baseBranch, forkSha, repoPath };
+      // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
+      // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
+      const resolved = await realpath(path);
+      return { path: resolved, branch, baseBranch, forkSha, repoPath };
+    } catch (error) {
+      // Returning an unpinned checkout lets a retry classify its branch as reused and derive a fork
+      // against a base ref that may have moved. This checkout did not exist before this call, so tear
+      // it down before exposing that state; retain a pre-existing branch for the run that owns it.
+      await git(repoPath, ["worktree", "unlock", path]).catch(() => undefined);
+      let cleanupFailure: unknown;
+      try {
+        await git(repoPath, ["worktree", "remove", "--force", path]);
+        if (createdBranch) await git(repoPath, ["branch", "-D", branch]);
+      } catch (cleanupError) {
+        cleanupFailure = cleanupError;
+      }
+      if (cleanupFailure) {
+        throw new Error(
+          `[worktree] could not capture ${branch}'s creation fork and could not remove the unpinned ` +
+            `checkout: ${gitError(cleanupFailure)} (original error: ${gitError(error)})`,
+        );
+      }
+      throw error;
+    }
   });
 
   if (warm) {

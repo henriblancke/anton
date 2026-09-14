@@ -110,7 +110,7 @@ export function repairLabel(
 
 /** A repair stamp's exact shape, so no unrelated `repair`-ish label is ever read as one. */
 const REPAIR_LABEL = new RegExp(
-  `^${REPAIR_NAMESPACE}:([a-z-]+):([0-9a-f]{${FINGERPRINT_HASH_LENGTH}}):(\\d+)(?::([A-Za-z0-9_-]+)(?::([A-Za-z0-9_-]+))?)?$`,
+  `^${REPAIR_NAMESPACE}:([a-z-]+):([0-9a-f]{${FINGERPRINT_HASH_LENGTH}}):(\\d+)(?::([A-Za-z0-9._-]+)(?::([A-Za-z0-9._-]+))?)?$`,
 );
 
 /** One repair anton already made on a bead, as the board remembers it. */

@@ -204,6 +204,17 @@ describe("the stamp on the bead", () => {
     expect(repair?.closure).toBeUndefined();
   });
 
+  it("parses closure provenance whose survivor is a nested bead", () => {
+    const closure = "closure-version";
+    const survivor = "anton-287p.1";
+    const repair = priorRepair(
+      bead([repairLabel(BEAD, "already-shipped", T0, closure, survivor)]),
+      "already-shipped",
+    );
+
+    expect(repair).toMatchObject({ closure, survivor });
+  });
+
   it("keeps a stamped repair when only its note fails to write", async () => {
     // The label is already durable at that point, so rejecting would hand the caller a failed
     // outcome it rolls back — leaving the bead suppressed for a repair that no longer exists.

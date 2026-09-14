@@ -281,7 +281,8 @@ suite("worktree manager (real git)", () => {
       await expect(createWorktree({ repoPath: repo, branch, warm: true })).rejects.toThrow(
         "object database unavailable",
       );
-      expect(existsSync(join(worktreePathFor(repo, branch), "node_modules"))).toBe(false);
+      expect(existsSync(worktreePathFor(repo, branch))).toBe(false);
+      expect(await branchExists(repo, branch)).toBe(false);
     } finally {
       shim.restore();
       delete process.env[WARM_COMMAND_ENV];
