@@ -26,14 +26,22 @@ vi.mock("./bd", async () => {
   };
 });
 
-const { allIssues, loadAllIssues, readAllIssues, refreshAllIssues } = await import("./issues");
+const {
+  allIssues,
+  loadAllIssues,
+  probeCycleEvidence,
+  readAllIssues,
+  refreshAllIssues,
+  resetCycleProbes,
+} = await import("./issues");
 const { cycleEvidenceFor } = await import("./cycle-evidence");
-const { resetIssueSnapshots } = await import("./snapshot");
+const { issueSnapshotVersion, resetIssueSnapshots } = await import("./snapshot");
 
 const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
 beforeEach(() => {
   resetIssueSnapshots();
+  resetCycleProbes();
   listMock.mockReset();
   cyclesMock.mockReset();
   cyclesMock.mockResolvedValue([]);
@@ -203,5 +211,51 @@ describe("loadAllIssues", () => {
     );
 
     expect((await loadAllIssues(REPO)).map((b) => b.id)).toEqual(["t-1", "g-1", "g-2"]);
+  });
+});
+
+describe("probeCycleEvidence (PR #274 review, round 3)", () => {
+  it("shares one in-flight probe per repository instead of spawning one per call", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    let resolveCycles!: (evidence: unknown) => void;
+    cyclesMock.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveCycles = resolve; }),
+    );
+
+    // Warm the snapshot without cycle evidence first, matching what the poll route does.
+    await allIssues(REPO);
+
+    probeCycleEvidence(REPO);
+    probeCycleEvidence(REPO);
+
+    // Both calls landed before the CLI call settled — only the first should have spawned it.
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+
+    resolveCycles([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    await vi.waitFor(async () =>
+      expect(cycleEvidenceFor(await allIssues(REPO))).toEqual([
+        { ids: ["t-1"], raw: { cycle: ["t-1"] } },
+      ]),
+    );
+  });
+
+  it("bumps the snapshot version only for the probe that attaches evidence, not every success", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await allIssues(REPO);
+    const before = issueSnapshotVersion(REPO);
+
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(issueSnapshotVersion(REPO)).toBe(before + 1));
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+
+    // Evidence is already attached to the retained board, so this probe must not re-fetch or
+    // bump the version again.
+    probeCycleEvidence(REPO);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+    expect(issueSnapshotVersion(REPO)).toBe(before + 1);
   });
 });

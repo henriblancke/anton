@@ -190,6 +190,22 @@ export function probeAllIssues(cwd: string): void {
   probeIssueSnapshot(cwd, () => loadAllIssues(cwd));
 }
 
+/** Per-repo in-flight cycle-evidence probe, so concurrent pollers (multiple open tabs, a slow or
+ * failing `bd`) share one `bd dep cycles` call instead of each spawning their own CLI process.
+ * Global-keyed for the reason {@link onBoardChanged}'s registry is: a module-scoped map would leave
+ * a probe started from one Next.js module registry invisible to a caller in another. */
+const CYCLE_PROBES_KEY = Symbol.for("anton.beads.cycleProbes");
+
+function cycleProbes(): Map<string, Promise<void>> {
+  const global = globalThis as unknown as Record<symbol, Map<string, Promise<void>> | undefined>;
+  return (global[CYCLE_PROBES_KEY] ??= new Map());
+}
+
+/** Test-only reset; runtime code should let in-flight probes finish and remove themselves. */
+export function resetCycleProbes(): void {
+  cycleProbes().clear();
+}
+
 /**
  * Nudge a stuck cycle-evidence gap toward recovery without making the caller wait (PR #274 review,
  * round 2 on this file: a failed `bd dep cycles` call has no retry path once the poll stops reaching
@@ -204,20 +220,37 @@ export function probeAllIssues(cwd: string): void {
  * the CURRENTLY retained snapshot and, on success, attaches it AND bumps the snapshot version, so a
  * poll that already matched the pre-recovery token stops 304-ing and rebuilds the board with the
  * evidence startability needs.
+ *
+ * A repository with a probe already in flight is a no-op call (PR #274 review, round 3: without this
+ * guard, several concurrent pollers each launch their own `bd dep cycles` process and each bumps the
+ * version on success — avoidable Dolt contention and repeated full board rebuilds for evidence one
+ * call already retrieves). The version bump itself stays conditional on the retained board actually
+ * lacking evidence at the moment this probe's `bd` call lands, so only the probe that transitions the
+ * snapshot from missing to present pays for a rebuild.
  */
 export function probeCycleEvidence(cwd: string): void {
-  void (async () => {
-    try {
-      const board = await getIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, {
-        blockOnPendingWrite: false,
-      });
-      if (cycleEvidenceFor(board) !== undefined) return;
-      attachCycleEvidence(board, await beads.depCycles(cwd));
-      markCycleEvidenceRecovered(cwd);
-    } catch {
-      // Still unavailable — the next probe (or an explicit `withCycles` read) retries.
-    }
-  })();
+  const probes = cycleProbes();
+  if (probes.has(cwd)) return;
+  // No stale-clobber guard needed on cleanup: the has-check above guarantees at most one probe
+  // per repo is ever registered at a time, unlike `entry.refresh` in snapshot.ts which a write can
+  // orphan mid-flight.
+  probes.set(
+    cwd,
+    (async () => {
+      try {
+        const board = await getIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, {
+          blockOnPendingWrite: false,
+        });
+        if (cycleEvidenceFor(board) !== undefined) return;
+        attachCycleEvidence(board, await beads.depCycles(cwd));
+        markCycleEvidenceRecovered(cwd);
+      } catch {
+        // Still unavailable — the next probe (or an explicit `withCycles` read) retries.
+      } finally {
+        probes.delete(cwd);
+      }
+    })(),
+  );
 }
 
 /**
