@@ -138,9 +138,9 @@ export async function resolveProjectSpend(
  * The meter a governed project actually paces against (anton-gnvw): its router's own usage when
  * routed through a gateway, the tick's account-wide read otherwise. `getRouterUsageCached` already
  * carries the short-TTL cache + single-flight + 429 backoff, keyed per (baseUrl, connectionId) — so
- * two routed projects sharing one router connection in the same tick still take one request, and a
- * router that cannot be read (no creds, a timeout, a non-200, a malformed body) collapses to `null`,
- * the same fail-open value `accountUsage` already carries when the Anthropic endpoint is down.
+ * two routed projects sharing one router connection in the same tick still take one request. A router
+ * or settings read that cannot be completed collapses to `null`; only successfully read, genuinely
+ * unrouted settings use the account meter.
  */
 export async function resolveProjectUsage(
   projectId: string | null,
@@ -173,10 +173,11 @@ async function resolveProjectMeter(
   readRouter: typeof getRouterUsageCached,
 ): Promise<ClaudeUsage | null> {
   if (!projectId) return accountUsage();
-  const settings = await getProjectSettings(getDb(), projectId).catch(() => null);
-  const baseUrl = settings?.claudeBaseUrl?.trim();
-  const connectionId = settings?.routerConnectionId?.trim();
-  if (!settings || !baseUrl || !connectionId) return accountUsage(); // unrouted → today's meter
+  const settings = await getProjectSettings(getDb(), projectId).catch(() => undefined);
+  if (settings === undefined) return null;
+  const baseUrl = settings.claudeBaseUrl?.trim();
+  const connectionId = settings.routerConnectionId?.trim();
+  if (!baseUrl || !connectionId) return accountUsage(); // unrouted → today's meter
   // Routed: the account meter is not this project's traffic, so it is never read on its behalf —
   // `accountUsage` goes uncalled and a router-only board makes no Anthropic request this tick.
   return readRouter(settings).catch(() => null);

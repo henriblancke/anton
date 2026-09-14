@@ -10,6 +10,7 @@ import { applyMigrationFile, applyMigrationsTo } from "./testing";
 
 const MIGRATION = "0038_quota_meter_history.sql";
 const INDEX_MIGRATION = "0039_common_scarlet_spider.sql";
+const BACKFILL_MIGRATION = "0040_legacy-quota-attempt-backfill.sql";
 
 /** Read a migration's documented reverse recipe so its executable steps cannot drift from the header. */
 function reverseStatements(migration: string = MIGRATION): string[] {
@@ -33,7 +34,7 @@ beforeEach(() => {
     .run();
   sqlite
     .prepare(
-      "insert into jobs (id, type, project_id, status) values ('job', 'execute-epic', 'project', 'done')",
+      "insert into jobs (id, type, project_id, status, spent_attempts, updated_at) values ('job', 'execute-epic', 'project', 'done', 2, unixepoch())",
     )
     .run();
   sqlite
@@ -46,12 +47,45 @@ beforeEach(() => {
 afterEach(() => sqlite.close());
 
 describe("drizzle/0038 — quota meter history", () => {
-  it("backfills historical burn samples to Anthropic without inventing attempt history", () => {
+  it("carries legacy unrouted attempts forward on the prior weekly approximation", () => {
     applyMigrationFile(sqlite, MIGRATION);
+    applyMigrationFile(sqlite, BACKFILL_MIGRATION);
 
     expect(sqlite.prepare("select meter_key from burn_samples where id = 'sample'").get()).toEqual({
       meter_key: "anthropic",
     });
+    expect(
+      sqlite
+        .prepare("select job_id, project_id, job_type, meter_key, count(*) as n from quota_attempts group by job_id, project_id, job_type, meter_key")
+        .get(),
+    ).toEqual({
+      job_id: "job",
+      project_id: "project",
+      job_type: "execute-epic",
+      meter_key: "anthropic",
+      n: 2,
+    });
+  });
+
+  it("fills only the legacy gap when a machine already wrote ledger attempts", () => {
+    applyMigrationFile(sqlite, MIGRATION);
+    sqlite
+      .prepare("insert into quota_attempts (id, job_id, project_id, job_type, meter_key) values ('current', 'job', 'project', 'execute-epic', 'anthropic')")
+      .run();
+
+    applyMigrationFile(sqlite, BACKFILL_MIGRATION);
+
+    expect(sqlite.prepare("select count(*) as n from quota_attempts").get()).toEqual({ n: 2 });
+  });
+
+  it("does not guess router history", () => {
+    applyMigrationFile(sqlite, MIGRATION);
+    sqlite
+      .prepare("update projects set settings_json = ? where id = 'project'")
+      .run(JSON.stringify({ claudeBaseUrl: "https://router.example/v1", routerConnectionId: "conn_1" }));
+
+    applyMigrationFile(sqlite, BACKFILL_MIGRATION);
+
     expect(sqlite.prepare("select count(*) as n from quota_attempts").get()).toEqual({ n: 0 });
   });
 

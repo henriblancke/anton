@@ -525,13 +525,32 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
     expect(account.calls()).toBe(0);
   });
 
-  it("falls back to the account usage when settings cannot be read at all", async () => {
-    // No project row for this id — getProjectSettings fails soft to {} in practice, but this
-    // resolver's own catch is what protects the governor from a hard settings-read failure.
+  it("falls back to the account usage for a successfully read but missing project", async () => {
+    // A missing row is an actual `{}` settings result, so it remains byte-identical to today's
+    // unrouted behavior. A rejected settings read is distinct and must not borrow the account meter.
     const account = accountThunk();
 
     expect(await resolveProjectUsage("missing", account.read)).toBe(ACCOUNT_USAGE);
     expect(account.calls()).toBe(1);
+  });
+
+  it("fails open when the project's settings cannot be reread", async () => {
+    project("routed", {
+      claudeBaseUrl: "https://gw.example.com",
+      claudeAuthTokenEnv: "GW_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+    const select = tdb.db.select.bind(tdb.db);
+    const selects = vi.spyOn(tdb.db, "select").mockImplementation(((columns?: Record<string, unknown>) => {
+      if (columns && "settingsJson" in columns) throw new Error("db read failed");
+      return select(columns as never);
+    }) as typeof tdb.db.select);
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage("routed", account.read)).toBeNull();
+    expect(account.calls()).toBe(0);
+
+    selects.mockRestore();
   });
 
   it("returns the account usage unchanged for the null-project bucket", async () => {

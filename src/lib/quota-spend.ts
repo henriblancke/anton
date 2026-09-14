@@ -50,10 +50,9 @@ export function weeklyWindowStart(usage: ClaudeUsage | null, now: number): numbe
  * `running` has already spent most of what it will. Rows with no attempt yet contribute nothing, so
  * a project that has only ENQUEUED work stays unattributed rather than reading as a measured zero.
  *
- * Summed from `spentAttempts`, not `attempts`: the latter is the retry budget, and `resumeJob` zeroes
- * it so an un-parked job gets a fresh run at `maxAttempts`. A meter on that column forgot every
- * attempt a job had burned the moment it was resumed, and each park/resume cycle handed the project
- * its share back (PR #248 review).
+ * Read from the append-only `quota_attempts` ledger, which freezes the meter and timestamp when
+ * Claude is reached. The legacy `attempts` retry budget is mutable, and the row-level
+ * `spentAttempts` diagnostic cannot preserve either fact after a route changes or a job resumes.
  */
 async function attemptsByProject(
   db: AntonDb,
