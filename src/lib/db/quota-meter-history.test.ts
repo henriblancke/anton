@@ -1,7 +1,6 @@
 /**
- * Meter-attribution migration (drizzle/0038): old burn rows were captured before projects could
- * route quota through a gateway, while future attempt rows need an immutable meter ledger. The
- * upgrade must preserve the former as the Anthropic default without inventing router history.
+ * Meter-attribution migration (drizzle/0038) preserves historical samples as Anthropic, while the
+ * follow-up index (0039) keeps a routed meter's global rolling average bounded as history grows.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
@@ -10,10 +9,11 @@ import { join } from "node:path";
 import { applyMigrationFile, applyMigrationsTo } from "./testing";
 
 const MIGRATION = "0038_quota_meter_history.sql";
+const INDEX_MIGRATION = "0039_common_scarlet_spider.sql";
 
-/** Read the documented reverse recipe so its executable steps cannot drift from the header. */
-function reverseStatements(): string[] {
-  return readFileSync(join(process.cwd(), "drizzle", MIGRATION), "utf8")
+/** Read a migration's documented reverse recipe so its executable steps cannot drift from the header. */
+function reverseStatements(migration: string = MIGRATION): string[] {
+  return readFileSync(join(process.cwd(), "drizzle", migration), "utf8")
     .split("\n")
     .flatMap((line) => (line.startsWith("--   ") ? [line.slice(5).trim()] : []));
 }
@@ -70,6 +70,27 @@ describe("drizzle/0038 — quota meter history", () => {
       (index) => index.name,
     );
     expect(indexes).toContain("quota_attempts_meter_created_project_idx");
+  });
+
+  it("indexes global meter-specific burn reads and reverses cleanly", () => {
+    applyMigrationFile(sqlite, MIGRATION);
+    applyMigrationFile(sqlite, INDEX_MIGRATION);
+
+    const explain = (
+      sqlite
+        .prepare(
+          "explain query plan select * from burn_samples where job_type = ? and meter_key = ? order by created_at desc limit 5",
+        )
+        .all("execute-epic", "anthropic") as { detail: string }[]
+    )
+      .map((row) => row.detail)
+      .join(" ");
+    expect(explain).toContain("burn_samples_type_meter_created_idx");
+
+    for (const statement of reverseStatements(INDEX_MIGRATION)) sqlite.exec(statement);
+    expect(
+      (sqlite.pragma("index_list(burn_samples)") as { name: string }[]).map((index) => index.name),
+    ).not.toContain("burn_samples_type_meter_created_idx");
   });
 
   it("reverses with the documented recipe while preserving the pre-migration rows", () => {

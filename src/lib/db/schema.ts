@@ -219,9 +219,10 @@ export const burnSamples = sqliteTable(
     createdAt: ts("created_at").notNull().default(now),
   },
   (table) => [
-    // Serve the "most recent N samples for this type" query without a full scan. Kept alongside the
-    // per-project index: the per-type average is still read globally for cost estimates.
+    // Serve the legacy global type-only estimate; the meter-specific global read has its own index.
     index("burn_samples_type_created_idx").on(table.jobType, table.createdAt),
+    // Serve "most recent N samples for this type and meter" without post-filtering other meters.
+    index("burn_samples_type_meter_created_idx").on(table.jobType, table.meterKey, table.createdAt),
     // Serve "most recent N samples for this project, type and meter" — the per-project spend read.
     index("burn_samples_project_type_meter_created_idx").on(
       table.projectId,
