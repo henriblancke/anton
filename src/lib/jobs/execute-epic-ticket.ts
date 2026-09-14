@@ -83,7 +83,7 @@ export async function runTicket(args: {
   const { ctx, worktreePath } = run;
   const closeOnDone = args.closeOnDone ?? true;
 
-  await claimTicket(run, ticket, operator);
+  const claimedOperator = await claimTicket(run, ticket, operator);
   const session = await openTicketSession(run, ticket);
   const budget = startTicketBudget(ctx, timeoutMs, (remainingMs) =>
     warnBudgetRunningOut(session.logPath, ticket, timeoutMs, remainingMs),
@@ -119,7 +119,7 @@ export async function runTicket(args: {
       progress,
       timeoutMs,
       standalone,
-      operator,
+      operator: claimedOperator,
       e,
     });
   } finally {

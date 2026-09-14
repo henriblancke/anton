@@ -450,6 +450,42 @@ describe("the delivery-evidence gate — zero diff still blocks and halts (anton
     expect(logged).toContain(`[aborted] ${TICKET_ID} was aborted mid-run`);
   });
 
+  it("rejects a verified claim when bd's configured holder changed while the agent ran", async () => {
+    readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40), committedAt: "2026-01-01T00:00:00Z" });
+    let targetReads = 0;
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id !== TICKET_ID) return shown(id);
+      targetReads += 1;
+      // Anton has no identity, but bd's authoritative post-claim read establishes its configured
+      // actor. The repair's fresh read then sees another holder take over while the agent ran.
+      return {
+        ...shown(id),
+        assignee: targetReads === 1 ? "bd-configured-op" : "other-operator",
+      };
+    });
+
+    const halt = await runTicket({
+      run: run(),
+      steps: steps(
+        { outcome: "blocked", klass: "already-shipped", reason: `Already implemented by ${SHIPPED_ID}` },
+        false,
+      ),
+      ticket: ticket(),
+      runTicketIds: [TICKET_ID],
+      timeoutMs: Infinity,
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+
+    expect(halt).toBeDefined();
+    expect(halt!.message).toMatch(/produced no delivery/);
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(setStatusMock).toHaveBeenCalledWith(REPO, TICKET_ID, "blocked");
+    const refusal = notesWritten().find((n) => n.includes("did not repair this as `already-shipped`"));
+    expect(refusal).toContain("claimed by `other-operator` now, not held for `bd-configured-op`");
+  });
+
   it("retires a verified claim when the signal never fires, closing the ticket against its survivor", async () => {
     readCommitNamingMock.mockResolvedValue({ state: "found", sha: "b".repeat(40), committedAt: "2026-01-01T00:00:00Z" });
 

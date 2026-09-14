@@ -78,7 +78,7 @@ export async function claimTicket(
   run: Omit<StepContext, "tickets">,
   ticket: Bead,
   operator: string | undefined,
-): Promise<void> {
+): Promise<string | undefined> {
   const repo = run.repoPath;
   // Claim the ticket for the operator as a HARD GATE before doing any work. On a shared board
   // the claim is the cross-operator coordination primitive (anton-live-sync R6): a failure here
@@ -176,6 +176,9 @@ export async function claimTicket(
   void beads
     .sync(repo)
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
+  // `bd update --claim` may resolve its configured actor when anton could not. Carry the
+  // authoritative post-claim assignee into settlement so the repair can detect a later reassignment.
+  return ownerOf(claimed);
 }
 
 /**
