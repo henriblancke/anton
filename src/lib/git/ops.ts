@@ -741,9 +741,18 @@ const REAP_POLL_MS = 25;
  */
 const REAP_CEILING_MS = 2_000;
 
-function commitTimeoutMs(): number {
+/**
+ * Resolve the commit budget: `requested` (from a caller who knows the project's setting) falling
+ * back to {@link DEFAULT_COMMIT_TIMEOUT_MS}, then CAPPED by {@link COMMIT_TIMEOUT_ENV} when that
+ * env var is set to a valid positive number. A cap rather than an override so a caller asking for
+ * a real 30-minute setting still gets bounded by the env var (`src/lib/beads/config.mjs`'s
+ * `budgetMs` is the same pattern) — the reap-suite tests above shrink the env var specifically to
+ * make a hook outlive the kill, and would go green-but-meaningless under an override.
+ */
+function commitTimeoutMs(requested?: number): number {
+  const passed = requested ?? DEFAULT_COMMIT_TIMEOUT_MS;
   const raw = Number(process.env[COMMIT_TIMEOUT_ENV]);
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_COMMIT_TIMEOUT_MS;
+  return Number.isFinite(raw) && raw > 0 ? Math.min(passed, raw) : passed;
 }
 
 /**
@@ -808,10 +817,11 @@ function reapCommitGroup(child: ChildProcess): Promise<void> {
  * tell a timeout from git's own non-zero exit by it (see {@link exitedWith}).
  */
 function commitTimedOut(args: string[], timeoutMs: number, stderr: string): Error {
+  const minutes = (timeoutMs / 60_000).toFixed(1);
   return Object.assign(
     new Error(
-      `git ${args[0]} timed out after ${timeoutMs}ms and was killed with everything it spawned: ` +
-        stderr,
+      `git ${args[0]} timed out after ${minutes} minute(s) (this project's "Commit timeout" ` +
+        `setting) and was killed with everything it spawned: ${stderr}`,
     ),
     { killed: true },
   );
@@ -840,7 +850,12 @@ function commitFailed(args: string[], code: number | null, stderr: string): Erro
  * Only the KILL path reaps. A commit that ends on its own already waited for its hooks — git runs
  * them synchronously — so there is nothing left to wait for.
  */
-function gitCommit(cwd: string, args: string[], hooksPath?: string): Promise<void> {
+function gitCommit(
+  cwd: string,
+  args: string[],
+  hooksPath?: string,
+  requestedTimeoutMs?: number,
+): Promise<void> {
   return new Promise((resolvePromise, reject) => {
     const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
     // stdout is dropped rather than piped: nothing here reads it, and a chatty hook filling an
@@ -850,7 +865,7 @@ function gitCommit(cwd: string, args: string[], hooksPath?: string): Promise<voi
       detached: process.platform !== "win32",
     });
     const stderr = boundedStderr(child);
-    const timeoutMs = commitTimeoutMs();
+    const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
     let killing = false;
     let settled = false;
     const settle = (emit: () => void) => {
@@ -1141,7 +1156,7 @@ export async function stageAll(worktreePath: string, hooksPath?: string): Promis
 export async function commitAll(
   worktreePath: string,
   message: string,
-  options: { bypassHooks?: boolean; hooksPath?: string } = {},
+  options: { bypassHooks?: boolean; hooksPath?: string; timeoutMs?: number } = {},
 ): Promise<{ committed: boolean }> {
   await stageAll(worktreePath, options.hooksPath);
   const bypass = options.bypassHooks ? ["--no-verify"] : [];
@@ -1150,7 +1165,12 @@ export async function commitAll(
     await git(worktreePath, ["diff", "--cached", "--quiet"]);
     return { committed: false };
   } catch {
-    await gitCommit(worktreePath, ["commit", ...bypass, "-m", message], options.hooksPath);
+    await gitCommit(
+      worktreePath,
+      ["commit", ...bypass, "-m", message],
+      options.hooksPath,
+      options.timeoutMs,
+    );
     return { committed: true };
   }
 }
@@ -1225,7 +1245,7 @@ export async function isAncestor(
 export async function commitMarker(
   worktreePath: string,
   message: string,
-  options: { satisfies?: string[]; hooksPath?: string } = {},
+  options: { satisfies?: string[]; hooksPath?: string; timeoutMs?: number } = {},
 ): Promise<void> {
   // `--allow-empty` PERMITS an empty commit; it does not FORCE one. Anything a caller happened to
   // leave staged would ship under a message saying this commit is empty, so the index is pinned to
@@ -1242,6 +1262,7 @@ export async function commitMarker(
     worktreePath,
     ["commit", "--allow-empty", "--no-verify", "-m", body],
     options.hooksPath,
+    options.timeoutMs,
   );
 }
 

@@ -3072,6 +3072,52 @@ suite("commitAll (real git · a hook that outlives the kill)", () => {
       expect(existsSync(marker)).toBe(true);
     },
   );
+
+  // anton-b3it: the env var is a CAP on a caller's requested budget, not an override — a caller
+  // asking for a real 30-minute setting must still be bounded by it.
+  it.runIf(process.platform !== "win32")(
+    "caps a caller's requested timeoutMs at the env value instead of honoring it",
+    async () => {
+      process.env[COMMIT_TIMEOUT_ENV] = "2000";
+      const start = Date.now();
+
+      await expect(
+        commitAll(repo, "t1: work the hook is sitting on", { timeoutMs: 30 * 60_000 }),
+      ).rejects.toThrow(/timed out/);
+
+      // Killed at the 2s cap, nowhere near the 30-minute request.
+      expect(Date.now() - start).toBeLessThan(15_000);
+      expect(existsSync(started)).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "bounds the commit by the passed timeoutMs when no env override is set",
+    async () => {
+      delete process.env[COMMIT_TIMEOUT_ENV];
+      const start = Date.now();
+
+      await expect(
+        commitAll(repo, "t1: work the hook is sitting on", { timeoutMs: 2_000 }),
+      ).rejects.toThrow(/timed out/);
+
+      expect(Date.now() - start).toBeLessThan(15_000);
+      expect(existsSync(started)).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "names the effective budget in minutes and points at the project's Commit timeout setting",
+    async () => {
+      delete process.env[COMMIT_TIMEOUT_ENV];
+
+      await expect(
+        commitAll(repo, "t1: work the hook is sitting on", { timeoutMs: 2_000 }),
+      ).rejects.toThrow(/timed out after 0\.0 minute\(s\).*Commit timeout/);
+    },
+  );
 });
 
 // PR #228 review: the marker is EMPTY, so it is made with this project's hooks bypassed — the only
