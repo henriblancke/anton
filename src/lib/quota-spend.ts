@@ -179,10 +179,19 @@ export async function quotaShareProjects(now: number = Date.now()): Promise<Quot
       return getRouterUsageCached(stored).catch(() => null);
     }),
   );
-  const meterWindows = new Map<string, number>();
+  // One connection can have credentials that differ between projects. A rejected credential must not
+  // replace a successful read of that same meter's reset window merely because it was listed later.
+  const usageByMeter = new Map<string, ClaudeUsage | null>();
   for (const [index, stored] of settings.entries()) {
-    meterWindows.set(quotaMeterKey(stored), weeklyWindowStart(meterUsage[index] ?? null, now));
+    const meterKey = quotaMeterKey(stored);
+    const usage = meterUsage[index] ?? null;
+    if (!usageByMeter.has(meterKey) || (usage && !usageByMeter.get(meterKey))) {
+      usageByMeter.set(meterKey, usage);
+    }
   }
+  const meterWindows = new Map(
+    [...usageByMeter].map(([meterKey, usage]) => [meterKey, weeklyWindowStart(usage, now)]),
+  );
   const attemptsByMeter = new Map(
     await Promise.all(
       [...meterWindows].map(async ([meterKey, since]) => [

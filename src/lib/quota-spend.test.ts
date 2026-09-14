@@ -40,7 +40,9 @@ vi.mock("./claude/router-usage", async () => {
   return {
     ...actual,
     getRouterUsageCached: async (settings: ProjectSettings) =>
-      routerUsageForTest.get(settings.routerConnectionId ?? "") ?? null,
+      routerUsageForTest.get(`${settings.routerConnectionId ?? ""}:${settings.claudeAuthTokenEnv ?? ""}`) ??
+      routerUsageForTest.get(settings.routerConnectionId ?? "") ??
+      null,
   };
 });
 vi.mock("./quota-eligibility", async () => {
@@ -295,6 +297,42 @@ describe("quotaShareProjects", () => {
         expect.objectContaining({ id: routerB, meterKey: meterB, spentWeeklyPct: 4 }),
       ]),
     );
+  });
+
+  it("keeps a successful weekly reset for a shared meter when another project's credential fails", async () => {
+    const valid = insertProject(tdb.db, { id: "valid", slug: "valid", name: "Valid", repoPath: "/tmp/valid" });
+    const rejected = insertProject(tdb.db, { id: "rejected", slug: "rejected", name: "Rejected", repoPath: "/tmp/rejected" });
+    const settings = (tokenEnv: string): ProjectSettings => ({
+      budgetAware: true,
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: tokenEnv,
+      routerConnectionId: "shared",
+    });
+    await setSettings(valid, settings("VALID_ROUTER_TOKEN"));
+    await setSettings(rejected, settings("REJECTED_ROUTER_TOKEN"));
+
+    const meter = "router:https://router.example/api/usage/shared";
+    routerUsageForTest.set("shared:VALID_ROUTER_TOKEN", {
+      ...usage(),
+      weeklyResetAt: new Date(NOW + 6 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+    routerUsageForTest.set("shared:REJECTED_ROUTER_TOKEN", null);
+    await seedSamples(valid, 2, meter);
+    await seedSamples(rejected, 2, meter);
+    const stale = await seedJob(valid, { status: "done", attempts: 1, meterKey: meter, id: "stale" });
+    await seedJob(valid, { status: "done", attempts: 1, meterKey: meter });
+    await seedJob(rejected, { status: "done", attempts: 1, meterKey: meter });
+    await tdb.db
+      .update(schema.quotaAttempts)
+      .set({ createdAt: new Date(NOW - 3 * 24 * 60 * 60 * 1000) })
+      .where(eq(schema.quotaAttempts.jobId, stale));
+
+    const shares = await quotaShareProjects(NOW);
+
+    expect(shares).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: valid, spentWeeklyPct: 2 }),
+      expect.objectContaining({ id: rejected, spentWeeklyPct: 2 }),
+    ]));
   });
 
   it("does not read Anthropic usage for a router-only board", async () => {
