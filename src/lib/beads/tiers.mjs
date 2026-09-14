@@ -70,6 +70,30 @@ const isFeature = (bead) => bead.issue_type === "feature";
 export const isContainer = (bead, board) =>
   isEpic(bead) && board.some((c) => c.issue_type === "feature" && parentOf(c) === bead.id);
 
+/**
+ * The card (a `feature`, or a non-container `epic` in the pre-tier fallback) whose run actually
+ * dispatches `bead` as one of its tickets — the same ancestor `ticket-view.boardCards.cardOf`
+ * resolves, reimplemented here rather than imported because `tiers.mjs` ships standalone in the
+ * release bundle (see file banner) and can't pull in the TS view layer.
+ *
+ * Undefined means no run dispatches this bead's PARENT alongside it: either a container epic sits
+ * on the chain (the existing `ticket-under-container-epic` fault), or the walk runs off a parentless
+ * bead first — the shape of a task/bug's own child, since `selectRunTickets` executes a parentless
+ * task/bug as a run of one (`[target]`) and never groups its children the way a feature does.
+ */
+function dispatchOwnerOf(bead, byId, board) {
+  const seen = new Set([bead.id]);
+  let parentId = parentOf(bead);
+  while (parentId && !seen.has(parentId)) {
+    const parent = byId.get(parentId);
+    if (!parent) return undefined;
+    if (isFeature(parent) || (isEpic(parent) && !isContainer(parent, board))) return parent.id;
+    seen.add(parentId);
+    parentId = parentOf(parent);
+  }
+  return undefined;
+}
+
 /** A bead is judged only while it is live work: closed is history, abandoned is a won't-do. */
 function isJudged(bead) {
   return (
@@ -138,8 +162,17 @@ export function validateBoardStructure(board, { cycles } = {}) {
 
       const partnerOfParent = parentOf(bead) === blockerId ? "parent" : parentOf(blocker) === bead.id ? "child" : null;
       // Ticket nesting assigns ownership, not dispatch order: a feature run dispatches both a task and
-      // its subtask, so their explicit `blocks` edge is the only order the executor can observe.
-      const bothDispatchedTickets = isTicketType(bead) && isTicketType(blocker);
+      // its subtask, so their explicit `blocks` edge is the only order the executor can observe. Type
+      // alone can't tell that apart from a parentless task/bug (a run of ONE — `selectRunTickets`
+      // executes `[target]`, never the task's own children): typing both endpoints as tickets is true
+      // in both shapes, so the exemption must also require they land in the SAME dispatched ticket set
+      // ({@link dispatchOwnerOf}), not merely that both carry a ticket-tier type.
+      const dispatchOwner = dispatchOwnerOf(bead, byId, board);
+      const bothDispatchedTickets =
+        isTicketType(bead) &&
+        isTicketType(blocker) &&
+        dispatchOwner !== undefined &&
+        dispatchOwner === dispatchOwnerOf(blocker, byId, board);
       if (partnerOfParent && !bothDispatchedTickets) {
         fault(
           bead.id,

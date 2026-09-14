@@ -141,6 +141,18 @@ describe("validateBoardStructure", () => {
       expect(rulesFor(board, "subtask")).toEqual([]);
     });
 
+    it("faults a ticket-type child of a PARENTLESS task/bug run target — same shape, not dispatched", () => {
+      // "parent" here is itself a run target (`isRunTarget` admits a parentless task/bug), but a
+      // standalone run of one — `selectRunTickets` executes `[target]` only, never a task's own
+      // children the way a feature groups its tickets. Same ticket-tier types on both ends of the
+      // edge as the exempt case above, but no card dispatches them together, so the child is dead.
+      const board = [
+        task("parent"),
+        task("subtask", "parent", { dependencies: [blocks("subtask", "parent")] }),
+      ];
+      expect(rulesFor(board, "subtask")).toEqual(["blocks-duplicates-parent"]);
+    });
+
     it("does not fault an ordinary blocks edge between unrelated beads", () => {
       const board = [
         ...HEALTHY,
