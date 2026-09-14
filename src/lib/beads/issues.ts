@@ -123,6 +123,29 @@ export async function loadAllIssues(
 }
 
 
+/**
+ * Enrich an already-loaded snapshot with `bd dep cycles` evidence WITHOUT failing the read that
+ * produced it. `allIssues`/`readAllIssues` back page renders and the board polling API, where the
+ * ordinary bead listing succeeding (often off a cached snapshot) must not be undone by this
+ * auxiliary query timing out or returning unreadable output. Leaving evidence unattached on failure
+ * is not silently unsafe: every startability projection that consumes `cycleEvidenceFor` already
+ * fails closed on `undefined` (see `missingCycleEvidenceGap`), so a transient failure here degrades
+ * "can this be approved" answers rather than crashing the board. A caller that must NOT proceed on
+ * stale/absent evidence uses `loadAllIssues` directly, which still lets `depCycles` reject (jobs
+ * rely on that to retry — see execute-epic-start).
+ */
+async function attachCyclesBestEffort(cwd: string, board: Bead[]): Promise<void> {
+  try {
+    attachCycleEvidence(board, await beads.depCycles(cwd));
+  } catch (e) {
+    console.warn(
+      `[beads.issues] ${cwd}: dep cycles read failed — board stays readable without cycle evidence; ` +
+        `startability projections fail closed until the next successful read: ` +
+        (e instanceof Error ? e.message : String(e)),
+    );
+  }
+}
+
 export async function allIssues(
   cwd: string,
   opts?: SnapshotReadOptions & { withCycles?: boolean },
@@ -132,7 +155,7 @@ export async function allIssues(
   // may therefore predate an approval reader: enrich that exact array rather than treating absent
   // evidence as an authoritative empty result.
   if (opts?.withCycles && cycleEvidenceFor(board) === undefined) {
-    attachCycleEvidence(board, await beads.depCycles(cwd));
+    await attachCyclesBestEffort(cwd, board);
   }
   return board;
 }
@@ -147,7 +170,7 @@ export async function readAllIssues(
   // Keep evidence attached to the cached array itself: `SnapshotRead` is a wrapper and copying the
   // board would lose the sidecar that pure approval projections consume.
   if (opts?.withCycles && cycleEvidenceFor(snapshot.beads) === undefined) {
-    attachCycleEvidence(snapshot.beads, await beads.depCycles(cwd));
+    await attachCyclesBestEffort(cwd, snapshot.beads);
   }
   return snapshot;
 }

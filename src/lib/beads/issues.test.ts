@@ -164,6 +164,29 @@ describe("loadAllIssues", () => {
     expect(cyclesMock).toHaveBeenCalledWith(REPO);
   });
 
+  it("readAllIssues degrades to a board without cycle evidence rather than fail the whole read", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockRejectedValue(new Error("bd: dep cycles timed out"));
+
+    const snapshot = await readAllIssues(REPO, { withCycles: true });
+
+    expect(snapshot.beads.map((b) => b.id)).toEqual(["t-1"]);
+    expect(cycleEvidenceFor(snapshot.beads)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("bd: dep cycles timed out");
+  });
+
+  it("allIssues degrades to a board without cycle evidence rather than fail the whole read", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockRejectedValue(new Error("bd: dep cycles timed out"));
+
+    const board = await allIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id)).toEqual(["t-1"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
   it("dedupes, so a bd that starts carrying gates in the ordinary listing doesn't double them", async () => {
     // Two gate edges, one of whose gates the ordinary listing already carries: the other still
     // dangles, so the second read fires and hands back both.
