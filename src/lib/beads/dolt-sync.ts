@@ -6,7 +6,8 @@
  * pull → commit → push. ./sync-coalescer decides WHEN a pass runs and imports the pass from here;
  * ./bd re-exports the public surface. Neither imports back, so each side is testable alone.
  */
-import { passwordVarHint } from "./bd-env";
+import { BoardUnreachableError } from "../jobs/errors";
+import { IDENTITY_MISMATCH_TEXT, passwordVarHint } from "./bd-env";
 import { isServerMode, readBoardMode, type BoardModeInfo } from "./board-mode";
 import { BOARD_READ_PROBE, formatServerTarget } from "./config.mjs";
 import { bd, type BdExec } from "./dolt-exec";
@@ -65,6 +66,37 @@ const FIRST_PUBLISH_PULL_OUTPUT = [
 
 export function isFirstPublishPullOutput(output: string): boolean {
   return FIRST_PUBLISH_PULL_OUTPUT.some((re) => re.test(output));
+}
+
+/**
+ * bd/dolt failure text meaning the BOARD is unreachable, not just this one job (anton-ej1l) — every
+ * job that touches this board fails the same way, so a caller that only counts failures reads one
+ * outage as N independent ones. Four causes, matched on bd's own wording so classification stays
+ * accurate however anton's message around it is worded:
+ *   - bd's project-identity guard refusing a mismatched database ({@link IDENTITY_MISMATCH_TEXT}).
+ *   - the shared Dolt server refusing the connection outright.
+ *   - the embedded dolt binary missing, so bd's own auto-start can't recover.
+ *   - the host out of disk, so neither embedded nor server dolt can write.
+ * An ordinary bd error — a refused claim, an unknown bead id — matches none of these.
+ */
+const BOARD_UNREACHABLE_OUTPUT = [
+  /Dolt server unreachable/i,
+  /dolt is not installed|not found in PATH/i,
+  /no space left|ENOSPC/i,
+];
+
+export function isBoardUnreachableOutput(output: string): boolean {
+  return (
+    output.includes(IDENTITY_MISMATCH_TEXT) || BOARD_UNREACHABLE_OUTPUT.some((re) => re.test(output))
+  );
+}
+
+/** Wraps `message` in {@link BoardUnreachableError} when `output` matches {@link isBoardUnreachableOutput},
+ * else in a plain `Error` — the one place both of dolt-sync's bd-failure throw sites decide which. */
+function doltSyncFailure(message: string, output: string, cause: unknown): Error {
+  return isBoardUnreachableOutput(output)
+    ? new BoardUnreachableError(message, { cause })
+    : new Error(message, { cause });
 }
 
 // ── The pass's shape ──
@@ -197,7 +229,7 @@ export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Pro
     } catch (e) {
       const err = e as Error & { stdout?: string; stderr?: string };
       const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
-      throw new Error(`${probe.message(cwd, target)} Underlying error: ${output}`, { cause: e });
+      throw doltSyncFailure(`${probe.message(cwd, target)} Underlying error: ${output}`, output, e);
     }
   }
   // Stamped only after BOTH probes pass, so a server that was down — or a board it would not serve —
@@ -272,7 +304,7 @@ export async function runDoltSync(
       // local state, real divergence) rejects here — in a full pass, before push — so a pass that
       // never applied inbound changes is never silently recorded as "synced" on a no-op push.
       if (args[1] === "pull" && isFirstPublishPullOutput(output)) continue;
-      throw new Error(`bd ${args.join(" ")} failed in ${cwd}: ${output}`, { cause: e });
+      throw doltSyncFailure(`bd ${args.join(" ")} failed in ${cwd}: ${output}`, output, e);
     }
   }
   return "synced";

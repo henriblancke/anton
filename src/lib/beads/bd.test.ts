@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { isBoardUnreachableError } from "../jobs/errors";
 import {
   beads,
   buildCookArgs,
@@ -9,6 +10,7 @@ import {
   getSyncStatus,
   getSyncStatusToken,
   isBenignSyncOutput,
+  isBoardUnreachableOutput,
   isMissingBeadError,
   isNotWiredOutput,
   LABELS,
@@ -508,6 +510,26 @@ describe("isNotWiredOutput", () => {
   });
 });
 
+describe("isBoardUnreachableOutput", () => {
+  it("matches all four board-gone causes", () => {
+    expect(isBoardUnreachableOutput("PROJECT IDENTITY MISMATCH — refusing to connect")).toBe(true);
+    expect(
+      isBoardUnreachableOutput(
+        "shared Dolt server unreachable for /repo (configured target 127.0.0.1:0). Underlying error: Dolt server unreachable at 127.0.0.1:0",
+      ),
+    ).toBe(true);
+    expect(
+      isBoardUnreachableOutput("dolt is not installed (not found in PATH)"),
+    ).toBe(true);
+    expect(isBoardUnreachableOutput("ENOSPC: no space left on device")).toBe(true);
+  });
+
+  it("does not match an ordinary bd error (a refused claim, a bad id)", () => {
+    expect(isBoardUnreachableOutput("issue not claimable: status blocked")).toBe(false);
+    expect(isBoardUnreachableOutput("bd: issue anton-e1 not found")).toBe(false);
+  });
+});
+
 describe("runDoltSync", () => {
   it("a full pass runs `bd dolt pull`, `commit`, `push` in order against the given cwd", async () => {
     const calls: Array<{ cwd: string; args: string[] }> = [];
@@ -577,14 +599,15 @@ describe("runDoltSync", () => {
 
   it("a full pass rejects a real (non-first-publish) pull failure before push", async () => {
     const calls: string[][] = [];
-    await expect(
-      runDoltSync("/repo", async (_cwd, args) => {
-        calls.push(args);
-        if (args[1] === "pull") throw execError({ stderr: "Error: failed to get remote db\n" });
-        return "";
-      }),
-    ).rejects.toThrow(/bd dolt pull failed [\s\S]*failed to get remote db/);
+    const rejection = runDoltSync("/repo", async (_cwd, args) => {
+      calls.push(args);
+      if (args[1] === "pull") throw execError({ stderr: "Error: failed to get remote db\n" });
+      return "";
+    });
+    await expect(rejection).rejects.toThrow(/bd dolt pull failed [\s\S]*failed to get remote db/);
     expect(calls).toEqual([["dolt", "pull"]]); // never reached commit/push
+    // An ordinary sync failure is not the board itself going away.
+    await rejection.catch((e) => expect(isBoardUnreachableError(e)).toBe(false));
   });
 
   it("a pull-only pass rejects on a real pull failure", async () => {
@@ -606,6 +629,15 @@ describe("runDoltSync", () => {
         throw execError({ stderr: "Error: push to origin/main: permission denied\n" });
       }),
     ).rejects.toThrow(/bd dolt push failed [\s\S]*permission denied/);
+  });
+
+  it("rejects with BoardUnreachableError when a sync step's failure says the board is gone", async () => {
+    const rejection = runDoltSync("/repo", async (_cwd, args) => {
+      if (args[1] === "pull") throw execError({ stderr: "ENOSPC: no space left on device\n" });
+      return "";
+    });
+    await expect(rejection).rejects.toThrow(/bd dolt pull failed [\s\S]*no space left/);
+    await rejection.catch((e) => expect(isBoardUnreachableError(e)).toBe(true));
   });
 
   it("a real commit failure stops the sync before push runs", async () => {

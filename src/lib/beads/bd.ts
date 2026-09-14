@@ -183,7 +183,12 @@ function parseRunLease(label: string): { expiry: number | undefined; owner: stri
 // here so every existing `from ".../beads/bd"` import keeps working.
 export { BD_KILL_GRACE_ENV, BD_MAX_BUFFER_ENV, BD_STEP_TIMEOUT_ENV, BD_STEP_TIMEOUT_MS } from "./dolt-exec";
 export { runBdForTest, type BdExec } from "./dolt-exec";
-export { isBenignSyncOutput, isFirstPublishPullOutput, isNotWiredOutput } from "./dolt-sync";
+export {
+  isBenignSyncOutput,
+  isBoardUnreachableOutput,
+  isFirstPublishPullOutput,
+  isNotWiredOutput,
+} from "./dolt-sync";
 export { PREFLIGHT_TTL_MS, preflightSharedServer, resetServerPreflight, runDoltSync } from "./dolt-sync";
 export type { SyncMode, SyncOutcome } from "./dolt-sync";
 export { getSyncStatus, getSyncStatusToken, SYNC_STALL_MS } from "./sync-coalescer";
