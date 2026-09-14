@@ -109,9 +109,6 @@ export { routerUsageUrl } from "./router-endpoint";
 const key = (url: string, connectionId: string, tokenEnv: string): string =>
   `${url}::${connectionId}::${tokenEnv}`;
 
-/** Cool-off armed on a 429, shared only by readers using the same router credentials. */
-const backoffUntil = new Map<string, number>();
-
 type RouterSettings = Pick<ProjectSettings, "claudeBaseUrl" | "claudeAuthTokenEnv" | "routerConnectionId">;
 
 /**
@@ -146,7 +143,7 @@ export async function fetchRouterUsage(
     });
     if (res.status === 429) {
       const waitMs = backoffMsFor(res.headers.get("retry-after"));
-      backoffUntil.set(key(url, connectionId, tokenEnv), Date.now() + waitMs);
+      state().backoffUntil.set(key(url, connectionId, tokenEnv), Date.now() + waitMs);
       console.warn(`[router-usage] ${baseUrl} 429 — backing off ${Math.round(waitMs / 1000)}s`);
       return null;
     }
@@ -165,8 +162,32 @@ interface RouterCacheEntry {
   at: number;
   value: RouterUsage | null;
 }
-const cache = new Map<string, RouterCacheEntry>();
-const inFlight = new Map<string, Promise<RouterUsage | null>>();
+
+interface RouterUsageState {
+  cache: Map<string, RouterCacheEntry>;
+  inFlight: Map<string, Promise<RouterUsage | null>>;
+  backoffUntil: Map<string, number>;
+}
+
+/**
+ * Cache, single-flight, and 429 backoff live on `globalThis`, not module scope, for the same reason
+ * as the job runner's singletons (`service-runner.ts:33-41`): Next compiles `instrumentation.ts` and
+ * the app layer (RSC pages, route handlers) into SEPARATE module registries, so a module-level `Map`
+ * yields one cache PER registry. Without this, the runner's governor/burn reads and a
+ * `/router-usage` or Settings read never share a TTL, single-flight, or 429 backoff — concurrent
+ * reads can duplicate router requests, and a 429 seen by one registry doesn't quiet the other.
+ * Symbol.for keyed, matching the convention for process-wide state here.
+ */
+const STATE_KEY = Symbol.for("anton.claude.routerUsageState");
+
+function state(): RouterUsageState {
+  const global = globalThis as unknown as Record<symbol, RouterUsageState | undefined>;
+  return (global[STATE_KEY] ??= {
+    cache: new Map(),
+    inFlight: new Map(),
+    backoffUntil: new Map(),
+  });
+}
 
 /**
  * TTL-bypassing read for a routed burn-sampling window. It honors a router's shared 429 backoff and
@@ -190,17 +211,18 @@ export async function getRouterUsageFresh(
     return null;
   }
 
+  const s = state();
   const k = key(url, connectionId, tokenEnv);
-  if (now() < (backoffUntil.get(k) ?? 0)) return null;
+  if (now() < (s.backoffUntil.get(k) ?? 0)) return null;
 
   // A sampling edge cannot reuse a pre-existing flight: it may have begun before the job and
   // therefore cannot be the post-job side of the burn window. Wait for it to settle, then start
   // fresh evidence (or join a post-wait caller that already did), preserving single-flight.
-  const stale = inFlight.get(k);
+  const stale = s.inFlight.get(k);
   if (stale) {
     await stale.catch(() => null);
-    if (now() < (backoffUntil.get(k) ?? 0)) return null;
-    const current = inFlight.get(k);
+    if (now() < (s.backoffUntil.get(k) ?? 0)) return null;
+    const current = s.inFlight.get(k);
     if (current) return current;
   }
 
@@ -208,13 +230,13 @@ export async function getRouterUsageFresh(
   const promise = (async () => {
     try {
       const value = await fetchRouterUsage(settings, fetcher);
-      cache.set(k, { at: ts, value });
+      s.cache.set(k, { at: ts, value });
       return value;
     } finally {
-      inFlight.delete(k);
+      s.inFlight.delete(k);
     }
   })();
-  inFlight.set(k, promise);
+  s.inFlight.set(k, promise);
   return promise;
 }
 
@@ -242,36 +264,38 @@ export async function getRouterUsageCached(
     return null;
   }
 
+  const s = state();
   const k = key(url, connectionId, tokenEnv);
   const ts = now();
 
-  const until = backoffUntil.get(k) ?? 0;
-  if (ts < until) return cache.get(k)?.value ?? null;
+  const until = s.backoffUntil.get(k) ?? 0;
+  if (ts < until) return s.cache.get(k)?.value ?? null;
 
-  const entry = cache.get(k);
+  const entry = s.cache.get(k);
   if (entry && ts - entry.at < USAGE_CACHE_TTL_MS) return entry.value;
 
-  const pending = inFlight.get(k);
+  const pending = s.inFlight.get(k);
   if (pending) return pending;
 
   const promise = (async () => {
     try {
       const value = await fetchRouterUsage(settings, fetcher);
-      cache.set(k, { at: ts, value });
+      s.cache.set(k, { at: ts, value });
       return value;
     } finally {
-      inFlight.delete(k);
+      s.inFlight.delete(k);
     }
   })();
-  inFlight.set(k, promise);
+  s.inFlight.set(k, promise);
   return promise;
 }
 
 /** Clear every keyed cache/backoff/in-flight entry. Test-only. */
 export function resetRouterUsageCache(): void {
-  cache.clear();
-  inFlight.clear();
-  backoffUntil.clear();
+  const s = state();
+  s.cache.clear();
+  s.inFlight.clear();
+  s.backoffUntil.clear();
 }
 
 /** Arm the 429 backoff for one canonical management endpoint, connection, and credential source. Test-only. */
@@ -281,5 +305,5 @@ export function armRouterBackoffForTest(
   tokenEnv: string,
   until: number,
 ): void {
-  backoffUntil.set(key(routerUsageUrl(baseUrl, connectionId), connectionId, tokenEnv), until);
+  state().backoffUntil.set(key(routerUsageUrl(baseUrl, connectionId), connectionId, tokenEnv), until);
 }
