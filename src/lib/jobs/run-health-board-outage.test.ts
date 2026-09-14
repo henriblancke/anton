@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Bead, Gate } from "../beads/bd";
+import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
 import { BoardUnreachableError } from "./errors";
 import { getRunHealthReport } from "../run-health";
 import { getJob, toMs, type Clock } from "./queue";
@@ -38,6 +39,7 @@ beforeEach(() => {
 afterEach(() => {
   t.close();
   vi.clearAllMocks();
+  resetBoardModeCache();
 });
 
 describe("run-health board outages", () => {
@@ -175,5 +177,36 @@ describe("run-health board outages", () => {
 
     expect(await getRunHealthReport(t.db, t.projectId)).toBeUndefined();
     expect(await getJob(t.db, jobId)).toMatchObject({ status: "queued", attempts: 1 });
+  });
+
+  it("classifies a direct shared-server read failure as an outage even when bd's raw text matches no known pattern", async () => {
+    // These two reads (beads.list/beads.gateList) bypass preflightSharedServer entirely, so bd's
+    // transport-level diagnostic ("dial tcp ...: connect: connection refused") never goes through the
+    // classifier that fixed the earlier preflight thread — it lands here as a PLAIN Error, not a
+    // BoardUnreachableError. On a shared server this read boundary IS the board, so any failure here
+    // must still raise the outage report rather than rethrow unclassified (PR #277 review).
+    pinBoardMode("/tmp/p1", { mode: "server", host: "dolt.example.dev", port: 3306, database: "anton" });
+    listMock.mockRejectedValue(new Error("dial tcp 10.0.0.9:3306: connect: connection refused"));
+
+    const jobId = await driveJob({
+      db: t.db,
+      clock,
+      type: "run-health",
+      projectId: t.projectId,
+      handler: (deps) => makeRunHealthHandler(deps),
+      config: { boardUnreachableRetryMs: PROBE_MS },
+    });
+
+    const job = await getJob(t.db, jobId);
+    expect(job).toMatchObject({ status: "queued", attempts: 0 });
+    expect(toMs(job?.runAt)).toBe(NOW + PROBE_MS);
+
+    const report = await getRunHealthReport(t.db, t.projectId);
+    expect(report?.findings).toEqual([
+      expect.objectContaining({
+        kind: "exhausted-job",
+        key: "exhausted-job:board-unreachable:p1:database-unreadable",
+      }),
+    ]);
   });
 });

@@ -25,6 +25,7 @@ import {
   type BoardUnreachableCause,
   type Gate,
 } from "../beads/bd";
+import { isServerMode } from "../beads/board-mode";
 import { BOARD_UNREACHABLE_FINDING_PREFIX } from "../escalation-kinds";
 import { getPrActivity, prNumberFromRef, type PrActivity } from "../git/pr";
 import {
@@ -36,6 +37,7 @@ import {
 import { listRunsByStatus, type RunRow } from "../runs";
 import { getRunHealthReport, saveRunHealthReport, type RunHealthFinding } from "../run-health";
 import {
+  BoardUnreachableError,
   isBoardUnreachableError,
   parkedAskGateIds,
   poisonBlockerIds,
@@ -603,20 +605,28 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
         beads.gateList(project.repoPath),
       ]);
     } catch (e) {
-      if (!isBoardUnreachableError(e)) throw e;
+      // These two reads bypass preflightSharedServer entirely, so on a shared server they ARE the
+      // board-read boundary — same reasoning preflight applies to its own probes: nothing else here
+      // touches the board, so ANY failure is a board outage by context, not just the ones bd's raw
+      // text happens to match. Without this an unmatched diagnostic (e.g. a bare "dial tcp ...
+      // connection refused" that never went through preflight) surfaced as a plain Error, so
+      // run-health rethrew instead of raising the outage report and unstick had nothing to escalate
+      // (PR #277 review). Embedded-mode errors keep the old, stricter gate.
+      const serverMode = isServerMode(project.repoPath);
+      if (!isBoardUnreachableError(e) && !serverMode) throw e;
       // The thrower's own classification wins when it set one: it knows structurally which probe
       // failed, or that bd itself hung, rather than this reparsing raw text that a preflight's own
       // wrapper message (or an unmatched diagnostic like "database not found") would silently miss
-      // (PR #277 review). Text parsing stays as the fallback for errors classified purely from bd's
-      // raw output, which is still the only signal available for those.
+      // (PR #277 review). Text parsing is next; an unmatched shared-server failure still falls back
+      // to "database-unreadable" — these ARE reads, just like BOARD_READ_PROBE's own fallback.
       // bd's summary includes stderr only; the raw process seam retains stdout on the error too.
-      const { stdout, stderr } = e as typeof e & { stdout?: unknown; stderr?: unknown };
+      const err = e as Error & { stdout?: unknown; stderr?: unknown; boardCause?: BoardUnreachableCause };
       const output = [
-        e.message,
-        typeof stdout === "string" ? stdout : "",
-        typeof stderr === "string" ? stderr : "",
+        err.message,
+        typeof err.stdout === "string" ? err.stdout : "",
+        typeof err.stderr === "string" ? err.stderr : "",
       ].join("\n");
-      const cause = e.boardCause ?? boardUnreachableCause(output);
+      const cause = err.boardCause ?? boardUnreachableCause(output) ?? (serverMode ? "database-unreadable" : undefined);
       if (!cause) throw e;
       const previous = await getRunHealthReport(db, projectId);
       await saveRunHealthReport(db, clock, {
@@ -631,7 +641,12 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
           ),
         ],
       });
-      throw e;
+      // Rethrow as a board outage the runner recognizes, so it refunds this attempt instead of
+      // spending it: an unmatched shared-server diagnostic reaches this branch as a plain Error
+      // (`isBoardUnreachableError(e)` false), and left as-is the runner would burn the ordinary retry
+      // budget and can still park run-health outright, exactly what saving the report above exists to
+      // prevent (PR #277 review).
+      throw isBoardUnreachableError(e) ? e : new BoardUnreachableError(err.message, { cause: e, boardCause: cause });
     }
     const [parkedRuns, settledJobs, activeEpicKeys] = await Promise.all([
       listRunsByStatus(db, projectId, ["parked"]),
