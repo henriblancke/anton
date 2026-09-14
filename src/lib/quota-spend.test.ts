@@ -16,6 +16,7 @@ import type { ClaudeUsage } from "./claude/usage";
 import type { ProjectSettings } from "./projects";
 
 const routerUsageForTest = new Map<string, ClaudeUsage | null>();
+let accountUsageReads = 0;
 vi.mock("./db", async () => {
   const actual = await vi.importActual<typeof import("./db")>("./db");
   return { ...actual, getDb: () => tdb.db };
@@ -26,7 +27,13 @@ vi.mock("./projects", async () => {
 });
 vi.mock("./claude/usage", async () => {
   const actual = await vi.importActual<typeof import("./claude/usage")>("./claude/usage");
-  return { ...actual, getClaudeUsageCached: async () => usage() };
+  return {
+    ...actual,
+    getClaudeUsageCached: async () => {
+      accountUsageReads += 1;
+      return usage();
+    },
+  };
 });
 vi.mock("./claude/router-usage", async () => {
   const actual = await vi.importActual<typeof import("./claude/router-usage")>("./claude/router-usage");
@@ -58,6 +65,7 @@ let tdb: TestDb;
 beforeEach(() => {
   tdb = makeTestDb();
   routerUsageForTest.clear();
+  accountUsageReads = 0;
 });
 afterEach(() => tdb.close());
 
@@ -285,6 +293,52 @@ describe("quotaShareProjects", () => {
         expect.objectContaining({ id: account, meterKey: "anthropic", spentWeeklyPct: 2 }),
         expect.objectContaining({ id: routerA, meterKey: meterA, spentWeeklyPct: 16 }),
         expect.objectContaining({ id: routerB, meterKey: meterB, spentWeeklyPct: 4 }),
+      ]),
+    );
+  });
+
+  it("does not read Anthropic usage for a router-only board", async () => {
+    const first = insertProject(tdb.db, { id: "router-a", slug: "router-a", name: "Router A", repoPath: "/tmp/router-a" });
+    const second = insertProject(tdb.db, { id: "router-b", slug: "router-b", name: "Router B", repoPath: "/tmp/router-b" });
+    const routerSettings = (connectionId: string): ProjectSettings => ({
+      budgetAware: true,
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: "ROUTER_TOKEN",
+      routerConnectionId: connectionId,
+    });
+    await setSettings(first, routerSettings("conn-a"));
+    await setSettings(second, routerSettings("conn-b"));
+    routerUsageForTest.set("conn-a", usage());
+    routerUsageForTest.set("conn-b", usage());
+
+    await quotaShareProjects(NOW);
+
+    expect(accountUsageReads).toBe(0);
+  });
+
+  it("splits default shares only among projects on the same meter", async () => {
+    const first = insertProject(tdb.db, { id: "router-a", slug: "router-a", name: "Router A", repoPath: "/tmp/router-a" });
+    const second = insertProject(tdb.db, { id: "router-b", slug: "router-b", name: "Router B", repoPath: "/tmp/router-b" });
+    const other = insertProject(tdb.db, { id: "router-c", slug: "router-c", name: "Router C", repoPath: "/tmp/router-c" });
+    const routerSettings = (connectionId: string): ProjectSettings => ({
+      budgetAware: true,
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: "ROUTER_TOKEN",
+      routerConnectionId: connectionId,
+    });
+    await setSettings(first, routerSettings("shared"));
+    await setSettings(second, routerSettings("shared"));
+    await setSettings(other, routerSettings("other"));
+    routerUsageForTest.set("shared", usage());
+    routerUsageForTest.set("other", usage());
+
+    const shares = await quotaShareProjects(NOW);
+
+    expect(shares).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: first, sharePct: 50 }),
+        expect.objectContaining({ id: second, sharePct: 50 }),
+        expect.objectContaining({ id: other, sharePct: 100 }),
       ]),
     );
   });

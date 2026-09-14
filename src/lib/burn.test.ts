@@ -167,6 +167,23 @@ describe("getBurnAverage", () => {
     expect(stringer.seeded).toBe(true);
     expect(stringer.sessionAvg).toBe(TIER_SEEDS.S.sessionPct);
   });
+
+  it("keeps fleet averages within one effective meter", async () => {
+    const routerA = "router:https://router.example/api/usage/a";
+    const routerB = "router:https://router.example/api/usage/b";
+    for (let i = 0; i < BURN_SAMPLE_WINDOW; i++) {
+      await recordBurnSample(t.db, clock, "execute-epic", null, { sessionDelta: 10, weeklyDelta: 1 });
+      clock.advance(1_000);
+      await recordBurnSample(t.db, clock, "execute-epic", null, { sessionDelta: 30, weeklyDelta: 3 }, routerA);
+      clock.advance(1_000);
+      await recordBurnSample(t.db, clock, "execute-epic", null, { sessionDelta: 50, weeklyDelta: 5 }, routerB);
+      clock.advance(1_000);
+    }
+
+    expect((await getBurnAverage(t.db, "execute-epic", "anthropic")).weeklyAvg).toBe(1);
+    expect((await getBurnAverage(t.db, "execute-epic", routerA)).weeklyAvg).toBe(3);
+    expect((await getBurnAverage(t.db, "execute-epic", routerB)).weeklyAvg).toBe(5);
+  });
 });
 
 describe("sampleJobBurn", () => {

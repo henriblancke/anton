@@ -329,7 +329,7 @@ export interface JobContext {
    * target, a target that disappeared, a lease held elsewhere) burned nothing, and inferring that
    * from the settlement type misses every such exit that isn't a reschedule.
    */
-  claudeReached: () => Promise<void>;
+  claudeReached: (meterKey?: string) => Promise<void>;
   /**
    * Enqueue a per-PR fix job for a run target, deduped against a live one — see
    * `queue.enqueueReviewFixPrIfAbsent`. Handlers fan out THROUGH the runner rather than calling the
@@ -1375,7 +1375,7 @@ export class JobRunner {
       const hold = () =>
         (job.status === "running" ? valueHeldReclaimIds : valueHeldJobIds).add(job.id);
 
-      if (await this.valueGateHolds(usage, policy, job, payload, nowMs, costByType)) {
+      if (await this.valueGateHolds(usage, policy, job, payload, nowMs, meterKey, costByType)) {
         hold();
         continue;
       }
@@ -1414,6 +1414,7 @@ export class JobRunner {
     job: JobRow,
     payload: { epicBeadId?: unknown } | null,
     nowMs: number,
+    meterKey: string,
     costByType: Map<string, number>,
   ): Promise<boolean> {
     let labels: readonly string[] = [];
@@ -1432,7 +1433,7 @@ export class JobRunner {
 
     let sessionCost = costByType.get(job.type);
     if (sessionCost === undefined) {
-      sessionCost = (await getBurnAverage(this.db, job.type as JobType)).sessionAvg;
+      sessionCost = (await getBurnAverage(this.db, job.type as JobType, meterKey)).sessionAvg;
       costByType.set(job.type, sessionCost);
     }
     const value = jobValueScore(
@@ -1564,15 +1565,17 @@ export class JobRunner {
           },
           signal: controller.signal,
           report: (info) => Object.assign(entry.live, info),
-          claudeReached: async () => {
+          claudeReached: async (effectiveMeterKey) => {
             // First spawn only: the charge is per attempt, and a multi-spawn handler keeps the
-            // window it opened.
+            // window it opened. The dispatch passes the meter derived from the frozen routing it is
+            // about to use, so a settings edit between prompt construction and spawn cannot charge a
+            // different quota pool.
             if (claudeReached) return;
             claudeReached = true;
             // The charge is the durable record that this attempt burned quota — written now, not at
             // the lease, so a crash in preflight leaves nothing to refund. Fail-soft: the meter is a
             // pacing estimate, and a write that fails must not stand between the job and Claude.
-            meterKey = await this.resolveProjectMeterKeySafe(job.projectId);
+            meterKey = effectiveMeterKey ?? await this.resolveProjectMeterKeySafe(job.projectId);
             await chargeSpentAttempt(this.db, job, meterKey, this.clock).catch((e) => {
               this.log.error(`job ${job.id} (${job.type}): could not charge the spend meter`, e);
             });

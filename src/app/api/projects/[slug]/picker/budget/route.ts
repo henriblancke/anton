@@ -43,10 +43,15 @@ export const GET = withProject<{ slug: string }>(async (_request, { project }) =
   // An unreadable board is an EMPTY board, the governor's own fail-open (`service-policy`): this
   // project is absent from it and so unshared, which draws the full headroom rather than dropping
   // the line with a 500 until the next successful read.
-  const share = resolveGovernedShare(project.id, await budgetAwareQuotaShares().catch(() => []));
+  const meterKey = quotaMeterKey(settings);
+  const share = resolveGovernedShare(
+    project.id,
+    (await budgetAwareQuotaShares().catch(() => [])).filter(
+      (entry) => (entry.meterKey ?? "anthropic") === meterKey,
+    ),
+  );
   const policy = withQuotaShare(resolveBudgetPolicy(settings), share.sharePct);
 
-  const meterKey = quotaMeterKey(settings);
   const usage = meterKey === "anthropic"
     ? await getClaudeUsageCached()
     : await getRouterUsageCached(settings).catch(() => null);
@@ -65,7 +70,7 @@ export const GET = withProject<{ slug: string }>(async (_request, { project }) =
   // project's rate against the account cap would show cards the fleet's burn exhausts sooner, and
   // the reverse for an expensive one.
   const [account, projectAverage] = await Promise.all([
-    getBurnAverage(db, RUN_JOB_TYPE),
+    getBurnAverage(db, RUN_JOB_TYPE, meterKey),
     getProjectBurnAverage(db, project.id, RUN_JOB_TYPE, meterKey),
   ]);
   const signal: BudgetSignal = {

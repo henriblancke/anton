@@ -149,17 +149,31 @@ export interface BurnAverage {
 }
 
 /**
- * Rolling per-type burn average over the most recent `window` samples. Under-sampled types blend the
- * real samples they have with the tier seed (empty slots padded with the seed), so callers always get
- * a usable number that tracks real burn from the first sample. Read path via the shared anton.db by
- * default; the runner/tests inject their own connection.
+ * Rolling per-type burn average over the most recent `window` samples on one effective meter. Under-
+ * sampled types blend the real samples they have with the tier seed (empty slots padded with the seed),
+ * so callers always get a usable number that tracks real burn from the first sample. Read path via the
+ * shared anton.db by default; the runner/tests inject their own connection.
  */
+export function getBurnAverage(
+  db: AntonDb,
+  jobType: JobType,
+  window?: number,
+): Promise<BurnAverage>;
+export function getBurnAverage(
+  db: AntonDb,
+  jobType: JobType,
+  meterKey: string,
+  window?: number,
+): Promise<BurnAverage>;
 export async function getBurnAverage(
   db: AntonDb,
   jobType: JobType,
-  window: number = BURN_SAMPLE_WINDOW,
+  meterOrWindow: string | number = BURN_SAMPLE_WINDOW,
+  maybeWindow?: number,
 ): Promise<BurnAverage> {
-  return averageOf(await recentSamples(db, jobType, undefined, undefined, window), jobType, window);
+  const meterKey = typeof meterOrWindow === "string" ? meterOrWindow : "anthropic";
+  const window = typeof meterOrWindow === "number" ? meterOrWindow : (maybeWindow ?? BURN_SAMPLE_WINDOW);
+  return averageOf(await recentSamples(db, jobType, undefined, meterKey, window), jobType, window);
 }
 
 /**
@@ -196,13 +210,11 @@ async function recentSamples(
     })
     .from(schema.burnSamples)
     .where(
-      projectId === undefined
-        ? eq(schema.burnSamples.jobType, jobType)
-        : and(
-            eq(schema.burnSamples.jobType, jobType),
-            eq(schema.burnSamples.projectId, projectId),
-            eq(schema.burnSamples.meterKey, meterKey!),
-          ),
+      and(
+        eq(schema.burnSamples.jobType, jobType),
+        ...(projectId === undefined ? [] : [eq(schema.burnSamples.projectId, projectId)]),
+        ...(meterKey === undefined ? [] : [eq(schema.burnSamples.meterKey, meterKey)]),
+      ),
     )
     .orderBy(desc(schema.burnSamples.createdAt))
     .limit(window);

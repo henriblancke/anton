@@ -8,6 +8,7 @@
 import { metered } from "../../claude-invocations";
 import { formatAntonResult, parseAntonResult } from "../../claude/anton-result";
 import { claudeRouting, runClaude } from "../../claude/driver";
+import { quotaMeterKey } from "../../quota-meter";
 import { appendSessionLog, endSession, setSessionClaudeId } from "../../sessions";
 import { resolveModel } from "../model-routing";
 import { stepName } from "./resolve";
@@ -50,7 +51,8 @@ export async function dispatchClaude(
   ctx.ctx.report({ sessionId: session.sessionId, cwd: ctx.worktreePath });
 
   try {
-    await ctx.ctx.claudeReached();
+    const routing = claudeRouting(ctx.settings);
+    await ctx.ctx.claudeReached(quotaMeterKey(ctx.settings));
     const result = await claude({
       cwd: ctx.worktreePath,
       prompt: args.prompt,
@@ -62,7 +64,7 @@ export async function dispatchClaude(
         // though this session is filed under the run target by callers that share a session.
         labels: ctx.tickets.length === 1 ? (ctx.tickets[0]?.labels ?? []) : ctx.target.labels,
       }),
-      routing: claudeRouting(ctx.settings),
+      routing,
       permissionMode: ctx.settings.permissionMode ?? "bypassPermissions",
       signal: ctx.ctx.signal,
       onEvent: session.onEvent,
