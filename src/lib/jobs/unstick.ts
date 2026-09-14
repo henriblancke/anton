@@ -34,6 +34,7 @@
  *     direction that double-runs.
  */
 import { beads, type Bead, type Gate } from "../beads/bd";
+import { isBoardUnreachableFindingKey } from "../escalation-kinds";
 import { getPrActivity, type PrActivity } from "../git/pr";
 import {
   DEFAULT_MAX_RETRIES,
@@ -43,12 +44,7 @@ import {
 } from "../projects";
 import { getRunHealthReport, type RunHealthFinding } from "../run-health";
 import { listRunsByStatus, type RunRow } from "../runs";
-import {
-  detectExhaustedJobs,
-  detectOpenHumanGates,
-  detectStalePrs,
-  isBoardUnreachableFindingKey,
-} from "./run-health";
+import { detectExhaustedJobs, detectOpenHumanGates, detectStalePrs } from "./run-health";
 import {
   listOpenEscalations,
   markEscalationNoted,

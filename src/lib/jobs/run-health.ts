@@ -25,6 +25,7 @@ import {
   type BoardUnreachableCause,
   type Gate,
 } from "../beads/bd";
+import { BOARD_UNREACHABLE_FINDING_PREFIX } from "../escalation-kinds";
 import { getPrActivity, prNumberFromRef, type PrActivity } from "../git/pr";
 import {
   DEFAULT_MAX_RETRIES,
@@ -276,14 +277,6 @@ interface OutageGroup {
   representative: JobRow;
   since: number;
   count: number;
-}
-
-/** Stable key prefix for the one project/cause escalation a board outage may raise. */
-export const BOARD_UNREACHABLE_FINDING_PREFIX = "exhausted-job:board-unreachable:";
-
-/** Whether a finding or escalation key represents a project-wide board outage. */
-export function isBoardUnreachableFindingKey(key: string): boolean {
-  return key.startsWith(BOARD_UNREACHABLE_FINDING_PREFIX);
 }
 
 /**

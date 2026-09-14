@@ -9,7 +9,7 @@ import { Disclosure } from "@/components/health/disclosure";
 import { DismissAllButton } from "@/components/health/dismiss-all-button";
 import { EscalationActions } from "@/components/health/escalation-actions";
 import { escalationAge } from "@/components/health/escalation-age";
-import { isDismissable } from "@/lib/escalation-kinds";
+import { isBoardUnreachableFindingKey, isDismissable } from "@/lib/escalation-kinds";
 import type { EscalationKind, EscalationView } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -22,6 +22,28 @@ export const ESCALATION_LABELS: Record<EscalationKind, string> = {
   "needs-human": "Waiting on you",
   "autopilot-disarm": "Autopilot disarmed",
 };
+
+/**
+ * The failure-GROUP bucket a row displays under — same as its `kind`, except a LIVE board outage (an
+ * `exhausted-job` finding keyed on `BOARD_UNREACHABLE_FINDING_PREFIX`) gets its own. It hasn't spent
+ * any retries — the runner refunds the affected jobs and leaves them queued — so grouping it under
+ * "Retries spent" would misstate what happened, and letting it inherit that group's "Dismiss all"
+ * would let one click silence a board failure for as long as it continues: `outageSince` deliberately
+ * keeps its `since`/`reason` stable across probes, so a dismissal's signature keeps matching until the
+ * outage itself ends. See {@link isDismissable}.
+ */
+type GroupKind = EscalationKind | "board-outage";
+
+const GROUP_LABELS: Record<GroupKind, string> = {
+  ...ESCALATION_LABELS,
+  "board-outage": "Board outage",
+};
+
+function groupKindOf(escalation: EscalationView): GroupKind {
+  return escalation.kind === "exhausted-job" && isBoardUnreachableFindingKey(escalation.findingKey)
+    ? "board-outage"
+    : escalation.kind;
+}
 
 /**
  * Whether this row is a REQUEST rather than a failure — the difference between "anton needs thirty
@@ -124,25 +146,26 @@ export function NeedsYouSection({
   );
 }
 
-/** One kind's worth of failures — what a burst collapses into. */
+/** One group's worth of failures — what a burst collapses into. */
 interface FailureGroup {
-  kind: EscalationKind;
+  kind: GroupKind;
   rows: EscalationView[];
 }
 
 /**
- * Failures bucketed by kind, each bucket in the order it arrived in.
+ * Failures bucketed by {@link groupKindOf}, each bucket in the order it arrived in.
  *
- * Kinds appear in the order their first row does rather than in a fixed ranking: the rows arrive
+ * Buckets appear in the order their first row does rather than in a fixed ranking: the rows arrive
  * newest stall first, so this puts the freshest trouble at the top — which is what a founder opening
  * this page after a bad night is looking for.
  */
 function groupByKind(failures: EscalationView[]): FailureGroup[] {
-  const groups = new Map<EscalationKind, EscalationView[]>();
+  const groups = new Map<GroupKind, EscalationView[]>();
   for (const escalation of failures) {
-    const rows = groups.get(escalation.kind);
+    const key = groupKindOf(escalation);
+    const rows = groups.get(key);
     if (rows) rows.push(escalation);
-    else groups.set(escalation.kind, [escalation]);
+    else groups.set(key, [escalation]);
   }
   return [...groups].map(([kind, rows]) => ({ kind, rows }));
 }
@@ -154,11 +177,12 @@ const FOLD_ABOVE = 5;
  * One kind of failure, with the one verb that answers all of it at once.
  *
  * "Dismiss all" is offered only where dismissing means something (see `isDismissable`): on a
- * `needs-human` or an `autopilot-disarm` it would settle rows that must not be settled, and the
- * server refuses it anyway — offering a button the server refuses is worse than not offering it.
+ * `needs-human`, an `autopilot-disarm`, or a live `board-outage` bucket it would settle rows that
+ * must not be settled, and the server refuses it anyway — offering a button the server refuses is
+ * worse than not offering it.
  */
 function FailureGroup({ slug, group }: { slug: string; group: FailureGroup }) {
-  const label = ESCALATION_LABELS[group.kind] ?? group.kind;
+  const label = GROUP_LABELS[group.kind] ?? group.kind;
   const rows = (
     <ul className="divide-y divide-border/50">
       {group.rows.map((escalation) => (
