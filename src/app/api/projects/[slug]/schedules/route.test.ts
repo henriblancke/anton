@@ -12,7 +12,7 @@ import * as schema from "@/lib/db/schema";
 import { nextRun } from "@/lib/jobs/cron";
 import type { Clock } from "@/lib/jobs/queue";
 import { Scheduler } from "@/lib/jobs/scheduler";
-import { seedDefaultSchedules } from "@/lib/schedules";
+import { backfillDefaultSchedules, seedDefaultSchedules } from "@/lib/schedules";
 import type { Project } from "@/lib/types";
 
 let project: Project | null = null;
@@ -301,6 +301,21 @@ describe("schedules route", () => {
     expect(scheduleRow("nightly-stringer").nextRunAt!.getTime()).toBe(
       nextRun("*/5 * * * *", dueMs),
     );
+  });
+
+  it("PATCH marks the row autoArmed so a delayed backfill never re-enables an operator's choice (PR #277 review)", async () => {
+    // The operator disables run-health, then only customizes its cron — never touching `enabled`
+    // again — while the row is still disabled. Editing either field is still an operator decision
+    // this row must remember, not the untouched legacy state backfillDefaultSchedules exists to arm.
+    await PATCH(patchReq({ type: "run-health", enabled: false }), ctx("tmp"));
+    await PATCH(patchReq({ type: "run-health", cron: "*/10 * * * *" }), ctx("tmp"));
+    const row = scheduleRow("run-health");
+    expect(row.enabled).toBe(false);
+    expect(row.autoArmed).toBe(true);
+
+    await backfillDefaultSchedules(tdb.db, { now: () => Date.now() });
+    // A delayed/repeated backfill must not silently flip the operator's disabled choice back on.
+    expect(scheduleRow("run-health").enabled).toBe(false);
   });
 
   it("PATCH with an unknown type 400s", async () => {

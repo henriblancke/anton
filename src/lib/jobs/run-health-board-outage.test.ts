@@ -179,14 +179,44 @@ describe("run-health board outages", () => {
     expect(await getJob(t.db, jobId)).toMatchObject({ status: "queued", attempts: 1 });
   });
 
-  it("classifies a direct shared-server read failure as an outage even when bd's raw text matches no known pattern", async () => {
-    // These two reads (beads.list/beads.gateList) bypass preflightSharedServer entirely, so bd's
-    // transport-level diagnostic ("dial tcp ...: connect: connection refused") never goes through the
-    // classifier that fixed the earlier preflight thread — it lands here as a PLAIN Error, not a
-    // BoardUnreachableError. On a shared server this read boundary IS the board, so any failure here
-    // must still raise the outage report rather than rethrow unclassified (PR #277 review).
+  it("classifies a raw shared-server transport diagnostic directly, at any direct bd call site", async () => {
+    // "dial tcp ...: connect: connection refused" is the raw Go net-package text a shared-server
+    // dial failure surfaces as, unwrapped — board-unreachable.ts's classifier now recognizes it
+    // (PR #277 review) so every direct `bd` call site (not just this read boundary's own ANY-failure
+    // fallback below) gets the precise `server-unreachable` cause instead of a generic fallback.
     pinBoardMode("/tmp/p1", { mode: "server", host: "dolt.example.dev", port: 3306, database: "anton" });
     listMock.mockRejectedValue(new Error("dial tcp 10.0.0.9:3306: connect: connection refused"));
+
+    const jobId = await driveJob({
+      db: t.db,
+      clock,
+      type: "run-health",
+      projectId: t.projectId,
+      handler: (deps) => makeRunHealthHandler(deps),
+      config: { boardUnreachableRetryMs: PROBE_MS },
+    });
+
+    const job = await getJob(t.db, jobId);
+    expect(job).toMatchObject({ status: "queued", attempts: 0 });
+    expect(toMs(job?.runAt)).toBe(NOW + PROBE_MS);
+
+    const report = await getRunHealthReport(t.db, t.projectId);
+    expect(report?.findings).toEqual([
+      expect.objectContaining({
+        kind: "exhausted-job",
+        key: "exhausted-job:board-unreachable:p1:server-unreachable",
+      }),
+    ]);
+  });
+
+  it("classifies a direct shared-server read failure as an outage even when bd's raw text matches no known pattern", async () => {
+    // These two reads (beads.list/beads.gateList) bypass preflightSharedServer entirely, so an
+    // unrecognized transport diagnostic never goes through the classifier that fixed the earlier
+    // preflight thread — it lands here as a PLAIN Error, not a BoardUnreachableError. On a shared
+    // server this read boundary IS the board, so any failure here must still raise the outage report
+    // rather than rethrow unclassified (PR #277 review).
+    pinBoardMode("/tmp/p1", { mode: "server", host: "dolt.example.dev", port: 3306, database: "anton" });
+    listMock.mockRejectedValue(new Error("unexpected server response: garbled packet"));
 
     const jobId = await driveJob({
       db: t.db,

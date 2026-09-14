@@ -525,6 +525,15 @@ describe("isBoardUnreachableOutput", () => {
     expect(isBoardUnreachableOutput("ENOSPC: no space left on device")).toBe(true);
   });
 
+  it("matches a raw shared-server dial failure, unwrapped by any bd wrapper text", () => {
+    // The Go net-package text a shared-server transport failure surfaces as, at any direct bd call
+    // site — not just a preflight probe that already classifies ANY failure by context (PR #277
+    // review).
+    expect(
+      isBoardUnreachableOutput("dial tcp 10.0.0.9:3306: connect: connection refused"),
+    ).toBe(true);
+  });
+
   it("does not match an ordinary bd error (a refused claim, a bad id)", () => {
     expect(isBoardUnreachableOutput("issue not claimable: status blocked")).toBe(false);
     expect(isBoardUnreachableOutput("bd: issue anton-e1 not found")).toBe(false);
@@ -546,6 +555,9 @@ describe("boardUnreachableCause", () => {
       ),
     ).toBe("dolt-missing");
     expect(boardUnreachableCause("ENOSPC: no space left on device")).toBe("disk-full");
+    expect(
+      boardUnreachableCause("dial tcp 10.0.0.9:3306: connect: connection refused"),
+    ).toBe("server-unreachable");
   });
 
   it("returns undefined for an ordinary bd error", () => {

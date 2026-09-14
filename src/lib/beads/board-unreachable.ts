@@ -24,7 +24,13 @@ const BOARD_UNREACHABLE_CAUSES: ReadonlyArray<{
   // bd's failed auto-start names both its absent binary and the unavailable target; the binary is
   // the actionable cause, so it must win over the generic server phrase.
   { cause: "dolt-missing", pattern: /dolt is not installed|not found in PATH/i },
-  { cause: "server-unreachable", pattern: /Dolt server unreachable/i },
+  // "Dolt server unreachable" is bd's own wrapper message; `dial tcp` is the raw Go net-package text
+  // a shared-server transport failure surfaces AS, unwrapped, at any call site that talks to the
+  // server directly instead of through a probe that already classifies by context (e.g.
+  // review-fix.ts's `beads.list`, which bypasses preflightSharedServer's ANY-failure fallback) — left
+  // unmatched, those diagnostics fell through as a plain Error and burned an ordinary retry budget
+  // per job instead of collapsing into run-health's one outage finding (PR #277 review).
+  { cause: "server-unreachable", pattern: /Dolt server unreachable|dial tcp\b/i },
   { cause: "disk-full", pattern: /no space left|ENOSPC/i },
 ];
 
