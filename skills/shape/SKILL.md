@@ -287,9 +287,13 @@ const orderTickets = (tickets) => {
   }
   return order.length === tickets.length ? order.map((id) => tickets.find((t) => t.id === id)) : tickets;
 };
+// Mirrors execute-epic-dispatch.ts's `live` filter: an abandoned ticket is closed but was never
+// committed, and the executor drops it from the run entirely before computing held/dispatchable —
+// so it must never appear in this printed order either.
+const isAbandoned = (b) => (b.labels ?? []).includes("abandoned");
 for (const feature of all.filter((b) => b.issue_type === "feature")) {
   console.log(`feature ${feature.id}:`);
-  const tickets = runTickets(feature.id);
+  const tickets = runTickets(feature.id).filter((t) => !isAbandoned(t));
   const held = heldIds(feature, tickets);
   const dispatchable = tickets.filter((t) => !held.has(t.id));
   for (const [index, ticket] of orderTickets(dispatchable).entries())

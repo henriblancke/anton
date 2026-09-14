@@ -49,10 +49,17 @@ export async function refreshRunBoard(
   //    the post-publish race arbitration (step 1b) must NOT steal the lease from it by owner order
   //    when our pre-check couldn't rule it out (anton-jz1).
   let preCheckTrusted = true;
+  // Tracks whether the pull just below actually landed fresh remote state, separately from
+  // `preCheckTrusted` (which also goes false on a failed `show`). The cycle re-check below only
+  // needs to retry/park when THIS pull succeeded — that's the only case where a fresh `blocks`
+  // cycle could have just landed and the fallback snapshot's cycle evidence is stale by
+  // construction, not merely by chance.
+  let pulled = true;
   try {
     await beads.pull(repo);
   } catch {
     preCheckTrusted = false; // stale local snapshot — an incumbent lease may be invisible below
+    pulled = false;
   }
   let leaseTarget = run.target;
   try {
@@ -92,8 +99,25 @@ export async function refreshRunBoard(
       // this fresh list fall through into worktree/PR handling instead of finishing idempotently.
       leaseTarget = freshTarget;
     }
-  } catch {
-    // keep the pre-pull snapshot
+  } catch (e) {
+    // Retry/park rather than silently keep the pre-pull snapshot — but ONLY when the pull above
+    // actually landed fresh state (PR #274 review). This re-list is the ONLY read that carries
+    // authoritative `bd dep cycles` evidence for `regateRefreshedBoard`'s structure gate — the exact
+    // case that gate exists to catch is a pull that just landed a `blocks` cycle among this run's
+    // own tickets. If the pull succeeded but THIS call then times out or returns unreadable output,
+    // falling back to the pre-pull `all` would validate against cycle evidence that's already stale
+    // in precisely the case that matters, letting a newly-cyclic board through undetected. A plain
+    // (counting) throw: a transient `bd`/timeout hiccup self-heals within the retry budget, and a
+    // permanent one parks for a human instead of looping forever.
+    // When the pull ITSELF failed, nothing new could have landed — the pre-pull snapshot's cycle
+    // evidence is still the freshest this attempt has, so the original best-effort fallback stands.
+    if (pulled) {
+      throw new Error(
+        `${epicBeadId} pulled a fresh board but could not re-list it with cycle evidence — refusing ` +
+          `to validate this run's structure against the pre-pull snapshot, which could miss a ` +
+          `blocks-cycle the pull just introduced. (${e instanceof Error ? e.message : String(e)})`,
+      );
+    }
   }
   return { preCheckTrusted, leaseTarget };
 }
