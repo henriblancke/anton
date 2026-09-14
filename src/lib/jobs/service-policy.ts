@@ -125,13 +125,15 @@ export async function resolveProjectSpend(
  */
 export async function resolveProjectUsage(
   projectId: string | null,
-  accountUsage: ClaudeUsage | null,
+  accountUsage: () => Promise<ClaudeUsage | null>,
 ): Promise<ClaudeUsage | null> {
-  if (!projectId) return accountUsage;
+  if (!projectId) return accountUsage();
   const settings = await getProjectSettings(getDb(), projectId).catch(() => null);
   const baseUrl = settings?.claudeBaseUrl?.trim();
   const connectionId = settings?.routerConnectionId?.trim();
-  if (!settings || !baseUrl || !connectionId) return accountUsage; // unrouted → today's meter
+  if (!settings || !baseUrl || !connectionId) return accountUsage(); // unrouted → today's meter
+  // Routed: the account meter is not this project's traffic, so it is never read on its behalf —
+  // `accountUsage` goes uncalled and a router-only board makes no Anthropic request this tick.
   return getRouterUsageCached(settings).catch(() => null);
 }
 

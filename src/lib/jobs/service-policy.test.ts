@@ -15,6 +15,7 @@ import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
 import { insertProject } from "@/lib/testing/project";
 import { DEFAULT_PROJECT_BUDGET_POLICY, type ProjectSettings } from "@/lib/projects";
+import type { UsageSnapshot } from "@/lib/usage";
 
 let tdb: TestDb;
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
@@ -347,6 +348,20 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
   const ACCOUNT_USAGE = { sessionPct: 40, weeklyPct: 20, sessionResetAt: null, weeklyResetAt: null, plan: "max" };
   const ROUTER_USAGE = { sessionPct: 5, weeklyPct: 1, sessionResetAt: null, weeklyResetAt: null, plan: "Claude Code" };
 
+  /**
+   * The account meter as the governor passes it: a thunk, plus the call count. The count is the
+   * assertion that matters for a routed project — "resolved off the router" and "never asked
+   * Anthropic" are different claims, and only the second one is what routing buys.
+   */
+  function accountThunk(value: UsageSnapshot | null = ACCOUNT_USAGE) {
+    let calls = 0;
+    const read = async () => {
+      calls += 1;
+      return value;
+    };
+    return { read, calls: () => calls };
+  }
+
   beforeEach(() => {
     tdb = makeTestDb();
     routerUsageOverride = null;
@@ -363,14 +378,18 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
       routerConnectionId: "conn_1",
     });
     routerUsageOverride = async () => ROUTER_USAGE;
+    const account = accountThunk();
 
-    expect(await resolveProjectUsage("routed", ACCOUNT_USAGE)).toEqual(ROUTER_USAGE);
+    expect(await resolveProjectUsage("routed", account.read)).toEqual(ROUTER_USAGE);
+    expect(account.calls()).toBe(0); // the whole point of routing: no Anthropic request at all
   });
 
   it("returns the account usage unchanged for an unrouted project — byte-identical to today", async () => {
     project("plain", {});
+    const account = accountThunk();
 
-    expect(await resolveProjectUsage("plain", ACCOUNT_USAGE)).toBe(ACCOUNT_USAGE);
+    expect(await resolveProjectUsage("plain", account.read)).toBe(ACCOUNT_USAGE);
+    expect(account.calls()).toBe(1);
   });
 
   it("fails open to null when a routed project's router cannot be read", async () => {
@@ -380,17 +399,26 @@ describe("resolveProjectUsage (anton-gnvw)", () => {
       routerConnectionId: "conn_1",
     });
     routerUsageOverride = async () => null; // unreadable: no creds, timeout, non-200, malformed body
+    const account = accountThunk();
 
-    expect(await resolveProjectUsage("routed", ACCOUNT_USAGE)).toBeNull();
+    expect(await resolveProjectUsage("routed", account.read)).toBeNull();
+    // Fails open to null rather than silently borrowing the account meter, which is not its traffic.
+    expect(account.calls()).toBe(0);
   });
 
   it("falls back to the account usage when settings cannot be read at all", async () => {
     // No project row for this id — getProjectSettings fails soft to {} in practice, but this
     // resolver's own catch is what protects the governor from a hard settings-read failure.
-    expect(await resolveProjectUsage("missing", ACCOUNT_USAGE)).toBe(ACCOUNT_USAGE);
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage("missing", account.read)).toBe(ACCOUNT_USAGE);
+    expect(account.calls()).toBe(1);
   });
 
   it("returns the account usage unchanged for the null-project bucket", async () => {
-    expect(await resolveProjectUsage(null, ACCOUNT_USAGE)).toBe(ACCOUNT_USAGE);
+    const account = accountThunk();
+
+    expect(await resolveProjectUsage(null, account.read)).toBe(ACCOUNT_USAGE);
+    expect(account.calls()).toBe(1);
   });
 });

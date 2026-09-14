@@ -1129,11 +1129,8 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     // session-headroom defer), exactly as before anton-gnvw.
     h.seedProjects("routed", "unrouted");
     const ran: string[] = [];
-    const resolveProjectUsage: ProjectUsageResolver = async (
-      pid,
-      accountUsage,
-    ) =>
-      pid === "routed" ? usage({ sessionPct: 10, weeklyPct: 0 }) : accountUsage;
+    const resolveProjectUsage: ProjectUsageResolver = async (pid, accountUsage) =>
+      pid === "routed" ? usage({ sessionPct: 10, weeklyPct: 0 }) : accountUsage();
     const r = budgetRunner(
       h,
       async (ctx) => {
@@ -1172,7 +1169,7 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     let ran = 0;
     const resolveProjectUsage: ProjectUsageResolver = async (pid, accountUsage) => {
       expect(pid).toBe("routed");
-      expect(accountUsage).toBeNull();
+      expect(await accountUsage()).toBeNull();
       return usage({ sessionPct: 99, weeklyPct: 0 });
     };
     const r = budgetRunner(
@@ -1224,6 +1221,66 @@ describe("JobRunner budget governor paces a routed project on its own meter (ant
     const job = await getJob(h.db, id);
     expect(job?.status).toBe("done");
     expect(runAtBefore).toBeLessThanOrEqual(h.clock.now()); // never pushed out by a stale pace
+  });
+
+  it("a router-only governed tick never reads the Anthropic account meter at all", async () => {
+    // The finding this test exists for: the governor used to read the account meter up front, so a
+    // board where EVERY governed project is routed still called an endpoint whose answer nothing
+    // would consult — a request to a service the operator routed away from, and (on a cold or
+    // unreachable read) its latency in front of the router reads that actually decide pacing.
+    h.seedProjects("routed-a", "routed-b");
+    let accountReads = 0;
+    const ran: string[] = [];
+    const resolveProjectUsage: ProjectUsageResolver = async () => usage({ sessionPct: 10, weeklyPct: 0 });
+    const r = budgetRunner(
+      h,
+      async (ctx) => {
+        ran.push(ctx.projectId ?? "?");
+      },
+      {
+        readUsage: async () => {
+          accountReads += 1;
+          return usage({ sessionPct: 99 });
+        },
+        resolveProjectUsage,
+      },
+    );
+    await r.enqueue({ type: "execute-epic", projectId: "routed-a" });
+    await r.enqueue({ type: "execute-epic", projectId: "routed-b" });
+
+    expect(await r.tickOnce()).toBe(2);
+    await r.whenIdle();
+
+    expect(ran.sort()).toEqual(["routed-a", "routed-b"]);
+    expect(accountReads).toBe(0);
+  });
+
+  it("a mixed board reads the account meter ONCE, however many unrouted projects want it", async () => {
+    // Lazy must not become per-project: the account read is shared across every unrouted project in
+    // the tick, exactly as the single eager read was.
+    h.seedProjects("routed", "unrouted-a", "unrouted-b");
+    let accountReads = 0;
+    const resolveProjectUsage: ProjectUsageResolver = async (pid, accountUsage) =>
+      pid === "routed" ? usage({ sessionPct: 10, weeklyPct: 0 }) : accountUsage();
+    const r = budgetRunner(
+      h,
+      async () => {},
+      {
+        readUsage: async () => {
+          accountReads += 1;
+          return usage({ sessionPct: 10 }); // healthy: nothing defers, every project resolves
+        },
+        resolveProjectUsage,
+      },
+    );
+    await r.enqueue({ type: "execute-epic", projectId: "routed" });
+    await r.enqueue({ type: "execute-epic", projectId: "unrouted-a" });
+    await r.enqueue({ type: "execute-epic", projectId: "unrouted-b" });
+
+    expect(await r.tickOnce()).toBe(3);
+    await r.whenIdle();
+
+    expect(accountReads).toBe(1); // two unrouted projects, one shared read
   });
 
   it("without a resolveProjectUsage resolver, behavior is byte-identical to the account meter for every project", async () => {

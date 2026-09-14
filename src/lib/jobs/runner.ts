@@ -195,16 +195,20 @@ export type ProjectSpendResolver = (
  * traffic, or (with `resolveBudgetPolicy` gating on the account meter alone) fails open on a read
  * that was never wrong for it in the first place, silently un-pacing the one project that opted in.
  *
- * `accountUsage` is the tick's own Anthropic read (possibly `null`), passed through so an UNROUTED
- * project's resolution needs no second read: this resolver returns it unchanged, byte-identical to
- * the pre-anton-gnvw behavior. A routed project's read is expected to be cached/deduplicated by
- * endpoint internally (mirroring {@link getRouterUsageCached}) — the same router config shared by
- * two projects in one tick must not double the request. Fails open like every other governor
- * read: an unreadable router returns `null`, which `budgetGate`/`admitJob` already treat as admit.
+ * `accountUsage` is the tick's Anthropic read, passed as a THUNK rather than a value so the read is
+ * never made on behalf of a project that will not use it. An unrouted project awaits it and gets
+ * the tick's shared read, byte-identical to the pre-anton-gnvw behavior; a routed project resolves
+ * off its router and never calls the thunk, so a board where every governed project is routed makes
+ * no Anthropic request at all — which is the point of routing. The thunk memoizes within the tick,
+ * so N unrouted projects still cost one read. A routed project's read is expected to be
+ * cached/deduplicated by endpoint internally (mirroring {@link getRouterUsageCached}) — the same
+ * router config shared by two projects in one tick must not double the request. Fails open like
+ * every other governor read: an unreadable router returns `null`, which `budgetGate`/`admitJob`
+ * already treat as admit.
  */
 export type ProjectUsageResolver = (
   projectId: string | null,
-  accountUsage: ClaudeUsage | null,
+  accountUsage: () => Promise<ClaudeUsage | null>,
 ) => Promise<ClaudeUsage | null>;
 
 /**
@@ -1091,16 +1095,25 @@ export class JobRunner {
     }
     if (governed.length === 0) return; // no project is budget-aware → never read usage
 
-    const usage = await this.readUsageSafe();
+    // The tick's Anthropic read, deferred until a project actually needs it. Reading it eagerly
+    // here would make every governed tick call the account endpoint even when every governed
+    // project is routed and none of the results would be used — on a router-only board that is a
+    // request to an endpoint the operator has deliberately stopped using, and its latency (up to
+    // the 5s fetch ceiling on a cold/unreachable read) lands in front of the router reads that DO
+    // decide pacing. Memoized, so the N unrouted projects that do want it still share one read.
+    let accountRead: Promise<ClaudeUsage | null> | null = null;
+    const accountUsage = () => (accountRead ??= this.readUsageSafe());
+
     const now = this.clock.now();
     for (const { pid, policy } of governed) {
       // The meter this project actually paces against (anton-gnvw): its own router when routed,
-      // the account-wide read above otherwise. Resolve it even when the account meter is absent:
-      // an unreadable Anthropic endpoint says nothing about a healthy routed meter. A resolver
-      // failure uses its account argument, preserving the fail-open behavior for that project.
+      // the tick's account read otherwise — and only a project that reaches for the account meter
+      // causes it to be read at all. Resolve it even when the account meter is absent: an
+      // unreadable Anthropic endpoint says nothing about a healthy routed meter. A resolver failure
+      // falls back to the account read, preserving the fail-open behavior for that project.
       const projectUsage = this.resolveProjectUsage
-        ? await this.resolveProjectUsage(pid, usage).catch(() => usage)
-        : usage;
+        ? await this.resolveProjectUsage(pid, accountUsage).catch(() => accountUsage())
+        : await accountUsage();
       if (!projectUsage) {
         // Fail open only for the project whose meter is unavailable. Resume its own stale governor
         // deferrals, but keep evaluating other governed projects with their independent meters.
