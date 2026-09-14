@@ -47,11 +47,13 @@ describe("step:commit", () => {
     await commitStep(sandbox.context({ tickets: [ticket("anton-a")] }));
     expect(ops.commitAll).toHaveBeenLastCalledWith(sandbox.dir, "anton-a: ticket anton-a", {
       hooksPath: undefined,
+      timeoutMs: 120_000,
     });
 
     await commitStep(sandbox.context({ tickets: [ticket("anton-a"), ticket("anton-b")] }));
     expect(ops.commitAll).toHaveBeenLastCalledWith(sandbox.dir, `${target.id}: ${target.title}`, {
       hooksPath: undefined,
+      timeoutMs: 120_000,
     });
   });
 

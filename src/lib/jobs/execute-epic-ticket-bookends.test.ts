@@ -77,6 +77,7 @@ function run(): Omit<StepContext, "tickets"> {
     branch: "anton/anton-f1",
     db: {},
     clock: { now: () => 0 },
+    settings: {},
   } as unknown as Omit<StepContext, "tickets">;
 }
 
@@ -152,7 +153,7 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
     expect(commitMarkerMock).toHaveBeenCalledWith(
       WORKTREE,
       expect.stringContaining(`anton: ${ticket.id} satisfied by 0123456`),
-      { satisfies: [ticket.id] },
+      { satisfies: [ticket.id], hooksPath: undefined, timeoutMs: 120_000 },
     );
     const [, message] = commitMarkerMock.mock.calls[0] as [string, string];
     expect(message).toContain('"anton-t1: Add the schema"');

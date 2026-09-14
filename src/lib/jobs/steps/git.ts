@@ -18,6 +18,7 @@ import {
   type WorktreeState,
 } from "../../git/ops";
 import { PoisonEpic } from "../errors";
+import { resolveCommitTimeoutMs } from "../../projects";
 import { buildPrTitle } from "../pr-title";
 import { stepSubject, type StepContext } from "./context";
 import { prBody } from "./prompts";
@@ -64,7 +65,10 @@ export async function commitStep(ctx: StepContext): Promise<StepResultWith<"comm
   // a no-op now that this has already staged everything.
   await stageAll(ctx.worktreePath);
   const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
-  const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx), { hooksPath });
+  const { committed } = await commitAll(ctx.worktreePath, commitMessage(ctx), {
+    hooksPath,
+    timeoutMs: resolveCommitTimeoutMs(ctx.settings),
+  });
   if (committed) return { ok: true, detail: "committed", facts: { committed: true } };
 
   // No anchor to compare against: fall back to the index alone. The pre-anton-8t1f behaviour, kept

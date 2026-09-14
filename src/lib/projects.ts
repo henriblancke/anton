@@ -563,6 +563,15 @@ export const DEFAULT_AUTOPILOT_SCORE_WINDOW = 3;
  */
 export const DEFAULT_AUTOPILOT_WIP_LIMIT = 3;
 
+/**
+ * The commit budget every `commitAll`/`commitMarker` call runs under, in ms (anton-zse2). An unset
+ * setting resolves to {@link DEFAULT_COMMIT_TIMEOUT_MINUTES} — the same default `commitAll` itself
+ * falls back to, so a project with no setting is byte-identical to before this existed.
+ */
+export function resolveCommitTimeoutMs(settings: ProjectSettings): number {
+  return (settings.commitTimeoutMinutes ?? DEFAULT_COMMIT_TIMEOUT_MINUTES) * 60_000;
+}
+
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const REVIEW_FIX_CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
