@@ -449,6 +449,37 @@ describe("Scheduler.tickOnce", () => {
     expect(await backfillDefaultSchedules(tdb.db, clock)).toEqual([]);
   });
 
+  it("arms a pre-existing disabled run-health row without re-arming other opt-in schedules", async () => {
+    await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "run-health",
+      cron: "0 * * * *",
+      enabled: false,
+    });
+    await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "gardener",
+      cron: "0 5 * * *",
+      enabled: false,
+    });
+
+    const backfills = await backfillDefaultSchedules(tdb.db, clock);
+
+    expect(backfills).toContainEqual({ projectId: "p1", created: expect.any(Array), armedRunHealth: true });
+    const rows = tdb.db
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.projectId, "p1"))
+      .all();
+    const runHealth = rows.find((row) => row.type === "run-health")!;
+    const gardener = rows.find((row) => row.type === "gardener")!;
+    expect(runHealth.enabled).toBe(true);
+    expect(toMs(runHealth.nextRunAt)).toBeGreaterThan(clock.now());
+    expect(gardener).toMatchObject({ enabled: false, nextRunAt: null });
+
+    expect(await backfillDefaultSchedules(tdb.db, clock)).toEqual([]);
+  });
+
   it("ensureSchedule is idempotent per (project,type)", async () => {
     const a = await ensureSchedule(tdb.db, clock, {
       projectId: "p1",

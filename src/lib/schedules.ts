@@ -282,18 +282,16 @@ export async function listSchedules(
  * bd, so this cadence is the one wait gates cannot replace — see review-fix.ts's header.
  *
  * `enabled: false` seeds the ROW without arming it — the operator sees the automation in settings
- * and turns it on deliberately. run-health (anton-4ks0) ships that way: it reports on work a human
- * must then judge, so an operator who never asked for it shouldn't start accruing reports. unstick
- * (anton-wvcy) is armed by default but is a strict no-op until run-health has written a report, so
- * turning the sweep on is the single switch that arms the whole detect → act loop. The alternative —
- * shipping both disabled — trades an idle hourly job (one report read, no bd, no writes) for an
- * operator who enables the sweep and silently gets findings nothing ever acts on. An operator who
- * won't use run-health can turn unstick off independently; the settings row says as much.
+ * and turns it on deliberately. run-health (anton-4ks0) and unstick (anton-wvcy) are exceptions:
+ * together they detect and surface board outages, so both are armed by default. Existing
+ * installations are re-armed at boot as part of the same upgrade path, because the former
+ * run-health default left the outage detector silent. An operator can still turn either automation
+ * off independently in settings.
  *
- * gardener (anton-3nv7) ships disabled for run-health's reason and one more: it is the only recurring
- * job that WRITES to the board unprompted (it closes epics bd judges done and repairs the blocked
- * flag). An operator who never asked for a patrol should not find work closed on their board — so
- * arming it is a deliberate act, and the report it produces is what earns the trust to leave it on.
+ * gardener (anton-3nv7) ships disabled because it is the only recurring job that WRITES to the
+ * board unprompted (it closes epics bd judges done and repairs the blocked flag). An operator who
+ * never asked for a patrol should not find work closed on their board — so arming it is a deliberate
+ * act, and the report it produces is what earns the trust to leave it on.
  * Its judgment tier also carries the re-judgement of parked work (anton-dsnr): daily is a fine
  * cadence for a 90-day silence, and it needs no switch of its own because it costs no session and
  * files nothing a founder has not already left parked for a quarter.
@@ -389,17 +387,18 @@ export async function seedDefaultSchedules(
 export interface ScheduleBackfill {
   projectId: string;
   created: ScheduledJobType[];
+  /** The formerly opt-in outage detector that this release deliberately makes essential. */
+  armedRunHealth: boolean;
 }
 
 /**
  * Seed every registered project's missing default schedules — the upgrade path for schedule types
- * shipped after a project was added.
+ * shipped after a project was added. It also upgrades the former opt-in `run-health` row: board
+ * outages must be detected for existing projects too, and {@link updateSchedule} restores the
+ * scheduler's `nextRunAt` instead of leaving an enabled-but-never-due row.
  *
- * {@link seedDefaultSchedules} otherwise runs only while INSERTING a project, and no migration
- * backfills schedule rows, so on an existing installation a newly-shipped type simply never exists:
- * turning on `run-health` from settings creates just that row and leaves `unstick` unscheduled,
- * accruing reports with nothing to act on them. Run at boot (jobs/service.ts). Safe to repeat — it
- * only inserts types the project is missing, so a schedule an operator disabled stays disabled.
+ * Other existing rows remain exactly as their operator left them. Safe to repeat: after the first
+ * pass the row is enabled, so later boots make no change.
  */
 export async function backfillDefaultSchedules(
   db: AntonDb,
@@ -409,7 +408,21 @@ export async function backfillDefaultSchedules(
   const backfills: ScheduleBackfill[] = [];
   for (const project of projects) {
     const created = await seedDefaultSchedules(db, clock, project.id);
-    if (created.length > 0) backfills.push({ projectId: project.id, created });
+    const runHealth = await db
+      .select({ id: schema.schedules.id, enabled: schema.schedules.enabled })
+      .from(schema.schedules)
+      .where(
+        and(
+          eq(schema.schedules.projectId, project.id),
+          eq(schema.schedules.type, "run-health"),
+        ),
+      )
+      .limit(1);
+    const armedRunHealth = runHealth[0]?.enabled === false;
+    if (armedRunHealth) await updateSchedule(db, clock, runHealth[0].id, { enabled: true });
+    if (created.length > 0 || armedRunHealth) {
+      backfills.push({ projectId: project.id, created, armedRunHealth });
+    }
   }
   return backfills;
 }

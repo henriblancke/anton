@@ -380,7 +380,7 @@ export interface ProjectSettings {
   /**
    * How long a run may sit stuck before the run-health sweep (anton-4ks0) calls it a finding.
    * Absent → {@link DEFAULT_RUN_HEALTH_THRESHOLDS}; a stored value need only carry the knobs the
-   * operator touched. Only consulted by the `run-health` schedule, which is off by default.
+   * operator touched. Consulted by the hourly `run-health` schedule.
    */
   runHealth?: RunHealthThresholds;
   /**

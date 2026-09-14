@@ -25,10 +25,12 @@ vi.mock("../beads/bd", async () => {
 
 const NOW = 1_700_000_000_000;
 const PROBE_MS = 30 * 60_000;
-const clock: Clock = { now: () => NOW };
+let now = NOW;
+const clock: Clock = { now: () => now };
 let t: TestProjectDb;
 
 beforeEach(() => {
+  now = NOW;
   t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" });
   gateListMock.mockResolvedValue([]);
 });
@@ -68,6 +70,33 @@ describe("run-health board outages", () => {
         reason: expect.stringContaining("check the server is up and reachable"),
       }),
     ]);
+  });
+
+  it("preserves a continuing outage's first observation across failed probes", async () => {
+    listMock.mockRejectedValue(
+      new BoardUnreachableError("Command failed: bd list --status all\nDolt server unreachable"),
+    );
+
+    await driveJob({
+      db: t.db,
+      clock,
+      type: "run-health",
+      projectId: t.projectId,
+      handler: (deps) => makeRunHealthHandler(deps),
+      config: { boardUnreachableRetryMs: PROBE_MS },
+    });
+    now += PROBE_MS;
+    await driveJob({
+      db: t.db,
+      clock,
+      type: "run-health",
+      projectId: t.projectId,
+      handler: (deps) => makeRunHealthHandler(deps),
+      config: { boardUnreachableRetryMs: PROBE_MS },
+    });
+
+    const [finding] = (await getRunHealthReport(t.db, t.projectId))?.findings ?? [];
+    expect(finding).toMatchObject({ since: NOW, ageMs: PROBE_MS });
   });
 
   it("finds a board outage whose bd classifier text was written only to stdout", async () => {

@@ -1419,6 +1419,36 @@ describe("board-wide outage escalations", () => {
     };
   }
 
+  it("keeps a legacy parked-job outage actionable after the board recovers", async () => {
+    seedJob("j-legacy", {
+      status: "parked",
+      attempts: 3,
+      lastError: `failed 3×: ${OUTAGE}`,
+      epicBeadId: "e-9",
+    });
+    await seedReport({
+      ...outageFinding("p1"),
+      jobId: "j-legacy",
+      beadId: "e-9",
+    });
+
+    expect(await sweep()).toMatchObject({ escalated: 1, held: 0 });
+    expect(escalationRows()).toHaveLength(1);
+  });
+
+  it("retires a recovered outage after a successful local board read even when the remote pull fails", async () => {
+    await seedReport(outageFinding("p1"));
+    listMock.mockRejectedValue(new Error(OUTAGE));
+    expect(await sweep()).toMatchObject({ escalated: 1 });
+
+    pullMock.mockRejectedValue(new Error("remote authentication failed"));
+    listMock.mockResolvedValue([openEpic("e-1")]);
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
   it("raises one persisted escalation per project for sixteen queued outage jobs, separates causes, and retires it after recovery", async () => {
     const projects = ["p1", "p2", "p3", "p4"] as const;
     for (const projectId of projects.slice(1)) {
@@ -1552,7 +1582,7 @@ describe("a mixed report", () => {
 
 describe("an idle pass", () => {
   it("does nothing at all when the sweep has never run for this project", async () => {
-    // run-health ships off by default, so "no report" is the normal state, not an error.
+    // A fresh installation can reach this before the first hourly sweep, so no report is normal.
     expect(await sweep()).toEqual({ findings: 0, resumed: 0, escalated: 0, held: 0, settled: 0 });
     expect(jobRows()).toEqual([]);
     expect(listMock).not.toHaveBeenCalled();

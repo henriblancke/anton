@@ -38,6 +38,7 @@ function ctxOf(o: Partial<UnstickContext> = {}): UnstickContext {
     parkedRuns: new Map(),
     board: new Map([["e-1", openEpic("e-1")]]),
     boardFresh: true,
+    boardReadable: true,
     deadLeaseGraceMs: GRACE,
     usageWindowEndsAt: () => undefined,
     epicCancelled: () => false,

@@ -130,6 +130,8 @@ export interface UnstickContext {
    * resume that depends on it stands down (see {@link leaseStandDown}).
    */
   boardFresh: boolean;
+  /** Whether this pass could read the local board at all, independently of remote-pull freshness. */
+  boardReadable: boolean;
   /**
    * The project's dead-lease grace, in ms — the same one `detectDeadLeases` applies past expiry. The
    * re-check has to re-apply it, or it would be strictly weaker than the detector that raised the
@@ -448,8 +450,11 @@ export function classifyExhaustedJob(
 ): UnstickVerdict {
   const settled = finding.beadId ? epicSettled(ctx, finding.beadId) : undefined;
   if (settled) return hold(settled);
-  if (isBoardUnreachableFindingKey(finding.key)) {
-    return ctx.boardFresh
+  // Live outage findings are written at the failed board read and deliberately carry no job: the
+  // affected job has already been refunded and requeued. Legacy aggregates point at a parked job,
+  // which must keep being actionable after a later successful board read until that job moves.
+  if (isBoardUnreachableFindingKey(finding.key) && !finding.jobId) {
+    return ctx.boardReadable
       ? hold("the board is answering again")
       : escalate(finding.reason);
   }
@@ -602,8 +607,8 @@ export async function unstickPass(
   const findings = report?.findings ?? [];
   summary.findings = findings.length;
 
-  // No report at all means the run-health sweep has never run here (it ships off by default), and
-  // with nothing open to reconcile there is nothing to act on: not an error, just an idle pass.
+  // No report at all means the run-health sweep has not run here yet, and with nothing open to
+  // reconcile there is nothing to act on: not an error, just an idle pass.
   const pending = partitionOpenEscalations(await listOpenEscalations(db, projectId), findings);
   if (findings.length === 0 && pending.gateWaits.length === 0 && pending.endedStalls.length === 0) {
     return summary;
@@ -767,10 +772,12 @@ async function buildPassState(
   // board is deliberately untrusted: it prevents lease-sensitive resumes and makes no claim that
   // absent beads have settled.
   let board: Bead[] = [];
+  let boardReadable = true;
   try {
     board = await beads.list(repoPath, ["--status", "all"]);
   } catch (e) {
     boardFresh = false;
+    boardReadable = false;
     console.error(
       `[unstick] beads list failed for ${projectId}; holding every lease-gated resume this pass`,
       e,
@@ -792,6 +799,7 @@ async function buildPassState(
     parkedRuns: new Map(parkedRunRows.map((r) => [r.id, r])),
     board: new Map(board.map((b) => [b.id, b])),
     boardFresh,
+    boardReadable,
     deadLeaseGraceMs: thresholds.deadLeaseMinutes * 60_000,
     usageWindowEndsAt: (epicBeadId) => usageWindowEnd(latestJobs.get(epicBeadId)),
     epicCancelled: (epicBeadId) => latestJobs.get(epicBeadId)?.status === "cancelled",
@@ -1093,8 +1101,10 @@ async function stallEnded(
         : "the PR has since merged, closed, or been picked back up";
 
     case "exhausted-job":
-      if (isBoardUnreachableFindingKey(row.findingKey)) {
-        return live.ctx.boardFresh ? "the board is answering again" : undefined;
+      // A live outage alert has no representative job and ends on the next successful board read.
+      // Legacy aggregates name a parked job, which needs the ordinary job re-check after recovery.
+      if (isBoardUnreachableFindingKey(row.findingKey) && !view.jobId) {
+        return live.ctx.boardReadable ? "the board is answering again" : undefined;
       }
       return (await exhaustedJobStillStuck(db, view, live))
         ? undefined

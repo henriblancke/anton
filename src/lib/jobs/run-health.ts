@@ -13,7 +13,8 @@
  * converges on the identical report rather than accumulating. Acting on a finding (resume, escalate)
  * is the follow-up job (anton-wvcy).
  *
- * Off by default: the schedule is seeded disabled (schedules.ts), so a project opts in.
+ * Scheduled by default (schedules.ts): board outages need one project-level escalation without an
+ * operator first opting into the detector.
  */
 import {
   beads,
@@ -32,7 +33,7 @@ import {
   resolveRunHealthThresholds,
 } from "../projects";
 import { listRunsByStatus, type RunRow } from "../runs";
-import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
+import { getRunHealthReport, saveRunHealthReport, type RunHealthFinding } from "../run-health";
 import {
   isBoardUnreachableError,
   parkedAskGateIds,
@@ -283,15 +284,27 @@ export function boardUnreachableFinding(
   projectId: string,
   cause: BoardUnreachableCause,
   nowMs: number,
+  since = nowMs,
 ): RunHealthFinding {
   const { target, remedy } = BOARD_OUTAGE_REMEDY[cause];
   return {
     kind: "exhausted-job",
     key: `${BOARD_UNREACHABLE_FINDING_PREFIX}${projectId}:${cause}`,
     reason: `${target} is unreachable. ${remedy}.`,
-    since: nowMs,
-    ageMs: 0,
+    since,
+    ageMs: Math.max(0, nowMs - since),
   };
+}
+
+/** Keep one continuing outage's original observation time, so dismissals match it across probes. */
+export function outageSince(
+  findings: RunHealthFinding[],
+  projectId: string,
+  cause: BoardUnreachableCause,
+  nowMs: number,
+): number {
+  const key = `${BOARD_UNREACHABLE_FINDING_PREFIX}${projectId}:${cause}`;
+  return findings.find((finding) => finding.key === key)?.since ?? nowMs;
 }
 
 /**
@@ -585,10 +598,18 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
       ].join("\n");
       const cause = boardUnreachableCause(output);
       if (!cause) throw e;
+      const previous = await getRunHealthReport(db, projectId);
       await saveRunHealthReport(db, clock, {
         projectId,
         jobId: ctx.jobId,
-        findings: [boardUnreachableFinding(projectId, cause, nowMs)],
+        findings: [
+          boardUnreachableFinding(
+            projectId,
+            cause,
+            nowMs,
+            outageSince(previous?.findings ?? [], projectId, cause, nowMs),
+          ),
+        ],
       });
       throw e;
     }
