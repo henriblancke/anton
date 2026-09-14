@@ -742,6 +742,7 @@ describe("settings route — self-review settings (anton-of1m)", () => {
       branch: "anton/settings-round-trip",
       baseBranch: "main",
       baseRef: "origin/main",
+      baseForkSha: "f0f0f0forkcommit",
       target: { id: "anton-settings", title: "Settings round trip", status: "in_progress", issue_type: "feature" },
       tickets: [{ id: "anton-settings", title: "Settings round trip", status: "in_progress", issue_type: "feature" }],
       settings,
