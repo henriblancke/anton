@@ -5,7 +5,8 @@ import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
-import { formatStructureViolations, structureGaps } from "@/lib/beads/structure";
+import { cycleEvidenceFor } from "@/lib/beads/cycle-evidence";
+import { formatStructureViolations, structureGaps, type StructureViolation } from "@/lib/beads/structure";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, stealRefused } from "@/lib/beads/claim";
 import { approveAndClaim, unwindApproveClaim } from "@/lib/beads/approve-claim";
@@ -93,7 +94,10 @@ const APPLY_STATUS = { unusable: 422, refused: 409, failed: 500, unsettled: 500 
  * against the board as of the write: the target is not (or is no longer) a run target, or a steal's
  * victim started their run while this approval was in flight.
  */
-type ApproveRefusal = { notRunTarget: string } | { moved: string };
+type ApproveRefusal =
+  | { notRunTarget: string }
+  | { moved: string }
+  | { structure: StructureViolation[] };
 
 /**
  * Why this bead is not something approval may enqueue, or undefined when it is a run target. Reuses
@@ -511,6 +515,16 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       const refusal = notRunTargetReason(locked, lockedBoard);
       if (refusal) return { notRunTarget: refusal };
 
+      // The locked board is the state the approval writes against. Re-run the blocking structure
+      // gate here so a blocks cycle that landed after the pre-lock read cannot be approved and
+      // enqueued under stale graph evidence.
+      if (willEnqueue) {
+        const blockingStructure = structureGaps(epicId, lockedBoard, {
+          cycles: cycleEvidenceFor(lockedBoard),
+        }).blocking;
+        if (blockingStructure.length > 0) return { structure: blockingStructure };
+      }
+
       wroteLabel = !beads.isApproved(locked);
 
       // The human-work report, taken off the same locked read the approval writes against — see the
@@ -548,6 +562,15 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
         `${epicId} is claimed by ${owner} and is already ${refusal.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
         owner,
         refusal.moved,
+      );
+    }
+    if ("structure" in refusal) {
+      return NextResponse.json(
+        {
+          error: `${epicId} breaks the tier structure: ${formatStructureViolations(refusal.structure)}`,
+          rules: refusal.structure.map((v) => v.rule),
+        },
+        { status: 422 },
       );
     }
     return NextResponse.json({ error: refusal.notRunTarget }, { status: 422 });
