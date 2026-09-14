@@ -122,6 +122,7 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   await cascadeChildClaims(run);
   await assertReservedTicketsClaimable(run, gates);
   await publishRunClaim(run);
+  await assertPublishedBoardCycleFree(run);
   return {
     done: false,
     ticketSteps,
@@ -443,12 +444,16 @@ async function commitsHere(run: EpicRun, held: HumanHeldTicket[]): Promise<Set<s
  * a shared server (nothing to reconcile in either), so only a real refresh failure rejects.
  *
  * Re-runs the structure/cycle gate too (PR #274 review), WITH its own `bd dep cycles` evidence: this
- * is the LAST pull before dispatch, so it is also the last chance to catch a `blocks` cycle among the
- * run's own tickets that a cross-machine write landed after `regateRefreshedBoard`'s check. Without
- * it, a cycle that arrives in this specific window rides straight through — `orderTickets` falls back
- * to source order the moment its topological sort can't place every ticket, and dispatch never learns
- * the order it fell back to was never validated. Reusing the same pull this claimability read already
- * pays for costs nothing extra on the path that matters.
+ * is the last pull BEFORE the claim publishes, so it is the last chance to catch a `blocks` cycle
+ * among the run's own tickets that a cross-machine write landed after `regateRefreshedBoard`'s check.
+ * Without it, a cycle that arrives in this specific window rides straight through — `orderTickets`
+ * falls back to source order the moment its topological sort can't place every ticket, and dispatch
+ * never learns the order it fell back to was never validated. Reusing the same pull this claimability
+ * read already pays for costs nothing extra on the path that matters.
+ *
+ * Not the LAST pull overall, though: {@link publishRunClaim} right after this runs a full sync, which
+ * pulls again as part of its own push. {@link assertPublishedBoardCycleFree} is what covers that
+ * later window (PR #274 review, round 2) — this function only owns the one ending here.
  */
 async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Promise<void> {
   const { repo, targetId: epicBeadId } = run;
@@ -483,6 +488,42 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
   const held = humanHeldTickets(dispatchableChildren(gates).map((c) => reserved.get(c.id) ?? c));
   if (held.length === 0) return;
   throw humanHeldPoison(epicBeadId, held, run.branch, await commitsHere(run, held));
+}
+
+/**
+ * Step 3c-bis. Re-run the structure/cycle gate ONE more time, on the board {@link publishRunClaim}'s
+ * own sync just pulled (PR #274 review, round 2).
+ *
+ * `assertReservedTicketsClaimable` pulls and gates the board right before the claim publishes — but
+ * `publishRunClaim`'s `beads.sync` pulls AGAIN, as the first half of its own push, one line later. On
+ * an embedded board that is a second window, after the last gate ran, in which another machine's
+ * write can land a `blocks` cycle among this run's own tickets before dispatch starts. Nothing here
+ * asks about it: `publishRunClaim` only cares whether the push landed, and this is the last point
+ * before the ticket loop where a board read is still cheap. Asked here, on the board that pull
+ * actually left behind, closes the window the same way `assertReservedTicketsClaimable` closes the
+ * one before it.
+ *
+ * No pull of its own: `beads.sync` already pulled as its first step, so the local db already carries
+ * whatever landed, and pulling again would race the push that same sync may still be finishing.
+ */
+async function assertPublishedBoardCycleFree(run: EpicRun): Promise<void> {
+  const { repo, targetId: epicBeadId } = run;
+  let board: Bead[];
+  try {
+    board = await loadAllIssues(repo, { strictGates: true, withCycles: true });
+  } catch (e) {
+    throw new Error(
+      `${epicBeadId} could not re-read the board after publishing its claim to confirm it is ` +
+        `still cycle-free — retrying rather than dispatching into an ordering nobody validated. ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
+  const structural = structureGaps(epicBeadId, board, { cycles: cycleEvidenceFor(board) });
+  if (structural.blocking.length > 0) {
+    throw new PoisonEpic(
+      `${epicBeadId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
+    );
+  }
 }
 
 /**

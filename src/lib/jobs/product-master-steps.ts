@@ -171,10 +171,14 @@ export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): 
       // proposal armed at `apply` then passes `writtenSinceFiling` on evidence nobody ever saw.
       if (applied.records.some(movedTheBoard)) {
         const observedAtMs = scope.clock.now();
-        // Strict on the gates, like the pass's first read (product-master.ts): this snapshot is the
-        // premise the tier after it files from, and a gate listing that failed would read every
-        // resolved gate as an open blocker.
-        snapshot = { board: await loadAllIssues(repo, { strictGates: true }), observedAtMs };
+        // Strict on the gates and carrying cycle evidence, like the pass's first read
+        // (product-master.ts): this snapshot is the premise the tier after it files from, and a
+        // gate listing that failed, or a board missing cycle evidence, would read every startable
+        // claim as blocked (the approval gate treats missing cycle evidence as an open gap).
+        snapshot = {
+          board: await loadAllIssues(repo, { strictGates: true, withCycles: true }),
+          observedAtMs,
+        };
       }
       return emission.created.length;
     } catch (e) {
