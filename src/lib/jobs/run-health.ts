@@ -257,6 +257,16 @@ const BOARD_OUTAGE_REMEDY: Record<BoardUnreachableCause, { target: string; remed
     target: "the host's disk",
     remedy: "free up disk space",
   },
+  "database-unreadable": {
+    target: "this project's Dolt database on the shared server",
+    remedy:
+      "check .beads/metadata.json names the database this project's board actually lives in, and that its database account may read it",
+  },
+  "board-timeout": {
+    target: "bd itself",
+    remedy:
+      "check for a wedged Dolt server or a stuck process holding the local Dolt lock, and restart it if needed",
+  },
 };
 
 /** One board-wide outage's still-growing tally, kept while the job loop finds more of its jobs. */
@@ -601,6 +611,11 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
       ]);
     } catch (e) {
       if (!isBoardUnreachableError(e)) throw e;
+      // The thrower's own classification wins when it set one: it knows structurally which probe
+      // failed, or that bd itself hung, rather than this reparsing raw text that a preflight's own
+      // wrapper message (or an unmatched diagnostic like "database not found") would silently miss
+      // (PR #277 review). Text parsing stays as the fallback for errors classified purely from bd's
+      // raw output, which is still the only signal available for those.
       // bd's summary includes stderr only; the raw process seam retains stdout on the error too.
       const { stdout, stderr } = e as typeof e & { stdout?: unknown; stderr?: unknown };
       const output = [
@@ -608,7 +623,7 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
         typeof stdout === "string" ? stdout : "",
         typeof stderr === "string" ? stderr : "",
       ].join("\n");
-      const cause = boardUnreachableCause(output);
+      const cause = e.boardCause ?? boardUnreachableCause(output);
       if (!cause) throw e;
       const previous = await getRunHealthReport(db, projectId);
       await saveRunHealthReport(db, clock, {

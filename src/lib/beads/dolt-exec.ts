@@ -205,13 +205,22 @@ export async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<st
         // Partial stdout/stderr is deliberately NOT attached: a wedged step's captured output is
         // startup noise, and runDoltSync prefers it over the message — which would bury the real
         // cause exactly as it did for stringer (anton-be1s).
+        //
+        // Classified as a board outage, not a plain Error (PR #277 review): every bd invocation here
+        // touches the board, and a hang past budget is exactly the field failure this module's own
+        // docs describe — a wedged `git fetch` holding the exclusive Dolt lock, which then fails
+        // EVERY later bd call in this repo, not just this one. Left as a plain Error, run-health never
+        // sees it and every job it stalls floods the report individually instead of collapsing onto
+        // one outage finding. There is no output text to pattern-match here, so the cause is assigned
+        // directly rather than left for a downstream reparse to miss.
         reject(
           Object.assign(
-            new Error(
+            new BoardUnreachableError(
               `bd ${args.join(" ")} in ${cwd} exceeded its ${budgetMs}ms budget ` +
                 `(elapsed ${Date.now() - startedAt}ms) and its process group was killed. ` +
                 `bd or a child of it (typically \`git fetch\` against an unreachable remote) hung; ` +
                 `if it held the Dolt lock, later bd calls in this repo may fail until the tree is gone.`,
+              { boardCause: "board-timeout" },
             ),
             { killed: true, signal: "SIGTERM" as NodeJS.Signals },
           ),

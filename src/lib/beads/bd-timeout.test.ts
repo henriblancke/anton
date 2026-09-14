@@ -200,6 +200,19 @@ describe("bd timeout reaps the whole process group (anton-jfjw.1)", () => {
     expect(err.message).toContain(`${BUDGET_MS}ms budget`); // and the budget it blew
   });
 
+  it("classifies a budget timeout as a board outage (PR #277 review)", async () => {
+    // A wedged bd is exactly the field failure this module exists to reap: a `git fetch` holding the
+    // exclusive Dolt lock, which then fails every later bd call in this repo. Left as a plain Error,
+    // run-health never sees it and every job it stalls parks individually instead of collapsing onto
+    // one outage finding.
+    fakeBd("bd-hangs-classified", ["#!/bin/sh", "sleep 30"]);
+    const err = (await runBd(dir, ["dolt", "pull"]).catch((e: Error) => e)) as Error & {
+      boardCause?: string;
+    };
+    expect(isBoardUnreachableError(err)).toBe(true);
+    expect(err.boardCause).toBe("board-timeout");
+  });
+
   it("surfaces the wedge through runDoltSync instead of burying it under partial output", async () => {
     // A wedged step's captured stderr is startup noise; runDoltSync prefers attached output over the
     // message, so attaching it would hide the real cause (the anton-be1s failure mode). It must not.

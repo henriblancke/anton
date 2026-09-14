@@ -125,6 +125,42 @@ describe("run-health board outages", () => {
     ]);
   });
 
+  it("persists an outage from the thrower's own boardCause when bd's text matches no known pattern", async () => {
+    // The shared-server board-read preflight wraps its own contextual message around whatever bd
+    // printed ("database not found", "permission denied", ...) — text `boardUnreachableCause` was
+    // never going to recognize. Without an explicit `boardCause` this used to fall through and
+    // rethrow instead of raising the outage report (PR #277 review).
+    listMock.mockRejectedValue(
+      new BoardUnreachableError(
+        "shared Dolt server board.example.test accepted the connection but will not serve the board " +
+          "for /tmp/p1. Underlying error: database not found",
+        { boardCause: "database-unreadable" },
+      ),
+    );
+
+    const jobId = await driveJob({
+      db: t.db,
+      clock,
+      type: "run-health",
+      projectId: t.projectId,
+      handler: (deps) => makeRunHealthHandler(deps),
+      config: { boardUnreachableRetryMs: PROBE_MS },
+    });
+
+    const job = await getJob(t.db, jobId);
+    expect(job).toMatchObject({ status: "queued", attempts: 0 });
+    expect(toMs(job?.runAt)).toBe(NOW + PROBE_MS);
+
+    const report = await getRunHealthReport(t.db, t.projectId);
+    expect(report?.findings).toEqual([
+      expect.objectContaining({
+        kind: "exhausted-job",
+        key: "exhausted-job:board-unreachable:p1:database-unreadable",
+        reason: expect.stringContaining("its database account may read it"),
+      }),
+    ]);
+  });
+
   it("does not turn an ordinary board error into an outage report", async () => {
     listMock.mockRejectedValue(new Error("bead not found"));
 

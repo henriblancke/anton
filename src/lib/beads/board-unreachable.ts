@@ -3,12 +3,19 @@ import { IDENTITY_MISMATCH_TEXT } from "./bd-env";
 /**
  * Which board dependency a bd failure cannot reach. The cause stays named because a project's
  * identity mismatch needs a different remedy from a shared-server outage.
+ *
+ * `database-unreadable` and `board-timeout` are never matched from raw text (see
+ * {@link boardUnreachableCause}) — a preflight's board-read probe and a wedged bd invocation don't
+ * produce a reliable, greppable message, so the thrower assigns these directly on
+ * `BoardUnreachableError.boardCause` instead of relying on this classifier (PR #277 review).
  */
 export type BoardUnreachableCause =
   | "identity-mismatch"
   | "server-unreachable"
   | "dolt-missing"
-  | "disk-full";
+  | "disk-full"
+  | "database-unreadable"
+  | "board-timeout";
 
 const BOARD_UNREACHABLE_CAUSES: ReadonlyArray<{
   cause: Exclude<BoardUnreachableCause, "identity-mismatch">;

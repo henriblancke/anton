@@ -3,6 +3,7 @@
  * See DESIGN.md §4. These are the *only* way a handler asks for backoff vs. poison-pill vs.
  * plain retry — the runner never inspects error messages.
  */
+import type { BoardUnreachableCause } from "../beads/board-unreachable";
 
 /**
  * The handler hit an API/usage limit it cannot retry through. The runner PARKS the job and
@@ -287,9 +288,21 @@ export class StaleCheckoutError extends Error {
  * re-parsing bd's text itself.
  */
 export class BoardUnreachableError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
+  /**
+   * The specific way the board is unreachable, set by the thrower when it already knows this
+   * structurally — which preflight probe failed, or that bd itself hung past its budget — rather
+   * than leaving a downstream caller to reparse raw bd text. `boardUnreachableCause` only recognizes
+   * a handful of known message patterns; a preflight's own wrapper message or an unmatched
+   * diagnostic (e.g. "database not found", "permission denied") silently falls through it, which
+   * used to make run-health rethrow instead of raising the board-outage report it should have
+   * raised (PR #277 review). Undefined for errors classified purely from raw output text.
+   */
+  readonly boardCause?: BoardUnreachableCause;
+
+  constructor(message: string, options?: ErrorOptions & { boardCause?: BoardUnreachableCause }) {
     super(message, options);
     this.name = "BoardUnreachableError";
+    this.boardCause = options?.boardCause;
   }
 }
 

@@ -8,7 +8,7 @@
  */
 import { BoardUnreachableError } from "../jobs/errors";
 import { passwordVarHint } from "./bd-env";
-import { isBoardUnreachableOutput } from "./board-unreachable";
+import { boardUnreachableCause, isBoardUnreachableOutput } from "./board-unreachable";
 import { isServerMode, readBoardMode, type BoardModeInfo } from "./board-mode";
 import { BOARD_READ_PROBE, formatServerTarget } from "./config.mjs";
 import { bd, type BdExec } from "./dolt-exec";
@@ -182,6 +182,9 @@ export function resetServerPreflight(): void {
 const PREFLIGHT_PROBES = [
   {
     args: ["dolt", "test"],
+    // What this probe is FOR, if bd's raw text names no more specific cause: a plain connection test
+    // failing IS "the server is unreachable" almost by definition.
+    fallbackCause: "server-unreachable",
     message: (cwd: string, target: string) =>
       `shared Dolt server unreachable for ${cwd} (configured target ${target}). ` +
       `Check the server is up and reachable, that .beads/metadata.json names the right ` +
@@ -190,6 +193,11 @@ const PREFLIGHT_PROBES = [
   },
   {
     args: BOARD_READ_PROBE,
+    // A failed board read connects fine but can't serve THIS project's database — bd's own wording
+    // for "not found"/"permission denied" varies too much to pattern-match reliably (PR #277 review),
+    // so a probe that fails here without a more specific cause is classified from what it actually
+    // tests: the database is unreadable.
+    fallbackCause: "database-unreadable",
     message: (cwd: string, target: string) =>
       `shared Dolt server ${target} accepted the connection but will not serve the board for ${cwd}. ` +
       `Check that .beads/metadata.json names the database this project's board actually lives in, ` +
@@ -217,9 +225,13 @@ export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Pro
       // Classifying from output text (as `doltSyncFailure` does) would miss diagnostics that never
       // matched `isBoardUnreachableOutput`'s patterns, e.g. dial tcp: connect: connection refused,
       // and let a preflight failure fall into ordinary job retry/parking instead of the refunded
-      // board-outage backoff that de-duplicates parks across every job during an outage.
+      // board-outage backoff that de-duplicates parks across every job during an outage. `boardCause`
+      // makes that same reasoning survive to run-health: a specific text match (dolt-missing,
+      // disk-full, identity-mismatch) still wins, but an unmatched diagnostic falls back to what this
+      // PROBE tests rather than silently losing its classification.
       throw new BoardUnreachableError(`${probe.message(cwd, target)} Underlying error: ${output}`, {
         cause: e,
+        boardCause: boardUnreachableCause(output) ?? probe.fallbackCause,
       });
     }
   }
