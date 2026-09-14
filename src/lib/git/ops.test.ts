@@ -58,7 +58,8 @@ import {
   satisfiedMarkerTarget,
   SATISFIES_TRAILER,
 } from "./ops";
-import { GH_BIN_ENV } from "./ops";
+import { DEFAULT_COMMIT_TIMEOUT_MS, GH_BIN_ENV } from "./ops";
+import { DEFAULT_COMMIT_TIMEOUT_MINUTES } from "@/lib/projects";
 
 function has(cmd: string): boolean {
   try {
@@ -3295,5 +3296,11 @@ suite("sibling attribution trailers (real git)", () => {
     expect(await branchSatisfiesTicket(gone, "anton-s1")).toBeUndefined();
     // …and `strict` is how a caller whose safe answer is the other one sees the failure instead.
     await expect(readSatisfiedClaims(gone, { strict: true })).rejects.toThrow();
+  });
+});
+
+describe("commit timeout default", () => {
+  it("agrees with the project setting's default (anton-wq0k) — the two must never drift apart", () => {
+    expect(DEFAULT_COMMIT_TIMEOUT_MINUTES * 60_000).toBe(DEFAULT_COMMIT_TIMEOUT_MS);
   });
 });

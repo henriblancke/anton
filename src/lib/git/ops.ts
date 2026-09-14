@@ -721,8 +721,12 @@ function gitBounded(
  */
 export const COMMIT_TIMEOUT_ENV = "ANTON_GIT_COMMIT_TIMEOUT_MS";
 
-/** The same budget every other git call here runs under. */
-const DEFAULT_COMMIT_TIMEOUT_MS = 120_000;
+/**
+ * The same budget every other git call here runs under. Exported so
+ * {@link "@/lib/projects".DEFAULT_COMMIT_TIMEOUT_MINUTES} can be asserted equal to it — the two
+ * defaults must never drift apart silently.
+ */
+export const DEFAULT_COMMIT_TIMEOUT_MS = 120_000;
 
 /** What a killed commit's group gets to tear itself down before SIGKILL follows. */
 const COMMIT_KILL_GRACE_MS = 5_000;

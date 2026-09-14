@@ -676,6 +676,32 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect("reviewMaxRounds" in persisted()).toBe(false);
   });
 
+  it("PATCH persists an in-range commitTimeoutMinutes, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ commitTimeoutMinutes: 5 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.commitTimeoutMinutes).toBe(5);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.commitTimeoutMinutes).toBe(5);
+  });
+
+  it("PATCH rejects an out-of-range or non-integer commitTimeoutMinutes", async () => {
+    for (const bad of [0, 61, 2.5, "long"]) {
+      const res = await PATCH(patchReq({ commitTimeoutMinutes: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/commitTimeoutMinutes/);
+    }
+    expect("commitTimeoutMinutes" in persisted()).toBe(false);
+  });
+
+  it('PATCH "" / null clears commitTimeoutMinutes back to the default (key removed)', async () => {
+    await PATCH(patchReq({ commitTimeoutMinutes: 10 }), ctx("tmp"));
+    const res = await PATCH(patchReq({ commitTimeoutMinutes: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.commitTimeoutMinutes).toBeUndefined();
+    expect("commitTimeoutMinutes" in persisted()).toBe(false);
+  });
+
   it("PATCH persists the score-alarm thresholds, including 0 as the off switch (anton-i98r)", async () => {
     // The cap rides along: a 3-round streak under the default cap of 2 could never trip, and is
     // rejected by the cross-check below.
