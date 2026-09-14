@@ -7,6 +7,7 @@
  * The job runner + execute-epic job depend on exactly these exports.
  */
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { hostname } from "node:os";
@@ -468,11 +469,22 @@ export async function createWorktree(opts: {
     const path = worktreePathFor(repoPath, branch);
     await mkdir(dirname(path), { recursive: true });
 
+    const exists = await branchExists(repoPath, branch);
+    if (await unsafeForkBranch(repoPath, branch)) {
+      if (exists) {
+        throw new Error(
+          `[worktree] refusing to reuse ${branch}: fork capture failed after creating it, so its ` +
+            `history is unpinned; delete the branch before retrying`,
+        );
+      }
+      await clearUnsafeForkBranch(repoPath, branch);
+    }
+
     // `--lock` as part of the ADD, never a `worktree lock` after it: git documents the two-step form
     // as racy, and this is the race that matters — between the two commands a concurrent anton's
     // teardown reads a fresh, unlocked checkout on the expected branch and force-removes it.
     const lockArgs = claimed ? ["--lock", "--reason", claimLockReason(claimed)] : [];
-    const createdBranch = !(await branchExists(repoPath, branch));
+    const createdBranch = !exists;
     if (createdBranch) {
       await git(repoPath, ["worktree", "add", ...lockArgs, path, "-b", branch, baseBranch]);
     } else {
@@ -494,18 +506,34 @@ export async function createWorktree(opts: {
       // against a base ref that may have moved. This checkout did not exist before this call, so tear
       // it down before exposing that state; retain a pre-existing branch for the run that owns it.
       await git(repoPath, ["worktree", "unlock", path]).catch(() => undefined);
-      let cleanupFailure: unknown;
       try {
         await git(repoPath, ["worktree", "remove", "--force", path]);
-        if (createdBranch) await git(repoPath, ["branch", "-D", branch]);
       } catch (cleanupError) {
-        cleanupFailure = cleanupError;
-      }
-      if (cleanupFailure) {
         throw new Error(
           `[worktree] could not capture ${branch}'s creation fork and could not remove the unpinned ` +
-            `checkout: ${gitError(cleanupFailure)} (original error: ${gitError(error)})`,
+            `checkout: ${gitError(cleanupError)} (original error: ${gitError(error)})`,
         );
+      }
+
+      if (createdBranch) {
+        try {
+          await git(repoPath, ["branch", "-D", branch]);
+        } catch (cleanupError) {
+          try {
+            await markUnsafeForkBranch(repoPath, branch);
+          } catch (markError) {
+            throw new Error(
+              `[worktree] could not capture ${branch}'s creation fork, removed its checkout, but ` +
+                `could neither delete nor mark the branch unsafe: ${gitError(markError)} ` +
+                `(branch deletion: ${gitError(cleanupError)}; original error: ${gitError(error)})`,
+            );
+          }
+          throw new Error(
+            `[worktree] could not capture ${branch}'s creation fork and deleted its checkout, but ` +
+              `the branch remains unsafe to reuse: ${gitError(cleanupError)} ` +
+              `(original error: ${gitError(error)})`,
+          );
+        }
       }
       throw error;
     }
@@ -573,6 +601,32 @@ export async function listBranches(repoPath: string, prefix: string): Promise<st
     `refs/heads/${prefix}/`,
   ]);
   return out.split("\n").filter(Boolean);
+}
+
+/** A durable local ref for a branch whose fresh fork could not be captured or cleaned up. */
+function unsafeForkRef(branch: string): string {
+  return `refs/anton/unsafe-fork/${createHash("sha256").update(branch).digest("hex")}`;
+}
+
+/** Whether a prior failed fork capture left this branch unsafe to reuse. */
+async function unsafeForkBranch(repoPath: string, branch: string): Promise<boolean> {
+  try {
+    await git(repoPath, ["show-ref", "--verify", "--quiet", unsafeForkRef(branch)]);
+    return true;
+  } catch (err) {
+    if ((err as { code?: number }).code === 1) return false;
+    throw err;
+  }
+}
+
+/** Mark the surviving branch before returning a failed fork capture to a future retry. */
+async function markUnsafeForkBranch(repoPath: string, branch: string): Promise<void> {
+  await git(repoPath, ["update-ref", unsafeForkRef(branch), "HEAD"]);
+}
+
+/** A branch an operator removed is safe to create again; its stale marker must not block it. */
+async function clearUnsafeForkBranch(repoPath: string, branch: string): Promise<void> {
+  await git(repoPath, ["update-ref", "-d", unsafeForkRef(branch)]);
 }
 
 /**

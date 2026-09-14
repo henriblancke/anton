@@ -295,6 +295,37 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  it("marks a branch unsafe when fork cleanup removes its checkout but cannot delete its branch", async () => {
+    const branch = "anton/run-fork-cleanup-branch-fails";
+    const shim = gitShim([
+      'if [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then',
+      '  echo "fatal: object database unavailable" >&2',
+      "  exit 128",
+      "fi",
+      'if [ "$3" = "branch" ] && [ "$4" = "-D" ]; then',
+      '  echo "fatal: cannot lock ref" >&2',
+      "  exit 1",
+      "fi",
+    ]);
+
+    try {
+      await expect(createWorktree({ repoPath: repo, branch })).rejects.toThrow(
+        /branch remains unsafe to reuse/,
+      );
+      expect(existsSync(worktreePathFor(repo, branch))).toBe(false);
+      expect(await branchExists(repo, branch)).toBe(true);
+    } finally {
+      shim.restore();
+    }
+
+    await expect(createWorktree({ repoPath: repo, branch })).rejects.toThrow(/refusing to reuse/);
+
+    execFileSync("git", ["-C", repo, "branch", "-D", branch]);
+    const recreated = await createWorktree({ repoPath: repo, branch });
+    expect(recreated.forkSha).toMatch(/^[0-9a-f]{40}$/);
+    await removeWorktree(recreated, { deleteBranch: true });
+  });
+
   it("returns the creation fork when warm-command resolution throws", async () => {
     const priorVitest = process.env.VITEST;
     delete process.env.VITEST;
