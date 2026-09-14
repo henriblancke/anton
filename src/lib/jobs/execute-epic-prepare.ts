@@ -122,7 +122,7 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   await cascadeChildClaims(run);
   await assertReservedTicketsClaimable(run, gates);
   await publishRunClaim(run);
-  await assertPublishedBoardCycleFree(run);
+  await assertPublishedBoardCycleFree(run, gates);
   return {
     done: false,
     ticketSteps,
@@ -512,8 +512,18 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
  * the stale `run.all`/`run.tickets` would carry it nowhere, so `partitionTickets`'s
  * `orderTickets(tickets, all)` would still sort by the pre-pull edges and could dispatch the
  * dependent first. Adopted the same way {@link confirmSelectionUnderLease} adopts its own read.
+ *
+ * READINESS is re-derived from the same adopted board, for the same reason (PR #274 review, round
+ * 4): the edge this window can land is not only an internal cycle — it is just as validly a new
+ * EXTERNAL blocker on one of this run's own tickets (or on the target itself). `partitionTickets`
+ * dispatches by `gates.gated` alone; its own re-gate ({@link regateReopened}) fires only for a
+ * ticket a supersede reopened, so a plain new blocker on an ordinary live ticket would otherwise
+ * ride the stale `gated` this function's caller already captured straight through as dispatchable.
+ * Recomputed the same way `regateRefreshedBoard` and `armHumanTicketWaits` do, and PARKED on the
+ * same poison a blocker reopening at either of those points already takes: this is just the last
+ * window one can land in before the loop starts.
  */
-async function assertPublishedBoardCycleFree(run: EpicRun): Promise<void> {
+async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Promise<void> {
   const { repo, targetId: epicBeadId } = run;
   let board: Bead[];
   try {
@@ -534,6 +544,10 @@ async function assertPublishedBoardCycleFree(run: EpicRun): Promise<void> {
   run.all = board;
   run.target = adoptRefreshedTarget(board, epicBeadId, run.target);
   run.tickets = run.standaloneRun ? [run.target] : runTickets(board, epicBeadId);
+  const freshReadiness = run.readiness(run.all);
+  if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness, run.all);
+  gates.readiness = freshReadiness;
+  gates.gated = new Set(freshReadiness.gated);
 }
 
 /**

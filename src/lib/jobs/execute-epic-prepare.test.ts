@@ -441,6 +441,42 @@ describe("prepareEpicRun — the structure/cycle gate re-runs on the board the r
       { type: "blocks", issue_id: "t-2", depends_on_id: "t-1" },
     ]);
   });
+
+  // A cycle is not the only shape this window can land: a valid new EXTERNAL blocker on one of the
+  // run's own tickets is just as invisible to `structureGaps` (it blocks nothing, so nothing is
+  // cyclic), and unlike the internal edge above, it must gate a ticket rather than merely reorder it.
+  // Before this fix, `assertPublishedBoardCycleFree` adopted the board into `run.all`/`run.tickets`
+  // but returned the STALE `gates.gated` its caller captured earlier — so `partitionTickets` would
+  // dispatch the newly-blocked ticket anyway (PR #274 review, round 4).
+  it("recomputes readiness and the gated set from the board publishRunClaim's own sync pulled", async () => {
+    const preEdge = board(ticket("t-1"), ticket("t-2"));
+    attachCycleEvidence(preEdge, []);
+    const postBlock = board(ticket("t-1"), ticket("t-2"));
+    attachCycleEvidence(postBlock, []);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(preEdge));
+    // The first two reads (the lease's confirmation, then the pre-publish claimability check) see
+    // the pre-block board; only the read after `publishRunClaim`'s own sync sees the new blocker.
+    loadAllIssuesMock.mockResolvedValueOnce(preEdge).mockResolvedValueOnce(preEdge).mockResolvedValue(postBlock);
+
+    const theRun = run(preEdge);
+    // Readiness reacts to the board it's handed, the same way a real `runReadiness` would once a
+    // fresh external `blocks` edge lands on t-2: gated only once the ADOPTED board carries it.
+    theRun.readiness = (b: Bead[]) => {
+      const gatedOnPostBlock = b === postBlock;
+      return {
+        blockers: gatedOnPostBlock ? ["anton-elsewhere"] : [],
+        gated: gatedOnPostBlock ? ["t-2"] : [],
+        runnable: true,
+      };
+    };
+
+    const prep = await prepareEpicRun(theRun);
+
+    expect(prep.done).toBe(false);
+    if (prep.done) return;
+    expect([...prep.gated]).toContain("t-2");
+    expect(prep.readiness.blockers).toContain("anton-elsewhere");
+  });
 });
 
 describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)", () => {
