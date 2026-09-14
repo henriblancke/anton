@@ -1238,8 +1238,14 @@ export class JobRunner {
       const snapshot = snapshotByProject.get(pid) ?? { meterKey: "anthropic", usage: null };
       const projectUsage = snapshot.usage;
       if (!projectUsage) {
-        // Fail open only for the project whose meter is unavailable. Resume its own stale governor
-        // deferrals, but keep evaluating other governed projects with their independent meters.
+        // Fail open only for the project whose meter is unavailable — leave its jobs leasable. But
+        // still record the meter identity it resolved to: `revalidateAdmittedGovernorMeters` and the
+        // handler's own `admittedMeterKey` check (PR #269 review) both key off this map, and without
+        // an entry here a route flip between this read and lease/dispatch would go undetected,
+        // dispatching onto a newly selected meter that never cleared `budgetGate`.
+        admittedMeters.set(pid, snapshot);
+        // Resume its own stale governor deferrals, but keep evaluating other governed projects with
+        // their independent meters.
         await resumeBudgetDeferredJobs(this.db, this.clock, {
           types: GOVERNED_JOB_TYPES,
           projectId: pid,
