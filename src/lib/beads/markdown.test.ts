@@ -399,6 +399,11 @@ describe("unterminatedCloser", () => {
     expect(unterminatedCloser("```\n<!-- literal\n```")).toBeUndefined();
   });
 
+  it("does not mistake fence-looking text inside closed comments or raw HTML for a fence", () => {
+    expect(unterminatedCloser("<!--\n```\n-->")).toBeUndefined();
+    expect(unterminatedCloser("<script>\n```\n</script>")).toBeUndefined();
+  });
+
   it("is the closing tag of a persistent HTML block the body ends inside", () => {
     // These blocks end at their own closing text, not at a blank line, so anything appended after
     // one lands inside it — hidden in every renderer while this scanner still read the heading,

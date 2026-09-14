@@ -814,6 +814,21 @@ describe("reconcileFollowUpDescription", () => {
     );
   });
 
+  it("appends a visible Acceptance after a closed construct holds a fence-looking line", () => {
+    for (const partial of [
+      "## Goal\nharden the retry\n\n## Context\n<!--\n```\n-->",
+      "## Goal\nharden the retry\n\n## Context\n<script>\n```\n</script>",
+    ]) {
+      const reconciled = reconcileFollowUpDescription(partial, edited);
+
+      expect(reconciled).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+      expect(reconciled).not.toContain("```\n\n## Acceptance Criteria");
+      expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
+        "- [ ] Cover the exhausted path.",
+      );
+    }
+  });
+
   it("closes a persistent HTML block the hand-made description ends inside — one runs past the blank line", () => {
     // `<script>` and its kind end at their own closing tag, not at a blank line, so an appended
     // `## Acceptance` was swallowed in every renderer while the judge — blind to HTML blocks — read

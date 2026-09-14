@@ -426,6 +426,7 @@ export function unterminatedCloser(source: string): string | undefined {
   });
   if (!closer) {
     const lines = scanMarkdown(source);
+    const inHtml = htmlBlockLines(source);
     const codeSpans: { start: number; end: number }[] = [];
     visit(root, (node) => {
       if (node.type === "inlineCode" && node.position) {
@@ -437,7 +438,7 @@ export function unterminatedCloser(source: string): string | undefined {
     let commentOpen = false;
     let fence: { offset: number; opener: string } | undefined;
     let offset = 0;
-    for (const line of lines) {
+    for (const [lineIndex, line] of lines.entries()) {
       const fenced = line.fenced;
       let at = 0;
       while (!fenced) {
@@ -456,7 +457,7 @@ export function unterminatedCloser(source: string): string | undefined {
         commentOffset = offset + start;
         at = start + 4;
       }
-      const candidate = openingFence(line.text);
+      const candidate = !line.commented && !inHtml[lineIndex] ? openingFence(line.text) : undefined;
       if (candidate) {
         if (fence && closingFence(line.text, openingFence(fence.opener)!)) fence = undefined;
         else fence = { offset, opener: line.text };
