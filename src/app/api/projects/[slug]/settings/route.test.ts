@@ -15,6 +15,7 @@ const gitOps = vi.hoisted(() => ({
   commitMarker: vi.fn(),
   isAncestor: vi.fn(),
   openPullRequest: vi.fn(),
+  pushBranch: vi.fn(),
   readWorktreeState: vi.fn(),
   resolveHooksPathOverride: vi.fn(),
   stageAll: vi.fn(),
@@ -30,7 +31,7 @@ vi.mock("@/lib/db", () => ({
 vi.mock("@/lib/git/ops", () => gitOps);
 
 const { GET, PATCH } = await import("./route");
-const { commitStep } = await import("@/lib/jobs/steps/git");
+const { commitStep, prStep } = await import("@/lib/jobs/steps/git");
 
 const ctx = (slug: string) => ({ params: Promise.resolve({ slug }) });
 
@@ -716,6 +717,32 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect("commitTimeoutMinutes" in persisted()).toBe(false);
   });
 
+  it("PATCH persists an in-range pushTimeoutMinutes, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ pushTimeoutMinutes: 5 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.pushTimeoutMinutes).toBe(5);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pushTimeoutMinutes).toBe(5);
+  });
+
+  it("PATCH rejects an out-of-range or non-integer pushTimeoutMinutes", async () => {
+    for (const bad of [0, 61, 2.5, "long"]) {
+      const res = await PATCH(patchReq({ pushTimeoutMinutes: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/pushTimeoutMinutes/);
+    }
+    expect("pushTimeoutMinutes" in persisted()).toBe(false);
+  });
+
+  it('PATCH "" / null clears pushTimeoutMinutes back to the default (key removed)', async () => {
+    await PATCH(patchReq({ pushTimeoutMinutes: 10 }), ctx("tmp"));
+    const res = await PATCH(patchReq({ pushTimeoutMinutes: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.pushTimeoutMinutes).toBeUndefined();
+    expect("pushTimeoutMinutes" in persisted()).toBe(false);
+  });
+
   it("saves, reads, then gives commitAll the project's configured commit budget", async () => {
     const saved = await PATCH(patchReq({ commitTimeoutMinutes: 5 }), ctx("tmp"));
     expect(saved.status).toBe(200);
@@ -752,6 +779,56 @@ describe("settings route — self-review settings (anton-of1m)", () => {
       "/tmp/p1",
       "anton-settings: Settings round trip",
       expect.objectContaining({ timeoutMs: 5 * 60_000 }),
+    );
+  });
+
+  it("saves, reads, then gives pushBranch the project's configured push budget", async () => {
+    const saved = await PATCH(patchReq({ pushTimeoutMinutes: 5 }), ctx("tmp"));
+    expect(saved.status).toBe(200);
+
+    const { settings } = await (await GET(new Request("http://t/"), ctx("tmp"))).json();
+    gitOps.openPullRequest.mockImplementation(async (options) => {
+      await gitOps.pushBranch(
+        options.worktreePath ?? options.repoPath,
+        options.branch,
+        undefined,
+        options.pushTimeoutMs,
+        options.signal,
+      );
+      return { url: "https://example.test/pr/7", ref: "gh-7" };
+    });
+
+    const signal = new AbortController().signal;
+    await prStep({
+      db: tdb.db,
+      clock: { now: () => 0 },
+      ctx: {
+        signal,
+        heartbeat: async () => {},
+        report: () => {},
+        claudeReached: async () => {},
+        jobId: "job-test",
+        type: "execute-epic",
+      },
+      projectId: "p1",
+      runId: "run-test",
+      repoPath: "/tmp/p1",
+      worktreePath: "/tmp/p1",
+      branch: "anton/settings-round-trip",
+      baseBranch: "main",
+      baseRef: "origin/main",
+      baseForkSha: "f0f0f0forkcommit",
+      target: { id: "anton-settings", title: "Settings round trip", status: "in_progress", issue_type: "feature" },
+      tickets: [{ id: "anton-settings", title: "Settings round trip", status: "in_progress", issue_type: "feature" }],
+      settings,
+    });
+
+    expect(gitOps.pushBranch).toHaveBeenCalledWith(
+      "/tmp/p1",
+      "anton/settings-round-trip",
+      undefined,
+      5 * 60_000,
+      signal,
     );
   });
 

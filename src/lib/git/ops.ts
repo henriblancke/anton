@@ -1438,6 +1438,105 @@ export async function hasRemote(repoPath: string, name = "origin"): Promise<bool
 }
 
 /**
+ * Override the push budget, same shape as {@link COMMIT_TIMEOUT_ENV} — a CAP, never an override, so
+ * a project's real setting still gets bounded by it. Read per call, not module-cached, for the same
+ * reason {@link commitTimeoutMs} is.
+ */
+export const PUSH_TIMEOUT_ENV = "ANTON_GIT_PUSH_TIMEOUT_MS";
+
+/** The push budget every caller gets when it has no project setting of its own to pass. */
+export const DEFAULT_PUSH_TIMEOUT_MS = 120_000;
+
+/**
+ * Resolve the push budget: `requested` (from a caller who knows the project's setting) falling back
+ * to {@link DEFAULT_PUSH_TIMEOUT_MS}, then CAPPED by {@link PUSH_TIMEOUT_ENV} when that env var is
+ * set to a valid positive number — the push counterpart to {@link commitTimeoutMs}, same reasoning.
+ */
+function pushTimeoutMs(requested?: number): number {
+  const passed = requested ?? DEFAULT_PUSH_TIMEOUT_MS;
+  const raw = Number(process.env[PUSH_TIMEOUT_ENV]);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(passed, raw) : passed;
+}
+
+/** The rejection a push killed by its own budget carries, mirroring {@link commitTimedOut}. */
+function pushTimedOut(args: string[], timeoutMs: number, stderr: string): Error {
+  return Object.assign(
+    new Error(
+      `git ${args[0]} timed out after ${formatCommitBudget(timeoutMs)} (this project's "Push timeout" ` +
+        `setting) and was killed with everything it spawned: ${stderr}`,
+    ),
+    { killed: true },
+  );
+}
+
+/**
+ * Run a `git push` and return only once it — and any `pre-push` hook it spawned — is GONE, the push
+ * counterpart to {@link gitCommit} (PR #228 review, extended by anton-o74nf). `pre-push` is project
+ * code exactly like `pre-commit`: free to outlive a plain `execFile` timeout, and a caller told the
+ * push failed while a hook is still writing has no way to know it. So the push leads a process group
+ * of its own and a timeout hands that group to {@link reapCommitGroup} — the reaper is generic over
+ * any spawned child, not specific to commits — before any verdict is returned.
+ *
+ * Does NOT go through the shared {@link git} helper: that helper's fixed `execFile` timeout is the
+ * exact mechanism this works around.
+ */
+function gitPush(
+  cwd: string,
+  args: string[],
+  hooksPath?: string,
+  requestedTimeoutMs?: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+      return;
+    }
+
+    const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
+    // stdout is dropped rather than piped, same as gitCommit: nothing here reads it, and a chatty
+    // hook filling an unread pipe would block the push outright.
+    const child = spawn("git", [...configArgs, "-C", cwd, ...args], {
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    const stderr = boundedStderr(child);
+    const timeoutMs = pushTimeoutMs(requestedTimeoutMs);
+    let killing = false;
+    let settled = false;
+    const settle = (emit: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(budget);
+      signal?.removeEventListener("abort", abort);
+      emit();
+    };
+    const abort = () => {
+      if (killing || settled) return;
+      killing = true;
+      void reapCommitGroup(child).then(() =>
+        settle(() => reject(signal?.reason ?? new DOMException("The operation was aborted", "AbortError"))),
+      );
+    };
+    const budget = setTimeout(() => {
+      if (killing || settled) return;
+      killing = true;
+      void reapCommitGroup(child).then(() =>
+        settle(() => reject(pushTimedOut(args, timeoutMs, stderr()))),
+      );
+    }, timeoutMs);
+    signal?.addEventListener("abort", abort, { once: true });
+
+    child.on("error", (err) => settle(() => reject(err)));
+    child.on("close", (code) => {
+      // A kill in flight owns the verdict: its group may still hold live writers.
+      if (killing) return;
+      settle(() => (code === 0 ? resolvePromise() : reject(commitFailed(args, code, stderr()))));
+    });
+  });
+}
+
+/**
  * Push `branch` to `origin`, run from `cwd` — the run's WORKTREE when the caller has one, never the
  * base repo checkout. `git push` itself only needs the shared object database (a worktree and its
  * base checkout are the same repository), so pushing from either succeeds identically — but a
@@ -1447,9 +1546,19 @@ export async function hasRemote(repoPath: string, name = "origin"): Promise<bool
  * it on — unrelated to the branch actually being pushed — so the hook compares two unrelated trees
  * and fails almost every push. Run from the worktree, `cwd`'s checkout IS the branch being pushed, so
  * the hook sees what it expects.
+ *
+ * `timeoutMs` is optional so every existing caller keeps its current behavior (anton-o74nf); see
+ * {@link gitPush} for what bounds it. `signal` gives cancellation the same whole-process-group
+ * reap as a budget expiry, so a cancelled run cannot leave its pre-push hook behind.
  */
-export async function pushBranch(cwd: string, branch: string, hooksPath?: string): Promise<void> {
-  await git(cwd, ["push", "-u", "origin", branch], hooksPath);
+export async function pushBranch(
+  cwd: string,
+  branch: string,
+  hooksPath?: string,
+  timeoutMs?: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  await gitPush(cwd, ["push", "-u", "origin", branch], hooksPath, timeoutMs, signal);
 }
 
 /**
@@ -2978,6 +3087,13 @@ export async function openPullRequest(opts: {
   base: string;
   title: string;
   body: string;
+  /**
+   * The project's push budget, in ms — forwarded to {@link pushBranch} untouched. `gh` itself is
+   * unaffected: only the push ahead of it is bounded. Absent → {@link pushBranch}'s own default.
+   */
+  pushTimeoutMs?: number;
+  /** Cancels and reaps the in-flight push with its whole process group. */
+  signal?: AbortSignal;
 }): Promise<PullRequest> {
   if (!(await hasRemote(opts.repoPath))) {
     throw new Error(
@@ -2985,7 +3101,13 @@ export async function openPullRequest(opts: {
     );
   }
   const hooksPath = await resolveHooksPathOverride(opts.repoPath, opts.worktreePath);
-  await pushBranch(opts.worktreePath ?? opts.repoPath, opts.branch, hooksPath);
+  await pushBranch(
+    opts.worktreePath ?? opts.repoPath,
+    opts.branch,
+    hooksPath,
+    opts.pushTimeoutMs,
+    opts.signal,
+  );
 
   const existing = await findOpenPullRequest(opts.repoPath, opts.branch);
   if (existing) {

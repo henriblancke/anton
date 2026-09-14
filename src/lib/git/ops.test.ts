@@ -68,8 +68,8 @@ import {
   satisfiedMarkerTarget,
   SATISFIES_TRAILER,
 } from "./ops";
-import { DEFAULT_COMMIT_TIMEOUT_MS, GH_BIN_ENV } from "./ops";
-import { DEFAULT_COMMIT_TIMEOUT_MINUTES } from "@/lib/projects";
+import { DEFAULT_COMMIT_TIMEOUT_MS, DEFAULT_PUSH_TIMEOUT_MS, GH_BIN_ENV, PUSH_TIMEOUT_ENV } from "./ops";
+import { DEFAULT_COMMIT_TIMEOUT_MINUTES, DEFAULT_PUSH_TIMEOUT_MINUTES } from "@/lib/projects";
 
 function has(cmd: string): boolean {
   try {
@@ -3768,4 +3768,162 @@ describe("commit timeout default", () => {
   it("agrees with the project setting's default (anton-wq0k) — the two must never drift apart", () => {
     expect(DEFAULT_COMMIT_TIMEOUT_MINUTES * 60_000).toBe(DEFAULT_COMMIT_TIMEOUT_MS);
   });
+});
+
+describe("push timeout default", () => {
+  it("agrees with the project setting's default (anton-i5wkg) — the two must never drift apart", () => {
+    expect(DEFAULT_PUSH_TIMEOUT_MINUTES * 60_000).toBe(DEFAULT_PUSH_TIMEOUT_MS);
+  });
+});
+
+// anton-o74nf: `git push` runs PROJECT code too — a `pre-push` hook — so it gets the same
+// process-group treatment PR #228 gave the commit path. Mirrors "commitAll (real git · a hook that
+// outlives the kill)" above, against `pushBranch`/`gitPush` instead.
+suite("pushBranch (real git · a pre-push hook that outlives the kill)", () => {
+  let sandbox: string;
+  let repo: string;
+  let bare: string;
+  let started: string;
+  let marker: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-push-hook-"));
+    repo = join(sandbox, "repo");
+    bare = join(sandbox, "remote.git");
+    started = join(sandbox, "hook-started");
+    marker = join(sandbox, "late-hook-write");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "--bare", "-q", bare], { stdio: "ignore" });
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["remote", "add", "origin", bare]);
+
+    // A real pre-push hook that survives the kill exactly like the commit-path hook: it hands back
+    // the stdio it inherited — so nothing about it holds the push's pipes open — and keeps writing
+    // afterwards.
+    const hook = join(repo, ".git", "hooks", "pre-push");
+    writeFileSync(
+      hook,
+      [
+        "#!/bin/sh",
+        `trap 'exec >/dev/null 2>&1; sleep 1; : > ${JSON.stringify(marker)}; exit 1' TERM`,
+        `: > ${JSON.stringify(started)}`,
+        "sleep 30 &",
+        "wait",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(hook, 0o755);
+  });
+
+  afterEach(() => {
+    delete process.env[PUSH_TIMEOUT_ENV];
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "reports the failed push only once its hook has gone",
+    async () => {
+      // Comfortably longer than git takes to reach its hook, so the kill lands on a hook that is
+      // actually running — the state the reap exists for.
+      process.env[PUSH_TIMEOUT_ENV] = "2000";
+
+      await expect(pushBranch(repo, "main")).rejects.toThrow(/timed out/);
+
+      expect(existsSync(started)).toBe(true);
+      // Asked the instant the caller is told, with no waiting: the write the hook made AFTER the
+      // signal is already on disk, so nothing racing the rejection can see the hook as still alive.
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "reaps an in-flight pre-push hook when the job aborts before its configured budget",
+    async () => {
+      const controller = new AbortController();
+      const reason = new Error("job made no progress");
+      const pending = pushBranch(repo, "main", undefined, 30 * 60_000, controller.signal);
+
+      await vi.waitFor(() => expect(existsSync(started)).toBe(true));
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+      // The hook writes only after TERM. Seeing it before the abort reaches the caller proves the
+      // cancellation path waited for the group, not merely for git's direct child process.
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  // anton-o74nf: the env var is a CAP on a caller's requested budget, not an override — a caller
+  // asking for a real 30-minute setting must still be bounded by it.
+  it.runIf(process.platform !== "win32")(
+    "caps a caller's requested timeoutMs at the env value instead of honoring it",
+    async () => {
+      process.env[PUSH_TIMEOUT_ENV] = "2000";
+      const start = Date.now();
+
+      await expect(pushBranch(repo, "main", undefined, 30 * 60_000)).rejects.toThrow(/timed out/);
+
+      // Killed at the 2s cap, nowhere near the 30-minute request.
+      expect(Date.now() - start).toBeLessThan(15_000);
+      expect(existsSync(started)).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "bounds the push by the passed timeoutMs when no env override is set",
+    async () => {
+      delete process.env[PUSH_TIMEOUT_ENV];
+      const start = Date.now();
+
+      await expect(pushBranch(repo, "main", undefined, 2_000)).rejects.toThrow(/timed out/);
+
+      expect(Date.now() - start).toBeLessThan(15_000);
+      expect(existsSync(started)).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "ignores an invalid env var and keeps the passed timeoutMs intact",
+    async () => {
+      process.env[PUSH_TIMEOUT_ENV] = "not-a-number";
+      const start = Date.now();
+
+      await expect(pushBranch(repo, "main", undefined, 2_000)).rejects.toThrow(/timed out/);
+
+      expect(Date.now() - start).toBeLessThan(15_000);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "ignores a non-positive env var and keeps the passed timeoutMs intact",
+    async () => {
+      process.env[PUSH_TIMEOUT_ENV] = "-5";
+      const start = Date.now();
+
+      await expect(pushBranch(repo, "main", undefined, 2_000)).rejects.toThrow(/timed out/);
+
+      expect(Date.now() - start).toBeLessThan(15_000);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "names the effective sub-minute budget and points at the project's Push timeout setting",
+    async () => {
+      delete process.env[PUSH_TIMEOUT_ENV];
+
+      await expect(pushBranch(repo, "main", undefined, 2_000)).rejects.toThrow(
+        /timed out after 2,000 ms \(0\.033 minute\(s\)\).*Push timeout/,
+      );
+    },
+  );
 });

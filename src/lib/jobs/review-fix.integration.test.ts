@@ -4,7 +4,7 @@
  * bd/git against a temp repo with a bare origin, using fake `claude`/`gh` so the flow is
  * deterministic without spending API quota or hitting GitHub. Skipped without bd + git.
  */
-import { afterAll, beforeAll, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -15,6 +15,22 @@ import { driveJob, makeJobRunner } from "@/lib/testing/jobs";
 import { beads, LABELS } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
+
+// Records every `pushBranch` call's args while delegating to the real implementation — so a test
+// can assert the resolved push budget (anton-n93lo) rode through `commitAndPushFix` without giving
+// up the real git push the rest of this suite depends on.
+const pushBranchCalls: unknown[][] = [];
+vi.mock("../git/ops", async () => {
+  const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
+  return {
+    ...actual,
+    pushBranch: (...args: Parameters<typeof actual.pushBranch>) => {
+      pushBranchCalls.push(args);
+      return actual.pushBranch(...args);
+    },
+  };
+});
+
 import { makeReviewFixHandler, makeReviewFixPrHandler } from "./review-fix";
 import { createWorktree } from "../git/worktree";
 import { resetOperatorCache } from "../operator";
@@ -251,6 +267,11 @@ process.exit(0);`,
     expect(sessions[0].kind).toBe("review-fix");
     expect(sessions[0].status).toBe("done");
     expect(sessions[0].beadId).toBe(epicId);
+
+    // No pushTimeoutMinutes setting on this project — resolves to the 2-minute default, the same
+    // one `pushBranch` itself falls back to (anton-n93lo): byte-identical to before this existed.
+    expect(pushBranchCalls.at(-1)?.[3]).toBe(2 * 60_000);
+    expect(pushBranchCalls.at(-1)?.[4]).toBeInstanceOf(AbortSignal);
   });
 
   it.runIf(process.platform !== "win32")(
@@ -299,6 +320,25 @@ process.exit(0);`,
       expect(last.prompt).toContain(marker); // operator override reached claude
       expect(last.prompt).toContain("rename foo to bar"); // PR context still appended beneath it
       expect(last.prompt).not.toContain("Triage every finding"); // default file was NOT used
+    } finally {
+      await tdb.db
+        .update(schema.projects)
+        .set({ settingsJson: "{}" })
+        .where(eq(schema.projects.id, projectId));
+    }
+  });
+
+  it("threads the project's configured push timeout into the review fix's pushBranch call", async () => {
+    await tdb.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ pushTimeoutMinutes: 7 }) })
+      .where(eq(schema.projects.id, projectId));
+    try {
+      await runSweep();
+      // Read from the run's PINNED settings snapshot (same rule claudeRouting(settings) follows),
+      // not re-read mid-run — proven here by the resolved budget actually reaching pushBranch.
+      expect(pushBranchCalls.at(-1)?.[3]).toBe(7 * 60_000);
+      expect(pushBranchCalls.at(-1)?.[4]).toBeInstanceOf(AbortSignal);
     } finally {
       await tdb.db
         .update(schema.projects)

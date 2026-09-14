@@ -75,6 +75,11 @@ describe("dirtyFields", () => {
     expect(dirty({ commitTimeoutMinutes: 10 }).commitTimeoutMinutes).toBe(true);
   });
 
+  it("reads an edited push timeout as dirty, and resolves an absent one to the default", () => {
+    expect(draft().pushTimeoutMinutes).toBe(2);
+    expect(dirty({ pushTimeoutMinutes: 10 }).pushTimeoutMinutes).toBe(true);
+  });
+
   it("does not read trailing whitespace on a prompt as an edit", () => {
     expect(dirty({ seedPrompt: "  prefer RSC  " }, { seedPrompt: "prefer RSC" }).seedPrompt).toBe(
       false,
@@ -144,6 +149,11 @@ describe("settingsPatchBody", () => {
   it("carries the commit timeout through to the save body", () => {
     const d = draft({ commitTimeoutMinutes: 10 });
     expect(settingsPatchBody(d, BUNDLED, []).commitTimeoutMinutes).toBe(10);
+  });
+
+  it("carries the push timeout through to the save body", () => {
+    const d = draft({ pushTimeoutMinutes: 10 });
+    expect(settingsPatchBody(d, BUNDLED, []).pushTimeoutMinutes).toBe(10);
   });
 
   it("sends only the bundled ids that are on, pruning a stale user agent", () => {

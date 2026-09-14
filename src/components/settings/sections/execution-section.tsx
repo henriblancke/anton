@@ -5,6 +5,8 @@ import { Toggle } from "@/components/atoms";
 import {
   COMMIT_TIMEOUT_MINUTES_MAX,
   COMMIT_TIMEOUT_MINUTES_MIN,
+  PUSH_TIMEOUT_MINUTES_MAX,
+  PUSH_TIMEOUT_MINUTES_MIN,
 } from "@/components/settings/settings-constants";
 import { PctField, SectionHeading } from "@/components/settings/settings-fields";
 import type { SettingsForm } from "@/components/settings/use-settings-form";
@@ -60,6 +62,14 @@ export function ExecutionSection({ form }: { form: SettingsForm }) {
             min={COMMIT_TIMEOUT_MINUTES_MIN}
             max={COMMIT_TIMEOUT_MINUTES_MAX}
             hint="pre-commit hooks · default 2"
+          />
+          <MinutesField
+            label="Push timeout"
+            value={draft.pushTimeoutMinutes}
+            onChange={(value) => set("pushTimeoutMinutes", value)}
+            min={PUSH_TIMEOUT_MINUTES_MIN}
+            max={PUSH_TIMEOUT_MINUTES_MAX}
+            hint="pre-push hooks · default 2"
           />
           <label className="flex flex-col gap-1.5">
             <span className="text-[12.5px] text-muted-foreground">Retries</span>
