@@ -55,6 +55,8 @@ import { resolveModel } from "./model-routing";
 import {
   branchAheadOfRemote,
   commitAll,
+  isAncestor,
+  readWorktreeState,
   fetchOrigin,
   mergeIntoCurrent,
   needsHooksPathOverrideForMerge,
@@ -87,6 +89,8 @@ import { resolveOperator } from "../operator";
 import {
   getProjectById,
   getProjectSettings,
+  resolveCommitTimeoutMs,
+  resolvePushTimeoutMs,
   resolveVerifyGates,
   type ProjectSettings,
 } from "../projects";
@@ -649,6 +653,8 @@ async function runFixSession(args: {
       epic.id,
       branch,
       number,
+      settings,
+      ctx.signal,
     );
 
     await applyThreadOutcomes({
@@ -723,6 +729,8 @@ async function commitAndPushFix(
   epicId: string,
   branch: string,
   number: number,
+  settings: ProjectSettings,
+  signal: AbortSignal,
 ): Promise<boolean> {
   // Staged BEFORE `resolveHooksPathOverride` is asked anything (PR #263 review, round 37) — the
   // same fix `commitStep` applies for the same reason: its submodule-staleness check reads the
@@ -734,11 +742,37 @@ async function commitAndPushFix(
   // has already staged everything.
   await stageAll(worktreePath);
   const hooksPath = await resolveHooksPathOverride(repo, worktreePath);
-  const { committed } = await commitAll(
-    worktreePath,
-    `${epicId}: address review feedback (PR #${number})`,
-    { hooksPath },
-  );
+  // `post-commit` runs after HEAD advances. A timeout can therefore reject `commitAll` after the
+  // fix landed; recognize only a forward move on this run's branch, never an unrelated rewrite.
+  const before = await readWorktreeState(worktreePath);
+  let committed: boolean;
+  try {
+    ({ committed } = await commitAll(
+      worktreePath,
+      `${epicId}: address review feedback (PR #${number})`,
+      { hooksPath, timeoutMs: resolveCommitTimeoutMs(settings), signal },
+    ));
+  } catch (error) {
+    // An operator cancellation stops the entire review-fix lifecycle: do not push, resolve threads,
+    // or mark its session done merely because Git had already advanced HEAD.
+    if (signal.aborted) throw error;
+    const after = await readWorktreeState(worktreePath);
+    if (after.head === before.head) throw error;
+    if (after.ref !== `refs/heads/${branch}`) {
+      throw new PoisonError(
+        `review fix for PR #${number} left HEAD on ${after.ref ?? `a detached HEAD (${after.head})`} ` +
+          `instead of the run's ${branch}`,
+        { cause: error },
+      );
+    }
+    if (!(await isAncestor(worktreePath, before.head, after.head))) {
+      throw new PoisonError(
+        `review fix for PR #${number} rewrote ${branch} instead of adding its commit`,
+        { cause: error },
+      );
+    }
+    committed = true;
+  }
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
   // From the worktree, not `repo` (the base checkout) — see pushBranch's doc comment: a project's
   // pre-push hook that inspects the working tree must see the branch actually being pushed. The
@@ -746,7 +780,9 @@ async function commitAndPushFix(
   // worktreePath) queries worktreePath when given, per its own contract) — the same "read from the
   // worktree, not the base repo" behavior this file's onbranch-includeIf reasoning depends on
   // elsewhere, not the base checkout's config.
-  if (pushed) await pushBranch(worktreePath, branch, hooksPath);
+  if (pushed) {
+    await pushBranch(worktreePath, branch, hooksPath, resolvePushTimeoutMs(settings), signal);
+  }
   return pushed;
 }
 

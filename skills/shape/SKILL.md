@@ -1,6 +1,6 @@
 ---
 name: shape
-version: bcd28df71182
+version: 2b495718a437
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -287,7 +287,7 @@ const orderTickets = (tickets) => {
   }
   return order.length === tickets.length ? order.map((id) => tickets.find((t) => t.id === id)) : tickets;
 };
-// Mirrors execute-epic-dispatch.ts's `live` filter: an abandoned ticket is closed but was never
+// Mirrors the `live` filter in execute-epic-dispatch.ts: an abandoned ticket is closed but was never
 // committed, and the executor drops it from the run entirely before computing held/dispatchable —
 // so it must never appear in this printed order either.
 const isAbandoned = (b) => (b.labels ?? []).includes("abandoned");

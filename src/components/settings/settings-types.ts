@@ -92,6 +92,10 @@ export interface EditableSettings {
   reviewFixConcurrency?: number;
   jobTimeoutMinutes?: number;
   ticketTimeoutMinutes?: number;
+  /** Pre-commit hooks' own cap (anton-n5e7); absent = DEFAULT_COMMIT_TIMEOUT_MINUTES (2 min). */
+  commitTimeoutMinutes?: number;
+  /** Pre-push hooks' own cap (anton-7agwq); absent = DEFAULT_PUSH_TIMEOUT_MINUTES (2 min). */
+  pushTimeoutMinutes?: number;
   maxRetries?: number;
   agents?: string[];
   autonomy?: boolean;

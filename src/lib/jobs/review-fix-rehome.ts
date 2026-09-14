@@ -11,6 +11,7 @@
  * verdicts are re-read rather than trusted when they are applied.
  */
 import { beads, ownerOf, type Bead } from "../beads/bd";
+import { withBeadWriteLocks } from "../beads/claim-lock";
 import {
   memoisedShow,
   ridesOn,
@@ -582,6 +583,22 @@ async function detachFrom(
   bead: Bead,
   parentId: string,
 ): Promise<void> {
+  // The reads and the write are ONE locked step, under the moved bead's lock and its new home's —
+  // the same set every other re-parent writer holds (gardener apply-steps `lockedBeads`, PR #238
+  // review). An unlocked reparent is invisible to the retirement that closes a ticket as already
+  // shipped: it re-reads the board under exactly these locks to see that the ticket still hangs
+  // where it was checked, and a move that holds none of them can land between that read and the
+  // supersede, closing the ticket inside a run it just joined.
+  await withBeadWriteLocks(run.repo, [bead.id, run.epic.id], () =>
+    detachUnderLocks(run, bead, parentId),
+  );
+}
+
+async function detachUnderLocks(
+  run: RehomeRun,
+  bead: Bead,
+  parentId: string,
+): Promise<void> {
   const shipped = await run.reread(bead.id);
   // Still the sweep's evidence until the board confirms it: a ticket another operator has since
   // moved off this ancestor rides on nothing, and detaching would rewrite an edge that is theirs.
@@ -677,6 +694,20 @@ async function moveOne(
   followUp: string,
 ): Promise<"taken" | "done"> {
   if (settledAlready(run, mover)) return "done";
+  // Under the mover's lock and the follow-up's, for {@link detachFrom}'s reason: a reparent that
+  // holds neither is one the already-shipped retirement cannot order itself against (PR #238
+  // review). Every bead the mover carries rides along on its edge, so the retirement holds the
+  // locks of the ticket's ancestors too — and this lock is what makes that hold mean anything.
+  return withBeadWriteLocks(run.repo, [mover.id, followUp], () =>
+    moveUnderLocks(run, mover, followUp),
+  );
+}
+
+async function moveUnderLocks(
+  run: RehomeRun,
+  mover: Bead,
+  followUp: string,
+): Promise<"taken" | "done"> {
   const live = await run.reread(mover.id);
   if (ridesOnMover(run, mover, live)) return "done";
   if (await moverBlocked(run, mover, live)) return "done";

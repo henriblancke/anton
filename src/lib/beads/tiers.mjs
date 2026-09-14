@@ -153,9 +153,15 @@ export function validateBoardStructure(board, { cycles } = {}) {
     }
 
     for (const cycle of cycleMemberships.get(bead.id) ?? []) {
-      const partner = (bead.dependencies ?? []).find(
-        (dep) => dep?.type === "blocks" && cycle.members.has(dep.depends_on_id),
-      )?.depends_on_id;
+      // Prefer the edge bd's own reported path actually walks (`next`), not just any `blocks` edge
+      // into the cycle's member set: a bead can hold a chord into the same cycle (e.g. `a -> c` on
+      // top of the real loop `a -> b -> c -> a`), and picking that chord names a `bd dep remove`
+      // that leaves the reported loop fully intact. Falls back to the old any-member search only
+      // when the path edge isn't found on this bead (bd's report and the board disagreeing).
+      const edges = (bead.dependencies ?? []).filter((dep) => dep?.type === "blocks");
+      const onPath = edges.find((dep) => dep.depends_on_id === cycle.next.get(bead.id));
+      const partner = (onPath ?? edges.find((dep) => cycle.members.has(dep.depends_on_id)))
+        ?.depends_on_id;
       fault(
         bead.id,
         "blocks-cycle",
@@ -323,7 +329,11 @@ function cycleMembers(byId, cycles) {
     const ids = Array.isArray(cycle?.ids) ? cycle.ids.filter((id) => typeof id === "string") : [];
     const mapped = ids.filter((id) => byId.has(id));
     const members = new Set(mapped);
-    const evidence = { members, complete: ids.length > 0 && mapped.length === ids.length };
+    // bd reports the loop IN ORDER — id[i] waits on id[i+1], wrapping back to id[0] — so this
+    // adjacency is the one real edge per member the loop actually walks, as opposed to `members`
+    // (a Set) which can't distinguish that edge from an unrelated chord into the same cycle.
+    const next = new Map(ids.map((id, i) => [id, ids[(i + 1) % ids.length]]));
+    const evidence = { members, next, complete: ids.length > 0 && mapped.length === ids.length };
     for (const id of mapped) {
       const memberCycles = memberships.get(id);
       if (memberCycles) memberCycles.push(evidence);

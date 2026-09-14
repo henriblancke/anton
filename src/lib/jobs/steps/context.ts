@@ -70,7 +70,10 @@ export interface StepContext {
    * identity, which the spend ledger records as the dimension separating what a run cost from what a
    * nightly pass cost (anton-77l9).
    */
-  ctx: Pick<JobContext, "signal" | "heartbeat" | "report" | "claudeReached" | "jobId" | "type">;
+  ctx: Pick<JobContext, "signal" | "heartbeat" | "report" | "claudeReached" | "jobId" | "type"> & {
+    /** The run-level signal when `signal` is a derived ticket deadline. */
+    jobSignal?: AbortSignal;
+  };
   projectId: string;
   runId: string;
   /** The project repo — where bd and gh run. Never the worktree. */
@@ -87,6 +90,14 @@ export interface StepContext {
    * step must NOT, since `gh` takes a branch and not a remote-tracking ref.
    */
   baseRef: string;
+  /**
+   * The commit this run's branch forked from its base, pinned at worktree CREATION (PR #238 review).
+   * Dispatch partitions the run's tickets against `baseForkSha..HEAD`. Unlike {@link baseRef} — a
+   * movable ref a sibling run's fetch can rewind behind the fork point — this is the immutable commit
+   * the checkout was cut at, resolved once and reused across resumes so the delta never widens into
+   * pre-fork history and reads an old ticket's commit as this run's delivery.
+   */
+  baseForkSha: string;
   /** The run target — the epic, or the single bead of a standalone run. */
   target: Bead;
   /** The ticket(s) this step covers, in execution order. */

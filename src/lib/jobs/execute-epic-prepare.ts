@@ -89,8 +89,8 @@ interface RunGates {
  * claim. Answers `{ done: true }` when the target needs nothing more from this attempt.
  */
 export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
-  const { preCheckTrusted, leaseTarget } = await refreshRunBoard(run);
-  if (await settleCompletedRun(run, leaseTarget)) return { done: true };
+  const { preCheckTrusted, currentBoardTrusted, leaseTarget } = await refreshRunBoard(run);
+  if (await settleCompletedRun(run, leaseTarget, currentBoardTrusted)) return { done: true };
   // Step 0-pre. Refuse to start a new run on a stale checkout (anton-mh3c). Placed AFTER the
   // completion short-circuit so a target already carried to its pull request still settles
   // idempotently rather than being grounded by a staleness with nothing left to run. The gate lives
@@ -441,6 +441,14 @@ async function commitsHere(run: EpicRun, held: HumanHeldTicket[]): Promise<Set<s
  * the pre-pull board and publication would then import the very block it was asked about, which is
  * the stale-read shape it exists to remove. `beads.pull` resolves for a board with no remote and for
  * a shared server (nothing to reconcile in either), so only a real refresh failure rejects.
+ *
+ * Re-runs the structure/cycle gate too (PR #274 review), WITH its own `bd dep cycles` evidence: this
+ * is the LAST pull before dispatch, so it is also the last chance to catch a `blocks` cycle among the
+ * run's own tickets that a cross-machine write landed after `regateRefreshedBoard`'s check. Without
+ * it, a cycle that arrives in this specific window rides straight through — `orderTickets` falls back
+ * to source order the moment its topological sort can't place every ticket, and dispatch never learns
+ * the order it fell back to was never validated. Reusing the same pull this claimability read already
+ * pays for costs nothing extra on the path that matters.
  */
 async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Promise<void> {
   const { repo, targetId: epicBeadId } = run;
@@ -450,17 +458,25 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
   if (gates.children.length === 0) return;
   // Fails CLOSED, like the confirmation read in step 1c and the cascade it follows: a run that
   // cannot prove its reserved children are claimable must not enter the loop. Retryable — the next
-  // attempt reuses this worktree and re-takes the same idempotent reservations.
+  // attempt reuses this worktree and re-takes the same idempotent reservations. `withCycles: true`
+  // lets a `bd dep cycles` failure reject this same read rather than silently omitting evidence — the
+  // structure gate below must not mistake "couldn't ask" for "asked, none reported".
   let reservedBoard: Bead[];
   try {
     await beads.pull(repo);
-    reservedBoard = await loadAllIssues(repo, { strictGates: true });
+    reservedBoard = await loadAllIssues(repo, { strictGates: true, withCycles: true });
   } catch (e) {
     throw new Error(
       `${epicBeadId} could not refresh and re-read the board after reserving its tickets to ` +
         `confirm none of them is held for a person — retrying rather than dispatching into a ` +
         `claim gate that would stop the run mid-feature. ` +
         `(${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
+  const structural = structureGaps(epicBeadId, reservedBoard, { cycles: cycleEvidenceFor(reservedBoard) });
+  if (structural.blocking.length > 0) {
+    throw new PoisonEpic(
+      `${epicBeadId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
     );
   }
   const reserved = new Map(runTickets(reservedBoard, epicBeadId).map((t) => [t.id, t]));
@@ -629,4 +645,3 @@ async function armHumanTicketWaits(run: EpicRun, gates: RunGates): Promise<void>
   gates.readiness = freshReadiness;
   gates.children = freshChildren;
 }
-

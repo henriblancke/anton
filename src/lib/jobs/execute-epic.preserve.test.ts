@@ -20,6 +20,18 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
+
+const ops = vi.hoisted(() => ({ commitMarker: vi.fn() }));
+vi.mock("../git/ops", async () => {
+  const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
+  return {
+    ...actual,
+    commitMarker: (...args: Parameters<typeof actual.commitMarker>) => {
+      ops.commitMarker(...args);
+      return actual.commitMarker(...args);
+    },
+  };
+});
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -29,7 +41,11 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import type { Worktree } from "../git/worktree";
 import type { ProjectSettings } from "../projects";
-import { COMMIT_TIMEOUT_ENV, readPreservedCommitFor, readWorktreeState } from "../git/ops";
+import {
+  COMMIT_TIMEOUT_ENV,
+  readPreservedCommitFor,
+  readWorktreeState,
+} from "../git/ops";
 import { isPoisonError } from "./errors";
 import { TicketTimeoutError } from "./execute-epic-errors";
 import { outOfTimeParkMessage } from "./execute-epic-dispatch";
@@ -96,12 +112,14 @@ suite("preserveTimedOutWork (real git)", () => {
       branch: BRANCH,
       baseBranch: "main",
       baseRef: "origin/main",
+      baseForkSha: "f0f0f0forkcommit",
       target: ticket,
       settings,
     };
   }
 
   beforeEach(() => {
+    ops.commitMarker.mockReset();
     tdb = makeTestDb();
     sandbox = mkdtempSync(join(tmpdir(), "anton-preserve-"));
     repo = join(sandbox, "repo");
@@ -296,6 +314,63 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(subjects()).toContain("feat: the agent's own subject");
     expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
   });
+
+  it("honors the configured commit timeout in the preserved-work marker", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("FINISHED.md", "work the agent committed itself, against the contract\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: the agent's own subject"]);
+    await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true", commitTimeoutMinutes: 5 }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(ops.commitMarker).toHaveBeenCalledWith(
+      repo,
+      expect.any(String),
+      expect.objectContaining({ timeoutMs: 5 * 60_000 }),
+    );
+  });
+
+  it(
+    "kills a preserved-work commit at the project's configured Commit timeout",
+    async () => {
+      const baseline = await readWorktreeState(repo);
+      write("FINISHED.md", "gate-passing work the slow hook must not outlive\n");
+      const hooks = join(repo, ".git", "hooks");
+      const killed = join(sandbox, "hook-killed");
+      mkdirSync(hooks, { recursive: true });
+      writeFileSync(
+        join(hooks, "pre-commit"),
+        `#!/bin/sh\ntrap 'touch "${killed}"; exit 1' TERM\nsleep 120 &\nwait\n`,
+        { mode: 0o755 },
+      );
+      const started = Date.now();
+
+      const kept = await preserveTimedOutWork({
+        run: run(new AbortController().signal, { testCommand: "true", commitTimeoutMinutes: 1 }),
+        ticket,
+        logPath,
+        baseline,
+        committed: false,
+        timeoutMs: 60_000,
+        standalone: true,
+      });
+
+      // The preserve retries its already-verified tree with hooks bypassed, so the final commit lands;
+      // the hook's TERM trap is the evidence that the first real commit died at the project's setting.
+      expect(kept).toEqual({ branch: BRANCH, retained: false });
+      expect(existsSync(killed)).toBe(true);
+      expect(Date.now() - started).toBeLessThan(90_000);
+      expect(head()).not.toBe(baseline.head);
+    },
+    120_000,
+  );
 
   // The marker is the ONLY way either reader finds self-committed work, and a project whose
   // `commit-msg` hook enforces its own subject convention refuses anton's `WIP` one (PR #228
@@ -664,22 +739,21 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
   });
 
-  // The abort's other landing spot: `commitAll` runs on no signal (a pre-commit hook can hold it for
-  // minutes), so a kill can arrive with the preserved commit already made. Read as an ordinary
-  // preserve it would write the board a human is deciding on; read as a failure it would roll the
-  // commit away. It is neither — the work stays on the branch and the bead belongs to the abort.
-  it("reports the JOB's abort that lands while the preserved commit is being made", async () => {
+  // The abort's other landing spot: a pre-commit hook can hold the commit open. The signal now
+  // reaches `commitAll`, which reaps that hook group before this preserve returns, so an abort that
+  // lands before git creates its commit leaves neither a WIP commit nor a later hook writing here.
+  it("stops a rejected preserved commit before retrying once the job aborts", async () => {
     const baseline = await readWorktreeState(repo);
-    write("HALF_WRITTEN.md", "finished work the kill must not delete\n");
+    write("HALF_WRITTEN.md", "finished work the kill must not retry\n");
     const hooks = join(repo, ".git", "hooks");
     mkdirSync(hooks, { recursive: true });
-    // The kill is fired BY the commit, not by a wall clock: on a loaded machine the gates take
-    // longer than any timer chosen here, and the abort would land in the gate window instead — a
-    // different path, whose pass says nothing about this one.
     const committing = join(sandbox, "committing");
-    writeFileSync(join(hooks, "pre-commit"), `#!/bin/sh\ntouch "${committing}"\nsleep 1\n`, {
-      mode: 0o755,
-    });
+    const reaped = join(sandbox, "hook-reaped");
+    writeFileSync(
+      join(hooks, "pre-commit"),
+      `#!/bin/sh\ntouch "${committing}"\ntrap 'touch "${reaped}"; exit 1' TERM\nsleep 120 &\nwait\n`,
+      { mode: 0o755 },
+    );
     const abort = new AbortController();
     const watch = setInterval(() => {
       if (existsSync(committing)) abort.abort();
@@ -696,9 +770,45 @@ suite("preserveTimedOutWork (real git)", () => {
     }).finally(() => clearInterval(watch));
 
     expect(kept).toEqual({ jobAborted: true });
-    // The commit landed before the kill was noticed — it stays, and the caller writes nothing.
-    expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
-    expect(head()).not.toBe(baseline.head);
+    expect(existsSync(reaped)).toBe(true);
+    expect(subjects()).not.toContain(`WIP ${ticket.id}: ${ticket.title}`);
+    expect(head()).toBe(baseline.head);
+  });
+
+  it("reports the JOB's abort that lands while the preserved commit is being made", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("HALF_WRITTEN.md", "finished work the kill must not delete\n");
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    // The kill is fired BY the commit, not by a wall clock: on a loaded machine the gates take
+    // longer than any timer chosen here, and the abort would land in the gate window instead — a
+    // different path, whose pass says nothing about this one.
+    const committing = join(sandbox, "committing");
+    const reaped = join(sandbox, "hook-reaped");
+    writeFileSync(
+      join(hooks, "pre-commit"),
+      `#!/bin/sh\ntouch "${committing}"\ntrap 'touch "${reaped}"; exit 1' TERM\nsleep 120 &\nwait\n`,
+      { mode: 0o755 },
+    );
+    const abort = new AbortController();
+    const watch = setInterval(() => {
+      if (existsSync(committing)) abort.abort();
+    }, 10);
+
+    const kept = await preserveTimedOutWork({
+      run: run(abort.signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    }).finally(() => clearInterval(watch));
+
+    expect(kept).toEqual({ jobAborted: true });
+    expect(existsSync(reaped)).toBe(true);
+    expect(subjects()).not.toContain(`WIP ${ticket.id}: ${ticket.title}`);
+    expect(head()).toBe(baseline.head);
   });
 });
 
@@ -725,6 +835,7 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -829,6 +940,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -958,6 +1070,7 @@ suite("settleTicketTimeout — a satisfied step the deadline caught during its b
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -1082,6 +1195,7 @@ suite("settleTicketTimeout — unmarkable self-committed work stops the run", ()
     branch: BRANCH,
     baseBranch: "main",
     baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
     target: ticket,
     settings: { testCommand: "true" } satisfies ProjectSettings,
   });
@@ -1162,6 +1276,7 @@ suite("assertPreservedWorkFitsShape — preserved work may only ride the shape t
     path: repo,
     branch: BRANCH,
     baseBranch: "main",
+    createdBranch: false,
     repoPath: repo,
   });
   const epicRun = (standaloneRun: boolean): EpicRun =>
@@ -1252,6 +1367,7 @@ describe("outOfTimeParkMessage — what the operator may safely do next (anton-d
           ...(preservedUnknown ? { preservedUnknown: true } : {}),
         },
       ],
+      retired: [],
     }) as unknown as EpicRun;
 
   it("warns that splitting means taking the preserved commit off the branch first", () => {
@@ -1282,5 +1398,46 @@ describe("outOfTimeParkMessage — what the operator may safely do next (anton-d
     expect(message).toMatch(/UNKNOWN/);
     expect(message).toContain(`could not read \`${BRANCH}\`'s history`);
     expect(message).toContain(`checking \`${BRANCH}\` for a preserved commit first`);
+  });
+
+  // One ticket timed out and another was RETIRED as already shipped (anton-5bpd): nothing is
+  // delivered, so this is the park that fires — and "every ticket ran out of time, re-scope them"
+  // would tell the operator to re-scope work the board has already settled (PR #238 review). The
+  // ledger is named, by provenance, so only the half this run verified is called verified.
+  it("names the tickets the run retired beside the ones that ran out of time, by provenance", () => {
+    const run = {
+      ...parkRun(false),
+      targetId: "anton-feat",
+      standaloneRun: false,
+      timedOut: [{ id: "anton-t1", delivered: false }],
+      retired: [
+        { id: "anton-r1", replacedBy: "anton-s1", source: "this-run" },
+        { id: "anton-r2", replacedBy: "anton-s2", source: "pre-existing" },
+      ],
+    } as unknown as EpicRun;
+
+    const message = outOfTimeParkMessage(run, []);
+
+    expect(message).toContain("every ticket under anton-feat left to run ran out of time (anton-t1)");
+    expect(message).toContain(
+      "already shipped, verified and closed as superseded (anton-r1 → superseded by anton-s1)",
+    );
+    expect(message).toContain(
+      "which this run did not verify (anton-r2 → superseded by anton-s2)",
+    );
+    expect(message).toContain("Re-scope the ones that ran out of time into smaller tickets");
+    expect(message).toMatch(/rolled back, so resuming starts it over/);
+  });
+
+  it("keeps the plain all-timeouts wording when nothing was retired", () => {
+    const message = outOfTimeParkMessage(
+      { ...parkRun(false), standaloneRun: false } as unknown as EpicRun,
+      ["anton-skip"],
+    );
+
+    expect(message).toContain(`every ticket under ${ticket.id} ran out of time (${ticket.id})`);
+    expect(message).toContain("or was skipped behind one that did (anton-skip)");
+    expect(message).not.toMatch(/retired/);
+    expect(message).toContain("Re-scope them into smaller tickets");
   });
 });

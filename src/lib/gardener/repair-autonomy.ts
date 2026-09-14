@@ -37,10 +37,11 @@ export type RepairAutonomyOverrides = Partial<RepairAutonomyPolicy>;
 /**
  * The shipped policy.
  *
- * The two FACTUAL repairs (R5.4) ship at `shadow`: they invent nothing — one rewrites a pointer to
- * what it already meant, the other records an ordering that already exists — but "safe to compute"
- * is not "armed to write", and a project that upgrades into this feature must not wake up to anton
- * having rewritten its beads. Shadow is what makes arming them an informed act rather than a leap:
+ * The FACTUAL repairs (R5.4, anton-5bpd) ship at `shadow`: they invent nothing — one rewrites a
+ * pointer to what it already meant, one records an ordering that already exists, and one retires a
+ * ticket against work git and the board already hold — but "safe to compute" is not "armed to
+ * write", and a project that upgrades into this feature must not wake up to anton having rewritten
+ * its beads. Shadow is what makes arming them an informed act rather than a leap:
  * a week of records says what `apply` would have done, on this board, in the repair's own words.
  * Those records are a note on the ticket and a line in the run's log: the dial gates the FIX, never
  * anton's account of it — a repair files no bead, so there is nowhere else that account could live.
@@ -51,12 +52,13 @@ export type RepairAutonomyOverrides = Partial<RepairAutonomyPolicy>;
 export const DEFAULT_REPAIR_AUTONOMY_POLICY: RepairAutonomyPolicy = {
   "ref-stale": "shadow",
   "dep-missing": "shadow",
+  "already-shipped": "shadow",
   "acceptance-missing": "propose",
   oversized: "propose",
 };
 
 /**
- * The classes anton actually HAS a repair for — the factual pair, and the only two
+ * The classes anton actually HAS a repair for — the factual ones, and the only three
  * `repairBlockedTicket` (jobs/execute-epic-ticket-repair.ts) dispatches. The inventive pair have no
  * implementation behind them, so no level above `propose` could ever be honoured for them.
  *
@@ -67,6 +69,7 @@ export const DEFAULT_REPAIR_AUTONOMY_POLICY: RepairAutonomyPolicy = {
 export const ARMABLE_REPAIR_CLASSES = [
   "ref-stale",
   "dep-missing",
+  "already-shipped",
 ] as const satisfies readonly RepairClass[];
 
 /**

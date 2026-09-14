@@ -231,6 +231,36 @@ describe("stepTaskBlock", () => {
     expect(block).toContain(`- ${target.id} — ${target.title}`);
   });
 
+  it("inlines every ticket's contract so an already-shipped report is scoped to work the agent received", () => {
+    const second = ticket({
+      id: "anton-t2",
+      title: "Second ticket",
+      description: "## Goal\n\nShip the second thing.",
+      acceptance_criteria: "- [ ] the second thing ships",
+      context: "The second ticket's surrounding system.",
+    });
+    const block = stepTaskBlock(
+      {
+        target,
+        tickets: [
+          { ...target, description: "## Goal\n\nShip the first thing.", acceptance_criteria: "- [ ] the first thing ships" },
+          second,
+        ],
+        branch: "anton/anton-8d0f",
+        baseBranch: "main",
+      },
+      "claude",
+    );
+
+    expect(block).toContain(`## Ticket contract — ${target.id}`);
+    expect(block).toContain("Ship the first thing.");
+    expect(block).toContain("the first thing ships");
+    expect(block).toContain("## Ticket contract — anton-t2");
+    expect(block).toContain("Ship the second thing.");
+    expect(block).toContain("the second thing ships");
+    expect(block).toContain("The second ticket's surrounding system.");
+  });
+
   // A formula may run a generic step before `step:implement` (PR #255 review), so on resume this
   // step is dispatched first onto a timed-out attempt's preserved commits and must be told they
   // exist — but not told to settle the ticket, which is the implementer's job and the gate's.

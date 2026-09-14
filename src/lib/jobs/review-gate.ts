@@ -20,6 +20,7 @@ import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } fr
 import {
   commitAll,
   diffAgainstBase,
+  gitCommonDir,
   readWorktreeState,
   resolveMergeBase,
   restoreWorktreeState,
@@ -28,7 +29,7 @@ import {
   type BranchDiff,
   type WorktreeState,
 } from "../git/ops";
-import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings } from "../projects";
+import { resolveCommitTimeoutMs, resolveReviewConfig, resolveVerifyGates, type ProjectSettings } from "../projects";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
@@ -42,6 +43,7 @@ import {
   type ReviewReportResult,
   type ReviewerSource,
 } from "./review-context";
+import { resolveReviewSandbox, type ReviewSandboxSettings } from "./review-sandbox";
 import type { JobContext } from "./runner";
 import { captureVerifyGates, type VerifyGateOutcome } from "./shell";
 
@@ -117,11 +119,17 @@ export interface ReviewGateDeps {
   diff?: (worktreePath: string, base: string) => Promise<BranchDiff>;
   /** Pin the movable base branch to the fork-point commit every round is judged against. */
   mergeBase?: (worktreePath: string, base: string) => Promise<string>;
-  commit?: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
+  commit?: (
+    worktreePath: string,
+    message: string,
+    options: { timeoutMs?: number; signal?: AbortSignal },
+  ) => Promise<{ committed: boolean }>;
   /** Fingerprint the worktree around a review — the read-only guard's before/after. */
   readState?: (worktreePath: string) => Promise<WorktreeState>;
   /** Undo whatever a review wrote, back to the fingerprint taken before it ran. */
   restoreState?: (worktreePath: string, state: WorktreeState) => Promise<void>;
+  /** The ref store the review session's sandbox pins shut — see `resolveReviewSandbox`. */
+  gitCommonDir?: (worktreePath: string) => Promise<string>;
   /** Hash the tree a commit would write — the fix session's proof across its own commit hooks. */
   hashTree?: (worktreePath: string) => Promise<string>;
 }
@@ -205,11 +213,11 @@ export interface ReviewGateArgs {
  * writing subcommands: an enumeration rots into a gap the next git release opens, and the reviewer
  * needs none of it — anton hands it the diff, the file list, and the beads.
  *
- * KNOWN RESIDUAL (anton-t6tu): `Bash` itself stays, because the review contract asks the reviewer to
- * run the project's own read-only checks. A shell can still write bytes anywhere — `printf <sha> >
- * <repo>/.git/refs/heads/anton/<future-bead>` plants exactly the branch the git deny rule exists to
- * prevent, with no `git` process and no visible change to this worktree. No tool-name filter closes
- * that; it needs OS-level filesystem containment for the session, which is that bead's work.
+ * `Bash` itself stays, because the review contract asks the reviewer to run the project's own
+ * read-only checks — and a shell writes bytes with none of the tools above, so this list is only
+ * half the guard. The other half is not a tool filter at all: the session runs under Claude Code's
+ * Bash sandbox with the repository's ref store denied at the OS level (anton-t6tu, see
+ * jobs/review-sandbox).
  */
 export const REVIEW_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash(git:*)"];
 
@@ -284,10 +292,21 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const fixClaude = meter("review-fix");
   const readDiff = args.deps?.diff ?? diffAgainstBase;
   const mergeBase = args.deps?.mergeBase ?? resolveMergeBase;
-  const commit = args.deps?.commit ?? commitAll;
+  const commit =
+    args.deps?.commit ??
+    ((commitWorktreePath: string, message: string, options: { timeoutMs?: number; signal?: AbortSignal }) =>
+      commitAll(commitWorktreePath, message, options));
   const readState = args.deps?.readState ?? readWorktreeState;
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
   const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
+
+  // Resolved ONCE, before the first session is recorded: the repository's ref store does not move
+  // between rounds, and an unsandboxable host must fail the gate outright rather than after a review
+  // has already run unconfined.
+  const sandbox = await resolveReviewSandbox({
+    worktreePath,
+    readGitCommonDir: args.deps?.gitCommonDir ?? gitCommonDir,
+  });
 
   // Pin the fork point once, for every round: `baseBranch` is a MOVABLE ref (`origin/<base>`), and a
   // sibling run's fetch or a resumed worktree can advance it while this gate runs. Re-resolving it
@@ -330,6 +349,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       round,
       maxRounds: config.maxRounds,
       claude,
+      sandbox,
       readState,
       restoreState,
       verified,
@@ -437,9 +457,10 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
  *
  * The fingerprint covers the worktree, so `git` is denied outright ({@link REVIEW_DENIED_TOOLS}) to
  * cover what it cannot see: the repository the worktree belongs to, where a written ref leaves the
- * tree byte-identical. And the session is loaded from the operator's settings only
- * ({@link REVIEW_SETTING_SOURCES}), so the branch under review cannot configure — or hook — the
- * session judging it.
+ * tree byte-identical. A shell reaches that ref store without `git`, so the session also runs
+ * SANDBOXED, with the common dir denied at the OS level (see `resolveReviewSandbox`). And the
+ * session is loaded from the operator's settings only ({@link REVIEW_SETTING_SOURCES}), so the
+ * branch under review cannot configure — or hook — the session judging it.
  *
  * The revert runs on EVERY exit once the baseline is settled — a review that throws or reports an
  * error is exactly as capable of having written first, and its leftovers would otherwise outlive it
@@ -466,6 +487,8 @@ async function runReviewSession(args: {
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
+  /** OS-level filesystem containment for this session — resolved once per gate (anton-t6tu). */
+  sandbox: ReviewSandboxSettings;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
   /** Re-assert the run lease after the gates, before the reviewer session is spent. */
@@ -601,6 +624,9 @@ async function runReviewSession(args: {
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         disallowedTools: REVIEW_DENIED_TOOLS,
         settingSources: [...REVIEW_SETTING_SOURCES],
+        // Outranks the `user` sources above, so the machine's own config cannot relax the sandbox
+        // this session is contained by.
+        settingsJson: JSON.stringify(args.sandbox),
         signal: ctx.signal,
         onEvent,
       });
@@ -877,7 +903,11 @@ async function runGateFixSession(args: {
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
-  commit: (worktreePath: string, message: string) => Promise<{ committed: boolean }>;
+  commit: (
+    worktreePath: string,
+    message: string,
+    options: { timeoutMs?: number; signal?: AbortSignal },
+  ) => Promise<{ committed: boolean }>;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
   /** Hash the tree a commit would write — how the gate proves the committed tree is the tested one. */
@@ -965,7 +995,10 @@ async function runGateFixSession(args: {
       // Hashing either side of the commit is how the evidence proves it describes the committed
       // tree; when it does not, it is dropped and the next round runs the gates itself.
       const testedTree = await hashTreeOrUnknown(args.hashTree, worktreePath);
-      const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`);
+      const { committed } = await commit(worktreePath, `${target.id}: address self-review findings (round ${round})`, {
+        timeoutMs: resolveCommitTimeoutMs(settings),
+        signal: ctx.signal,
+      });
       // Set the instant the commit lands, BEFORE the second hash: past here the round's work is
       // verified and committed, and the rollback below must not touch it however this session ends.
       // Hashing after it would otherwise put a good, gate-passing fix behind `discardSessionWrites`.

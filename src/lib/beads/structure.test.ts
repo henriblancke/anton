@@ -178,6 +178,22 @@ describe("validateBoardStructure", () => {
       expect(aCycle?.message).toContain("bd dep remove a c");
     });
 
+    it("recommends the reported loop's own edge over a chord into the same cycle (PR #274 review)", () => {
+      // Loop is a -> b -> c -> a; `a` also holds an unrelated chord straight to `c`. Recommending
+      // `bd dep remove a c` would leave the reported three-node loop fully intact — the fix must
+      // walk bd's own reported order (`ids`), not just treat the cycle as an unordered member set.
+      const board = [
+        task("a", undefined, { dependencies: [blocks("a", "c"), blocks("a", "b")] }),
+        task("b", undefined, { dependencies: [blocks("b", "c")] }),
+        task("c", undefined, { dependencies: [blocks("c", "a")] }),
+      ];
+      const cycles = [{ ids: ["a", "b", "c"], raw: { cycle: ["a", "b", "c"] } }];
+      const violations = validateBoardStructure(board, { cycles });
+      const aCycle = violations.find((v) => v.id === "a" && v.rule === "blocks-cycle");
+      expect(aCycle?.message).toContain("bd dep remove a b");
+      expect(aCycle?.message).not.toContain("bd dep remove a c");
+    });
+
     it("does not infer cycles when bd supplies no cycle evidence", () => {
       const board = [
         task("a", undefined, { dependencies: [blocks("a", "b")] }),

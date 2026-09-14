@@ -234,6 +234,7 @@ function gate(
   result: Promise<ReviewGateResult>;
   calls: RunClaudeOptions[];
   commitMessages: string[];
+  commitOptions: Array<{ timeoutMs?: number; signal?: AbortSignal }>;
   restores: string[];
   /** The worktree's dirt as each round's diff was read — the review must see a settled tree. */
   diffStates: string[];
@@ -242,6 +243,7 @@ function gate(
 } {
   const { run, calls } = fakeClaude(replies);
   const commitMessages: string[] = [];
+  const commitOptions: Array<{ timeoutMs?: number; signal?: AbortSignal }> = [];
   const diffStates: string[] = [];
   const rounds: ReviewRound[] = [];
   const result = runReviewGate({
@@ -266,8 +268,9 @@ function gate(
         diffStates.push((await worktree.readState()).status);
         return diff;
       },
-      commit: async (_path, message) => {
+      commit: async (_path, message, options) => {
         commitMessages.push(message);
+        commitOptions.push(options ?? {});
         const committed = commits[commitMessages.length - 1] ?? true;
         if (committed) worktree.onCommit();
         return { committed };
@@ -277,7 +280,7 @@ function gate(
       ...(hashTree ? { hashTree } : {}),
     },
   });
-  return { result, calls, commitMessages, restores: worktree.restores, diffStates, rounds };
+  return { result, calls, commitMessages, commitOptions, restores: worktree.restores, diffStates, rounds };
 }
 
 /** The recorded sessions in start order — the UI's view of the gate. */
@@ -325,6 +328,18 @@ describe("runReviewGate — convergence", () => {
     expect(blockingFindings(out.unresolved)).toEqual([]);
     expect(calls).toHaveLength(3); // review → fix → review
     expect(commitMessages).toEqual(["anton-gate1: address self-review findings (round 1)"]);
+  });
+
+  it("gives the self-review fix commit the project's configured budget", async () => {
+    const { result, commitOptions } = gate([report(4, [BLOCKING]), "fixed", report(9, [])], {
+      commitTimeoutMinutes: 10,
+    });
+
+    await result;
+
+    expect(commitOptions).toHaveLength(1);
+    expect(commitOptions[0]?.timeoutMs).toBe(10 * 60_000);
+    expect(commitOptions[0]?.signal).toBe(ctx.signal);
   });
 
   it("keeps child-ticket label routing through review fixes", async () => {
@@ -682,6 +697,31 @@ describe("runReviewGate — sessions", () => {
     expect(calls[2].settingSources).toEqual([...REVIEW_SETTING_SOURCES]);
     // The fixer is an implementer: the project's own hooks apply to the code it writes.
     expect(calls[1].settingSources).toBeUndefined();
+  });
+
+  it("sandboxes the reviewer's shell with the repository's ref store denied (anton-t6tu)", async () => {
+    // The half no tool-name filter reaches: `Bash` stays, and a shell writes bytes without any of
+    // the denied tools — `printf <sha> > <repo>/.git/refs/heads/anton/<future-bead>` plants a branch
+    // `createWorktree` later adopts, leaving this worktree byte-identical. Only OS-level containment
+    // closes it, so the dispatch has to CARRY the sandbox settings, not merely be entitled to them.
+    const { result, calls } = gate([report(4, [BLOCKING]), "fixed", report(9, [])]);
+    await result;
+
+    const commonDir = execFileSync("git", ["-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+      .toString()
+      .trim();
+    for (const review of [calls[0], calls[2]]) {
+      const { sandbox } = JSON.parse(review.settingsJson!);
+      expect(sandbox.enabled).toBe(true);
+      expect(sandbox.failIfUnavailable).toBe(true);
+      expect(sandbox.allowUnsandboxedCommands).toBe(false);
+      // The ref store, in both the form git reports and the form anton configured — on macOS a temp
+      // path reaches the kernel symlink-resolved, and a deny rule only bites the path it names.
+      expect(sandbox.filesystem.denyWrite).toContain(commonDir);
+      expect(sandbox.filesystem.denyWrite).toContain(join(dir, ".git"));
+    }
+    // The fixer commits its work through git: sandboxing it out of the ref store would break the round.
+    expect(calls[1].settingsJson).toBeUndefined();
   });
 });
 
