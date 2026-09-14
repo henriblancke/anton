@@ -2,8 +2,9 @@
 --
 -- `spent_attempts` was the prior estimate's durable counter (0033) and `updated_at` was its
 -- deliberately approximate weekly boundary. A current router configuration cannot identify the
--- historical meter, so only projects that are still safely unrouted are carried forward. Already
--- recorded ledger rows are subtracted, making this safe if a machine had applied 0038 before 0040.
+-- historical meter, so only projects with no legacy gateway URL are carried forward. A connection id
+-- was introduced after gateway routing, so it cannot identify routed history on upgrade. Already recorded
+-- ledger rows are subtracted, making this safe if a machine had applied 0038 before 0040.
 --
 -- Reverse:
 --   DELETE FROM `quota_attempts` WHERE `id` LIKE 'legacy:%';
@@ -20,10 +21,7 @@ WITH RECURSIVE attempts (`id`, `job_id`, `project_id`, `job_type`, `created_at`,
   INNER JOIN `projects` ON `projects`.`id` = `jobs`.`project_id`
   WHERE `jobs`.`spent_attempts` > (SELECT count(*) FROM `quota_attempts` WHERE `job_id` = `jobs`.`id`)
     AND `jobs`.`updated_at` >= unixepoch() - 7 * 24 * 60 * 60
-    AND NOT (
-      COALESCE(NULLIF(trim(CASE WHEN json_valid(`projects`.`settings_json`) THEN json_extract(`projects`.`settings_json`, '$.claudeBaseUrl') END), ''), '') <> ''
-      AND COALESCE(NULLIF(trim(CASE WHEN json_valid(`projects`.`settings_json`) THEN json_extract(`projects`.`settings_json`, '$.routerConnectionId') END), ''), '') <> ''
-    )
+    AND COALESCE(NULLIF(trim(CASE WHEN json_valid(`projects`.`settings_json`) THEN json_extract(`projects`.`settings_json`, '$.claudeBaseUrl') END), ''), '') = ''
   UNION ALL
   SELECT
     'legacy:' || `job_id` || ':' || (`remaining` + 1),

@@ -78,11 +78,11 @@ describe("drizzle/0038 — quota meter history", () => {
     expect(sqlite.prepare("select count(*) as n from quota_attempts").get()).toEqual({ n: 2 });
   });
 
-  it("does not guess router history", () => {
+  it("does not attribute legacy gateway attempts to Anthropic", () => {
     applyMigrationFile(sqlite, MIGRATION);
     sqlite
       .prepare("update projects set settings_json = ? where id = 'project'")
-      .run(JSON.stringify({ claudeBaseUrl: "https://router.example/v1", routerConnectionId: "conn_1" }));
+      .run(JSON.stringify({ claudeBaseUrl: "https://router.example/v1", claudeAuthTokenEnv: "ROUTER_TOKEN" }));
 
     applyMigrationFile(sqlite, BACKFILL_MIGRATION);
 
