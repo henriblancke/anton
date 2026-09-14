@@ -576,7 +576,14 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
       ]);
     } catch (e) {
       if (!isBoardUnreachableError(e)) throw e;
-      const cause = boardUnreachableCause(e.message);
+      // bd's summary includes stderr only; the raw process seam retains stdout on the error too.
+      const { stdout, stderr } = e as typeof e & { stdout?: unknown; stderr?: unknown };
+      const output = [
+        e.message,
+        typeof stdout === "string" ? stdout : "",
+        typeof stderr === "string" ? stderr : "",
+      ].join("\n");
+      const cause = boardUnreachableCause(output);
       if (!cause) throw e;
       await saveRunHealthReport(db, clock, {
         projectId,

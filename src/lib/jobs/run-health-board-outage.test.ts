@@ -70,6 +70,32 @@ describe("run-health board outages", () => {
     ]);
   });
 
+  it("finds a board outage whose bd classifier text was written only to stdout", async () => {
+    listMock.mockRejectedValue(
+      Object.assign(new BoardUnreachableError("Command failed: bd list --status all\nstderr was empty"), {
+        stdout: "Dolt server unreachable at board.example.test",
+        stderr: "",
+      }),
+    );
+
+    await driveJob({
+      db: t.db,
+      clock,
+      type: "run-health",
+      projectId: t.projectId,
+      handler: (deps) => makeRunHealthHandler(deps),
+      config: { boardUnreachableRetryMs: PROBE_MS },
+    });
+
+    const report = await getRunHealthReport(t.db, t.projectId);
+    expect(report?.findings).toEqual([
+      expect.objectContaining({
+        kind: "exhausted-job",
+        key: "exhausted-job:board-unreachable:p1:server-unreachable",
+      }),
+    ]);
+  });
+
   it("does not turn an ordinary board error into an outage report", async () => {
     listMock.mockRejectedValue(new Error("bead not found"));
 
