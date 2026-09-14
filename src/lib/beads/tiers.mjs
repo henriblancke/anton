@@ -403,6 +403,18 @@ export function formatStructureViolations(violations) {
   return violations.map((v) => `${v.id} → ${v.message}`).join("; ");
 }
 
+/**
+ * The four mechanical `blocks`-edge faults — an author reads these differently from a tier fault:
+ * "this edge is broken" versus "this bead is in the wrong place". `formatStructureReport` uses this
+ * to keep the two apart instead of interleaving them in board order.
+ */
+const ORDERING_RULES = new Set([
+  "blocks-edge-self",
+  "blocks-edge-dangling",
+  "blocks-duplicates-parent",
+  "blocks-cycle",
+]);
+
 /** The board's tier conformance, for `anton board-check` and `/shape`'s Phase 5 audit. */
 export function buildStructureReport(board) {
   const violations = validateBoardStructure(board);
@@ -414,14 +426,22 @@ export function buildStructureReport(board) {
   };
 }
 
-/** The report as text: a headline, then one line per violation, worst severity first. */
+/**
+ * The report as text: a headline, then violations grouped so an ordering fault (a broken `blocks`
+ * edge) never interleaves with a tier fault (a bead in the wrong place) — the two need different
+ * fixes and reading them shuffled together buries whichever group is smaller. Worst severity first
+ * within each group.
+ */
 export function formatStructureReport(report, label = "") {
   const head = `${label ? `${label}: ` : ""}${report.judged} live beads — ${report.blocking} blocking, ${report.advisory} advisory`;
   if (report.violations.length === 0) return `${head}\n  ✓ epic → feature → ticket holds`;
-  const lines = ["blocking", "advisory"].flatMap((severity) =>
-    report.violations
-      .filter((v) => v.severity === severity)
-      .map((v) => `  ${severity === "blocking" ? "✗" : "!"} ${v.id} [${v.rule}] ${v.message}`),
-  );
-  return [head, ...lines].join("\n");
+
+  const line = (v) => `  ${v.severity === "blocking" ? "✗" : "!"} ${v.id} [${v.rule}] ${v.message}`;
+  const bySeverity = (vs) => ["blocking", "advisory"].flatMap((s) => vs.filter((v) => v.severity === s));
+  const section = (title, vs) => (vs.length === 0 ? [] : [`${title}:`, ...bySeverity(vs).map(line)]);
+
+  const ordering = report.violations.filter((v) => ORDERING_RULES.has(v.rule));
+  const tier = report.violations.filter((v) => !ORDERING_RULES.has(v.rule));
+
+  return [head, ...section("ordering faults", ordering), ...section("tier faults", tier)].join("\n");
 }

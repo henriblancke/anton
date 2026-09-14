@@ -202,6 +202,74 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     expect(r.status).toBe(1);
   });
 
+  // The four mechanical ordering faults (anton-5n57p) live in tiers.mjs and are unit-tested off
+  // literal boards there (structure.test.ts). What's under test here is the WIRING: board-check
+  // counts them into its blocking total, exits non-zero on them, and prints them apart from tier
+  // faults rather than interleaved in board order.
+  describe("ordering faults", () => {
+    const dep = (issue_id: string, depends_on_id: string) => ({ type: "blocks", issue_id, depends_on_id });
+
+    it("counts a self-blocking edge as blocking and exits non-zero", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "t3")] },
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).toContain("[blocks-edge-self]");
+      expect(r.stdout).toContain("t3");
+      expect(r.status).toBe(1);
+    });
+
+    it("counts a blocks-edge to a nonexistent bead as blocking and exits non-zero", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "ghost")] },
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).toContain("[blocks-edge-dangling]");
+      expect(r.stdout).toContain("ghost");
+      expect(r.status).toBe(1);
+    });
+
+    it("counts a blocks-edge that duplicates the parent-child edge as blocking and exits non-zero", async () => {
+      const board = [...HEALTHY, { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "f1")] }];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).toContain("[blocks-duplicates-parent]");
+      expect(r.status).toBe(1);
+    });
+
+    it("counts a blocks cycle as blocking and exits non-zero", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "a", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("a", "b")] },
+        { id: "b", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("b", "a")] },
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.status).toBe(1);
+    });
+
+    it("groups ordering faults apart from tier faults instead of interleaving them", async () => {
+      const board = [
+        ...HEALTHY,
+        STRAY, // a tier fault: ticket-under-container-epic
+        { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "t3")] }, // an ordering fault
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.status).toBe(1);
+      const orderingHeader = r.stdout.indexOf("ordering faults:");
+      const tierHeader = r.stdout.indexOf("tier faults:");
+      const orderingLine = r.stdout.indexOf("[blocks-edge-self]");
+      const tierLine = r.stdout.indexOf("[ticket-under-container-epic]");
+      expect(orderingHeader).toBeGreaterThanOrEqual(0);
+      expect(tierHeader).toBeGreaterThan(orderingHeader);
+      // Every ordering line sits under its own header, before the tier header starts.
+      expect(orderingLine).toBeGreaterThan(orderingHeader);
+      expect(orderingLine).toBeLessThan(tierHeader);
+      expect(tierLine).toBeGreaterThan(tierHeader);
+    });
+  });
+
   // Some bd builds reject `--status all`; src/lib/beads/issues.ts already treats that as a supported
   // variation. Without the same fallback here, /shape's mandatory Phase 5 audit failed having
   // checked nothing at all on exactly those installs.
