@@ -25,16 +25,15 @@ export default defineConfig({
     // legitimate case; a genuine deadlock hangs indefinitely, so it still surfaces here.
     testTimeout: 150_000,
     hookTimeout: 150_000,
-    // Reliability knob, not just a speed one: above ~4 concurrent workers the Dolt-server race
-    // above reappears. `maxWorkers` caps how many test FILES run at once (vitest 4 replaced
-    // `poolOptions.forks.maxForks` with this top-level option). Tune up only alongside evidence the
-    // suite still completes without hanging.
+    // Reliability knob, not just a speed one: the real bd/Dolt cases create temporary repositories
+    // and servers. Any concurrent files can starve valid cases long enough to hit the uniform timeout
+    // in CI, while one worker completes the same cases without relaxing assertions or deadlines.
+    // `maxWorkers` caps test FILES (Vitest 4 replaced `poolOptions.forks.maxForks` with this option).
+    // Tune up only with evidence that the full suite stays green under contention.
     //
-    // CI additionally shards ACROSS jobs (ci.yml `integration`, 4-way `--shard`, anton-m4b5.3):
-    // each shard is a separate GitHub-hosted runner with its OWN `maxWorkers: 4`, so sharding adds
-    // parallel runners rather than raising per-job fork concurrency — it does not reopen the
-    // port/lock race anton-vgoh tracks. `--shard` is a CLI flag, not a config option, so it is
-    // passed on the command line (`bun run test:integration -- --shard=N/4`) rather than here.
-    maxWorkers: 4,
+    // CI still shards ACROSS jobs (ci.yml `integration`, 4-way `--shard`): each GitHub-hosted runner
+    // applies this cap independently. `--shard` is a CLI flag, not a config option, so it is passed
+    // on the command line (`bun run test:integration -- --shard=N/4`) rather than here.
+    maxWorkers: 1,
   },
 });
