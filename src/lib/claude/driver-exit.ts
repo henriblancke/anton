@@ -153,21 +153,29 @@ const MODEL_REFUSAL_RE =
   /there's an issue with the selected model \(([^)]+)\)\.\s*it may not exist or you may not have access to it/i;
 
 /**
- * The park a model-id refusal deserves, or null when `detail` isn't one. The rejected id can come
- * from either place `resolveModel` reads (model-routing.ts): a matching row in this project's
- * Model routing table, or — when nothing matched — the General default `settings.model`. Nothing
- * here knows which one actually fired, so the message names both rather than sending the operator
- * to edit a routing rule that was never in play, which would leave a bad General default active for
- * every unmatched job and the park unresolved.
+ * The park a model-id refusal deserves, or null when `stderr` isn't one. Checked ONLY against
+ * Claude Code's own stderr, never the model-authored result text: a failed session whose result
+ * quotes this diagnostic (e.g. while testing or documenting this exact error) would otherwise park
+ * immediately even though the configured model demonstrably ran — that failure belongs on the
+ * ordinary retry path, not here (anton-r0tb).
+ *
+ * The rejected id can come from any of the three places `resolveModel` (model-routing.ts) and
+ * `buildClaudeArgs` (driver-spawn.ts) leave it: a matching row in this project's Model routing
+ * table, the General default `settings.model` when nothing matched, or — when neither is set —
+ * `--model` is omitted entirely and Claude Code falls back to its OWN default configuration,
+ * outside this project's settings altogether. Nothing here knows which one actually fired, so the
+ * message names all three rather than sending the operator to edit a routing rule that was never
+ * in play, which would leave a bad default active for every unmatched job and the park unresolved.
  */
-function modelRefusalError(detail: string): PoisonError | null {
-  const modelId = detail.match(MODEL_REFUSAL_RE)?.[1]?.trim();
+function modelRefusalError(stderr: string): PoisonError | null {
+  const modelId = stderr.match(MODEL_REFUSAL_RE)?.[1]?.trim();
   if (!modelId) return null;
   return new PoisonError(
     `claude refused to start: the model "${modelId}" doesn't exist or isn't accessible. ` +
-      `Configured in this project's settings, either as the General default model or a matching ` +
-      `Model routing rule (settings_json.modelRoutes) — fix the id there, since retrying will not ` +
-      `change it.`,
+      `Configured in this project's settings as the General default model or a matching Model ` +
+      `routing rule (settings_json.modelRoutes) — or, if neither is set, inherited from Claude ` +
+      `Code's own default configuration outside this project. Fix the id there, since retrying ` +
+      `will not change it.`,
   );
 }
 
@@ -185,7 +193,8 @@ function exitCodeError(exit: ClaudeExit, sessionId: string | undefined): Error {
   // Prefer the agent's own result summary over stderr for the surfaced message — on a deterministic
   // failure that's where the real reason lives (anton-juar).
   const detail = resultText.trim() || exit.stderr.trim() || `claude exited with code ${exit.code}`;
-  const modelRefusal = modelRefusalError(detail);
+  // stderr only — see modelRefusalError's doc on why the model-authored result text is excluded.
+  const modelRefusal = modelRefusalError(exit.stderr);
   if (modelRefusal) return modelRefusal;
   const message = `claude exited with code ${exit.code}: ${detail.slice(-2000)}`;
   const signature = transientSignature(resultText, exit.stderr, exit.stream.resultRaw !== undefined);

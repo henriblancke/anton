@@ -94,6 +94,28 @@ describe("exitError", () => {
     expect(err?.message).toContain("claude-opus-4-8");
     expect(err?.message).toContain("General default model");
     expect(err?.message).toContain("settings_json.modelRoutes");
+    expect(err?.message).toContain("Claude Code's own default configuration");
+  });
+
+  it("does not park on a model-authored result that merely quotes the refusal wording (anton-r0tb)", () => {
+    // The model actually ran (there's a result), so this is an ordinary deterministic failure, not
+    // a startup refusal — a failed session that quotes this diagnostic while testing/documenting it
+    // must not be poisoned into an unresolvable park.
+    const err = exitError(
+      exit({
+        code: 1,
+        stream: stream({
+          resultRaw: {
+            type: "result",
+            is_error: true,
+            result:
+              "Reproduced the bug: claude prints \"There's an issue with the selected model (claude-opus-4-8). It may not exist or you may not have access to it.\" on stderr.",
+          },
+        }),
+      }),
+    );
+
+    expect(isPoisonError(err)).toBe(false);
   });
 
   it("still retries a transient 5xx from the same endpoint rather than parking (anton-ggf6)", () => {
