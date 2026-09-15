@@ -329,6 +329,45 @@ describe("loadAllIssues", () => {
 
     expect((await loadAllIssues(REPO)).map((b) => b.id)).toEqual(["t-1", "g-1", "g-2"]);
   });
+
+  it("re-fetches gates strictly when a concurrent non-strict refresh already claimed the shared loader (PR #274 review)", async () => {
+    // Same race as the cycles case above, but for gates: `probeAllIssues`/a bare `refreshAllIssues`
+    // reaches `refreshIssueSnapshot` first with a NON-strict loader, so its own internal gate read
+    // degrades on failure (swallowed to []) instead of throwing. A caller that asked for
+    // `strictGates` must not silently accept that degraded board — it must notice the still-dangling
+    // blocker and re-fetch the gate strictly.
+    listMock.mockImplementationOnce(async () => [target]); // the one shared work read
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // the shared loader's own (non-strict) gate read — degrades, swallowed
+    listMock.mockImplementationOnce(async () => [gate]); // this call's own strict re-fetch — succeeds
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { strictGates: true });
+
+    const [ordinaryBoard, approvalBoard] = await Promise.all([ordinary, approval]);
+
+    // The plain caller still gets the degraded (pre-existing, intentional) behaviour.
+    expect(ordinaryBoard.map((b) => b.id)).toEqual(["t-1"]);
+    // The strict caller recovers the gate rather than reading the dangling edge as an open blocker.
+    expect(approvalBoard.map((b) => b.id).sort()).toEqual(["g-1", "t-1"]);
+  });
+
+  it("still throws under strictGates when the shared board is degraded and the re-fetch fails too", async () => {
+    listMock.mockImplementationOnce(async () => [target]);
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // shared loader's gate read — degrades
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // this call's own strict re-fetch — also fails, and strict must let it reject
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { strictGates: true });
+
+    await expect(approval).rejects.toThrow("database is locked");
+    await expect(ordinary).resolves.toEqual([{ ...target }]);
+  });
 });
 
 describe("probeCycleEvidence (PR #274 review, round 3)", () => {

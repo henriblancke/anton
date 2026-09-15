@@ -204,7 +204,7 @@ edges — **not** board order, not creation order):
 # partitionTickets (execute-epic-dispatch.ts) applies before dispatch — the executor never runs a held
 # ticket in this pass, so numbering it alongside the rest would claim an order nobody will observe.
 # Some supported bd builds reject --status all, so merge their open and closed reads before sorting.
-node -e '
+node <<'NODE_EOF'
 const { execFileSync } = require("node:child_process");
 const list = (args = []) => JSON.parse(execFileSync("bd", ["list", ...args, "--json", "--limit", "0"], { encoding: "utf8" }));
 let all;
@@ -332,7 +332,7 @@ for (const feature of all.filter((b) => b.issue_type === "feature")) {
   for (const ticket of tickets.filter((t) => held.has(t.id)))
     console.log(`  held (external blocker, not dispatched this pass): ${ticket.id}\t${ticket.title}`);
 }
-'
+NODE_EOF
 ```
 
 Then assert out loud, naming the tickets: "feature `<id>` dispatches `t1` → `t2` → `t3`; that

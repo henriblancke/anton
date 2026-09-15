@@ -281,6 +281,19 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
     attachCycleEvidence(board, await beads.depCycles(cwd));
     markCycleEvidenceRecovered(cwd);
   }
+  // Same race, for gates (PR #274 review): `refreshIssueSnapshot`'s single-flight is loader-blind, so
+  // a concurrent `probeAllIssues` already in flight when this call lands can win the race and hand
+  // back a board whose gate read never asked for `strictGates` — including one that failed and
+  // silently degraded to []. A dangling blocker on the board actually returned is always a gate by
+  // construction (see `loadGateIssues`), so any left over here means this exact board's gate read
+  // was non-strict or never ran. Re-fetch strictly and let it throw, never accept a board whose gates
+  // might be silently missing under a caller that asked to fail loud on exactly that.
+  if (opts.strictGates) {
+    const dangling = danglingBlockerIds(board);
+    if (dangling.length > 0) {
+      return dedupeById([...board, ...await loadGateIssues(cwd, true, dangling)]);
+    }
+  }
   return board;
 }
 
