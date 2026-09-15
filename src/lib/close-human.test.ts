@@ -148,6 +148,41 @@ describe("closeHumanTicket", () => {
     await expect(closeHumanTicket(project, "target")).rejects.toThrow(NotCloseableError);
   });
 
+  it("closes a task parented directly on a container epic — no run target in its ancestry", async () => {
+    // PR #288 review: `runTargetOf`'s abandon-cascade fallback resolves the immediate parent when the
+    // walk finds no run target at all, so a task sibling to a `feature` on a CONTAINER epic (one with
+    // a feature child elsewhere) used to read the container as still "holding" a live run — 409ing
+    // this route pointing at a target that can never itself run. The board's own `holdsRun` read
+    // (ticket-detail.ts, operator-queue.ts) already answers false here; this route must agree.
+    const epic = makeBead({ id: "epic", issue_type: "epic", labels: [] });
+    const feature = makeBead({ id: "feature", issue_type: "feature", parent: "epic", labels: [] });
+    const ticket = makeBead({ id: "ticket", issue_type: "task", parent: "epic" });
+    const board = [epic, feature, ticket];
+    listMock.mockResolvedValue(board);
+    showMock.mockResolvedValueOnce(ticket).mockResolvedValueOnce({ ...ticket, status: "closed" });
+
+    await closeHumanTicket(project, "ticket");
+
+    expect(cancelRunMock).toHaveBeenCalledWith("p1", "epic");
+    expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "ticket");
+  });
+
+  it("does not refuse on a task poured under an open molecule — the whole pipeline subtree is pruned", async () => {
+    // Codex review (PR #288): filtering only the molecule/gate NODES still left a poured `task` step
+    // underneath them in `open`, so this route kept 409ing for the run's whole lifetime.
+    const target = makeBead({ id: "target", issue_type: "feature" });
+    const molecule = makeBead({ id: "mol-1", parent: "target", issue_type: "molecule", labels: [] });
+    const step = makeBead({ id: "step-1", parent: "mol-1", issue_type: "task", labels: [] });
+    const board = [target, molecule, step];
+    listMock.mockResolvedValue(board);
+    showMock.mockResolvedValueOnce(target).mockResolvedValueOnce({ ...target, status: "closed" });
+
+    await closeHumanTicket(project, "target");
+
+    expect(cancelRunMock).toHaveBeenCalledWith("p1", "target");
+    expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "target");
+  });
+
   it("does not refuse on an open molecule/gate hung under the target — pipeline plumbing, not open work", async () => {
     // The poured-run shape (gate-molecule.integration.test.ts): a molecule root and its gate
     // children sit open under the feature for as long as its run does. A feature relabelled

@@ -5,14 +5,14 @@
  * {@link abandonTicket}: this records a delivery — the work happened — not a won't-do.
  */
 import { beads, isBlockedByOpenIssues, LABELS, type Bead } from "./beads/bd";
-import { isPipelineArtifact } from "./beads/contract";
 import { loadAllIssues } from "./beads/issues";
 import { withBeadWriteLock } from "./beads/claim-lock";
-import { openDescendants, runTargetOf } from "./abandon";
+import { runTargetOf } from "./abandon";
 import { openBlockersOf } from "./jobs/execute-epic-human-gate";
 import { cancelRunForTarget } from "./jobs/service";
 import { nudgeSync } from "./beads/sync-nudge";
 import { freshDetail } from "./ticket-detail";
+import { liveRunTargetOf, openWorkUnder } from "./ticket-view";
 import type { Project, TicketDetail } from "./types";
 
 /** Thrown when the target exists but isn't in a state this action can settle (route → 409). */
@@ -24,26 +24,6 @@ export class NotCloseableError extends Error {
 }
 
 const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
-
-/**
- * The run target still holding `bead`, when that target is open, not deferred, and not itself
- * `agent:human` — i.e. a run that could still reach this ticket and arm a gate on it. `undefined`
- * for a run target itself (nothing holds it — it IS the work) and for a ticket whose target has
- * already settled or gone human (execute-epic poisons a human target before dispatching a single
- * child, so no gate is ever armed under it — no run is coming for this ticket either way).
- *
- * Mirrors `holdsRunOf` (ticket-detail.ts) / `operatorQueue`'s inline check (operator-queue.ts): the
- * same read that already withholds the UI's own Mark done control, applied here so a direct or
- * stale request can't reach a click the UI itself refuses to offer.
- */
-function stillHeldByLiveRun(bead: Bead, board: Bead[]): Bead | undefined {
-  if (beads.isRunTarget(bead, board)) return undefined;
-  const target = board.find((b) => b.id === runTargetOf(bead, board));
-  if (!target || target.status === "closed" || beads.isDeferred(target) || beads.isHumanWork(target)) {
-    return undefined;
-  }
-  return target;
-}
 
 /**
  * Close a human bead as done. No cascade: an `agent:human` run target with open work still under it
@@ -61,12 +41,13 @@ function stillHeldByLiveRun(bead: Bead, board: Bead[]): Bead | undefined {
  * (`bd gate resolve`) instead; the run's own preflight closes the ticket once it does.
  *
  * Refused for the same reason, one step EARLIER, when the child's run target still HOLDS a run
- * that has simply not reached this ticket yet ({@link stillHeldByLiveRun} — the same `holdsRun`
- * predicate operator-queue.ts and ticket-detail.ts derive, which is what keeps the UI's own Mark
- * done control from ever offering this click). Before a run's human-ticket preflight arms this
- * ticket's gate, it carries no `blocks` dependency at all, so `openBlockersOf` reads it as clear —
- * a direct or stale request in exactly that window would sail past the check above, cancel a
- * healthy run mid-flight, and close a ticket that run was going to settle itself.
+ * that has simply not reached this ticket yet ({@link liveRunTargetOf} in ticket-view.ts — the one
+ * `holdsRun` predicate this route, operator-queue.ts, and ticket-detail.ts all derive from, which is
+ * what keeps the UI's own Mark done control from ever offering this click). Before a run's
+ * human-ticket preflight arms this ticket's gate, it carries no `blocks` dependency at all, so
+ * `openBlockersOf` reads it as clear — a direct or stale request in exactly that window would sail
+ * past the check above, cancel a healthy run mid-flight, and close a ticket that run was going to
+ * settle itself.
  *
  * A run still executing this bead's OWN target is killed FIRST, before the close is written — the
  * same order abandon uses and for the same reason: if the bead was relabelled `agent:human` after
@@ -100,11 +81,12 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
     // permanently even after `bd gate resolve`. strictGates: a stale gate read must fail this write
     // rather than silently degrade to that same false-open reading.
     const board = await loadAllIssues(repo, { strictGates: true });
-    // Pipeline plumbing (a poured `molecule` root, its `gate` children) is never user work — every
-    // other work surface holds it out through isPipelineArtifact, and this guard must too: a molecule
-    // hung under the feature stays open for as long as its run does, so counting it here would 409
-    // this route for the run's own lifetime, before cancelRunForTarget below ever gets to stop it.
-    const open = openDescendants(board, id).filter((b) => !isPipelineArtifact(b));
+    // Pipeline plumbing (a poured `molecule` root, its `gate` children, and every step poured under
+    // them) is never user work — {@link openWorkUnder} prunes those whole subtrees, and this guard
+    // must too: a molecule hung under the feature stays open for as long as its run does, so counting
+    // it (or its steps) here would 409 this route for the run's own lifetime, before cancelRunForTarget
+    // below ever gets to stop it.
+    const open = openWorkUnder(bead, board);
     if (open.length > 0) {
       throw new NotCloseableError(
         `${id} still has open work under it (${open.map((b) => b.id).join(", ")}) — close or ` +
@@ -128,7 +110,7 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
     // still reach this ticket has no `blocks` dependency to catch here until its own preflight
     // arms one, and cancelling it now would kill a healthy, unrelated run for a ticket it was
     // going to settle itself.
-    const liveTarget = stillHeldByLiveRun(bead, board);
+    const liveTarget = liveRunTargetOf(bead, board);
     if (liveTarget) {
       throw new NotCloseableError(
         `${id} still rides on ${liveTarget.id}'s run, which is open and could still reach it — ` +

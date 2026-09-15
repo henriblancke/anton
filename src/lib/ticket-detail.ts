@@ -5,18 +5,16 @@
  */
 import { beads, type BeadPatch } from "./beads/bd";
 import { withBeadWriteLock } from "./beads/claim-lock";
-import { isPipelineArtifact } from "./beads/contract";
 import { allIssues, ensureDescription } from "./beads/issues";
-import { descendantsOf } from "./beads/subtree";
 import { nudgeSync } from "./beads/sync-nudge";
 import { formatHumanNote, parseTicketNotes, type TicketNote } from "./beads/notes";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import {
-  boardCards,
   createdMeta,
   deriveStage,
-  isRunTicket,
+  hasOpenDescendants,
   labelValue,
+  liveRunTargetOf,
   parseAcceptance,
   parseGoal,
   runContractStatus,
@@ -24,39 +22,6 @@ import {
 import { listAllBeads } from "./tickets";
 import type { Bead } from "./beads/bd";
 import type { Project, TicketDetail } from "./types";
-
-/**
- * The same `holdsRun` predicate `operatorQueue` derives (operator-queue.ts), pure over a board this
- * caller already holds. FALSE for a run target itself (nothing holds it — it IS the work), for a
- * ticket whose nearest run-target ancestor is itself `agent:human` (execute-epic poisons that target
- * before dispatching a single child, so no gate is ever armed under it — PR #214 review), and for a
- * ticket whose target has already settled (closed or deferred): no run will ever resume to reach it,
- * so nothing holds it either — mirroring the `isOpenWork(gate)` precondition `operatorQueue` filters
- * on before it ever computes `holdsRun` (codex review, PR #288).
- */
-function holdsRunOf(bead: Bead, all: Bead[]): boolean {
-  if (beads.isRunTarget(bead, all)) return false;
-  const cards = boardCards(all);
-  if (!isRunTicket(bead, cards)) return false;
-  const target = all.find((b) => b.id === cards.cardOf(bead));
-  if (!target) return false;
-  return target.status !== "closed" && !beads.isDeferred(target) && !beads.isHumanWork(target);
-}
-
-/**
- * Whether `bead` still has open work under it — the same read `closeHumanTicket` (close-human.ts)
- * makes before it will close a bead, mirrored here off the primitive it shares (`descendantsOf`),
- * so this dialog's Mark done can withhold itself exactly where that route would 409. Only an epic or
- * a feature can have children in this board's shape, so this is trivially false for a task/bug.
- * Pipeline plumbing (a poured `molecule` root, its `gate` children) is filtered out like
- * `closeHumanTicket` filters it: it stays open for the run's own lifetime, and counting it here
- * would withhold Mark done for as long as the run does, even though the route itself would accept.
- */
-function hasOpenDescendantsOf(bead: Bead, all: Bead[]): boolean {
-  return (
-    descendantsOf(all, bead.id, (b) => b.status !== "closed" && !isPipelineArtifact(b)).length > 0
-  );
-}
 
 function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined, all: Bead[]): TicketDetail {
   return {
@@ -87,8 +52,8 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined, all: Bea
     // button posts to the approve route, and gating on the bead alone (contractStatusOf) would
     // withhold the closed-PR Force run the gate permits on an in-review legacy standalone.
     contract: runContractStatus(full, []),
-    holdsRun: holdsRunOf(lite, all),
-    hasOpenDescendants: hasOpenDescendantsOf(lite, all),
+    holdsRun: liveRunTargetOf(lite, all) !== undefined,
+    hasOpenDescendants: hasOpenDescendants(lite, all),
   };
 }
 
@@ -136,11 +101,11 @@ export async function getTicketDetail(project: Project, id: string): Promise<Tic
  * post-write refresh in the background, which is the very load that next poll then shares.
  *
  * A parentless task/bug skips the board read entirely (anton-0zih's zero-spawn invariant):
- * `holdsRunOf` only needs siblings/ancestors to walk `cardOf`'s parent chain, and a bead with no
+ * `liveRunTargetOf` only needs siblings/ancestors to walk `cardOf`'s parent chain, and a bead with no
  * parent has none to walk — its own classification (parentless task/bug is trivially a run target)
- * never depends on the rest of the board, and a task/bug is always a leaf so `hasOpenDescendantsOf`
+ * never depends on the rest of the board, and a task/bug is always a leaf so `hasOpenDescendants`
  * is trivially false too. An epic or a feature is not exempt even when parentless: either can hold
- * children of its own regardless of its OWN parent, so `hasOpenDescendantsOf` needs the real board
+ * children of its own regardless of its OWN parent, so `hasOpenDescendants` needs the real board
  * to answer for those two types.
  */
 export async function freshDetail(project: Project, bead: Bead): Promise<TicketDetail> {

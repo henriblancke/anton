@@ -16,6 +16,7 @@ import {
   isTicketTier,
   type ContractStatus,
 } from "./beads/contract";
+import { descendantsOf } from "./beads/subtree";
 import type {
   ChildReadiness,
   Epic,
@@ -245,6 +246,57 @@ export function boardCards(all: Bead[]): BoardCards {
  */
 export function isRunTicket(bead: Bead, cards: BoardCards): boolean {
   return !cards.ids.has(bead.id) && !isPipelineArtifact(bead) && isTicketTier(bead);
+}
+
+/**
+ * The run target still holding `bead` — open, not deferred, and not itself `agent:human` — or
+ * `undefined` when nothing does: `bead` IS a run target itself, no ancestor is a run target at all
+ * (a task parented directly on a CONTAINER epic, whose `feature` child lives elsewhere — `cardOf`
+ * finds no card and correctly answers "nothing holds this"), or the nearest one has already settled
+ * or gone human.
+ *
+ * The one predicate `closeHumanTicket` (close-human.ts), `ticket-detail`'s Mark-done gate, and
+ * `operatorQueue`'s row both derive from — previously three separate reads that disagreed on exactly
+ * this "no run target in the ancestry" case (PR #288 review): a walk that fell back to the immediate
+ * parent read a container epic as still holding the ticket, so the UI offered Mark done while the
+ * close route 409'd pointing at a container that will never run.
+ */
+export function liveRunTargetOf(bead: Bead, all: Bead[]): Bead | undefined {
+  if (beads.isRunTarget(bead, all)) return undefined;
+  const cards = boardCards(all);
+  if (!isRunTicket(bead, cards)) return undefined;
+  const targetId = cards.cardOf(bead);
+  const target = targetId ? all.find((b) => b.id === targetId) : undefined;
+  if (!target || target.status === "closed" || beads.isDeferred(target) || beads.isHumanWork(target)) {
+    return undefined;
+  }
+  return target;
+}
+
+/**
+ * The still-open descendants of `bead`, with whole pipeline-artifact subtrees pruned: a poured
+ * `molecule` and its `gate` children coordinate a run's own work and stay open for as long as that
+ * run does, so counting them — or the `task` steps poured under them — would read a healthy in-flight
+ * run as work blocking a close forever.
+ *
+ * The one read `closeHumanTicket` (close-human.ts), the ticket dialog's Mark-done gate, and the
+ * operator queue's row all shared as three separate copies that had drifted apart: one filtered only
+ * the pipeline-artifact node itself (still surfacing its poured `task` steps as open, PR #288
+ * review), and one filtered no pipeline artifacts at all (disagreeing with the ticket dialog on the
+ * identical bead).
+ */
+export function openWorkUnder(bead: Bead, all: Bead[]): Bead[] {
+  return descendantsOf(
+    all,
+    bead.id,
+    (b) => b.status !== "closed" && !isPipelineArtifact(b),
+    isPipelineArtifact,
+  );
+}
+
+/** Whether {@link openWorkUnder} finds anything — the boolean form the board and detail views render. */
+export function hasOpenDescendants(bead: Bead, all: Bead[]): boolean {
+  return openWorkUnder(bead, all).length > 0;
 }
 
 /**

@@ -172,6 +172,23 @@ describe("getTicketDetail holdsRun", () => {
     expect(detail.holdsRun).toBe(false);
   });
 
+  it("holds no run for a task parented directly on a container epic — no ancestor is a run target", async () => {
+    // A container epic (one with a feature child elsewhere) is never a card (boardCards), so a
+    // sibling task parented on it has no run-target ancestor at all. This must read the same as
+    // liveRunTargetOf (ticket-view.ts, shared with close-human.ts): a divergent walk that fell back
+    // to the immediate parent read the container as still holding the ticket (PR #288 review),
+    // which offered Mark done here while closeHumanTicket 409'd pointing at a target that never runs.
+    fakeBd([
+      bead({ id: "e1", issue_type: "epic" }),
+      bead({ id: "f1", issue_type: "feature", parent: "e1", labels: ["approved"] }),
+      bead({ id: "e1.1", issue_type: "task", parent: "e1", labels: ["agent:human"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "e1.1");
+
+    expect(detail.holdsRun).toBe(false);
+  });
+
   it("holds no run once the target is deferred — snoozed, so no run reaches it either", async () => {
     fakeBd([
       bead({
@@ -234,6 +251,21 @@ describe("getTicketDetail hasOpenDescendants", () => {
       bead({ id: "e1", issue_type: "epic", labels: ["agent:human"] }),
       bead({ id: "e1.1", issue_type: "molecule", parent: "e1" }),
       bead({ id: "e1.2", issue_type: "gate", parent: "e1.1" }),
+    ]);
+
+    const detail = await getTicketDetail(project, "e1");
+
+    expect(detail.hasOpenDescendants).toBe(false);
+  });
+
+  it("does not flag it for a task poured under an open molecule — the whole subtree is pruned", async () => {
+    // Codex review (PR #288): filtering only the molecule/gate NODES still counted a poured `task`
+    // step underneath them as open work, so this withheld Mark done for as long as the run lasted
+    // even though closeHumanTicket's own (now-shared) read would have allowed the close.
+    fakeBd([
+      bead({ id: "e1", issue_type: "epic", labels: ["agent:human"] }),
+      bead({ id: "e1.1", issue_type: "molecule", parent: "e1" }),
+      bead({ id: "e1.2", issue_type: "task", parent: "e1.1" }),
     ]);
 
     const detail = await getTicketDetail(project, "e1");

@@ -161,6 +161,34 @@ describe("operatorQueue — the set", () => {
     expect(operatorQueue(board)[0].hasOpenDescendants).toBeUndefined();
   });
 
+  it("does not flag a human epic for an open molecule/gate hung under it — pipeline plumbing, not open work", () => {
+    // PR #288 review: this predicate used to filter no pipeline artifacts at all, disagreeing with
+    // the identical read on the ticket dialog (ticket-detail.ts) and closeHumanTicket, which both
+    // already excluded a bare molecule/gate — hiding a working Mark done here for a bead the close
+    // route would actually accept.
+    const board = [
+      bead({ id: "e1", issue_type: "epic", labels: ["approved", "agent:human"] }),
+      bead({ id: "e1.1", issue_type: "molecule", parent: "e1", labels: [] }),
+      bead({ id: "e1.2", issue_type: "gate", parent: "e1.1", labels: [] }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.id).toBe("e1");
+    expect(target.hasOpenDescendants).toBeUndefined();
+  });
+
+  it("does not flag a human epic for a task poured under an open molecule — the whole subtree is pruned", () => {
+    // Codex review (PR #288): filtering only the molecule/gate NODES still left a poured `task` step
+    // underneath them counted as open work, 409ing the close for as long as the run lasted.
+    const board = [
+      bead({ id: "e1", issue_type: "epic", labels: ["approved", "agent:human"] }),
+      bead({ id: "e1.1", issue_type: "molecule", parent: "e1", labels: [] }),
+      bead({ id: "e1.2", issue_type: "task", parent: "e1.1", labels: [] }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.id).toBe("e1");
+    expect(target.hasOpenDescendants).toBeUndefined();
+  });
+
   it("carries what the row acts on: the goal, the chips, and when it was asked", () => {
     const board = [
       bead({
