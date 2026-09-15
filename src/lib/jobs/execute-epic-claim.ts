@@ -206,6 +206,17 @@ export async function warmRunWorktree(
   }
   await ctx.heartbeat();
 
+  // What an `already-shipped` claim is checked against (PR #279 review). `baseForkSha` above is
+  // deliberately frozen across resumes for dispatch partitioning; a refresh that actually moved this
+  // reused checkout onto a newer base (anything but `skipped_dirty` — that outcome left the branch
+  // untouched) brought commits into the branch's history that a claim can truthfully cite, so the
+  // verifier checks against the base the tree was JUST refreshed onto rather than the older, frozen
+  // fork it would otherwise reject a true claim against.
+  const alreadyShippedBase =
+    worktree.refreshOutcome && worktree.refreshOutcome.outcome !== "skipped_dirty"
+      ? worktree.refreshOutcome.baseSha
+      : baseForkSha;
+
   // Every step of the walk runs through the step registry (anton-4npr) — one entry point per step,
   // dispatched in the order the project's formula declares. This is what they all operate on; each
   // dispatch adds the ticket(s) in scope (and, per ticket, that ticket's session) plus the formula
@@ -222,6 +233,7 @@ export async function warmRunWorktree(
     baseBranch,
     baseRef: freshBase,
     baseForkSha,
+    alreadyShippedBase,
     target,
     settings,
     assertLeaseHeld: lease.assertHeld,

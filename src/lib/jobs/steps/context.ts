@@ -98,6 +98,17 @@ export interface StepContext {
    * pre-fork history and reads an old ticket's commit as this run's delivery.
    */
   baseForkSha: string;
+  /**
+   * The base an `already-shipped` claim is verified against (PR #279 review) — deliberately NOT
+   * always {@link baseForkSha}. That pin stays frozen across resumes so dispatch keeps partitioning
+   * against the commit the checkout forked from; but a reused checkout's refresh (anton-s55u) can
+   * bring newer base commits into the branch's history AFTER that pin was taken, and a survivor
+   * commit cited from one of those would be truthfully reachable from the tree this run now holds
+   * while still failing a check against the older, frozen fork. This is that refreshed base when a
+   * clean refresh actually applied one (`worktree.refreshOntoBase`'s `baseSha`, on every outcome but
+   * `skipped_dirty`, where the branch never moved) — {@link baseForkSha} otherwise.
+   */
+  alreadyShippedBase: string;
   /** The run target — the epic, or the single bead of a standalone run. */
   target: Bead;
   /** The ticket(s) this step covers, in execution order. */
