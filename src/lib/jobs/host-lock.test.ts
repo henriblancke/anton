@@ -27,6 +27,7 @@ const {
   RETIRE_SWAP_OCCUPIED_MARKER,
   WRITE_FAIL_MARKER,
   REPUBLISH_MARKER,
+  LATE_PUBLISH_MARKER,
   SUCCESSOR_TOKEN,
   D2_TOKEN,
   CREATOR_TOKEN,
@@ -41,6 +42,7 @@ const {
   RETIRE_SWAP_OCCUPIED_MARKER: "test-retire-swap-occupied",
   WRITE_FAIL_MARKER: "test-write-fail",
   REPUBLISH_MARKER: "test-republish-race",
+  LATE_PUBLISH_MARKER: "test-late-publish-race",
   SUCCESSOR_TOKEN: "11111111-1111-4111-8111-111111111111",
   D2_TOKEN: "22222222-2222-4222-8222-222222222222",
   CREATOR_TOKEN: "33333333-3333-4333-8333-333333333333",
@@ -123,6 +125,30 @@ vi.mock("node:fs/promises", async (importOriginal) => {
           await actual.writeFile(
             `${dir}/owner.json`,
             JSON.stringify({ token: CREATOR_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "resumed-creator" }),
+            "utf8",
+          );
+        }
+      }
+      // Fires on the 3rd stat(dir) (bare path, no suffix) for the late-publish-race test —
+      // reclaim()'s own snapshot of `dir` passed to retire() as `expected`, taken right after the
+      // metadata recheck already found no holder published. Simulates the suspended creator
+      // resuming and publishing owner.json into `dir` in exactly that gap — the race the finding
+      // describes: publication doesn't change `dir`'s device+inode, so the snapshot alone can't
+      // reveal it; only retire()'s post-rename check of the content it actually moved can.
+      if (
+        typeof path === "string" &&
+        path.includes(LATE_PUBLISH_MARKER) &&
+        !path.includes(".reclaiming") &&
+        !path.includes(".retired-") &&
+        !path.endsWith("owner.json") &&
+        !path.endsWith(".tmp")
+      ) {
+        const n = (statCalls.get(path) ?? 0) + 1;
+        statCalls.set(path, n);
+        if (n === 3) {
+          await actual.writeFile(
+            `${path}/owner.json`,
+            JSON.stringify({ token: CREATOR_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "late-resumed-creator" }),
             "utf8",
           );
         }
@@ -634,6 +660,36 @@ describe("withHostLock", () => {
 
     expect(ran).toBe(true); // advisory: still runs, just unlocked
     // The republished lease must survive completely untouched — not retired out from under it.
+    const holder = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(holder.token).toBe(CREATOR_TOKEN);
+  });
+
+  it("does not retire a metadata-less orphan whose creator publishes between the recheck and the retire snapshot", async () => {
+    const name = `${LATE_PUBLISH_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // A metadata-less orphan old enough to be reclaimed, so the acquire loop drives straight into
+    // reclaim(). The injected stat() above fires on reclaim()'s snapshot of `dir` passed to retire()
+    // as `expected` — right after the metadata recheck already found nothing published — and
+    // simulates the suspended creator resuming and publishing owner.json in exactly that gap: the
+    // finding's race. `dir`'s device+inode never changes when its contents do, so the snapshot alone
+    // can't reveal the publish; retire() must bind the authorization check to the content its own
+    // rename actually moved, not to the earlier recheck, or it would still evict the creator that
+    // just legitimately claimed the lease.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    // Short budget: the creator's published lease is never released in this test, so a correct run
+    // always falls through to the advisory timeout rather than ever reclaiming.
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 200 });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // The published lease must survive completely untouched, still live at the original path — not
+    // retired to a tombstone out from under it.
     const holder = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
     expect(holder.token).toBe(CREATOR_TOKEN);
   });

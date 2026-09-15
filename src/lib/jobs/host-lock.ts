@@ -24,6 +24,9 @@ const DEFAULT_MAX_WAIT_MS = 30 * 60_000;
 /** How long a held lock may go unrefreshed before a peer treats it as abandoned. */
 const STALE_AFTER_MS = 60_000;
 
+/** Metadata filename inside a lock directory. */
+const OWNER_FILE = "owner.json";
+
 /** Poll interval while waiting for a peer to release. */
 const POLL_MS = 2_000;
 
@@ -58,8 +61,23 @@ interface LockFile {
  * found `dir` gone) always fails without touching the filesystem: there is nothing to verify a
  * grabbed object against, so moving whatever now sits at `dir` could not be justified as retiring
  * what the caller intended.
+ *
+ * `verify`, when given, runs after the rename and the identity check both pass, against the
+ * content that rename just moved atomically to `dest` — not against an earlier, separately
+ * awaited read. A decision to retire (e.g. reclaim's abandonment judgment) is made from metadata
+ * read before this call; `dir`'s own device+inode can't reveal a write that landed in between,
+ * since content changes don't change identity. Binding the check to what actually got moved closes
+ * that gap: a resumed creator either published before the rename (so `dest` now carries it, and
+ * `verify` sees the mismatch) or after (so its own identity check against the now-vacated `dir`
+ * fails first, per the write()/isOurDir() contract below). A verify failure restores `dest`, same
+ * as an identity mismatch.
  */
-async function retire(dir: string, token: string, expected: Stats | undefined): Promise<boolean> {
+async function retire(
+  dir: string,
+  token: string,
+  expected: Stats | undefined,
+  verify?: (dest: string) => Promise<boolean>,
+): Promise<boolean> {
   // Holder metadata is in a host-writable temp directory. Accept only tokens this module creates so
   // a forged owner file cannot turn the rename destination into a path traversal.
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token)) {
@@ -86,6 +104,13 @@ async function retire(dir: string, token: string, expected: Stats | undefined): 
     // grabbed successor stranded under this tombstone — the narrower residual window this file's
     // other retirements already accept, since no rename-if-absent primitive exists to close it
     // further.
+    await rename(dest, dir).catch(() => {});
+    return false;
+  }
+  if (verify && !(await verify(dest))) {
+    // Identity matched — this is genuinely the directory `expected` names — but its content, moved
+    // here atomically by the rename above, no longer matches the state that authorized retiring it.
+    // Whoever published that content is the legitimate holder; restore rather than evict them.
     await rename(dest, dir).catch(() => {});
     return false;
   }
@@ -181,16 +206,18 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     // `dir`'s own device+inode doesn't change when a file inside it does, so retire()'s identity
     // check can't tell "still the orphan we judged abandoned" from "the same directory, but its
     // creator resumed, published owner.json, and entered `fn` in the gap since `holder` was read
-    // above." Re-read the metadata immediately before the destructive retire and require it still
-    // matches the exact state that authorized this reclaim — still unpublished, or still the same
-    // stale heartbeat — so a creator that legitimately renewed its lease in that gap is never
-    // evicted out from under itself.
-    const recheckHolder = await readHolder(metaPath);
-    const stillAuthorized =
+    // above." Re-read the metadata immediately before the destructive retire as a cheap early exit —
+    // still unpublished, or still the same stale heartbeat — so an obviously-renewed lease never
+    // even reaches the rename below. This alone isn't sufficient: it's a separate awaited read, so a
+    // creator resuming in the gap *after* this check but before retire()'s own rename would still
+    // slip past it. The `verify` callback passed to retire() below closes that: it re-checks
+    // authorization against the metadata retire()'s rename actually moved, atomically bound to the
+    // retirement itself rather than to an earlier snapshot.
+    const isStillAuthorized = (candidate: LockFile | undefined): boolean =>
       holder === undefined
-        ? recheckHolder === undefined
-        : recheckHolder?.token === holder.token && recheckHolder.heartbeatAt === holder.heartbeatAt;
-    if (!stillAuthorized) {
+        ? candidate === undefined
+        : candidate?.token === holder.token && candidate.heartbeatAt === holder.heartbeatAt;
+    if (!isStillAuthorized(await readHolder(metaPath))) {
       return false;
     }
     // Bind the retire to `dir`'s identity as of right now, not just the gate check above: if this
@@ -199,7 +226,9 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     // whatever its own rename actually grabbed, and restores it on a mismatch, so a successor's
     // fresh `mkdir` there gets moved back instead of being retired as if it were still the orphan
     // this decision was made against.
-    return await retire(dir, token, await safeStat(dir));
+    return await retire(dir, token, await safeStat(dir), async (dest) =>
+      isStillAuthorized(await readHolder(join(dest, OWNER_FILE))),
+    );
   } finally {
     const ownRecheck = await safeStat(gate);
     if (ownRecheck !== undefined && sameIdentity(ownGateStat, ownRecheck)) {
@@ -297,7 +326,7 @@ export async function withHostLock<T>(
 ): Promise<T> {
   const maxWaitMs = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
   const dir = join(LOCK_ROOT, name);
-  const metaPath = join(dir, "owner.json");
+  const metaPath = join(dir, OWNER_FILE);
   const deadline = Date.now() + maxWaitMs;
   const token = randomUUID();
 
