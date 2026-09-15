@@ -1,4 +1,4 @@
-import { beads, type Bead } from "./bd";
+import { beads, type Bead, type DepCycle } from "./bd";
 import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import {
   getBeadDescription,
@@ -133,6 +133,33 @@ export async function loadAllIssues(
 
 
 /**
+ * Per-repo in-flight `bd dep cycles` fetch, shared by every best-effort cycle-evidence path
+ * (`attachCyclesBestEffort` below and {@link probeCycleEvidence}) so concurrent callers coalesce
+ * into one CLI call instead of each spawning their own (PR #274 review, round 6 on this file):
+ * several cold page renders sharing one snapshot load each reach `readAllIssues`/`allIssues` with
+ * `withCycles` before the first enrichment finishes, and every poller running `probeCycleEvidence`
+ * is racing the same gap. Global-keyed for the same cross-module-registry reason as
+ * `cyclesByBoard`/the snapshot registry.
+ */
+const CYCLE_FETCHES_KEY = Symbol.for("anton.beads.cycleFetches");
+
+function cycleFetches(): Map<string, Promise<DepCycle[]>> {
+  const global = globalThis as unknown as Record<symbol, Map<string, Promise<DepCycle[]>> | undefined>;
+  return (global[CYCLE_FETCHES_KEY] ??= new Map());
+}
+
+function fetchCyclesShared(cwd: string): Promise<DepCycle[]> {
+  const fetches = cycleFetches();
+  const existing = fetches.get(cwd);
+  if (existing) return existing;
+  const fetch = beads.depCycles(cwd).finally(() => {
+    if (fetches.get(cwd) === fetch) fetches.delete(cwd);
+  });
+  fetches.set(cwd, fetch);
+  return fetch;
+}
+
+/**
  * Enrich an already-loaded snapshot with `bd dep cycles` evidence WITHOUT failing the read that
  * produced it. `allIssues`/`readAllIssues` back page renders and the board polling API, where the
  * ordinary bead listing succeeding (often off a cached snapshot) must not be undone by this
@@ -143,6 +170,14 @@ export async function loadAllIssues(
  * stale/absent evidence uses `loadAllIssues` directly, which still lets `depCycles` reject (jobs
  * rely on that to retry — see execute-epic-start).
  *
+ * The CLI call itself goes through {@link fetchCyclesShared}, so several concurrent readers hitting
+ * the same missing-evidence snapshot (or a `probeCycleEvidence` poll landing at the same moment)
+ * spawn `bd dep cycles` once. The board is rechecked after that shared fetch settles before
+ * attaching + bumping the version (PR #274 review, round 6): whichever caller resumes first performs
+ * both, and every later caller sees evidence already on its (shared) board array and skips both —
+ * only the call that actually transitions the retained board from missing to present pays for the
+ * version bump.
+ *
  * Bumps the snapshot version on success (PR #274 review, round 4 on this file), same as
  * {@link probeCycleEvidence}: without it, a page that rendered a cached board with no evidence and
  * then recovers it here leaves the poll path's freshness token untouched, so a concurrent poller
@@ -151,8 +186,11 @@ export async function loadAllIssues(
  */
 async function attachCyclesBestEffort(cwd: string, board: Bead[]): Promise<void> {
   try {
-    attachCycleEvidence(board, await beads.depCycles(cwd));
-    markCycleEvidenceRecovered(cwd);
+    const cycles = await fetchCyclesShared(cwd);
+    if (cycleEvidenceFor(board) === undefined) {
+      attachCycleEvidence(board, cycles);
+      markCycleEvidenceRecovered(cwd);
+    }
   } catch (e) {
     console.warn(
       `[beads.issues] ${cwd}: dep cycles read failed — board stays readable without cycle evidence; ` +
@@ -279,8 +317,14 @@ export function probeCycleEvidence(cwd: string): void {
           blockOnPendingWrite: false,
         });
         if (cycleEvidenceFor(board) !== undefined) return;
-        attachCycleEvidence(board, await beads.depCycles(cwd));
-        markCycleEvidenceRecovered(cwd);
+        const cycles = await fetchCyclesShared(cwd);
+        // Recheck: a concurrent `attachCyclesBestEffort` sharing this fetch (or a probe that beat
+        // this one to it) may already have attached evidence — and bumped the version — while this
+        // awaited the shared CLI call.
+        if (cycleEvidenceFor(board) === undefined) {
+          attachCycleEvidence(board, cycles);
+          markCycleEvidenceRecovered(cwd);
+        }
       } catch {
         // Still unavailable — the next probe (or an explicit `withCycles` read) retries.
       } finally {

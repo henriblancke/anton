@@ -245,6 +245,33 @@ describe("loadAllIssues", () => {
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
+  it("coalesces concurrent best-effort enrichments into one dep-cycles call and one version bump (PR #274 review, round 6)", async () => {
+    // Warm the snapshot with no evidence first, matching several cold page renders sharing one load.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await allIssues(REPO);
+    const before = issueSnapshotVersion(REPO);
+
+    let resolveCycles!: (evidence: unknown) => void;
+    cyclesMock.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveCycles = resolve; }),
+    );
+
+    // Two independent readers of the same repo — `readAllIssues` and `allIssues` — both observe
+    // missing evidence before either enrichment finishes.
+    const viaRead = readAllIssues(REPO, { withCycles: true });
+    const viaAll = allIssues(REPO, { withCycles: true });
+
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    resolveCycles([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const [snapshot, board] = await Promise.all([viaRead, viaAll]);
+
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+    expect(cycleEvidenceFor(snapshot.beads)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+  });
+
   it("dedupes, so a bd that starts carrying gates in the ordinary listing doesn't double them", async () => {
     // Two gate edges, one of whose gates the ordinary listing already carries: the other still
     // dangles, so the second read fires and hands back both.
