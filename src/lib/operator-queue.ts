@@ -8,7 +8,9 @@
  * it lands instead.
  *
  * Pure over a board snapshot the caller already holds, so it costs no bd spawn of its own: board.ts
- * hands it the same `workBeads` list the cards are built from.
+ * hands it the RAW `allBeads` snapshot, not the pipeline-stripped `workBeads` the cards are built
+ * from — `hasOpenBlockers` below needs closed gate beads on hand to resolve `blocks` edges, and a
+ * gate absent from the lookup reads as an open blocker forever (PR #288 review).
  */
 import { beads, type Bead } from "./beads/bd";
 import { isPipelineArtifact } from "./beads/contract";
@@ -64,8 +66,10 @@ function byNewestAsk(a: OperatorQueueItem, b: OperatorQueueItem): number {
  * a ticket under an unapproved (or closed, or abandoned) target is not queued for anyone yet. Every
  * other bead answers for itself.
  *
- * Container epics and pipeline plumbing are not work and never appear: a container's features each
- * run on their own, and a molecule/gate coordinates work without being any.
+ * Container epics and pipeline plumbing are not work and never appear as a queue row: a container's
+ * features each run on their own, and a molecule/gate coordinates work without being any. But `all`
+ * must still be the UNFILTERED board — closed gates included — because the blocker/descendant
+ * eligibility checks below key off `bead.id` lookups into it (PR #288 review).
  */
 export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
   const work = all.filter((bead) => !isPipelineArtifact(bead));

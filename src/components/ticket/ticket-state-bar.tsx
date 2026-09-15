@@ -208,7 +208,7 @@ export function TicketStateBar({
             size="sm"
             className="border-stage-done/40 bg-stage-done/10 text-stage-done hover:bg-stage-done/20"
             onClick={confirmMarkDone}
-            disabled={pending === "close"}
+            disabled={busy}
           >
             <CheckIcon aria-hidden="true" />
             {pending === "close" ? "Marking done…" : "Confirm mark done"}
@@ -218,7 +218,7 @@ export function TicketStateBar({
             variant="ghost"
             size="sm"
             onClick={() => setCloseArming(false)}
-            disabled={pending === "close"}
+            disabled={busy}
           >
             Cancel
           </Button>
@@ -242,7 +242,7 @@ export function TicketStateBar({
               }
             }}
             maxLength={MAX_ABANDON_REASON_CHARS}
-            disabled={pending === "abandon"}
+            disabled={busy}
             placeholder="Why is this ticket won't-do?"
             aria-label="Reason for abandoning this ticket"
             className="h-7 flex-1 rounded-lg border border-border bg-card px-2.5 text-xs text-foreground outline-none focus:border-primary/60"
@@ -252,7 +252,7 @@ export function TicketStateBar({
             variant="destructive"
             size="sm"
             onClick={confirmAbandon}
-            disabled={pending === "abandon" || !reason.trim()}
+            disabled={busy || !reason.trim()}
             title={reason.trim() ? undefined : "A reason is required"}
           >
             <CircleSlashIcon aria-hidden="true" />
@@ -266,7 +266,7 @@ export function TicketStateBar({
               setArming(false);
               setReason("");
             }}
-            disabled={pending === "abandon"}
+            disabled={busy}
           >
             Cancel
           </Button>
