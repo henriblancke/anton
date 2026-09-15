@@ -150,4 +150,19 @@ describe.skipIf(!hasBun)("check-control-bytes CLI", () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
   });
+
+  it("fails a tree carrying a bidi override (anton-33xn's Trojan Source case)", () => {
+    // The ticket's `## Verify` fixture — a RLO character, the "Trojan Source" mechanism: it
+    // reorders the characters that follow when rendered, so a reviewer's editor and the compiler
+    // can disagree about what the code says. Built via fromCodePoint rather than a literal escape
+    // so this test file itself doesn't embed the character this whole gate exists to reject.
+    const rlo = String.fromCodePoint(0x202e);
+    track("clean.ts", "export const answer = 42;\n");
+    track("tainted.ts", Buffer.from(`const evil = 1; // ${rlo} desivrp\n`, "utf8"));
+
+    const result = run();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("tainted.ts:1:20: U+202E (RLO)");
+    expect(result.stderr).not.toContain("clean.ts");
+  });
 });
