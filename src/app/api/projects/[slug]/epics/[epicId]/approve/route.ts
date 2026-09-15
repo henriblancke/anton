@@ -204,12 +204,6 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     return applyProposalResponse(project, target, allBeads);
   }
 
-  // Cycle evidence, fetched here rather than on the initial read above (PR #274 review): only a
-  // real run-target approval reaches the structural gate below that consumes it, so proposals — the
-  // branch just above — never pay for this, and never fail on it either. Attaches to the SAME
-  // `allBeads` array already in hand, so this costs one `bd dep cycles` spawn, not a second `bd list`.
-  await ensureCycleEvidence(project.repoPath, allBeads);
-
   // Cheap refusal first, off the read above — most non-run-targets never get near the lock. The
   // verdict is re-taken under the lock before anything is written, because this read cannot hold.
   const notRunnable = notRunTargetReason(target, allBeads);
@@ -351,12 +345,15 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   //
   // One call, both severities: the refusal below and the advisory further down are the same subtree
   // read, and asking twice would walk the whole board twice.
-  // Cycle evidence already rode in on `allBeads` — `ensureCycleEvidence` attached it after the
-  // proposal branch above (the initial `refreshAllIssues` read is deliberately WITHOUT
-  // `withCycles`), so a second `bd dep cycles` here would pull a fresh, possibly divergent snapshot
-  // for the same board instead of reusing what's attached to it. Gated on `willEnqueue` because that
-  // evidence is only relevant to a request that will start work — a cycle cannot change a response or
-  // an enqueue decision otherwise.
+  // Cycle evidence, fetched here rather than on the initial read above (PR #274 review, round 2):
+  // a pure ownership take-over of a blocked target never reaches this gate (`willEnqueue` is false),
+  // so it must not pay for `bd dep cycles` or fail the whole request when that command times out, is
+  // unavailable, or returns unreadable output — none of which changes an outcome that skips the gate
+  // entirely. Attaches to the SAME `allBeads` array already in hand, so this costs at most one
+  // `bd dep cycles` spawn, not a second `bd list`.
+  if (willEnqueue) {
+    await ensureCycleEvidence(project.repoPath, allBeads);
+  }
   const structural = willEnqueue
     ? structureGaps(epicId, allBeads, { cycles: cycleEvidenceFor(allBeads) })
     : { blocking: [], advisory: [] };
