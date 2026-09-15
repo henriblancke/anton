@@ -147,6 +147,18 @@ export function issueSnapshotVersion(cwd: string): number {
 }
 
 /**
+ * Monotonic counter bumped on every invalidation ({@link invalidateIssueSnapshot}) — unlike
+ * `version`, which a cycle-evidence recovery also bumps, this moves ONLY when the board itself
+ * was invalidated (a local write or a remote pull). Callers that share an in-flight `bd dep
+ * cycles` fetch across concurrent readers use it to detect a snapshot replaced mid-fetch, so a
+ * result describing a stale graph is never attached to a newer one (PR #274 review, round 7 on
+ * `issues.ts:154`).
+ */
+export function issueSnapshotGeneration(cwd: string): number {
+  return entryFor(cwd).generation;
+}
+
+/**
  * Bump the version alone — no content changed, no beads replaced, no generation advance — for a side
  * channel that recovers independently of the bead data itself (PR #274 review, round 2 on
  * `issues.ts:158`: a `bd dep cycles` retry landing evidence that a prior read couldn't get).

@@ -3,6 +3,7 @@ import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import {
   getBeadDescription,
   getIssueSnapshot,
+  issueSnapshotGeneration,
   markCycleEvidenceRecovered,
   probeIssueSnapshot,
   readIssueSnapshot,
@@ -117,6 +118,12 @@ export async function loadAllIssues(
   // which a concurrently-repaired cycle could make the attached evidence stale against `board`'s
   // own edges.
   const cyclesPromise = opts.withCycles ? beads.depCycles(cwd) : undefined;
+  // Observed right away: if `loadWorkIssues` throws first, this function returns before the
+  // `await cyclesPromise` below ever runs, and a `cyclesPromise` that also rejects would
+  // otherwise be an unhandled rejection — which Bun can escalate to a process-level failure
+  // instead of the recoverable board-read error it actually is. This handler only marks the
+  // rejection observed; the `await` below still sees (and propagates) the original rejection.
+  cyclesPromise?.catch(() => {});
   const work = await loadWorkIssues(cwd);
   // CONDITIONAL, not unconditional: a board read sits on the operator's critical path behind the
   // Dolt lock, and anton-hwkx trimmed approve down to exactly one. A board with no dangling blocker
@@ -133,13 +140,22 @@ export async function loadAllIssues(
 
 
 /**
- * Per-repo in-flight `bd dep cycles` fetch, shared by every best-effort cycle-evidence path
- * (`attachCyclesBestEffort` below and {@link probeCycleEvidence}) so concurrent callers coalesce
- * into one CLI call instead of each spawning their own (PR #274 review, round 6 on this file):
- * several cold page renders sharing one snapshot load each reach `readAllIssues`/`allIssues` with
- * `withCycles` before the first enrichment finishes, and every poller running `probeCycleEvidence`
- * is racing the same gap. Global-keyed for the same cross-module-registry reason as
- * `cyclesByBoard`/the snapshot registry.
+ * Per-repo, per-generation in-flight `bd dep cycles` fetch, shared by every best-effort
+ * cycle-evidence path (`attachCyclesBestEffort` below and {@link probeCycleEvidence}) so
+ * concurrent callers coalesce into one CLI call instead of each spawning their own (PR #274
+ * review, round 6 on this file): several cold page renders sharing one snapshot load each reach
+ * `readAllIssues`/`allIssues` with `withCycles` before the first enrichment finishes, and every
+ * poller running `probeCycleEvidence` is racing the same gap. Global-keyed for the same
+ * cross-module-registry reason as `cyclesByBoard`/the snapshot registry.
+ *
+ * Keyed by {@link issueSnapshotGeneration} alongside `cwd` (PR #274 review, round 7 on
+ * `issues.ts:154`): a board write bumps the generation and replaces the cached snapshot, but a
+ * cycles fetch started against the OLD graph can still be in flight. A repo-only key would let a
+ * reader enriching the NEW snapshot reuse that stale-graph result and attach it as if it were
+ * current — a newly introduced cycle could be recorded as cycle-free, and because evidence then
+ * reads as present, every probe stops retrying until unrelated content changes. Scoping the key to
+ * the generation makes a write start a fresh fetch for readers of the new snapshot while letting
+ * in-flight readers of the old one still coalesce on the original call.
  */
 const CYCLE_FETCHES_KEY = Symbol.for("anton.beads.cycleFetches");
 
@@ -148,14 +164,15 @@ function cycleFetches(): Map<string, Promise<DepCycle[]>> {
   return (global[CYCLE_FETCHES_KEY] ??= new Map());
 }
 
-function fetchCyclesShared(cwd: string): Promise<DepCycle[]> {
+function fetchCyclesShared(cwd: string, generation: number): Promise<DepCycle[]> {
   const fetches = cycleFetches();
-  const existing = fetches.get(cwd);
+  const key = `${cwd}::${generation}`;
+  const existing = fetches.get(key);
   if (existing) return existing;
   const fetch = beads.depCycles(cwd).finally(() => {
-    if (fetches.get(cwd) === fetch) fetches.delete(cwd);
+    if (fetches.get(key) === fetch) fetches.delete(key);
   });
-  fetches.set(cwd, fetch);
+  fetches.set(key, fetch);
   return fetch;
 }
 
@@ -186,8 +203,12 @@ function fetchCyclesShared(cwd: string): Promise<DepCycle[]> {
  */
 async function attachCyclesBestEffort(cwd: string, board: Bead[]): Promise<void> {
   try {
-    const cycles = await fetchCyclesShared(cwd);
-    if (cycleEvidenceFor(board) === undefined) {
+    const generation = issueSnapshotGeneration(cwd);
+    const cycles = await fetchCyclesShared(cwd, generation);
+    // A write replaced the snapshot while this fetch was in flight: `cycles` describes the graph
+    // this generation's board no longer represents. Leave evidence unattached rather than stamp a
+    // stale-graph result as current — the next probe or read retries against the new generation.
+    if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
       attachCycleEvidence(board, cycles);
       markCycleEvidenceRecovered(cwd);
     }
@@ -317,11 +338,14 @@ export function probeCycleEvidence(cwd: string): void {
           blockOnPendingWrite: false,
         });
         if (cycleEvidenceFor(board) !== undefined) return;
-        const cycles = await fetchCyclesShared(cwd);
-        // Recheck: a concurrent `attachCyclesBestEffort` sharing this fetch (or a probe that beat
-        // this one to it) may already have attached evidence — and bumped the version — while this
-        // awaited the shared CLI call.
-        if (cycleEvidenceFor(board) === undefined) {
+        const generation = issueSnapshotGeneration(cwd);
+        const cycles = await fetchCyclesShared(cwd, generation);
+        // Recheck evidence: a concurrent `attachCyclesBestEffort` sharing this fetch (or a probe
+        // that beat this one to it) may already have attached it — and bumped the version — while
+        // this awaited the shared CLI call. Recheck generation too: a write replacing the snapshot
+        // mid-fetch means `cycles` describes a graph this board no longer represents, so it must
+        // not be stamped onto it as current (PR #274 review, round 7).
+        if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
           attachCycleEvidence(board, cycles);
           markCycleEvidenceRecovered(cwd);
         }
