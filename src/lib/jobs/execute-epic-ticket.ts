@@ -10,11 +10,17 @@
  * — with the judgement on a timed-out ticket's work in execute-epic-ticket-preserve.ts — and the
  * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
-import type { Bead } from "../beads/bd";
+import { beads, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude } from "../claude/driver";
 import { branchAddedCommit } from "../git/ops";
+import {
+  readBoardBaseline,
+  readBoardEvidence,
+  type BoardEvidenceResult,
+  type BoardFingerprint,
+} from "./execute-epic-board-evidence";
 import { BlockedByAgentError, NeedsHumanError, NoDeliveryError } from "./execute-epic-errors";
 import {
   claimTicket,
@@ -89,11 +95,14 @@ export async function runTicket(args: {
     warnBudgetRunningOut(session.logPath, ticket, timeoutMs, remainingMs),
   );
   const baseline = await readTicketBaseline(worktreePath);
+  // Only for a bead shaped `delivery:board` (anton-fc5x) — the read costs a whole-board `bd list`,
+  // paid here so every OTHER ticket's zero-diff path stays exactly as cheap as it always was.
+  const boardBaseline = beads.isBoardOnly(ticket) ? await readBoardBaseline(run.repoPath) : null;
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
 
   try {
-    await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress });
+    await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress, boardBaseline });
     const settlement = await ticketSettlement(run, progress);
     // The deadline only stops what observes it (PR #253 review). The gate's branch reads and the
     // settlement's commit lookup are plain git reads that take no signal, so a deadline landing
@@ -142,8 +151,11 @@ async function walkTicketSteps(args: {
   ticketCtx: StepContext;
   session: { sessionId: string; logPath: string };
   progress: TicketProgress;
+  /** The pre-dispatch board read a board-only ticket's evidence check diffs against; null for every
+   * other ticket, and for one whose baseline read itself failed (anton-fc5x). */
+  boardBaseline: BoardFingerprint | null;
 }): Promise<void> {
-  const { run, ticket, ticketCtx, session, progress } = args;
+  const { run, ticket, ticketCtx, session, progress, boardBaseline } = args;
   const { db } = run;
   const { sessionId, logPath } = session;
   for (const { step: cooked, definition } of args.steps) {
@@ -208,8 +220,12 @@ async function walkTicketSteps(args: {
       }
       continue;
     }
-    await assertDelivered(ticket, result.facts ?? {}, progress, (commit) =>
-      branchAddedCommit(run.repoPath, run.branch, run.baseRef, commit),
+    await assertDelivered(
+      ticket,
+      result.facts ?? {},
+      progress,
+      (commit) => branchAddedCommit(run.repoPath, run.branch, run.baseRef, commit),
+      boardBaseline ? () => readBoardEvidence(run.repoPath, boardBaseline) : undefined,
     );
   }
 }
@@ -274,6 +290,12 @@ export async function assertDelivered(
   facts: StepFacts,
   progress: TicketProgress,
   branchAdded: BranchAddedCommit,
+  /**
+   * The board-only evidence check (anton-fc5x), present only when the ticket carries
+   * `LABELS.boardOnly` and its pre-dispatch baseline read succeeded. `undefined` for every other
+   * ticket, which is what keeps the zero-diff guard's plain-code behavior byte-for-byte unchanged.
+   */
+  checkBoardEvidence?: () => Promise<BoardEvidenceResult>,
 ): Promise<void> {
   const committed = facts.committed === true;
   // The TREE fact is recorded first and unconditionally — the timeout path reads it to know there
@@ -295,6 +317,20 @@ export async function assertDelivered(
     ) {
       progress.delivered = true;
       return;
+    }
+    // A board-only ticket (anton-fc5x) has no git diff BY DESIGN — its product is bd writes, which
+    // `.beads/.gitignore` keeps out of the tree on purpose. An empty tree is not evidence of nothing
+    // there; it asks the board instead, and settles on THAT read, never on the agent's word alone:
+    // `delivered` is required (an honest `blocked` or a missing line still falls through to the
+    // plain zero-diff block below, exactly as it does for any other ticket), and the board must
+    // independently show writes that landed AND synced.
+    if (checkBoardEvidence && beads.isBoardOnly(ticket) && selfReport?.outcome === "delivered") {
+      const evidence = await checkBoardEvidence();
+      if (evidence.found && evidence.synced) {
+        progress.delivered = true;
+        return;
+      }
+      throw new NoDeliveryError(boardOnlyNoDeliveryMessage(ticket, evidence));
     }
     // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
     // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
@@ -340,6 +376,28 @@ export async function assertDelivered(
     );
   }
   progress.delivered = true;
+}
+
+/**
+ * Why a board-only ticket's zero diff still did not settle (anton-fc5x) — the two ways the board
+ * evidence check can come up short, named precisely so the operator note says which.
+ */
+function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult): string {
+  if (!evidence.found) {
+    return (
+      `${ticket.id} produced no delivery: claude exited cleanly, self-reported delivered, and this ` +
+      `ticket is marked \`delivery:board\` — but no bd write landed on the board since the ticket ` +
+      `started (the whole board's title/description/status was compared against the pre-dispatch ` +
+      `read and nothing differs). Blocking the ticket for operator review — a board-only ticket ` +
+      `with no board evidence is the same false success a git zero diff is.`
+    );
+  }
+  return (
+    `${ticket.id} produced no delivery: bd writes were found on ${evidence.ids.join(", ")} since ` +
+    `the ticket started, but they could not be confirmed synced (\`bd dolt push\` did not report ` +
+    `synced or shared-server). Blocking the ticket for operator review until the sync channel is ` +
+    `healthy, then resume the run.`
+  );
 }
 
 /**

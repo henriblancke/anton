@@ -1864,6 +1864,92 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
   });
 });
 
+describe("assertDelivered — a board-only ticket settles on the board, never the git tree (anton-fc5x)", () => {
+  const ticket: Bead = {
+    id: "anton-board",
+    title: "assertDelivered settles a board-only ticket on board evidence",
+    status: "in_progress",
+    issue_type: "task",
+    labels: [LABELS.boardOnly],
+  };
+  const progress = (selfReport: TicketProgress["selfReport"]): TicketProgress => ({
+    committed: false,
+    delivered: false,
+    selfReport,
+  });
+  const neverAsked = async (): Promise<boolean> => {
+    throw new Error("assertDelivered asked the branch about a board-only ticket");
+  };
+  const failure = (run: Promise<void>) => run.then(() => null, (e: Error) => e);
+
+  it("settles delivered once the board shows evidence that is confirmed synced", async () => {
+    const p = progress({ outcome: "delivered" });
+    const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
+
+    await expect(assertDelivered(ticket, { committed: false }, p, neverAsked, check)).resolves.toBeUndefined();
+    expect(p).toMatchObject({ committed: false, delivered: true });
+  });
+
+  it("blocks when the board shows no evidence at all, naming the check it failed", async () => {
+    const p = progress({ outcome: "delivered" });
+    const check = async () => ({ found: false, ids: [], synced: false });
+
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+    expect(err?.name).toBe("PoisonError");
+    expect(err?.message).toMatch(/anton-board produced no delivery/);
+    expect(err?.message).toMatch(/no bd write landed on the board since the ticket started/);
+    expect(p).toMatchObject({ committed: false, delivered: false });
+  });
+
+  it("blocks when the board changed but the sync could not be confirmed, naming the beads", async () => {
+    const p = progress({ outcome: "delivered" });
+    const check = async () => ({ found: true, ids: ["swept-1", "swept-2"], synced: false });
+
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+    expect(err?.message).toMatch(/swept-1, swept-2/);
+    expect(err?.message).toMatch(/could not be confirmed synced/);
+    expect(p).toMatchObject({ committed: false, delivered: false });
+  });
+
+  it("never checks the board on a missing or blocked self-report — the agent's word is required, not sufficient", async () => {
+    const check = async () => {
+      throw new Error("the board-only check ran without a `delivered` self-report");
+    };
+
+    const missing = await failure(assertDelivered(ticket, { committed: false }, progress(null), neverAsked, check));
+    expect(missing?.message).toMatch(/produced no delivery/);
+
+    const blocked = await failure(
+      assertDelivered(
+        ticket,
+        { committed: false },
+        progress({ outcome: "blocked", klass: "other", reason: "couldn't find anything to sweep" }),
+        neverAsked,
+        check,
+      ),
+    );
+    expect(blocked?.message).toMatch(/produced no delivery/);
+  });
+
+  it("leaves an ordinary (non-board-only) ticket's zero diff completely unaffected", async () => {
+    const codeTicket: Bead = { ...ticket, id: "anton-code", labels: [] };
+    const check = async () => {
+      throw new Error("the board-only check ran for a ticket with no delivery:board label");
+    };
+    const p = progress({ outcome: "delivered" });
+
+    const err = await failure(assertDelivered(codeTicket, { committed: false }, p, neverAsked, check));
+    expect(err?.message).toBe(
+      "anton-code produced no delivery: claude exited cleanly and passed the verify gates but " +
+        "left no changes to commit (zero diff). Blocking the ticket for operator review and " +
+        "halting the epic — nothing landed, so closing it would be a false success. The agent " +
+        "self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.",
+    );
+  });
+});
+
 /**
  * anton-vqql: a blocked ticket's note has to say WHY. The agent's reason is already parsed and
  * logged; these cases pin it to the bead, alongside the evidence an operator would otherwise dig

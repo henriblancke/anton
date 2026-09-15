@@ -139,6 +139,16 @@ export const LABELS = {
    * read here by every chokepoint that must refuse it — see {@link beads.isHumanWork}.
    */
   agentHuman: `agent:${HUMAN_AGENT}`,
+  /**
+   * This run target's entire deliverable is board writes — bd updates to the Dolt DB, which
+   * `.beads/.gitignore` deliberately keeps out of the tree (`refs/dolt/data` is the sync channel,
+   * not the tree; see CLAUDE.md and anton-fc5x). Set at SHAPING time, on the bead, like
+   * `agentHuman` — never inferred from the agent's own report, because an agent claiming its own
+   * ticket is exempt from the zero-diff guard is exactly the false success that guard exists to
+   * catch. Read by {@link beads.isBoardOnly} and consulted only where a clean git tree would
+   * otherwise be read as "nothing delivered" (execute-epic-ticket.ts `assertDelivered`).
+   */
+  boardOnly: "delivery:board",
 } as const;
 
 /** Prefix of the run-lease label (see LABELS.runLease). */
@@ -1370,6 +1380,13 @@ export const beads = {
    * the runner agree at every level of the tree.
    */
   isHumanWork: (b: Bead) => b.labels?.includes(LABELS.agentHuman) ?? false,
+
+  /**
+   * A run target shaped as board-only (`delivery:board`, {@link LABELS.boardOnly}): its deliverable
+   * is bd writes, never a git diff. `assertDelivered`'s zero-diff guard reads this to decide whether
+   * a clean git tree needs board evidence instead of a commit before it can settle as delivered.
+   */
+  isBoardOnly: (b: Bead) => b.labels?.includes(LABELS.boardOnly) ?? false,
 
   isEpic: (b: Bead) => b.issue_type === "epic",
 

@@ -761,15 +761,30 @@ async function releaseFailedTicket(args: {
   // resume that follows the blocker landing impossible — `bd update --claim` refuses a `blocked`
   // bead, so the wait would become permanent.
   const staysClaimable = args.repair?.action === "repaired" || args.repair?.action === "parked";
+  // A board-only ticket (anton-fc5x) that fails ITS OWN zero-diff guard is not a human dead end the
+  // way a code ticket's is: the guard's own finding — no board evidence, or evidence the sync
+  // channel could not confirm — is exactly the kind of thing a retry can resolve, and `blocked` is a
+  // status `bd update --claim` refuses (see unclaimableStatus), which would wedge the very ticket a
+  // resumed run needs to reclaim (the anton-f5f3 incident this ticket exists to fix). Left `open`
+  // instead, with the `not-delivered` marker so a later read still knows this run reserved but did
+  // not deliver it — `blockFailedTicket` still writes the operator-facing note either way.
+  const boardOnlyNoDelivery = noDelivery && beads.isBoardOnly(ticket);
   if ((committed || noDelivery || agentBlocked) && !needsHuman && !staysClaimable) {
     await blockFailedTicket({
       run,
       ticket,
       sessionId: session.sessionId,
-      kind: noDelivery ? "no-delivery" : agentBlocked ? "agent-blocked" : "post-commit",
+      kind: boardOnlyNoDelivery
+        ? "board-only-no-evidence"
+        : noDelivery
+          ? "no-delivery"
+          : agentBlocked
+            ? "agent-blocked"
+            : "post-commit",
       committed,
       selfReport,
       error: e,
+      keepOpen: boardOnlyNoDelivery,
     });
   } else {
     await safe(() => beads.setStatus(repo, ticket.id, "open"));
@@ -913,7 +928,11 @@ async function retirementReopenedDuringRelease(
   return true;
 }
 
-/** Block the bead for a human, with the note that says which failure this was and where its evidence is. */
+/**
+ * Block the bead for a human, with the note that says which failure this was and where its evidence
+ * is — or, for a board-only ticket's own guard (`keepOpen`, anton-fc5x), leave it claimable instead:
+ * `open` with the `not-delivered` marker rather than a `blocked` status bd's own claim gate refuses.
+ */
 async function blockFailedTicket(args: {
   run: Omit<StepContext, "tickets">;
   ticket: Bead;
@@ -922,10 +941,16 @@ async function blockFailedTicket(args: {
   committed: boolean;
   selfReport: AntonResult | null;
   error: unknown;
+  keepOpen?: boolean;
 }): Promise<void> {
-  const { run, ticket, sessionId, kind, committed, selfReport, error } = args;
+  const { run, ticket, sessionId, kind, committed, selfReport, error, keepOpen } = args;
   const repo = run.repoPath;
-  await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
+  if (keepOpen) {
+    await safe(() => beads.tag(repo, ticket.id, [LABELS.notDelivered]));
+    await safe(() => beads.setStatus(repo, ticket.id, "open"));
+  } else {
+    await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
+  }
   // The tip this ticket's work landed on — the operator's route from the note straight to the
   // diff. Best-effort and only when something was committed: an unreadable worktree costs the
   // sha, never the note and never the verdict (see `blockNoteEvidence`).
@@ -981,7 +1006,11 @@ function blockNoteDetail(text: string): string {
     : flat;
 }
 
-export type TicketBlockKind = "no-delivery" | "agent-blocked" | "post-commit";
+export type TicketBlockKind =
+  | "no-delivery"
+  | "agent-blocked"
+  | "post-commit"
+  | "board-only-no-evidence";
 
 /**
  * The operator-facing note left on a ticket the run blocked (anton-vqql).
@@ -1025,8 +1054,11 @@ export function ticketBlockNote(args: {
         ? `the agent self-reported ANTON-RESULT: blocked and committed only partial work — it ` +
           `declared the ticket incomplete${reason ? `: "${reason}"` : ` (no reason given)`}; needs ` +
           `a human to finish or re-scope it, then resume the run.`
-        : `run failed after committing work — needs review.` +
-          (failure ? ` It failed with: ${failure}` : "");
+        : kind === "board-only-no-evidence"
+          ? `${failure || "board-only ticket found no evidence of delivery"} — left open (not ` +
+            `blocked) so a resumed run can reclaim and retry it without a manual status edit.`
+          : `run failed after committing work — needs review.` +
+            (failure ? ` It failed with: ${failure}` : "");
 
   // Written through the shared grammar: the board's park gate reads this clause back to tell a
   // committed block (review and close) from a zero-diff one (reopen and re-run) — see block-note.ts.
