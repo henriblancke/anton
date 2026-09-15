@@ -432,6 +432,26 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
     expect(warmRunWorktreeMock).not.toHaveBeenCalled();
   });
 
+  it("defers a new start when migrations are pending, filesystem and build clean (anton-sm1l)", async () => {
+    // The exact gap the observed failures fell through: a pull moves the code and the migration
+    // files together, so the other three halves all read current while the schema the process
+    // queries is one the code on disk has already outgrown.
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "current" },
+      dependencies: { state: "match" },
+      build: { state: "current" },
+      schema: { state: "pending", migrations: ["0007_add_dismissed_at.sql"] },
+    });
+
+    const error = await refusalFrom(clean);
+
+    expect(error).toBeInstanceOf(StaleCheckoutError);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("pending migrations");
+    expect(error.message).toContain("0007_add_dismissed_at.sql");
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+  });
+
   it("dispatches normally when anton is running its own latest code", async () => {
     const prep = await prepareEpicRun(run(clean));
 
@@ -578,6 +598,25 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
     expect(message).toContain("restart anton");
   });
 
+  it("names the pending migrations and the remedy when the schema has migrations pending (anton-sm1l)", () => {
+    // The gap the other three halves cannot see: a pull moves the code and the migration files
+    // together, so this is the only half that catches a schema the code on disk has already
+    // outgrown.
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "current" },
+        dependencies: { state: "match" },
+        build: { state: "current" },
+        schema: { state: "pending", migrations: ["0007_add_dismissed_at.sql"] },
+      },
+      ROOT,
+    );
+
+    expect(message).toContain("pending migrations");
+    expect(message).toContain("0007_add_dismissed_at.sql");
+    expect(message).toContain("apply them");
+  });
+
   it("names BOTH when the checkout is behind AND dependencies drifted", () => {
     const message = staleCheckoutRefusal(
       {
@@ -639,6 +678,19 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
           dependencies: { state: "match" },
           build: { state: "unknown", reason: "lsof: command not found" },
           schema: { state: "current" },
+        },
+        ROOT,
+      ),
+    ).toBeUndefined();
+    // A database that could not be opened is not a database proven current — the same fail-open
+    // rule every other half here follows (anton-sm1l).
+    expect(
+      staleCheckoutRefusal(
+        {
+          checkout: { state: "current" },
+          dependencies: { state: "match" },
+          build: { state: "current" },
+          schema: { state: "unknown", reason: "anton.db could not be located" },
         },
         ROOT,
       ),

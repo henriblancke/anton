@@ -115,6 +115,15 @@ export function staleCheckoutRefusal(
     // modules it booted with — so the disk can be current while the running build is not (anton-vzhf).
     stale.push("the code on disk has already moved past the build it is running");
   }
+  if (freshness.schema.state === "pending") {
+    // The database, not the disk or the process — a pull moves the code and the migration files
+    // together, so this is the half the other three cannot see (anton-sm1l). Unlike `replaced` and
+    // `drifted`, the remedy clears it for every process at once with no restart to wait for.
+    stale.push(
+      `anton.db has pending migrations (${freshness.schema.migrations.join(", ")}) — apply them, ` +
+        `then restart anton`,
+    );
+  }
   if (stale.length === 0) return undefined;
   return (
     `${STALE_CHECKOUT_REFUSAL_PREFIX} ` +
