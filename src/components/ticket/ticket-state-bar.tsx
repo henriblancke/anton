@@ -100,6 +100,7 @@ export function TicketStateBar({
       const data = (await res.json()) as { detail?: TicketDetail };
       setArming(false);
       setReason("");
+      setCloseArming(false);
       toast.success("Abandoned — this ticket won't be done", { description: why });
       if (data.detail) onChanged(data.detail);
     } catch (err) {
@@ -120,6 +121,8 @@ export function TicketStateBar({
       }
       const data = (await res.json()) as { detail?: TicketDetail };
       setCloseArming(false);
+      setArming(false);
+      setReason("");
       toast.success("Marked done");
       if (data.detail) onChanged(data.detail);
     } catch (err) {
@@ -167,7 +170,11 @@ export function TicketStateBar({
                 selected={detail.abandoned}
                 tone="abandon"
                 disabled={!canAbandon || busy}
-                onClick={() => canAbandon && setArming(true)}
+                onClick={() => {
+                  if (!canAbandon) return;
+                  setCloseArming(false);
+                  setArming(true);
+                }}
                 title={
                   canAbandon
                     ? "Abandon — close as won't-do; keeps its history but nothing ships"
@@ -189,7 +196,11 @@ export function TicketStateBar({
               size="sm"
               className="border-stage-done/40 text-stage-done hover:bg-stage-done/10"
               disabled={busy}
-              onClick={() => setCloseArming(true)}
+              onClick={() => {
+                setArming(false);
+                setReason("");
+                setCloseArming(true);
+              }}
               title="Mark done — closes this as delivered; no agent run ever will"
             >
               <CheckIcon aria-hidden="true" />
@@ -199,7 +210,7 @@ export function TicketStateBar({
         </div>
       </div>
 
-      {closeArming && (
+      {closeArming && canMarkDone && (
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="text-xs text-muted-foreground">Mark this done? It can&apos;t be reopened.</span>
           <Button
@@ -225,7 +236,7 @@ export function TicketStateBar({
         </div>
       )}
 
-      {arming && (
+      {arming && canAbandon && (
         <div className="flex flex-wrap items-center gap-1.5">
           <label htmlFor={inputId} className="sr-only">
             Reason for abandoning this ticket

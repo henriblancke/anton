@@ -228,4 +228,32 @@ describe("TicketStateBar", () => {
     expect(url).toBe("/api/projects/anton/tickets/t-1/close");
     expect(init.method).toBe("POST");
   });
+
+  it("clears the Abandon confirmation when Mark done is armed instead", () => {
+    // Regression: arming Abandon then Mark done used to leave both confirmations mounted, so
+    // whichever finished first left the other stale-but-enabled to fire a second, 409ing POST.
+    render(
+      <TicketStateBar slug="anton" ticketId="t-1" detail={detail({ agent: "human" })} onChanged={vi.fn()} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Abandoned/ }));
+    expect(screen.getByRole("button", { name: /Confirm abandon/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    expect(screen.queryByRole("button", { name: /Confirm abandon/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Confirm mark done" })).toBeTruthy();
+  });
+
+  it("clears the Mark done confirmation when Abandon is armed instead", () => {
+    render(
+      <TicketStateBar slug="anton" ticketId="t-1" detail={detail({ agent: "human" })} onChanged={vi.fn()} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    expect(screen.getByRole("button", { name: "Confirm mark done" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Abandoned/ }));
+    expect(screen.queryByRole("button", { name: "Confirm mark done" })).toBeNull();
+    expect(screen.getByRole("button", { name: /Confirm abandon/ })).toBeTruthy();
+  });
 });
