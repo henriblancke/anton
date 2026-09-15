@@ -40,8 +40,21 @@ export function claimOwnerFor(runId: string): string {
 export async function warmRunWorktree(
   run: EpicRun,
 ): Promise<{ worktree: Worktree; runStep: Omit<StepContext, "tickets"> }> {
-  const { db, clock, ctx, projectId, repo, runId, branch, project, settings, lease, target, tickets } =
-    run;
+  const {
+    db,
+    clock,
+    ctx,
+    projectId,
+    repo,
+    runId,
+    branch,
+    project,
+    settings,
+    lease,
+    target,
+    tickets,
+    existing,
+  } = run;
   // 2. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
   // (anton-x3o): resolveFreshBase fetches origin/<base> and returns `origin/<base>` so a run
   // whose local base is stale still starts at the remote tip; it's best-effort and falls back
@@ -129,6 +142,16 @@ export async function warmRunWorktree(
   // neither, and recomputes once — no worse than the old behaviour — storing the answer on its row.
   let storedFork: string | undefined;
   let baseForkSha: string;
+  // The last EFFECTIVE (non-`skipped_dirty`) refresh this branch received, from a resume before this
+  // one — read off the row as this attempt found it, before the write below can overwrite it (PR #279
+  // review). A later resume's `skipped_dirty` records that THIS attempt didn't move the branch, not
+  // that no attempt ever did; without this, that skip would stomp a prior success's record with the
+  // fresh base it was never brought up to, losing the only base a truthful already-shipped claim
+  // naming that success's commits could still be checked against.
+  const priorEffectiveRefreshSha =
+    existing?.baseRefreshOutcome && existing.baseRefreshOutcome !== "skipped_dirty"
+      ? (existing.baseRefreshSha ?? undefined)
+      : undefined;
   try {
     // Pin reads are part of the same atomic setup as the pin write: a fresh checkout with neither
     // must be removed, or a retry could reuse its branch and derive a fork from a moved base.
@@ -172,8 +195,12 @@ export async function warmRunWorktree(
       // What refreshOntoBase did to a reused checkout at this warm (anton-s55u) — the only durable
       // record of whether this attempt implemented against a stale tree that got fixed. Undefined
       // (a fresh creation, or a caller that didn't opt into refresh) leaves the row's prior value
-      // alone rather than overwriting it with a claim this attempt never made.
-      ...(worktree.refreshOutcome
+      // alone rather than overwriting it with a claim this attempt never made. A `skipped_dirty`
+      // following a prior EFFECTIVE refresh is likewise left alone (PR #279 review): the branch still
+      // carries that refresh's commits, so overwriting its record with this attempt's non-move would
+      // erase the only durable evidence of it.
+      ...(worktree.refreshOutcome &&
+      !(worktree.refreshOutcome.outcome === "skipped_dirty" && priorEffectiveRefreshSha !== undefined)
         ? {
             baseRefreshOutcome: worktree.refreshOutcome.outcome,
             baseRefreshSha: worktree.refreshOutcome.baseSha,
@@ -211,11 +238,14 @@ export async function warmRunWorktree(
   // reused checkout onto a newer base (anything but `skipped_dirty` — that outcome left the branch
   // untouched) brought commits into the branch's history that a claim can truthfully cite, so the
   // verifier checks against the base the tree was JUST refreshed onto rather than the older, frozen
-  // fork it would otherwise reject a true claim against.
+  // fork it would otherwise reject a true claim against. A `skipped_dirty` THIS attempt falls back to
+  // the last EFFECTIVE refresh a prior resume already applied and left recorded on the row, not
+  // straight to `baseForkSha` (PR #279 review) — `skipped_dirty` means only that this attempt didn't
+  // move the branch, and the commits an earlier resume's refresh brought in are still on it.
   const alreadyShippedBase =
     worktree.refreshOutcome && worktree.refreshOutcome.outcome !== "skipped_dirty"
       ? worktree.refreshOutcome.baseSha
-      : baseForkSha;
+      : (priorEffectiveRefreshSha ?? baseForkSha);
 
   // Every step of the walk runs through the step registry (anton-4npr) — one entry point per step,
   // dispatched in the order the project's formula declares. This is what they all operate on; each

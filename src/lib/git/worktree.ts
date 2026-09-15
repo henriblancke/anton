@@ -473,12 +473,40 @@ async function dirtyPaths(worktreePath: string): Promise<string[]> {
 }
 
 /**
+ * Whether `worktreePath` has a rebase or merge left mid-flight by a process that died before its own
+ * catch block could run `--abort` (a kill between the `git rebase`/`git merge` call above and the
+ * `catch` that aborts it, or an anton process itself being killed there). `--path-format=absolute`
+ * matters: plain `--git-path` prints relative to the CALLER's cwd, not `-C worktreePath` (the same
+ * gotcha `worktree.test.ts` already works around for `info/exclude`), so a relative read here would
+ * resolve against the wrong directory entirely.
+ */
+async function unfinishedGitOperation(worktreePath: string): Promise<"rebase" | "merge" | undefined> {
+  const [rebaseMerge, rebaseApply, mergeHead] = await Promise.all(
+    ["rebase-merge", "rebase-apply", "MERGE_HEAD"].map((gitPath) =>
+      git(worktreePath, ["rev-parse", "--path-format=absolute", "--git-path", gitPath]),
+    ),
+  );
+  if (existsSync(rebaseMerge) || existsSync(rebaseApply)) return "rebase";
+  if (existsSync(mergeHead)) return "merge";
+  return undefined;
+}
+
+/**
  * Bring a REUSED checkout's branch up to `baseBranch` before anything is dispatched against it
  * (anton-s55u). Without this, a worktree/branch picked back up from a parked or failed run keeps
  * whatever base it was cut from — a resumed run can silently implement, test, and self-review
  * against a tree many commits behind main.
  *
  * Outcomes, in order of how much the checkout may safely move:
+ * - An unfinished rebase or merge from a process that died mid-operation (before its own catch
+ *   could abort it): `--path-format=absolute --git-path rebase-merge`/`rebase-apply`/`MERGE_HEAD`
+ *   still exist on disk. `status --porcelain` alone can't tell this apart from ordinary parked
+ *   edits — a conflicted rebase reports its conflict paths the same way a dirty tree does — but HEAD
+ *   is DETACHED here while `branch` still points at its pre-rebase tip, so dispatching into it would
+ *   let an agent commit onto detached history while the PR step pushes the unchanged named branch,
+ *   silently losing every commit the resumed session makes. Aborted (restoring `branch` and its
+ *   working tree to the pre-refresh state, the same recovery `git rebase -h` names as the control
+ *   for this exact state) and failed loud — never dispatched into.
  * - Already at `baseBranch`: no-op.
  * - No unique commits (the branch is an ancestor of the fresh base, or equal to it): fast-forwarded
  *   with `reset --hard` — nothing of the run's is on this branch yet, so there's nothing to lose.
@@ -531,6 +559,21 @@ async function refreshOntoBase(opts: {
   } catch (err) {
     throw new Error(
       `[worktree] could not resolve base ${baseBranch} to refresh ${branch}: ${gitError(err)}`,
+    );
+  }
+
+  // Checked BEFORE the dirty-tree escape below: an interrupted rebase/merge reports its conflict
+  // paths through `status --porcelain` exactly like ordinary parked edits, so without this check
+  // that escape would read it as "leave it alone" and dispatch straight into a checkout with HEAD
+  // detached mid-operation and `branch` still at its stale pre-refresh tip.
+  const unfinished = await unfinishedGitOperation(worktreePath);
+  if (unfinished) {
+    await git(worktreePath, [unfinished, "--abort"]).catch(() => undefined);
+    throw new Error(
+      `[worktree] ${worktreePath} had an unfinished git ${unfinished} in progress on ${branch} — a ` +
+        `prior process likely died before it could abort its own ${unfinished === "rebase" ? "rebase" : "merge"} ` +
+        `onto ${baseBranch}. Aborted it to restore ${branch} and its working tree to their pre-refresh ` +
+        `state. Inspect ${worktreePath} and resume the run once it is confirmed clean.`,
     );
   }
 
