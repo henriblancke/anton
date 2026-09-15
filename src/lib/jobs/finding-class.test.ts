@@ -217,6 +217,11 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("other");
   });
 
+  it("does not classify a parsing bug as work-loss when the work noun is only a following gerund's object", () => {
+    const note = "The first character is dropped when parsing a request, corrupting the result.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
   it("does not classify a numeric-precision bug as work-loss merely because it says 'data loss'", () => {
     const note = "Casting this bigint to number causes data loss for large IDs.";
     expect(classifyFindingClass(finding(note))).toBe("other");

@@ -45,13 +45,20 @@ const CLAUSE_GAP = "[^,;:.'\\u2019\\u2013\\u2014]{0,30}?";
 const WORK_LOSS_VERB_AFTER = "(?:is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))";
 const WORK_LOSS_OBJECT_AFTER = "(?:is (?:silently )?(?:discarded|lost|dropped)|silently drops?)";
 const WORK_LOSS_SUBJECT_FIRST = new RegExp(`\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\b${WORK_LOSS_VERB_AFTER}\\b`, "gi");
-const WORK_LOSS_VERB_FIRST = new RegExp(`\\b${WORK_LOSS_OBJECT_AFTER}\\b${CLAUSE_GAP}\\b${WORK_LOSS_SIGNAL}\\b`, "i");
+// The gap is captured so matchesWorkLossVerbFirst can reject it below when the noun belongs to an
+// intervening clause rather than to this verb.
+const WORK_LOSS_VERB_FIRST = new RegExp(`\\b${WORK_LOSS_OBJECT_AFTER}\\b(${CLAUSE_GAP})\\b${WORK_LOSS_SIGNAL}\\b`, "gi");
 // A noun right after a preposition ("for each request", "in every batch") is that preposition's
 // object, not the loss verb's subject: "For each request the first character is dropped" must not
 // credit "request" as the lost value just because no punctuation sits between them. Tested against
 // the text immediately preceding the candidate subject.
 const WORK_LOSS_PREPOSITIONAL_OBJECT =
   /\b(?:for|per|in|during|within|throughout|across|among|about|regarding|concerning|via|of|with|without|to|from|into|onto|upon)\s+(?:each|every|any|all|both|no|another|some|one|this|that|these|those|a|an|the|our|their|its|his|her|my|your)?\s*$/i;
+// A gerund between the loss verb and the candidate noun ("is dropped when parsing a request") means
+// the noun is that gerund's object, not the lost value — the lost value there is "the first
+// character", not "a request". Reject any gap containing one rather than crediting the noun to the
+// loss verb just because no clause-breaking punctuation sits between them.
+const WORK_LOSS_INTERVENING_GERUND = /\b\w+ing\b/i;
 
 function matchesWorkLossPassive(note: string): boolean {
   for (const match of note.matchAll(WORK_LOSS_SUBJECT_FIRST)) {
@@ -59,7 +66,11 @@ function matchesWorkLossPassive(note: string): boolean {
     const precedingText = note.slice(Math.max(0, index - 40), index);
     if (!WORK_LOSS_PREPOSITIONAL_OBJECT.test(precedingText)) return true;
   }
-  return WORK_LOSS_VERB_FIRST.test(note);
+  for (const match of note.matchAll(WORK_LOSS_VERB_FIRST)) {
+    const gap = match[1] ?? "";
+    if (!WORK_LOSS_INTERVENING_GERUND.test(gap)) return true;
+  }
+  return false;
 }
 
 // Active "loses"/"lose", "drops"/"drop", and "discards"/"discard" count the same as the passive
