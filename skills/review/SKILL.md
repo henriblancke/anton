@@ -86,11 +86,16 @@ and an existing write), the write is in scope even though it isn't itself a diff
      token correctly protects the read-to-write window. Name the mechanism and where it's
      enforced; this is not a finding, but it is not silence either.
    - **Safe/no interleaving** — the mutation has a dependent read, but none of the actors in
-     step 3 can actually land between the read and the write: a synchronous, function-local
-     sequence with no `await` or yield point in between, or an atomic primitive (a CAS, an
-     `INSERT ... ON CONFLICT`) whose read-modify-write is indivisible by construction rather than
-     protected by an explicit lock. Name which actors you checked and why each is ruled out; this
-     is not a finding, but it is not silence either.
+     step 3 can actually land between the read and the write. A synchronous, function-local
+     sequence with no `await` or yield point in between only rules out **the event loop itself**
+     (other JS tasks on this process) — it proves nothing about another process, another machine,
+     or a firing deadline, because the OS can still preempt this process between two separate
+     synchronous filesystem, database, or CLI calls. To rule out those actors, name an atomic
+     primitive (a CAS, an `INSERT ... ON CONFLICT`) whose read-modify-write is indivisible by
+     construction, or otherwise prove the external actor cannot run in that window (e.g. it holds
+     no access to the shared resource) — never the mere absence of `await`. Name which actors you
+     checked and why each is ruled out, and by which of these two mechanisms; this is not a
+     finding, but it is not silence either.
    - **No dependent read** — the mutation writes unconditionally, or from data it owns outright,
      with no prior read whose staleness could matter. Name why no read is being trusted; this is
      not a finding, but it is not silence either.
