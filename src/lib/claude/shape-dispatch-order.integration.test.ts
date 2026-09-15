@@ -14,7 +14,7 @@ let realBd = "";
 function phaseFiveOrderCommand(): string {
   const skill = readFileSync(skillPath("shape"), "utf8");
   const match = skill.match(
-    /# Prints every feature's actual executor dispatch order[\s\S]*?\n(node -e '[\s\S]*?\n')\n```/,
+    /# Prints every feature's actual executor dispatch order[\s\S]*?\n(node <<'NODE_EOF'[\s\S]*?\nNODE_EOF)\n```/,
   );
   if (!match) throw new Error("/shape Phase 5 has no executable dispatch-order audit");
   return match[1];
