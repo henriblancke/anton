@@ -95,6 +95,17 @@ interface RunGates {
    * Empty until the arm step runs.
    */
   armedHumanIds: Set<string>;
+  /**
+   * Ticket ids THIS preflight itself already found answered-but-blocked — held rather than closed
+   * because an ORDINARY prerequisite is still open (PR #274 review, round 10). `armHumanTicketGates`
+   * judges this against `run.all`, the board `preflightHumanTickets` read, so a ticket landing here
+   * is not evidence of a race in a LATER window — it is this pass's own correct verdict on the board
+   * it already saw. `assertPublishedBoardCycleFree`'s `answeredSinceArmed` re-reads a fresher board
+   * and would otherwise see the exact same answered-but-still-blocked gate and misread its own
+   * preflight's settled judgment as a race that needs a retry, looping the run on a ticket nothing
+   * has actually left unhandled. Empty until the arm step runs.
+   */
+  answeredButBlockedIds: Set<string>;
 }
 
 /**
@@ -249,6 +260,7 @@ function regateRefreshedBoard(run: EpicRun, leaseTarget: Bead): RunGates {
     children: freshChildren,
     isResumeSkipped,
     armedHumanIds: new Set(),
+    answeredButBlockedIds: new Set(),
   };
 }
 
@@ -694,6 +706,14 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
   // alongside its siblings, until the dispatch backstop (execute-epic-dispatch.ts's `isHumanWork`
   // check) poison-parks the WHOLE run on it. Retrying instead re-enters from the top, where the next
   // preflight pass sees the resolved gate and closes the ticket the normal way.
+  //
+  // EXCLUDES `answeredButBlockedIds` (PR #274 review, round 10): a ticket answered but held on an
+  // ordinary prerequisite still open ("ship the API, then sign the DPA") reads exactly the same as
+  // a fresh answer here — open, `agent:human`, an answered gate — but the preflight already judged
+  // it against `run.all` and correctly HELD it rather than closing or re-arming it. Without the
+  // exclusion this pass would flag its own settled verdict as a race, throw, and re-enter from the
+  // top only to reach the identical hold again — an infinite retry on a ticket nothing has actually
+  // left unhandled, spending the run's whole attempt budget on work already correctly done.
   const answeredSinceArmed = freshTickets.filter(
     (t) =>
       t.id !== epicBeadId &&
@@ -701,6 +721,7 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
       beads.isHumanWork(t) &&
       !gates.isResumeSkipped(t) &&
       gates.armedHumanIds.has(t.id) &&
+      !gates.answeredButBlockedIds.has(t.id) &&
       answeredHumanGate(board, t) !== undefined,
   );
   if (answeredSinceArmed.length > 0) {
@@ -884,6 +905,10 @@ async function armHumanTicketWaits(run: EpicRun, gates: RunGates): Promise<void>
     // ({@link assertPublishedBoardCycleFree}) exempts only these ids from its "newly relabelled"
     // retry — a ticket this pass never touched must still trip it if it turns up human later.
     gates.armedHumanIds = new Set(humanPreflight.handled);
+    // This pass's own verdict on an answered-but-still-blocked ticket, carried so the publish-time
+    // check below can tell "this pass already saw and correctly held it" from "the answer landed in
+    // a window this pass never read" (PR #274 review, round 10).
+    gates.answeredButBlockedIds = new Set(answeredButBlocked.keys());
     // A held answered-gate ticket joins the verdict as gated, so the dispatch loop holds it by
     // the same rule as any other blocked child rather than reaching it as open human work and
     // parking on the "it should be held by a gate" backstop. Its blockers join the list the park

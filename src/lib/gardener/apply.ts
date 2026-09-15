@@ -244,8 +244,13 @@ async function applyApproved(
   return applySteps(repo, proposal, plan, decision.steps, decision.summary, actor, signal);
 }
 
-/** Move kinds whose decision consults `cycleEvidenceFor` — directly or through the picker. */
-const CYCLE_AWARE_MOVES: ReadonlySet<GardenerPlan["move"]> = new Set(["approve", "unapprove"]);
+/**
+ * Move kinds whose decision consults `cycleEvidenceFor` — directly or through the picker. Exported
+ * so a caller that reads cycle evidence outside `applyProposal` (the shadow pass's board fetch,
+ * `shadow.ts`) can gate its own `bd dep cycles` call on the identical set rather than a copy that
+ * drifts from this one.
+ */
+export const CYCLE_AWARE_MOVES: ReadonlySet<GardenerPlan["move"]> = new Set(["approve", "unapprove"]);
 
 /**
  * `bd dep cycles` evidence, fetched only for the moves that consume it — `unapprove`, via

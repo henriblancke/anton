@@ -706,11 +706,12 @@ describe("gardener patrol · shadow mode", () => {
     expect(await sessionLog()).toContain(
       "[gardener] SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD APPLY: closed t-4 as shipped\n",
     );
-    // One create (the proposal), then a fresh board and authoritative cycle read for the shadow —
-    // `depCycles` before `list` because `loadAllIssues({ withCycles: true })` starts both reads
-    // concurrently (issues.ts round 5) rather than sequencing the cycles read after the listing.
+    // One create (the proposal), then a fresh board for the shadow — no `depCycles` this time
+    // (PR #274 review round 2): `shipped-orphan` is a `retire` move, and `retire`/`link`/
+    // `reparent`/… never consult cycle evidence, so the shadow's `loadAllIssues` asks for
+    // `withCycles: false` and pays for no `bd dep cycles` call it would not use.
     // Nothing else: t-4 is never closed, deferred or updated by a pass that only says what it would do.
-    expect(calls).toEqual([...READS, "create", "depCycles", "list"]);
+    expect(calls).toEqual([...READS, "create", "list"]);
     expect(closeMock).not.toHaveBeenCalled();
   });
 
@@ -780,8 +781,8 @@ describe("gardener patrol · shadow mode", () => {
       `SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD REFUSE: ` +
         `${decision.status === "refuse" ? decision.reason : ""}\n`,
     );
-    // Same concurrent-start order as above: `depCycles` fires before `list` even starts.
-    expect(calls).toEqual([...READS, "create", "depCycles", "list"]);
+    // Same reasoning as above: `shipped-orphan` is cycle-blind, so no `depCycles` call.
+    expect(calls).toEqual([...READS, "create", "list"]);
   });
 
   it("dates the fence on bd's one-second grid, so a same-second write reads as the tie apply refuses", async () => {

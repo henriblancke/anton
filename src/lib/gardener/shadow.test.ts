@@ -323,6 +323,43 @@ describe("which proposals a pass shadows", () => {
 
     expect(records.map((r) => r.proposal)).toEqual(["anton-p1", "anton-p3"]);
     expect(loadMock).toHaveBeenCalledTimes(1);
+    // Neither shadowed target is `approve`/`unapprove` — both are `retire` — so cycle evidence is
+    // never consulted and the shadow does not pay for a `bd dep cycles` call it will not use.
+    expect(loadMock).toHaveBeenCalledWith(REPO, { withCycles: false });
+  });
+
+  it("asks for cycle evidence when a shadowed target is an approve move", async () => {
+    const withheld = makeDetection({
+      kind: "withheld-approval",
+      move: "approve",
+      subjects: ["anton-a"],
+      summary: "anton-a is the board's next target and carries no approval",
+      evidence: ["anton-a ranks first among the run targets", "nothing on the board approves it"],
+    });
+
+    await shadow([filed(withheld, "anton-p1")], {
+      policy: resolveProposalAutonomyPolicy({ "withheld-approval": "shadow" }),
+    });
+
+    // `approve`/`unapprove` are the only moves `planApply` ever consults cycle evidence for
+    // (apply.ts `CYCLE_AWARE_MOVES`), so this is the one shadow that must pay for the read.
+    expect(loadMock).toHaveBeenCalledWith(REPO, { withCycles: true });
+  });
+
+  it("still asks for cycle evidence when an approve move is mixed with cycle-blind ones", async () => {
+    const withheld = makeDetection({
+      kind: "withheld-approval",
+      move: "approve",
+      subjects: ["anton-b"],
+      summary: "anton-b is the board's next target and carries no approval",
+      evidence: ["anton-b ranks first among the run targets", "nothing on the board approves it"],
+    });
+    serve([bead("anton-a"), bead("anton-b")]);
+
+    await shadow([filed(staleAsk("anton-a"), "anton-p1"), filed(withheld, "anton-p2")], {
+      policy: resolveProposalAutonomyPolicy({ stale: "shadow", "withheld-approval": "shadow" }),
+    });
+
     expect(loadMock).toHaveBeenCalledWith(REPO, { withCycles: true });
   });
 });

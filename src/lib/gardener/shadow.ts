@@ -19,7 +19,7 @@
  */
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
-import { planApply, toBdStampGrid, type ApplyMoment } from "./apply";
+import { CYCLE_AWARE_MOVES, planApply, toBdStampGrid, type ApplyMoment } from "./apply";
 import {
   autonomyFor,
   type ProposalAutonomyPolicy,
@@ -114,9 +114,16 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
   const targets = shadowable(input.created, input.policy, input.record);
   if (targets.length === 0 || input.signal?.aborted) return [];
 
+  // Fetched only when a shadowed target's move actually consults cycle evidence (`approve` /
+  // `unapprove` — `planApply` only reaches the approval gate for those). Every other move
+  // (`reparent`, `link`, `retire`, …) is cycle-blind, so an unconditional `bd dep cycles` call would
+  // pay a subprocess this shadow never uses — and worse, if that call fails, `loadAllIssues`'s
+  // `withCycles: true` rejects the WHOLE read, discarding otherwise-valid shadow records for moves
+  // that never asked for cycle evidence in the first place.
+  const needsCycles = targets.some(({ plan }) => CYCLE_AWARE_MOVES.has(plan.move));
   let board: Bead[];
   try {
-    board = await loadAllIssues(input.repo, { withCycles: true });
+    board = await loadAllIssues(input.repo, { withCycles: needsCycles });
   } catch (e) {
     // The read is the shadow's whole input, so losing it loses every record — but it costs the pass
     // nothing else, because a shadow has nothing to leave half-done.
