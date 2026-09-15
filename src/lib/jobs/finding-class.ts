@@ -54,7 +54,13 @@ const DATA_LOSS_CONTEXT = new RegExp(
 const WORK_LOSS_PASSIVE_AUX = "(?:is|are|was|were|has been|have been|had been)";
 const WORK_LOSS_VERB_AFTER = `(?:${WORK_LOSS_PASSIVE_AUX} (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))`;
 const WORK_LOSS_OBJECT_AFTER = `(?:${WORK_LOSS_PASSIVE_AUX} (?:silently )?(?:discarded|lost|dropped)|silently drops?)`;
-const WORK_LOSS_SUBJECT_FIRST = new RegExp(`\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\b${WORK_LOSS_VERB_AFTER}\\b`, "gi");
+// Whitespace only, not CLAUSE_GAP: "the record delimiter is dropped" and "the item count is
+// lost" both have a WORK_LOSS_SIGNAL word ("record", "item") immediately before another noun
+// ("delimiter", "count") that is the subject's real head — the signal word there is an
+// attributive modifier, not the thing being lost. Requiring the verb to sit right after the
+// signal word (mod whitespace) means a following noun breaks the match instead of the arbitrary
+// gap letting it be skipped over, so only "record is dropped"/"job is lost"-shaped subjects bind.
+const WORK_LOSS_SUBJECT_FIRST = new RegExp(`\\b${WORK_LOSS_SIGNAL}\\b\\s+\\b${WORK_LOSS_VERB_AFTER}\\b`, "gi");
 // The gap is captured so matchesWorkLossVerbFirst can reject it below when the noun belongs to an
 // intervening clause rather than to this verb.
 const WORK_LOSS_VERB_FIRST = new RegExp(`\\b${WORK_LOSS_OBJECT_AFTER}\\b(${CLAUSE_GAP})\\b${WORK_LOSS_SIGNAL}\\b`, "gi");
