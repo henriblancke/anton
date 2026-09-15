@@ -14,6 +14,7 @@ const detail = (over: {
   agent?: string;
   holdsRun?: boolean;
   hasOpenDescendants?: boolean;
+  hasOpenBlockers?: boolean;
 }) =>
   ({
     id: "t-1",
@@ -26,6 +27,7 @@ const detail = (over: {
     agent: over.agent,
     holdsRun: over.holdsRun,
     hasOpenDescendants: over.hasOpenDescendants,
+    hasOpenBlockers: over.hasOpenBlockers,
   }) as TicketDetail;
 
 afterEach(() => {
@@ -179,6 +181,20 @@ describe("TicketStateBar", () => {
         slug="anton"
         ticketId="t-1"
         detail={detail({ agent: "human", hasOpenDescendants: true })}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("withholds Mark done from a bead still held by an ordinary open blocks dependency", () => {
+    // PR #288 review: `closeHumanTicket` 409s on any open `blocks` dependency, not just a live run
+    // or open descendants, so this control must withhold on it too.
+    render(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human", hasOpenBlockers: true })}
         onChanged={vi.fn()}
       />,
     );

@@ -440,12 +440,22 @@ export interface OperatorQueueItem {
    */
   holdsRun?: boolean;
   /**
-   * Whether this bead still has open work under it — epic/feature only, since a task/bug is always
-   * a leaf. `closeHumanTicket` (close-human.ts) refuses to close a bead with open descendants
-   * (409), so this withholds Mark done exactly where that route would 409 (mirrors the `holdsRun`
-   * gap fix, PR #214 review).
+   * Whether this bead still has open work under it. bd nesting is type-agnostic, so this is never
+   * assumed false off the bead's own type alone (PR #288 review) — a parentless task/bug/chore can
+   * hold open children too. `closeHumanTicket` (close-human.ts) refuses to close a bead with open
+   * descendants (409), so this withholds Mark done exactly where that route would 409 (mirrors the
+   * `holdsRun` gap fix, PR #214 review).
    */
   hasOpenDescendants?: boolean;
+  /**
+   * Whether this bead's own `blocks` dependencies still hold it — the same rule `bd close` (and
+   * `closeHumanTicket`'s pre-check, via `openBlockersOf` in jobs/execute-epic-human-gate.ts) refuses
+   * against: an open BLOCKS dependency, gate or not, not just a run's own hold. Distinct from
+   * `holdsRun` (a live run that has not yet reached this ticket) — an ordinary sibling prerequisite
+   * ("sign the contract, then wire the account") blocks the close even with no run in flight, so
+   * Mark done must withhold on it too (PR #288 review).
+   */
+  hasOpenBlockers?: boolean;
 }
 
 export interface Board {
@@ -606,12 +616,22 @@ export interface TicketDetail extends Ticket {
    */
   holdsRun?: boolean;
   /**
-   * Whether this bead still has open work under it — epic/feature only, since a task/bug is always
-   * a leaf. `closeHumanTicket` (close-human.ts) refuses to close a bead with open descendants
-   * (409), so this withholds Mark done exactly where that route would 409 (mirrors the `holdsRun`
-   * gap fix, PR #214 review).
+   * Whether this bead still has open work under it. bd nesting is type-agnostic, so this is never
+   * assumed false off the bead's own type alone (PR #288 review) — a parentless task/bug/chore can
+   * hold open children too. `closeHumanTicket` (close-human.ts) refuses to close a bead with open
+   * descendants (409), so this withholds Mark done exactly where that route would 409 (mirrors the
+   * `holdsRun` gap fix, PR #214 review).
    */
   hasOpenDescendants?: boolean;
+  /**
+   * Whether this bead's own `blocks` dependencies still hold it — the same rule `bd close` (and
+   * `closeHumanTicket`'s pre-check, via `openBlockersOf` in jobs/execute-epic-human-gate.ts) refuses
+   * against: an open BLOCKS dependency, gate or not, not just a run's own hold. Distinct from
+   * `holdsRun` (a live run that has not yet reached this ticket) — an ordinary sibling prerequisite
+   * ("sign the contract, then wire the account") blocks the close even with no run in flight, so
+   * Mark done must withhold on it too (PR #288 review).
+   */
+  hasOpenBlockers?: boolean;
 }
 
 // ── Board drag-and-drop ──

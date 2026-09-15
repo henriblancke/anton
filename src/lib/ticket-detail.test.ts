@@ -330,6 +330,61 @@ describe("updateTicket read economy", () => {
     expect(detail.hasOpenDescendants).toBe(true);
     expect(bd.list).toHaveBeenCalled();
   });
+
+  it("reads the board after saving a parentless agent:human task with an open child", async () => {
+    // Codex review (PR #288): bd nesting is type-agnostic, so a parentless task/bug/chore is NOT
+    // always a leaf — the old shortcut assumed it was and reported this ticket as having no open
+    // descendants, exposing Mark done even though closeHumanTicket would 409 on the open child.
+    const bd = fakeBd([
+      bead({ id: "t-1", title: "Old", labels: ["agent:human"] }),
+      bead({ id: "t-1.1", issue_type: "task", parent: "t-1" }),
+    ]);
+    await getTicketDetail(project, "t-1"); // warm the board
+    bd.list.mockClear();
+
+    const detail = await updateTicket(project, "t-1", { title: "New" });
+
+    expect(detail.title).toBe("New");
+    expect(detail.hasOpenDescendants).toBe(true);
+    expect(bd.list).toHaveBeenCalled();
+  });
+
+  it("keeps the zero-spawn shortcut for a parentless non-human task, even with an open child", async () => {
+    // hasOpenDescendants is never READ off non-human work (Mark done only renders for agent:human),
+    // so an inaccurate answer here is harmless and the save stays cheap.
+    const bd = fakeBd([
+      bead({ id: "t-1", title: "Old" }),
+      bead({ id: "t-1.1", issue_type: "task", parent: "t-1" }),
+    ]);
+    await getTicketDetail(project, "t-1");
+    bd.list.mockClear();
+
+    const detail = await updateTicket(project, "t-1", { title: "New" });
+
+    expect(detail.title).toBe("New");
+    expect(bd.list).not.toHaveBeenCalled();
+  });
+
+  it("reads the board for a parentless agent:human task held by an ordinary blocks dependency", async () => {
+    // Same gap, the other predicate: `closeHumanTicket` also 409s on any open `blocks` dependency,
+    // not just an open descendant or a live run — the board read must cover it too.
+    const bd = fakeBd([
+      bead({ id: "b-1" }),
+      bead({
+        id: "t-1",
+        title: "Old",
+        labels: ["agent:human"],
+        dependencies: [{ issue_id: "t-1", depends_on_id: "b-1", type: "blocks" }],
+      }),
+    ]);
+    await getTicketDetail(project, "t-1");
+    bd.list.mockClear();
+
+    const detail = await updateTicket(project, "t-1", { title: "New" });
+
+    expect(detail.hasOpenBlockers).toBe(true);
+    expect(bd.list).toHaveBeenCalled();
+  });
 });
 
 // The edit path takes the same lock, for the premise rather than the proposal bead: a retirement

@@ -112,12 +112,13 @@ function QueueRow({
 }) {
   const started = startedLabel(item.stage);
   // Nothing else ever closes this row: a run target's work is never dispatched, and a ticket under
-  // one is never reached either — both are refused before dispatch. Two cases are excluded because
+  // one is never reached either — both are refused before dispatch. Three cases are excluded because
   // `bd close` would refuse them the same way: a ticket that HOLDS a run (an armed human gate) —
   // the resumed run closes that ticket itself (PR #214 review — that row points at "Resolve &
-  // resume" instead) — and a bead that still has open work under it (`closeHumanTicket`,
-  // close-human.ts, refuses with a 409 rather than orphaning or silently claiming it as done).
-  const canMarkDone = !item.holdsRun && !item.hasOpenDescendants;
+  // resume" instead) — a bead that still has open work under it (`closeHumanTicket`, close-human.ts,
+  // refuses with a 409 rather than orphaning or silently claiming it as done), and a bead still held
+  // by an ordinary open `blocks` dependency (same route, same 409, no run involved — PR #288 review).
+  const canMarkDone = !item.holdsRun && !item.hasOpenDescendants && !item.hasOpenBlockers;
 
   return (
     <div className="flex min-w-0 flex-1 flex-col gap-1">

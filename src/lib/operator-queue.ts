@@ -15,6 +15,7 @@ import { isPipelineArtifact } from "./beads/contract";
 import {
   boardCards,
   deriveStage,
+  hasOpenBlockers as computeHasOpenBlockers,
   hasOpenDescendants as computeHasOpenDescendants,
   isRunTicket,
   labelValue,
@@ -93,6 +94,11 @@ export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
     // which previously read this off two other copies of the predicate that had drifted apart
     // (PR #288 review).
     const hasOpenDescendants = computeHasOpenDescendants(bead, all);
+    // Mirrors hasOpenDescendants above: `closeHumanTicket` also 409s on an ordinary open `blocks`
+    // dependency (openBlockersOf in jobs/execute-epic-human-gate.ts), a hold `holdsRun` never
+    // represents — a live run and a plain sibling prerequisite are different reasons the close would
+    // fail, and the row must withhold Mark done for either (PR #288 review).
+    const blocked = computeHasOpenBlockers(bead, all);
 
     const goal = parseGoal(bead);
     const risk = labelValue(bead.labels, "risk");
@@ -107,6 +113,7 @@ export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
       ...(size ? { size } : {}),
       ...(target ? { runTarget: { id: target.id, title: target.title }, holdsRun } : {}),
       ...(hasOpenDescendants ? { hasOpenDescendants } : {}),
+      ...(blocked ? { hasOpenBlockers: blocked } : {}),
     });
   }
 

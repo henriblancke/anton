@@ -189,6 +189,35 @@ describe("operatorQueue — the set", () => {
     expect(target.hasOpenDescendants).toBeUndefined();
   });
 
+  it("flags a human ticket still held by an ordinary open blocks dependency", () => {
+    // PR #288 review: neither `holdsRun` nor `hasOpenDescendants` represents a plain sibling
+    // prerequisite ("sign the contract, then wire the account"), so this row offered Mark done for
+    // work `closeHumanTicket` would still 409 — it 409s on ANY open `blocks` dependency, not just a
+    // run's own hold.
+    const board = [
+      bead({ id: "b1", labels: ["approved"] }),
+      bead({
+        id: "t1",
+        dependencies: [{ issue_id: "t1", depends_on_id: "b1", type: "blocks" }],
+      }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.id).toBe("t1");
+    expect(target.hasOpenBlockers).toBe(true);
+  });
+
+  it("does not flag it once the blocker closes", () => {
+    const board = [
+      bead({ id: "b1", status: "closed" }),
+      bead({
+        id: "t1",
+        dependencies: [{ issue_id: "t1", depends_on_id: "b1", type: "blocks" }],
+      }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.hasOpenBlockers).toBeUndefined();
+  });
+
   it("carries what the row acts on: the goal, the chips, and when it was asked", () => {
     const board = [
       bead({

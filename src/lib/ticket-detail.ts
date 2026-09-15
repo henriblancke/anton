@@ -12,6 +12,7 @@ import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import {
   createdMeta,
   deriveStage,
+  hasOpenBlockers,
   hasOpenDescendants,
   labelValue,
   liveRunTargetOf,
@@ -54,6 +55,7 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined, all: Bea
     contract: runContractStatus(full, []),
     holdsRun: liveRunTargetOf(lite, all) !== undefined,
     hasOpenDescendants: hasOpenDescendants(lite, all),
+    hasOpenBlockers: hasOpenBlockers(lite, all),
   };
 }
 
@@ -100,18 +102,27 @@ export async function getTicketDetail(project: Project, id: string): Promise<Tic
  * write cannot have changed. `blockOnPendingWrite: false` serves the retained board and kicks the
  * post-write refresh in the background, which is the very load that next poll then shares.
  *
- * A parentless task/bug skips the board read entirely (anton-0zih's zero-spawn invariant):
+ * A parentless task/bug/chore skips the board read entirely (anton-0zih's zero-spawn invariant):
  * `liveRunTargetOf` only needs siblings/ancestors to walk `cardOf`'s parent chain, and a bead with no
  * parent has none to walk — its own classification (parentless task/bug is trivially a run target)
- * never depends on the rest of the board, and a task/bug is always a leaf so `hasOpenDescendants`
- * is trivially false too. An epic or a feature is not exempt even when parentless: either can hold
- * children of its own regardless of its OWN parent, so `hasOpenDescendants` needs the real board
- * to answer for those two types.
+ * never depends on the rest of the board. An epic or a feature is not exempt even when parentless:
+ * either can hold children of its own regardless of its OWN parent, so `hasOpenDescendants` needs the
+ * real board to answer for those two types.
+ *
+ * bd nesting is type-agnostic (ticket-view.ts's `runTickets` doc), so a parentless task/bug/chore is
+ * NOT always a leaf — it can hold its own open children, or its own open `blocks` dependencies. The
+ * shortcut stays safe for one there anyway because `hasOpenDescendants`/`hasOpenBlockers` on a
+ * non-`agent:human` bead are never read: both exist only to gate Mark done (ticket-state-bar.tsx,
+ * operator-queue.tsx), which never renders off agent work. An `agent:human` bead earns the real board
+ * read regardless of its own type, so its Mark done gate is never computed off a false "no children"
+ * or "no blockers" (PR #288 review) — everything else keeps the zero-spawn shortcut, where an
+ * inaccurate answer is simply never surfaced.
  */
 export async function freshDetail(project: Project, bead: Bead): Promise<TicketDetail> {
   const parentId = parentOf(bead);
   const canHaveChildren = bead.issue_type === "epic" || bead.issue_type === "feature";
-  if (!parentId && !canHaveChildren) return withPrUrl(project, bead, bead, undefined, [bead]);
+  const needsBoard = parentId !== undefined || canHaveChildren || beads.isHumanWork(bead);
+  if (!needsBoard) return withPrUrl(project, bead, bead, undefined, [bead]);
   const all = await allIssues(project.repoPath, { blockOnPendingWrite: false });
   const epic = parentId ? all.find((b) => b.id === parentId) : undefined;
   return withPrUrl(project, bead, bead, epic, all);

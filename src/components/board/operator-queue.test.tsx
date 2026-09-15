@@ -218,6 +218,20 @@ describe("OperatorQueue", () => {
     expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
   });
 
+  it("withholds Mark done from a bead still held by an ordinary open blocks dependency", () => {
+    // PR #288 review: `closeHumanTicket` 409s on any open `blocks` dependency, not just a held run
+    // or open descendants, so the row must withhold on it too.
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[item({ id: "anton-t1", hasOpenBlockers: true })]}
+        onOpenTicket={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
   it("arms a confirm before POSTing the close route, then reports the row settled", async () => {
     const fetchMock = vi
       .fn()

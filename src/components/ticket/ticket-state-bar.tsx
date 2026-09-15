@@ -46,19 +46,21 @@ export function TicketStateBar({
   const canAbandon = detail.stage !== "done" && !detail.abandoned;
   // Mark done is the one close route `agent:human` work has (anton-fgqr) — no run ever finishes it,
   // so it's offered wherever the bead is open human work, and nowhere else: never on agent work (a
-  // run is expected to close that) and never on a bead that has already settled. `holdsRun` and
-  // `hasOpenDescendants` withhold it exactly where the operator queue's inline control does (PR #214
-  // review): a ticket a resumed run still holds, or a bead with open work still under it, both 409
-  // on `bd close` (an open gate, or `closeHumanTicket`'s own open-descendants check), so this control
-  // never offers a click that cannot succeed — Resolve & resume, or closing/abandoning the open work
-  // first, is that bead's actual path off the board.
+  // run is expected to close that) and never on a bead that has already settled. `holdsRun`,
+  // `hasOpenDescendants` and `hasOpenBlockers` withhold it exactly where the operator queue's inline
+  // control does (PR #214, #288 review): a ticket a resumed run still holds, a bead with open work
+  // still under it, or a bead still held by an ordinary open `blocks` dependency all 409 on `bd close`
+  // (an open gate, `closeHumanTicket`'s own open-descendants check, or its blocker check), so this
+  // control never offers a click that cannot succeed — Resolve & resume, closing/abandoning the open
+  // work, or clearing the blocker first, is that bead's actual path off the board.
   const isHumanWork = detail.agent === HUMAN_AGENT;
   const canMarkDone =
     isHumanWork &&
     resolution !== "done" &&
     resolution !== "abandoned" &&
     !detail.holdsRun &&
-    !detail.hasOpenDescendants;
+    !detail.hasOpenDescendants &&
+    !detail.hasOpenBlockers;
   const busy = pending !== null;
 
   async function toggleSnooze(next: boolean) {
