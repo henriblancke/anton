@@ -329,18 +329,30 @@ suite("worktree manager (real git)", () => {
       expect(status).not.toContain("rebase in progress");
     });
 
-    it("refuses to touch a dirty reused worktree, naming the uncommitted paths", async () => {
+    it("skips refreshing a dirty reused worktree instead of discarding its uncommitted work", async () => {
+      // A dirty reused checkout is what a run parked on a usage limit or a `needs-human` ask leaves
+      // behind on purpose (PR #279 review) — refusing the whole resume here would strand it forever,
+      // since every later attempt reuses the same worktree and hits the same dirty tree.
       const branch = "anton/refresh-dirty";
       const first = await createWorktree({ repoPath: repo, branch });
       advanceDefaultBranch("dirty-base.txt", "advance 3\n", "advance main (dirty)");
+      const freshMain = branchTip(defaultBranch());
       writeFileSync(join(first.path, "README.md"), "uncommitted local edit\n");
+      const beforeSha = headOf(first.path);
 
-      await expect(
-        createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
-      ).rejects.toThrow(/uncommitted changes[\s\S]*README\.md/);
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
 
-      // Left exactly as it was — no reset, no stash, no discarded edit.
-      expect(readFileSync(join(first.path, "README.md"), "utf8")).toBe("uncommitted local edit\n");
+        expect(second.path).toBe(first.path);
+        // Left exactly as it was — no reset, no stash, no discarded edit.
+        expect(readFileSync(join(first.path, "README.md"), "utf8")).toBe("uncommitted local edit\n");
+        expect(headOf(second.path)).toBe(beforeSha);
+        expect(second.refreshOutcome).toEqual({ outcome: "skipped_dirty", baseSha: freshMain });
+        expect(log.mock.calls.flat().join(" ")).toContain("skipping refresh");
+      } finally {
+        log.mockRestore();
+      }
     });
 
     it("refreshes onto the fresh base even when only the branch survives (worktree dir was removed)", async () => {

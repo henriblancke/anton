@@ -49,10 +49,13 @@ export interface Worktree {
   refreshOutcome?: RefreshOutcome;
 }
 
-/** The three shapes {@link refreshOntoBase} can bring a reused checkout up to date in. */
+/** The four shapes {@link refreshOntoBase} can leave a reused checkout in. */
 export interface RefreshOutcome {
-  outcome: "noop" | "fast_forwarded" | "rebased";
-  /** The base commit the checkout was (or already was) brought up to. */
+  outcome: "noop" | "fast_forwarded" | "rebased" | "skipped_dirty";
+  /**
+   * The base commit the checkout was (or already was) brought up to — or, for `skipped_dirty`, the
+   * fresh base it was NOT brought up to, so a human reading the row can see how far behind it sat.
+   */
   baseSha: string;
 }
 
@@ -464,16 +467,20 @@ async function dirtyPaths(worktreePath: string): Promise<string[]> {
  * whatever base it was cut from — a resumed run can silently implement, test, and self-review
  * against a tree many commits behind main.
  *
- * Three outcomes, in order of how much the checkout may safely move:
+ * Four outcomes, in order of how much the checkout may safely move:
  * - Already at `baseBranch`: no-op.
  * - No unique commits (the branch is an ancestor of the fresh base, or equal to it): fast-forwarded
  *   with `reset --hard` — nothing of the run's is on this branch yet, so there's nothing to lose.
  * - Unique commits: rebased onto `baseBranch` so they land on top of the fresh tree. A rebase that
  *   cannot apply cleanly is ABORTED, never forced — the run fails loud naming the divergence rather
  *   than discarding work or leaving the checkout mid-rebase.
- *
- * A dirty checkout (anything `git status --porcelain` reports, tracked or not) is refused outright,
- * before touching anything: resuming a run that left uncommitted state must not silently reset it.
+ * - Dirty (anything `git status --porcelain` reports, tracked or not): SKIPPED, never touched.
+ *   Resetting or rebasing over uncommitted state would discard it, but a dirty reused checkout is
+ *   exactly what a run parked on a usage limit or a `needs-human` ask leaves behind on purpose
+ *   (execute-epic-ticket-settle.ts keeps it precisely so the resume can continue from it) — refusing
+ *   the refresh outright would strand that resume forever, since every later attempt reuses the same
+ *   worktree and hits the same dirty tree (PR #279 review). So the checkout dispatches against
+ *   whatever base it already has instead; only a CLEAN reused checkout is worth the trip forward.
  */
 async function refreshOntoBase(opts: {
   repoPath: string;
@@ -483,14 +490,6 @@ async function refreshOntoBase(opts: {
 }): Promise<RefreshOutcome> {
   const { repoPath, worktreePath, branch, baseBranch } = opts;
 
-  const dirty = await dirtyPaths(worktreePath);
-  if (dirty.length > 0) {
-    throw new Error(
-      `[worktree] refusing to refresh ${branch} onto ${baseBranch}: ${worktreePath} has uncommitted ` +
-        `changes (${dirty.join(", ")}) — commit, stash, or discard them before this run can resume`,
-    );
-  }
-
   let baseSha: string;
   try {
     baseSha = await git(repoPath, ["rev-parse", "--verify", `${baseBranch}^{commit}`]);
@@ -499,6 +498,16 @@ async function refreshOntoBase(opts: {
       `[worktree] could not resolve base ${baseBranch} to refresh ${branch}: ${gitError(err)}`,
     );
   }
+
+  const dirty = await dirtyPaths(worktreePath);
+  if (dirty.length > 0) {
+    console.log(
+      `[worktree] skipping refresh of ${branch} onto ${baseBranch}: ${worktreePath} has uncommitted ` +
+        `changes (${dirty.join(", ")}) — dispatching against its existing base instead of discarding them`,
+    );
+    return { outcome: "skipped_dirty", baseSha };
+  }
+
   const branchSha = await git(repoPath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
   if (baseSha === branchSha) return { outcome: "noop", baseSha }; // already current
 
