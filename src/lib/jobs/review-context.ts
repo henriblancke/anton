@@ -181,8 +181,9 @@ export async function resolveReviewerContract(
     const reasoning = await loadTrustedAgentPrompt(config.agent, projectDir, baseRev);
     if (reasoning) return { reasoning, reviewer: { kind: "agent", id: config.agent } };
   }
-  if (config.prompt) {
-    return { reasoning: config.prompt.trim(), reviewer: { kind: "prompt" } };
+  const operatorPrompt = config.prompt?.trim();
+  if (operatorPrompt) {
+    return { reasoning: operatorPrompt, reviewer: { kind: "prompt" } };
   }
   return { reasoning: await loadSkill("review"), reviewer: { kind: "default" } };
 }

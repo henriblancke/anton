@@ -9,9 +9,13 @@
  *  - the branch tip — `readWorktreeState`'s HEAD, moved by any added, amended, or reset commit;
  *  - a hash of everything else `buildReviewPrompt` bakes into what the reviewer actually reads: the
  *    resolved reviewer contract, the `resolveReviewConfig` fields that shape the verdict (`enabled`,
- *    `maxRounds`, `scoreAlarm`), the target and ticket contracts (Goal/Acceptance/Out of
- *    scope/Verify), and which `step:review` occurrence this is — since a formula may name the step
- *    more than once (review-gate.ts) and each is its own independent gate.
+ *    `maxRounds`, `scoreAlarm`), the target and ticket contracts (title, Goal/Acceptance/Out of
+ *    scope/Verify), which `step:review` occurrence this is — since a formula may name the step more
+ *    than once (review-gate.ts) and each is its own independent gate — and the advisories carried
+ *    INTO this gate: a later `step:review` is handed the still-open advisories an earlier one in the
+ *    same formula left off (`buildReviewPrompt`'s `carriedAdvisories`), and the run row keeps only the
+ *    latest clean key, so a resumed earlier gate that reruns and produces a different carry must not
+ *    let a stale key for the later gate go on matching it.
  *
  * HEAD is the right tip by construction: the gate reviews `merge-base..HEAD` and the PR contains
  * `merge-base..HEAD`, so "what the reviewer saw" and "what the human merges" are the same range. The
@@ -49,6 +53,7 @@ function fingerprintBeads(target: Bead, tickets: Bead[]): string {
   return JSON.stringify(
     beads.map((b) => ({
       id: b.id,
+      title: b.title,
       goal: goalBody(b) ?? "",
       acceptance: acceptanceBody(b) ?? "",
       outOfScope: outOfScopeBody(b) ?? "",
@@ -63,8 +68,9 @@ function fingerprintContract(args: {
   config: ReviewConfig;
   stepId: string;
   contracts: string;
+  carriedAdvisories: ReviewFinding[];
 }): string {
-  const { reviewer, reasoning, config, stepId, contracts } = args;
+  const { reviewer, reasoning, config, stepId, contracts, carriedAdvisories } = args;
   return createHash("sha256")
     .update(
       JSON.stringify({
@@ -75,6 +81,7 @@ function fingerprintContract(args: {
         scoreAlarm: config.scoreAlarm,
         stepId,
         contracts,
+        carriedAdvisories,
       }),
     )
     .digest("hex");
@@ -96,8 +103,15 @@ export async function computeReviewKey(args: {
   /** This step's id within the formula ({@link CookedStep.id}) — distinct `step:review` occurrences
    * must never satisfy one another's resume check (anton-nyz1v). */
   stepId: string;
+  /**
+   * The still-open advisories this gate is handed on entry (`carry.advisories`, restated to it as
+   * `buildReviewPrompt`'s `carriedAdvisories`) — a later `step:review` reads a different prompt when
+   * an earlier gate in the same formula reruns and settles a different set on an otherwise identical
+   * tree, even though `stepId` alone can't tell the two runs apart (anton-nyz1v).
+   */
+  carriedAdvisories: ReviewFinding[];
 }): Promise<ReviewKey> {
-  const { worktreePath, baseBranch, settings, target, tickets, stepId } = args;
+  const { worktreePath, baseBranch, settings, target, tickets, stepId, carriedAdvisories } = args;
   const [baseRev, state] = await Promise.all([
     resolveMergeBase(worktreePath, baseBranch),
     readWorktreeState(worktreePath),
@@ -108,7 +122,7 @@ export async function computeReviewKey(args: {
   return {
     baseRev,
     head: state.head,
-    fingerprint: fingerprintContract({ reviewer, reasoning, config, stepId, contracts }),
+    fingerprint: fingerprintContract({ reviewer, reasoning, config, stepId, contracts, carriedAdvisories }),
   };
 }
 

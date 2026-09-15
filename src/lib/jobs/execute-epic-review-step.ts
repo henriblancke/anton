@@ -39,6 +39,12 @@ export async function runReviewStep(
   const { cooked, definition, stepCtx } = dispatch;
   const { worktree } = prep;
 
+  // Snapshotted before the gate below can overwrite it (line ~204): this is what THIS gate's
+  // prompt actually carries in, and it belongs in both the skip check and the persisted key —
+  // reusing whatever `carry.advisories` holds AFTER the gate runs would key on this step's own
+  // OUTGOING advisories instead of the incoming set its prompt was built from (anton-nyz1v).
+  const incomingAdvisories = carry.advisories;
+
   // The resume key (anton-qmuyt): a CLEAN verdict is keyed to the tree it judged — the merge-base,
   // the branch tip, and the reviewer contract's fingerprint — so a resume that finds the same key
   // skips the gate instead of blindly re-judging work already passed. Checked up front, before
@@ -63,6 +69,7 @@ export async function runReviewStep(
         target: stepCtx.target,
         tickets: stepCtx.tickets,
         stepId: cooked.id,
+        carriedAdvisories: incomingAdvisories,
       });
       if (reviewKeyToken(key) === recordedKey.reviewKey) {
         // The recorded attempt already owns the board labels — this attempt writes none of those.
@@ -216,6 +223,7 @@ export async function runReviewStep(
         target: stepCtx.target,
         tickets: stepCtx.tickets,
         stepId: cooked.id,
+        carriedAdvisories: incomingAdvisories,
       });
       await updateRun(db, clock, runId, {
         reviewKey: reviewKeyToken(key),

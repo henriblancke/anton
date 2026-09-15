@@ -77,9 +77,9 @@ describe("computeReviewKey", () => {
     rmSync(projectDir, { recursive: true, force: true });
   });
 
-  // Every call below fixes the target/tickets/stepId that are not this test's concern, so each
-  // test varies exactly one input and the assertions read as "only this changed."
-  const FIXED = { target: TARGET, tickets: [TARGET], stepId: "step:review-1" };
+  // Every call below fixes the target/tickets/stepId/carriedAdvisories that are not this test's
+  // concern, so each test varies exactly one input and the assertions read as "only this changed."
+  const FIXED = { target: TARGET, tickets: [TARGET], stepId: "step:review-1", carriedAdvisories: [] };
 
   it("keys on the merge-base and the branch tip, matching what git itself reports", async () => {
     const baseSha = execFileSync("git", ["-C", projectDir, "rev-parse", BASE]).toString().trim();
@@ -155,6 +155,7 @@ describe("computeReviewKey", () => {
       target: TARGET,
       tickets: [before],
       stepId: FIXED.stepId,
+      carriedAdvisories: [],
     });
     const b = await computeReviewKey({
       worktreePath: projectDir,
@@ -163,6 +164,33 @@ describe("computeReviewKey", () => {
       target: TARGET,
       tickets: [after],
       stepId: FIXED.stepId,
+      carriedAdvisories: [],
+    });
+    expect(b.baseRev).toBe(a.baseRev);
+    expect(b.head).toBe(a.head);
+    expect(b.fingerprint).not.toBe(a.fingerprint);
+  });
+
+  it("changes the fingerprint — never the base or the tip — when a ticket's title changes", async () => {
+    const before = bead({ id: "anton-2", title: "old title" });
+    const after = bead({ id: "anton-2", title: "new title" });
+    const a = await computeReviewKey({
+      worktreePath: projectDir,
+      baseBranch: BASE,
+      settings: {},
+      target: TARGET,
+      tickets: [before],
+      stepId: FIXED.stepId,
+      carriedAdvisories: [],
+    });
+    const b = await computeReviewKey({
+      worktreePath: projectDir,
+      baseBranch: BASE,
+      settings: {},
+      target: TARGET,
+      tickets: [after],
+      stepId: FIXED.stepId,
+      carriedAdvisories: [],
     });
     expect(b.baseRev).toBe(a.baseRev);
     expect(b.head).toBe(a.head);
@@ -177,6 +205,7 @@ describe("computeReviewKey", () => {
       target: TARGET,
       tickets: [TARGET],
       stepId: "step:review-1",
+      carriedAdvisories: [],
     });
     const b = await computeReviewKey({
       worktreePath: projectDir,
@@ -185,6 +214,31 @@ describe("computeReviewKey", () => {
       target: TARGET,
       tickets: [TARGET],
       stepId: "step:review-2",
+      carriedAdvisories: [],
+    });
+    expect(b.baseRev).toBe(a.baseRev);
+    expect(b.head).toBe(a.head);
+    expect(reviewKeyToken(b)).not.toBe(reviewKeyToken(a));
+  });
+
+  it("changes the fingerprint when the carried-in advisories differ, on an identical tree, contract, and step", async () => {
+    const a = await computeReviewKey({
+      worktreePath: projectDir,
+      baseBranch: BASE,
+      settings: {},
+      target: TARGET,
+      tickets: [TARGET],
+      stepId: "step:review-2",
+      carriedAdvisories: [{ severity: "advisory", location: "a.ts:1", note: "still open" }],
+    });
+    const b = await computeReviewKey({
+      worktreePath: projectDir,
+      baseBranch: BASE,
+      settings: {},
+      target: TARGET,
+      tickets: [TARGET],
+      stepId: "step:review-2",
+      carriedAdvisories: [{ severity: "advisory", location: "b.ts:2", note: "a different set" }],
     });
     expect(b.baseRev).toBe(a.baseRev);
     expect(b.head).toBe(a.head);
