@@ -152,14 +152,22 @@ function quotaError(exit: ClaudeExit): UsageLimitError | null {
 const MODEL_REFUSAL_RE =
   /there's an issue with the selected model \(([^)]+)\)\.\s*it may not exist or you may not have access to it/i;
 
-/** The park a model-id refusal deserves, or null when `detail` isn't one. */
+/**
+ * The park a model-id refusal deserves, or null when `detail` isn't one. The rejected id can come
+ * from either place `resolveModel` reads (model-routing.ts): a matching row in this project's
+ * Model routing table, or — when nothing matched — the General default `settings.model`. Nothing
+ * here knows which one actually fired, so the message names both rather than sending the operator
+ * to edit a routing rule that was never in play, which would leave a bad General default active for
+ * every unmatched job and the park unresolved.
+ */
 function modelRefusalError(detail: string): PoisonError | null {
   const modelId = detail.match(MODEL_REFUSAL_RE)?.[1]?.trim();
   if (!modelId) return null;
   return new PoisonError(
     `claude refused to start: the model "${modelId}" doesn't exist or isn't accessible. ` +
-      `Configured in this project's settings under Model routing (settings_json.modelRoutes) — ` +
-      `fix the id there, since retrying will not change it.`,
+      `Configured in this project's settings, either as the General default model or a matching ` +
+      `Model routing rule (settings_json.modelRoutes) — fix the id there, since retrying will not ` +
+      `change it.`,
   );
 }
 

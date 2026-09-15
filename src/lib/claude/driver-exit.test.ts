@@ -92,6 +92,7 @@ describe("exitError", () => {
     expect(isPoisonError(err)).toBe(true);
     expect(isRecoverableClaudeError(err)).toBe(false);
     expect(err?.message).toContain("claude-opus-4-8");
+    expect(err?.message).toContain("General default model");
     expect(err?.message).toContain("settings_json.modelRoutes");
   });
 
