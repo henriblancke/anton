@@ -22,30 +22,47 @@ const FLOOR_PCT = 6;
 /**
  * A column's segment heights, as a percent of the shared container height (`peak` sets the scale
  * for every column, so the tallest column's segments sum to exactly 100%). Flooring each segment
- * independently against a full 100% track — the previous approach — asks a column with more than
+ * independently against a full 100% track — an earlier approach — asks a column with more than
  * one severity for over 100% of its own track, and flexbox silently shrinks every segment to fit,
  * distorting the very ratios the chart exists to show (anton-knyp).
  *
- * Instead the floor is reserved out of the track up front: every present severity below the floor
- * gets exactly `FLOOR_PCT`, and the rest of the track is split by count among the severities left —
- * which is all of it, at their natural proportions, when nothing needed flooring.
+ * Reserving the floor out of the track up front for every undersized severity has its own failure:
+ * on a low-total column, several tiny severities can each need `FLOOR_PCT` while together costing
+ * more than the whole track, clamping the reserve pool to zero and starving the one severity that
+ * didn't need flooring — even when it holds the column's overwhelming majority (anton-knyp). So the
+ * floor is spent in rounds instead of reserved in one shot: each round floors the *whole* group of
+ * severities currently under floor, but only when the track can afford that group together — never
+ * a partial group, which would floor some undersized severities and not their equally-undersized
+ * peers depending on iteration order. Once a round's group is unaffordable, everything left splits
+ * what remains of the track by its natural proportion, so the majority is never starved to reserve
+ * space for floors the column can't actually pay for.
  */
 function severityHeights(bySeverity: Record<ScanSeverity, number>, total: number, peak: number) {
-  const present = SCAN_SEVERITIES.filter((s) => bySeverity[s] > 0);
   const track = (total / peak) * 100;
 
-  const floored = present.filter((s) => (bySeverity[s] / total) * track < FLOOR_PCT);
-  const flooredSet = new Set(floored);
-  const scaledCount = present
-    .filter((s) => !flooredSet.has(s))
-    .reduce((sum, s) => sum + bySeverity[s], 0);
-  const remainingTrack = Math.max(0, track - floored.length * FLOOR_PCT);
+  let remaining = SCAN_SEVERITIES.filter((s) => bySeverity[s] > 0);
+  let remainingTrack = track;
+  let remainingCount = total;
+  const floored = new Set<ScanSeverity>();
+
+  while (remaining.length > 0) {
+    const underFloor = remaining.filter(
+      (s) => (bySeverity[s] / remainingCount) * remainingTrack < FLOOR_PCT,
+    );
+    if (underFloor.length === 0 || underFloor.length * FLOOR_PCT > remainingTrack) break;
+
+    for (const s of underFloor) floored.add(s);
+    remainingTrack -= underFloor.length * FLOOR_PCT;
+    remainingCount -= underFloor.reduce((sum, s) => sum + bySeverity[s], 0);
+    remaining = remaining.filter((s) => !underFloor.includes(s));
+  }
 
   const heights = new Map<ScanSeverity, number>();
-  for (const s of present) {
+  for (const s of SCAN_SEVERITIES) {
+    if (bySeverity[s] <= 0) continue;
     heights.set(
       s,
-      flooredSet.has(s) ? FLOOR_PCT : (bySeverity[s] / scaledCount) * remainingTrack,
+      floored.has(s) ? FLOOR_PCT : (bySeverity[s] / remainingCount) * remainingTrack,
     );
   }
   return heights;

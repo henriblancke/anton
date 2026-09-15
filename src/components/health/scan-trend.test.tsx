@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
 import { ScanTrend } from "@/components/health/scan-trend";
+import { SCAN_SEVERITIES } from "@/lib/scan-severity";
 import type { ScanHealthPoint, SeverityCounts } from "@/lib/types";
 
 afterEach(cleanup);
@@ -129,6 +130,29 @@ describe("ScanTrend", () => {
     // No severity needed the floor here, so ratios hold to the underlying counts within a pixel.
     expect(heights[0] / heights[1]).toBeCloseTo(34 / 33, 1);
     expect(heights[1] / heights[2]).toBeCloseTo(33 / 33, 1);
+  });
+
+  // anton-knyp: a low-total column with several tiny severities can't afford `FLOOR_PCT` for all of
+  // them out of its own small track — reserving it anyway starved the majority severity to 0% height.
+  it("never starves a column's majority severity to 0% when siblings can't all afford the floor", () => {
+    render(
+      <ScanTrend
+        points={[
+          point("a", 1_700_000_000, { critical: 1, high: 1, medium: 100, low: 1 }),
+          point("b", 1_700_086_400, { low: 1000 }),
+        ]}
+      />,
+    );
+
+    const column = screen.getByTitle(/103 new signals/);
+    const bars = Array.from(column.querySelectorAll<HTMLElement>("span[style]"));
+    const heights = bars.map((bar) => Number.parseFloat(bar.style.height));
+    const sum = heights.reduce((a, b) => a + b, 0);
+
+    // medium holds 100 of the column's 103 signals — it must dwarf every other segment, not vanish.
+    const mediumIndex = SCAN_SEVERITIES.indexOf("medium");
+    expect(heights[mediumIndex]).toBeGreaterThan(0);
+    expect(heights[mediumIndex]).toBeGreaterThan(sum / 2);
   });
 
   it("still draws a visible segment for a count of 1 against a large peak", () => {
