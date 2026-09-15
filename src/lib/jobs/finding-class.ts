@@ -16,13 +16,14 @@ export type FindingClass = "fencing-toctou" | "cancellation" | "fail-open" | "wo
 type Matcher = RegExp | ((note: string) => boolean);
 
 /**
- * The passive "is discarded/lost/dropped" and "lost/dropped after/when" phrasings say nothing about
- * loss *of work* on their own — "the first character is dropped when parsing" or "the diagnostic
- * context is lost after wrapping the error" match the words without describing a work-loss regression.
- * They only count when a work-bearing noun (job, task, queue, ...) or a retry/requeue signal appears
- * within a short window of the match.
+ * The passive "is discarded/lost/dropped", "lost/dropped after/when", and "silently drops" phrasings
+ * say nothing about loss *of work* on their own — "the first character is dropped when parsing", "the
+ * diagnostic context is lost after wrapping the error", or "the logger silently drops duplicate metric
+ * labels" all match the words without describing a work-loss regression. They only count when a
+ * work-bearing noun (job, task, queue, ...) or a retry/requeue signal appears within a short window of
+ * the match.
  */
-const WORK_LOSS_PASSIVE = /is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when)/gi;
+const WORK_LOSS_PASSIVE = /is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when)|silently drops?/gi;
 const WORK_SUBJECT =
   /\b(?:job|task|queue|batch|record|item|request|message|event|payload|entry|entries|submission|update)s?\b/i;
 const RETRY_SIGNAL = /\b(?:retry|retried|retries|requeue|requeued|re-?queue|re-?queued|redeliver|redelivered|reprocess|reprocessed)\b/i;
@@ -42,7 +43,7 @@ function matchesWorkLossPassive(note: string): boolean {
 
 function matchesWorkLoss(note: string): boolean {
   return (
-    /work.?loss|loses? (?:the )?work|silently drops?|never retried|unhandled rejection|work is lost|data loss/i.test(
+    /work.?loss|loses? (?:the )?work|never retried|unhandled rejection|work is lost|data loss/i.test(
       note,
     ) || matchesWorkLossPassive(note)
   );

@@ -128,6 +128,21 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("other");
   });
 
+  it("does not classify a 'silently drops' finding without work context as work-loss", () => {
+    const note = "This validator silently drops invalid UTF-8 characters instead of erroring.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify a 'silently drops' finding about metric labels as work-loss", () => {
+    const note = "The logger silently drops duplicate metric labels, which skews the aggregated counts.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies a 'silently drops' finding with work context as work-loss", () => {
+    const note = "The worker silently drops the job when the connection resets, with no retry and no log.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();

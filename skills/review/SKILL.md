@@ -60,9 +60,12 @@ to survive pattern-matching the code shape — then judge the rest on the axes t
 
 ### 3a. The interleaving pass (mandatory)
 
-This is a forced enumeration, not a mood you bring to "correctness." For **every state mutation in
-the diff** — every write to the beads board, the Dolt DB, a file, a lock, a claim, a marker, a
-queue — walk these steps and put the result in your notes before you move on:
+This is a forced enumeration, not a mood you bring to "correctness." For **every state mutation
+whose read-to-write window is touched by the diff** — every write to the beads board, the Dolt DB,
+a file, a lock, a claim, a marker, a queue — walk these steps and put the result in your notes
+before you move on. This includes a mutation whose own line is unchanged: if the diff inserts,
+removes, or moves an `await` (or otherwise changes what can run between an existing dependent read
+and an existing write), the write is in scope even though it isn't itself a diff line.
 
 1. **Name the mutation.** File:line, and what it writes.
 2. **Name the read it depends on.** The value(s) the code trusted before deciding to write —
