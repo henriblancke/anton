@@ -836,6 +836,22 @@ describe("scan", () => {
       Title: `finding at ${path}`,
     });
 
+    // anton-fj1q PR #295 review: filtering signals after stringer exits is too late when a nested
+    // worktree is large enough to exhaust a collector's --collector-timeout budget — the collector
+    // times out mid-walk and omits its REAL findings too, not just the phantom ones. Excluding the
+    // worktree from stringer's OWN walk (its --exclude, built before execFileAsync spawns it) is
+    // the only fix that stops the cost from being paid at all.
+    it("excludes a nested worktree from stringer's own walk, not just from the signals read back", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr252-threads");
+      const argvDump = join(dir, "argv.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+
+      await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      const globs = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1].split(",");
+      expect(globs).toContain(`${join(".worktrees", "pr252-threads")}/**`);
+    });
+
     it("drops signals under a worktree checked out at a non-.claude path, whatever collector reported them", async () => {
       const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr252-threads");
       // The nested checkout is a real copy of the tracked tree, so the same file exists at both paths.
@@ -988,10 +1004,14 @@ describe("scan", () => {
         expect(result.worktree.dropped).toEqual([]);
       });
 
-      // stringer emits one signal per location in the group, each sharing the same Description —
-      // so the group having 2+ real locations elsewhere must not save a signal whose OWN FilePath
-      // is the nested one; that specific signal still points triage at a path that never ships.
-      it("drops a signal whose own FilePath is nested even though its group has two real locations", async () => {
+      // stringer emits ONE signal per clone GROUP, not one per location — its FilePath is just the
+      // Description's first-listed location (verified against a real 97-signal scan: every FilePath
+      // equals its own Description's first entry, see scan-duplication.d9eab116.fixture.json). So a
+      // group whose first-listed location happens to be the nested one still has two real locations
+      // to report, and there is no sibling signal to fall back on — dropping it outright would
+      // silently delete the whole finding. It must be re-anchored to a surviving real location
+      // instead.
+      it("re-anchors a clone group's signal when its own FilePath is the nested location but two real locations remain", async () => {
         const repo = initRepoWithWorktree(
           { "src/a.ts": CODE_BLOCK, "src/b.ts": CODE_BLOCK },
           ".worktrees/pr252-threads",
@@ -999,23 +1019,20 @@ describe("scan", () => {
         mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
         writeFileSync(join(repo, ".worktrees/pr252-threads/src/a.ts"), CODE_BLOCK, "utf8");
 
-        const locations = [
-          "src/a.ts:2",
-          "src/b.ts:2",
-          ".worktrees/pr252-threads/src/a.ts:2",
-        ];
         process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
-          cloneFinding("src/a.ts", 2, locations),
-          cloneFinding("src/b.ts", 2, locations),
-          cloneFinding(".worktrees/pr252-threads/src/a.ts", 2, locations),
+          cloneFinding(".worktrees/pr252-threads/src/a.ts", 2, [
+            ".worktrees/pr252-threads/src/a.ts:2",
+            "src/a.ts:2",
+            "src/b.ts:2",
+          ]),
         ]);
 
         const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
-        expect(result.signals.map((s) => s.FilePath).sort()).toEqual(["src/a.ts", "src/b.ts"]);
-        expect(result.worktree.dropped).toEqual([
-          { path: ".worktrees/pr252-threads/src/a.ts", kind: "code-clone", severity: expect.any(String) },
-        ]);
+        expect(result.signals).toHaveLength(1);
+        expect(result.signals[0].FilePath).toBe("src/a.ts");
+        expect(result.signals[0].Line).toBe(2);
+        expect(result.worktree.dropped).toEqual([]);
       });
     });
 

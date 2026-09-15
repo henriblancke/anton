@@ -697,7 +697,9 @@ async function listNestedWorktrees(repoPath: string): Promise<string[] | { unava
 /**
  * Drop the signals describing a path inside another checkout of this same repo, and say how many.
  * Runs BEFORE annotation, same as {@link dropUntrackedSignals} — a filter applied downstream of it
- * would leave the trend charting findings the agent never saw.
+ * would leave the trend charting findings the agent never saw. `nested` is precomputed by the
+ * caller ({@link scan} needs it before spawning stringer, to build `--exclude`) — this filter is a
+ * backstop against whatever a glob exclude doesn't catch, not the primary defense.
  *
  * Unlike {@link dropUntrackedSignals} this runs over every collector's signals, not just
  * `githygiene`'s: the 2026-09-10 scan of this repo split its phantom signals across complexity,
@@ -705,25 +707,28 @@ async function listNestedWorktrees(repoPath: string): Promise<string[] | { unava
  * finding for ANY collector on the tree that ships.
  *
  * A `duplication` signal gets its own rule: it reports a GROUP of locations (in `Description`, see
- * {@link parseLocations}), and its own `FilePath` is only ONE of them. Checking `FilePath` alone
- * would keep a clone whose "duplicate" is entirely the nested worktree mirroring the real file, so
- * once a signal names two or more locations, the vote runs over ALL of them: it survives only if at
- * least two locations sit outside every nested worktree, because one real location left is not a
- * duplicate of anything the tree still has.
+ * {@link parseLocations}), and its own `FilePath` is only ONE of them — specifically, the FIRST one
+ * stringer listed (verified against a 97-signal real scan, fixture at
+ * `scan-duplication.d9eab116.fixture.json`: 97 signals, 97 distinct Descriptions, every `FilePath`
+ * equal to its own Description's first location — one signal per clone GROUP, not one per
+ * location). Checking `FilePath` alone would keep a clone whose "duplicate" is entirely the nested
+ * worktree mirroring the real file, so once a signal names two or more locations, the vote runs
+ * over ALL of them: it survives only if at least two locations sit outside every nested worktree,
+ * because one real location left is not a duplicate of anything the tree still has.
  *
- * That group vote alone isn't enough, though: a signal whose OWN `FilePath` sits inside a nested
- * worktree must never reach triage even when the rest of its group votes to keep it — a group with
- * two real locations plus a nested one still emits a signal FOR the nested location (stringer emits
- * one `code-clone`/`near-clone` signal per location, all sharing the same `Description`), and that
- * signal's `FilePath` names a file whose edits never ship. So the signal's own path is checked and
- * dropped unconditionally FIRST, independent of how many real locations the rest of the group has —
- * the sibling signals for the group's real locations still carry the finding through untouched.
+ * Because there is only ONE signal per group, a group that survives the vote must be KEPT even when
+ * its own `FilePath` happens to be the nested location — there is no sibling signal for the
+ * surviving real locations to carry the finding through on its own. Dropping it unconditionally,
+ * as an earlier version of this filter did, silently deleted every valid clone group whose
+ * representative happened to be listed first-and-nested (anton-fj1q PR #295 review). Instead the
+ * signal is re-anchored: `FilePath`/`Line` are rewritten to a surviving real location, so triage
+ * still points at a file whose edits ship.
  */
 async function dropWorktreeSignals(
   repoPath: string,
   signals: ScanSignal[],
+  nested: string[] | { unavailable: string },
 ): Promise<{ kept: ScanSignal[]; worktree: WorktreeFilter }> {
-  const nested = await listNestedWorktrees(repoPath);
   if (!Array.isArray(nested)) {
     return { kept: signals, worktree: { dropped: [], worktrees: [], ...nested } };
   }
@@ -734,21 +739,26 @@ async function dropWorktreeSignals(
   const dropped: DroppedSignal[] = [];
   const kept = signals.filter((signal) => {
     if (collectorOf(signal) === DUPLICATION_COLLECTOR) {
-      const ownPath = repoRelativePath(repoPath, signal);
-      if (ownPath !== undefined && isNested(ownPath)) {
-        dropped.push({ path: ownPath, kind: kindOf(signal), severity: severityOfSignal(signal) });
-        return false;
-      }
-
       const locations = parseLocations(signal);
       if (locations.length >= 2) {
         const resolved = locations
-          .map((loc) => insideRepo(repoPath, loc.path))
-          .filter((path): path is string => path !== undefined);
-        const real = resolved.filter((path) => !isNested(path));
-        if (real.length >= 2) return true;
+          .map((loc) => {
+            const path = insideRepo(repoPath, loc.path);
+            return path === undefined ? undefined : { path, line: loc.line };
+          })
+          .filter((loc): loc is { path: string; line: number } => loc !== undefined);
+        const real = resolved.filter((loc) => !isNested(loc.path));
+        if (real.length >= 2) {
+          const ownPath = repoRelativePath(repoPath, signal);
+          if (ownPath === undefined || isNested(ownPath)) {
+            signal.FilePath = real[0].path;
+            signal.Line = real[0].line;
+          }
+          return true;
+        }
+        const ownPath = repoRelativePath(repoPath, signal);
         dropped.push({
-          path: ownPath ?? resolved[0] ?? "",
+          path: ownPath ?? resolved[0]?.path ?? "",
           kind: kindOf(signal),
           severity: severityOfSignal(signal),
         });
@@ -807,7 +817,12 @@ export function describeWorktreeFilter(filter: WorktreeFilter): string | undefin
 async function readAnnotatedSignals(
   scanFile: string,
   repoPath: string,
-  opts: { exclude: readonly string[]; abort?: AbortSignal },
+  opts: {
+    exclude: readonly string[];
+    /** Precomputed by {@link scan} (it already needs this to build stringer's --exclude). */
+    nested: string[] | { unavailable: string };
+    abort?: AbortSignal;
+  },
 ): Promise<{
   signals: ScanSignal[];
   worktree: WorktreeFilter;
@@ -847,9 +862,10 @@ async function readAnnotatedSignals(
   }
 
   // Nested-worktree signals first, over every collector: a phantom path is never worth the cost the
-  // filters below pay to read its content, and this is the cheapest of the five (one `git worktree
-  // list`, no per-signal cost).
-  const { kept: real, worktree } = await dropWorktreeSignals(repoPath, signals);
+  // filters below pay to read its content. `scan()` already excluded these paths from the walk
+  // itself, so this is now a backstop rather than the primary defense — reusing its `nested` result
+  // instead of re-asking `git worktree list` here.
+  const { kept: real, worktree } = await dropWorktreeSignals(repoPath, signals, opts.nested);
   const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, real);
   // Secrets next, while the githygiene findings are together: it reads the flagged line, so it
   // should never be paid for a finding the index already contradicted.
@@ -940,11 +956,25 @@ export async function scan(opts: {
   const unwind = async (): Promise<string | undefined> =>
     baseline ? restoreBaseline(opts.repoPath, baseline) : undefined;
 
+  // Enumerated BEFORE stringer is spawned, not after it exits: excluding a nested worktree from the
+  // walk is the only fix that actually keeps it from costing anything. Filtering its signals out
+  // afterward (dropWorktreeSignals, below) is too late once a large one has already run every
+  // collector past its --collector-timeout budget — a collector that times out mid-walk omits its
+  // REAL findings too, not just the phantom ones (anton-fj1q: a 60s budget, and 759 phantom signals
+  // from one nested checkout). `nested` is threaded through to `readAnnotatedSignals` so it isn't
+  // asked for twice, and so the post-hoc filter still runs as a backstop against whatever a glob
+  // exclude doesn't catch (a worktree created mid-scan, a collector that ignores --exclude).
+  const nested = await listNestedWorktrees(opts.repoPath);
+
   const args = ["scan", opts.repoPath, "--format", "json", "-o", opts.scanFile];
   if (delta) args.push("--delta");
   // Skip build output / caches so the walk stays on source (the .next build dir alone made this scan
   // time out), and cap each collector so a runaway one can't hang the whole scan past the timeout.
-  const exclude = [...DEFAULT_SCAN_EXCLUDES, ...(opts.exclude ?? [])];
+  const exclude = [
+    ...DEFAULT_SCAN_EXCLUDES,
+    ...(Array.isArray(nested) ? nested.map((wt) => `${wt}/**`) : []),
+    ...(opts.exclude ?? []),
+  ];
   args.push("--exclude", exclude.join(","));
   args.push("--collector-timeout", COLLECTOR_TIMEOUT);
   // Keep stderr free of ANSI escapes so the collector-failure parse stays reliable when a TTY leaks in.
@@ -1002,6 +1032,7 @@ export async function scan(opts: {
   try {
     read = await readAnnotatedSignals(opts.scanFile, opts.repoPath, {
       exclude,
+      nested,
       abort: opts.signal,
     });
   } catch (err) {
