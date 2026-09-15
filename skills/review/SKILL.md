@@ -1,6 +1,6 @@
 ---
 name: review
-version: 16ad20660756
+version: 2fbbc4da23b6
 description: >-
   Reasoning contract for anton's pre-PR self-review gate: in a fresh context, review the diff the
   run's implementing agent just produced — correctness, code quality, project principle adherence,
@@ -55,12 +55,46 @@ promising name exists, and not because the implementer said so.
 
 ## 3. Review the diff in depth
 
-Read the whole diff, then judge it on:
+Read the whole diff. Run the interleaving pass below first — it is the class of defect most likely
+to survive pattern-matching the code shape — then judge the rest on the axes that follow.
+
+### 3a. The interleaving pass (mandatory)
+
+This is a forced enumeration, not a mood you bring to "correctness." For **every state mutation in
+the diff** — every write to the beads board, the Dolt DB, a file, a lock, a claim, a marker, a
+queue — walk these steps and put the result in your notes before you move on:
+
+1. **Name the mutation.** File:line, and what it writes.
+2. **Name the read it depends on.** The value(s) the code trusted before deciding to write —
+   often several commits or an `await` earlier than the write itself.
+3. **Name what can change that value, and who could change it**, choosing only from actors that
+   actually exist in this system:
+   - **another process** on the same machine — a second run, a concurrent worker
+   - **another machine holding the shared board** — a `bd`/Dolt sync racing the write (pull, push,
+     or another machine's claim landing mid-read)
+   - **a firing deadline** — a schedule tick, a budget or reap window closing
+   - **a cancellation** — the run or ticket being cancelled between the read and the write
+   - **the event loop itself** — an `await` between the read and the write that hands control to
+     something else before the write lands
+4. **Reach a verdict.** Either a finding — blocking if a stale read can corrupt state or let the
+   write proceed on a fact that is no longer true, advisory if the window is real but narrow and
+   benign — or, once every mutation in the diff has been walked, the explicit sentence **"no
+   mutation-with-dependent-read in this diff."** Restating this pass without walking every
+   mutation satisfies nothing; it must produce findings or that sentence.
+
+Calibrate against the shape of defects this catches, drawn from real escapes: "fence the marker
+before accepting the retirement," "recheck cancellation after the final WIP await," "re-read
+before releasing a retired claim," "reassert the claim after the final policy await." Each is a
+decision that trusted a read across a yield point instead of rechecking it at the write.
+
+### 3b. The rest of the diff
+
+Judge everything else on:
 
 **Correctness.** Does it do what it claims on the inputs that actually occur? Hunt the edge cases:
-empty/absent/malformed input, boundary values, concurrency and interleaving, partial failure and
-retry, unhandled rejections, resource cleanup. Trace at least one realistic end-to-end path per
-criterion instead of pattern-matching the code shape.
+empty/absent/malformed input, boundary values, partial failure and retry, unhandled rejections,
+resource cleanup. Trace at least one realistic end-to-end path per criterion instead of
+pattern-matching the code shape.
 
 **Robustness and safety.** Error paths as carefully as happy paths. Untrusted input validated at the
 boundary. No secret, token, or server-only value reaching a client bundle, a log, or a UI surface.
