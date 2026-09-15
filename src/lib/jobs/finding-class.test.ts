@@ -108,6 +108,16 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("fencing-toctou");
   });
 
+  it("does not classify a dropped-character parsing bug as work-loss", () => {
+    const note = "The first character is dropped when parsing a negative number, corrupting the result.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify a lost error-context finding as work-loss", () => {
+    const note = "The diagnostic context is lost after wrapping the error, making the cause hard to trace.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
   it("does not classify generic error-path phrasing without a loss signal as work-loss", () => {
     const note = "On the error path, the handler returns the wrong status code instead of a 500.";
     expect(classifyFindingClass(finding(note))).toBe("other");

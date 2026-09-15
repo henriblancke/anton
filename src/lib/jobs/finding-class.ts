@@ -13,13 +13,48 @@ import type { ReviewFinding } from "./review-context";
 
 export type FindingClass = "fencing-toctou" | "cancellation" | "fail-open" | "work-loss" | "scope" | "other";
 
+type Matcher = RegExp | ((note: string) => boolean);
+
+/**
+ * The passive "is discarded/lost/dropped" and "lost/dropped after/when" phrasings say nothing about
+ * loss *of work* on their own — "the first character is dropped when parsing" or "the diagnostic
+ * context is lost after wrapping the error" match the words without describing a work-loss regression.
+ * They only count when a work-bearing noun (job, task, queue, ...) or a retry/requeue signal appears
+ * within a short window of the match.
+ */
+const WORK_LOSS_PASSIVE = /is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when)/gi;
+const WORK_SUBJECT =
+  /\b(?:job|task|queue|batch|record|item|request|message|event|payload|entry|entries|submission|update)s?\b/i;
+const RETRY_SIGNAL = /\b(?:retry|retried|retries|requeue|requeued|re-?queue|re-?queued|redeliver|redelivered|reprocess|reprocessed)\b/i;
+const WORK_LOSS_CONTEXT_WINDOW = 60;
+
+function matchesWorkLossPassive(note: string): boolean {
+  WORK_LOSS_PASSIVE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = WORK_LOSS_PASSIVE.exec(note))) {
+    const start = Math.max(0, match.index - WORK_LOSS_CONTEXT_WINDOW);
+    const end = Math.min(note.length, match.index + match[0].length + WORK_LOSS_CONTEXT_WINDOW);
+    const context = note.slice(start, end);
+    if (WORK_SUBJECT.test(context) || RETRY_SIGNAL.test(context)) return true;
+  }
+  return false;
+}
+
+function matchesWorkLoss(note: string): boolean {
+  return (
+    /work.?loss|loses? (?:the )?work|silently drops?|never retried|unhandled rejection|work is lost|data loss/i.test(
+      note,
+    ) || matchesWorkLossPassive(note)
+  );
+}
+
 /**
  * Ordered most-distinctive-first, and checked in this order: a note can plausibly use words from more
  * than one class ("the abort leaves a stale lock held"), so the first pattern that matches wins rather
  * than every match being weighed. Fencing/TOCTOU goes first as the audit's largest and highest-P1
  * class — the one a coarse taxonomy most needs to not misfile as something vaguer.
  */
-const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: RegExp }> = [
+const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher }> = [
   {
     klass: "fencing-toctou",
     pattern:
@@ -40,8 +75,7 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: RegExp }
     // Generic error-path phrasing ("on the error path", "catch block swallows") is deliberately
     // excluded: it says nothing about loss on its own (e.g. "wrong status code on the error path"
     // isn't work-loss), so this only fires on an accompanying loss/drop/retry signal.
-    pattern:
-      /work.?loss|loses? (?:the )?work|silently drops?|is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when)|never retried|unhandled rejection|work is lost|data loss/i,
+    pattern: matchesWorkLoss,
   },
   {
     klass: "scope",
@@ -58,7 +92,8 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: RegExp }
 export function classifyFindingClass(finding: ReviewFinding): FindingClass {
   const note = finding.note;
   for (const { klass, pattern } of PATTERNS) {
-    if (pattern.test(note)) return klass;
+    const matched = typeof pattern === "function" ? pattern(note) : pattern.test(note);
+    if (matched) return klass;
   }
   return "other";
 }
