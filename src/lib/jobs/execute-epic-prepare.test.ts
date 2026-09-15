@@ -777,6 +777,44 @@ describe("prepareEpicRun — the structure/cycle gate re-runs on the board the r
     expect(publishRunClaimMock).toHaveBeenCalled();
   });
 
+  // The inverse of the relabel two tests up (chatgpt-codex-connector, PR #274 review): a ticket THIS
+  // run already armed a wait for may have its `agent:human` label REMOVED during the sync — an
+  // operator decided an agent should run it after all. Before this fix, `relabelledHuman` only
+  // watched tickets that still carry the label and `answeredSinceArmed` also required it, so this
+  // ticket's open gate survived untouched: the readiness recomputed after would read it as blocked
+  // forever, with no one left watching to answer a wait for a person no longer needed.
+  it("retries when the publish sync un-labels a child this run already armed a wait for", async () => {
+    const humanT2 = { ...ticket("t-2"), labels: [LABELS.agentHuman] } as Bead;
+    const clean = board(ticket("t-1"), humanT2);
+    attachCycleEvidence(clean, []);
+    const unlabelled = board(ticket("t-1"), ticket("t-2"));
+    attachCycleEvidence(unlabelled, []);
+    // Mirrors the real preflight: this run already armed a wait for t-2 (it's `handled`), on the
+    // board where it still carried the label.
+    preflightHumanTicketsMock.mockResolvedValue({
+      board: clean,
+      target: clean.find((b) => b.id === TARGET)!,
+      children: [ticket("t-1"), humanT2],
+      tickets: [ticket("t-1"), humanT2],
+      answeredButBlocked: new Map<string, string[]>(),
+      armed: true,
+      handled: new Set(["t-2"]),
+    });
+    loadAllIssuesMock
+      .mockResolvedValueOnce(clean)
+      .mockResolvedValueOnce(clean)
+      .mockResolvedValue(unlabelled);
+
+    const error = await refusalFrom(clean);
+
+    // Retryable, not a park: the next attempt re-enters from the top, where the preflight's own
+    // `retireRelabelledGates` resolves the now-obsolete gate the normal way.
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("t-2");
+    expect(error.message).toContain(LABELS.agentHuman);
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
   it("leaves a resume-skipped human-labelled child alone — its work is already done", async () => {
     // A ticket a prior attempt already delivered and closed is not a person waiting to be asked
     // again; `isResumeSkipped` is the same exclusion `armHumanTicketWaits` itself applies.

@@ -711,6 +711,25 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
         `its siblings first and poison-parking the run once dispatch reaches it`,
     );
   }
+  // The inverse of `relabelledHuman` above: a ticket THIS run already armed a wait for may have had
+  // its `agent:human` label REMOVED during the sync — an operator decided an agent should run it
+  // after all. Neither check above catches it: `relabelledHuman` only watches tickets that carry the
+  // label now, and `answeredSinceArmed` also requires `isHumanWork(t)`. Left unhandled, the ticket's
+  // open gate is never retired, so the readiness recomputed below reads it as blocked and it stays
+  // gated forever behind a wait for a person that no longer applies, while its independent siblings
+  // dispatch normally. Retried instead, so the next attempt re-enters `armHumanTicketWaits`, whose own
+  // `retireRelabelledGates` resolves the now-obsolete gate the normal way.
+  const relabelledAgentWork = freshTickets.filter(
+    (t) => t.id !== epicBeadId && !gates.isResumeSkipped(t) && gates.armedHumanIds.has(t.id) && !beads.isHumanWork(t),
+  );
+  if (relabelledAgentWork.length > 0) {
+    throw new Error(
+      `${epicBeadId}'s claim published to a board that had already un-labelled ` +
+        `${relabelledAgentWork.map((t) => t.id).join(", ")} ${LABELS.agentHuman} — retrying so the ` +
+        `human-ticket preflight retires the now-obsolete gate, rather than leaving it blocked on a ` +
+        `wait for a person no longer needed`,
+    );
+  }
   run.all = board;
   run.target = adoptedTarget;
   run.tickets = freshTickets;

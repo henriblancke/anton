@@ -215,6 +215,22 @@ try {
   for (const bead of [...list(), ...list(["--status", "closed"])]) if (!byId.has(bead.id)) byId.set(bead.id, bead);
   all = [...byId.values()];
 }
+// Gate beads are omitted from every ordinary `bd list`, even `--status all` (bd 1.1.2) — only
+// `--type gate` surfaces them — while the `blocks` edge a gate puts on its ticket IS carried there.
+// Without them, isHeld's fail-safe below reads a RESOLVED gate as a dangling, still-open blocker and
+// prints a dispatchable ticket as held, though the executor's gate-hydrated board dispatches it fine.
+// Mirrors the production reader's compensation (src/lib/beads/issues.ts's loadGateIssues), same
+// supported-status fallback.
+let gates;
+try {
+  gates = list(["--status", "all", "--type", "gate"]);
+} catch {
+  const byId = new Map();
+  for (const bead of [...list(["--type", "gate"]), ...list(["--status", "closed", "--type", "gate"])])
+    if (!byId.has(bead.id)) byId.set(bead.id, bead);
+  gates = [...byId.values()];
+}
+for (const gate of gates) if (!all.some((b) => b.id === gate.id)) all.push(gate);
 const parentOf = (b) => b.parent ?? b.parent_id;
 const pipeline = new Set(["molecule", "gate"]);
 const ticketTypes = new Set(["task", "bug", "chore", "feature"]);

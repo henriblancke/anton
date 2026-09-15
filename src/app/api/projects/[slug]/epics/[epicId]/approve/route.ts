@@ -351,12 +351,12 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   //
   // One call, both severities: the refusal below and the advisory further down are the same subtree
   // read, and asking twice would walk the whole board twice.
-  // Cycle evidence already rode in on `allBeads` — the forced fresh read above asked for it via
-  // `withCycles: true`, and it is now unconditional (every approval-gate projection needs it), so a
-  // second `bd dep cycles` here would pull a fresh, possibly divergent snapshot for the same board
-  // instead of reusing what's attached to it. Gated on `willEnqueue` because that evidence is only
-  // relevant to a request that will start work — a cycle cannot change a response or an enqueue
-  // decision otherwise.
+  // Cycle evidence already rode in on `allBeads` — `ensureCycleEvidence` attached it after the
+  // proposal branch above (the initial `refreshAllIssues` read is deliberately WITHOUT
+  // `withCycles`), so a second `bd dep cycles` here would pull a fresh, possibly divergent snapshot
+  // for the same board instead of reusing what's attached to it. Gated on `willEnqueue` because that
+  // evidence is only relevant to a request that will start work — a cycle cannot change a response or
+  // an enqueue decision otherwise.
   const structural = willEnqueue
     ? structureGaps(epicId, allBeads, { cycles: cycleEvidenceFor(allBeads) })
     : { blocking: [], advisory: [] };
