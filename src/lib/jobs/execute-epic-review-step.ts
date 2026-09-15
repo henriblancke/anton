@@ -9,7 +9,7 @@
  */
 import { beads } from "../beads/bd";
 import { resolveReviewConfig } from "../projects";
-import { updateRun } from "../runs";
+import { findRunReviewKeyForBranch, updateRun } from "../runs";
 import { isForeignRunOwner, isPoisonError } from "./errors";
 import { ReviewBlockedError } from "./execute-epic-errors";
 import { safe } from "./execute-epic-persist";
@@ -35,29 +35,43 @@ export async function runReviewStep(
   dispatch: RunStepDispatch,
   carry: RunPhaseCarry,
 ): Promise<void> {
-  const { db, clock, ctx, projectId, repo, runId, targetId: epicBeadId, settings, existing } = run;
+  const { db, clock, ctx, projectId, repo, runId, targetId: epicBeadId, branch, settings, existing } = run;
   const { cooked, definition, stepCtx } = dispatch;
   const { worktree } = prep;
 
   // The resume key (anton-qmuyt): a CLEAN verdict is keyed to the tree it judged — the merge-base,
   // the branch tip, and the reviewer contract's fingerprint — so a resume that finds the same key
   // skips the gate instead of blindly re-judging work already passed. Checked up front, before
-  // WHETHER the gate even runs, and keyed to the RUN ROW: `existing` is only set when this attempt
-  // resumed the same row in place, so an ordinary retry's fresh row, and every row written before
-  // this column existed, carry no key and always review — no backfill, no inference.
-  if (existing?.reviewKey) {
+  // WHETHER the gate even runs.
+  //
+  // Read off the BRANCH, not off `existing` alone (anton-nyz1v): a git fault at step:pr is an
+  // ordinary Error that settles the row `failed`, which `findOpenRunForEpic` excludes, so the
+  // runner's automatic retry opens a FRESH row with `existing` undefined while reusing this very
+  // branch and worktree — exactly the resume this key exists to make cheap. `existing`, when set,
+  // is preferred as the more direct read (same reasoning as `findRunFormulaForBranch`'s callers);
+  // the branch-scoped lookup covers every row this attempt did NOT resume in place. A row with no
+  // key anywhere on the branch, or a stale one, always reviews — no backfill, no inference.
+  const recordedKey = existing?.reviewKey
+    ? { reviewKey: existing.reviewKey, reviewKeyAdvisories: existing.reviewKeyAdvisories, reviewScore: existing.reviewScore }
+    : await findRunReviewKeyForBranch(db, projectId, epicBeadId, branch, runId);
+  if (recordedKey) {
     try {
       const key = await computeReviewKey({
         worktreePath: stepCtx.worktreePath,
         baseBranch: stepCtx.baseRef,
         settings,
       });
-      if (reviewKeyToken(key) === existing.reviewKey) {
-        // The recorded attempt already owns the score and its board labels — this attempt writes
-        // neither. It DOES restore the advisories, since they ride in `prBody` (steps/git.ts) and
-        // a skip that started with an empty carry would drop them out of the PR with nothing to
-        // show it happened.
-        carry.advisories = parseRecordedAdvisories(existing.reviewKeyAdvisories);
+      if (reviewKeyToken(key) === recordedKey.reviewKey) {
+        // The recorded attempt already owns the board labels — this attempt writes none of those.
+        // It DOES restore the advisories, since they ride in `prBody` (steps/git.ts) and a skip
+        // that started with an empty carry would drop them out of the PR with nothing to show it
+        // happened. It also restores the SCORE onto this row (anton-nyz1v): `openRunRow` resets
+        // `reviewScore` to null on every resume, and a skip that left it null would settle `done`
+        // with no score of its own — indistinguishable from an unreviewed run to the
+        // score-regression breaker (picker-score-breaker.ts's `readScoreSeries`, one entry per
+        // target's NEWEST attempt).
+        carry.advisories = parseRecordedAdvisories(recordedKey.reviewKeyAdvisories);
+        await updateRun(db, clock, runId, { reviewScore: recordedKey.reviewScore });
         const session = deferPassSession(db, clock, { ctx, projectId, runId, kind: "review-skip" });
         await session.log(
           `[review] skipped self-review: ${key.baseRev.slice(0, 12)}..${key.head.slice(0, 12)} ` +

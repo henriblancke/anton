@@ -14,6 +14,7 @@ import type { ReviewGateResult } from "./review-gate";
 import type { ReviewKey } from "./review-key";
 
 const updateRunMock = vi.fn();
+const findRunReviewKeyForBranchMock = vi.fn();
 const beadsNoteMock = vi.fn();
 const computeReviewKeyMock = vi.fn<(...args: unknown[]) => Promise<ReviewKey>>();
 const reviewKeyTokenMock = vi.fn<(key: ReviewKey) => string>();
@@ -28,7 +29,11 @@ const reconcileOrphanPullRequestMock = vi.fn();
 
 vi.mock("../runs", async () => {
   const actual = await vi.importActual<typeof import("../runs")>("../runs");
-  return { ...actual, updateRun: (...a: unknown[]) => updateRunMock(...a) };
+  return {
+    ...actual,
+    updateRun: (...a: unknown[]) => updateRunMock(...a),
+    findRunReviewKeyForBranch: (...a: unknown[]) => findRunReviewKeyForBranchMock(...a),
+  };
 });
 
 vi.mock("../beads/bd", async () => {
@@ -74,7 +79,9 @@ function target(): Bead {
   return { id: TARGET, issue_type: "feature", status: "open", labels: [] } as unknown as Bead;
 }
 
-function epicRun(existing?: Partial<{ reviewKey: string | null; reviewKeyAdvisories: string | null }>): EpicRun {
+function epicRun(
+  existing?: Partial<{ reviewKey: string | null; reviewKeyAdvisories: string | null; reviewScore: number | null }>,
+): EpicRun {
   return {
     db: {},
     clock: { now: () => Date.now() },
@@ -83,8 +90,11 @@ function epicRun(existing?: Partial<{ reviewKey: string | null; reviewKeyAdvisor
     repo: REPO,
     runId: RUN_ID,
     targetId: TARGET,
+    branch: `anton/${TARGET}`,
     settings: {},
-    existing: existing ? { id: RUN_ID, reviewKey: null, reviewKeyAdvisories: null, ...existing } : undefined,
+    existing: existing
+      ? { id: RUN_ID, reviewKey: null, reviewKeyAdvisories: null, reviewScore: null, ...existing }
+      : undefined,
     orphanNotice: "",
   } as unknown as EpicRun;
 }
@@ -140,6 +150,7 @@ beforeEach(() => {
   persistPartialReviewScoresMock.mockResolvedValue(undefined);
   reconcileOrphanPullRequestMock.mockResolvedValue(undefined);
   updateRunMock.mockResolvedValue(undefined);
+  findRunReviewKeyForBranchMock.mockResolvedValue(undefined);
   beadsNoteMock.mockResolvedValue("");
 });
 
@@ -151,13 +162,16 @@ describe("runReviewStep — resume key", () => {
     parseRecordedAdvisoriesMock.mockReturnValue(recorded);
 
     const handler = vi.fn();
-    const run = epicRun({ reviewKey: "base1:head1:fp1", reviewKeyAdvisories: "[...]" });
+    const run = epicRun({ reviewKey: "base1:head1:fp1", reviewKeyAdvisories: "[...]", reviewScore: 8 });
     const c = carry();
 
     await runReviewStep(run, prep(), dispatch(handler), c);
 
     expect(handler).not.toHaveBeenCalled();
     expect(c.advisories).toEqual(recorded);
+    // `existing` on the row is consulted first — a branch-wide scan is unnecessary work when this
+    // attempt resumed the very row that earned the verdict.
+    expect(findRunReviewKeyForBranchMock).not.toHaveBeenCalled();
     expect(deferPassSessionMock).toHaveBeenCalledWith(
       run.db,
       run.clock,
@@ -165,9 +179,45 @@ describe("runReviewStep — resume key", () => {
     );
     expect(sessionLogMock).toHaveBeenCalled();
     expect(sessionEndMock).toHaveBeenCalledWith("done");
-    // The recorded attempt already owns the score and its board labels — a skip touches neither.
-    expect(updateRunMock).not.toHaveBeenCalled();
+    // The recorded attempt already owns the board labels — a skip touches neither. It DOES restore
+    // the score onto this row (anton-nyz1v), since `openRunRow` reset it to null on resume and a
+    // skip that left it there would read as an unreviewed gap to the score-regression breaker.
+    expect(updateRunMock).toHaveBeenCalledTimes(1);
+    expect(updateRunMock).toHaveBeenCalledWith(run.db, run.clock, RUN_ID, { reviewScore: 8 });
     expect(persistReviewScoresMock).not.toHaveBeenCalled();
+  });
+
+  it("skips the gate off a branch-scoped key when the retry opened a fresh row (anton-nyz1v)", async () => {
+    // A git fault at step:pr settles the row `failed`, so the runner's retry finds no open run
+    // (`existing` is undefined) even though it reuses the same branch and worktree an earlier
+    // attempt already reviewed clean. The key must still be found — off the branch, not the row.
+    computeReviewKeyMock.mockResolvedValue({ baseRev: "base5", head: "head5", fingerprint: "fp5" });
+    reviewKeyTokenMock.mockReturnValue("base5:head5:fp5");
+    const recorded: ReviewFinding[] = [{ severity: "advisory", location: "w.ts:1", note: "nit" }];
+    parseRecordedAdvisoriesMock.mockReturnValue(recorded);
+    findRunReviewKeyForBranchMock.mockResolvedValue({
+      reviewKey: "base5:head5:fp5",
+      reviewKeyAdvisories: "[...]",
+      reviewScore: 7,
+    });
+
+    const handler = vi.fn();
+    const run = epicRun(undefined);
+    const c = carry();
+
+    await runReviewStep(run, prep(), dispatch(handler), c);
+
+    expect(findRunReviewKeyForBranchMock).toHaveBeenCalledWith(
+      run.db,
+      run.projectId,
+      TARGET,
+      run.branch,
+      RUN_ID,
+    );
+    expect(handler).not.toHaveBeenCalled();
+    expect(c.advisories).toEqual(recorded);
+    expect(updateRunMock).toHaveBeenCalledWith(run.db, run.clock, RUN_ID, { reviewScore: 7 });
+    expect(sessionEndMock).toHaveBeenCalledWith("done");
   });
 
   it("reviews in full when the recorded key no longer matches the tree", async () => {
@@ -176,6 +226,24 @@ describe("runReviewStep — resume key", () => {
 
     const handler = vi.fn(async () => ({ facts: { review: cleanResult() } }));
     const run = epicRun({ reviewKey: "base1:head1:fp1", reviewKeyAdvisories: null });
+
+    await runReviewStep(run, prep(), dispatch(handler), carry());
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(deferPassSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("reviews in full when the branch-scoped key no longer matches the tree", async () => {
+    computeReviewKeyMock.mockResolvedValue({ baseRev: "base6", head: "head6", fingerprint: "fp6" });
+    reviewKeyTokenMock.mockReturnValue("base6:head6:fp6");
+    findRunReviewKeyForBranchMock.mockResolvedValue({
+      reviewKey: "stale:key:fp",
+      reviewKeyAdvisories: null,
+      reviewScore: 3,
+    });
+
+    const handler = vi.fn(async () => ({ facts: { review: cleanResult() } }));
+    const run = epicRun(undefined);
 
     await runReviewStep(run, prep(), dispatch(handler), carry());
 
