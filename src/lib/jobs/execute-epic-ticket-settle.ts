@@ -82,6 +82,15 @@ export interface TicketProgress {
    * reported no snapshot of its own.
    */
   dispatched?: Bead;
+  /**
+   * The `board-evidence-pending:*` ids a board-only ticket's evidence check confirmed synced this
+   * attempt (anton-fc5x review round 4) — set only once {@link import("./execute-epic-board-evidence").
+   * readBoardEvidence} finds real, synced evidence, so the ticket's own success path can release the
+   * marker via `clearBoardEvidencePending` once the handoff (attribution commit + close/in-review)
+   * has actually completed, rather than the evidence check clearing it prematurely. Absent for every
+   * non-board-only ticket, and for a board-only one whose evidence never confirmed synced.
+   */
+  boardEvidenceIds?: string[];
 }
 
 /**

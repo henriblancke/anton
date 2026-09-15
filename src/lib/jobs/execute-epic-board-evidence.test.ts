@@ -27,6 +27,7 @@ vi.mock("../beads/issues", async () => {
 
 const {
   boardEvidence,
+  clearBoardEvidencePending,
   fingerprintBoard,
   isBoardOnlyRun,
   readBoardBaseline,
@@ -99,6 +100,16 @@ describe("fingerprintBoard / boardEvidence (anton-fc5x)", () => {
     () => {
       const before = fingerprintBoard([bead("a", { acceptance_criteria: "- [ ] old rubric" })]);
       const after = fingerprintBoard([bead("a", { acceptance_criteria: "- [ ] repaired rubric" })]);
+      expect(boardEvidence(before, after)).toEqual(["a"]);
+    },
+  );
+
+  it(
+    "catches an external_ref change — attaching/changing a tracker reference is a supported " +
+      "board-only write that touches neither status, description nor labels (anton-fc5x review round 4)",
+    () => {
+      const before = fingerprintBoard([bead("a", { external_ref: undefined })]);
+      const after = fingerprintBoard([bead("a", { external_ref: "LIN-123" })]);
       expect(boardEvidence(before, after)).toEqual(["a"]);
     },
   );
@@ -248,17 +259,60 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     expect(setBoardEvidencePendingMock).toHaveBeenCalledWith("/repo", ticket.id, ["a"], []);
   });
 
-  it("clears a stale `board-evidence-pending:*` label once the sync confirms", async () => {
-    const wasPending = bead("t-1", { labels: [LABELS.boardEvidencePending(["a"])] });
-    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
-    const baseline = (await readBoardBaseline("/repo"))!;
-    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
-    pushMock.mockResolvedValueOnce("synced");
-    await readBoardEvidence("/repo", baseline, wasPending);
-    expect(setBoardEvidencePendingMock).toHaveBeenCalledWith("/repo", "t-1", [], [
-      LABELS.boardEvidencePending(["a"]),
-    ]);
+  it(
+    "retains a matching `board-evidence-pending:*` label once the sync confirms, rather than " +
+      "clearing it (anton-fc5x review round 4) — the handoff (attribution + close) hasn't happened " +
+      "yet, so the caller must clear it explicitly once it has",
+    async () => {
+      const wasPending = bead("t-1", { labels: [LABELS.boardEvidencePending(["a"])] });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("synced");
+      // Mocks in this suite accumulate call history across tests (no per-test reset), so a "nothing
+      // NEW happened" assertion snapshots the count rather than asserting zero calls ever.
+      const callsBefore = setBoardEvidencePendingMock.mock.calls.length;
+      const result = await readBoardEvidence("/repo", baseline, wasPending);
+      expect(result).toEqual({ found: true, ids: ["a"], synced: true });
+      // The marker already names exactly this id set, so there's nothing new to persist.
+      expect(setBoardEvidencePendingMock.mock.calls.length).toBe(callsBefore);
+    },
+  );
+
+  it(
+    "clearBoardEvidencePending releases the marker only once the caller says the handoff finished",
+    async () => {
+      await clearBoardEvidencePending("/repo", "t-1", ["a"]);
+      expect(setBoardEvidencePendingMock).toHaveBeenCalledWith("/repo", "t-1", [], [
+        LABELS.boardEvidencePending(["a"]),
+      ]);
+    },
+  );
+
+  it("clearBoardEvidencePending is a no-op for an empty id set", async () => {
+    const callsBefore = setBoardEvidencePendingMock.mock.calls.length;
+    await clearBoardEvidencePending("/repo", "t-1", []);
+    expect(setBoardEvidencePendingMock.mock.calls.length).toBe(callsBefore);
   });
+
+  it(
+    "a synced check that finds NEW ids beyond the stale marker still writes the expanded set",
+    async () => {
+      const wasPending = bead("t-1", { labels: [LABELS.boardEvidencePending(["a"])] });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" }), bead("b", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([
+        bead("a", { description: "swept" }),
+        bead("b", { description: "also swept" }),
+      ]);
+      pushMock.mockResolvedValueOnce("synced");
+      const result = await readBoardEvidence("/repo", baseline, wasPending);
+      expect(result).toEqual({ found: true, ids: ["a", "b"], synced: true });
+      expect(setBoardEvidencePendingMock).toHaveBeenCalledWith("/repo", "t-1", ["a", "b"], [
+        LABELS.boardEvidencePending(["a"]),
+      ]);
+    },
+  );
 
   it(
     "recovers a prior attempt's unsynced evidence across a park/resume, even though the RESUMED " +

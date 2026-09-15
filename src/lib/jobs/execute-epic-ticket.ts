@@ -16,6 +16,7 @@ import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claud
 import { runClaude } from "../claude/driver";
 import { branchAddedCommit } from "../git/ops";
 import {
+  clearBoardEvidencePending,
   isBoardOnlyRun,
   readBoardBaseline,
   readBoardEvidence,
@@ -97,17 +98,30 @@ export async function runTicket(args: {
     warnBudgetRunningOut(session.logPath, ticket, timeoutMs, remainingMs),
   );
   const baseline = await readTicketBaseline(worktreePath);
-  // Only for a ticket whose delivery is board-only (anton-fc5x) — the ticket's own `delivery:board`
-  // label, or its run target's (see {@link isBoardOnlyRun}: SKILL.md has shapers label the run
-  // target, which an epic/feature's dispatched children never carry themselves). The read costs a
-  // whole-board `bd list`, paid here so every OTHER ticket's zero-diff path stays exactly as cheap
-  // as it always was.
-  const boardBaseline = isBoardOnlyRun(run, ticket) ? await readBoardBaseline(run.repoPath) : null;
+  // The classification (anton-fc5x review round 4) is kept SEPARATE from whether the baseline read
+  // that backs it actually succeeded. A board-only ticket whose `bd list` exhausted its retries is
+  // still a board-only ticket — collapsing the two into one `null` (as before) made an unreadable
+  // baseline indistinguishable from "this was never board-only", which let `walkTicketSteps` skip
+  // the board-evidence gate entirely and fall through to the tree-based path: an incidental commit
+  // would then settle delivered without the board ever being checked, the exact false success this
+  // gate exists to prevent. The read costs a whole-board `bd list`, paid here so every OTHER
+  // ticket's zero-diff path stays exactly as cheap as it always was.
+  const boardOnly = isBoardOnlyRun(run, ticket);
+  const boardBaseline = boardOnly ? await readBoardBaseline(run.repoPath) : null;
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
 
   try {
-    await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress, boardBaseline });
+    await walkTicketSteps({
+      run,
+      steps: args.steps,
+      ticket,
+      ticketCtx,
+      session,
+      progress,
+      boardOnly,
+      boardBaseline,
+    });
     const settlement = await ticketSettlement(run, progress);
     // The deadline only stops what observes it (PR #253 review). The gate's branch reads and the
     // settlement's commit lookup are plain git reads that take no signal, so a deadline landing
@@ -122,6 +136,12 @@ export async function runTicket(args: {
       );
     }
     const { closed } = await finishTicket(ticketCtx, ticket, session.sessionId, closeOnDone, settlement);
+    // The pending marker (anton-fc5x review round 4) is released only now — the whole handoff this
+    // ticket's board evidence unblocked (attribution commit + close/in-review) has gone through
+    // without throwing. See {@link clearBoardEvidencePending}.
+    if (progress.boardEvidenceIds) {
+      await clearBoardEvidencePending(run.repoPath, ticket.id, progress.boardEvidenceIds);
+    }
     return { ...settlement, closed };
   } catch (e) {
     // Always throws; returned so the signature carries the `never` and the walk's answer is typed.
@@ -156,11 +176,16 @@ async function walkTicketSteps(args: {
   ticketCtx: StepContext;
   session: { sessionId: string; logPath: string };
   progress: TicketProgress;
-  /** The pre-dispatch board read a board-only ticket's evidence check diffs against; null for every
-   * other ticket, and for one whose baseline read itself failed (anton-fc5x). */
+  /** Whether THIS ticket's delivery is board-only ({@link isBoardOnlyRun}) — decided from labels
+   * alone, never from whether {@link boardBaseline} came back (anton-fc5x review round 4). Drives
+   * which delivery-evidence path `assertDelivered` takes; `boardBaseline` only decides whether that
+   * path can actually compare against something. */
+  boardOnly: boolean;
+  /** The pre-dispatch board read a board-only ticket's evidence check diffs against; null when this
+   * ticket isn't board-only, or when it is but the baseline read itself failed (anton-fc5x). */
   boardBaseline: BoardFingerprint | null;
 }): Promise<void> {
-  const { run, ticket, ticketCtx, session, progress, boardBaseline } = args;
+  const { run, ticket, ticketCtx, session, progress, boardOnly, boardBaseline } = args;
   const { db } = run;
   const { sessionId, logPath } = session;
   for (const { step: cooked, definition } of args.steps) {
@@ -230,8 +255,21 @@ async function walkTicketSteps(args: {
       result.facts ?? {},
       progress,
       (commit) => branchAddedCommit(run.repoPath, run.branch, run.baseRef, commit),
-      boardBaseline ? () => readBoardEvidence(run.repoPath, boardBaseline, ticket) : undefined,
-      boardBaseline ? () => recordBoardOnlyAttribution(ticketCtx) : undefined,
+      // Gated on `boardOnly`, never on `boardBaseline` alone (anton-fc5x review round 4) — an
+      // unreadable baseline still owes this ticket the board-only path, just one that fails closed
+      // instead of silently falling through to the tree-based check below.
+      boardOnly
+        ? boardBaseline
+          ? () => readBoardEvidence(run.repoPath, boardBaseline, ticket)
+          : () =>
+              Promise.resolve<BoardEvidenceResult>({
+                found: false,
+                ids: [],
+                synced: false,
+                baselineUnavailable: true,
+              })
+        : undefined,
+      boardOnly ? () => recordBoardOnlyAttribution(ticketCtx) : undefined,
     );
   }
 }
@@ -434,6 +472,12 @@ async function assertBoardOnlyDelivered(
   if (selfReport?.outcome === "delivered") {
     const result = await evidence.checkBoardEvidence();
     if (result.found && result.synced) {
+      // The evidence is confirmed but the handoff isn't done yet — the marker stays on the bead
+      // (readBoardEvidence never clears it) until the ticket's own success path releases it via
+      // `clearBoardEvidencePending`, once attribution and close/in-review have actually gone
+      // through (anton-fc5x review round 4). Recorded on `progress` because that path has no other
+      // way to learn which ids this attempt's evidence check confirmed.
+      progress.boardEvidenceIds = result.ids;
       // The board is confirmed. Record the empty attribution commit only when the branch genuinely
       // hasn't moved yet (anton-fc5x review round 3) — an incidental tree change already gives
       // `step:pr` a real diff to open against, so a second commit here would be redundant.
@@ -462,6 +506,16 @@ async function assertBoardOnlyDelivered(
  * evidence check can come up short, named precisely so the operator note says which.
  */
 function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult): string {
+  if (evidence.baselineUnavailable) {
+    return (
+      `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
+      `is bd writes to the board, not the git tree — but the pre-dispatch board baseline could not be ` +
+      `read (after retries), so no comparison against it could be made at all. Blocking the ticket for ` +
+      `operator review until the board read is healthy, then resume the run — an unreadable baseline ` +
+      `fails closed rather than falling through to the tree-based check a board-only ticket must never ` +
+      `settle on.`
+    );
+  }
   if (!evidence.found) {
     return (
       `${ticket.id} produced no delivery: claude exited cleanly, self-reported delivered, and this ` +

@@ -1891,6 +1891,37 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
   });
 
   it(
+    "records the confirmed ids on `progress.boardEvidenceIds` (anton-fc5x review round 4) — the " +
+      "ticket's own success path reads this back to release the `board-evidence-pending:*` marker " +
+      "only once the handoff (attribution + close) actually completes, never from inside the check",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({ found: true, ids: ["swept-1", "swept-2"], synced: true });
+
+      await expect(assertDelivered(ticket, { committed: false }, p, neverAsked, check)).resolves.toBeUndefined();
+      expect(p.boardEvidenceIds).toEqual(["swept-1", "swept-2"]);
+    },
+  );
+
+  it(
+    "blocks and fails closed when the board-evidence check itself reports an unreadable baseline, " +
+      "rather than silently falling through to the tree-based zero-diff path (anton-fc5x review round " +
+      "4, finding 1/3: a board-only ticket whose baseline read failed must never be treated as an " +
+      "ordinary ticket, even when an incidental commit exists on the branch)",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({ found: false, ids: [], synced: false, baselineUnavailable: true });
+
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+      expect(err?.name).toBe("PoisonError");
+      expect(err?.message).toMatch(/anton-board produced no delivery/);
+      expect(err?.message).toMatch(/pre-dispatch board baseline could not be read/);
+      expect(p).toMatchObject({ committed: false, delivered: false });
+    },
+  );
+
+  it(
     "records the branch's empty attribution commit and flips `committed` true once the board is " +
       "confirmed (anton-fc5x review round 3) — a board-only delivery otherwise leaves the branch " +
       "identical to its base, and the run's `step:pr` fails `gh pr create` on that empty diff",

@@ -46,6 +46,7 @@
 import {
   BOARD_EVIDENCE_PENDING_PREFIX,
   beads,
+  LABELS,
   REVIEW_SCORE_PREFIX,
   RUN_LEASE_PREFIX,
   STAGE_PREFIX,
@@ -87,7 +88,11 @@ function contentLabels(b: Bead): string[] {
  * status/title/description/labels, and would otherwise fingerprint as no change at all.
  * `acceptance_criteria` is included (anton-fc5x review round 3) for the same reason: `bd update
  * --acceptance` is a supported board-only write (bd-args.ts) that the list projection exposes under
- * this field (formula.integration.test.ts), and it touches neither status nor description. */
+ * this field (formula.integration.test.ts), and it touches neither status nor description.
+ * `external_ref` is included (anton-fc5x review round 4) for the same reason again: it is a real,
+ * persisted content field (`bd linear sync --push` / `beads.setExternalRef`), not anton's own
+ * bookkeeping, so a board-only ticket whose sole deliverable is attaching or changing a tracker
+ * reference must not fingerprint as unchanged. */
 export interface BoardFingerprint {
   readonly beads: ReadonlyMap<string, string>;
 }
@@ -108,6 +113,7 @@ function fingerprintOf(b: Bead): string {
     contentLabels(b),
     beads.parentOf(b) ?? null,
     normalizedDependencies(b),
+    b.external_ref ?? "",
   ]);
 }
 
@@ -153,6 +159,11 @@ export interface BoardEvidenceResult {
   /** Whether the sync pass confirmed those writes reached the remote (or, on a shared Dolt server,
    * that propagation is inherent) — meaningless when `found` is false. */
   synced: boolean;
+  /** The pre-dispatch board baseline could not be read (anton-fc5x review round 4) — a board-only
+   * ticket's classification came from the ticket/run-target label alone, so this is not "no board
+   * evidence", it is "no comparison could be made at all". Named separately so the operator note
+   * says which. */
+  baselineUnavailable?: boolean;
 }
 
 /**
@@ -177,9 +188,18 @@ export interface BoardEvidenceResult {
  * `readBoardBaseline` takes a fresh board read every attempt: a resumed ticket whose agent makes no
  * further writes (correctly — the prior attempt's writes already landed) would otherwise diff an
  * unchanged board against itself and report no evidence at all, even once the sync channel
- * recovers. The marker is best-effort in both directions — written when evidence is still
- * unconfirmed, cleared once it is — so a failed bookkeeping write costs a future retry's memory,
- * never this one's verdict.
+ * recovers.
+ *
+ * The marker is written whenever evidence is found, synced or not (anton-fc5x review round 4) — it
+ * is NOT cleared here just because the push confirmed synced. A confirmed sync is not the end of
+ * this ticket's handoff: the caller still has to record the attribution commit and close the bead,
+ * and either can fail after this point. Clearing the marker on "synced" alone would lose the only
+ * record of this evidence if the process dies (or one of those later steps fails) before settlement
+ * actually completes — a resumed attempt's fresh baseline would then silently absorb the change as
+ * "no evidence" and reject a delivery that already landed. The caller clears the marker explicitly,
+ * via {@link clearBoardEvidencePending}, only once the whole handoff has gone through. The write here
+ * is skipped when the marker already holds exactly this id set, so a retry that finds nothing new
+ * doesn't churn the label on every attempt.
  */
 export async function readBoardEvidence(
   repo: string,
@@ -195,12 +215,29 @@ export async function readBoardEvidence(
   const outcome = await beads.push(repo).catch(() => "not-wired" as const);
   const synced = outcome === "synced" || outcome === "shared-server";
   const stale = beads.boardEvidencePendingLabels(ticket);
-  if (synced) {
-    if (stale.length > 0) await beads.setBoardEvidencePending(repo, ticket.id, [], stale).catch(() => {});
-  } else {
+  if (stale.length !== 1 || stale[0] !== LABELS.boardEvidencePending(ids)) {
     await beads.setBoardEvidencePending(repo, ticket.id, ids, stale).catch(() => {});
   }
   return { found: true, ids, synced };
+}
+
+/**
+ * Release the pending marker once the handoff its evidence unblocked has actually completed —
+ * the attribution commit (if any) landed and the bead settled (anton-fc5x review round 4). Deliberately
+ * separate from {@link readBoardEvidence}, which only ever ADDS to the marker: only the ticket's own
+ * success path, after `finishTicket` returns without throwing, knows the handoff truly finished.
+ * Best-effort like every other write here — a failed clear costs a harmless extra comparison on the
+ * next board-only ticket that touches this bead, never a false verdict.
+ */
+export async function clearBoardEvidencePending(
+  repo: string,
+  ticketId: string,
+  ids: readonly string[],
+): Promise<void> {
+  if (ids.length === 0) return;
+  await beads
+    .setBoardEvidencePending(repo, ticketId, [], [LABELS.boardEvidencePending(ids)])
+    .catch(() => {});
 }
 
 /**
