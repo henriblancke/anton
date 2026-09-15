@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 431489e90027
+version: ad4498b495b9
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -206,7 +206,10 @@ edges — **not** board order, not creation order):
 # Some supported bd builds reject --status all, so merge their open and closed reads before sorting.
 node <<'NODE_EOF'
 const { execFileSync } = require("node:child_process");
-const list = (args = []) => JSON.parse(execFileSync("bd", ["list", ...args, "--json", "--limit", "0"], { encoding: "utf8" }));
+// Some supported bd builds wrap the array in an envelope (`{ issues: [...] }` / `{ results: [...] }`)
+// instead of returning it bare — same normalization as the production parser (src/lib/beads/bd-json.ts).
+const asArray = (d) => (Array.isArray(d) ? d : (d && (d.issues ?? d.results ?? d.molecules)) ?? []);
+const list = (args = []) => asArray(JSON.parse(execFileSync("bd", ["list", ...args, "--json", "--limit", "0"], { encoding: "utf8" })));
 let all;
 try {
   all = list(["--status", "all"]);

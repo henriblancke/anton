@@ -248,7 +248,10 @@ describe("required skill assets", () => {
       chmodSync(bd, 0o755);
 
       try {
-        const command = shape.match(/node -e '\n([\s\S]*?)\n'/)?.[1];
+        // The script is embedded as a heredoc (`node <<'NODE_EOF' ... NODE_EOF`), not a single-quoted
+        // `node -e '...'`, because its own source contains single quotes bash would otherwise close
+        // early on (PR #274 review).
+        const command = shape.match(/node <<'NODE_EOF'\n([\s\S]*?)\nNODE_EOF/)?.[1];
         expect(command).toBeDefined();
         const audit = spawnSync("node", ["-e", command!], {
           cwd: temp,

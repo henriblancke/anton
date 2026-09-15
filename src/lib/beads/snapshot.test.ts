@@ -75,18 +75,63 @@ describe("issue snapshots", () => {
     expect(issueSnapshotVersion("/b")).toBe(bVersion);
   });
 
-  it("carries cycle evidence forward across a refresh with identical content that didn't ask for it", async () => {
-    // Cycle evidence is a WeakMap sidecar keyed on array identity (cycle-evidence.ts), so a fresh
-    // array from an ordinary refresh never inherits it on its own — even when the graph it describes
-    // hasn't changed. Without carrying it forward, an evidence-bearing snapshot loses its evidence on
-    // the very next unrelated TTL refresh.
+  it("keeps the retained array's identity across a refresh with identical content that didn't ask for it", async () => {
+    // Cycle evidence is a WeakMap sidecar keyed on array identity (cycle-evidence.ts). An ordinary
+    // refresh whose content hasn't changed must reuse the retained array rather than latch a
+    // fresh-but-identical one (PR #274 review round 9): a concurrent cycle probe racing this refresh
+    // may already hold a reference to the retained array and attach evidence to THAT object, and
+    // swapping in a new object here would silently discard that attachment even though the probe
+    // reported success. Reusing identity means evidence attached to the retained array — before,
+    // during, or after this refresh — stays visible.
     const first = await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
     attachCycleEvidence(first, [{ ids: ["a"], raw: {} }]);
 
     const second = await refreshIssueSnapshot("/repo", async () => [bead("a")], 200);
 
-    expect(second).not.toBe(first);
+    expect(second).toBe(first);
     expect(cycleEvidenceFor(second)).toEqual([{ ids: ["a"], raw: {} }]);
+  });
+
+  it("does not discard evidence a concurrent probe attached to the retained array while an unrelated refresh was in flight", async () => {
+    // Reproduces the board/route.ts poll race (PR #274 review): probeAllIssues (an ordinary,
+    // cycles-blind refresh) and probeCycleEvidence (which attaches evidence to whatever array
+    // getIssueSnapshot handed it) fire together. If the ordinary refresh replaced the retained array
+    // even on unchanged content, evidence the probe attached to the now-discarded old array would
+    // never surface through the entry again.
+    const retained = await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+
+    let resolveRefresh!: (beads: Bead[]) => void;
+    const refresh = refreshIssueSnapshot(
+      "/repo",
+      () => new Promise<Bead[]>((resolve) => (resolveRefresh = resolve)),
+      200,
+    );
+
+    // The probe attaches evidence to the array it read BEFORE the in-flight refresh resolves —
+    // exactly the object `retained` points to, since the entry hasn't moved yet.
+    attachCycleEvidence(retained, [{ ids: ["a"], raw: {} }]);
+
+    resolveRefresh([bead("a")]);
+    const next = await refresh;
+
+    expect(next).toBe(retained);
+    expect(cycleEvidenceFor(next)).toEqual([{ ids: ["a"], raw: {} }]);
+  });
+
+  it("carries evidence the refresh itself fetched onto the retained array's identity", async () => {
+    // Mirrors `refreshAllIssues({ withCycles: true })`: the loader's own result already carries
+    // evidence attached to a freshly-allocated array. Content is unchanged, so the retained array's
+    // identity is kept — the fresh evidence must be copied onto it rather than dropped along with
+    // the array it arrived on.
+    await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+
+    const withEvidence = await refreshIssueSnapshot(
+      "/repo",
+      async () => attachCycleEvidence([bead("a")], [{ ids: ["a"], raw: {} }]),
+      200,
+    );
+
+    expect(cycleEvidenceFor(withEvidence)).toEqual([{ ids: ["a"], raw: {} }]);
   });
 
   it("does not carry stale cycle evidence forward once the graph content actually changes", async () => {

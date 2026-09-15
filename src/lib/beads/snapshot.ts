@@ -229,22 +229,30 @@ export function refreshIssueSnapshot(
       // A cold entry has no board to differ FROM, so the first read of a repo sets the baseline
       // rather than announcing a move nobody made.
       const moved = entry.serialized !== null && entry.serialized !== serialized;
-      // Identical graph content: this fresh array (the cycle sidecar is WeakMap-keyed on array
-      // identity, so a new array never inherits it) still describes the same graph the retained
-      // evidence was read for, so carry it forward. Without this, an ordinary refresh that never
-      // asked for cycles drops previously-attached evidence on every poll even when nothing
-      // changed, forcing the next evidence probe to re-spawn `bd dep cycles` and bump the version
-      // for no real change.
+      // Identical graph content: keep the RETAINED array's identity instead of latching this fresh
+      // one (PR #274 review round 9 on this file). The cycle sidecar is WeakMap-keyed on array
+      // identity, so a concurrent cycle probe/attach racing this refresh (board/route.ts fires both
+      // on every poll) may already hold a reference to the retained array and attach its evidence to
+      // THAT object; swapping in a new-but-identical array here would silently discard that
+      // attachment, leaving the entry evidence-less even though the probe reported success and
+      // bumped the version. Reusing the retained array when nothing moved means any evidence
+      // attached to it — before, during, or after this refresh — stays visible through `entry.beads`.
+      const nextBeads = moved || !entry.beads ? beads : entry.beads;
       const hadEvidence = entry.beads ? cycleEvidenceFor(entry.beads) !== undefined : false;
-      if (!moved && entry.beads && cycleEvidenceFor(beads) === undefined) {
-        const evidence = cycleEvidenceFor(entry.beads);
-        if (evidence !== undefined) attachCycleEvidence(beads, evidence);
+      // This exact load may itself carry fresh evidence (a `withCycles` loader, e.g.
+      // `refreshAllIssues({ withCycles: true })`, attaches it to `beads` before this `.then` runs).
+      // When we kept the retained array's identity above, that evidence lives on a different, since-
+      // discarded object unless copied across — so back it onto `nextBeads` rather than silently
+      // dropping a fetch this very call paid for.
+      if (nextBeads !== beads && !hadEvidence) {
+        const freshEvidence = cycleEvidenceFor(beads);
+        if (freshEvidence !== undefined) attachCycleEvidence(nextBeads, freshEvidence);
       }
       // Evidence becoming available where the retained snapshot had none is also a reason to bump,
       // even when the bead content itself is unchanged — a `withCycles` refresh that finally lands
       // real evidence after a prior attempt degraded must give a stuck poller a fresh token, not
       // wait for unrelated content to change too (mirrors `markCycleEvidenceRecovered`'s reasoning).
-      const evidenceRecovered = !hadEvidence && cycleEvidenceFor(beads) !== undefined;
+      const evidenceRecovered = !hadEvidence && cycleEvidenceFor(nextBeads) !== undefined;
       if (entry.serialized !== serialized || evidenceRecovered) entry.version += 1;
       // Content actually differing is a graph change regardless of whether anything called
       // `invalidateIssueSnapshot` — a shared-server board can move from another machine's write, and
@@ -252,7 +260,7 @@ export function refreshIssueSnapshot(
       // in flight against the pre-refresh graph keeps coalescing onto the replaced board (see
       // {@link issueSnapshotGeneration}).
       if (moved) entry.generation += 1;
-      entry.beads = beads;
+      entry.beads = nextBeads;
       entry.serialized = serialized;
       entry.loadedAt = now;
       // This read started after (and its generation matches) the write, so it reflects it — the
@@ -260,7 +268,7 @@ export function refreshIssueSnapshot(
       entry.pendingWrite = false;
       // Announced AFTER the entry has taken the new board, so a listener that reads back sees it.
       if (moved) announceBoardChange(cwd);
-      return beads;
+      return nextBeads;
     })
     .finally(() => {
       if (entry.refresh === refresh) entry.refresh = null;

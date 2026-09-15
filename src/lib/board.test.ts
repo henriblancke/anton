@@ -1060,7 +1060,12 @@ describe("hygiene report on the board (anton-uwal)", () => {
   }
 
   beforeEach(() => {
-    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "Loose task" })]);
+    // A fresh array on every call, matching real `bd list` (always a new `JSON.parse` per spawn):
+    // several tests below call `resetIssueSnapshots()` mid-test to simulate a full reload, and
+    // `getBoard` always asks for cycle evidence — a REUSED array reference would let evidence
+    // attached to it on an earlier "load" (the WeakMap sidecar is identity-keyed, untouched by
+    // reset) silently carry over into a later one that never actually re-fetched it.
+    listMock.mockImplementation(async () => [makeBead({ id: "t-1", title: "Loose task" })]);
   });
 
   it("carries the latest patrol report in the board payload", async () => {
@@ -1953,7 +1958,10 @@ describe("the generation a drawn pick is named by (anton-f12y)", () => {
     // the veto routes different names for one pick — and move the freshness token, so no poll on a
     // quiet board would ever 304 again.
     const board = [feature()];
-    listMock.mockResolvedValue(board);
+    // A fresh array each call (mirrors real `bd list`): the reset below simulates a full reload, and
+    // a reused reference would let cycle evidence from the first load's WeakMap attachment (identity-
+    // keyed, untouched by reset) leak into the second load that never actually re-fetched it.
+    listMock.mockImplementation(async () => [...board]);
 
     const first = await getBoard(project);
     resetIssueSnapshots();

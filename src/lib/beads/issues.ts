@@ -5,6 +5,7 @@ import {
   getIssueSnapshot,
   hydrateIssueSnapshot,
   issueSnapshotGeneration,
+  issueSnapshotVersion,
   markCycleEvidenceRecovered,
   probeIssueSnapshot,
   readIssueSnapshot,
@@ -266,6 +267,13 @@ export async function readAllIssues(
   // board would lose the sidecar that pure approval projections consume.
   if (opts?.withCycles && cycleEvidenceFor(snapshot.beads) === undefined) {
     await attachCyclesBestEffort(cwd, snapshot.beads);
+    // `snapshot.version` was captured atomically with `snapshot.beads` ABOVE, before this recovery
+    // could bump it (`attachCyclesBestEffort` → `markCycleEvidenceRecovered`) — so a caller that
+    // stamps a response with it (getBoard) would understate its own version relative to what
+    // `issueSnapshotVersion` reports moments later, and the very next poll (comparing against that
+    // fresher number) would never match and re-fetch a board that hasn't actually changed since.
+    // Re-read it so the version we hand back describes the exact (now-enriched) board being returned.
+    return { beads: snapshot.beads, version: issueSnapshotVersion(cwd) };
   }
   return snapshot;
 }
@@ -305,6 +313,12 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
       // resolved gate's `blocks` edge as still dangling and open. See `hydrateIssueSnapshot`.
       const generation = issueSnapshotGeneration(cwd);
       const hydrated = dedupeById([...board, ...await loadGateIssues(cwd, true, dangling)]);
+      // `dedupeById` allocates a new array, and the cycle sidecar is WeakMap-keyed on array identity
+      // (cycle-evidence.ts) — so a caller combining `withCycles` and `strictGates` would otherwise
+      // lose the evidence just attached to `board` above the moment this branch rebuilds it (PR #274
+      // review). Re-attach onto the rebuilt array before it's cached or returned.
+      const cycles = cycleEvidenceFor(board);
+      if (cycles !== undefined) attachCycleEvidence(hydrated, cycles);
       hydrateIssueSnapshot(cwd, hydrated, generation);
       return hydrated;
     }

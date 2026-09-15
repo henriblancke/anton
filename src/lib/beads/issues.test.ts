@@ -353,6 +353,30 @@ describe("loadAllIssues", () => {
     expect(approvalBoard.map((b) => b.id).sort()).toEqual(["g-1", "t-1"]);
   });
 
+  it("keeps cycle evidence attached when the strictGates hydration branch rebuilds the array (PR #274 review)", async () => {
+    // Same race as above, but this caller also asks for `withCycles`. The concurrent non-strict
+    // refresh wins the shared loader with a gate-less, cycle-less board; this caller then attaches
+    // cycle evidence directly onto that shared board (the `withCycles` block above the strictGates
+    // one) before the strictGates branch rebuilds a NEW array via `dedupeById` to fold in the
+    // recovered gate. `dedupeById` allocates a fresh array, and the cycle sidecar is WeakMap-keyed
+    // on identity, so without re-attaching, the evidence just fetched is silently dropped from both
+    // this function's return value and the retained snapshot it hydrates.
+    listMock.mockImplementationOnce(async () => [target]); // the one shared work read
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // the shared loader's own (non-strict) gate read — degrades, swallowed
+    listMock.mockImplementationOnce(async () => [gate]); // this call's own strict re-fetch — succeeds
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { withCycles: true, strictGates: true });
+
+    const [, approvalBoard] = await Promise.all([ordinary, approval]);
+
+    expect(approvalBoard.map((b) => b.id).sort()).toEqual(["g-1", "t-1"]);
+    expect(cycleEvidenceFor(approvalBoard)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+  });
+
   it("still throws under strictGates when the shared board is degraded and the re-fetch fails too", async () => {
     listMock.mockImplementationOnce(async () => [target]);
     listMock.mockImplementationOnce(async () => {
