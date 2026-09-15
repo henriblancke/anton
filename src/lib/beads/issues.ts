@@ -2,7 +2,6 @@ import { beads, type Bead, type DepCycle } from "./bd";
 import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import {
   getBeadDescription,
-  getIssueSnapshot,
   hydrateIssueSnapshot,
   issueSnapshotGeneration,
   issueSnapshotVersion,
@@ -415,11 +414,14 @@ export function probeCycleEvidence(cwd: string): void {
     cwd,
     (async () => {
       try {
-        const board = await getIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, {
+        // Read via `readIssueSnapshot`, not `getIssueSnapshot` + a follow-up `issueSnapshotGeneration`
+        // call: the two reads aren't atomic, so a concurrent refresh landing in the gap could hand back
+        // a `board` and a `generation` describing two different graphs (PR #274 review, round 8) — the
+        // same hazard `allIssues`/`readAllIssues` above were fixed for.
+        const { beads: board, generation } = await readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, {
           blockOnPendingWrite: false,
         });
         if (cycleEvidenceFor(board) !== undefined) return;
-        const generation = issueSnapshotGeneration(cwd);
         const cycles = await fetchCyclesShared(cwd, generation);
         // Recheck evidence: a concurrent `attachCyclesBestEffort` sharing this fetch (or a probe
         // that beat this one to it) may already have attached it — and bumped the version — while
