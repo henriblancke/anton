@@ -1067,25 +1067,34 @@ async function readAnnotatedSignals(
     );
   }
 
+  // Canonicalized once, up front: every filter below classifies an absolute signal `FilePath`
+  // against this root via `insideRepo`'s plain `path.relative`, which is lexical and never resolves
+  // symlinks itself. `listNestedWorktrees` already resolves the same repo for its own comparison, so
+  // a `repoPath` handed in as a symlink (or a macOS `/tmp` vs `/private/tmp` spelling) would otherwise
+  // make a real nested-worktree signal's canonical absolute path compare as outside the repo and
+  // survive every filter here. Falls back to the given path, matching `listNestedWorktrees`'s own
+  // `realpath` failure handling, since a repo that no longer resolves shouldn't block the whole scan.
+  const resolvedRepoPath = await realpath(repoPath).catch(() => repoPath);
+
   // Nested-worktree signals first, over every collector: a phantom path is never worth the cost the
   // filters below pay to read its content. `scan()` already excluded these paths from the walk
   // itself, so this is now a backstop rather than the primary defense — `opts.nested` is the union
   // of scan()'s pre- and post-scan enumerations, not just its first (pre-scan) result, so a worktree
   // created mid-scan is still caught here even though it slipped stringer's `--exclude`.
-  const { kept: real, worktree } = await dropWorktreeSignals(repoPath, signals, opts.nested);
-  const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, real);
+  const { kept: real, worktree } = await dropWorktreeSignals(resolvedRepoPath, signals, opts.nested);
+  const { kept: tracked, untracked } = await dropUntrackedSignals(resolvedRepoPath, real);
   // Secrets next, while the githygiene findings are together: it reads the flagged line, so it
   // should never be paid for a finding the index already contradicted.
-  const { kept: unfaked, secrets } = await filterSecretSignals(repoPath, tracked);
+  const { kept: unfaked, secrets } = await filterSecretSignals(resolvedRepoPath, tracked);
   // Coupling after that: it reads the source of the modules a signal names, so it should never be
   // paid for a finding the index already contradicted.
-  const { kept: coupled, coupling } = await filterCouplingSignals(repoPath, unfaked);
+  const { kept: coupled, coupling } = await filterCouplingSignals(resolvedRepoPath, unfaked);
   // Same reason, same order: reading the source at a reported clone window is only worth paying for
   // a finding the index hasn't already contradicted.
-  const { kept: deduped, duplication } = await filterDuplicationSignals(repoPath, coupled);
+  const { kept: deduped, duplication } = await filterDuplicationSignals(resolvedRepoPath, coupled);
   // Deadcode last: one `git grep` per symbol is cheap but not free, so it runs over only what every
   // cheaper filter left.
-  const { kept, deadcode } = await filterDeadcodeSignals(repoPath, deduped, {
+  const { kept, deadcode } = await filterDeadcodeSignals(resolvedRepoPath, deduped, {
     exclude: opts.exclude,
     abort: opts.abort,
   });

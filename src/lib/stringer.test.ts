@@ -10,7 +10,9 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -994,6 +996,30 @@ describe("scan", () => {
       ]);
       const written = JSON.parse(readFileSync(join(dir, "scan.json"), "utf8")) as { FilePath: string }[];
       expect(written.map((s) => s.FilePath)).toEqual(["src/app.ts"]);
+    });
+
+    // PR #295 review (thread on stringer.ts:975): `insideRepo` compares an absolute signal path
+    // against `repoPath` with plain lexical `path.relative`, which never resolves symlinks itself.
+    // A collector reports a signal's `FilePath` as a canonical absolute path, so a `repoPath` handed
+    // in as a symlink made every nested-worktree signal compare as outside the repo and survive this
+    // filter -- exactly the class of phantom finding this whole describe block exists to drop.
+    it("drops a nested-worktree signal reported as a canonical absolute path, even when repoPath is a symlink", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/sym-wt");
+      const canonicalRepo = realpathSync(repo);
+      const repoLink = join(dir, "repo-link");
+      symlinkSync(canonicalRepo, repoLink);
+
+      const absoluteNestedPath = join(canonicalRepo, ".worktrees", "sym-wt", "src", "app.ts");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding(absoluteNestedPath),
+      ]);
+
+      const result = await scan({ repoPath: repoLink, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(0);
+      expect(result.worktree.dropped).toEqual([
+        { path: join(".worktrees", "sym-wt", "src", "app.ts"), kind: "todo", severity: expect.any(String) },
+      ]);
     });
 
     it("leaves a directory that only looks like a worktree, and a same-named file, untouched", async () => {
