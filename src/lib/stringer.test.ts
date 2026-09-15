@@ -25,6 +25,7 @@ import {
   STRINGER_BIN_ENV,
   describeCollectorFailure,
   describeUntrackedFilter,
+  describeWorktreeFilter,
   extractSignals,
   formatTimeout,
   parseCollectorFailures,
@@ -806,6 +807,143 @@ describe("scan", () => {
     });
   });
 
+  // anton-bqge fixed this for `.claude/worktrees/`; anton-fj1q generalizes it to a worktree checked
+  // out at ANY in-repo path, derived from `git worktree list` rather than a directory name list —
+  // the 2026-09-10 scan of this repo spent 759 of 894 signals on one checked out at `.worktrees/`.
+  describe("signals from a nested git worktree", () => {
+    /** A real git repo with a real nested worktree checked out at `sub` (repo-relative). */
+    function initRepoWithWorktree(files: Record<string, string>, sub: string): string {
+      const repo = join(dir, "repo");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      for (const [name, body] of Object.entries(files)) {
+        mkdirSync(join(repo, name, ".."), { recursive: true });
+        writeFileSync(join(repo, name), body, "utf8");
+      }
+      run("add", "-A");
+      run("commit", "-qm", "init");
+      run("worktree", "add", "-q", "-b", "wt-branch", sub);
+      return repo;
+    }
+
+    const finding = (path: string, source = "todos", kind = "todo") => ({
+      Source: source,
+      Kind: kind,
+      FilePath: path,
+      Title: `finding at ${path}`,
+    });
+
+    it("drops signals under a worktree checked out at a non-.claude path, whatever collector reported them", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr252-threads");
+      // The nested checkout is a real copy of the tracked tree, so the same file exists at both paths.
+      mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+      writeFileSync(join(repo, ".worktrees/pr252-threads/src/app.ts"), "export {};\n", "utf8");
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding("src/app.ts", "complexity", "high-complexity"),
+        finding(".worktrees/pr252-threads/src/app.ts", "complexity", "high-complexity"),
+        finding(".worktrees/pr252-threads/src/app.ts", "duplication", "code-clone"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/app.ts" }]);
+      expect(result.worktree.worktrees).toEqual([join(".worktrees", "pr252-threads")]);
+      expect(result.worktree.dropped).toEqual([
+        {
+          path: join(".worktrees", "pr252-threads", "src", "app.ts"),
+          kind: "high-complexity",
+          severity: expect.any(String),
+        },
+        {
+          path: join(".worktrees", "pr252-threads", "src", "app.ts"),
+          kind: "code-clone",
+          severity: expect.any(String),
+        },
+      ]);
+      const written = JSON.parse(readFileSync(join(dir, "scan.json"), "utf8")) as { FilePath: string }[];
+      expect(written.map((s) => s.FilePath)).toEqual(["src/app.ts"]);
+    });
+
+    it("leaves a directory that only looks like a worktree, and a same-named file, untouched", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr252-threads");
+      writeFileSync(join(repo, "worktrees.ts"), "export const x = 1;\n", "utf8");
+      mkdirSync(join(repo, "src/lib/worktrees"), { recursive: true });
+      writeFileSync(join(repo, "src/lib/worktrees/index.ts"), "export {};\n", "utf8");
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding("worktrees.ts"),
+        finding("src/lib/worktrees/index.ts"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(2);
+      expect(result.worktree.dropped).toEqual([]);
+      expect(result.worktree.worktrees).toEqual([join(".worktrees", "pr252-threads")]);
+    });
+
+    it("scans a repo with no nested worktree exactly as it does today", async () => {
+      const repo = join(dir, "plain-repo");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      writeFileSync(join(repo, "src.ts"), "export {};\n", "utf8");
+      run("add", "-A");
+      run("commit", "-qm", "init");
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [finding("src.ts")]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.worktree).toEqual({ dropped: [], worktrees: [] });
+    });
+
+    it("counts everything and reports why when git worktree list cannot be asked", async () => {
+      const notARepo = join(dir, "loose-wt");
+      mkdirSync(notARepo, { recursive: true });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding(".worktrees/x/src/app.ts"),
+      ]);
+
+      const result = await scan({ repoPath: notARepo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.worktree.dropped).toEqual([]);
+      expect(result.worktree.unavailable).toBeTruthy();
+    });
+  });
+
+  describe("describeWorktreeFilter", () => {
+    it("says nothing when nothing was dropped", () => {
+      expect(describeWorktreeFilter({ dropped: [], worktrees: [] })).toBeUndefined();
+      expect(describeWorktreeFilter({ dropped: [], worktrees: [".worktrees/x"] })).toBeUndefined();
+    });
+
+    it("names the dropped paths and the nested worktree(s) they sit under", () => {
+      const line = describeWorktreeFilter({
+        worktrees: [".worktrees/pr252-threads"],
+        dropped: [
+          { path: ".worktrees/pr252-threads/src/app.ts", kind: "high-complexity", severity: "medium" },
+        ],
+      });
+      expect(line).toContain("1 signal(s)");
+      expect(line).toContain(".worktrees/pr252-threads");
+      expect(line).toContain("src/app.ts");
+    });
+
+    it("warns when git worktree list could not be read, without claiming anything was dropped", () => {
+      const line = describeWorktreeFilter({ dropped: [], worktrees: [], unavailable: "not a git repo" });
+      expect(line).toContain("not a git repo");
+      expect(line).toContain("counted this pass");
+    });
+  });
 
   // anton-r016: `githygiene`'s secret detector matches on the SHAPE of an assignment — a name
   // holding "PASSWORD" with a string on the right — so every fake credential in anton's own test

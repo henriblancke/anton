@@ -10,7 +10,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
 import { filterCouplingSignals, type CouplingFilter } from "./scan-coupling";
@@ -174,6 +174,12 @@ export interface ScanResult {
   signals: ScanSignal[];
   /** Collectors that died during the scan — their signals are silently absent from the JSON. */
   collectorFailures: CollectorFailure[];
+  /**
+   * What the nested-worktree filter removed from `signals` before anyone counted them — every
+   * collector's findings about a path inside another checkout of this same repo (see
+   * {@link dropWorktreeSignals}).
+   */
+  worktree: WorktreeFilter;
   /** What the untracked-file filter removed from `signals` before anyone counted them. */
   untracked: UntrackedFilter;
   /**
@@ -591,6 +597,127 @@ export function describeUntrackedFilter(filter: UntrackedFilter): string | undef
 }
 
 /**
+ * A git worktree checked out INSIDE the repo it scans is a second full copy of the tree: every real
+ * finding under it is also reported at its own path, so it must never reach triage. `.claude/**`
+ * already excludes Claude Code's own isolation worktrees (anton-bqge) from the walk, but a worktree
+ * at any OTHER in-repo path — `.worktrees/<name>/`, or wherever the next tool picks — was still
+ * walked in full (anton-fj1q: 759 of 894 signals in the 2026-09-10 scan of this repo).
+ *
+ * `git worktree list` is what actually distinguishes a second checkout from a directory that merely
+ * looks like one (`src/lib/worktrees/`, a file named `worktrees.ts`) — a name list has to be kept
+ * current by hand and misses the next tool; asking git what a worktree IS does not.
+ */
+export interface WorktreeFilter {
+  /** The signals dropped because they describe a path inside a nested worktree. */
+  dropped: DroppedSignal[];
+  /** The nested worktrees this scan found, repo-relative — whether or not they held any signals. */
+  worktrees: string[];
+  /**
+   * Why `git worktree list` could not be asked, when it couldn't be. Nothing is dropped in that
+   * case: a filter that can't enumerate worktrees must leave every signal in, so an unreadable repo
+   * under-filters rather than silently deleting findings.
+   */
+  unavailable?: string;
+}
+
+/**
+ * Every OTHER checkout of this repo, repo-relative. `git worktree list --porcelain` always reports
+ * the scanned checkout itself first, so that entry is never a nested worktree and is dropped; a path
+ * git names outside `repoPath` (a worktree of some other repo entirely — not possible in practice,
+ * but not this filter's claim to make) is dropped too.
+ *
+ * Resolved through `realpath` on both sides before comparing: git reports worktree paths with
+ * symlinks resolved, but `repoPath` itself may not be (a symlinked checkout, or — on macOS — a temp
+ * dir under `/var`, itself a symlink to `/private/var`). Comparing one resolved path against one
+ * unresolved path would find no common prefix at all and read every nested worktree as outside the
+ * repo, silently disabling the whole filter.
+ */
+async function listNestedWorktrees(repoPath: string): Promise<string[] | { unavailable: string }> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", repoPath, "worktree", "list", "--porcelain"],
+      { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+    );
+    const paths = stdout
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length).trim())
+      .filter(Boolean);
+    const resolvedRepo = await realpath(repoPath).catch(() => repoPath);
+    const nested: string[] = [];
+    for (const wt of paths.slice(1)) {
+      const resolvedWt = await realpath(wt).catch(() => wt);
+      const rel = relative(resolvedRepo, resolvedWt);
+      if (rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) nested.push(rel);
+    }
+    return nested;
+  } catch (err) {
+    return { unavailable: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Drop the signals describing a path inside another checkout of this same repo, and say how many.
+ * Runs BEFORE annotation, same as {@link dropUntrackedSignals} — a filter applied downstream of it
+ * would leave the trend charting findings the agent never saw.
+ *
+ * Unlike {@link dropUntrackedSignals} this runs over every collector's signals, not just
+ * `githygiene`'s: the 2026-09-10 scan of this repo split its phantom signals across complexity,
+ * patterns, duplication, coupling AND todos (759 of 894 total) — a nested worktree is never a valid
+ * finding for ANY collector on the tree that ships.
+ */
+async function dropWorktreeSignals(
+  repoPath: string,
+  signals: ScanSignal[],
+): Promise<{ kept: ScanSignal[]; worktree: WorktreeFilter }> {
+  const nested = await listNestedWorktrees(repoPath);
+  if (!Array.isArray(nested)) {
+    return { kept: signals, worktree: { dropped: [], worktrees: [], ...nested } };
+  }
+  if (nested.length === 0) return { kept: signals, worktree: { dropped: [], worktrees: [] } };
+
+  const dropped: DroppedSignal[] = [];
+  const kept = signals.filter((signal) => {
+    const path = repoRelativePath(repoPath, signal);
+    const under =
+      path !== undefined && nested.some((wt) => path === wt || path.startsWith(`${wt}${sep}`));
+    if (!under) return true;
+    dropped.push({ path: path as string, kind: kindOf(signal), severity: severityOfSignal(signal) });
+    return false;
+  });
+  return { kept, worktree: { dropped, worktrees: nested } };
+}
+
+/**
+ * What the worktree filter removed, and which nested checkouts it found; undefined when there is
+ * nothing to say (no nested worktree found, and nothing dropped).
+ */
+export function describeWorktreeFilter(filter: WorktreeFilter): string | undefined {
+  if (filter.unavailable) {
+    return (
+      `git worktree list could not be read (${filter.unavailable}) — findings under a nested ` +
+      `checkout, if any, are counted this pass`
+    );
+  }
+  if (filter.dropped.length === 0) return undefined;
+  const byPath = new Map<string, Set<string>>();
+  for (const { path, kind, severity } of filter.dropped) {
+    const kinds = byPath.get(path) ?? new Set<string>();
+    kinds.add(`${severity} ${kind}`);
+    byPath.set(path, kinds);
+  }
+  const entries = [...byPath].map(([path, kinds]) => `${path} (${[...kinds].join(", ")})`);
+  const shown = entries.slice(0, 10);
+  const rest = entries.length - shown.length;
+  return (
+    `dropped ${filter.dropped.length} signal(s) under ${filter.worktrees.length} nested worktree(s) ` +
+    `(${filter.worktrees.join(", ")}) about ${byPath.size} path(s): ${shown.join("; ")}` +
+    `${rest > 0 ? ` (+${rest} more)` : ""}`
+  );
+}
+
+/**
  * Read the scan stringer just wrote, stamp anton's derived severity onto every signal, and write it
  * back. Two guarantees ride on this one parse:
  *
@@ -614,6 +741,7 @@ async function readAnnotatedSignals(
   opts: { exclude: readonly string[]; abort?: AbortSignal },
 ): Promise<{
   signals: ScanSignal[];
+  worktree: WorktreeFilter;
   untracked: UntrackedFilter;
   coupling: CouplingFilter;
   duplication: DuplicationFilter;
@@ -649,7 +777,11 @@ async function readAnnotatedSignals(
     );
   }
 
-  const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, signals);
+  // Nested-worktree signals first, over every collector: a phantom path is never worth the cost the
+  // filters below pay to read its content, and this is the cheapest of the five (one `git worktree
+  // list`, no per-signal cost).
+  const { kept: real, worktree } = await dropWorktreeSignals(repoPath, signals);
+  const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, real);
   // Secrets next, while the githygiene findings are together: it reads the flagged line, so it
   // should never be paid for a finding the index already contradicted.
   const { kept: unfaked, secrets } = await filterSecretSignals(repoPath, tracked);
@@ -667,7 +799,7 @@ async function readAnnotatedSignals(
   });
   for (const signal of kept) annotateSignal(signal);
   await writeFile(scanFile, JSON.stringify(withSignals(parsed, kept)), "utf8");
-  return { signals: kept, untracked, coupling, duplication, secrets, deadcode };
+  return { signals: kept, worktree, untracked, coupling, duplication, secrets, deadcode };
 }
 
 /**
@@ -817,6 +949,7 @@ export async function scan(opts: {
     scanFile: opts.scanFile,
     signals: read.signals,
     collectorFailures: parseCollectorFailures(stderr),
+    worktree: read.worktree,
     untracked: read.untracked,
     coupling: read.coupling,
     duplication: read.duplication,
