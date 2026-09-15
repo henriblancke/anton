@@ -698,6 +698,19 @@ function isAbortError(err: unknown): boolean {
 }
 
 /**
+ * Normalizes an abort into an identity `isAbortError` recognizes, no matter what the signal's own
+ * `reason` carries. `AbortSignal.timeout()` sets `reason` to a `TimeoutError`, and a caller's own
+ * `abort(customReason)` can set it to anything -- neither satisfies `isAbortError`, so a probe
+ * racing {@link withBudget} against such a signal would reject with a value `listNestedWorktrees`
+ * can't recognize as cancellation, converting a real abort into a plain lookup failure
+ * ("unavailable") that can let an already-cancelled scan report success (PR #295 review).
+ */
+function toAbortError(reason: unknown): Error {
+  if (isAbortError(reason)) return reason as Error;
+  return new DOMException("This operation was aborted", "AbortError");
+}
+
+/**
  * Thrown by {@link withBudget} on deadline expiry (as opposed to the promise it's racing rejecting
  * on its own). Distinguished from a genuine filesystem lookup failure (ENOENT, EACCES, ...) so
  * callers can rethrow it like an abort instead of falling back to an unresolved path: falling back
@@ -722,13 +735,13 @@ function isDeadlineError(err: unknown): boolean {
  * waiting on it, which is the actual guarantee a deadline/abort makes to its caller.
  */
 function withBudget<T>(promise: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
-  if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("aborted", "AbortError"));
+  if (signal?.aborted) return Promise.reject(toAbortError(signal.reason));
   const remaining = deadline - Date.now();
   if (remaining <= 0) return Promise.reject(new ProbeDeadlineExceededError());
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => {
       clearTimeout(timer);
-      reject(signal?.reason ?? new DOMException("aborted", "AbortError"));
+      reject(toAbortError(signal?.reason));
     };
     const timer = setTimeout(() => {
       signal?.removeEventListener("abort", onAbort);
@@ -764,6 +777,11 @@ async function listNestedWorktrees(
   repoPath: string,
   opts: { timeoutMs: number; signal?: AbortSignal },
 ): Promise<string[] | { unavailable: string }> {
+  // Same "budget already spent" guard as githubToken's own `if (timeoutMs <= 0) return undefined`:
+  // without it, `Math.max(1, Math.min(30_000, opts.timeoutMs))` below floors the subprocess timeout
+  // at 1ms instead of skipping the spawn, so a call made after the deadline has already passed still
+  // shells out to `git worktree list` rather than reporting unavailable immediately (PR #295 review).
+  if (opts.timeoutMs <= 0) return { unavailable: "no time budget remaining for the nested-worktree lookup" };
   const deadline = Date.now() + Math.max(0, opts.timeoutMs);
   try {
     const { stdout } = await execFileAsync(
@@ -1202,24 +1220,34 @@ export async function scan(opts: {
   // short ANTON_STRINGER_TIMEOUT_MS be exceeded by another full lookup on top of it (anton-fj1q PR
   // #295 review).
   const env = { ...process.env };
+  // Tracks whichever preflight step actually ran last, so the deadline-exhaustion error below (if
+  // any) names the real culprit instead of always blaming `gh auth token`: when GITHUB_TOKEN is
+  // already set, or the budget is already gone before this step starts (githubToken's own
+  // `timeoutMs <= 0` guard then skips the spawn entirely), `gh` is never invoked and staying pinned
+  // to it points operators at the wrong CLI (PR #295 review).
+  let lastPreflightStep = "the nested-worktree lookup (git worktree list)";
   if (!env.GITHUB_TOKEN) {
-    const token = await githubToken(deadline - Date.now(), opts.signal);
-    if (token) env.GITHUB_TOKEN = token;
+    const tokenBudget = deadline - Date.now();
+    if (tokenBudget > 0) {
+      lastPreflightStep = "the gh auth token lookup";
+      const token = await githubToken(tokenBudget, opts.signal);
+      if (token) env.GITHUB_TOKEN = token;
+    }
   }
   // The lookup above can itself consume part of the outer deadline -- charge that against what's
   // left rather than handing stringer the full timeoutMs again, or a slow `gh auth token` lets the
   // whole scan overrun ANTON_STRINGER_TIMEOUT_MS by however long the lookup took.
   const remainingMs = deadline - Date.now();
   // execFile treats `timeout: 0` as "no timeout" (Node and Bun both), so a budget already
-  // exhausted by the token lookup must reject here instead of spawning stringer uncapped. This is
+  // exhausted by a preflight step must reject here instead of spawning stringer uncapped. This is
   // BEFORE the try below on purpose: stringer never ran, so the baseline is untouched and doesn't
   // need unwinding -- routing it through rejectWithBaselineRestored would risk turning a harmless
-  // credential-lookup timeout into a poison error if that (unneeded) restore itself failed.
+  // preflight timeout into a poison error if that (unneeded) restore itself failed.
   if (remainingMs <= 0) {
     // Not toScanError -- that formatter's message says stringer was killed, but stringer was
     // never spawned here; blaming it would send an operator chasing the wrong executable.
     throw new Error(
-      `gh auth token lookup consumed the scan's ${formatTimeout(timeoutMs)} deadline before stringer could start (no output written).`,
+      `${lastPreflightStep} consumed the scan's ${formatTimeout(timeoutMs)} deadline before stringer could start (no output written).`,
     );
   }
   let stderr = "";
