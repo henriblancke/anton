@@ -162,6 +162,23 @@ describe("loadAllIssues", () => {
     expect(cyclesMock).toHaveBeenCalledTimes(1);
   });
 
+  it("bumps the snapshot version when a synchronous retry recovers evidence a prior read missed", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockRejectedValueOnce(new Error("bd: dep cycles timed out"));
+
+    // First read warms the snapshot with no evidence attached (degraded, per the test above).
+    await allIssues(REPO, { withCycles: true });
+    const before = issueSnapshotVersion(REPO);
+
+    // A later read's retry succeeds — a poller that already matched `before` must see a new token,
+    // or it 304s the same empty-startability board until unrelated bead content changes.
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const board = await allIssues(REPO, { withCycles: true });
+
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+  });
+
   it("enriches a versioned board read before it reaches a policy projection", async () => {
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
     cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);

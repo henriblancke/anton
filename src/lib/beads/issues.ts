@@ -134,10 +134,17 @@ export async function loadAllIssues(
  * "can this be approved" answers rather than crashing the board. A caller that must NOT proceed on
  * stale/absent evidence uses `loadAllIssues` directly, which still lets `depCycles` reject (jobs
  * rely on that to retry — see execute-epic-start).
+ *
+ * Bumps the snapshot version on success (PR #274 review, round 4 on this file), same as
+ * {@link probeCycleEvidence}: without it, a page that rendered a cached board with no evidence and
+ * then recovers it here leaves the poll path's freshness token untouched, so a concurrent poller
+ * that already matched the pre-recovery version keeps 304-ing an empty-startability board until
+ * unrelated bead content changes.
  */
 async function attachCyclesBestEffort(cwd: string, board: Bead[]): Promise<void> {
   try {
     attachCycleEvidence(board, await beads.depCycles(cwd));
+    markCycleEvidenceRecovered(cwd);
   } catch (e) {
     console.warn(
       `[beads.issues] ${cwd}: dep cycles read failed — board stays readable without cycle evidence; ` +
