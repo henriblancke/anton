@@ -191,6 +191,16 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
   });
 
+  it("classifies a plural passive 'are discarded' work-loss finding", () => {
+    const note = "The queued jobs are discarded if processing fails, with no requeue and no log.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies a plural passive 'are silently discarded' work-loss finding", () => {
+    const note = "Both queue entries are silently discarded on an exception, losing the caller's submission.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
   it("does not classify a parsing bug as work-loss merely because an incidental noun is nearby", () => {
     const note = "While parsing a request, the first character is dropped when decoding a negative number.";
     expect(classifyFindingClass(finding(note))).toBe("other");

@@ -16,8 +16,8 @@ export type FindingClass = "fencing-toctou" | "cancellation" | "fail-open" | "wo
 type Matcher = RegExp | ((note: string) => boolean);
 
 /**
- * The passive "is discarded/lost/dropped", "lost/dropped after/when", and "silently drops" phrasings
- * say nothing about loss *of work* on their own — "the first character is dropped when parsing", "the
+ * The passive "is/are discarded/lost/dropped", "lost/dropped after/when", and "silently drops"
+ * phrasings say nothing about loss *of work* on their own — "the first character is dropped when parsing", "the
  * diagnostic context is lost after wrapping the error", or "the logger silently drops duplicate metric
  * labels" all match the words without describing a work-loss regression. They only count when a
  * work-bearing noun (job, task, queue, ...) or a retry/requeue signal is the verb's actual subject or
@@ -44,8 +44,9 @@ const DATA_LOSS_CONTEXT = new RegExp(
   `\\bdata loss\\b${CLAUSE_GAP}\\b(?:${WORK_LOSS_SUBJECT}|errors?)\\b|\\b(?:${WORK_LOSS_SUBJECT}|errors?)\\b${CLAUSE_GAP}\\bdata loss\\b`,
   "i",
 );
-const WORK_LOSS_VERB_AFTER = "(?:is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))";
-const WORK_LOSS_OBJECT_AFTER = "(?:is (?:silently )?(?:discarded|lost|dropped)|silently drops?)";
+const WORK_LOSS_VERB_AFTER =
+  "(?:(?:is|are) (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))";
+const WORK_LOSS_OBJECT_AFTER = "(?:(?:is|are) (?:silently )?(?:discarded|lost|dropped)|silently drops?)";
 const WORK_LOSS_SUBJECT_FIRST = new RegExp(`\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\b${WORK_LOSS_VERB_AFTER}\\b`, "gi");
 // The gap is captured so matchesWorkLossVerbFirst can reject it below when the noun belongs to an
 // intervening clause rather than to this verb.
