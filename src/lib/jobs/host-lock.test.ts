@@ -4,7 +4,7 @@
  * owner died. Lock names are unique per test because the lock root is a real shared /tmp directory.
  */
 import { describe, expect, it } from "vitest";
-import { mkdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -120,12 +120,24 @@ describe("withHostLock", () => {
     await utimes(dir, old, old);
 
     let ran = false;
-    // Short budget: this can only pass by reclaiming the orphan, not by polling out to maxWaitMs.
+    const start = Date.now();
+    // Large budget: a genuine reclaim finishes almost instantly. A regression to the old
+    // `holder?.token && retire(...)` short-circuit (which can never fire for a metadata-less
+    // holder) would instead fall through to the advisory wait-out-the-budget path, which a small
+    // maxWaitMs can't distinguish from success — so use a budget big enough that only a real
+    // reclaim finishes inside it.
     await withHostLock(name, async () => {
       ran = true;
-    }, { maxWaitMs: 200 });
+    }, { maxWaitMs: 5000 });
+    const elapsedMs = Date.now() - start;
 
     expect(ran).toBe(true);
+    expect(elapsedMs).toBeLessThan(1000);
+
+    // The reclaim path retires the orphan to a token-specific tombstone before re-acquiring the
+    // live path — a fingerprint the advisory fallback never produces, since it never touches `dir`.
+    const siblings = await readdir(LOCK_ROOT);
+    expect(siblings.some((entry) => entry.startsWith(`${name}.retired-`))).toBe(true);
   });
 
   it("does not steal a metadata-less lock dir still inside the stale window", async () => {
