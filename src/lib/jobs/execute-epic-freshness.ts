@@ -33,9 +33,22 @@ import { checkSelfFreshness, selfRepoRoot, type SelfFreshness } from "./self-fre
  * surfaces, and `staleBreaker` shows the stopped state in the app independent of the deferral.
  */
 export async function assertSelfCheckoutFresh(): Promise<void> {
-  const root = selfRepoRoot();
-  const refusal = staleCheckoutRefusal(await checkSelfFreshness(root), root);
+  const refusal = await selfCheckoutRefusal();
   if (refusal) throw new StaleCheckoutError(refusal);
+}
+
+/**
+ * The same verdict as a VALUE rather than a throw — what the runner's dispatch gate (anton-kqst)
+ * consults for every job type other than execute-epic.
+ *
+ * Extracted so the two gates cannot drift: the seam and this in-place preflight must refuse with the
+ * identical message, since it is the durable record on the row and the string
+ * {@link isStaleCheckoutDeferral} reads back. Returning the refusal instead of raising it is what
+ * lets the runner hold the answer behind its own window without catching an exception per job.
+ */
+export async function selfCheckoutRefusal(): Promise<string | undefined> {
+  const root = selfRepoRoot();
+  return staleCheckoutRefusal(await checkSelfFreshness(root), root);
 }
 
 /**

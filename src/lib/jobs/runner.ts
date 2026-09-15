@@ -14,6 +14,8 @@
  *   • Stale process          — `StaleCheckoutError` → recheck on a slow cadence, attempt refunded:
  *                              anton is behind its own code, so it defers new starts until it is
  *                              restarted on fresh code (anton-mh3c) rather than parking each job.
+ *                              Evaluated at the DISPATCH seam (anton-kqst), so it covers every job
+ *                              type rather than only the one that happens to gate itself.
  *
  * The decision logic (`nextAction`) is a pure function so it can be unit-tested without timers.
  * See DESIGN.md §4.
@@ -64,7 +66,9 @@ import {
   isStaleCheckoutError,
   isSyncNotWiredError,
   isUsageLimitError,
+  StaleCheckoutError,
 } from "./errors";
+import { selfCheckoutRefusal } from "./execute-epic-freshness";
 import { PollingLoop } from "./polling-loop";
 import {
   JOB_TYPE_TIER,
@@ -97,6 +101,17 @@ export interface RunnerConfig {
    * deferred row waits before the fresh process leases it.
    */
   staleCheckoutRetryMs: number;
+  /**
+   * How long one self-freshness verdict is reused across dispatches (anton-kqst). The gate runs at
+   * the dispatch seam, so it is asked once per JOB rather than once per run — and `gate-check` alone
+   * dispatches on the order of twelve thousand times, each of which would otherwise pay a `git
+   * fetch`. The verdict only moves when someone merges or an operator pulls/reinstalls, so holding it
+   * for a window costs nothing but bounds the check at one read per window per machine.
+   *
+   * Must be at least one poll interval (`tickMs`) for the bound to mean anything; the default matches
+   * `BREAKER_POLL_MS`, the cadence the board already reads the same verdict on.
+   */
+  staleCheckoutVerdictMs: number;
   /**
    * Recheck cadence for a run refused because its routing changed after budget admission (see
    * `RouteAdmissionStaleError`). Short, unlike the other soft-reschedule cadences above: the
@@ -135,6 +150,7 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   quotaCooloffMs: 30 * 60_000,
   notWiredRetryMs: 5 * 60_000,
   staleCheckoutRetryMs: 5 * 60_000,
+  staleCheckoutVerdictMs: 60_000,
   routeRevalidationRetryMs: 10_000,
   maxConcurrent: 1,
   maxReviewFixConcurrent: 1,
@@ -169,6 +185,17 @@ export interface JobPolicy {
   /** Max attempts before the job is parked for a human. */
   maxAttempts: number;
 }
+
+/**
+ * How the runner learns anton is behind its own latest code (anton-kqst) — the refusal message, or
+ * undefined when the process is current.
+ *
+ * Injected rather than imported so the gate is a runner-level concern with a test seam, like every
+ * other environment read here: the default fires a `git fetch` and reads the lockfile, node_modules,
+ * the boot build identity and anton.db, none of which a unit suite driving a fake handler should pay
+ * for or depend on.
+ */
+export type SelfFreshnessReader = () => Promise<string | undefined>;
 
 /** Resolve a project's job policy. May be async (reads settings from the DB). */
 export type JobPolicyResolver = (
@@ -623,6 +650,16 @@ export class JobRunner {
   private readonly resolveProjectMeterKey: ProjectMeterKeyResolver | null;
   private readonly liveRunCheck: LiveRunCheck | null;
   private readonly readBeadLabels: BeadLabelsReader | null;
+  private readonly readSelfCheckoutRefusal: SelfFreshnessReader;
+  /**
+   * The last self-freshness verdict and when it SETTLED — the window that keeps the dispatch gate
+   * (anton-kqst) at one read per `staleCheckoutVerdictMs` instead of one per job. `pass` is the
+   * in-flight read, so the jobs of a single tick share one evaluation rather than starting a fetch
+   * each: dispatch is concurrent (rolling dispatch leases up to `maxConcurrent` in one go), and
+   * without it the very first tick after boot would fan out a read per leased job before any of them
+   * had settled a verdict to reuse.
+   */
+  private staleVerdict: { at: number; pass: Promise<string | undefined> } | null = null;
   private readonly readUsage: () => Promise<ClaudeUsage | null>;
   private readonly readUsageFresh: () => Promise<ClaudeUsage | null>;
   /** Last logged value-gate hold set (sorted ids) — logs only on change, not every 2s tick. */
@@ -700,6 +737,13 @@ export class JobRunner {
      */
     readBeadLabels?: BeadLabelsReader;
     /**
+     * Whether anton is running behind its own latest code (anton-kqst). Consulted at the dispatch
+     * seam for every job type except `execute-epic`, which gates itself in place. Defaults to the
+     * real self-freshness verdict; injectable so a suite can drive a stale process without a git
+     * remote, and so no unit suite pays for a `git fetch` against the tree it runs in.
+     */
+    readSelfCheckoutRefusal?: SelfFreshnessReader;
+    /**
      * Cached Claude-usage reader for the budget governor. Defaults to the shared, cached read so
      * per-tick bursts collapse to one upstream fetch. Injectable for deterministic tests.
      */
@@ -726,6 +770,7 @@ export class JobRunner {
     this.resolveProjectMeterKey = deps.resolveProjectMeterKey ?? null;
     this.liveRunCheck = deps.liveRunCheck ?? null;
     this.readBeadLabels = deps.readBeadLabels ?? null;
+    this.readSelfCheckoutRefusal = deps.readSelfCheckoutRefusal ?? selfCheckoutRefusal;
     this.readUsage = deps.readUsage ?? getClaudeUsageCached;
     this.readUsageFresh = deps.readUsageFresh ?? getClaudeUsageFresh;
     this.loop = new PollingLoop({
@@ -1605,6 +1650,52 @@ export class JobRunner {
     return cost;
   }
 
+  /**
+   * The checkout-staleness gate, at the seam every job type passes through (anton-kqst).
+   *
+   * anton running behind its own latest code is a property of the PROCESS, not of one job type — so
+   * work dispatched on it ships stale code (or queries a schema that code has outgrown) whatever the
+   * type. The gate used to live inside `execute-epic` alone, which left the other nine dispatching
+   * unguarded; `unstick` is the one that actually broke on 2026-09-10, in two projects.
+   *
+   * Returns the refusal to defer on, or undefined to dispatch. Called for every type EXCEPT
+   * `execute-epic` — the caller skips it synchronously, see the call site for why.
+   *
+   * `sync-push` is NOT exempt: its commit is already durable locally, so a deferral costs only
+   * publication latency that the operator's restart ends — while a stale process pushing through
+   * superseded sync code writes to a board every machine shares.
+   *
+   * The verdict is held for `staleCheckoutVerdictMs` rather than read per job, and the clean path
+   * spawns nothing beyond that one read per window: the refusal is a plain value, so a dispatch costs
+   * a map lookup and a comparison. A reader that THROWS fails open — dispatching on a check that
+   * never answered is the {@link staleCheckoutRefusal} rule (an offline runner is not a stale one),
+   * and a gate that grounded every job on its own failure would be a worse outage than the one it
+   * guards against.
+   */
+  private async staleCheckoutHold(): Promise<string | undefined> {
+    const held = this.staleVerdict;
+    // A verdict inside the window is reused — settled or still in flight, so the jobs of one tick
+    // share a single read rather than starting a fetch each.
+    if (held && this.clock.now() - held.at < this.config.staleCheckoutVerdictMs) return await held.pass;
+
+    const pass = this.readSelfCheckoutRefusal().catch((e) => {
+      this.log.error("self-freshness read failed; dispatching anyway", e);
+      return undefined;
+    });
+    const entry = { at: this.clock.now(), pass };
+    this.staleVerdict = entry;
+    try {
+      return await pass;
+    } finally {
+      // Re-armed from when the read SETTLED, not when it started, so a slow read does not hand the
+      // next caller a verdict that has already spent most of its own window. Awaiting `pass` (this
+      // call's own read) rather than re-reading `this.staleVerdict` is what keeps the answer the one
+      // this call armed: a concurrent caller whose window lapsed mid-read may have replaced the
+      // field, and returning that instead would block this job on an unrelated later read.
+      entry.at = this.clock.now();
+    }
+  }
+
   private async processJob(job: JobRow, admittedMeterKey: string | undefined): Promise<void> {
     const handler = this.handlers.get(job.type as JobType);
     const controller = new AbortController();
@@ -1695,6 +1786,25 @@ export class JobRunner {
       // What the handler reported it did — carried to `settle` so only a COMPLETED job records it.
       let effect: JobEffect | undefined;
       try {
+        // The staleness gate, before anything this attempt could do (anton-kqst). Raised as the
+        // error the durability policy already knows, so the deferral IS the existing contract —
+        // rescheduled on the slow cadence with the attempt refunded and the refusal kept on the row
+        // as `lastError` — rather than a second mechanism that could drift from it.
+        //
+        // `execute-epic` is exempt, and the check is SYNCHRONOUS so its dispatch path adds not even
+        // an awaited no-op. Two reasons, both load-bearing:
+        //   • It gates itself in `prepareEpicRun`, whose gate sits AFTER the completion
+        //     short-circuit on purpose — a target already carried to its pull request must settle
+        //     idempotently rather than be grounded by a staleness with nothing left to run. A gate
+        //     here, ahead of the handler, would defer exactly that settlement.
+        //   • Its handler charges the project's spend meter from inside `ctx.claudeReached`, so the
+        //     await sequence between dispatch and that call is observable to anything watching the
+        //     row (PR #248's cancel accounting reads it mid-flight). Adding a hop for a type that
+        //     answers `undefined` anyway would change that ordering for no gate at all.
+        if (job.type !== "execute-epic") {
+          const stale = await this.staleCheckoutHold();
+          if (stale) throw new StaleCheckoutError(stale);
+        }
         if (!handler) throw new Error(`no handler registered for job type "${job.type}"`);
         const ctx: JobContext = {
           jobId: job.id,
