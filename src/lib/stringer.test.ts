@@ -1059,6 +1059,44 @@ describe("scan", () => {
       expect(result.signals).toHaveLength(1);
       expect(result.worktree).toEqual({ dropped: [], worktrees: [] });
     });
+
+    // PR #295 review (thread on stringer.ts:684): `should_prune_worktree` never reports `prunable`
+    // for a LOCKED worktree — this repo locks its own (worktree.ts:485-491) — so the prunable check
+    // alone misses this case. If a locked worktree is deleted outside git and its path reused as an
+    // ordinary tracked directory, the stale registration must still be recognized as dead by checking
+    // for a live checkout marker (a `.git` file), not just the absence of `prunable`.
+    it("does not exclude a path whose worktree registration is locked but no longer a checkout", async () => {
+      const repo = join(dir, "locked-repo");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      mkdirSync(join(repo, "src"), { recursive: true });
+      writeFileSync(join(repo, "src/app.ts"), "export {};\n", "utf8");
+      run("add", "-A");
+      run("commit", "-qm", "init");
+      run("worktree", "add", "-q", "--lock", "-b", "wt-branch", ".worktrees/stale");
+      rmSync(join(repo, ".worktrees/stale"), { recursive: true, force: true });
+      mkdirSync(join(repo, ".worktrees/stale"), { recursive: true });
+      writeFileSync(join(repo, ".worktrees/stale/real.ts"), "export {};\n", "utf8");
+      run("add", "-A");
+      run("commit", "-qm", "recreate");
+      const porcelain = execFileSync("git", ["-C", repo, "worktree", "list", "--porcelain"], {
+        encoding: "utf8",
+      });
+      expect(porcelain).toContain("locked");
+      expect(porcelain).not.toContain("prunable");
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv-locked.json"), [
+        finding(".worktrees/stale/real.ts"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan-locked.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.worktree).toEqual({ dropped: [], worktrees: [] });
+    });
   });
 
   describe("describeWorktreeFilter", () => {

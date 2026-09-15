@@ -10,7 +10,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { readFile, writeFile, mkdir, realpath, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
 import { filterCouplingSignals, type CouplingFilter } from "./scan-coupling";
@@ -659,13 +659,38 @@ export interface WorktreeFilter {
  * `existsSync` check for the same fact, anton-2wvb). Reading only the `worktree ` field would treat
  * that stale registration as a live nested checkout and drop every real signal under a path that is
  * no longer a worktree at all — so a prunable record is excluded before its path is even resolved.
+ *
+ * `prunable` alone isn't enough, though: `should_prune_worktree` never reports it for a *locked*
+ * worktree (this repo locks its own, see `worktree.ts:485-491`), so a locked worktree deleted
+ * outside git and reused as an ordinary tracked directory still passes the prunable check — git
+ * keeps citing `locked` for a registration that no longer points at a checkout. A real worktree
+ * always has a `.git` FILE (not directory) at its root pointing back at the main repo's
+ * `.git/worktrees/<name>`; a reused-as-ordinary directory doesn't. `isWorktreeCheckout` verifies
+ * that marker before a resolved path is trusted, so a stale locked registration is dropped from
+ * `nested` the same as a prunable one — real findings under its path keep flowing to triage.
+ *
+ * Bounded by (and cancellable via) the caller's own scan deadline/signal, same reasoning as
+ * {@link githubToken}: this runs before `scan()`'s deadline clock starts, so the caller passes a
+ * budget already charged against the outer timeout rather than an independent one — otherwise an
+ * already-cancelled scan (or a near-zero ANTON_STRINGER_TIMEOUT_MS) could sit here regardless.
  */
-async function listNestedWorktrees(repoPath: string): Promise<string[] | { unavailable: string }> {
+async function isWorktreeCheckout(path: string): Promise<boolean> {
+  try {
+    return (await stat(join(path, ".git"))).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function listNestedWorktrees(
+  repoPath: string,
+  opts: { timeoutMs: number; signal?: AbortSignal },
+): Promise<string[] | { unavailable: string }> {
   try {
     const { stdout } = await execFileAsync(
       "git",
       ["-C", repoPath, "worktree", "list", "--porcelain", "-z"],
-      { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+      { timeout: Math.max(1, Math.min(30_000, opts.timeoutMs)), maxBuffer: 8 * 1024 * 1024, signal: opts.signal },
     );
     const records: string[][] = [[]];
     for (const field of stdout.split("\0")) {
@@ -685,11 +710,17 @@ async function listNestedWorktrees(repoPath: string): Promise<string[] | { unava
       const wt = worktreeLine.slice("worktree ".length);
       const resolvedWt = await realpath(wt).catch(() => wt);
       if (resolvedWt === resolvedRepo) continue;
+      if (!(await isWorktreeCheckout(resolvedWt))) continue;
       const rel = relative(resolvedRepo, resolvedWt);
       if (rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) nested.push(rel);
     }
     return nested;
   } catch (err) {
+    // A caller abort must propagate, not collapse into "unavailable": swallowing it here would let
+    // scan() proceed as if nothing were nested instead of short-circuiting as cancellation (mirrors
+    // githubToken's own AbortError check, for the same reason).
+    const e = err as { name?: string; code?: unknown } | null;
+    if (e?.name === "AbortError" || e?.code === "ABORT_ERR") throw err;
     return { unavailable: err instanceof Error ? err.message : String(err) };
   }
 }
@@ -956,6 +987,12 @@ export async function scan(opts: {
   const unwind = async (): Promise<string | undefined> =>
     baseline ? restoreBaseline(opts.repoPath, baseline) : undefined;
 
+  // Computed BEFORE the nested-worktree lookup below, not after: that lookup shells out to git and
+  // must be charged against the scan's own deadline/signal like every other step, not given an
+  // independent wait on top of it (anton-fj1q PR #295 review).
+  const timeoutMs = scanTimeoutMs();
+  const deadline = Date.now() + timeoutMs;
+
   // Enumerated BEFORE stringer is spawned, not after it exits: excluding a nested worktree from the
   // walk is the only fix that actually keeps it from costing anything. Filtering its signals out
   // afterward (dropWorktreeSignals, below) is too late once a large one has already run every
@@ -964,7 +1001,10 @@ export async function scan(opts: {
   // from one nested checkout). `nested` is threaded through to `readAnnotatedSignals` so it isn't
   // asked for twice, and so the post-hoc filter still runs as a backstop against whatever a glob
   // exclude doesn't catch (a worktree created mid-scan, a collector that ignores --exclude).
-  const nested = await listNestedWorktrees(opts.repoPath);
+  const nested = await listNestedWorktrees(opts.repoPath, {
+    timeoutMs: deadline - Date.now(),
+    signal: opts.signal,
+  });
 
   const args = ["scan", opts.repoPath, "--format", "json", "-o", opts.scanFile];
   if (delta) args.push("--delta");
@@ -979,9 +1019,6 @@ export async function scan(opts: {
   args.push("--collector-timeout", COLLECTOR_TIMEOUT);
   // Keep stderr free of ANSI escapes so the collector-failure parse stays reliable when a TTY leaks in.
   args.push("--no-color");
-
-  const timeoutMs = scanTimeoutMs();
-  const deadline = Date.now() + timeoutMs;
   // A caller's own GITHUB_TOKEN (CI, an operator's shell) wins — `gh auth token` is only a
   // fallback for when nothing already set it, and only set when it actually resolves. Bounded by
   // and cancellable via the same deadline/signal as the scan itself, so a slow credential store
