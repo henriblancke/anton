@@ -53,6 +53,20 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("fencing-toctou");
   });
 
+  it("classifies a 're-read before releasing a retired claim' finding as fencing/TOCTOU", () => {
+    const note =
+      "This claim is released without a re-read before releasing a retired claim — another machine's " +
+      "sync could have already reassigned it by the time this write lands.";
+    expect(classifyFindingClass(finding(note))).toBe("fencing-toctou");
+  });
+
+  it("classifies a 'reassert the claim after the final policy await' finding as fencing/TOCTOU", () => {
+    const note =
+      "The code should reassert the claim after the final policy await instead of trusting the value " +
+      "read before it — the policy check can yield and let another run retire the claim first.";
+    expect(classifyFindingClass(finding(note))).toBe("fencing-toctou");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();

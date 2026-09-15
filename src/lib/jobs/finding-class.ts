@@ -23,7 +23,7 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: RegExp }
   {
     klass: "fencing-toctou",
     pattern:
-      /\btoctou\b|time-of-check|time of check|race condition|races? with|check-then-act|check then act|\b(?:un)?fenc(?:e|ing|ed)\b|fencing token|without (?:holding|acquiring) the lock|between the check and|stale (?:lease|read)|concurrent(?:ly)? (?:writ|modif|updat)/i,
+      /\btoctou\b|time-of-check|time of check|race condition|races? with|check-then-act|check then act|\b(?:un)?fenc(?:e|ing|ed)\b|fencing token|without (?:holding|acquiring) the lock|between the check and|stale (?:lease|read)|concurrent(?:ly)? (?:writ|modif|updat)|re-?reads? .{0,60}?before|reassert(?:s|ed|ing)? (?:the )?(?:claim|lock|lease|marker|ownership)|retired claim|final \S+ await/i,
   },
   {
     klass: "cancellation",
