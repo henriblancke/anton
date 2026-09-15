@@ -236,6 +236,18 @@ suite("worktree manager (real git)", () => {
       expect(second.path).toBe(first.path);
       expect(headOf(second.path)).toBe(beforeSha);
       expect(existsSync(join(second.path, "opt-out.txt"))).toBe(false);
+      expect(second.refreshOutcome).toBeUndefined();
+    });
+
+    it("reports a noop outcome when a reused checkout is already at the fresh base", async () => {
+      const branch = "anton/refresh-noop";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const currentMain = branchTip(defaultBranch());
+
+      const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+
+      expect(second.path).toBe(first.path);
+      expect(second.refreshOutcome).toEqual({ outcome: "noop", baseSha: currentMain });
     });
 
     it("fast-forwards a reused worktree with no unique commits onto the fresh base", async () => {
@@ -254,6 +266,10 @@ suite("worktree manager (real git)", () => {
         expect(headOf(second.path)).toBe(freshMain);
         expect(branchTip(branch)).toBe(freshMain);
         expect(log.mock.calls.flat().join(" ")).toContain("fast-forwarded");
+        // anton-s55u: the outcome is returned, not just logged — a caller persists this onto the
+        // run row so a stale-tree resume is queryable later, not only visible in that attempt's
+        // stdout.
+        expect(second.refreshOutcome).toEqual({ outcome: "fast_forwarded", baseSha: freshMain });
       } finally {
         log.mockRestore();
       }
@@ -286,6 +302,7 @@ suite("worktree manager (real git)", () => {
         expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
         expect(headOf(second.path)).not.toBe(uniqueSha); // rebased onto a new base commit
         expect(log.mock.calls.flat().join(" ")).toContain("rebased");
+        expect(second.refreshOutcome).toEqual({ outcome: "rebased", baseSha: freshMain });
       } finally {
         log.mockRestore();
       }

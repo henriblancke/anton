@@ -40,6 +40,20 @@ export interface Worktree {
   createdBranch: boolean;
   /** The main repo the worktree belongs to. */
   repoPath: string;
+  /**
+   * What {@link refreshOntoBase} did to a REUSED checkout, when `refresh: true` was passed
+   * (anton-s55u) — undefined for a freshly-created checkout (nothing to refresh) or when the caller
+   * didn't opt in. Callers that need this queryable later than the process's own stdout (a resumed
+   * run's staleness, hours on) persist it onto their own record — see execute-epic-claim.ts.
+   */
+  refreshOutcome?: RefreshOutcome;
+}
+
+/** The three shapes {@link refreshOntoBase} can bring a reused checkout up to date in. */
+export interface RefreshOutcome {
+  outcome: "noop" | "fast_forwarded" | "rebased";
+  /** The base commit the checkout was (or already was) brought up to. */
+  baseSha: string;
 }
 
 /** Run a git command in `repoPath`, returning trimmed stdout. */
@@ -466,7 +480,7 @@ async function refreshOntoBase(opts: {
   worktreePath: string;
   branch: string;
   baseBranch: string;
-}): Promise<void> {
+}): Promise<RefreshOutcome> {
   const { repoPath, worktreePath, branch, baseBranch } = opts;
 
   const dirty = await dirtyPaths(worktreePath);
@@ -486,7 +500,7 @@ async function refreshOntoBase(opts: {
     );
   }
   const branchSha = await git(repoPath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
-  if (baseSha === branchSha) return; // already current
+  if (baseSha === branchSha) return { outcome: "noop", baseSha }; // already current
 
   if (await isAncestor(worktreePath, branch, baseBranch)) {
     // The branch carries nothing `baseBranch` doesn't already have — safe to fast-forward in place.
@@ -494,12 +508,13 @@ async function refreshOntoBase(opts: {
     console.log(
       `[worktree] fast-forwarded ${branch} to ${baseBranch} (${baseSha.slice(0, 12)}) — no unique commits`,
     );
-    return;
+    return { outcome: "fast_forwarded", baseSha };
   }
 
   try {
     await git(worktreePath, ["rebase", baseBranch]);
     console.log(`[worktree] rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
+    return { outcome: "rebased", baseSha };
   } catch (err) {
     await git(worktreePath, ["rebase", "--abort"]).catch(() => undefined);
     const unique = await git(worktreePath, ["log", "--oneline", `${baseBranch}..${branch}`]).catch(
@@ -567,7 +582,13 @@ export async function createWorktree(opts: {
       // Opt-in only (see `refresh` above) — a caller like review-fix reuses an already-pushed PR
       // branch whose divergence from base is the whole point, not staleness.
       if (opts.refresh) {
-        await refreshOntoBase({ repoPath, worktreePath: existing.path, branch, baseBranch });
+        const refreshOutcome = await refreshOntoBase({
+          repoPath,
+          worktreePath: existing.path,
+          branch,
+          baseBranch,
+        });
+        return { ...existing, refreshOutcome };
       }
       return existing;
     }
@@ -605,9 +626,10 @@ export async function createWorktree(opts: {
       // behind. Bring it up to date before anything reads HEAD below (opt-in only, see `refresh`
       // above). A freshly-CREATED branch (the `-b` case above) needs none of this: it was just cut
       // from `baseBranch` itself.
-      if (!createdBranch && opts.refresh) {
-        await refreshOntoBase({ repoPath, worktreePath: path, branch, baseBranch });
-      }
+      const refreshOutcome =
+        !createdBranch && opts.refresh
+          ? await refreshOntoBase({ repoPath, worktreePath: path, branch, baseBranch })
+          : undefined;
       // Read the new checkout's HEAD *before* warming: the branch was just cut from `baseBranch`, and
       // warming (or any later fetch) can rewind that ref behind the commit the checkout records. HEAD
       // is fixed to the creation commit regardless — only read here, not after the warm below.
@@ -616,7 +638,7 @@ export async function createWorktree(opts: {
       // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
       // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
       const resolved = await realpath(path);
-      return { path: resolved, branch, baseBranch, forkSha, createdBranch, repoPath };
+      return { path: resolved, branch, baseBranch, forkSha, createdBranch, repoPath, refreshOutcome };
     } catch (error) {
       // Returning an unpinned checkout lets a retry classify its branch as reused and derive a fork
       // against a base ref that may have moved. This checkout did not exist before this call, so tear

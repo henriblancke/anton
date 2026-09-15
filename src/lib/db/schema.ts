@@ -58,6 +58,16 @@ export const runs = sqliteTable("runs", {
   // resumes (a reused worktree's HEAD has moved on, so recomputing then is wrong). Null on rows
   // written before this column existed, which fall back to recomputing.
   baseForkSha: text("base_fork_sha"),
+  // What refreshOntoBase (worktree.ts) did to a REUSED checkout at this attempt's warm, before the
+  // agent was dispatched (anton-s55u) — noop | fast_forwarded | rebased. Without this, a stale-tree
+  // resume left no evidence anywhere queryable: the outcome only ever reached a console.log the job
+  // runner doesn't persist. Null when the checkout was freshly created (nothing to refresh) or the
+  // caller didn't opt into refresh (e.g. review-fix's PR branches).
+  baseRefreshOutcome: text("base_refresh_outcome"),
+  // The base commit the checkout was refreshed onto, paired with baseRefreshOutcome above — lets a
+  // human confirm which base a resumed run actually implemented against, hours later, without
+  // re-deriving it from a diff.
+  baseRefreshSha: text("base_refresh_sha"),
   // queued | running | parked | done | failed
   status: text("status").notNull().default("queued"),
   // The self-review score THIS attempt earned (anton-cekf), 0-10, null until its review gate reports

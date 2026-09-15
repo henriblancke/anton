@@ -134,6 +134,16 @@ export async function warmRunWorktree(
       // checkout retains its own pin, but a recreated branch must replace a stale row pin: that old
       // value describes the deleted checkout and could widen delivery evidence on a later retry.
       ...(!reusedCheckout || !storedFork ? { baseForkSha } : {}),
+      // What refreshOntoBase did to a reused checkout at this warm (anton-s55u) — the only durable
+      // record of whether this attempt implemented against a stale tree that got fixed. Undefined
+      // (a fresh creation, or a caller that didn't opt into refresh) leaves the row's prior value
+      // alone rather than overwriting it with a claim this attempt never made.
+      ...(worktree.refreshOutcome
+        ? {
+            baseRefreshOutcome: worktree.refreshOutcome.outcome,
+            baseRefreshSha: worktree.refreshOutcome.baseSha,
+          }
+        : {}),
     });
   } catch (error) {
     // A newly-created checkout without a pinned fork is unsafe to reuse: any setup failure before
