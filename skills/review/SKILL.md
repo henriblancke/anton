@@ -88,11 +88,14 @@ queue — walk these steps and put the result in your notes before you move on:
      `INSERT ... ON CONFLICT`) whose read-modify-write is indivisible by construction rather than
      protected by an explicit lock. Name which actors you checked and why each is ruled out; this
      is not a finding, but it is not silence either.
-   - Once every mutation in the diff has been walked and none needed any of the three verdicts
-     above, the explicit sentence **"no mutation-with-dependent-read in this diff."**
+   - **No dependent read** — the mutation writes unconditionally, or from data it owns outright,
+     with no prior read whose staleness could matter. Name why no read is being trusted; this is
+     not a finding, but it is not silence either.
 
-   Restating this pass without walking every mutation satisfies nothing; it must produce a
-   verdict for each mutation found, or that sentence.
+   Restating this pass without walking every mutation satisfies nothing; it must produce one of
+   these four verdicts for each mutation found. Reserve the summary sentence **"no
+   mutation-with-dependent-read in this diff"** for a diff with no state mutations at all — once
+   any mutation exists, it gets its own verdict from the list above, never the summary sentence.
 
 Calibrate against the shape of defects this catches, drawn from real escapes: "fence the marker
 before accepting the retirement," "recheck cancellation after the final WIP await," "re-read
