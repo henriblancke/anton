@@ -146,7 +146,8 @@ async function settleClaim(
   const shared = isServerMode(repoPath);
   const push = deps.push ?? beads.push;
   const pull = deps.pull ?? beads.pull;
-  const readBoard = deps.board ?? ((cwd: string) => loadAllIssues(cwd, { withCycles: true }));
+  const readBoard =
+    deps.board ?? ((cwd: string) => loadAllIssues(cwd, { strictGates: true, withCycles: true }));
   const sleep = deps.sleep ?? sleepMs;
 
   // Is there a second writer whose write this pass has to WAIT OUT? A shared server always has one;
