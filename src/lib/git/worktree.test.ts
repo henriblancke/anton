@@ -485,6 +485,54 @@ suite("worktree manager (real git)", () => {
       expect(headOf(second.path)).toBe(freshMain);
       expect(branchTip(branch)).toBe(freshMain);
     });
+
+    // anton-s55u (PR #279 review): the directory-removed reuse path recreates the checkout via a
+    // separate `git worktree add ... branch` call, so it reaches `refreshOntoBase` through different
+    // code than the "directory still exists" path above — `preserveShas` must be forwarded there too,
+    // or a resume through exactly this scenario can still rebase away a commit a bead's satisfied-
+    // note cites as evidence, silently breaking the board's note-to-object link.
+    it("merges instead of rebasing a cited commit when only the branch survives (worktree dir was removed)", async () => {
+      const branch = "anton/refresh-recreated-preserved";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "cited ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "cited ticket commit"]);
+      const citedSha = headOf(first.path);
+      rmSync(first.path, { recursive: true, force: true });
+
+      advanceDefaultBranch(
+        "recreated-preserved-base.txt",
+        "advance 7\n",
+        "advance main (recreated preserved)",
+      );
+      const freshMain = branchTip(defaultBranch());
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: defaultBranch(),
+          refresh: true,
+          preserveShas: [citedSha],
+        });
+
+        expect(second.path).toBe(first.path);
+        expect(existsSync(join(second.path, "recreated-preserved-base.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+        // The cited commit is untouched — still reachable as-is, not rewritten by a rebase.
+        const mergeBase = execFileSync(
+          "git",
+          ["-C", second.path, "merge-base", citedSha, branch],
+          { encoding: "utf8" },
+        ).trim();
+        expect(mergeBase).toBe(citedSha);
+        expect(log.mock.calls.flat().join(" ")).toContain("merged");
+        expect(second.refreshOutcome).toEqual({ outcome: "merged", baseSha: freshMain });
+      } finally {
+        log.mockRestore();
+      }
+    });
   });
 
   // The symlink-into-the-worktree + info/exclude bridge was replaced with a `-c

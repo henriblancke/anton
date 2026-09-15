@@ -556,7 +556,10 @@ async function refreshOntoBase(opts: {
 
   if (await isAncestor(worktreePath, branch, baseSha)) {
     // The branch carries nothing the base doesn't already have — safe to fast-forward in place.
-    await git(worktreePath, ["reset", "--hard", baseSha], hooksPath);
+    // `merge --ff-only` rather than `reset --hard`: the latter moves HEAD/index/worktree without
+    // firing `post-merge` or `post-checkout`, so repos relying on those hooks for generated state
+    // would resume stale after a fast-forward (PR #279 review).
+    await git(worktreePath, ["merge", "--ff-only", baseSha], hooksPath);
     console.log(
       `[worktree] fast-forwarded ${branch} to ${baseBranch} (${baseSha.slice(0, 12)}) — no unique commits`,
     );
@@ -744,7 +747,13 @@ export async function createWorktree(opts: {
       // from `baseBranch` itself.
       const refreshOutcome =
         !createdBranch && opts.refresh
-          ? await refreshOntoBase({ repoPath, worktreePath: path, branch, baseBranch })
+          ? await refreshOntoBase({
+              repoPath,
+              worktreePath: path,
+              branch,
+              baseBranch,
+              preserveShas: opts.preserveShas,
+            })
           : undefined;
       // Read the new checkout's HEAD *before* warming: the branch was just cut from `baseBranch`, and
       // warming (or any later fetch) can rewind that ref behind the commit the checkout records. HEAD
