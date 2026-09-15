@@ -53,7 +53,7 @@ function matchesWorkLoss(note: string): boolean {
 
 // Every other fencing/TOCTOU alternative already carries its own ownership/lease/lock context in
 // its wording; only the bare fenc(e/ing/ed) word doesn't — see matchesFencingToctou below.
-const FENCING_BARE = /\b(?:un)?fenc(?:e|ing|ed)\b/i;
+const FENCING_BARE = /\b(?:un)?fenc(?:e|ing|ed)\b/gi;
 const FENCING_OWNERSHIP_CONTEXT =
   /\b(?:lease|lock|claim|ownership|owner|worker|concurrent(?:ly)?|races?|racing|guard|marker|token|acquir\w*|hold(?:ing|s)?)\b/i;
 const FENCING_REST =
@@ -63,15 +63,18 @@ const FENCING_REST =
  * The bare "fenc(e/ing/ed)" word is as much Markdown vocabulary ("the example is unfenced, so it
  * renders as code") as it is an ownership-race term ("read without a fence"), so on its own it
  * only counts when a lease/lock/claim/ownership/concurrency word appears within 60 chars of it —
- * otherwise the next review round gets sent hunting for a race that was never reported.
+ * otherwise the next review round gets sent hunting for a race that was never reported. A note can
+ * carry more than one bare occurrence (an unrelated Markdown mention followed by the real one), so
+ * every occurrence is checked rather than stopping at the first.
  */
 function matchesFencingToctou(note: string): boolean {
   if (FENCING_REST.test(note)) return true;
-  const bareMatch = FENCING_BARE.exec(note);
-  if (!bareMatch) return false;
-  const start = Math.max(0, bareMatch.index - 60);
-  const end = Math.min(note.length, bareMatch.index + bareMatch[0].length + 60);
-  return FENCING_OWNERSHIP_CONTEXT.test(note.slice(start, end));
+  for (const bareMatch of note.matchAll(FENCING_BARE)) {
+    const start = Math.max(0, bareMatch.index - 60);
+    const end = Math.min(note.length, bareMatch.index + bareMatch[0].length + 60);
+    if (FENCING_OWNERSHIP_CONTEXT.test(note.slice(start, end))) return true;
+  }
+  return false;
 }
 
 /**

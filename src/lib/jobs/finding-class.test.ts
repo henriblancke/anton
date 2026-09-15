@@ -179,6 +179,13 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("other");
   });
 
+  it("classifies fencing/TOCTOU when an unrelated unfenced-Markdown mention precedes the real lease race by more than 60 chars", () => {
+    const note =
+      "The Markdown example above is unfenced, so the prose renders as code instead of a code block. " +
+      "Separately, and much more seriously, this unfenced lease read lets another worker replace the owner before update.";
+    expect(classifyFindingClass(finding(note))).toBe("fencing-toctou");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();
