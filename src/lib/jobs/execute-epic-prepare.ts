@@ -7,7 +7,7 @@
  * that follow from holding it (the human waits, the checkout, the claim and its cascade). Moving a
  * step across that line changes what a park leaves behind, so each one says where it sits and why.
  */
-import { beads, type Bead } from "../beads/bd";
+import { beads, LABELS, staleClaimReason, type Bead } from "../beads/bd";
 import { cycleEvidenceFor } from "../beads/cycle-evidence";
 import { loadAllIssues } from "../beads/issues";
 import { formatStructureViolations, structureGaps } from "../beads/structure";
@@ -534,6 +534,29 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
  * Recomputed the same way `regateRefreshedBoard` and `armHumanTicketWaits` do, and PARKED on the
  * same poison a blocker reopening at either of those points already takes: this is just the last
  * window one can land in before the loop starts.
+ *
+ * The TARGET's own eligibility is RE-ASSERTED against this board, not just its label (PR #274
+ * review, round 6): `adoptRefreshedTarget` only ever asked `agent:human`, so a target this same
+ * pull found deleted, unapproved, abandoned, or reparented out of run-target shape (a standalone
+ * task a re-parent landed under another card in this exact window) rode straight through — either
+ * as `adoptRefreshedTarget`'s stale fallback (nothing on the board to find) or as the fresh,
+ * newly-ineligible bead itself, since nothing downstream of here repeats what
+ * {@link assertRunnableTarget} already asked once at the top of the run. `staleClaimReason` is the
+ * SAME question `claimVerified` asks after its own settle window; asked again here because
+ * `publishRunClaim`'s sync is one more window the same drift can land in. PARKED, not retried, for
+ * the reason {@link runTargetDrift}'s callers park: a target that has stopped being runnable does
+ * not become one again by trying.
+ *
+ * The CHILDREN's `agent:human` label is watched too (PR #274 review, round 6): `armHumanTicketWaits`
+ * ran its preflight — and armed its gates — on the board its OWN refresh brought back, which sits
+ * before `publishRunClaim`'s sync. A relabel landing in the gap keeps the ticket's id in both the
+ * pre- and post-sync sets, so {@link ticketSetDrift} (id-only, by design) reads it as no change at
+ * all, and the readiness re-derived above never asks the label either — a person's work would
+ * dispatch to the default agent with no wait ever armed for it. Re-running the full arm-and-write
+ * preflight here is out: it is documented to run BEFORE any worktree, claim or session exists,
+ * exactly because arming is a write racing the very claim this function follows. So the label is
+ * REJECTED as drift instead, the same shape `ticketSetDrift` already retries on: the next attempt
+ * re-enters from the top, where `armHumanTicketWaits` sees the fresh label and arms its wait properly.
  */
 async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Promise<void> {
   const { repo, targetId: epicBeadId } = run;
@@ -553,7 +576,21 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
       `${epicBeadId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
     );
   }
+  const freshTargetBead = board.find((b) => b.id === epicBeadId);
+  if (!freshTargetBead) {
+    throw new PoisonEpic(
+      `${epicBeadId} is no longer on the board after its claim published — refusing to execute ` +
+        `work that vanished from under this run`,
+    );
+  }
   const adoptedTarget = adoptRefreshedTarget(board, epicBeadId, run.target);
+  const staleReason = staleClaimReason(adoptedTarget, board);
+  if (staleReason) {
+    throw new PoisonEpic(
+      `${epicBeadId} is no longer eligible to run (${staleReason}) — its claim published to a ` +
+        `board that had already moved on, so refusing to execute work this run no longer owns`,
+    );
+  }
   const freshTickets = run.standaloneRun ? [adoptedTarget] : runTickets(board, epicBeadId);
   const drift = ticketSetDrift(run.tickets, freshTickets);
   if (drift) {
@@ -561,6 +598,17 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
       `${epicBeadId}'s ticket set changed while its claim was publishing (${drift}) — retrying so ` +
         `the contract, agent and reserved-ticket gates run over the whole set rather than ` +
         `dispatching a ticket none of them judged`,
+    );
+  }
+  const relabelledHuman = freshTickets.filter(
+    (t) => t.id !== epicBeadId && beads.isHumanWork(t) && !gates.isResumeSkipped(t),
+  );
+  if (relabelledHuman.length > 0) {
+    throw new Error(
+      `${epicBeadId}'s claim published to a board that had already relabelled ` +
+        `${relabelledHuman.map((t) => t.id).join(", ")} ${LABELS.agentHuman} — retrying so the ` +
+        `human-ticket preflight arms a wait for it before anything dispatches, rather than sending ` +
+        `a person's work to the default agent`,
     );
   }
   run.all = board;

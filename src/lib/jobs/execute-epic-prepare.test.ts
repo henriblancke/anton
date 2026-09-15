@@ -14,7 +14,7 @@
  * which a real board cannot be asked for on demand.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bead } from "../beads/bd";
+import { LABELS, type Bead } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
 
 const refreshRunBoardMock = vi.fn();
@@ -114,7 +114,12 @@ import type { EpicRun } from "./execute-epic-run";
 const REPO = "/tmp/anton";
 const TARGET = "anton-fude";
 
-const feature = (): Bead => ({ id: TARGET, title: "Feature", issue_type: "feature", status: "open" }) as Bead;
+// Approved (PR #274 review, round 6): a target only ever reaches `prepareEpicRun` once
+// `assertRunnableTarget` (execute-epic-start.ts) has already required this label, and
+// `assertPublishedBoardCycleFree`'s own late re-check of it (`staleClaimReason`) would otherwise
+// poison every board this fixture builds.
+const feature = (): Bead =>
+  ({ id: TARGET, title: "Feature", issue_type: "feature", status: "open", labels: [LABELS.approved] }) as Bead;
 
 const ticket = (id: string, status = "open"): Bead =>
   ({ id, title: id, issue_type: "task", status, parent: TARGET }) as Bead;
@@ -476,6 +481,141 @@ describe("prepareEpicRun — the structure/cycle gate re-runs on the board the r
     if (prep.done) return;
     expect([...prep.gated]).toContain("t-2");
     expect(prep.readiness.blockers).toContain("anton-elsewhere");
+  });
+
+  // The target's OWN eligibility, not just its `agent:human` label, is re-asked against the board
+  // `publishRunClaim`'s own sync just pulled (PR #274 review, round 6): `adoptRefreshedTarget` alone
+  // never asked whether the target is still approved, still live, or still shaped as a run target —
+  // so a change landing in this exact window rode straight through and this run dispatched into it.
+  it("parks when the target was unapproved by the board publish just pulled", async () => {
+    const clean = board(ticket("t-1"));
+    attachCycleEvidence(clean, []);
+    const unapproved = board(ticket("t-1"));
+    unapproved[0] = { ...unapproved[0], labels: [] } as Bead;
+    attachCycleEvidence(unapproved, []);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(clean));
+    // The first two reads (the lease's confirmation, then the pre-publish claimability check) see
+    // the still-approved target; only the read after `publishRunClaim`'s own sync sees it withdrawn.
+    loadAllIssuesMock.mockResolvedValueOnce(clean).mockResolvedValueOnce(clean).mockResolvedValue(unapproved);
+
+    const error = await refusalFrom(clean);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain(TARGET);
+    expect(error.message).toContain("approval was withdrawn");
+    // Parked, not retried — an unapproved target doesn't become approved again by trying.
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
+  it("parks when the target was abandoned by the board publish just pulled", async () => {
+    const clean = board(ticket("t-1"));
+    attachCycleEvidence(clean, []);
+    const abandoned = board(ticket("t-1"));
+    abandoned[0] = { ...abandoned[0], labels: [LABELS.approved, LABELS.abandoned] } as Bead;
+    attachCycleEvidence(abandoned, []);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(clean));
+    loadAllIssuesMock.mockResolvedValueOnce(clean).mockResolvedValueOnce(clean).mockResolvedValue(abandoned);
+
+    const error = await refusalFrom(clean);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain(TARGET);
+    expect(error.message).toContain("abandoned");
+  });
+
+  it("parks when the target vanished from the board publish just pulled", async () => {
+    const clean = board(ticket("t-1"));
+    attachCycleEvidence(clean, []);
+    const vanished = [ticket("t-1")];
+    attachCycleEvidence(vanished, []);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(clean));
+    loadAllIssuesMock.mockResolvedValueOnce(clean).mockResolvedValueOnce(clean).mockResolvedValue(vanished);
+
+    const error = await refusalFrom(clean);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain(TARGET);
+    expect(error.message).toContain("no longer on the board");
+  });
+
+  it("parks when a standalone target was reparented under another card by the publish sync", async () => {
+    // The case the review names explicitly: a parentless task/bug (a standalone run's own single
+    // ticket) that an approved gardener re-parent lands under another card in this exact window.
+    // `isRunTarget` excludes a parented task, so the target that published this run's claim is, by
+    // the time the sync lands, executing as someone ELSE's ticket.
+    const standalone: Bead = {
+      id: TARGET,
+      title: "Standalone",
+      issue_type: "task",
+      status: "open",
+      labels: [LABELS.approved],
+    } as Bead;
+    const preReparent = [standalone];
+    attachCycleEvidence(preReparent, []);
+    const reparented: Bead = { ...standalone, parent: "anton-other" } as Bead;
+    const postReparent = [reparented];
+    attachCycleEvidence(postReparent, []);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(preReparent));
+    // A standalone target's subtree is empty (it IS its own ticket), so
+    // `assertReservedTicketsClaimable` skips its own board read (`gates.children.length === 0`) —
+    // only the lease confirmation (step 1c) and this gate's own read consume the mock queue.
+    loadAllIssuesMock.mockResolvedValueOnce(preReparent).mockResolvedValue(postReparent);
+
+    const theRun = run(preReparent);
+    theRun.standaloneRun = true;
+    theRun.tickets = [standalone];
+
+    const error = await prepareEpicRun(theRun).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect((error as Error).message).toContain(TARGET);
+    expect((error as Error).message).toContain("no longer a run target");
+  });
+
+  // A child's `agent:human` relabel, not just the target's own label, is watched too (PR #274
+  // review, round 6): `armHumanTicketWaits` classified and armed its gates on the board ITS OWN
+  // refresh brought back, which sits before `publishRunClaim`'s sync. A relabel landing in that gap
+  // keeps the ticket's id in both sets, so `ticketSetDrift` (id-only, by design) reads it as no
+  // change — before this fix nothing downstream asked the label again, and a person's work would
+  // have dispatched to the default agent with no wait ever armed for it.
+  it("retries rather than dispatching when a child was relabelled agent:human by the publish sync", async () => {
+    const clean = board(ticket("t-1"), ticket("t-2"));
+    attachCycleEvidence(clean, []);
+    const relabelled = board(ticket("t-1"), { ...ticket("t-2"), labels: [LABELS.agentHuman] } as Bead);
+    attachCycleEvidence(relabelled, []);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(clean));
+    loadAllIssuesMock.mockResolvedValueOnce(clean).mockResolvedValueOnce(clean).mockResolvedValue(relabelled);
+
+    const error = await refusalFrom(clean);
+
+    // Retryable, not a park: the next attempt re-enters from the top, where `armHumanTicketWaits`
+    // sees the fresh label on a board of its own and arms a proper wait for it.
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("t-2");
+    expect(error.message).toContain(LABELS.agentHuman);
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
+  it("leaves a resume-skipped human-labelled child alone — its work is already done", async () => {
+    // A ticket a prior attempt already delivered and closed is not a person waiting to be asked
+    // again; `isResumeSkipped` is the same exclusion `armHumanTicketWaits` itself applies.
+    const clean = board(ticket("t-1"), ticket("t-2"));
+    attachCycleEvidence(clean, []);
+    const relabelled = board(
+      ticket("t-1"),
+      { ...ticket("t-2", "closed"), labels: [LABELS.agentHuman] } as Bead,
+    );
+    attachCycleEvidence(relabelled, []);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(clean));
+    loadAllIssuesMock.mockResolvedValueOnce(clean).mockResolvedValueOnce(clean).mockResolvedValue(relabelled);
+
+    const prep = await prepareEpicRun(run(clean));
+
+    expect(prep.done).toBe(false);
+    expect(publishRunClaimMock).toHaveBeenCalled();
   });
 });
 
