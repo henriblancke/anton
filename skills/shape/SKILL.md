@@ -243,6 +243,12 @@ const cardIds = new Set(all.filter((b) =>
   (b.issue_type === "epic" && !all.some((c) => c.issue_type === "feature" && parentOf(c) === b.id)),
 ).map((b) => b.id));
 const cardOf = (b) => {
+  // A pipeline artifact (gate/molecule) is unattributable even when reparented beneath the ticket
+  // it blocks — mirrors runTargetResolver's isPipelineArtifact check in epic-graph.ts, which runs
+  // before walking to the parent. Without it, a gate reparented under its own ticket (a supported
+  // real-bd shape) would resolve through the ticket up to the feature, and isHeld would read the
+  // feature's status instead of the still-open gate's.
+  if (pipeline.has(b.issue_type)) return undefined;
   const seen = new Set([b.id]); let parent = parentOf(b);
   while (parent && !seen.has(parent)) {
     if (cardIds.has(parent)) return parent;

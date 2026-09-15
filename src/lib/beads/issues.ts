@@ -266,6 +266,7 @@ export async function readAllIssues(
   // Keep evidence attached to the cached array itself: `SnapshotRead` is a wrapper and copying the
   // board would lose the sidecar that pure approval projections consume.
   if (opts?.withCycles && cycleEvidenceFor(snapshot.beads) === undefined) {
+    const generation = issueSnapshotGeneration(cwd);
     await attachCyclesBestEffort(cwd, snapshot.beads);
     // Only re-read the version if THIS array actually got enriched. `attachCyclesBestEffort` skips
     // attaching when a concurrent refresh already replaced the retained board (its own generation
@@ -277,6 +278,18 @@ export async function readAllIssues(
     // (PR #274 review, round 4), so `snapshot.version` (captured before that bump) would understate it —
     // re-read to describe the exact (now-enriched) board being returned.
     if (cycleEvidenceFor(snapshot.beads) !== undefined) {
+      // Evidence attaching only proves THIS array was enriched, not that it's still the retained
+      // board (PR #274 review, round 12): `attachCyclesBestEffort`'s own generation guard closes the
+      // race during ITS internal await, but the outer `await` above still yields a microtask tick on
+      // the way back here, wide enough for a concurrent content-changing refresh or local
+      // invalidation to advance the retained snapshot past this array in between. Pairing the old,
+      // now-enriched array with `issueSnapshotVersion` read after that gap would stamp it with a
+      // version describing beads the caller never actually returned — the same stale-304 failure mode
+      // this whole re-read exists to avoid. Re-checking the generation here closes that gap: on a
+      // mismatch, the board moved, so get a consistent pair fresh rather than trust this one.
+      if (issueSnapshotGeneration(cwd) !== generation) {
+        return readAllIssues(cwd, opts);
+      }
       return { beads: snapshot.beads, version: issueSnapshotVersion(cwd) };
     }
   }
