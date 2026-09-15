@@ -567,13 +567,19 @@ async function refreshOntoBase(opts: {
   }
 
   // A checkout's own remote-tracking ref only moves when THIS repo pushes `branch` itself (a claim
-  // holds the checkout for the run's whole lifetime, so no other worker pushes it meanwhile) — if it
-  // already matches this branch's tip, those commits are public and rebasing would rewrite them.
+  // holds the checkout for the run's whole lifetime, so no other worker pushes it meanwhile) — if
+  // its tip is still reachable from this branch's tip, those commits are public and rebasing would
+  // rewrite them. Ancestry, not equality: a retry can merge a newer base into an already-pushed
+  // branch and then fail before pushing that merge, leaving `origin/<branch>` an ancestor of the
+  // local tip rather than equal to it (PR #279 review) — exact equality would misclassify that as
+  // unpublished, rebase it, and turn the later non-forcing `pushBranch` into a rejected non-fast-
+  // forward push.
   const remoteSha = await git(
     repoPath,
     ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`],
   ).catch(() => undefined);
-  const remotelyPublished = remoteSha !== undefined && remoteSha === branchSha;
+  const remotelyPublished =
+    remoteSha !== undefined && (await isAncestor(worktreePath, remoteSha, branchSha));
 
   // A commit already cited as evidence on a bead (a satisfied-note's `by.commit`) is just as
   // unsafe to rewrite as a pushed one — the board's record of it would otherwise survive the

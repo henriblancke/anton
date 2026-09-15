@@ -346,6 +346,52 @@ suite("worktree manager (real git)", () => {
       }
     });
 
+    // anton-s55u (PR #279 review, second round): a retry can merge a newer base into an already-
+    // pushed branch and then fail before pushing that merge — `origin/<branch>` is then an ANCESTOR
+    // of the local tip, not equal to it. Exact-equality would misclassify that as unpublished and
+    // rebase it, so the next retry's own non-forcing push is rejected as non-fast-forward forever.
+    it("merges instead of rebasing when origin's tip is an ancestor of the branch, not equal to it", async () => {
+      const branch = "anton/refresh-published-ancestor";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "pushed ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "already-pushed ticket commit"]);
+      const pushedSha = headOf(first.path);
+      // A prior `pushBranch` published this tip...
+      execFileSync("git", ["update-ref", `refs/remotes/origin/${branch}`, pushedSha], { cwd: repo });
+      // ...then a later attempt merged a newer base into the branch locally but failed before it
+      // could push that merge — the branch has moved past what origin knows about.
+      writeFileSync(join(first.path, "unpushed-merge.txt"), "merged but not yet pushed\n");
+      execFileSync("git", ["-C", first.path, "add", "unpushed-merge.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unpushed merge commit"]);
+      const unpushedSha = headOf(first.path);
+      expect(unpushedSha).not.toBe(pushedSha);
+
+      advanceDefaultBranch("published-ancestor-base.txt", "advance 5b\n", "advance main (published ancestor)");
+      const freshMain = branchTip(defaultBranch());
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+
+        expect(second.path).toBe(first.path);
+        expect(existsSync(join(second.path, "published-ancestor-base.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "unpushed-merge.txt"))).toBe(true);
+        // Both the published commit and the unpushed one on top of it are untouched, not rewritten.
+        const mergeBase = execFileSync(
+          "git",
+          ["-C", second.path, "merge-base", pushedSha, branch],
+          { encoding: "utf8" },
+        ).trim();
+        expect(mergeBase).toBe(pushedSha);
+        expect(log.mock.calls.flat().join(" ")).toContain("merged");
+        expect(second.refreshOutcome).toEqual({ outcome: "merged", baseSha: freshMain });
+      } finally {
+        log.mockRestore();
+      }
+    });
+
     // anton-s55u (PR #279 review): a satisfied-note (anton-8h4b) can cite a commit that hasn't been
     // pushed yet — the run settled a sibling ticket against it before parking. Rewriting that
     // commit's sha in a later resume's refresh would leave the board's note pointing at an object

@@ -9,6 +9,8 @@
 import { beads, LABELS, unclaimableStatus } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { assignChildren, formatReservedChildren } from "../beads/child-assign";
+import { latestBlockNoteCommit } from "../beads/block-note";
+import { parseTicketNotes } from "../beads/notes";
 import { latestSatisfiedRecord } from "../beads/satisfied-note";
 import { resolveForkPoint, resolveFreshBase } from "../git/ops";
 import {
@@ -64,10 +66,30 @@ export async function warmRunWorktree(
   // a note from elsewhere proves nothing here (the same filter notedSatisfaction applies). A refresh
   // that rebased one of these out from under the board would leave the note pointing at an object
   // the branch no longer carries (PR #279 review), so refreshOntoBase merges instead when it finds one.
-  const preserveShas = tickets
+  const satisfiedShas = tickets
     .map((t) => latestSatisfiedRecord(t.notes))
     .filter((record): record is NonNullable<typeof record> => record !== undefined && record.branch === branch)
     .map((record) => record.commit);
+  // A block note's committed sha is just as durable a reference as a satisfied note's (PR #279
+  // review): a ticket that fails after committing, or times out with preserved work, records its
+  // branch tip via `blockNoteEvidence`; a human later closing or reopening that ticket leaves the
+  // note in place while a clean resume can still rebase the branch onto an advanced base. Without
+  // this, only satisfied-note shas were protected, so the rebase would rewrite the commit the
+  // still-durable block note names and its review evidence would go unreachable.
+  const blockNoteShas = tickets
+    .map((t) =>
+      latestBlockNoteCommit(
+        parseTicketNotes(t.notes)
+          .filter((n) => n.source === "system")
+          .map((n) => n.text),
+      ),
+    )
+    .filter(
+      (record): record is { committed: true; branch: string; head: string } =>
+        record !== undefined && record.committed && record.branch === branch && record.head !== undefined,
+    )
+    .map((record) => record.head);
+  const preserveShas = [...satisfiedShas, ...blockNoteShas];
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
