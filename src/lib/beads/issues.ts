@@ -309,6 +309,13 @@ export async function readAllIssues(
 
 export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}): Promise<Bead[]> {
   const board = await refreshIssueSnapshot(cwd, () => loadAllIssues(cwd, opts));
+  // Captured atomically with `board` above, before either await below (PR #274 review, round 14):
+  // reading this later — e.g. right before the `strictGates` gate fetch — risks a concurrent
+  // invalidation or refresh bumping the entry's generation in the window opened by the `withCycles`
+  // branch's own `await` first. `hydrateIssueSnapshot`'s guard would then see that NEWER generation
+  // match and accept `hydrated` (built from THIS stale `board`), overwriting the already-current
+  // cache and hiding the concurrent change from `getBoard` and other warm readers.
+  const boardGeneration = issueSnapshotGeneration(cwd);
   // A concurrent non-authoritative refresh may have won the snapshot loader. Enrich the exact board
   // returned here so callers that must make approval decisions never lose the requested evidence.
   // Routed through `fetchCyclesShared` (PR #274 review) rather than a direct `beads.depCycles` call:
@@ -339,8 +346,9 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
       // `dedupeById` builds a new array, so without writing it back the entry stays on the degraded,
       // gate-less board `refreshIssueSnapshot` just cached — and a same-request caller that rebuilds
       // the board from the snapshot afterward (e.g. the approve route's `getBoard`) would read a
-      // resolved gate's `blocks` edge as still dangling and open. See `hydrateIssueSnapshot`.
-      const generation = issueSnapshotGeneration(cwd);
+      // resolved gate's `blocks` edge as still dangling and open. See `hydrateIssueSnapshot`. Guarded
+      // by `boardGeneration`, captured above alongside `board` itself rather than re-read here — see
+      // that capture site for why a fresh read at this point would be too late.
       const hydrated = dedupeById([...board, ...await loadGateIssues(cwd, true, dangling)]);
       // `dedupeById` allocates a new array, and the cycle sidecar is WeakMap-keyed on array identity
       // (cycle-evidence.ts) — so a caller combining `withCycles` and `strictGates` would otherwise
@@ -348,7 +356,7 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
       // review). Re-attach onto the rebuilt array before it's cached or returned.
       const cycles = cycleEvidenceFor(board);
       if (cycles !== undefined) attachCycleEvidence(hydrated, cycles);
-      hydrateIssueSnapshot(cwd, hydrated, generation);
+      hydrateIssueSnapshot(cwd, hydrated, boardGeneration);
       return hydrated;
     }
   }
