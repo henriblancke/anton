@@ -131,6 +131,16 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     if (dirCreatedAt === undefined || !isAbandoned(holder, dirCreatedAt, Date.now())) {
       return false;
     }
+    // Re-verify this decider still owns the gate immediately before the destructive retire: if this
+    // decider was suspended long enough for a peer to reap its gate as stale (or, transitively, for
+    // reapGate's own restore-on-mismatch to lose a race and strand a *different* decider's gate —
+    // see reapGate above), a fresh decider can already have reclaimed this same orphan under its own
+    // token and re-acquired `dir` as a live successor. Retiring by pathname without this check would
+    // rename that successor's live directory away instead of the orphan this decision was made
+    // against.
+    if (!sameIdentity(ownGateStat, await safeStat(gate))) {
+      return false;
+    }
     const token = holder?.token ?? randomUUID();
     return await retire(dir, token);
   } finally {
@@ -294,7 +304,14 @@ export async function withHostLock<T>(
   // the acquisition atomically (Node exposes no create+fstat primitive for directories) — a creator
   // suspended by the OS for longer than STALE_AFTER_MS across exactly that gap can still capture a
   // successor's inode here. write() and the release below cross-check the published token as an
-  // independent second signal so that mistake can never overwrite or retire a live successor.
+  // independent second signal for that case — except in the narrow sub-window where the resumed
+  // creator's write races in before the successor's own first write has published any metadata yet:
+  // readHolder then returns undefined, the token check has nothing to compare against, and the
+  // resumed creator can briefly publish its own stale token into the successor's directory. The
+  // successor's own next write then sees the mismatch, backs off, and falls back to running
+  // unlocked — the same advisory fallback as every other lost race here, not data corruption. Fully
+  // closing it would need an atomic mkdir+fstat primitive Node doesn't expose, same as the
+  // inode-snapshot gap above.
   const ourDirStat = await safeStat(dir);
   const isOurDir = async (): Promise<boolean> => sameIdentity(ourDirStat, await safeStat(dir));
 
@@ -311,7 +328,9 @@ export async function withHostLock<T>(
       // resumed from a long enough OS-level suspension can still have captured `ourDirStat` from
       // that same successor's fresh mkdir (the inode snapshot above is itself a separate pathname
       // lookup, not bound atomically to our own mkdir) — content ownership catches what inode
-      // identity alone was fooled into missing, so this can never overwrite a live successor.
+      // identity alone was fooled into missing, so this can't overwrite a live successor once that
+      // successor has published its own metadata (see the docstring above for the narrower
+      // pre-first-write sub-case this can't catch).
       const current = await readHolder(metaPath);
       if (current && current.token !== token) return false;
       await writeFile(
@@ -319,6 +338,23 @@ export async function withHostLock<T>(
         JSON.stringify({ token, pid: process.pid, heartbeatAt: Date.now(), label: opts.label ?? "" }),
         "utf8",
       );
+      // Re-verify immediately before the rename that actually publishes into `dir`: a peer can fully
+      // reclaim and recreate `dir` (or publish its own metadata) in the gap since the checks above,
+      // and writeFile/rename resolve by pathname rather than by the directory identity checked
+      // above — the writeFile just above can silently land its `.tmp` file inside a successor's
+      // freshly recreated directory instead of ours. That's harmless on its own; skipping the rename
+      // here is what stops it from going further and overwriting the successor's real owner.json.
+      // This narrows, but — without an atomic rename-if-unchanged primitive Node doesn't expose —
+      // can't fully close, the same class of residual gap already documented above.
+      if (!(await isOurDir())) {
+        await rm(tmpMetaPath, { force: true }).catch(() => {});
+        return false;
+      }
+      const recheck = await readHolder(metaPath);
+      if (recheck && recheck.token !== token) {
+        await rm(tmpMetaPath, { force: true }).catch(() => {});
+        return false;
+      }
       await rename(tmpMetaPath, metaPath);
       return true;
     } catch {
