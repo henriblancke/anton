@@ -143,11 +143,15 @@ function quotaError(exit: ClaudeExit): UsageLimitError | null {
 }
 
 /**
- * Claude Code's own refusal when `--model` names something that doesn't exist or isn't reachable —
- * a typo'd or withdrawn id (anton-ggf6). Observed verbatim in anton.db: "There's an issue with the
- * selected model (claude-opus-4-8). It may not exist or you may not have access to it. Run --model
- * to pick a different model." No retry changes a model id, so a match here must park instead of
- * burning the job's whole retry budget the way a plain deterministic Error would.
+ * Claude Code's own refusal when `--model` names something that doesn't exist OR that the current
+ * account/credential isn't entitled to use — a typo'd/withdrawn id, or a valid id the configured
+ * account or gateway credential lacks access to (anton-ggf6). Observed verbatim in anton.db:
+ * "There's an issue with the selected model (claude-opus-4-8). It may not exist or you may not
+ * have access to it. Run --model to pick a different model." Claude Code emits the identical
+ * diagnostic for both causes, and nothing here can tell which one fired, so the park must name
+ * both remedies rather than assuming the id itself is wrong. No retry fixes either case, so a
+ * match here must park instead of burning the job's whole retry budget the way a plain
+ * deterministic Error would.
  */
 const MODEL_REFUSAL_RE =
   /there's an issue with the selected model \(([^)]+)\)\.\s*it may not exist or you may not have access to it/i;
@@ -171,11 +175,12 @@ function modelRefusalError(stderr: string): PoisonError | null {
   const modelId = stderr.match(MODEL_REFUSAL_RE)?.[1]?.trim();
   if (!modelId) return null;
   return new PoisonError(
-    `claude refused to start: the model "${modelId}" doesn't exist or isn't accessible. ` +
-      `Configured in this project's settings as the General default model or a matching Model ` +
-      `routing rule (settings_json.modelRoutes) — or, if neither is set, inherited from Claude ` +
-      `Code's own default configuration outside this project. Fix the id there, since retrying ` +
-      `will not change it.`,
+    `claude refused to start: the model "${modelId}" doesn't exist, or the configured account ` +
+      `or gateway credential doesn't have access to it. Configured in this project's settings as ` +
+      `the General default model or a matching Model routing rule (settings_json.modelRoutes) — ` +
+      `or, if neither is set, inherited from Claude Code's own default configuration outside this ` +
+      `project. Fix the id there if it's wrong, or grant that account/credential access to the ` +
+      `model if the id is correct — retrying alone will not resolve either case.`,
   );
 }
 

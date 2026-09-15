@@ -79,8 +79,10 @@ describe("exitError", () => {
     expect(err?.message).toBe("claude exited with code 2: three tests fail");
   });
 
-  it("parks a nonexistent/inaccessible model id on the first attempt, naming it and where it's configured (anton-ggf6)", () => {
-    // Observed verbatim in anton.db — Claude Code's own refusal when --model doesn't resolve.
+  it("parks a nonexistent/inaccessible model id on the first attempt, naming both remedies (anton-ggf6)", () => {
+    // Observed verbatim in anton.db — Claude Code's own refusal when --model doesn't resolve, which
+    // is also what an entitlement gap (valid id, no account/credential access) looks like (anton-r0tb
+    // review feedback on PR #278) — so the park must name both remedies, not just a bad id.
     const err = exitError(
       exit({
         code: 1,
@@ -95,6 +97,7 @@ describe("exitError", () => {
     expect(err?.message).toContain("General default model");
     expect(err?.message).toContain("settings_json.modelRoutes");
     expect(err?.message).toContain("Claude Code's own default configuration");
+    expect(err?.message).toContain("grant that account/credential access");
   });
 
   it("does not park on a model-authored result that merely quotes the refusal wording (anton-r0tb)", () => {
