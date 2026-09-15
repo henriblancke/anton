@@ -84,6 +84,7 @@ function makeRun(runId = RUN_ID): EpicRun {
     settings: {},
     lease: { assertHeld: () => {} },
     target: { id: EPIC, title: EPIC } as Bead,
+    tickets: [],
   } as unknown as EpicRun;
 }
 

@@ -15,6 +15,8 @@ import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
 import {
+  branchContainsCommit,
+  hasCommonHistory,
   isAncestor,
   needsHooksPathOverrideForMerge,
   resolveHooksPathOverrideForMerge,
@@ -512,8 +514,16 @@ async function refreshOntoBase(opts: {
   worktreePath: string;
   branch: string;
   baseBranch: string;
+  /**
+   * Commits a bead's satisfied-note already cites as evidence (anton-8h4b) — e.g. `formatSatisfiedNote`'s
+   * `by.commit`, resolved by the caller from this run's tickets. A rebase would rewrite any of these
+   * still on the branch to a new sha, leaving that board record pointing at an object the branch no
+   * longer carries (PR #279 review) — so if one is present, this refresh merges instead, the same
+   * accommodation already made for a commit that's been pushed to origin.
+   */
+  preserveShas?: string[];
 }): Promise<RefreshOutcome> {
-  const { repoPath, worktreePath, branch, baseBranch } = opts;
+  const { repoPath, worktreePath, branch, baseBranch, preserveShas } = opts;
 
   let baseSha: string;
   try {
@@ -560,14 +570,30 @@ async function refreshOntoBase(opts: {
     repoPath,
     ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`],
   ).catch(() => undefined);
-  const alreadyPublished = remoteSha !== undefined && remoteSha === branchSha;
+  const remotelyPublished = remoteSha !== undefined && remoteSha === branchSha;
 
-  if (alreadyPublished) {
+  // A commit already cited as evidence on a bead (a satisfied-note's `by.commit`) is just as
+  // unsafe to rewrite as a pushed one — the board's record of it would otherwise survive the
+  // rebase while the object it names doesn't (PR #279 review).
+  let preservedSha: string | undefined;
+  if (!remotelyPublished && preserveShas && preserveShas.length > 0) {
+    for (const sha of preserveShas) {
+      if (await branchContainsCommit(repoPath, branch, sha)) {
+        preservedSha = sha;
+        break;
+      }
+    }
+  }
+
+  if (remotelyPublished || preservedSha) {
     try {
       await git(worktreePath, ["merge", "--no-edit", baseSha], hooksPath);
       console.log(
-        `[worktree] merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch} — its commits are ` +
-          `already on origin, so rebasing would have rewritten published history`,
+        `[worktree] merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch} — ` +
+          (remotelyPublished
+            ? `its commits are already on origin, so rebasing would have rewritten published history`
+            : `commit ${preservedSha!.slice(0, 12)} is already cited on a bead, so rebasing would ` +
+                `have made that reference unreachable`),
       );
       return { outcome: "merged", baseSha };
     } catch (err) {
@@ -577,11 +603,25 @@ async function refreshOntoBase(opts: {
       );
       throw new Error(
         `[worktree] ${branch} diverges from ${baseBranch} and could not be merged onto it cleanly ` +
-          `(refusing to rebase since its commits are already published) — refusing to discard or ` +
-          `rewrite its commits. Unique commits:\n${unique}\nResolve the conflict in ${worktreePath} ` +
-          `and retry (${gitError(err)})`,
+          `(refusing to rebase since its commits are already ` +
+          `${remotelyPublished ? "published" : "cited on a bead"}) — refusing to discard or rewrite ` +
+          `its commits. Unique commits:\n${unique}\nResolve the conflict in ${worktreePath} and ` +
+          `retry (${gitError(err)})`,
       );
     }
+  }
+
+  // Git accepts `rebase <base>` even when `branch` and `base` share no common ancestor — it then
+  // replays the branch's ENTIRE history, root commit included, on top of a tree that has nothing to
+  // do with it, duplicating rather than rejecting it. That's exactly what a force-pushed or recreated
+  // `origin/<baseBranch>` looks like from here, so refuse rather than let git's own permissiveness
+  // stand in for a check (PR #279 review).
+  if (!(await hasCommonHistory(worktreePath, branch, baseSha))) {
+    throw new Error(
+      `[worktree] ${branch} and ${baseBranch} (${baseSha.slice(0, 12)}) share no common history — ` +
+        `refusing to rebase onto an unrelated base (this can happen when ${baseBranch} was force-` +
+        `pushed or recreated). Resolve manually in ${worktreePath} and retry.`,
+    );
   }
 
   try {
@@ -622,6 +662,8 @@ export async function createWorktree(opts: {
    * under review-fix's own, deliberately merge-based (never rebase) reconciliation with its base.
    */
   refresh?: boolean;
+  /** Passed through to {@link refreshOntoBase} when `refresh` is set — see its own doc comment. */
+  preserveShas?: string[];
 }): Promise<Worktree> {
   const { repoPath, branch, warm, signal } = opts;
 
@@ -660,6 +702,7 @@ export async function createWorktree(opts: {
           worktreePath: existing.path,
           branch,
           baseBranch,
+          preserveShas: opts.preserveShas,
         });
         return { ...existing, refreshOutcome };
       }

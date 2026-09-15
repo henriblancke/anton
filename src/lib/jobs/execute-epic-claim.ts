@@ -9,6 +9,7 @@
 import { beads, LABELS, unclaimableStatus } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { assignChildren, formatReservedChildren } from "../beads/child-assign";
+import { latestSatisfiedRecord } from "../beads/satisfied-note";
 import { resolveForkPoint, resolveFreshBase } from "../git/ops";
 import {
   acquireWorktreeClaim,
@@ -37,7 +38,8 @@ export function claimOwnerFor(runId: string): string {
 export async function warmRunWorktree(
   run: EpicRun,
 ): Promise<{ worktree: Worktree; runStep: Omit<StepContext, "tickets"> }> {
-  const { db, clock, ctx, projectId, repo, runId, branch, project, settings, lease, target } = run;
+  const { db, clock, ctx, projectId, repo, runId, branch, project, settings, lease, target, tickets } =
+    run;
   // 2. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
   // (anton-x3o): resolveFreshBase fetches origin/<base> and returns `origin/<base>` so a run
   // whose local base is stale still starts at the remote tip; it's best-effort and falls back
@@ -58,6 +60,14 @@ export async function warmRunWorktree(
   const worktreeClaim = claimOwnerFor(runId);
   run.worktreeClaim = worktreeClaim;
   await acquireWorktreeClaim(repo, branch, worktreeClaim);
+  // Commits a satisfied-note already cites as this ticket's evidence (anton-8h4b), for THIS branch —
+  // a note from elsewhere proves nothing here (the same filter notedSatisfaction applies). A refresh
+  // that rebased one of these out from under the board would leave the note pointing at an object
+  // the branch no longer carries (PR #279 review), so refreshOntoBase merges instead when it finds one.
+  const preserveShas = tickets
+    .map((t) => latestSatisfiedRecord(t.notes))
+    .filter((record): record is NonNullable<typeof record> => record !== undefined && record.branch === branch)
+    .map((record) => record.commit);
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
@@ -72,6 +82,7 @@ export async function warmRunWorktree(
     // branch tracks `baseBranch` by construction (unlike review-fix's PR branches, which diverge
     // from base by design and must never be rebased underneath an already-pushed PR).
     refresh: true,
+    preserveShas,
   });
   run.worktree = worktree;
   // `createWorktree` made this decision under its branch lock; a caller-side ref probe could go
