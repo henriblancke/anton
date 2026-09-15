@@ -961,12 +961,15 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
     await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
 
     expect(runTicketMock).not.toHaveBeenCalled();
-    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton-repo", "anton-a", [
-      "anton-eb1",
-    ]);
+    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+      "/tmp/anton-repo",
+      "anton-a",
+      ["anton-eb1"],
+      false,
+    );
   });
 
-  it("does nothing when the ticket carries no pending marker", async () => {
+  it("does nothing when the ticket carries no pending marker and no preserved baseline", async () => {
     const child = bead("anton-a", { status: "closed", labels: [LABELS.boardOnly] });
     hasCommitMock.mockResolvedValue(true);
 
@@ -974,4 +977,28 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
 
     expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
   });
+
+  it(
+    "retries the cleanup for a surviving preserved baseline alone, even with no pending marker " +
+      "(PR #284 review) — a prior halt can clear the marker and then exhaust its retries on just " +
+      "the baseline, so the resume must still reach it",
+    () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceBaseline: JSON.stringify({ a: "hash" }) },
+      });
+      hasCommitMock.mockResolvedValue(true);
+
+      return dispatchRunTickets(makeRun([child], new AbortController().signal), prep()).then(() => {
+        expect(runTicketMock).not.toHaveBeenCalled();
+        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+          "/tmp/anton-repo",
+          "anton-a",
+          [],
+          true,
+        );
+      });
+    },
+  );
 });

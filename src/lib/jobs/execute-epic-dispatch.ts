@@ -1109,9 +1109,15 @@ async function dispatchTicket(
     // close/in-review transition already landed, the same post-condition `runTicket` gates the
     // cleanup on, so retrying it now is exactly as safe as the original call was. A no-op for every
     // ticket with nothing pending — not board-only, or one whose marker already cleared.
+    //
+    // Checked as two independent survivors, not just the marker (PR #284 review): a prior halt can
+    // clear the marker and then exhaust its retries on the preserved baseline, so `stalePending`
+    // alone reads as "nothing left to do" while the baseline is still stranded on the bead. Passing
+    // `hasPreservedBaseline` lets the retry reach it even when no ids are pending at all.
     const stalePending = beads.pendingBoardEvidence(ticket);
-    if (stalePending.length > 0) {
-      await clearBoardEvidencePending(repo, ticket.id, stalePending);
+    const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
+    if (stalePending.length > 0 || hasPreservedBaseline) {
+      await clearBoardEvidencePending(repo, ticket.id, stalePending, hasPreservedBaseline);
     }
     if (standaloneRun) {
       // Resume after a failed PR step: this standalone ticket committed and moved to in-review

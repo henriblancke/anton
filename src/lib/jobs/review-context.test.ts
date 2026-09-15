@@ -332,7 +332,58 @@ describe("reviewContext", () => {
       diff: { files: [], patch: "", truncated: false },
     });
     expect(empty).toContain("NO changes against its base");
+    expect(empty).toContain("report that as blocking");
   });
+
+  it(
+    "reads an empty diff as expected, not blocking, when every bead this run delivered is " +
+      "`delivery:board` (PR #284 review) — the run's own board-evidence check already confirmed " +
+      "those writes before this review ran",
+    () => {
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const out = reviewContext({
+        target: epic,
+        tickets: [boardOnlyTicket],
+        diff: { files: [], patch: "", truncated: false },
+      });
+      expect(out).toContain("NO changes against its base");
+      expect(out).toContain("expected here");
+      expect(out).not.toContain("report that as blocking");
+      expect(out).toContain("Judge the Acceptance criteria above against that confirmed board delivery");
+    },
+  );
+
+  it(
+    "also reads an empty diff as expected when only the RUN TARGET carries `delivery:board` — the " +
+      "documented legacy shape where a child ticket never carries the label itself",
+    () => {
+      const boardOnlyEpic: Bead = { ...epic, labels: ["delivery:board"] };
+      const out = reviewContext({
+        target: boardOnlyEpic,
+        tickets: [ticket],
+        diff: { files: [], patch: "", truncated: false },
+      });
+      // isBoardOnlyRun-style fallback: a plain ticket under a board-only-labelled target still
+      // counts as board-only (the documented legacy shape), so this is deliberately NOT blocking.
+      expect(out).not.toContain("report that as blocking");
+    },
+  );
+
+  it(
+    "still reports blocking on an empty diff for a MIXED run — one ticket is `delivery:board` " +
+      "but another (and the target) is not, so the diff being empty is unexplained",
+    () => {
+      const boardOnlyTicket: Bead = { ...ticket, id: "anton-x1.1", labels: ["delivery:board"] };
+      const plainTicket: Bead = { ...ticket, id: "anton-x1.2", labels: [] };
+      const codeEpic: Bead = { ...epic, labels: [] };
+      const out = reviewContext({
+        target: codeEpic,
+        tickets: [boardOnlyTicket, plainTicket],
+        diff: { files: [], patch: "", truncated: false },
+      });
+      expect(out).toContain("report that as blocking");
+    },
+  );
 
   it("repeats a truncated patch's deletions, which the worktree cannot show", () => {
     // "Read the files in the worktree" is impossible for a file the run removed, and the reviewer has

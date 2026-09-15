@@ -964,7 +964,17 @@ async function blockFailedTicket(args: {
   const marked = keepOpen
     ? await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered]))
     : true;
-  await safe(() => beads.setStatus(repo, ticket.id, keepOpen ? "open" : "blocked"));
+  // Retried and checked, not `safe`, for the SAME reason as the marker above when `keepOpen` (PR
+  // #284 review): the status write is what makes the ticket claimable again, not just labelled. The
+  // release right after this call (`releaseTicketClaim`) unassigns it regardless of whether this
+  // write landed, so a swallowed transient failure here could leave the bead `in_progress` with no
+  // assignee — unowned AND unclaimable (bd's claim gate refuses a non-`open` status), stranding it
+  // past what a resumed run can pick back up. The `blocked` write for a non-board-only failure stays
+  // best-effort: that path already halts the run below regardless of whether it lands, since a human
+  // review gate wedged open in place of `blocked` is a stricter state, not a looser one.
+  const statusSet = keepOpen
+    ? await mustPersist(() => beads.setStatus(repo, ticket.id, "open"))
+    : await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
   // The tip this ticket's work landed on — the operator's route from the note straight to the
   // diff. Best-effort and only when something was committed: an unreadable worktree costs the
   // sha, never the note and never the verdict (see `blockNoteEvidence`).
@@ -984,12 +994,20 @@ async function blockFailedTicket(args: {
   // operator's account either way, but without the marker itself a resume's clean tree would read
   // this exact same ticket as fresh rather than already-attempted-and-undelivered, and a later
   // merge of the rest of the feature would close it as shipped. Halt instead of absorbing it.
-  if (!marked) {
+  //
+  // `keepOpen && !statusSet` halts for the same class of reason (PR #284 review): the release right
+  // after this call unassigns the ticket regardless, so a status write bd kept refusing here would
+  // leave the bead `in_progress` with no assignee — unowned, and unclaimable since bd's claim gate
+  // refuses anything but `open`. A resumed run could never take it back.
+  if (!marked || (keepOpen && !statusSet)) {
+    const failures = [
+      !marked && `record \`${LABELS.notDelivered}\` on it`,
+      keepOpen && !statusSet && "return it to `open`",
+    ].filter((s): s is string => Boolean(s));
     throw new PoisonEpic(
-      `${ticket.id} failed its board-only delivery check, but bd would not record ` +
-        `\`${LABELS.notDelivered}\` on it — the run stopped rather than leave the ticket open and ` +
-        `reach a pull request whose merge would close this undelivered ticket as shipped. Check ` +
-        `the beads DB, then resume the run`,
+      `${ticket.id} failed its board-only delivery check, but bd would not ${failures.join(" or ")} ` +
+        `— the run stopped rather than leave the ticket in a state a resumed run cannot safely ` +
+        `reclaim. Check the beads DB, then resume the run`,
     );
   }
 }

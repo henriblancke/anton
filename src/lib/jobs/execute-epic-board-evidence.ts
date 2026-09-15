@@ -93,7 +93,10 @@ function contentLabels(b: Bead): string[] {
  * `external_ref` is included (anton-fc5x review round 4) for the same reason again: it is a real,
  * persisted content field (`bd linear sync --push` / `beads.setExternalRef`), not anton's own
  * bookkeeping, so a board-only ticket whose sole deliverable is attaching or changing a tracker
- * reference must not fingerprint as unchanged. */
+ * reference must not fingerprint as unchanged. `issue_type` is included (anton-fc5x review round 5)
+ * for the same reason once more: `bd update <id> --type task` is a supported board-only repair
+ * (tiers.mjs) that retypes a bead without touching status, title, description or labels, so leaving
+ * it out would fingerprint that repair as no change at all. */
 export interface BoardFingerprint {
   readonly beads: ReadonlyMap<string, string>;
 }
@@ -111,6 +114,7 @@ function fingerprintOf(b: Bead): string {
     b.description ?? "",
     b.acceptance_criteria ?? "",
     b.priority ?? null,
+    b.issue_type ?? "",
     contentLabels(b),
     beads.parentOf(b) ?? null,
     normalizedDependencies(b),
@@ -415,16 +419,28 @@ export async function readBoardEvidence(
  * reopen there could read them as current evidence and accept a no-op run as delivered. So the push
  * is part of the same all-or-nothing gate as the two writes: unconfirmed sync throws {@link
  * PoisonEpic} exactly like an unpersisted write, rather than returning as if the cleanup were done.
+ *
+ * `hasBaseline` (PR #284 review) covers the PARTIAL-failure resume case a plain `ids.length === 0`
+ * guard would otherwise skip entirely: a prior call can clear the marker but exhaust its retries on
+ * the baseline, throwing `PoisonEpic` with the marker already gone. A resumed retry that only checks
+ * `pendingBoardEvidence` then sees nothing pending and never calls this again — this ticket's own
+ * cleanup path is done — leaving the preserved baseline stranded on an already-closed bead for a
+ * later, unrelated reopen to misread as a stale-but-current snapshot. Callers pass whichever of the
+ * two survivors still needs clearing; either alone is enough to avoid the no-op early return.
  */
 export async function clearBoardEvidencePending(
   repo: string,
   ticketId: string,
   ids: readonly string[],
+  hasBaseline = false,
 ): Promise<void> {
-  if (ids.length === 0) return;
-  const markerCleared = await mustPersist(() =>
-    beads.setBoardEvidencePending(repo, ticketId, [], [LABELS.boardEvidencePending(ids)]),
-  );
+  if (ids.length === 0 && !hasBaseline) return;
+  const markerCleared =
+    ids.length === 0
+      ? true
+      : await mustPersist(() =>
+          beads.setBoardEvidencePending(repo, ticketId, [], [LABELS.boardEvidencePending(ids)]),
+        );
   const baselineCleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId));
   const cleared = markerCleared && baselineCleared;
   const synced = cleared

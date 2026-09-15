@@ -128,6 +128,16 @@ describe("fingerprintBoard / boardEvidence (anton-fc5x)", () => {
     },
   );
 
+  it(
+    "catches an issue_type change — `bd update <id> --type task` is a supported board-only " +
+      "repair (tiers.mjs) that touches neither status, description nor labels (anton-fc5x review round 5)",
+    () => {
+      const before = fingerprintBoard([bead("a", { issue_type: "bug" })]);
+      const after = fingerprintBoard([bead("a", { issue_type: "task" })]);
+      expect(boardEvidence(before, after)).toEqual(["a"]);
+    },
+  );
+
   it("catches a content label change — a board-only ticket may exist to relabel/reparent (anton-fc5x review round 1)", () => {
     const before = fingerprintBoard([bead("a", { labels: ["domain:eng"] })]);
     const after = fingerprintBoard([bead("a", { labels: ["domain:eng", "size:M"] })]);
@@ -663,13 +673,41 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     },
   );
 
-  it("clearBoardEvidencePending is a no-op for an empty id set", async () => {
+  it("clearBoardEvidencePending is a no-op for an empty id set with no preserved baseline", async () => {
     const callsBefore = setBoardEvidencePendingMock.mock.calls.length;
     const baselineCallsBefore = clearBoardEvidenceBaselineMock.mock.calls.length;
     await clearBoardEvidencePending("/repo", "t-1", []);
     expect(setBoardEvidencePendingMock.mock.calls.length).toBe(callsBefore);
     expect(clearBoardEvidenceBaselineMock.mock.calls.length).toBe(baselineCallsBefore);
   });
+
+  it(
+    "clearBoardEvidencePending still clears a surviving preserved baseline when no ids are pending " +
+      "(PR #284 review) — a prior call can clear the marker and then exhaust its retries on the " +
+      "baseline alone, so `hasBaseline` must reach the cleanup even with an empty id set",
+    async () => {
+      const callsBefore = setBoardEvidencePendingMock.mock.calls.length;
+      pushMock.mockResolvedValueOnce("synced");
+      await clearBoardEvidencePending("/repo", "t-baseline-only", [], true);
+      expect(clearBoardEvidenceBaselineMock).toHaveBeenCalledWith("/repo", "t-baseline-only");
+      // No pending ids means nothing for the marker write to remove — it must not be called at all.
+      expect(setBoardEvidencePendingMock.mock.calls.length).toBe(callsBefore);
+      expect(pushMock).toHaveBeenCalledWith("/repo");
+    },
+  );
+
+  it(
+    "clearBoardEvidencePending throws when clearing a surviving baseline alone exhausts every " +
+      "retry (PR #284 review) — the same halt-for-a-human contract as the marker-only failure",
+    async () => {
+      clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+      clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+      clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+      await expect(
+        clearBoardEvidencePending("/repo", "t-baseline-only-stranded", [], true),
+      ).rejects.toThrow(/t-baseline-only-stranded/);
+    },
+  );
 
   it(
     "throws rather than resolving quietly when the marker-clear exhausts every retry (PR #284 " +

@@ -10,7 +10,7 @@
  * relies on. That is why the score is demanded by the appended context rather than by the skill.
  */
 import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../beads/contract";
-import { type Bead } from "../beads/bd";
+import { beads, type Bead } from "../beads/bd";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../claude/agent-prompt";
 import { loadSkill } from "../claude/prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
@@ -473,7 +473,7 @@ export function reviewContext(run: ReviewRun): string {
   return [
     ...headerSection(run),
     ...beadsSection(run),
-    ...diffSection(run.diff),
+    ...diffSection(run.diff, isBoardOnlyDelivery(run)),
     ...principlesSection(run),
     ...carriedAdvisorySection(run.carriedAdvisories ?? []),
     ...verifiedGatesSection(run.verified ?? [], run.gatesDiscarded ?? false),
@@ -567,8 +567,37 @@ function truncatedContractNote(cut: boolean): string[] {
   ];
 }
 
-function diffSection(diff: BranchDiff): string[] {
+/**
+ * Whether every bead this run had to deliver was labelled `delivery:board` up front (anton-fc5x
+ * follow-up, PR #284 review) — read off the beads' OWN labels (or the run target's, for the legacy
+ * shape a ticket doesn't carry itself — see {@link beads.isBoardOnly}'s docstring), never inferred
+ * from the diff being empty: that would let any zero-diff run masquerade as a confirmed board-only
+ * delivery. Safe to trust here because a ticket that failed its OWN board-evidence check never
+ * reaches `step:review` at all — `assertBoardOnlyDelivered` blocks or parks it before the run's
+ * `step:commit`/`step:review` — so a labelled ticket that made it into this run's tickets already
+ * had its evidence confirmed and synced.
+ */
+function isBoardOnlyDelivery(run: ReviewRun): boolean {
+  const units = run.tickets.length > 0 ? run.tickets : [run.target];
+  return units.every((t) => beads.isBoardOnly(t) || beads.isBoardOnly(run.target));
+}
+
+function diffSection(diff: BranchDiff, boardOnlyDelivery: boolean): string[] {
   if (diff.files.length === 0) {
+    if (boardOnlyDelivery) {
+      return [
+        `## The diff under review`,
+        ``,
+        `The run produced NO changes against its base — expected here. Every bead this run had to`,
+        `deliver is labelled \`delivery:board\`: its product is a bd write (a bead's status, labels,`,
+        `parentage, or another board field), which \`.beads/.gitignore\` deliberately keeps out of the`,
+        `git tree. anton's own board-evidence check already confirmed those writes landed and synced`,
+        `before this review ran — a zero-diff run is not, by itself, evidence of nothing delivered`,
+        `here. Judge the Acceptance criteria above against that confirmed board delivery instead of a`,
+        `code diff; there is deliberately none to read.`,
+        ``,
+      ];
+    }
     return [
       `## The diff under review`,
       ``,
