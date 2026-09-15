@@ -10,6 +10,7 @@
  * failing the epic, because a slow check is better than a stuck queue.
  */
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -75,26 +76,27 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     // A live decision never outlives STALE_AFTER_MS (it's a handful of local fs ops), so reap a
     // gate older than that: worst case we race a genuinely live decider and lose the reap's own
     // mkdir, which is harmless since that decider's `finally` still removes it.
-    const gateCreatedAt = await dirMtimeMs(gate);
-    if (gateCreatedAt !== undefined && Date.now() - gateCreatedAt > STALE_AFTER_MS) {
-      // Re-stat immediately before deleting. The check above and this reap are two separate
-      // awaits, and a legitimate decider can reap this same stale gate and `mkdir` a fresh one
-      // at this path in the gap between them. Deleting by pathname alone can't tell the two
-      // apart; requiring the mtime to still match confirms we're removing the exact instance we
-      // judged stale, never a live decider's gate — which would otherwise let two deciders run
-      // the reclaim decision concurrently and break mutual exclusion on `dir`.
-      if ((await dirMtimeMs(gate)) === gateCreatedAt) {
+    const gateStat = await safeStat(gate);
+    if (gateStat !== undefined && Date.now() - gateStat.mtimeMs > STALE_AFTER_MS) {
+      // Re-check identity, not mtime, immediately before deleting. The age check above and this
+      // reap are two separate awaits, and a legitimate decider can reap this same stale gate and
+      // `mkdir` a fresh one at this path in the gap between them — comfortably within the same
+      // mtime tick, so a repeated mtime comparison can mistake that successor's gate for the one
+      // we judged stale. Device+inode identifies the exact instance, so it can't make that mistake
+      // — which would otherwise let two deciders run the reclaim decision concurrently and break
+      // mutual exclusion on `dir`.
+      if (sameIdentity(gateStat, await safeStat(gate))) {
         await rm(gate, { recursive: true, force: true }).catch(() => {});
       }
     }
     return false; // let the caller's normal deadline/poll path retry reclaim() next iteration
   }
-  // The gate's own mtime right after we created it — this decider's identity. If we (the owner)
-  // pause past STALE_AFTER_MS before reaching `finally`, the reap branch above can treat our gate
-  // as abandoned, remove it, and let a new decider `mkdir` a fresh one at the same path. Deleting
-  // that successor's gate by pathname alone in our own `finally` would let a third decider in
-  // concurrently with the second — so re-verify the mtime still matches ours before removing.
-  const ownGateCreatedAt = await dirMtimeMs(gate);
+  // This decider's own gate identity, captured right after our `mkdir` created it. If we (the
+  // owner) pause past STALE_AFTER_MS before reaching `finally`, the reap branch above can treat
+  // our gate as abandoned, remove it, and let a new decider `mkdir` a fresh one at the same path —
+  // likely within the same mtime tick as ours, so comparing mtime alone can't tell our gate from
+  // that successor's. Device+inode can: re-verify identity, not mtime, before removing.
+  const ownGateStat = await safeStat(gate);
   try {
     const holder = await readHolder(metaPath);
     const dirCreatedAt = holder ? 0 : await dirMtimeMs(dir);
@@ -104,7 +106,7 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     const token = holder?.token ?? randomUUID();
     return await retire(dir, token);
   } finally {
-    if (ownGateCreatedAt !== undefined && (await dirMtimeMs(gate)) === ownGateCreatedAt) {
+    if (sameIdentity(ownGateStat, await safeStat(gate))) {
       await rm(gate, { recursive: true, force: true }).catch(() => {});
     }
   }
@@ -152,6 +154,28 @@ async function dirMtimeMs(dir: string): Promise<number | undefined> {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Full stat, used where a caller needs to tell "the exact same filesystem object" from "a
+ * different one that now happens to sit at the same path" — mtime alone can't. A reclaim's
+ * replacement directory (or gate) is created moments after the original is renamed away or
+ * removed, comfortably within the same timestamp tick at typical filesystem mtime granularity, so
+ * a repeated mtime comparison can mistake the successor for the instance it was compared against.
+ * Device+inode can't be fooled the same way: the OS never hands the successor our original's
+ * identity. Undefined when the path doesn't exist.
+ */
+async function safeStat(path: string): Promise<Stats | undefined> {
+  try {
+    return await stat(path);
+  } catch {
+    return undefined;
+  }
+}
+
+/** True only when both stats exist and name the same filesystem object (device+inode). */
+function sameIdentity(a: Stats | undefined, b: Stats | undefined): boolean {
+  return a !== undefined && b !== undefined && a.dev === b.dev && a.ino === b.ino;
 }
 
 /**
@@ -228,33 +252,30 @@ export async function withHostLock<T>(
 
   if (!held) return fn();
 
-  // `dir`'s mtime right after our own `mkdir` created it — this acquisition's identity, re-checked
-  // and advanced on every write below. A reclaim of a metadata-less orphan mints its own random
-  // token (there's no holder token to read yet) and renames the whole directory away rather than
-  // editing it in place, so if we were paused long enough to be reclaimed, a successor's fresh
-  // `mkdir` now lives at `dir` with a different mtime. Without this check a resumed creator would
-  // write its token into (or retire) that successor's directory while the successor is still inside
-  // its own critical section.
-  let expectedMtime = await dirMtimeMs(dir);
+  // This acquisition's identity: `dir`'s device+inode captured once, right after our own `mkdir`
+  // created it. A reclaim of a metadata-less orphan mints its own random token (there's no holder
+  // token to read yet) and renames the whole directory away rather than editing it in place, so if
+  // we were paused long enough to be reclaimed, a successor's fresh `mkdir` now lives at `dir` —
+  // likely sharing our old mtime at typical filesystem timestamp granularity, but never our inode.
+  // Because this value is a stable snapshot rather than something advanced after every write, a
+  // write that fails outright can never leave the identity check out of sync with reality: each
+  // check is independent and always compares against the same original snapshot.
+  const ourDirStat = await safeStat(dir);
+  const isOurDir = async (): Promise<boolean> => sameIdentity(ourDirStat, await safeStat(dir));
 
   // Write-then-rename so a reader never observes a truncated mid-heartbeat file. A torn read would
   // parse as undefined and, since overwriting owner.json doesn't bump the directory's own mtime,
   // fall back to the (stale) dirCreatedAt — misreading a live, heartbeating holder as an orphan.
   // rename is atomic within one directory, so readHolder always sees a complete write or none.
-  //
-  // Both the tmp-file create and the rename are themselves directory-entry changes, so they advance
-  // `dir`'s own mtime — the identity check below must compare against the mtime our *previous*
-  // write left behind, then record the new one, rather than a single value fixed at acquire time.
   const tmpMetaPath = `${metaPath}.${token}.tmp`;
   const write = async (): Promise<boolean> => {
-    if (expectedMtime === undefined || (await dirMtimeMs(dir)) !== expectedMtime) return false;
+    if (!(await isOurDir())) return false;
     await writeFile(
       tmpMetaPath,
       JSON.stringify({ token, pid: process.pid, heartbeatAt: Date.now(), label: opts.label ?? "" }),
       "utf8",
     );
     await rename(tmpMetaPath, metaPath);
-    expectedMtime = await dirMtimeMs(dir);
     return true;
   };
   if (!(await write())) {
@@ -265,7 +286,8 @@ export async function withHostLock<T>(
   }
   // Keep the heartbeat fresh so a long-but-healthy hold is never mistaken for a crash. Unref'd so a
   // pending tick can't hold the process open. A heartbeat that loses the identity check above
-  // silently no-ops — the lock then goes stale from a peer's view and gets reclaimed normally.
+  // silently no-ops — the lock then goes stale from a peer's view and gets reclaimed normally, and
+  // the next tick re-checks independently rather than compounding a missed write into a stuck state.
   const beat = setInterval(() => void write().catch(() => {}), STALE_AFTER_MS / 3);
   beat.unref?.();
 
@@ -274,11 +296,10 @@ export async function withHostLock<T>(
   } finally {
     clearInterval(beat);
     // Re-verify identity before retiring, same as before writing: if a peer already reclaimed this
-    // acquisition (our heartbeat lapsed long enough), `dir` now belongs to a successor and must not
-    // be retired out from under it. The token-specific tombstone still protects the case where
-    // metadata existed at reclaim time (reclaim reuses `holder.token`, so its rename destination
-    // collides with ours and fails).
-    if (expectedMtime !== undefined && (await dirMtimeMs(dir)) === expectedMtime) {
+    // acquisition, `dir` now belongs to a successor and must not be retired out from under it. The
+    // token-specific tombstone still protects the case where metadata existed at reclaim time
+    // (reclaim reuses `holder.token`, so its rename destination collides with ours and fails).
+    if (await isOurDir()) {
       await retire(dir, token);
     }
   }
