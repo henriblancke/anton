@@ -1216,12 +1216,19 @@ function bdDepCycles(repo) {
   return exec("bd", ["-C", repo, "dep", "cycles", "--json"], budgetMs("network"));
 }
 
-/** bd's listing as an array, or null when this build's output can't be parsed. */
+/**
+ * bd's listing as an array, or null when this build's output can't be parsed. bd --json returns
+ * either a top-level array or a `{ <key>: [...] }` envelope — mirrors src/lib/beads/bd-json.ts's
+ * `asArray`, which this CLI bundle can't import (that file is TS; this is a plain-Node launcher).
+ */
 function parseBoard(stdout) {
   try {
     const parsed = JSON.parse(stdout || "[]");
+    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed?.issues)) return parsed.issues;
+    if (Array.isArray(parsed?.results)) return parsed.results;
     // bd omits the key entirely on an empty board rather than emitting [].
-    return Array.isArray(parsed) ? parsed : [];
+    return [];
   } catch {
     return null;
   }

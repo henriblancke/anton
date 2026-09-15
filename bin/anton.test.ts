@@ -293,6 +293,37 @@ describe("anton board-check (bd stubbed on PATH)", () => {
       expect(r.status).toBe(0);
     });
 
+    it("hydrates gate records when bd wraps the gate listing in an { issues: [...] } envelope", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "gate1", issue_type: "gate", status: "open" },
+        { id: "waiter", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("waiter", "gate1")] },
+      ];
+      const open = board.filter((b) => b.status !== "closed" && b.issue_type !== "gate");
+      const gates = board.filter((b) => b.issue_type === "gate");
+      const bin = await dirs.make("anton-bdbin-envelope-");
+      writeFakeBd(
+        bin,
+        [
+          "#!/usr/bin/env node",
+          "const a = process.argv.slice(2);",
+          `const open = ${JSON.stringify(JSON.stringify(open))};`,
+          `const gates = ${JSON.stringify(JSON.stringify(gates))};`,
+          'if (a.includes("dep") && a.includes("cycles")) { console.log("[]"); process.exit(0); }',
+          "// Same shape bd uses for `bd ready`/some `bd list` builds: `{ issues: [...] }` rather than a bare array.",
+          'if (a.includes("--type") && a[a.indexOf("--type") + 1] === "gate") {',
+          '  console.log(JSON.stringify({ issues: JSON.parse(gates) }));',
+          "  process.exit(0);",
+          "}",
+          "console.log(open);",
+          "process.exit(0);",
+        ].join("\n"),
+      );
+      const r = runCheck(bin);
+      expect(r.stdout).not.toContain("[blocks-edge-dangling]");
+      expect(r.status).toBe(0);
+    });
+
     it("fails loud when bd's authoritative cycle output is malformed", async () => {
       const r = runCheck(await fakeBd(HEALTHY, { cycleOutput: "not json" }));
       expect(r.stderr).toContain("cycle output this build can't parse");
