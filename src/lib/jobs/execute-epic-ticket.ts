@@ -10,12 +10,13 @@
  * — with the judgement on a timed-out ticket's work in execute-epic-ticket-preserve.ts — and the
  * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
-import { beads, type Bead } from "../beads/bd";
+import type { Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude } from "../claude/driver";
 import { branchAddedCommit } from "../git/ops";
 import {
+  isBoardOnlyRun,
   readBoardBaseline,
   readBoardEvidence,
   type BoardEvidenceResult,
@@ -95,9 +96,12 @@ export async function runTicket(args: {
     warnBudgetRunningOut(session.logPath, ticket, timeoutMs, remainingMs),
   );
   const baseline = await readTicketBaseline(worktreePath);
-  // Only for a bead shaped `delivery:board` (anton-fc5x) — the read costs a whole-board `bd list`,
-  // paid here so every OTHER ticket's zero-diff path stays exactly as cheap as it always was.
-  const boardBaseline = beads.isBoardOnly(ticket) ? await readBoardBaseline(run.repoPath) : null;
+  // Only for a ticket whose delivery is board-only (anton-fc5x) — the ticket's own `delivery:board`
+  // label, or its run target's (see {@link isBoardOnlyRun}: SKILL.md has shapers label the run
+  // target, which an epic/feature's dispatched children never carry themselves). The read costs a
+  // whole-board `bd list`, paid here so every OTHER ticket's zero-diff path stays exactly as cheap
+  // as it always was.
+  const boardBaseline = isBoardOnlyRun(run, ticket) ? await readBoardBaseline(run.repoPath) : null;
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
 
@@ -291,9 +295,14 @@ export async function assertDelivered(
   progress: TicketProgress,
   branchAdded: BranchAddedCommit,
   /**
-   * The board-only evidence check (anton-fc5x), present only when the ticket carries
-   * `LABELS.boardOnly` and its pre-dispatch baseline read succeeded. `undefined` for every other
-   * ticket, which is what keeps the zero-diff guard's plain-code behavior byte-for-byte unchanged.
+   * The board-only evidence check (anton-fc5x), present only when the caller resolved this
+   * ticket's delivery as board-only ({@link isBoardOnlyRun} — the ticket's own `delivery:board`
+   * label, or its run target's) and the pre-dispatch baseline read succeeded. `undefined` for every
+   * other ticket, which is what keeps the zero-diff guard's plain-code behavior byte-for-byte
+   * unchanged. Its mere presence IS the board-only verdict below — `assertDelivered` does not
+   * re-derive it from the ticket alone, because that was exactly the anton-fc5x review round 2
+   * finding 1/3 bug: a child ticket dispatched under a board-only-labelled run TARGET never carries
+   * the label itself.
    */
   checkBoardEvidence?: () => Promise<BoardEvidenceResult>,
 ): Promise<void> {
@@ -324,7 +333,7 @@ export async function assertDelivered(
     // `delivered` is required (an honest `blocked` or a missing line still falls through to the
     // plain zero-diff block below, exactly as it does for any other ticket), and the board must
     // independently show writes that landed AND synced.
-    if (checkBoardEvidence && beads.isBoardOnly(ticket) && selfReport?.outcome === "delivered") {
+    if (checkBoardEvidence && selfReport?.outcome === "delivered") {
       const evidence = await checkBoardEvidence();
       if (evidence.found && evidence.synced) {
         progress.delivered = true;

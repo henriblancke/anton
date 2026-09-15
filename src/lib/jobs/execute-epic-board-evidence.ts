@@ -12,8 +12,9 @@
  *
  * The agent runs `bd` directly in its own worktree process, never through this app's `bd.ts`
  * wrapper — so the in-process issue snapshot (snapshot.ts) never sees the agent's writes land and
- * cannot be trusted for either read here. Both reads below go straight through `beads.list`,
- * bypassing that cache.
+ * cannot be trusted for either read here. Both reads below go through {@link mustReadBoard} (never a
+ * bare `bd list --status all` — see its own docstring), which bypasses that cache and retries a
+ * contended Dolt read instead of failing the evidence check on one round trip.
  *
  * KNOWN GAP (anton-fc5x review round 1, finding 2): the diff below is of the WHOLE board, not of
  * writes this ticket's agent can be shown to have made. A concurrent write from anything else with
@@ -35,6 +36,7 @@
  * anton-j5i8 exists to catch and the reason this check exists at all.
  */
 import { beads, REVIEW_SCORE_PREFIX, RUN_LEASE_PREFIX, STAGE_PREFIX, type Bead } from "../beads/bd";
+import { mustReadBoard } from "./execute-epic-persist";
 
 /**
  * Label prefixes anton itself rewrites on a claim, a heartbeat lease refresh or a review round,
@@ -54,15 +56,33 @@ function contentLabels(b: Bead): string[] {
     .toSorted();
 }
 
-/** A point-in-time fingerprint of the whole board's CONTENT — status, title, description, priority
- * and every non-bookkeeping label. Deliberately not assignee, notes or metadata, which anton itself
- * rewrites on a claim, a heartbeat lease refresh or a note, regardless of what the agent did. */
+/** A point-in-time fingerprint of the whole board's CONTENT — status, title, description, priority,
+ * every non-bookkeeping label, parentage and dependency edges. Deliberately not assignee, notes or
+ * metadata, which anton itself rewrites on a claim, a heartbeat lease refresh or a note, regardless
+ * of what the agent did. Parent and dependencies are included (anton-fc5x review round 2) because a
+ * reparent or a `bd dep add`/`bd supersede` — both canonical board-only deliverables per this
+ * module's own docstring — touch only those edges, never status/title/description/labels, and would
+ * otherwise fingerprint as no change at all. */
 export interface BoardFingerprint {
   readonly beads: ReadonlyMap<string, string>;
 }
 
+/** `b`'s dependency edges as a stable, order-independent view — `bd list --json` does not
+ * guarantee edge order, so re-fetching identical content twice must not read as a change. */
+function normalizedDependencies(b: Bead): string[] {
+  return (b.dependencies ?? []).map((d) => `${d.type}:${d.depends_on_id}`).toSorted();
+}
+
 function fingerprintOf(b: Bead): string {
-  return JSON.stringify([b.status, b.title, b.description ?? "", b.priority ?? null, contentLabels(b)]);
+  return JSON.stringify([
+    b.status,
+    b.title,
+    b.description ?? "",
+    b.priority ?? null,
+    contentLabels(b),
+    beads.parentOf(b) ?? null,
+    normalizedDependencies(b),
+  ]);
 }
 
 /** Fingerprint every bead in a board read, keyed by id. */
@@ -89,15 +109,13 @@ export function boardEvidence(before: BoardFingerprint, after: BoardFingerprint)
  * The pre-dispatch board read a board-only ticket's evidence check diffs against — taken once, as
  * early as `runTicket` can manage, so writes the agent makes anywhere on the board are inside the
  * window this compares. Best-effort like the git baseline it sits beside (`readTicketBaseline`): an
- * unreadable board costs the evidence check, never the run, and `assertDelivered` treats a missing
- * baseline as "nothing to compare", which fails the same closed way a genuine zero diff does.
+ * unreadable board (after {@link mustReadBoard}'s own retries) costs the evidence check, never the
+ * run, and `assertDelivered` treats a missing baseline as "nothing to compare", which fails the same
+ * closed way a genuine zero diff does.
  */
 export async function readBoardBaseline(repo: string): Promise<BoardFingerprint | null> {
-  try {
-    return fingerprintBoard(await beads.list(repo, ["--status", "all"]));
-  } catch {
-    return null;
-  }
+  const board = await mustReadBoard(repo);
+  return board ? fingerprintBoard(board) : null;
 }
 
 /** What the post-run board read found, relative to the baseline. */
@@ -117,17 +135,36 @@ export interface BoardEvidenceResult {
  * that changed nothing has no writes to confirm, and a bare sync pass proves nothing about THIS
  * ticket's delivery even when it succeeds.
  *
- * A push that throws (a real auth/network/remote-conflict failure, per `runDoltSync`'s contract) is
- * read as unsynced rather than propagated: the caller's gate must fail closed on "found, but
- * unconfirmed" exactly as it does on "not found", never crash the ticket walk over the sync probe.
+ * The board read goes through {@link mustReadBoard} rather than a bare `beads.list`, and a read that
+ * fails all its retries reads as "not found" — the same closed failure as a genuine zero diff —
+ * instead of throwing a plain `Error` out of `assertDelivered`. Thrown here it would skip the
+ * board-only `NoDeliveryError`/`keepOpen` path entirely and fall to generic release handling (anton-fc5x
+ * review round 1). A push that throws (a real auth/network/remote-conflict failure, per
+ * `runDoltSync`'s contract) is read as unsynced rather than propagated for the same reason: the
+ * caller's gate must fail closed on "found, but unconfirmed" exactly as it does on "not found",
+ * never crash the ticket walk over the sync probe.
  */
 export async function readBoardEvidence(
   repo: string,
   baseline: BoardFingerprint,
 ): Promise<BoardEvidenceResult> {
-  const after = fingerprintBoard(await beads.list(repo, ["--status", "all"]));
-  const ids = boardEvidence(baseline, after);
+  const board = await mustReadBoard(repo);
+  if (!board) return { found: false, ids: [], synced: false };
+  const ids = boardEvidence(baseline, fingerprintBoard(board));
   if (ids.length === 0) return { found: false, ids: [], synced: false };
   const outcome = await beads.push(repo).catch(() => "not-wired" as const);
   return { found: true, ids, synced: outcome === "synced" || outcome === "shared-server" };
+}
+
+/**
+ * Whether THIS TICKET's delivery is board-only (anton-fc5x review round 2) — checking the ticket
+ * alone misses the documented shape: `skills/bd/SKILL.md` has shapers put `delivery:board` "on a run
+ * target," and for a legacy `epic` with plain `task` children (or a `feature` with `task`/`subtask`
+ * children) the run TARGET is the epic/feature, never the dispatched child `runTicket` calls this
+ * for. Checked on both so a label placed on either settles the same way — the target's alone
+ * (inherited by every child), or a ticket's own (e.g. a standalone target, which IS its run's
+ * target).
+ */
+export function isBoardOnlyRun(run: { readonly target: Bead }, ticket: Bead): boolean {
+  return beads.isBoardOnly(ticket) || beads.isBoardOnly(run.target);
 }

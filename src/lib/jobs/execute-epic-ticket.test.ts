@@ -72,6 +72,9 @@ function run(): Omit<StepContext, "tickets"> {
     baseRef: "main",
     db: {},
     clock: { now: () => 0 },
+    // Read by isBoardOnlyRun's target-side check (anton-fc5x review round 1) — an ordinary,
+    // non-board-only run target, since none of this suite's cases concern board-only delivery.
+    target: ticket,
   } as unknown as Omit<StepContext, "tickets">;
 }
 

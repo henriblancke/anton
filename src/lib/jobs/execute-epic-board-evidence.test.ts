@@ -1,23 +1,33 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Bead } from "../beads/bd";
 
-const listMock = vi.fn<(repo: string, args?: string[]) => Promise<Bead[]>>();
 const pushMock = vi.fn<(repo: string) => Promise<string>>();
+// The evidence check reads the board through `mustReadBoard` (anton-fc5x review round 2), never a
+// bare `bd list --status all` — so the fixture mocks the same seam `loadAllIssues` sits behind,
+// matching every other test of a `mustReadBoard` caller in this directory.
+const loadAllIssuesMock = vi.fn<(repo: string, opts?: unknown) => Promise<Bead[]>>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
     ...actual,
-    beads: { ...actual.beads, list: listMock, push: pushMock },
+    beads: { ...actual.beads, push: pushMock },
   };
+});
+
+vi.mock("../beads/issues", async () => {
+  const actual = await vi.importActual<typeof import("../beads/issues")>("../beads/issues");
+  return { ...actual, loadAllIssues: (repo: string, opts?: unknown) => loadAllIssuesMock(repo, opts) };
 });
 
 const {
   boardEvidence,
   fingerprintBoard,
+  isBoardOnlyRun,
   readBoardBaseline,
   readBoardEvidence,
 } = await import("./execute-epic-board-evidence");
+const { LABELS } = await import("../beads/bd");
 
 function bead(id: string, over: Partial<Bead> = {}): Bead {
   return { id, title: `title-${id}`, status: "open", description: "desc", ...over } as Bead;
@@ -105,56 +115,136 @@ describe("fingerprintBoard / boardEvidence (anton-fc5x)", () => {
       expect(boardEvidence(before, after)).toEqual(["unrelated"]);
     },
   );
+
+  it("catches a reparent — a board-only ticket may exist to move a bead under a new parent (anton-fc5x review round 2)", () => {
+    const before = fingerprintBoard([bead("a", { parent_id: "epic-1" })]);
+    const after = fingerprintBoard([bead("a", { parent_id: "epic-2" })]);
+    expect(boardEvidence(before, after)).toEqual(["a"]);
+  });
+
+  it("catches a dependency edge add/remove — a board-only ticket may exist to `bd dep add`/`bd supersede` (anton-fc5x review round 2)", () => {
+    const before = fingerprintBoard([bead("a", { dependencies: [] })]);
+    const after = fingerprintBoard([
+      bead("a", { dependencies: [{ issue_id: "a", depends_on_id: "b", type: "blocks" }] }),
+    ]);
+    expect(boardEvidence(before, after)).toEqual(["a"]);
+  });
+
+  it("does not read a reordering of the same dependency edges as a change", () => {
+    const deps = [
+      { issue_id: "a", depends_on_id: "b", type: "blocks" },
+      { issue_id: "a", depends_on_id: "c", type: "related" },
+    ];
+    const before = fingerprintBoard([bead("a", { dependencies: deps })]);
+    const after = fingerprintBoard([bead("a", { dependencies: [...deps].reverse() })]);
+    expect(boardEvidence(before, after)).toEqual([]);
+  });
 });
 
 describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
+  /** mustReadBoard's default retry budget (execute-epic-persist.ts) — queued as distinct
+   * rejections (never a persistent `mockRejectedValue`) so the failure does not leak into a
+   * later test's mock queue once this call's retries are exhausted. */
+  const rejectEveryRetry = () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      loadAllIssuesMock.mockRejectedValueOnce(new Error("bd unreachable"));
+    }
+  };
+
   it("returns null when the baseline read fails, so the caller fails closed rather than skip the check", async () => {
-    listMock.mockRejectedValueOnce(new Error("bd unreachable"));
+    rejectEveryRetry();
     await expect(readBoardBaseline("/repo")).resolves.toBeNull();
   });
 
+  it(
+    "reports not-found rather than throwing when the post-run read fails all its retries " +
+      "(anton-fc5x review round 2) — a thrown error here would skip the board-only NoDeliveryError " +
+      "path and fall to generic release handling",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      rejectEveryRetry();
+      await expect(readBoardEvidence("/repo", baseline)).resolves.toEqual({
+        found: false,
+        ids: [],
+        synced: false,
+      });
+      expect(pushMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("reports not-found and skips the sync probe when nothing changed", async () => {
-    listMock.mockResolvedValueOnce([bead("a")]);
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
     const baseline = (await readBoardBaseline("/repo"))!;
-    listMock.mockResolvedValueOnce([bead("a")]);
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
     const result = await readBoardEvidence("/repo", baseline);
     expect(result).toEqual({ found: false, ids: [], synced: false });
     expect(pushMock).not.toHaveBeenCalled();
   });
 
   it("reports found + synced once a real write lands and the push confirms it", async () => {
-    listMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
     const baseline = (await readBoardBaseline("/repo"))!;
-    listMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
     pushMock.mockResolvedValueOnce("synced");
     const result = await readBoardEvidence("/repo", baseline);
     expect(result).toEqual({ found: true, ids: ["a"], synced: true });
   });
 
   it("reports found on a shared Dolt server too — propagation is inherent there", async () => {
-    listMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
     const baseline = (await readBoardBaseline("/repo"))!;
-    listMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
     pushMock.mockResolvedValueOnce("shared-server");
     const result = await readBoardEvidence("/repo", baseline);
     expect(result.synced).toBe(true);
   });
 
   it("reports found but UNSYNCED when the push cannot confirm it — never trusts presence alone", async () => {
-    listMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
     const baseline = (await readBoardBaseline("/repo"))!;
-    listMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
     pushMock.mockResolvedValueOnce("not-wired");
     const result = await readBoardEvidence("/repo", baseline);
     expect(result).toEqual({ found: true, ids: ["a"], synced: false });
   });
 
   it("reports found but unsynced when the push itself throws, rather than crashing the ticket walk", async () => {
-    listMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
     const baseline = (await readBoardBaseline("/repo"))!;
-    listMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
     pushMock.mockRejectedValueOnce(new Error("push failed: auth"));
     const result = await readBoardEvidence("/repo", baseline);
     expect(result).toEqual({ found: true, ids: ["a"], synced: false });
+  });
+});
+
+describe("isBoardOnlyRun — reads the label from the ticket OR its run target (anton-fc5x review round 2)", () => {
+  const child = bead("anton-child", { labels: [] });
+
+  it("is true when the dispatched TICKET itself carries `delivery:board`", () => {
+    const labelledChild = bead("anton-child", { labels: [LABELS.boardOnly] });
+    const unlabelledTarget = bead("anton-epic", { labels: [] });
+    expect(isBoardOnlyRun({ target: unlabelledTarget }, labelledChild)).toBe(true);
+  });
+
+  it(
+    "is true when only the run TARGET carries `delivery:board` — the documented shape " +
+      "(skills/bd/SKILL.md: the label goes 'on a run target') for a legacy epic or feature whose " +
+      "children never carry it themselves",
+    () => {
+      const labelledTarget = bead("anton-epic", { labels: [LABELS.boardOnly] });
+      expect(isBoardOnlyRun({ target: labelledTarget }, child)).toBe(true);
+    },
+  );
+
+  it("is false when neither the ticket nor its run target carries the label", () => {
+    const unlabelledTarget = bead("anton-epic", { labels: [] });
+    expect(isBoardOnlyRun({ target: unlabelledTarget }, child)).toBe(false);
+  });
+
+  it("is true for a standalone run, where the ticket IS the run target", () => {
+    const standalone = bead("anton-standalone", { labels: [LABELS.boardOnly] });
+    expect(isBoardOnlyRun({ target: standalone }, standalone)).toBe(true);
   });
 });

@@ -30,6 +30,7 @@ import {
   type WorktreeState,
 } from "../git/ops";
 import { appendSessionLog, endSession, type JobSession } from "../sessions";
+import { isBoardOnlyRun } from "./execute-epic-board-evidence";
 import { isUsageLimitError, PoisonEpic } from "./errors";
 import {
   BlockedByAgentError,
@@ -768,7 +769,7 @@ async function releaseFailedTicket(args: {
   // resumed run needs to reclaim (the anton-f5f3 incident this ticket exists to fix). Left `open`
   // instead, with the `not-delivered` marker so a later read still knows this run reserved but did
   // not deliver it — `blockFailedTicket` still writes the operator-facing note either way.
-  const boardOnlyNoDelivery = noDelivery && beads.isBoardOnly(ticket);
+  const boardOnlyNoDelivery = noDelivery && isBoardOnlyRun(run, ticket);
   if ((committed || noDelivery || agentBlocked) && !needsHuman && !staysClaimable) {
     await blockFailedTicket({
       run,
@@ -945,12 +946,16 @@ async function blockFailedTicket(args: {
 }): Promise<void> {
   const { run, ticket, sessionId, kind, committed, selfReport, error, keepOpen } = args;
   const repo = run.repoPath;
-  if (keepOpen) {
-    await safe(() => beads.tag(repo, ticket.id, [LABELS.notDelivered]));
-    await safe(() => beads.setStatus(repo, ticket.id, "open"));
-  } else {
-    await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
-  }
+  // The `not-delivered` marker is merge finalization's ONLY signal that a board-only ticket left
+  // open here is in no diff (anton-67xj) — `safe` would let a failed write here open a PR whose
+  // merge closes this never-written work as shipped, exactly the failure `mustPersist`'s own
+  // docstring calls out this label for (anton-fc5x review round 2, finding 6). Retried, like
+  // `blockTimedOutTicket`'s own write of the same label, before the run is allowed to proceed
+  // without it — every other status/note write below stays best-effort.
+  const marked = keepOpen
+    ? await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered]))
+    : true;
+  await safe(() => beads.setStatus(repo, ticket.id, keepOpen ? "open" : "blocked"));
   // The tip this ticket's work landed on — the operator's route from the note straight to the
   // diff. Best-effort and only when something was committed: an unreadable worktree costs the
   // sha, never the note and never the verdict (see `blockNoteEvidence`).
@@ -966,6 +971,18 @@ async function blockFailedTicket(args: {
       ticketBlockNote({ kind, selfReport, error, sessionId, branch: run.branch, committed, head }),
     ),
   );
+  // Same reasoning as `blockTimedOutTicket`'s own unmarked halt: the note above carries the
+  // operator's account either way, but without the marker itself a resume's clean tree would read
+  // this exact same ticket as fresh rather than already-attempted-and-undelivered, and a later
+  // merge of the rest of the feature would close it as shipped. Halt instead of absorbing it.
+  if (!marked) {
+    throw new PoisonEpic(
+      `${ticket.id} failed its board-only delivery check, but bd would not record ` +
+        `\`${LABELS.notDelivered}\` on it — the run stopped rather than leave the ticket open and ` +
+        `reach a pull request whose merge would close this undelivered ticket as shipped. Check ` +
+        `the beads DB, then resume the run`,
+    );
+  }
 }
 
 /** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */

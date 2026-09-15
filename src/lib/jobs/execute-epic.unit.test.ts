@@ -1935,12 +1935,14 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
 
   it("leaves an ordinary (non-board-only) ticket's zero diff completely unaffected", async () => {
     const codeTicket: Bead = { ...ticket, id: "anton-code", labels: [] };
-    const check = async () => {
-      throw new Error("the board-only check ran for a ticket with no delivery:board label");
-    };
     const p = progress({ outcome: "delivered" });
 
-    const err = await failure(assertDelivered(codeTicket, { committed: false }, p, neverAsked, check));
+    // Production never passes checkBoardEvidence for a ticket whose delivery isn't board-only
+    // (see isBoardOnlyRun in execute-epic-board-evidence.ts) — assertDelivered trusts the
+    // parameter's mere presence rather than re-deriving board-only-ness from the ticket's own
+    // label (anton-fc5x review round 2, finding 1/3: that re-derivation is what missed a child
+    // ticket dispatched under a board-only-labelled run TARGET).
+    const err = await failure(assertDelivered(codeTicket, { committed: false }, p, neverAsked, undefined));
     expect(err?.message).toBe(
       "anton-code produced no delivery: claude exited cleanly and passed the verify gates but " +
         "left no changes to commit (zero diff). Blocking the ticket for operator review and " +
@@ -1948,6 +1950,23 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
         "self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.",
     );
   });
+
+  it(
+    "runs the board-only check for a ticket with no `delivery:board` label of its own, once " +
+      "checkBoardEvidence is passed — the caller (runTicket) resolves board-only-ness against the " +
+      "run TARGET too, so a child ticket inheriting the label is checked the same way a directly " +
+      "labelled one is (anton-fc5x review round 2, finding 1/3)",
+    async () => {
+      const inheritedChild: Bead = { ...ticket, id: "anton-inherited-child", labels: [] };
+      const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
+      const p = progress({ outcome: "delivered" });
+
+      await expect(
+        assertDelivered(inheritedChild, { committed: false }, p, neverAsked, check),
+      ).resolves.toBeUndefined();
+      expect(p).toMatchObject({ committed: false, delivered: true });
+    },
+  );
 });
 
 /**
