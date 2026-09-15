@@ -330,6 +330,21 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
   });
 
+  it("does not classify a numeric-precision bug as work-loss merely because 'error' is nearby", () => {
+    const note = "Converting the error code to number causes data loss for large values.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies a past-tense passive 'were discarded' work-loss finding", () => {
+    const note = "The queued jobs were discarded when processing failed, with no requeue and no log.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies a perfect-passive 'has been discarded' work-loss finding", () => {
+    const note = "The queued job has been discarded after the retry limit was reached, losing the submission.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();

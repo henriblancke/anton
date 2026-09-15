@@ -16,13 +16,17 @@ export type FindingClass = "fencing-toctou" | "cancellation" | "fail-open" | "wo
 type Matcher = RegExp | ((note: string) => boolean);
 
 /**
- * The passive "is/are discarded/lost/dropped", "lost/dropped after/when", and "silently drops"
- * phrasings say nothing about loss *of work* on their own — "the first character is dropped when parsing", "the
- * diagnostic context is lost after wrapping the error", or "the logger silently drops duplicate metric
- * labels" all match the words without describing a work-loss regression. They only count when a
- * work-bearing noun (job, task, queue, ...) or a retry/requeue signal is the verb's actual subject or
- * object — adjacent with no clause boundary in between — not merely mentioned nearby: "while parsing a
- * request, the first character is dropped" has "request" in an earlier, unrelated clause.
+ * The passive "is/are/was/were/has-been/have-been/had-been discarded/lost/dropped",
+ * "lost/dropped after/when", and "silently drops" phrasings say nothing about loss *of work* on
+ * their own — "the first character is dropped when parsing", "the diagnostic context is lost
+ * after wrapping the error", or "the logger silently drops duplicate metric labels" all match the
+ * words without describing a work-loss regression. They only count when a work-bearing noun (job,
+ * task, queue, ...) or a retry/requeue signal is the verb's actual subject or object — adjacent
+ * with no clause boundary in between — not merely mentioned nearby: "while parsing a request, the
+ * first character is dropped" has "request" in an earlier, unrelated clause. Past-tense and
+ * perfect-passive auxiliaries ("were discarded", "has been discarded") count the same as "is/are"
+ * — a finding describing loss that already happened is still a work-loss finding, not just one
+ * phrased in the present tense.
  */
 const WORK_LOSS_SUBJECT =
   "(?:job|task|queue|batch|record|item|request|message|event|payload|entry|entries|submission|update)s?";
@@ -36,17 +40,20 @@ const WORK_LOSS_SIGNAL = `(?:${WORK_LOSS_SUBJECT}|${WORK_LOSS_RETRY})`;
 // after the colon, so "request" can't bind across it to "is dropped".
 const CLAUSE_GAP = "[^,;:.'\\u2019\\u2013\\u2014]{0,30}?";
 // Bare "data loss" says nothing about lost *work* on its own — "casting this bigint to number
-// causes data loss for large IDs" is a numeric-precision bug, not a dropped job/queue entry. It
-// only counts when a work-bearing noun (WORK_LOSS_SUBJECT) or "error(s)" shares the same clause —
-// the same CLAUSE_GAP exclusions as the other contextual loss matchers, so "causes data loss; the
-// job status remains correct" doesn't credit "job" across the semicolon.
+// causes data loss for large IDs" is a numeric-precision bug, not a dropped job/queue entry, and
+// so is "converting the error code to number causes data loss for large values": a bare "error"
+// mention nearby isn't a work-loss signal either, since a numeric-precision or formatting bug can
+// happen to sit next to the word "error" without any job, task, or retry ever being lost. It only
+// counts when an actual work-bearing noun or retry/requeue signal (WORK_LOSS_SIGNAL) shares the
+// same clause — the same CLAUSE_GAP exclusions as the other contextual loss matchers, so "causes
+// data loss; the job status remains correct" doesn't credit "job" across the semicolon.
 const DATA_LOSS_CONTEXT = new RegExp(
-  `\\bdata loss\\b${CLAUSE_GAP}\\b(?:${WORK_LOSS_SUBJECT}|errors?)\\b|\\b(?:${WORK_LOSS_SUBJECT}|errors?)\\b${CLAUSE_GAP}\\bdata loss\\b`,
+  `\\bdata loss\\b${CLAUSE_GAP}\\b${WORK_LOSS_SIGNAL}\\b|\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\bdata loss\\b`,
   "i",
 );
-const WORK_LOSS_VERB_AFTER =
-  "(?:(?:is|are) (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))";
-const WORK_LOSS_OBJECT_AFTER = "(?:(?:is|are) (?:silently )?(?:discarded|lost|dropped)|silently drops?)";
+const WORK_LOSS_PASSIVE_AUX = "(?:is|are|was|were|has been|have been|had been)";
+const WORK_LOSS_VERB_AFTER = `(?:${WORK_LOSS_PASSIVE_AUX} (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))`;
+const WORK_LOSS_OBJECT_AFTER = `(?:${WORK_LOSS_PASSIVE_AUX} (?:silently )?(?:discarded|lost|dropped)|silently drops?)`;
 const WORK_LOSS_SUBJECT_FIRST = new RegExp(`\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\b${WORK_LOSS_VERB_AFTER}\\b`, "gi");
 // The gap is captured so matchesWorkLossVerbFirst can reject it below when the noun belongs to an
 // intervening clause rather than to this verb.
