@@ -203,6 +203,18 @@ describe("OperatorQueue", () => {
     expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
   });
 
+  it("withholds Mark done from a bead that still has open work under it — closeHumanTicket would 409", () => {
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[item({ id: "anton-e1", hasOpenDescendants: true })]}
+        onOpenTicket={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
   it("arms a confirm before POSTing the close route, then reports the row settled", async () => {
     const fetchMock = vi
       .fn()

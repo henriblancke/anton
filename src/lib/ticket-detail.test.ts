@@ -159,6 +159,46 @@ describe("getTicketDetail holdsRun", () => {
   });
 });
 
+// Direct coverage for hasOpenDescendantsOf (unexported, exercised through getTicketDetail) — the
+// read-path half of the same canMarkDone gap the P288 review flagged on close-human.ts: a human
+// epic/feature with open work still under it must read as such so ticket-state-bar.tsx can withhold
+// Mark done exactly where closeHumanTicket would 409. Has to agree with operatorQueue's own
+// `hasOpenDescendants`, which operator-queue.test.ts already pins, so these mirror that file's shape.
+describe("getTicketDetail hasOpenDescendants", () => {
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("flags a human epic that still has an open child under it", async () => {
+    fakeBd([
+      bead({ id: "e1", issue_type: "epic", labels: ["agent:human"] }),
+      bead({ id: "e1.1", issue_type: "task", parent: "e1" }),
+    ]);
+
+    const detail = await getTicketDetail(project, "e1");
+
+    expect(detail.hasOpenDescendants).toBe(true);
+  });
+
+  it("does not flag it once the child has closed", async () => {
+    fakeBd([
+      bead({ id: "e1", issue_type: "epic", labels: ["agent:human"] }),
+      bead({ id: "e1.1", issue_type: "task", parent: "e1", status: "closed" }),
+    ]);
+
+    const detail = await getTicketDetail(project, "e1");
+
+    expect(detail.hasOpenDescendants).toBe(false);
+  });
+
+  it("never flags a task/bug — it is always a leaf, whatever its own status", async () => {
+    fakeBd([bead({ id: "t-1" })]);
+
+    const detail = await getTicketDetail(project, "t-1");
+
+    expect(detail.hasOpenDescendants).toBe(false);
+  });
+});
+
 describe("updateTicket read economy", () => {
   beforeEach(() => resetIssueSnapshots());
   afterEach(() => vi.restoreAllMocks());
@@ -197,6 +237,23 @@ describe("updateTicket read economy", () => {
     expect(detail.epicAssignee).toBe("alice");
     // At most the background refresh the client's next poll shares — never awaited here.
     expect(bd.list.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+
+  it("reads the board after saving a parentless epic — hasOpenDescendants needs it even though holdsRun does not", async () => {
+    const bd = fakeBd([
+      bead({ id: "e-1", title: "Epic", issue_type: "epic" }),
+      bead({ id: "e-1.1", issue_type: "task", parent: "e-1" }),
+    ]);
+    await getTicketDetail(project, "e-1"); // warm the board
+    bd.list.mockClear();
+
+    const detail = await updateTicket(project, "e-1", { title: "New" });
+
+    expect(detail.title).toBe("New");
+    // Unlike a parentless task/bug (a leaf, exempt above), an epic/feature can hold children
+    // regardless of its own parent — the zero-spawn shortcut must not apply to it.
+    expect(detail.hasOpenDescendants).toBe(true);
+    expect(bd.list).toHaveBeenCalled();
   });
 });
 

@@ -136,6 +136,31 @@ describe("operatorQueue — the set", () => {
     expect(operatorQueue(board)).toEqual([]);
   });
 
+  it("flags a human epic that still has open work under it — Mark done would 409 there", () => {
+    const board = [
+      bead({ id: "e1", issue_type: "epic", labels: ["approved", "agent:human"] }),
+      bead({ id: "e1.1", issue_type: "task", parent: "e1" }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.id).toBe("e1");
+    expect(target.hasOpenDescendants).toBe(true);
+  });
+
+  it("does not flag a human epic once its child has closed", () => {
+    const board = [
+      bead({ id: "e1", issue_type: "epic", labels: ["approved", "agent:human"] }),
+      bead({ id: "e1.1", issue_type: "task", parent: "e1", status: "closed" }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.id).toBe("e1");
+    expect(target.hasOpenDescendants).toBeUndefined();
+  });
+
+  it("does not flag a leaf human ticket — a task/bug never has children", () => {
+    const board = [bead({ id: "t1" })];
+    expect(operatorQueue(board)[0].hasOpenDescendants).toBeUndefined();
+  });
+
   it("carries what the row acts on: the goal, the chips, and when it was asked", () => {
     const board = [
       bead({

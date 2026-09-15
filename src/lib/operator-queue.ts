@@ -12,6 +12,7 @@
  */
 import { beads, type Bead } from "./beads/bd";
 import { isPipelineArtifact } from "./beads/contract";
+import { descendantsOf } from "./beads/subtree";
 import { boardCards, deriveStage, isRunTicket, labelValue, parseGoal } from "./ticket-view";
 import type { OperatorQueueItem } from "./types";
 
@@ -23,6 +24,22 @@ import type { OperatorQueueItem } from "./types";
  */
 function isOpenWork(bead: Bead): boolean {
   return bead.status !== "closed" && !beads.isDeferred(bead);
+}
+
+/**
+ * Whether `bead` still has open work under it — the same read `closeHumanTicket` (close-human.ts)
+ * makes before it will close a bead (`openDescendants`, mirrored here off the primitive it shares,
+ * `descendantsOf`), so a row's Mark done can withhold itself exactly where that route would 409.
+ * Only an epic or a feature can have children in this board's shape, so this is trivially false for
+ * everything else — cheap to compute unconditionally rather than special-cased by type.
+ *
+ * Walked over the FULL board (`all`, not the pipeline-artifact-filtered `work`), matching the board
+ * `closeHumanTicket` reads: a descendant this queue's own filtering drops would still make bd refuse
+ * the close, so dropping it here too would let this predicate answer "clear" for a bead the server
+ * is about to 409.
+ */
+function hasOpenDescendantsOf(bead: Bead, all: Bead[]): boolean {
+  return descendantsOf(all, bead.id, (b) => b.status !== "closed").length > 0;
 }
 
 /**
@@ -80,6 +97,9 @@ export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
     // is ever armed on this ticket — the row must not send the operator looking for an escalation
     // that does not exist (PR #214 review).
     const holdsRun = target ? !beads.isHumanWork(target) : false;
+    // Mark done closes THIS bead (item.id), not its run target, so it's this bead's own
+    // descendants — not the target's — that decide whether `bd close` would refuse it.
+    const hasOpenDescendants = hasOpenDescendantsOf(bead, all);
 
     const goal = parseGoal(bead);
     const risk = labelValue(bead.labels, "risk");
@@ -93,6 +113,7 @@ export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
       ...(risk ? { risk } : {}),
       ...(size ? { size } : {}),
       ...(target ? { runTarget: { id: target.id, title: target.title }, holdsRun } : {}),
+      ...(hasOpenDescendants ? { hasOpenDescendants } : {}),
     });
   }
 

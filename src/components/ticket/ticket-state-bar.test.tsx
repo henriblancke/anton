@@ -7,7 +7,14 @@ import type { Stage, TicketDetail } from "@/lib/types";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
-const detail = (over: { stage?: Stage; deferred?: boolean; abandoned?: boolean; agent?: string }) =>
+const detail = (over: {
+  stage?: Stage;
+  deferred?: boolean;
+  abandoned?: boolean;
+  agent?: string;
+  holdsRun?: boolean;
+  hasOpenDescendants?: boolean;
+}) =>
   ({
     id: "t-1",
     title: "Do the thing",
@@ -17,6 +24,8 @@ const detail = (over: { stage?: Stage; deferred?: boolean; abandoned?: boolean; 
     deferred: over.deferred ?? false,
     abandoned: over.abandoned ?? false,
     agent: over.agent,
+    holdsRun: over.holdsRun,
+    hasOpenDescendants: over.hasOpenDescendants,
   }) as TicketDetail;
 
 afterEach(() => {
@@ -148,6 +157,28 @@ describe("TicketStateBar", () => {
         slug="anton"
         ticketId="t-1"
         detail={detail({ agent: "human", stage: "done" })}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("withholds Mark done from a held ticket, and from a bead with open work under it", () => {
+    const { rerender } = render(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human", holdsRun: true })}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+
+    rerender(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human", hasOpenDescendants: true })}
         onChanged={vi.fn()}
       />,
     );

@@ -5,6 +5,7 @@
  * {@link abandonTicket}: this records a delivery — the work happened — not a won't-do.
  */
 import { beads, isBlockedByOpenIssues, LABELS, type Bead } from "./beads/bd";
+import { loadAllIssues } from "./beads/issues";
 import { withBeadWriteLock } from "./beads/claim-lock";
 import { openDescendants, runTargetOf } from "./abandon";
 import { openBlockersOf } from "./jobs/execute-epic-human-gate";
@@ -63,10 +64,13 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
     }
     assertOpen(bead, id);
 
-    // --skip-labels (bd 1.1.0): openDescendants, runTargetOf and openBlockersOf only inspect
-    // parent, status, type and inline `dependencies` — none of which this flag touches — so label
-    // hydration on this read is dead weight (matches abandon.ts / epic-detail.ts).
-    const board = await beads.list(repo, ["--status", "all", "--skip-labels"]);
+    // Through loadAllIssues, never a bare `bd list --status all` (PR #238 review pattern, also
+    // execute-epic-persist.ts / execute-epic-human-gate.ts): bd omits gate beads from an ordinary
+    // listing while still carrying the `blocks` edge they put on the bead they gate, so a raw list
+    // makes openBlockersOf read a RESOLVED gate as an open blocker forever — 409ing this route
+    // permanently even after `bd gate resolve`. strictGates: a stale gate read must fail this write
+    // rather than silently degrade to that same false-open reading.
+    const board = await loadAllIssues(repo, { strictGates: true });
     const open = openDescendants(board, id);
     if (open.length > 0) {
       throw new NotCloseableError(

@@ -439,6 +439,13 @@ export interface OperatorQueueItem {
    * held run to resume (PR #214 review).
    */
   holdsRun?: boolean;
+  /**
+   * Whether this bead still has open work under it — epic/feature only, since a task/bug is always
+   * a leaf. `closeHumanTicket` (close-human.ts) refuses to close a bead with open descendants
+   * (409), so this withholds Mark done exactly where that route would 409 (mirrors the `holdsRun`
+   * gap fix, PR #214 review).
+   */
+  hasOpenDescendants?: boolean;
 }
 
 export interface Board {
@@ -598,6 +605,13 @@ export interface TicketDetail extends Ticket {
    * (poisoned before dispatch, so no gate is ever armed under it).
    */
   holdsRun?: boolean;
+  /**
+   * Whether this bead still has open work under it — epic/feature only, since a task/bug is always
+   * a leaf. `closeHumanTicket` (close-human.ts) refuses to close a bead with open descendants
+   * (409), so this withholds Mark done exactly where that route would 409 (mirrors the `holdsRun`
+   * gap fix, PR #214 review).
+   */
+  hasOpenDescendants?: boolean;
 }
 
 // ── Board drag-and-drop ──

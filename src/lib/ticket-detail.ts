@@ -6,6 +6,7 @@
 import { beads, type BeadPatch } from "./beads/bd";
 import { withBeadWriteLock } from "./beads/claim-lock";
 import { allIssues, ensureDescription } from "./beads/issues";
+import { descendantsOf } from "./beads/subtree";
 import { nudgeSync } from "./beads/sync-nudge";
 import { formatHumanNote, parseTicketNotes, type TicketNote } from "./beads/notes";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
@@ -35,6 +36,16 @@ function holdsRunOf(bead: Bead, all: Bead[]): boolean {
   if (!isRunTicket(bead, cards)) return false;
   const target = all.find((b) => b.id === cards.cardOf(bead));
   return target ? !beads.isHumanWork(target) : false;
+}
+
+/**
+ * Whether `bead` still has open work under it — the same read `closeHumanTicket` (close-human.ts)
+ * makes before it will close a bead, mirrored here off the primitive it shares (`descendantsOf`),
+ * so this dialog's Mark done can withhold itself exactly where that route would 409. Only an epic or
+ * a feature can have children in this board's shape, so this is trivially false for a task/bug.
+ */
+function hasOpenDescendantsOf(bead: Bead, all: Bead[]): boolean {
+  return descendantsOf(all, bead.id, (b) => b.status !== "closed").length > 0;
 }
 
 function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined, all: Bead[]): TicketDetail {
@@ -67,6 +78,7 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined, all: Bea
     // withhold the closed-PR Force run the gate permits on an in-review legacy standalone.
     contract: runContractStatus(full, []),
     holdsRun: holdsRunOf(lite, all),
+    hasOpenDescendants: hasOpenDescendantsOf(lite, all),
   };
 }
 
@@ -113,16 +125,20 @@ export async function getTicketDetail(project: Project, id: string): Promise<Tic
  * write cannot have changed. `blockOnPendingWrite: false` serves the retained board and kicks the
  * post-write refresh in the background, which is the very load that next poll then shares.
  *
- * A parentless bead skips the board read entirely (anton-0zih's zero-spawn invariant): `holdsRunOf`
- * only needs siblings/ancestors to walk `cardOf`'s parent chain, and a bead with no parent has none
- * to walk — its own classification (parentless task/bug is trivially a run target; anything else
- * classifies as no card) never depends on the rest of the board.
+ * A parentless task/bug skips the board read entirely (anton-0zih's zero-spawn invariant):
+ * `holdsRunOf` only needs siblings/ancestors to walk `cardOf`'s parent chain, and a bead with no
+ * parent has none to walk — its own classification (parentless task/bug is trivially a run target)
+ * never depends on the rest of the board, and a task/bug is always a leaf so `hasOpenDescendantsOf`
+ * is trivially false too. An epic or a feature is not exempt even when parentless: either can hold
+ * children of its own regardless of its OWN parent, so `hasOpenDescendantsOf` needs the real board
+ * to answer for those two types.
  */
 export async function freshDetail(project: Project, bead: Bead): Promise<TicketDetail> {
   const parentId = parentOf(bead);
-  if (!parentId) return withPrUrl(project, bead, bead, undefined, [bead]);
+  const canHaveChildren = bead.issue_type === "epic" || bead.issue_type === "feature";
+  if (!parentId && !canHaveChildren) return withPrUrl(project, bead, bead, undefined, [bead]);
   const all = await allIssues(project.repoPath, { blockOnPendingWrite: false });
-  const epic = all.find((b) => b.id === parentId);
+  const epic = parentId ? all.find((b) => b.id === parentId) : undefined;
   return withPrUrl(project, bead, bead, epic, all);
 }
 
