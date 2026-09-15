@@ -8,20 +8,6 @@
 import { beads, type Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 
-/**
- * Swallow errors from best-effort bd side effects (already-applied labels, etc.). Reports whether
- * the write actually landed, so a caller whose write carries content that exists nowhere else can
- * fall back instead of assuming it (see {@link reviewParkMessage}).
- */
-export async function safe(fn: () => Promise<unknown>): Promise<boolean> {
-  try {
-    await fn();
-    return true;
-  } catch {
-    return false; // best-effort
-  }
-}
-
 /** Backoff between {@link mustPersist} attempts — long enough to outlast a contended Dolt write. */
 export const PERSIST_RETRY_MS = 500;
 

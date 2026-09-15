@@ -36,7 +36,7 @@ import {
   ungatedAskMessage,
   type ArmedHumanGate,
 } from "./execute-epic-human-gate";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import type { EpicRun } from "./execute-epic-run";
 import { enqueueSyncPushDeduped } from "./queue";
 
