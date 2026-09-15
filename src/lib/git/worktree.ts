@@ -14,7 +14,11 @@ import { hostname } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
-import { isAncestor } from "./ops";
+import {
+  isAncestor,
+  needsHooksPathOverrideForMerge,
+  resolveHooksPathOverrideForMerge,
+} from "./ops";
 
 const execFileAsync = promisify(execFile);
 
@@ -49,9 +53,9 @@ export interface Worktree {
   refreshOutcome?: RefreshOutcome;
 }
 
-/** The four shapes {@link refreshOntoBase} can leave a reused checkout in. */
+/** The shapes {@link refreshOntoBase} can leave a reused checkout in. */
 export interface RefreshOutcome {
-  outcome: "noop" | "fast_forwarded" | "rebased" | "skipped_dirty";
+  outcome: "noop" | "fast_forwarded" | "rebased" | "merged" | "skipped_dirty";
   /**
    * The base commit the checkout was (or already was) brought up to — or, for `skipped_dirty`, the
    * fresh base it was NOT brought up to, so a human reading the row can see how far behind it sat.
@@ -59,9 +63,14 @@ export interface RefreshOutcome {
   baseSha: string;
 }
 
-/** Run a git command in `repoPath`, returning trimmed stdout. */
-async function git(repoPath: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["-C", repoPath, ...args], {
+/**
+ * Run a git command in `repoPath`, returning trimmed stdout. `hooksPath`, when given, is passed as
+ * `-c core.hooksPath=<value>` — see {@link refreshOntoBase}'s use of it for why a reset/rebase onto
+ * a fresh base needs the same override review-fix's premerge already resolves for its own merges.
+ */
+async function git(repoPath: string, args: string[], hooksPath?: string): Promise<string> {
+  const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
+  const { stdout } = await execFileAsync("git", [...configArgs, "-C", repoPath, ...args], {
     timeout: 120_000,
     maxBuffer: 16 * 1024 * 1024,
   });
@@ -467,20 +476,36 @@ async function dirtyPaths(worktreePath: string): Promise<string[]> {
  * whatever base it was cut from — a resumed run can silently implement, test, and self-review
  * against a tree many commits behind main.
  *
- * Four outcomes, in order of how much the checkout may safely move:
+ * Outcomes, in order of how much the checkout may safely move:
  * - Already at `baseBranch`: no-op.
  * - No unique commits (the branch is an ancestor of the fresh base, or equal to it): fast-forwarded
  *   with `reset --hard` — nothing of the run's is on this branch yet, so there's nothing to lose.
- * - Unique commits: rebased onto `baseBranch` so they land on top of the fresh tree. A rebase that
- *   cannot apply cleanly is ABORTED, never forced — the run fails loud naming the divergence rather
- *   than discarding work or leaving the checkout mid-rebase.
+ * - Unique commits, none of them pushed to `origin/<branch>` yet: rebased onto the base so they land
+ *   on top of the fresh tree.
+ * - Unique commits that ARE already on `origin/<branch>` (this checkout's own tip matches its remote-
+ *   tracking ref): MERGED instead of rebased. A prior attempt can push the branch via
+ *   `openPullRequest`'s `pushBranch` and then fail before `gh pr create` completes — a case the
+ *   run's retry path explicitly resumes from — so by the time this refresh runs again, those commits
+ *   are already public. Rebasing them here would rewrite that published history, and the later
+ *   retry's own `pushBranch` runs a plain, deliberately non-forcing `git push -u origin <branch>`
+ *   that then rejects the rewritten branch as non-fast-forward on every subsequent attempt (PR #279
+ *   review). Merging preserves what's already pushed while still bringing the checkout current.
+ * - A rebase or merge that cannot apply cleanly is ABORTED, never forced — the run fails loud naming
+ *   the divergence rather than discarding work or leaving the checkout mid-operation.
  * - Dirty (anything `git status --porcelain` reports, tracked or not): SKIPPED, never touched.
- *   Resetting or rebasing over uncommitted state would discard it, but a dirty reused checkout is
- *   exactly what a run parked on a usage limit or a `needs-human` ask leaves behind on purpose
- *   (execute-epic-ticket-settle.ts keeps it precisely so the resume can continue from it) — refusing
- *   the refresh outright would strand that resume forever, since every later attempt reuses the same
- *   worktree and hits the same dirty tree (PR #279 review). So the checkout dispatches against
- *   whatever base it already has instead; only a CLEAN reused checkout is worth the trip forward.
+ *   Resetting, rebasing, or merging over uncommitted state would discard it, but a dirty reused
+ *   checkout is exactly what a run parked on a usage limit or a `needs-human` ask leaves behind on
+ *   purpose (execute-epic-ticket-settle.ts keeps it precisely so the resume can continue from it) —
+ *   refusing the refresh outright would strand that resume forever, since every later attempt reuses
+ *   the same worktree and hits the same dirty tree (PR #279 review). So the checkout dispatches
+ *   against whatever base it already has instead; only a CLEAN reused checkout is worth the trip
+ *   forward.
+ *
+ * `baseBranch` is resolved to `baseSha` ONCE, up front, and every ancestry check, rebase/merge
+ * target, and diagnostic log below uses that pinned sha rather than rereading the mutable branch
+ * name — a concurrent run's fetch can advance `origin/<baseBranch>` between this resolution and the
+ * git calls that act on it, and rereading the ref name would then act on a base that moved out from
+ * under the sha this function returns and its caller persists (PR #279 review).
  */
 async function refreshOntoBase(opts: {
   repoPath: string;
@@ -511,22 +536,61 @@ async function refreshOntoBase(opts: {
   const branchSha = await git(repoPath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
   if (baseSha === branchSha) return { outcome: "noop", baseSha }; // already current
 
-  if (await isAncestor(worktreePath, branch, baseBranch)) {
-    // The branch carries nothing `baseBranch` doesn't already have — safe to fast-forward in place.
-    await git(worktreePath, ["reset", "--hard", baseSha]);
+  // Resolved once against the pinned `baseSha` (not `baseBranch`) so the reset/rebase/merge below
+  // fire the SAME `post-checkout`/`pre-rebase`/`post-merge` hook this base's tree actually carries —
+  // the identical reasoning review-fix's premerge already applies to its own fast-forward and
+  // conflict-resolution merges (needsHooksPathOverrideForMerge's own doc comment).
+  const hooksPath = (await needsHooksPathOverrideForMerge(repoPath, worktreePath, baseSha))
+    ? await resolveHooksPathOverrideForMerge(repoPath, worktreePath, baseSha)
+    : undefined;
+
+  if (await isAncestor(worktreePath, branch, baseSha)) {
+    // The branch carries nothing the base doesn't already have — safe to fast-forward in place.
+    await git(worktreePath, ["reset", "--hard", baseSha], hooksPath);
     console.log(
       `[worktree] fast-forwarded ${branch} to ${baseBranch} (${baseSha.slice(0, 12)}) — no unique commits`,
     );
     return { outcome: "fast_forwarded", baseSha };
   }
 
+  // A checkout's own remote-tracking ref only moves when THIS repo pushes `branch` itself (a claim
+  // holds the checkout for the run's whole lifetime, so no other worker pushes it meanwhile) — if it
+  // already matches this branch's tip, those commits are public and rebasing would rewrite them.
+  const remoteSha = await git(
+    repoPath,
+    ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`],
+  ).catch(() => undefined);
+  const alreadyPublished = remoteSha !== undefined && remoteSha === branchSha;
+
+  if (alreadyPublished) {
+    try {
+      await git(worktreePath, ["merge", "--no-edit", baseSha], hooksPath);
+      console.log(
+        `[worktree] merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch} — its commits are ` +
+          `already on origin, so rebasing would have rewritten published history`,
+      );
+      return { outcome: "merged", baseSha };
+    } catch (err) {
+      await git(worktreePath, ["merge", "--abort"]).catch(() => undefined);
+      const unique = await git(worktreePath, ["log", "--oneline", `${baseSha}..${branch}`]).catch(
+        () => "(could not list them)",
+      );
+      throw new Error(
+        `[worktree] ${branch} diverges from ${baseBranch} and could not be merged onto it cleanly ` +
+          `(refusing to rebase since its commits are already published) — refusing to discard or ` +
+          `rewrite its commits. Unique commits:\n${unique}\nResolve the conflict in ${worktreePath} ` +
+          `and retry (${gitError(err)})`,
+      );
+    }
+  }
+
   try {
-    await git(worktreePath, ["rebase", baseBranch]);
+    await git(worktreePath, ["rebase", baseSha], hooksPath);
     console.log(`[worktree] rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
     return { outcome: "rebased", baseSha };
   } catch (err) {
     await git(worktreePath, ["rebase", "--abort"]).catch(() => undefined);
-    const unique = await git(worktreePath, ["log", "--oneline", `${baseBranch}..${branch}`]).catch(
+    const unique = await git(worktreePath, ["log", "--oneline", `${baseSha}..${branch}`]).catch(
       () => "(could not list them)",
     );
     throw new Error(

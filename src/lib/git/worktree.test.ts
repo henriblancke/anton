@@ -308,6 +308,44 @@ suite("worktree manager (real git)", () => {
       }
     });
 
+    // anton-s55u (PR #279 review): a prior attempt can push the branch via `pushBranch` and then
+    // fail before `gh pr create` completes; the resumed run's refresh must not rewrite those
+    // already-public commits, or the retry's own non-forcing push rejects the rebased branch forever.
+    it("merges instead of rebasing when the branch's unique commits are already on origin", async () => {
+      const branch = "anton/refresh-published";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "pushed ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "already-pushed ticket commit"]);
+      const uniqueSha = headOf(first.path);
+      // Simulate a prior `pushBranch` having already published this tip — no real remote is set up
+      // in this suite, so a bare remote-tracking ref stands in for what a real push would leave.
+      execFileSync("git", ["update-ref", `refs/remotes/origin/${branch}`, uniqueSha], { cwd: repo });
+
+      advanceDefaultBranch("published-base.txt", "advance 5\n", "advance main (published)");
+      const freshMain = branchTip(defaultBranch());
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+
+        expect(second.path).toBe(first.path);
+        expect(existsSync(join(second.path, "published-base.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+        // The already-pushed commit is untouched (still reachable as-is), not rewritten by a rebase.
+        const mergeBase = execFileSync(
+          "git",
+          ["-C", second.path, "merge-base", uniqueSha, branch],
+          { encoding: "utf8" },
+        ).trim();
+        expect(mergeBase).toBe(uniqueSha);
+        expect(log.mock.calls.flat().join(" ")).toContain("merged");
+        expect(second.refreshOutcome).toEqual({ outcome: "merged", baseSha: freshMain });
+      } finally {
+        log.mockRestore();
+      }
+    });
+
     it("fails loud on a conflicting divergence and never discards the branch's commits", async () => {
       const branch = "anton/refresh-conflict";
       const first = await createWorktree({ repoPath: repo, branch });

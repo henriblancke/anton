@@ -41,9 +41,11 @@ export async function warmRunWorktree(
   // 2. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
   // (anton-x3o): resolveFreshBase fetches origin/<base> and returns `origin/<base>` so a run
   // whose local base is stale still starts at the remote tip; it's best-effort and falls back
-  // to the local base offline. On resume this is moot — createWorktree short-circuits to the
-  // existing worktree, so the base is never re-applied mid-run. Note the PR `base` below stays
-  // the plain branch name (gh needs a branch, not a remote-tracking ref).
+  // to the local base offline. On resume, createWorktree short-circuits to the existing
+  // worktree, but the `refresh: true` below (anton-s55u) still brings a reused checkout up to
+  // this freshly-resolved base before returning it — see refreshOntoBase's own doc comment for
+  // how. Note the PR `base` below stays the plain branch name (gh needs a branch, not a
+  // remote-tracking ref).
   const baseBranch = settings.baseBranch ?? project.defaultBranch;
   // Held for the review gate below too: it diffs the branch against this base's MERGE BASE, so
   // the remote-tracking ref is the accurate fork point even when the local base has drifted.
