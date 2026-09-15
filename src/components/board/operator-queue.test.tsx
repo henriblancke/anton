@@ -18,7 +18,10 @@ import type { OperatorQueueItem } from "@/lib/types";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 function item(o: Partial<OperatorQueueItem> = {}): OperatorQueueItem {
   return {

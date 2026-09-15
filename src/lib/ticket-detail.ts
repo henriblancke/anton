@@ -26,16 +26,20 @@ import type { Project, TicketDetail } from "./types";
 
 /**
  * The same `holdsRun` predicate `operatorQueue` derives (operator-queue.ts), pure over a board this
- * caller already holds. FALSE for a run target itself (nothing holds it — it IS the work), and for a
- * ticket whose nearest run-target ancestor is itself `agent:human`: execute-epic poisons that target
- * before dispatching a single child, so no gate is ever armed under it (PR #214 review).
+ * caller already holds. FALSE for a run target itself (nothing holds it — it IS the work), for a
+ * ticket whose nearest run-target ancestor is itself `agent:human` (execute-epic poisons that target
+ * before dispatching a single child, so no gate is ever armed under it — PR #214 review), and for a
+ * ticket whose target has already settled (closed or deferred): no run will ever resume to reach it,
+ * so nothing holds it either — mirroring the `isOpenWork(gate)` precondition `operatorQueue` filters
+ * on before it ever computes `holdsRun` (codex review, PR #288).
  */
 function holdsRunOf(bead: Bead, all: Bead[]): boolean {
   if (beads.isRunTarget(bead, all)) return false;
   const cards = boardCards(all);
   if (!isRunTicket(bead, cards)) return false;
   const target = all.find((b) => b.id === cards.cardOf(bead));
-  return target ? !beads.isHumanWork(target) : false;
+  if (!target) return false;
+  return target.status !== "closed" && !beads.isDeferred(target) && !beads.isHumanWork(target);
 }
 
 /**

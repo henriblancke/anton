@@ -157,6 +157,37 @@ describe("getTicketDetail holdsRun", () => {
 
     expect(detail.holdsRun).toBe(false);
   });
+
+  it("holds no run once the target has closed — no run is left to resume and reach it", async () => {
+    // Codex review (PR #288): a human child left open under an already-closed, non-human target is
+    // stranded — no run will ever arm a gate on it again — so Mark done must be offered, not withheld
+    // as if a live run still owned it.
+    fakeBd([
+      bead({ id: "f1", title: "Ship billing", issue_type: "feature", status: "closed", labels: ["approved"] }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1", labels: ["agent:human"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "f1.1");
+
+    expect(detail.holdsRun).toBe(false);
+  });
+
+  it("holds no run once the target is deferred — snoozed, so no run reaches it either", async () => {
+    fakeBd([
+      bead({
+        id: "f1",
+        title: "Ship billing",
+        issue_type: "feature",
+        status: "deferred",
+        labels: ["approved"],
+      }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1", labels: ["agent:human"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "f1.1");
+
+    expect(detail.holdsRun).toBe(false);
+  });
 });
 
 // Direct coverage for hasOpenDescendantsOf (unexported, exercised through getTicketDetail) — the
