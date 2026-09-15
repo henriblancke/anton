@@ -82,6 +82,15 @@ interface RunGates {
   /** The target's working-layer subtree on the current board — `tickets` minus the standalone case. */
   children: Bead[];
   isResumeSkipped: (t: Bead) => boolean;
+  /**
+   * Ticket ids the human preflight ({@link armHumanTicketWaits}) actually armed a wait for, or
+   * closed as answered — a strict subset of `gated` (PR #274 review). `gated` also holds tickets
+   * an ORDINARY cross-run blocker gates, which never got a human wait armed for them; conflating
+   * the two would let a ticket relabelled `agent:human` AFTER the preflight, but whose id already
+   * sat in `gated` for an unrelated reason, ride through the publish-time relabel check unhandled.
+   * Empty until the arm step runs.
+   */
+  armedHumanIds: Set<string>;
 }
 
 /**
@@ -230,7 +239,13 @@ function regateRefreshedBoard(run: EpicRun, leaseTarget: Bead): RunGates {
   // exist yet at this point.
   const isResumeSkipped = (t: Bead) => resumeSkipped(t, run.standaloneRun);
   run.target = target;
-  return { readiness: freshReadiness, gated, children: freshChildren, isResumeSkipped };
+  return {
+    readiness: freshReadiness,
+    gated,
+    children: freshChildren,
+    isResumeSkipped,
+    armedHumanIds: new Set(),
+  };
 }
 
 /**
@@ -558,15 +573,35 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
  * REJECTED as drift instead, the same shape `ticketSetDrift` already retries on: the next attempt
  * re-enters from the top, where `armHumanTicketWaits` sees the fresh label and arms its wait properly.
  *
- * EXCLUDES anything already in `gates.gated` (fresh evidence, PR #274 review round 7):
- * `preflightHumanTickets` arms a wait WITHOUT clearing the label — only a person relabelling the
- * ticket does that — so every ticket this run already armed still carries `agent:human` here, and
- * the open gate it armed already blocks the ticket, which is exactly what put its id in `gated` when
- * `armHumanTicketWaits` re-derived readiness. Judging the label alone would reject those same
- * already-handled tickets as "newly relabelled" on every attempt, parking the whole run forever
- * instead of dispatching its independent siblings. Excluding `gated` narrows this to what it must
- * catch: a ticket relabelled human AFTER the preflight ran, which never got a wait armed and so
- * never joined `gated` at all.
+ * EXCLUDES anything already in `gates.armedHumanIds` (fresh evidence, PR #274 review round 7,
+ * corrected round 8): `preflightHumanTickets` arms a wait WITHOUT clearing the label — only a
+ * person relabelling the ticket does that — so every ticket this run already armed still carries
+ * `agent:human` here, and the open gate it armed already blocks the ticket. Judging the label alone
+ * would reject those same already-handled tickets as "newly relabelled" on every attempt, parking
+ * the whole run forever instead of dispatching its independent siblings.
+ *
+ * NOT `gates.gated`, which round 7 used first and which is the wrong set: `gated` also holds
+ * tickets an ORDINARY cross-run blocker gates, tickets that never went through
+ * {@link armHumanTicketWaits}'s arm at all. A ticket externally blocked when the preflight ran
+ * carries no wait — it fell out of `isUnarmedHumanWork` because it wasn't yet `agent:human`, or
+ * because a blocker made it uninteresting to arm — but its id still lands in `gated`. If this same
+ * window then both resolves that external blocker AND relabels the ticket `agent:human`, `gated`
+ * membership alone would exempt it from this check, the readiness re-derived below would find it
+ * unblocked, and it would dispatch to the default agent with no human wait ever armed. `armedHumanIds`
+ * is the narrower, correct set: only ids {@link preflightHumanTickets} itself armed a wait for or
+ * closed as answered (`state.handled`), so a ticket the preflight never touched still trips this
+ * check no matter what else changed about it in the meantime.
+ *
+ * ALSO re-runs the allowlist, contract and claimable gates over this adopted board (fresh evidence,
+ * PR #274 review round 9): `ticketSetDrift` above is ID-only, so a `publishRunClaim` sync that
+ * swaps in a changed OBJECT for an existing id — a disabled agent's label, a stripped Acceptance
+ * section, a status flipped to `blocked`/`deferred` — passes it untouched, and everything upstream
+ * (`assertAgentsEnabled`, `assertBeadContract`, `assertTicketsClaimable`) judged the pre-sync
+ * objects. Left unchecked, that ticket would ride the readiness recompute below straight into
+ * dispatch under a boundary the operator disabled it for, or fail its hard claim gate after earlier
+ * siblings already ran. Re-run here, over `run.tickets`/`gates.children` as this function just
+ * adopted them, the same read-only functions steps 0b/0c/0c-bis already are — one more window the
+ * same drift can land in, closed the same way.
  */
 async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Promise<void> {
   const { repo, targetId: epicBeadId } = run;
@@ -601,7 +636,8 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
         `board that had already moved on, so refusing to execute work this run no longer owns`,
     );
   }
-  const freshTickets = run.standaloneRun ? [adoptedTarget] : runTickets(board, epicBeadId);
+  const freshChildren = runTickets(board, epicBeadId);
+  const freshTickets = run.standaloneRun ? [adoptedTarget] : freshChildren;
   const drift = ticketSetDrift(run.tickets, freshTickets);
   if (drift) {
     throw new Error(
@@ -615,7 +651,7 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
       t.id !== epicBeadId &&
       beads.isHumanWork(t) &&
       !gates.isResumeSkipped(t) &&
-      !gates.gated.has(t.id),
+      !gates.armedHumanIds.has(t.id),
   );
   if (relabelledHuman.length > 0) {
     throw new Error(
@@ -628,10 +664,17 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
   run.all = board;
   run.target = adoptedTarget;
   run.tickets = freshTickets;
+  gates.children = freshChildren;
   const freshReadiness = run.readiness(run.all);
   if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness, run.all);
   gates.readiness = freshReadiness;
   gates.gated = new Set(freshReadiness.gated);
+  // Re-run the read-only allowlist/contract/claimable gates over the board just adopted (PR #274
+  // review round 9) — see the doc comment above for why `ticketSetDrift`'s id-only diff cannot
+  // catch a changed OBJECT behind an unchanged id.
+  assertAgentsEnabled(run, gates);
+  assertBeadContract(run, gates);
+  await assertTicketsClaimable(run, gates);
 }
 
 /**
@@ -767,6 +810,11 @@ async function armHumanTicketWaits(run: EpicRun, gates: RunGates): Promise<void>
     freshChildren = humanPreflight.children;
     run.tickets = humanPreflight.tickets;
     freshReadiness = run.readiness(run.all);
+    // The narrower set (PR #274 review): what actually got a wait armed or was closed as
+    // answered, not everything `gated` below folds in. The publish-time relabel check
+    // ({@link assertPublishedBoardCycleFree}) exempts only these ids from its "newly relabelled"
+    // retry — a ticket this pass never touched must still trip it if it turns up human later.
+    gates.armedHumanIds = new Set(humanPreflight.handled);
     // A held answered-gate ticket joins the verdict as gated, so the dispatch loop holds it by
     // the same rule as any other blocked child rather than reaching it as open human work and
     // parking on the "it should be held by a gate" backstop. Its blockers join the list the park

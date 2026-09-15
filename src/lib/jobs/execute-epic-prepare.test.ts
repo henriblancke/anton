@@ -168,6 +168,9 @@ function preflight(adopted: Bead[]) {
     tickets: children,
     answeredButBlocked: new Map<string, string[]>(),
     armed: true,
+    // Mirrors the real preflight: every `agent:human` ticket it is handed a board carrying gets a
+    // wait armed (or closed, if answered) — `handled` is that set, not merely `gated`'s superset.
+    handled: new Set(children.filter((c) => c.labels?.includes(LABELS.agentHuman)).map((c) => c.id)),
   };
 }
 
@@ -365,6 +368,30 @@ describe("prepareEpicRun — a held child is caught on every board the run adopt
     expect(prep.done).toBe(false);
     expect(warmRunWorktreeMock).toHaveBeenCalled();
     expect(claimRunTargetMock).toHaveBeenCalled();
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
+  // Fresh evidence (PR #274 review, round 9): `ticketSetDrift` only compares ids, so a child that
+  // keeps its id but has its STATUS flipped to `blocked`/`deferred` by `publishRunClaim`'s own sync
+  // rides straight through it — and readiness never asks about status either, only `blocks` edges.
+  // Before this fix nothing re-read `assertTicketsClaimable` against the board that sync pulled, so
+  // this run adopted t-2 as dispatchable and would have dispatched t-1 before dying at t-2's own
+  // hard claim gate.
+  it("parks when only the board publishRunClaim's own sync pulled shows a child's status change", async () => {
+    const all = board(ticket("t-1"), ticket("t-2"));
+    loadAllIssuesMock
+      .mockResolvedValueOnce(all) // step 1c's confirmation: still clean
+      .mockResolvedValueOnce(all) // step 3b-bis's reserved-board read: still clean
+      .mockResolvedValue(board(ticket("t-1"), ticket("t-2", "blocked"))); // publish's own sync
+    preflightHumanTicketsMock.mockResolvedValue(preflight(all));
+
+    const error = await refusalFrom(all);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("t-2");
+    expect(error.message).toContain("blocked pending human review");
+    // Caught on the board publishRunClaim's own sync just pulled, not before it — the claim did
+    // publish.
     expect(publishRunClaimMock).toHaveBeenCalled();
   });
 });
@@ -620,6 +647,43 @@ describe("prepareEpicRun — the structure/cycle gate re-runs on the board the r
     expect(prep.done).toBe(false);
     if (prep.done) return;
     expect([...prep.gated]).toContain("t-2");
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
+  // Fresh evidence (PR #274 review, round 8): `gated` is the WRONG set to exempt against — it also
+  // holds a child an ORDINARY cross-run blocker gates, one the human preflight never touched because
+  // it wasn't `agent:human` work yet. If the publish sync BOTH relabels that same child and clears
+  // its ordinary blocker in the same window, exempting on `gated` alone would wave it through as
+  // "already handled" even though no wait was ever armed for it — and the readiness recomputed right
+  // after would then read it as unblocked and dispatchable. `armedHumanIds` (this fix) only exempts
+  // ids the preflight itself armed a wait for or closed as answered, so this same ticket still trips
+  // the check.
+  it("retries when the publish sync relabels a child that was only EXTERNALLY gated, never armed", async () => {
+    const clean = board(ticket("t-1"), ticket("t-2"));
+    attachCycleEvidence(clean, []);
+    const relabelled = board(ticket("t-1"), { ...ticket("t-2"), labels: [LABELS.agentHuman] } as Bead);
+    attachCycleEvidence(relabelled, []);
+    // No human work for the preflight to arm — t-2 isn't `agent:human` on the board it reads.
+    preflightHumanTicketsMock.mockResolvedValue(preflight(clean));
+    loadAllIssuesMock.mockResolvedValueOnce(clean).mockResolvedValueOnce(clean).mockResolvedValue(relabelled);
+
+    const theRun = run(clean);
+    // t-2 starts held by an ORDINARY blocker (not a human wait) — gone by the time the published
+    // board is read, which is exactly the window this fix closes.
+    theRun.readiness = (b: Bead[]) =>
+      b === relabelled
+        ? { blockers: [], gated: [], runnable: true }
+        : { blockers: ["anton-elsewhere"], gated: ["t-2"], runnable: true };
+
+    const error = await prepareEpicRun(theRun).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect((error as Error).message).toContain("t-2");
+    expect((error as Error).message).toContain(LABELS.agentHuman);
     expect(publishRunClaimMock).toHaveBeenCalled();
   });
 
