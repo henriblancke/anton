@@ -45,6 +45,10 @@ describe("parseRecordedAdvisories", () => {
 
 describe("computeReviewKey", () => {
   let projectDir: string;
+  // computeReviewKey now takes the already-resolved merge-base COMMIT (the gate pins it once,
+  // up front, and passes the SHA — see review-gate.ts) rather than a branch name it resolves
+  // itself, so every call below passes this resolved SHA in place of the old `baseBranch: BASE`.
+  let baseRev: string;
   const BASE = "main";
 
   function git(...args: string[]): void {
@@ -69,6 +73,7 @@ describe("computeReviewKey", () => {
     git("config", "user.email", "test@example.com");
     git("config", "user.name", "test");
     commitFile("README.md", "# project\n");
+    baseRev = execFileSync("git", ["-C", projectDir, "rev-parse", BASE]).toString().trim();
     git("checkout", "-qb", "feature");
     commitFile("src/widget.tsx", "export const Widget = () => null;\n");
   });
@@ -83,22 +88,22 @@ describe("computeReviewKey", () => {
 
   it("keys on the merge-base and the branch tip, matching what git itself reports", async () => {
     const baseSha = execFileSync("git", ["-C", projectDir, "rev-parse", BASE]).toString().trim();
-    const key = await computeReviewKey({ worktreePath: projectDir, baseBranch: BASE, settings: {}, ...FIXED });
+    const key = await computeReviewKey({ worktreePath: projectDir, baseRev, settings: {}, ...FIXED });
     expect(key.baseRev).toBe(baseSha);
     expect(key.head).toBe(headSha());
   });
 
   it("is deterministic for an unchanged tree and contract", async () => {
     const settings: ProjectSettings = { reviewPrompt: "OPERATOR CONTRACT." };
-    const a = await computeReviewKey({ worktreePath: projectDir, baseBranch: BASE, settings, ...FIXED });
-    const b = await computeReviewKey({ worktreePath: projectDir, baseBranch: BASE, settings, ...FIXED });
+    const a = await computeReviewKey({ worktreePath: projectDir, baseRev, settings, ...FIXED });
+    const b = await computeReviewKey({ worktreePath: projectDir, baseRev, settings, ...FIXED });
     expect(reviewKeyToken(a)).toBe(reviewKeyToken(b));
   });
 
   it("moves the tip — and so the token — on a new commit", async () => {
-    const before = await computeReviewKey({ worktreePath: projectDir, baseBranch: BASE, settings: {}, ...FIXED });
+    const before = await computeReviewKey({ worktreePath: projectDir, baseRev, settings: {}, ...FIXED });
     commitFile("src/other.tsx", "export const Other = () => null;\n");
-    const after = await computeReviewKey({ worktreePath: projectDir, baseBranch: BASE, settings: {}, ...FIXED });
+    const after = await computeReviewKey({ worktreePath: projectDir, baseRev, settings: {}, ...FIXED });
     expect(after.head).not.toBe(before.head);
     expect(reviewKeyToken(after)).not.toBe(reviewKeyToken(before));
   });
@@ -106,13 +111,13 @@ describe("computeReviewKey", () => {
   it("changes the fingerprint — never the base or the tip — when the reviewer contract changes", async () => {
     const a = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: { reviewPrompt: "CONTRACT A." },
       ...FIXED,
     });
     const b = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: { reviewPrompt: "CONTRACT B." },
       ...FIXED,
     });
@@ -122,10 +127,10 @@ describe("computeReviewKey", () => {
   });
 
   it("changes the fingerprint when maxRounds or the score alarm changes, even with the shipped contract", async () => {
-    const a = await computeReviewKey({ worktreePath: projectDir, baseBranch: BASE, settings: {}, ...FIXED });
+    const a = await computeReviewKey({ worktreePath: projectDir, baseRev, settings: {}, ...FIXED });
     const b = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: { reviewMaxRounds: 5 },
       ...FIXED,
     });
@@ -133,10 +138,10 @@ describe("computeReviewKey", () => {
   });
 
   it("changes the fingerprint when review is toggled off, even with the tree and contract unchanged", async () => {
-    const a = await computeReviewKey({ worktreePath: projectDir, baseBranch: BASE, settings: {}, ...FIXED });
+    const a = await computeReviewKey({ worktreePath: projectDir, baseRev, settings: {}, ...FIXED });
     const b = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: { reviewEnabled: false },
       ...FIXED,
     });
@@ -146,10 +151,10 @@ describe("computeReviewKey", () => {
   });
 
   it("changes the fingerprint when a verify-gate command is added, even with the tree and contract unchanged", async () => {
-    const a = await computeReviewKey({ worktreePath: projectDir, baseBranch: BASE, settings: {}, ...FIXED });
+    const a = await computeReviewKey({ worktreePath: projectDir, baseRev, settings: {}, ...FIXED });
     const b = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: { testCommand: "npm test" },
       ...FIXED,
     });
@@ -163,7 +168,7 @@ describe("computeReviewKey", () => {
     const after = bead({ id: "anton-2", description: "## Acceptance Criteria\n\n- [ ] NEW criterion\n" });
     const a = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: {},
       target: TARGET,
       tickets: [before],
@@ -172,7 +177,7 @@ describe("computeReviewKey", () => {
     });
     const b = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: {},
       target: TARGET,
       tickets: [after],
@@ -189,7 +194,7 @@ describe("computeReviewKey", () => {
     const after = bead({ id: "anton-2", title: "new title" });
     const a = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: {},
       target: TARGET,
       tickets: [before],
@@ -198,7 +203,7 @@ describe("computeReviewKey", () => {
     });
     const b = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: {},
       target: TARGET,
       tickets: [after],
@@ -213,7 +218,7 @@ describe("computeReviewKey", () => {
   it("changes the fingerprint between two step:review occurrences on an identical tree and contract", async () => {
     const a = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: {},
       target: TARGET,
       tickets: [TARGET],
@@ -222,7 +227,7 @@ describe("computeReviewKey", () => {
     });
     const b = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: {},
       target: TARGET,
       tickets: [TARGET],
@@ -237,7 +242,7 @@ describe("computeReviewKey", () => {
   it("changes the fingerprint when the carried-in advisories differ, on an identical tree, contract, and step", async () => {
     const a = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: {},
       target: TARGET,
       tickets: [TARGET],
@@ -246,7 +251,7 @@ describe("computeReviewKey", () => {
     });
     const b = await computeReviewKey({
       worktreePath: projectDir,
-      baseBranch: BASE,
+      baseRev,
       settings: {},
       target: TARGET,
       tickets: [TARGET],

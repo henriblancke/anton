@@ -3918,6 +3918,19 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
     expect(verdict.transient).toBe(true);
   });
 
+  it("classifies a transient 5xx reported without the 'HTTP NNN' token as transient (git 2.43's own wording, anton-280)", () => {
+    // Confirmed against a real reproduction: `git push -h` documents `--porcelain` as
+    // machine-readable, and git 2.43 exits 128 with just this line for a 503 — no "HTTP 502"-style
+    // prefix, which is what the `/HTTP 5\d\d/` pattern above requires.
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: "fatal: unable to access '...': The requested URL returned error: 503\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+  });
+
   it("classifies a gpg signing misconfiguration exit-128 failure as permanent — the opposite verdict from DNS at the same exit code", () => {
     const verdict = classifyPushFailure({
       code: 128,

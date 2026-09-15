@@ -8,6 +8,7 @@
  * anton says about it are one decision: the message hedges on whether the bead note landed.
  */
 import { beads } from "../beads/bd";
+import { resolveMergeBase } from "../git/ops";
 import { resolveReviewConfig } from "../projects";
 import { findRunReviewKeyForBranch, updateRun } from "../runs";
 import { isForeignRunOwner, isPoisonError } from "./errors";
@@ -62,9 +63,12 @@ export async function runReviewStep(
     : await findRunReviewKeyForBranch(db, projectId, epicBeadId, branch, runId);
   if (recordedKey) {
     try {
+      // No gate has run in this attempt yet, so there is no pinned SHA to reuse — resolve
+      // `baseRef` fresh, exactly like the gate itself does on entry (review-gate.ts).
+      const baseRev = await resolveMergeBase(stepCtx.worktreePath, stepCtx.baseRef);
       const key = await computeReviewKey({
         worktreePath: stepCtx.worktreePath,
-        baseBranch: stepCtx.baseRef,
+        baseRev,
         settings,
         target: stepCtx.target,
         tickets: stepCtx.tickets,
@@ -211,14 +215,19 @@ export async function runReviewStep(
   carry.advisories = review.unresolved.filter((f) => f.severity === "advisory");
 
   // A CLEAN verdict is keyed to the tree it judged (anton-qmuyt), so a resume that finds the
-  // worktree unchanged can skip re-judging it. Recomputed here rather than reusing any
-  // up-front read: a converging gate can dispatch fixer commits mid-round, so only the tree
-  // AFTER the gate concluded is the one this verdict actually covers.
+  // worktree unchanged can skip re-judging it. The HEAD half is recomputed here rather than
+  // reusing any up-front read, since a converging gate can dispatch fixer commits mid-round and
+  // only the tree AFTER the gate concluded is the one this verdict actually covers. The base half
+  // is NOT recomputed: `review.baseRev` is the exact commit the gate pinned and judged against
+  // (review-gate.ts) — re-resolving `baseRef` here would let a sibling run's fetch or a rewound
+  // ref record a clean key for a different base (and thus a different diff and trusted-rule
+  // files) than the reviewer actually saw, letting a later retry skip a review that never
+  // happened against that tree.
   if (review.outcome === "clean") {
     try {
       const key = await computeReviewKey({
         worktreePath: stepCtx.worktreePath,
-        baseBranch: stepCtx.baseRef,
+        baseRev: review.baseRev,
         settings,
         target: stepCtx.target,
         tickets: stepCtx.tickets,

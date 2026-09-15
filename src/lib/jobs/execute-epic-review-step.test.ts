@@ -26,6 +26,7 @@ const persistReviewScoresMock = vi.fn<(...args: unknown[]) => Promise<number | u
 const persistPartialReviewScoresMock = vi.fn<(...args: unknown[]) => Promise<number | undefined>>();
 const resolveReviewConfigMock = vi.fn();
 const reconcileOrphanPullRequestMock = vi.fn();
+const resolveMergeBaseMock = vi.fn<(...args: unknown[]) => Promise<string>>();
 
 vi.mock("../runs", async () => {
   const actual = await vi.importActual<typeof import("../runs")>("../runs");
@@ -45,6 +46,10 @@ vi.mock("../projects", async () => {
   const actual = await vi.importActual<typeof import("../projects")>("../projects");
   return { ...actual, resolveReviewConfig: (...a: unknown[]) => resolveReviewConfigMock(...a) };
 });
+
+vi.mock("../git/ops", () => ({
+  resolveMergeBase: (...a: unknown[]) => resolveMergeBaseMock(...a),
+}));
 
 vi.mock("./review-key", () => ({
   computeReviewKey: (...a: unknown[]) => computeReviewKeyMock(...a),
@@ -125,6 +130,7 @@ function carry(): RunPhaseCarry {
 function cleanResult(unresolved: ReviewFinding[] = []): ReviewGateResult {
   return {
     outcome: "clean",
+    baseRev: "gate-pinned-base",
     rounds: [{ round: 1, reviewSessionId: "s1", blocking: 0, advisory: unresolved.length }],
     unresolved,
     reviewer: { kind: "default" },
@@ -135,6 +141,7 @@ function cleanResult(unresolved: ReviewFinding[] = []): ReviewGateResult {
 function blockedResult(): ReviewGateResult {
   return {
     outcome: "unresolved",
+    baseRev: "gate-pinned-base",
     rounds: [{ round: 1, reviewSessionId: "s1", blocking: 1, advisory: 0 }],
     unresolved: [{ severity: "blocking", location: "x.ts:1", note: "bad" }],
     reviewer: { kind: "default" },
@@ -149,6 +156,7 @@ beforeEach(() => {
   persistReviewScoresMock.mockResolvedValue(undefined);
   persistPartialReviewScoresMock.mockResolvedValue(undefined);
   reconcileOrphanPullRequestMock.mockResolvedValue(undefined);
+  resolveMergeBaseMock.mockResolvedValue("resolved-base");
   updateRunMock.mockResolvedValue(undefined);
   findRunReviewKeyForBranchMock.mockResolvedValue(undefined);
   beadsNoteMock.mockResolvedValue("");
@@ -277,6 +285,12 @@ describe("runReviewStep — resume key", () => {
     await runReviewStep(run, prep(), dispatch(handler), c);
 
     expect(c.advisories).toEqual([advisory]);
+    // The resume key persisted for a clean verdict reuses the SHA the gate itself pinned and
+    // judged against — never a fresh resolution of `baseRef`, which is a movable ref a sibling
+    // run could have advanced between the verdict and this write (anton-nyz1v).
+    expect(computeReviewKeyMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ baseRev: "gate-pinned-base" }),
+    );
     expect(updateRunMock).toHaveBeenCalledWith(run.db, run.clock, RUN_ID, {
       reviewKey: "base3:head3:fp3",
       reviewKeyAdvisories: JSON.stringify([advisory]),

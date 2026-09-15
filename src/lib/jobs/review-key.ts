@@ -29,7 +29,7 @@
 import { createHash } from "node:crypto";
 import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../beads/contract";
 import type { Bead } from "../beads/types";
-import { readWorktreeState, resolveMergeBase } from "../git/ops";
+import { readWorktreeState } from "../git/ops";
 import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings, type ReviewConfig, type VerifyGate } from "../projects";
 import { resolveReviewerContract, type ReviewFinding, type ReviewerSource } from "./review-context";
 
@@ -99,8 +99,15 @@ function fingerprintContract(args: {
  */
 export async function computeReviewKey(args: {
   worktreePath: string;
-  /** The pinned fork ref the review step itself diffs against ({@link StepContext.baseRef}). */
-  baseBranch: string;
+  /**
+   * The merge-base COMMIT the review actually judged — the gate's own pinned SHA
+   * ({@link ReviewGateResult.baseRev}) when one is available, or a fresh resolution of
+   * {@link StepContext.baseRef} when checking a resume before any gate in this attempt has run.
+   * Never re-resolve `baseRef` after a gate has already pinned one: the branch it names is
+   * movable, and a sibling run's fetch between the gate's verdict and this call could advance it
+   * to a commit the reviewer never saw.
+   */
+  baseRev: string;
   settings: ProjectSettings;
   /** The run target and its tickets — the same beads {@link fingerprintBeads} reads Acceptance from. */
   target: Bead;
@@ -116,11 +123,8 @@ export async function computeReviewKey(args: {
    */
   carriedAdvisories: ReviewFinding[];
 }): Promise<ReviewKey> {
-  const { worktreePath, baseBranch, settings, target, tickets, stepId, carriedAdvisories } = args;
-  const [baseRev, state] = await Promise.all([
-    resolveMergeBase(worktreePath, baseBranch),
-    readWorktreeState(worktreePath),
-  ]);
+  const { worktreePath, baseRev, settings, target, tickets, stepId, carriedAdvisories } = args;
+  const state = await readWorktreeState(worktreePath);
   const config = resolveReviewConfig(settings);
   const verifyGates = resolveVerifyGates(settings);
   const { reasoning, reviewer } = await resolveReviewerContract(settings, worktreePath, baseRev);

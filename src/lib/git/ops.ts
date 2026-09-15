@@ -1632,7 +1632,11 @@ export function classifyPushFailure(result: {
     if (
       /Could not resolve host/i.test(stderr) ||
       /Connection reset/i.test(stderr) ||
-      /HTTP 5\d\d/.test(stderr)
+      /HTTP 5\d\d/.test(stderr) ||
+      // Git's own diagnostic for an HTTP remote that answers with a 5xx: confirmed against a real
+      // 503 with `git push -h`'s porcelain mode — "The requested URL returned error: 503" — which
+      // the `HTTP 5\d\d` form above never matches, so a transient 5xx was misclassified permanent.
+      /returned error: 5\d\d/.test(stderr)
     ) {
       return { transient: true, reason: `a transient transport failure reaching the remote: ${stderr}` };
     }
