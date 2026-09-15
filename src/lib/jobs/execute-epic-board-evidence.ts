@@ -352,6 +352,19 @@ export async function readBoardEvidence(
       // The marker never made it onto the board at all, so there is nothing new for the push below
       // to cover — but the content edits still might be, and the caller's message distinguishes
       // `markerUnpersisted` from `!synced` regardless of this value, so it is still worth reporting.
+      //
+      // The baseline is preserved too, reusing the same recovery mechanism as the `!board` branch
+      // above (PR #284 review): `freshIds` is real here — the board content already changed — but
+      // with no marker AND no preserved baseline, a resumed attempt's `readBoardBaseline` takes a
+      // FRESH read that already reflects this change, diffs it against itself, and finds nothing —
+      // permanently losing this attempt's confirmed evidence even once the write channel recovers.
+      // Guarded on nothing already preserved so a repeated retry doesn't churn the write every
+      // attempt.
+      if (!beads.boardEvidenceBaseline(ticket)) {
+        await mustPersist(() =>
+          beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
+        );
+      }
       const outcome = await beads.push(repo).catch(() => "not-wired" as const);
       return {
         found: true,
@@ -393,6 +406,15 @@ export async function readBoardEvidence(
  * instead. The caller (`runTicket`) invokes this only AFTER the ticket has already closed/transitioned
  * successfully, outside the try/catch that reclassifies a ticket as failed — this poison is about the
  * cleanup write, not this ticket's own (already-settled) delivery, and must not reopen or reblock it.
+ *
+ * Confirmed synced too, not just persisted (PR #284 review): on a non-server Dolt board these writes
+ * only clear LOCAL state, and unlike marker creation in {@link readBoardEvidence} nothing previously
+ * confirmed the cleanup itself reached the remote. A process death (or a failed best-effort final
+ * `beads.sync`) between a local-only clear and the next push would leave another machine's pull still
+ * seeing the stale marker and preserved baseline after this ticket has already closed — and a later
+ * reopen there could read them as current evidence and accept a no-op run as delivered. So the push
+ * is part of the same all-or-nothing gate as the two writes: unconfirmed sync throws {@link
+ * PoisonEpic} exactly like an unpersisted write, rather than returning as if the cleanup were done.
  */
 export async function clearBoardEvidencePending(
   repo: string,
@@ -404,18 +426,28 @@ export async function clearBoardEvidencePending(
     beads.setBoardEvidencePending(repo, ticketId, [], [LABELS.boardEvidencePending(ids)]),
   );
   const baselineCleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId));
-  if (!markerCleared || !baselineCleared) {
-    const failed = [
-      !markerCleared && "the pending-evidence marker",
-      !baselineCleared && "the preserved baseline",
-    ]
-      .filter((s): s is string => s !== false)
-      .join(" and ");
+  const cleared = markerCleared && baselineCleared;
+  const synced = cleared
+    ? await beads
+        .push(repo)
+        .then((outcome) => outcome === "synced" || outcome === "shared-server")
+        .catch(() => false)
+    : false;
+  if (!cleared || !synced) {
+    const detail = cleared
+      ? "both cleanup writes landed locally, but the confirming push could not verify they reached " +
+        "the remote"
+      : `bd would not clear ${[
+          !markerCleared && "the pending-evidence marker",
+          !baselineCleared && "the preserved baseline",
+        ]
+          .filter((s): s is string => s !== false)
+          .join(" and ")} it left on the board (after retries)`;
     throw new PoisonEpic(
-      `${ticketId} delivered and closed, but bd would not clear ${failed} it left on the board ` +
-        `(after retries) — the run stopped rather than leave a stale board-evidence record on an ` +
-        `already-closed ticket, which a later reopen could read as current evidence for no new work. ` +
-        `Check the beads DB, then resume the run.`,
+      `${ticketId} delivered and closed, but ${detail} — the run stopped rather than leave a stale ` +
+        `board-evidence record on an already-closed ticket, which a later reopen could read as ` +
+        `current evidence for no new work. Check the beads DB${cleared ? " and the sync channel" : ""}, ` +
+        `then resume the run.`,
     );
   }
 }
