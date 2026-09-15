@@ -257,17 +257,20 @@ describe("runTicket — releases the board-evidence marker only once the handoff
     expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton", boardTicket.id, ["anton-x1"]);
   });
 
-  it("does NOT clear the pending marker when bd refused the requested transition — a child ticket's " +
-    "already-landed board edits must stay recoverable", async () => {
+  it("fails loud instead of returning success when bd refused the requested transition — a " +
+    "child ticket's already-landed board edits must stay recoverable, not settle as delivered " +
+    "with a stale marker on a bead that never closed", async () => {
     finishTicketMock.mockResolvedValue({ closed: false, transitioned: false });
 
-    await runTicket({
-      run: run(),
-      steps: [deliveredCommitStep()],
-      ticket: boardTicket,
-      runTicketIds: [boardTicket.id],
-      timeoutMs: 5_000,
-    });
+    await expect(
+      runTicket({
+        run: run(),
+        steps: [deliveredCommitStep()],
+        ticket: boardTicket,
+        runTicketIds: [boardTicket.id],
+        timeoutMs: 5_000,
+      }),
+    ).rejects.toThrow(/board evidence was confirmed/);
 
     expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
   });

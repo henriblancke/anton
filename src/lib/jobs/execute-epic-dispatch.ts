@@ -25,6 +25,7 @@ import {
   worktreeHasCommitFor,
   type SatisfiedClaim,
 } from "../git/ops";
+import { clearBoardEvidencePending } from "./execute-epic-board-evidence";
 import { blockedTailReason, PoisonEpic } from "./errors";
 import {
   deliveredTickets,
@@ -1100,6 +1101,18 @@ async function dispatchTicket(
     );
   }
   if (delivery) {
+    // A prior attempt's board-evidence cleanup can fail (bd keeps refusing the write) AFTER this
+    // ticket already closed/transitioned — `runTicket` throws `PoisonEpic` and halts that attempt,
+    // but `runTicket` is the only caller of `clearBoardEvidencePending` and this resume just skipped
+    // it. Retry the cleanup here so a stale pending marker does not survive past the run that halted
+    // on it: `doneOnBoard` (required for `delivery` to be set at all) means this ticket's
+    // close/in-review transition already landed, the same post-condition `runTicket` gates the
+    // cleanup on, so retrying it now is exactly as safe as the original call was. A no-op for every
+    // ticket with nothing pending — not board-only, or one whose marker already cleared.
+    const stalePending = beads.pendingBoardEvidence(ticket);
+    if (stalePending.length > 0) {
+      await clearBoardEvidencePending(repo, ticket.id, stalePending);
+    }
     if (standaloneRun) {
       // Resume after a failed PR step: this standalone ticket committed and moved to in-review
       // on a prior attempt. Step 2 above re-tagged the target stage:implementing (it can't

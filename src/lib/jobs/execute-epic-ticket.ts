@@ -24,6 +24,7 @@ import {
   type BoardFingerprint,
 } from "./execute-epic-board-evidence";
 import { BlockedByAgentError, NeedsHumanError, NoDeliveryError } from "./execute-epic-errors";
+import { PoisonEpic } from "./errors";
 import {
   claimTicket,
   finishTicket,
@@ -185,8 +186,26 @@ export async function runTicket(args: {
   // must halt the run (see `clearBoardEvidencePending`'s own docstring), but this ticket has already
   // closed/transitioned successfully — reclassifying it as a failure here would reopen or reblock a
   // delivery that genuinely landed. The thrown error propagates straight out of `runTicket` instead.
-  if (progress.boardEvidenceIds && finished.transitioned) {
-    await clearBoardEvidencePending(run.repoPath, ticket.id, progress.boardEvidenceIds);
+  if (progress.boardEvidenceIds) {
+    if (finished.transitioned) {
+      await clearBoardEvidencePending(run.repoPath, ticket.id, progress.boardEvidenceIds);
+    } else {
+      // `finishTicket`'s close/in-review write is best-effort — right for a normal ticket, where an
+      // unclosed bead is a survivable, PR-visible state (PR #253 review). It is wrong for a
+      // board-only ticket: returning success here would leave the pending-evidence marker on a bead
+      // that never closed/transitioned, and a later reopen — or, for an epic child, review-fix's
+      // merge-time close of whatever the epic left open (`closeFinalized` in
+      // review-fix-finalize.ts, which closes directly and never calls `clearBoardEvidencePending`)
+      // — could then read that stale marker as current evidence for a ticket that got no new work.
+      // Fail loud instead of conceding a delivered settlement over a handoff that did not land.
+      throw new PoisonEpic(
+        `${ticket.id}'s board evidence was confirmed and its handoff commit recorded, but bd would ` +
+          `not ${closeOnDone ? "close the bead" : "move it to stage:in-review"} — returning success ` +
+          `now would leave the pending-evidence marker on a bead that never transitioned, which a ` +
+          `later reopen could read as current evidence for no new work. Check the beads DB, then ` +
+          `resume the run.`,
+      );
+    }
   }
   return { ...finished.settlement, closed: finished.closed };
 }
