@@ -57,6 +57,23 @@ async function retire(dir: string, token: string): Promise<boolean> {
 }
 
 /**
+ * Remove a directory that looks abandoned without letting the destructive step itself resolve the
+ * pathname fresh against whatever a peer put there in the meantime. Renaming to a reap-private
+ * tombstone first means the actual `rm` always targets a name nothing else can be racing against —
+ * it narrows, though (without an fd-relative removal syscall Node doesn't expose) can't fully close,
+ * the window between the caller's identity check and this reap actually running.
+ */
+async function reapGate(gate: string): Promise<void> {
+  const tombstone = `${gate}.reaped-${randomUUID()}`;
+  try {
+    await rename(gate, tombstone);
+  } catch {
+    return; // already gone, or already reaped by someone else
+  }
+  await rm(tombstone, { recursive: true, force: true }).catch(() => {});
+}
+
+/**
  * Reclaim a directory that looked abandoned on an earlier, now-stale read. Metadata-less orphans
  * have no shared token to rename to, so each concurrent reclaimer used to mint its own random one —
  * meaning two peers could both "win" distinct tombstones, and a delayed peer's rename could steal
@@ -86,7 +103,7 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
       // — which would otherwise let two deciders run the reclaim decision concurrently and break
       // mutual exclusion on `dir`.
       if (sameIdentity(gateStat, await safeStat(gate))) {
-        await rm(gate, { recursive: true, force: true }).catch(() => {});
+        await reapGate(gate);
       }
     }
     return false; // let the caller's normal deadline/poll path retry reclaim() next iteration
@@ -107,7 +124,7 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     return await retire(dir, token);
   } finally {
     if (sameIdentity(ownGateStat, await safeStat(gate))) {
-      await rm(gate, { recursive: true, force: true }).catch(() => {});
+      await reapGate(gate);
     }
   }
 }
@@ -260,6 +277,12 @@ export async function withHostLock<T>(
   // Because this value is a stable snapshot rather than something advanced after every write, a
   // write that fails outright can never leave the identity check out of sync with reality: each
   // check is independent and always compares against the same original snapshot.
+  //
+  // This snapshot is itself a plain pathname lookup performed after `mkdir` resolves, not bound to
+  // the acquisition atomically (Node exposes no create+fstat primitive for directories) — a creator
+  // suspended by the OS for longer than STALE_AFTER_MS across exactly that gap can still capture a
+  // successor's inode here. write() and the release below cross-check the published token as an
+  // independent second signal so that mistake can never overwrite or retire a live successor.
   const ourDirStat = await safeStat(dir);
   const isOurDir = async (): Promise<boolean> => sameIdentity(ourDirStat, await safeStat(dir));
 
@@ -270,13 +293,27 @@ export async function withHostLock<T>(
   const tmpMetaPath = `${metaPath}.${token}.tmp`;
   const write = async (): Promise<boolean> => {
     if (!(await isOurDir())) return false;
-    await writeFile(
-      tmpMetaPath,
-      JSON.stringify({ token, pid: process.pid, heartbeatAt: Date.now(), label: opts.label ?? "" }),
-      "utf8",
-    );
-    await rename(tmpMetaPath, metaPath);
-    return true;
+    try {
+      // A second, independent signal alongside the inode check above: if a reclaim already
+      // published a successor's metadata under `dir`, its token can never equal ours. A creator
+      // resumed from a long enough OS-level suspension can still have captured `ourDirStat` from
+      // that same successor's fresh mkdir (the inode snapshot above is itself a separate pathname
+      // lookup, not bound atomically to our own mkdir) — content ownership catches what inode
+      // identity alone was fooled into missing, so this can never overwrite a live successor.
+      const current = await readHolder(metaPath);
+      if (current && current.token !== token) return false;
+      await writeFile(
+        tmpMetaPath,
+        JSON.stringify({ token, pid: process.pid, heartbeatAt: Date.now(), label: opts.label ?? "" }),
+        "utf8",
+      );
+      await rename(tmpMetaPath, metaPath);
+      return true;
+    } catch {
+      // `dir` can vanish between the checks above and this write (another reclaim, this time in
+      // the gap write() itself introduces) — advisory fallback, same as every other lost race here.
+      return false;
+    }
   };
   if (!(await write())) {
     // Lost this acquisition to a reclaim before we could publish metadata for it. `dir` now belongs
@@ -299,8 +336,13 @@ export async function withHostLock<T>(
     // acquisition, `dir` now belongs to a successor and must not be retired out from under it. The
     // token-specific tombstone still protects the case where metadata existed at reclaim time
     // (reclaim reuses `holder.token`, so its rename destination collides with ours and fails).
+    // Cross-check the published token too, same reasoning as in write(): the inode snapshot alone
+    // can't be trusted if a resumed, long-suspended acquisition ever mis-bound it to a successor.
     if (await isOurDir()) {
-      await retire(dir, token);
+      const current = await readHolder(metaPath);
+      if (!current || current.token === token) {
+        await retire(dir, token);
+      }
     }
   }
 }

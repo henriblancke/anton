@@ -16,41 +16,48 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Markers used to scope the node:fs/promises interception below to exactly one test each, so the
 // injected races never leak into the rest of the suite's real filesystem timing.
-const { RESUME_MARKER, GATE_MARKER } = vi.hoisted(() => ({
+const { RESUME_MARKER, GATE_MARKER, FIRST_STAT_MARKER, WRITE_VANISH_MARKER, SUCCESSOR_TOKEN } = vi.hoisted(() => ({
   RESUME_MARKER: "test-resume-corrupt",
   GATE_MARKER: "test-gate-ownership",
+  FIRST_STAT_MARKER: "test-first-snapshot-corrupt",
+  WRITE_VANISH_MARKER: "test-write-vanish",
+  SUCCESSOR_TOKEN: "11111111-1111-4111-8111-111111111111",
 }));
 
-// Both races below hinge on a pause between two specific awaits inside host-lock.ts that real
+// All races below hinge on a pause between two specific awaits inside host-lock.ts that real
 // timing can't force deterministically (they'd need an actual 60s+ stall). Intercepting the fs
 // call that sits at the seam lets the peer's race action run at exactly the right moment instead.
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   const statCalls = new Map<string, number>();
   const readFileCalls = new Map<string, number>();
+
+  const installSuccessor = async (dir: string) => {
+    await actual.rename(dir, `${dir}.retired-${SUCCESSOR_TOKEN}`);
+    await actual.mkdir(dir);
+    await actual.writeFile(
+      `${dir}/owner.json`,
+      JSON.stringify({ token: SUCCESSOR_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "successor" }),
+      "utf8",
+    );
+  };
+
   return {
     ...actual,
     // Fires on the 2nd stat(dir) for the resume-corrupt test — the identity re-check inside
     // write(), right after the first stat captured our own acquisition's mtime. Simulates a peer
     // fully reclaiming and re-acquiring `dir` in the gap.
+    //
+    // Fires on the 1st stat(dir) for the first-snapshot-corrupt test — the very capture of
+    // `ourDirStat` right after our own mkdir(dir) resolved. Simulates a peer reclaiming `dir` and
+    // re-acquiring it before this creator ever gets to observe its own, correct identity.
     stat: async (path: unknown, ...rest: unknown[]) => {
-      if (typeof path === "string" && path.includes(RESUME_MARKER)) {
+      if (typeof path === "string" && (path.includes(RESUME_MARKER) || path.includes(FIRST_STAT_MARKER))) {
         const n = (statCalls.get(path) ?? 0) + 1;
         statCalls.set(path, n);
-        if (n === 2) {
-          const successorToken = "11111111-1111-4111-8111-111111111111";
-          await actual.rename(path, `${path}.retired-${successorToken}`);
-          await actual.mkdir(path);
-          await actual.writeFile(
-            `${path}/owner.json`,
-            JSON.stringify({
-              token: successorToken,
-              pid: process.pid,
-              heartbeatAt: Date.now(),
-              label: "successor",
-            }),
-            "utf8",
-          );
+        const fireAt = path.includes(FIRST_STAT_MARKER) ? 1 : 2;
+        if (n === fireAt) {
+          await installSuccessor(path);
         }
       }
       // @ts-expect-error -- forwarding whatever arguments the caller passed
@@ -72,6 +79,17 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       }
       // @ts-expect-error -- forwarding whatever arguments the caller passed
       return actual.readFile(path, ...rest);
+    },
+    // Fires on the metadata write for the write-vanish test — simulates `dir` being reclaimed out
+    // from under a live acquisition in the gap write() itself introduces (after its own ownership
+    // checks pass, before the write that publishes/refreshes metadata actually lands).
+    writeFile: async (path: unknown, ...rest: unknown[]) => {
+      if (typeof path === "string" && path.includes(WRITE_VANISH_MARKER) && path.endsWith(".tmp")) {
+        const dir = path.slice(0, path.indexOf("/owner.json."));
+        await actual.rm(dir, { recursive: true, force: true }).catch(() => {});
+      }
+      // @ts-expect-error -- forwarding whatever arguments the caller passed
+      return actual.writeFile(path, ...rest);
     },
   };
 });
@@ -334,8 +352,47 @@ describe("withHostLock", () => {
 
     expect(ran).toBe(true); // advisory: still runs, just unlocked
     const successor = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
-    expect(successor.token).toBe("11111111-1111-4111-8111-111111111111");
+    expect(successor.token).toBe(SUCCESSOR_TOKEN);
     expect((await stat(dir)).isDirectory()).toBe(true);
+  });
+
+  it("does not let a creator whose very first identity snapshot was already wrong corrupt a successor's lock", async () => {
+    const name = `${FIRST_STAT_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // The injected stat() above fires on the FIRST stat(dir) call — the capture of `ourDirStat`
+    // itself, right after our own mkdir(dir) resolved — simulating a peer fully reclaiming and
+    // re-acquiring `dir` before this creator ever observes its own correct identity. Unlike the
+    // "resumed creator" case above, inode comparison can never catch this: `ourDirStat` itself is
+    // now the successor's inode, so every isOurDir() check would wrongly agree. Only the token
+    // cross-check in write()/release can save the successor here.
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    const successor = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(successor.token).toBe(SUCCESSOR_TOKEN);
+    expect((await stat(dir)).isDirectory()).toBe(true);
+  });
+
+  it("falls back to running unlocked when dir vanishes between the ownership checks and the metadata write", async () => {
+    const name = `${WRITE_VANISH_MARKER}-${process.pid}`;
+
+    // The injected writeFile() above fires on the initial metadata write and removes `dir` right
+    // before the real write lands, simulating a reclaim in the narrow gap between write()'s
+    // ownership checks (which both still pass, since nothing has raced yet at that point) and the
+    // write syscall itself. write() must swallow the resulting ENOENT and fall back to running `fn`
+    // unlocked rather than letting it escape withHostLock as a rejection.
+    let ran = false;
+    await expect(
+      withHostLock(name, async () => {
+        ran = true;
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(ran).toBe(true);
   });
 
   it("does not let a resumed reclaimer's cleanup remove a successor's reclaiming gate", async () => {
