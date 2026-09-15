@@ -267,13 +267,18 @@ export async function readAllIssues(
   // board would lose the sidecar that pure approval projections consume.
   if (opts?.withCycles && cycleEvidenceFor(snapshot.beads) === undefined) {
     await attachCyclesBestEffort(cwd, snapshot.beads);
-    // `snapshot.version` was captured atomically with `snapshot.beads` ABOVE, before this recovery
-    // could bump it (`attachCyclesBestEffort` → `markCycleEvidenceRecovered`) — so a caller that
-    // stamps a response with it (getBoard) would understate its own version relative to what
-    // `issueSnapshotVersion` reports moments later, and the very next poll (comparing against that
-    // fresher number) would never match and re-fetch a board that hasn't actually changed since.
-    // Re-read it so the version we hand back describes the exact (now-enriched) board being returned.
-    return { beads: snapshot.beads, version: issueSnapshotVersion(cwd) };
+    // Only re-read the version if THIS array actually got enriched. `attachCyclesBestEffort` skips
+    // attaching when a concurrent refresh already replaced the retained board (its own generation
+    // guard) — in that case `snapshot.beads` is untouched and pairing it with a freshly-read version
+    // (which may have advanced for that unrelated replacement) would return a mismatched pair: the
+    // caller (getBoard) stamps a response with a version describing beads it never actually returned,
+    // and the next `/board?version=...` poll would 304 against content the client never received.
+    // When this array WAS enriched, `markCycleEvidenceRecovered` bumped the version for it specifically
+    // (PR #274 review, round 4), so `snapshot.version` (captured before that bump) would understate it —
+    // re-read to describe the exact (now-enriched) board being returned.
+    if (cycleEvidenceFor(snapshot.beads) !== undefined) {
+      return { beads: snapshot.beads, version: issueSnapshotVersion(cwd) };
+    }
   }
   return snapshot;
 }
