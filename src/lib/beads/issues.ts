@@ -204,10 +204,18 @@ function fetchCyclesShared(cwd: string, generation: number): Promise<DepCycle[]>
  * then recovers it here leaves the poll path's freshness token untouched, so a concurrent poller
  * that already matched the pre-recovery version keeps 304-ing an empty-startability board until
  * unrelated bead content changes.
+ *
+ * `generation` must be the value read atomically alongside `board` (i.e. from the same
+ * `readIssueSnapshot`/`getIssueSnapshot` call), never a fresh `issueSnapshotGeneration(cwd)` read
+ * taken here (PR #274 review, round 13): a caller that fetches `board` and only then asks this
+ * function to resolve the generation leaves a gap — bridged by at least one `await` back up the
+ * call stack — in which a background refresh can replace the retained snapshot. A fresh read at
+ * that point returns the NEW generation while `board` is still the OLD, retired array; the guard
+ * below would then compare the new generation against itself and happily stamp the new graph's
+ * cycle result onto the old board.
  */
-async function attachCyclesBestEffort(cwd: string, board: Bead[]): Promise<void> {
+async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: number): Promise<void> {
   try {
-    const generation = issueSnapshotGeneration(cwd);
     const cycles = await fetchCyclesShared(cwd, generation);
     // A write replaced the snapshot while this fetch was in flight: `cycles` describes the graph
     // this generation's board no longer represents. Leave evidence unattached rather than stamp a
@@ -246,12 +254,15 @@ export async function allIssues(
   cwd: string,
   opts?: SnapshotReadOptions & { withCycles?: boolean },
 ): Promise<Bead[]> {
-  const board = await getIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
+  // Read via `readIssueSnapshot`, not `getIssueSnapshot`, so the generation passed to
+  // `attachCyclesBestEffort` below is the one this exact `board` array was returned with, not a
+  // fresh (possibly already-advanced) one read after the fact (PR #274 review, round 13).
+  const { beads: board, generation } = await readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
   // The snapshot key is the repository, not every reader's projection needs. A warm page snapshot
   // may therefore predate an approval reader: enrich that exact array rather than treating absent
   // evidence as an authoritative empty result.
   if (opts?.withCycles && cycleEvidenceFor(board) === undefined) {
-    await attachCyclesBestEffort(cwd, board);
+    await attachCyclesBestEffort(cwd, board, generation);
   }
   return board;
 }
@@ -272,29 +283,24 @@ export async function readAllIssues(
     // `snapshot.beads` with an already-advanced "current" generation and let `attachCyclesBestEffort`
     // (whose own guard compares against that same already-advanced value) enrich a retired array.
     const generation = snapshot.generation;
-    await attachCyclesBestEffort(cwd, snapshot.beads);
-    // Only re-read the version if THIS array actually got enriched. `attachCyclesBestEffort` skips
-    // attaching when a concurrent refresh already replaced the retained board (its own generation
-    // guard) — in that case `snapshot.beads` is untouched and pairing it with a freshly-read version
-    // (which may have advanced for that unrelated replacement) would return a mismatched pair: the
-    // caller (getBoard) stamps a response with a version describing beads it never actually returned,
-    // and the next `/board?version=...` poll would 304 against content the client never received.
-    // When this array WAS enriched, `markCycleEvidenceRecovered` bumped the version for it specifically
-    // (PR #274 review, round 4), so `snapshot.version` (captured before that bump) would understate it —
-    // re-read to describe the exact (now-enriched) board being returned.
+    await attachCyclesBestEffort(cwd, snapshot.beads, generation);
+    // Check the move BEFORE the evidence-attached check, not nested inside it (PR #274 review,
+    // round 13): `attachCyclesBestEffort` now declines to attach when the board moved out from
+    // under it (its own generation guard, checked against the SAME `generation` passed in here), so
+    // a mismatch means `snapshot.beads` is a retired array that never got enriched at all — nesting
+    // this check inside "evidence attached" would let that retired, evidence-less board fall through
+    // to the plain `return snapshot` below instead of retrying, silently serving stale beads with no
+    // cycle evidence. Retry unconditionally on a mismatch so the caller always gets a consistent,
+    // current (board, version) pair rather than one the write already left behind.
+    if (issueSnapshotGeneration(cwd) !== generation) {
+      return readAllIssues(cwd, opts);
+    }
+    // No move: only re-read the version if THIS array actually got enriched. When it did,
+    // `markCycleEvidenceRecovered` bumped the version for it specifically (PR #274 review, round 4),
+    // so `snapshot.version` (captured before that bump) would understate it — re-read to describe the
+    // exact (now-enriched) board being returned. When it didn't (a `bd dep cycles` failure, not a
+    // move — the move case already returned above), fall through to the plain snapshot below.
     if (cycleEvidenceFor(snapshot.beads) !== undefined) {
-      // Evidence attaching only proves THIS array was enriched, not that it's still the retained
-      // board (PR #274 review, round 12): `attachCyclesBestEffort`'s own generation guard closes the
-      // race during ITS internal await, but the outer `await` above still yields a microtask tick on
-      // the way back here, wide enough for a concurrent content-changing refresh or local
-      // invalidation to advance the retained snapshot past this array in between. Pairing the old,
-      // now-enriched array with `issueSnapshotVersion` read after that gap would stamp it with a
-      // version describing beads the caller never actually returned — the same stale-304 failure mode
-      // this whole re-read exists to avoid. Re-checking the generation here closes that gap: on a
-      // mismatch, the board moved, so get a consistent pair fresh rather than trust this one.
-      if (issueSnapshotGeneration(cwd) !== generation) {
-        return readAllIssues(cwd, opts);
-      }
       return { beads: snapshot.beads, version: issueSnapshotVersion(cwd), generation };
     }
   }
