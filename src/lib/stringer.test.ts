@@ -55,6 +55,47 @@ let prevTimeout: string | undefined;
 let prevGhBin: string | undefined;
 let prevGithubToken: string | undefined;
 
+/**
+ * Minimal single-row CSV decoder mirroring Go's `encoding/csv` (what pflag's `StringSlice` actually
+ * parses `--exclude` with) -- just enough to prove a comma embedded in an exclude glob round-trips
+ * through the quoting `scan()` applies, rather than splitting into two entries the way a plain
+ * `split(",")` would.
+ */
+function decodeCsvRow(row: string): string[] {
+  const fields: string[] = [];
+  let i = 0;
+  while (i <= row.length) {
+    if (row[i] === '"') {
+      let field = "";
+      i++;
+      while (i < row.length) {
+        if (row[i] === '"' && row[i + 1] === '"') {
+          field += '"';
+          i += 2;
+          continue;
+        }
+        if (row[i] === '"') {
+          i++;
+          break;
+        }
+        field += row[i];
+        i++;
+      }
+      fields.push(field);
+      i++; // skip the delimiter after the closing quote
+    } else {
+      const next = row.indexOf(",", i);
+      if (next === -1) {
+        fields.push(row.slice(i));
+        break;
+      }
+      fields.push(row.slice(i, next));
+      i = next + 1;
+    }
+  }
+  return fields;
+}
+
 /** Fake stringer with a scripted body (executable node script), for the failure-path tests. */
 function writeScript(name: string, body: string[]): string {
   const path = join(dir, name);
@@ -865,6 +906,23 @@ describe("scan", () => {
 
       const globs = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1].split(",");
       expect(globs).toContain(`${join(".worktrees", "pr252-threads")}/**`);
+    });
+
+    // PR #295 review (thread on stringer.ts:1160): stringer's `--exclude` is a Go pflag string-slice,
+    // parsed with `encoding/csv` -- a naive `split(",")` (what every other test in this file uses,
+    // since none of their globs contain a comma) would silently split a worktree path that DOES
+    // contain one into two patterns, truncating the exclude for that path. This decodes the argv
+    // value the same way stringer's own CSV parser would, so it proves the path round-trips whole.
+    it("keeps a comma in a nested worktree path from splitting into two --exclude patterns", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr,252-threads");
+      const argvDump = join(dir, "argv.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+
+      await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      const excludeArg = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1];
+      const globs = decodeCsvRow(excludeArg);
+      expect(globs).toContain(`${join(".worktrees", "pr,252-threads")}/**`);
     });
 
     // PR #295 review (thread on stringer.ts:1177): a worktree another process creates AFTER the
@@ -8569,6 +8627,45 @@ describe("scan", () => {
       await expect(
         scan({ repoPath: repo, scanFile: join(dir, "scan.json"), signal: ac.signal }),
       ).rejects.toMatchObject({ name: "AbortError" });
+    } finally {
+      fsProbeControl.hangRealpath = false;
+    }
+  });
+
+  // PR #295 review (thread on stringer.ts:768): the POST-scan re-enumeration isn't followed by any
+  // further deadline check the way the pre-scan one is (the `remainingMs <= 0` guard before spawning
+  // stringer) -- so if a deadline hit inside it were swallowed and papered over with a stale fallback
+  // path instead of propagated, scan() would resolve successfully having silently reported "nothing
+  // nested" rather than "couldn't tell". The realpath hang is switched on only after the pre-scan
+  // lookup (real fs, fast) has already finished, so it hits specifically the post-scan lookup that
+  // runs after the fake stringer's own delay.
+  it("reports the worktree filter unavailable when the post-scan re-enumeration hits its deadline, instead of a stale snapshot", async () => {
+    const repo = join(dir, "repo");
+    mkdirSync(repo, { recursive: true });
+    execFileSync("git", ["-C", repo, "init", "-q"]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+    writeFileSync(join(repo, "app.ts"), "export {};\n", "utf8");
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "init"]);
+
+    process.env[STRINGER_BIN_ENV] = writeScript("delayed-stringer", [
+      "setTimeout(() => {",
+      "  const i = process.argv.indexOf('-o');",
+      "  require('fs').writeFileSync(process.argv[i + 1], JSON.stringify([]));",
+      "  process.exit(0);",
+      "}, 150);",
+    ]);
+    process.env.ANTON_STRINGER_TIMEOUT_MS = "500";
+    process.env.GITHUB_TOKEN = "operator-provided-token"; // skip the `gh auth token` lookup
+    setTimeout(() => {
+      fsProbeControl.hangRealpath = true;
+    }, 30);
+
+    try {
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+      expect(result.worktree.unavailable).toBeTruthy();
+      expect(result.worktree.dropped).toEqual([]);
     } finally {
       fsProbeControl.hangRealpath = false;
     }

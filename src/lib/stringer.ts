@@ -698,6 +698,24 @@ function isAbortError(err: unknown): boolean {
 }
 
 /**
+ * Thrown by {@link withBudget} on deadline expiry (as opposed to the promise it's racing rejecting
+ * on its own). Distinguished from a genuine filesystem lookup failure (ENOENT, EACCES, ...) so
+ * callers can rethrow it like an abort instead of falling back to an unresolved path: falling back
+ * here would let `scan()` return an incomplete worktree snapshot *and* still report success past its
+ * own deadline, exactly the silent overrun {@link withBudget} exists to prevent.
+ */
+class ProbeDeadlineExceededError extends Error {
+  constructor() {
+    super("filesystem probe exceeded the scan deadline");
+    this.name = "ProbeDeadlineExceededError";
+  }
+}
+
+function isDeadlineError(err: unknown): boolean {
+  return err instanceof ProbeDeadlineExceededError;
+}
+
+/**
  * Race a promise against what's left of `deadline` and the caller's `signal`, so a caller waiting on
  * it can't be made to hang past either. This does NOT cancel the underlying operation — Node gives
  * no way to interrupt a pending `stat`/`realpath` mid-syscall — it only stops the caller from
@@ -706,7 +724,7 @@ function isAbortError(err: unknown): boolean {
 function withBudget<T>(promise: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
   if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("aborted", "AbortError"));
   const remaining = deadline - Date.now();
-  if (remaining <= 0) return Promise.reject(new Error("filesystem probe exceeded the scan deadline"));
+  if (remaining <= 0) return Promise.reject(new ProbeDeadlineExceededError());
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => {
       clearTimeout(timer);
@@ -714,7 +732,7 @@ function withBudget<T>(promise: Promise<T>, deadline: number, signal?: AbortSign
     };
     const timer = setTimeout(() => {
       signal?.removeEventListener("abort", onAbort);
-      reject(new Error("filesystem probe exceeded the scan deadline"));
+      reject(new ProbeDeadlineExceededError());
     }, remaining);
     timer.unref?.();
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -737,7 +755,7 @@ async function isWorktreeCheckout(path: string, deadline: number, signal?: Abort
   try {
     return (await withBudget(stat(join(path, ".git")), deadline, signal)).isFile();
   } catch (err) {
-    if (isAbortError(err)) throw err;
+    if (isAbortError(err) || isDeadlineError(err)) throw err;
     return false;
   }
 }
@@ -763,7 +781,7 @@ async function listNestedWorktrees(
     }
 
     const resolvedRepo = await withBudget(realpath(repoPath), deadline, opts.signal).catch((err) => {
-      if (isAbortError(err)) throw err;
+      if (isAbortError(err) || isDeadlineError(err)) throw err;
       return repoPath;
     });
     const nested: string[] = [];
@@ -773,7 +791,7 @@ async function listNestedWorktrees(
       if (record.some((l) => l === "prunable" || l.startsWith("prunable "))) continue;
       const wt = worktreeLine.slice("worktree ".length);
       const resolvedWt = await withBudget(realpath(wt), deadline, opts.signal).catch((err) => {
-        if (isAbortError(err)) throw err;
+        if (isAbortError(err) || isDeadlineError(err)) throw err;
         return wt;
       });
       if (resolvedWt === resolvedRepo) continue;
@@ -1111,6 +1129,19 @@ async function githubToken(timeoutMs: number, signal?: AbortSignal): Promise<str
   }
 }
 
+/**
+ * stringer's `-e/--exclude` is a Go pflag string-slice: every value handed to it (including the
+ * single comma-joined argument `scan()` builds) is parsed with `encoding/csv`, not a naive
+ * `string.split(",")`. A glob with an unescaped comma -- e.g. a nested worktree checked out at a
+ * path containing one -- would otherwise split into two patterns, silently truncating the exclude
+ * and leaving stringer free to walk (and pay the cost of) whatever the truncated remainder names.
+ * Quote only when a glob actually needs it, so every existing plain glob's argv stays byte-identical.
+ */
+function csvEscapeExclude(glob: string): string {
+  if (!/[",\r\n]/.test(glob)) return glob;
+  return `"${glob.replace(/"/g, '""')}"`;
+}
+
 export async function scan(opts: {
   repoPath: string;
   scanFile: string;
@@ -1160,7 +1191,7 @@ export async function scan(opts: {
     ...(Array.isArray(nested) ? nested.map((wt) => `${wt}/**`) : []),
     ...(opts.exclude ?? []),
   ];
-  args.push("--exclude", exclude.join(","));
+  args.push("--exclude", exclude.map(csvEscapeExclude).join(","));
   args.push("--collector-timeout", COLLECTOR_TIMEOUT);
   // Keep stderr free of ANSI escapes so the collector-failure parse stays reliable when a TTY leaks in.
   args.push("--no-color");
