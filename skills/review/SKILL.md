@@ -1,6 +1,6 @@
 ---
 name: review
-version: 2fbbc4da23b6
+version: 98b2e577312e
 description: >-
   Reasoning contract for anton's pre-PR self-review gate: in a fresh context, review the diff the
   run's implementing agent just produced — correctness, code quality, project principle adherence,
@@ -76,11 +76,17 @@ queue — walk these steps and put the result in your notes before you move on:
    - **a cancellation** — the run or ticket being cancelled between the read and the write
    - **the event loop itself** — an `await` between the read and the write that hands control to
      something else before the write lands
-4. **Reach a verdict.** Either a finding — blocking if a stale read can corrupt state or let the
-   write proceed on a fact that is no longer true, advisory if the window is real but narrow and
-   benign — or, once every mutation in the diff has been walked, the explicit sentence **"no
-   mutation-with-dependent-read in this diff."** Restating this pass without walking every
-   mutation satisfies nothing; it must produce findings or that sentence.
+4. **Reach a verdict**, one of three:
+   - **A finding** — blocking if a stale read can corrupt state or let the write proceed on a
+     fact that is no longer true, advisory if the window is real but narrow and benign.
+   - **Safe/fenced** — the mutation has a dependent read, but a transaction, lock, or fencing
+     token correctly protects the read-to-write window. Name the mechanism and where it's
+     enforced; this is not a finding, but it is not silence either.
+   - Once every mutation in the diff has been walked and none needed either verdict above, the
+     explicit sentence **"no mutation-with-dependent-read in this diff."**
+
+   Restating this pass without walking every mutation satisfies nothing; it must produce a
+   verdict for each mutation found, or that sentence.
 
 Calibrate against the shape of defects this catches, drawn from real escapes: "fence the marker
 before accepting the retirement," "recheck cancellation after the final WIP await," "re-read

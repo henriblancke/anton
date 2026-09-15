@@ -67,6 +67,20 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("fencing-toctou");
   });
 
+  it("classifies a cancellation finding mentioning a final await as cancellation, not fencing/TOCTOU", () => {
+    const note =
+      "This should recheck cancellation after the final WIP await — the handler keeps writing to the " +
+      "response after the abort signal fires instead of bailing out once the pending work resolves.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
+  it("classifies a fail-open finding mentioning a final await as fail-open, not fencing/TOCTOU", () => {
+    const note =
+      "After the final retry await, the catch block swallows the error and proceeds as if the request " +
+      "succeeded — this fails open instead of surfacing the failure to the caller.";
+    expect(classifyFindingClass(finding(note))).toBe("fail-open");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();
