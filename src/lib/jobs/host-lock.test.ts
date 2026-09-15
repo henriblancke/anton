@@ -24,6 +24,7 @@ const {
   RECREATE_MARKER,
   RETIRE_RACE_MARKER,
   RETIRE_SWAP_MARKER,
+  RETIRE_SWAP_OCCUPIED_MARKER,
   WRITE_FAIL_MARKER,
   SUCCESSOR_TOKEN,
   D2_TOKEN,
@@ -35,6 +36,7 @@ const {
   RECREATE_MARKER: "test-recreate-before-publish",
   RETIRE_RACE_MARKER: "test-retire-race",
   RETIRE_SWAP_MARKER: "test-retire-swap",
+  RETIRE_SWAP_OCCUPIED_MARKER: "test-retire-swap-occupied",
   WRITE_FAIL_MARKER: "test-write-fail",
   SUCCESSOR_TOKEN: "11111111-1111-4111-8111-111111111111",
   D2_TOKEN: "22222222-2222-4222-8222-222222222222",
@@ -104,6 +106,18 @@ vi.mock("node:fs/promises", async (importOriginal) => {
           );
         }
       }
+      // Fires on retire()'s post-rename safeStat(dest) for the retire-swap-occupied test — right
+      // after this call's rename already grabbed the successor and moved it to `dest`, but before
+      // the mismatch is detected. Simulates a third process racing `mkdir(dir)` into the now-vacant
+      // path in that exact gap, before the restore rename has a chance to run.
+      if (typeof path === "string" && path.includes(RETIRE_SWAP_OCCUPIED_MARKER) && path.includes(".retired-")) {
+        const n = (statCalls.get(path) ?? 0) + 1;
+        statCalls.set(path, n);
+        if (n === 1) {
+          const dir = path.slice(0, path.indexOf(".retired-"));
+          await actual.mkdir(dir).catch(() => {});
+        }
+      }
       // @ts-expect-error -- forwarding whatever arguments the caller passed
       return actual.stat(path, ...rest);
     },
@@ -113,6 +127,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     // re-acquired `dir` as a live successor in exactly that gap, so this call's rename grabs the
     // successor instead of the orphan it was meant to retire.
     rename: async (oldPath: unknown, newPath: unknown, ...rest: unknown[]) => {
+      // RETIRE_SWAP_OCCUPIED_MARKER embeds RETIRE_SWAP_MARKER as a substring, so this branch also
+      // covers the retire-swap-occupied test below.
       if (
         typeof oldPath === "string" &&
         oldPath.includes(RETIRE_SWAP_MARKER) &&
@@ -600,5 +616,30 @@ describe("withHostLock", () => {
     const successor = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
     expect(successor.token).toBe(SUCCESSOR_TOKEN);
     expect((await stat(dir)).isDirectory()).toBe(true);
+  });
+
+  it("restores the displaced live successor even when a third acquisition fills the vacated dir first", async () => {
+    const name = `${RETIRE_SWAP_OCCUPIED_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // Same swap as above — retire()'s own rename grabs a live successor instead of the orphan it was
+    // meant to retire — but a third process also races an empty `mkdir(dir)` into the gap between
+    // that rename and the mismatch check, before the restore has a chance to run. The third process
+    // has published nothing yet, so it must not be allowed to strand the displaced successor (which
+    // is still running its own protected section under the identity that just got renamed away) —
+    // the restore must evict the empty newcomer and put the live successor back.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 200 });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // The live successor must end up back at `dir`, not the empty newcomer that raced in.
+    const holder = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(holder.token).toBe(SUCCESSOR_TOKEN);
   });
 });

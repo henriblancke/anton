@@ -73,22 +73,20 @@ async function retire(dir: string, token: string, expected: Stats | undefined): 
     return false;
   }
   if (!sameIdentity(expected, await safeStat(dest))) {
-    // Grabbed a successor's live directory instead of the one `expected` names. `dir` has been
-    // vacant since the rename above — long enough for a third process to `mkdir(dir)` and become a
-    // live acquisition of its own. Restoring blindly would either silently replace that fresh, still
-    // -empty directory (POSIX allows a rename onto an empty directory) or, once it has published
-    // metadata, fail and strand the grabbed successor under this tombstone forever — and in the
-    // replace case the third process's directory vanishes under it while it keeps believing it holds
-    // the lock, breaking mutual exclusion. Re-check occupancy immediately before the restore rename
-    // to close as much of that window as Node's fs API allows (no rename-if-absent primitive is
-    // exposed): if anything now sits at `dir`, leave the grabbed successor stranded rather than risk
-    // clobbering a newer acquisition — a leaked tombstone is recoverable by inspection, a broken
-    // mutual exclusion isn't. A third process can still land in the gap between this check and the
-    // rename call itself; that residual window can't be fully closed without an OS-level
-    // no-replace rename.
-    if ((await safeStat(dir)) === undefined) {
-      await rename(dest, dir).catch(() => {});
-    }
+    // Grabbed a successor's live directory instead of the one `expected` names. That successor may
+    // still be running its own protected section under the identity we just renamed away — it has no
+    // idea `dir` moved, and it isn't a leaked tombstone we can leave for inspection later. Restore
+    // unconditionally rather than checking `dir` for a new occupant first: a third process racing
+    // `mkdir(dir)` into the gap this rename opened has (by construction) published nothing yet, so
+    // POSIX allows rename to replace that still-empty directory outright, evicting it — the third
+    // process's own identity check (the same one every other lost race in this file relies on) then
+    // sees `dir` no longer matches what it created and falls back to running unlocked, same as any
+    // other loser here. Only once an occupant has advanced far enough to publish metadata does the
+    // directory stop being empty, and then the rename simply fails (caught below) and leaves the
+    // grabbed successor stranded under this tombstone — the narrower residual window this file's
+    // other retirements already accept, since no rename-if-absent primitive exists to close it
+    // further.
+    await rename(dest, dir).catch(() => {});
     return false;
   }
   return true;
