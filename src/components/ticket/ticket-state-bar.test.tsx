@@ -7,7 +7,7 @@ import type { Stage, TicketDetail } from "@/lib/types";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
-const detail = (over: { stage?: Stage; deferred?: boolean; abandoned?: boolean }) =>
+const detail = (over: { stage?: Stage; deferred?: boolean; abandoned?: boolean; agent?: string }) =>
   ({
     id: "t-1",
     title: "Do the thing",
@@ -16,6 +16,7 @@ const detail = (over: { stage?: Stage; deferred?: boolean; abandoned?: boolean }
     type: "task",
     deferred: over.deferred ?? false,
     abandoned: over.abandoned ?? false,
+    agent: over.agent,
   }) as TicketDetail;
 
 afterEach(() => {
@@ -115,5 +116,69 @@ describe("TicketStateBar", () => {
     );
     expect((screen.getByRole("button", { name: /Active/ }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: /Snoozed/ }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("offers Mark done on an open agent:human bead — no run ever closes it", () => {
+    render(
+      <TicketStateBar slug="anton" ticketId="t-1" detail={detail({ agent: "human" })} onChanged={vi.fn()} />,
+    );
+    expect(screen.getByRole("button", { name: "Mark done" })).toBeTruthy();
+  });
+
+  it("withholds Mark done from agent work — a run is expected to close that", () => {
+    render(
+      <TicketStateBar slug="anton" ticketId="t-1" detail={detail({ agent: "nextjs" })} onChanged={vi.fn()} />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("withholds Mark done from a human bead that already settled — abandoned or done", () => {
+    const { rerender } = render(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human", abandoned: true })}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+
+    rerender(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human", stage: "done" })}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("arms a confirm before POSTing the close route, distinct from Abandon's reason form", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ detail: detail({ agent: "human", stage: "done" }) }), {
+          status: 200,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const onChanged = vi.fn();
+
+    render(
+      <TicketStateBar slug="anton" ticketId="t-1" detail={detail({ agent: "human" })} onChanged={onChanged} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    expect(fetchMock).not.toHaveBeenCalled();
+    // No reason field, unlike Abandon — a delivery needs no justification.
+    expect(screen.queryByLabelText(/Reason/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm mark done" }));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/api/projects/anton/tickets/t-1/close");
+    expect(init.method).toBe("POST");
   });
 });

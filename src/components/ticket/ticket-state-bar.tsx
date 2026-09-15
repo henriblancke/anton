@@ -4,7 +4,7 @@ import { useId, useState } from "react";
 import { toast } from "sonner";
 import { CheckIcon, CircleDotIcon, CircleSlashIcon, MoonIcon } from "lucide-react";
 
-import { MAX_ABANDON_REASON_CHARS, STAGES, type Stage, type TicketDetail } from "@/lib/types";
+import { HUMAN_AGENT, MAX_ABANDON_REASON_CHARS, STAGES, type Stage, type TicketDetail } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { STAGE_ACCENT_DOT, STAGE_LABELS } from "@/components/board/board-utils";
 import { Button } from "@/components/ui/button";
@@ -34,15 +34,21 @@ export function TicketStateBar({
   /** Hands back the refreshed detail so the dialog can reconcile its own copy + draft. */
   onChanged: (detail: TicketDetail) => void;
 }) {
-  const [pending, setPending] = useState<null | "snooze" | "abandon">(null);
+  const [pending, setPending] = useState<null | "snooze" | "abandon" | "close">(null);
   const [arming, setArming] = useState(false);
   const [reason, setReason] = useState("");
+  const [closeArming, setCloseArming] = useState(false);
   const inputId = useId();
 
   const resolution = resolutionOf(detail);
   // Abandon settles work that hasn't settled — the route 409s an already-closed bead, so it's offered
   // exactly where it can succeed (mirrors the old `canAbandon` gate).
   const canAbandon = detail.stage !== "done" && !detail.abandoned;
+  // Mark done is the one close route `agent:human` work has (anton-fgqr) — no run ever finishes it,
+  // so it's offered wherever the bead is open human work, and nowhere else: never on agent work (a
+  // run is expected to close that) and never on a bead that has already settled.
+  const isHumanWork = detail.agent === HUMAN_AGENT;
+  const canMarkDone = isHumanWork && resolution !== "done" && resolution !== "abandoned";
   const busy = pending !== null;
 
   async function toggleSnooze(next: boolean) {
@@ -87,6 +93,26 @@ export function TicketStateBar({
     } catch (err) {
       // Stay armed on failure so the typed reason survives a retry.
       toast.error(err instanceof Error ? err.message : "Abandon failed");
+    } finally {
+      setPending(null);
+    }
+  }
+
+  async function confirmMarkDone() {
+    setPending("close");
+    try {
+      const res = await fetch(`/api/projects/${slug}/tickets/${ticketId}/close`, { method: "POST" });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `Mark done failed (${res.status})`);
+      }
+      const data = (await res.json()) as { detail?: TicketDetail };
+      setCloseArming(false);
+      toast.success("Marked done");
+      if (data.detail) onChanged(data.detail);
+    } catch (err) {
+      // Stay armed on failure so a retry doesn't require re-finding the control.
+      toast.error(err instanceof Error ? err.message : "Mark done failed");
     } finally {
       setPending(null);
     }
@@ -141,8 +167,51 @@ export function TicketStateBar({
               </SegmentButton>
             </div>
           )}
+          {/* A distinct action, not a fourth segment: Abandon settles work that will NOT be done,
+              while this records a delivery — the two must never read as the same kind of click.
+              Only human work ever needs it (anton-fgqr) — a run closes everything else itself. */}
+          {canMarkDone && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="border-stage-done/40 text-stage-done hover:bg-stage-done/10"
+              disabled={busy}
+              onClick={() => setCloseArming(true)}
+              title="Mark done — closes this as delivered; no agent run ever will"
+            >
+              <CheckIcon aria-hidden="true" />
+              Mark done
+            </Button>
+          )}
         </div>
       </div>
+
+      {closeArming && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-xs text-muted-foreground">Mark this done? It can&apos;t be reopened.</span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="border-stage-done/40 bg-stage-done/10 text-stage-done hover:bg-stage-done/20"
+            onClick={confirmMarkDone}
+            disabled={pending === "close"}
+          >
+            <CheckIcon aria-hidden="true" />
+            {pending === "close" ? "Marking done…" : "Confirm mark done"}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => setCloseArming(false)}
+            disabled={pending === "close"}
+          >
+            Cancel
+          </Button>
+        </div>
+      )}
 
       {arming && (
         <div className="flex flex-wrap items-center gap-1.5">

@@ -71,6 +71,13 @@ export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
  */
 export const MAX_ABANDON_REASON_CHARS = 500;
 
+/**
+ * The `agent:` label value for work a PERSON executes, not an agent — mirrors `beads.HUMAN_AGENT` /
+ * `LABELS.agentHuman` (lib/beads/bd.ts). Duplicated here, not imported, so a client surface can gate
+ * the Mark-done action on `detail.agent === HUMAN_AGENT` without pulling lib/beads into the bundle.
+ */
+export const HUMAN_AGENT = "human";
+
 // The self-review's own shapes, re-exported type-only for the same reason as the contract above:
 // the rework dialog renders findings and score rounds, and a value import of lib/jobs would drag
 // the whole job runtime into the browser bundle.
