@@ -228,6 +228,18 @@ describe("getTicketDetail hasOpenDescendants", () => {
 
     expect(detail.hasOpenDescendants).toBe(false);
   });
+
+  it("does not flag it for an open molecule/gate under it — pipeline plumbing, not user work", async () => {
+    fakeBd([
+      bead({ id: "e1", issue_type: "epic", labels: ["agent:human"] }),
+      bead({ id: "e1.1", issue_type: "molecule", parent: "e1" }),
+      bead({ id: "e1.2", issue_type: "gate", parent: "e1.1" }),
+    ]);
+
+    const detail = await getTicketDetail(project, "e1");
+
+    expect(detail.hasOpenDescendants).toBe(false);
+  });
 });
 
 describe("updateTicket read economy", () => {

@@ -5,6 +5,7 @@
  */
 import { beads, type BeadPatch } from "./beads/bd";
 import { withBeadWriteLock } from "./beads/claim-lock";
+import { isPipelineArtifact } from "./beads/contract";
 import { allIssues, ensureDescription } from "./beads/issues";
 import { descendantsOf } from "./beads/subtree";
 import { nudgeSync } from "./beads/sync-nudge";
@@ -47,9 +48,14 @@ function holdsRunOf(bead: Bead, all: Bead[]): boolean {
  * makes before it will close a bead, mirrored here off the primitive it shares (`descendantsOf`),
  * so this dialog's Mark done can withhold itself exactly where that route would 409. Only an epic or
  * a feature can have children in this board's shape, so this is trivially false for a task/bug.
+ * Pipeline plumbing (a poured `molecule` root, its `gate` children) is filtered out like
+ * `closeHumanTicket` filters it: it stays open for the run's own lifetime, and counting it here
+ * would withhold Mark done for as long as the run does, even though the route itself would accept.
  */
 function hasOpenDescendantsOf(bead: Bead, all: Bead[]): boolean {
-  return descendantsOf(all, bead.id, (b) => b.status !== "closed").length > 0;
+  return (
+    descendantsOf(all, bead.id, (b) => b.status !== "closed" && !isPipelineArtifact(b)).length > 0
+  );
 }
 
 function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined, all: Bead[]): TicketDetail {
