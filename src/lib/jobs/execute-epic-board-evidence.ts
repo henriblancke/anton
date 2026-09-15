@@ -52,6 +52,7 @@ import {
   STAGE_PREFIX,
   type Bead,
 } from "../beads/bd";
+import { PoisonEpic } from "./errors";
 import { mustPersist, mustReadBoard } from "./execute-epic-persist";
 
 /**
@@ -204,6 +205,19 @@ export interface BoardEvidenceResult {
    * landed, with nothing left on the ticket to recover it from.
    */
   markerUnpersisted?: boolean;
+  /**
+   * The FIRST attempt's recovery baseline (see {@link readBoardEvidence}'s `!board` branch) could
+   * not be made durable — persisted AND confirmed synced — before this attempt gave up (PR #284
+   * review round 9). Always paired with `evidenceUnavailable: true`. Named separately because it is
+   * a sharper warning than a merely unreadable post-run board: if this ticket resumes on ANOTHER
+   * machine (the run-lease actor is machine-scoped, not run-scoped), that machine never sees this
+   * preserved baseline either, so `readBoardBaseline` takes a FRESH read there too — one that may
+   * already have absorbed this ticket's own writes through an independent sync pass — and an
+   * idempotent retry that correctly makes no further writes then reads as no evidence at all,
+   * permanently. Resuming on the SAME machine is still safe (the baseline sits in this process's
+   * local Dolt state regardless of whether it pushed), so the operator note has to say which.
+   */
+  baselineUnconfirmed?: boolean;
 }
 
 /**
@@ -295,9 +309,33 @@ export async function readBoardEvidence(
     // sync pass this check never confirmed (see that function's docstring). Skipped once a baseline
     // is already preserved, so a repeated read failure doesn't churn the write every attempt.
     if (!beads.boardEvidenceBaseline(ticket)) {
-      await mustPersist(() =>
+      // Persisted AND confirmed synced before this recovery baseline is trusted (PR #284 review
+      // round 9) — a write that only landed locally, or landed but never confirmed reaching the
+      // remote, does not help a resume on ANOTHER machine (the run-lease actor is machine-scoped,
+      // not run-scoped): that machine's `readBoardBaseline` finds no preserved baseline either and
+      // falls back to a fresh read that may already have absorbed this ticket's own — by-then synced
+      // through some other channel — writes, permanently rejecting an idempotent retry as unchanged.
+      // `baselineUnconfirmed` is reported (never silently folded into a plain `evidenceUnavailable`)
+      // so the operator note can say precisely that resuming on THIS machine is safe but resuming
+      // elsewhere is not.
+      const persisted = await mustPersist(() =>
         beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
       );
+      const synced = persisted
+        ? await beads
+            .push(repo)
+            .then((outcome) => outcome === "synced" || outcome === "shared-server")
+            .catch(() => false)
+        : false;
+      if (!persisted || !synced) {
+        return {
+          found: pending.length > 0,
+          ids: pending,
+          synced: false,
+          evidenceUnavailable: true,
+          baselineUnconfirmed: true,
+        };
+      }
     }
     return { found: pending.length > 0, ids: pending, synced: false, evidenceUnavailable: true };
   }
@@ -346,6 +384,15 @@ export async function readBoardEvidence(
  * The preserved baseline ({@link beads.setBoardEvidenceBaseline}), if any, is released in the same
  * call — its recovery job is done the moment the marker it backs is cleared, and leaving it behind
  * would anchor a future, unrelated reopening of this ticket to a board snapshot from long before it.
+ *
+ * Both writes must land or this throws {@link PoisonEpic} (PR #284 review round 9) — resolving
+ * quietly on a partial or total failure is NOT harmless (see the retry note above): a surviving
+ * pending marker lets a later reopen read stale evidence as current and accept it with no new work,
+ * and a surviving baseline anchors a future, unrelated reopening of this ticket to a stale snapshot.
+ * Both are false-success risks this run must not carry forward silently, so it halts for a human
+ * instead. The caller (`runTicket`) invokes this only AFTER the ticket has already closed/transitioned
+ * successfully, outside the try/catch that reclassifies a ticket as failed — this poison is about the
+ * cleanup write, not this ticket's own (already-settled) delivery, and must not reopen or reblock it.
  */
 export async function clearBoardEvidencePending(
   repo: string,
@@ -353,10 +400,24 @@ export async function clearBoardEvidencePending(
   ids: readonly string[],
 ): Promise<void> {
   if (ids.length === 0) return;
-  await mustPersist(() =>
+  const markerCleared = await mustPersist(() =>
     beads.setBoardEvidencePending(repo, ticketId, [], [LABELS.boardEvidencePending(ids)]),
   );
-  await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId));
+  const baselineCleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId));
+  if (!markerCleared || !baselineCleared) {
+    const failed = [
+      !markerCleared && "the pending-evidence marker",
+      !baselineCleared && "the preserved baseline",
+    ]
+      .filter((s): s is string => s !== false)
+      .join(" and ");
+    throw new PoisonEpic(
+      `${ticketId} delivered and closed, but bd would not clear ${failed} it left on the board ` +
+        `(after retries) — the run stopped rather than leave a stale board-evidence record on an ` +
+        `already-closed ticket, which a later reopen could read as current evidence for no new work. ` +
+        `Check the beads DB, then resume the run.`,
+    );
+  }
 }
 
 /**

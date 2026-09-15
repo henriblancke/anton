@@ -112,6 +112,11 @@ export async function runTicket(args: {
   const boardBaseline = boardOnly ? await readBoardBaseline(run.repoPath, ticket) : null;
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline, boardOnly);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
+  // Set only once the ticket itself has genuinely finished (PR #284 review round 9) — kept outside
+  // the try/catch below so the marker cleanup after it can propagate a failure WITHOUT routing
+  // through `settleFailedTicket`, which exists to fail an UNSETTLED ticket and would reopen/reblock
+  // this one on a cleanup write that has nothing to do with whether its work landed.
+  let finished: { settlement: TicketSettlement; closed: boolean; transitioned: boolean } | undefined;
 
   try {
     await walkTicketSteps({
@@ -144,21 +149,7 @@ export async function runTicket(args: {
       closeOnDone,
       settlement,
     );
-    // The pending marker (anton-fc5x review round 4) is released only now — the whole handoff this
-    // ticket's board evidence unblocked (attribution commit + close/in-review) has gone through
-    // without throwing. See {@link clearBoardEvidencePending}.
-    //
-    // Gated on `transitioned`, not just on the marker's presence (PR #284 review round 7): `closed`
-    // reads `false` for a standalone target's normal `stage:in-review` success, so an unconditional
-    // clear here released the marker on a bd write that may have been REFUSED — a child ticket whose
-    // board edits already landed would then have no pending ids for a later retry to prove delivery
-    // from. `transitioned` is the one answer that covers both the epic-child close and the standalone
-    // in-review move, and is true only when the write that ends this ticket's handoff actually
-    // landed.
-    if (progress.boardEvidenceIds && transitioned) {
-      await clearBoardEvidencePending(run.repoPath, ticket.id, progress.boardEvidenceIds);
-    }
-    return { ...settlement, closed };
+    finished = { settlement, closed, transitioned };
   } catch (e) {
     // Always throws; returned so the signature carries the `never` and the walk's answer is typed.
     return settleFailedTicket({
@@ -177,6 +168,27 @@ export async function runTicket(args: {
   } finally {
     budget.stop();
   }
+
+  // The pending marker (anton-fc5x review round 4) is released only now — the whole handoff this
+  // ticket's board evidence unblocked (attribution commit + close/in-review) has gone through
+  // without throwing. See {@link clearBoardEvidencePending}.
+  //
+  // Gated on `transitioned`, not just on the marker's presence (PR #284 review round 7): `closed`
+  // reads `false` for a standalone target's normal `stage:in-review` success, so an unconditional
+  // clear here released the marker on a bd write that may have been REFUSED — a child ticket whose
+  // board edits already landed would then have no pending ids for a later retry to prove delivery
+  // from. `transitioned` is the one answer that covers both the epic-child close and the standalone
+  // in-review move, and is true only when the write that ends this ticket's handoff actually
+  // landed.
+  //
+  // Left OUTSIDE the try/catch above (PR #284 review round 9): a cleanup write bd keeps refusing
+  // must halt the run (see `clearBoardEvidencePending`'s own docstring), but this ticket has already
+  // closed/transitioned successfully — reclassifying it as a failure here would reopen or reblock a
+  // delivery that genuinely landed. The thrown error propagates straight out of `runTicket` instead.
+  if (progress.boardEvidenceIds && finished.transitioned) {
+    await clearBoardEvidencePending(run.repoPath, ticket.id, progress.boardEvidenceIds);
+  }
+  return { ...finished.settlement, closed: finished.closed };
 }
 
 /**
@@ -530,6 +542,18 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
       `operator review until the board read is healthy, then resume the run — an unreadable baseline ` +
       `fails closed rather than falling through to the tree-based check a board-only ticket must never ` +
       `settle on.`
+    );
+  }
+  if (evidence.baselineUnconfirmed) {
+    return (
+      `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
+      `is bd writes to the board, not the git tree — the post-run board read failed (after retries), ` +
+      `and the recovery baseline this attempt tried to preserve for a resume could not be made ` +
+      `durable either (persisted and confirmed synced). Blocking the ticket for operator review — ` +
+      `RESUMING ON THIS SAME MACHINE is safe, but resuming on a different one will not see this ` +
+      `attempt's baseline and may silently absorb this ticket's own already-synced writes as ` +
+      `pre-existing, permanently rejecting an idempotent retry as unchanged. Check the beads DB and ` +
+      `the sync channel, then resume the run on this machine.`
     );
   }
   if (evidence.evidenceUnavailable) {

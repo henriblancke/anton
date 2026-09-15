@@ -232,13 +232,17 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
       const baseline = (await readBoardBaseline("/repo"))!;
       rejectEveryRetry();
+      // The recovery baseline write must now be persisted AND confirmed synced before this reads as
+      // plain `evidenceUnavailable` rather than the sharper `baselineUnconfirmed` (PR #284 review
+      // round 9) — both succeed here.
+      pushMock.mockResolvedValueOnce("synced");
       await expect(readBoardEvidence("/repo", baseline, ticket)).resolves.toEqual({
         found: false,
         ids: [],
         synced: false,
         evidenceUnavailable: true,
       });
-      expect(pushMock).not.toHaveBeenCalled();
+      expect(pushMock).toHaveBeenCalledWith("/repo");
     },
   );
 
@@ -251,13 +255,14 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
       const baseline = (await readBoardBaseline("/repo"))!;
       rejectEveryRetry();
+      pushMock.mockResolvedValueOnce("synced");
       await expect(readBoardEvidence("/repo", baseline, resumedTicket)).resolves.toEqual({
         found: true,
         ids: ["a"],
         synced: false,
         evidenceUnavailable: true,
       });
-      expect(pushMock).not.toHaveBeenCalled();
+      expect(pushMock).toHaveBeenCalledWith("/repo");
     },
   );
 
@@ -269,6 +274,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
       const baseline = (await readBoardBaseline("/repo"))!;
       rejectEveryRetry();
+      pushMock.mockResolvedValueOnce("synced");
       const freshTicket = bead("t-baseline");
       await readBoardEvidence("/repo", baseline, freshTicket);
       expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith(
@@ -276,6 +282,49 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "t-baseline",
         Object.fromEntries(baseline.beads),
       );
+    },
+  );
+
+  it(
+    "reports baselineUnconfirmed rather than a plain evidenceUnavailable when the recovery " +
+      "baseline is persisted but the confirming push cannot verify it synced (PR #284 review " +
+      "round 9) — a baseline that only landed locally does not help a resume on ANOTHER machine",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      rejectEveryRetry();
+      const freshTicket = bead("t-baseline-unsynced");
+      pushMock.mockResolvedValueOnce("not-wired");
+      await expect(readBoardEvidence("/repo", baseline, freshTicket)).resolves.toEqual({
+        found: false,
+        ids: [],
+        synced: false,
+        evidenceUnavailable: true,
+        baselineUnconfirmed: true,
+      });
+    },
+  );
+
+  it(
+    "reports baselineUnconfirmed when the recovery baseline write itself fails every retry — the " +
+      "push is never reached, so persistence alone still fails closed (PR #284 review round 9)",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      rejectEveryRetry();
+      const freshTicket = bead("t-baseline-unpersisted");
+      const pushCallsBefore = pushMock.mock.calls.length;
+      setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+      await expect(readBoardEvidence("/repo", baseline, freshTicket)).resolves.toEqual({
+        found: false,
+        ids: [],
+        synced: false,
+        evidenceUnavailable: true,
+        baselineUnconfirmed: true,
+      });
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
     },
   );
 
@@ -300,9 +349,12 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
     const baseline = (await readBoardBaseline("/repo"))!;
     loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+    // Mocks in this suite accumulate call history across tests (no per-test reset), so "the sync
+    // probe was skipped" is a delta assertion, not an absolute one.
+    const callsBefore = pushMock.mock.calls.length;
     const result = await readBoardEvidence("/repo", baseline, ticket);
     expect(result).toEqual({ found: false, ids: [], synced: false });
-    expect(pushMock).not.toHaveBeenCalled();
+    expect(pushMock.mock.calls.length).toBe(callsBefore);
   });
 
   it(
@@ -317,6 +369,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       const firstBaseline = (await readBoardBaseline("/repo"))!;
       const firstTicket = bead("t-recover");
       rejectEveryRetry();
+      pushMock.mockResolvedValueOnce("synced");
       const firstAttempt = await readBoardEvidence("/repo", firstBaseline, firstTicket);
       expect(firstAttempt).toEqual({
         found: false,
@@ -519,6 +572,34 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     expect(setBoardEvidencePendingMock.mock.calls.length).toBe(callsBefore);
     expect(clearBoardEvidenceBaselineMock.mock.calls.length).toBe(baselineCallsBefore);
   });
+
+  it(
+    "throws rather than resolving quietly when the marker-clear exhausts every retry (PR #284 " +
+      "review round 9) — a swallowed failure here leaves a stale marker on an already-closed bead " +
+      "that a later reopen could read as current evidence for no new work",
+    async () => {
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      await expect(clearBoardEvidencePending("/repo", "t-marker-stranded", ["a"])).rejects.toThrow(
+        /t-marker-stranded/,
+      );
+    },
+  );
+
+  it(
+    "throws when the baseline-clear exhausts every retry, even though the marker itself cleared " +
+      "fine (PR #284 review round 9) — a surviving preserved baseline anchors a future reopening of " +
+      "this ticket to a stale board snapshot",
+    async () => {
+      clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+      clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+      clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+      await expect(clearBoardEvidencePending("/repo", "t-baseline-stranded", ["a"])).rejects.toThrow(
+        /t-baseline-stranded/,
+      );
+    },
+  );
 
   it(
     "a synced check that finds NEW ids beyond the stale marker still writes the expanded set",
