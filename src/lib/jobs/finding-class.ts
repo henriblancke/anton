@@ -20,25 +20,26 @@ type Matcher = RegExp | ((note: string) => boolean);
  * say nothing about loss *of work* on their own — "the first character is dropped when parsing", "the
  * diagnostic context is lost after wrapping the error", or "the logger silently drops duplicate metric
  * labels" all match the words without describing a work-loss regression. They only count when a
- * work-bearing noun (job, task, queue, ...) or a retry/requeue signal appears within a short window of
- * the match.
+ * work-bearing noun (job, task, queue, ...) or a retry/requeue signal is the verb's actual subject or
+ * object — adjacent with no clause boundary in between — not merely mentioned nearby: "while parsing a
+ * request, the first character is dropped" has "request" in an earlier, unrelated clause.
  */
-const WORK_LOSS_PASSIVE = /is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when)|silently drops?/gi;
-const WORK_SUBJECT =
-  /\b(?:job|task|queue|batch|record|item|request|message|event|payload|entry|entries|submission|update)s?\b/i;
-const RETRY_SIGNAL = /\b(?:retry|retried|retries|requeue|requeued|re-?queue|re-?queued|redeliver|redelivered|reprocess|reprocessed)\b/i;
-const WORK_LOSS_CONTEXT_WINDOW = 60;
+const WORK_LOSS_SUBJECT =
+  "(?:job|task|queue|batch|record|item|request|message|event|payload|entry|entries|submission|update)s?";
+const WORK_LOSS_RETRY =
+  "(?:retry|retried|retries|requeue|requeued|re-?queue|re-?queued|redeliver|redelivered|reprocess|reprocessed)";
+const WORK_LOSS_SIGNAL = `(?:${WORK_LOSS_SUBJECT}|${WORK_LOSS_RETRY})`;
+// No comma/semicolon/dash/period in the gap, so a noun from an earlier clause can't be credited
+// as this loss's subject.
+const CLAUSE_GAP = "[^,;.\\u2013\\u2014]{0,30}?";
+const WORK_LOSS_PASSIVE = new RegExp(
+  `\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\b(?:is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))\\b` +
+    `|\\b(?:is (?:silently )?(?:discarded|lost|dropped)|silently drops?)\\b${CLAUSE_GAP}\\b${WORK_LOSS_SIGNAL}\\b`,
+  "i",
+);
 
 function matchesWorkLossPassive(note: string): boolean {
-  WORK_LOSS_PASSIVE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = WORK_LOSS_PASSIVE.exec(note))) {
-    const start = Math.max(0, match.index - WORK_LOSS_CONTEXT_WINDOW);
-    const end = Math.min(note.length, match.index + match[0].length + WORK_LOSS_CONTEXT_WINDOW);
-    const context = note.slice(start, end);
-    if (WORK_SUBJECT.test(context) || RETRY_SIGNAL.test(context)) return true;
-  }
-  return false;
+  return WORK_LOSS_PASSIVE.test(note);
 }
 
 function matchesWorkLoss(note: string): boolean {
@@ -63,8 +64,11 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher 
   },
   {
     klass: "cancellation",
+    // \bcancell?(?:ations?|ing|ed|s)?\b covers both the noun/past-tense forms and the active
+    // verb forms ("cancels", "cancelling"/"canceling") reviewers actually write, across both
+    // single-L and double-L spellings.
     pattern:
-      /cancell?ation|\bcancell?ed\b|\baborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|orphaned (?:request|task|job)/i,
+      /\bcancell?(?:ations?|ing|ed|s)?\b|\baborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|orphaned (?:request|task|job)/i,
   },
   {
     klass: "fail-open",

@@ -91,6 +91,21 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("cancellation");
   });
 
+  it("classifies a 'cancelling' (active, double-L) finding as cancellation", () => {
+    const note = "Cancelling the run during this await does not stop the handler from finishing its work.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
+  it("classifies a 'canceling' (active, single-L) finding as cancellation", () => {
+    const note = "Canceling the upload mid-flight leaves the temp file behind on disk.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
+  it("classifies a 'cancels' (active present-tense) finding as cancellation", () => {
+    const note = "When the caller cancels the request, the handler keeps writing to the response anyway.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
   it("classifies a passive 'is lost' work-loss finding", () => {
     const note = "The job is lost after dequeue if the handler throws before it acknowledges the message.";
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
@@ -141,6 +156,17 @@ describe("classifyFindingClass", () => {
   it("classifies a 'silently drops' finding with work context as work-loss", () => {
     const note = "The worker silently drops the job when the connection resets, with no retry and no log.";
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("does not classify a parsing bug as work-loss merely because an incidental noun is nearby", () => {
+    const note = "While parsing a request, the first character is dropped when decoding a negative number.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify a parsing bug as work-loss merely because a work noun is in an earlier sentence", () => {
+    const note =
+      "Even though the item queue was recently updated, the first character is dropped when decoding a negative number.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
   });
 
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
