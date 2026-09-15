@@ -113,6 +113,37 @@ describe("ScanTrend", () => {
     expect(column.innerHTML).toContain("bg-risk-med/70");
   });
 
+  // anton-knyp: the peak column's unfloored segments already sum to exactly 100% of the track, so
+  // flooring each one independently against a full 100% track asks for >100% and flexbox silently
+  // shrinks every segment to fit — distorting the ratios the chart exists to show.
+  it("holds a peak column's segment ratios instead of shrinking them to fit the floor", () => {
+    render(<ScanTrend points={[point("a", 1_700_000_000, { critical: 34, high: 33, medium: 33 })]} />);
+
+    const column = screen.getByTitle(/100 new signals/);
+    const heights = Array.from(column.querySelectorAll<HTMLElement>("span[style]")).map((bar) =>
+      Number.parseFloat(bar.style.height),
+    );
+    const sum = heights.reduce((a, b) => a + b, 0);
+
+    expect(sum).toBeLessThanOrEqual(100.01);
+    // No severity needed the floor here, so ratios hold to the underlying counts within a pixel.
+    expect(heights[0] / heights[1]).toBeCloseTo(34 / 33, 1);
+    expect(heights[1] / heights[2]).toBeCloseTo(33 / 33, 1);
+  });
+
+  it("still draws a visible segment for a count of 1 against a large peak", () => {
+    render(<ScanTrend points={[point("a", 1_700_000_000, { critical: 40, low: 1 })]} />);
+
+    const column = screen.getByTitle(/41 new signals/);
+    const heights = Array.from(column.querySelectorAll<HTMLElement>("span[style]")).map((bar) =>
+      Number.parseFloat(bar.style.height),
+    );
+    const sum = heights.reduce((a, b) => a + b, 0);
+
+    expect(sum).toBeLessThanOrEqual(100.01);
+    expect(heights[1]).toBeGreaterThanOrEqual(6);
+  });
+
   it("keeps the collector failure visible on a baseline column", () => {
     const points: ScanHealthPoint[] = [
       { ...point("a", 1_700_000_000, { low: 100 }), baseline: true, incomplete: true },

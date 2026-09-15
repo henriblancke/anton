@@ -16,6 +16,41 @@ const SEVERITY_BAR: Record<ScanSeverity, string> = {
   low: "bg-stage-backlog/70",
 };
 
+/** A segment's minimum share of the container height — floored so a single signal still draws. */
+const FLOOR_PCT = 6;
+
+/**
+ * A column's segment heights, as a percent of the shared container height (`peak` sets the scale
+ * for every column, so the tallest column's segments sum to exactly 100%). Flooring each segment
+ * independently against a full 100% track — the previous approach — asks a column with more than
+ * one severity for over 100% of its own track, and flexbox silently shrinks every segment to fit,
+ * distorting the very ratios the chart exists to show (anton-knyp).
+ *
+ * Instead the floor is reserved out of the track up front: every present severity below the floor
+ * gets exactly `FLOOR_PCT`, and the rest of the track is split by count among the severities left —
+ * which is all of it, at their natural proportions, when nothing needed flooring.
+ */
+function severityHeights(bySeverity: Record<ScanSeverity, number>, total: number, peak: number) {
+  const present = SCAN_SEVERITIES.filter((s) => bySeverity[s] > 0);
+  const track = (total / peak) * 100;
+
+  const floored = present.filter((s) => (bySeverity[s] / total) * track < FLOOR_PCT);
+  const flooredSet = new Set(floored);
+  const scaledCount = present
+    .filter((s) => !flooredSet.has(s))
+    .reduce((sum, s) => sum + bySeverity[s], 0);
+  const remainingTrack = Math.max(0, track - floored.length * FLOOR_PCT);
+
+  const heights = new Map<ScanSeverity, number>();
+  for (const s of present) {
+    heights.set(
+      s,
+      flooredSet.has(s) ? FLOOR_PCT : (bySeverity[s] / scaledCount) * remainingTrack,
+    );
+  }
+  return heights;
+}
+
 /**
  * One column per scan, oldest → newest, stacked by severity (anton-bz1w). Bars rather than a line:
  * each column is one nightly pass — a discrete event with an internal split — not a sample of a
@@ -79,21 +114,19 @@ export function ScanTrend({ points, className }: { points: ScanHealthPoint[]; cl
           >
             {point.total > 0 ? (
               // Worst first, so a column reads top-down the way the legend does.
-              SCAN_SEVERITIES.filter((s) => point.bySeverity[s] > 0).map((severity) => (
-                <span
-                  key={severity}
-                  className={cn(
-                    "w-full rounded-[1px]",
-                    SEVERITY_BAR[severity],
-                    point.incomplete && "opacity-40",
-                  )}
-                  // Floored so a single signal still draws — an invisible segment reads as absent,
-                  // which is the one thing it is not.
-                  style={{
-                    height: `${Math.max(6, (point.bySeverity[severity] / peak) * 100)}%`,
-                  }}
-                />
-              ))
+              Array.from(severityHeights(point.bySeverity, point.total, peak)).map(
+                ([severity, height]) => (
+                  <span
+                    key={severity}
+                    className={cn(
+                      "w-full rounded-[1px]",
+                      SEVERITY_BAR[severity],
+                      point.incomplete && "opacity-40",
+                    )}
+                    style={{ height: `${height}%` }}
+                  />
+                ),
+              )
             ) : point.incomplete ? null : (
               <span className="h-0.5 w-full rounded-[1px] bg-stage-done/60" />
             )}
