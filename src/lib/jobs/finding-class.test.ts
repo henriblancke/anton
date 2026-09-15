@@ -123,6 +123,22 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("other");
   });
 
+  it("does not classify a bare 'aborted' transaction finding as cancellation", () => {
+    const note =
+      "The transaction was aborted after the unique constraint failed, but the code reports success.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies a 'signal.aborted' finding as cancellation even without a nearby await", () => {
+    const note = "The handler never checks signal.aborted before writing the response.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
+  it("classifies an 'aborted' finding as cancellation when await is nearby", () => {
+    const note = "The request was aborted during this await, but the handler keeps writing to the response.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
   it("classifies a passive 'is lost' work-loss finding", () => {
     const note = "The job is lost after dequeue if the handler throws before it acknowledges the message.";
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
@@ -199,6 +215,16 @@ describe("classifyFindingClass", () => {
   it("does not classify a parsing bug as work-loss when the work noun is only a preposition's object", () => {
     const note = "For each request the first character is dropped when parsing a negative number.";
     expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify a numeric-precision bug as work-loss merely because it says 'data loss'", () => {
+    const note = "Casting this bigint to number causes data loss for large IDs.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies a 'data loss' finding as work-loss when a work-bearing noun is nearby", () => {
+    const note = "A crash here causes data loss on the pending job before it can be retried.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
   });
 
   it("classifies an active 'loses the job' finding as work-loss", () => {

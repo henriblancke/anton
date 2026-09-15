@@ -29,6 +29,13 @@ const WORK_LOSS_SUBJECT =
 const WORK_LOSS_RETRY =
   "(?:retry|retried|retries|requeue|requeued|re-?queue|re-?queued|redeliver|redelivered|reprocess|reprocessed)";
 const WORK_LOSS_SIGNAL = `(?:${WORK_LOSS_SUBJECT}|${WORK_LOSS_RETRY})`;
+// Bare "data loss" says nothing about lost *work* on its own — "casting this bigint to number
+// causes data loss for large IDs" is a numeric-precision bug, not a dropped job/queue entry. It
+// only counts when a work-bearing noun (WORK_LOSS_SUBJECT) or "error(s)" shares the same clause.
+const DATA_LOSS_CONTEXT = new RegExp(
+  `\\bdata loss\\b[^.]{0,30}\\b(?:${WORK_LOSS_SUBJECT}|errors?)\\b|\\b(?:${WORK_LOSS_SUBJECT}|errors?)\\b[^.]{0,30}\\bdata loss\\b`,
+  "i",
+);
 // No comma/semicolon/colon/dash/period/apostrophe in the gap, so a noun from an earlier clause —
 // or a possessive that hands the subject role to whatever follows it ("the request body's first
 // character is dropped") — can't be credited as this loss's subject. The colon matters the same
@@ -63,7 +70,8 @@ const WORK_LOSS_ACTIVE = new RegExp(`\\b(?:loses?|drops?|discards?)\\b${CLAUSE_G
 
 function matchesWorkLoss(note: string): boolean {
   return (
-    /work.?loss|never retried|unhandled rejection|work is lost|data loss/i.test(note) ||
+    /work.?loss|never retried|unhandled rejection|work is lost/i.test(note) ||
+    DATA_LOSS_CONTEXT.test(note) ||
     WORK_LOSS_ACTIVE.test(note) ||
     matchesWorkLossPassive(note)
   );
@@ -110,13 +118,14 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher 
     klass: "cancellation",
     // \bcancell?(?:ations?|ing|ed|s)?\b covers both the noun/past-tense forms and the active
     // verb forms ("cancels", "cancelling"/"canceling") reviewers actually write, across both
-    // single-L and double-L spellings. Active "abort(s|ing)" only counts when "await" appears
-    // nearby in the same clause (no period between them) — an unqualified "abort" is as often an
-    // unrelated transaction/operation abort ("the transaction aborts when the constraint fails")
-    // as it is cancellation, so it needs the await context the other abort alternatives already
-    // carry via "after the abort" / "ignores the abort" / etc.
+    // single-L and double-L spellings. Active "abort(s|ing)" and past-tense "aborted" only count
+    // when "await" appears nearby in the same clause (no period between them), or (for "aborted")
+    // the literal "signal.aborted" API reference — an unqualified "abort"/"aborted" is as often an
+    // unrelated transaction/operation abort ("the transaction was aborted after the unique
+    // constraint failed") as it is cancellation, so it needs the await/signal context the other
+    // abort alternatives already carry via "after the abort" / "ignores the abort" / etc.
     pattern:
-      /\bcancell?(?:ations?|ing|ed|s)?\b|\baborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|orphaned (?:request|task|job)|\babort(?:s|ing)\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\babort(?:s|ing)\b/i,
+      /\bcancell?(?:ations?|ing|ed|s)?\b|\bsignal\.aborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|orphaned (?:request|task|job)|\babort(?:s|ing)\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\babort(?:s|ing)\b|\baborted\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\baborted\b/i,
   },
   {
     klass: "fail-open",
