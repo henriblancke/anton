@@ -312,6 +312,14 @@ export interface RecordedReviewKey {
  * re-check — turning a two-gate formula into a one-gate one. A genuine cross-attempt retry is
  * unaffected: its fresh row carries a DIFFERENT id than the failed one it is meant to recover.
  *
+ * That exclusion alone does not stop a DIFFERENT cross-step mixup: a failed attempt's row still
+ * carries whichever step's key was written onto it LAST, and a retry's second `step:review` could
+ * otherwise find that recovered row (excluded is only the retry's OWN id) and treat a verdict the
+ * FIRST gate produced as its own. `computeReviewKey`'s fingerprint is bound to the step's id for
+ * exactly this reason (anton-nyz1v) — a token computed for one step's occurrence cannot equal one
+ * computed for another's, so a mismatched recovery falls through to a real review, same as no key
+ * at all.
+ *
  * Otherwise safe to consult unconditionally — a stale key from an unrelated earlier attempt on this
  * branch simply fails the token comparison in `runReviewStep` and the gate reviews in full, exactly
  * as a row with no key at all does.

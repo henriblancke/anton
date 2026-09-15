@@ -60,6 +60,9 @@ export async function runReviewStep(
         worktreePath: stepCtx.worktreePath,
         baseBranch: stepCtx.baseRef,
         settings,
+        target: stepCtx.target,
+        tickets: stepCtx.tickets,
+        stepId: cooked.id,
       });
       if (reviewKeyToken(key) === recordedKey.reviewKey) {
         // The recorded attempt already owns the board labels — this attempt writes none of those.
@@ -210,6 +213,9 @@ export async function runReviewStep(
         worktreePath: stepCtx.worktreePath,
         baseBranch: stepCtx.baseRef,
         settings,
+        target: stepCtx.target,
+        tickets: stepCtx.tickets,
+        stepId: cooked.id,
       });
       await updateRun(db, clock, runId, {
         reviewKey: reviewKeyToken(key),

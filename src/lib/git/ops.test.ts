@@ -113,6 +113,41 @@ process.exit(r.status ?? 1);
   return binDir;
 }
 
+/**
+ * A git shim that fails the FIRST `push` it sees with a {@link classifyPushFailure}-transient cause
+ * (exit 128, "Could not resolve host") and forwards every other invocation — including the retried
+ * push — to the real git, so `pushBranch`'s retry loop is proven against an actual transient failure
+ * rather than one asserted only against the classifier in isolation (anton-1cjaw round 2).
+ */
+function shimGitFailingPushOnce(sandboxDir: string, counterFile: string): string {
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const binDir = join(sandboxDir, "push-shim-bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+const counter=${JSON.stringify(counterFile)};
+if(a.includes('push')){
+  let n=0;
+  try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch{}
+  n+=1;
+  fs.writeFileSync(counter,String(n));
+  if(n===1){
+    process.stderr.write("fatal: unable to access 'https://example.invalid/': Could not resolve host: example.invalid\\n");
+    process.exit(128);
+  }
+}
+const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+process.exit(r.status ?? 1);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
 // The disabling sentinel `resolveHooksPathOverrideForMerge` returns instead of `undefined` whenever
 // `core.hooksPath` IS configured but no source verified to match the incoming commit exists (PR #263
 // review, round 26): an absolute path guaranteed to not exist on disk, which git's own hook lookup
@@ -4186,5 +4221,54 @@ suite("pushBranch retries only classified-transient failures (real git)", () => 
         .split("\n")
         .filter(Boolean),
     ).toHaveLength(1);
+  });
+
+  it("retries a classified-transient failure and succeeds on the second attempt", async () => {
+    const counter = join(sandbox, "push-attempts.log");
+    const binDir = shimGitFailingPushOnce(sandbox, counter);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    try {
+      await pushBranch(repo, "main");
+    } finally {
+      process.env.PATH = prevPath;
+    }
+
+    // Two invocations of the shim's `push` branch — the failed first attempt, and the retry that
+    // actually landed — proves the retry ran for real rather than the classifier alone saying it should.
+    expect(Number(readFileSync(counter, "utf8").trim())).toBe(2);
+    const localHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const remoteHead = execFileSync("git", ["-C", bare, "rev-parse", "main"], { encoding: "utf8" }).trim();
+    expect(remoteHead).toBe(localHead);
+  });
+
+  it("aborts immediately during backoff instead of waiting out the 1s delay", async () => {
+    const counter = join(sandbox, "push-attempts-abort.log");
+    const binDir = shimGitFailingPushOnce(sandbox, counter);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    const controller = new AbortController();
+    const reason = new Error("job made no progress");
+    try {
+      const pending = pushBranch(repo, "main", undefined, undefined, controller.signal);
+
+      // Wait for the first (transient, per the shim) attempt to fail — `pushBranch` is now asleep
+      // in its 1s backoff before the retry.
+      await vi.waitFor(() => expect(readFileSync(counter, "utf8").trim()).toBe("1"), {
+        timeout: 800,
+        interval: 10,
+      });
+      const abortedAt = Date.now();
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+      // Well under the 1s backoff `sleepMs` alone would have waited out — proves the abort raced
+      // the sleep rather than waiting for `gitPush`'s own check at the top of the next attempt.
+      expect(Date.now() - abortedAt).toBeLessThan(500);
+      // No second attempt: the abort landed during backoff, before the retry ever ran.
+      expect(readFileSync(counter, "utf8").trim()).toBe("1");
+    } finally {
+      process.env.PATH = prevPath;
+    }
   });
 });

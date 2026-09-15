@@ -1698,6 +1698,32 @@ const PUSH_RETRY_BACKOFF_MS = [1_000, 3_000];
  * a fault backoff can never fix is never looped on 3 times before the caller finds out. Success on
  * any attempt is indistinguishable to the caller from success on the first.
  */
+/**
+ * Resolves after `ms` like {@link sleepMs}, but rejects the instant `signal` aborts instead of
+ * waiting out the rest of the delay — the same abort shape {@link gitPush} itself rejects with, so a
+ * caller cancelling mid-backoff sees the SAME error whether the abort landed during the sleep or
+ * during the push it wraps, rather than waiting up to {@link PUSH_RETRY_BACKOFF_MS}'s longest gap for
+ * `gitPush`'s own check at the top of the next attempt to notice.
+ */
+function sleepOrAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return sleepMs(ms);
+  if (signal.aborted) {
+    return Promise.reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    if (typeof timer.unref === "function") timer.unref();
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function pushBranch(
   cwd: string,
   branch: string,
@@ -1706,7 +1732,7 @@ export async function pushBranch(
   signal?: AbortSignal,
 ): Promise<void> {
   for (let attempt = 1; attempt <= PUSH_MAX_ATTEMPTS; attempt += 1) {
-    if (attempt > 1) await sleepMs(PUSH_RETRY_BACKOFF_MS[attempt - 2]);
+    if (attempt > 1) await sleepOrAbort(PUSH_RETRY_BACKOFF_MS[attempt - 2], signal);
     try {
       await gitPush(cwd, ["push", "--porcelain", "-u", "origin", branch], hooksPath, timeoutMs, signal);
       return;
