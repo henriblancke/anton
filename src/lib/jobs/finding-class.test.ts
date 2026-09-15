@@ -345,6 +345,31 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
   });
 
+  it("classifies an active 'drops all queued jobs' finding as work-loss (quantifier before the direct object)", () => {
+    const note = "The handler drops all queued jobs when processing throws, with no requeue and no log.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies an active 'loses every pending task' finding as work-loss (quantifier before the direct object)", () => {
+    const note = "The worker loses every pending task before it can retry.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies an active 'discards both queued requests' finding as work-loss (quantifier before the direct object)", () => {
+    const note = "The service discards both queued requests when the connection resets.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies a fail-open finding phrased as returned authorization after a failed dependency", () => {
+    const note = "The permission check returns true when the database lookup throws, granting access it shouldn't.";
+    expect(classifyFindingClass(finding(note))).toBe("fail-open");
+  });
+
+  it("classifies a fail-open finding phrased as a catch returning an allowed verdict", () => {
+    const note = "On an unexpected error the catch returns allowed instead of denying the request.";
+    expect(classifyFindingClass(finding(note))).toBe("fail-open");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();

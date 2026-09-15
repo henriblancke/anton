@@ -97,8 +97,11 @@ function matchesWorkLossPassive(note: string): boolean {
 // between the verb and the work noun, so the work noun there is a prepositional object, not what
 // got dropped. The gap only allows a short run of determiners/adjectives right after the verb, so
 // an intervening noun or preposition breaks the match instead of being skipped over.
+// Quantifiers ("all", "both", "every") sit in the same determiner slot as "the"/"queued"/etc —
+// "drops all queued jobs" is exactly as much a direct-object work-loss as "drops the queued job" —
+// so they're admitted here rather than via a separate branch.
 const WORK_LOSS_DIRECT_OBJECT_DETERMINER =
-  "(?:the|a|an|this|that|these|those|our|their|its|his|her|my|your|queued|pending|in-?flight|unacked|unprocessed|failed|new|old)";
+  "(?:the|a|an|this|that|these|those|our|their|its|his|her|my|your|all|both|every|queued|pending|in-?flight|unacked|unprocessed|failed|new|old)";
 const WORK_LOSS_ACTIVE = new RegExp(
   `\\b(?:loses?|drops?|discards?)\\b(?:\\s+${WORK_LOSS_DIRECT_OBJECT_DETERMINER}){0,3}\\s+\\b(?:work|${WORK_LOSS_SIGNAL})\\b`,
   "i",
@@ -195,8 +198,14 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher 
   },
   {
     klass: "fail-open",
+    // "returns true/allowed/granted/authorized/permitted" tied to a throw/fail/error/catch within
+    // the same sentence is a fail-open finding phrased as returned authorization rather than one of
+    // the literal "fails open"/"fail-open" formulations above — e.g. "the permission check returns
+    // true when the database lookup throws" or "the catch returns allowed". Bounded to `[^.]{0,50}?`
+    // (not a full CLAUSE_GAP) since either order (result-then-cause or cause-then-result) is valid
+    // English here and both need covering.
     pattern:
-      /fails? open|fail-open|defaults? to (?:allow|permit)|silently allow|treats? (?:an? )?error as (?:success|ok|allowed)|swallows? the error and (?:continues|proceeds)|permissive fallback/i,
+      /fails? open|fail-open|defaults? to (?:allow|permit)|silently allow|treats? (?:an? )?error as (?:success|ok|allowed)|swallows? the error and (?:continues|proceeds)|permissive fallback|returns? (?:true|allowed|granted|authorized|permitted)[^.]{0,50}?(?:throws?|thrown|throwing|fails?|failed|failure|errors?|errored|exception|rejects?|rejected|catch(?:es|ing)?)|(?:throws?|thrown|throwing|fails?|failed|failure|errors?|errored|exception|rejects?|rejected|catch(?:es|ing)?)[^.]{0,50}?returns? (?:true|allowed|granted|authorized|permitted)/i,
   },
   {
     klass: "work-loss",
