@@ -3,7 +3,7 @@
  * mutual exclusion, advisory (never-wedging) behavior under contention, and reclaim of a lock whose
  * owner died. Lock names are unique per test because the lock root is a real shared /tmp directory.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdir, readdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -13,6 +13,68 @@ import { withHostLock } from "./host-lock";
 const LOCK_ROOT = join(tmpdir(), "anton-host-locks");
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Markers used to scope the node:fs/promises interception below to exactly one test each, so the
+// injected races never leak into the rest of the suite's real filesystem timing.
+const { RESUME_MARKER, GATE_MARKER } = vi.hoisted(() => ({
+  RESUME_MARKER: "test-resume-corrupt",
+  GATE_MARKER: "test-gate-ownership",
+}));
+
+// Both races below hinge on a pause between two specific awaits inside host-lock.ts that real
+// timing can't force deterministically (they'd need an actual 60s+ stall). Intercepting the fs
+// call that sits at the seam lets the peer's race action run at exactly the right moment instead.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const statCalls = new Map<string, number>();
+  const readFileCalls = new Map<string, number>();
+  return {
+    ...actual,
+    // Fires on the 2nd stat(dir) for the resume-corrupt test — the identity re-check inside
+    // write(), right after the first stat captured our own acquisition's mtime. Simulates a peer
+    // fully reclaiming and re-acquiring `dir` in the gap.
+    stat: async (path: unknown, ...rest: unknown[]) => {
+      if (typeof path === "string" && path.includes(RESUME_MARKER)) {
+        const n = (statCalls.get(path) ?? 0) + 1;
+        statCalls.set(path, n);
+        if (n === 2) {
+          const successorToken = "11111111-1111-4111-8111-111111111111";
+          await actual.rename(path, `${path}.retired-${successorToken}`);
+          await actual.mkdir(path);
+          await actual.writeFile(
+            `${path}/owner.json`,
+            JSON.stringify({
+              token: successorToken,
+              pid: process.pid,
+              heartbeatAt: Date.now(),
+              label: "successor",
+            }),
+            "utf8",
+          );
+        }
+      }
+      // @ts-expect-error -- forwarding whatever arguments the caller passed
+      return actual.stat(path, ...rest);
+    },
+    // Fires on the 2nd readFile(metaPath) for the gate-ownership test — reclaim()'s own
+    // readHolder(), right after it captured its own gate's mtime. Simulates a peer reaping that
+    // (apparently stale) gate and creating its own replacement in the gap.
+    readFile: async (path: unknown, ...rest: unknown[]) => {
+      if (typeof path === "string" && path.includes(GATE_MARKER) && path.endsWith("owner.json")) {
+        const n = (readFileCalls.get(path) ?? 0) + 1;
+        readFileCalls.set(path, n);
+        if (n === 2) {
+          const dir = path.slice(0, -"/owner.json".length);
+          const gate = `${dir}.reclaiming`;
+          await actual.rm(gate, { recursive: true, force: true }).catch(() => {});
+          await actual.mkdir(gate);
+        }
+      }
+      // @ts-expect-error -- forwarding whatever arguments the caller passed
+      return actual.readFile(path, ...rest);
+    },
+  };
+});
 
 describe("withHostLock", () => {
   it("serializes concurrent holders of the same lock", async () => {
@@ -255,5 +317,47 @@ describe("withHostLock", () => {
     await holder;
 
     expect(seen).toEqual([process.pid]);
+  });
+
+  it("does not let a resumed creator corrupt a successor's lock", async () => {
+    const name = `${RESUME_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // The injected stat() above fires between our own mkdir(dir) and our first metadata write,
+    // simulating a peer fully reclaiming `dir` and re-acquiring it in that gap — the exact window
+    // the finding describes as unprotected. This call must detect the swap and back off rather
+    // than writing into (or later retiring) the successor's directory.
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    const successor = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(successor.token).toBe("11111111-1111-4111-8111-111111111111");
+    expect((await stat(dir)).isDirectory()).toBe(true);
+  });
+
+  it("does not let a resumed reclaimer's cleanup remove a successor's reclaiming gate", async () => {
+    const name = `${GATE_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const gate = `${dir}.reclaiming`;
+    // A metadata-less orphan old enough to be reclaimed, so the acquire loop drives straight into
+    // reclaim(). The injected readFile() above fires on reclaim()'s own readHolder() call — right
+    // after it captured its own gate's mtime — and simulates a peer reaping that gate as stale and
+    // creating its own replacement in the gap.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 5000 });
+
+    expect(ran).toBe(true);
+    // The reclaimer's own finally must not have deleted the successor's replacement gate by
+    // pathname alone — it must still be standing.
+    expect((await stat(gate)).isDirectory()).toBe(true);
   });
 });

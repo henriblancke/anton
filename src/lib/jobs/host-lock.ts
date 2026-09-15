@@ -89,6 +89,12 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     }
     return false; // let the caller's normal deadline/poll path retry reclaim() next iteration
   }
+  // The gate's own mtime right after we created it — this decider's identity. If we (the owner)
+  // pause past STALE_AFTER_MS before reaching `finally`, the reap branch above can treat our gate
+  // as abandoned, remove it, and let a new decider `mkdir` a fresh one at the same path. Deleting
+  // that successor's gate by pathname alone in our own `finally` would let a third decider in
+  // concurrently with the second — so re-verify the mtime still matches ours before removing.
+  const ownGateCreatedAt = await dirMtimeMs(gate);
   try {
     const holder = await readHolder(metaPath);
     const dirCreatedAt = holder ? 0 : await dirMtimeMs(dir);
@@ -98,7 +104,9 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     const token = holder?.token ?? randomUUID();
     return await retire(dir, token);
   } finally {
-    await rm(gate, { recursive: true, force: true }).catch(() => {});
+    if (ownGateCreatedAt !== undefined && (await dirMtimeMs(gate)) === ownGateCreatedAt) {
+      await rm(gate, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
@@ -220,22 +228,44 @@ export async function withHostLock<T>(
 
   if (!held) return fn();
 
+  // `dir`'s mtime right after our own `mkdir` created it — this acquisition's identity, re-checked
+  // and advanced on every write below. A reclaim of a metadata-less orphan mints its own random
+  // token (there's no holder token to read yet) and renames the whole directory away rather than
+  // editing it in place, so if we were paused long enough to be reclaimed, a successor's fresh
+  // `mkdir` now lives at `dir` with a different mtime. Without this check a resumed creator would
+  // write its token into (or retire) that successor's directory while the successor is still inside
+  // its own critical section.
+  let expectedMtime = await dirMtimeMs(dir);
+
   // Write-then-rename so a reader never observes a truncated mid-heartbeat file. A torn read would
   // parse as undefined and, since overwriting owner.json doesn't bump the directory's own mtime,
   // fall back to the (stale) dirCreatedAt — misreading a live, heartbeating holder as an orphan.
   // rename is atomic within one directory, so readHolder always sees a complete write or none.
+  //
+  // Both the tmp-file create and the rename are themselves directory-entry changes, so they advance
+  // `dir`'s own mtime — the identity check below must compare against the mtime our *previous*
+  // write left behind, then record the new one, rather than a single value fixed at acquire time.
   const tmpMetaPath = `${metaPath}.${token}.tmp`;
-  const write = async () => {
+  const write = async (): Promise<boolean> => {
+    if (expectedMtime === undefined || (await dirMtimeMs(dir)) !== expectedMtime) return false;
     await writeFile(
       tmpMetaPath,
       JSON.stringify({ token, pid: process.pid, heartbeatAt: Date.now(), label: opts.label ?? "" }),
       "utf8",
     );
     await rename(tmpMetaPath, metaPath);
+    expectedMtime = await dirMtimeMs(dir);
+    return true;
   };
-  await write();
+  if (!(await write())) {
+    // Lost this acquisition to a reclaim before we could publish metadata for it. `dir` now belongs
+    // to a successor — never write into or retire it; just run unlocked, same as any other advisory
+    // fallback.
+    return fn();
+  }
   // Keep the heartbeat fresh so a long-but-healthy hold is never mistaken for a crash. Unref'd so a
-  // pending tick can't hold the process open.
+  // pending tick can't hold the process open. A heartbeat that loses the identity check above
+  // silently no-ops — the lock then goes stale from a peer's view and gets reclaimed normally.
   const beat = setInterval(() => void write().catch(() => {}), STALE_AFTER_MS / 3);
   beat.unref?.();
 
@@ -243,9 +273,14 @@ export async function withHostLock<T>(
     return await fn();
   } finally {
     clearInterval(beat);
-    // The token-specific tombstone also makes release safe if this acquisition was reclaimed: its
-    // tombstone already exists, so a late release cannot move or delete the successor at `dir`.
-    await retire(dir, token);
+    // Re-verify identity before retiring, same as before writing: if a peer already reclaimed this
+    // acquisition (our heartbeat lapsed long enough), `dir` now belongs to a successor and must not
+    // be retired out from under it. The token-specific tombstone still protects the case where
+    // metadata existed at reclaim time (reclaim reuses `holder.token`, so its rename destination
+    // collides with ours and fails).
+    if (expectedMtime !== undefined && (await dirMtimeMs(dir)) === expectedMtime) {
+      await retire(dir, token);
+    }
   }
 }
 
