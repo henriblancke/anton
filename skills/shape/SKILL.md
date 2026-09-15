@@ -209,7 +209,28 @@ const { execFileSync } = require("node:child_process");
 // Some supported bd builds wrap the array in an envelope (`{ issues: [...] }` / `{ results: [...] }`)
 // instead of returning it bare — same normalization as the production parser (src/lib/beads/bd-json.ts).
 const asArray = (d) => (Array.isArray(d) ? d : (d && (d.issues ?? d.results ?? d.molecules)) ?? []);
-const list = (args = []) => asArray(JSON.parse(execFileSync("bd", ["list", ...args, "--json", "--limit", "0"], { encoding: "utf8" })));
+// Mirrors src/lib/beads/dolt-exec.ts's BD_STEP_TIMEOUT_MS: a locked or unreachable Dolt server must
+// fail this mandatory audit loudly, not hang it forever. A timeout is NOT "this flag is unsupported"
+// — feeding it into the --status-all fallback below would just re-issue more calls against the same
+// wedged server, so it's reported and the script exits before the caller's try/catch can swallow it.
+const BD_LIST_TIMEOUT_MS = 60_000;
+const list = (args = []) => {
+  let stdout;
+  try {
+    stdout = execFileSync("bd", ["list", ...args, "--json", "--limit", "0"], {
+      encoding: "utf8",
+      timeout: BD_LIST_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+  } catch (err) {
+    if (err.killed || err.signal) {
+      console.error(`bd list ${args.join(" ")} timed out after ${BD_LIST_TIMEOUT_MS}ms — board could not be checked. Resolve the lock/connectivity issue before confirming.`);
+      process.exit(1);
+    }
+    throw err;
+  }
+  return asArray(JSON.parse(stdout));
+};
 let all;
 try {
   all = list(["--status", "all"]);
