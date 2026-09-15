@@ -30,6 +30,13 @@ export interface SnapshotRead {
   /** The snapshot version these exact beads carry — captured in the same tick they were read, so a
    * concurrent background refresh can never advance the version past the data a caller returns. */
   version: number;
+  /** The generation these exact beads were retained under — captured in the same tick as `beads`,
+   * same reasoning as `version`. A caller that later re-checks {@link issueSnapshotGeneration} to
+   * decide whether `beads` is still the retained array must compare against THIS value, not a fresh
+   * read taken after the `await` that produced the snapshot: a concurrent refresh can land (and bump
+   * the generation) in the gap between this promise resolving and the caller's next synchronous line,
+   * which would otherwise pair a stale `beads` array with an already-advanced "current" generation. */
+  generation: number;
 }
 
 const SNAPSHOTS_KEY = Symbol.for("anton.beads.issueSnapshots");
@@ -357,7 +364,7 @@ export async function readIssueSnapshot(
   if (retained) {
     if (entry.pendingWrite && blockOnPendingWrite) {
       await refreshIssueSnapshot(cwd, loader, now).catch(() => {});
-      return { beads: entry.beads ?? retained, version: entry.version };
+      return { beads: entry.beads ?? retained, version: entry.version, generation: entry.generation };
     }
     // Serve retained now, but a pending write or a stale TTL still needs a fresh read behind it.
     if (
@@ -366,13 +373,13 @@ export async function readIssueSnapshot(
     ) {
       void refreshIssueSnapshot(cwd, loader, now).catch(() => {});
     }
-    return { beads: retained, version: entry.version };
+    return { beads: retained, version: entry.version, generation: entry.generation };
   }
   // Take the loader's own result, not just the cache: when a write invalidates mid-flight the
   // generation guard refuses to repopulate the cache but still hands the loaded board back here —
   // reading `entry.beads` alone would serve a successful load as an empty board.
   const loaded = await refreshIssueSnapshot(cwd, loader, now);
-  return { beads: entry.beads ?? loaded, version: entry.version };
+  return { beads: entry.beads ?? loaded, version: entry.version, generation: entry.generation };
 }
 
 /** Start a freshness probe without making the caller wait for embedded Dolt. */

@@ -280,10 +280,11 @@ describe("issue snapshots", () => {
     invalidateIssueSnapshot("/repo", true);
     resolveCold([bead("loaded")]);
 
-    // Version 1: the write bumped it, the discarded load did not.
+    // Version 1: the write bumped it, the discarded load did not. Generation 1 for the same reason.
     await expect(read).resolves.toEqual({
       beads: [bead("loaded")],
       version: 1,
+      generation: 1,
     });
 
     // …and the guard still holds: the raced load did not repopulate the cache, so the next

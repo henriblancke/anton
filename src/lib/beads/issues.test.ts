@@ -13,6 +13,10 @@ import type { Bead } from "./bd";
 
 const listMock = vi.fn();
 const cyclesMock = vi.fn();
+// Lets one test simulate a concurrent refresh landing in the gap between `readIssueSnapshot`
+// resolving and its caller reading the result — the exact race window PR #274 review flagged.
+// Defaults to the real implementation so every other test is unaffected.
+const readIssueSnapshotMock = vi.fn();
 
 vi.mock("./bd", async () => {
   const actual = await vi.importActual<typeof import("./bd")>("./bd");
@@ -23,6 +27,18 @@ vi.mock("./bd", async () => {
       list: (...args: unknown[]) => listMock(...args),
       depCycles: (...args: unknown[]) => cyclesMock(...args),
     },
+  };
+});
+
+vi.mock("./snapshot", async () => {
+  const actual = await vi.importActual<typeof import("./snapshot")>("./snapshot");
+  readIssueSnapshotMock.mockImplementation(
+    (...args: Parameters<typeof actual.readIssueSnapshot>) => actual.readIssueSnapshot(...args),
+  );
+  return {
+    ...actual,
+    readIssueSnapshot: (...args: Parameters<typeof actual.readIssueSnapshot>) =>
+      readIssueSnapshotMock(...args),
   };
 });
 
@@ -310,6 +326,34 @@ describe("loadAllIssues", () => {
     // Reader B's board is the current one and gets its own, fresh evidence.
     expect(boardB.map((b) => b.id)).toEqual(["t-2"]);
     expect(cycleEvidenceFor(boardB)).toEqual([]);
+  });
+
+  it("retries readAllIssues rather than pair a pre-move board with the post-move version (PR #274 review)", async () => {
+    // A refresh replaces the retained board in the gap between `readIssueSnapshot` resolving and
+    // `readAllIssues` reading the generation that pairs with it — the race the review flagged:
+    // capturing that generation via a fresh `issueSnapshotGeneration(cwd)` call after the fact can
+    // observe the POST-move generation while still holding the PRE-move beads array, so the mismatch
+    // check downstream trivially matches itself and never catches the move.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await allIssues(REPO);
+
+    readIssueSnapshotMock.mockImplementationOnce(async (...args: unknown[]) => {
+      const snapshot = await (
+        await vi.importActual<typeof import("./snapshot")>("./snapshot")
+      ).readIssueSnapshot(
+        ...(args as Parameters<typeof import("./snapshot").readIssueSnapshot>),
+      );
+      await refreshIssueSnapshot(REPO, async () => [{ ...target, id: "t-2", dependencies: [] }]);
+      return snapshot;
+    });
+
+    const result = await readAllIssues(REPO, { withCycles: true });
+
+    // Must reflect the board that moved DURING the read, not the stale pre-move one — otherwise the
+    // returned version would describe beads the caller never actually returned, and the next
+    // `/board?version=...` poll would 304 against content the client never received.
+    expect(result.beads.map((b) => b.id)).toEqual(["t-2"]);
+    expect(cycleEvidenceFor(result.beads)).toEqual([]);
   });
 
   it("dedupes, so a bd that starts carrying gates in the ordinary listing doesn't double them", async () => {

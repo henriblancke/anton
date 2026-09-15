@@ -266,7 +266,12 @@ export async function readAllIssues(
   // Keep evidence attached to the cached array itself: `SnapshotRead` is a wrapper and copying the
   // board would lose the sidecar that pure approval projections consume.
   if (opts?.withCycles && cycleEvidenceFor(snapshot.beads) === undefined) {
-    const generation = issueSnapshotGeneration(cwd);
+    // Read from the snapshot itself, not a fresh `issueSnapshotGeneration(cwd)` call: a concurrent
+    // background refresh can land (and bump the generation) in the microtask gap between the `await
+    // readIssueSnapshot` above resolving and this line running, which would otherwise pair the OLD
+    // `snapshot.beads` with an already-advanced "current" generation and let `attachCyclesBestEffort`
+    // (whose own guard compares against that same already-advanced value) enrich a retired array.
+    const generation = snapshot.generation;
     await attachCyclesBestEffort(cwd, snapshot.beads);
     // Only re-read the version if THIS array actually got enriched. `attachCyclesBestEffort` skips
     // attaching when a concurrent refresh already replaced the retained board (its own generation
@@ -290,7 +295,7 @@ export async function readAllIssues(
       if (issueSnapshotGeneration(cwd) !== generation) {
         return readAllIssues(cwd, opts);
       }
-      return { beads: snapshot.beads, version: issueSnapshotVersion(cwd) };
+      return { beads: snapshot.beads, version: issueSnapshotVersion(cwd), generation };
     }
   }
   return snapshot;
