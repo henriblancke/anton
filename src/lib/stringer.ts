@@ -683,11 +683,61 @@ export interface WorktreeFilter {
  * {@link githubToken}: this runs before `scan()`'s deadline clock starts, so the caller passes a
  * budget already charged against the outer timeout rather than an independent one — otherwise an
  * already-cancelled scan (or a near-zero ANTON_STRINGER_TIMEOUT_MS) could sit here regardless.
+ *
+ * That budget covers the whole lookup, not just the `git worktree list` subprocess: the `realpath`/
+ * `stat` probes below it (per registered worktree) run against the actual filesystem, and neither
+ * fs API takes a timeout — `realpath` doesn't accept a `signal` at all, and `stat`'s only checks one
+ * at the call's start, not while the syscall is in flight. Left unbounded, a registered worktree on
+ * a stalled mount (or an abort that lands while these are pending) could still hang `scan()` past
+ * `ANTON_STRINGER_TIMEOUT_MS` after the subprocess above already returned. {@link withBudget} races
+ * each probe against what's left of the deadline and the caller's signal instead.
  */
-async function isWorktreeCheckout(path: string): Promise<boolean> {
+function isAbortError(err: unknown): boolean {
+  const e = err as { name?: string; code?: unknown } | null;
+  return e?.name === "AbortError" || e?.code === "ABORT_ERR";
+}
+
+/**
+ * Race a promise against what's left of `deadline` and the caller's `signal`, so a caller waiting on
+ * it can't be made to hang past either. This does NOT cancel the underlying operation — Node gives
+ * no way to interrupt a pending `stat`/`realpath` mid-syscall — it only stops the caller from
+ * waiting on it, which is the actual guarantee a deadline/abort makes to its caller.
+ */
+function withBudget<T>(promise: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("aborted", "AbortError"));
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(new Error("filesystem probe exceeded the scan deadline"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new DOMException("aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      reject(new Error("filesystem probe exceeded the scan deadline"));
+    }, remaining);
+    timer.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+async function isWorktreeCheckout(path: string, deadline: number, signal?: AbortSignal): Promise<boolean> {
   try {
-    return (await stat(join(path, ".git"))).isFile();
-  } catch {
+    return (await withBudget(stat(join(path, ".git")), deadline, signal)).isFile();
+  } catch (err) {
+    if (isAbortError(err)) throw err;
     return false;
   }
 }
@@ -696,6 +746,7 @@ async function listNestedWorktrees(
   repoPath: string,
   opts: { timeoutMs: number; signal?: AbortSignal },
 ): Promise<string[] | { unavailable: string }> {
+  const deadline = Date.now() + Math.max(0, opts.timeoutMs);
   try {
     const { stdout } = await execFileAsync(
       "git",
@@ -711,19 +762,25 @@ async function listNestedWorktrees(
       records[records.length - 1].push(field);
     }
 
-    const resolvedRepo = await realpath(repoPath).catch(() => repoPath);
+    const resolvedRepo = await withBudget(realpath(repoPath), deadline, opts.signal).catch((err) => {
+      if (isAbortError(err)) throw err;
+      return repoPath;
+    });
     const nested: string[] = [];
     for (const [index, record] of records.entries()) {
       const worktreeLine = record.find((l) => l.startsWith("worktree "));
       if (!worktreeLine) continue;
       if (record.some((l) => l === "prunable" || l.startsWith("prunable "))) continue;
       const wt = worktreeLine.slice("worktree ".length);
-      const resolvedWt = await realpath(wt).catch(() => wt);
+      const resolvedWt = await withBudget(realpath(wt), deadline, opts.signal).catch((err) => {
+        if (isAbortError(err)) throw err;
+        return wt;
+      });
       if (resolvedWt === resolvedRepo) continue;
       // git always lists the main worktree first, and only LINKED worktrees carry the `.git`
       // file marker — see the doc comment above for why the main entry skips this check.
       const isMainWorktree = index === 0;
-      if (!isMainWorktree && !(await isWorktreeCheckout(resolvedWt))) continue;
+      if (!isMainWorktree && !(await isWorktreeCheckout(resolvedWt, deadline, opts.signal))) continue;
       const rel = relative(resolvedRepo, resolvedWt);
       if (rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) nested.push(rel);
     }
@@ -731,9 +788,10 @@ async function listNestedWorktrees(
   } catch (err) {
     // A caller abort must propagate, not collapse into "unavailable": swallowing it here would let
     // scan() proceed as if nothing were nested instead of short-circuiting as cancellation (mirrors
-    // githubToken's own AbortError check, for the same reason).
-    const e = err as { name?: string; code?: unknown } | null;
-    if (e?.name === "AbortError" || e?.code === "ABORT_ERR") throw err;
+    // githubToken's own AbortError check, for the same reason). A deadline hit inside the
+    // realpath/stat probes above lands here too, as a plain Error — reported as "unavailable" the
+    // same as any other lookup failure, not silently swallowed into an empty `nested` list.
+    if (isAbortError(err)) throw err;
     return { unavailable: err instanceof Error ? err.message : String(err) };
   }
 }
@@ -767,7 +825,32 @@ async function listNestedWorktrees(
  * representative happened to be listed first-and-nested (anton-fj1q PR #295 review). Instead the
  * signal is re-anchored: `FilePath`/`Line` are rewritten to a surviving real location, so triage
  * still points at a file whose edits ship.
+ *
+ * `Description` is rewritten the same way, dropping any nested location from its list, not just
+ * `FilePath`/`Line`. {@link filterDuplicationSignals} reparses `Description` downstream
+ * ({@link parseLocations}) and gives every location it lists its own declaration/code vote — left
+ * unrewritten, the nested copy (identical text to the real location it mirrors) casts a second vote
+ * for the same class, which can turn a genuine tie between two real locations into a false
+ * declarative majority and drop a real clone.
  */
+
+/**
+ * Drop every `  - path:line` entry from a duplication signal's `Description` whose raw text isn't
+ * in `keep` (see {@link parseLocations} for the format this mirrors). Matched against the RAW
+ * location text stringer emitted, not a resolved/repo-relative form, since that's what's actually
+ * in the string being edited. Everything else — the preamble line, blank lines, indentation — is
+ * left untouched.
+ */
+function reanchorDescription(description: string, keep: Set<string>): string {
+  return description
+    .split("\n")
+    .filter((line) => {
+      const match = /^\s*-\s+(.+):(\d+)\s*$/.exec(line);
+      return match === null || keep.has(`${match[1]}:${match[2]}`);
+    })
+    .join("\n");
+}
+
 async function dropWorktreeSignals(
   repoPath: string,
   signals: ScanSignal[],
@@ -785,24 +868,26 @@ async function dropWorktreeSignals(
     if (collectorOf(signal) === DUPLICATION_COLLECTOR) {
       const locations = parseLocations(signal);
       if (locations.length >= 2) {
-        const resolved = locations
-          .map((loc) => {
-            const path = insideRepo(repoPath, loc.path);
-            return path === undefined ? undefined : { path, line: loc.line };
-          })
-          .filter((loc): loc is { path: string; line: number } => loc !== undefined);
-        const real = resolved.filter((loc) => !isNested(loc.path));
+        const withResolved = locations.map((loc) => {
+          const resolvedPath = insideRepo(repoPath, loc.path);
+          return { raw: loc, resolved: resolvedPath === undefined ? undefined : { path: resolvedPath, line: loc.line } };
+        });
+        const real = withResolved.filter((loc) => loc.resolved !== undefined && !isNested(loc.resolved.path));
         if (real.length >= 2) {
           const ownPath = repoRelativePath(repoPath, signal);
           if (ownPath === undefined || isNested(ownPath)) {
-            signal.FilePath = real[0].path;
-            signal.Line = real[0].line;
+            signal.FilePath = real[0].resolved!.path;
+            signal.Line = real[0].resolved!.line;
+          }
+          if (real.length < locations.length) {
+            const keep = new Set(real.map((loc) => `${loc.raw.path}:${loc.raw.line}`));
+            signal.Description = reanchorDescription(signal.Description ?? "", keep);
           }
           return true;
         }
         const ownPath = repoRelativePath(repoPath, signal);
         dropped.push({
-          path: ownPath ?? resolved[0]?.path ?? "",
+          path: ownPath ?? withResolved[0]?.resolved?.path ?? "",
           kind: kindOf(signal),
           severity: severityOfSignal(signal),
         });

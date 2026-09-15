@@ -3,7 +3,7 @@
  * that keep a scan off a huge node_modules and away from the 10-minute timeout) and signal counting,
  * against a fake stringer binary that records its argv and writes a canned scan file.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   chmodSync,
   existsSync,
@@ -33,6 +33,21 @@ import {
 } from "./stringer";
 import { isPoisonError } from "./jobs/errors";
 import { GH_BIN_ENV } from "./git/ops";
+
+// Passthrough by default -- only the deadline/abort tests for the per-worktree realpath probe
+// (PR #295 review, stringer.ts:721) flip this on, so the ~320 other tests in this file that exercise
+// real worktrees are unaffected.
+const fsProbeControl = vi.hoisted(() => ({ hangRealpath: false }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const realpath: typeof actual.realpath = ((path: string, options?: unknown) =>
+    fsProbeControl.hangRealpath
+      ? new Promise(() => {})
+      : // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (actual.realpath as any)(path, options)) as typeof actual.realpath;
+  return { ...actual, realpath };
+});
 
 let dir: string;
 let prevBin: string | undefined;
@@ -1033,6 +1048,37 @@ describe("scan", () => {
         expect(result.signals[0].FilePath).toBe("src/a.ts");
         expect(result.signals[0].Line).toBe(2);
         expect(result.worktree.dropped).toEqual([]);
+      });
+
+      // PR #295 review (thread on stringer.ts:801): re-anchoring FilePath/Line isn't enough on its
+      // own -- filterDuplicationSignals reparses Description right back off this same signal
+      // downstream (scan-duplication.ts's parseLocations) and gives every location it lists its own
+      // declaration/code vote. A nested mirror left in that list casts a second vote for whichever
+      // real location it copies, which can turn a genuine tie into a false declarative majority and
+      // drop a real clone -- so Description must drop the nested entry too, not just FilePath/Line.
+      it("drops the nested location from Description too, not just FilePath/Line", async () => {
+        const repo = initRepoWithWorktree(
+          { "src/a.ts": CODE_BLOCK, "src/b.ts": CODE_BLOCK },
+          ".worktrees/pr252-threads",
+        );
+        mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+        writeFileSync(join(repo, ".worktrees/pr252-threads/src/a.ts"), CODE_BLOCK, "utf8");
+
+        process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+          cloneFinding(".worktrees/pr252-threads/src/a.ts", 2, [
+            ".worktrees/pr252-threads/src/a.ts:2",
+            "src/a.ts:2",
+            "src/b.ts:2",
+          ]),
+        ]);
+
+        const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+        expect(result.signals).toHaveLength(1);
+        const description = result.signals[0].Description as string;
+        expect(description).not.toContain(".worktrees/pr252-threads/src/a.ts:2");
+        expect(description).toContain("src/a.ts:2");
+        expect(description).toContain("src/b.ts:2");
       });
     });
 
@@ -8396,6 +8442,59 @@ describe("scan", () => {
     await expect(
       scan({ repoPath: "/repo", scanFile: join(dir, "s.json"), signal: ac.signal }),
     ).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  // PR #295 review (thread on stringer.ts:721): the git subprocess above is bounded by `timeout`/
+  // `signal`, but the `realpath` probe run per registered worktree afterward is a plain fs call with
+  // no timeout of its own. A registered worktree on a stalled mount must not be able to hang scan()
+  // past its own deadline just because that probe never returns.
+  it("bounds a stalled realpath probe by the scan's own deadline instead of hanging past it", async () => {
+    const repo = join(dir, "repo");
+    mkdirSync(repo, { recursive: true });
+    execFileSync("git", ["-C", repo, "init", "-q"]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+    writeFileSync(join(repo, "app.ts"), "export {};\n", "utf8");
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "init"]);
+
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), []);
+    process.env.ANTON_STRINGER_TIMEOUT_MS = "100";
+    fsProbeControl.hangRealpath = true;
+    try {
+      // A permanently-hanging realpath must not hang scan() itself: the nested-worktree lookup's
+      // own withBudget wrapper times it out against the (tiny) scan deadline above, which then
+      // leaves nothing left for the rest of the scan to spend -- so this rejects promptly with a
+      // deadline error rather than hanging on the still-pending realpath call underneath.
+      await expect(scan({ repoPath: repo, scanFile: join(dir, "scan.json") })).rejects.toThrow(
+        /deadline/,
+      );
+    } finally {
+      fsProbeControl.hangRealpath = false;
+    }
+  });
+
+  it("propagates a caller abort raised while a realpath probe is pending, without hanging", async () => {
+    const repo = join(dir, "repo");
+    mkdirSync(repo, { recursive: true });
+    execFileSync("git", ["-C", repo, "init", "-q"]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+    writeFileSync(join(repo, "app.ts"), "export {};\n", "utf8");
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "init"]);
+
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), []);
+    fsProbeControl.hangRealpath = true;
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 50);
+    try {
+      await expect(
+        scan({ repoPath: repo, scanFile: join(dir, "scan.json"), signal: ac.signal }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+    } finally {
+      fsProbeControl.hangRealpath = false;
+    }
   });
 
   it("rejects without launching stringer when gh auth token exhausts the scan deadline", async () => {
