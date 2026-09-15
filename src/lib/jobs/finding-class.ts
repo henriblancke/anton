@@ -187,6 +187,56 @@ function matchesCancellation(note: string): boolean {
   return false;
 }
 
+// "returns true/allowed/granted/authorized/permitted" tied to a throw/fail/error/catch within the
+// same sentence is a fail-open finding phrased as returned authorization rather than one of the
+// literal "fails open"/"fail-open" formulations below — e.g. "the permission check returns true
+// when the database lookup throws" or "the catch returns allowed". Bounded to `[^.]{0,50}?` (not a
+// full CLAUSE_GAP) since either order (result-then-cause or cause-then-result) is valid English
+// here and both need covering.
+const FAIL_OPEN_LITERAL =
+  /fails? open|fail-open|defaults? to (?:allow|permit)|silently allow|treats? (?:an? )?error as (?:success|ok|allowed)|swallows? the error and (?:continues|proceeds)|permissive fallback/i;
+const FAIL_OPEN_ERROR_WORD = "(?:throws?|thrown|throwing|fails?|failed|failure|errors?|errored|exception|rejects?|rejected|catch(?:es|ing)?)";
+// "allowed"/"granted"/"authorized"/"permitted" are themselves authorization-specific — no extra
+// context needed. Bare "true" isn't: "the equality helper returns true for unequal inputs, causing
+// an error in sorting" ties a boolean return to an error word with no authorization semantics at
+// all, so a "returns true ... error" match only counts once an actual permission/access/check word
+// (matchesFailOpenTrueResult below) also appears nearby.
+const FAIL_OPEN_AUTHORIZED_RESULT_FIRST = new RegExp(
+  `returns? (?:allowed|granted|authorized|permitted)[^.]{0,50}?${FAIL_OPEN_ERROR_WORD}`,
+  "i",
+);
+const FAIL_OPEN_AUTHORIZED_RESULT_LAST = new RegExp(
+  `${FAIL_OPEN_ERROR_WORD}[^.]{0,50}?returns? (?:allowed|granted|authorized|permitted)`,
+  "i",
+);
+const FAIL_OPEN_TRUE_RESULT_FIRST = new RegExp(`returns? true[^.]{0,50}?${FAIL_OPEN_ERROR_WORD}`, "gi");
+const FAIL_OPEN_TRUE_RESULT_LAST = new RegExp(`${FAIL_OPEN_ERROR_WORD}[^.]{0,50}?returns? true`, "gi");
+const FAIL_OPEN_AUTH_CONTEXT =
+  /\b(?:permission|permissions|access|auth|authz|authoriz\w*|grant\w*|allow\w*|privilege\w*|role\w*|acl|scoped?|entitlement\w*|check|checks|checking|validat\w*|verif\w*)\b/i;
+
+function matchesFailOpenTrueResult(note: string): boolean {
+  for (const re of [FAIL_OPEN_TRUE_RESULT_FIRST, FAIL_OPEN_TRUE_RESULT_LAST]) {
+    re.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(note))) {
+      const start = Math.max(0, match.index - 60);
+      const end = Math.min(note.length, match.index + match[0].length + 60);
+      if (FAIL_OPEN_AUTH_CONTEXT.test(note.slice(start, end))) return true;
+      re.lastIndex = match.index + 1;
+    }
+  }
+  return false;
+}
+
+function matchesFailOpen(note: string): boolean {
+  return (
+    FAIL_OPEN_LITERAL.test(note) ||
+    FAIL_OPEN_AUTHORIZED_RESULT_FIRST.test(note) ||
+    FAIL_OPEN_AUTHORIZED_RESULT_LAST.test(note) ||
+    matchesFailOpenTrueResult(note)
+  );
+}
+
 const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher }> = [
   {
     klass: "fencing-toctou",
@@ -198,14 +248,7 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher 
   },
   {
     klass: "fail-open",
-    // "returns true/allowed/granted/authorized/permitted" tied to a throw/fail/error/catch within
-    // the same sentence is a fail-open finding phrased as returned authorization rather than one of
-    // the literal "fails open"/"fail-open" formulations above — e.g. "the permission check returns
-    // true when the database lookup throws" or "the catch returns allowed". Bounded to `[^.]{0,50}?`
-    // (not a full CLAUSE_GAP) since either order (result-then-cause or cause-then-result) is valid
-    // English here and both need covering.
-    pattern:
-      /fails? open|fail-open|defaults? to (?:allow|permit)|silently allow|treats? (?:an? )?error as (?:success|ok|allowed)|swallows? the error and (?:continues|proceeds)|permissive fallback|returns? (?:true|allowed|granted|authorized|permitted)[^.]{0,50}?(?:throws?|thrown|throwing|fails?|failed|failure|errors?|errored|exception|rejects?|rejected|catch(?:es|ing)?)|(?:throws?|thrown|throwing|fails?|failed|failure|errors?|errored|exception|rejects?|rejected|catch(?:es|ing)?)[^.]{0,50}?returns? (?:true|allowed|granted|authorized|permitted)/i,
+    pattern: matchesFailOpen,
   },
   {
     klass: "work-loss",

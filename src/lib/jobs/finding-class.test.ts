@@ -370,6 +370,11 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("fail-open");
   });
 
+  it("classifies a bare 'returns true' next to an error word with no authorization context as other, not fail-open", () => {
+    const note = "The equality helper returns true for unequal inputs, causing an error in sorting.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();
