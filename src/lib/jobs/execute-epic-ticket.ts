@@ -10,7 +10,7 @@
  * — with the judgement on a timed-out ticket's work in execute-epic-ticket-preserve.ts — and the
  * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
-import type { Bead } from "../beads/bd";
+import { beads, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude } from "../claude/driver";
@@ -513,6 +513,14 @@ async function assertBoardOnlyDelivered(
     selfReport.commit &&
     (await branchAdded(selfReport.commit))
   ) {
+    // Carry forward any pending board evidence a PRIOR attempt already confirmed and left on this
+    // ticket (PR #284 review round 10): a `satisfied` resume settles on the branch alone and never
+    // calls `checkBoardEvidence`, so without this `progress.boardEvidenceIds` stays unset and
+    // `runTicket`'s cleanup never calls `clearBoardEvidencePending` — the marker (and its preserved
+    // baseline) survive this ticket's close/transition with nothing left to release them, exactly
+    // the stale record a later reopen could misread as current evidence for no new work.
+    const pending = beads.pendingBoardEvidence(ticket);
+    if (pending.length > 0) progress.boardEvidenceIds = pending;
     progress.delivered = true;
     return;
   }

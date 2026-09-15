@@ -364,17 +364,25 @@ export async function readBoardEvidence(
       // permanently losing this attempt's confirmed evidence even once the write channel recovers.
       // Guarded on nothing already preserved so a repeated retry doesn't churn the write every
       // attempt.
-      if (!beads.boardEvidenceBaseline(ticket)) {
-        await mustPersist(() =>
+      const baselineAlreadyPreserved = Boolean(beads.boardEvidenceBaseline(ticket));
+      const baselinePersisted =
+        baselineAlreadyPreserved ||
+        (await mustPersist(() =>
           beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
-        );
-      }
+        ));
       const outcome = await beads.push(repo).catch(() => "not-wired" as const);
+      const synced = outcome === "synced" || outcome === "shared-server";
+      // Confirmed (persisted AND synced) exactly like the `!board` branch's recovery baseline (PR
+      // #284 review round 10) — both marker and baseline are unrecoverable state once this attempt's
+      // baseline is superseded, so a baseline write that landed only locally, or never landed at all,
+      // is reported the same way that branch reports it: `baselineUnconfirmed`, not silently folded
+      // into `markerUnpersisted`/`synced`, which describe the marker and content edits only.
       return {
         found: true,
         ids,
-        synced: outcome === "synced" || outcome === "shared-server",
+        synced,
         markerUnpersisted: true,
+        ...(!baselinePersisted || !synced ? { baselineUnconfirmed: true } : {}),
       };
     }
   }
