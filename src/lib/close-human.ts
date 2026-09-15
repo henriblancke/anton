@@ -11,6 +11,7 @@ import { runTargetOf } from "./abandon";
 import { openBlockersOf } from "./jobs/execute-epic-human-gate";
 import { cancelRunForTarget } from "./jobs/service";
 import { nudgeSync } from "./beads/sync-nudge";
+import { runMembers } from "./rework-target";
 import { freshDetail } from "./ticket-detail";
 import { liveRunTargetOf, openWorkUnder } from "./ticket-view";
 import type { Project, TicketDetail } from "./types";
@@ -55,6 +56,20 @@ const messageOf = (e: unknown): string => (e instanceof Error ? e.message : Stri
  * keep committing toward a PR the board just called done. Machine-local, like every job cancel
  * here: a run on another machine stops at its next lease/ticket boundary, where a closed ticket is
  * skipped the same way an abandoned one is.
+ *
+ * Only when the resolved target actually OWNS the bead's run is it cancelled. `runTargetOf` walks
+ * the WHOLE parent chain to the nearest run-target ancestor with no stop at pipeline plumbing and
+ * no notion of which children a run actually dispatches, so an `agent:human` bead poured under a
+ * molecule resolves to the enclosing feature even though that feature's ordinary run never
+ * dispatches a gated step, and a child under a standalone task/bug resolves to that parent even
+ * though its run executes only the parent itself. {@link runMembers} (rework-target.ts) is the set
+ * a run actually contains — `runTickets`/`cardOf`, which stops at pipeline plumbing, collapsed to
+ * the target alone on a standalone run — so membership in it is what gates the cancel; cancelling
+ * on a bare `runTargetOf` read would kill a healthy, unrelated run for a ticket it was never going
+ * to touch. Exempted: `runTargetOf`'s OWN fallback for "no run target anywhere in the ancestry" (a
+ * task on a container epic) resolves to a non-run-target parent that owns no run either way — a
+ * harmless no-op cancel, left unconditional rather than run through a membership check that assumes
+ * a real target.
  *
  * Throws on an unknown id (bd's own error → 404), a bead that isn't `agent:human` (→ 409 — an agent
  * run is expected to close it), an already-settled bead (→ 409), open work still under it (→ 409),
@@ -120,7 +135,14 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
       );
     }
 
-    await cancelRunForTarget(project.id, runTargetOf(bead, board));
+    const targetId = runTargetOf(bead, board);
+    const target = board.find((b) => b.id === targetId);
+    const isRealTarget = !!target && beads.isRunTarget(target, board);
+    const ownedByTarget =
+      bead.id === targetId || !isRealTarget || runMembers(target!, board).some((b) => b.id === bead.id);
+    if (ownedByTarget) {
+      await cancelRunForTarget(project.id, targetId);
+    }
 
     try {
       await beads.close(repo, id);

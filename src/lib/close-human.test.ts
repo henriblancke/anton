@@ -199,4 +199,36 @@ describe("closeHumanTicket", () => {
     expect(cancelRunMock).toHaveBeenCalledWith("p1", "target");
     expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "target");
   });
+
+  it("does not cancel the enclosing feature's run for an agent:human bead poured under a molecule", async () => {
+    // Codex review (PR #288): `runTargetOf` walks straight through pipeline plumbing to the
+    // enclosing feature, but that feature's ordinary run never dispatches a step poured under a
+    // molecule — cancelling it here would kill a healthy, unrelated run.
+    const feature = makeBead({ id: "feature", issue_type: "feature", labels: [], status: "open" });
+    const molecule = makeBead({ id: "mol-1", parent: "feature", issue_type: "molecule", labels: [] });
+    const step = makeBead({ id: "step-1", parent: "mol-1" });
+    const board = [feature, molecule, step];
+    listMock.mockResolvedValue(board);
+    showMock.mockResolvedValueOnce(step).mockResolvedValueOnce({ ...step, status: "closed" });
+
+    await closeHumanTicket(project, "step-1");
+
+    expect(cancelRunMock).not.toHaveBeenCalled();
+    expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "step-1");
+  });
+
+  it("does not cancel a standalone task's run for its own agent:human child — that run never touches it", async () => {
+    // Same mismatch, different shape (execute-epic-start.ts selectRunTickets / rework.test.ts): a
+    // standalone task/bug's run executes only the parent itself, never its children.
+    const solo = makeBead({ id: "solo", issue_type: "task", labels: [], status: "open" });
+    const child = makeBead({ id: "child", parent: "solo" });
+    const board = [solo, child];
+    listMock.mockResolvedValue(board);
+    showMock.mockResolvedValueOnce(child).mockResolvedValueOnce({ ...child, status: "closed" });
+
+    await closeHumanTicket(project, "child");
+
+    expect(cancelRunMock).not.toHaveBeenCalled();
+    expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "child");
+  });
 });
