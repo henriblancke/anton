@@ -918,6 +918,76 @@ describe("scan", () => {
       expect(result.worktree.dropped).toEqual([]);
       expect(result.worktree.unavailable).toBeTruthy();
     });
+
+    // A cross-worktree clone group names its real checkout in FilePath and lists every location,
+    // real or phantom, only in Description (see scan-duplication.ts's parseLocations). Checking
+    // FilePath alone would keep the signal because the real checkout isn't itself nested — but the
+    // "duplicate" it reports is entirely the nested worktree mirroring that one real file.
+    describe("a duplication signal's clone locations, not just its FilePath", () => {
+      // Real, computing code (not a bare declaration) so it survives filterDuplicationSignals's own
+      // non-code filter downstream — this test is about the worktree filter, not that one. The
+      // reported block starts at line 2, below the signature, so every window line reads as the
+      // function's body.
+      const CODE_BLOCK = [
+        "export function total(a: number, b: number) {",
+        "  const sum = a + b;",
+        "  const doubled = sum * 2;",
+        "  const tripled = sum * 3;",
+        "  const quadrupled = sum * 4;",
+        "  const quintupled = sum * 5;",
+        "  return doubled;",
+        "}",
+        "",
+      ].join("\n");
+
+      const cloneFinding = (filePath: string, line: number, locations: string[]) => ({
+        Source: "duplication",
+        Kind: "code-clone",
+        FilePath: filePath,
+        Line: line,
+        Title: `Duplicated block (6 lines, ${locations.length} locations)`,
+        Description: `Duplicated code found in:\n${locations.map((l) => `  - ${l}`).join("\n")}\n`,
+      });
+
+      it("drops a clone group left with only one real location outside the nested worktree", async () => {
+        const repo = initRepoWithWorktree({ "src/app.ts": CODE_BLOCK }, ".worktrees/pr252-threads");
+        mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+        writeFileSync(join(repo, ".worktrees/pr252-threads/src/app.ts"), CODE_BLOCK, "utf8");
+
+        process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+          cloneFinding("src/app.ts", 2, ["src/app.ts:2", ".worktrees/pr252-threads/src/app.ts:2"]),
+        ]);
+
+        const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+        expect(result.signals).toHaveLength(0);
+        expect(result.worktree.dropped).toEqual([
+          { path: "src/app.ts", kind: "code-clone", severity: expect.any(String) },
+        ]);
+      });
+
+      it("keeps a clone group that still has two real locations outside the nested worktree", async () => {
+        const repo = initRepoWithWorktree(
+          { "src/a.ts": CODE_BLOCK, "src/b.ts": CODE_BLOCK },
+          ".worktrees/pr252-threads",
+        );
+        mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+        writeFileSync(join(repo, ".worktrees/pr252-threads/src/a.ts"), CODE_BLOCK, "utf8");
+
+        process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+          cloneFinding("src/a.ts", 2, [
+            "src/a.ts:2",
+            "src/b.ts:2",
+            ".worktrees/pr252-threads/src/a.ts:2",
+          ]),
+        ]);
+
+        const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+        expect(result.signals).toHaveLength(1);
+        expect(result.worktree.dropped).toEqual([]);
+      });
+    });
   });
 
   describe("describeWorktreeFilter", () => {

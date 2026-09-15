@@ -15,7 +15,12 @@ import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
 import { filterCouplingSignals, type CouplingFilter } from "./scan-coupling";
 import { filterDeadcodeSignals, type DeadcodeFilter } from "./scan-deadcode";
-import { filterDuplicationSignals, type DuplicationFilter } from "./scan-duplication";
+import {
+  filterDuplicationSignals,
+  parseLocations,
+  DUPLICATION_COLLECTOR,
+  type DuplicationFilter,
+} from "./scan-duplication";
 import { filterSecretSignals, type SecretFilter } from "./scan-secrets";
 import { PoisonError } from "./jobs/errors";
 import { GH_BIN_ENV } from "./git/ops";
@@ -498,14 +503,16 @@ async function readTrackedPaths(repoPath: string): Promise<Set<string> | { unava
  * no path, the repo root itself (collectors spell it `.`), or a path outside the scanned repo.
  * None of those is evidence of anything.
  */
+// normalize, not a `./` strip: it also collapses mid-path traversals, so a collector spelling a
+// tracked file `src/../app.ts` matches the index instead of missing it and losing a real finding.
+function toRepoRelative(repoPath: string, raw: string): string | undefined {
+  const rel = isAbsolute(raw) ? relative(repoPath, raw) : normalize(raw);
+  return !rel || rel === "." || rel === ".." || rel.startsWith(`..${sep}`) ? undefined : rel;
+}
+
 function repoRelativePath(repoPath: string, signal: ScanSignal): string | undefined {
   const raw = signal.FilePath ?? signal.filePath;
-  if (typeof raw !== "string" || !raw) return undefined;
-  // normalize, not a `./` strip: it also collapses mid-path traversals, so a collector spelling a
-  // tracked file `src/../app.ts` matches the index instead of missing it and losing a real finding.
-  const rel = isAbsolute(raw) ? relative(repoPath, raw) : normalize(raw);
-  if (!rel || rel === "." || rel === ".." || rel.startsWith(`..${sep}`)) return undefined;
-  return rel;
+  return typeof raw === "string" && raw ? toRepoRelative(repoPath, raw) : undefined;
 }
 
 /** What a signal says it found, falling back to its collector when it named no kind. */
@@ -566,11 +573,29 @@ async function dropUntrackedSignals(
 }
 
 /**
+ * "path (severity kind, severity kind); path2 (...)" for a set of dropped signals, grouped by path
+ * and capped at 10 path entries with a `(+N more)` tail — the shared body every `describe*Filter`
+ * below renders. Each caller owns its own drop-count/filter-specific preamble; this only formats
+ * what was lost, because that's what an operator triages on: a dropped `medium large-binary` is the
+ * phantom a filter exists for, a dropped `critical committed-secret` is anton going quiet about a
+ * leaked key and wants a look.
+ */
+function formatDroppedSignals(dropped: readonly DroppedSignal[]): { paths: number; list: string } {
+  const byPath = new Map<string, Set<string>>();
+  for (const { path, kind, severity } of dropped) {
+    const kinds = byPath.get(path) ?? new Set<string>();
+    kinds.add(`${severity} ${kind}`);
+    byPath.set(path, kinds);
+  }
+  // "; " between paths, since each entry already spends ", " on its kinds.
+  const entries = [...byPath].map(([path, kinds]) => `${path} (${[...kinds].join(", ")})`);
+  const shown = entries.slice(0, 10);
+  const rest = entries.length - shown.length;
+  return { paths: byPath.size, list: `${shown.join("; ")}${rest > 0 ? ` (+${rest} more)` : ""}` };
+}
+
+/**
  * What the untracked filter removed, and what each drop CLAIMED; undefined when it removed nothing.
- *
- * Each path carries its findings' severity and kind, because that is what an operator triages on: a
- * dropped `medium large-binary` is the phantom this filter exists for, a dropped `critical
- * committed-secret` is anton going quiet about a leaked key and wants a look.
  */
 export function describeUntrackedFilter(filter: UntrackedFilter): string | undefined {
   if (filter.unavailable) {
@@ -580,19 +605,9 @@ export function describeUntrackedFilter(filter: UntrackedFilter): string | undef
     );
   }
   if (filter.dropped.length === 0) return undefined;
-  const byPath = new Map<string, Set<string>>();
-  for (const { path, kind, severity } of filter.dropped) {
-    const kinds = byPath.get(path) ?? new Set<string>();
-    kinds.add(`${severity} ${kind}`);
-    byPath.set(path, kinds);
-  }
-  // "; " between paths, since each entry already spends ", " on its kinds.
-  const entries = [...byPath].map(([path, kinds]) => `${path} (${[...kinds].join(", ")})`);
-  const shown = entries.slice(0, 10);
-  const rest = entries.length - shown.length;
+  const { paths, list } = formatDroppedSignals(filter.dropped);
   return (
-    `dropped ${filter.dropped.length} signal(s) about ${byPath.size} path(s) git does not track: ` +
-    `${shown.join("; ")}${rest > 0 ? ` (+${rest} more)` : ""}`
+    `dropped ${filter.dropped.length} signal(s) about ${paths} path(s) git does not track: ${list}`
   );
 }
 
@@ -666,6 +681,14 @@ async function listNestedWorktrees(repoPath: string): Promise<string[] | { unava
  * `githygiene`'s: the 2026-09-10 scan of this repo split its phantom signals across complexity,
  * patterns, duplication, coupling AND todos (759 of 894 total) — a nested worktree is never a valid
  * finding for ANY collector on the tree that ships.
+ *
+ * A `duplication` signal gets its own rule: it reports a GROUP of locations (in `Description`, see
+ * {@link parseLocations}), and its single `FilePath` is only the first of them — often the real
+ * checkout, with the phantom copy named nowhere but that list. Checking `FilePath` alone would keep
+ * a clone whose "duplicate" is entirely the nested worktree mirroring the real file, so once a
+ * signal names two or more locations, the vote runs over ALL of them: it survives only if at least
+ * two locations sit outside every nested worktree, because one real location left is not a
+ * duplicate of anything the tree still has.
  */
 async function dropWorktreeSignals(
   repoPath: string,
@@ -677,11 +700,31 @@ async function dropWorktreeSignals(
   }
   if (nested.length === 0) return { kept: signals, worktree: { dropped: [], worktrees: [] } };
 
+  const isNested = (path: string) => nested.some((wt) => path === wt || path.startsWith(`${wt}${sep}`));
+
   const dropped: DroppedSignal[] = [];
   const kept = signals.filter((signal) => {
+    if (collectorOf(signal) === DUPLICATION_COLLECTOR) {
+      const locations = parseLocations(signal);
+      if (locations.length >= 2) {
+        const resolved = locations
+          .map((loc) => toRepoRelative(repoPath, loc.path))
+          .filter((path): path is string => path !== undefined);
+        const real = resolved.filter((path) => !isNested(path));
+        if (real.length >= 2) return true;
+        dropped.push({
+          path: repoRelativePath(repoPath, signal) ?? resolved[0] ?? "",
+          kind: kindOf(signal),
+          severity: severityOfSignal(signal),
+        });
+        return false;
+      }
+      // Description carried fewer than two locations (or none stringer's list format covers), so
+      // there is nothing to vote over — fall back to the single-path check every other signal gets.
+    }
+
     const path = repoRelativePath(repoPath, signal);
-    const under =
-      path !== undefined && nested.some((wt) => path === wt || path.startsWith(`${wt}${sep}`));
+    const under = path !== undefined && isNested(path);
     if (!under) return true;
     dropped.push({ path: path as string, kind: kindOf(signal), severity: severityOfSignal(signal) });
     return false;
@@ -701,19 +744,10 @@ export function describeWorktreeFilter(filter: WorktreeFilter): string | undefin
     );
   }
   if (filter.dropped.length === 0) return undefined;
-  const byPath = new Map<string, Set<string>>();
-  for (const { path, kind, severity } of filter.dropped) {
-    const kinds = byPath.get(path) ?? new Set<string>();
-    kinds.add(`${severity} ${kind}`);
-    byPath.set(path, kinds);
-  }
-  const entries = [...byPath].map(([path, kinds]) => `${path} (${[...kinds].join(", ")})`);
-  const shown = entries.slice(0, 10);
-  const rest = entries.length - shown.length;
+  const { paths, list } = formatDroppedSignals(filter.dropped);
   return (
     `dropped ${filter.dropped.length} signal(s) under ${filter.worktrees.length} nested worktree(s) ` +
-    `(${filter.worktrees.join(", ")}) about ${byPath.size} path(s): ${shown.join("; ")}` +
-    `${rest > 0 ? ` (+${rest} more)` : ""}`
+    `(${filter.worktrees.join(", ")}) about ${paths} path(s): ${list}`
   );
 }
 

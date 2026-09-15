@@ -23,7 +23,7 @@ import { isAbsolute, join, normalize, relative, sep } from "node:path";
 import { collectorOf, type ScanSignal } from "./scan-severity";
 
 /** The collector these rules are about; every other signal rides through untouched. */
-const DUPLICATION_COLLECTOR = "duplication";
+export const DUPLICATION_COLLECTOR = "duplication";
 
 /**
  * How many files one filter pass will read. A scan can carry a hundred duplication signals across
@@ -264,7 +264,7 @@ const DECLARATIVE: ReadonlySet<LineClass> = new Set<LineClass>([
 ]);
 
 /** A location stringer reported the block at. */
-interface Location {
+export interface Location {
   /** Repo-relative path, as stringer spelled it. */
   path: string;
   /** 1-based first line of the block. */
@@ -1773,7 +1773,7 @@ function classifyLines(
 }
 
 /** The locations stringer listed in its description, falling back to the signal's own file:line. */
-function parseLocations(signal: ScanSignal): Location[] {
+export function parseLocations(signal: ScanSignal): Location[] {
   const description = signal.Description ?? signal.description ?? "";
   const found: Location[] = [];
   const seen = new Set<string>();
