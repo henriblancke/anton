@@ -169,6 +169,16 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("other");
   });
 
+  it("does not classify a parsing bug as work-loss merely because a work noun possesses the real subject", () => {
+    const note = "The request body's first character is dropped when decoding a negative number.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify unfenced Markdown as fencing/TOCTOU without ownership context", () => {
+    const note = "The Markdown example is unfenced, so the prose renders as code instead of a code block.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();

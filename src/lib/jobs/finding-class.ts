@@ -29,9 +29,10 @@ const WORK_LOSS_SUBJECT =
 const WORK_LOSS_RETRY =
   "(?:retry|retried|retries|requeue|requeued|re-?queue|re-?queued|redeliver|redelivered|reprocess|reprocessed)";
 const WORK_LOSS_SIGNAL = `(?:${WORK_LOSS_SUBJECT}|${WORK_LOSS_RETRY})`;
-// No comma/semicolon/dash/period in the gap, so a noun from an earlier clause can't be credited
-// as this loss's subject.
-const CLAUSE_GAP = "[^,;.\\u2013\\u2014]{0,30}?";
+// No comma/semicolon/dash/period/apostrophe in the gap, so a noun from an earlier clause — or a
+// possessive that hands the subject role to whatever follows it ("the request body's first
+// character is dropped") — can't be credited as this loss's subject.
+const CLAUSE_GAP = "[^,;.'\\u2019\\u2013\\u2014]{0,30}?";
 const WORK_LOSS_PASSIVE = new RegExp(
   `\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\b(?:is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))\\b` +
     `|\\b(?:is (?:silently )?(?:discarded|lost|dropped)|silently drops?)\\b${CLAUSE_GAP}\\b${WORK_LOSS_SIGNAL}\\b`,
@@ -50,6 +51,29 @@ function matchesWorkLoss(note: string): boolean {
   );
 }
 
+// Every other fencing/TOCTOU alternative already carries its own ownership/lease/lock context in
+// its wording; only the bare fenc(e/ing/ed) word doesn't — see matchesFencingToctou below.
+const FENCING_BARE = /\b(?:un)?fenc(?:e|ing|ed)\b/i;
+const FENCING_OWNERSHIP_CONTEXT =
+  /\b(?:lease|lock|claim|ownership|owner|worker|concurrent(?:ly)?|races?|racing|guard|marker|token|acquir\w*|hold(?:ing|s)?)\b/i;
+const FENCING_REST =
+  /\btoctou\b|time-of-check|time of check|race condition|races? with|check-then-act|check then act|fencing token|without (?:holding|acquiring) the lock|between the check and|stale (?:lease|read)|concurrent(?:ly)? (?:writ|modif|updat)|re-?reads? .{0,60}?before|reassert(?:s|ed|ing)? (?:the )?(?:claim|lock|lease|marker|ownership)|retired claim|final (?:fenc(?:e|ing)|lock|lease|claim|token|marker|ownership|guard)\s+await|lease (?:can |could |may |might |will )?expir(?:e|es|ed|ing)|expir(?:e|es|ed|ing) .{0,60}?(?:lease|ownership|claim)|ownership (?:may |could |can |might |will )?(?:transfer|change|shift|reassign)/i;
+
+/**
+ * The bare "fenc(e/ing/ed)" word is as much Markdown vocabulary ("the example is unfenced, so it
+ * renders as code") as it is an ownership-race term ("read without a fence"), so on its own it
+ * only counts when a lease/lock/claim/ownership/concurrency word appears within 60 chars of it —
+ * otherwise the next review round gets sent hunting for a race that was never reported.
+ */
+function matchesFencingToctou(note: string): boolean {
+  if (FENCING_REST.test(note)) return true;
+  const bareMatch = FENCING_BARE.exec(note);
+  if (!bareMatch) return false;
+  const start = Math.max(0, bareMatch.index - 60);
+  const end = Math.min(note.length, bareMatch.index + bareMatch[0].length + 60);
+  return FENCING_OWNERSHIP_CONTEXT.test(note.slice(start, end));
+}
+
 /**
  * Ordered most-distinctive-first, and checked in this order: a note can plausibly use words from more
  * than one class ("the abort leaves a stale lock held"), so the first pattern that matches wins rather
@@ -59,8 +83,7 @@ function matchesWorkLoss(note: string): boolean {
 const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher }> = [
   {
     klass: "fencing-toctou",
-    pattern:
-      /\btoctou\b|time-of-check|time of check|race condition|races? with|check-then-act|check then act|\b(?:un)?fenc(?:e|ing|ed)\b|fencing token|without (?:holding|acquiring) the lock|between the check and|stale (?:lease|read)|concurrent(?:ly)? (?:writ|modif|updat)|re-?reads? .{0,60}?before|reassert(?:s|ed|ing)? (?:the )?(?:claim|lock|lease|marker|ownership)|retired claim|final (?:fenc(?:e|ing)|lock|lease|claim|token|marker|ownership|guard)\s+await|lease (?:can |could |may |might |will )?expir(?:e|es|ed|ing)|expir(?:e|es|ed|ing) .{0,60}?(?:lease|ownership|claim)|ownership (?:may |could |can |might |will )?(?:transfer|change|shift|reassign)/i,
+    pattern: matchesFencingToctou,
   },
   {
     klass: "cancellation",
