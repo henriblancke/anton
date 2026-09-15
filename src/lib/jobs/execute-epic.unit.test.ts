@@ -2003,6 +2003,35 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
     expect(p).toMatchObject({ committed: false, delivered: false });
   });
 
+  it(
+    "blocks and fails closed — rather than settling delivered — when the evidence marker itself " +
+      "could not be persisted (PR #284 review round 5): found+synced alone is not a settled verdict " +
+      "when the durable record of it never landed, since a crash right after this point would strand " +
+      "a genuinely-shipped delivery with nothing left to recover it from",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({
+        found: true,
+        ids: ["swept-1"],
+        synced: true,
+        markerUnpersisted: true,
+      });
+      const recordBoardAttribution = async () => {
+        throw new Error("recordBoardAttribution ran without a settled evidence verdict");
+      };
+
+      const err = await failure(
+        assertDelivered(ticket, { committed: false }, p, neverAsked, check, recordBoardAttribution),
+      );
+
+      expect(err?.name).toBe("PoisonError");
+      expect(err?.message).toMatch(/anton-board produced no delivery/);
+      expect(err?.message).toMatch(/pending-evidence marker/);
+      expect(err?.message).toMatch(/swept-1/);
+      expect(p).toMatchObject({ committed: false, delivered: false });
+    },
+  );
+
   it("blocks when the board changed but the sync could not be confirmed, naming the beads", async () => {
     const p = progress({ outcome: "delivered" });
     const check = async () => ({ found: true, ids: ["swept-1", "swept-2"], synced: false });

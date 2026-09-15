@@ -471,7 +471,7 @@ async function assertBoardOnlyDelivered(
   }
   if (selfReport?.outcome === "delivered") {
     const result = await evidence.checkBoardEvidence();
-    if (result.found && result.synced) {
+    if (result.found && result.synced && !result.markerUnpersisted) {
       // The evidence is confirmed but the handoff isn't done yet — the marker stays on the bead
       // (readBoardEvidence never clears it) until the ticket's own success path releases it via
       // `clearBoardEvidencePending`, once attribution and close/in-review have actually gone
@@ -536,6 +536,16 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
       `started (the whole board's title/description/status was compared against the pre-dispatch ` +
       `read and nothing differs). Blocking the ticket for operator review — a board-only ticket ` +
       `with no board evidence is the same false success a git zero diff is.`
+    );
+  }
+  if (evidence.markerUnpersisted) {
+    return (
+      `${ticket.id} produced no delivery: bd writes were found on ${evidence.ids.join(", ")}` +
+      (evidence.synced ? " and confirmed synced" : "") +
+      `, but the pending-evidence marker that records them could not be persisted to the board ` +
+      `(after retries). Blocking the ticket for operator review until the board write channel is ` +
+      `healthy, then resume the run — without that marker, a crash before this ticket's ` +
+      `attribution/close completes would strand this evidence with nothing left to recover it from.`
     );
   }
   return (

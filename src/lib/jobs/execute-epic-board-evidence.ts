@@ -171,6 +171,16 @@ export interface BoardEvidenceResult {
    * happened. `ids`/`found` still carry whatever a PRIOR attempt already confirmed and left pending
    * (see {@link readBoardEvidence}) — this attempt simply could not add to or confirm them. */
   evidenceUnavailable?: boolean;
+  /**
+   * The pending-evidence marker write failed after every retry (PR #284 review round 5) — evidence
+   * was found (and `synced` reports whether the push itself confirmed), but the durable record of it
+   * could not be persisted to the board. Named separately so the caller stops here rather than
+   * reading `found && synced` as a settled verdict: that marker is the ONLY record of `ids` once the
+   * next attempt's baseline is taken fresh, so proceeding as if this attempt succeeded risks a crash
+   * between here and this ticket's attribution/close permanently stranding a delivery that already
+   * landed, with nothing left on the ticket to recover it from.
+   */
+  markerUnpersisted?: boolean;
 }
 
 /**
@@ -219,6 +229,9 @@ export interface BoardEvidenceResult {
  * pending marker either, and permanently rejects a delivery that already shipped. Retrying (and
  * logging every refusal) narrows that window without pretending a write bd keeps refusing is
  * recoverable — an exhausted retry still leaves the marker unset, exactly as it would have before.
+ * The result then reports `markerUnpersisted: true` (PR #284 review round 5) rather than the found
+ * evidence it still carries: an unset marker is exactly the state this attempt cannot safely build
+ * on top of, so the caller stops here instead of treating found-and-synced as a settled verdict.
  */
 export async function readBoardEvidence(
   repo: string,
@@ -238,7 +251,10 @@ export async function readBoardEvidence(
   const synced = outcome === "synced" || outcome === "shared-server";
   const stale = beads.boardEvidencePendingLabels(ticket);
   if (stale.length !== 1 || stale[0] !== LABELS.boardEvidencePending(ids)) {
-    await mustPersist(() => beads.setBoardEvidencePending(repo, ticket.id, ids, stale));
+    const persisted = await mustPersist(() =>
+      beads.setBoardEvidencePending(repo, ticket.id, ids, stale),
+    );
+    if (!persisted) return { found: true, ids, synced, markerUnpersisted: true };
   }
   return { found: true, ids, synced };
 }

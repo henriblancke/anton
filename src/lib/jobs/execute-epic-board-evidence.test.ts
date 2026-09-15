@@ -299,6 +299,28 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
+    "reports markerUnpersisted rather than a plain found+synced verdict when every marker-write " +
+      "retry fails (PR #284 review round 5) — the marker is the only durable record of this evidence, " +
+      "so the caller must stop here instead of treating this attempt as settled",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("synced");
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      const result = await readBoardEvidence("/repo", baseline, ticket);
+      expect(result).toEqual({
+        found: true,
+        ids: ["a"],
+        synced: true,
+        markerUnpersisted: true,
+      });
+    },
+  );
+
+  it(
     "retains a matching `board-evidence-pending:*` label once the sync confirms, rather than " +
       "clearing it (anton-fc5x review round 4) — the handoff (attribution + close) hasn't happened " +
       "yet, so the caller must clear it explicitly once it has",
