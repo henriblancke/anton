@@ -152,7 +152,10 @@ describe("ScanTrend", () => {
     // medium holds 100 of the column's 103 signals — it must dwarf every other segment, not vanish.
     const mediumIndex = SCAN_SEVERITIES.indexOf("medium");
     expect(heights[mediumIndex]).toBeGreaterThan(0);
-    expect(heights[mediumIndex]).toBeGreaterThan(sum / 2);
+    for (let i = 0; i < heights.length; i++) {
+      if (i !== mediumIndex) expect(heights[mediumIndex]).toBeGreaterThan(heights[i]);
+    }
+    expect(sum).toBeLessThanOrEqual(100.01);
   });
 
   // anton-knyp: when every severity in a column is under the floor and together they cost more
@@ -188,6 +191,27 @@ describe("ScanTrend", () => {
 
     expect(sum).toBeLessThanOrEqual(100.01);
     expect(heights[1]).toBeGreaterThanOrEqual(6);
+  });
+
+  // anton-knyp round 3: a quiet column's own track can be too small to fund the floor out of
+  // itself even though the container has ample room — the floor must draw against the shared 100%
+  // ceiling, not get capped at whatever the column's own (tiny) proportional track allows.
+  it("still floors a quiet column's segments next to a much taller peak column", () => {
+    render(
+      <ScanTrend
+        points={[
+          point("a", 1_700_000_000, { critical: 40, low: 1 }),
+          point("b", 1_700_086_400, { low: 4100 }),
+        ]}
+      />,
+    );
+
+    const column = screen.getByTitle(/41 new signals/);
+    const heights = Array.from(column.querySelectorAll<HTMLElement>("span[style]")).map((bar) =>
+      Number.parseFloat(bar.style.height),
+    );
+
+    for (const h of heights) expect(h).toBeGreaterThanOrEqual(6);
   });
 
   it("keeps the collector failure visible on a baseline column", () => {

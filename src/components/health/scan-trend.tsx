@@ -26,53 +26,34 @@ const FLOOR_PCT = 6;
  * one severity for over 100% of its own track, and flexbox silently shrinks every segment to fit,
  * distorting the very ratios the chart exists to show (anton-knyp).
  *
- * So the floor is funded out of the track itself, like flex-shrink: every severity starts at its
- * natural proportional share, and any severity under `FLOOR_PCT` is topped up by draining severities
- * that are over it — a bigger donor gives more, a needier severity gets more. That keeps a column
- * with one dominant severity and several tiny ones from reserving `FLOOR_PCT` per tiny severity
- * up front, which on a low-total column can together cost more than the whole track and starve the
- * dominant severity to zero even though it holds the column's overwhelming majority (anton-knyp).
+ * So each severity is floored against `FLOOR_PCT` directly: it draws at its natural proportional
+ * share of the track, or `FLOOR_PCT`, whichever is bigger. That lets a short column's segments grow
+ * past what its own track would proportionally allow — the container's shared 100% budget is the
+ * only ceiling, not the column's own (often tiny) track, since funding the raise out of the track
+ * itself starves a quiet column next to a tall peak the same way flooring against a full 100% track
+ * once did (anton-knyp): at most 4 severities and a 6% floor cost at most 24% of the container, so a
+ * column has to already be within ~76% of the peak's track before flooring can threaten to overflow
+ * it at all.
  *
- * When the track can't fund the full raise (every above-floor severity drained to its own floor
- * still isn't enough), the raise is capped at whatever surplus exists rather than left unfunded —
- * dropping every under-floor severity back to its raw, often sub-pixel, proportional share, which
- * silently violates the single-signal-must-still-draw invariant on a short column next to a tall
- * peak column (anton-knyp). And when nothing in the column clears the floor at all — no majority to
- * protect — the track is split evenly, since there is no principled way to favor one tiny severity
- * over another equally tiny one.
+ * Only when that raise pushes the column's own total past the shared 100% ceiling — which can only
+ * happen on a column whose track was already close to it — do the above-floor segments give back
+ * the difference, in proportion to how far each cleared the floor, the same way flex-shrink would.
  */
 function severityHeights(bySeverity: Record<ScanSeverity, number>, total: number, peak: number) {
   const track = (total / peak) * 100;
   const present = SCAN_SEVERITIES.filter((s) => bySeverity[s] > 0);
 
   const heights = new Map<ScanSeverity, number>(
-    present.map((s) => [s, (bySeverity[s] / total) * track]),
+    present.map((s) => [s, Math.max((bySeverity[s] / total) * track, FLOOR_PCT)]),
   );
 
-  const shortfall = present.reduce((sum, s) => sum + Math.max(0, FLOOR_PCT - (heights.get(s) ?? 0)), 0);
-  if (shortfall === 0) return heights;
+  const overflow = [...heights.values()].reduce((sum, h) => sum + h, 0) - 100;
+  if (overflow <= 0) return heights;
 
   const surplus = present.reduce((sum, s) => sum + Math.max(0, (heights.get(s) ?? 0) - FLOOR_PCT), 0);
-
-  if (surplus >= shortfall) {
-    // The track can fund every under-floor severity to exactly FLOOR_PCT, paid for by shrinking
-    // each above-floor severity in proportion to its own surplus.
-    for (const s of present) {
-      const h = heights.get(s) ?? 0;
-      if (h < FLOOR_PCT) heights.set(s, FLOOR_PCT);
-      else if (h > FLOOR_PCT) heights.set(s, h - ((h - FLOOR_PCT) / surplus) * shortfall);
-    }
-  } else if (surplus > 0) {
-    // Draining every above-floor severity down to its own floor still can't fully fund the raise:
-    // take all of it, and split that among the under-floor severities by how short each one is.
-    for (const s of present) {
-      const h = heights.get(s) ?? 0;
-      if (h < FLOOR_PCT) heights.set(s, h + ((FLOOR_PCT - h) / shortfall) * surplus);
-      else if (h > FLOOR_PCT) heights.set(s, FLOOR_PCT);
-    }
-  } else {
-    const share = track / present.length;
-    for (const s of present) heights.set(s, share);
+  for (const s of present) {
+    const h = heights.get(s) ?? 0;
+    if (h > FLOOR_PCT) heights.set(s, h - ((h - FLOOR_PCT) / surplus) * overflow);
   }
 
   return heights;
