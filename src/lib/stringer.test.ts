@@ -867,6 +867,45 @@ describe("scan", () => {
       expect(globs).toContain(`${join(".worktrees", "pr252-threads")}/**`);
     });
 
+    // PR #295 review (thread on stringer.ts:1177): a worktree another process creates AFTER the
+    // pre-scan enumeration but WHILE stringer is still walking is in neither stringer's --exclude
+    // (built from that stale enumeration) nor the pre-scan `nested` snapshot -- only a
+    // re-enumeration after stringer exits, unioned with the pre-scan read, still catches it. The
+    // fake stringer below stands in for "another process": it creates the worktree itself, mid-run,
+    // before writing its own output and exiting.
+    it("catches a worktree created after stringer's walk started, via the post-scan re-enumeration", async () => {
+      const repo = join(dir, "repo-mid-scan");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      writeFileSync(join(repo, "src.ts"), "export {};\n", "utf8");
+      run("add", "-A");
+      run("commit", "-qm", "init");
+
+      const bin = writeScript("late-worktree-stringer", [
+        "const { execFileSync } = require('child_process');",
+        "const fs = require('fs');",
+        "const repoPath = process.argv[3];",
+        "execFileSync('git', ['-C', repoPath, 'worktree', 'add', '-q', '-b', 'late-branch', '.worktrees/late']);",
+        "const i = process.argv.indexOf('-o');",
+        "fs.writeFileSync(process.argv[i + 1], JSON.stringify([" +
+          "{ Source: 'todos', Kind: 'todo', FilePath: '.worktrees/late/src.ts', Title: 'late todo' }" +
+          "]));",
+        "process.exit(0);",
+      ]);
+      process.env[STRINGER_BIN_ENV] = bin;
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(0);
+      expect(result.worktree.worktrees).toContain(join(".worktrees", "late"));
+      expect(result.worktree.dropped).toEqual([
+        { path: join(".worktrees", "late", "src.ts"), kind: "todo", severity: expect.any(String) },
+      ]);
+    });
+
     it("drops signals under a worktree checked out at a non-.claude path, whatever collector reported them", async () => {
       const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr252-threads");
       // The nested checkout is a real copy of the tracked tree, so the same file exists at both paths.
@@ -1076,6 +1115,44 @@ describe("scan", () => {
 
         expect(result.signals).toHaveLength(1);
         const description = result.signals[0].Description as string;
+        expect(description).not.toContain(".worktrees/pr252-threads/src/a.ts:2");
+        expect(description).toContain("src/a.ts:2");
+        expect(description).toContain("src/b.ts:2");
+      });
+
+      // PR #295 review (thread on stringer.ts:884): a signal carrying only the lowercase
+      // `description` alias (or `Description: null` alongside it) must have THAT field rewritten,
+      // not `Description`. Writing `Description` unconditionally plants an empty string there, which
+      // outranks a populated `description` in parseLocations's own `Description ?? description ?? ""`
+      // fallback (`??` only yields to null/undefined, not to ""), so filterDuplicationSignals would
+      // reparse zero locations and fall back to a single FilePath -- silently losing the real
+      // location this re-anchor is supposed to preserve.
+      it("rewrites the lowercase description alias when that's the one that carried the locations", async () => {
+        const repo = initRepoWithWorktree(
+          { "src/a.ts": CODE_BLOCK, "src/b.ts": CODE_BLOCK },
+          ".worktrees/pr252-threads",
+        );
+        mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+        writeFileSync(join(repo, ".worktrees/pr252-threads/src/a.ts"), CODE_BLOCK, "utf8");
+
+        const locations = [".worktrees/pr252-threads/src/a.ts:2", "src/a.ts:2", "src/b.ts:2"];
+        const lowercaseCloneFinding = {
+          Source: "duplication",
+          Kind: "code-clone",
+          FilePath: ".worktrees/pr252-threads/src/a.ts",
+          Line: 2,
+          Title: `Duplicated block (6 lines, ${locations.length} locations)`,
+          Description: null,
+          description: `Duplicated code found in:\n${locations.map((l) => `  - ${l}`).join("\n")}\n`,
+        };
+        process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [lowercaseCloneFinding]);
+
+        const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+        expect(result.signals).toHaveLength(1);
+        const kept = result.signals[0] as { Description: string | null; description?: string };
+        expect(kept.Description).toBeFalsy();
+        const description = kept.description as string;
         expect(description).not.toContain(".worktrees/pr252-threads/src/a.ts:2");
         expect(description).toContain("src/a.ts:2");
         expect(description).toContain("src/b.ts:2");

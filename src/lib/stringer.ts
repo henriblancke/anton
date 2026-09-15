@@ -797,6 +797,29 @@ async function listNestedWorktrees(
 }
 
 /**
+ * Union two `listNestedWorktrees` snapshots into one the post-scan backstop can filter against.
+ * The pre-scan snapshot alone is stale by the time stringer exits: a worktree another process
+ * creates mid-scan is in neither the `--exclude` list (built before stringer ran) nor an unrefreshed
+ * `nested`, so its signals would sail through the one filter meant to catch what `--exclude` missed
+ * (anton-fj1q PR #295 review). Unioning misses nothing either lookup saw; if either lookup couldn't
+ * enumerate, the merged result stays conservative and reports unavailable rather than silently
+ * trusting whichever half did resolve, the same "under-filter over delete a real finding" rule
+ * {@link WorktreeFilter.unavailable} already applies to a single failed lookup.
+ */
+function mergeNestedWorktrees(
+  before: string[] | { unavailable: string },
+  after: string[] | { unavailable: string },
+): string[] | { unavailable: string } {
+  if (!Array.isArray(before) || !Array.isArray(after)) {
+    const reasons = [before, after]
+      .filter((snapshot): snapshot is { unavailable: string } => !Array.isArray(snapshot))
+      .map((snapshot) => snapshot.unavailable);
+    return { unavailable: reasons.join("; ") };
+  }
+  return Array.from(new Set([...before, ...after]));
+}
+
+/**
  * Drop the signals describing a path inside another checkout of this same repo, and say how many.
  * Runs BEFORE annotation, same as {@link dropUntrackedSignals} — a filter applied downstream of it
  * would leave the trend charting findings the agent never saw. `nested` is precomputed by the
@@ -831,7 +854,11 @@ async function listNestedWorktrees(
  * ({@link parseLocations}) and gives every location it lists its own declaration/code vote — left
  * unrewritten, the nested copy (identical text to the real location it mirrors) casts a second vote
  * for the same class, which can turn a genuine tie between two real locations into a false
- * declarative majority and drop a real clone.
+ * declarative majority and drop a real clone. Whichever casing alias actually held the text
+ * (`Description` or the lowercase `description` stringer sometimes emits) is the one rewritten, in
+ * `parseLocations`'s own `??` order — writing `Description` unconditionally would plant an empty
+ * string there that outranks a populated `description` in that same fallback chain, since `??` only
+ * yields to null/undefined, not to `""` (anton-fj1q PR #295 review).
  */
 
 /**
@@ -881,7 +908,17 @@ async function dropWorktreeSignals(
           }
           if (real.length < locations.length) {
             const keep = new Set(real.map((loc) => `${loc.raw.path}:${loc.raw.line}`));
-            signal.Description = reanchorDescription(signal.Description ?? "", keep);
+            // Rewrite whichever alias actually supplied the text `parseLocations` read (its own
+            // `Description ?? description` order), not `Description` unconditionally: a signal that
+            // only ever carried the lowercase alias has `Description` as null/undefined, and writing
+            // an empty string there would outrank `description` in that same `??` chain downstream
+            // (`??` only falls through on null/undefined, not on ""), silently blanking the
+            // locations `filterDuplicationSignals` re-parses (anton-fj1q PR #295 review).
+            if (signal.Description !== undefined && signal.Description !== null) {
+              signal.Description = reanchorDescription(signal.Description, keep);
+            } else if (signal.description !== undefined && signal.description !== null) {
+              signal.description = reanchorDescription(signal.description, keep);
+            }
           }
           return true;
         }
@@ -948,7 +985,11 @@ async function readAnnotatedSignals(
   repoPath: string,
   opts: {
     exclude: readonly string[];
-    /** Precomputed by {@link scan} (it already needs this to build stringer's --exclude). */
+    /**
+     * The union of {@link scan}'s pre-scan enumeration (it already needs one to build stringer's
+     * --exclude) and its post-scan re-enumeration, via {@link mergeNestedWorktrees} — not the
+     * pre-scan snapshot alone, or a worktree created mid-scan would be invisible to this backstop too.
+     */
     nested: string[] | { unavailable: string };
     abort?: AbortSignal;
   },
@@ -992,8 +1033,9 @@ async function readAnnotatedSignals(
 
   // Nested-worktree signals first, over every collector: a phantom path is never worth the cost the
   // filters below pay to read its content. `scan()` already excluded these paths from the walk
-  // itself, so this is now a backstop rather than the primary defense — reusing its `nested` result
-  // instead of re-asking `git worktree list` here.
+  // itself, so this is now a backstop rather than the primary defense — `opts.nested` is the union
+  // of scan()'s pre- and post-scan enumerations, not just its first (pre-scan) result, so a worktree
+  // created mid-scan is still caught here even though it slipped stringer's `--exclude`.
   const { kept: real, worktree } = await dropWorktreeSignals(repoPath, signals, opts.nested);
   const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, real);
   // Secrets next, while the githygiene findings are together: it reads the flagged line, so it
@@ -1101,9 +1143,9 @@ export async function scan(opts: {
   // afterward (dropWorktreeSignals, below) is too late once a large one has already run every
   // collector past its --collector-timeout budget — a collector that times out mid-walk omits its
   // REAL findings too, not just the phantom ones (anton-fj1q: a 60s budget, and 759 phantom signals
-  // from one nested checkout). `nested` is threaded through to `readAnnotatedSignals` so it isn't
-  // asked for twice, and so the post-hoc filter still runs as a backstop against whatever a glob
-  // exclude doesn't catch (a worktree created mid-scan, a collector that ignores --exclude).
+  // from one nested checkout). This snapshot is re-taken after stringer exits (below, right before
+  // `readAnnotatedSignals`) and the two are unioned, so a worktree created after this lookup but
+  // before stringer finishes walking still gets caught by the post-scan backstop.
   const nested = await listNestedWorktrees(opts.repoPath, {
     timeoutMs: deadline - Date.now(),
     signal: opts.signal,
@@ -1172,9 +1214,22 @@ export async function scan(opts: {
 
   let read: Awaited<ReturnType<typeof readAnnotatedSignals>>;
   try {
+    // Re-enumerated AFTER stringer exits, inside the same try as the read below: the pre-scan
+    // `nested` above is a snapshot from before the walk started, so a worktree another process
+    // creates while stringer runs is invisible to it — passing that stale snapshot to the post-scan
+    // backstop would mean the backstop can't recognize the very race it exists to catch (anton-fj1q
+    // PR #295 review). A caller abort during this second lookup must unwind the baseline exactly
+    // like one during the read itself, hence sharing this try rather than its own.
+    const nestedAfter = await listNestedWorktrees(opts.repoPath, {
+      timeoutMs: deadline - Date.now(),
+      signal: opts.signal,
+    });
+    // Filtered against the union of both reads, not the fresher one alone, so a worktree that
+    // existed pre-scan but (for whatever reason) drops out of this second listing is still caught.
+    const nestedForFilter = mergeNestedWorktrees(nested, nestedAfter);
     read = await readAnnotatedSignals(opts.scanFile, opts.repoPath, {
       exclude,
-      nested,
+      nested: nestedForFilter,
       abort: opts.signal,
     });
   } catch (err) {
