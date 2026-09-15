@@ -88,6 +88,36 @@ describe("closeHumanTicket", () => {
     expect(closeMock).not.toHaveBeenCalled();
   });
 
+  it("rejects an agent:human child of a live, open, ordinary target BEFORE its gate is armed", async () => {
+    // feature is open and ordinary (not agent:human), and the run's human-ticket preflight has not
+    // reached `ticket` yet — no `blocks` dependency exists on it at all, so openBlockersOf alone
+    // would read it as clear. The target still holds a run that could reach it, so this must still
+    // refuse rather than cancel that run out from under its other, unrelated work.
+    const ticket = makeBead({ id: "ticket", parent: "feature" });
+    const feature = makeBead({ id: "feature", issue_type: "feature", labels: [] });
+    const board = [feature, ticket];
+    showMock.mockResolvedValue(ticket);
+    listMock.mockResolvedValue(board);
+
+    await expect(closeHumanTicket(project, "ticket")).rejects.toThrow(NotCloseableError);
+
+    expect(cancelRunMock).not.toHaveBeenCalled();
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("closes an agent:human child once its target has settled (closed) — no run is coming for it", async () => {
+    const ticket = makeBead({ id: "ticket", parent: "feature" });
+    const feature = makeBead({ id: "feature", issue_type: "feature", labels: [], status: "closed" });
+    const board = [feature, ticket];
+    listMock.mockResolvedValue(board);
+    showMock.mockResolvedValueOnce(ticket).mockResolvedValueOnce({ ...ticket, status: "closed" });
+
+    await closeHumanTicket(project, "ticket");
+
+    expect(cancelRunMock).toHaveBeenCalledWith("p1", "feature");
+    expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "ticket");
+  });
+
   it("closes a human run target with no open blockers, cancelling only its own run", async () => {
     const target = makeBead({ id: "target" });
     listMock.mockResolvedValue([target]);

@@ -26,6 +26,26 @@ export class NotCloseableError extends Error {
 const messageOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /**
+ * The run target still holding `bead`, when that target is open, not deferred, and not itself
+ * `agent:human` — i.e. a run that could still reach this ticket and arm a gate on it. `undefined`
+ * for a run target itself (nothing holds it — it IS the work) and for a ticket whose target has
+ * already settled or gone human (execute-epic poisons a human target before dispatching a single
+ * child, so no gate is ever armed under it — no run is coming for this ticket either way).
+ *
+ * Mirrors `holdsRunOf` (ticket-detail.ts) / `operatorQueue`'s inline check (operator-queue.ts): the
+ * same read that already withholds the UI's own Mark done control, applied here so a direct or
+ * stale request can't reach a click the UI itself refuses to offer.
+ */
+function stillHeldByLiveRun(bead: Bead, board: Bead[]): Bead | undefined {
+  if (beads.isRunTarget(bead, board)) return undefined;
+  const target = board.find((b) => b.id === runTargetOf(bead, board));
+  if (!target || target.status === "closed" || beads.isDeferred(target) || beads.isHumanWork(target)) {
+    return undefined;
+  }
+  return target;
+}
+
+/**
  * Close a human bead as done. No cascade: an `agent:human` run target with open work still under it
  * is refused rather than closed out from under that work (the open question PR review left standing
  * — closing what is still open would either orphan it or silently claim it as done, and neither is
@@ -39,6 +59,14 @@ const messageOf = (e: unknown): string => (e instanceof Error ? e.message : Stri
  * executing, so without this check the call below would cancel that run — killing healthy,
  * unrelated work — and only then discover `bd close` was always going to refuse. Resolve the gate
  * (`bd gate resolve`) instead; the run's own preflight closes the ticket once it does.
+ *
+ * Refused for the same reason, one step EARLIER, when the child's run target still HOLDS a run
+ * that has simply not reached this ticket yet ({@link stillHeldByLiveRun} — the same `holdsRun`
+ * predicate operator-queue.ts and ticket-detail.ts derive, which is what keeps the UI's own Mark
+ * done control from ever offering this click). Before a run's human-ticket preflight arms this
+ * ticket's gate, it carries no `blocks` dependency at all, so `openBlockersOf` reads it as clear —
+ * a direct or stale request in exactly that window would sail past the check above, cancel a
+ * healthy run mid-flight, and close a ticket that run was going to settle itself.
  *
  * A run still executing this bead's OWN target is killed FIRST, before the close is written — the
  * same order abandon uses and for the same reason: if the bead was relabelled `agent:human` after
@@ -93,6 +121,20 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
         `${id} is still held by an open blocker (${blockers.join(", ")}) — \`bd close\` would ` +
           `refuse it; resolve the blocker (\`bd gate resolve\` for a human gate) instead, which ` +
           `closes the ticket through its run rather than out from under it`,
+      );
+    }
+
+    // Reject BEFORE cancelling anything, same as the blockers check above: a target that could
+    // still reach this ticket has no `blocks` dependency to catch here until its own preflight
+    // arms one, and cancelling it now would kill a healthy, unrelated run for a ticket it was
+    // going to settle itself.
+    const liveTarget = stillHeldByLiveRun(bead, board);
+    if (liveTarget) {
+      throw new NotCloseableError(
+        `${id} still rides on ${liveTarget.id}'s run, which is open and could still reach it — ` +
+          `closing it now would mean cancelling that run first. Wait for it to arm a human gate on ` +
+          `${id} and resolve that (\`bd gate resolve\`) instead, or abandon ${liveTarget.id} first ` +
+          `if the run itself should stop`,
       );
     }
 
