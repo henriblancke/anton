@@ -274,6 +274,26 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("fencing-toctou");
   });
 
+  it("classifies work-loss when a prepositional work noun precedes the real subject", () => {
+    const note = "For each request the queued job is lost when processing fails, with no retry.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("does not classify an active 'drops support for' finding as work-loss", () => {
+    const note = "The API drops support for queue items in this release, without a migration path.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify an active 'drops a field from' finding as work-loss", () => {
+    const note = "The parser drops a field from the request while normalizing the payload.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify a numeric-precision bug as work-loss when a work noun follows a semicolon", () => {
+    const note = "Casting this bigint to number causes data loss; the job status remains correct.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();

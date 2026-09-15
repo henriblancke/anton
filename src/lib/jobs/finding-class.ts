@@ -29,19 +29,21 @@ const WORK_LOSS_SUBJECT =
 const WORK_LOSS_RETRY =
   "(?:retry|retried|retries|requeue|requeued|re-?queue|re-?queued|redeliver|redelivered|reprocess|reprocessed)";
 const WORK_LOSS_SIGNAL = `(?:${WORK_LOSS_SUBJECT}|${WORK_LOSS_RETRY})`;
-// Bare "data loss" says nothing about lost *work* on its own — "casting this bigint to number
-// causes data loss for large IDs" is a numeric-precision bug, not a dropped job/queue entry. It
-// only counts when a work-bearing noun (WORK_LOSS_SUBJECT) or "error(s)" shares the same clause.
-const DATA_LOSS_CONTEXT = new RegExp(
-  `\\bdata loss\\b[^.]{0,30}\\b(?:${WORK_LOSS_SUBJECT}|errors?)\\b|\\b(?:${WORK_LOSS_SUBJECT}|errors?)\\b[^.]{0,30}\\bdata loss\\b`,
-  "i",
-);
 // No comma/semicolon/colon/dash/period/apostrophe in the gap, so a noun from an earlier clause —
 // or a possessive that hands the subject role to whatever follows it ("the request body's first
 // character is dropped") — can't be credited as this loss's subject. The colon matters the same
 // way a comma does: "For each request: the first character is dropped" introduces a new clause
 // after the colon, so "request" can't bind across it to "is dropped".
 const CLAUSE_GAP = "[^,;:.'\\u2019\\u2013\\u2014]{0,30}?";
+// Bare "data loss" says nothing about lost *work* on its own — "casting this bigint to number
+// causes data loss for large IDs" is a numeric-precision bug, not a dropped job/queue entry. It
+// only counts when a work-bearing noun (WORK_LOSS_SUBJECT) or "error(s)" shares the same clause —
+// the same CLAUSE_GAP exclusions as the other contextual loss matchers, so "causes data loss; the
+// job status remains correct" doesn't credit "job" across the semicolon.
+const DATA_LOSS_CONTEXT = new RegExp(
+  `\\bdata loss\\b${CLAUSE_GAP}\\b(?:${WORK_LOSS_SUBJECT}|errors?)\\b|\\b(?:${WORK_LOSS_SUBJECT}|errors?)\\b${CLAUSE_GAP}\\bdata loss\\b`,
+  "i",
+);
 const WORK_LOSS_VERB_AFTER = "(?:is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))";
 const WORK_LOSS_OBJECT_AFTER = "(?:is (?:silently )?(?:discarded|lost|dropped)|silently drops?)";
 const WORK_LOSS_SUBJECT_FIRST = new RegExp(`\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\b${WORK_LOSS_VERB_AFTER}\\b`, "gi");
@@ -61,10 +63,17 @@ const WORK_LOSS_PREPOSITIONAL_OBJECT =
 const WORK_LOSS_INTERVENING_GERUND = /\b\w+ing\b/i;
 
 function matchesWorkLossPassive(note: string): boolean {
-  for (const match of note.matchAll(WORK_LOSS_SUBJECT_FIRST)) {
-    const index = match.index ?? 0;
+  // A manual exec loop, not matchAll: a rejected match ("For each request the queued job is
+  // lost") consumes all the way through the verb, swallowing "job" inside its span. matchAll
+  // would resume after that whole span and never give "job" its own chance to match, so on
+  // rejection we resume scanning from just past the rejected subject instead.
+  WORK_LOSS_SUBJECT_FIRST.lastIndex = 0;
+  let subjectMatch: RegExpExecArray | null;
+  while ((subjectMatch = WORK_LOSS_SUBJECT_FIRST.exec(note))) {
+    const index = subjectMatch.index;
     const precedingText = note.slice(Math.max(0, index - 40), index);
     if (!WORK_LOSS_PREPOSITIONAL_OBJECT.test(precedingText)) return true;
+    WORK_LOSS_SUBJECT_FIRST.lastIndex = index + 1;
   }
   for (const match of note.matchAll(WORK_LOSS_VERB_FIRST)) {
     const gap = match[1] ?? "";
@@ -74,10 +83,18 @@ function matchesWorkLossPassive(note: string): boolean {
 }
 
 // Active "loses"/"lose", "drops"/"drop", and "discards"/"discard" count the same as the passive
-// forms above, but only with a work-bearing object right after the verb ("loses the job", "drops
-// the job when processing throws", "discards the queued task before retry") — an object-less verb
-// ("drops support for X", "discards the connection") says nothing about work loss on its own.
-const WORK_LOSS_ACTIVE = new RegExp(`\\b(?:loses?|drops?|discards?)\\b${CLAUSE_GAP}\\b(?:work|${WORK_LOSS_SIGNAL})\\b`, "i");
+// forms above, but only when the work-bearing noun is the verb's actual direct object, not just
+// some later noun the arbitrary CLAUSE_GAP happened to reach: "drops support for queue items" and
+// "discards a field from the request" both have a real (non-work) object — "support", "a field" —
+// between the verb and the work noun, so the work noun there is a prepositional object, not what
+// got dropped. The gap only allows a short run of determiners/adjectives right after the verb, so
+// an intervening noun or preposition breaks the match instead of being skipped over.
+const WORK_LOSS_DIRECT_OBJECT_DETERMINER =
+  "(?:the|a|an|this|that|these|those|our|their|its|his|her|my|your|queued|pending|in-?flight|unacked|unprocessed|failed|new|old)";
+const WORK_LOSS_ACTIVE = new RegExp(
+  `\\b(?:loses?|drops?|discards?)\\b(?:\\s+${WORK_LOSS_DIRECT_OBJECT_DETERMINER}){0,3}\\s+\\b(?:work|${WORK_LOSS_SIGNAL})\\b`,
+  "i",
+);
 
 function matchesWorkLoss(note: string): boolean {
   return (
