@@ -81,6 +81,26 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("fail-open");
   });
 
+  it("classifies a finding describing the abort signal firing mid-await as cancellation", () => {
+    const note = "The abort signal can fire during this await, and the code keeps writing to the response anyway.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
+  it("classifies a finding describing signal.aborted as true as cancellation", () => {
+    const note = "The run continues when signal.aborted is true instead of bailing out of the loop.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
+  it("classifies a passive 'is lost' work-loss finding", () => {
+    const note = "The job is lost after dequeue if the handler throws before it acknowledges the message.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies a passive 'is dropped' work-loss finding", () => {
+    const note = "The queue entry is dropped when processing fails, with no requeue and no log of the failure.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();

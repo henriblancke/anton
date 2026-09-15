@@ -28,7 +28,7 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: RegExp }
   {
     klass: "cancellation",
     pattern:
-      /cancell?ation|\bcancell?ed\b|abortsignal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? after (?:the )?(?:cancel|abort)|orphaned (?:request|task|job)/i,
+      /cancell?ation|\bcancell?ed\b|\baborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|orphaned (?:request|task|job)/i,
   },
   {
     klass: "fail-open",
@@ -38,7 +38,7 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: RegExp }
   {
     klass: "work-loss",
     pattern:
-      /work.?loss|loses? (?:the )?work|(?:on the|in the) error path|silently drops?|is (?:silently )?discarded|never retried|unhandled rejection|catch block swallows|work is lost|data loss/i,
+      /work.?loss|loses? (?:the )?work|(?:on the|in the) error path|silently drops?|is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when)|never retried|unhandled rejection|catch block swallows|work is lost|data loss/i,
   },
   {
     klass: "scope",
