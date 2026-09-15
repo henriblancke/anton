@@ -77,7 +77,15 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     // mkdir, which is harmless since that decider's `finally` still removes it.
     const gateCreatedAt = await dirMtimeMs(gate);
     if (gateCreatedAt !== undefined && Date.now() - gateCreatedAt > STALE_AFTER_MS) {
-      await rm(gate, { recursive: true, force: true }).catch(() => {});
+      // Re-stat immediately before deleting. The check above and this reap are two separate
+      // awaits, and a legitimate decider can reap this same stale gate and `mkdir` a fresh one
+      // at this path in the gap between them. Deleting by pathname alone can't tell the two
+      // apart; requiring the mtime to still match confirms we're removing the exact instance we
+      // judged stale, never a live decider's gate — which would otherwise let two deciders run
+      // the reclaim decision concurrently and break mutual exclusion on `dir`.
+      if ((await dirMtimeMs(gate)) === gateCreatedAt) {
+        await rm(gate, { recursive: true, force: true }).catch(() => {});
+      }
     }
     return false; // let the caller's normal deadline/poll path retry reclaim() next iteration
   }
