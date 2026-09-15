@@ -109,6 +109,14 @@ export async function loadAllIssues(
   cwd: string,
   opts: LoadIssuesOptions = {},
 ): Promise<Bead[]> {
+  // Fired alongside `loadWorkIssues`, not after the board is fully assembled (PR #274 review,
+  // round 5 on this file): `bd dep cycles` and `bd list` are two independent CLI reads with no
+  // shared transaction, so SOME window where they see different graph revisions is unavoidable.
+  // Starting this one concurrently shrinks that window to the listing's own duration instead of
+  // stacking the cycles read after it (and after the conditional gate read besides) — the gap in
+  // which a concurrently-repaired cycle could make the attached evidence stale against `board`'s
+  // own edges.
+  const cyclesPromise = opts.withCycles ? beads.depCycles(cwd) : undefined;
   const work = await loadWorkIssues(cwd);
   // CONDITIONAL, not unconditional: a board read sits on the operator's critical path behind the
   // Dolt lock, and anton-hwkx trimmed approve down to exactly one. A board with no dangling blocker
@@ -120,7 +128,7 @@ export async function loadAllIssues(
   const board = dangling.length === 0
     ? work
     : dedupeById([...work, ...await loadGateIssues(cwd, opts.strictGates ?? false, dangling)]);
-  return opts.withCycles ? attachCycleEvidence(board, await beads.depCycles(cwd)) : board;
+  return cyclesPromise ? attachCycleEvidence(board, await cyclesPromise) : board;
 }
 
 
