@@ -187,8 +187,13 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
   const board = await refreshIssueSnapshot(cwd, () => loadAllIssues(cwd, opts));
   // A concurrent non-authoritative refresh may have won the snapshot loader. Enrich the exact board
   // returned here so callers that must make approval decisions never lose the requested evidence.
+  // Bumping the version on success, same as `attachCyclesBestEffort`: this evidence lands OUTSIDE
+  // `refreshIssueSnapshot`'s own recovery bump (its loader returned a board with none, so from its
+  // point of view nothing changed), so without this a poller stuck on missing evidence would still
+  // never see a fresh token for the one recovery that happens to land through this exact race.
   if (opts.withCycles && cycleEvidenceFor(board) === undefined) {
     attachCycleEvidence(board, await beads.depCycles(cwd));
+    markCycleEvidenceRecovered(cwd);
   }
   return board;
 }

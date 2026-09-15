@@ -150,6 +150,39 @@ describe("loadAllIssues", () => {
     expect(cyclesMock).toHaveBeenCalledWith(REPO);
   });
 
+  it("bumps the version when a concurrent non-cycled refresh wins the shared loader race", async () => {
+    // Warm the snapshot first so the race below reloads IDENTICAL content — isolating the assertion
+    // from the ordinary "first load ever" version bump every cold snapshot gets regardless of cycles.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await refreshAllIssues(REPO);
+    const before = issueSnapshotVersion(REPO);
+
+    // The shared loader in `refreshIssueSnapshot` is claimed by whichever caller reaches it first
+    // (issues.ts:188's own comment: "a concurrent non-authoritative refresh may have won the
+    // snapshot loader"). Deterministically stage that race: `refreshAllIssues(REPO)` (no cycles)
+    // is called first and claims the in-flight loader before `refreshAllIssues(REPO, {withCycles})`
+    // ever runs its own.
+    let resolveList!: (value: Bead[]) => void;
+    listMock.mockImplementationOnce(
+      () => new Promise<Bead[]>((resolve) => { resolveList = resolve; }),
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { withCycles: true });
+
+    resolveList([{ ...target, dependencies: [] }]);
+    const [ordinaryBoard, approvalBoard] = await Promise.all([ordinary, approval]);
+
+    expect(approvalBoard).toBe(ordinaryBoard);
+    expect(cycleEvidenceFor(approvalBoard)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    // Content is identical to the warmed baseline, so this bump can only come from the evidence
+    // recovery itself — landed OUTSIDE `refreshIssueSnapshot`'s own recovery bump (its loader
+    // returned a board with none, so from its point of view nothing changed). Without it a poller
+    // stuck on missing evidence would never see a fresh token for a recovery that lands this way.
+    expect(issueSnapshotVersion(REPO)).toBeGreaterThan(before);
+  });
+
   it("enriches a warm ordinary snapshot when an approval projection needs cycle evidence", async () => {
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
     cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);

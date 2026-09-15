@@ -573,7 +573,7 @@ async function settledDrifted(
 ): Promise<string | undefined> {
   let board: Bead[];
   try {
-    board = await readWholeBoard(repo);
+    board = await readWholeBoard(repo, CYCLE_AWARE_MOVES.has(plan.move));
   } catch (e) {
     // Same rule as `reread`'s: a board we could not read says nothing, so the proposal stays open.
     return `the board could not be re-read to confirm the move is already applied (${messageOf(e)}) — nothing was written`;

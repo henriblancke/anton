@@ -1,3 +1,4 @@
+import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import type { Bead } from "./types";
 
 export const ISSUE_SNAPSHOT_MAX_AGE_MS = 30_000;
@@ -209,7 +210,23 @@ export function refreshIssueSnapshot(
       // A cold entry has no board to differ FROM, so the first read of a repo sets the baseline
       // rather than announcing a move nobody made.
       const moved = entry.serialized !== null && entry.serialized !== serialized;
-      if (entry.serialized !== serialized) entry.version += 1;
+      // Identical graph content: this fresh array (the cycle sidecar is WeakMap-keyed on array
+      // identity, so a new array never inherits it) still describes the same graph the retained
+      // evidence was read for, so carry it forward. Without this, an ordinary refresh that never
+      // asked for cycles drops previously-attached evidence on every poll even when nothing
+      // changed, forcing the next evidence probe to re-spawn `bd dep cycles` and bump the version
+      // for no real change.
+      const hadEvidence = entry.beads ? cycleEvidenceFor(entry.beads) !== undefined : false;
+      if (!moved && entry.beads && cycleEvidenceFor(beads) === undefined) {
+        const evidence = cycleEvidenceFor(entry.beads);
+        if (evidence !== undefined) attachCycleEvidence(beads, evidence);
+      }
+      // Evidence becoming available where the retained snapshot had none is also a reason to bump,
+      // even when the bead content itself is unchanged — a `withCycles` refresh that finally lands
+      // real evidence after a prior attempt degraded must give a stuck poller a fresh token, not
+      // wait for unrelated content to change too (mirrors `markCycleEvidenceRecovered`'s reasoning).
+      const evidenceRecovered = !hadEvidence && cycleEvidenceFor(beads) !== undefined;
+      if (entry.serialized !== serialized || evidenceRecovered) entry.version += 1;
       entry.beads = beads;
       entry.serialized = serialized;
       entry.loadedAt = now;

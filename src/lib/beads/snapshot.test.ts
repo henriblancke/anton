@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./bd";
+import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import {
   ISSUE_SNAPSHOT_MAX_AGE_MS,
   getBeadDescription,
@@ -71,6 +72,50 @@ describe("issue snapshots", () => {
     invalidateIssueSnapshot("/a", true);
     expect(issueSnapshotVersion("/a")).toBe(aVersion + 1);
     expect(issueSnapshotVersion("/b")).toBe(bVersion);
+  });
+
+  it("carries cycle evidence forward across a refresh with identical content that didn't ask for it", async () => {
+    // Cycle evidence is a WeakMap sidecar keyed on array identity (cycle-evidence.ts), so a fresh
+    // array from an ordinary refresh never inherits it on its own — even when the graph it describes
+    // hasn't changed. Without carrying it forward, an evidence-bearing snapshot loses its evidence on
+    // the very next unrelated TTL refresh.
+    const first = await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    attachCycleEvidence(first, [{ ids: ["a"], raw: {} }]);
+
+    const second = await refreshIssueSnapshot("/repo", async () => [bead("a")], 200);
+
+    expect(second).not.toBe(first);
+    expect(cycleEvidenceFor(second)).toEqual([{ ids: ["a"], raw: {} }]);
+  });
+
+  it("does not carry stale cycle evidence forward once the graph content actually changes", async () => {
+    const first = await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    attachCycleEvidence(first, [{ ids: ["a"], raw: {} }]);
+
+    const second = await refreshIssueSnapshot(
+      "/repo",
+      async () => [bead("a"), bead("b")],
+      200,
+    );
+
+    expect(cycleEvidenceFor(second)).toBeUndefined();
+  });
+
+  it("bumps the version when a refresh recovers cycle evidence even though bead content is unchanged", async () => {
+    await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    const before = issueSnapshotVersion("/repo");
+
+    // Content is identical to the prior read, but this load itself attaches evidence the retained
+    // snapshot never had — a poller stuck on "evidence unavailable" needs a fresh token for this,
+    // not only for a content change.
+    const recovered = await refreshIssueSnapshot(
+      "/repo",
+      async () => attachCycleEvidence([bead("a")], [{ ids: ["a"], raw: {} }]),
+      200,
+    );
+
+    expect(cycleEvidenceFor(recovered)).toEqual([{ ids: ["a"], raw: {} }]);
+    expect(issueSnapshotVersion("/repo")).toBe(before + 1);
   });
 
   it("blocks a full board read on a fresh post-write load instead of serving the stale board", async () => {

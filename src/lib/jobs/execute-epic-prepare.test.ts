@@ -16,6 +16,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
+import { HUMAN_GATE_ARMED_LABEL, humanGateReason, humanTicketAsk } from "./execute-epic-human-gate";
 
 const refreshRunBoardMock = vi.fn();
 const settleCompletedRunMock = vi.fn();
@@ -684,6 +685,60 @@ describe("prepareEpicRun — the structure/cycle gate re-runs on the board the r
     expect(error).not.toBeInstanceOf(PoisonEpic);
     expect((error as Error).message).toContain("t-2");
     expect((error as Error).message).toContain(LABELS.agentHuman);
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
+  // chatgpt-codex-connector (PR #274 review): a gate THIS run armed can be answered by a person
+  // during `publishRunClaim`'s own sync — a window that opens after `armHumanTicketWaits` already
+  // ran. Closing the ticket on its answer only happens inside that preflight pass
+  // (`answeredHumanGate`), so left unhandled the ticket would sit open, still `agent:human`, with a
+  // resolved gate — reading as ordinary unblocked work to the readiness recomputed below, until the
+  // dispatch backstop poison-parked the whole run on it instead of the preflight ever recognizing
+  // the answer.
+  it("retries when a human gate this run armed is resolved during the publish sync, before its ticket is closed", async () => {
+    const humanT2 = {
+      ...ticket("t-2"),
+      labels: [LABELS.agentHuman],
+      dependencies: [{ issue_id: "t-2", depends_on_id: "g-2", type: "blocks" }],
+    } as Bead;
+    const reason = humanGateReason("t-2", { ticketId: "t-2", ask: humanTicketAsk(humanT2) });
+    const armedGate = {
+      id: "g-2",
+      title: "Gate: human",
+      status: "open",
+      issue_type: "gate",
+      await_type: "human",
+      description: `Ad-hoc gate blocking t-2\n\nReason: ${reason}`,
+      labels: [HUMAN_GATE_ARMED_LABEL],
+    } as Bead;
+    // The pre-sync board the arm ran against, with its gate still OPEN — every read before the sync
+    // (including the structural tier check) needs the referenced gate bead actually on the board.
+    const clean = [...board(ticket("t-1"), humanT2), armedGate];
+    attachCycleEvidence(clean, []);
+    const answered = [feature(), ticket("t-1"), humanT2, { ...armedGate, status: "closed" }];
+    attachCycleEvidence(answered, []);
+    // Mirrors the real preflight: this run already armed a wait for t-2 (it's `handled`), but the
+    // gate it armed was still OPEN at the time — the answer lands later, in the sync window. Built
+    // by hand rather than the shared `preflight()` fixture, which naively treats every non-target id
+    // as a ticket — wrong here, since `clean` carries the gate bead itself (needed for the tier
+    // check above to accept its `blocks` edge).
+    preflightHumanTicketsMock.mockResolvedValue({
+      board: clean,
+      target: clean.find((b) => b.id === TARGET)!,
+      children: [ticket("t-1"), humanT2],
+      tickets: [ticket("t-1"), humanT2],
+      answeredButBlocked: new Map<string, string[]>(),
+      armed: true,
+      handled: new Set(["t-2"]),
+    });
+    loadAllIssuesMock.mockResolvedValueOnce(clean).mockResolvedValueOnce(clean).mockResolvedValue(answered);
+
+    const error = await refusalFrom(clean);
+
+    // Retryable, not a park: the next attempt re-enters from the top, where the preflight sees the
+    // resolved gate and closes t-2 the normal way, before anything dispatches.
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("t-2");
     expect(publishRunClaimMock).toHaveBeenCalled();
   });
 

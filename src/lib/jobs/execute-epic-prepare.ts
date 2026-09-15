@@ -36,7 +36,11 @@ import {
   publishRunClaim,
   warmRunWorktree,
 } from "./execute-epic-claim";
-import { adoptRefreshedTarget, preflightHumanTickets } from "./execute-epic-human-gate";
+import {
+  adoptRefreshedTarget,
+  answeredHumanGate,
+  preflightHumanTickets,
+} from "./execute-epic-human-gate";
 import { refreshRunBoard, settleCompletedRun } from "./execute-epic-recover";
 import type { EpicRun } from "./execute-epic-run";
 // The formula/step family, the run-lease, AND the checkout-staleness preflight (anton-vzhf) sit
@@ -592,6 +596,15 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
  * closed as answered (`state.handled`), so a ticket the preflight never touched still trips this
  * check no matter what else changed about it in the meantime.
  *
+ * `armedHumanIds` membership alone is not proof the ticket is settled, though: a gate this run armed
+ * can be RESOLVED by a person during `publishRunClaim`'s own sync, a window that opens after the
+ * preflight already ran — and closing the ticket on its answer only happens inside that preflight
+ * pass ({@link answeredHumanGate}), not here. Left unhandled, the ticket would sit open, still
+ * `agent:human`, with a now-resolved gate — reading as ordinary unblocked work to the readiness
+ * recomputed below, until the dispatch backstop poison-parks the whole run on it. So this is checked
+ * too, and retried the same way: the next attempt's preflight sees the resolved gate and closes the
+ * ticket properly before anything dispatches.
+ *
  * ALSO re-runs the allowlist, contract and claimable gates over this adopted board (fresh evidence,
  * PR #274 review round 9): `ticketSetDrift` above is ID-only, so a `publishRunClaim` sync that
  * swaps in a changed OBJECT for an existing id — a disabled agent's label, a stripped Acceptance
@@ -659,6 +672,32 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
         `${relabelledHuman.map((t) => t.id).join(", ")} ${LABELS.agentHuman} — retrying so the ` +
         `human-ticket preflight arms a wait for it before anything dispatches, rather than sending ` +
         `a person's work to the default agent`,
+    );
+  }
+  // A gate `armHumanTicketWaits` armed for one of THESE tickets may have been resolved during
+  // `publishRunClaim`'s own sync — a window that opens after the preflight pass, which is the only
+  // place that closes a ticket on its answer ({@link answeredHumanGate}). `armedHumanIds` correctly
+  // exempts these from `relabelledHuman` above (the preflight already knows about them), but an
+  // answer landing in this later window leaves the ticket open, still `agent:human`, with a resolved
+  // gate — so the readiness recomputed below reads it as ordinary unblocked work, dispatchable
+  // alongside its siblings, until the dispatch backstop (execute-epic-dispatch.ts's `isHumanWork`
+  // check) poison-parks the WHOLE run on it. Retrying instead re-enters from the top, where the next
+  // preflight pass sees the resolved gate and closes the ticket the normal way.
+  const answeredSinceArmed = freshTickets.filter(
+    (t) =>
+      t.id !== epicBeadId &&
+      t.status === "open" &&
+      beads.isHumanWork(t) &&
+      !gates.isResumeSkipped(t) &&
+      gates.armedHumanIds.has(t.id) &&
+      answeredHumanGate(board, t) !== undefined,
+  );
+  if (answeredSinceArmed.length > 0) {
+    throw new Error(
+      `${epicBeadId}'s claim published to a board where the human gate armed on ` +
+        `${answeredSinceArmed.map((t) => t.id).join(", ")} was resolved during the sync — retrying ` +
+        `so the human-ticket preflight recognizes the answer and closes it, rather than dispatching ` +
+        `its siblings first and poison-parking the run once dispatch reaches it`,
     );
   }
   run.all = board;

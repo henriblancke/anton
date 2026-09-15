@@ -83,6 +83,16 @@ const SETTLING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede"])
 const RETIRING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede", "defer"]);
 
 /**
+ * Verbs whose write-time re-check consults `cycleEvidenceFor` — mirrors apply.ts's
+ * `CYCLE_AWARE_MOVES` for the decide half. Only {@link assertStartHolds} (approve, via
+ * `startBarred`) and {@link lockedWrite} (unapprove, via `assertStillDegraded`'s `approvalGaps`)
+ * ever read cycle evidence; every other re-check here (reparent, retire, link) never does, so
+ * paying for a `bd dep cycles` subprocess — and letting its failure refuse the whole read — for
+ * those verbs gains nothing and risks refusing a step over a subsystem it never needed.
+ */
+const CYCLE_AWARE_VERBS: ReadonlySet<ApplyStep["verb"]> = new Set(["approve", "unapprove"]);
+
+/**
  * The bead a step points AT rather than writes to: a re-parent's new home, a link's blocker, a
  * supersede's survivor. The move's correctness rests on it as surely as on the subject — attaching
  * work under a home a run just claimed strands it, and an edge to a blocker that just closed leaves
@@ -296,7 +306,7 @@ async function lockedSubjectSatisfied(repo: string, step: ApplyStep): Promise<bo
 async function assertSatisfiedClusterHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "reparent" || !step.cluster) return;
   const doing = `before settling ${step.id}'s move under ${step.parent} as already made`;
-  assertClusterHolds(step, await lockedBoard(repo, doing));
+  assertClusterHolds(step, await lockedBoard(repo, doing, false));
 }
 
 /** The bead this step POINTS AT, re-judged under its own lock by the bar the decision used. */
@@ -320,7 +330,7 @@ async function assertOwnerIdle(repo: string, step: ApplyStep): Promise<void> {
 /** What a RETIREMENT owes the board it is about to take a bead out of. */
 async function assertRetirementHolds(repo: string, step: ApplyStep): Promise<void> {
   if (!RETIRING.has(step.verb)) return;
-  const board = await lockedBoard(repo, `before retiring ${step.id}`);
+  const board = await lockedBoard(repo, `before retiring ${step.id}`, false);
   assertOwnerUnchanged(step, board);
   if (SETTLING.has(step.verb)) assertNothingStranded(step.id, board);
 }
@@ -332,7 +342,7 @@ async function assertRetirementHolds(repo: string, step: ApplyStep): Promise<voi
  */
 async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "reparent") return;
-  const board = await lockedBoard(repo, `before re-parenting under ${step.parent}`);
+  const board = await lockedBoard(repo, `before re-parenting under ${step.parent}`, false);
   assertOwnerUnchanged(step, board);
   assertHomeFitsSubject(step, board);
   assertClusterHolds(step, board);
@@ -405,7 +415,7 @@ function assertClusterHolds(step: ReparentStep, board: BoardIndex): void {
 async function assertEvidenceHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "link" || step.kind !== "implied-order") return;
   const doing = `before recording ${step.blocker} as ${step.id}'s blocker`;
-  assertOrderingStated(step.id, step.blocker, await lockedBoard(repo, doing));
+  assertOrderingStated(step.id, step.blocker, await lockedBoard(repo, doing, false));
 }
 
 /**
@@ -425,7 +435,7 @@ async function assertEvidenceHolds(repo: string, step: ApplyStep): Promise<void>
  */
 async function assertStartHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "approve") return;
-  const board = await lockedBoard(repo, `before approving ${step.id}`);
+  const board = await lockedBoard(repo, `before approving ${step.id}`, CYCLE_AWARE_VERBS.has(step.verb));
   assertStillStartable(step.id, board);
 }
 
@@ -449,7 +459,7 @@ function assertStillStartable(id: string, board: BoardIndex): void {
 async function lockedWrite(repo: string, step: ApplyStep): Promise<ApplyStep> {
   if (step.verb !== "unapprove") return step;
   const doing = `before withdrawing the approval on ${step.id}`;
-  const board = await lockedBoard(repo, doing);
+  const board = await lockedBoard(repo, doing, CYCLE_AWARE_VERBS.has(step.verb));
   return { ...step, note: unapproveNote(assertStillDegraded(step.id, board)) };
 }
 
@@ -495,9 +505,9 @@ function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
  * refusal naming what the read was needed for. Same rule as `reread`'s: a board we could not read
  * says nothing, so the step refuses and nothing is written.
  */
-async function lockedBoard(repo: string, doing: string): Promise<BoardIndex> {
+async function lockedBoard(repo: string, doing: string, withCycles: boolean): Promise<BoardIndex> {
   try {
-    return indexBoard(await readWholeBoard(repo));
+    return indexBoard(await readWholeBoard(repo, withCycles));
   } catch (e) {
     throw new SubjectMovedError(
       `the board could not be re-read ${doing} (${messageOf(e)}) — nothing was written`,
@@ -647,9 +657,15 @@ function assertStillDegraded(id: string, board: BoardIndex): ApprovalGap[] {
  * blocker, which is a `blocked` approval gap — so {@link assertStillDegraded} would find gaps that
  * were repaired and strip the `approved` label off sound work, unattended. Failing the read closed
  * costs nothing extra, because every caller here already refuses on a read it could not make.
+ *
+ * `withCycles` is the caller's to decide, not this function's: only the approve/unapprove re-checks
+ * ({@link CYCLE_AWARE_VERBS}) ever consult cycle evidence, and `loadAllIssues`'s `withCycles: true`
+ * calls `beads.depCycles` with no try/catch — a `bd dep cycles` timeout or unreadable output would
+ * otherwise reject this WHOLE read and refuse a reparent/retire/link step over a subsystem it never
+ * needed (matches apply.ts's `withCycleEvidenceIfNeeded`/`CYCLE_AWARE_MOVES` for the decide half).
  */
-export function readWholeBoard(repo: string): Promise<Bead[]> {
-  return loadAllIssues(repo, { strictGates: true, withCycles: true });
+export function readWholeBoard(repo: string, withCycles: boolean): Promise<Bead[]> {
+  return loadAllIssues(repo, { strictGates: true, withCycles });
 }
 
 /** A bead read from inside its own write lock. A read that FAILED is never a bead that vanished. */
