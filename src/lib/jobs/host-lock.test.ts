@@ -180,6 +180,34 @@ describe("withHostLock", () => {
     expect(stillLive.token).toBe(oldToken);
   });
 
+  it("does not let two concurrent reclaimers of the same orphan both enter the section", async () => {
+    const name = `test-reclaim-concurrent-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    // Same metadata-less orphan as the "never got its owner.json written" case, but this time two
+    // peers race to reclaim it at once. Each used to mint its own random token and retire
+    // independently — this reproduces that race directly rather than relying on real OS timing.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let active = 0;
+    let maxActive = 0;
+    const section = async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await sleep(30);
+      active--;
+    };
+
+    await Promise.all([
+      withHostLock(name, section, { maxWaitMs: 5000 }),
+      withHostLock(name, section, { maxWaitMs: 5000 }),
+      withHostLock(name, section, { maxWaitMs: 5000 }),
+    ]);
+
+    expect(maxActive).toBe(1);
+  });
+
   it("reports the holder to onWait only when contended", async () => {
     const name = `test-onwait-${process.pid}`;
     const uncontended: unknown[] = [];

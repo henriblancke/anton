@@ -9,7 +9,7 @@
  * best-effort by design: a caller that cannot acquire within its budget runs anyway rather than
  * failing the epic, because a slow check is better than a stuck queue.
  */
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -52,6 +52,36 @@ async function retire(dir: string, token: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Reclaim a directory that looked abandoned on an earlier, now-stale read. Metadata-less orphans
+ * have no shared token to rename to, so each concurrent reclaimer used to mint its own random one —
+ * meaning two peers could both "win" distinct tombstones, and a delayed peer's rename could steal
+ * whatever now lives at `dir`, including a fresh acquisition that replaced the orphan in between.
+ * `${dir}.reclaiming` is an exclusive mkdir gate: only the process that creates it gets to decide,
+ * and it re-reads holder/mtime state under the gate rather than trusting the caller's stale read —
+ * so a peer that loses the gate (or wins it late) always judges the *current* directory, never
+ * mistakes a just-recreated live lock for the orphan that justified its own reclaim attempt.
+ */
+async function reclaim(dir: string, metaPath: string): Promise<boolean> {
+  const gate = `${dir}.reclaiming`;
+  try {
+    await mkdir(gate);
+  } catch {
+    return false; // another peer is already deciding whether to reclaim this dir
+  }
+  try {
+    const holder = await readHolder(metaPath);
+    const dirCreatedAt = holder ? 0 : await dirMtimeMs(dir);
+    if (dirCreatedAt === undefined || !isAbandoned(holder, dirCreatedAt, Date.now())) {
+      return false;
+    }
+    const token = holder?.token ?? randomUUID();
+    return await retire(dir, token);
+  } finally {
+    await rm(gate, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -149,15 +179,12 @@ export async function withHostLock<T>(
       const dirCreatedAt = holder ? 0 : await dirMtimeMs(dir);
       if (dirCreatedAt === undefined) continue;
       if (isAbandoned(holder, dirCreatedAt, Date.now())) {
-        // A token is required to retire safely (it becomes the tombstone's stable destination, so a
-        // delayed reclaimer can never move a successor's lock). Metadata-less acquisitions have none
-        // to reuse, so mint one here purely to name that destination.
-        const reclaimToken = holder?.token ?? randomUUID();
-        if (await retire(dir, reclaimToken)) {
+        if (await reclaim(dir, metaPath)) {
           continue;
         }
-        // A failed retirement usually means another waiter already reclaimed this acquisition.
-        // Fall through to the normal deadline/poll path; spinning here would defeat maxWaitMs.
+        // Another peer is already reclaiming this dir, already won, or a fresh holder appeared by
+        // the time we got the gate. Fall through to the normal deadline/poll path; spinning here
+        // would defeat maxWaitMs.
       }
       const remaining = deadline - Date.now();
       if (opts.signal?.aborted || remaining <= 0) break; // advisory: run unlocked
@@ -169,12 +196,19 @@ export async function withHostLock<T>(
 
   if (!held) return fn();
 
-  const write = () =>
-    writeFile(
-      metaPath,
+  // Write-then-rename so a reader never observes a truncated mid-heartbeat file. A torn read would
+  // parse as undefined and, since overwriting owner.json doesn't bump the directory's own mtime,
+  // fall back to the (stale) dirCreatedAt — misreading a live, heartbeating holder as an orphan.
+  // rename is atomic within one directory, so readHolder always sees a complete write or none.
+  const tmpMetaPath = `${metaPath}.${token}.tmp`;
+  const write = async () => {
+    await writeFile(
+      tmpMetaPath,
       JSON.stringify({ token, pid: process.pid, heartbeatAt: Date.now(), label: opts.label ?? "" }),
       "utf8",
     );
+    await rename(tmpMetaPath, metaPath);
+  };
   await write();
   // Keep the heartbeat fresh so a long-but-healthy hold is never mistaken for a crash. Unref'd so a
   // pending tick can't hold the process open.
