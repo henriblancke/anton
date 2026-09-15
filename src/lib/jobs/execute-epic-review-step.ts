@@ -23,8 +23,10 @@ import {
 } from "./execute-epic-review";
 import type { EpicRun } from "./execute-epic-run";
 import type { RunPhaseCarry, RunStepDispatch } from "./execute-epic-run-step";
+import { deferPassSession } from "./pass-preamble";
 import { persistPartialReviewScores, persistReviewScores } from "./review-score";
 import { blockingFindings, type ReviewRound } from "./review-gate";
+import { computeReviewKey, parseRecordedAdvisories, reviewKeyToken } from "./review-key";
 
 /** The pre-PR self-review gate: dispatch it, then act on the verdict it returns. */
 export async function runReviewStep(
@@ -33,17 +35,52 @@ export async function runReviewStep(
   dispatch: RunStepDispatch,
   carry: RunPhaseCarry,
 ): Promise<void> {
-  const { db, clock, repo, runId, targetId: epicBeadId, settings } = run;
+  const { db, clock, ctx, projectId, repo, runId, targetId: epicBeadId, settings, existing } = run;
   const { cooked, definition, stepCtx } = dispatch;
   const { worktree } = prep;
+
+  // The resume key (anton-qmuyt): a CLEAN verdict is keyed to the tree it judged — the merge-base,
+  // the branch tip, and the reviewer contract's fingerprint — so a resume that finds the same key
+  // skips the gate instead of blindly re-judging work already passed. Checked up front, before
+  // WHETHER the gate even runs, and keyed to the RUN ROW: `existing` is only set when this attempt
+  // resumed the same row in place, so an ordinary retry's fresh row, and every row written before
+  // this column existed, carry no key and always review — no backfill, no inference.
+  if (existing?.reviewKey) {
+    try {
+      const key = await computeReviewKey({
+        worktreePath: stepCtx.worktreePath,
+        baseBranch: stepCtx.baseRef,
+        settings,
+      });
+      if (reviewKeyToken(key) === existing.reviewKey) {
+        // The recorded attempt already owns the score and its board labels — this attempt writes
+        // neither. It DOES restore the advisories, since they ride in `prBody` (steps/git.ts) and
+        // a skip that started with an empty carry would drop them out of the PR with nothing to
+        // show it happened.
+        carry.advisories = parseRecordedAdvisories(existing.reviewKeyAdvisories);
+        const session = deferPassSession(db, clock, { ctx, projectId, runId, kind: "review-skip" });
+        await session.log(
+          `[review] skipped self-review: ${key.baseRev.slice(0, 12)}..${key.head.slice(0, 12)} ` +
+            `matches the tree and reviewer contract an earlier attempt on this run already passed ` +
+            `clean — see ${epicBeadId}'s review-score history for that verdict. An uncommitted ` +
+            `repair does not move this key; commit it before resuming to force a fresh review.\n`,
+        );
+        await session.end("done");
+        return;
+      }
+    } catch (e) {
+      // Best-effort, like every other resume-key write below: a transient failure recomputing the
+      // key must never block a run on bookkeeping. It just costs a redundant review — the same
+      // outcome as a row that carries no key at all.
+      console.error(`[review] could not recompute the resume key for ${epicBeadId} — reviewing in full`, e);
+    }
+  }
+
   // The pre-PR self-review gate (anton-omum): a fresh-context reviewer reads THIS run's
   // diff, its blocking findings are fixed on the branch, and only then does the PR open — so
   // the PR the founder merges has already been reviewed once. The formula says WHERE the
-  // gate runs; the project setting still says WHETHER (absent ⇒ on). Nothing about the
-  // verdict is persisted as a resume marker on purpose: a parked run that is resumed
-  // re-reviews the worktree as it stands now, which is the only state the fixes it just made
-  // are visible in. A run that already opened its PR never reaches here — step 0a
-  // short-circuits it.
+  // gate runs; the project setting still says WHETHER (absent ⇒ on). A run that already opened
+  // its PR never reaches here — step 0a short-circuits it.
   if (!resolveReviewConfig(settings).enabled) return;
   // Filled by the gate as each round completes, so a gate that THROWS — returning nothing —
   // still leaves this attempt's score history to persist below.
@@ -148,4 +185,26 @@ export async function runReviewStep(
   // one it did not restate is settled, not forgotten. Accumulating here would instead
   // resurrect advisories a later reviewer judged resolved.
   carry.advisories = review.unresolved.filter((f) => f.severity === "advisory");
+
+  // A CLEAN verdict is keyed to the tree it judged (anton-qmuyt), so a resume that finds the
+  // worktree unchanged can skip re-judging it. Recomputed here rather than reusing any
+  // up-front read: a converging gate can dispatch fixer commits mid-round, so only the tree
+  // AFTER the gate concluded is the one this verdict actually covers.
+  if (review.outcome === "clean") {
+    try {
+      const key = await computeReviewKey({
+        worktreePath: stepCtx.worktreePath,
+        baseBranch: stepCtx.baseRef,
+        settings,
+      });
+      await updateRun(db, clock, runId, {
+        reviewKey: reviewKeyToken(key),
+        reviewKeyAdvisories: JSON.stringify(carry.advisories),
+      });
+    } catch (e) {
+      // Best-effort: a resume key that failed to write just means the next resume reviews in
+      // full again — the same safe default as a row that never carried one.
+      console.error(`[review] could not persist the resume key for ${epicBeadId}`, e);
+    }
+  }
 }

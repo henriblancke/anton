@@ -206,6 +206,10 @@ export type RunPatch = Partial<{
   error: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
   reviewScore: number | null;
+  /** A clean verdict's resume key (anton-qmuyt) — see the column's own note. */
+  reviewKey: string | null;
+  /** The clean verdict's advisories, serialized — restored into the carry when a resume skips. */
+  reviewKeyAdvisories: string | null;
   /** ms; converted to seconds. Rewritten by a resume — see the column's own note. */
   attemptStartedAt: number;
   endedAt: number; // ms; converted to seconds
