@@ -590,6 +590,14 @@ export interface TicketDetail extends Ticket {
   /** Contract status over the bead's own run (runContractStatus, same as the standalone chip), so
    * the dialog's Run affordance agrees with the approve gate instead of 422ing on click. */
   contract?: ContractStatus;
+  /**
+   * Whether a run actually reaches this ticket and holds on it — the same predicate
+   * `OperatorQueueItem.holdsRun` derives (PR #214 review), so this dialog's Mark done can withhold
+   * itself exactly where the operator queue's inline control already does. Absent/false for a run
+   * target itself (nothing holds it) and for a ticket whose target is itself `agent:human`
+   * (poisoned before dispatch, so no gate is ever armed under it).
+   */
+  holdsRun?: boolean;
 }
 
 // ── Board drag-and-drop ──

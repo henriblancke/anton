@@ -2,8 +2,9 @@
  * Real-bd route test for the human-work close (anton-fgqr). Boots a temp bd repo, points
  * getProjectBySlug at it, then drives the actual handler: POST closes an open `agent:human` bead as
  * done, and 409s everything this action must refuse — agent work, an already-settled bead, and open
- * work still underneath it. Skipped when `bd`/`git` aren't installed. Mirrors the abandon route
- * integration test.
+ * work still underneath it. The job runner is mocked — this asserts the cancel is REQUESTED for the
+ * right run target before the close is written, same as the abandon route integration test. Skipped
+ * when `bd`/`git` aren't installed. Mirrors the abandon route integration test.
  */
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
@@ -12,9 +13,17 @@ import { describeBd, makeBdRepo, paramsCtx, tmpProject, type BdRepo } from "@/li
 import type { Project, TicketDetail } from "@/lib/types";
 
 let project: Project | null = null;
+const cancelled: Array<[string, string]> = [];
 
 vi.mock("@/lib/projects", () => ({
   getProjectBySlug: async (slug: string) => (project && project.slug === slug ? project : null),
+}));
+
+vi.mock("@/lib/jobs/service", () => ({
+  cancelRunForTarget: async (projectId: string, epicBeadId: string) => {
+    cancelled.push([projectId, epicBeadId]);
+    return true;
+  },
 }));
 
 const { POST } = await import("./route");
@@ -37,9 +46,12 @@ describeBd("ticket close route (real bd)", () => {
   });
 
   // Every case creates its own beads, so a warm snapshot would leak a pre-write list between them.
-  beforeEach(() => resetIssueSnapshots());
+  beforeEach(() => {
+    resetIssueSnapshots();
+    cancelled.length = 0;
+  });
 
-  it("closes an open agent:human ticket as done", async () => {
+  it("closes an open agent:human ticket as done, cancelling any run still executing it first", async () => {
     const id = await beads.create(repo, {
       title: "Sign the contract",
       type: "task",
@@ -55,6 +67,7 @@ describeBd("ticket close route (real bd)", () => {
     const bead = await beads.show(repo, id);
     expect(bead.status).toBe("closed");
     expect(beads.isAbandoned(bead)).toBe(false);
+    expect(cancelled).toEqual([["proj-1", id]]);
   });
 
   it("409s work an agent run is expected to close instead", async () => {

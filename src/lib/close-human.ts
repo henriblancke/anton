@@ -6,7 +6,8 @@
  */
 import { beads, LABELS, type Bead } from "./beads/bd";
 import { withBeadWriteLock } from "./beads/claim-lock";
-import { openDescendants } from "./abandon";
+import { openDescendants, runTargetOf } from "./abandon";
+import { cancelRunForTarget } from "./jobs/service";
 import { nudgeSync } from "./beads/sync-nudge";
 import { freshDetail } from "./ticket-detail";
 import type { Project, TicketDetail } from "./types";
@@ -27,6 +28,13 @@ const messageOf = (e: unknown): string => (e instanceof Error ? e.message : Stri
  * — closing what is still open would either orphan it or silently claim it as done, and neither is
  * honest). Close the descendants first, or abandon them.
  *
+ * A run still executing this bead's target is killed FIRST, before the close is written — the same
+ * order abandon uses and for the same reason: if the bead was relabelled `agent:human` after its
+ * agent had already started, closing it out from under that agent must not leave it free to keep
+ * committing toward a PR the board just called done. Machine-local, like every job cancel here: a
+ * run on another machine stops at its next lease/ticket boundary, where a closed ticket is skipped
+ * the same way an abandoned one is.
+ *
  * Throws on an unknown id (bd's own error → 404), a bead that isn't `agent:human` (→ 409 — an agent
  * run is expected to close it), an already-settled bead (→ 409), open work still under it (→ 409),
  * or a bead `bd close` itself refuses — e.g. one an open human gate still blocks (→ 409).
@@ -42,7 +50,9 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
     }
     assertOpen(bead, id);
 
-    const board = await beads.list(repo, ["--status", "all"]);
+    // --skip-labels (bd 1.1.0): openDescendants and runTargetOf only inspect parent, status and
+    // type, so label hydration on this read is dead weight (matches abandon.ts / epic-detail.ts).
+    const board = await beads.list(repo, ["--status", "all", "--skip-labels"]);
     const open = openDescendants(board, id);
     if (open.length > 0) {
       throw new NotCloseableError(
@@ -50,6 +60,8 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
           `abandon those first`,
       );
     }
+
+    await cancelRunForTarget(project.id, runTargetOf(bead, board));
 
     try {
       await beads.close(repo, id);

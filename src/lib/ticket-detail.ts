@@ -10,8 +10,10 @@ import { nudgeSync } from "./beads/sync-nudge";
 import { formatHumanNote, parseTicketNotes, type TicketNote } from "./beads/notes";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import {
+  boardCards,
   createdMeta,
   deriveStage,
+  isRunTicket,
   labelValue,
   parseAcceptance,
   parseGoal,
@@ -21,7 +23,21 @@ import { listAllBeads } from "./tickets";
 import type { Bead } from "./beads/bd";
 import type { Project, TicketDetail } from "./types";
 
-function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketDetail {
+/**
+ * The same `holdsRun` predicate `operatorQueue` derives (operator-queue.ts), pure over a board this
+ * caller already holds. FALSE for a run target itself (nothing holds it — it IS the work), and for a
+ * ticket whose nearest run-target ancestor is itself `agent:human`: execute-epic poisons that target
+ * before dispatching a single child, so no gate is ever armed under it (PR #214 review).
+ */
+function holdsRunOf(bead: Bead, all: Bead[]): boolean {
+  if (beads.isRunTarget(bead, all)) return false;
+  const cards = boardCards(all);
+  if (!isRunTicket(bead, cards)) return false;
+  const target = all.find((b) => b.id === cards.cardOf(bead));
+  return target ? !beads.isHumanWork(target) : false;
+}
+
+function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined, all: Bead[]): TicketDetail {
   return {
     id: lite.id,
     title: lite.title,
@@ -50,6 +66,7 @@ function toTicketDetail(lite: Bead, full: Bead, epic: Bead | undefined): TicketD
     // button posts to the approve route, and gating on the bead alone (contractStatusOf) would
     // withhold the closed-PR Force run the gate permits on an in-review legacy standalone.
     contract: runContractStatus(full, []),
+    holdsRun: holdsRunOf(lite, all),
   };
 }
 
@@ -62,9 +79,10 @@ async function withPrUrl(
   lite: Bead,
   full: Bead,
   epic: Bead | undefined,
+  all: Bead[],
 ): Promise<TicketDetail> {
   const base = await githubBaseUrl(project.repoPath);
-  return attachPrUrl(toTicketDetail(lite, full, epic), base);
+  return attachPrUrl(toTicketDetail(lite, full, epic, all), base);
 }
 
 /** Read a ticket's full detail off the board snapshot (stale-but-retained, so a GET never blocks). */
@@ -80,7 +98,7 @@ export async function getTicketDetail(project: Project, id: string): Promise<Tic
 
   const parentId = parentOf(lite);
   const epic = parentId ? all.find((b) => b.id === parentId) : undefined;
-  return withPrUrl(project, lite, full, epic);
+  return withPrUrl(project, lite, full, epic, all);
 }
 
 /**
@@ -94,15 +112,18 @@ export async function getTicketDetail(project: Project, id: string): Promise<Tic
  * queued behind the Dolt lock — on the save request's critical path for two header fields that the
  * write cannot have changed. `blockOnPendingWrite: false` serves the retained board and kicks the
  * post-write refresh in the background, which is the very load that next poll then shares.
+ *
+ * A parentless bead skips the board read entirely (anton-0zih's zero-spawn invariant): `holdsRunOf`
+ * only needs siblings/ancestors to walk `cardOf`'s parent chain, and a bead with no parent has none
+ * to walk — its own classification (parentless task/bug is trivially a run target; anything else
+ * classifies as no card) never depends on the rest of the board.
  */
 export async function freshDetail(project: Project, bead: Bead): Promise<TicketDetail> {
   const parentId = parentOf(bead);
-  const epic = parentId
-    ? (await allIssues(project.repoPath, { blockOnPendingWrite: false })).find(
-        (b) => b.id === parentId,
-      )
-    : undefined;
-  return withPrUrl(project, bead, bead, epic);
+  if (!parentId) return withPrUrl(project, bead, bead, undefined, [bead]);
+  const all = await allIssues(project.repoPath, { blockOnPendingWrite: false });
+  const epic = all.find((b) => b.id === parentId);
+  return withPrUrl(project, bead, bead, epic, all);
 }
 
 /**
