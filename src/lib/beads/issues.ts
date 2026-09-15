@@ -327,9 +327,15 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
   // evidence would still never see a fresh token for the one recovery that happens to land through
   // this exact race.
   if (opts.withCycles && cycleEvidenceFor(board) === undefined) {
-    const cycles = await fetchCyclesShared(cwd, issueSnapshotGeneration(cwd));
-    attachCycleEvidence(board, cycles);
-    markCycleEvidenceRecovered(cwd);
+    // Keyed and guarded by `boardGeneration`, not a fresh `issueSnapshotGeneration(cwd)` read here
+    // (PR #274 review, round 15): the snapshot can move again while this fetch is in flight, and a
+    // fresh read at either point would key the shared fetch to — or stamp its result onto `board`
+    // under — a generation that no longer describes the graph `cycles` was actually fetched for.
+    const cycles = await fetchCyclesShared(cwd, boardGeneration);
+    if (issueSnapshotGeneration(cwd) === boardGeneration) {
+      attachCycleEvidence(board, cycles);
+      markCycleEvidenceRecovered(cwd);
+    }
   }
   // Same race, for gates (PR #274 review): `refreshIssueSnapshot`'s single-flight is loader-blind, so
   // a concurrent `probeAllIssues` already in flight when this call lands can win the race and hand
