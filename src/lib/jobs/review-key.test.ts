@@ -145,6 +145,19 @@ describe("computeReviewKey", () => {
     expect(b.fingerprint).not.toBe(a.fingerprint);
   });
 
+  it("changes the fingerprint when a verify-gate command is added, even with the tree and contract unchanged", async () => {
+    const a = await computeReviewKey({ worktreePath: projectDir, baseBranch: BASE, settings: {}, ...FIXED });
+    const b = await computeReviewKey({
+      worktreePath: projectDir,
+      baseBranch: BASE,
+      settings: { testCommand: "npm test" },
+      ...FIXED,
+    });
+    expect(b.baseRev).toBe(a.baseRev);
+    expect(b.head).toBe(a.head);
+    expect(b.fingerprint).not.toBe(a.fingerprint);
+  });
+
   it("changes the fingerprint — never the base or the tip — when a ticket's Acceptance changes", async () => {
     const before = bead({ id: "anton-2", description: "## Acceptance Criteria\n\n- [ ] old criterion\n" });
     const after = bead({ id: "anton-2", description: "## Acceptance Criteria\n\n- [ ] NEW criterion\n" });

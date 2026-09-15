@@ -9,11 +9,14 @@
  *  - the branch tip — `readWorktreeState`'s HEAD, moved by any added, amended, or reset commit;
  *  - a hash of everything else `buildReviewPrompt` bakes into what the reviewer actually reads: the
  *    resolved reviewer contract, the `resolveReviewConfig` fields that shape the verdict (`enabled`,
- *    `maxRounds`, `scoreAlarm`), the target and ticket contracts (title, Goal/Acceptance/Out of
- *    scope/Verify), which `step:review` occurrence this is — since a formula may name the step more
- *    than once (review-gate.ts) and each is its own independent gate — and the advisories carried
- *    INTO this gate: a later `step:review` is handed the still-open advisories an earlier one in the
- *    same formula left off (`buildReviewPrompt`'s `carriedAdvisories`), and the run row keeps only the
+ *    `maxRounds`, `scoreAlarm`), the `resolveVerifyGates` commands `runReviewSession` runs as evidence
+ *    for the reviewer (review-gate.ts) — a project that adds or edits `testCommand`, `lintCommand`,
+ *    `typecheckCommand`, or `buildCommand` after a clean verdict must not have a resume skip the newly
+ *    required gate — the target and ticket contracts (title, Goal/Acceptance/Out of scope/Verify),
+ *    which `step:review` occurrence this is — since a formula may name the step more than once
+ *    (review-gate.ts) and each is its own independent gate — and the advisories carried INTO this
+ *    gate: a later `step:review` is handed the still-open advisories an earlier one in the same
+ *    formula left off (`buildReviewPrompt`'s `carriedAdvisories`), and the run row keeps only the
  *    latest clean key, so a resumed earlier gate that reruns and produces a different carry must not
  *    let a stale key for the later gate go on matching it.
  *
@@ -27,7 +30,7 @@ import { createHash } from "node:crypto";
 import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../beads/contract";
 import type { Bead } from "../beads/types";
 import { readWorktreeState, resolveMergeBase } from "../git/ops";
-import { resolveReviewConfig, type ProjectSettings, type ReviewConfig } from "../projects";
+import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings, type ReviewConfig, type VerifyGate } from "../projects";
 import { resolveReviewerContract, type ReviewFinding, type ReviewerSource } from "./review-context";
 
 export interface ReviewKey {
@@ -66,11 +69,12 @@ function fingerprintContract(args: {
   reviewer: ReviewerSource;
   reasoning: string;
   config: ReviewConfig;
+  verifyGates: VerifyGate[];
   stepId: string;
   contracts: string;
   carriedAdvisories: ReviewFinding[];
 }): string {
-  const { reviewer, reasoning, config, stepId, contracts, carriedAdvisories } = args;
+  const { reviewer, reasoning, config, verifyGates, stepId, contracts, carriedAdvisories } = args;
   return createHash("sha256")
     .update(
       JSON.stringify({
@@ -79,6 +83,7 @@ function fingerprintContract(args: {
         enabled: config.enabled,
         maxRounds: config.maxRounds,
         scoreAlarm: config.scoreAlarm,
+        verifyGates,
         stepId,
         contracts,
         carriedAdvisories,
@@ -117,12 +122,13 @@ export async function computeReviewKey(args: {
     readWorktreeState(worktreePath),
   ]);
   const config = resolveReviewConfig(settings);
+  const verifyGates = resolveVerifyGates(settings);
   const { reasoning, reviewer } = await resolveReviewerContract(settings, worktreePath, baseRev);
   const contracts = fingerprintBeads(target, tickets);
   return {
     baseRev,
     head: state.head,
-    fingerprint: fingerprintContract({ reviewer, reasoning, config, stepId, contracts, carriedAdvisories }),
+    fingerprint: fingerprintContract({ reviewer, reasoning, config, verifyGates, stepId, contracts, carriedAdvisories }),
   };
 }
 
