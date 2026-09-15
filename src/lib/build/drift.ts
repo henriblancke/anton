@@ -136,8 +136,13 @@ function appRoot(): string | null {
  * This install's anton.db path — resolved exactly as `getDb` resolves it, so the record lands beside
  * it. Null only when the cwd was already gone before this module ever loaded and no `ANTON_DB` names
  * the state dir; there is nothing left to read a record from in that case.
+ *
+ * Exported because the schema half of the freshness verdict (jobs/self-freshness) must ask about the
+ * SAME database the running process uses (anton-sm1l). Resolving it there independently is how the
+ * two drift: this one survives an `anton update` that deleted the cwd out from under the process,
+ * which a bare `process.cwd()` does not.
  */
-function dbPath(): string | null {
+export function antonDbPath(): string | null {
   if (process.env.ANTON_DB) return process.env.ANTON_DB;
   const root = appRoot();
   return root ? join(root, "anton.db") : null;
@@ -290,7 +295,7 @@ export function recordServerBuild({
 }): void {
   const identity = bootIdentity();
   (globalThis as unknown as Record<symbol, Boot>)[BOOT_KEY] = { identity, runner, dependencies };
-  const db = dbPath();
+  const db = antonDbPath();
   if (!db) return;
   writeBuildRecord(buildRecordPath(db), identity, { appRoot: appRoot(), runner, dependencies });
   pruneBuildRecords(db);
@@ -416,7 +421,7 @@ function bootedAtOf(record: { bootedAt?: unknown } | null | undefined): number |
 }
 
 export function serverBuildDrift({ fresh = false }: { fresh?: boolean } = {}): BuildDrift | null {
-  const db = dbPath();
+  const db = antonDbPath();
   const record = db ? (readBuildRecord(buildRecordPath(db)) as (BuildIdentity & { bootedAt?: unknown }) | null) : null;
   const running = record ?? booted()?.identity ?? null;
   if (!running) return null;
@@ -539,7 +544,7 @@ export function selfBootDependencies(): string | null {
  * the runner could not establish one: an absence is not evidence, so the reader claims nothing.
  */
 export async function runnerBootDependencies(): Promise<string | null> {
-  const db = dbPath();
+  const db = antonDbPath();
   const root = appRoot();
   const records: BuildRecord[] =
     db && root ? liveBuildRecords(db, root).map(({ record }: { record: BuildRecord }) => record) : [];
@@ -552,7 +557,7 @@ export async function runnerBootDependencies(): Promise<string | null> {
 }
 
 async function readServerDrifts(): Promise<ServerDrift[]> {
-  const db = dbPath();
+  const db = antonDbPath();
   const root = appRoot();
   const records: BuildRecord[] =
     db && root ? liveBuildRecords(db, root).map(({ record }: { record: BuildRecord }) => record) : [];

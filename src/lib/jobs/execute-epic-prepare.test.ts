@@ -201,6 +201,7 @@ beforeEach(() => {
     checkout: { state: "current" },
     dependencies: { state: "match" },
     build: { state: "current" },
+    schema: { state: "current" },
   });
   // No human work by default: nothing written, nothing adopted.
   preflightHumanTicketsMock.mockImplementation((args: { board: Bead[] }) =>
@@ -376,6 +377,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
       checkout: { state: "behind", behind: 3, upstream: "origin/main" },
       dependencies: { state: "match" },
       build: { state: "current" },
+      schema: { state: "current" },
     });
 
     const error = await refusalFrom(clean);
@@ -399,6 +401,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
       checkout: { state: "current" },
       dependencies: { state: "drift", packages: ["drizzle-orm", "next"] },
       build: { state: "current" },
+      schema: { state: "current" },
     });
 
     const error = await refusalFrom(clean);
@@ -417,6 +420,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
       checkout: { state: "current" },
       dependencies: { state: "match" },
       build: { state: "drifted", drift: "outdated" },
+      schema: { state: "current" },
     });
 
     const error = await refusalFrom(clean);
@@ -443,6 +447,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
       checkout: { state: "unreachable", reason: "connection refused" },
       dependencies: { state: "unknown", reason: "bun.lock could not be read" },
       build: { state: "current" },
+      schema: { state: "current" },
     });
 
     const prep = await prepareEpicRun(run(clean));
@@ -479,6 +484,7 @@ describe("assertPreStartPoisonIsFresh — a stale process does not park permanen
       checkout: { state: "behind", behind: 2, upstream: "origin/main" },
       dependencies: { state: "match" },
       build: { state: "current" },
+      schema: { state: "current" },
     });
 
     const error = await assertPreStartPoisonIsFresh(poison).then(
@@ -511,6 +517,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
         checkout: { state: "behind", behind: 2, upstream: "origin/main" },
         dependencies: { state: "match" },
         build: { state: "current" },
+        schema: { state: "current" },
       },
       ROOT,
     );
@@ -528,6 +535,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
         checkout: { state: "current" },
         dependencies: { state: "drift", packages: ["left-pad"] },
         build: { state: "current" },
+        schema: { state: "current" },
       },
       ROOT,
     );
@@ -544,6 +552,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
         checkout: { state: "current" },
         dependencies: { state: "match" },
         build: { state: "drifted", drift: "outdated" },
+        schema: { state: "current" },
       },
       ROOT,
     );
@@ -560,6 +569,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
         checkout: { state: "current" },
         dependencies: { state: "replaced" },
         build: { state: "current" },
+        schema: { state: "current" },
       },
       ROOT,
     );
@@ -574,6 +584,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
         checkout: { state: "behind", behind: 1, upstream: "origin/main" },
         dependencies: { state: "drift", packages: ["next"] },
         build: { state: "current" },
+        schema: { state: "current" },
       },
       ROOT,
     );
@@ -589,6 +600,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
           checkout: { state: "current" },
           dependencies: { state: "match" },
           build: { state: "current" },
+          schema: { state: "current" },
         },
         ROOT,
       ),
@@ -602,6 +614,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
           checkout: { state: "no-upstream" },
           dependencies: { state: "unknown", reason: "x" },
           build: { state: "current" },
+          schema: { state: "current" },
         },
         ROOT,
       ),
@@ -612,6 +625,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
           checkout: { state: "unreachable", reason: "x" },
           dependencies: { state: "match" },
           build: { state: "current" },
+          schema: { state: "current" },
         },
         ROOT,
       ),
@@ -624,6 +638,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
           checkout: { state: "current" },
           dependencies: { state: "match" },
           build: { state: "unknown", reason: "lsof: command not found" },
+          schema: { state: "current" },
         },
         ROOT,
       ),

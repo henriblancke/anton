@@ -259,6 +259,7 @@ describe("AutopilotBreakerHeader", () => {
             checkout: { state: "current" },
             dependencies: { state: "match" },
             build: { state: "current" },
+            schema: { state: "current" },
           })}
         />,
       );

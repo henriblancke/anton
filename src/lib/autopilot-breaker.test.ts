@@ -14,6 +14,7 @@ function freshness(o: Partial<SelfFreshness> = {}): SelfFreshness {
     checkout: { state: "current" },
     dependencies: { state: "match" },
     build: { state: "current" },
+    schema: { state: "current" },
     ...o,
   };
 }
