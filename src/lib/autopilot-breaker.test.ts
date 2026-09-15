@@ -101,6 +101,20 @@ describe("staleBreaker", () => {
     ]);
   });
 
+  // `bun run db:migrate` invokes drizzle-kit, a devDep `scripts/build-bundle.mjs` deliberately never
+  // ships — a release bundle applies its migrations in-process on every `anton start` instead, so its
+  // remedy is the restart the card's other halves already prescribe (PR #281 review).
+  it("names a bundle-compatible remedy for pending migrations when isBundle is set", () => {
+    const stale = staleBreaker(
+      freshness({ schema: { state: "pending", migrations: ["0038_add_base_fork_sha.sql"] } }),
+      { isBundle: true },
+    );
+    expect(stale?.evidence).toEqual([
+      "anton.db has pending migration (0038_add_base_fork_sha.sql) — restart anton " +
+        "(`anton stop` && `anton start`) to apply them",
+    ]);
+  });
+
   it("clears for every process at once — no restart to wait for, unlike the other latched halves", () => {
     const stale = staleBreaker(
       freshness({

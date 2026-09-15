@@ -69,7 +69,7 @@ import {
   StaleCheckoutError,
 } from "./errors";
 import { cacheGeneration } from "../build/drift";
-import { selfCheckoutRefusal } from "./execute-epic-freshness";
+import { schemaFreshRefusal, selfCheckoutRefusal } from "./execute-epic-freshness";
 import { PollingLoop } from "./polling-loop";
 import {
   JOB_TYPE_TIER,
@@ -668,13 +668,25 @@ export class JobRunner {
    * outgrew. A verdict whose generation no longer matches the current one is treated as expired
    * exactly like one past its TTL, not specially invalidated — so `staleCheckoutHold` has one reuse
    * condition, not two.
+   *
+   * `inFlight` covers the read itself (PR #281 review): `at` is stamped to the SETTLE time, not the
+   * start, so a caller arriving after `staleCheckoutVerdictMs` has elapsed since the read STARTED —
+   * but before a slow read (a `git fetch` under load) has settled — must still join the one already
+   * running rather than reading `at` as expired and firing a second, fully redundant read. The TTL
+   * check only applies once `inFlight` clears.
    */
-  private staleVerdict: { at: number; generation: number; pass: Promise<string | undefined> } | null =
-    null;
+  private staleVerdict: {
+    at: number;
+    generation: number;
+    inFlight: boolean;
+    pass: Promise<string | undefined>;
+  } | null = null;
   private readonly readUsage: () => Promise<ClaudeUsage | null>;
   private readonly readUsageFresh: () => Promise<ClaudeUsage | null>;
   /** Last logged value-gate hold set (sorted ids) — logs only on change, not every 2s tick. */
   private valueHoldLogKey = "";
+  /** Whether the tick-level schema gate already logged its current stale verdict — same reasoning. */
+  private tickSchemaStaleLogged = false;
 
   /**
    * Monotonic dispatch counter per meter — lets a burn window detect that another job on the SAME
@@ -1016,6 +1028,29 @@ export class JobRunner {
   async tickOnce(): Promise<number> {
     const capacity = this.config.maxConcurrent - this.inFlight.size;
     if (capacity <= 0) return 0;
+
+    // Schema-freshness gate, ahead of every schema-dependent read this tick makes (PR #281 review).
+    // `leaseDue`'s full-row `.select()`/`.returning()` and the policy resolver's per-project reads
+    // below all use the CURRENT Drizzle schema, so a pending migration that changed the `jobs` table
+    // breaks them with a hard "no such column" before `processJob`'s per-job gate is ever reached.
+    // Unlike that per-job gate, this one is NOT skipped for execute-epic: the crash lives in the
+    // QUEUE query itself, which leases every type through the same statement, so no type can be
+    // exempted from it — execute-epic keeps its own separate schema guard ahead of `beginEpicRun`
+    // (`assertSchemaFreshBeforeEpicStart`, anton-sm1l) for the race where a migration lands between
+    // this check and that job's handler running. Schema-only, not the full stale-checkout verdict:
+    // the checkout/dependency/build halves stay behind `staleCheckoutHold`'s per-job gate, which
+    // execute-epic IS exempt from, so an already-complete run can still settle idempotently. No job
+    // is leased when schema is stale, so there is nothing to refund or reschedule — the still-due
+    // rows stay queued and this same cheap, local, uncached read runs again next tick.
+    const schemaStale = schemaFreshRefusal();
+    if (schemaStale) {
+      if (!this.tickSchemaStaleLogged) {
+        this.tickSchemaStaleLogged = true;
+        this.log.error(`tick skipped, dispatching would break on it: ${schemaStale}`);
+      }
+      return 0;
+    }
+    this.tickSchemaStaleLogged = false;
 
     // Schedule master-switch (anton-7l7): a DISABLED schedule caps its jobs at 0, so an
     // already-queued or backoff/quota-rescheduled review-fix (or any scheduled type) is NOT leased
@@ -1682,28 +1717,41 @@ export class JobRunner {
    * never answered is the {@link staleCheckoutRefusal} rule (an offline runner is not a stale one),
    * and a gate that grounded every job on its own failure would be a worse outage than the one it
    * guards against.
+   *
+   * Schema is checked FRESH on every call, ahead of and independent from that cached window (PR #281
+   * review): {@link schemaFreshRefusal} is a synchronous, LOCAL read of two small bookkeeping tables —
+   * far cheaper than the checkout half's `git fetch` — and unlike that fetch it has no invalidation
+   * path an external actor can trip. `checkoutMoved` (the only production caller bumping
+   * `cacheGeneration()`) fires from anton's OWN scheduled pull; an operator running `git pull` by hand
+   * leaves the generation untouched, so a schema answer folded into the cached window could reuse a
+   * clean verdict for up to `staleCheckoutVerdictMs` after that pull added a migration this process
+   * hasn't applied. Reading it uncached every time removes that gap entirely rather than shrinking it.
    */
   private async staleCheckoutHold(): Promise<string | undefined> {
+    const schemaStale = schemaFreshRefusal();
+    if (schemaStale) return schemaStale;
+
     const held = this.staleVerdict;
     const generation = cacheGeneration();
-    // A verdict inside the window is reused — settled or still in flight, so the jobs of one tick
-    // share a single read rather than starting a fetch each — but only while the checkout hasn't
-    // moved since it was taken. `checkoutMoved` bumping the generation retires it early for the same
-    // reason a `build/drift` reader would drop its own cache on the same signal: a verdict answered
-    // before the pull says nothing about the schema (or checkout, or build) the pull just changed.
-    if (
-      held &&
-      held.generation === generation &&
-      this.clock.now() - held.at < this.config.staleCheckoutVerdictMs
-    ) {
-      return await held.pass;
+    // A verdict inside the window is reused — settled or still in flight — but only while the
+    // checkout hasn't moved since it was taken. `checkoutMoved` bumping the generation retires it
+    // early for the same reason a `build/drift` reader would drop its own cache on the same signal: a
+    // verdict answered before the pull says nothing about the checkout (or build) the pull just
+    // changed. `held.inFlight` is checked BEFORE the TTL, not folded into the same comparison: `at`
+    // only advances to the settle time in the `finally` below, so while the read is still running it
+    // keeps reading the START time — a read slower than `staleCheckoutVerdictMs` (a `git fetch` under
+    // load) would otherwise look expired to a caller arriving mid-read, sending it off to start a
+    // second, fully redundant read instead of joining the one already in flight.
+    if (held && held.generation === generation) {
+      if (held.inFlight) return await held.pass;
+      if (this.clock.now() - held.at < this.config.staleCheckoutVerdictMs) return await held.pass;
     }
 
     const pass = this.readSelfCheckoutRefusal().catch((e) => {
       this.log.error("self-freshness read failed; dispatching anyway", e);
       return undefined;
     });
-    const entry = { at: this.clock.now(), generation, pass };
+    const entry = { at: this.clock.now(), generation, inFlight: true, pass };
     this.staleVerdict = entry;
     try {
       return await pass;
@@ -1714,6 +1762,7 @@ export class JobRunner {
       // this call armed: a concurrent caller whose window lapsed mid-read may have replaced the
       // field, and returning that instead would block this job on an unrelated later read.
       entry.at = this.clock.now();
+      entry.inFlight = false;
     }
   }
 

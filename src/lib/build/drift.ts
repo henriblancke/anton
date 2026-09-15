@@ -631,4 +631,4 @@ function runsJobs(record: BuildRecord): boolean | undefined {
   return typeof record.runner === "boolean" ? record.runner : undefined;
 }
 
-export { describeBuildDrift, describeBuildIdentity };
+export { describeBuildDrift, describeBuildIdentity, isBundleInstall };

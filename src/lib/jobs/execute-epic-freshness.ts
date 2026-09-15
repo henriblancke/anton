@@ -43,6 +43,29 @@ export async function assertSelfCheckoutFresh(): Promise<void> {
 }
 
 /**
+ * The schema half's refusal alone, as a value (PR #281 review) — what a caller that cannot afford
+ * the checkout/dependency/build halves' network fetch and lockfile read needs. Unlike those three,
+ * schema is a synchronous, LOCAL read of two small bookkeeping tables, so it carries no caching
+ * contract of its own: a caller wanting the schema answer fresh on every ask (the runner's dispatch
+ * gate, PR #281 review) can call this directly instead of paying for — or trusting the cache window
+ * of — the full {@link checkSelfFreshness} pass.
+ *
+ * Extracted so a throwing caller ({@link assertSchemaFreshBeforeEpicStart}) and a value caller share
+ * one message rather than assembling their own `SelfFreshness` shape and drifting apart.
+ */
+export function schemaFreshRefusal(root: string = selfRepoRoot()): string | undefined {
+  return staleCheckoutRefusal(
+    {
+      checkout: { state: "current" },
+      dependencies: { state: "match" },
+      build: { state: "current" },
+      schema: schemaFreshness(root),
+    },
+    root,
+  );
+}
+
+/**
  * Step -1. Refuse to start `execute-epic` when `anton.db` has migrations the checkout carries but
  * has not applied (anton-sm1l / PR #281 review) — asked BEFORE `beginEpicRun`, unlike the rest of
  * this gate.
@@ -62,16 +85,7 @@ export async function assertSelfCheckoutFresh(): Promise<void> {
  * pass.
  */
 export function assertSchemaFreshBeforeEpicStart(): void {
-  const root = selfRepoRoot();
-  const refusal = staleCheckoutRefusal(
-    {
-      checkout: { state: "current" },
-      dependencies: { state: "match" },
-      build: { state: "current" },
-      schema: schemaFreshness(root),
-    },
-    root,
-  );
+  const refusal = schemaFreshRefusal();
   if (refusal) throw new StaleCheckoutError(refusal);
 }
 

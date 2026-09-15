@@ -209,8 +209,19 @@ function commits(n: number): string {
  *
  * The counterpart of the run-side `staleCheckoutRefusal` (jobs/execute-epic-freshness.ts): the same
  * halves, phrased for a card (detail + per-half evidence with its command) rather than a park line.
+ *
+ * `isBundle` picks the schema remedy (PR #281 review): `bun run db:migrate` is only executable in a
+ * source checkout — `scripts/build-bundle.mjs` ships no `drizzle-kit` devDep, so a release bundle has
+ * no `bun run` for it to invoke at all. A bundle install instead applies pending migrations
+ * in-process on every `anton start` (including the daemon's own startup), so its remedy is the
+ * restart every other latched half on this card already asks for, not a source-only script. The
+ * caller passes it rather than this module reading the filesystem itself, keeping this a pure
+ * function of its inputs.
  */
-export function staleBreaker(freshness: SelfFreshness): AutopilotStale | undefined {
+export function staleBreaker(
+  freshness: SelfFreshness,
+  { isBundle = false }: { isBundle?: boolean } = {},
+): AutopilotStale | undefined {
   const behind: string[] = [];
   const evidence: string[] = [];
 
@@ -254,8 +265,10 @@ export function staleBreaker(freshness: SelfFreshness): AutopilotStale | undefin
     const many = migrations.length !== 1;
     behind.push(`${migrations.length} pending migration${many ? "s" : ""}`);
     evidence.push(
-      `anton.db has pending migration${many ? "s" : ""} (${migrations.join(", ")}) — run ` +
-        "`bun run db:migrate`",
+      `anton.db has pending migration${many ? "s" : ""} (${migrations.join(", ")}) — ` +
+        (isBundle
+          ? "restart anton (`anton stop` && `anton start`) to apply them"
+          : "run `bun run db:migrate`"),
     );
   }
 
