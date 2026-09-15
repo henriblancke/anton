@@ -54,6 +54,32 @@ describe("composeSystemPrompt", () => {
   it("throws when the base is empty", () => {
     expect(() => composeSystemPrompt({ base: "  " })).toThrow(/base is required/);
   });
+
+  // PR #284 review: a board-only ticket's deliverable is bd writes, never a git diff, so the base's
+  // "never report delivered on an unchanged tree" rule — written for the tree-based ticket it always
+  // used to be — leaves a compliant agent no outcome but a false `blocked`. The carve-out rides ahead
+  // of the agent/seed layers since it is a fact about THIS run's classification, not a customization.
+  it("adds the board-only carve-out ahead of the agent/seed layers when boardOnly is set", () => {
+    const out = composeSystemPrompt({
+      base,
+      agentPrompt: "AGENT: nextjs specialist",
+      seedPrompt: "SEED: prefer server components",
+      boardOnly: true,
+    });
+    expect(out).toContain("This ticket is board-only");
+    expect(out).toContain("ANTON-RESULT: delivered");
+    expect(out.toLowerCase()).toContain("unchanged");
+    const iBase = out.indexOf("BASE CONTRACT");
+    const iBoardOnly = out.indexOf("This ticket is board-only");
+    const iAgent = out.indexOf("AGENT: nextjs");
+    expect(iBase).toBeLessThan(iBoardOnly);
+    expect(iBoardOnly).toBeLessThan(iAgent);
+  });
+
+  it("omits the board-only carve-out when boardOnly is not set", () => {
+    const out = composeSystemPrompt({ base });
+    expect(out).not.toContain("This ticket is board-only");
+  });
 });
 
 describe("loadBaseSystemPrompt (real file)", () => {

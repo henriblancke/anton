@@ -232,6 +232,16 @@ export interface BoardEvidenceResult {
  * The result then reports `markerUnpersisted: true` (PR #284 review round 5) rather than the found
  * evidence it still carries: an unset marker is exactly the state this attempt cannot safely build
  * on top of, so the caller stops here instead of treating found-and-synced as a settled verdict.
+ *
+ * The marker is written BEFORE the confirming push, not after (PR #284 review round 7). On a
+ * non-server Dolt board, `beads.push` is what makes any LOCAL write visible to another machine — so
+ * a push taken before the marker exists confirms only the content edits, never the marker itself. A
+ * process or machine death in the gap between that push and the marker write would leave another
+ * machine's next pull seeing the content edits (already synced) folded into its fresh baseline as
+ * pre-existing state — nothing to diff — with no pending marker to say those ids belong to this
+ * ticket's delivery: the exact stranding {@link clearBoardEvidencePending}'s docs warn about, just
+ * one push earlier. Writing the marker first and pushing once after means the same push confirms
+ * both together.
  */
 export async function readBoardEvidence(
   repo: string,
@@ -247,15 +257,28 @@ export async function readBoardEvidence(
   const pending = beads.pendingBoardEvidence(ticket);
   const ids = [...new Set([...pending, ...freshIds])].toSorted();
   if (ids.length === 0) return { found: false, ids: [], synced: false };
-  const outcome = await beads.push(repo).catch(() => "not-wired" as const);
-  const synced = outcome === "synced" || outcome === "shared-server";
   const stale = beads.boardEvidencePendingLabels(ticket);
   if (stale.length !== 1 || stale[0] !== LABELS.boardEvidencePending(ids)) {
     const persisted = await mustPersist(() =>
       beads.setBoardEvidencePending(repo, ticket.id, ids, stale),
     );
-    if (!persisted) return { found: true, ids, synced, markerUnpersisted: true };
+    if (!persisted) {
+      // The marker never made it onto the board at all, so there is nothing new for the push below
+      // to cover — but the content edits still might be, and the caller's message distinguishes
+      // `markerUnpersisted` from `!synced` regardless of this value, so it is still worth reporting.
+      const outcome = await beads.push(repo).catch(() => "not-wired" as const);
+      return {
+        found: true,
+        ids,
+        synced: outcome === "synced" || outcome === "shared-server",
+        markerUnpersisted: true,
+      };
+    }
   }
+  // One push, after the marker (if any) is on the board, so it is the confirming sync for both the
+  // content edits and the recovery marker together.
+  const outcome = await beads.push(repo).catch(() => "not-wired" as const);
+  const synced = outcome === "synced" || outcome === "shared-server";
   return { found: true, ids, synced };
 }
 

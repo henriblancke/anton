@@ -243,6 +243,29 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     expect(result).toEqual({ found: true, ids: ["a"], synced: true });
   });
 
+  it(
+    "writes the pending marker BEFORE the confirming push, not after (PR #284 review round 7) — on " +
+      "a non-server Dolt board the push is what makes a local write visible to another machine, so " +
+      "a push taken first would confirm the content edits without ever covering the recovery marker",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      const order: string[] = [];
+      setBoardEvidencePendingMock.mockImplementationOnce(() => {
+        order.push("marker");
+        return Promise.resolve("");
+      });
+      pushMock.mockImplementationOnce(() => {
+        order.push("push");
+        return Promise.resolve("synced");
+      });
+      const result = await readBoardEvidence("/repo", baseline, ticket);
+      expect(result).toEqual({ found: true, ids: ["a"], synced: true });
+      expect(order).toEqual(["marker", "push"]);
+    },
+  );
+
   it("reports found on a shared Dolt server too — propagation is inherent there", async () => {
     loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
     const baseline = (await readBoardBaseline("/repo"))!;

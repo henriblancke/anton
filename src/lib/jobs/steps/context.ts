@@ -131,6 +131,17 @@ export interface StepContext {
    * falls back to the index alone, which is exactly the behaviour that predates this field.
    */
   ticketStartHead?: string;
+  /**
+   * Whether THIS ticket's delivery is board-only ({@link
+   * import("../execute-epic-board-evidence").isBoardOnlyRun}), decided once by {@link
+   * import("../execute-epic-ticket").runTicket} and carried through so a dispatching step (`step:
+   * implement`, `step:claude`) can tell the agent its outcome-reporting rule is different for this
+   * ticket (anton-fc5x PR #284 review) — see {@link
+   * import("../../claude/system-prompt").SystemPromptLayers.boardOnly}. Absent (not just false) for
+   * a caller invoking a handler directly, or a run-phase context spanning more than one ticket,
+   * where "board-only" is not one ticket's fact to carry.
+   */
+  boardOnly?: boolean;
   /** Re-assert the cross-machine run-lease; throws when it has lapsed (anton-jz1). */
   assertLeaseHeld?: () => void;
   /**

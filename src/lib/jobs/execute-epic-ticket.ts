@@ -108,7 +108,7 @@ export async function runTicket(args: {
   // ticket's zero-diff path stays exactly as cheap as it always was.
   const boardOnly = isBoardOnlyRun(run, ticket);
   const boardBaseline = boardOnly ? await readBoardBaseline(run.repoPath) : null;
-  const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline);
+  const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline, boardOnly);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
 
   try {
@@ -135,11 +135,25 @@ export async function runTicket(args: {
           : `${ticket.id}'s run was aborted while the delivery gate was reading the branch`,
       );
     }
-    const { closed } = await finishTicket(ticketCtx, ticket, session.sessionId, closeOnDone, settlement);
+    const { closed, transitioned } = await finishTicket(
+      ticketCtx,
+      ticket,
+      session.sessionId,
+      closeOnDone,
+      settlement,
+    );
     // The pending marker (anton-fc5x review round 4) is released only now — the whole handoff this
     // ticket's board evidence unblocked (attribution commit + close/in-review) has gone through
     // without throwing. See {@link clearBoardEvidencePending}.
-    if (progress.boardEvidenceIds) {
+    //
+    // Gated on `transitioned`, not just on the marker's presence (PR #284 review round 7): `closed`
+    // reads `false` for a standalone target's normal `stage:in-review` success, so an unconditional
+    // clear here released the marker on a bd write that may have been REFUSED — a child ticket whose
+    // board edits already landed would then have no pending ids for a later retry to prove delivery
+    // from. `transitioned` is the one answer that covers both the epic-child close and the standalone
+    // in-review move, and is true only when the write that ends this ticket's handoff actually
+    // landed.
+    if (progress.boardEvidenceIds && transitioned) {
       await clearBoardEvidencePending(run.repoPath, ticket.id, progress.boardEvidenceIds);
     }
     return { ...settlement, closed };
