@@ -48,6 +48,11 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("scope");
   });
 
+  it("classifies an 'unfenced' finding as fencing/TOCTOU even without a word boundary before 'fenc'", () => {
+    const note = "The unfenced lease read lets another worker replace the owner before update.";
+    expect(classifyFindingClass(finding(note))).toBe("fencing-toctou");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();
