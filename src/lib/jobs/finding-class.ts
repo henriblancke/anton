@@ -35,21 +35,36 @@ const WORK_LOSS_SIGNAL = `(?:${WORK_LOSS_SUBJECT}|${WORK_LOSS_RETRY})`;
 // way a comma does: "For each request: the first character is dropped" introduces a new clause
 // after the colon, so "request" can't bind across it to "is dropped".
 const CLAUSE_GAP = "[^,;:.'\\u2019\\u2013\\u2014]{0,30}?";
-const WORK_LOSS_PASSIVE = new RegExp(
-  `\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\b(?:is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))\\b` +
-    `|\\b(?:is (?:silently )?(?:discarded|lost|dropped)|silently drops?)\\b${CLAUSE_GAP}\\b${WORK_LOSS_SIGNAL}\\b`,
-  "i",
-);
+const WORK_LOSS_VERB_AFTER = "(?:is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))";
+const WORK_LOSS_OBJECT_AFTER = "(?:is (?:silently )?(?:discarded|lost|dropped)|silently drops?)";
+const WORK_LOSS_SUBJECT_FIRST = new RegExp(`\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\b${WORK_LOSS_VERB_AFTER}\\b`, "gi");
+const WORK_LOSS_VERB_FIRST = new RegExp(`\\b${WORK_LOSS_OBJECT_AFTER}\\b${CLAUSE_GAP}\\b${WORK_LOSS_SIGNAL}\\b`, "i");
+// A noun right after a preposition ("for each request", "in every batch") is that preposition's
+// object, not the loss verb's subject: "For each request the first character is dropped" must not
+// credit "request" as the lost value just because no punctuation sits between them. Tested against
+// the text immediately preceding the candidate subject.
+const WORK_LOSS_PREPOSITIONAL_OBJECT =
+  /\b(?:for|per|in|during|within|throughout|across|among|about|regarding|concerning|via|of|with|without|to|from|into|onto|upon)\s+(?:each|every|any|all|both|no|another|some|one|this|that|these|those|a|an|the|our|their|its|his|her|my|your)?\s*$/i;
 
 function matchesWorkLossPassive(note: string): boolean {
-  return WORK_LOSS_PASSIVE.test(note);
+  for (const match of note.matchAll(WORK_LOSS_SUBJECT_FIRST)) {
+    const index = match.index ?? 0;
+    const precedingText = note.slice(Math.max(0, index - 40), index);
+    if (!WORK_LOSS_PREPOSITIONAL_OBJECT.test(precedingText)) return true;
+  }
+  return WORK_LOSS_VERB_FIRST.test(note);
 }
+
+// Active "loses"/"lose" counts the same as the passive forms above, but only with a work-bearing
+// object right after it ("loses the job", "loses the queued job before it can be retried") — an
+// object-less "loses" says nothing about work loss on its own.
+const WORK_LOSS_ACTIVE = new RegExp(`\\bloses?\\b${CLAUSE_GAP}\\b(?:work|${WORK_LOSS_SIGNAL})\\b`, "i");
 
 function matchesWorkLoss(note: string): boolean {
   return (
-    /work.?loss|loses? (?:the )?work|never retried|unhandled rejection|work is lost|data loss/i.test(
-      note,
-    ) || matchesWorkLossPassive(note)
+    /work.?loss|never retried|unhandled rejection|work is lost|data loss/i.test(note) ||
+    WORK_LOSS_ACTIVE.test(note) ||
+    matchesWorkLossPassive(note)
   );
 }
 

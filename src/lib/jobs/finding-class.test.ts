@@ -196,6 +196,21 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("other");
   });
 
+  it("does not classify a parsing bug as work-loss when the work noun is only a preposition's object", () => {
+    const note = "For each request the first character is dropped when parsing a negative number.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies an active 'loses the job' finding as work-loss", () => {
+    const note = "The handler loses the job when processing throws, with no requeue and no log.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies an active 'loses the queued job' finding as work-loss", () => {
+    const note = "The error path loses the queued job before it can be retried.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
   it("does not classify unfenced Markdown as fencing/TOCTOU without ownership context", () => {
     const note = "The Markdown example is unfenced, so the prose renders as code instead of a code block.";
     expect(classifyFindingClass(finding(note))).toBe("other");
