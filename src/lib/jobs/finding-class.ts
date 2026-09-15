@@ -97,9 +97,26 @@ const WORK_LOSS_ACTIVE = new RegExp(
   "i",
 );
 
+// Bare "unhandled rejection" says nothing about lost *work* on its own — "this unhandled rejection
+// causes the endpoint to return 500 instead of the validation response" is a wrong-status-code bug,
+// not a dropped job. It only counts when a work-bearing noun or retry/requeue signal
+// (WORK_LOSS_SIGNAL) shares the same ~60-char window, the same gating the other loss matchers apply.
+const UNHANDLED_REJECTION = /\bunhandled rejections?\b/gi;
+const WORK_LOSS_SIGNAL_RE = new RegExp(`\\b${WORK_LOSS_SIGNAL}\\b`, "i");
+
+function matchesUnhandledRejection(note: string): boolean {
+  for (const match of note.matchAll(UNHANDLED_REJECTION)) {
+    const start = Math.max(0, match.index - 60);
+    const end = Math.min(note.length, match.index + match[0].length + 60);
+    if (WORK_LOSS_SIGNAL_RE.test(note.slice(start, end))) return true;
+  }
+  return false;
+}
+
 function matchesWorkLoss(note: string): boolean {
   return (
-    /work.?loss|never retried|unhandled rejection|work is lost/i.test(note) ||
+    /work.?loss|never retried|work is lost/i.test(note) ||
+    matchesUnhandledRejection(note) ||
     DATA_LOSS_CONTEXT.test(note) ||
     WORK_LOSS_ACTIVE.test(note) ||
     matchesWorkLossPassive(note)
@@ -138,6 +155,28 @@ function matchesFencingToctou(note: string): boolean {
  * than every match being weighed. Fencing/TOCTOU goes first as the audit's largest and highest-P1
  * class — the one a coarse taxonomy most needs to not misfile as something vaguer.
  */
+// Bare "cancel(s/ling/led/lation)" is as much ordinary prose ("this migration cancels the effect of
+// PR #200", "the transaction was canceled by the database after a constraint failure", "no way to
+// cancel the upload") as it is the cancellation-after-await race this class means to summarise — none
+// of those describe an await/signal race. So, like the bare `fenc(e/ing/ed)` word above, it only
+// counts when await/signal/request/run/caller-cancellation context appears within 60 chars — the
+// other alternatives below already carry that context in their own wording (abort-signal mentions,
+// "after the abort", an await adjacent to abort/aborted) and don't need the gate.
+const CANCEL_BARE = /\bcancell?(?:ations?|ing|ed|s)?\b/gi;
+const CANCEL_CONTEXT = /\b(?:awaits?|awaited|awaiting|signal|abortsignal|abortcontroller|requests?|caller|run|mid-?flight|in-?flight)\b/i;
+const CANCEL_REST =
+  /\bsignal\.aborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|orphaned (?:request|task|job)|\babort(?:s|ing)\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\babort(?:s|ing)\b|\baborted\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\baborted\b/i;
+
+function matchesCancellation(note: string): boolean {
+  if (CANCEL_REST.test(note)) return true;
+  for (const match of note.matchAll(CANCEL_BARE)) {
+    const start = Math.max(0, match.index - 60);
+    const end = Math.min(note.length, match.index + match[0].length + 60);
+    if (CANCEL_CONTEXT.test(note.slice(start, end))) return true;
+  }
+  return false;
+}
+
 const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher }> = [
   {
     klass: "fencing-toctou",
@@ -145,16 +184,7 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher 
   },
   {
     klass: "cancellation",
-    // \bcancell?(?:ations?|ing|ed|s)?\b covers both the noun/past-tense forms and the active
-    // verb forms ("cancels", "cancelling"/"canceling") reviewers actually write, across both
-    // single-L and double-L spellings. Active "abort(s|ing)" and past-tense "aborted" only count
-    // when "await" appears nearby in the same clause (no period between them), or (for "aborted")
-    // the literal "signal.aborted" API reference — an unqualified "abort"/"aborted" is as often an
-    // unrelated transaction/operation abort ("the transaction was aborted after the unique
-    // constraint failed") as it is cancellation, so it needs the await/signal context the other
-    // abort alternatives already carry via "after the abort" / "ignores the abort" / etc.
-    pattern:
-      /\bcancell?(?:ations?|ing|ed|s)?\b|\bsignal\.aborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|orphaned (?:request|task|job)|\babort(?:s|ing)\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\babort(?:s|ing)\b|\baborted\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\baborted\b/i,
+    pattern: matchesCancellation,
   },
   {
     klass: "fail-open",

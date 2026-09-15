@@ -101,6 +101,22 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("cancellation");
   });
 
+  it("does not classify a bare 'cancels' finding about an unrelated code change as cancellation", () => {
+    const note = "This migration cancels the effect of PR #200, reverting the retry backoff to its old value.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify a bare 'cancel' finding describing a missing UI affordance as cancellation", () => {
+    const note = "The button has no way to cancel the upload, so users are stuck waiting for it to finish.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify a bare 'canceled' transaction/error finding as cancellation", () => {
+    const note =
+      "The transaction was canceled by the database after a constraint failure, but the code reports success.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
   it("classifies a 'cancels' (active present-tense) finding as cancellation", () => {
     const note = "When the caller cancels the request, the handler keeps writing to the response anyway.";
     expect(classifyFindingClass(finding(note))).toBe("cancellation");
@@ -302,6 +318,16 @@ describe("classifyFindingClass", () => {
   it("does not classify a numeric-precision bug as work-loss when a work noun follows a semicolon", () => {
     const note = "Casting this bigint to number causes data loss; the job status remains correct.";
     expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify an unhandled rejection without work context as work-loss", () => {
+    const note = "This unhandled rejection causes the endpoint to return 500 instead of the validation response.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies an unhandled rejection with work context as work-loss", () => {
+    const note = "This unhandled rejection swallows the pending job update with no retry and no log.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
   });
 
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
