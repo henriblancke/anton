@@ -364,9 +364,19 @@ export async function withHostLock<T>(
     }
   };
   if (!(await write())) {
-    // Lost this acquisition to a reclaim before we could publish metadata for it. `dir` now belongs
-    // to a successor — never write into or retire it; just run unlocked, same as any other advisory
-    // fallback.
+    // write() also returns false when `dir` is still ours but the write itself failed outright (a
+    // transient I/O error on writeFile/rename, caught above) — not just when a reclaim already took
+    // `dir`. Left standing, that directory has no readable metadata and no heartbeat coming (we're
+    // about to fall back to running unlocked), so every peer would misjudge it as "maybe mid-write"
+    // for a full STALE_AFTER_MS before anyone could reclaim it. Retire it now, same identity/token
+    // check as the normal release below, so a reclaim by a successor never took `dir` out from under
+    // this check in the meantime.
+    if (await isOurDir()) {
+      const current = await readHolder(metaPath);
+      if (!current || current.token === token) {
+        await retire(dir, token);
+      }
+    }
     return fn();
   }
   // Keep the heartbeat fresh so a long-but-healthy hold is never mistaken for a crash. Unref'd so a

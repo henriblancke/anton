@@ -23,6 +23,7 @@ const {
   WRITE_VANISH_MARKER,
   RECREATE_MARKER,
   RETIRE_RACE_MARKER,
+  WRITE_FAIL_MARKER,
   SUCCESSOR_TOKEN,
   D2_TOKEN,
 } = vi.hoisted(() => ({
@@ -32,6 +33,7 @@ const {
   WRITE_VANISH_MARKER: "test-write-vanish",
   RECREATE_MARKER: "test-recreate-before-publish",
   RETIRE_RACE_MARKER: "test-retire-race",
+  WRITE_FAIL_MARKER: "test-write-fail",
   SUCCESSOR_TOKEN: "11111111-1111-4111-8111-111111111111",
   D2_TOKEN: "22222222-2222-4222-8222-222222222222",
 }));
@@ -137,6 +139,12 @@ vi.mock("node:fs/promises", async (importOriginal) => {
         const dir = path.slice(0, path.indexOf("/owner.json."));
         await actual.rename(dir, `${dir}.retired-recreate-race`);
         await actual.mkdir(dir);
+      }
+      // Fires on every metadata write for the write-fail test — simulates a transient I/O error
+      // (e.g. a full disk or an EIO) on the write itself, unlike the vanish/recreate cases above:
+      // `dir` is left standing, untouched, still owned by this acquisition.
+      if (typeof path === "string" && path.includes(WRITE_FAIL_MARKER) && path.endsWith(".tmp")) {
+        throw new Error("simulated transient write failure");
       }
       // @ts-expect-error -- forwarding whatever arguments the caller passed
       return actual.writeFile(path, ...rest);
@@ -443,6 +451,28 @@ describe("withHostLock", () => {
     ).resolves.toBeUndefined();
 
     expect(ran).toBe(true);
+  });
+
+  it("retires the lock dir when the initial publish fails outright with dir still ours", async () => {
+    const name = `${WRITE_FAIL_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // The injected writeFile() above throws on the initial metadata write without touching `dir`,
+    // simulating a transient I/O error rather than a reclaim race. Unlike the write-vanish case,
+    // `dir` is still standing and still ours when write() gives up — if it were left behind
+    // metadata-less and un-heartbeated, every peer would misjudge it as "maybe mid-write" and wait
+    // out the full stale window before anyone could reclaim it.
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // The live path must be gone — retired to a token-specific tombstone — rather than left standing
+    // metadata-less for peers to wait out.
+    await expect(stat(dir)).rejects.toThrow();
+    const siblings = await readdir(LOCK_ROOT);
+    expect(siblings.some((entry) => entry.startsWith(`${name}.retired-`))).toBe(true);
   });
 
   it("does not let a resumed writer publish into a successor's dir recreated before its first write", async () => {
