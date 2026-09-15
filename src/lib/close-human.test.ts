@@ -117,4 +117,21 @@ describe("closeHumanTicket", () => {
 
     await expect(closeHumanTicket(project, "target")).rejects.toThrow(NotCloseableError);
   });
+
+  it("does not refuse on an open molecule/gate hung under the target — pipeline plumbing, not open work", async () => {
+    // The poured-run shape (gate-molecule.integration.test.ts): a molecule root and its gate
+    // children sit open under the feature for as long as its run does. A feature relabelled
+    // agent:human mid-run must still be closeable rather than 409ing on its own run plumbing.
+    const target = makeBead({ id: "target", issue_type: "feature" });
+    const molecule = makeBead({ id: "mol-1", parent: "target", issue_type: "molecule", labels: [] });
+    const gate = makeBead({ id: "gate-1", parent: "mol-1", issue_type: "gate", labels: [] });
+    const board = [target, molecule, gate];
+    listMock.mockResolvedValue(board);
+    showMock.mockResolvedValueOnce(target).mockResolvedValueOnce({ ...target, status: "closed" });
+
+    await closeHumanTicket(project, "target");
+
+    expect(cancelRunMock).toHaveBeenCalledWith("p1", "target");
+    expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "target");
+  });
 });

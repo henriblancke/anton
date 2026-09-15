@@ -5,6 +5,7 @@
  * {@link abandonTicket}: this records a delivery — the work happened — not a won't-do.
  */
 import { beads, isBlockedByOpenIssues, LABELS, type Bead } from "./beads/bd";
+import { isPipelineArtifact } from "./beads/contract";
 import { loadAllIssues } from "./beads/issues";
 import { withBeadWriteLock } from "./beads/claim-lock";
 import { openDescendants, runTargetOf } from "./abandon";
@@ -71,7 +72,11 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
     // permanently even after `bd gate resolve`. strictGates: a stale gate read must fail this write
     // rather than silently degrade to that same false-open reading.
     const board = await loadAllIssues(repo, { strictGates: true });
-    const open = openDescendants(board, id);
+    // Pipeline plumbing (a poured `molecule` root, its `gate` children) is never user work — every
+    // other work surface holds it out through isPipelineArtifact, and this guard must too: a molecule
+    // hung under the feature stays open for as long as its run does, so counting it here would 409
+    // this route for the run's own lifetime, before cancelRunForTarget below ever gets to stop it.
+    const open = openDescendants(board, id).filter((b) => !isPipelineArtifact(b));
     if (open.length > 0) {
       throw new NotCloseableError(
         `${id} still has open work under it (${open.map((b) => b.id).join(", ")}) — close or ` +
