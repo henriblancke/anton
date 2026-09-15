@@ -101,6 +101,23 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
   });
 
+  it("classifies a lease-expiry ownership race as fencing/TOCTOU", () => {
+    const note =
+      "The lease can expire during this await, so ownership may transfer before this write lands, " +
+      "letting another worker's claim win the race.";
+    expect(classifyFindingClass(finding(note))).toBe("fencing-toctou");
+  });
+
+  it("does not classify generic error-path phrasing without a loss signal as work-loss", () => {
+    const note = "On the error path, the handler returns the wrong status code instead of a 500.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify a bare 'catch block swallows' mention without a loss signal as work-loss", () => {
+    const note = "The catch block swallows the exception but logs a misleading message about the cause.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
   it("classifies an unmatched finding as the single catch-all rather than throwing", () => {
     const note = "The variable name `tmp2` is unclear — rename it to something that says what it holds.";
     expect(() => classifyFindingClass(finding(note))).not.toThrow();

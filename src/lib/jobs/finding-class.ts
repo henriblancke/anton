@@ -23,7 +23,7 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: RegExp }
   {
     klass: "fencing-toctou",
     pattern:
-      /\btoctou\b|time-of-check|time of check|race condition|races? with|check-then-act|check then act|\b(?:un)?fenc(?:e|ing|ed)\b|fencing token|without (?:holding|acquiring) the lock|between the check and|stale (?:lease|read)|concurrent(?:ly)? (?:writ|modif|updat)|re-?reads? .{0,60}?before|reassert(?:s|ed|ing)? (?:the )?(?:claim|lock|lease|marker|ownership)|retired claim|final (?:fenc(?:e|ing)|lock|lease|claim|token|marker|ownership|guard)\s+await/i,
+      /\btoctou\b|time-of-check|time of check|race condition|races? with|check-then-act|check then act|\b(?:un)?fenc(?:e|ing|ed)\b|fencing token|without (?:holding|acquiring) the lock|between the check and|stale (?:lease|read)|concurrent(?:ly)? (?:writ|modif|updat)|re-?reads? .{0,60}?before|reassert(?:s|ed|ing)? (?:the )?(?:claim|lock|lease|marker|ownership)|retired claim|final (?:fenc(?:e|ing)|lock|lease|claim|token|marker|ownership|guard)\s+await|lease (?:can |could |may |might |will )?expir(?:e|es|ed|ing)|expir(?:e|es|ed|ing) .{0,60}?(?:lease|ownership|claim)|ownership (?:may |could |can |might |will )?(?:transfer|change|shift|reassign)/i,
   },
   {
     klass: "cancellation",
@@ -37,8 +37,11 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: RegExp }
   },
   {
     klass: "work-loss",
+    // Generic error-path phrasing ("on the error path", "catch block swallows") is deliberately
+    // excluded: it says nothing about loss on its own (e.g. "wrong status code on the error path"
+    // isn't work-loss), so this only fires on an accompanying loss/drop/retry signal.
     pattern:
-      /work.?loss|loses? (?:the )?work|(?:on the|in the) error path|silently drops?|is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when)|never retried|unhandled rejection|catch block swallows|work is lost|data loss/i,
+      /work.?loss|loses? (?:the )?work|silently drops?|is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when)|never retried|unhandled rejection|work is lost|data loss/i,
   },
   {
     klass: "scope",
