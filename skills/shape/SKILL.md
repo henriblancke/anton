@@ -251,6 +251,11 @@ const cardOf = (b) => {
 const runTickets = (featureId) => all.filter((b) =>
   !cardIds.has(b.id) && !pipeline.has(b.issue_type) && ticketTypes.has(b.issue_type) && cardOf(b) === featureId,
 );
+// The run target a blocker itself ships under — mirrors runTargetResolver in epic-graph.ts. A
+// blocker that IS a card (an external feature/leaf-epic) resolves to itself; a ticket blocker
+// resolves to its card; anything else (an unattributable id) falls back to the blocker's own id,
+// same as computeChildReadiness's `runTargetOf(blockerId) ?? blockerId`.
+const runTargetOf = (id) => (cardIds.has(id) ? id : cardOf(byId.get(id) ?? { id }) ?? id);
 const blockersOf = new Map();
 for (const bead of all) for (const edge of bead.dependencies ?? []) {
   if (edge.type !== "blocks") continue;
@@ -262,12 +267,19 @@ for (const bead of all) for (const edge of bead.dependencies ?? []) {
 // feature that depends on one of them — same shape as the computeEpicGraph blocked-children rollup
 // (epic-graph.ts), simplified to "closed" for done (this audit runs on freshly shaped work, so a
 // merged-but-not-closed distinction does not arise).
+//
+// A blocker outside this feature is judged by its OWN run target, not its own status (PR #274
+// review): a closed ticket that belongs to another feature whose PR hasn't merged has not shipped —
+// closing a child commits it locally, it doesn't release it — so the dependent must stay held until
+// that whole feature is done, mirroring `computeChildReadiness`'s `runTargetOf` mapping.
 const heldIds = (feature, tickets) => {
   const ids = new Set(tickets.map((t) => t.id));
   const isHeld = (blockerId) => {
     if (ids.has(blockerId)) return false; // inside this feature — ordering, not a gate
-    const blocker = byId.get(blockerId);
-    return !blocker || blocker.status !== "closed"; // unknown or open blocker reads as held (fail-safe)
+    const gate = runTargetOf(blockerId);
+    if (gate === feature.id) return false; // this feature's own subtree — ordering, not a gate
+    const target = byId.get(gate);
+    return !target || target.status !== "closed"; // unknown or open run target reads as held (fail-safe)
   };
   // Same short-circuit as unitHeld in runReadiness (epic-graph.ts): a `blocks` edge on the
   // feature itself gates every ticket underneath, not just the ones naming the blocker directly.

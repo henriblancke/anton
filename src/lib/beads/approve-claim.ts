@@ -120,7 +120,11 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
     const unrefreshed = await input.refresh?.();
     if (unrefreshed !== undefined) return { refused: unrefreshed };
 
-    const board = await loadAllIssues(repoPath, { withCycles: true });
+    // `strictGates` (PR #274 review): both callers gate this locked read behind structural checks
+    // (`blocks-edge-dangling` among them), and a degraded gate-less board misreads a gate's own
+    // `blocks` edge as dangling — valid structure reported as board corruption. A transient gate
+    // listing failure must fail this write instead, the same as every other approval-path board read.
+    const board = await loadAllIssues(repoPath, { withCycles: true, strictGates: true });
     const locked = board.find((b) => b.id === beadId);
     if (!locked) return { vanished: true };
 
