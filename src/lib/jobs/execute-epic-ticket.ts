@@ -41,6 +41,7 @@ import {
   type TicketSettlement,
 } from "./execute-epic-ticket-settle";
 import type { ResolvedStep } from "./run-formula";
+import { recordBoardOnlyAttribution } from "./step-registry";
 import type { StepContext, StepFacts } from "./step-registry";
 
 /**
@@ -230,6 +231,7 @@ async function walkTicketSteps(args: {
       progress,
       (commit) => branchAddedCommit(run.repoPath, run.branch, run.baseRef, commit),
       boardBaseline ? () => readBoardEvidence(run.repoPath, boardBaseline) : undefined,
+      boardBaseline ? () => recordBoardOnlyAttribution(ticketCtx) : undefined,
     );
   }
 }
@@ -305,6 +307,15 @@ export async function assertDelivered(
    * the label itself.
    */
   checkBoardEvidence?: () => Promise<BoardEvidenceResult>,
+  /**
+   * Records the empty attribution commit a confirmed board-only delivery needs on the branch
+   * (anton-fc5x review round 3) — present exactly when `checkBoardEvidence` is, since both come from
+   * the same board-only verdict. Without it, a board-only ticket settles `delivered` on a branch that
+   * never moved, and the run's later `step:pr` fails `gh pr create` on an empty diff instead of
+   * reaching review. `undefined` in a test that only exercises the board-evidence verdict itself,
+   * which is why `committed` stays `false` unless this actually ran.
+   */
+  recordBoardAttribution?: () => Promise<void>,
 ): Promise<void> {
   const committed = facts.committed === true;
   // The TREE fact is recorded first and unconditionally — the timeout path reads it to know there
@@ -336,6 +347,15 @@ export async function assertDelivered(
     if (checkBoardEvidence && selfReport?.outcome === "delivered") {
       const evidence = await checkBoardEvidence();
       if (evidence.found && evidence.synced) {
+        // The board is confirmed, but the BRANCH still hasn't moved (anton-fc5x review round 3):
+        // left here, `committed` would stay false and this run's `step:pr` would hand `gh pr create`
+        // a branch identical to its base. Record the empty attribution commit the branch is missing
+        // before settling — `committed` only flips once that has actually happened, never on the
+        // board verdict alone.
+        if (recordBoardAttribution) {
+          await recordBoardAttribution();
+          progress.committed = true;
+        }
         progress.delivered = true;
         return;
       }

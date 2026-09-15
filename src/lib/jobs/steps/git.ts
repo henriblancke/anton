@@ -225,11 +225,12 @@ async function recordAttribution(ctx: StepContext, why: string): Promise<boolean
   // nonexistent one (PR #263 review, round 15).
   //
   // This call needs no round-37 stage-before-resolve fix: `commitMarker` stages nothing of its own
-  // (it `reset --mixed HEAD`s the index, then commits EMPTY) — both callers reach this only after
-  // the content itself already landed on HEAD, either the agent's own commits
-  // (`adoptAgentCommits`) or an earlier attempt's preserved commit (`adoptPreservedWork`). So
-  // `resolveHooksPathOverride` here reads a submodule gitlink that is already committed, not merely
-  // staged — the round-36/37 index-vs-HEAD gap this file's other call site closes does not apply.
+  // (it `reset --mixed HEAD`s the index, then commits EMPTY) — every caller reaches this only after
+  // the content itself already landed on HEAD (the agent's own commits in `adoptAgentCommits`, an
+  // earlier attempt's preserved commit in `adoptPreservedWork`), or, for `recordBoardOnlyAttribution`,
+  // after nothing in the git tree changed at all. Either way `resolveHooksPathOverride` here reads a
+  // submodule gitlink that is already committed, never one merely staged — the round-36/37
+  // index-vs-HEAD gap this file's other call site closes does not apply.
   const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
   await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`, {
     hooksPath,
@@ -237,6 +238,26 @@ async function recordAttribution(ctx: StepContext, why: string): Promise<boolean
     signal: ctx.ctx.signal,
   });
   return true;
+}
+
+/**
+ * The board-only case (anton-fc5x review round 3): `assertDelivered` calls this only once it has
+ * already confirmed the board changed and synced. `delivery:board`'s whole point is that its product
+ * is a bd write, which `.beads/.gitignore` keeps out of the git tree by design — so without this the
+ * branch stays byte-identical to its base, and the run's `step:pr` (which needs at least one commit
+ * ahead of base) fails `gh pr create` on an empty diff instead of reaching review. An empty
+ * attribution commit under this ticket's id closes that gap, and doubles as the marker
+ * `worktreeHasCommitFor` reads on a resume — so `recordAttribution`'s own idempotency check skips a
+ * second one when a previous attempt already recorded it.
+ */
+export async function recordBoardOnlyAttribution(ctx: StepContext): Promise<void> {
+  await recordAttribution(
+    ctx,
+    "This ticket's delivery is board-only — its product is a bd write, which `.beads/.gitignore` " +
+      "keeps out of the git tree by design. This empty commit records the ticket so the run's " +
+      "branch carries evidence of it and `step:pr` has a commit ahead of base to open a pull " +
+      "request on.",
+  );
 }
 
 /**

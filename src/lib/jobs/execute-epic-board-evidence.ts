@@ -10,6 +10,14 @@
  * source of evidence: the board itself, read fresh before the agent starts and again after it
  * finishes, diffed on the fields anton's own bookkeeping never touches.
  *
+ * Confirmed evidence here still leaves the BRANCH untouched, and the run's `step:pr` needs at least
+ * one commit ahead of base or `gh pr create` fails on an empty diff (anton-fc5x review round 3). That
+ * gap is closed one layer up, in `assertDelivered` (execute-epic-ticket.ts): once this module
+ * confirms `found && synced`, it records an empty attribution commit via
+ * {@link import("./steps/git").recordBoardOnlyAttribution} before settling the ticket delivered — so
+ * this module only ever answers "did the board change", never touches git itself.
+ *
+
  * The agent runs `bd` directly in its own worktree process, never through this app's `bd.ts`
  * wrapper — so the in-process issue snapshot (snapshot.ts) never sees the agent's writes land and
  * cannot be trusted for either read here. Both reads below go through {@link mustReadBoard} (never a
@@ -56,13 +64,16 @@ function contentLabels(b: Bead): string[] {
     .toSorted();
 }
 
-/** A point-in-time fingerprint of the whole board's CONTENT — status, title, description, priority,
- * every non-bookkeeping label, parentage and dependency edges. Deliberately not assignee, notes or
- * metadata, which anton itself rewrites on a claim, a heartbeat lease refresh or a note, regardless
- * of what the agent did. Parent and dependencies are included (anton-fc5x review round 2) because a
- * reparent or a `bd dep add`/`bd supersede` — both canonical board-only deliverables per this
- * module's own docstring — touch only those edges, never status/title/description/labels, and would
- * otherwise fingerprint as no change at all. */
+/** A point-in-time fingerprint of the whole board's CONTENT — status, title, description,
+ * acceptance criteria, priority, every non-bookkeeping label, parentage and dependency edges.
+ * Deliberately not assignee, notes or metadata, which anton itself rewrites on a claim, a heartbeat
+ * lease refresh or a note, regardless of what the agent did. Parent and dependencies are included
+ * (anton-fc5x review round 2) because a reparent or a `bd dep add`/`bd supersede` — both canonical
+ * board-only deliverables per this module's own docstring — touch only those edges, never
+ * status/title/description/labels, and would otherwise fingerprint as no change at all.
+ * `acceptance_criteria` is included (anton-fc5x review round 3) for the same reason: `bd update
+ * --acceptance` is a supported board-only write (bd-args.ts) that the list projection exposes under
+ * this field (formula.integration.test.ts), and it touches neither status nor description. */
 export interface BoardFingerprint {
   readonly beads: ReadonlyMap<string, string>;
 }
@@ -78,6 +89,7 @@ function fingerprintOf(b: Bead): string {
     b.status,
     b.title,
     b.description ?? "",
+    b.acceptance_criteria ?? "",
     b.priority ?? null,
     contentLabels(b),
     beads.parentOf(b) ?? null,

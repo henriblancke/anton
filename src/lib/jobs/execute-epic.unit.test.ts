@@ -1890,6 +1890,39 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
     expect(p).toMatchObject({ committed: false, delivered: true });
   });
 
+  it(
+    "records the branch's empty attribution commit and flips `committed` true once the board is " +
+      "confirmed (anton-fc5x review round 3) — a board-only delivery otherwise leaves the branch " +
+      "identical to its base, and the run's `step:pr` fails `gh pr create` on that empty diff",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
+      let recorded = false;
+      const recordBoardAttribution = async () => {
+        recorded = true;
+      };
+
+      await expect(
+        assertDelivered(ticket, { committed: false }, p, neverAsked, check, recordBoardAttribution),
+      ).resolves.toBeUndefined();
+
+      expect(recorded).toBe(true);
+      expect(p).toMatchObject({ committed: true, delivered: true });
+    },
+  );
+
+  it("never records an attribution commit when the board shows no confirmed evidence", async () => {
+    const p = progress({ outcome: "delivered" });
+    const check = async () => ({ found: false, ids: [], synced: false });
+    const recordBoardAttribution = async () => {
+      throw new Error("recordBoardAttribution ran without confirmed board evidence");
+    };
+
+    await expect(
+      failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check, recordBoardAttribution)),
+    ).resolves.toBeInstanceOf(Error);
+  });
+
   it("blocks when the board shows no evidence at all, naming the check it failed", async () => {
     const p = progress({ outcome: "delivered" });
     const check = async () => ({ found: false, ids: [], synced: false });

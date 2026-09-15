@@ -84,6 +84,16 @@ describe("fingerprintBoard / boardEvidence (anton-fc5x)", () => {
     expect(boardEvidence(before, after)).toEqual(["a"]);
   });
 
+  it(
+    "catches an acceptance-criteria change — `bd update --acceptance` is a supported board-only " +
+      "write that touches neither status nor description (anton-fc5x review round 3)",
+    () => {
+      const before = fingerprintBoard([bead("a", { acceptance_criteria: "- [ ] old rubric" })]);
+      const after = fingerprintBoard([bead("a", { acceptance_criteria: "- [ ] repaired rubric" })]);
+      expect(boardEvidence(before, after)).toEqual(["a"]);
+    },
+  );
+
   it("catches a content label change — a board-only ticket may exist to relabel/reparent (anton-fc5x review round 1)", () => {
     const before = fingerprintBoard([bead("a", { labels: ["domain:eng"] })]);
     const after = fingerprintBoard([bead("a", { labels: ["domain:eng", "size:M"] })]);

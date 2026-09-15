@@ -61,7 +61,7 @@ export {
 } from "./steps/result";
 export { claudeStep, implementStep, readForDispatch } from "./steps/agent";
 export { reviewStep, verifyStep } from "./steps/gates";
-export { commitStep, prStep } from "./steps/git";
+export { commitStep, prStep, recordBoardOnlyAttribution } from "./steps/git";
 export { prBody, ticketPrompt, truncateField } from "./steps/prompts";
 export { stepName, STEP_LABEL_PREFIX, type StepRegistry } from "./steps/resolve";
 
