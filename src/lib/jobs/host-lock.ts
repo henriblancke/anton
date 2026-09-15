@@ -178,6 +178,21 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
       return false;
     }
     const token = holder?.token ?? randomUUID();
+    // `dir`'s own device+inode doesn't change when a file inside it does, so retire()'s identity
+    // check can't tell "still the orphan we judged abandoned" from "the same directory, but its
+    // creator resumed, published owner.json, and entered `fn` in the gap since `holder` was read
+    // above." Re-read the metadata immediately before the destructive retire and require it still
+    // matches the exact state that authorized this reclaim — still unpublished, or still the same
+    // stale heartbeat — so a creator that legitimately renewed its lease in that gap is never
+    // evicted out from under itself.
+    const recheckHolder = await readHolder(metaPath);
+    const stillAuthorized =
+      holder === undefined
+        ? recheckHolder === undefined
+        : recheckHolder?.token === holder.token && recheckHolder.heartbeatAt === holder.heartbeatAt;
+    if (!stillAuthorized) {
+      return false;
+    }
     // Bind the retire to `dir`'s identity as of right now, not just the gate check above: if this
     // decider is suspended between here and retire()'s own rename, a peer can still reap this gate
     // and reclaim `dir` under a different token in that gap. retire() verifies this snapshot against
