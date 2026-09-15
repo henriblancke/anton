@@ -43,7 +43,14 @@
  * never be fooled by the agent's OWN unsubstantiated self-report, which is the false-success shape
  * anton-j5i8 exists to catch and the reason this check exists at all.
  */
-import { beads, REVIEW_SCORE_PREFIX, RUN_LEASE_PREFIX, STAGE_PREFIX, type Bead } from "../beads/bd";
+import {
+  BOARD_EVIDENCE_PENDING_PREFIX,
+  beads,
+  REVIEW_SCORE_PREFIX,
+  RUN_LEASE_PREFIX,
+  STAGE_PREFIX,
+  type Bead,
+} from "../beads/bd";
 import { mustReadBoard } from "./execute-epic-persist";
 
 /**
@@ -52,9 +59,16 @@ import { mustReadBoard } from "./execute-epic-persist";
  * ticket or any other running concurrently, as the ticket's delivery. Every OTHER label (`size:`,
  * `domain:`, `agent:`, `source:`, a gardener/pm fingerprint, …) is real content a board-only ticket
  * may exist to write — e.g. a batch relabel or reparent — and must be fingerprinted like any other
- * field (anton-fc5x review round 1).
+ * field (anton-fc5x review round 1). `board-evidence-pending:*` (anton-fc5x follow-up) belongs here
+ * too — it is this very check's own cross-retry marker (see {@link readBoardEvidence}), so diffing
+ * it would have the marker fingerprint as the ticket's own evidence the moment it is written.
  */
-const BOOKKEEPING_LABEL_PREFIXES = [RUN_LEASE_PREFIX, STAGE_PREFIX, REVIEW_SCORE_PREFIX];
+const BOOKKEEPING_LABEL_PREFIXES = [
+  RUN_LEASE_PREFIX,
+  STAGE_PREFIX,
+  REVIEW_SCORE_PREFIX,
+  BOARD_EVIDENCE_PENDING_PREFIX,
+];
 
 /** `b`'s labels, minus anton's own bookkeeping prefixes, in a stable order so re-fetching the same
  * content twice (labels can come back in a different order) never reads as a change. */
@@ -155,17 +169,38 @@ export interface BoardEvidenceResult {
  * `runDoltSync`'s contract) is read as unsynced rather than propagated for the same reason: the
  * caller's gate must fail closed on "found, but unconfirmed" exactly as it does on "not found",
  * never crash the ticket walk over the sync probe.
+ *
+ * An unsynced write is not the end of the story (anton-fc5x follow-up): `ticket` — read fresh at
+ * this attempt's claim, so it carries whatever a PRIOR attempt persisted — may already hold
+ * `board-evidence-pending:*` ids a previous call left behind when it found writes but could not
+ * confirm the push. Those are unioned into THIS attempt's diff rather than replaced by it, because
+ * `readBoardBaseline` takes a fresh board read every attempt: a resumed ticket whose agent makes no
+ * further writes (correctly — the prior attempt's writes already landed) would otherwise diff an
+ * unchanged board against itself and report no evidence at all, even once the sync channel
+ * recovers. The marker is best-effort in both directions — written when evidence is still
+ * unconfirmed, cleared once it is — so a failed bookkeeping write costs a future retry's memory,
+ * never this one's verdict.
  */
 export async function readBoardEvidence(
   repo: string,
   baseline: BoardFingerprint,
+  ticket: Bead,
 ): Promise<BoardEvidenceResult> {
   const board = await mustReadBoard(repo);
   if (!board) return { found: false, ids: [], synced: false };
-  const ids = boardEvidence(baseline, fingerprintBoard(board));
+  const freshIds = boardEvidence(baseline, fingerprintBoard(board));
+  const pending = beads.pendingBoardEvidence(ticket);
+  const ids = [...new Set([...pending, ...freshIds])].toSorted();
   if (ids.length === 0) return { found: false, ids: [], synced: false };
   const outcome = await beads.push(repo).catch(() => "not-wired" as const);
-  return { found: true, ids, synced: outcome === "synced" || outcome === "shared-server" };
+  const synced = outcome === "synced" || outcome === "shared-server";
+  const stale = beads.boardEvidencePendingLabels(ticket);
+  if (synced) {
+    if (stale.length > 0) await beads.setBoardEvidencePending(repo, ticket.id, [], stale).catch(() => {});
+  } else {
+    await beads.setBoardEvidencePending(repo, ticket.id, ids, stale).catch(() => {});
+  }
+  return { found: true, ids, synced };
 }
 
 /**

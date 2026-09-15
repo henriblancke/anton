@@ -6,12 +6,17 @@ const pushMock = vi.fn<(repo: string) => Promise<string>>();
 // bare `bd list --status all` — so the fixture mocks the same seam `loadAllIssues` sits behind,
 // matching every other test of a `mustReadBoard` caller in this directory.
 const loadAllIssuesMock = vi.fn<(repo: string, opts?: unknown) => Promise<Bead[]>>();
+// `setBoardEvidencePending` shells out to `bd update` for real (bdWrite) — mocked so the cross-retry
+// marker tests exercise the call, not a live `bd` process against a fake "/repo".
+const setBoardEvidencePendingMock = vi.fn<
+  (repo: string, id: string, ids: readonly string[], stale?: string[]) => Promise<string>
+>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
     ...actual,
-    beads: { ...actual.beads, push: pushMock },
+    beads: { ...actual.beads, push: pushMock, setBoardEvidencePending: setBoardEvidencePendingMock },
   };
 });
 
@@ -28,6 +33,10 @@ const {
   readBoardEvidence,
 } = await import("./execute-epic-board-evidence");
 const { LABELS } = await import("../beads/bd");
+
+// Every test below only cares whether the marker write HAPPENED and with what ids — never whether
+// the underlying `bd update` "succeeded" — so a resolved no-op is the right default throughout.
+setBoardEvidencePendingMock.mockResolvedValue("");
 
 function bead(id: string, over: Partial<Bead> = {}): Bead {
   return { id, title: `title-${id}`, status: "open", description: "desc", ...over } as Bead;
@@ -166,6 +175,8 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     await expect(readBoardBaseline("/repo")).resolves.toBeNull();
   });
 
+  const ticket = bead("t-1");
+
   it(
     "reports not-found rather than throwing when the post-run read fails all its retries " +
       "(anton-fc5x review round 2) — a thrown error here would skip the board-only NoDeliveryError " +
@@ -174,7 +185,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
       const baseline = (await readBoardBaseline("/repo"))!;
       rejectEveryRetry();
-      await expect(readBoardEvidence("/repo", baseline)).resolves.toEqual({
+      await expect(readBoardEvidence("/repo", baseline, ticket)).resolves.toEqual({
         found: false,
         ids: [],
         synced: false,
@@ -187,7 +198,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
     const baseline = (await readBoardBaseline("/repo"))!;
     loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
-    const result = await readBoardEvidence("/repo", baseline);
+    const result = await readBoardEvidence("/repo", baseline, ticket);
     expect(result).toEqual({ found: false, ids: [], synced: false });
     expect(pushMock).not.toHaveBeenCalled();
   });
@@ -197,7 +208,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     const baseline = (await readBoardBaseline("/repo"))!;
     loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
     pushMock.mockResolvedValueOnce("synced");
-    const result = await readBoardEvidence("/repo", baseline);
+    const result = await readBoardEvidence("/repo", baseline, ticket);
     expect(result).toEqual({ found: true, ids: ["a"], synced: true });
   });
 
@@ -206,7 +217,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     const baseline = (await readBoardBaseline("/repo"))!;
     loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
     pushMock.mockResolvedValueOnce("shared-server");
-    const result = await readBoardEvidence("/repo", baseline);
+    const result = await readBoardEvidence("/repo", baseline, ticket);
     expect(result.synced).toBe(true);
   });
 
@@ -215,7 +226,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     const baseline = (await readBoardBaseline("/repo"))!;
     loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
     pushMock.mockResolvedValueOnce("not-wired");
-    const result = await readBoardEvidence("/repo", baseline);
+    const result = await readBoardEvidence("/repo", baseline, ticket);
     expect(result).toEqual({ found: true, ids: ["a"], synced: false });
   });
 
@@ -224,9 +235,57 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     const baseline = (await readBoardBaseline("/repo"))!;
     loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
     pushMock.mockRejectedValueOnce(new Error("push failed: auth"));
-    const result = await readBoardEvidence("/repo", baseline);
+    const result = await readBoardEvidence("/repo", baseline, ticket);
     expect(result).toEqual({ found: true, ids: ["a"], synced: false });
   });
+
+  it("persists the found-but-unsynced ids on the ticket as a `board-evidence-pending:*` label", async () => {
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+    const baseline = (await readBoardBaseline("/repo"))!;
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+    pushMock.mockResolvedValueOnce("not-wired");
+    await readBoardEvidence("/repo", baseline, ticket);
+    expect(setBoardEvidencePendingMock).toHaveBeenCalledWith("/repo", ticket.id, ["a"], []);
+  });
+
+  it("clears a stale `board-evidence-pending:*` label once the sync confirms", async () => {
+    const wasPending = bead("t-1", { labels: [LABELS.boardEvidencePending(["a"])] });
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+    const baseline = (await readBoardBaseline("/repo"))!;
+    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+    pushMock.mockResolvedValueOnce("synced");
+    await readBoardEvidence("/repo", baseline, wasPending);
+    expect(setBoardEvidencePendingMock).toHaveBeenCalledWith("/repo", "t-1", [], [
+      LABELS.boardEvidencePending(["a"]),
+    ]);
+  });
+
+  it(
+    "recovers a prior attempt's unsynced evidence across a park/resume, even though the RESUMED " +
+      "attempt's own fresh baseline shows no further diff (anton-fc5x follow-up) — the prior " +
+      "writes already landed on the board before this attempt's baseline was even read, so only " +
+      "the ticket's persisted `board-evidence-pending:*` marker still names them",
+    async () => {
+      // Attempt 1: the agent's write lands but the push cannot confirm it synced.
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const firstBaseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("not-wired");
+      const firstAttempt = await readBoardEvidence("/repo", firstBaseline, ticket);
+      expect(firstAttempt).toEqual({ found: true, ids: ["a"], synced: false });
+
+      // Resume: a NEW baseline is read against the board as it now stands — already carrying
+      // attempt 1's write — and the ticket bead comes back with the marker attempt 1 persisted.
+      const resumedTicket = bead("t-1", { labels: [LABELS.boardEvidencePending(["a"])] });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      const secondBaseline = (await readBoardBaseline("/repo"))!;
+      // The resumed agent makes no further board writes — the work is already done.
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("synced");
+      const secondAttempt = await readBoardEvidence("/repo", secondBaseline, resumedTicket);
+      expect(secondAttempt).toEqual({ found: true, ids: ["a"], synced: true });
+    },
+  );
 });
 
 describe("isBoardOnlyRun — reads the label from the ticket OR its run target (anton-fc5x review round 2)", () => {

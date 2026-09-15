@@ -149,6 +149,17 @@ export const LABELS = {
    * otherwise be read as "nothing delivered" (execute-epic-ticket.ts `assertDelivered`).
    */
   boardOnly: "delivery:board",
+  /**
+   * Board-only evidence (anton-fc5x) a PRIOR attempt found changed but could not confirm synced —
+   * `board-evidence-pending:<id>,<id>,...`. Carries the ids across a park/resume: `readBoardBaseline`
+   * takes a FRESH board read on every attempt, so a resumed ticket whose agent makes no further
+   * board writes (because the prior attempt's writes already landed, just unsynced) would otherwise
+   * diff its new baseline against an unchanged board and read as no evidence at all — even once the
+   * sync channel recovers. Prefix-diffed like `reviewScore`, so the value stays single (the latest
+   * known set), never inferred from the agent's own report for the same reason `boardOnly` itself
+   * isn't. See {@link beads.pendingBoardEvidence} / {@link beads.setBoardEvidencePending}.
+   */
+  boardEvidencePending: (ids: readonly string[]) => `board-evidence-pending:${ids.join(",")}`,
 } as const;
 
 /** Prefix of the run-lease label (see LABELS.runLease). */
@@ -156,6 +167,9 @@ export const RUN_LEASE_PREFIX = "run-lease:";
 
 /** Prefix of the review-score label (see LABELS.reviewScore). */
 export const REVIEW_SCORE_PREFIX = "review-score:";
+
+/** Prefix of the board-evidence-pending label (see LABELS.boardEvidencePending). */
+export const BOARD_EVIDENCE_PENDING_PREFIX = "board-evidence-pending:";
 
 /** Prefix of the stage label (see LABELS.stage). */
 export const STAGE_PREFIX = "stage:";
@@ -941,6 +955,37 @@ export const beads = {
       ...stale.flatMap((l) => ["--remove-label", l]),
       "--add-label",
       LABELS.reviewScore(score),
+    ]),
+
+  /** The bead's existing `board-evidence-pending:*` label — the stale set
+   * {@link beads.setBoardEvidencePending} replaces (anton-fc5x). */
+  boardEvidencePendingLabels: (b: Bead): string[] =>
+    (b.labels ?? []).filter((l) => l.startsWith(BOARD_EVIDENCE_PENDING_PREFIX)),
+
+  /** Ids a PRIOR attempt found changed but could not confirm synced, parsed back off the bead's own
+   * label (anton-fc5x) — empty when none is pending. See {@link LABELS.boardEvidencePending}. */
+  pendingBoardEvidence: (b: Bead): string[] => {
+    const label = beads.boardEvidencePendingLabels(b)[0];
+    return label
+      ? label
+          .slice(BOARD_EVIDENCE_PENDING_PREFIX.length)
+          .split(",")
+          .filter(Boolean)
+      : [];
+  },
+
+  /**
+   * Publish the board-only evidence still awaiting sync confirmation as a state label in ONE
+   * update, like {@link beads.setReviewScore}: drop every prior `board-evidence-pending:*` (pass
+   * them as `stale`) and add the new set. An empty `ids` with a non-empty `stale` clears the marker
+   * (confirmed synced) without adding a replacement.
+   */
+  setBoardEvidencePending: (cwd: string, id: string, ids: readonly string[], stale: string[] = []) =>
+    bdWrite(cwd, [
+      "update",
+      id,
+      ...stale.flatMap((l) => ["--remove-label", l]),
+      ...(ids.length > 0 ? ["--add-label", LABELS.boardEvidencePending(ids)] : []),
     ]),
 
   /**

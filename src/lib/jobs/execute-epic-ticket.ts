@@ -230,7 +230,7 @@ async function walkTicketSteps(args: {
       result.facts ?? {},
       progress,
       (commit) => branchAddedCommit(run.repoPath, run.branch, run.baseRef, commit),
-      boardBaseline ? () => readBoardEvidence(run.repoPath, boardBaseline) : undefined,
+      boardBaseline ? () => readBoardEvidence(run.repoPath, boardBaseline, ticket) : undefined,
       boardBaseline ? () => recordBoardOnlyAttribution(ticketCtx) : undefined,
     );
   }
@@ -326,6 +326,21 @@ export async function assertDelivered(
   progress.committed = committed;
   progress.delivered = false;
   const { selfReport } = progress;
+
+  // A board-only ticket (anton-fc5x) has the BOARD as its evidence of record, never the tree —
+  // resolved here, before the `committed` split below, so an incidental tree change (a stray
+  // generated file, an accidental edit) can never let it fall into the tree-based "commit exists"
+  // path and settle delivered on a commit that says nothing about whether any `bd` write actually
+  // landed (PR #284 review round 2). Everything past this block assumes `checkBoardEvidence` is
+  // absent.
+  if (checkBoardEvidence) {
+    await assertBoardOnlyDelivered(ticket, committed, selfReport, progress, branchAdded, {
+      checkBoardEvidence,
+      recordBoardAttribution,
+    });
+    return;
+  }
+
   if (!committed) {
     // A satisfied step settles on the branch's answer, never on the claim (anton-nuft). The read is
     // skipped when the claim names nothing: parsing already rejects such a line, but the type does
@@ -337,29 +352,6 @@ export async function assertDelivered(
     ) {
       progress.delivered = true;
       return;
-    }
-    // A board-only ticket (anton-fc5x) has no git diff BY DESIGN — its product is bd writes, which
-    // `.beads/.gitignore` keeps out of the tree on purpose. An empty tree is not evidence of nothing
-    // there; it asks the board instead, and settles on THAT read, never on the agent's word alone:
-    // `delivered` is required (an honest `blocked` or a missing line still falls through to the
-    // plain zero-diff block below, exactly as it does for any other ticket), and the board must
-    // independently show writes that landed AND synced.
-    if (checkBoardEvidence && selfReport?.outcome === "delivered") {
-      const evidence = await checkBoardEvidence();
-      if (evidence.found && evidence.synced) {
-        // The board is confirmed, but the BRANCH still hasn't moved (anton-fc5x review round 3):
-        // left here, `committed` would stay false and this run's `step:pr` would hand `gh pr create`
-        // a branch identical to its base. Record the empty attribution commit the branch is missing
-        // before settling — `committed` only flips once that has actually happened, never on the
-        // board verdict alone.
-        if (recordBoardAttribution) {
-          await recordBoardAttribution();
-          progress.committed = true;
-        }
-        progress.delivered = true;
-        return;
-      }
-      throw new NoDeliveryError(boardOnlyNoDeliveryMessage(ticket, evidence));
     }
     // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
     // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
@@ -405,6 +397,64 @@ export async function assertDelivered(
     );
   }
   progress.delivered = true;
+}
+
+/**
+ * The board-only half of the delivery-evidence gate (anton-fc5x), split out of {@link
+ * assertDelivered} so it can run BEFORE the tree-based `committed` split rather than nested inside
+ * its `!committed` branch — a board-only ticket's deliverable is bd writes, and an incidental tree
+ * change (a stray generated file, an accidental edit) must not let it take the tree-based "commit
+ * exists" path and settle delivered without the board ever being checked (PR #284 review round 2).
+ *
+ * Mirrors the shape of the tree-based gate on purpose: a verified `satisfied` claim settles first
+ * (still meaningful here — e.g. this ticket's own previously recorded attribution commit from an
+ * earlier dispatch), a `delivered` claim settles on confirmed board evidence, and everything else
+ * (an honest `blocked`, a missing line, or an unverified `satisfied`) is the same false-success
+ * shape a plain zero diff is, regardless of what — if anything — the tree happened to pick up.
+ */
+async function assertBoardOnlyDelivered(
+  ticket: Bead,
+  committed: boolean,
+  selfReport: TicketProgress["selfReport"],
+  progress: TicketProgress,
+  branchAdded: BranchAddedCommit,
+  evidence: {
+    checkBoardEvidence: () => Promise<BoardEvidenceResult>;
+    recordBoardAttribution?: () => Promise<void>;
+  },
+): Promise<void> {
+  if (
+    selfReport?.outcome === "satisfied" &&
+    selfReport.commit &&
+    (await branchAdded(selfReport.commit))
+  ) {
+    progress.delivered = true;
+    return;
+  }
+  if (selfReport?.outcome === "delivered") {
+    const result = await evidence.checkBoardEvidence();
+    if (result.found && result.synced) {
+      // The board is confirmed. Record the empty attribution commit only when the branch genuinely
+      // hasn't moved yet (anton-fc5x review round 3) — an incidental tree change already gives
+      // `step:pr` a real diff to open against, so a second commit here would be redundant.
+      if (!committed && evidence.recordBoardAttribution) {
+        await evidence.recordBoardAttribution();
+        progress.committed = true;
+      }
+      progress.delivered = true;
+      return;
+    }
+    throw new NoDeliveryError(boardOnlyNoDeliveryMessage(ticket, result));
+  }
+  // No verified evidence: an honest `blocked`, a missing line, or a `satisfied` claim the branch did
+  // not bear out. Cross-checked and folded into the reason exactly as the tree-based gate does
+  // (anton-j5i8) — never worded as a "zero diff", since this ticket's tree may well have changed.
+  throw new NoDeliveryError(
+    `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
+      `is bd writes to the board, not the git tree — and nothing here confirms any landed. Blocking ` +
+      `the ticket for operator review and halting the epic — nothing verified landed, so closing it ` +
+      `would be a false success.${selfReportSuffix(selfReport)}`,
+  );
 }
 
 /**

@@ -2000,6 +2000,72 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
       expect(p).toMatchObject({ committed: false, delivered: true });
     },
   );
+
+  describe(
+    "an incidental tree change never lets a board-only ticket skip its own evidence check " +
+      "(PR #284 review round 2) — the board check used to sit under `if (!committed)`, so a stray " +
+      "commit (an accidental generated file) fell straight to the tree-based path below and could " +
+      "settle delivered on a `delivered` self-report with NO bd write ever confirmed",
+    () => {
+      it("still requires confirmed board evidence when the tree also committed something", async () => {
+        const p = progress({ outcome: "delivered" });
+        const check = async () => ({ found: false, ids: [], synced: false });
+
+        const err = await failure(assertDelivered(ticket, { committed: true }, p, neverAsked, check));
+
+        expect(err?.name).toBe("PoisonError");
+        expect(err?.message).toMatch(/no bd write landed on the board since the ticket started/);
+        expect(p).toMatchObject({ committed: true, delivered: false });
+      });
+
+      it("blocks a missing self-report plus a stray commit rather than treating the commit as delivery", async () => {
+        const check = async () => {
+          throw new Error("the board-only check ran without a `delivered` self-report");
+        };
+
+        const err = await failure(assertDelivered(ticket, { committed: true }, progress(null), neverAsked, check));
+
+        expect(err?.message).toMatch(/produced no delivery/);
+      });
+
+      it("blocks a self-reported block plus a stray commit as a plain board no-delivery, not `BlockedByAgentError`", async () => {
+        const check = async () => {
+          throw new Error("the board-only check ran without a `delivered` self-report");
+        };
+        const blockedReport = { outcome: "blocked" as const, klass: "other" as const, reason: "nothing to sweep" };
+
+        const err = await failure(
+          assertDelivered(ticket, { committed: true }, progress(blockedReport), neverAsked, check),
+        );
+
+        expect(err?.name).toBe("PoisonError");
+        expect(err?.message).toMatch(/produced no delivery/);
+      });
+
+      it("still settles delivered on confirmed board evidence when the tree also committed something", async () => {
+        const p = progress({ outcome: "delivered" });
+        const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
+
+        await expect(
+          assertDelivered(ticket, { committed: true }, p, neverAsked, check),
+        ).resolves.toBeUndefined();
+        expect(p).toMatchObject({ committed: true, delivered: true });
+      });
+
+      it("never records a redundant attribution commit when the tree already committed something", async () => {
+        const p = progress({ outcome: "delivered" });
+        const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
+        const recordBoardAttribution = async () => {
+          throw new Error("recordBoardAttribution ran even though the branch already had a commit");
+        };
+
+        await expect(
+          assertDelivered(ticket, { committed: true }, p, neverAsked, check, recordBoardAttribution),
+        ).resolves.toBeUndefined();
+        expect(p).toMatchObject({ committed: true, delivered: true });
+      });
+    },
+  );
 });
 
 /**
