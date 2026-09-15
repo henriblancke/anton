@@ -1027,6 +1027,8 @@ async function readAnnotatedSignals(
      * pre-scan snapshot alone, or a worktree created mid-scan would be invisible to this backstop too.
      */
     nested: string[] | { unavailable: string };
+    /** The scan's own outer deadline (absolute), charged against the `realpath` probe below. */
+    deadline: number;
     abort?: AbortSignal;
   },
 ): Promise<{
@@ -1072,9 +1074,17 @@ async function readAnnotatedSignals(
   // symlinks itself. `listNestedWorktrees` already resolves the same repo for its own comparison, so
   // a `repoPath` handed in as a symlink (or a macOS `/tmp` vs `/private/tmp` spelling) would otherwise
   // make a real nested-worktree signal's canonical absolute path compare as outside the repo and
-  // survive every filter here. Falls back to the given path, matching `listNestedWorktrees`'s own
-  // `realpath` failure handling, since a repo that no longer resolves shouldn't block the whole scan.
-  const resolvedRepoPath = await realpath(repoPath).catch(() => repoPath);
+  // survive every filter here. Falls back to the given path on ANY failure here — including a
+  // deadline hit or a caller abort, unlike the per-worktree probes in `listNestedWorktrees` that
+  // rethrow those — since (unlike that lookup) there is no "unavailable" state for this step to
+  // report: an unresolved path only degrades the lexical lookup below to what `insideRepo` already
+  // does without canonicalization, so failing the whole scan over it would be worse than the drift it
+  // guards against. Raced against the scan's own deadline/abort via `withBudget` so a stalled mount
+  // can't hang this call forever the way a plain `realpath` would — this runs AFTER stringer has
+  // already exited, so nothing else is left running to blame for the hang (PR #295 review).
+  const resolvedRepoPath = await withBudget(realpath(repoPath), opts.deadline, opts.abort).catch(
+    () => repoPath,
+  );
 
   // Nested-worktree signals first, over every collector: a phantom path is never worth the cost the
   // filters below pay to read its content. `scan()` already excluded these paths from the walk
@@ -1298,6 +1308,7 @@ export async function scan(opts: {
     read = await readAnnotatedSignals(opts.scanFile, opts.repoPath, {
       exclude,
       nested: nestedForFilter,
+      deadline,
       abort: opts.signal,
     });
   } catch (err) {
