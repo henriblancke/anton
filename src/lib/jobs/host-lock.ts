@@ -41,14 +41,26 @@ interface LockFile {
  * there. Reclaim and release use the same token-specific destination. Once either wins, that
  * non-empty tombstone remains as a guard: a delayed actor for the old acquisition cannot rename a
  * successor over it. The tiny files live under the OS temp directory and are cleared on reboot.
+ *
+ * `expected` is the caller's identity snapshot of `dir` from when it validated the retirement —
+ * gate ownership, token match, whatever the caller checked. Re-stating `dir` and comparing right
+ * here, immediately before the rename, binds that validation to the mutation itself: a caller
+ * suspended between its own check and this call can no longer retire a successor that reclaimed
+ * `dir` in the gap, because the successor's fresh `mkdir` never carries the expected inode. The
+ * comparison is unconditional, including when `expected` is undefined (the caller's own snapshot
+ * already found `dir` gone) — `sameIdentity` then never matches, so a peer's fresh directory at the
+ * same path is refused rather than renamed on the strength of a stale "it was gone" belief. This
+ * narrows, but — absent an atomic rename-if-unchanged primitive Node doesn't expose — can't fully
+ * close, the residual gap between this recheck and the `rename` two lines below.
  */
-async function retire(dir: string, token: string): Promise<boolean> {
+async function retire(dir: string, token: string, expected: Stats | undefined): Promise<boolean> {
   // Holder metadata is in a host-writable temp directory. Accept only tokens this module creates so
   // a forged owner file cannot turn the rename destination into a path traversal.
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token)) {
     return false;
   }
   try {
+    if (!sameIdentity(expected, await safeStat(dir))) return false;
     await rename(dir, `${dir}.retired-${token}`);
     return true;
   } catch {
@@ -142,7 +154,12 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
       return false;
     }
     const token = holder?.token ?? randomUUID();
-    return await retire(dir, token);
+    // Bind the retire to `dir`'s identity as of right now, not just the gate check above: if this
+    // decider is suspended between here and retire()'s own rename, a peer can still reap this gate
+    // and reclaim `dir` under a different token in that gap. retire() re-verifies this snapshot
+    // immediately before renaming, so it catches a successor's fresh `mkdir` there instead of
+    // moving it as if it were still the orphan this decision was made against.
+    return await retire(dir, token, await safeStat(dir));
   } finally {
     const ownRecheck = await safeStat(gate);
     if (ownRecheck !== undefined && sameIdentity(ownGateStat, ownRecheck)) {
@@ -374,7 +391,11 @@ export async function withHostLock<T>(
     if (await isOurDir()) {
       const current = await readHolder(metaPath);
       if (!current || current.token === token) {
-        await retire(dir, token);
+        // Pass ourDirStat, not just the isOurDir()/readHolder checks above: those can pass and
+        // then this call still be suspended past a successor's reclaim before it reaches retire()'s
+        // own rename. retire() re-verifies ourDirStat immediately before that rename, so it catches
+        // the successor there instead of moving it.
+        await retire(dir, token, ourDirStat);
       }
     }
     return fn();
@@ -411,7 +432,10 @@ export async function withHostLock<T>(
     if (await isOurDir()) {
       const current = await readHolder(metaPath);
       if (!current || current.token === token) {
-        await retire(dir, token);
+        // Same binding as the fallback retirement above: retire() re-verifies ourDirStat right
+        // before its rename, so a successor that reclaimed `dir` while this call was suspended is
+        // caught there instead of being moved.
+        await retire(dir, token, ourDirStat);
       }
     }
   }
