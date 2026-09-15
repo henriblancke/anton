@@ -243,6 +243,21 @@ export function staleBreaker(freshness: SelfFreshness): AutopilotStale | undefin
     behind.push("its running build is out of date");
     evidence.push("The code on disk has moved past the build anton is running — restart anton");
   }
+  if (freshness.schema.state === "pending") {
+    // The half `staleCheckoutRefusal` gained for anton-sm1l but this card did not (PR #281 review):
+    // without it, the dispatch gate defers every non-`execute-epic` job the instant schema goes
+    // pending while this band stays empty — "nothing renders when the checkout is clean" then lies,
+    // since the checkout is not clean, work is piling up `queued`, and the only visible trace is each
+    // job's own `lastError`. Database, not disk or process, so — unlike `replaced` and `drifted` —
+    // this clears for every process at once the moment the migration runs, no restart to wait for.
+    const { migrations } = freshness.schema;
+    const many = migrations.length !== 1;
+    behind.push(`${migrations.length} pending migration${many ? "s" : ""}`);
+    evidence.push(
+      `anton.db has pending migration${many ? "s" : ""} (${migrations.join(", ")}) — run ` +
+        "`bun run db:migrate`",
+    );
+  }
 
   if (evidence.length === 0) return undefined;
   return {

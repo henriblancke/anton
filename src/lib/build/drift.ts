@@ -194,7 +194,12 @@ function booted(): Boot | null {
  */
 const GENERATION_KEY = Symbol.for("anton.build.cacheGeneration");
 
-function cacheGeneration(): number {
+/**
+ * Exported so a caller with its OWN cache keyed to "has the checkout moved" — the job runner's
+ * stale-checkout verdict (anton-kqst review) — can retire it on the same signal this module retires
+ * its own reads by, rather than drifting from it behind a second invalidation path.
+ */
+export function cacheGeneration(): number {
   return (globalThis as unknown as Record<symbol, number | undefined>)[GENERATION_KEY] ?? 0;
 }
 

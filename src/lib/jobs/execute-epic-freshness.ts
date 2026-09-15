@@ -8,7 +8,12 @@
  */
 import { BREAKER_EFFECT } from "../autopilot-breaker";
 import { isPoisonError, StaleCheckoutError, STALE_CHECKOUT_REFUSAL_PREFIX } from "./errors";
-import { checkSelfFreshness, selfRepoRoot, type SelfFreshness } from "./self-freshness";
+import {
+  checkSelfFreshness,
+  schemaFreshness,
+  selfRepoRoot,
+  type SelfFreshness,
+} from "./self-freshness";
 
 /**
  * Step 0-pre. Refuse to START a new run when anton is running behind its own latest code
@@ -34,6 +39,39 @@ import { checkSelfFreshness, selfRepoRoot, type SelfFreshness } from "./self-fre
  */
 export async function assertSelfCheckoutFresh(): Promise<void> {
   const refusal = await selfCheckoutRefusal();
+  if (refusal) throw new StaleCheckoutError(refusal);
+}
+
+/**
+ * Step -1. Refuse to start `execute-epic` when `anton.db` has migrations the checkout carries but
+ * has not applied (anton-sm1l / PR #281 review) — asked BEFORE `beginEpicRun`, unlike the rest of
+ * this gate.
+ *
+ * `execute-epic` is exempt from the runner's dispatch-seam gate (anton-kqst) so a target already
+ * carried to its pull request can still settle idempotently, and `assertSelfCheckoutFresh` above
+ * honours that by sitting in `prepareEpicRun`, after the completion short-circuit. Schema doesn't get
+ * that exemption for free: `beginEpicRun`'s very first board step, `findOpenRunForEpic`, selects the
+ * `runs` row with every column the CURRENT schema names — the same row settlement itself would read —
+ * so a pending migration fails that query before completion can even be decided, not just before a
+ * new run starts. Waiting for `prepareEpicRun`'s gate leaves that read to fail as a raw "no such
+ * column", not the clean, reschedulable deferral every other stale-schema job gets.
+ *
+ * Only the schema half, and read synchronously off the two small bookkeeping tables it touches — no
+ * upstream fetch, no lockfile read, nothing the checkout/dependency/build halves need — so calling it
+ * ahead of `beginEpicRun`'s own board read costs the clean path one local read, not a second freshness
+ * pass.
+ */
+export function assertSchemaFreshBeforeEpicStart(): void {
+  const root = selfRepoRoot();
+  const refusal = staleCheckoutRefusal(
+    {
+      checkout: { state: "current" },
+      dependencies: { state: "match" },
+      build: { state: "current" },
+      schema: schemaFreshness(root),
+    },
+    root,
+  );
   if (refusal) throw new StaleCheckoutError(refusal);
 }
 
@@ -118,10 +156,12 @@ export function staleCheckoutRefusal(
   if (freshness.schema.state === "pending") {
     // The database, not the disk or the process — a pull moves the code and the migration files
     // together, so this is the half the other three cannot see (anton-sm1l). Unlike `replaced` and
-    // `drifted`, the remedy clears it for every process at once with no restart to wait for.
+    // `drifted`, the remedy clears it for every process at once with no restart to wait for. No
+    // "then restart anton" here: the trailing clause below already supplies it once for the whole
+    // joined message, and appending it per-half duplicated it whenever schema joined another stale
+    // half (PR #281 review).
     stale.push(
-      `anton.db has pending migrations (${freshness.schema.migrations.join(", ")}) — apply them, ` +
-        `then restart anton`,
+      `anton.db has pending migrations (${freshness.schema.migrations.join(", ")}) — apply them`,
     );
   }
   if (stale.length === 0) return undefined;

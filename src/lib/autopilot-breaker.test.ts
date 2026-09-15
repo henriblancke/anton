@@ -86,6 +86,37 @@ describe("staleBreaker", () => {
     expect(staleBreaker(freshness({ build: { state: "unknown", reason: "lsof missing" } }))).toBeUndefined();
   });
 
+  // Without this, `staleCheckoutRefusal` (anton-sm1l) defers every non-`execute-epic` job the
+  // instant schema goes pending while this band — the operator's only OTHER signal — stayed empty,
+  // breaking "nothing renders when the checkout is clean": the checkout is not clean, work is
+  // piling up in `queued`, and only each job's own `lastError` said so (PR #281 review).
+  it("names the pending migrations and the command that clears them", () => {
+    const stale = staleBreaker(
+      freshness({ schema: { state: "pending", migrations: ["0038_add_base_fork_sha.sql"] } }),
+    );
+    expect(stale?.kind).toBe("stale");
+    expect(stale?.detail).toContain("1 pending migration");
+    expect(stale?.evidence).toEqual([
+      "anton.db has pending migration (0038_add_base_fork_sha.sql) — run `bun run db:migrate`",
+    ]);
+  });
+
+  it("clears for every process at once — no restart to wait for, unlike the other latched halves", () => {
+    const stale = staleBreaker(
+      freshness({
+        schema: {
+          state: "pending",
+          migrations: ["0038_add_base_fork_sha.sql", "0039_add_thing.sql"],
+        },
+      }),
+    );
+    expect(stale?.detail).toContain("2 pending migrations");
+    expect(stale?.evidence).toEqual([
+      "anton.db has pending migrations (0038_add_base_fork_sha.sql, 0039_add_thing.sql) — run " +
+        "`bun run db:migrate`",
+    ]);
+  });
+
   it("carries one evidence line per stale half when both are behind", () => {
     const stale = staleBreaker(
       freshness({

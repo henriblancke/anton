@@ -327,8 +327,13 @@ async function buildFreshness(buildDrift: RunningProcess["buildDrift"]): Promise
  * database that is not there yet (a first-run install before `anton setup`), a checkout with no
  * `drizzle/` directory, an unreadable file. Refusing a start on a schema check that never ran is the
  * same false stop an unreachable remote would be.
+ *
+ * Exported so `execute-epic-freshness.ts` can ask this half ALONE, synchronously, before
+ * `beginEpicRun` touches the `runs` table (PR #281 review) — the other three halves stay behind the
+ * full {@link checkSelfFreshness} pass, which this one skips a network fetch and a lockfile read to
+ * avoid paying twice for.
  */
-function schemaFreshness(repoPath: string): SchemaFreshness {
+export function schemaFreshness(repoPath: string): SchemaFreshness {
   const dbPath = antonDbPath();
   if (!dbPath) return { state: "unknown", reason: "anton.db could not be located" };
   try {

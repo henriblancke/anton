@@ -68,6 +68,7 @@ import {
   isUsageLimitError,
   StaleCheckoutError,
 } from "./errors";
+import { cacheGeneration } from "../build/drift";
 import { selfCheckoutRefusal } from "./execute-epic-freshness";
 import { PollingLoop } from "./polling-loop";
 import {
@@ -652,14 +653,24 @@ export class JobRunner {
   private readonly readBeadLabels: BeadLabelsReader | null;
   private readonly readSelfCheckoutRefusal: SelfFreshnessReader;
   /**
-   * The last self-freshness verdict and when it SETTLED — the window that keeps the dispatch gate
-   * (anton-kqst) at one read per `staleCheckoutVerdictMs` instead of one per job. `pass` is the
-   * in-flight read, so the jobs of a single tick share one evaluation rather than starting a fetch
-   * each: dispatch is concurrent (rolling dispatch leases up to `maxConcurrent` in one go), and
-   * without it the very first tick after boot would fan out a read per leased job before any of them
-   * had settled a verdict to reuse.
+   * The last self-freshness verdict, when it SETTLED, and the `build/drift` cache generation it was
+   * read against — the window that keeps the dispatch gate (anton-kqst) at one read per
+   * `staleCheckoutVerdictMs` instead of one per job. `pass` is the in-flight read, so the jobs of a
+   * single tick share one evaluation rather than starting a fetch each: dispatch is concurrent
+   * (rolling dispatch leases up to `maxConcurrent` in one go), and without it the very first tick
+   * after boot would fan out a read per leased job before any of them had settled a verdict to reuse.
+   *
+   * `generation` is what keeps a CLEAN verdict from outliving the pull it was clean about (PR #281
+   * review): `checkoutMoved` bumps `cacheGeneration()` the instant anton's own checkout fast-forwards
+   * — including the migration files a schema-pending pull adds — but the TTL alone knows nothing of
+   * that; it would keep answering `undefined` for up to `staleCheckoutVerdictMs` after a pull that
+   * made the answer stale, dispatching non-`execute-epic` work against the schema that pull just
+   * outgrew. A verdict whose generation no longer matches the current one is treated as expired
+   * exactly like one past its TTL, not specially invalidated — so `staleCheckoutHold` has one reuse
+   * condition, not two.
    */
-  private staleVerdict: { at: number; pass: Promise<string | undefined> } | null = null;
+  private staleVerdict: { at: number; generation: number; pass: Promise<string | undefined> } | null =
+    null;
   private readonly readUsage: () => Promise<ClaudeUsage | null>;
   private readonly readUsageFresh: () => Promise<ClaudeUsage | null>;
   /** Last logged value-gate hold set (sorted ids) — logs only on change, not every 2s tick. */
@@ -1674,15 +1685,25 @@ export class JobRunner {
    */
   private async staleCheckoutHold(): Promise<string | undefined> {
     const held = this.staleVerdict;
+    const generation = cacheGeneration();
     // A verdict inside the window is reused — settled or still in flight, so the jobs of one tick
-    // share a single read rather than starting a fetch each.
-    if (held && this.clock.now() - held.at < this.config.staleCheckoutVerdictMs) return await held.pass;
+    // share a single read rather than starting a fetch each — but only while the checkout hasn't
+    // moved since it was taken. `checkoutMoved` bumping the generation retires it early for the same
+    // reason a `build/drift` reader would drop its own cache on the same signal: a verdict answered
+    // before the pull says nothing about the schema (or checkout, or build) the pull just changed.
+    if (
+      held &&
+      held.generation === generation &&
+      this.clock.now() - held.at < this.config.staleCheckoutVerdictMs
+    ) {
+      return await held.pass;
+    }
 
     const pass = this.readSelfCheckoutRefusal().catch((e) => {
       this.log.error("self-freshness read failed; dispatching anyway", e);
       return undefined;
     });
-    const entry = { at: this.clock.now(), pass };
+    const entry = { at: this.clock.now(), generation, pass };
     this.staleVerdict = entry;
     try {
       return await pass;

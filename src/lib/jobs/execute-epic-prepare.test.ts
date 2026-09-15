@@ -617,6 +617,24 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
     expect(message).toContain("apply them");
   });
 
+  it("does not duplicate 'restart anton' when schema is the only stale half (PR #281 review)", () => {
+    // The trailing clause the message always closes with already names the restart once, for every
+    // stale half joined into it. The schema half used to name it a second time, so a schema-only
+    // deferral read "...apply them, then restart anton in /path, then restart anton." — a duplicate
+    // that no `.toContain` assertion above would have caught.
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "current" },
+        dependencies: { state: "match" },
+        build: { state: "current" },
+        schema: { state: "pending", migrations: ["0007_add_dismissed_at.sql"] },
+      },
+      ROOT,
+    );
+
+    expect(message?.match(/restart anton/g)).toHaveLength(1);
+  });
+
   it("names BOTH when the checkout is behind AND dependencies drifted", () => {
     const message = staleCheckoutRefusal(
       {

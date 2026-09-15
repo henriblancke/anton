@@ -9,8 +9,10 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
+import { checkoutMoved } from "../build/drift";
 import * as schema from "../db/schema";
 import { enqueue, getJob, type JobType } from "./queue";
+import { selfRepoRoot } from "./self-freshness";
 import type { JobHandler, JobPolicy, JobPolicyResolver, JobRunner, RunnerConfig } from "./runner";
 import { CONFIG, useRunnerHarness, waitUntil } from "./runner.fixture";
 
@@ -939,6 +941,42 @@ describe("JobRunner dispatch (live, in-memory db)", () => {
       expect(await r.tickOnce()).toBe(1);
       await r.whenIdle();
       expect(reads).toBe(2);
+    });
+
+    it("retires a cached clean verdict early when the checkout moves, even inside the window", async () => {
+      // A clean verdict answered before a pull says nothing about what the pull changed — e.g. the
+      // migration a schema-pending pull just added (PR #281 review). `checkoutMoved` — fired by
+      // whatever fast-forwarded anton's own checkout — bumps `build/drift`'s cache generation, and
+      // the gate must retire its cached verdict on that signal rather than trust the TTL alone.
+      let reads = 0;
+      let refusal: string | undefined = undefined;
+      const r = h.makeRunner({
+        handlers: { unstick: async () => {} },
+        readSelfCheckoutRefusal: async () => {
+          reads += 1;
+          return refusal;
+        },
+      });
+      await r.enqueue({ type: "unstick" });
+      expect(await r.tickOnce()).toBe(1);
+      await r.whenIdle();
+      expect(reads).toBe(1); // the clean verdict is cached
+
+      // The checkout moves under the cached verdict, well inside the TTL, and the next read would
+      // now answer stale. `selfRepoRoot()` — not `process.cwd()` — is what `checkoutMoved` compares
+      // against: the two only coincide when `ANTON_APP_ROOT` is unset, and the box running this test
+      // may already have it pointed elsewhere.
+      checkoutMoved(selfRepoRoot());
+      refusal = REFUSAL;
+      h.clock.advance(CONFIG.staleCheckoutVerdictMs - 1);
+
+      const jobId = await r.enqueue({ type: "unstick" });
+      expect(await r.tickOnce()).toBe(1);
+      await r.whenIdle();
+      expect(reads).toBe(2); // re-read despite being inside the window — the generation changed
+      const job = await getJob(h.db, jobId);
+      expect(job?.status).toBe("queued"); // deferred on the now-current, no-longer-clean verdict
+      expect(job?.lastError).toContain("behind its own latest code");
     });
 
     it("leaves execute-epic to its own in-place gate — no double evaluation", async () => {
