@@ -61,14 +61,24 @@ async function retire(dir: string, token: string): Promise<boolean> {
  * pathname fresh against whatever a peer put there in the meantime. Renaming to a reap-private
  * tombstone first means the actual `rm` always targets a name nothing else can be racing against —
  * it narrows, though (without an fd-relative removal syscall Node doesn't expose) can't fully close,
- * the window between the caller's identity check and this reap actually running.
+ * the window between the caller's identity check and the `rename` itself: a decider can reap this
+ * same stale gate and `mkdir` a fresh one at this path in that gap, so the rename can move the
+ * replacement rather than the gate `expected` names. Bind the reap to that checked identity by
+ * re-verifying it against what actually got moved, and putting back anything that doesn't match
+ * instead of deleting a gate that may be live.
  */
-async function reapGate(gate: string): Promise<void> {
+async function reapGate(gate: string, expected: Stats): Promise<void> {
   const tombstone = `${gate}.reaped-${randomUUID()}`;
   try {
     await rename(gate, tombstone);
   } catch {
     return; // already gone, or already reaped by someone else
+  }
+  if (!sameIdentity(expected, await safeStat(tombstone))) {
+    // Moved a successor's fresh gate instead of the stale one `expected` names — restore it rather
+    // than deleting a decider's live gate out from under it.
+    await rename(tombstone, gate).catch(() => {});
+    return;
   }
   await rm(tombstone, { recursive: true, force: true }).catch(() => {});
 }
@@ -102,8 +112,9 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
       // we judged stale. Device+inode identifies the exact instance, so it can't make that mistake
       // — which would otherwise let two deciders run the reclaim decision concurrently and break
       // mutual exclusion on `dir`.
-      if (sameIdentity(gateStat, await safeStat(gate))) {
-        await reapGate(gate);
+      const recheck = await safeStat(gate);
+      if (recheck !== undefined && sameIdentity(gateStat, recheck)) {
+        await reapGate(gate, recheck);
       }
     }
     return false; // let the caller's normal deadline/poll path retry reclaim() next iteration
@@ -123,8 +134,9 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     const token = holder?.token ?? randomUUID();
     return await retire(dir, token);
   } finally {
-    if (sameIdentity(ownGateStat, await safeStat(gate))) {
-      await reapGate(gate);
+    const ownRecheck = await safeStat(gate);
+    if (ownRecheck !== undefined && sameIdentity(ownGateStat, ownRecheck)) {
+      await reapGate(gate, ownRecheck);
     }
   }
 }
@@ -325,13 +337,25 @@ export async function withHostLock<T>(
   // pending tick can't hold the process open. A heartbeat that loses the identity check above
   // silently no-ops — the lock then goes stale from a peer's view and gets reclaimed normally, and
   // the next tick re-checks independently rather than compounding a missed write into a stuck state.
-  const beat = setInterval(() => void write().catch(() => {}), STALE_AFTER_MS / 3);
+  // Chained (never run concurrently) so `pendingWrite` always names every write still in flight, not
+  // just the most recent tick's — awaiting it below can otherwise return before an earlier write,
+  // still mid-syscall, has actually landed.
+  let pendingWrite: Promise<unknown> = Promise.resolve();
+  const beat = setInterval(() => {
+    pendingWrite = pendingWrite.then(() => write().catch(() => {}));
+  }, STALE_AFTER_MS / 3);
   beat.unref?.();
 
   try {
     return await fn();
   } finally {
     clearInterval(beat);
+    // A heartbeat write already past write()'s own ownership/token checks when `fn` settles is still
+    // racing this retire — clearInterval only stops *future* ticks. Left unawaited, that write's
+    // writeFile+rename can land after this block retires `dir` and a successor acquires the same
+    // path, publishing our stale token into the successor's metadata and wedging its heartbeat and
+    // release. Wait for it (and anything chained after it) before touching `dir` again.
+    await pendingWrite;
     // Re-verify identity before retiring, same as before writing: if a peer already reclaimed this
     // acquisition, `dir` now belongs to a successor and must not be retired out from under it. The
     // token-specific tombstone still protects the case where metadata existed at reclaim time
