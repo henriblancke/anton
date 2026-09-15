@@ -14,6 +14,7 @@ import { hostname } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
+import { isAncestor } from "./ops";
 
 const execFileAsync = promisify(execFile);
 
@@ -399,7 +400,10 @@ function conflictingClaim(
 /**
  * Create (or reuse) an isolated worktree + branch off `baseBranch` (default: the repo's current
  * HEAD branch). Idempotent: if a worktree for `branch` already exists it is returned as-is
- * (supports crash recovery / resumable runs). `warm: true` runs project setup (deps install — see
+ * (supports crash recovery / resumable runs) — or, with `refresh: true` (anton-s55u), brought up to
+ * `baseBranch` first (see {@link refreshOntoBase}) rather than handed back holding whatever base it
+ * happened to be cut from, which a resumed run would otherwise silently implement, test, and
+ * self-review against. `warm: true` runs project setup (deps install — see
  * {@link resolveWarmCommand}), and is a no-op when nothing is needed.
  *
  * Reuse is refused while ANOTHER job holds the checkout (see {@link withWorktreeClaim}). Handing
@@ -422,6 +426,93 @@ async function readForkAtCreation(worktreePath: string): Promise<string> {
   return git(worktreePath, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
 }
 
+/**
+ * Every path `git status --porcelain` reports as dirty, tracked or not. Deliberately NOT routed
+ * through {@link git}: its whole-output `.trim()` eats the leading status-code space of the FIRST
+ * line only (e.g. " M README.md" → "M README.md"), shifting the fixed 3-character offset below and
+ * truncating that one path's first letter — trailing newlines alone are safe to drop.
+ */
+async function dirtyPaths(worktreePath: string): Promise<string[]> {
+  const { stdout } = await execFileAsync("git", ["-C", worktreePath, "status", "--porcelain"], {
+    timeout: 120_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return stdout
+    .replace(/\n+$/, "")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.slice(3).trim());
+}
+
+/**
+ * Bring a REUSED checkout's branch up to `baseBranch` before anything is dispatched against it
+ * (anton-s55u). Without this, a worktree/branch picked back up from a parked or failed run keeps
+ * whatever base it was cut from — a resumed run can silently implement, test, and self-review
+ * against a tree many commits behind main.
+ *
+ * Three outcomes, in order of how much the checkout may safely move:
+ * - Already at `baseBranch`: no-op.
+ * - No unique commits (the branch is an ancestor of the fresh base, or equal to it): fast-forwarded
+ *   with `reset --hard` — nothing of the run's is on this branch yet, so there's nothing to lose.
+ * - Unique commits: rebased onto `baseBranch` so they land on top of the fresh tree. A rebase that
+ *   cannot apply cleanly is ABORTED, never forced — the run fails loud naming the divergence rather
+ *   than discarding work or leaving the checkout mid-rebase.
+ *
+ * A dirty checkout (anything `git status --porcelain` reports, tracked or not) is refused outright,
+ * before touching anything: resuming a run that left uncommitted state must not silently reset it.
+ */
+async function refreshOntoBase(opts: {
+  repoPath: string;
+  worktreePath: string;
+  branch: string;
+  baseBranch: string;
+}): Promise<void> {
+  const { repoPath, worktreePath, branch, baseBranch } = opts;
+
+  const dirty = await dirtyPaths(worktreePath);
+  if (dirty.length > 0) {
+    throw new Error(
+      `[worktree] refusing to refresh ${branch} onto ${baseBranch}: ${worktreePath} has uncommitted ` +
+        `changes (${dirty.join(", ")}) — commit, stash, or discard them before this run can resume`,
+    );
+  }
+
+  let baseSha: string;
+  try {
+    baseSha = await git(repoPath, ["rev-parse", "--verify", `${baseBranch}^{commit}`]);
+  } catch (err) {
+    throw new Error(
+      `[worktree] could not resolve base ${baseBranch} to refresh ${branch}: ${gitError(err)}`,
+    );
+  }
+  const branchSha = await git(repoPath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
+  if (baseSha === branchSha) return; // already current
+
+  if (await isAncestor(worktreePath, branch, baseBranch)) {
+    // The branch carries nothing `baseBranch` doesn't already have — safe to fast-forward in place.
+    await git(worktreePath, ["reset", "--hard", baseSha]);
+    console.log(
+      `[worktree] fast-forwarded ${branch} to ${baseBranch} (${baseSha.slice(0, 12)}) — no unique commits`,
+    );
+    return;
+  }
+
+  try {
+    await git(worktreePath, ["rebase", baseBranch]);
+    console.log(`[worktree] rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
+  } catch (err) {
+    await git(worktreePath, ["rebase", "--abort"]).catch(() => undefined);
+    const unique = await git(worktreePath, ["log", "--oneline", `${baseBranch}..${branch}`]).catch(
+      () => "(could not list them)",
+    );
+    throw new Error(
+      `[worktree] ${branch} diverges from ${baseBranch} and could not be rebased onto it cleanly — ` +
+        `refusing to discard its commits. Unique commits:\n${unique}\nResolve the conflict in ` +
+        `${worktreePath} and retry (${gitError(err)})`,
+    );
+  }
+}
+
 export async function createWorktree(opts: {
   repoPath: string;
   branch: string;
@@ -435,6 +526,14 @@ export async function createWorktree(opts: {
   claimedBy?: string;
   /** Abort an in-flight install so an operator's kill doesn't hold the run's slot for the full warm timeout. */
   signal?: AbortSignal;
+  /**
+   * Bring a REUSED checkout's branch up to `baseBranch` (anton-s55u) — see {@link refreshOntoBase}.
+   * Opt-in, not the default: an execute run's branch is meant to track its base and wants exactly
+   * this, but review-fix's branch is an already-pushed PR whose commits diverging from base is the
+   * NORMAL case, not staleness — rebasing it here would rewrite already-pushed history out from
+   * under review-fix's own, deliberately merge-based (never rebase) reconciliation with its base.
+   */
+  refresh?: boolean;
 }): Promise<Worktree> {
   const { repoPath, branch, warm, signal } = opts;
 
@@ -453,8 +552,9 @@ export async function createWorktree(opts: {
       );
     }
     const claimed = holders[0];
+    const baseBranch = opts.baseBranch ?? (await currentBranch(repoPath));
     const existing: Worktree | null = record
-      ? { path: record.path, branch, baseBranch: branch, createdBranch: false, repoPath }
+      ? { path: record.path, branch, baseBranch, createdBranch: false, repoPath }
       : null;
     // A registration can outlive its checkout: `git worktree list` reports an administrative record,
     // and the directory may already be gone (anton-2wvb). Reusing such a path hands a non-existent
@@ -462,12 +562,18 @@ export async function createWorktree(opts: {
     // missing `claude` binary and sends debugging in entirely the wrong direction. Verify on disk.
     if (existing && existsSync(existing.path)) {
       if (claimed) await lockClaimedWorktree(repoPath, branch, claimed);
+      // anton-s55u: a reused checkout keeps whatever base it was cut from unless brought up to date
+      // here — a resumed run would otherwise implement, test, and self-review against a stale tree.
+      // Opt-in only (see `refresh` above) — a caller like review-fix reuses an already-pushed PR
+      // branch whose divergence from base is the whole point, not staleness.
+      if (opts.refresh) {
+        await refreshOntoBase({ repoPath, worktreePath: existing.path, branch, baseBranch });
+      }
       return existing;
     }
     // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
     if (existing) await forgetStaleWorktree(repoPath, existing.path);
 
-    const baseBranch = opts.baseBranch ?? (await currentBranch(repoPath));
     const path = worktreePathFor(repoPath, branch);
     await mkdir(dirname(path), { recursive: true });
 
@@ -494,6 +600,14 @@ export async function createWorktree(opts: {
     }
 
     try {
+      // A pre-existing branch materialized onto a FRESH worktree directory is still a reuse
+      // (anton-s55u) — its checkout is new, but its branch may be sitting on a base many commits
+      // behind. Bring it up to date before anything reads HEAD below (opt-in only, see `refresh`
+      // above). A freshly-CREATED branch (the `-b` case above) needs none of this: it was just cut
+      // from `baseBranch` itself.
+      if (!createdBranch && opts.refresh) {
+        await refreshOntoBase({ repoPath, worktreePath: path, branch, baseBranch });
+      }
       // Read the new checkout's HEAD *before* warming: the branch was just cut from `baseBranch`, and
       // warming (or any later fetch) can rewind that ref behind the commit the checkout records. HEAD
       // is fixed to the creation commit regardless — only read here, not after the warm below.

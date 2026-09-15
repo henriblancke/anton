@@ -65,6 +65,11 @@ export async function warmRunWorktree(
     // A cold install can run for minutes; without the job's signal an operator's kill would wait
     // it out, holding the run's concurrency slot the whole time.
     signal: ctx.signal,
+    // anton-s55u: a resumed run must implement against the tree it will merge into, not whatever
+    // base a parked or failed prior attempt cut this branch from. Safe here specifically: this
+    // branch tracks `baseBranch` by construction (unlike review-fix's PR branches, which diverge
+    // from base by design and must never be rebased underneath an already-pushed PR).
+    refresh: true,
   });
   run.worktree = worktree;
   // `createWorktree` made this decision under its branch lock; a caller-side ref probe could go
