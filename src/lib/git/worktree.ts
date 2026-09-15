@@ -588,6 +588,24 @@ async function refreshOntoBase(opts: {
     }
   }
 
+  // Checked BEFORE either the merge or the rebase path below, not just the rebase one: git refuses
+  // both `merge` and `rebase` onto a base with no common ancestor, but its `merge` refusal ("refusing
+  // to merge unrelated histories") would otherwise surface first for a branch that's published or
+  // cited on a bead, landing in the merge path's own catch block and misattributing the failure to a
+  // content conflict rather than the unrelated-history cause named here (PR #279 review). Checking
+  // once, up front, gives both paths the same accurate diagnostic — and still protects the rebase
+  // path from git's own permissiveness there: `rebase <base>` accepts an unrelated base by replaying
+  // the branch's ENTIRE history, root commit included, on top of a tree that has nothing to do with
+  // it, rather than rejecting it. That's exactly what a force-pushed or recreated `origin/<baseBranch>`
+  // looks like from here.
+  if (!(await hasCommonHistory(worktreePath, branch, baseSha))) {
+    throw new Error(
+      `[worktree] ${branch} and ${baseBranch} (${baseSha.slice(0, 12)}) share no common history — ` +
+        `refusing to merge or rebase onto an unrelated base (this can happen when ${baseBranch} was ` +
+        `force-pushed or recreated). Resolve manually in ${worktreePath} and retry.`,
+    );
+  }
+
   if (remotelyPublished || preservedSha) {
     try {
       await git(worktreePath, ["merge", "--no-edit", baseSha], hooksPath);
@@ -612,19 +630,6 @@ async function refreshOntoBase(opts: {
           `retry (${gitError(err)})`,
       );
     }
-  }
-
-  // Git accepts `rebase <base>` even when `branch` and `base` share no common ancestor — it then
-  // replays the branch's ENTIRE history, root commit included, on top of a tree that has nothing to
-  // do with it, duplicating rather than rejecting it. That's exactly what a force-pushed or recreated
-  // `origin/<baseBranch>` looks like from here, so refuse rather than let git's own permissiveness
-  // stand in for a check (PR #279 review).
-  if (!(await hasCommonHistory(worktreePath, branch, baseSha))) {
-    throw new Error(
-      `[worktree] ${branch} and ${baseBranch} (${baseSha.slice(0, 12)}) share no common history — ` +
-        `refusing to rebase onto an unrelated base (this can happen when ${baseBranch} was force-` +
-        `pushed or recreated). Resolve manually in ${worktreePath} and retry.`,
-    );
   }
 
   try {
