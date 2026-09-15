@@ -603,6 +603,41 @@ describe("prepareEpicRun — the structure/cycle gate re-runs on the board the r
     expect((error as Error).message).toContain("no longer a run target");
   });
 
+  // Fresh evidence (PR #274 review): a previously CHILDLESS feature — a standalone run's own single
+  // ticket, same as the reparent case above — gains its FIRST child during the publish sync instead.
+  // `run.standaloneRun` still reads `true` from before that sync, so before this fix `freshTickets`
+  // stayed `[adoptedTarget]`, the id-only drift check saw no change (the target's own id never
+  // moved), and this run would have dispatched the feature itself as a standalone ticket — the new
+  // child bypassing the reservation, contract and human-work gates entirely.
+  it("retries when a standalone target gains its first child during the publish sync", async () => {
+    const childless = board();
+    attachCycleEvidence(childless, []);
+    const withChild = board(ticket("t-1"));
+    attachCycleEvidence(withChild, []);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(childless));
+    // A standalone target's subtree is empty (it IS its own ticket), so
+    // `assertReservedTicketsClaimable` skips its own board read (`gates.children.length === 0`) —
+    // only the lease confirmation (step 1c) and this gate's own read consume the mock queue.
+    loadAllIssuesMock.mockResolvedValueOnce(childless).mockResolvedValue(withChild);
+
+    const theRun = run(childless);
+    theRun.standaloneRun = true;
+    theRun.tickets = [theRun.target];
+
+    const error = await prepareEpicRun(theRun).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+
+    // Retryable, not a park: the next attempt re-enters from the top, where every gate — allowlist,
+    // contract, claimable, human — runs over the newly-grouped feature's real ticket set.
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect((error as Error).message).toContain(TARGET);
+    expect((error as Error).message).toContain("attached t-1");
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
   // A child's `agent:human` relabel, not just the target's own label, is watched too (PR #274
   // review, round 6): `armHumanTicketWaits` classified and armed its gates on the board ITS OWN
   // refresh brought back, which sits before `publishRunClaim`'s sync. A relabel landing in that gap

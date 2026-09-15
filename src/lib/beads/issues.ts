@@ -154,6 +154,23 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[]): Promise<void>
   }
 }
 
+/**
+ * Attach `bd dep cycles` evidence to an already-loaded, forced-fresh board, for a caller that has a
+ * `bd list` read it must not repeat (unlike a plain `withCycles: true` load, this reuses the board
+ * already in hand instead of paying for a second one) but still must NOT proceed on missing evidence
+ * — unlike {@link attachCyclesBestEffort}, this lets a failed `depCycles` call reject.
+ *
+ * A no-op when the board already carries evidence, so a caller may call it defensively without ever
+ * risking a redundant `bd dep cycles` spawn.
+ */
+export async function ensureCycleEvidence(cwd: string, board: Bead[]): Promise<Bead[]> {
+  if (cycleEvidenceFor(board) === undefined) {
+    attachCycleEvidence(board, await beads.depCycles(cwd));
+    markCycleEvidenceRecovered(cwd);
+  }
+  return board;
+}
+
 export async function allIssues(
   cwd: string,
   opts?: SnapshotReadOptions & { withCycles?: boolean },

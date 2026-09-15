@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
 import { humanGates } from "@/lib/approval-gate";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
-import { refreshAllIssues } from "@/lib/beads/issues";
+import { ensureCycleEvidence, refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
 import { cycleEvidenceFor } from "@/lib/beads/cycle-evidence";
@@ -176,7 +176,14 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // issuing a second `bd list`. Crucially, `refreshAllIssues` goes through `loadAllIssues`, which
   // falls back to separate open/closed reads where `--status all` fails; calling `beads.list` directly
   // here would skip that fallback and 500 the whole approval in exactly the scenario the board handles.
-  const allBeads = await refreshAllIssues(project.repoPath, { withCycles: true });
+  //
+  // Deliberately WITHOUT `withCycles` here (PR #274 review): a gardener proposal below never reaches
+  // a gate that consumes cycle evidence — its own apply path fetches it conditionally, only for the
+  // moves that need it (`applyProposal`'s `CYCLE_AWARE_MOVES`) — so forcing that read unconditionally
+  // on this very first fetch would reject the WHOLE approval, proposal included, whenever `bd dep
+  // cycles` is unavailable, slow, or returns unreadable output. Fetched separately, after the
+  // proposal branch below excludes proposals, for the run targets that actually need it.
+  const allBeads = await refreshAllIssues(project.repoPath);
   // Validate the target is actually runnable *before* touching labels or enqueuing. Approval is the
   // run trigger, so labeling-and-enqueuing a bead that execute-epic will only poison-park is a false
   // green: the operator sees "approved" but no run ever reaches a PR. Reuse the same isRunTarget gate
@@ -196,6 +203,12 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   if (isProposalBead(target)) {
     return applyProposalResponse(project, target, allBeads);
   }
+
+  // Cycle evidence, fetched here rather than on the initial read above (PR #274 review): only a
+  // real run-target approval reaches the structural gate below that consumes it, so proposals — the
+  // branch just above — never pay for this, and never fail on it either. Attaches to the SAME
+  // `allBeads` array already in hand, so this costs one `bd dep cycles` spawn, not a second `bd list`.
+  await ensureCycleEvidence(project.repoPath, allBeads);
 
   // Cheap refusal first, off the read above — most non-run-targets never get near the lock. The
   // verdict is re-taken under the lock before anything is written, because this read cannot hold.

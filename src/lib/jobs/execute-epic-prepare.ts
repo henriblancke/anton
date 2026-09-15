@@ -650,6 +650,17 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
     );
   }
   const freshChildren = runTickets(board, epicBeadId);
+  // Recompute the shape from THIS board before selecting `freshTickets` (PR #274 review): a
+  // previously childless target that gained its FIRST child during `publishRunClaim`'s sync would
+  // otherwise still read `run.standaloneRun` from before that sync, `freshTickets` would stay
+  // `[adoptedTarget]`, the id-only drift check below would see no change (the target's own id never
+  // moved), and the new child would dispatch bypassing every gate above it — the reservation, the
+  // agent/contract/claimable checks, the human-work wait — as if it were the whole run. Re-derived
+  // the same way `execute-epic-recover.ts`'s `settleCompletedRun` does (`groupsChildren` over
+  // `runTickets`), so the two never disagree. ASSIGNED to `run.standaloneRun`, not just used locally,
+  // so every dispatch-time reader of the flag (execute-epic-dispatch.ts) sees the shape this board
+  // actually has rather than the one the run started with.
+  run.standaloneRun = !beads.groupsChildren(adoptedTarget, freshChildren);
   const freshTickets = run.standaloneRun ? [adoptedTarget] : freshChildren;
   const drift = ticketSetDrift(run.tickets, freshTickets);
   if (drift) {
