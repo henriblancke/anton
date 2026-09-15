@@ -1097,6 +1097,47 @@ describe("scan", () => {
       expect(result.signals).toHaveLength(1);
       expect(result.worktree).toEqual({ dropped: [], worktrees: [] });
     });
+
+    // PR #295 review (thread on stringer.ts:679): `isWorktreeCheckout`'s `.git`-is-a-FILE marker is
+    // only true for a LINKED worktree. `git worktree list` always reports the MAIN worktree first,
+    // and its `.git` is an ordinary directory — so when `repoPath` names a linked worktree with the
+    // main checkout nested beneath it, requiring the file marker on every record wrongly excludes
+    // that main checkout from `nested`, leaving its real findings to double-report undropped.
+    it("excludes the main checkout when repoPath is a linked worktree with the main checkout nested beneath it", async () => {
+      const mainRepo = join(dir, "main");
+      mkdirSync(mainRepo, { recursive: true });
+      const runMain = (...args: string[]) => execFileSync("git", ["-C", mainRepo, ...args]);
+      runMain("init", "-q");
+      runMain("config", "user.email", "t@example.com");
+      runMain("config", "user.name", "test");
+      writeFileSync(join(mainRepo, "app.ts"), "export {};\n", "utf8");
+      runMain("add", "-A");
+      runMain("commit", "-qm", "init");
+
+      // Add the linked worktree at an empty directory, then move the main checkout underneath it
+      // and repoint the linked worktree's `.git` file marker at the main checkout's new location —
+      // reproducing a main checkout nested beneath the linked worktree that scans it.
+      const outer = join(dir, "outer");
+      mkdirSync(outer, { recursive: true });
+      runMain("worktree", "add", "-q", outer, "-b", "wt-branch");
+      const nestedMain = join(outer, "main-nested");
+      execFileSync("mv", [mainRepo, nestedMain]);
+      const gitFile = join(outer, ".git");
+      writeFileSync(gitFile, readFileSync(gitFile, "utf8").replace(mainRepo, nestedMain), "utf8");
+      expect(existsSync(join(nestedMain, ".git"))).toBe(true);
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding(join("main-nested", "app.ts")),
+      ]);
+
+      const result = await scan({ repoPath: outer, scanFile: join(dir, "scan.json") });
+
+      expect(result.worktree.worktrees).toEqual(["main-nested"]);
+      expect(result.signals).toEqual([]);
+      expect(result.worktree.dropped).toEqual([
+        { path: join("main-nested", "app.ts"), kind: "todo", severity: expect.any(String) },
+      ]);
+    });
   });
 
   describe("describeWorktreeFilter", () => {

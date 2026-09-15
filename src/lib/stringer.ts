@@ -663,11 +663,21 @@ export interface WorktreeFilter {
  * `prunable` alone isn't enough, though: `should_prune_worktree` never reports it for a *locked*
  * worktree (this repo locks its own, see `worktree.ts:485-491`), so a locked worktree deleted
  * outside git and reused as an ordinary tracked directory still passes the prunable check — git
- * keeps citing `locked` for a registration that no longer points at a checkout. A real worktree
+ * keeps citing `locked` for a registration that no longer points at a checkout. A LINKED worktree
  * always has a `.git` FILE (not directory) at its root pointing back at the main repo's
  * `.git/worktrees/<name>`; a reused-as-ordinary directory doesn't. `isWorktreeCheckout` verifies
  * that marker before a resolved path is trusted, so a stale locked registration is dropped from
  * `nested` the same as a prunable one — real findings under its path keep flowing to triage.
+ *
+ * That marker check is skipped for the MAIN worktree specifically: git guarantees `worktree list`
+ * reports it first regardless of which checkout `repoPath` names, and its `.git` is an ordinary
+ * DIRECTORY, not the file marker a linked worktree has — so when `repoPath` is itself a linked
+ * worktree with the main checkout nested beneath it, requiring the file marker on every record
+ * would fail `isWorktreeCheckout` for that main checkout and leave it out of `--exclude` entirely,
+ * silently letting its whole tree double-report every real finding (anton-fj1q PR #295 review).
+ * The main worktree can't be a stale registration the way a linked one can — it's the checkout the
+ * repo's own `.git` lives in — so skipping the marker check for it only widens what's excluded, it
+ * never lets a fake one in.
  *
  * Bounded by (and cancellable via) the caller's own scan deadline/signal, same reasoning as
  * {@link githubToken}: this runs before `scan()`'s deadline clock starts, so the caller passes a
@@ -703,14 +713,17 @@ async function listNestedWorktrees(
 
     const resolvedRepo = await realpath(repoPath).catch(() => repoPath);
     const nested: string[] = [];
-    for (const record of records) {
+    for (const [index, record] of records.entries()) {
       const worktreeLine = record.find((l) => l.startsWith("worktree "));
       if (!worktreeLine) continue;
       if (record.some((l) => l === "prunable" || l.startsWith("prunable "))) continue;
       const wt = worktreeLine.slice("worktree ".length);
       const resolvedWt = await realpath(wt).catch(() => wt);
       if (resolvedWt === resolvedRepo) continue;
-      if (!(await isWorktreeCheckout(resolvedWt))) continue;
+      // git always lists the main worktree first, and only LINKED worktrees carry the `.git`
+      // file marker — see the doc comment above for why the main entry skips this check.
+      const isMainWorktree = index === 0;
+      if (!isMainWorktree && !(await isWorktreeCheckout(resolvedWt))) continue;
       const rel = relative(resolvedRepo, resolvedWt);
       if (rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) nested.push(rel);
     }
@@ -942,8 +955,13 @@ async function readAnnotatedSignals(
  *
  * Bounded by (and cancellable via) the caller's own scan deadline/signal — this lookup must not
  * outlive a scan a caller already gave up on, so it never adds its own independent wait past that.
+ * `timeoutMs` is the caller's REMAINING budget, not a fresh one: a budget already exhausted by an
+ * earlier step (the nested-worktree lookup) must skip the `gh` call outright rather than spawn it
+ * with a zero/negative timeout, which `execFile` would read as "no timeout" and hang past the
+ * scan's own deadline (anton-fj1q PR #295 review).
  */
 async function githubToken(timeoutMs: number, signal?: AbortSignal): Promise<string | undefined> {
+  if (timeoutMs <= 0) return undefined;
   const gh = process.env[GH_BIN_ENV] ?? "gh";
   try {
     // stringer's github collector always calls api.github.com, never an enterprise host -- so
@@ -1020,12 +1038,14 @@ export async function scan(opts: {
   // Keep stderr free of ANSI escapes so the collector-failure parse stays reliable when a TTY leaks in.
   args.push("--no-color");
   // A caller's own GITHUB_TOKEN (CI, an operator's shell) wins — `gh auth token` is only a
-  // fallback for when nothing already set it, and only set when it actually resolves. Bounded by
-  // and cancellable via the same deadline/signal as the scan itself, so a slow credential store
-  // can't add its own wait on top of (or outlive) an already-cancelled/short-deadline scan.
+  // fallback for when nothing already set it, and only set when it actually resolves. Charged
+  // against what's LEFT of the deadline, not the outer timeoutMs again: the nested-worktree lookup
+  // above already spent part of that budget, and handing this call the full timeoutMs would let a
+  // short ANTON_STRINGER_TIMEOUT_MS be exceeded by another full lookup on top of it (anton-fj1q PR
+  // #295 review).
   const env = { ...process.env };
   if (!env.GITHUB_TOKEN) {
-    const token = await githubToken(timeoutMs, opts.signal);
+    const token = await githubToken(deadline - Date.now(), opts.signal);
     if (token) env.GITHUB_TOKEN = token;
   }
   // The lookup above can itself consume part of the outer deadline -- charge that against what's
