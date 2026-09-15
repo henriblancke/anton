@@ -70,7 +70,16 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
   try {
     await mkdir(gate);
   } catch {
-    return false; // another peer is already deciding whether to reclaim this dir
+    // Someone else holds the gate — either a live decision in progress, or a decider that was
+    // killed between its own `mkdir(gate)` and the `finally`'s `rm(gate)`, orphaning it forever.
+    // A live decision never outlives STALE_AFTER_MS (it's a handful of local fs ops), so reap a
+    // gate older than that: worst case we race a genuinely live decider and lose the reap's own
+    // mkdir, which is harmless since that decider's `finally` still removes it.
+    const gateCreatedAt = await dirMtimeMs(gate);
+    if (gateCreatedAt !== undefined && Date.now() - gateCreatedAt > STALE_AFTER_MS) {
+      await rm(gate, { recursive: true, force: true }).catch(() => {});
+    }
+    return false; // let the caller's normal deadline/poll path retry reclaim() next iteration
   }
   try {
     const holder = await readHolder(metaPath);
@@ -175,16 +184,23 @@ export async function withHostLock<T>(
       }
       // Metadata-less dirs (killed between mkdir and the owner.json write) have no heartbeat to
       // judge, so fall back to the directory's own mtime. A dir that just vanished out from under
-      // us is neither abandoned nor live — go straight back to mkdir instead of guessing its age.
+      // us is neither abandoned nor live — its age is unknowable, so skip the reclaim judgment.
       const dirCreatedAt = holder ? 0 : await dirMtimeMs(dir);
-      if (dirCreatedAt === undefined) continue;
-      if (isAbandoned(holder, dirCreatedAt, Date.now())) {
+      if (dirCreatedAt !== undefined && isAbandoned(holder, dirCreatedAt, Date.now())) {
         if (await reclaim(dir, metaPath)) {
           continue;
         }
         // Another peer is already reclaiming this dir, already won, or a fresh holder appeared by
         // the time we got the gate. Fall through to the normal deadline/poll path; spinning here
         // would defeat maxWaitMs.
+      }
+      if (dirCreatedAt === undefined) {
+        // Usually a benign race with a peer's release/reclaim, but if LOCK_ROOT itself was swept
+        // (e.g. a temp cleaner) mkdir(dir) would keep failing with ENOENT forever. Recreate it so
+        // that can't happen, and fall through to the same deadline/poll check as any other
+        // contended attempt instead of retrying unconditionally — an unconditional retry here
+        // would never observe maxWaitMs and could spin indefinitely.
+        await mkdir(LOCK_ROOT, { recursive: true }).catch(() => {});
       }
       const remaining = deadline - Date.now();
       if (opts.signal?.aborted || remaining <= 0) break; // advisory: run unlocked

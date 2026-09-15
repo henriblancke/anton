@@ -180,6 +180,37 @@ describe("withHostLock", () => {
     expect(stillLive.token).toBe(oldToken);
   });
 
+  it("reaps an orphaned reclaiming gate left by a killed reclaimer", async () => {
+    const name = `test-reclaim-gate-orphan-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const gate = `${dir}.reclaiming`;
+    // An orphaned holder dir, old enough to be reclaimable...
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+    // ...but a `.reclaiming` gate left behind by an earlier reclaimer that was killed between its
+    // own `mkdir(gate)` and the `finally`'s `rm(gate)`. Backdated past STALE_AFTER_MS so it reads
+    // as abandoned too, rather than a live decision in progress.
+    await mkdir(gate, { recursive: true });
+    await utimes(gate, old, old);
+
+    let ran = false;
+    const start = Date.now();
+    // Without reaping, `mkdir(gate)` keeps hitting EEXIST forever and reclaim() always returns
+    // false, so this can only pass by waiting out the full advisory budget — use a budget large
+    // enough that only an actual reclaim (one poll cycle to reap the gate, then a second to retire
+    // the dir) finishes inside it.
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 5000 });
+    const elapsedMs = Date.now() - start;
+
+    expect(ran).toBe(true);
+    expect(elapsedMs).toBeLessThan(4000);
+    const siblings = await readdir(LOCK_ROOT);
+    expect(siblings.some((entry) => entry.startsWith(`${name}.retired-`))).toBe(true);
+  });
+
   it("does not let two concurrent reclaimers of the same orphan both enter the section", async () => {
     const name = `test-reclaim-concurrent-${process.pid}`;
     const dir = join(LOCK_ROOT, name);
