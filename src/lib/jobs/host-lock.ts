@@ -73,9 +73,22 @@ async function retire(dir: string, token: string, expected: Stats | undefined): 
     return false;
   }
   if (!sameIdentity(expected, await safeStat(dest))) {
-    // Grabbed a successor's live directory instead of the one `expected` names — put it back rather
-    // than leaving it stranded under a tombstone that peers will never look for it under.
-    await rename(dest, dir).catch(() => {});
+    // Grabbed a successor's live directory instead of the one `expected` names. `dir` has been
+    // vacant since the rename above — long enough for a third process to `mkdir(dir)` and become a
+    // live acquisition of its own. Restoring blindly would either silently replace that fresh, still
+    // -empty directory (POSIX allows a rename onto an empty directory) or, once it has published
+    // metadata, fail and strand the grabbed successor under this tombstone forever — and in the
+    // replace case the third process's directory vanishes under it while it keeps believing it holds
+    // the lock, breaking mutual exclusion. Re-check occupancy immediately before the restore rename
+    // to close as much of that window as Node's fs API allows (no rename-if-absent primitive is
+    // exposed): if anything now sits at `dir`, leave the grabbed successor stranded rather than risk
+    // clobbering a newer acquisition — a leaked tombstone is recoverable by inspection, a broken
+    // mutual exclusion isn't. A third process can still land in the gap between this check and the
+    // rename call itself; that residual window can't be fully closed without an OS-level
+    // no-replace rename.
+    if ((await safeStat(dir)) === undefined) {
+      await rename(dest, dir).catch(() => {});
+    }
     return false;
   }
   return true;
