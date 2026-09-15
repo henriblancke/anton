@@ -5,7 +5,7 @@
  * driver.ts because the ORDER of these checks is the contract the runner's durability logic is
  * built on, and it is only reviewable when it reads top to bottom in one place.
  */
-import { RecoverableClaudeError, UsageLimitError } from "../jobs/errors";
+import { PoisonError, RecoverableClaudeError, UsageLimitError } from "../jobs/errors";
 import type { StreamState } from "./driver-events";
 import { usageLimitError, type ClaudeChannels } from "./driver-limits";
 import { parseModelUsage, type ModelUsageEntry } from "./model-usage";
@@ -143,17 +143,42 @@ function quotaError(exit: ClaudeExit): UsageLimitError | null {
 }
 
 /**
+ * Claude Code's own refusal when `--model` names something that doesn't exist or isn't reachable —
+ * a typo'd or withdrawn id (anton-ggf6). Observed verbatim in anton.db: "There's an issue with the
+ * selected model (claude-opus-4-8). It may not exist or you may not have access to it. Run --model
+ * to pick a different model." No retry changes a model id, so a match here must park instead of
+ * burning the job's whole retry budget the way a plain deterministic Error would.
+ */
+const MODEL_REFUSAL_RE =
+  /there's an issue with the selected model \(([^)]+)\)\.\s*it may not exist or you may not have access to it/i;
+
+/** The park a model-id refusal deserves, or null when `detail` isn't one. */
+function modelRefusalError(detail: string): PoisonError | null {
+  const modelId = detail.match(MODEL_REFUSAL_RE)?.[1]?.trim();
+  if (!modelId) return null;
+  return new PoisonError(
+    `claude refused to start: the model "${modelId}" doesn't exist or isn't accessible. ` +
+      `Configured in this project's settings under Model routing (settings_json.modelRoutes) — ` +
+      `fix the id there, since retrying will not change it.`,
+  );
+}
+
+/**
  * A non-zero exit is resume-eligible only when it looks transient — a network/upstream drop in
  * Claude Code's own channels (broadly in stderr, narrowly in the model-authored result text), or a
  * death before the final result event. A deterministic non-zero exit (the agent errored, a real
  * content failure) has a result event and no transient signal, so it stays a plain Error → today's
- * fresh retry.
+ * fresh retry — UNLESS it's a nonexistent/inaccessible model id, which no retry can fix and must
+ * park on the first attempt instead (anton-ggf6, checked ahead of the transient scan since a bad
+ * model id is deterministic no matter how its wording brushes past a transient phrase).
  */
 function exitCodeError(exit: ClaudeExit, sessionId: string | undefined): Error {
   const resultText = resultTextOf(exit);
   // Prefer the agent's own result summary over stderr for the surfaced message — on a deterministic
   // failure that's where the real reason lives (anton-juar).
   const detail = resultText.trim() || exit.stderr.trim() || `claude exited with code ${exit.code}`;
+  const modelRefusal = modelRefusalError(detail);
+  if (modelRefusal) return modelRefusal;
   const message = `claude exited with code ${exit.code}: ${detail.slice(-2000)}`;
   const signature = transientSignature(resultText, exit.stderr, exit.stream.resultRaw !== undefined);
   return signature

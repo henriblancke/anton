@@ -4,7 +4,12 @@
  * code — so each test here pins one rung of that ladder.
  */
 import { describe, expect, it } from "vitest";
-import { isRecoverableClaudeError, isUsageLimitError, type RecoverableClaudeError } from "../jobs/errors";
+import {
+  isPoisonError,
+  isRecoverableClaudeError,
+  isUsageLimitError,
+  type RecoverableClaudeError,
+} from "../jobs/errors";
 import { createStreamState, type StreamState } from "./driver-events";
 import { exitError, toClaudeResult, transientSignature, type ClaudeExit } from "./driver-exit";
 
@@ -72,6 +77,34 @@ describe("exitError", () => {
 
     expect(isRecoverableClaudeError(err)).toBe(false);
     expect(err?.message).toBe("claude exited with code 2: three tests fail");
+  });
+
+  it("parks a nonexistent/inaccessible model id on the first attempt, naming it and where it's configured (anton-ggf6)", () => {
+    // Observed verbatim in anton.db — Claude Code's own refusal when --model doesn't resolve.
+    const err = exitError(
+      exit({
+        code: 1,
+        stderr:
+          "There's an issue with the selected model (claude-opus-4-8). It may not exist or you may not have access to it. Run --model to pick a different model.",
+      }),
+    );
+
+    expect(isPoisonError(err)).toBe(true);
+    expect(isRecoverableClaudeError(err)).toBe(false);
+    expect(err?.message).toContain("claude-opus-4-8");
+    expect(err?.message).toContain("settings_json.modelRoutes");
+  });
+
+  it("still retries a transient 5xx from the same endpoint rather than parking (anton-ggf6)", () => {
+    const err = exitError(
+      exit({
+        code: 1,
+        stderr: "API Error: 503 Service Unavailable",
+      }),
+    );
+
+    expect(isPoisonError(err)).toBe(false);
+    expect(isRecoverableClaudeError(err)).toBe(true);
   });
 
   it("classifies a gateway [402] billing stop as a quota hit, not a resumed transient (anton-x96g)", () => {
