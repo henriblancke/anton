@@ -9,7 +9,7 @@ interface SnapshotEntry {
   version: number;
   generation: number;
   loadedAt: number;
-  refresh: Promise<Bead[]> | null;
+  refresh: Promise<SnapshotRead> | null;
   // A local write bumped the version but retained last-good beads. Full board reads must block on a
   // fresh post-write read (never serve the stale-but-version-stamped board); cleared once one lands.
   pendingWrite: boolean;
@@ -223,6 +223,24 @@ export function refreshIssueSnapshot(
   loader: () => Promise<Bead[]>,
   now = Date.now(),
 ): Promise<Bead[]> {
+  return refreshIssueSnapshotRead(cwd, loader, now).then((read) => read.beads);
+}
+
+/**
+ * Like {@link refreshIssueSnapshot} but returns the generation the resolved board was retained
+ * under, captured in the same synchronous step as `entry.beads` itself (PR #274 review,
+ * `issues.ts:317`). A caller that reads `beads` here and `issueSnapshotGeneration(cwd)`
+ * separately afterward has a gap: another consumer of this same single-flight promise can run
+ * its own continuation — including one that invalidates or hydrates the entry — before the
+ * caller's next line executes, advancing the generation past the board actually being handed
+ * back. Returning both from inside the resolving `.then` closes that gap the same way
+ * {@link SnapshotRead} does for {@link readIssueSnapshot}.
+ */
+export function refreshIssueSnapshotRead(
+  cwd: string,
+  loader: () => Promise<Bead[]>,
+  now = Date.now(),
+): Promise<SnapshotRead> {
   const entry = entryFor(cwd);
   if (entry.refresh) return entry.refresh;
   const generation = entry.generation;
@@ -231,7 +249,9 @@ export function refreshIssueSnapshot(
     .then((beads) => {
       // A write or sync invalidated this loader while it was running. Its result predates that
       // boundary and must never repopulate the current snapshot.
-      if (entry.generation !== generation) return entry.beads ?? beads;
+      if (entry.generation !== generation) {
+        return { beads: entry.beads ?? beads, version: entry.version, generation: entry.generation };
+      }
       const serialized = JSON.stringify(beads);
       // A cold entry has no board to differ FROM, so the first read of a repo sets the baseline
       // rather than announcing a move nobody made.
@@ -280,7 +300,7 @@ export function refreshIssueSnapshot(
       entry.pendingWrite = false;
       // Announced AFTER the entry has taken the new board, so a listener that reads back sees it.
       if (moved) announceBoardChange(cwd);
-      return nextBeads;
+      return { beads: nextBeads, version: entry.version, generation: entry.generation };
     })
     .finally(() => {
       if (entry.refresh === refresh) entry.refresh = null;
@@ -311,6 +331,11 @@ export function hydrateIssueSnapshot(cwd: string, hydrated: Bead[], generation: 
   entry.beads = hydrated;
   entry.serialized = JSON.stringify(hydrated);
   entry.version += 1;
+  // This swaps the retained array's identity, same as a moved refresh — bump generation so an
+  // in-flight enrichment keyed on the pre-hydration generation (e.g. `attachCyclesBestEffort`'s
+  // shared fetch) fails its own guard and retries against `hydrated` instead of attaching its
+  // result to the now-retired array (PR #274 review).
+  entry.generation += 1;
 }
 
 /**

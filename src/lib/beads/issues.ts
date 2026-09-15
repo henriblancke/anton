@@ -8,7 +8,7 @@ import {
   markCycleEvidenceRecovered,
   probeIssueSnapshot,
   readIssueSnapshot,
-  refreshIssueSnapshot,
+  refreshIssueSnapshotRead,
   type SnapshotRead,
   type SnapshotReadOptions,
 } from "./snapshot";
@@ -307,14 +307,17 @@ export async function readAllIssues(
 }
 
 export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}): Promise<Bead[]> {
-  const board = await refreshIssueSnapshot(cwd, () => loadAllIssues(cwd, opts));
-  // Captured atomically with `board` above, before either await below (PR #274 review, round 14):
-  // reading this later — e.g. right before the `strictGates` gate fetch — risks a concurrent
-  // invalidation or refresh bumping the entry's generation in the window opened by the `withCycles`
-  // branch's own `await` first. `hydrateIssueSnapshot`'s guard would then see that NEWER generation
-  // match and accept `hydrated` (built from THIS stale `board`), overwriting the already-current
-  // cache and hiding the concurrent change from `getBoard` and other warm readers.
-  const boardGeneration = issueSnapshotGeneration(cwd);
+  // Read via `refreshIssueSnapshotRead`, not `refreshIssueSnapshot` + a separate
+  // `issueSnapshotGeneration(cwd)` call, so `boardGeneration` is the generation `board` was
+  // actually retained under (PR #274 review, round 16): this promise is single-flight, and another
+  // consumer of that same promise — including one that invalidates or hydrates the entry — can run
+  // its own continuation before this `await` resumes, advancing the generation in the gap a
+  // separate post-hoc read would land in. `hydrateIssueSnapshot`'s guard would then see that NEWER
+  // generation match and accept `hydrated` (built from THIS stale `board`), overwriting the
+  // already-current cache and hiding the concurrent change from `getBoard` and other warm readers.
+  const { beads: board, generation: boardGeneration } = await refreshIssueSnapshotRead(cwd, () =>
+    loadAllIssues(cwd, opts),
+  );
   // A concurrent non-authoritative refresh may have won the snapshot loader. Enrich the exact board
   // returned here so callers that must make approval decisions never lose the requested evidence.
   // Routed through `fetchCyclesShared` (PR #274 review) rather than a direct `beads.depCycles` call:
