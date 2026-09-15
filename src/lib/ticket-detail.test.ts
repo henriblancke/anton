@@ -117,6 +117,48 @@ describe("getTicketDetail contract status", () => {
   });
 });
 
+// Direct coverage for holdsRunOf (unexported, so exercised through getTicketDetail) — the read-path
+// half of the canMarkDone/holdsRun gap two rounds of PR review flagged on ticket-state-bar.tsx. It
+// has to agree with operatorQueue's own `holdsRun` (operator-queue.ts), which operator-queue.test.ts
+// already pins, so these mirror that file's fixtures rather than inventing new ones.
+describe("getTicketDetail holdsRun", () => {
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("holds no run for the run target itself — nothing holds it, it IS the work", async () => {
+    fakeBd([bead({ id: "f1", title: "Ship billing", issue_type: "feature", labels: ["approved"] })]);
+
+    const detail = await getTicketDetail(project, "f1");
+
+    expect(detail.holdsRun).toBe(false);
+  });
+
+  it("holds a run for a human ticket inside an approved, non-human run target", async () => {
+    fakeBd([
+      bead({ id: "f1", title: "Ship billing", issue_type: "feature", labels: ["approved"] }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1", labels: ["agent:human"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "f1.1");
+
+    expect(detail.holdsRun).toBe(true);
+  });
+
+  it("holds no run when the target itself is agent:human — execute-epic poisons it before dispatch", async () => {
+    // Same shape the earlier PR review round flagged: the target was relabelled agent:human out
+    // from under a ticket that already had a gate armed on it. No gate is ever (re-)armed here, so
+    // Mark done must not be withheld as if one were.
+    fakeBd([
+      bead({ id: "f1", title: "Buy the domain", issue_type: "feature", labels: ["agent:human"] }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1", labels: ["agent:human"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "f1.1");
+
+    expect(detail.holdsRun).toBe(false);
+  });
+});
+
 describe("updateTicket read economy", () => {
   beforeEach(() => resetIssueSnapshots());
   afterEach(() => vi.restoreAllMocks());
