@@ -23,6 +23,7 @@ const {
   WRITE_VANISH_MARKER,
   RECREATE_MARKER,
   RETIRE_RACE_MARKER,
+  RETIRE_SWAP_MARKER,
   WRITE_FAIL_MARKER,
   SUCCESSOR_TOKEN,
   D2_TOKEN,
@@ -33,6 +34,7 @@ const {
   WRITE_VANISH_MARKER: "test-write-vanish",
   RECREATE_MARKER: "test-recreate-before-publish",
   RETIRE_RACE_MARKER: "test-retire-race",
+  RETIRE_SWAP_MARKER: "test-retire-swap",
   WRITE_FAIL_MARKER: "test-write-fail",
   SUCCESSOR_TOKEN: "11111111-1111-4111-8111-111111111111",
   D2_TOKEN: "22222222-2222-4222-8222-222222222222",
@@ -45,6 +47,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   const statCalls = new Map<string, number>();
   const readFileCalls = new Map<string, number>();
+  const renameCalls = new Map<string, number>();
 
   const installSuccessor = async (dir: string) => {
     await actual.rename(dir, `${dir}.retired-${SUCCESSOR_TOKEN}`);
@@ -103,6 +106,27 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       }
       // @ts-expect-error -- forwarding whatever arguments the caller passed
       return actual.stat(path, ...rest);
+    },
+    // Fires on the 1st rename(dir, ...) for the retire-swap test — retire()'s own rename of `dir`
+    // to its tombstone, right after reclaim() captured the orphan's real identity as `expected` but
+    // before this call's rename acts on it. Simulates a peer that fully retired the same orphan and
+    // re-acquired `dir` as a live successor in exactly that gap, so this call's rename grabs the
+    // successor instead of the orphan it was meant to retire.
+    rename: async (oldPath: unknown, newPath: unknown, ...rest: unknown[]) => {
+      if (
+        typeof oldPath === "string" &&
+        oldPath.includes(RETIRE_SWAP_MARKER) &&
+        !oldPath.includes(".retired-") &&
+        !oldPath.includes(".reclaiming")
+      ) {
+        const n = (renameCalls.get(oldPath) ?? 0) + 1;
+        renameCalls.set(oldPath, n);
+        if (n === 1) {
+          await installSuccessor(oldPath);
+        }
+      }
+      // @ts-expect-error -- forwarding whatever arguments the caller passed
+      return actual.rename(oldPath, newPath, ...rest);
     },
     // Fires on the 2nd readFile(metaPath) for the gate-ownership test — reclaim()'s own
     // readHolder(), right after it captured its own gate's mtime. Simulates a peer reaping that
@@ -547,5 +571,34 @@ describe("withHostLock", () => {
     // D2's live acquisition must survive completely untouched.
     const holder = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
     expect(holder.token).toBe(D2_TOKEN);
+  });
+
+  it("restores a successor's directory when retire()'s own rename grabs it instead of the orphan", async () => {
+    const name = `${RETIRE_SWAP_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // A metadata-less orphan old enough to be reclaimed, so the acquire loop drives straight into
+    // reclaim(). The injected rename() above fires on retire()'s own rename of `dir` to its
+    // tombstone — after retire() has already been handed the orphan's real, pre-swap identity as
+    // `expected`, but before the rename itself runs. It simulates a peer that fully retired this
+    // same orphan and re-acquired `dir` as a live successor in that exact gap, so this call's
+    // rename mechanically succeeds but grabs the successor's directory instead of the orphan.
+    // retire() must detect that mismatch against `expected` and restore the successor rather than
+    // leaving it stranded under this call's tombstone.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 200 });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // The successor's live acquisition must survive completely untouched, restored to `dir` rather
+    // than left sitting under a tombstone no peer will ever look for it under.
+    const successor = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(successor.token).toBe(SUCCESSOR_TOKEN);
+    expect((await stat(dir)).isDirectory()).toBe(true);
   });
 });

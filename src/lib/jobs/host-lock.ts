@@ -43,15 +43,21 @@ interface LockFile {
  * successor over it. The tiny files live under the OS temp directory and are cleared on reboot.
  *
  * `expected` is the caller's identity snapshot of `dir` from when it validated the retirement —
- * gate ownership, token match, whatever the caller checked. Re-stating `dir` and comparing right
- * here, immediately before the rename, binds that validation to the mutation itself: a caller
- * suspended between its own check and this call can no longer retire a successor that reclaimed
- * `dir` in the gap, because the successor's fresh `mkdir` never carries the expected inode. The
- * comparison is unconditional, including when `expected` is undefined (the caller's own snapshot
- * already found `dir` gone) — `sameIdentity` then never matches, so a peer's fresh directory at the
- * same path is refused rather than renamed on the strength of a stale "it was gone" belief. This
- * narrows, but — absent an atomic rename-if-unchanged primitive Node doesn't expose — can't fully
- * close, the residual gap between this recheck and the `rename` two lines below.
+ * gate ownership, token match, whatever the caller checked. A prior version re-stated `dir` and
+ * compared its identity in a check that ran, then separately awaited the `rename` two lines below —
+ * which still left a gap: this whole call can be suspended between those two awaits (this lock is
+ * advisory across independent host *processes*, so "suspended" means real wall-clock time in which
+ * a peer process keeps running), during which a peer can retire this same directory under its own
+ * token and let a successor `mkdir` a fresh one at `dir` before the rename here ever fires — moving
+ * that successor under this call's tombstone instead of the orphan `expected` names. Renaming first
+ * and verifying identity on what actually landed at the destination closes that gap: once the
+ * rename completes, the object we hold at `dest` is ours alone (nothing else knows that path), so
+ * the check that follows is authoritative rather than stale, and a mismatch means we grabbed a
+ * successor's live directory by mistake — restore it immediately rather than stranding it under a
+ * tombstone it never owned. Passing `expected` as `undefined` (the caller's own snapshot already
+ * found `dir` gone) always fails without touching the filesystem: there is nothing to verify a
+ * grabbed object against, so moving whatever now sits at `dir` could not be justified as retiring
+ * what the caller intended.
  */
 async function retire(dir: string, token: string, expected: Stats | undefined): Promise<boolean> {
   // Holder metadata is in a host-writable temp directory. Accept only tokens this module creates so
@@ -59,13 +65,20 @@ async function retire(dir: string, token: string, expected: Stats | undefined): 
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token)) {
     return false;
   }
+  if (expected === undefined) return false;
+  const dest = `${dir}.retired-${token}`;
   try {
-    if (!sameIdentity(expected, await safeStat(dir))) return false;
-    await rename(dir, `${dir}.retired-${token}`);
-    return true;
+    await rename(dir, dest);
   } catch {
     return false;
   }
+  if (!sameIdentity(expected, await safeStat(dest))) {
+    // Grabbed a successor's live directory instead of the one `expected` names — put it back rather
+    // than leaving it stranded under a tombstone that peers will never look for it under.
+    await rename(dest, dir).catch(() => {});
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -156,9 +169,10 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     const token = holder?.token ?? randomUUID();
     // Bind the retire to `dir`'s identity as of right now, not just the gate check above: if this
     // decider is suspended between here and retire()'s own rename, a peer can still reap this gate
-    // and reclaim `dir` under a different token in that gap. retire() re-verifies this snapshot
-    // immediately before renaming, so it catches a successor's fresh `mkdir` there instead of
-    // moving it as if it were still the orphan this decision was made against.
+    // and reclaim `dir` under a different token in that gap. retire() verifies this snapshot against
+    // whatever its own rename actually grabbed, and restores it on a mismatch, so a successor's
+    // fresh `mkdir` there gets moved back instead of being retired as if it were still the orphan
+    // this decision was made against.
     return await retire(dir, token, await safeStat(dir));
   } finally {
     const ownRecheck = await safeStat(gate);
@@ -393,8 +407,8 @@ export async function withHostLock<T>(
       if (!current || current.token === token) {
         // Pass ourDirStat, not just the isOurDir()/readHolder checks above: those can pass and
         // then this call still be suspended past a successor's reclaim before it reaches retire()'s
-        // own rename. retire() re-verifies ourDirStat immediately before that rename, so it catches
-        // the successor there instead of moving it.
+        // own rename. retire() verifies ourDirStat against whatever that rename actually grabbed and
+        // restores it on a mismatch, so the successor is moved back instead of staying stranded.
         await retire(dir, token, ourDirStat);
       }
     }
@@ -432,9 +446,9 @@ export async function withHostLock<T>(
     if (await isOurDir()) {
       const current = await readHolder(metaPath);
       if (!current || current.token === token) {
-        // Same binding as the fallback retirement above: retire() re-verifies ourDirStat right
-        // before its rename, so a successor that reclaimed `dir` while this call was suspended is
-        // caught there instead of being moved.
+        // Same binding as the fallback retirement above: retire() verifies ourDirStat against
+        // whatever its rename actually grabbed, so a successor that reclaimed `dir` while this call
+        // was suspended is moved back instead of staying stranded.
         await retire(dir, token, ourDirStat);
       }
     }
