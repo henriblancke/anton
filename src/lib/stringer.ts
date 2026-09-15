@@ -636,8 +636,11 @@ export interface WorktreeFilter {
 }
 
 /**
- * Every OTHER checkout of this repo, repo-relative. `git worktree list --porcelain` always reports
- * the scanned checkout itself first, so that entry is never a nested worktree and is dropped; a path
+ * Every OTHER checkout of this repo, repo-relative. `git worktree list --porcelain` lists the main
+ * worktree first, then linked worktrees — not necessarily the checkout named by `repoPath`: when
+ * `repoPath` is itself a linked worktree and the main worktree sits beneath it, the main checkout
+ * would be misread as nested if we dropped by list position. So each entry is compared by resolved
+ * path against `repoPath` instead — only the entry that IS the scanned checkout is excluded; a path
  * git names outside `repoPath` (a worktree of some other repo entirely — not possible in practice,
  * but not this filter's claim to make) is dropped too.
  *
@@ -646,23 +649,30 @@ export interface WorktreeFilter {
  * dir under `/var`, itself a symlink to `/private/var`). Comparing one resolved path against one
  * unresolved path would find no common prefix at all and read every nested worktree as outside the
  * repo, silently disabling the whole filter.
+ *
+ * Parsed with `--porcelain -z`: an in-repo worktree path containing a newline would truncate on a
+ * plain `\n` split, so `realpath` and the containment check below would silently miss everything
+ * under it. `-z` NUL-terminates each line instead, so paths are read whole — and since NUL, not
+ * whitespace, is the delimiter, the path is used as-is rather than trimmed (a trailing space in a
+ * real path is significant and must survive).
  */
 async function listNestedWorktrees(repoPath: string): Promise<string[] | { unavailable: string }> {
   try {
     const { stdout } = await execFileAsync(
       "git",
-      ["-C", repoPath, "worktree", "list", "--porcelain"],
+      ["-C", repoPath, "worktree", "list", "--porcelain", "-z"],
       { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
     );
     const paths = stdout
-      .split("\n")
+      .split("\0")
       .filter((line) => line.startsWith("worktree "))
-      .map((line) => line.slice("worktree ".length).trim())
+      .map((line) => line.slice("worktree ".length))
       .filter(Boolean);
     const resolvedRepo = await realpath(repoPath).catch(() => repoPath);
     const nested: string[] = [];
-    for (const wt of paths.slice(1)) {
+    for (const wt of paths) {
       const resolvedWt = await realpath(wt).catch(() => wt);
+      if (resolvedWt === resolvedRepo) continue;
       const rel = relative(resolvedRepo, resolvedWt);
       if (rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) nested.push(rel);
     }
