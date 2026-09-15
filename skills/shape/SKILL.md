@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 92d5591fbc5e
+version: 5dbfa7066555
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
