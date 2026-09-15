@@ -11,12 +11,24 @@ const loadAllIssuesMock = vi.fn<(repo: string, opts?: unknown) => Promise<Bead[]
 const setBoardEvidencePendingMock = vi.fn<
   (repo: string, id: string, ids: readonly string[], stale?: string[]) => Promise<string>
 >();
+// The preserved-baseline writes (PR #284 review round 8) shell out to `bd update` too — mocked for
+// the same reason `setBoardEvidencePendingMock` is.
+const setBoardEvidenceBaselineMock = vi.fn<
+  (repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>
+>();
+const clearBoardEvidenceBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
     ...actual,
-    beads: { ...actual.beads, push: pushMock, setBoardEvidencePending: setBoardEvidencePendingMock },
+    beads: {
+      ...actual.beads,
+      push: pushMock,
+      setBoardEvidencePending: setBoardEvidencePendingMock,
+      setBoardEvidenceBaseline: setBoardEvidenceBaselineMock,
+      clearBoardEvidenceBaseline: clearBoardEvidenceBaselineMock,
+    },
   };
 });
 
@@ -38,6 +50,8 @@ const { LABELS } = await import("../beads/bd");
 // Every test below only cares whether the marker write HAPPENED and with what ids — never whether
 // the underlying `bd update` "succeeded" — so a resolved no-op is the right default throughout.
 setBoardEvidencePendingMock.mockResolvedValue("");
+setBoardEvidenceBaselineMock.mockResolvedValue("");
+clearBoardEvidenceBaselineMock.mockResolvedValue("");
 
 function bead(id: string, over: Partial<Bead> = {}): Bead {
   return { id, title: `title-${id}`, status: "open", description: "desc", ...over } as Bead;
@@ -186,6 +200,28 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     await expect(readBoardBaseline("/repo")).resolves.toBeNull();
   });
 
+  it(
+    "reuses a preserved baseline off the ticket instead of taking a fresh read (PR #284 review " +
+      "round 8) — a resumed attempt must anchor to the ORIGINAL pre-dispatch board, not one a " +
+      "sync pass may have already moved on",
+    async () => {
+      const preserved = { a: "preserved-hash" };
+      const ticketWithBaseline = bead("t-preserved", {
+        metadata: { boardEvidenceBaseline: JSON.stringify(preserved) },
+      });
+      const callsBefore = loadAllIssuesMock.mock.calls.length;
+      const baseline = await readBoardBaseline("/repo", ticketWithBaseline);
+      expect(baseline).toEqual({ beads: new Map(Object.entries(preserved)) });
+      expect(loadAllIssuesMock.mock.calls.length).toBe(callsBefore);
+    },
+  );
+
+  it("still takes a fresh read when the ticket carries no preserved baseline", async () => {
+    loadAllIssuesMock.mockResolvedValueOnce([bead("z")]);
+    const baseline = await readBoardBaseline("/repo", bead("t-fresh"));
+    expect(baseline).toEqual(fingerprintBoard([bead("z")]));
+  });
+
   const ticket = bead("t-1");
 
   it(
@@ -225,6 +261,41 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     },
   );
 
+  it(
+    "preserves this attempt's baseline on the ticket when the post-run read fails outright and " +
+      "nothing was pending before (PR #284 review round 8) — the one case a resumed attempt's " +
+      "fresh baseline would otherwise silently absorb this ticket's own already-synced writes",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      rejectEveryRetry();
+      const freshTicket = bead("t-baseline");
+      await readBoardEvidence("/repo", baseline, freshTicket);
+      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-baseline",
+        Object.fromEntries(baseline.beads),
+      );
+    },
+  );
+
+  it(
+    "does not re-persist the baseline when the ticket already carries one — a repeated read " +
+      "failure must not churn the write every attempt",
+    async () => {
+      const preserved = { a: "already-preserved-hash" };
+      const ticketWithBaseline = bead("t-baseline-again", {
+        metadata: { boardEvidenceBaseline: JSON.stringify(preserved) },
+      });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      rejectEveryRetry();
+      const callsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
+      await readBoardEvidence("/repo", baseline, ticketWithBaseline);
+      expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(callsBefore);
+    },
+  );
+
   it("reports not-found and skips the sync probe when nothing changed", async () => {
     loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
     const baseline = (await readBoardBaseline("/repo"))!;
@@ -233,6 +304,41 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     expect(result).toEqual({ found: false, ids: [], synced: false });
     expect(pushMock).not.toHaveBeenCalled();
   });
+
+  it(
+    "recovers evidence after a total post-run read failure with no prior pending ids, across a " +
+      "park/resume, even though an independent sync pass already lands this ticket's write before " +
+      "the resumed attempt starts (PR #284 review round 8) — the exact stranding the preserved " +
+      "baseline exists to prevent",
+    async () => {
+      // Attempt 1: the agent's write lands locally, but the post-run read fails outright — no
+      // prior pending ids exist yet, so `pending` alone cannot carry the evidence forward.
+      loadAllIssuesMock.mockResolvedValueOnce([bead("z", { description: "old" })]);
+      const firstBaseline = (await readBoardBaseline("/repo"))!;
+      const firstTicket = bead("t-recover");
+      rejectEveryRetry();
+      const firstAttempt = await readBoardEvidence("/repo", firstBaseline, firstTicket);
+      expect(firstAttempt).toEqual({
+        found: false,
+        ids: [],
+        synced: false,
+        evidenceUnavailable: true,
+      });
+      const preserved = Object.fromEntries(firstBaseline.beads);
+      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith("/repo", "t-recover", preserved);
+
+      // Resume: a heartbeat/backstop sync (outside this check) already pushed the write, so a
+      // FRESH board read alone would show no diff at all. But the ticket now carries the baseline
+      // attempt 1 preserved, and `readBoardBaseline` reuses it instead of reading fresh.
+      const resumedTicket = bead("t-recover", { metadata: { boardEvidenceBaseline: JSON.stringify(preserved) } });
+      const secondBaseline = (await readBoardBaseline("/repo", resumedTicket))!;
+      expect(secondBaseline).toEqual(firstBaseline);
+      loadAllIssuesMock.mockResolvedValueOnce([bead("z", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("synced");
+      const secondAttempt = await readBoardEvidence("/repo", secondBaseline, resumedTicket);
+      expect(secondAttempt).toEqual({ found: true, ids: ["z"], synced: true });
+    },
+  );
 
   it("reports found + synced once a real write lands and the push confirms it", async () => {
     loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
@@ -373,10 +479,45 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     },
   );
 
+  it(
+    "clearBoardEvidencePending also releases a preserved baseline (PR #284 review round 8) — its " +
+      "recovery job is done once the marker it backs is cleared",
+    async () => {
+      await clearBoardEvidencePending("/repo", "t-1", ["a"]);
+      expect(clearBoardEvidenceBaselineMock).toHaveBeenCalledWith("/repo", "t-1");
+    },
+  );
+
+  it(
+    "retries the marker-clear through mustPersist rather than swallowing the first failure (PR " +
+      "#284 review round 8) — a single contended Dolt write must not permanently strand a stale " +
+      "marker on an already-closed bead",
+    async () => {
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidencePendingMock.mockResolvedValueOnce("");
+      await clearBoardEvidencePending("/repo", "t-retry-clear", ["a"]);
+      const calls = setBoardEvidencePendingMock.mock.calls.slice(-2);
+      expect(calls[0]).toEqual([
+        "/repo",
+        "t-retry-clear",
+        [],
+        [LABELS.boardEvidencePending(["a"])],
+      ]);
+      expect(calls[1]).toEqual([
+        "/repo",
+        "t-retry-clear",
+        [],
+        [LABELS.boardEvidencePending(["a"])],
+      ]);
+    },
+  );
+
   it("clearBoardEvidencePending is a no-op for an empty id set", async () => {
     const callsBefore = setBoardEvidencePendingMock.mock.calls.length;
+    const baselineCallsBefore = clearBoardEvidenceBaselineMock.mock.calls.length;
     await clearBoardEvidencePending("/repo", "t-1", []);
     expect(setBoardEvidencePendingMock.mock.calls.length).toBe(callsBefore);
+    expect(clearBoardEvidenceBaselineMock.mock.calls.length).toBe(baselineCallsBefore);
   });
 
   it(

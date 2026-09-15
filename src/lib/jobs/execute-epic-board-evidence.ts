@@ -137,6 +137,17 @@ export function boardEvidence(before: BoardFingerprint, after: BoardFingerprint)
   return changed;
 }
 
+/** `fingerprint`, as a JSON-safe value bd's metadata can carry — see {@link
+ * beads.setBoardEvidenceBaseline}. */
+function serializeFingerprint(fingerprint: BoardFingerprint): Record<string, string> {
+  return Object.fromEntries(fingerprint.beads);
+}
+
+/** The inverse of {@link serializeFingerprint}. */
+function deserializeFingerprint(serialized: Record<string, string>): BoardFingerprint {
+  return { beads: new Map(Object.entries(serialized)) };
+}
+
 /**
  * The pre-dispatch board read a board-only ticket's evidence check diffs against — taken once, as
  * early as `runTicket` can manage, so writes the agent makes anywhere on the board are inside the
@@ -144,8 +155,20 @@ export function boardEvidence(before: BoardFingerprint, after: BoardFingerprint)
  * unreadable board (after {@link mustReadBoard}'s own retries) costs the evidence check, never the
  * run, and `assertDelivered` treats a missing baseline as "nothing to compare", which fails the same
  * closed way a genuine zero diff does.
+ *
+ * `ticket` (PR #284 review) lets a RESUMED attempt reuse a PRIOR attempt's preserved baseline
+ * instead of taking a fresh one. A fresh read on every attempt is wrong the moment a post-run read
+ * fails outright (see {@link readBoardEvidence}'s `!board` branch): this ticket's own writes can
+ * still reach the remote through a sync pass that runs independently of this check (the heartbeat
+ * backstop, a write-nudged push), so a resumed attempt's fresh baseline would already include them
+ * — and an idempotent agent that correctly makes no further writes would then diff as no evidence
+ * at all, forever. Reusing the preserved baseline instead keeps the comparison anchored to the
+ * board as it stood before this ticket's FIRST attempt ever ran. Omitted (or carrying nothing
+ * preserved), this takes a fresh read exactly as before.
  */
-export async function readBoardBaseline(repo: string): Promise<BoardFingerprint | null> {
+export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<BoardFingerprint | null> {
+  const preserved = ticket && beads.boardEvidenceBaseline(ticket);
+  if (preserved) return deserializeFingerprint(preserved);
   const board = await mustReadBoard(repo);
   return board ? fingerprintBoard(board) : null;
 }
@@ -201,6 +224,19 @@ export interface BoardEvidenceResult {
  * reason: the caller's gate must fail closed on "found, but unconfirmed" exactly as it does on "not
  * found", never crash the ticket walk over the sync probe.
  *
+ * A TOTAL read failure (`!board`) with NO prior pending ids (PR #284 review round 8) is the one
+ * case `pending` cannot cover — a first attempt has nothing to fall back on. This ticket's own
+ * writes can still reach the remote through a sync pass that runs independently of this check (the
+ * heartbeat backstop, a write-nudged push), so leaving no trace here would let a resumed attempt's
+ * `readBoardBaseline` take a FRESH baseline that already absorbed them — the same stranding the
+ * pending marker exists to prevent, just one step earlier, and with no marker possible because no
+ * diff was ever computed. So THIS attempt's baseline is preserved on the ticket
+ * ({@link beads.setBoardEvidenceBaseline}) instead: a resumed attempt reuses it rather than reading
+ * fresh, anchoring the eventual diff to the board as it stood before this ticket's first attempt
+ * ever ran, however many read failures and external syncs land in between. Released by {@link
+ * clearBoardEvidencePending} alongside the pending-ids marker, once the handoff those ids unblocked
+ * actually completes.
+ *
  * An unsynced write is not the end of the story (anton-fc5x follow-up): `ticket` — read fresh at
  * this attempt's claim, so it carries whatever a PRIOR attempt persisted — may already hold
  * `board-evidence-pending:*` ids a previous call left behind when it found writes but could not
@@ -251,6 +287,18 @@ export async function readBoardEvidence(
   const board = await mustReadBoard(repo);
   if (!board) {
     const pending = beads.pendingBoardEvidence(ticket);
+    // No post-run read at all means `freshIds` can never be computed THIS attempt — the one case
+    // `pending` alone (a PRIOR attempt's confirmed-but-unsynced ids) cannot cover, because a first
+    // attempt has no prior marker to fall back on (PR #284 review). The baseline this attempt
+    // already read is preserved instead, so a resumed attempt's `readBoardBaseline` reuses it
+    // rather than taking a fresh one that may already have absorbed this ticket's writes through a
+    // sync pass this check never confirmed (see that function's docstring). Skipped once a baseline
+    // is already preserved, so a repeated read failure doesn't churn the write every attempt.
+    if (!beads.boardEvidenceBaseline(ticket)) {
+      await mustPersist(() =>
+        beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
+      );
+    }
     return { found: pending.length > 0, ids: pending, synced: false, evidenceUnavailable: true };
   }
   const freshIds = boardEvidence(baseline, fingerprintBoard(board));
@@ -287,8 +335,17 @@ export async function readBoardEvidence(
  * the attribution commit (if any) landed and the bead settled (anton-fc5x review round 4). Deliberately
  * separate from {@link readBoardEvidence}, which only ever ADDS to the marker: only the ticket's own
  * success path, after `finishTicket` returns without throwing, knows the handoff truly finished.
- * Best-effort like every other write here — a failed clear costs a harmless extra comparison on the
- * next board-only ticket that touches this bead, never a false verdict.
+ *
+ * Retried through {@link mustPersist} rather than a bare `.catch(() => {})` (PR #284 review round 8):
+ * a swallowed failure here is NOT harmless — it leaves the stale marker on an already-closed bead,
+ * so a later reopen (a review send-back on this same board-only ticket) reads `pendingBoardEvidence`
+ * as CURRENT evidence and can accept the reopened ticket as delivered on an agent that made no new
+ * write at all. Retrying narrows that window; an exhausted retry still leaves the marker in place
+ * exactly as before, logged like every other refused write here.
+ *
+ * The preserved baseline ({@link beads.setBoardEvidenceBaseline}), if any, is released in the same
+ * call — its recovery job is done the moment the marker it backs is cleared, and leaving it behind
+ * would anchor a future, unrelated reopening of this ticket to a board snapshot from long before it.
  */
 export async function clearBoardEvidencePending(
   repo: string,
@@ -296,9 +353,10 @@ export async function clearBoardEvidencePending(
   ids: readonly string[],
 ): Promise<void> {
   if (ids.length === 0) return;
-  await beads
-    .setBoardEvidencePending(repo, ticketId, [], [LABELS.boardEvidencePending(ids)])
-    .catch(() => {});
+  await mustPersist(() =>
+    beads.setBoardEvidencePending(repo, ticketId, [], [LABELS.boardEvidencePending(ids)]),
+  );
+  await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId));
 }
 
 /**

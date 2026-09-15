@@ -107,7 +107,9 @@ export async function runTicket(args: {
   // gate exists to prevent. The read costs a whole-board `bd list`, paid here so every OTHER
   // ticket's zero-diff path stays exactly as cheap as it always was.
   const boardOnly = isBoardOnlyRun(run, ticket);
-  const boardBaseline = boardOnly ? await readBoardBaseline(run.repoPath) : null;
+  // `ticket` is passed so a resumed attempt reuses a PRIOR attempt's preserved baseline instead of
+  // taking a fresh one (PR #284 review round 8) — see readBoardBaseline's own docstring.
+  const boardBaseline = boardOnly ? await readBoardBaseline(run.repoPath, ticket) : null;
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline, boardOnly);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
 

@@ -188,6 +188,16 @@ export const GH_PR_REF = /^gh-\d+$/i;
 const RETIRED_PR_KEY = "retiredPr";
 
 /**
+ * Metadata key holding a board-only ticket's PRESERVED pre-dispatch board fingerprint (PR #284
+ * review) — see {@link beads.setBoardEvidenceBaseline} / {@link beads.boardEvidenceBaseline}. Set
+ * only when a post-run board read fails outright, so a resumed attempt can diff against the
+ * ORIGINAL baseline instead of a fresh one that may already have absorbed this ticket's own
+ * writes through an unrelated sync pass (the heartbeat backstop, a write-nudged push) that runs
+ * independently of this check's own confirming push.
+ */
+const BOARD_EVIDENCE_BASELINE_KEY = "boardEvidenceBaseline";
+
+/**
  * Parse a `run-lease:<expiry>[:<owner>]` label into its expiry (ms epoch) and optional owner (the
  * publishing run's id, anton-jz1). `expiry` is undefined for a malformed/non-numeric value. A label
  * with no `:<owner>` suffix (legacy format, or a liveness-only publish) parses `owner: undefined`.
@@ -987,6 +997,37 @@ export const beads = {
       ...stale.flatMap((l) => ["--remove-label", l]),
       ...(ids.length > 0 ? ["--add-label", LABELS.boardEvidencePending(ids)] : []),
     ]),
+
+  /**
+   * A prior attempt's PRESERVED pre-dispatch board fingerprint (PR #284 review), parsed back off
+   * the bead's own metadata — `undefined` when none was ever preserved, or the stored value is
+   * unreadable JSON (read as "nothing preserved" rather than thrown, since a malformed value is no
+   * worse than one that was never written). See {@link BOARD_EVIDENCE_BASELINE_KEY}.
+   */
+  boardEvidenceBaseline: (b: Bead): Record<string, string> | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_BASELINE_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /** Preserve `fingerprint` (a serialized {@link BoardFingerprint}) as this ticket's recoverable
+   * pre-dispatch baseline. */
+  setBoardEvidenceBaseline: (cwd: string, id: string, fingerprint: Record<string, string>) =>
+    bdWrite(cwd, [
+      "update",
+      id,
+      "--set-metadata",
+      `${BOARD_EVIDENCE_BASELINE_KEY}=${JSON.stringify(fingerprint)}`,
+    ]),
+
+  /** Release a preserved baseline once the handoff it backed has completed. */
+  clearBoardEvidenceBaseline: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_BASELINE_KEY]),
 
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,
