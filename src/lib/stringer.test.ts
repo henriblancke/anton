@@ -987,6 +987,60 @@ describe("scan", () => {
         expect(result.signals).toHaveLength(1);
         expect(result.worktree.dropped).toEqual([]);
       });
+
+      // stringer emits one signal per location in the group, each sharing the same Description —
+      // so the group having 2+ real locations elsewhere must not save a signal whose OWN FilePath
+      // is the nested one; that specific signal still points triage at a path that never ships.
+      it("drops a signal whose own FilePath is nested even though its group has two real locations", async () => {
+        const repo = initRepoWithWorktree(
+          { "src/a.ts": CODE_BLOCK, "src/b.ts": CODE_BLOCK },
+          ".worktrees/pr252-threads",
+        );
+        mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+        writeFileSync(join(repo, ".worktrees/pr252-threads/src/a.ts"), CODE_BLOCK, "utf8");
+
+        const locations = [
+          "src/a.ts:2",
+          "src/b.ts:2",
+          ".worktrees/pr252-threads/src/a.ts:2",
+        ];
+        process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+          cloneFinding("src/a.ts", 2, locations),
+          cloneFinding("src/b.ts", 2, locations),
+          cloneFinding(".worktrees/pr252-threads/src/a.ts", 2, locations),
+        ]);
+
+        const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+        expect(result.signals.map((s) => s.FilePath).sort()).toEqual(["src/a.ts", "src/b.ts"]);
+        expect(result.worktree.dropped).toEqual([
+          { path: ".worktrees/pr252-threads/src/a.ts", kind: "code-clone", severity: expect.any(String) },
+        ]);
+      });
+    });
+
+    // anton-2wvb / PR #295: a worktree deleted without `git worktree remove` leaves a `prunable`
+    // registration behind; if its path is later reused as an ordinary directory, that registration
+    // must not be read as a live nested checkout — doing so would drop every real signal under it.
+    it("does not exclude a path whose worktree registration is prunable", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/stale");
+      rmSync(join(repo, ".worktrees/stale"), { recursive: true, force: true });
+      mkdirSync(join(repo, ".worktrees/stale"), { recursive: true });
+      writeFileSync(join(repo, ".worktrees/stale/real.ts"), "export {};\n", "utf8");
+      execFileSync("git", ["-C", repo, "add", "-A"]);
+      execFileSync("git", ["-C", repo, "commit", "-qm", "recreate"]);
+      expect(execFileSync("git", ["-C", repo, "worktree", "list", "--porcelain"], { encoding: "utf8" })).toContain(
+        "prunable",
+      );
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding(".worktrees/stale/real.ts"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.worktree).toEqual({ dropped: [], worktrees: [] });
     });
   });
 

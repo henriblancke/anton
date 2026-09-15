@@ -11,13 +11,14 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { readFile, writeFile, mkdir, realpath, rm } from "node:fs/promises";
-import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
 import { filterCouplingSignals, type CouplingFilter } from "./scan-coupling";
 import { filterDeadcodeSignals, type DeadcodeFilter } from "./scan-deadcode";
 import {
   filterDuplicationSignals,
   parseLocations,
+  insideRepo,
   DUPLICATION_COLLECTOR,
   type DuplicationFilter,
 } from "./scan-duplication";
@@ -501,18 +502,12 @@ async function readTrackedPaths(repoPath: string): Promise<Set<string> | { unava
 /**
  * A signal's path as git would spell it, or undefined when it isn't one git can be asked about:
  * no path, the repo root itself (collectors spell it `.`), or a path outside the scanned repo.
- * None of those is evidence of anything.
+ * None of those is evidence of anything. Containment itself is {@link insideRepo} — shared with
+ * scan-duplication.ts's location parsing rather than a second copy of the same check.
  */
-// normalize, not a `./` strip: it also collapses mid-path traversals, so a collector spelling a
-// tracked file `src/../app.ts` matches the index instead of missing it and losing a real finding.
-function toRepoRelative(repoPath: string, raw: string): string | undefined {
-  const rel = isAbsolute(raw) ? relative(repoPath, raw) : normalize(raw);
-  return !rel || rel === "." || rel === ".." || rel.startsWith(`..${sep}`) ? undefined : rel;
-}
-
 function repoRelativePath(repoPath: string, signal: ScanSignal): string | undefined {
   const raw = signal.FilePath ?? signal.filePath;
-  return typeof raw === "string" && raw ? toRepoRelative(repoPath, raw) : undefined;
+  return typeof raw === "string" && raw ? insideRepo(repoPath, raw) : undefined;
 }
 
 /** What a signal says it found, falling back to its collector when it named no kind. */
@@ -652,9 +647,18 @@ export interface WorktreeFilter {
  *
  * Parsed with `--porcelain -z`: an in-repo worktree path containing a newline would truncate on a
  * plain `\n` split, so `realpath` and the containment check below would silently miss everything
- * under it. `-z` NUL-terminates each line instead, so paths are read whole — and since NUL, not
- * whitespace, is the delimiter, the path is used as-is rather than trimmed (a trailing space in a
- * real path is significant and must survive).
+ * under it. `-z` NUL-terminates each attribute instead of newline-terminating it, and ends a record
+ * with an empty field where plain `--porcelain` writes a blank line — so paths are read whole, and
+ * since NUL, not whitespace, is the delimiter, a path is used as-is rather than trimmed (a trailing
+ * space in a real path is significant and must survive).
+ *
+ * Parsed as whole RECORDS rather than isolated `worktree ` lines, so a `prunable` attribute in the
+ * same block is seen: a registration can outlive its checkout — deleted without `git worktree
+ * remove` — and git keeps reporting it (marked `prunable gitdir file points to non-existent
+ * location`) even once the path has been recreated as an ordinary directory (see `worktree.ts`'s own
+ * `existsSync` check for the same fact, anton-2wvb). Reading only the `worktree ` field would treat
+ * that stale registration as a live nested checkout and drop every real signal under a path that is
+ * no longer a worktree at all — so a prunable record is excluded before its path is even resolved.
  */
 async function listNestedWorktrees(repoPath: string): Promise<string[] | { unavailable: string }> {
   try {
@@ -663,14 +667,22 @@ async function listNestedWorktrees(repoPath: string): Promise<string[] | { unava
       ["-C", repoPath, "worktree", "list", "--porcelain", "-z"],
       { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
     );
-    const paths = stdout
-      .split("\0")
-      .filter((line) => line.startsWith("worktree "))
-      .map((line) => line.slice("worktree ".length))
-      .filter(Boolean);
+    const records: string[][] = [[]];
+    for (const field of stdout.split("\0")) {
+      if (field === "") {
+        if (records[records.length - 1].length > 0) records.push([]);
+        continue;
+      }
+      records[records.length - 1].push(field);
+    }
+
     const resolvedRepo = await realpath(repoPath).catch(() => repoPath);
     const nested: string[] = [];
-    for (const wt of paths) {
+    for (const record of records) {
+      const worktreeLine = record.find((l) => l.startsWith("worktree "));
+      if (!worktreeLine) continue;
+      if (record.some((l) => l === "prunable" || l.startsWith("prunable "))) continue;
+      const wt = worktreeLine.slice("worktree ".length);
       const resolvedWt = await realpath(wt).catch(() => wt);
       if (resolvedWt === resolvedRepo) continue;
       const rel = relative(resolvedRepo, resolvedWt);
@@ -693,12 +705,19 @@ async function listNestedWorktrees(repoPath: string): Promise<string[] | { unava
  * finding for ANY collector on the tree that ships.
  *
  * A `duplication` signal gets its own rule: it reports a GROUP of locations (in `Description`, see
- * {@link parseLocations}), and its single `FilePath` is only the first of them — often the real
- * checkout, with the phantom copy named nowhere but that list. Checking `FilePath` alone would keep
- * a clone whose "duplicate" is entirely the nested worktree mirroring the real file, so once a
- * signal names two or more locations, the vote runs over ALL of them: it survives only if at least
- * two locations sit outside every nested worktree, because one real location left is not a
+ * {@link parseLocations}), and its own `FilePath` is only ONE of them. Checking `FilePath` alone
+ * would keep a clone whose "duplicate" is entirely the nested worktree mirroring the real file, so
+ * once a signal names two or more locations, the vote runs over ALL of them: it survives only if at
+ * least two locations sit outside every nested worktree, because one real location left is not a
  * duplicate of anything the tree still has.
+ *
+ * That group vote alone isn't enough, though: a signal whose OWN `FilePath` sits inside a nested
+ * worktree must never reach triage even when the rest of its group votes to keep it — a group with
+ * two real locations plus a nested one still emits a signal FOR the nested location (stringer emits
+ * one `code-clone`/`near-clone` signal per location, all sharing the same `Description`), and that
+ * signal's `FilePath` names a file whose edits never ship. So the signal's own path is checked and
+ * dropped unconditionally FIRST, independent of how many real locations the rest of the group has —
+ * the sibling signals for the group's real locations still carry the finding through untouched.
  */
 async function dropWorktreeSignals(
   repoPath: string,
@@ -715,15 +734,21 @@ async function dropWorktreeSignals(
   const dropped: DroppedSignal[] = [];
   const kept = signals.filter((signal) => {
     if (collectorOf(signal) === DUPLICATION_COLLECTOR) {
+      const ownPath = repoRelativePath(repoPath, signal);
+      if (ownPath !== undefined && isNested(ownPath)) {
+        dropped.push({ path: ownPath, kind: kindOf(signal), severity: severityOfSignal(signal) });
+        return false;
+      }
+
       const locations = parseLocations(signal);
       if (locations.length >= 2) {
         const resolved = locations
-          .map((loc) => toRepoRelative(repoPath, loc.path))
+          .map((loc) => insideRepo(repoPath, loc.path))
           .filter((path): path is string => path !== undefined);
         const real = resolved.filter((path) => !isNested(path));
         if (real.length >= 2) return true;
         dropped.push({
-          path: repoRelativePath(repoPath, signal) ?? resolved[0] ?? "",
+          path: ownPath ?? resolved[0] ?? "",
           kind: kindOf(signal),
           severity: severityOfSignal(signal),
         });
