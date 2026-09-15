@@ -29,10 +29,12 @@ const WORK_LOSS_SUBJECT =
 const WORK_LOSS_RETRY =
   "(?:retry|retried|retries|requeue|requeued|re-?queue|re-?queued|redeliver|redelivered|reprocess|reprocessed)";
 const WORK_LOSS_SIGNAL = `(?:${WORK_LOSS_SUBJECT}|${WORK_LOSS_RETRY})`;
-// No comma/semicolon/dash/period/apostrophe in the gap, so a noun from an earlier clause — or a
-// possessive that hands the subject role to whatever follows it ("the request body's first
-// character is dropped") — can't be credited as this loss's subject.
-const CLAUSE_GAP = "[^,;.'\\u2019\\u2013\\u2014]{0,30}?";
+// No comma/semicolon/colon/dash/period/apostrophe in the gap, so a noun from an earlier clause —
+// or a possessive that hands the subject role to whatever follows it ("the request body's first
+// character is dropped") — can't be credited as this loss's subject. The colon matters the same
+// way a comma does: "For each request: the first character is dropped" introduces a new clause
+// after the colon, so "request" can't bind across it to "is dropped".
+const CLAUSE_GAP = "[^,;:.'\\u2019\\u2013\\u2014]{0,30}?";
 const WORK_LOSS_PASSIVE = new RegExp(
   `\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\b(?:is (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))\\b` +
     `|\\b(?:is (?:silently )?(?:discarded|lost|dropped)|silently drops?)\\b${CLAUSE_GAP}\\b${WORK_LOSS_SIGNAL}\\b`,
@@ -92,9 +94,13 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher 
     klass: "cancellation",
     // \bcancell?(?:ations?|ing|ed|s)?\b covers both the noun/past-tense forms and the active
     // verb forms ("cancels", "cancelling"/"canceling") reviewers actually write, across both
-    // single-L and double-L spellings.
+    // single-L and double-L spellings. Active "abort(s|ing)" only counts when "await" appears
+    // nearby in the same clause (no period between them) — an unqualified "abort" is as often an
+    // unrelated transaction/operation abort ("the transaction aborts when the constraint fails")
+    // as it is cancellation, so it needs the await context the other abort alternatives already
+    // carry via "after the abort" / "ignores the abort" / etc.
     pattern:
-      /\bcancell?(?:ations?|ing|ed|s)?\b|\baborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|orphaned (?:request|task|job)/i,
+      /\bcancell?(?:ations?|ing|ed|s)?\b|\baborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|orphaned (?:request|task|job)|\babort(?:s|ing)\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\babort(?:s|ing)\b/i,
   },
   {
     klass: "fail-open",

@@ -106,6 +106,23 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("cancellation");
   });
 
+  it("classifies an active 'aborts ... during this await' finding as cancellation", () => {
+    const note =
+      "The caller aborts the request during this await, but the handler still writes the response.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
+  it("classifies an active 'Aborting ... during this await' finding as cancellation", () => {
+    const note = "Aborting the run during this await does not stop the worker.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
+  it("does not classify an unrelated transaction abort as cancellation", () => {
+    const note =
+      "The transaction aborts when the unique constraint is violated, rolling back all pending writes.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
   it("classifies a passive 'is lost' work-loss finding", () => {
     const note = "The job is lost after dequeue if the handler throws before it acknowledges the message.";
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
@@ -171,6 +188,11 @@ describe("classifyFindingClass", () => {
 
   it("does not classify a parsing bug as work-loss merely because a work noun possesses the real subject", () => {
     const note = "The request body's first character is dropped when decoding a negative number.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify a parsing bug as work-loss when a colon separates the work noun's clause", () => {
+    const note = "For each request: the first character is dropped when parsing a negative number.";
     expect(classifyFindingClass(finding(note))).toBe("other");
   });
 
