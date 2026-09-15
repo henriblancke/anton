@@ -211,6 +211,26 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
   });
 
+  it("classifies an active 'drops the job' finding as work-loss", () => {
+    const note = "The handler drops the job when processing throws, with no requeue and no log.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies an active 'discards the queued task' finding as work-loss", () => {
+    const note = "The worker discards the queued task before retry, so the client's submission is never processed.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("does not classify an object-less 'drops' finding as work-loss", () => {
+    const note = "This release drops support for the legacy config format without a migration path.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify an object-less 'discards' finding as work-loss", () => {
+    const note = "The pool discards the idle connection after the timeout elapses.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
   it("does not classify unfenced Markdown as fencing/TOCTOU without ownership context", () => {
     const note = "The Markdown example is unfenced, so the prose renders as code instead of a code block.";
     expect(classifyFindingClass(finding(note))).toBe("other");

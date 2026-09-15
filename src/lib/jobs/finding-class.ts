@@ -55,10 +55,11 @@ function matchesWorkLossPassive(note: string): boolean {
   return WORK_LOSS_VERB_FIRST.test(note);
 }
 
-// Active "loses"/"lose" counts the same as the passive forms above, but only with a work-bearing
-// object right after it ("loses the job", "loses the queued job before it can be retried") — an
-// object-less "loses" says nothing about work loss on its own.
-const WORK_LOSS_ACTIVE = new RegExp(`\\bloses?\\b${CLAUSE_GAP}\\b(?:work|${WORK_LOSS_SIGNAL})\\b`, "i");
+// Active "loses"/"lose", "drops"/"drop", and "discards"/"discard" count the same as the passive
+// forms above, but only with a work-bearing object right after the verb ("loses the job", "drops
+// the job when processing throws", "discards the queued task before retry") — an object-less verb
+// ("drops support for X", "discards the connection") says nothing about work loss on its own.
+const WORK_LOSS_ACTIVE = new RegExp(`\\b(?:loses?|drops?|discards?)\\b${CLAUSE_GAP}\\b(?:work|${WORK_LOSS_SIGNAL})\\b`, "i");
 
 function matchesWorkLoss(note: string): boolean {
   return (
