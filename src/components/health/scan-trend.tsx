@@ -121,20 +121,27 @@ export function ScanTrend({ points, className }: { points: ScanHealthPoint[]; cl
             className="flex h-full min-w-1.5 flex-1 flex-col justify-end"
           >
             {point.total > 0 ? (
-              // Worst first, so a column reads top-down the way the legend does.
-              Array.from(severityHeights(point.bySeverity, point.total, peak)).map(
-                ([severity, height]) => (
-                  <span
-                    key={severity}
-                    className={cn(
-                      "w-full rounded-[1px]",
-                      SEVERITY_BAR[severity],
-                      point.incomplete && "opacity-40",
-                    )}
-                    style={{ height: `${height}%` }}
-                  />
-                ),
-              )
+              // A flex-1 wrapper, not the column itself, hosts the percent-sized segments: the
+              // amber marker below is a flex sibling with its own fixed size, so wrapping the
+              // segments lets flex subtract the marker's height first — the segments' 100% then
+              // means 100% of what's left, not 100% of the column, so a floored segment can no
+              // longer be shrunk back below its floor by the marker's own footprint (anton-knyp).
+              <span className="flex w-full flex-1 flex-col justify-end">
+                {/* Worst first, so a column reads top-down the way the legend does. */}
+                {Array.from(severityHeights(point.bySeverity, point.total, peak)).map(
+                  ([severity, height]) => (
+                    <span
+                      key={severity}
+                      className={cn(
+                        "w-full rounded-[1px]",
+                        SEVERITY_BAR[severity],
+                        point.incomplete && "opacity-40",
+                      )}
+                      style={{ height: `${height}%` }}
+                    />
+                  ),
+                )}
+              </span>
             ) : point.incomplete ? null : (
               <span className="h-0.5 w-full rounded-[1px] bg-stage-done/60" />
             )}

@@ -75,7 +75,7 @@ describe("ScanTrend", () => {
     expect(label).not.toMatch(/new signals per scan/i);
 
     // Scaled to the noisiest INCREMENTAL scan (3), not to the baseline's 100.
-    const bar = screen.getByTitle(/2 new signals/).firstElementChild as HTMLElement;
+    const bar = screen.getByTitle(/2 new signals/).querySelector("span[style]") as HTMLElement;
     expect(Number.parseFloat(bar.style.height)).toBeCloseTo(66.7, 0);
   });
 
@@ -97,6 +97,32 @@ describe("ScanTrend", () => {
     const column = screen.getByTitle(/incomplete scan/);
     expect(column.innerHTML).toContain("bg-risk-med/70");
     expect(column.innerHTML).not.toContain("bg-stage-done");
+  });
+
+  // anton-knyp round 4: the segments used to claim 100% of the column directly, so the amber
+  // marker appended after them pushed total content past the column's height and flexbox shrank
+  // every segment — including ones floored at 6% — right back below their floor. The segments
+  // must sit in their own flex-1 wrapper so the marker's height is subtracted from what they
+  // divide up, not tacked on top of it.
+  it("reserves room for the incomplete marker instead of piling it onto a full column", () => {
+    render(
+      <ScanTrend
+        points={[{ ...point("a", 1_700_000_000, { critical: 1, high: 1, low: 1 }), incomplete: true }]}
+      />,
+    );
+
+    const column = screen.getByTitle(/incomplete scan/);
+    const marker = column.querySelector(".bg-risk-med\\/70") as HTMLElement;
+    const segments = Array.from(column.querySelectorAll<HTMLElement>("span[style]"));
+
+    // The marker sits outside the segments' wrapper, as a flex sibling with its own footprint —
+    // not nested inside it, where its height would come out of the segments' own 100% budget.
+    for (const segment of segments) expect(marker.contains(segment)).toBe(false);
+    // The wrapper hosting the segments is itself a flex-1 item, so the marker's fixed size is
+    // subtracted from the space it divides up rather than layered on top of a full column.
+    const wrapper = segments[0].parentElement!;
+    expect(wrapper.className).toContain("flex-1");
+    expect(wrapper).not.toBe(column);
   });
 
   it("dims an incomplete column that did find signals — its counts are a floor", () => {
