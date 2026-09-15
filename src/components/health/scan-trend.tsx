@@ -39,12 +39,11 @@ const FLOOR_PCT = 6;
  * happen on a column whose track was already close to it — do the above-floor segments give back
  * the difference, in proportion to how far each cleared the floor, the same way flex-shrink would.
  */
-function severityHeights(bySeverity: Record<ScanSeverity, number>, total: number, peak: number) {
-  const track = (total / peak) * 100;
+function severityHeights(bySeverity: Record<ScanSeverity, number>, peak: number) {
   const present = SCAN_SEVERITIES.filter((s) => bySeverity[s] > 0);
 
   const heights = new Map<ScanSeverity, number>(
-    present.map((s) => [s, Math.max((bySeverity[s] / total) * track, FLOOR_PCT)]),
+    present.map((s) => [s, Math.max((bySeverity[s] / peak) * 100, FLOOR_PCT)]),
   );
 
   const overflow = [...heights.values()].reduce((sum, h) => sum + h, 0) - 100;
@@ -128,7 +127,7 @@ export function ScanTrend({ points, className }: { points: ScanHealthPoint[]; cl
               // longer be shrunk back below its floor by the marker's own footprint (anton-knyp).
               <span className="flex w-full flex-1 flex-col justify-end">
                 {/* Worst first, so a column reads top-down the way the legend does. */}
-                {Array.from(severityHeights(point.bySeverity, point.total, peak)).map(
+                {Array.from(severityHeights(point.bySeverity, peak)).map(
                   ([severity, height]) => (
                     <span
                       key={severity}
