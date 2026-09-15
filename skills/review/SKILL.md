@@ -76,14 +76,20 @@ queue — walk these steps and put the result in your notes before you move on:
    - **a cancellation** — the run or ticket being cancelled between the read and the write
    - **the event loop itself** — an `await` between the read and the write that hands control to
      something else before the write lands
-4. **Reach a verdict**, one of three:
+4. **Reach a verdict**, one of four:
    - **A finding** — blocking if a stale read can corrupt state or let the write proceed on a
      fact that is no longer true, advisory if the window is real but narrow and benign.
    - **Safe/fenced** — the mutation has a dependent read, but a transaction, lock, or fencing
      token correctly protects the read-to-write window. Name the mechanism and where it's
      enforced; this is not a finding, but it is not silence either.
-   - Once every mutation in the diff has been walked and none needed either verdict above, the
-     explicit sentence **"no mutation-with-dependent-read in this diff."**
+   - **Safe/no interleaving** — the mutation has a dependent read, but none of the actors in
+     step 3 can actually land between the read and the write: a synchronous, function-local
+     sequence with no `await` or yield point in between, or an atomic primitive (a CAS, an
+     `INSERT ... ON CONFLICT`) whose read-modify-write is indivisible by construction rather than
+     protected by an explicit lock. Name which actors you checked and why each is ruled out; this
+     is not a finding, but it is not silence either.
+   - Once every mutation in the diff has been walked and none needed any of the three verdicts
+     above, the explicit sentence **"no mutation-with-dependent-read in this diff."**
 
    Restating this pass without walking every mutation satisfies nothing; it must produce a
    verdict for each mutation found, or that sentence.
