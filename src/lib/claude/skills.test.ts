@@ -3,9 +3,22 @@
  * (`skills/<name>/SKILL.md`) exist and are well-formed, so a `/shape` run — and anton's own jobs —
  * have full operating context from anton's assets alone, with no loom/plugin dependency.
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
+import { orderTickets } from "../jobs/execute-epic-board";
+import { runTickets } from "../ticket-view";
 import { INSTALLED_SKILLS, REQUIRED_SKILLS, SKILLS_DIR, loadSkill, skillPath } from "./prompt";
 import { stripFrontmatter } from "./agent-prompt";
 import { readSkillStamp, skillDigest } from "./skill-stamp.mjs";
@@ -187,6 +200,98 @@ describe("required skill assets", () => {
       expect(shape).toMatch(/Audit the tiers\. This step is not optional/);
       expect(shape).toMatch(/anton board-check/);
       expect(shape).toMatch(/If the audit and your intent disagree, the audit is right/);
+    });
+
+    // A well-formed `blocks` edge pointing the wrong way is the one ordering fault no checker can
+    // decide (anton-q6vu6): bd accepts it silently, so the printed dispatch order is the only
+    // evidence and asserting it is on the author, not a mechanical gate.
+    it("shape's Phase 5 requires the ordering audit beside the tier audit, equally non-optional", () => {
+      expect(shape).toMatch(/Audit the ordering\. This step is not optional either/);
+      expect(shape).toMatch(/topological order over `blocks`\s+edges/);
+      expect(shape).toMatch(/not\*\* board order, not creation order/);
+      expect(shape).toMatch(/nearest-card\s+membership/);
+      expect(shape).toMatch(/arbitrary working-layer nesting/);
+      expect(shape).toMatch(/pipeline exclusion/);
+      expect(shape).toMatch(/open and closed reads/);
+      expect(shape).toMatch(/Kahn ordering/);
+      expect(shape).toMatch(/matches the intended build order because/);
+      expect(shape).toMatch(/naming the tickets/);
+    });
+
+    it("shape's ordering audit prints the executor's nested, blocker-first dispatch order", () => {
+      const dep = (issue_id: string, depends_on_id: string) => ({
+        issue_id,
+        depends_on_id,
+        type: "blocks",
+      });
+      const board = [
+        { id: "epic", title: "Epic", status: "open", issue_type: "epic" },
+        { id: "feature", title: "Feature", status: "open", issue_type: "feature", parent: "epic" },
+        // Source order is deliberately backwards: the audit must expose that `schema` dispatches first.
+        { id: "endpoint", title: "Endpoint", status: "open", issue_type: "task", parent: "feature", dependencies: [dep("endpoint", "schema")] },
+        { id: "schema", title: "Schema", status: "open", issue_type: "task", parent: "feature" },
+        { id: "nested", title: "Nested wiring", status: "open", issue_type: "task", parent: "endpoint" },
+        { id: "gate", title: "Gate", status: "open", issue_type: "gate", parent: "feature" },
+      ];
+      const expected = orderTickets(runTickets(board, "feature"), board).map((bead) => bead.id);
+      expect(expected).toEqual(["schema", "nested", "endpoint"]);
+
+      const temp = mkdtempSync(join(tmpdir(), "anton-shape-order-"));
+      const bin = join(temp, "bin");
+      mkdirSync(bin);
+      const bd = join(bin, "bd");
+      const rendered = JSON.stringify(board);
+      writeFileSync(
+        bd,
+        `#!/usr/bin/env node\nconst args = process.argv.slice(2);\nif (args.includes("--status") && args[args.indexOf("--status") + 1] === "all") process.exit(1);\nprocess.stdout.write(${JSON.stringify(rendered)});\n`,
+      );
+      chmodSync(bd, 0o755);
+
+      try {
+        // The script is embedded as a heredoc (`node <<'NODE_EOF' ... NODE_EOF`), not a single-quoted
+        // `node -e '...'`, because its own source contains single quotes bash would otherwise close
+        // early on (PR #274 review).
+        const command = shape.match(/node <<'NODE_EOF'\n([\s\S]*?)\nNODE_EOF/)?.[1];
+        expect(command).toBeDefined();
+        const audit = spawnSync("node", ["-e", command!], {
+          cwd: temp,
+          encoding: "utf8",
+          env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+        });
+        expect(audit.status, audit.stderr).toBe(0);
+        expect(audit.stdout).toContain("feature feature:");
+        expect(
+          audit.stdout
+            .match(/^\s+\d+\.\s+(\S+)/gm)
+            ?.map((line) => line.trim().split(/\s+/)[1]),
+        ).toEqual(expected);
+      } finally {
+        rmSync(temp, { recursive: true, force: true });
+      }
+    });
+
+    it("shape and bd state the same unmisreadable edge direction, with the schema worked example", () => {
+      for (const body of [shape, bd]) {
+        expect(body).toMatch(/one spelling of[\s\S]{0,60}cannot be misread/);
+        expect(body).toMatch(/`bd dep add/);
+        expect(body).toMatch(/\*\*LATER\*\* ticket/);
+        expect(body).toMatch(/\*\*EARLIER\*\* ticket/);
+        expect(body).toMatch(
+          /a ticket that uses a schema depends on the ticket that\s+builds the schema/,
+        );
+        expect(body).toMatch(/never the reverse/);
+      }
+    });
+
+    it("shape and bd both state bd accepts a reversed edge silently", () => {
+      for (const body of [shape, bd]) {
+        expect(body).toMatch(/reversed edge/);
+        expect(body).toMatch(/backwards `blocks` edge\s+creates\s+with exit 0/);
+        expect(body).toMatch(/`bd lint` reports it clean/);
+        expect(body).toMatch(/`bd dep cycles` finds nothing/);
+      }
+      // The mismatch is fixed before confirming, never explained away — stated in shape only.
+      expect(shape).toMatch(/never\s+explain the mismatch away/);
     });
 
     it("shape maps a mid-shape structural instruction onto the tiers instead of obeying it", () => {

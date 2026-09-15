@@ -2,10 +2,11 @@ import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
 import { humanGates } from "@/lib/approval-gate";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
-import { refreshAllIssues } from "@/lib/beads/issues";
+import { ensureCycleEvidence, refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
-import { formatStructureViolations, structureGaps } from "@/lib/beads/structure";
+import { cycleEvidenceFor } from "@/lib/beads/cycle-evidence";
+import { formatStructureViolations, structureGaps, type StructureViolation } from "@/lib/beads/structure";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, stealRefused } from "@/lib/beads/claim";
 import { approveAndClaim, unwindApproveClaim } from "@/lib/beads/approve-claim";
@@ -93,7 +94,10 @@ const APPLY_STATUS = { unusable: 422, refused: 409, failed: 500, unsettled: 500 
  * against the board as of the write: the target is not (or is no longer) a run target, or a steal's
  * victim started their run while this approval was in flight.
  */
-type ApproveRefusal = { notRunTarget: string } | { moved: string };
+type ApproveRefusal =
+  | { notRunTarget: string }
+  | { moved: string }
+  | { structure: StructureViolation[] };
 
 /**
  * Why this bead is not something approval may enqueue, or undefined when it is a run target. Reuses
@@ -172,8 +176,20 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // issuing a second `bd list`. Crucially, `refreshAllIssues` goes through `loadAllIssues`, which
   // falls back to separate open/closed reads where `--status all` fails; calling `beads.list` directly
   // here would skip that fallback and 500 the whole approval in exactly the scenario the board handles.
-  const allBeads = await refreshAllIssues(project.repoPath);
-
+  //
+  // Deliberately WITHOUT `withCycles` here (PR #274 review): a gardener proposal below never reaches
+  // a gate that consumes cycle evidence — its own apply path fetches it conditionally, only for the
+  // moves that need it (`applyProposal`'s `CYCLE_AWARE_MOVES`) — so forcing that read unconditionally
+  // on this very first fetch would reject the WHOLE approval, proposal included, whenever `bd dep
+  // cycles` is unavailable, slow, or returns unreadable output. Fetched separately, after the
+  // proposal branch below excludes proposals, for the run targets that actually need it.
+  //
+  // WITH `strictGates` (PR #274 review): the structure gate below judges `blocks-edge-dangling` off
+  // this same read, and a degraded gate-less board makes a gate's own `blocks` edge misread as a
+  // dangling one — reporting valid graph structure as corruption and telling the operator to delete
+  // an edge that's fine. A transient `bd list --type gate` failure must surface as a failed read
+  // (this request throws, the operator retries) rather than a misleading 422.
+  const allBeads = await refreshAllIssues(project.repoPath, { strictGates: true });
   // Validate the target is actually runnable *before* touching labels or enqueuing. Approval is the
   // run trigger, so labeling-and-enqueuing a bead that execute-epic will only poison-park is a false
   // green: the operator sees "approved" but no run ever reaches a PR. Reuse the same isRunTarget gate
@@ -335,8 +351,17 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   //
   // One call, both severities: the refusal below and the advisory further down are the same subtree
   // read, and asking twice would walk the whole board twice.
+  // Cycle evidence, fetched here rather than on the initial read above (PR #274 review, round 2):
+  // a pure ownership take-over of a blocked target never reaches this gate (`willEnqueue` is false),
+  // so it must not pay for `bd dep cycles` or fail the whole request when that command times out, is
+  // unavailable, or returns unreadable output — none of which changes an outcome that skips the gate
+  // entirely. Attaches to the SAME `allBeads` array already in hand, so this costs at most one
+  // `bd dep cycles` spawn, not a second `bd list`.
+  if (willEnqueue) {
+    await ensureCycleEvidence(project.repoPath, allBeads);
+  }
   const structural = willEnqueue
-    ? structureGaps(epicId, allBeads)
+    ? structureGaps(epicId, allBeads, { cycles: cycleEvidenceFor(allBeads) })
     : { blocking: [], advisory: [] };
   if (structural.blocking.length > 0) {
     return NextResponse.json(
@@ -495,6 +520,12 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     beadId: epicId,
     expectedOwner: owner,
     nextOwner: operator ?? owner,
+    // A pure take-over of a blocked target (`willEnqueue === false`) never reaches the structure
+    // re-check below that consumes cycle evidence, so this locked read must not pay for — or fail
+    // over — a `bd dep cycles` that only a would-be enqueue needs (codex review, PR #274: "Skip
+    // cycle reads for non-enqueuing takeovers"). Mirrors the identical `willEnqueue` gate the
+    // pre-lock read already applies to `ensureCycleEvidence` above.
+    needsCycles: willEnqueue,
     guard: (locked, lockedBoard) => {
       // Re-take the run-target verdict HERE, under the lock. The pre-lock gate answered from a read
       // taken before every gate below it ran, and the Add-work commit (lib/backlog.ts
@@ -508,6 +539,16 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       // `createDraftFeature`'s own re-check refuses the draft.
       const refusal = notRunTargetReason(locked, lockedBoard);
       if (refusal) return { notRunTarget: refusal };
+
+      // The locked board is the state the approval writes against. Re-run the blocking structure
+      // gate here so a blocks cycle that landed after the pre-lock read cannot be approved and
+      // enqueued under stale graph evidence.
+      if (willEnqueue) {
+        const blockingStructure = structureGaps(epicId, lockedBoard, {
+          cycles: cycleEvidenceFor(lockedBoard),
+        }).blocking;
+        if (blockingStructure.length > 0) return { structure: blockingStructure };
+      }
 
       wroteLabel = !beads.isApproved(locked);
 
@@ -546,6 +587,15 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
         `${epicId} is claimed by ${owner} and is already ${refusal.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
         owner,
         refusal.moved,
+      );
+    }
+    if ("structure" in refusal) {
+      return NextResponse.json(
+        {
+          error: `${epicId} breaks the tier structure: ${formatStructureViolations(refusal.structure)}`,
+          rules: refusal.structure.map((v) => v.rule),
+        },
+        { status: 422 },
       );
     }
     return NextResponse.json({ error: refusal.notRunTarget }, { status: 422 });

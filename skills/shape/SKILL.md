@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 1ee53194bc2e
+version: 5dbfa7066555
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -187,6 +187,203 @@ Then assert the five invariants out loud against what you just printed, naming c
   signature of leaves mistyped as features; fix it before you confirm, don't explain it away.
 
 If the audit and your intent disagree, the audit is right.
+
+**Audit the ordering. This step is not optional either, and it is the one no checker can do for
+you** — a `blocks` edge pointing the wrong way is well-formed: `bd lint` passes, `bd dep cycles`
+finds nothing, and `bd create --graph` exits 0. The edge is syntactically fine and semantically
+backwards, and nothing mechanical can tell the difference between "t2 blocks t1" meant and "t1
+blocks t2" meant — only you, holding the intended build order, can. For every feature, print the
+tickets in the order the executor will actually dispatch them (the topological order over `blocks`
+edges — **not** board order, not creation order):
+
+```bash
+# Prints every feature's actual executor dispatch order. It mirrors runTickets: nearest-card membership,
+# arbitrary working-layer nesting, pipeline exclusion, and Kahn ordering with source-list ties. A
+# ticket held by a blocker OUTSIDE this feature (work in another run) is excluded from the numbered
+# order and listed separately, mirroring runReadiness's gated partition (execute-epic-board.ts) that
+# partitionTickets (execute-epic-dispatch.ts) applies before dispatch — the executor never runs a held
+# ticket in this pass, so numbering it alongside the rest would claim an order nobody will observe.
+# Some supported bd builds reject --status all, so merge their open and closed reads before sorting.
+node <<'NODE_EOF'
+const { execFileSync } = require("node:child_process");
+// Some supported bd builds wrap the array in an envelope (`{ issues: [...] }` / `{ results: [...] }`)
+// instead of returning it bare — same normalization as the production parser (src/lib/beads/bd-json.ts).
+const asArray = (d) => (Array.isArray(d) ? d : (d && (d.issues ?? d.results ?? d.molecules)) ?? []);
+// Mirrors src/lib/beads/dolt-exec.ts's BD_STEP_TIMEOUT_MS: a locked or unreachable Dolt server must
+// fail this mandatory audit loudly, not hang it forever. A timeout is NOT "this flag is unsupported"
+// — feeding it into the --status-all fallback below would just re-issue more calls against the same
+// wedged server, so it's reported and the script exits before the caller's try/catch can swallow it.
+const BD_LIST_TIMEOUT_MS = 60_000;
+const list = (args = []) => {
+  let stdout;
+  try {
+    stdout = execFileSync("bd", ["list", ...args, "--json", "--limit", "0"], {
+      encoding: "utf8",
+      timeout: BD_LIST_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+  } catch (err) {
+    if (err.killed || err.signal) {
+      console.error(`bd list ${args.join(" ")} timed out after ${BD_LIST_TIMEOUT_MS}ms — board could not be checked. Resolve the lock/connectivity issue before confirming.`);
+      process.exit(1);
+    }
+    throw err;
+  }
+  return asArray(JSON.parse(stdout));
+};
+let all;
+try {
+  all = list(["--status", "all"]);
+} catch {
+  const byId = new Map();
+  for (const bead of [...list(), ...list(["--status", "closed"])]) if (!byId.has(bead.id)) byId.set(bead.id, bead);
+  all = [...byId.values()];
+}
+// Gate beads are omitted from every ordinary `bd list`, even `--status all` (bd 1.1.2) — only
+// `--type gate` surfaces them — while the `blocks` edge a gate puts on its ticket IS carried there.
+// Without them, isHeld's fail-safe below reads a RESOLVED gate as a dangling, still-open blocker and
+// prints a dispatchable ticket as held, though the executor's gate-hydrated board dispatches it fine.
+// Mirrors the production reader's compensation (src/lib/beads/issues.ts's loadGateIssues), same
+// supported-status fallback.
+let gates;
+try {
+  gates = list(["--status", "all", "--type", "gate"]);
+} catch {
+  const byId = new Map();
+  for (const bead of [...list(["--type", "gate"]), ...list(["--status", "closed", "--type", "gate"])])
+    if (!byId.has(bead.id)) byId.set(bead.id, bead);
+  gates = [...byId.values()];
+}
+for (const gate of gates) if (!all.some((b) => b.id === gate.id)) all.push(gate);
+const parentOf = (b) => b.parent ?? b.parent_id;
+const pipeline = new Set(["molecule", "gate"]);
+const ticketTypes = new Set(["task", "bug", "chore", "feature"]);
+const byId = new Map(all.map((b) => [b.id, b]));
+const cardIds = new Set(all.filter((b) =>
+  b.issue_type === "feature" ||
+  (b.issue_type === "epic" && !all.some((c) => c.issue_type === "feature" && parentOf(c) === b.id)),
+).map((b) => b.id));
+const cardOf = (b) => {
+  // A pipeline artifact (gate/molecule) is unattributable even when reparented beneath the ticket
+  // it blocks — mirrors runTargetResolver's isPipelineArtifact check in epic-graph.ts, which runs
+  // before walking to the parent. Without it, a gate reparented under its own ticket (a supported
+  // real-bd shape) would resolve through the ticket up to the feature, and isHeld would read the
+  // feature's status instead of the still-open gate's.
+  if (pipeline.has(b.issue_type)) return undefined;
+  const seen = new Set([b.id]); let parent = parentOf(b);
+  while (parent && !seen.has(parent)) {
+    if (cardIds.has(parent)) return parent;
+    seen.add(parent); const ancestor = byId.get(parent);
+    if (ancestor && pipeline.has(ancestor.issue_type)) return undefined;
+    parent = ancestor && parentOf(ancestor);
+  }
+};
+const runTickets = (featureId) => all.filter((b) =>
+  !cardIds.has(b.id) && !pipeline.has(b.issue_type) && ticketTypes.has(b.issue_type) && cardOf(b) === featureId,
+);
+// The run target a blocker itself ships under — mirrors runTargetResolver in epic-graph.ts. A
+// blocker that IS a card (an external feature/leaf-epic) resolves to itself; a ticket blocker
+// resolves to its card; anything else (an unattributable id) falls back to the blocker's own id,
+// same as computeChildReadiness's `runTargetOf(blockerId) ?? blockerId`.
+const runTargetOf = (id) => (cardIds.has(id) ? id : cardOf(byId.get(id) ?? { id }) ?? id);
+const blockersOf = new Map();
+for (const bead of all) for (const edge of bead.dependencies ?? []) {
+  if (edge.type !== "blocks") continue;
+  const prereqs = blockersOf.get(edge.issue_id) ?? [];
+  prereqs.push(edge.depends_on_id);
+  blockersOf.set(edge.issue_id, prereqs);
+}
+// Tickets gated by a blocker outside this feature ticket set, propagated to anything inside the
+// feature that depends on one of them — same shape as the computeEpicGraph blocked-children rollup
+// (epic-graph.ts), simplified to "closed" for done (this audit runs on freshly shaped work, so a
+// merged-but-not-closed distinction does not arise).
+//
+// A blocker outside this feature is judged by its OWN run target, not its own status (PR #274
+// review): a closed ticket that belongs to another feature whose PR hasn't merged has not shipped —
+// closing a child commits it locally, it doesn't release it — so the dependent must stay held until
+// that whole feature is done, mirroring `computeChildReadiness`'s `runTargetOf` mapping.
+const heldIds = (feature, tickets) => {
+  const ids = new Set(tickets.map((t) => t.id));
+  const isHeld = (blockerId) => {
+    if (ids.has(blockerId)) return false; // inside this feature — ordering, not a gate
+    const gate = runTargetOf(blockerId);
+    if (gate === feature.id) return false; // this feature's own subtree — ordering, not a gate
+    const target = byId.get(gate);
+    return !target || target.status !== "closed"; // unknown or open run target reads as held (fail-safe)
+  };
+  // Same short-circuit as unitHeld in runReadiness (epic-graph.ts): a `blocks` edge on the
+  // feature itself gates every ticket underneath, not just the ones naming the blocker directly.
+  if ((blockersOf.get(feature.id) ?? []).some(isHeld)) return ids;
+  const heldByExternal = (id) => (blockersOf.get(id) ?? []).some(isHeld);
+  const held = new Set(tickets.filter((t) => heldByExternal(t.id)).map((t) => t.id));
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const t of tickets) {
+      if (held.has(t.id)) continue;
+      if ((blockersOf.get(t.id) ?? []).some((id) => ids.has(id) && held.has(id))) { held.add(t.id); grew = true; }
+    }
+  }
+  return held;
+};
+const orderTickets = (tickets) => {
+  const ids = new Set(tickets.map((t) => t.id));
+  const adj = new Map(tickets.map((t) => [t.id, []]));
+  for (const bead of all) for (const edge of bead.dependencies ?? []) {
+    if (edge.type === "blocks" && ids.has(edge.issue_id) && ids.has(edge.depends_on_id))
+      adj.get(edge.depends_on_id).push(edge.issue_id); // blocker → dependent
+  }
+  const indegree = new Map(tickets.map((t) => [t.id, 0]));
+  for (const dependents of adj.values()) for (const id of dependents) indegree.set(id, indegree.get(id) + 1);
+  const queue = tickets.filter((t) => indegree.get(t.id) === 0).map((t) => t.id);
+  const order = [];
+  while (queue.length) {
+    const id = queue.shift(); order.push(id);
+    for (const dependent of adj.get(id)) {
+      indegree.set(dependent, indegree.get(dependent) - 1);
+      if (indegree.get(dependent) === 0) queue.push(dependent);
+    }
+  }
+  return order.length === tickets.length ? order.map((id) => tickets.find((t) => t.id === id)) : tickets;
+};
+// Mirrors the `live` filter in execute-epic-dispatch.ts: an abandoned ticket is closed but was never
+// committed, and the executor drops it from the run entirely before computing held/dispatchable — but
+// only AFTER topologically ordering the full ticket set, not before. Filtering abandoned tickets out
+// ahead of orderTickets would remove them from the dependency graph, so a chain like A -> abandoned B
+// -> C could sort differently here than in the executor, which orders {A, B, C} together and only then
+// skips B. Order first, filter after, so the printed order can never diverge from the real dispatch.
+const isAbandoned = (b) => (b.labels ?? []).includes("abandoned");
+for (const feature of all.filter((b) => b.issue_type === "feature")) {
+  console.log(`feature ${feature.id}:`);
+  const tickets = orderTickets(runTickets(feature.id)).filter((t) => !isAbandoned(t));
+  const held = heldIds(feature, tickets);
+  const dispatchable = tickets.filter((t) => !held.has(t.id));
+  for (const [index, ticket] of dispatchable.entries())
+    console.log(`  ${index + 1}. ${ticket.id}\t${ticket.title}`);
+  for (const ticket of tickets.filter((t) => held.has(t.id)))
+    console.log(`  held (external blocker, not dispatched this pass): ${ticket.id}\t${ticket.title}`);
+}
+NODE_EOF
+```
+
+Then assert out loud, naming the tickets: "feature `<id>` dispatches `t1` → `t2` → `t3`; that
+matches the intended build order because `t2` uses the schema `t1` builds, and `t3`'s endpoint
+needs `t2`'s wiring." If you cannot name the reason each step precedes the next, you have not
+audited it — you have read the list back.
+
+**The one spelling of the edge that cannot be misread:** `bd dep add <blocked> <blocker>` — the
+**LATER** ticket (the one that depends) is the first argument, the **EARLIER** ticket (the one it
+depends on) is the second. Worked example: a ticket that uses a schema depends on the ticket that
+builds the schema, so `bd dep add <uses-schema-ticket> <builds-schema-ticket>` — never the reverse.
+Read `--graph`'s `blocks` edges the same way: `{"from_key": "t2", "to_key": "t1", "type": "blocks"}`
+means `t2` depends on `t1`, so `t1` runs first.
+
+**bd will not catch a reversed edge for you.** Verified on bd 1.1.2: a backwards `blocks` edge
+creates with exit 0, `bd lint` reports it clean, and `bd dep cycles` finds nothing — the wrong
+ticket simply surfaces in `bd ready` first, silently. The printed dispatch order above is the
+**only** evidence you get. If it doesn't match the build order you intended, fix the edge
+(`bd dep remove` the wrong one, `bd dep add` the right direction) before you confirm — never
+explain the mismatch away as acceptable, because there is no mechanical check downstream that will
+catch it later.
 
 **Confirm.** Show the user the tree with the feature's one-line PR scope and its ticket count, name
 the epic it attached to and whether you created it, report the `anton board-check` result, and confirm

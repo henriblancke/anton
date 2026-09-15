@@ -62,6 +62,7 @@ vi.mock("../beads/bd", async () => {
       // unstubbed it would shell out to a real `bd dolt push` from a unit suite.
       push: async () => "synced" as const,
       list: (...a: [string, string[]?]) => listMock(...a),
+      depCycles: async () => [],
       showWithComments: (...a: [string, string]) => showWithCommentsMock(...a),
       show: (...a: [string, string]) => showMock(...a),
       create: (cwd: string, opts: ProposalCreate) => {

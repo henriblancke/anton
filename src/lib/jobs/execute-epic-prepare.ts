@@ -7,8 +7,10 @@
  * that follow from holding it (the human waits, the checkout, the claim and its cascade). Moving a
  * step across that line changes what a park leaves behind, so each one says where it sits and why.
  */
-import { beads, type Bead } from "../beads/bd";
+import { beads, LABELS, staleClaimReason, type Bead } from "../beads/bd";
+import { cycleEvidenceFor } from "../beads/cycle-evidence";
 import { loadAllIssues } from "../beads/issues";
+import { formatStructureViolations, structureGaps } from "../beads/structure";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
 import {
   branchContainsCommit,
@@ -34,7 +36,11 @@ import {
   publishRunClaim,
   warmRunWorktree,
 } from "./execute-epic-claim";
-import { adoptRefreshedTarget, preflightHumanTickets } from "./execute-epic-human-gate";
+import {
+  adoptRefreshedTarget,
+  answeredHumanGate,
+  preflightHumanTickets,
+} from "./execute-epic-human-gate";
 import { refreshRunBoard, settleCompletedRun } from "./execute-epic-recover";
 import type { EpicRun } from "./execute-epic-run";
 // The formula/step family, the run-lease, AND the checkout-staleness preflight (anton-vzhf) sit
@@ -80,6 +86,30 @@ interface RunGates {
   /** The target's working-layer subtree on the current board — `tickets` minus the standalone case. */
   children: Bead[];
   isResumeSkipped: (t: Bead) => boolean;
+  /**
+   * Ticket ids the human preflight ({@link armHumanTicketWaits}) actually armed a wait for, or
+   * closed as answered — a strict subset of `gated` (PR #274 review). `gated` also holds tickets
+   * an ORDINARY cross-run blocker gates, which never got a human wait armed for them; conflating
+   * the two would let a ticket relabelled `agent:human` AFTER the preflight, but whose id already
+   * sat in `gated` for an unrelated reason, ride through the publish-time relabel check unhandled.
+   * Empty until the arm step runs.
+   */
+  armedHumanIds: Set<string>;
+  /**
+   * Tickets THIS preflight itself already found answered-but-blocked, keyed to the ordinary
+   * blocker ids still holding each one — held rather than closed because an ORDINARY prerequisite
+   * is still open (PR #274 review, round 10). `armHumanTicketGates` judges this against `run.all`,
+   * the board `preflightHumanTickets` read, so a ticket landing here is not evidence of a race in a
+   * LATER window — it is this pass's own correct verdict on the board it already saw.
+   * `assertPublishedBoardCycleFree`'s `answeredSinceArmed` re-reads a fresher board and would
+   * otherwise see the exact same answered-but-still-blocked gate and misread its own preflight's
+   * settled judgment as a race that needs a retry, looping the run on a ticket nothing has
+   * actually left unhandled — but only for as long as the recorded blockers are still open on the
+   * board that check re-reads (PR #274 review, round 11): once one of them closes, the exemption
+   * must lapse so the ticket returns through that same check and the next preflight pass. Empty
+   * until the arm step runs.
+   */
+  answeredButBlocked: Map<string, string[]>;
 }
 
 /**
@@ -120,6 +150,7 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   await cascadeChildClaims(run);
   await assertReservedTicketsClaimable(run, gates);
   await publishRunClaim(run);
+  await assertPublishedBoardCycleFree(run, gates);
   return {
     done: false,
     ticketSteps,
@@ -133,14 +164,33 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
 }
 
 /**
- * Steps 0a-bis and 0a-ter. Re-run the readiness gate and re-derive the target's SHAPE against the
- * freshly-pulled board, then take the lease's leftovers. Both properties belong to the whole BOARD,
- * not to the bead, so a pull that changed either must be judged before anything is held.
+ * Steps 0a-pre, 0a-bis and 0a-ter. Re-run the structure/cycle gate, the readiness gate, and re-derive
+ * the target's SHAPE — all against the freshly-pulled board — then take the lease's leftovers. Every
+ * one of these properties belongs to the whole BOARD, not to the bead, so a pull that changed any of
+ * them must be judged before anything is held.
  */
 function regateRefreshedBoard(run: EpicRun, leaseTarget: Bead): RunGates {
   const { targetId: epicBeadId, lease } = run;
   const { all } = run;
   let target = run.target;
+  // 0a-pre. Re-run the authoritative structure/cycle gate against the freshly-pulled board too
+  //     (PR #274 review). The top-of-handler check (execute-epic-start.ts) ran on the PRE-pull
+  //     snapshot; `refreshRunBoard`'s pull, just above, can itself land an internal `blocks` cycle
+  //     among this run's OWN tickets that check never saw — a cross-machine Dolt merge lands on its
+  //     own schedule, not this job's. `runReadiness` below treats an internal edge as ORDERING, not
+  //     a blocker, so it would never notice the cycle, and `orderTickets` (execute-epic-board.ts)
+  //     falls back to input order the moment its topological sort can't place every ticket — which
+  //     would dispatch a dependent ticket ahead of the prerequisite the very edges say it must
+  //     follow. Poison before anything is held, exactly like the top-of-handler check; the fix is on
+  //     the board, not a retry. Reads `all` (the board `refreshRunBoard` just adopted into `run.all`,
+  //     or the pre-pull snapshot if that adoption failed) with `cycleEvidenceFor`, which is populated
+  //     only when the read that produced `all` asked for cycles — `refreshRunBoard`'s re-list does.
+  const structural = structureGaps(epicBeadId, all, { cycles: cycleEvidenceFor(all) });
+  if (structural.blocking.length > 0) {
+    throw new PoisonEpic(
+      `${epicBeadId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
+    );
+  }
   // 0a-bis. Re-run the job-start readiness gate against the freshly-pulled board (anton-jz1).
   //     The top-of-handler `blockers` check ran on the PRE-pull `all`, so a `blocks` edge
   //     another machine pushed before this pull is invisible there — and the `fresh` adoption
@@ -208,7 +258,14 @@ function regateRefreshedBoard(run: EpicRun, leaseTarget: Bead): RunGates {
   // exist yet at this point.
   const isResumeSkipped = (t: Bead) => resumeSkipped(t, run.standaloneRun);
   run.target = target;
-  return { readiness: freshReadiness, gated, children: freshChildren, isResumeSkipped };
+  return {
+    readiness: freshReadiness,
+    gated,
+    children: freshChildren,
+    isResumeSkipped,
+    armedHumanIds: new Set(),
+    answeredButBlocked: new Map(),
+  };
 }
 
 /**
@@ -420,6 +477,18 @@ async function commitsHere(run: EpicRun, held: HumanHeldTicket[]): Promise<Set<s
  * the pre-pull board and publication would then import the very block it was asked about, which is
  * the stale-read shape it exists to remove. `beads.pull` resolves for a board with no remote and for
  * a shared server (nothing to reconcile in either), so only a real refresh failure rejects.
+ *
+ * Re-runs the structure/cycle gate too (PR #274 review), WITH its own `bd dep cycles` evidence: this
+ * is the last pull BEFORE the claim publishes, so it is the last chance to catch a `blocks` cycle
+ * among the run's own tickets that a cross-machine write landed after `regateRefreshedBoard`'s check.
+ * Without it, a cycle that arrives in this specific window rides straight through — `orderTickets`
+ * falls back to source order the moment its topological sort can't place every ticket, and dispatch
+ * never learns the order it fell back to was never validated. Reusing the same pull this claimability
+ * read already pays for costs nothing extra on the path that matters.
+ *
+ * Not the LAST pull overall, though: {@link publishRunClaim} right after this runs a full sync, which
+ * pulls again as part of its own push. {@link assertPublishedBoardCycleFree} is what covers that
+ * later window (PR #274 review, round 2) — this function only owns the one ending here.
  */
 async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Promise<void> {
   const { repo, targetId: epicBeadId } = run;
@@ -429,11 +498,13 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
   if (gates.children.length === 0) return;
   // Fails CLOSED, like the confirmation read in step 1c and the cascade it follows: a run that
   // cannot prove its reserved children are claimable must not enter the loop. Retryable — the next
-  // attempt reuses this worktree and re-takes the same idempotent reservations.
+  // attempt reuses this worktree and re-takes the same idempotent reservations. `withCycles: true`
+  // lets a `bd dep cycles` failure reject this same read rather than silently omitting evidence — the
+  // structure gate below must not mistake "couldn't ask" for "asked, none reported".
   let reservedBoard: Bead[];
   try {
     await beads.pull(repo);
-    reservedBoard = await loadAllIssues(repo, { strictGates: true });
+    reservedBoard = await loadAllIssues(repo, { strictGates: true, withCycles: true });
   } catch (e) {
     throw new Error(
       `${epicBeadId} could not refresh and re-read the board after reserving its tickets to ` +
@@ -442,10 +513,277 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
         `(${e instanceof Error ? e.message : String(e)})`,
     );
   }
+  const structural = structureGaps(epicBeadId, reservedBoard, { cycles: cycleEvidenceFor(reservedBoard) });
+  if (structural.blocking.length > 0) {
+    throw new PoisonEpic(
+      `${epicBeadId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
+    );
+  }
   const reserved = new Map(runTickets(reservedBoard, epicBeadId).map((t) => [t.id, t]));
   const held = humanHeldTickets(dispatchableChildren(gates).map((c) => reserved.get(c.id) ?? c));
   if (held.length === 0) return;
   throw humanHeldPoison(epicBeadId, held, run.branch, await commitsHere(run, held));
+}
+
+/**
+ * Step 3c-bis. Re-run the structure/cycle gate ONE more time, on the board {@link publishRunClaim}'s
+ * own sync just pulled (PR #274 review, round 2).
+ *
+ * `assertReservedTicketsClaimable` pulls and gates the board right before the claim publishes — but
+ * `publishRunClaim`'s `beads.sync` pulls AGAIN, as the first half of its own push, one line later. On
+ * an embedded board that is a second window, after the last gate ran, in which another machine's
+ * write can land a `blocks` cycle among this run's own tickets before dispatch starts. Nothing here
+ * asks about it: `publishRunClaim` only cares whether the push landed, and this is the last point
+ * before the ticket loop where a board read is still cheap. Asked here, on the board that pull
+ * actually left behind, closes the window the same way `assertReservedTicketsClaimable` closes the
+ * one before it.
+ *
+ * No pull of its own: `beads.sync` already pulled as its first step, so the local db already carries
+ * whatever landed, and pulling again would race the push that same sync may still be finishing.
+ *
+ * ADOPTED, not merely checked (PR #274 review, round 3): a valid `blocks` edge landing in this same
+ * window is invisible to the structure gate above — it is acyclic, so nothing blocks — but it is a
+ * new prerequisite `orderTickets` must place. Judging it against `board` and then dispatching from
+ * the stale `run.all`/`run.tickets` would carry it nowhere, so `partitionTickets`'s
+ * `orderTickets(tickets, all)` would still sort by the pre-pull edges and could dispatch the
+ * dependent first. Adopted the same way {@link confirmSelectionUnderLease} adopts its own read.
+ *
+ * MEMBERSHIP is not adopted the same way (PR #274 review, round 5): the board this reads is the one
+ * `publishRunClaim`'s own sync just pulled, and that pull can bring back a child ticket attached
+ * (say, an approved gardener re-parent landing in the same window `confirmSelectionUnderLease`
+ * already guards earlier) AFTER `assertBeadContract`, `assertAgentsEnabled` and
+ * `assertReservedTicketsClaimable` have all already run over the set this run reserved. Silently
+ * widening `run.tickets` to `runTickets(board, epicBeadId)` here would carry a ticket into dispatch
+ * that none of those gates, nor the cascade, ever looked at — the exact drift
+ * {@link confirmSelectionUnderLease} exists to catch, just one window later. So membership is
+ * DIFFED against the set this run already reserved, the same way that function diffs its own read,
+ * and a change retries preparation rather than being adopted — the retry re-reserves and re-gates
+ * whatever set the board holds by then.
+ *
+ * READINESS is re-derived from the same adopted board, for the same reason (PR #274 review, round
+ * 4): the edge this window can land is not only an internal cycle — it is just as validly a new
+ * EXTERNAL blocker on one of this run's own tickets (or on the target itself). `partitionTickets`
+ * dispatches by `gates.gated` alone; its own re-gate ({@link regateReopened}) fires only for a
+ * ticket a supersede reopened, so a plain new blocker on an ordinary live ticket would otherwise
+ * ride the stale `gated` this function's caller already captured straight through as dispatchable.
+ * Recomputed the same way `regateRefreshedBoard` and `armHumanTicketWaits` do, and PARKED on the
+ * same poison a blocker reopening at either of those points already takes: this is just the last
+ * window one can land in before the loop starts.
+ *
+ * The TARGET's own eligibility is RE-ASSERTED against this board, not just its label (PR #274
+ * review, round 6): `adoptRefreshedTarget` only ever asked `agent:human`, so a target this same
+ * pull found deleted, unapproved, abandoned, or reparented out of run-target shape (a standalone
+ * task a re-parent landed under another card in this exact window) rode straight through — either
+ * as `adoptRefreshedTarget`'s stale fallback (nothing on the board to find) or as the fresh,
+ * newly-ineligible bead itself, since nothing downstream of here repeats what
+ * {@link assertRunnableTarget} already asked once at the top of the run. `staleClaimReason` is the
+ * SAME question `claimVerified` asks after its own settle window; asked again here because
+ * `publishRunClaim`'s sync is one more window the same drift can land in. PARKED, not retried, for
+ * the reason {@link runTargetDrift}'s callers park: a target that has stopped being runnable does
+ * not become one again by trying.
+ *
+ * The CHILDREN's `agent:human` label is watched too (PR #274 review, round 6): `armHumanTicketWaits`
+ * ran its preflight — and armed its gates — on the board its OWN refresh brought back, which sits
+ * before `publishRunClaim`'s sync. A relabel landing in the gap keeps the ticket's id in both the
+ * pre- and post-sync sets, so {@link ticketSetDrift} (id-only, by design) reads it as no change at
+ * all, and the readiness re-derived above never asks the label either — a person's work would
+ * dispatch to the default agent with no wait ever armed for it. Re-running the full arm-and-write
+ * preflight here is out: it is documented to run BEFORE any worktree, claim or session exists,
+ * exactly because arming is a write racing the very claim this function follows. So the label is
+ * REJECTED as drift instead, the same shape `ticketSetDrift` already retries on: the next attempt
+ * re-enters from the top, where `armHumanTicketWaits` sees the fresh label and arms its wait properly.
+ *
+ * EXCLUDES anything already in `gates.armedHumanIds` (fresh evidence, PR #274 review round 7,
+ * corrected round 8): `preflightHumanTickets` arms a wait WITHOUT clearing the label — only a
+ * person relabelling the ticket does that — so every ticket this run already armed still carries
+ * `agent:human` here, and the open gate it armed already blocks the ticket. Judging the label alone
+ * would reject those same already-handled tickets as "newly relabelled" on every attempt, parking
+ * the whole run forever instead of dispatching its independent siblings.
+ *
+ * NOT `gates.gated`, which round 7 used first and which is the wrong set: `gated` also holds
+ * tickets an ORDINARY cross-run blocker gates, tickets that never went through
+ * {@link armHumanTicketWaits}'s arm at all. A ticket externally blocked when the preflight ran
+ * carries no wait — it fell out of `isUnarmedHumanWork` because it wasn't yet `agent:human`, or
+ * because a blocker made it uninteresting to arm — but its id still lands in `gated`. If this same
+ * window then both resolves that external blocker AND relabels the ticket `agent:human`, `gated`
+ * membership alone would exempt it from this check, the readiness re-derived below would find it
+ * unblocked, and it would dispatch to the default agent with no human wait ever armed. `armedHumanIds`
+ * is the narrower, correct set: only ids {@link preflightHumanTickets} itself armed a wait for or
+ * closed as answered (`state.handled`), so a ticket the preflight never touched still trips this
+ * check no matter what else changed about it in the meantime.
+ *
+ * `armedHumanIds` membership alone is not proof the ticket is settled, though: a gate this run armed
+ * can be RESOLVED by a person during `publishRunClaim`'s own sync, a window that opens after the
+ * preflight already ran — and closing the ticket on its answer only happens inside that preflight
+ * pass ({@link answeredHumanGate}), not here. Left unhandled, the ticket would sit open, still
+ * `agent:human`, with a now-resolved gate — reading as ordinary unblocked work to the readiness
+ * recomputed below, until the dispatch backstop poison-parks the whole run on it. So this is checked
+ * too, and retried the same way: the next attempt's preflight sees the resolved gate and closes the
+ * ticket properly before anything dispatches.
+ *
+ * ALSO re-runs the allowlist, contract and claimable gates over this adopted board (fresh evidence,
+ * PR #274 review round 9): `ticketSetDrift` above is ID-only, so a `publishRunClaim` sync that
+ * swaps in a changed OBJECT for an existing id — a disabled agent's label, a stripped Acceptance
+ * section, a status flipped to `blocked`/`deferred` — passes it untouched, and everything upstream
+ * (`assertAgentsEnabled`, `assertBeadContract`, `assertTicketsClaimable`) judged the pre-sync
+ * objects. Left unchecked, that ticket would ride the readiness recompute below straight into
+ * dispatch under a boundary the operator disabled it for, or fail its hard claim gate after earlier
+ * siblings already ran. Re-run here, over `run.tickets`/`gates.children` as this function just
+ * adopted them, the same read-only functions steps 0b/0c/0c-bis already are — one more window the
+ * same drift can land in, closed the same way.
+ */
+async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Promise<void> {
+  const { repo, targetId: epicBeadId } = run;
+  let board: Bead[];
+  try {
+    board = await loadAllIssues(repo, { strictGates: true, withCycles: true });
+  } catch (e) {
+    throw new Error(
+      `${epicBeadId} could not re-read the board after publishing its claim to confirm it is ` +
+        `still cycle-free — retrying rather than dispatching into an ordering nobody validated. ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
+  const structural = structureGaps(epicBeadId, board, { cycles: cycleEvidenceFor(board) });
+  if (structural.blocking.length > 0) {
+    throw new PoisonEpic(
+      `${epicBeadId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
+    );
+  }
+  const freshTargetBead = board.find((b) => b.id === epicBeadId);
+  if (!freshTargetBead) {
+    throw new PoisonEpic(
+      `${epicBeadId} is no longer on the board after its claim published — refusing to execute ` +
+        `work that vanished from under this run`,
+    );
+  }
+  const adoptedTarget = adoptRefreshedTarget(board, epicBeadId, run.target);
+  const staleReason = staleClaimReason(adoptedTarget, board);
+  if (staleReason) {
+    throw new PoisonEpic(
+      `${epicBeadId} is no longer eligible to run (${staleReason}) — its claim published to a ` +
+        `board that had already moved on, so refusing to execute work this run no longer owns`,
+    );
+  }
+  const freshChildren = runTickets(board, epicBeadId);
+  // Recompute the shape from THIS board before selecting `freshTickets` (PR #274 review): a
+  // previously childless target that gained its FIRST child during `publishRunClaim`'s sync would
+  // otherwise still read `run.standaloneRun` from before that sync, `freshTickets` would stay
+  // `[adoptedTarget]`, the id-only drift check below would see no change (the target's own id never
+  // moved), and the new child would dispatch bypassing every gate above it — the reservation, the
+  // agent/contract/claimable checks, the human-work wait — as if it were the whole run. Re-derived
+  // the same way `execute-epic-recover.ts`'s `settleCompletedRun` does (`groupsChildren` over
+  // `runTickets`), so the two never disagree. ASSIGNED to `run.standaloneRun`, not just used locally,
+  // so every dispatch-time reader of the flag (execute-epic-dispatch.ts) sees the shape this board
+  // actually has rather than the one the run started with.
+  run.standaloneRun = !beads.groupsChildren(adoptedTarget, freshChildren);
+  const freshTickets = run.standaloneRun ? [adoptedTarget] : freshChildren;
+  const drift = ticketSetDrift(run.tickets, freshTickets);
+  if (drift) {
+    throw new Error(
+      `${epicBeadId}'s ticket set changed while its claim was publishing (${drift}) — retrying so ` +
+        `the contract, agent and reserved-ticket gates run over the whole set rather than ` +
+        `dispatching a ticket none of them judged`,
+    );
+  }
+  const relabelledHuman = freshTickets.filter(
+    (t) =>
+      t.id !== epicBeadId &&
+      beads.isHumanWork(t) &&
+      !gates.isResumeSkipped(t) &&
+      !gates.armedHumanIds.has(t.id),
+  );
+  if (relabelledHuman.length > 0) {
+    throw new Error(
+      `${epicBeadId}'s claim published to a board that had already relabelled ` +
+        `${relabelledHuman.map((t) => t.id).join(", ")} ${LABELS.agentHuman} — retrying so the ` +
+        `human-ticket preflight arms a wait for it before anything dispatches, rather than sending ` +
+        `a person's work to the default agent`,
+    );
+  }
+  // A gate `armHumanTicketWaits` armed for one of THESE tickets may have been resolved during
+  // `publishRunClaim`'s own sync — a window that opens after the preflight pass, which is the only
+  // place that closes a ticket on its answer ({@link answeredHumanGate}). `armedHumanIds` correctly
+  // exempts these from `relabelledHuman` above (the preflight already knows about them), but an
+  // answer landing in this later window leaves the ticket open, still `agent:human`, with a resolved
+  // gate — so the readiness recomputed below reads it as ordinary unblocked work, dispatchable
+  // alongside its siblings, until the dispatch backstop (execute-epic-dispatch.ts's `isHumanWork`
+  // check) poison-parks the WHOLE run on it. Retrying instead re-enters from the top, where the next
+  // preflight pass sees the resolved gate and closes the ticket the normal way.
+  //
+  // EXCLUDES a ticket still held by its recorded `answeredButBlocked` blockers (PR #274 review,
+  // round 10): a ticket answered but held on an ordinary prerequisite still open ("ship the API,
+  // then sign the DPA") reads exactly the same as a fresh answer here — open, `agent:human`, an
+  // answered gate — but the preflight already judged it against `run.all` and correctly HELD it
+  // rather than closing or re-arming it. Without the exclusion this pass would flag its own settled
+  // verdict as a race, throw, and re-enter from the top only to reach the identical hold again — an
+  // infinite retry on a ticket nothing has actually left unhandled, spending the run's whole attempt
+  // budget on work already correctly done.
+  //
+  // The exclusion holds ONLY while those recorded blockers are still open on THIS board, not
+  // unconditionally on ticket id (PR #274 review, round 11): `publishRunClaim`'s sync can close the
+  // very prerequisite the preflight held the ticket on, which makes the ticket dispatchable right
+  // now — an ordinary readiness recompute would pick that up, but the blanket id exemption below it
+  // would still suppress the retry that is this function's only path back into a preflight pass.
+  // Left unconditional, the ticket stays parked behind a resolved gate answer while independent
+  // siblings dispatch, until the dispatch backstop poison-parks the whole run on a ticket that was
+  // actually ready. Re-checking each recorded blocker's status against `board` here means a
+  // newly-released blocker un-exempts the ticket, so it flows through this same retry into the next
+  // preflight pass, which closes it the normal way.
+  const boardById = new Map(board.map((b) => [b.id, b]));
+  const stillHeldByRecordedBlockers = (ticketId: string): boolean =>
+    (gates.answeredButBlocked.get(ticketId) ?? []).some((id) => boardById.get(id)?.status !== "closed");
+  const answeredSinceArmed = freshTickets.filter(
+    (t) =>
+      t.id !== epicBeadId &&
+      t.status === "open" &&
+      beads.isHumanWork(t) &&
+      !gates.isResumeSkipped(t) &&
+      gates.armedHumanIds.has(t.id) &&
+      !stillHeldByRecordedBlockers(t.id) &&
+      answeredHumanGate(board, t) !== undefined,
+  );
+  if (answeredSinceArmed.length > 0) {
+    throw new Error(
+      `${epicBeadId}'s claim published to a board where the human gate armed on ` +
+        `${answeredSinceArmed.map((t) => t.id).join(", ")} was resolved during the sync — retrying ` +
+        `so the human-ticket preflight recognizes the answer and closes it, rather than dispatching ` +
+        `its siblings first and poison-parking the run once dispatch reaches it`,
+    );
+  }
+  // The inverse of `relabelledHuman` above: a ticket THIS run already armed a wait for may have had
+  // its `agent:human` label REMOVED during the sync — an operator decided an agent should run it
+  // after all. Neither check above catches it: `relabelledHuman` only watches tickets that carry the
+  // label now, and `answeredSinceArmed` also requires `isHumanWork(t)`. Left unhandled, the ticket's
+  // open gate is never retired, so the readiness recomputed below reads it as blocked and it stays
+  // gated forever behind a wait for a person that no longer applies, while its independent siblings
+  // dispatch normally. Retried instead, so the next attempt re-enters `armHumanTicketWaits`, whose own
+  // `retireRelabelledGates` resolves the now-obsolete gate the normal way.
+  const relabelledAgentWork = freshTickets.filter(
+    (t) => t.id !== epicBeadId && !gates.isResumeSkipped(t) && gates.armedHumanIds.has(t.id) && !beads.isHumanWork(t),
+  );
+  if (relabelledAgentWork.length > 0) {
+    throw new Error(
+      `${epicBeadId}'s claim published to a board that had already un-labelled ` +
+        `${relabelledAgentWork.map((t) => t.id).join(", ")} ${LABELS.agentHuman} — retrying so the ` +
+        `human-ticket preflight retires the now-obsolete gate, rather than leaving it blocked on a ` +
+        `wait for a person no longer needed`,
+    );
+  }
+  run.all = board;
+  run.target = adoptedTarget;
+  run.tickets = freshTickets;
+  gates.children = freshChildren;
+  const freshReadiness = run.readiness(run.all);
+  if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness, run.all);
+  gates.readiness = freshReadiness;
+  gates.gated = new Set(freshReadiness.gated);
+  // Re-run the read-only allowlist/contract/claimable gates over the board just adopted (PR #274
+  // review round 9) — see the doc comment above for why `ticketSetDrift`'s id-only diff cannot
+  // catch a changed OBJECT behind an unchanged id.
+  assertAgentsEnabled(run, gates);
+  assertBeadContract(run, gates);
+  await assertTicketsClaimable(run, gates);
 }
 
 /**
@@ -581,6 +919,16 @@ async function armHumanTicketWaits(run: EpicRun, gates: RunGates): Promise<void>
     freshChildren = humanPreflight.children;
     run.tickets = humanPreflight.tickets;
     freshReadiness = run.readiness(run.all);
+    // The narrower set (PR #274 review): what actually got a wait armed or was closed as
+    // answered, not everything `gated` below folds in. The publish-time relabel check
+    // ({@link assertPublishedBoardCycleFree}) exempts only these ids from its "newly relabelled"
+    // retry — a ticket this pass never touched must still trip it if it turns up human later.
+    gates.armedHumanIds = new Set(humanPreflight.handled);
+    // This pass's own verdict on an answered-but-still-blocked ticket, carried with the recorded
+    // blocker ids so the publish-time check below can tell "this pass already saw and correctly
+    // held it, and its blockers are still open" from "the answer landed in a window this pass never
+    // read" or "a recorded blocker has since closed" (PR #274 review, rounds 10-11).
+    gates.answeredButBlocked = new Map(answeredButBlocked);
     // A held answered-gate ticket joins the verdict as gated, so the dispatch loop holds it by
     // the same rule as any other blocked child rather than reaching it as open human work and
     // parking on the "it should be held by a gate" backstop. Its blockers join the list the park

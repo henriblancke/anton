@@ -119,7 +119,7 @@ export interface StartGateInput {
 /** The board this gate judges everything against. FAILS CLOSED, like every other read here. */
 async function readGateBoard(repoPath: string): Promise<Bead[] | string> {
   try {
-    return await loadAllIssues(repoPath);
+    return await loadAllIssues(repoPath, { strictGates: true, withCycles: true });
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
     return `the board could not be read before starting (${detail})`;

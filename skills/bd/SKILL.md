@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 7e8368fe1280
+version: 315e5fc96628
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
@@ -332,6 +332,19 @@ bd dep add <blocked> <blocker>          # hard ordering (blocked depends on bloc
 bd link <a> <b> --type related          # soft context link
 bd link <new> <origin> --type discovered-from   # provenance for work found mid-flight
 ```
+
+**The one spelling of `bd dep add` that cannot be misread:** the **LATER** ticket (the one that
+depends) is the first argument, the **EARLIER** ticket (the one it depends on, the blocker) is the
+second. Worked example: a ticket that uses a schema depends on the ticket that builds the schema,
+so `bd dep add <uses-schema-ticket> <builds-schema-ticket>` — never the reverse. The same reading
+applies to a `--graph` plan's `blocks` edges: `{"from_key": "t2", "to_key": "t1", "type": "blocks"}`
+means `t2` depends on `t1`, so `t1` runs first.
+
+**bd accepts a reversed edge silently.** Verified on bd 1.1.2: a backwards `blocks` edge creates
+with exit 0, `bd lint` reports it clean, and `bd dep cycles` finds nothing — the only symptom is
+the wrong ticket surfacing in `bd ready` first. No mechanical check catches this; `/shape`'s Phase 5
+ordering audit — printing the executor's actual dispatch order and asserting it against the
+intended build order, naming the tickets — is the only thing that does.
 
 ## Read the board (dedupe / inspect)
 
