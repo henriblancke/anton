@@ -4,7 +4,7 @@
  * owner died. Lock names are unique per test because the lock root is a real shared /tmp directory.
  */
 import { describe, expect, it } from "vitest";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -107,6 +107,43 @@ describe("withHostLock", () => {
     }, { maxWaitMs: 200 });
 
     expect(ran).toBe(true);
+  });
+
+  it("reclaims an orphaned lock dir that never got its owner.json written", async () => {
+    const name = `test-orphan-stale-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    // Models a process killed between `mkdir` and the metadata write: the dir exists, empty, with
+    // no owner.json. Backdate its mtime past the stale window so it reads as an old orphan rather
+    // than a peer that just started.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    // Short budget: this can only pass by reclaiming the orphan, not by polling out to maxWaitMs.
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 200 });
+
+    expect(ran).toBe(true);
+  });
+
+  it("does not steal a metadata-less lock dir still inside the stale window", async () => {
+    const name = `test-orphan-fresh-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    // Same empty, metadata-less dir, but freshly created — a peer could be mid-write right now, so
+    // it must be waited on rather than reclaimed.
+    await mkdir(dir, { recursive: true });
+
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 100 });
+
+    // Advisory fallback still lets it run unlocked once the budget elapses, but the original dir
+    // must still be standing at its live path — reclaimed dirs get renamed away by `retire`.
+    expect(ran).toBe(true);
+    expect((await stat(dir)).isDirectory()).toBe(true);
   });
 
   it("does not let a second stale reclaimer remove the live path", async () => {

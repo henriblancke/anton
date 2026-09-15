@@ -9,7 +9,7 @@
  * best-effort by design: a caller that cannot acquire within its budget runs anyway rather than
  * failing the epic, because a slow check is better than a stuck queue.
  */
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -86,6 +86,20 @@ async function readHolder(metaPath: string): Promise<LockFile | undefined> {
 }
 
 /**
+ * The directory's own mtime, used as the acquisition's age when there is no metadata to read yet.
+ * Undefined when the directory has already vanished (a race with a release/reclaim elsewhere) —
+ * callers should just retry the acquire rather than judging staleness against a value that no
+ * longer describes anything.
+ */
+async function dirMtimeMs(dir: string): Promise<number | undefined> {
+  try {
+    return (await stat(dir)).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * A holder is abandoned when its process is gone, or when it stopped heartbeating long enough that
  * a crash mid-hold is the only explanation. Unreadable metadata is treated as abandoned only once
  * it is also old, so a peer that is mid-write is never stolen from.
@@ -116,7 +130,6 @@ export async function withHostLock<T>(
 
   let held = false;
   let notifiedWait = false;
-  let dirCreatedAt = Date.now();
 
   while (!held) {
     try {
@@ -130,11 +143,17 @@ export async function withHostLock<T>(
         opts.onWait?.(holder);
         notifiedWait = true;
       }
+      // Metadata-less dirs (killed between mkdir and the owner.json write) have no heartbeat to
+      // judge, so fall back to the directory's own mtime. A dir that just vanished out from under
+      // us is neither abandoned nor live — go straight back to mkdir instead of guessing its age.
+      const dirCreatedAt = holder ? 0 : await dirMtimeMs(dir);
+      if (dirCreatedAt === undefined) continue;
       if (isAbandoned(holder, dirCreatedAt, Date.now())) {
-        // Only metadata with an acquisition token can be reclaimed safely. `retire`'s stable,
-        // token-specific destination prevents a delayed reclaimer from moving a successor's lock.
-        if (holder?.token && (await retire(dir, holder.token))) {
-          dirCreatedAt = Date.now();
+        // A token is required to retire safely (it becomes the tombstone's stable destination, so a
+        // delayed reclaimer can never move a successor's lock). Metadata-less acquisitions have none
+        // to reuse, so mint one here purely to name that destination.
+        const reclaimToken = holder?.token ?? randomUUID();
+        if (await retire(dir, reclaimToken)) {
           continue;
         }
         // A failed retirement usually means another waiter already reclaimed this acquisition.
