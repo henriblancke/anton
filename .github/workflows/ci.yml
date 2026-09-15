@@ -128,7 +128,23 @@ jobs:
         with:
           bun-version: "1.4.2" # match package.json `packageManager`
       - name: Install
-        run: bun install --frozen-lockfile
+        # Bounded retry (anton-auo7): node-pty's postinstall shells out to node-gyp, which fetches
+        # Node headers from nodejs.org — a bare network blip there once failed this report-only job
+        # in 16s while `check`/`integration` installed fine on the same commit (PR #203), painting a
+        # red check on a PR with nothing wrong. `continue-on-error` only stops the JOB from blocking
+        # the merge; the failed check still shows red and triggered a review-fix cycle over pure
+        # infra flake. Retrying the install absorbs that flake instead of surfacing it as red.
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if bun install --frozen-lockfile; then
+              exit 0
+            fi
+            echo "::warning::bun install failed (attempt ${attempt}/3), retrying…"
+            sleep $((attempt * 5))
+          done
+          echo "::error::bun install failed after 3 attempts"
+          exit 1
       - name: Test with coverage
         run: bun run test:coverage
       - name: Upload coverage report
