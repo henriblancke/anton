@@ -270,6 +270,30 @@ export function refreshIssueSnapshot(
 }
 
 /**
+ * Overwrite the retained board with `hydrated`, guarded by `generation` (PR #274 review,
+ * `issues.ts:294`). `refreshIssueSnapshot`'s single-flight loader is loader-blind: a concurrent
+ * refresh that never asked for `strictGates` can win the race and latch a gate-less board onto this
+ * entry before a `strictGates` caller re-fetches the missing gates and merges them into a NEW array
+ * downstream (`dedupeById` never mutates the retained one in place, unlike the cycle-evidence
+ * WeakMap attachment). Without writing that merged array back here, the entry stays on the degraded
+ * board it already cached, so every later reader of THIS snapshot (a subsequent `getBoard` in the
+ * same request, another page's poll) keeps seeing a `blocks` edge to a resolved gate as still
+ * dangling and open.
+ *
+ * `generation` must be read (via {@link issueSnapshotGeneration}) before the extra gate fetch that
+ * produced `hydrated` — a mismatch here means the entry moved (an invalidation, a newer refresh)
+ * while that fetch was in flight, so `hydrated` describes a graph this entry no longer represents
+ * and must not be stamped onto it.
+ */
+export function hydrateIssueSnapshot(cwd: string, hydrated: Bead[], generation: number): void {
+  const entry = entryFor(cwd);
+  if (entry.generation !== generation) return;
+  entry.beads = hydrated;
+  entry.serialized = JSON.stringify(hydrated);
+  entry.version += 1;
+}
+
+/**
  * The background board read currently in flight for `cwd`, or null when none is (anton-3dpp).
  *
  * The refreshes above are deliberately un-awaited — that is what keeps a read from waiting behind

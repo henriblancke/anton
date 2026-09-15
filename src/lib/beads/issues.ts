@@ -3,6 +3,7 @@ import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import {
   getBeadDescription,
   getIssueSnapshot,
+  hydrateIssueSnapshot,
   issueSnapshotGeneration,
   markCycleEvidenceRecovered,
   probeIssueSnapshot,
@@ -273,12 +274,18 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
   const board = await refreshIssueSnapshot(cwd, () => loadAllIssues(cwd, opts));
   // A concurrent non-authoritative refresh may have won the snapshot loader. Enrich the exact board
   // returned here so callers that must make approval decisions never lose the requested evidence.
-  // Bumping the version on success, same as `attachCyclesBestEffort`: this evidence lands OUTSIDE
-  // `refreshIssueSnapshot`'s own recovery bump (its loader returned a board with none, so from its
-  // point of view nothing changed), so without this a poller stuck on missing evidence would still
-  // never see a fresh token for the one recovery that happens to land through this exact race.
+  // Routed through `fetchCyclesShared` (PR #274 review) rather than a direct `beads.depCycles` call:
+  // several concurrent `refreshAllIssues({ withCycles: true })` callers can hit this same race at
+  // once (e.g. concurrent approval/proposal-apply requests against one repo), and a direct call here
+  // would spawn its own `bd dep cycles` process per caller instead of coalescing like every other
+  // cycles path in this file. Bumping the version on success, same as `attachCyclesBestEffort`: this
+  // evidence lands OUTSIDE `refreshIssueSnapshot`'s own recovery bump (its loader returned a board
+  // with none, so from its point of view nothing changed), so without this a poller stuck on missing
+  // evidence would still never see a fresh token for the one recovery that happens to land through
+  // this exact race.
   if (opts.withCycles && cycleEvidenceFor(board) === undefined) {
-    attachCycleEvidence(board, await beads.depCycles(cwd));
+    const cycles = await fetchCyclesShared(cwd, issueSnapshotGeneration(cwd));
+    attachCycleEvidence(board, cycles);
     markCycleEvidenceRecovered(cwd);
   }
   // Same race, for gates (PR #274 review): `refreshIssueSnapshot`'s single-flight is loader-blind, so
@@ -291,7 +298,15 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
   if (opts.strictGates) {
     const dangling = danglingBlockerIds(board);
     if (dangling.length > 0) {
-      return dedupeById([...board, ...await loadGateIssues(cwd, true, dangling)]);
+      // Hydrate the RETAINED snapshot too, not just this function's return value (PR #274 review):
+      // `dedupeById` builds a new array, so without writing it back the entry stays on the degraded,
+      // gate-less board `refreshIssueSnapshot` just cached — and a same-request caller that rebuilds
+      // the board from the snapshot afterward (e.g. the approve route's `getBoard`) would read a
+      // resolved gate's `blocks` edge as still dangling and open. See `hydrateIssueSnapshot`.
+      const generation = issueSnapshotGeneration(cwd);
+      const hydrated = dedupeById([...board, ...await loadGateIssues(cwd, true, dangling)]);
+      hydrateIssueSnapshot(cwd, hydrated, generation);
+      return hydrated;
     }
   }
   return board;
