@@ -243,8 +243,13 @@ export function refreshIssueSnapshot(
       // `refreshAllIssues({ withCycles: true })`, attaches it to `beads` before this `.then` runs).
       // When we kept the retained array's identity above, that evidence lives on a different, since-
       // discarded object unless copied across — so back it onto `nextBeads` rather than silently
-      // dropping a fetch this very call paid for.
-      if (nextBeads !== beads && !hadEvidence) {
+      // dropping a fetch this very call paid for. Copy it even when `nextBeads` already carries
+      // evidence: that prior evidence can itself be stale (e.g. a racing `bd list`/`bd dep cycles`
+      // pair — `attachCyclesBestEffort` in issues.ts — that observed two different graph revisions),
+      // and this consistent, explicitly-requested refresh is the one path that can self-heal it. A
+      // `hadEvidence` guard here left a stale sidecar permanently stuck once content stopped
+      // changing (PR #274 review, round 10 on this file).
+      if (nextBeads !== beads) {
         const freshEvidence = cycleEvidenceFor(beads);
         if (freshEvidence !== undefined) attachCycleEvidence(nextBeads, freshEvidence);
       }

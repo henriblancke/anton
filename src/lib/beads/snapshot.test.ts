@@ -134,6 +134,25 @@ describe("issue snapshots", () => {
     expect(cycleEvidenceFor(withEvidence)).toEqual([{ ids: ["a"], raw: {} }]);
   });
 
+  it("replaces evidence already on the retained array when this refresh itself lands fresh evidence", async () => {
+    // A racing `bd list`/`bd dep cycles` pair (attachCyclesBestEffort in issues.ts) can observe two
+    // different graph revisions and attach evidence to the retained array that doesn't actually
+    // describe it. A later `withCycles` refresh is a consistent, authoritative read and must be able
+    // to correct that mismatch even though content hasn't changed since — otherwise the stale sidecar
+    // would stick until unrelated bead content changed too (PR #274 review, round 10).
+    const retained = await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    attachCycleEvidence(retained, [{ ids: ["stale"], raw: {} }]);
+
+    const refreshed = await refreshIssueSnapshot(
+      "/repo",
+      async () => attachCycleEvidence([bead("a")], [{ ids: ["fresh"], raw: {} }]),
+      200,
+    );
+
+    expect(refreshed).toBe(retained);
+    expect(cycleEvidenceFor(refreshed)).toEqual([{ ids: ["fresh"], raw: {} }]);
+  });
+
   it("does not carry stale cycle evidence forward once the graph content actually changes", async () => {
     const first = await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
     attachCycleEvidence(first, [{ ids: ["a"], raw: {} }]);
