@@ -4,9 +4,10 @@
  * without this the only way to settle one was the `bd close` CLI (PR #214). Distinct from
  * {@link abandonTicket}: this records a delivery — the work happened — not a won't-do.
  */
-import { beads, LABELS, type Bead } from "./beads/bd";
+import { beads, isBlockedByOpenIssues, LABELS, type Bead } from "./beads/bd";
 import { withBeadWriteLock } from "./beads/claim-lock";
 import { openDescendants, runTargetOf } from "./abandon";
+import { openBlockersOf } from "./jobs/execute-epic-human-gate";
 import { cancelRunForTarget } from "./jobs/service";
 import { nudgeSync } from "./beads/sync-nudge";
 import { freshDetail } from "./ticket-detail";
@@ -28,16 +29,28 @@ const messageOf = (e: unknown): string => (e instanceof Error ? e.message : Stri
  * — closing what is still open would either orphan it or silently claim it as done, and neither is
  * honest). Close the descendants first, or abandon them.
  *
- * A run still executing this bead's target is killed FIRST, before the close is written — the same
- * order abandon uses and for the same reason: if the bead was relabelled `agent:human` after its
- * agent had already started, closing it out from under that agent must not leave it free to keep
- * committing toward a PR the board just called done. Machine-local, like every job cancel here: a
- * run on another machine stops at its next lease/ticket boundary, where a closed ticket is skipped
- * the same way an abandoned one is.
+ * Refused up front, before anything is killed, when an open blocker already holds the bead ({@link
+ * openBlockersOf} — the same read `bd close` itself would answer with "blocked by open issues"):
+ * a direct or stale request can target an `agent:human` CHILD ticket that is being held by a gate
+ * an active, otherwise-ordinary run armed on it (execute-epic-human-gate.ts's
+ * `armHumanTicketGates`). `runTargetOf` for that child resolves to the PARENT the run is actually
+ * executing, so without this check the call below would cancel that run — killing healthy,
+ * unrelated work — and only then discover `bd close` was always going to refuse. Resolve the gate
+ * (`bd gate resolve`) instead; the run's own preflight closes the ticket once it does.
+ *
+ * A run still executing this bead's OWN target is killed FIRST, before the close is written — the
+ * same order abandon uses and for the same reason: if the bead was relabelled `agent:human` after
+ * its agent had already started, closing it out from under that agent must not leave it free to
+ * keep committing toward a PR the board just called done. Machine-local, like every job cancel
+ * here: a run on another machine stops at its next lease/ticket boundary, where a closed ticket is
+ * skipped the same way an abandoned one is.
  *
  * Throws on an unknown id (bd's own error → 404), a bead that isn't `agent:human` (→ 409 — an agent
  * run is expected to close it), an already-settled bead (→ 409), open work still under it (→ 409),
- * or a bead `bd close` itself refuses — e.g. one an open human gate still blocks (→ 409).
+ * an open blocker already holding it (→ 409), or the close itself refusing on one that appeared in
+ * the gap since (→ 409). Any OTHER failure from `bd close` — the executable missing, a timeout,
+ * Dolt unhealthy — is not a verdict on the bead and is left to propagate as-is, so the caller's
+ * infrastructure failure stays a retryable error rather than reading as permanently unclosable.
  */
 export async function closeHumanTicket(project: Project, id: string): Promise<TicketDetail> {
   const repo = project.repoPath;
@@ -50,8 +63,9 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
     }
     assertOpen(bead, id);
 
-    // --skip-labels (bd 1.1.0): openDescendants and runTargetOf only inspect parent, status and
-    // type, so label hydration on this read is dead weight (matches abandon.ts / epic-detail.ts).
+    // --skip-labels (bd 1.1.0): openDescendants, runTargetOf and openBlockersOf only inspect
+    // parent, status, type and inline `dependencies` — none of which this flag touches — so label
+    // hydration on this read is dead weight (matches abandon.ts / epic-detail.ts).
     const board = await beads.list(repo, ["--status", "all", "--skip-labels"]);
     const open = openDescendants(board, id);
     if (open.length > 0) {
@@ -61,11 +75,24 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
       );
     }
 
+    // Reject BEFORE cancelling anything: an open blocker is exactly what makes `bd close` refuse
+    // below, so cancelling this bead's run target first would kill it for a close that was never
+    // going to land — and for a child ticket that target is an ordinary run's, not this bead's own.
+    const blockers = openBlockersOf(board, id);
+    if (blockers.length > 0) {
+      throw new NotCloseableError(
+        `${id} is still held by an open blocker (${blockers.join(", ")}) — \`bd close\` would ` +
+          `refuse it; resolve the blocker (\`bd gate resolve\` for a human gate) instead, which ` +
+          `closes the ticket through its run rather than out from under it`,
+      );
+    }
+
     await cancelRunForTarget(project.id, runTargetOf(bead, board));
 
     try {
       await beads.close(repo, id);
     } catch (e) {
+      if (!isBlockedByOpenIssues(e)) throw e;
       throw new NotCloseableError(`${id} could not be closed (${messageOf(e)})`);
     }
     return beads.show(repo, id);

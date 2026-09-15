@@ -1,0 +1,120 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { LABELS, type Bead } from "./beads/bd";
+import type { Project } from "./types";
+
+const showMock = vi.fn();
+const listMock = vi.fn();
+const closeMock = vi.fn();
+const cancelRunMock = vi.fn();
+
+vi.mock("./beads/bd", async () => {
+  const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
+  return {
+    ...actual,
+    beads: {
+      ...actual.beads,
+      show: (...args: unknown[]) => showMock(...args),
+      list: (...args: unknown[]) => listMock(...args),
+      close: (...args: unknown[]) => closeMock(...args),
+    },
+  };
+});
+
+vi.mock("./jobs/service", () => ({
+  cancelRunForTarget: (...args: unknown[]) => cancelRunMock(...args),
+}));
+
+vi.mock("./ticket-detail", () => ({
+  freshDetail: vi.fn().mockResolvedValue({ id: "detail" }),
+}));
+
+vi.mock("./beads/sync-nudge", () => ({
+  nudgeSync: vi.fn(),
+}));
+
+const { closeHumanTicket, NotCloseableError } = await import("./close-human");
+
+function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
+  return {
+    title: overrides.id,
+    status: "open",
+    issue_type: "task",
+    labels: [LABELS.agentHuman],
+    ...overrides,
+  };
+}
+
+describe("closeHumanTicket", () => {
+  const project: Project = {
+    id: "p1",
+    slug: "anton",
+    name: "anton",
+    repoPath: "/tmp/anton",
+    defaultBranch: "main",
+    hasBeads: true,
+    createdAt: 0,
+  };
+
+  beforeEach(() => {
+    showMock.mockReset();
+    listMock.mockReset();
+    closeMock.mockReset().mockResolvedValue(undefined);
+    cancelRunMock.mockReset().mockResolvedValue(false);
+  });
+
+  it("rejects a held human child ticket without cancelling the run it lives under", async () => {
+    // feature is an ordinary, active run target; ticket is its agent:human child, currently held
+    // by a gate that same run armed on it (execute-epic-human-gate.ts's armHumanTicketGates).
+    const ticket = makeBead({ id: "ticket", parent: "feature" });
+    const feature = makeBead({
+      id: "feature",
+      issue_type: "feature",
+      labels: [],
+    });
+    const gate = makeBead({ id: "gate-1", issue_type: "chore", labels: [], status: "open" });
+    const board = [
+      feature,
+      { ...ticket, dependencies: [{ issue_id: "ticket", depends_on_id: "gate-1", type: "blocks" }] },
+      gate,
+    ];
+    showMock.mockResolvedValue(ticket);
+    listMock.mockResolvedValue(board);
+
+    await expect(closeHumanTicket(project, "ticket")).rejects.toThrow(NotCloseableError);
+
+    // The whole point: nothing was cancelled, and bd close was never even attempted — the caller
+    // is told to resolve the gate instead of a destructive cancel-then-fail round trip.
+    expect(cancelRunMock).not.toHaveBeenCalled();
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("closes a human run target with no open blockers, cancelling only its own run", async () => {
+    const target = makeBead({ id: "target" });
+    listMock.mockResolvedValue([target]);
+    showMock.mockResolvedValueOnce(target).mockResolvedValueOnce({ ...target, status: "closed" });
+
+    await closeHumanTicket(project, "target");
+
+    expect(cancelRunMock).toHaveBeenCalledWith("p1", "target");
+    expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "target");
+  });
+
+  it("lets a bd close infrastructure failure propagate instead of reading it as unclosable", async () => {
+    const target = makeBead({ id: "target" });
+    listMock.mockResolvedValue([target]);
+    showMock.mockResolvedValue(target);
+    closeMock.mockRejectedValue(new Error("bd: connection refused"));
+
+    await expect(closeHumanTicket(project, "target")).rejects.toThrow("connection refused");
+    await expect(closeHumanTicket(project, "target")).rejects.not.toBeInstanceOf(NotCloseableError);
+  });
+
+  it("maps bd's own close refusal (an open blocker it discovers itself) to NotCloseableError", async () => {
+    const target = makeBead({ id: "target" });
+    listMock.mockResolvedValue([target]);
+    showMock.mockResolvedValue(target);
+    closeMock.mockRejectedValue(new Error("blocked by open issues [gate-1] (use --force to override)"));
+
+    await expect(closeHumanTicket(project, "target")).rejects.toThrow(NotCloseableError);
+  });
+});
