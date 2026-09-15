@@ -54,20 +54,57 @@ describe("fingerprintBoard / boardEvidence (anton-fc5x)", () => {
     expect(boardEvidence(before, after)).toEqual(["a"]);
   });
 
-  it("ignores label, assignee, note and priority churn — anton's own bookkeeping, not the agent's work", () => {
+  it("ignores bookkeeping-label, assignee and note churn — anton's own writes, not the agent's work", () => {
     const before = fingerprintBoard([
-      bead("a", { labels: ["stage:implementing"], assignee: "op-1", priority: 2, notes: "old" }),
+      bead("a", { labels: ["stage:implementing"], assignee: "op-1", notes: "old" }),
     ]);
     const after = fingerprintBoard([
       bead("a", {
         labels: ["run-lease:123", "review-score:8"],
         assignee: "op-2",
-        priority: 1,
         notes: "anton: something",
       }),
     ]);
     expect(boardEvidence(before, after)).toEqual([]);
   });
+
+  it("catches a priority change — a board-only ticket may exist to reprioritize a batch (anton-fc5x review round 1)", () => {
+    const before = fingerprintBoard([bead("a", { priority: 2 })]);
+    const after = fingerprintBoard([bead("a", { priority: 0 })]);
+    expect(boardEvidence(before, after)).toEqual(["a"]);
+  });
+
+  it("catches a content label change — a board-only ticket may exist to relabel/reparent (anton-fc5x review round 1)", () => {
+    const before = fingerprintBoard([bead("a", { labels: ["domain:eng"] })]);
+    const after = fingerprintBoard([bead("a", { labels: ["domain:eng", "size:M"] })]);
+    expect(boardEvidence(before, after)).toEqual(["a"]);
+  });
+
+  it("still ignores bookkeeping labels layered on top of a real content-label change", () => {
+    const before = fingerprintBoard([bead("a", { labels: ["domain:eng", "stage:implementing"] })]);
+    const after = fingerprintBoard([bead("a", { labels: ["domain:eng", "run-lease:123"] })]);
+    expect(boardEvidence(before, after)).toEqual([]);
+  });
+
+  it("does not read a reordering of the same labels as a change", () => {
+    const before = fingerprintBoard([bead("a", { labels: ["size:M", "domain:eng"] })]);
+    const after = fingerprintBoard([bead("a", { labels: ["domain:eng", "size:M"] })]);
+    expect(boardEvidence(before, after)).toEqual([]);
+  });
+
+  it(
+    "KNOWN GAP (anton-fc5x review round 1, finding 2): a write landing on the board from anything " +
+      "other than this ticket's own agent — a sibling run, a gardener apply pass — is indistinguishable " +
+      "from this ticket's own evidence, because bd exposes no per-edit actor to filter on (see the module " +
+      "docstring). Pinned here so a future bd capability that closes this gap is a deliberate change to " +
+      "this test, not a silent behavior shift.",
+    () => {
+      const before = fingerprintBoard([bead("unrelated", { priority: 2 })]);
+      // A write this ticket's agent never made — e.g. a concurrent gardener repriotization pass.
+      const after = fingerprintBoard([bead("unrelated", { priority: 0 })]);
+      expect(boardEvidence(before, after)).toEqual(["unrelated"]);
+    },
+  );
 });
 
 describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {

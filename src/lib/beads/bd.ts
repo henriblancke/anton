@@ -152,10 +152,13 @@ export const LABELS = {
 } as const;
 
 /** Prefix of the run-lease label (see LABELS.runLease). */
-const RUN_LEASE_PREFIX = "run-lease:";
+export const RUN_LEASE_PREFIX = "run-lease:";
 
 /** Prefix of the review-score label (see LABELS.reviewScore). */
-const REVIEW_SCORE_PREFIX = "review-score:";
+export const REVIEW_SCORE_PREFIX = "review-score:";
+
+/** Prefix of the stage label (see LABELS.stage). */
+export const STAGE_PREFIX = "stage:";
 
 /**
  * Shape of a GitHub PR pointer (`gh-<number>`). The ONLY `external_ref` value anton treats as a PR:
