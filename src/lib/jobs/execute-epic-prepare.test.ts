@@ -599,6 +599,30 @@ describe("prepareEpicRun — the structure/cycle gate re-runs on the board the r
     expect(publishRunClaimMock).toHaveBeenCalled();
   });
 
+  // Fresh evidence (PR #274 review, round 7): `preflightHumanTickets` arms a wait for a human
+  // ticket WITHOUT clearing its `agent:human` label — only a person relabelling the ticket does
+  // that — so a ticket this run already armed still carries the label on every later read. Before
+  // this fix the label alone was read as drift, so this retried forever on every attempt instead
+  // of ever dispatching t-1, the independent sibling nothing was waiting on.
+  it("does not retry a child this run already armed a wait for — the label was already handled", async () => {
+    const clean = board(ticket("t-1"), { ...ticket("t-2"), labels: [LABELS.agentHuman] } as Bead);
+    attachCycleEvidence(clean, []);
+    loadAllIssuesMock.mockResolvedValue(clean);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(clean));
+
+    const theRun = run(clean);
+    // Mirrors the real `runReadiness`: once the arm's own gate blocks t-2, the board it re-derives
+    // readiness from reports t-2 as gated.
+    theRun.readiness = () => ({ blockers: [], gated: ["t-2"], runnable: true });
+
+    const prep = await prepareEpicRun(theRun);
+
+    expect(prep.done).toBe(false);
+    if (prep.done) return;
+    expect([...prep.gated]).toContain("t-2");
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
   it("leaves a resume-skipped human-labelled child alone — its work is already done", async () => {
     // A ticket a prior attempt already delivered and closed is not a person waiting to be asked
     // again; `isResumeSkipped` is the same exclusion `armHumanTicketWaits` itself applies.

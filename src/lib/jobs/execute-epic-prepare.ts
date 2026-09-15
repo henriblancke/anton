@@ -557,6 +557,16 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
  * exactly because arming is a write racing the very claim this function follows. So the label is
  * REJECTED as drift instead, the same shape `ticketSetDrift` already retries on: the next attempt
  * re-enters from the top, where `armHumanTicketWaits` sees the fresh label and arms its wait properly.
+ *
+ * EXCLUDES anything already in `gates.gated` (fresh evidence, PR #274 review round 7):
+ * `preflightHumanTickets` arms a wait WITHOUT clearing the label — only a person relabelling the
+ * ticket does that — so every ticket this run already armed still carries `agent:human` here, and
+ * the open gate it armed already blocks the ticket, which is exactly what put its id in `gated` when
+ * `armHumanTicketWaits` re-derived readiness. Judging the label alone would reject those same
+ * already-handled tickets as "newly relabelled" on every attempt, parking the whole run forever
+ * instead of dispatching its independent siblings. Excluding `gated` narrows this to what it must
+ * catch: a ticket relabelled human AFTER the preflight ran, which never got a wait armed and so
+ * never joined `gated` at all.
  */
 async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Promise<void> {
   const { repo, targetId: epicBeadId } = run;
@@ -601,7 +611,11 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
     );
   }
   const relabelledHuman = freshTickets.filter(
-    (t) => t.id !== epicBeadId && beads.isHumanWork(t) && !gates.isResumeSkipped(t),
+    (t) =>
+      t.id !== epicBeadId &&
+      beads.isHumanWork(t) &&
+      !gates.isResumeSkipped(t) &&
+      !gates.gated.has(t.id),
   );
   if (relabelledHuman.length > 0) {
     throw new Error(
