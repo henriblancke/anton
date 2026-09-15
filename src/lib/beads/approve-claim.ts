@@ -78,6 +78,20 @@ export interface ApproveClaimInput<R> {
    * nothing is written and it comes back as {@link ApproveClaimResult}'s `refused`.
    */
   guard: (locked: Bead, board: Bead[]) => R | undefined | Promise<R | undefined>;
+  /**
+   * Whether the locked read needs authoritative `bd dep cycles` evidence for `guard` to consume —
+   * default true (codex review, PR #274: "Skip cycle reads for non-enqueuing takeovers").
+   *
+   * `loadAllIssues`'s `withCycles` lets a failed cycles read reject the WHOLE read (unlike the
+   * best-effort board paths), which is right for a guard that gates a run on cycle evidence but
+   * wrong for one that does not consume it at all: a pure ownership take-over that will enqueue
+   * nothing (the approve route's `willEnqueue === false`) still reached this same locked read, so
+   * `bd dep cycles` being unavailable, slow, or unreadable 500'd a transfer no cycle verdict was
+   * ever going to gate. Only the caller knows whether its own `guard` reads cycle evidence off the
+   * board it's handed, so it says so here instead of this module guessing from `nextOwner` or
+   * `expectedOwner`.
+   */
+  needsCycles?: boolean;
 }
 
 /**
@@ -124,7 +138,15 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
     // (`blocks-edge-dangling` among them), and a degraded gate-less board misreads a gate's own
     // `blocks` edge as dangling — valid structure reported as board corruption. A transient gate
     // listing failure must fail this write instead, the same as every other approval-path board read.
-    const board = await loadAllIssues(repoPath, { withCycles: true, strictGates: true });
+    //
+    // `withCycles` is the CALLER's call (PR #274 review), not unconditional: unlike `strictGates`,
+    // which every caller needs, a guard that will not consume cycle evidence (the approve route's
+    // pure, non-enqueuing take-over) must not have this read reject over a `bd dep cycles` that
+    // timed out or came back unreadable — see {@link ApproveClaimInput.needsCycles}.
+    const board = await loadAllIssues(repoPath, {
+      withCycles: input.needsCycles ?? true,
+      strictGates: true,
+    });
     const locked = board.find((b) => b.id === beadId);
     if (!locked) return { vanished: true };
 

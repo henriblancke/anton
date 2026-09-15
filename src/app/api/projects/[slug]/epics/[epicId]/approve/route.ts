@@ -520,6 +520,12 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     beadId: epicId,
     expectedOwner: owner,
     nextOwner: operator ?? owner,
+    // A pure take-over of a blocked target (`willEnqueue === false`) never reaches the structure
+    // re-check below that consumes cycle evidence, so this locked read must not pay for — or fail
+    // over — a `bd dep cycles` that only a would-be enqueue needs (codex review, PR #274: "Skip
+    // cycle reads for non-enqueuing takeovers"). Mirrors the identical `willEnqueue` gate the
+    // pre-lock read already applies to `ensureCycleEvidence` above.
+    needsCycles: willEnqueue,
     guard: (locked, lockedBoard) => {
       // Re-take the run-target verdict HERE, under the lock. The pre-lock gate answered from a read
       // taken before every gate below it ran, and the Add-work commit (lib/backlog.ts
