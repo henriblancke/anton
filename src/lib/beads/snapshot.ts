@@ -147,12 +147,19 @@ export function issueSnapshotVersion(cwd: string): number {
 }
 
 /**
- * Monotonic counter bumped on every invalidation ({@link invalidateIssueSnapshot}) — unlike
- * `version`, which a cycle-evidence recovery also bumps, this moves ONLY when the board itself
- * was invalidated (a local write or a remote pull). Callers that share an in-flight `bd dep
- * cycles` fetch across concurrent readers use it to detect a snapshot replaced mid-fetch, so a
- * result describing a stale graph is never attached to a newer one (PR #274 review, round 7 on
- * `issues.ts:154`).
+ * Monotonic counter bumped whenever the retained board content actually changes — on every
+ * invalidation ({@link invalidateIssueSnapshot}) AND, below in {@link refreshIssueSnapshot}, on a
+ * TTL/probe refresh that discovers different content with no invalidation call in between (PR
+ * #274 review, round 8 on `issues.ts:213`). A shared-server board (`dolt_mode: server`) can move
+ * because ANOTHER machine wrote it — a change this repo only ever discovers by a plain TTL refresh
+ * noticing the graph differs, never through `invalidateIssueSnapshot`. Without the bump there,
+ * `attachCyclesBestEffort`'s shared-fetch key (`${cwd}::${generation}`) stays unchanged across that
+ * refresh, so an in-flight `bd dep cycles` call started against the OLD graph gets reused and
+ * stamped onto the REPLACED board as if it were current — a newly introduced cycle recorded as
+ * cycle-free, or a repaired one as still present, until some later change happens to bump it again.
+ * Callers that share an in-flight `bd dep cycles` fetch across concurrent readers use this counter
+ * to detect a snapshot replaced mid-fetch, so a result describing a stale graph is never attached
+ * to a newer one.
  */
 export function issueSnapshotGeneration(cwd: string): number {
   return entryFor(cwd).generation;
@@ -239,6 +246,12 @@ export function refreshIssueSnapshot(
       // wait for unrelated content to change too (mirrors `markCycleEvidenceRecovered`'s reasoning).
       const evidenceRecovered = !hadEvidence && cycleEvidenceFor(beads) !== undefined;
       if (entry.serialized !== serialized || evidenceRecovered) entry.version += 1;
+      // Content actually differing is a graph change regardless of whether anything called
+      // `invalidateIssueSnapshot` — a shared-server board can move from another machine's write, and
+      // a plain TTL refresh is the only place that ever notices. Bump here too, or a cycle fetch
+      // in flight against the pre-refresh graph keeps coalescing onto the replaced board (see
+      // {@link issueSnapshotGeneration}).
+      if (moved) entry.generation += 1;
       entry.beads = beads;
       entry.serialized = serialized;
       entry.loadedAt = now;

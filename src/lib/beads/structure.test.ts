@@ -413,6 +413,15 @@ describe("structureGaps", () => {
     const cyclic = [feature("a", "b"), feature("b", "a")];
     expect(() => structureGaps("a", cyclic)).not.toThrow();
   });
+
+  it("blocks every target, not just one whose subtree holds the cycle, on an unreadable bd cycle record (review finding)", () => {
+    // The `blocks-cycle` fault bd's report couldn't be fully mapped to board ids lands on the
+    // synthetic "board" id, deliberately bypassing subtree scoping (tiers.mjs:346) — there is no
+    // subtree to scope it to, since anton cannot name the cycle's members. `f2` has no relationship
+    // to any bead bd might have meant, yet it still refuses: fail-safe over availability.
+    const gaps = structureGaps("f2", BOARD, { cycles: [{ ids: [], raw: { unexpected: true } }] });
+    expect(gaps.blocking.map((v) => v.id)).toEqual(["board"]);
+  });
 });
 
 describe("the report", () => {

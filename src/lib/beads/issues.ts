@@ -149,8 +149,10 @@ export async function loadAllIssues(
  * cross-module-registry reason as `cyclesByBoard`/the snapshot registry.
  *
  * Keyed by {@link issueSnapshotGeneration} alongside `cwd` (PR #274 review, round 7 on
- * `issues.ts:154`): a board write bumps the generation and replaces the cached snapshot, but a
- * cycles fetch started against the OLD graph can still be in flight. A repo-only key would let a
+ * `issues.ts:154`; round 8 extended the generation bump itself to cover a content-changed TTL
+ * refresh, not just an explicit invalidation): the generation moves whenever the cached snapshot is
+ * replaced with different content, but a cycles fetch started against the OLD graph can still be in
+ * flight. A repo-only key would let a
  * reader enriching the NEW snapshot reuse that stale-graph result and attach it as if it were
  * current — a newly introduced cycle could be recorded as cycle-free, and because evidence then
  * reads as present, every probe stops retrying until unrelated content changes. Scoping the key to

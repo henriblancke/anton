@@ -6,6 +6,7 @@ import {
   getBeadDescription,
   getIssueSnapshot,
   invalidateIssueSnapshot,
+  issueSnapshotGeneration,
   issueSnapshotVersion,
   onBoardChanged,
   readIssueSnapshot,
@@ -99,6 +100,27 @@ describe("issue snapshots", () => {
     );
 
     expect(cycleEvidenceFor(second)).toBeUndefined();
+  });
+
+  it("bumps the generation when a refresh discovers changed content with no invalidation call in between (PR #274 review, round 8)", async () => {
+    // A shared-server board can move because ANOTHER machine wrote it — this repo only ever learns
+    // of that through a plain TTL refresh noticing the content differs, never through
+    // `invalidateIssueSnapshot`. The generation still has to move, or a cycles fetch started against
+    // the pre-refresh graph coalesces onto the replaced board as if it described it (issues.ts's
+    // `fetchCyclesShared`).
+    await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    const before = issueSnapshotGeneration("/repo");
+
+    await refreshIssueSnapshot("/repo", async () => [bead("a"), bead("b")], 200);
+    expect(issueSnapshotGeneration("/repo")).toBe(before + 1);
+  });
+
+  it("does not bump the generation when a refresh lands identical content", async () => {
+    await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    const before = issueSnapshotGeneration("/repo");
+
+    await refreshIssueSnapshot("/repo", async () => [bead("a")], 200);
+    expect(issueSnapshotGeneration("/repo")).toBe(before);
   });
 
   it("bumps the version when a refresh recovers cycle evidence even though bead content is unchanged", async () => {

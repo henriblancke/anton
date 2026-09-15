@@ -706,9 +706,11 @@ describe("gardener patrol · shadow mode", () => {
     expect(await sessionLog()).toContain(
       "[gardener] SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD APPLY: closed t-4 as shipped\n",
     );
-    // One create (the proposal), then a fresh board and authoritative cycle read for the shadow.
+    // One create (the proposal), then a fresh board and authoritative cycle read for the shadow —
+    // `depCycles` before `list` because `loadAllIssues({ withCycles: true })` starts both reads
+    // concurrently (issues.ts round 5) rather than sequencing the cycles read after the listing.
     // Nothing else: t-4 is never closed, deferred or updated by a pass that only says what it would do.
-    expect(calls).toEqual([...READS, "create", "list", "depCycles"]);
+    expect(calls).toEqual([...READS, "create", "depCycles", "list"]);
     expect(closeMock).not.toHaveBeenCalled();
   });
 
@@ -778,7 +780,8 @@ describe("gardener patrol · shadow mode", () => {
       `SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD REFUSE: ` +
         `${decision.status === "refuse" ? decision.reason : ""}\n`,
     );
-    expect(calls).toEqual([...READS, "create", "list", "depCycles"]);
+    // Same concurrent-start order as above: `depCycles` fires before `list` even starts.
+    expect(calls).toEqual([...READS, "create", "depCycles", "list"]);
   });
 
   it("dates the fence on bd's one-second grid, so a same-second write reads as the tie apply refuses", async () => {

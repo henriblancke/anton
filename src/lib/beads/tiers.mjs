@@ -343,6 +343,17 @@ export function validateBoardStructure(board, { cycles } = {}) {
  */
 export function structureGaps(targetId, board, options) {
   const subtree = descendantsOf(targetId, board);
+  // `v.id === "board"` is a DELIBERATE departure from subtree scoping, not an oversight of it. Every
+  // other fault here names a bead this function can place in (or out of) `targetId`'s subtree; the
+  // unreadable-cycle fault (see the `unreadableCycles` loop above) exists exactly because bd reported
+  // a real cycle whose members this version of anton COULD NOT MAP — there is no subtree to test
+  // membership against, since the id is synthetic. Scoping it away (as `dangling-parent` correctly is
+  // — that fault names a real, known bead, and a target whose subtree can't reach it was never going
+  // to see it here regardless) would silently clear it for every target, which is precisely the
+  // "empty answer" `validateBoardStructure`'s own comment refuses to give. Fail-safe over
+  // availability: an unmapped cycle blocks every approval until a human reads bd's raw report,
+  // exactly like `structure.test.ts`'s "blocks on an unreadable bd cycle record" case one layer down,
+  // now also covered at this (`structureGaps`) layer below.
   const owned = validateBoardStructure(board, options).filter((v) => v.id === "board" || subtree.has(v.id));
   return {
     blocking: owned.filter((v) => v.severity === "blocking"),

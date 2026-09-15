@@ -35,7 +35,7 @@ const {
   resetCycleProbes,
 } = await import("./issues");
 const { cycleEvidenceFor } = await import("./cycle-evidence");
-const { issueSnapshotVersion, resetIssueSnapshots } = await import("./snapshot");
+const { issueSnapshotVersion, refreshIssueSnapshot, resetIssueSnapshots } = await import("./snapshot");
 
 const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -270,6 +270,46 @@ describe("loadAllIssues", () => {
     expect(cycleEvidenceFor(snapshot.beads)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
     expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+  });
+
+  it("does not reuse a cycles fetch started against the pre-refresh graph once the board's content moves (PR #274 review, round 8)", async () => {
+    // A shared-server board can move because ANOTHER machine wrote it, discovered here by a plain
+    // TTL/probe refresh with no local invalidation call in between. The generation guard exists to
+    // stop a cycles fetch spawned against the graph BEFORE that move from being stamped onto the
+    // board AFTER it — this reproduces the race directly rather than waiting out the real TTL.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await allIssues(REPO);
+
+    let resolveFirst!: (v: unknown) => void;
+    let resolveSecond!: (v: unknown) => void;
+    cyclesMock
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSecond = resolve; }));
+
+    // Reader A's cycles fetch starts against the current (pre-refresh) snapshot and stays in flight.
+    const readerA = allIssues(REPO, { withCycles: true });
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+
+    // The board moves while reader A's fetch is still pending.
+    await refreshIssueSnapshot(REPO, async () => [{ ...target, id: "t-2", dependencies: [] }]);
+
+    // Reader B enriches the NEW snapshot. Its generation differs from reader A's in-flight fetch, so
+    // it must spawn its own `bd dep cycles` call instead of coalescing onto reader A's.
+    const readerB = allIssues(REPO, { withCycles: true });
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+
+    resolveFirst([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    resolveSecond([]);
+
+    const [boardA, boardB] = await Promise.all([readerA, readerB]);
+
+    // Reader A's board predates the move: the generation guard refuses to stamp the stale-graph
+    // result onto it, so it stays without evidence rather than report a cycle the current graph no
+    // longer necessarily has.
+    expect(cycleEvidenceFor(boardA)).toBeUndefined();
+    // Reader B's board is the current one and gets its own, fresh evidence.
+    expect(boardB.map((b) => b.id)).toEqual(["t-2"]);
+    expect(cycleEvidenceFor(boardB)).toEqual([]);
   });
 
   it("dedupes, so a bd that starts carrying gates in the ordinary listing doesn't double them", async () => {
