@@ -155,6 +155,28 @@ describe("ScanTrend", () => {
     expect(heights[mediumIndex]).toBeGreaterThan(sum / 2);
   });
 
+  // anton-knyp: when every severity in a column is under the floor and together they cost more
+  // than the column's own (small) track, the group must still degrade to a visible, even split —
+  // not fall back to raw sub-percent shares just because the floor itself is unaffordable.
+  it("splits the track evenly when no severity in the column clears the floor", () => {
+    render(
+      <ScanTrend
+        points={[
+          point("a", 1_700_000_000, { critical: 1, high: 1, medium: 1, low: 2 }),
+          point("b", 1_700_086_400, { low: 500 }),
+        ]}
+      />,
+    );
+
+    const column = screen.getByTitle(/5 new signals/);
+    const heights = Array.from(column.querySelectorAll<HTMLElement>("span[style]")).map((bar) =>
+      Number.parseFloat(bar.style.height),
+    );
+
+    for (const h of heights) expect(h).toBeGreaterThan(0);
+    expect(Math.max(...heights) - Math.min(...heights)).toBeLessThan(0.01);
+  });
+
   it("still draws a visible segment for a count of 1 against a large peak", () => {
     render(<ScanTrend points={[point("a", 1_700_000_000, { critical: 40, low: 1 })]} />);
 

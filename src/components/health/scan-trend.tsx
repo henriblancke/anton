@@ -26,45 +26,55 @@ const FLOOR_PCT = 6;
  * one severity for over 100% of its own track, and flexbox silently shrinks every segment to fit,
  * distorting the very ratios the chart exists to show (anton-knyp).
  *
- * Reserving the floor out of the track up front for every undersized severity has its own failure:
- * on a low-total column, several tiny severities can each need `FLOOR_PCT` while together costing
- * more than the whole track, clamping the reserve pool to zero and starving the one severity that
- * didn't need flooring — even when it holds the column's overwhelming majority (anton-knyp). So the
- * floor is spent in rounds instead of reserved in one shot: each round floors the *whole* group of
- * severities currently under floor, but only when the track can afford that group together — never
- * a partial group, which would floor some undersized severities and not their equally-undersized
- * peers depending on iteration order. Once a round's group is unaffordable, everything left splits
- * what remains of the track by its natural proportion, so the majority is never starved to reserve
- * space for floors the column can't actually pay for.
+ * So the floor is funded out of the track itself, like flex-shrink: every severity starts at its
+ * natural proportional share, and any severity under `FLOOR_PCT` is topped up by draining severities
+ * that are over it — a bigger donor gives more, a needier severity gets more. That keeps a column
+ * with one dominant severity and several tiny ones from reserving `FLOOR_PCT` per tiny severity
+ * up front, which on a low-total column can together cost more than the whole track and starve the
+ * dominant severity to zero even though it holds the column's overwhelming majority (anton-knyp).
+ *
+ * When the track can't fund the full raise (every above-floor severity drained to its own floor
+ * still isn't enough), the raise is capped at whatever surplus exists rather than left unfunded —
+ * dropping every under-floor severity back to its raw, often sub-pixel, proportional share, which
+ * silently violates the single-signal-must-still-draw invariant on a short column next to a tall
+ * peak column (anton-knyp). And when nothing in the column clears the floor at all — no majority to
+ * protect — the track is split evenly, since there is no principled way to favor one tiny severity
+ * over another equally tiny one.
  */
 function severityHeights(bySeverity: Record<ScanSeverity, number>, total: number, peak: number) {
   const track = (total / peak) * 100;
+  const present = SCAN_SEVERITIES.filter((s) => bySeverity[s] > 0);
 
-  let remaining = SCAN_SEVERITIES.filter((s) => bySeverity[s] > 0);
-  let remainingTrack = track;
-  let remainingCount = total;
-  const floored = new Set<ScanSeverity>();
+  const heights = new Map<ScanSeverity, number>(
+    present.map((s) => [s, (bySeverity[s] / total) * track]),
+  );
 
-  while (remaining.length > 0) {
-    const underFloor = remaining.filter(
-      (s) => (bySeverity[s] / remainingCount) * remainingTrack < FLOOR_PCT,
-    );
-    if (underFloor.length === 0 || underFloor.length * FLOOR_PCT > remainingTrack) break;
+  const shortfall = present.reduce((sum, s) => sum + Math.max(0, FLOOR_PCT - (heights.get(s) ?? 0)), 0);
+  if (shortfall === 0) return heights;
 
-    for (const s of underFloor) floored.add(s);
-    remainingTrack -= underFloor.length * FLOOR_PCT;
-    remainingCount -= underFloor.reduce((sum, s) => sum + bySeverity[s], 0);
-    remaining = remaining.filter((s) => !underFloor.includes(s));
+  const surplus = present.reduce((sum, s) => sum + Math.max(0, (heights.get(s) ?? 0) - FLOOR_PCT), 0);
+
+  if (surplus >= shortfall) {
+    // The track can fund every under-floor severity to exactly FLOOR_PCT, paid for by shrinking
+    // each above-floor severity in proportion to its own surplus.
+    for (const s of present) {
+      const h = heights.get(s) ?? 0;
+      if (h < FLOOR_PCT) heights.set(s, FLOOR_PCT);
+      else if (h > FLOOR_PCT) heights.set(s, h - ((h - FLOOR_PCT) / surplus) * shortfall);
+    }
+  } else if (surplus > 0) {
+    // Draining every above-floor severity down to its own floor still can't fully fund the raise:
+    // take all of it, and split that among the under-floor severities by how short each one is.
+    for (const s of present) {
+      const h = heights.get(s) ?? 0;
+      if (h < FLOOR_PCT) heights.set(s, h + ((FLOOR_PCT - h) / shortfall) * surplus);
+      else if (h > FLOOR_PCT) heights.set(s, FLOOR_PCT);
+    }
+  } else {
+    const share = track / present.length;
+    for (const s of present) heights.set(s, share);
   }
 
-  const heights = new Map<ScanSeverity, number>();
-  for (const s of SCAN_SEVERITIES) {
-    if (bySeverity[s] <= 0) continue;
-    heights.set(
-      s,
-      floored.has(s) ? FLOOR_PCT : (bySeverity[s] / remainingCount) * remainingTrack,
-    );
-  }
   return heights;
 }
 
