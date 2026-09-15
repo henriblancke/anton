@@ -52,7 +52,7 @@ import {
   STAGE_PREFIX,
   type Bead,
 } from "../beads/bd";
-import { mustReadBoard } from "./execute-epic-persist";
+import { mustPersist, mustReadBoard } from "./execute-epic-persist";
 
 /**
  * Label prefixes anton itself rewrites on a claim, a heartbeat lease refresh or a review round,
@@ -164,6 +164,13 @@ export interface BoardEvidenceResult {
    * evidence", it is "no comparison could be made at all". Named separately so the operator note
    * says which. */
   baselineUnavailable?: boolean;
+  /** The POST-run board read could not be read (after retries) — the symmetric case to {@link
+   * baselineUnavailable} for the other end of the comparison (PR #284 review). Named separately so
+   * `boardOnlyNoDeliveryMessage` can say "the board read failed, no comparison could be made" rather
+   * than fold this into `!found`'s "nothing differs", which is only true when the read actually
+   * happened. `ids`/`found` still carry whatever a PRIOR attempt already confirmed and left pending
+   * (see {@link readBoardEvidence}) — this attempt simply could not add to or confirm them. */
+  evidenceUnavailable?: boolean;
 }
 
 /**
@@ -173,13 +180,16 @@ export interface BoardEvidenceResult {
  * ticket's delivery even when it succeeds.
  *
  * The board read goes through {@link mustReadBoard} rather than a bare `beads.list`, and a read that
- * fails all its retries reads as "not found" — the same closed failure as a genuine zero diff —
- * instead of throwing a plain `Error` out of `assertDelivered`. Thrown here it would skip the
- * board-only `NoDeliveryError`/`keepOpen` path entirely and fall to generic release handling (anton-fc5x
- * review round 1). A push that throws (a real auth/network/remote-conflict failure, per
- * `runDoltSync`'s contract) is read as unsynced rather than propagated for the same reason: the
- * caller's gate must fail closed on "found, but unconfirmed" exactly as it does on "not found",
- * never crash the ticket walk over the sync probe.
+ * fails all its retries reads as `evidenceUnavailable: true` — never a plain `!found`, which would
+ * assert "nothing differs" when in fact no comparison was made at all (anton-fc5x review round 4/PR
+ * #284 follow-up) — instead of throwing a plain `Error` out of `assertDelivered`. Thrown here it
+ * would skip the board-only `NoDeliveryError`/`keepOpen` path entirely and fall to generic release
+ * handling (anton-fc5x review round 1). Whatever a PRIOR attempt already left pending on the ticket
+ * is still surfaced (never dropped) so a resumed ticket that already confirmed evidence keeps that
+ * fact even when THIS attempt's read fails. A push that throws (a real auth/network/remote-conflict
+ * failure, per `runDoltSync`'s contract) is read as unsynced rather than propagated for the same
+ * reason: the caller's gate must fail closed on "found, but unconfirmed" exactly as it does on "not
+ * found", never crash the ticket walk over the sync probe.
  *
  * An unsynced write is not the end of the story (anton-fc5x follow-up): `ticket` — read fresh at
  * this attempt's claim, so it carries whatever a PRIOR attempt persisted — may already hold
@@ -200,6 +210,15 @@ export interface BoardEvidenceResult {
  * via {@link clearBoardEvidencePending}, only once the whole handoff has gone through. The write here
  * is skipped when the marker already holds exactly this id set, so a retry that finds nothing new
  * doesn't churn the label on every attempt.
+ *
+ * That write goes through {@link mustPersist}, not a bare `.catch(() => {})` (PR #284 review round
+ * 4/follow-up): this marker is the ONLY record of `freshIds` once the next attempt's baseline is
+ * taken fresh (it will include whatever this attempt's writes already landed), so a single contended
+ * Dolt write that silently failed would strand a genuinely-delivered ticket — the settle-time sync
+ * later publishes the edits, a resumed attempt's fresh baseline absorbs them as "no change", finds no
+ * pending marker either, and permanently rejects a delivery that already shipped. Retrying (and
+ * logging every refusal) narrows that window without pretending a write bd keeps refusing is
+ * recoverable — an exhausted retry still leaves the marker unset, exactly as it would have before.
  */
 export async function readBoardEvidence(
   repo: string,
@@ -207,7 +226,10 @@ export async function readBoardEvidence(
   ticket: Bead,
 ): Promise<BoardEvidenceResult> {
   const board = await mustReadBoard(repo);
-  if (!board) return { found: false, ids: [], synced: false };
+  if (!board) {
+    const pending = beads.pendingBoardEvidence(ticket);
+    return { found: pending.length > 0, ids: pending, synced: false, evidenceUnavailable: true };
+  }
   const freshIds = boardEvidence(baseline, fingerprintBoard(board));
   const pending = beads.pendingBoardEvidence(ticket);
   const ids = [...new Set([...pending, ...freshIds])].toSorted();
@@ -216,7 +238,7 @@ export async function readBoardEvidence(
   const synced = outcome === "synced" || outcome === "shared-server";
   const stale = beads.boardEvidencePendingLabels(ticket);
   if (stale.length !== 1 || stale[0] !== LABELS.boardEvidencePending(ids)) {
-    await beads.setBoardEvidencePending(repo, ticket.id, ids, stale).catch(() => {});
+    await mustPersist(() => beads.setBoardEvidencePending(repo, ticket.id, ids, stale));
   }
   return { found: true, ids, synced };
 }

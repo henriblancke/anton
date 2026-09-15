@@ -516,6 +516,19 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
       `settle on.`
     );
   }
+  if (evidence.evidenceUnavailable) {
+    return (
+      `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
+      `is bd writes to the board, not the git tree — but the post-run board read could not be read ` +
+      `(after retries), so no comparison against the pre-dispatch baseline could be made this attempt.` +
+      (evidence.ids.length > 0
+        ? ` A prior attempt already confirmed evidence on ${evidence.ids.join(", ")}, which stays ` +
+          `pending on the ticket and will be picked up once the board read is healthy again.`
+        : "") +
+      ` Blocking the ticket for operator review until the board read is healthy, then resume the run — ` +
+      `an unreadable post-run board fails closed rather than being asserted unchanged.`
+    );
+  }
   if (!evidence.found) {
     return (
       `${ticket.id} produced no delivery: claude exited cleanly, self-reported delivered, and this ` +

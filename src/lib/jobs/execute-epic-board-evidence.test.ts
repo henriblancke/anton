@@ -189,7 +189,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   const ticket = bead("t-1");
 
   it(
-    "reports not-found rather than throwing when the post-run read fails all its retries " +
+    "reports evidenceUnavailable rather than throwing when the post-run read fails all its retries " +
       "(anton-fc5x review round 2) — a thrown error here would skip the board-only NoDeliveryError " +
       "path and fall to generic release handling",
     async () => {
@@ -200,6 +200,26 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         found: false,
         ids: [],
         synced: false,
+        evidenceUnavailable: true,
+      });
+      expect(pushMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it(
+    "surfaces a PRIOR attempt's already-confirmed pending ids even when THIS attempt's post-run " +
+      "read fails (PR #284 review) — the marker must not be silently dropped just because this " +
+      "attempt could not read the board at all",
+    async () => {
+      const resumedTicket = bead("t-1", { labels: [LABELS.boardEvidencePending(["a"])] });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      rejectEveryRetry();
+      await expect(readBoardEvidence("/repo", baseline, resumedTicket)).resolves.toEqual({
+        found: true,
+        ids: ["a"],
+        synced: false,
+        evidenceUnavailable: true,
       });
       expect(pushMock).not.toHaveBeenCalled();
     },
@@ -258,6 +278,25 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     await readBoardEvidence("/repo", baseline, ticket);
     expect(setBoardEvidencePendingMock).toHaveBeenCalledWith("/repo", ticket.id, ["a"], []);
   });
+
+  it(
+    "retries the marker write through `mustPersist` rather than swallowing the first failure (PR " +
+      "#284 review) — a single contended Dolt write must not permanently strand this evidence",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("not-wired");
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidencePendingMock.mockResolvedValueOnce("");
+      const result = await readBoardEvidence("/repo", baseline, ticket);
+      expect(result).toEqual({ found: true, ids: ["a"], synced: false });
+      // First attempt rejected, second (the retry) landed — both targeted the same write.
+      const calls = setBoardEvidencePendingMock.mock.calls.slice(-2);
+      expect(calls[0]).toEqual(["/repo", ticket.id, ["a"], []]);
+      expect(calls[1]).toEqual(["/repo", ticket.id, ["a"], []]);
+    },
+  );
 
   it(
     "retains a matching `board-evidence-pending:*` label once the sync confirms, rather than " +

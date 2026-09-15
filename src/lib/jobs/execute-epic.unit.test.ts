@@ -1922,6 +1922,43 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
   );
 
   it(
+    "blocks and fails closed — with a distinct message — when the POST-run board read is the one " +
+      "that failed (PR #284 review), never folded into the plain not-found branch: that branch " +
+      "asserts nothing differs, which is false when no comparison was ever made",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({ found: false, ids: [], synced: false, evidenceUnavailable: true });
+
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+      expect(err?.name).toBe("PoisonError");
+      expect(err?.message).toMatch(/anton-board produced no delivery/);
+      expect(err?.message).toMatch(/post-run board read could not be read/);
+      expect(err?.message).not.toMatch(/nothing differs/);
+      expect(p).toMatchObject({ committed: false, delivered: false });
+    },
+  );
+
+  it(
+    "names a prior attempt's already-pending ids in the evidenceUnavailable message, rather than " +
+      "silently dropping them, when THIS attempt's post-run read fails",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({
+        found: true,
+        ids: ["swept-1"],
+        synced: false,
+        evidenceUnavailable: true,
+      });
+
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+      expect(err?.message).toMatch(/swept-1/);
+      expect(err?.message).toMatch(/prior attempt/);
+    },
+  );
+
+  it(
     "records the branch's empty attribution commit and flips `committed` true once the board is " +
       "confirmed (anton-fc5x review round 3) — a board-only delivery otherwise leaves the branch " +
       "identical to its base, and the run's `step:pr` fails `gh pr create` on that empty diff",
