@@ -1197,7 +1197,22 @@ async function cmdUninstall(args = []) {
  */
 const NODE_MIN = 20;
 const NODE_DEV = "24.21.0";
-const NODE_DEV_MAJOR = Number(NODE_DEV.split(".")[0]);
+
+/**
+ * Which band a Node version falls in: "unsupported" | "below-dev" | "ok". Pure and exported, so the
+ * decision is testable without mocking `process.versions` (PR #298 review) — the same reason
+ * `cmdDev` and `ensureMigrated` take injected seams.
+ *
+ * The floor is MAJOR-only, matching how the bundle's ABI heal actually works: a prebuilt exists per
+ * Node major, so 20.0.0 and 20.11.0 are the same question. The dev pin is compared in FULL, because
+ * it is a pin — `.nvmrc` and `release.yml` name 24.21.0 exactly, and 24.0.0 is genuinely below what
+ * this repo builds against, so the major-only test would have waved it through silently.
+ */
+function nodeBand(version) {
+  const major = Number(String(version).replace(/^v/, "").split(".")[0]);
+  if (!(major >= NODE_MIN)) return "unsupported";
+  return compareVersions(version, NODE_DEV) < 0 ? "below-dev" : "ok";
+}
 
 /** Prereq check. Returns true when all *required* tools are present. */
 function checkPrereqs() {
@@ -1219,12 +1234,11 @@ function checkPrereqs() {
     console.log(`  ${present && !bdTooOld ? "✓" : "✗"} ${p.cmd.padEnd(9)} ${tag}  ${c.dim(p.why)}`);
     if ((!present || bdTooOld) && p.required) ok = false;
   }
-  const node = process.versions.node.split(".").map(Number);
-  const nodeOk = node[0] >= NODE_MIN;
-  const belowDev = nodeOk && node[0] < NODE_DEV_MAJOR;
+  const band = nodeBand(process.versions.node);
+  const nodeOk = band !== "unsupported";
   console.log(
     `  ${nodeOk ? "✓" : "✗"} ${"node".padEnd(9)} ${nodeOk ? c.green(process.versions.node) : c.red(`${process.versions.node} (need ≥${NODE_MIN})`)}` +
-      (belowDev ? c.yellow(`  ! below the ${NODE_DEV} this repo develops and releases against`) : ""),
+      (band === "below-dev" ? c.yellow(`  ! below the ${NODE_DEV} this repo develops and releases against`) : ""),
   );
   // Named, not failed: a bundle self-heals its native modules for any Node ≥ NODE_MIN, so a 20–23
   // machine is supported and must not be told otherwise. But `engines`/.nvmrc pin NODE_DEV, and a
@@ -2447,6 +2461,7 @@ export {
   compareVersions,
   NODE_MIN,
   NODE_DEV,
+  nodeBand,
   platformLabel,
   fetchLatestRelease,
   applyMigrations,

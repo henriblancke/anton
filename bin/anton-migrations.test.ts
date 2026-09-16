@@ -17,7 +17,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { chmod, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { applyMigrations, cmdDev, ensureBetterSqlite3, ensureMigrated, healNativeAbi, runLocalPinnedToThisNode } from "./anton.mjs";
+import { applyMigrations, cmdDev, ensureBetterSqlite3, ensureMigrated, healNativeAbi, NODE_DEV, nodeBand, runLocalPinnedToThisNode } from "./anton.mjs";
 
 import { exists, pathWith, REPO_ROOT, tempDir, withDb } from "./anton.fixture";
 
@@ -303,5 +303,41 @@ describe("every bin this launcher spawns is pinned to anton's own node", () => {
     const src = await readFile(join(REPO_ROOT, "bin", "anton.mjs"), "utf8");
     expect(src).toContain("spawn(process.execPath, spawnArgs");
     expect(src).not.toContain('spawn("node", spawnArgs');
+  });
+});
+
+describe("nodeBand (the two Node floors, decided purely)", () => {
+  // Extracted from `checkPrereqs` precisely so this is assertable: that function reads
+  // `process.versions.node` directly, so the band was only reachable by mocking a global, and the
+  // claim that it had been "checked across 18/20/22/24/26" rested on a throwaway script rather than
+  // anything committed (PR #298 review). These are that check, committed.
+  it("fails below the runtime floor", () => {
+    expect(nodeBand("18.20.0")).toBe("unsupported");
+    expect(nodeBand("v18.20.0")).toBe("unsupported"); // `v`-prefixed, as `node -v` prints it
+  });
+
+  it("passes-with-warning between the runtime floor and the dev pin", () => {
+    // Supported — the bundle self-heals per ABI — but not what this repo builds against.
+    expect(nodeBand("20.11.0")).toBe("below-dev");
+    expect(nodeBand("22.22.0")).toBe("below-dev");
+  });
+
+  it("warns on a 24 BELOW the pin, rather than waving the whole major through", () => {
+    // The dev pin is a pin: `.nvmrc` and release.yml name 24.21.0 exactly. A major-only comparison
+    // (the first draft) called 24.0.0 clean, which is the silent gap this warning exists to close.
+    expect(nodeBand("24.0.0")).toBe("below-dev");
+    expect(nodeBand("24.20.9")).toBe("below-dev");
+  });
+
+  it("is clean at the pin and above", () => {
+    expect(nodeBand(NODE_DEV)).toBe("ok");
+    expect(nodeBand("24.21.1")).toBe("ok");
+    expect(nodeBand("26.8.2")).toBe("ok");
+  });
+
+  it("agrees with the Node this suite is running on", () => {
+    // Ties the pure function to the real input `checkPrereqs` feeds it, so a version string shape
+    // node actually emits can never drift away from what the bands were tested with.
+    expect(["unsupported", "below-dev", "ok"]).toContain(nodeBand(process.versions.node));
   });
 });
