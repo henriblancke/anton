@@ -386,7 +386,7 @@ function runLocal(bin, args, env = {}) {
 }
 
 /**
- * `runLocal` for a bin that loads better-sqlite3, pinned to THIS Node.
+ * `runLocal` for a bin that loads better-sqlite3, run by THIS runtime.
  *
  * That is every bin this launcher spawns: `drizzle-kit` opens the DB to migrate, and `next` (dev,
  * build and start alike) reaches it through instrumentation as the server boots. Pinning only the
@@ -394,24 +394,61 @@ function runLocal(bin, args, env = {}) {
  * — migrations pass, the server dies reporting the mismatch with the numbers reversed (PR #298
  * review).
  *
- * Those bins start with `#!/usr/bin/env node`, so as their own process they resolve node from PATH
- * — which is not necessarily the node running anton. That split is routine rather than exotic: with
- * nvm installed alongside Homebrew, nvm's shim wins in an interactive shell and /opt/homebrew/bin
- * sorts first in a login shell, so the same command in the same directory can resolve either one.
+ * Those bins start with `#!/usr/bin/env node`, so left alone they resolve node from PATH — which is
+ * not necessarily the runtime running anton. That split is routine rather than exotic: with nvm
+ * installed alongside Homebrew, nvm's shim wins in an interactive shell and /opt/homebrew/bin sorts
+ * first in a login shell, so the same command in the same directory can resolve either one.
  *
  * It matters because better-sqlite3's addon is per-ABI: `ensureBetterSqlite3` can only heal for one
- * Node, and it heals for the one it is running in. Let the child resolve its own and the heal aims
- * at the wrong ABI — we would download a binary for OUR node and the child would still fail to load
- * it, reporting the mismatch with the numbers the other way round. So put this node's own directory
- * first on the child's PATH, making the binary we just verified the one the child actually loads.
+ * runtime, and it heals for the one it is running in. Let the child resolve its own and the heal
+ * aims at the wrong ABI — we download a binary for OURS and the child still fails to load it,
+ * reporting the mismatch with the numbers the other way round.
+ *
+ * So the bin's JS is handed to `process.execPath` DIRECTLY, and its shebang never gets a vote.
+ * Prepending `dirname(process.execPath)` to PATH instead — the first version of this — pins nothing
+ * when anton runs under Bun: `process.execPath` is then `bun`, whose directory holds no executable
+ * named `node`, so the child falls through to ambient Node while the heal targeted Bun's ABI. That
+ * is this very bug wearing a different hat (PR #298 review). Executing the file removes the
+ * question: the process that loads the addon is the process we healed for, by construction.
+ *
+ * The PATH prepend is KEPT on top, because it is still load-bearing for a bin that shells out to
+ * `node` itself, and it costs nothing. A `.bin` entry that is not a readable JS file (a binary, or
+ * a shim shape we do not recognise) falls back to spawning it as before — degraded to the PATH pin
+ * rather than failing outright.
  */
 function runLocalPinnedToThisNode(bin, args, env = {}) {
-  const nodeDir = dirname(process.execPath);
+  const runtimeDir = dirname(process.execPath);
   // Prepend to the PATH the child would otherwise get — a caller-supplied one when there is one,
   // this process's own otherwise. Rebuilding it from process.env unconditionally would silently
   // drop an override and send the child looking down the wrong PATH entirely.
   const base = env.PATH ?? process.env.PATH ?? "";
-  return runLocal(bin, args, { ...env, PATH: base ? `${nodeDir}${delimiter}${base}` : nodeDir });
+  const pinned = { ...env, PATH: base ? `${runtimeDir}${delimiter}${base}` : runtimeDir };
+  const script = resolveJsBin(bin);
+  if (!script) return runLocal(bin, args, pinned);
+  // `process.execPath` with the script as argv[1] — the shebang is bypassed entirely, so this holds
+  // under Bun and under any node whose directory is not on PATH.
+  return runLocal(process.execPath, [script, ...args], pinned);
+}
+
+/**
+ * The real JS file behind a vendored `node_modules/.bin` entry, or null when it is not one.
+ *
+ * npm/bun link these to the package's own `bin` script (`next` → `next/dist/bin/next`), so the
+ * target is ordinary JS that any runtime can execute directly. Returns null for a bare command
+ * name meant to come off PATH, a missing entry, or a file that does not start with a `node`
+ * shebang — the caller then spawns it the old way rather than guessing.
+ */
+function resolveJsBin(bin) {
+  if (bin.includes("/") || bin.includes("\\")) return null; // already a path — caller means it literally
+  const exe = join(BIN, bin);
+  if (!existsSync(exe)) return null;
+  try {
+    const target = realpathSync(exe);
+    const head = readFileSync(target, "utf8").slice(0, 64);
+    return /^#!.*\bnode\b/.test(head) ? target : null;
+  } catch {
+    return null; // unreadable or binary — fall back to spawning the bin itself
+  }
 }
 
 /**
@@ -1194,6 +1231,10 @@ async function cmdUninstall(args = []) {
  * `.nvmrc`, `engines.node`, and the Node `release.yml` builds the bundle with, pinned together so a
  * three-ABI machine (nvm, Homebrew, bun's embedded) has one answer. Both are declared here so the
  * check, the warning, and the docs cannot drift apart again (PR #298 review).
+ *
+ * Note that `ci.yml` pins NO Node: every gate there runs under Bun, so NODE_DEV is enforced by the
+ * RELEASE build, not by a PR check. A Node-ABI regression therefore surfaces at release time — which
+ * is why `ensureBetterSqlite3` heals at runtime rather than trusting any pin (PR #298 review).
  */
 const NODE_MIN = 20;
 const NODE_DEV = "24.21.0";
@@ -2468,6 +2509,7 @@ export {
   ensureMigrated,
   ensureBetterSqlite3,
   healNativeAbi,
+  resolveJsBin,
   cmdDev,
   runLocalPinnedToThisNode,
 };

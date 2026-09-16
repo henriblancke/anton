@@ -14,10 +14,10 @@
  * node from PATH is what made the heal aim at the wrong ABI in the first place.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { chmod, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { applyMigrations, cmdDev, ensureBetterSqlite3, ensureMigrated, healNativeAbi, NODE_DEV, nodeBand, runLocalPinnedToThisNode } from "./anton.mjs";
+import { applyMigrations, cmdDev, ensureBetterSqlite3, ensureMigrated, healNativeAbi, NODE_DEV, nodeBand, resolveJsBin, runLocalPinnedToThisNode } from "./anton.mjs";
 
 import { exists, pathWith, REPO_ROOT, tempDir, withDb } from "./anton.fixture";
 
@@ -135,6 +135,39 @@ describe("runLocalPinnedToThisNode (source checkout → drizzle-kit under THIS n
 
     expect(rc).toBe(0);
     // The decoy would have written "DECOY"; the pin means the child ran under anton's own node.
+    expect(await readFile(seen, "utf8")).toBe(process.execPath);
+  });
+
+  it("runs a vendored bin's JS through this runtime, so the shebang never gets a vote", async () => {
+    // The Bun hole (PR #298 review): under `bun bin/anton.mjs`, `process.execPath` is `bun`, and
+    // ~/.bun/bin holds no executable named `node` — so prepending that directory pins NOTHING and a
+    // `#!/usr/bin/env node` child still falls through to ambient Node, while the heal targeted Bun's
+    // ABI. Handing the bin's JS to process.execPath directly removes the question: the process that
+    // loads the addon IS the one we healed for, whatever runtime that is.
+    expect(resolveJsBin("next")).toBe(await realpath(join(REPO_ROOT, "node_modules", "next", "dist", "bin", "next")));
+    expect(resolveJsBin("drizzle-kit")).toBe(await realpath(join(REPO_ROOT, "node_modules", "drizzle-kit", "bin.cjs")));
+  });
+
+  it("falls back to spawning the bin when it is not resolvable JS", () => {
+    // Degrade to the PATH pin rather than fail: a bare command meant to come off PATH, a missing
+    // vendored entry, and an explicit path the caller means literally are all spawned as before.
+    expect(resolveJsBin("definitely-not-a-vendored-bin")).toBe(null);
+    expect(resolveJsBin("/tmp/some/explicit/path")).toBe(null);
+  });
+
+  it("still pins when the bin is spawned rather than resolved (the fallback path)", async () => {
+    dir = await tempDir("anton-node-pin-fallback-");
+    // The probe below is passed as a PATH, so resolveJsBin returns null and this exercises the
+    // fallback — which must still put this runtime first, exactly as it did before.
+    const decoy = join(dir, "node");
+    await writeFile(decoy, `#!/bin/sh\necho DECOY > "$ANTON_PIN_SEEN"\nexit 0\n`);
+    await chmod(decoy, 0o755);
+    const probe = join(dir, "probe");
+    await writeFile(probe, `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(process.env.ANTON_PIN_SEEN, process.execPath);\n`);
+    await chmod(probe, 0o755);
+    const seen = join(dir, "seen.txt");
+
+    expect(runLocalPinnedToThisNode(probe, [], { PATH: pathWith(dir), ANTON_PIN_SEEN: seen })).toBe(0);
     expect(await readFile(seen, "utf8")).toBe(process.execPath);
   });
 
@@ -284,17 +317,27 @@ describe("every bin this launcher spawns is pinned to anton's own node", () => {
   // instrumentation as the server boots. A bare `runLocal` call site is a child free to resolve a
   // different node than the one `ensureBetterSqlite3` just healed for, which moves the crash rather
   // than fixing it: migrations pass, then the server dies on the reversed mismatch (PR #298 review).
-  it("has no bare runLocal(...) call site left in anton.mjs", async () => {
+  it("has no bare runLocal(...) call site OUTSIDE the pinned wrapper", async () => {
     const src = await readFile(join(REPO_ROOT, "bin", "anton.mjs"), "utf8");
-    const bare = src
-      .split("\n")
-      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      .filter(({ line }) => /(?<!PinnedToThisNode)\brunLocal\(/.test(line) && !line.startsWith("*"))
-      // Two legal mentions: `runLocal`'s own definition, and the one delegation to it from inside
-      // `runLocalPinnedToThisNode`. Every OTHER call site is a child left free to pick its own node.
-      .filter(({ line }) => !line.startsWith("function runLocal(bin, args"))
-      .filter(({ line }) => !line.startsWith("return runLocal(bin, args, { ...env, PATH:"));
-    expect(bare.map(({ n, line }) => `${n}: ${line}`)).toEqual([]);
+    const lines = src.split("\n");
+    // `runLocal` is legal in exactly two places: its own definition, and inside
+    // `runLocalPinnedToThisNode`, which delegates to it. Anywhere else is a child left free to
+    // resolve its own runtime. Scoping by enclosing function (rather than by matching each allowed
+    // line's text) means the wrapper can be rewritten without the guard needing to learn its
+    // new shape — only the boundary matters.
+    const startsFn = (line: string, name: string) => line.startsWith(`function ${name}(`);
+    let enclosing = "";
+    const bare: string[] = [];
+    lines.forEach((raw, i) => {
+      const line = raw.trim();
+      if (/^function \w+\(/.test(line)) enclosing = line.slice("function ".length).split("(")[0];
+      if (startsFn(line, "runLocal") || startsFn(line, "runLocalPinnedToThisNode")) return;
+      if (line.startsWith("*") || line.startsWith("//")) return;
+      if (!/(?<!PinnedToThisNode)\brunLocal\(/.test(line)) return;
+      if (enclosing === "runLocalPinnedToThisNode") return;
+      bare.push(`${i + 1} (in ${enclosing}): ${line}`);
+    });
+    expect(bare).toEqual([]);
   });
 
   it("daemonizes the server with process.execPath, not a PATH-resolved node", async () => {
