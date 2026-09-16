@@ -8,6 +8,26 @@ description: This repo is indexed by graft/. For ANY task here, whether
 
 # graft
 
+## Setup (optional — the repo works without it)
+
+graft is a **global agent tool, not a project dependency**, so it is deliberately
+absent from `package.json`: it indexes the repo for whoever is driving an agent,
+and pinning it as a dep would install it for every CI job and teammate who never
+runs one. Install it once per machine:
+
+```sh
+npm i -g @nanonets/graft   # then: graft build
+```
+
+Without it this repo still builds, tests, and lints normally. The hooks and status
+line resolve graft through several fallbacks and **no-op silently** when it is
+missing. The one loud-ish edge: `.mcp.json` spawns the `graft` binary directly, so
+an agent host with no graft on PATH reports a failed MCP connection for that one
+server (an `ENOENT` the host contains) and carries on — the session is unaffected,
+but the `graft_*` tools this skill describes will not be there. Fall back to
+`grep`/`Read` in that case.
+
+
 `graft/` holds a graph of this repo: small markdown nodes that each explain one
 part in prose and name the exact `file:line` spans they cover, plus a wiring
 graph of who-calls-what. Querying a node costs a few hundred tokens; rebuilding
