@@ -222,6 +222,10 @@ function MarkDoneButton({
 }) {
   const [armed, setArmed] = useState(false);
   const [pending, setPending] = useState(false);
+  // `onDone` (useBoardPoll.refresh) only schedules an async fetch — it does not update this
+  // render. Without this flag the button re-enables until that fetch lands (or stays enabled
+  // forever if it fails), so a second click 409s on an already-closed ticket (PR #288 review).
+  const [settled, setSettled] = useState(false);
 
   async function confirm() {
     setPending(true);
@@ -233,12 +237,22 @@ function MarkDoneButton({
       }
       toast.success("Marked done");
       setArmed(false);
+      setSettled(true);
       onDone?.();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Mark done failed");
     } finally {
       setPending(false);
     }
+  }
+
+  if (settled) {
+    return (
+      <span className="inline-flex w-fit items-center gap-1 text-[11px] text-stage-done">
+        <CheckIcon className="size-3" aria-hidden="true" />
+        Marked done
+      </span>
+    );
   }
 
   if (armed) {
