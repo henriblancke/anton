@@ -624,8 +624,18 @@ async function refreshOntoBase(opts: {
    * accommodation already made for a commit that's been pushed to origin.
    */
   preserveShas?: string[];
+  /**
+   * The commit `branch` was ORIGINALLY cut from — the caller's pinned `baseForkSha`, when one is
+   * already on record for it (PR #279 review). A plain `git rebase <base>` replays everything after
+   * `merge-base(base, branch)`, not everything after the branch's own fork point; once `baseBranch`
+   * has been force-pushed or recreated past an older shared ancestor, that merge-base lands BEFORE
+   * the real fork and the plain form resurrects commits that were part of the ORIGINAL base — never
+   * touched by this run — as if they were the branch's own work. Passed, it becomes `--onto`'s
+   * upstream boundary instead, so only what's actually unique to `branch` gets replayed.
+   */
+  forkSha?: string;
 }): Promise<RefreshOutcome> {
-  const { repoPath, worktreePath, branch, baseBranch, preserveShas } = opts;
+  const { repoPath, worktreePath, branch, baseBranch, preserveShas, forkSha } = opts;
 
   let baseSha: string;
   try {
@@ -755,8 +765,24 @@ async function refreshOntoBase(opts: {
     }
   }
 
+  // The plain one-argument form below replays `merge-base(baseSha, branch)..branch` — the branch's
+  // own fork point only while `baseBranch` still contains it. Once `baseBranch` has been rewritten
+  // past an older shared ancestor, that merge-base lands before the real fork and the plain form
+  // would replay ORIGINAL base commits alongside the branch's own work, resurrecting them into the
+  // rebased branch (PR #279 review). `--onto <baseSha> <forkSha> <branch>` sidesteps this entirely:
+  // it transplants exactly `forkSha..branch` (branch's own commits since it actually forked, checked
+  // below) onto `baseSha`, with no requirement that `baseSha` still descend from `forkSha` — so it
+  // stays correct even for a `baseBranch` that was force-pushed or recreated past the real fork
+  // point. A fork point that isn't actually on `branch` (a stale or mismatched pin) is ignored —
+  // safer to fall back to the plain form than to `--onto` a boundary that doesn't describe this
+  // branch's history.
+  const rebaseArgs =
+    forkSha && (await branchContainsCommit(repoPath, branch, forkSha))
+      ? ["rebase", "--onto", baseSha, forkSha, branch]
+      : ["rebase", baseSha];
+
   try {
-    await git(worktreePath, ["rebase", baseSha], hooksPath);
+    await git(worktreePath, rebaseArgs, hooksPath);
     console.log(`[worktree] rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
     return { outcome: "rebased", baseSha };
   } catch (err) {
@@ -930,6 +956,7 @@ async function reuseIfPresent(
   existing: Worktree | null,
   refresh: boolean | undefined,
   preserveShas: string[] | undefined,
+  forkSha: string | undefined,
 ): Promise<Worktree | undefined> {
   if (!existing || !existsSync(existing.path)) return undefined;
   if (claimed) await lockClaimedWorktree(repoPath, branch, claimed);
@@ -940,6 +967,7 @@ async function reuseIfPresent(
     branch,
     baseBranch,
     preserveShas,
+    forkSha,
   });
   return { ...existing, refreshOutcome };
 }
@@ -952,6 +980,7 @@ async function materializeFreshWorktree(
   claimed: string | undefined,
   refresh: boolean | undefined,
   preserveShas: string[] | undefined,
+  knownForkSha: string | undefined,
 ): Promise<Worktree> {
   const path = worktreePathFor(repoPath, branch);
   await mkdir(dirname(path), { recursive: true });
@@ -968,7 +997,14 @@ async function materializeFreshWorktree(
   // freshly-CREATED branch (the `-b` case above) needs none of this: it was just cut from
   // `baseBranch` itself.
   if (!createdBranch && refresh) {
-    const refreshOutcome = await refreshOntoBase({ repoPath, worktreePath: path, branch, baseBranch, preserveShas });
+    const refreshOutcome = await refreshOntoBase({
+      repoPath,
+      worktreePath: path,
+      branch,
+      baseBranch,
+      preserveShas,
+      forkSha: knownForkSha,
+    });
     const refreshedForkSha = await readForkAtCreation(path);
     return { path: resolved, branch, baseBranch, forkSha: refreshedForkSha, createdBranch, repoPath, refreshOutcome };
   }
@@ -984,13 +1020,14 @@ async function materializeClaimedWorktree(
   claimedBy: string | undefined,
   refresh: boolean | undefined,
   preserveShas: string[] | undefined,
+  forkSha: string | undefined,
 ): Promise<Worktree> {
   const { claimed, existing, baseBranch } = await resolveClaimForCreate(repoPath, branch, baseBranchOpt, claimedBy);
-  const reused = await reuseIfPresent(repoPath, branch, baseBranch, claimed, existing, refresh, preserveShas);
+  const reused = await reuseIfPresent(repoPath, branch, baseBranch, claimed, existing, refresh, preserveShas, forkSha);
   if (reused) return reused;
   // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
   if (existing) await forgetStaleWorktree(repoPath, existing.path);
-  return materializeFreshWorktree(repoPath, branch, baseBranch, claimed, refresh, preserveShas);
+  return materializeFreshWorktree(repoPath, branch, baseBranch, claimed, refresh, preserveShas, forkSha);
 }
 
 export async function createWorktree(opts: {
@@ -1016,6 +1053,8 @@ export async function createWorktree(opts: {
   refresh?: boolean;
   /** Passed through to {@link refreshOntoBase} when `refresh` is set — see its own doc comment. */
   preserveShas?: string[];
+  /** Passed through to {@link refreshOntoBase} when `refresh` is set — see its `forkSha` doc comment. */
+  forkSha?: string;
 }): Promise<Worktree> {
   const { repoPath, branch, warm, signal } = opts;
 
@@ -1023,7 +1062,15 @@ export async function createWorktree(opts: {
   // outside it. A cold install runs for minutes, and by the time it starts the checkout exists and
   // the run row already names the branch, which is what the sweep re-reads before deleting anything.
   const wt = await withBranchLock(repoPath, branch, () =>
-    materializeClaimedWorktree(repoPath, branch, opts.baseBranch, opts.claimedBy, opts.refresh, opts.preserveShas),
+    materializeClaimedWorktree(
+      repoPath,
+      branch,
+      opts.baseBranch,
+      opts.claimedBy,
+      opts.refresh,
+      opts.preserveShas,
+      opts.forkSha,
+    ),
   );
 
   if (warm) {

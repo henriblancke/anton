@@ -103,6 +103,19 @@ export async function warmRunWorktree(
     )
     .map((record) => record.head);
   const preserveShas = [...satisfiedShas, ...blockNoteShas];
+  // The fork commit a PRIOR ATTEMPT on this branch already pinned, if any (PR #279 review) —
+  // resolved BEFORE the checkout is created/reused so a REUSED checkout's refresh below can rebase
+  // with `--onto` that exact boundary instead of the plain one-argument form, which would otherwise
+  // replay commits from the ORIGINAL base as if they were this branch's own once `baseBranch` has
+  // been rewritten past the branch's true fork point (see refreshOntoBase's `forkSha` doc). Branch-
+  // scoped only, not this run's own row too: THIS row is fresh far more often than not (a retry after
+  // an ordinary failure opens one), and re-reading it here as well would consume the same pin-read
+  // the try block below performs as its own atomic setup step — harmless when it succeeds, but a
+  // rejection there is exactly what the try block's own cleanup path exists to catch, and firing it a
+  // second time earlier would answer to a checkout this call hasn't created yet. Harmless to resolve
+  // even when the checkout turns out to be freshly created: refreshOntoBase never runs for one, so
+  // the value is simply unused.
+  const knownForkSha = await findRunBaseForkShaForBranch(db, projectId, run.targetId, branch);
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
@@ -118,6 +131,7 @@ export async function warmRunWorktree(
     // from base by design and must never be rebased underneath an already-pushed PR).
     refresh: true,
     preserveShas,
+    forkSha: knownForkSha,
   });
   run.worktree = worktree;
   // `createWorktree` made this decision under its branch lock; a caller-side ref probe could go

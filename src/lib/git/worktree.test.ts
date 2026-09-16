@@ -308,6 +308,86 @@ suite("worktree manager (real git)", () => {
       }
     });
 
+    // anton-s55u (PR #279 review): the plain one-argument `git rebase <base>` above replays
+    // `merge-base(base, branch)..branch`, the branch's own fork point only while `baseBranch` still
+    // contains it. Once `baseBranch` is force-pushed or recreated past an older shared ancestor, that
+    // merge-base lands BEFORE the real fork and the plain form would resurrect commits that were part
+    // of the ORIGINAL base — never touched by this run — as if they were the branch's own work.
+    // Isolated in its own repo: it rewrites the default branch's history, which the shared `repo`
+    // fixture other cases in this `describe` build on cumulatively.
+    it("rebases with --onto the pinned fork point, so a rewritten base does not resurrect a dropped base commit", async () => {
+      const ontoRepo = mkdtempSync(join(tmpdir(), "anton-wt-onto-repo-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: ontoRepo });
+        execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: ontoRepo });
+        execFileSync("git", ["config", "user.name", "anton-test"], { cwd: ontoRepo });
+        writeFileSync(join(ontoRepo, "README.md"), "# tmp\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "."]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "init"]);
+        const ontoDefaultBranch = execFileSync(
+          "git",
+          ["-C", ontoRepo, "symbolic-ref", "--short", "HEAD"],
+          { encoding: "utf8" },
+        ).trim();
+
+        // Main advances to `sharedBase` — the commit the ticket branch will fork from.
+        writeFileSync(join(ontoRepo, "shared-base.txt"), "shared\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "shared-base.txt"]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "advance main (later dropped)"]);
+        const sharedBase = execFileSync("git", ["-C", ontoRepo, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim();
+
+        const branch = "anton/refresh-onto-pin";
+        const first = await createWorktree({ repoPath: ontoRepo, branch, baseBranch: ontoDefaultBranch });
+        expect(first.forkSha).toBe(sharedBase);
+
+        writeFileSync(join(first.path, "own-work.txt"), "ticket work\n");
+        execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+        execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unique ticket commit"]);
+
+        // Force-push/recreate main: drop `sharedBase` (and its file) back to the ORIGINAL root, then
+        // commit a new, unrelated tip — main and the ticket branch now only share that root commit.
+        execFileSync("git", ["-C", ontoRepo, "reset", "--hard", `${sharedBase}~1`]);
+        writeFileSync(join(ontoRepo, "rewritten-base.txt"), "rewritten\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "rewritten-base.txt"]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "advance main (rewritten)"]);
+        const freshMain = execFileSync("git", ["-C", ontoRepo, "rev-parse", ontoDefaultBranch], {
+          encoding: "utf8",
+        }).trim();
+        expect(freshMain).not.toBe(sharedBase);
+
+        const log = vi.spyOn(console, "log").mockImplementation(() => {});
+        try {
+          const second = await createWorktree({
+            repoPath: ontoRepo,
+            branch,
+            baseBranch: ontoDefaultBranch,
+            refresh: true,
+            forkSha: first.forkSha,
+          });
+
+          expect(second.refreshOutcome).toEqual({ outcome: "rebased", baseSha: freshMain });
+          const rebaseLog = execFileSync(
+            "git",
+            ["-C", second.path, "log", "--oneline", `${freshMain}..HEAD`],
+            { encoding: "utf8" },
+          );
+          expect(rebaseLog).toContain("unique ticket commit");
+          expect(rebaseLog).not.toContain("advance main (later dropped)");
+          expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+          expect(existsSync(join(second.path, "rewritten-base.txt"))).toBe(true);
+          // The dropped base commit must never be replayed back in as if it were the branch's own work.
+          expect(existsSync(join(second.path, "shared-base.txt"))).toBe(false);
+          expect(log.mock.calls.flat().join(" ")).toContain("rebased");
+        } finally {
+          log.mockRestore();
+        }
+      } finally {
+        rmSync(ontoRepo, { recursive: true, force: true });
+      }
+    });
+
     // anton-s55u (PR #279 review): a prior attempt can push the branch via `pushBranch` and then
     // fail before `gh pr create` completes; the resumed run's refresh must not rewrite those
     // already-public commits, or the retry's own non-forcing push rejects the rebased branch forever.
