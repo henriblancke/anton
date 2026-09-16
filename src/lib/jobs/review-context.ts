@@ -43,9 +43,10 @@ const MAX_PRINCIPLES_CHARS = 8000;
 /**
  * Per verify gate. Enough for a runner's failure list and its summary, which is all the reviewer
  * needs from a check it did not have to run — and small enough that four green gates cannot crowd
- * out the diff they are evidence about.
+ * out the diff they are evidence about. Exported so a recorded gate failure gets the same cap one
+ * stage earlier, in a re-attempt's dispatch prompt (anton-ahsja).
  */
-const MAX_GATE_OUTPUT_CHARS = 3000;
+export const MAX_GATE_OUTPUT_CHARS = 3000;
 /**
  * Per instruction file, and across all of them — a deep tree can carry many.
  *
