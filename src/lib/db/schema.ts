@@ -77,6 +77,12 @@ export const runs = sqliteTable("runs", {
   // run-phase carry on a skip so `prBody` still shows them at the merge gate, exactly as a review
   // that actually ran would have left them.
   reviewKeyAdvisories: text("review_key_advisories"),
+  // The score THIS clean verdict earned, bound to `reviewKey` at the same write (anton-nyz1v #280
+  // review): `reviewScore` above is the row's mutable LATEST score, rewritten by every later
+  // `step:review` occurrence in the same formula — a resume that restores `reviewScore` off the row
+  // instead of off this column would hand an earlier gate's skip the score of a later, unrelated
+  // gate. Written only alongside `reviewKey`, on a clean verdict; never inferred or backfilled.
+  reviewKeyScore: integer("review_key_score"),
   attempts: integer("attempts").notNull().default(0),
   leaseExpiresAt: ts("lease_expires_at"),
   error: text("error"),

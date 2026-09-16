@@ -85,7 +85,11 @@ function target(): Bead {
 }
 
 function epicRun(
-  existing?: Partial<{ reviewKey: string | null; reviewKeyAdvisories: string | null; reviewScore: number | null }>,
+  existing?: Partial<{
+    reviewKey: string | null;
+    reviewKeyAdvisories: string | null;
+    reviewKeyScore: number | null;
+  }>,
 ): EpicRun {
   return {
     db: {},
@@ -98,7 +102,7 @@ function epicRun(
     branch: `anton/${TARGET}`,
     settings: {},
     existing: existing
-      ? { id: RUN_ID, reviewKey: null, reviewKeyAdvisories: null, reviewScore: null, ...existing }
+      ? { id: RUN_ID, reviewKey: null, reviewKeyAdvisories: null, reviewKeyScore: null, ...existing }
       : undefined,
     orphanNotice: "",
   } as unknown as EpicRun;
@@ -170,7 +174,7 @@ describe("runReviewStep — resume key", () => {
     parseRecordedAdvisoriesMock.mockReturnValue(recorded);
 
     const handler = vi.fn();
-    const run = epicRun({ reviewKey: "base1:head1:fp1", reviewKeyAdvisories: "[...]", reviewScore: 8 });
+    const run = epicRun({ reviewKey: "base1:head1:fp1", reviewKeyAdvisories: "[...]", reviewKeyScore: 8 });
     const c = carry();
 
     await runReviewStep(run, prep(), dispatch(handler), c);
@@ -294,6 +298,30 @@ describe("runReviewStep — resume key", () => {
     expect(updateRunMock).toHaveBeenCalledWith(run.db, run.clock, RUN_ID, {
       reviewKey: "base3:head3:fp3",
       reviewKeyAdvisories: JSON.stringify([advisory]),
+      // Bound to the key at the same write (PR #280 review) — `persistReviewScoresMock` reports
+      // no score in this test, so the key is recorded with none rather than falling back to
+      // whatever the row's mutable `reviewScore` happens to hold.
+      reviewKeyScore: null,
+    });
+  });
+
+  it("binds the clean verdict's own score to the key, not the row's later mutable score", async () => {
+    computeReviewKeyMock.mockResolvedValue({ baseRev: "base7", head: "head7", fingerprint: "fp7" });
+    reviewKeyTokenMock.mockReturnValue("base7:head7:fp7");
+    persistReviewScoresMock.mockResolvedValue(9);
+    const handler = vi.fn(async () => ({ facts: { review: cleanResult() } }));
+    const run = epicRun(undefined);
+
+    await runReviewStep(run, prep(), dispatch(handler), carry());
+
+    // Written twice: once as the row's latest score (read by every OTHER attempt's lookup), and
+    // again bound to the key itself — the copy a resume checking THIS key must read back, immune
+    // to whatever a later step:review does to the row's latest score afterward.
+    expect(updateRunMock).toHaveBeenCalledWith(run.db, run.clock, RUN_ID, { reviewScore: 9 });
+    expect(updateRunMock).toHaveBeenCalledWith(run.db, run.clock, RUN_ID, {
+      reviewKey: "base7:head7:fp7",
+      reviewKeyAdvisories: "[]",
+      reviewKeyScore: 9,
     });
   });
 

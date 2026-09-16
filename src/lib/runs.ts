@@ -210,6 +210,8 @@ export type RunPatch = Partial<{
   reviewKey: string | null;
   /** The clean verdict's advisories, serialized — restored into the carry when a resume skips. */
   reviewKeyAdvisories: string | null;
+  /** The score bound to `reviewKey` above — see the column's own note. */
+  reviewKeyScore: number | null;
   /** ms; converted to seconds. Rewritten by a resume — see the column's own note. */
   attemptStartedAt: number;
   endedAt: number; // ms; converted to seconds
@@ -335,7 +337,7 @@ export async function findRunReviewKeyForBranch(
     .select({
       reviewKey: schema.runs.reviewKey,
       reviewKeyAdvisories: schema.runs.reviewKeyAdvisories,
-      reviewScore: schema.runs.reviewScore,
+      reviewKeyScore: schema.runs.reviewKeyScore,
     })
     .from(schema.runs)
     .where(
@@ -356,7 +358,7 @@ export async function findRunReviewKeyForBranch(
   return {
     reviewKey: row.reviewKey,
     reviewKeyAdvisories: row.reviewKeyAdvisories,
-    reviewScore: row.reviewScore,
+    reviewScore: row.reviewKeyScore,
   };
 }
 

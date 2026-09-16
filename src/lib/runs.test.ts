@@ -55,6 +55,7 @@ interface SeedRun {
   reviewKey?: string;
   reviewKeyAdvisories?: string;
   reviewScore?: number;
+  reviewKeyScore?: number;
 }
 
 async function seed(run: SeedRun): Promise<void> {
@@ -70,6 +71,7 @@ async function seed(run: SeedRun): Promise<void> {
     reviewKey: run.reviewKey,
     reviewKeyAdvisories: run.reviewKeyAdvisories,
     reviewScore: run.reviewScore,
+    reviewKeyScore: run.reviewKeyScore,
     startedAt: new Date(run.startedAt ?? run.updatedAt),
     endedAt: run.endedAt === undefined ? null : new Date(run.endedAt),
     updatedAt: new Date(run.updatedAt),
@@ -173,7 +175,29 @@ describe("findRunReviewKeyForBranch (anton-nyz1v)", () => {
       updatedAt: 1_000_000,
       reviewKey: "base:head:fp",
       reviewKeyAdvisories: "[]",
+      reviewKeyScore: 8,
+    });
+
+    expect(await findRunReviewKeyForBranch(t.db, PROJECT, EPIC, BRANCH, "r2")).toEqual({
+      reviewKey: "base:head:fp",
+      reviewKeyAdvisories: "[]",
       reviewScore: 8,
+    });
+  });
+
+  it("reads the score bound to the key, never the row's mutable latest score (PR #280 review)", async () => {
+    // A second step:review in the same formula overwrote `reviewScore` on this very row after the
+    // first gate's clean verdict recorded `reviewKey`/`reviewKeyScore` — exactly what happens when a
+    // later gate blocks or only partially completes. The recovered score must stay bound to the key
+    // that matched, not follow the row's now-unrelated latest score.
+    await seed({
+      id: "r1",
+      status: "failed",
+      updatedAt: 1_000_000,
+      reviewKey: "base:head:fp",
+      reviewKeyAdvisories: "[]",
+      reviewKeyScore: 8,
+      reviewScore: 3,
     });
 
     expect(await findRunReviewKeyForBranch(t.db, PROJECT, EPIC, BRANCH, "r2")).toEqual({

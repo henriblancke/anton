@@ -14,11 +14,16 @@
  *    `typecheckCommand`, or `buildCommand` after a clean verdict must not have a resume skip the newly
  *    required gate — the target and ticket contracts (title, Goal/Acceptance/Out of scope/Verify),
  *    which `step:review` occurrence this is — since a formula may name the step more than once
- *    (review-gate.ts) and each is its own independent gate — and the advisories carried INTO this
+ *    (review-gate.ts) and each is its own independent gate — the advisories carried INTO this
  *    gate: a later `step:review` is handed the still-open advisories an earlier one in the same
  *    formula left off (`buildReviewPrompt`'s `carriedAdvisories`), and the run row keeps only the
  *    latest clean key, so a resumed earlier gate that reruns and produces a different carry must not
- *    let a stale key for the later gate go on matching it.
+ *    let a stale key for the later gate go on matching it — and the resolved reviewer MODEL (PR #280
+ *    review): `runReviewSession` picks it with `resolveModel(settings, {jobType: "execute-epic",
+ *    step: "review", labels})` (review-gate.ts), which a label change on the target/tickets or an
+ *    edited `modelRoutes`/`model` setting can move even though `reviewer`'s own shape (agent/prompt/
+ *    default) stays the same — a resume must not skip a review that would now run on a different
+ *    model than the one whose verdict it is honoring.
  *
  * HEAD is the right tip by construction: the gate reviews `merge-base..HEAD` and the PR contains
  * `merge-base..HEAD`, so "what the reviewer saw" and "what the human merges" are the same range. The
@@ -31,6 +36,7 @@ import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../beads/c
 import type { Bead } from "../beads/types";
 import { readWorktreeState } from "../git/ops";
 import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings, type ReviewConfig, type VerifyGate } from "../projects";
+import { resolveModel } from "./model-routing";
 import { resolveReviewerContract, type ReviewFinding, type ReviewerSource } from "./review-context";
 
 export interface ReviewKey {
@@ -67,6 +73,7 @@ function fingerprintBeads(target: Bead, tickets: Bead[]): string {
 
 function fingerprintContract(args: {
   reviewer: ReviewerSource;
+  reviewModel: string | undefined;
   reasoning: string;
   config: ReviewConfig;
   verifyGates: VerifyGate[];
@@ -74,11 +81,12 @@ function fingerprintContract(args: {
   contracts: string;
   carriedAdvisories: ReviewFinding[];
 }): string {
-  const { reviewer, reasoning, config, verifyGates, stepId, contracts, carriedAdvisories } = args;
+  const { reviewer, reviewModel, reasoning, config, verifyGates, stepId, contracts, carriedAdvisories } = args;
   return createHash("sha256")
     .update(
       JSON.stringify({
         reviewer,
+        reviewModel,
         reasoning,
         enabled: config.enabled,
         maxRounds: config.maxRounds,
@@ -129,10 +137,18 @@ export async function computeReviewKey(args: {
   const verifyGates = resolveVerifyGates(settings);
   const { reasoning, reviewer } = await resolveReviewerContract(settings, worktreePath, baseRev);
   const contracts = fingerprintBeads(target, tickets);
+  // The exact routing call `runReviewSession` makes (review-gate.ts) — same jobType/step/labels —
+  // so a route added, removed, or repointed after the clean verdict moves this key even when the
+  // reviewer's `kind` (agent/prompt/default) does not.
+  const reviewModel = resolveModel(settings, {
+    jobType: "execute-epic",
+    step: "review",
+    labels: [target, ...tickets].flatMap((bead) => bead.labels ?? []),
+  });
   return {
     baseRev,
     head: state.head,
-    fingerprint: fingerprintContract({ reviewer, reasoning, config, verifyGates, stepId, contracts, carriedAdvisories }),
+    fingerprint: fingerprintContract({ reviewer, reviewModel, reasoning, config, verifyGates, stepId, contracts, carriedAdvisories }),
   };
 }
 

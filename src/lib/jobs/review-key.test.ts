@@ -239,6 +239,49 @@ describe("computeReviewKey", () => {
     expect(reviewKeyToken(b)).not.toBe(reviewKeyToken(a));
   });
 
+  it("changes the fingerprint when the resolved reviewer model changes, even with the same contract shape", async () => {
+    // review-gate.ts picks the reviewer model with resolveModel({jobType: "execute-epic",
+    // step: "review", labels}) — a route added after a clean verdict must move this key even
+    // though `reviewer.kind` (agent/prompt/default) itself never changes (PR #280 review).
+    const a = await computeReviewKey({ worktreePath: projectDir, baseRev, settings: {}, ...FIXED });
+    const b = await computeReviewKey({
+      worktreePath: projectDir,
+      baseRev,
+      settings: { modelRoutes: [{ jobType: "execute-epic", step: "review", model: "claude-opus-5" }] },
+      ...FIXED,
+    });
+    expect(b.baseRev).toBe(a.baseRev);
+    expect(b.head).toBe(a.head);
+    expect(b.fingerprint).not.toBe(a.fingerprint);
+  });
+
+  it("changes the fingerprint when a label-scoped model route now matches the target's labels", async () => {
+    const settings: ProjectSettings = {
+      modelRoutes: [{ jobType: "execute-epic", step: "review", label: "risk:high", model: "claude-opus-5" }],
+    };
+    const plain = bead({ id: "anton-1", description: TARGET.description, labels: [] });
+    const risky = bead({ id: "anton-1", description: TARGET.description, labels: ["risk:high"] });
+    const a = await computeReviewKey({
+      worktreePath: projectDir,
+      baseRev,
+      settings,
+      target: plain,
+      tickets: [plain],
+      stepId: FIXED.stepId,
+      carriedAdvisories: [],
+    });
+    const b = await computeReviewKey({
+      worktreePath: projectDir,
+      baseRev,
+      settings,
+      target: risky,
+      tickets: [risky],
+      stepId: FIXED.stepId,
+      carriedAdvisories: [],
+    });
+    expect(b.fingerprint).not.toBe(a.fingerprint);
+  });
+
   it("changes the fingerprint when the carried-in advisories differ, on an identical tree, contract, and step", async () => {
     const a = await computeReviewKey({
       worktreePath: projectDir,

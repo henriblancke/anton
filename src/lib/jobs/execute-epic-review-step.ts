@@ -59,7 +59,7 @@ export async function runReviewStep(
   // the branch-scoped lookup covers every row this attempt did NOT resume in place. A row with no
   // key anywhere on the branch, or a stale one, always reviews — no backfill, no inference.
   const recordedKey = existing?.reviewKey
-    ? { reviewKey: existing.reviewKey, reviewKeyAdvisories: existing.reviewKeyAdvisories, reviewScore: existing.reviewScore }
+    ? { reviewKey: existing.reviewKey, reviewKeyAdvisories: existing.reviewKeyAdvisories, reviewScore: existing.reviewKeyScore }
     : await findRunReviewKeyForBranch(db, projectId, epicBeadId, branch, runId);
   if (recordedKey) {
     try {
@@ -237,6 +237,11 @@ export async function runReviewStep(
       await updateRun(db, clock, runId, {
         reviewKey: reviewKeyToken(key),
         reviewKeyAdvisories: JSON.stringify(carry.advisories),
+        // Bound to the key at the same write (PR #280 review): `reviewScore` on the row is
+        // mutable and a LATER `step:review` occurrence overwrites it without touching this
+        // clean verdict's key, so a resume must read the score back off this column, not off
+        // the row's current (possibly unrelated) latest score.
+        reviewKeyScore: reviewScore ?? null,
       });
     } catch (e) {
       // Best-effort: a resume key that failed to write just means the next resume reviews in
