@@ -7,6 +7,7 @@
  */
 import { beads, type Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
+import { sleepMs } from "../retry-helpers";
 
 /**
  * Swallow errors from best-effort bd side effects (already-applied labels, etc.). Reports whether
@@ -45,7 +46,7 @@ export async function mustPersist(fn: () => Promise<unknown>, attempts = 3): Pro
       return true;
     } catch (e) {
       console.error(`[execute-epic] bd write failed (attempt ${attempt}/${attempts}):`, e);
-      if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
+      if (attempt < attempts) await sleepMs(PERSIST_RETRY_MS);
     }
   }
   return false;
@@ -71,7 +72,7 @@ export async function mustRead(
       return await beads.show(repo, id);
     } catch (e) {
       console.error(`[execute-epic] bd read failed (attempt ${attempt}/${attempts}):`, e);
-      if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
+      if (attempt < attempts) await sleepMs(PERSIST_RETRY_MS);
     }
   }
   return undefined;
@@ -100,14 +101,8 @@ export async function mustReadBoard(
       return await loadAllIssues(repo, { strictGates: true });
     } catch (e) {
       console.error(`[execute-epic] bd board read failed (attempt ${attempt}/${attempts}):`, e);
-      if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
+      if (attempt < attempts) await sleepMs(PERSIST_RETRY_MS);
     }
   }
   return undefined;
 }
-
-const delayMs = (ms: number): Promise<void> =>
-  new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    if (typeof t.unref === "function") t.unref();
-  });

@@ -633,68 +633,6 @@ export interface WorktreeFilter {
   unavailable?: string;
 }
 
-/**
- * Every OTHER checkout of this repo, repo-relative. `git worktree list --porcelain` lists the main
- * worktree first, then linked worktrees — not necessarily the checkout named by `repoPath`: when
- * `repoPath` is itself a linked worktree and the main worktree sits beneath it, the main checkout
- * would be misread as nested if we dropped by list position. So each entry is compared by resolved
- * path against `repoPath` instead — only the entry that IS the scanned checkout is excluded; a path
- * git names outside `repoPath` (a worktree of some other repo entirely — not possible in practice,
- * but not this filter's claim to make) is dropped too.
- *
- * Resolved through `realpath` on both sides before comparing: git reports worktree paths with
- * symlinks resolved, but `repoPath` itself may not be (a symlinked checkout, or — on macOS — a temp
- * dir under `/var`, itself a symlink to `/private/var`). Comparing one resolved path against one
- * unresolved path would find no common prefix at all and read every nested worktree as outside the
- * repo, silently disabling the whole filter.
- *
- * Parsed with `--porcelain -z`: an in-repo worktree path containing a newline would truncate on a
- * plain `\n` split, so `realpath` and the containment check below would silently miss everything
- * under it. `-z` NUL-terminates each attribute instead of newline-terminating it, and ends a record
- * with an empty field where plain `--porcelain` writes a blank line — so paths are read whole, and
- * since NUL, not whitespace, is the delimiter, a path is used as-is rather than trimmed (a trailing
- * space in a real path is significant and must survive).
- *
- * Parsed as whole RECORDS rather than isolated `worktree ` lines, so a `prunable` attribute in the
- * same block is seen: a registration can outlive its checkout — deleted without `git worktree
- * remove` — and git keeps reporting it (marked `prunable gitdir file points to non-existent
- * location`) even once the path has been recreated as an ordinary directory (see `worktree.ts`'s own
- * `existsSync` check for the same fact, anton-2wvb). Reading only the `worktree ` field would treat
- * that stale registration as a live nested checkout and drop every real signal under a path that is
- * no longer a worktree at all — so a prunable record is excluded before its path is even resolved.
- *
- * `prunable` alone isn't enough, though: `should_prune_worktree` never reports it for a *locked*
- * worktree (this repo locks its own, see `worktree.ts:485-491`), so a locked worktree deleted
- * outside git and reused as an ordinary tracked directory still passes the prunable check — git
- * keeps citing `locked` for a registration that no longer points at a checkout. A LINKED worktree
- * always has a `.git` FILE (not directory) at its root pointing back at the main repo's
- * `.git/worktrees/<name>`; a reused-as-ordinary directory doesn't. `isWorktreeCheckout` verifies
- * that marker before a resolved path is trusted, so a stale locked registration is dropped from
- * `nested` the same as a prunable one — real findings under its path keep flowing to triage.
- *
- * That marker check is skipped for the MAIN worktree specifically: git guarantees `worktree list`
- * reports it first regardless of which checkout `repoPath` names, and its `.git` is an ordinary
- * DIRECTORY, not the file marker a linked worktree has — so when `repoPath` is itself a linked
- * worktree with the main checkout nested beneath it, requiring the file marker on every record
- * would fail `isWorktreeCheckout` for that main checkout and leave it out of `--exclude` entirely,
- * silently letting its whole tree double-report every real finding (anton-fj1q PR #295 review).
- * The main worktree can't be a stale registration the way a linked one can — it's the checkout the
- * repo's own `.git` lives in — so skipping the marker check for it only widens what's excluded, it
- * never lets a fake one in.
- *
- * Bounded by (and cancellable via) the caller's own scan deadline/signal, same reasoning as
- * {@link githubToken}: this runs before `scan()`'s deadline clock starts, so the caller passes a
- * budget already charged against the outer timeout rather than an independent one — otherwise an
- * already-cancelled scan (or a near-zero ANTON_STRINGER_TIMEOUT_MS) could sit here regardless.
- *
- * That budget covers the whole lookup, not just the `git worktree list` subprocess: the `realpath`/
- * `stat` probes below it (per registered worktree) run against the actual filesystem, and neither
- * fs API takes a timeout — `realpath` doesn't accept a `signal` at all, and `stat`'s only checks one
- * at the call's start, not while the syscall is in flight. Left unbounded, a registered worktree on
- * a stalled mount (or an abort that lands while these are pending) could still hang `scan()` past
- * `ANTON_STRINGER_TIMEOUT_MS` after the subprocess above already returned. {@link withBudget} races
- * each probe against what's left of the deadline and the caller's signal instead.
- */
 function isAbortError(err: unknown): boolean {
   const e = err as { name?: string; code?: unknown } | null;
   return e?.name === "AbortError" || e?.code === "ABORT_ERR";
@@ -776,6 +714,68 @@ async function isWorktreeCheckout(path: string, deadline: number, signal?: Abort
   }
 }
 
+/**
+ * Every OTHER checkout of this repo, repo-relative. `git worktree list --porcelain` lists the main
+ * worktree first, then linked worktrees — not necessarily the checkout named by `repoPath`: when
+ * `repoPath` is itself a linked worktree and the main worktree sits beneath it, the main checkout
+ * would be misread as nested if we dropped by list position. So each entry is compared by resolved
+ * path against `repoPath` instead — only the entry that IS the scanned checkout is excluded; a path
+ * git names outside `repoPath` (a worktree of some other repo entirely — not possible in practice,
+ * but not this filter's claim to make) is dropped too.
+ *
+ * Resolved through `realpath` on both sides before comparing: git reports worktree paths with
+ * symlinks resolved, but `repoPath` itself may not be (a symlinked checkout, or — on macOS — a temp
+ * dir under `/var`, itself a symlink to `/private/var`). Comparing one resolved path against one
+ * unresolved path would find no common prefix at all and read every nested worktree as outside the
+ * repo, silently disabling the whole filter.
+ *
+ * Parsed with `--porcelain -z`: an in-repo worktree path containing a newline would truncate on a
+ * plain `\n` split, so `realpath` and the containment check below would silently miss everything
+ * under it. `-z` NUL-terminates each attribute instead of newline-terminating it, and ends a record
+ * with an empty field where plain `--porcelain` writes a blank line — so paths are read whole, and
+ * since NUL, not whitespace, is the delimiter, a path is used as-is rather than trimmed (a trailing
+ * space in a real path is significant and must survive).
+ *
+ * Parsed as whole RECORDS rather than isolated `worktree ` lines, so a `prunable` attribute in the
+ * same block is seen: a registration can outlive its checkout — deleted without `git worktree
+ * remove` — and git keeps reporting it (marked `prunable gitdir file points to non-existent
+ * location`) even once the path has been recreated as an ordinary directory (see `worktree.ts`'s own
+ * `existsSync` check for the same fact, anton-2wvb). Reading only the `worktree ` field would treat
+ * that stale registration as a live nested checkout and drop every real signal under a path that is
+ * no longer a worktree at all — so a prunable record is excluded before its path is even resolved.
+ *
+ * `prunable` alone isn't enough, though: `should_prune_worktree` never reports it for a *locked*
+ * worktree (this repo locks its own, see `worktree.ts:485-491`), so a locked worktree deleted
+ * outside git and reused as an ordinary tracked directory still passes the prunable check — git
+ * keeps citing `locked` for a registration that no longer points at a checkout. A LINKED worktree
+ * always has a `.git` FILE (not directory) at its root pointing back at the main repo's
+ * `.git/worktrees/<name>`; a reused-as-ordinary directory doesn't. `isWorktreeCheckout` verifies
+ * that marker before a resolved path is trusted, so a stale locked registration is dropped from
+ * `nested` the same as a prunable one — real findings under its path keep flowing to triage.
+ *
+ * That marker check is skipped for the MAIN worktree specifically: git guarantees `worktree list`
+ * reports it first regardless of which checkout `repoPath` names, and its `.git` is an ordinary
+ * DIRECTORY, not the file marker a linked worktree has — so when `repoPath` is itself a linked
+ * worktree with the main checkout nested beneath it, requiring the file marker on every record
+ * would fail `isWorktreeCheckout` for that main checkout and leave it out of `--exclude` entirely,
+ * silently letting its whole tree double-report every real finding (anton-fj1q PR #295 review).
+ * The main worktree can't be a stale registration the way a linked one can — it's the checkout the
+ * repo's own `.git` lives in — so skipping the marker check for it only widens what's excluded, it
+ * never lets a fake one in.
+ *
+ * Bounded by (and cancellable via) the caller's own scan deadline/signal, same reasoning as
+ * {@link githubToken}: this runs before `scan()`'s deadline clock starts, so the caller passes a
+ * budget already charged against the outer timeout rather than an independent one — otherwise an
+ * already-cancelled scan (or a near-zero ANTON_STRINGER_TIMEOUT_MS) could sit here regardless.
+ *
+ * That budget covers the whole lookup, not just the `git worktree list` subprocess: the `realpath`/
+ * `stat` probes below it (per registered worktree) run against the actual filesystem, and neither
+ * fs API takes a timeout — `realpath` doesn't accept a `signal` at all, and `stat`'s only checks one
+ * at the call's start, not while the syscall is in flight. Left unbounded, a registered worktree on
+ * a stalled mount (or an abort that lands while these are pending) could still hang `scan()` past
+ * `ANTON_STRINGER_TIMEOUT_MS` after the subprocess above already returned. {@link withBudget} races
+ * each probe against what's left of the deadline and the caller's signal instead.
+ */
 async function listNestedWorktrees(
   repoPath: string,
   opts: { timeoutMs: number; signal?: AbortSignal },
@@ -866,6 +866,23 @@ function mergeNestedWorktrees(
 }
 
 /**
+ * Drop every `  - path:line` entry from a duplication signal's `Description` whose raw text isn't
+ * in `keep` (see {@link parseLocations} for the format this mirrors). Matched against the RAW
+ * location text stringer emitted, not a resolved/repo-relative form, since that's what's actually
+ * in the string being edited. Everything else — the preamble line, blank lines, indentation — is
+ * left untouched.
+ */
+function reanchorDescription(description: string, keep: Set<string>): string {
+  return description
+    .split("\n")
+    .filter((line) => {
+      const match = /^\s*-\s+(.+):(\d+)\s*$/.exec(line);
+      return match === null || keep.has(`${match[1]}:${match[2]}`);
+    })
+    .join("\n");
+}
+
+/**
  * Drop the signals describing a path inside another checkout of this same repo, and say how many.
  * Runs BEFORE annotation, same as {@link dropUntrackedSignals} — a filter applied downstream of it
  * would leave the trend charting findings the agent never saw. `nested` is precomputed by the
@@ -906,24 +923,6 @@ function mergeNestedWorktrees(
  * string there that outranks a populated `description` in that same fallback chain, since `??` only
  * yields to null/undefined, not to `""` (anton-fj1q PR #295 review).
  */
-
-/**
- * Drop every `  - path:line` entry from a duplication signal's `Description` whose raw text isn't
- * in `keep` (see {@link parseLocations} for the format this mirrors). Matched against the RAW
- * location text stringer emitted, not a resolved/repo-relative form, since that's what's actually
- * in the string being edited. Everything else — the preamble line, blank lines, indentation — is
- * left untouched.
- */
-function reanchorDescription(description: string, keep: Set<string>): string {
-  return description
-    .split("\n")
-    .filter((line) => {
-      const match = /^\s*-\s+(.+):(\d+)\s*$/.exec(line);
-      return match === null || keep.has(`${match[1]}:${match[2]}`);
-    })
-    .join("\n");
-}
-
 async function dropWorktreeSignals(
   repoPath: string,
   signals: ScanSignal[],

@@ -30,22 +30,8 @@
  * decision this pass just made, never on the row.
  */
 import { loadAllIssues } from "../beads/issues";
-import type { Bead } from "../beads/types";
-import { activeDisarm } from "../autopilot-disarm";
-import { describeFailureStreak } from "../autopilot-failure-streak";
-import { describeScoreSlide } from "../autopilot-score-slide";
-import { describeWipHold } from "../autopilot-wip";
 import { saveBoardPickerPlan } from "../board-picker-plan";
-import { activeDeferrals, pickerTrackRecord } from "../picker-veto";
-import { pickerApplyVerdict } from "../gardener/autonomy";
-import type { Policy } from "../policy/types";
-import {
-  getProjectById,
-  getProjectSettings,
-  resolvePickerApplyOverride,
-  resolvePickerAutonomy,
-  resolvePickerPolicy,
-} from "../projects";
+import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import {
   applyPickerPlan,
@@ -54,15 +40,8 @@ import {
   type PickerApplyOutcome,
   type PickerRunOps,
 } from "./picker-apply";
-import { checkFailureStreak } from "./picker-failure-breaker";
-import { checkScoreSlide } from "./picker-score-breaker";
-import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
-import {
-  ADMIT_ALL_POLICY,
-  decideBoardPickerPlan,
-  type BoardPickerDecision,
-} from "./picker-decision";
-import { armedPickerPolicy } from "./picker-policy";
+import { runBoardPickerBrakes, rankBoardPickerPlan, resolveArmedPolicy } from "./board-picker-brakes";
+import type { ReadPrActivity } from "./picker-wip-hold";
 import { systemClock, type AntonDb, type Clock } from "./queue";
 import type { JobContext, JobEffect, JobHandler } from "./runner";
 
@@ -107,84 +86,24 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // record a plan that excludes half the board as `blocked`. A rejection retries the pass instead.
     const board = await loadAllIssues(project.repoPath, { strictGates: true });
 
-    // The brake before the ranking (R4.4). A project whose last N runs all stopped without
-    // delivering is disarmed here, on the same board read the plan is computed from — the plan is
-    // still recorded, because it is a ranking and not a start, and the latch is what the apply step
-    // below refuses on.
-    const breaker = await checkFailureStreak(db, clock, { projectId, board });
-    if (breaker?.latched) {
-      console.warn(
-        `[board-picker] ${projectId}: disarmed — ${describeFailureStreak(breaker.streak)}`,
-      );
-    }
-
-    // The second quality brake (R4.3): runs that DELIVER but keep scoring below the floor. It runs
-    // after the failure breaker rather than beside it because both latch the same single disarm —
-    // whichever fires first owns the freeze, and the other reads it as already-disarmed and abstains
-    // rather than stacking a second thing for the operator to clear.
-    const slide = await checkScoreSlide(db, clock, { projectId });
-    if (slide?.latched) {
-      console.warn(`[board-picker] ${projectId}: disarmed — ${describeScoreSlide(slide.slide)}`);
-    }
-
-    // The FLOW brake (R4.2), and the only one that clears itself: while the operator's review queue
-    // is full, anton stops starting work and the next merge or close releases it. Reported at info
-    // rather than warn, and worded as a limit rather than a fault, because that is what it is — a
-    // hold drawn like a failure teaches an operator to discount the band the disarms need.
-    //
-    // Derived, never latched: it is re-asked on every pass — including the one that would start the
-    // work — so nothing here has to persist an answer that the next merge invalidates.
-    const hold = await checkWipLimit(db, {
+    // Every brake the pass asks before it may act on what it decides — disarm, the two failure
+    // breakers behind it, the WIP hold, the operator's track record and the autonomy it earns — asked
+    // in the registered order {@link BOARD_PICKER_BRAKES} pins, not inlined here (anton-7p5x).
+    const brakes = await runBoardPickerBrakes({
+      db,
+      clock,
       projectId,
       repoPath: project.repoPath,
       board,
       signal: ctx.signal,
       ...(deps.readPrActivity ? { readPrActivity: deps.readPrActivity } : {}),
     });
-    if (hold) console.info(`[board-picker] ${projectId}: holding — ${describeWipHold(hold)}`);
-
-    // Whether the project is FROZEN, asked of the disarm table rather than of the two checks above:
-    // both answer `undefined` on an already-disarmed project (a latch does not re-latch), so reading
-    // their verdicts alone would treat every pass after the first as armed again.
-    const disarm = await activeDisarm(db, projectId);
-
-    // The policy the operator accepted in settings, applied to the plan this pass records: a panel
-    // that says a policy is armed while the plan admits everything is advertising a boundary anton
-    // does not keep. An unarmed project keeps the structural default — the pass starts nothing, so
-    // an unnarrowed plan is a ranking, not an autopilot.
-    //
-    // The record is the second half of the autonomy resolution below (anton-vkp9): `apply` is
-    // floored by what this project's own releases and vetoes have EARNED, not by the setting alone.
-    // Re-read every pass — the window rolls, so a record that degrades after arming returns the
-    // picker to `shadow` on the next tick rather than the next time somebody looks at settings. Two
-    // independent reads, so one round trip rather than two on every pass.
-    const [settings, record] = await Promise.all([
-      getProjectSettings(db, projectId),
-      pickerTrackRecord(db, projectId),
-    ]);
-    const armed = resolvePickerPolicy(settings);
-    // How far this pass may go with what it decides. Resolved here, before the decision, so the one
-    // fact that turns a ranking into a start is read from the same settings snapshot the policy is.
-    const autonomy = resolvePickerAutonomy(settings, record);
-    // Said out loud, because a setting the pass silently ignores is the unexplained state this whole
-    // floor exists to avoid: the operator asked for `apply` and is getting `shadow`, and the counts
-    // are the only thing that tells them why, and what would lift it.
-    //
-    // A DELIBERATE arming is said out loud on every pass it carries (anton-d1lk), for the mirror
-    // reason: this project is starting work on a signature rather than on a record, and the log is
-    // where that has to be legible when nobody is looking at settings.
-    const verdict = pickerApplyVerdict(record, resolvePickerApplyOverride(settings));
-    if (settings.pickerAutonomy === "apply" && settings.pickerPolicy) {
-      if (autonomy !== "apply") {
-        console.info(`[board-picker] ${projectId}: apply not earned — ${verdict.reason}`);
-      } else if (verdict.arming === "deliberate" && verdict.deliberate) {
-        console.info(
-          `[board-picker] ${projectId}: apply armed deliberately by ${verdict.deliberate.by} ` +
-            `on ${verdict.deliberate.at} — ${verdict.earned.reason}`,
-        );
-      }
-    }
-    const decision = await decideOver(db, { projectId, board, observedAtMs, armed });
+    const decision = await rankBoardPickerPlan(db, {
+      projectId,
+      board,
+      observedAtMs,
+      armed: brakes.armed,
+    });
 
     // The board read is the only slow step, and it doesn't heartbeat: two `bd list` calls behind the
     // Dolt lock can outlast the per-attempt no-progress timeout on a big board, killing a pass that
@@ -219,66 +138,12 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // ARM (R1.5). Everything above decided; this is the only branch that writes to the board. The
     // three refusals are the brakes, in the order an operator would ask about them: a frozen project
     // needs a human to re-arm, a held one releases itself on the next merge, and a project below
-    // `apply` never asked for this at all.
-    //
-    // This verdict is the pass's ENTRY gate, not its last word: the apply spends a mirror refresh, a
-    // CAS and a settle window before it enqueues, and re-asks all three — the freeze, the stance and
-    // this hold — at its own final gate, unwinding its writes when any of them moved in that window
-    // (PR #218 review).
-    let applied: PickerApplyOutcome | undefined;
-    if (autonomy === "apply" && !disarm && !hold) {
-      // Re-gated on the signal, like the plan write above and for a sharper reason: `abortProject`
-      // aborts this pass AND deletes the project's queued/running rows, so a start that slipped
-      // through after the abort would write `approved` + a claim to the real board and insert a
-      // fresh execute-epic row — tripping the abort's own leftover guard and leaving an
-      // anton-claimed target on the board of a project being torn down.
-      ctx.signal.throwIfAborted();
-      applied = await startTopPick(ctx, {
-        db,
-        clock,
-        projectId,
-        repoPath: project.repoPath,
-        entries: decision.entries,
-        // The gate above only proves the pass was live when the apply began; the apply itself spends
-        // seconds on `bd`, so it re-asks at every seam and unwinds its own writes when a cancel wins
-        // (PR #218 review).
-        signal: ctx.signal,
-        // The flow brake's re-check, built here so it re-asks through the same `gh` reader this
-        // pass's entry check used — a test that never spawns `gh` must not start doing so at the
-        // apply's final gate.
-        held: pickerWipHold(db, {
-          projectId,
-          repoPath: project.repoPath,
-          signal: ctx.signal,
-          ...(deps.readPrActivity ? { readPrActivity: deps.readPrActivity } : {}),
-        }),
-        ...(deps.run ? { run: deps.run } : {}),
-      });
-      // The apply rewrote the very board the plan above was stamped from — the assignee and the
-      // `approved` label are both inputs to that fence (`stampBoard`) — so the row just saved now
-      // reads STALE, and a stale plan withholds the whole Up Next lane (PR #218 review). Left there,
-      // apply mode would never show the live preview its lower-ranked picks are vetoed from: every
-      // pass would start a target and invalidate its own ranking in the same breath. So the plan is
-      // re-decided over the post-write board, which drops the started target as `claimed` and leaves
-      // the survivors current.
-      //
-      // Keyed on the WRITES, not on the start (PR #218 review): a skip is not always a no-op on the
-      // board — a target an already-live run covers keeps the approval and the claim this pass
-      // wrote, which move the same fence a start does — and those passes would otherwise withhold Up
-      // Next for a cadence over a board change anton made itself.
-      if ("started" in applied || applied.skipped.wroteBoard) {
-        await restampAfterWrites(ctx, { db, clock, projectId, repoPath: project.repoPath });
-        // That restamp is a board read long, and a cancel landing in it is `abortProject` deleting
-        // the run those writes cover (PR #218 review) — the one the apply just enqueued, or the live
-        // one it deferred to. Writes covering no run are not a start: they come back off and the
-        // pass reports the skip it became rather than an outcome with no run behind it.
-        const swept = await applied.confirmStart?.();
-        if (swept) {
-          logApplyOutcome(projectId, swept);
-          applied = swept;
-        }
-      }
-    }
+    // `apply` never asked for this at all. The start itself, and the housekeeping that follows it, are
+    // {@link applyTopPick}'s — kept out of this function so its own nesting doesn't compound here.
+    const applied =
+      brakes.autonomy === "apply" && !brakes.disarm && !brakes.hold
+        ? await applyTopPick(ctx, { db, clock, projectId, repoPath: project.repoPath, decision, deps })
+        : undefined;
 
     // The pass always writes a row, so "changed" is about the RANKING, not the write: a board with
     // nothing claimable produces an empty plan, and calling that a result would make every idle slot
@@ -296,28 +161,74 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
 }
 
 /**
- * One decision over one board snapshot — the same function whether it is the pass's first read or
- * the re-read that follows its own start ({@link restampAfterStart}). Shared rather than repeated,
- * because a restamp decided by a second copy of these inputs could rank differently from the plan it
- * replaces for no reason an operator could see.
+ * Start the plan's top pick, once the brakes clear it, and settle the post-write housekeeping beside
+ * it — the restamp and the teardown re-confirmation. Split out of {@link makeBoardPickerHandler} so
+ * the arm gate's own nesting doesn't compound with the handler's.
  *
- * The deferrals are resolved here against the OBSERVATION instant, like the age criterion beside
- * them, so one decision answers "is this still deferred?" the same way for every target it ranks.
+ * Re-gated on the signal before it starts anything, and for a sharper reason than the plan write
+ * above: `abortProject` aborts this pass AND deletes the project's queued/running rows, so a start
+ * that slipped through after the abort would write `approved` + a claim to the real board and insert
+ * a fresh execute-epic row — tripping the abort's own leftover guard and leaving an anton-claimed
+ * target on the board of a project being torn down.
  */
-async function decideOver(
-  db: AntonDb,
-  input: { projectId: string; board: Bead[]; observedAtMs: number; armed?: Policy },
-): Promise<BoardPickerDecision> {
-  const { projectId, board, observedAtMs, armed } = input;
-  const at = new Date(observedAtMs);
-  return decideBoardPickerPlan({
-    board,
-    policy: armed ? armedPickerPolicy(armed, board, at) : ADMIT_ALL_POLICY,
-    // Stamped into the plan's freshness fence, so a settings edit that admits or excludes a target
-    // invalidates this plan the moment it lands rather than a cadence later.
-    ...(armed ? { armedPolicy: armed } : {}),
-    runtime: { observedAtMs, deferrals: await activeDeferrals(db, projectId, at) },
+async function applyTopPick(
+  ctx: JobContext,
+  input: {
+    db: AntonDb;
+    clock: Clock;
+    projectId: string;
+    repoPath: string;
+    decision: { entries: PickerApplyInput["entries"] };
+    deps: BoardPickerDeps;
+  },
+): Promise<PickerApplyOutcome> {
+  const { db, clock, projectId, repoPath, decision, deps } = input;
+  ctx.signal.throwIfAborted();
+  let applied = await startTopPick(ctx, {
+    db,
+    clock,
+    projectId,
+    repoPath,
+    entries: decision.entries,
+    // The gate above only proves the pass was live when the apply began; the apply itself spends
+    // seconds on `bd`, so it re-asks at every seam and unwinds its own writes when a cancel wins
+    // (PR #218 review).
+    signal: ctx.signal,
+    // The flow brake's re-check, built here so it re-asks through the same `gh` reader this pass's
+    // entry check used — a test that never spawns `gh` must not start doing so at the apply's final
+    // gate.
+    held: pickerWipHold(db, {
+      projectId,
+      repoPath,
+      signal: ctx.signal,
+      ...(deps.readPrActivity ? { readPrActivity: deps.readPrActivity } : {}),
+    }),
+    ...(deps.run ? { run: deps.run } : {}),
   });
+  // The apply rewrote the very board the plan above was stamped from — the assignee and the
+  // `approved` label are both inputs to that fence (`stampBoard`) — so the row just saved now reads
+  // STALE, and a stale plan withholds the whole Up Next lane (PR #218 review). Left there, apply mode
+  // would never show the live preview its lower-ranked picks are vetoed from: every pass would start
+  // a target and invalidate its own ranking in the same breath. So the plan is re-decided over the
+  // post-write board, which drops the started target as `claimed` and leaves the survivors current.
+  //
+  // Keyed on the WRITES, not on the start (PR #218 review): a skip is not always a no-op on the
+  // board — a target an already-live run covers keeps the approval and the claim this pass wrote,
+  // which move the same fence a start does — and those passes would otherwise withhold Up Next for a
+  // cadence over a board change anton made itself.
+  if ("started" in applied || applied.skipped.wroteBoard) {
+    await restampAfterWrites(ctx, { db, clock, projectId, repoPath });
+    // That restamp is a board read long, and a cancel landing in it is `abortProject` deleting the
+    // run those writes cover (PR #218 review) — the one the apply just enqueued, or the live one it
+    // deferred to. Writes covering no run are not a start: they come back off and the pass reports
+    // the skip it became rather than an outcome with no run behind it.
+    const swept = await applied.confirmStart?.();
+    if (swept) {
+      logApplyOutcome(projectId, swept);
+      applied = swept;
+    }
+  }
+  return applied;
 }
 
 /**
@@ -351,9 +262,9 @@ async function restampAfterWrites(
     // taken before the start would record survivors the current policy excludes and stamp them with
     // the superseded digest — which the next pass reads as stale, withholding Up Next for another
     // cadence, the very thing this restamp exists to prevent.
-    const armed = resolvePickerPolicy(await getProjectSettings(db, projectId));
+    const armed = await resolveArmedPolicy(db, projectId);
     const board = await loadAllIssues(repoPath, { strictGates: true });
-    const decision = await decideOver(db, { projectId, board, observedAtMs, armed });
+    const decision = await rankBoardPickerPlan(db, { projectId, board, observedAtMs, armed });
     if (ctx.signal.aborted) return;
     // Still the pass, so still the fallback writer (anton-m4il): the correction this restamp exists
     // to make is worth a cadence, never the generation a board read has since offered a start

@@ -64,7 +64,7 @@ function safeDecode(segment: string): string {
  * The hostname with its original case. `new URL(...).hostname` lowercases every label AND
  * percent-decodes it, but the value persisted is the raw string and several credential markers are
  * case-sensitive (`AKIA…`, `ghp_…`, `AIza…`) — so a token pasted as a label
- * (`AKIA…​.gateway.example`, or its encoded twin `%41KIA…`) would clear the normalized check yet
+ * (`AKIA….gateway.example`, or its encoded twin `%41KIA…`) would clear the normalized check yet
  * land in settings_json intact. Recover the label casing by decoding the raw authority and locating
  * the host in it; fall back to the normalized form when it can't be located (e.g. an IDN punycode
  * host, which carries no ASCII credential anyway).
