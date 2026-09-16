@@ -325,12 +325,19 @@ describe("every bin this launcher spawns is pinned to anton's own node", () => {
     // resolve its own runtime. Scoping by enclosing function (rather than by matching each allowed
     // line's text) means the wrapper can be rewritten without the guard needing to learn its
     // new shape — only the boundary matters.
-    const startsFn = (line: string, name: string) => line.startsWith(`function ${name}(`);
+    const startsFn = (line: string, name: string) =>
+      new RegExp(`^(?:async\\s+)?function\\s+${name}\\s*\\(`).test(line);
     let enclosing = "";
     const bare: string[] = [];
     lines.forEach((raw, i) => {
       const line = raw.trim();
-      if (/^function \w+\(/.test(line)) enclosing = line.slice("function ".length).split("(")[0];
+      // `async function` counts too (PR #298 review): matching only `function` let `enclosing` go
+      // STALE across every async declaration, so a bare `runLocal(` sitting in one of those
+      // stretches while `enclosing` still read "runLocalPinnedToThisNode" was skipped outright —
+      // this guard silently passing the exact regression it exists to catch. Verified by planting
+      // one: before this fix the scan missed it.
+      const decl = /^(?:async\s+)?function\s+(\w+)\s*\(/.exec(line);
+      if (decl) enclosing = decl[1];
       if (startsFn(line, "runLocal") || startsFn(line, "runLocalPinnedToThisNode")) return;
       if (line.startsWith("*") || line.startsWith("//")) return;
       if (!/(?<!PinnedToThisNode)\brunLocal\(/.test(line)) return;
@@ -338,6 +345,18 @@ describe("every bin this launcher spawns is pinned to anton's own node", () => {
       bare.push(`${i + 1} (in ${enclosing}): ${line}`);
     });
     expect(bare).toEqual([]);
+  });
+
+  it("rebuilds node-pty under the pinned runtime, not PATH's npm", async () => {
+    // node-pty is the OTHER per-ABI addon here, and `npm rebuild` resolves its own node from PATH —
+    // so on the two-runtime split this bead is about, setup would build it for the runtime the
+    // server is no longer using. Setup and start both pass; the interactive terminal fails on first
+    // open instead, which is the same bug displaced into the one surface nothing here tests
+    // (PR #298 review). Structural for the same reason as the guards above: no second runtime in CI.
+    const src = await readFile(join(REPO_ROOT, "bin", "anton.mjs"), "utf8");
+    const call = /spawnSync\("npm", \["rebuild", "node-pty"\], \{[\s\S]{0,400}?\}\);/.exec(src);
+    expect(call, "the node-pty rebuild call moved — update this guard").not.toBeNull();
+    expect(call![0]).toContain("dirname(process.execPath)");
   });
 
   it("daemonizes the server with process.execPath, not a PATH-resolved node", async () => {

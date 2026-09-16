@@ -1701,8 +1701,17 @@ async function cmdSetup(args = []) {
 
     // node-pty ships prebuilts that don't always match the local node ABI (DESIGN setup note).
     // Rebuild it best-effort so the interactive xterm works; a failure here is a warning, not fatal.
+    //
+    // Pinned like every other child (PR #298 review): npm resolves its own node from PATH, so on
+    // the two-runtime split this bead is about it would rebuild node-pty for the OTHER runtime —
+    // and the server, now pinned to this one, loads that addon when an interactive session opens.
+    // Setup and start would both pass, and the terminal would fail on first use instead.
     console.log(c.bold("\nRebuilding node-pty for this node ABI:"));
-    const rebuilt = spawnSync("npm", ["rebuild", "node-pty"], { cwd: APP_ROOT, stdio: "inherit" });
+    const rebuilt = spawnSync("npm", ["rebuild", "node-pty"], {
+      cwd: APP_ROOT,
+      stdio: "inherit",
+      env: { ...process.env, PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}` },
+    });
     if ((rebuilt.status ?? 1) !== 0) {
       console.log(c.yellow("node-pty rebuild skipped/failed — interactive sessions may not work until you run:"));
       console.log(c.dim("  cd node_modules/node-pty && npx node-gyp rebuild"));
