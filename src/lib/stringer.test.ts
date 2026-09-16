@@ -966,6 +966,49 @@ describe("scan", () => {
       ]);
     });
 
+    // PR #295 review (thread on stringer.ts:853): a transient failure in the PRE-scan lookup must not
+    // discard what the POST-scan retry resolved. `repoPath` isn't a git repo yet when the pre-scan
+    // `git worktree list` runs (it fails with "not a git repository"), so `mergeNestedWorktrees` gets
+    // one failed snapshot and one successful one -- an earlier version collapsed that into bare
+    // `unavailable` and skipped filtering entirely, letting every phantom signal under the worktree
+    // the post-scan lookup DID find straight through to triage. The fake stringer stands in for the
+    // repo coming into existence mid-scan: it inits the repo and adds the nested worktree itself,
+    // before writing output that names a path inside it.
+    it("still filters against the post-scan snapshot when the pre-scan lookup failed", async () => {
+      const repo = join(dir, "repo-not-yet-a-git-repo");
+      mkdirSync(repo, { recursive: true });
+
+      const bin = writeScript("preinit-worktree-stringer", [
+        "const { execFileSync } = require('child_process');",
+        "const fs = require('fs');",
+        "const path = require('path');",
+        "const repoPath = process.argv[3];",
+        "execFileSync('git', ['-C', repoPath, 'init', '-q']);",
+        "execFileSync('git', ['-C', repoPath, 'config', 'user.email', 't@example.com']);",
+        "execFileSync('git', ['-C', repoPath, 'config', 'user.name', 'test']);",
+        "fs.writeFileSync(path.join(repoPath, 'src.ts'), 'export {};\\n');",
+        "execFileSync('git', ['-C', repoPath, 'add', '-A']);",
+        "execFileSync('git', ['-C', repoPath, 'commit', '-qm', 'init']);",
+        "execFileSync('git', ['-C', repoPath, 'worktree', 'add', '-q', '-b', 'late-branch', '.worktrees/late']);",
+        "const i = process.argv.indexOf('-o');",
+        "fs.writeFileSync(process.argv[i + 1], JSON.stringify([" +
+          "{ Source: 'todos', Kind: 'todo', FilePath: '.worktrees/late/src.ts', Title: 'late todo' }" +
+          "]));",
+        "process.exit(0);",
+      ]);
+      process.env[STRINGER_BIN_ENV] = bin;
+      process.env.GITHUB_TOKEN = "operator-provided-token"; // skip the `gh auth token` lookup
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.worktree.unavailable).toBeTruthy();
+      expect(result.worktree.worktrees).toContain(join(".worktrees", "late"));
+      expect(result.signals).toHaveLength(0);
+      expect(result.worktree.dropped).toEqual([
+        { path: join(".worktrees", "late", "src.ts"), kind: "todo", severity: expect.any(String) },
+      ]);
+    });
+
     it("drops signals under a worktree checked out at a non-.claude path, whatever collector reported them", async () => {
       const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr252-threads");
       // The nested checkout is a real copy of the tracked tree, so the same file exists at both paths.

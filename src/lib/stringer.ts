@@ -623,9 +623,12 @@ export interface WorktreeFilter {
   /** The nested worktrees this scan found, repo-relative — whether or not they held any signals. */
   worktrees: string[];
   /**
-   * Why `git worktree list` could not be asked, when it couldn't be. Nothing is dropped in that
-   * case: a filter that can't enumerate worktrees must leave every signal in, so an unreadable repo
-   * under-filters rather than silently deleting findings.
+   * Why `git worktree list` could not be FULLY asked, when it couldn't be. Set whenever at least
+   * one of the pre-/post-scan lookups failed, even if the other one resolved: `dropped`/`worktrees`
+   * still reflect whatever that other lookup found, filtered as usual (see
+   * {@link mergeNestedWorktrees}) — a worktree only the failed half would have seen is the one thing
+   * still uncaught, so this under-filters rather than the reverse. Only when BOTH lookups fail are
+   * `dropped`/`worktrees` themselves empty, leaving every signal counted.
    */
   unavailable?: string;
 }
@@ -837,22 +840,29 @@ async function listNestedWorktrees(
  * The pre-scan snapshot alone is stale by the time stringer exits: a worktree another process
  * creates mid-scan is in neither the `--exclude` list (built before stringer ran) nor an unrefreshed
  * `nested`, so its signals would sail through the one filter meant to catch what `--exclude` missed
- * (anton-fj1q PR #295 review). Unioning misses nothing either lookup saw; if either lookup couldn't
- * enumerate, the merged result stays conservative and reports unavailable rather than silently
- * trusting whichever half did resolve, the same "under-filter over delete a real finding" rule
- * {@link WorktreeFilter.unavailable} already applies to a single failed lookup.
+ * (anton-fj1q PR #295 review). Unioning misses nothing either lookup saw.
+ *
+ * A transient failure in ONE snapshot must not discard what the OTHER one resolved. An earlier
+ * version returned bare `{ unavailable }` the moment either side failed, which meant a flaky
+ * pre-scan lookup followed by a successful post-scan retry threw away that retry's list too —
+ * `dropWorktreeSignals` then received "unavailable" instead of the worktrees the retry actually
+ * found, and every signal under one of them survived to triage as a phantom finding (anton-fj1q PR
+ * #295 review). So the worktrees either side resolved are always unioned into the result;
+ * `unavailable`, when set, rides alongside as a caveat rather than replacing that list —
+ * `dropWorktreeSignals` still filters against what's there, and {@link describeWorktreeFilter}
+ * reports the partial failure separately from whatever got dropped.
  */
 function mergeNestedWorktrees(
   before: string[] | { unavailable: string },
   after: string[] | { unavailable: string },
-): string[] | { unavailable: string } {
-  if (!Array.isArray(before) || !Array.isArray(after)) {
-    const reasons = [before, after]
-      .filter((snapshot): snapshot is { unavailable: string } => !Array.isArray(snapshot))
-      .map((snapshot) => snapshot.unavailable);
-    return { unavailable: reasons.join("; ") };
-  }
-  return Array.from(new Set([...before, ...after]));
+): { worktrees: string[]; unavailable?: string } {
+  const worktrees = Array.from(
+    new Set([...(Array.isArray(before) ? before : []), ...(Array.isArray(after) ? after : [])]),
+  );
+  const failures = [before, after]
+    .filter((snapshot): snapshot is { unavailable: string } => !Array.isArray(snapshot))
+    .map((snapshot) => snapshot.unavailable);
+  return failures.length === 0 ? { worktrees } : { worktrees, unavailable: failures.join("; ") };
 }
 
 /**
@@ -917,14 +927,17 @@ function reanchorDescription(description: string, keep: Set<string>): string {
 async function dropWorktreeSignals(
   repoPath: string,
   signals: ScanSignal[],
-  nested: string[] | { unavailable: string },
+  nested: { worktrees: string[]; unavailable?: string },
 ): Promise<{ kept: ScanSignal[]; worktree: WorktreeFilter }> {
-  if (!Array.isArray(nested)) {
-    return { kept: signals, worktree: { dropped: [], worktrees: [], ...nested } };
+  const { worktrees, unavailable } = nested;
+  // Whatever either lookup resolved is still filtered, even when the OTHER one failed — see
+  // `mergeNestedWorktrees`. Only when neither resolved anything (worktrees is empty) is there
+  // nothing to filter against; `unavailable`, if set, still rides along as a caveat.
+  if (worktrees.length === 0) {
+    return { kept: signals, worktree: { dropped: [], worktrees: [], ...(unavailable ? { unavailable } : {}) } };
   }
-  if (nested.length === 0) return { kept: signals, worktree: { dropped: [], worktrees: [] } };
 
-  const isNested = (path: string) => nested.some((wt) => path === wt || path.startsWith(`${wt}${sep}`));
+  const isNested = (path: string) => worktrees.some((wt) => path === wt || path.startsWith(`${wt}${sep}`));
 
   const dropped: DroppedSignal[] = [];
   const kept = signals.filter((signal) => {
@@ -976,26 +989,35 @@ async function dropWorktreeSignals(
     dropped.push({ path: path as string, kind: kindOf(signal), severity: severityOfSignal(signal) });
     return false;
   });
-  return { kept, worktree: { dropped, worktrees: nested } };
+  return { kept, worktree: { dropped, worktrees, ...(unavailable ? { unavailable } : {}) } };
 }
 
 /**
  * What the worktree filter removed, and which nested checkouts it found; undefined when there is
- * nothing to say (no nested worktree found, and nothing dropped).
+ * nothing to say (no nested worktree found, nothing dropped, and both lookups succeeded).
+ *
+ * `dropped`/`worktrees` and `unavailable` are reported independently rather than one gating the
+ * other: a partial failure (one of the pre-/post-scan lookups down, the other one resolved) can
+ * carry both at once — see {@link mergeNestedWorktrees} — and collapsing that case into just the
+ * "unavailable" branch would silently drop the record of what the successful half actually found
+ * and filtered (anton-fj1q PR #295 review).
  */
 export function describeWorktreeFilter(filter: WorktreeFilter): string | undefined {
-  if (filter.unavailable) {
-    return (
-      `git worktree list could not be read (${filter.unavailable}) — findings under a nested ` +
-      `checkout, if any, are counted this pass`
+  const parts: string[] = [];
+  if (filter.dropped.length > 0) {
+    const { paths, list } = formatDroppedSignals(filter.dropped);
+    parts.push(
+      `dropped ${filter.dropped.length} signal(s) under ${filter.worktrees.length} nested worktree(s) ` +
+        `(${filter.worktrees.join(", ")}) about ${paths} path(s): ${list}`,
     );
   }
-  if (filter.dropped.length === 0) return undefined;
-  const { paths, list } = formatDroppedSignals(filter.dropped);
-  return (
-    `dropped ${filter.dropped.length} signal(s) under ${filter.worktrees.length} nested worktree(s) ` +
-    `(${filter.worktrees.join(", ")}) about ${paths} path(s): ${list}`
-  );
+  if (filter.unavailable) {
+    parts.push(
+      `git worktree list could not be fully read (${filter.unavailable}) — findings under a nested ` +
+        `checkout neither lookup saw, if any, are still counted this pass`,
+    );
+  }
+  return parts.length === 0 ? undefined : parts.join("; ");
 }
 
 /**
@@ -1026,7 +1048,7 @@ async function readAnnotatedSignals(
      * --exclude) and its post-scan re-enumeration, via {@link mergeNestedWorktrees} — not the
      * pre-scan snapshot alone, or a worktree created mid-scan would be invisible to this backstop too.
      */
-    nested: string[] | { unavailable: string };
+    nested: { worktrees: string[]; unavailable?: string };
     /** The scan's own outer deadline (absolute), charged against the `realpath` probe below. */
     deadline: number;
     abort?: AbortSignal;
