@@ -119,12 +119,26 @@ export function TicketStateBar({
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Mark done failed (${res.status})`);
       }
-      const data = (await res.json()) as { detail?: TicketDetail };
+      // The close has already committed once the response is ok — a truncated or otherwise
+      // undecodable body isn't a failed close, and reporting it as one would leave the stale open
+      // detail on screen and invite a retry that 409s on the bead this call already closed. Parse
+      // best-effort and, failing that, re-read the ticket so the UI still lands on the closed state
+      // (PR #288 review).
+      const data = await res
+        .json()
+        .catch(() => null as { detail?: TicketDetail } | null);
       setCloseArming(false);
       setArming(false);
       setReason("");
       toast.success("Marked done");
-      if (data.detail) onChanged(data.detail);
+      if (data?.detail) {
+        onChanged(data.detail);
+      } else {
+        const refetched = await fetch(`/api/projects/${slug}/tickets/${ticketId}`)
+          .then((r) => (r.ok ? (r.json() as Promise<{ detail?: TicketDetail }>) : null))
+          .catch(() => null);
+        if (refetched?.detail) onChanged(refetched.detail);
+      }
     } catch (err) {
       // Stay armed on failure so a retry doesn't require re-finding the control.
       toast.error(err instanceof Error ? err.message : "Mark done failed");

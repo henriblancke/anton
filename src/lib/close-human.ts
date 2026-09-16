@@ -9,7 +9,7 @@ import { loadAllIssues } from "./beads/issues";
 import { withBeadWriteLock } from "./beads/claim-lock";
 import { runTargetOf } from "./abandon";
 import { openBlockersOf } from "./jobs/execute-epic-human-gate";
-import { cancelRunForTarget } from "./jobs/service";
+import { cancelRunForTarget, runIsLiveForTarget } from "./jobs/service";
 import { nudgeSync } from "./beads/sync-nudge";
 import { runMembers } from "./rework-target";
 import { bareDetail, freshDetail } from "./ticket-detail";
@@ -143,6 +143,21 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
 
     const targetId = runTargetOf(bead, board);
     const target = board.find((b) => b.id === targetId);
+
+    // liveRunTargetOf excludes a DEFERRED target from the guard above on the premise a human
+    // already snoozed it out of the way — but setTicketDeferred (ticket-detail.ts) only calls
+    // `beads.defer`; it never touches a job that had already started. A target deferred mid-run is
+    // still executing here, so without this check the route would fall through the guard above and
+    // treat that live job's cancel below as a routine side effect of closing an unrelated child,
+    // instead of refusing the way it does for every other still-reachable run (PR #288 review).
+    if (target && beads.isDeferred(target) && runIsLiveForTarget(project.id, targetId)) {
+      throw new NotCloseableError(
+        `${id} still rides on ${targetId}'s run, which is deferred but still executing — deferring ` +
+          `a target doesn't stop a job already in flight. Wait for it to finish or abandon ${targetId} ` +
+          `first`,
+      );
+    }
+
     const isRealTarget = !!target && beads.isRunTarget(target, board);
     const ownedByTarget =
       bead.id === targetId || !isRealTarget || runMembers(target!, board).some((b) => b.id === bead.id);

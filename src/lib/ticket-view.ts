@@ -260,6 +260,12 @@ export function isRunTicket(bead: Bead, cards: BoardCards): boolean {
  * this "no run target in the ancestry" case (PR #288 review): a walk that fell back to the immediate
  * parent read a container epic as still holding the ticket, so the UI offered Mark done while the
  * close route 409'd pointing at a container that will never run.
+ *
+ * A deferred target reads as "not live" here on the premise a human already snoozed it out of the
+ * way — but deferring never cancels a job that had already started (`setTicketDeferred`,
+ * ticket-detail.ts), so a target deferred mid-run can still be executing. `closeHumanTicket` covers
+ * that gap with its own `runIsLiveForTarget` check rather than this function reaching into
+ * machine-local job state (PR #288 review).
  */
 export function liveRunTargetOf(bead: Bead, all: Bead[]): Bead | undefined {
   if (beads.isRunTarget(bead, all)) return undefined;

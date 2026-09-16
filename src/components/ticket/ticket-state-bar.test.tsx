@@ -6,6 +6,7 @@ import { TicketStateBar } from "@/components/ticket/ticket-state-bar";
 import type { Stage, TicketDetail } from "@/lib/types";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+const { toast } = await import("sonner");
 
 const detail = (over: {
   stage?: Stage;
@@ -242,6 +243,41 @@ describe("TicketStateBar", () => {
     fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
     expect(screen.queryByRole("button", { name: /Confirm abandon/ })).toBeNull();
     expect(screen.getByRole("button", { name: "Confirm mark done" })).toBeTruthy();
+  });
+
+  it("settles Mark done from a re-fetch when the close response body can't be decoded", async () => {
+    // Codex review (PR #288): res.ok is already true once the close commits server-side, so a
+    // truncated/undecodable body must not read as a failed close and strand the stale open detail
+    // on screen, inviting a retry that 409s on the bead this call already closed.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("not json", { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: detail({ agent: "human", stage: "done" }) }), {
+          status: 200,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const onChanged = vi.fn();
+
+    render(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human" })}
+        onChanged={onChanged}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm mark done" }));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]![0]).toBe("/api/projects/anton/tickets/t-1");
+    expect(onChanged.mock.calls[0]![0].stage).toBe("done");
+    expect(toast.success).toHaveBeenCalledWith("Marked done");
+    expect(toast.error).not.toHaveBeenCalled();
   });
 
   it("clears the Mark done confirmation when Abandon is armed instead", () => {

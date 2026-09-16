@@ -6,6 +6,7 @@ const showMock = vi.fn();
 const listMock = vi.fn();
 const closeMock = vi.fn();
 const cancelRunMock = vi.fn();
+const runIsLiveMock = vi.fn();
 
 vi.mock("./beads/bd", async () => {
   const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
@@ -22,6 +23,7 @@ vi.mock("./beads/bd", async () => {
 
 vi.mock("./jobs/service", () => ({
   cancelRunForTarget: (...args: unknown[]) => cancelRunMock(...args),
+  runIsLiveForTarget: (...args: unknown[]) => runIsLiveMock(...args),
 }));
 
 const freshDetailMock = vi.fn().mockResolvedValue({ id: "detail" });
@@ -66,6 +68,7 @@ describe("closeHumanTicket", () => {
     listMock.mockReset();
     closeMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
+    runIsLiveMock.mockReset().mockReturnValue(false);
     freshDetailMock.mockReset().mockResolvedValue({ id: "detail" });
     bareDetailMock.mockReset().mockResolvedValue({ id: "bare-detail" });
     nudgeSyncMock.mockReset();
@@ -241,6 +244,50 @@ describe("closeHumanTicket", () => {
     expect(nudgeSyncMock).toHaveBeenCalledWith(project, "close-human");
     expect(bareDetailMock).toHaveBeenCalledWith(project, { ...target, status: "closed" });
     expect(detail).toEqual({ id: "bare-detail" });
+  });
+
+  it("refuses a deferred target whose execute-epic job is still live — defer doesn't cancel it", async () => {
+    // Codex review (PR #288): liveRunTargetOf reads a DEFERRED target as "not live" on the premise a
+    // human already snoozed it out of the way, but setTicketDeferred (ticket-detail.ts) only calls
+    // `beads.defer` — it never touches a job that had already started. Without this check the route
+    // falls through the liveTarget guard above and silently cancels the still-running job as a side
+    // effect of closing this unrelated child.
+    const ticket = makeBead({ id: "ticket", parent: "feature" });
+    const feature = makeBead({
+      id: "feature",
+      issue_type: "feature",
+      labels: [],
+      status: "deferred",
+    });
+    const board = [feature, ticket];
+    showMock.mockResolvedValue(ticket);
+    listMock.mockResolvedValue(board);
+    runIsLiveMock.mockReturnValue(true);
+
+    await expect(closeHumanTicket(project, "ticket")).rejects.toThrow(NotCloseableError);
+
+    expect(runIsLiveMock).toHaveBeenCalledWith("p1", "feature");
+    expect(cancelRunMock).not.toHaveBeenCalled();
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("closes a child of a deferred target once its job has actually stopped", async () => {
+    const ticket = makeBead({ id: "ticket", parent: "feature" });
+    const feature = makeBead({
+      id: "feature",
+      issue_type: "feature",
+      labels: [],
+      status: "deferred",
+    });
+    const board = [feature, ticket];
+    listMock.mockResolvedValue(board);
+    showMock.mockResolvedValueOnce(ticket).mockResolvedValueOnce({ ...ticket, status: "closed" });
+    runIsLiveMock.mockReturnValue(false);
+
+    await closeHumanTicket(project, "ticket");
+
+    expect(cancelRunMock).toHaveBeenCalledWith("p1", "feature");
+    expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "ticket");
   });
 
   it("does not cancel a standalone task's run for its own agent:human child — that run never touches it", async () => {
