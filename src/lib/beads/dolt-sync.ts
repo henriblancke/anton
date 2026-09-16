@@ -6,7 +6,9 @@
  * pull → commit → push. ./sync-coalescer decides WHEN a pass runs and imports the pass from here;
  * ./bd re-exports the public surface. Neither imports back, so each side is testable alone.
  */
+import { BoardUnreachableError, isBoardUnreachableError } from "../jobs/errors";
 import { passwordVarHint } from "./bd-env";
+import { boardUnreachableCause, isBoardUnreachableOutput } from "./board-unreachable";
 import { isServerMode, readBoardMode, type BoardModeInfo } from "./board-mode";
 import { BOARD_READ_PROBE, formatServerTarget } from "./config.mjs";
 import { bd, type BdExec } from "./dolt-exec";
@@ -65,6 +67,17 @@ const FIRST_PUBLISH_PULL_OUTPUT = [
 
 export function isFirstPublishPullOutput(output: string): boolean {
   return FIRST_PUBLISH_PULL_OUTPUT.some((re) => re.test(output));
+}
+
+export { boardUnreachableCause, isBoardUnreachableOutput } from "./board-unreachable";
+export type { BoardUnreachableCause } from "./board-unreachable";
+
+/** Wraps `message` in {@link BoardUnreachableError} when `output` matches {@link isBoardUnreachableOutput},
+ * else in a plain `Error` — the one place both of dolt-sync's bd-failure throw sites decide which. */
+function doltSyncFailure(message: string, output: string, cause: unknown): Error {
+  return isBoardUnreachableOutput(output)
+    ? new BoardUnreachableError(message, { cause })
+    : new Error(message, { cause });
 }
 
 // ── The pass's shape ──
@@ -169,6 +182,9 @@ export function resetServerPreflight(): void {
 const PREFLIGHT_PROBES = [
   {
     args: ["dolt", "test"],
+    // What this probe is FOR, if bd's raw text names no more specific cause: a plain connection test
+    // failing IS "the server is unreachable" almost by definition.
+    fallbackCause: "server-unreachable",
     message: (cwd: string, target: string) =>
       `shared Dolt server unreachable for ${cwd} (configured target ${target}). ` +
       `Check the server is up and reachable, that .beads/metadata.json names the right ` +
@@ -177,6 +193,11 @@ const PREFLIGHT_PROBES = [
   },
   {
     args: BOARD_READ_PROBE,
+    // A failed board read connects fine but can't serve THIS project's database — bd's own wording
+    // for "not found"/"permission denied" varies too much to pattern-match reliably (PR #277 review),
+    // so a probe that fails here without a more specific cause is classified from what it actually
+    // tests: the database is unreadable.
+    fallbackCause: "database-unreadable",
     message: (cwd: string, target: string) =>
       `shared Dolt server ${target} accepted the connection but will not serve the board for ${cwd}. ` +
       `Check that .beads/metadata.json names the database this project's board actually lives in, ` +
@@ -197,7 +218,21 @@ export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Pro
     } catch (e) {
       const err = e as Error & { stdout?: string; stderr?: string };
       const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
-      throw new Error(`${probe.message(cwd, target)} Underlying error: ${output}`, { cause: e });
+      // Unlike the generic bd-failure boundary below (and in dolt-exec.ts), this one does not need
+      // to pattern-match bd's raw text to know the board is unreachable: both PREFLIGHT_PROBES exist
+      // solely to test that reachability, so ANY failure here — "connection refused", a timeout, an
+      // identity mismatch, whatever bd's transport happens to print — IS a board outage by context.
+      // Classifying from output text (as `doltSyncFailure` does) would miss diagnostics that never
+      // matched `isBoardUnreachableOutput`'s patterns, e.g. dial tcp: connect: connection refused,
+      // and let a preflight failure fall into ordinary job retry/parking instead of the refunded
+      // board-outage backoff that de-duplicates parks across every job during an outage. `boardCause`
+      // makes that same reasoning survive to run-health: a specific text match (dolt-missing,
+      // disk-full, identity-mismatch) still wins, but an unmatched diagnostic falls back to what this
+      // PROBE tests rather than silently losing its classification.
+      throw new BoardUnreachableError(`${probe.message(cwd, target)} Underlying error: ${output}`, {
+        cause: e,
+        boardCause: boardUnreachableCause(output) ?? probe.fallbackCause,
+      });
     }
   }
   // Stamped only after BOTH probes pass, so a server that was down — or a board it would not serve —
@@ -272,7 +307,14 @@ export async function runDoltSync(
       // local state, real divergence) rejects here — in a full pass, before push — so a pass that
       // never applied inbound changes is never silently recorded as "synced" on a no-op push.
       if (args[1] === "pull" && isFirstPublishPullOutput(output)) continue;
-      throw new Error(`bd ${args.join(" ")} failed in ${cwd}: ${output}`, { cause: e });
+      // `bd()` itself already classifies some failures structurally — the per-step budget timeout
+      // throws a BoardUnreachableError with boardCause: "board-timeout" and no stdout/stderr to
+      // pattern-match. Reclassifying via doltSyncFailure's output regexes would silently downgrade
+      // that to a plain Error (the timeout message matches none of them), and callers like the
+      // sync-push handler would burn their retry budget instead of using the refunded board-outage
+      // cadence (PR #277 review).
+      if (isBoardUnreachableError(e)) throw e;
+      throw doltSyncFailure(`bd ${args.join(" ")} failed in ${cwd}: ${output}`, output, e);
     }
   }
   return "synced";

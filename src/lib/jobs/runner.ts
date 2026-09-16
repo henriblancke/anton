@@ -16,6 +16,9 @@
  *                              restarted on fresh code (anton-mh3c) rather than parking each job.
  *                              Evaluated at the DISPATCH seam (anton-kqst), so it covers every job
  *                              type rather than only the one that happens to gate itself.
+ *   • Board outage           — `BoardUnreachableError` → recheck on a probe cadence, attempt
+ *                              refunded: not this job's failure but the board's (anton-1q70), and it
+ *                              self-heals the moment the board answers again, no human involved.
  *
  * The decision logic (`nextAction`) is a pure function so it can be unit-tested without timers.
  * See DESIGN.md §4.
@@ -60,6 +63,7 @@ import {
 import { reconcileInterruptedRuns } from "../runs";
 import { runScheduleNow, type RunNowResult } from "../schedules";
 import {
+  isBoardUnreachableError,
   isPoisonError,
   isRouteAdmissionStaleError,
   isRunAlreadyLiveError,
@@ -114,6 +118,13 @@ export interface RunnerConfig {
    */
   staleCheckoutVerdictMs: number;
   /**
+   * Probe cadence for a job blocked because the board itself is unreachable (see
+   * `BoardUnreachableError`) — every job that touches the board fails the same way, so each one
+   * rechecks at this slow cadence rather than spending its retry budget in minutes. Self-clearing:
+   * the next successful probe against the board resumes normal cadence, no human involved.
+   */
+  boardUnreachableRetryMs: number;
+  /**
    * Recheck cadence for a run refused because its routing changed after budget admission (see
    * `RouteAdmissionStaleError`). Short, unlike the other soft-reschedule cadences above: the
    * condition isn't a standing outage to wait out, it's this project's NEXT tick — the governor
@@ -152,6 +163,7 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   notWiredRetryMs: 5 * 60_000,
   staleCheckoutRetryMs: 5 * 60_000,
   staleCheckoutVerdictMs: 60_000,
+  boardUnreachableRetryMs: 5 * 60_000,
   routeRevalidationRetryMs: 10_000,
   maxConcurrent: 1,
   maxReviewFixConcurrent: 1,
@@ -432,6 +444,7 @@ export type Outcome =
   | { kind: "lease-held"; error: string }
   | { kind: "not-wired"; error: string }
   | { kind: "stale-checkout"; error: string }
+  | { kind: "board-unreachable"; error: string }
   | { kind: "route-stale"; error: string }
   | { kind: "poison"; error: string }
   | { kind: "error"; error: string };
@@ -479,6 +492,7 @@ export function classifyError(e: unknown): Outcome {
   if (isRunAlreadyLiveError(e)) return { kind: "lease-held", error: e.message };
   if (isSyncNotWiredError(e)) return { kind: "not-wired", error: e.message };
   if (isStaleCheckoutError(e)) return { kind: "stale-checkout", error: e.message };
+  if (isBoardUnreachableError(e)) return { kind: "board-unreachable", error: e.message };
   if (isRouteAdmissionStaleError(e)) return { kind: "route-stale", error: e.message };
   if (isPoisonError(e)) return { kind: "poison", error: e.message };
   return { kind: "error", error: e instanceof Error ? e.message : String(e) };
@@ -547,6 +561,21 @@ export function nextAction(
       // KEEP the classified reason (like lease-held/not-wired): it names WHAT is stale and the
       // command that clears it, and is the only durable record on the row for the run-health sweep.
       const runAtMs = nowMs + config.staleCheckoutRetryMs;
+      return {
+        action: "reschedule",
+        runAtMs,
+        refundAttempt: true,
+        lastError: `${outcome.error} — rechecks at ${new Date(runAtMs).toISOString()}`,
+      };
+    }
+    case "board-unreachable": {
+      // The board itself is down (anton-ej1l), not this job — every job that touches it fails the
+      // same way, so spending the retry budget in minutes just parks the whole queue behind a human
+      // long after the board comes back. Back off to a probe cadence instead, attempt refunded, and
+      // KEEP the classified reason (like stale-checkout/not-wired/lease-held): it is the only durable
+      // record on the row of WHY the outage was diagnosed as board-wide. Self-heals: the next attempt
+      // that reaches the board past the outage settles normally, no human involved.
+      const runAtMs = nowMs + config.boardUnreachableRetryMs;
       return {
         action: "reschedule",
         runAtMs,

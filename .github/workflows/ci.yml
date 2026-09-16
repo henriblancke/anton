@@ -25,7 +25,7 @@ jobs:
           bun-version: "1.4.2" # match package.json `packageManager`
 
       - name: Install
-        run: bun install --frozen-lockfile
+        uses: ./.github/actions/bun-install-retry
 
       - name: Control bytes
         # Replaces the `Binary files differ` alarm that .gitattributes retires by forcing source
@@ -107,7 +107,7 @@ jobs:
           bd version | grep -q "bd version ${BD_VERSION}" || {
             echo "::error::bd version mismatch — expected ${BD_VERSION}, got: $(bd version)"; exit 1; }
       - name: Install
-        run: bun install --frozen-lockfile
+        uses: ./.github/actions/bun-install-retry
       - name: "Test (integration suites, shard ${{ matrix.shard }}/4)"
         # Dedicated config: `*.integration.test.ts` only, with a capped fork pool so the per-repo
         # Dolt sql-servers don't race and deadlock `bd dolt pull` under full parallelism (anton-0oi).
@@ -128,7 +128,7 @@ jobs:
         with:
           bun-version: "1.4.2" # match package.json `packageManager`
       - name: Install
-        run: bun install --frozen-lockfile
+        uses: ./.github/actions/bun-install-retry
       - name: Test with coverage
         run: bun run test:coverage
       - name: Upload coverage report

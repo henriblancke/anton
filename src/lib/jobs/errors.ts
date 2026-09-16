@@ -3,6 +3,7 @@
  * See DESIGN.md §4. These are the *only* way a handler asks for backoff vs. poison-pill vs.
  * plain retry — the runner never inspects error messages.
  */
+import type { BoardUnreachableCause } from "../beads/board-unreachable";
 
 /**
  * The handler hit an API/usage limit it cannot retry through. The runner PARKS the job and
@@ -280,6 +281,32 @@ export class StaleCheckoutError extends Error {
 }
 
 /**
+ * The bd/dolt board itself is unreachable — not this one job failing, but every job that touches
+ * the board failing the same way (anton-ej1l). The common bd process boundary classifies matching
+ * raw output, and dolt-sync preserves that classification around its additional context, so a caller
+ * can tell "the board is gone" apart from an ordinary bd error (a refused claim, a bad id) without
+ * re-parsing bd's text itself.
+ */
+export class BoardUnreachableError extends Error {
+  /**
+   * The specific way the board is unreachable, set by the thrower when it already knows this
+   * structurally — which preflight probe failed, or that bd itself hung past its budget — rather
+   * than leaving a downstream caller to reparse raw bd text. `boardUnreachableCause` only recognizes
+   * a handful of known message patterns; a preflight's own wrapper message or an unmatched
+   * diagnostic (e.g. "database not found", "permission denied") silently falls through it, which
+   * used to make run-health rethrow instead of raising the board-outage report it should have
+   * raised (PR #277 review). Undefined for errors classified purely from raw output text.
+   */
+  readonly boardCause?: BoardUnreachableCause;
+
+  constructor(message: string, options?: ErrorOptions & { boardCause?: BoardUnreachableCause }) {
+    super(message, options);
+    this.name = "BoardUnreachableError";
+    this.boardCause = options?.boardCause;
+  }
+}
+
+/**
  * The project's routing changed between this job's budget admission (the governor's per-tick check,
  * narrowed by a revalidation read — see `revalidateAdmittedGovernorMeters`) and the settings read
  * closest to actual dispatch (a run's own read, taken before it holds anything). The admitted meter
@@ -315,6 +342,13 @@ export function isRecoverableClaudeError(e: unknown): e is RecoverableClaudeErro
 
 export function isPoisonError(e: unknown): e is PoisonError {
   return e instanceof PoisonError || (e as { name?: string })?.name === "PoisonError";
+}
+
+export function isBoardUnreachableError(e: unknown): e is BoardUnreachableError {
+  return (
+    e instanceof BoardUnreachableError ||
+    (e as { name?: string })?.name === "BoardUnreachableError"
+  );
 }
 
 export function isRunAlreadyLiveError(e: unknown): e is RunAlreadyLiveError {

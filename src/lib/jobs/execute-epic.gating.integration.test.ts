@@ -17,7 +17,8 @@ import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
 import { parseTicketNotes } from "../beads/notes";
 import * as schema from "../db/schema";
-import { getJob, park, resumeJob } from "./queue";
+import { getJob, park, resumeJob, toMs } from "./queue";
+import { BoardUnreachableError } from "./errors";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
 import {
@@ -60,6 +61,30 @@ describeBd("execute-epic e2e — claims & gating (real handler · real bd/git ·
   beforeEach(async () => {
     clock.set(BASE_TIME_MS);
     await resetPerCaseState(tdb);
+  });
+
+  it("refunds an initial run-lease board outage at the probe cadence", async () => {
+    const probeMs = 30 * 60_000;
+    const quotaCooloffMs = 5 * 60_000;
+    const syncSpy = vi
+      .spyOn(beads, "sync")
+      .mockRejectedValueOnce(new BoardUnreachableError("Dolt server unreachable"));
+    const runner = makeEpicRunner(ctx, { boardUnreachableRetryMs: probeMs, quotaCooloffMs });
+
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: ctx.epicId });
+
+      const job = await getJob(tdb.db, jobId);
+      expect(job).toMatchObject({ status: "queued", attempts: 0 });
+      expect(toMs(job?.runAt)).toBe(BASE_TIME_MS + probeMs);
+      expect(toMs(job?.runAt)).not.toBe(BASE_TIME_MS + quotaCooloffMs);
+      expect(job?.lastError).toContain("Dolt server unreachable");
+      expect((await beads.show(repo, ctx.epicId)).labels ?? []).not.toContain("stage:in-review");
+    } finally {
+      syncSpy.mockRestore();
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
   });
 
   it("hard-gates on a ticket claimed by another operator: aborts without stealing the claim", async () => {
