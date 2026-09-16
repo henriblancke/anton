@@ -72,12 +72,14 @@ import {
   commentOnPr,
   getPrReview,
   prNumberFromRef,
+  reactToReviewComment,
   reRequestReview,
   replyToReviewComment,
   resolveReviewThread,
   reviewersRequestingChanges,
   threadsNeedingAttention,
   type Actionable,
+  type PrReactionContent,
   type PrReview,
   type ReviewThread,
 } from "../git/pr";
@@ -797,12 +799,14 @@ interface ThreadReplyArgs {
 }
 
 /**
- * Reply to each reported inline thread, resolving the fixed ones. Replying to declined threads
- * (even when nothing was pushed) is what stops them being re-triaged every sweep — an unresolved
- * thread whose last comment is anton's is no longer actionable (see threadsNeedingAttention). A
- * "fixed" claim without a push is a fabrication — leave that thread untouched.
+ * Reply to each reported inline thread, react on it, and resolve the fixed ones. Replying to
+ * declined threads (even when nothing was pushed) is what stops them being re-triaged every sweep
+ * — an unresolved thread whose last comment is anton's is no longer actionable (see
+ * threadsNeedingAttention); the reaction is the free calibration signal on top, not a substitute
+ * for the reply. A "fixed" claim without a push is a fabrication — leave that thread untouched,
+ * reply and reaction both.
  */
-async function applyThreadOutcomes(args: {
+export async function applyThreadOutcomes(args: {
   repo: string;
   number: number;
   pr: PrReview;
@@ -837,6 +841,7 @@ async function recordThreadOutcome(
   await safe(() =>
     replyToReviewComment(repo, number, anchorId, `${ANTON_MARK} ${note}`, signal),
   );
+  await safe(() => reactToReviewComment(repo, anchorId, reactionForOutcome(item.outcome), signal));
   if (item.outcome === "fixed")
     await safe(() => resolveReviewThread(repo, thread.id, signal));
   await appendSessionLog(
@@ -848,6 +853,18 @@ async function recordThreadOutcome(
 /** What anton says on a thread claude reported without a reply of its own. */
 const defaultReply = (outcome: ThreadOutcome["outcome"]): string =>
   outcome === "fixed" ? "addressed in the latest push" : "left as-is";
+
+/** The reaction that turns a triaged outcome into the reviewer's free calibration signal. */
+const reactionForOutcome = (outcome: ThreadOutcome["outcome"]): PrReactionContent => {
+  switch (outcome) {
+    case "fixed":
+      return "+1";
+    case "left":
+      return "-1";
+    case "needs-human":
+      return "eyes";
+  }
+};
 
 /** Post the PR-level "pushed a fix, please re-review" comment and re-request the change reviewers. */
 async function notifyReReview(args: {

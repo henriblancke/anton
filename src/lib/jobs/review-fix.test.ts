@@ -6,17 +6,23 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import * as schema from "../db/schema";
 import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 import { driveJob } from "@/lib/testing/jobs";
 import { getJob, type Clock } from "./queue";
-import type { PrReview } from "../git/pr";
+import { GH_BIN_ENV } from "../git/ops";
+import type { PrReview, ReviewThread } from "../git/pr";
 import {
+  applyThreadOutcomes,
   claimOwnerFor,
   inReviewEpics,
   makeReviewFixHandler,
   parseThreadReport,
   resolveReviewFixModel,
+  type ThreadOutcome,
 } from "./review-fix";
 import { LABELS, type Bead } from "../beads/bd";
 
@@ -356,5 +362,153 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     await dispatch();
     expect(dispatchedTargets()).toEqual([]);
     expect(getPrReviewMock).not.toHaveBeenCalled(); // not even read — ownership is decided first
+  });
+});
+
+/**
+ * The calibration reaction (anton-iwum0): each triaged finding's anchor comment gets a reaction
+ * mirroring its outcome, alongside the existing reply. `applyThreadOutcomes` is exercised directly
+ * against a fake `gh` binary — real `replyToReviewComment` / `reactToReviewComment` /
+ * `resolveReviewThread` run, and every invocation is logged so a test can assert on it.
+ */
+describe("applyThreadOutcomes (reactions)", () => {
+  let sandbox: string;
+  let binDir: string;
+  let logFile: string;
+  let prevGh: string | undefined;
+  let prevFail: string | undefined;
+
+  /** Fake gh: answers `repo view`, and logs every other invocation's argv as one JSON line. Fails
+   * any call touching `/reactions` when ANTON_TEST_FAIL_REACTIONS=1, so the "best-effort" contract
+   * can be proven without a real network failure. */
+  function installFakeGh(): void {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const fs = require('fs');
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+fs.appendFileSync(process.env.ANTON_TEST_GH_LOG, JSON.stringify(a) + '\\n');
+if (process.env.ANTON_TEST_FAIL_REACTIONS === '1' && a.some((x) => x.includes('/reactions'))) {
+  process.stderr.write('boom');
+  process.exit(1);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+  }
+
+  /** Every gh invocation logged so far, as argv arrays. */
+  const ghCalls = (): string[][] =>
+    readFileSync(logFile, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as string[]);
+
+  function thread(overrides: Partial<ReviewThread> = {}): ReviewThread {
+    return {
+      id: "RT_1",
+      isResolved: false,
+      isOutdated: false,
+      path: "src/a.ts",
+      line: 3,
+      comments: [{ id: 100, author: "alice", body: "please fix" }],
+      ...overrides,
+    };
+  }
+
+  function pr(threads: ReviewThread[]): PrReview {
+    return {
+      number: 7,
+      state: "OPEN",
+      reviewDecision: "CHANGES_REQUESTED",
+      mergeable: "MERGEABLE",
+      headRefName: "anton/epic-1",
+      url: "https://github.com/o/r/pull/7",
+      reviews: [],
+      failingChecks: [],
+      pendingChecks: 0,
+      threads,
+    };
+  }
+
+  const run = (report: ThreadOutcome[], threads: ReviewThread[], pushed: boolean) =>
+    applyThreadOutcomes({
+      repo: sandbox,
+      number: 7,
+      pr: pr(threads),
+      report,
+      pushed,
+      signal: new AbortController().signal,
+      logPath: join(sandbox, "session.log"),
+    });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-thread-outcomes-"));
+    binDir = join(sandbox, "bin");
+    mkdirSync(binDir);
+    logFile = join(sandbox, "gh-calls.log");
+    writeFileSync(logFile, "");
+    installFakeGh();
+    prevGh = process.env[GH_BIN_ENV];
+    prevFail = process.env.ANTON_TEST_FAIL_REACTIONS;
+    process.env[GH_BIN_ENV] = join(binDir, "gh");
+    process.env.ANTON_TEST_GH_LOG = logFile;
+    delete process.env.ANTON_TEST_FAIL_REACTIONS;
+  });
+
+  afterEach(() => {
+    if (prevGh === undefined) delete process.env[GH_BIN_ENV];
+    else process.env[GH_BIN_ENV] = prevGh;
+    if (prevFail === undefined) delete process.env.ANTON_TEST_FAIL_REACTIONS;
+    else process.env.ANTON_TEST_FAIL_REACTIONS = prevFail;
+    delete process.env.ANTON_TEST_GH_LOG;
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("reacts +1 on a fixed finding's anchor comment, and resolves the thread", async () => {
+    await run([{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }], [thread()], true);
+
+    const reaction = ghCalls().find((c) => c.some((x) => x.includes("/reactions")));
+    expect(reaction).toBeDefined();
+    expect(reaction!.join(" ")).toContain("repos/o/r/pulls/comments/100/reactions");
+    expect(reaction).toContain("content=+1");
+    expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(true);
+  });
+
+  it("reacts -1 on a declined (left) finding's anchor comment, without resolving the thread", async () => {
+    await run([{ id: "RT_1", outcome: "left", reply: "style-only, skipped" }], [thread()], true);
+
+    const reaction = ghCalls().find((c) => c.some((x) => x.includes("/reactions")));
+    expect(reaction).toBeDefined();
+    expect(reaction).toContain("content=-1");
+    // no resolveReviewThread mutation for a left thread
+    expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(false);
+  });
+
+  it("reacts eyes on a needs-human finding — handled explicitly, distinct from fixed/left", async () => {
+    await run([{ id: "RT_1", outcome: "needs-human", reply: "needs a product call" }], [thread()], true);
+
+    const reaction = ghCalls().find((c) => c.some((x) => x.includes("/reactions")));
+    expect(reaction).toContain("content=eyes");
+  });
+
+  it("posts no reaction (and no reply) for a fabricated fix — claimed fixed with nothing pushed", async () => {
+    await run([{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }], [thread()], false);
+
+    expect(ghCalls()).toEqual([]);
+  });
+
+  it("a reaction failure is best-effort — the reply still lands and the run stays green", async () => {
+    process.env.ANTON_TEST_FAIL_REACTIONS = "1";
+
+    await expect(
+      run([{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }], [thread()], true),
+    ).resolves.toBeUndefined();
+
+    const reply = ghCalls().find((c) => c.some((x) => x.includes("/replies")));
+    expect(reply).toBeDefined();
   });
 });
