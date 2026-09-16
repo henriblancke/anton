@@ -2,6 +2,9 @@
   "name": "anton",
   "version": "0.5.0",
   "private": true,
+  "engines": {
+    "node": ">=24.21.0"
+  },
   "bin": {
     "anton": "bin/anton.mjs"
   },

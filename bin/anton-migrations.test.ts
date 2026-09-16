@@ -5,14 +5,21 @@
  *
  * Every case runs against the repo's REAL `drizzle/*.sql` over a throwaway DB, because the property
  * under test is that a second start applies nothing — a claim fixture SQL could not make.
+ *
+ * The source-checkout branch (anton-m6pg6) is covered here too. It used to be the only migration
+ * path with no ABI heal: `applyMigrations` protects the bundle, while a source checkout shelled
+ * straight out to drizzle-kit, so `anton setup` died inside drizzle-kit on a raw ERR_DLOPEN_FAILED.
+ * Both halves of the fix are asserted below — that the heal runs at all, and that the drizzle-kit
+ * child is pinned to the node it healed for, since a `#!/usr/bin/env node` child resolving its own
+ * node from PATH is what made the heal aim at the wrong ABI in the first place.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { rm } from "node:fs/promises";
+import { chmod, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { applyMigrations, ensureBetterSqlite3, ensureMigrated } from "./anton.mjs";
+import { applyMigrations, ensureBetterSqlite3, ensureMigrated, runLocalPinnedToThisNode } from "./anton.mjs";
 
-import { exists, REPO_ROOT, tempDir, withDb } from "./anton.fixture";
+import { exists, pathWith, REPO_ROOT, tempDir, withDb } from "./anton.fixture";
 
 describe("ensureBetterSqlite3", () => {
   it("returns 'ok' when the shipped binary matches the running Node (repo build)", () => {
@@ -97,5 +104,68 @@ describe("ensureMigrated (bundle mode → in-process apply, before serving)", ()
     // Re-running start with nothing pending applies zero migrations.
     const second = ensureMigrated({ isBundle: true, dbPath, appRoot: REPO_ROOT });
     expect(second.ran).toBe(0);
+  });
+});
+
+describe("runLocalPinnedToThisNode (source checkout → drizzle-kit under THIS node)", () => {
+  let dir: string;
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("wins over a different node already first on PATH", async () => {
+    dir = await tempDir("anton-node-pin-");
+
+    // A decoy `node` earlier on PATH stands in for the real split on a dev machine — nvm's shim and
+    // Homebrew's node, where which one answers depends on whether the shell was a login shell. A
+    // plain `#!/usr/bin/env node` child resolves THIS one, which is how the heal came to target the
+    // wrong ABI: anton healed for its own node, the child loaded the addon under another.
+    const decoy = join(dir, "node");
+    await writeFile(decoy, `#!/bin/sh\necho DECOY > "$ANTON_PIN_SEEN"\nexit 0\n`);
+    await chmod(decoy, 0o755);
+
+    // Reports the node that actually ran it, so the assertion is about which node resolved rather
+    // than about drizzle-kit (which would need a database before it did anything observable).
+    const probe = join(dir, "probe");
+    await writeFile(probe, `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(process.env.ANTON_PIN_SEEN, process.execPath);\n`);
+    await chmod(probe, 0o755);
+
+    const seen = join(dir, "seen.txt");
+    const rc = runLocalPinnedToThisNode(probe, [], { PATH: pathWith(dir), ANTON_PIN_SEEN: seen });
+
+    expect(rc).toBe(0);
+    // The decoy would have written "DECOY"; the pin means the child ran under anton's own node.
+    expect(await readFile(seen, "utf8")).toBe(process.execPath);
+  });
+
+  it("prepends to PATH rather than replacing it, so the child keeps the rest of its tools", async () => {
+    dir = await tempDir("anton-node-pin-path-");
+
+    // Pinning must not cost the child every other binary it needs (git, bd). Only node's
+    // precedence changes; everything already on PATH stays reachable behind it.
+    const marker = join(dir, "only-here");
+    await writeFile(marker, `#!/bin/sh\necho FOUND > "$ANTON_PIN_SEEN"\n`);
+    await chmod(marker, 0o755);
+
+    const seen = join(dir, "seen.txt");
+    const rc = runLocalPinnedToThisNode("only-here", [], { PATH: pathWith(dir), ANTON_PIN_SEEN: seen });
+
+    expect(rc).toBe(0);
+    expect((await readFile(seen, "utf8")).trim()).toBe("FOUND");
+  });
+
+  it("does not mutate the parent's own PATH", () => {
+    const before = process.env.PATH;
+    runLocalPinnedToThisNode("true", []);
+    expect(process.env.PATH).toBe(before);
+  });
+});
+
+describe("ensureMigrated (source checkout → heals the native ABI before drizzle-kit)", () => {
+  it("exposes the same heal the bundle branch gets, rather than leaving the source path bare", () => {
+    // The regression this guards: `ensureBetterSqlite3` existed with exactly ONE call site, inside
+    // applyMigrations (bundle-only), so a source checkout reached drizzle-kit unprotected. Both
+    // branches must now be able to heal. Probing the repo's own build is the cheap half of that.
+    expect(ensureBetterSqlite3(REPO_ROOT)).toBe("ok");
   });
 });

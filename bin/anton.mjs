@@ -35,7 +35,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { arch as osArch, homedir, platform as osPlatform } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
@@ -377,6 +377,29 @@ function runLocal(bin, args, env = {}) {
     env: { ...process.env, ...serverRootEnv(), ...env },
   });
   return r.status ?? 1;
+}
+
+/**
+ * `runLocal` for a bin that loads better-sqlite3 (drizzle-kit), pinned to THIS Node.
+ *
+ * Those bins start with `#!/usr/bin/env node`, so as their own process they resolve node from PATH
+ * — which is not necessarily the node running anton. That split is routine rather than exotic: with
+ * nvm installed alongside Homebrew, nvm's shim wins in an interactive shell and /opt/homebrew/bin
+ * sorts first in a login shell, so the same command in the same directory can resolve either one.
+ *
+ * It matters because better-sqlite3's addon is per-ABI: `ensureBetterSqlite3` can only heal for one
+ * Node, and it heals for the one it is running in. Let the child resolve its own and the heal aims
+ * at the wrong ABI — we would download a binary for OUR node and the child would still fail to load
+ * it, reporting the mismatch with the numbers the other way round. So put this node's own directory
+ * first on the child's PATH, making the binary we just verified the one the child actually loads.
+ */
+function runLocalPinnedToThisNode(bin, args, env = {}) {
+  const nodeDir = dirname(process.execPath);
+  // Prepend to the PATH the child would otherwise get — a caller-supplied one when there is one,
+  // this process's own otherwise. Rebuilding it from process.env unconditionally would silently
+  // drop an override and send the child looking down the wrong PATH entirely.
+  const base = env.PATH ?? process.env.PATH ?? "";
+  return runLocal(bin, args, { ...env, PATH: base ? `${nodeDir}${delimiter}${base}` : nodeDir });
 }
 
 /**
@@ -767,7 +790,10 @@ function applyMigrations(dbPath, opts = {}) {
  * Apply any pending DB migrations before the server serves — so `anton start` never runs on a
  * stale schema and operators don't have to remember `anton setup`. Mirrors cmdSetup's branching:
  * a prebuilt bundle applies the committed SQL in-process (no drizzle-kit devDep is shipped), while
- * a source checkout uses drizzle-kit. Idempotent — a start with nothing pending is a clean no-op.
+ * a source checkout uses drizzle-kit. BOTH branches heal the native better-sqlite3 ABI first —
+ * the bundle inside applyMigrations, the source checkout here — because drizzle-kit loads the same
+ * addon and would otherwise die on a Node the binary was not built for (anton-m6pg6).
+ * Idempotent — a start with nothing pending is a clean no-op.
  * Throws on failure so the caller can abort rather than serve a stale schema. (The bundle DAEMON
  * path migrates in startDaemon; this covers source `start` and bundle `--foreground`.)
  */
@@ -779,9 +805,14 @@ function ensureMigrated(opts = {}) {
     if (ran) console.log(c.dim(`applied ${ran} migration(s) → ${dbPath}`));
     return { ran };
   }
-  // Source checkout: drizzle-kit tracks applied migrations in __drizzle_migrations, so re-running
-  // with nothing pending is a no-op. A non-zero exit (bad SQL, unreachable DB) must fail start.
-  const rc = runLocal("drizzle-kit", ["migrate"]);
+  // Source checkout: drizzle-kit opens the DB through the same native better-sqlite3 the bundle
+  // branch heals inside applyMigrations, so heal here too (anton-m6pg6). Without this the ABI
+  // mismatch surfaces from INSIDE drizzle-kit as a raw ERR_DLOPEN_FAILED stack, which reads as a
+  // migration bug rather than the one-command environment fix it actually is.
+  ensureBetterSqlite3(opts.appRoot);
+  // drizzle-kit tracks applied migrations in __drizzle_migrations, so re-running with nothing
+  // pending is a no-op. A non-zero exit (bad SQL, unreachable DB) must fail start.
+  const rc = runLocalPinnedToThisNode("drizzle-kit", ["migrate"]);
   if (rc !== 0) throw new Error("drizzle-kit migrate failed — see output above");
   return { ran: null };
 }
@@ -1544,7 +1575,8 @@ async function cmdSetup(args = []) {
     }
   } else {
     console.log(c.bold("\nApplying database migrations (drizzle-kit migrate):"));
-    const migrated = runLocal("drizzle-kit", ["migrate"]);
+    ensureBetterSqlite3(); // same heal the bundle branch gets via applyMigrations (anton-m6pg6)
+    const migrated = runLocalPinnedToThisNode("drizzle-kit", ["migrate"]);
     if (migrated !== 0) {
       console.log(c.red("migration failed — see output above."));
       return migrated;
@@ -2339,4 +2371,5 @@ export {
   applyMigrations,
   ensureMigrated,
   ensureBetterSqlite3,
+  runLocalPinnedToThisNode,
 };
