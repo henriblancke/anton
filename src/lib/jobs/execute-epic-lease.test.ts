@@ -11,7 +11,11 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
-import { isRunAlreadyLiveError } from "./errors";
+import {
+  BoardUnreachableError,
+  isBoardUnreachableError,
+  isRunAlreadyLiveError,
+} from "./errors";
 
 const publishRunLeaseMock = vi.fn();
 const clearRunLeaseMock = vi.fn();
@@ -96,9 +100,42 @@ describe("claim", () => {
     await l.claim(true).catch((e) => expect(isRunAlreadyLiveError(e)).toBe(true));
   });
 
+  it("preserves a typed board outage so the runner can refund it at probe cadence", async () => {
+    syncMock.mockRejectedValueOnce(new BoardUnreachableError("Dolt server unreachable"));
+
+    await lease(fakeClock())
+      .claim(true)
+      .then(() => expect.unreachable("claim should preserve the board outage"))
+      .catch((e) => {
+        expect(e).toBeInstanceOf(BoardUnreachableError);
+        expect(isBoardUnreachableError(e)).toBe(true);
+        expect(isRunAlreadyLiveError(e)).toBe(false);
+      });
+  });
+
+  it("preserves a typed board outage from the arbitration pull", async () => {
+    pullMock.mockRejectedValueOnce(new BoardUnreachableError("Dolt server unreachable"));
+
+    await expect(lease(fakeClock()).claim(true)).rejects.toSatisfy((e: unknown) => {
+      expect(isBoardUnreachableError(e)).toBe(true);
+      expect(isRunAlreadyLiveError(e)).toBe(false);
+      return true;
+    });
+  });
+
   it("parks when the arbitration pull fails — a stale view cannot prove the race was won", async () => {
     pullMock.mockRejectedValueOnce(new Error("offline"));
     await expect(lease(fakeClock()).claim(true)).rejects.toThrow(/arbitrate the run-lease race/);
+  });
+
+  it("preserves a typed board outage from the arbitration re-read", async () => {
+    showMock.mockRejectedValueOnce(new BoardUnreachableError("Dolt server unreachable"));
+
+    await expect(lease(fakeClock()).claim(true)).rejects.toSatisfy((e: unknown) => {
+      expect(isBoardUnreachableError(e)).toBe(true);
+      expect(isRunAlreadyLiveError(e)).toBe(false);
+      return true;
+    });
   });
 
   it("parks when the arbitration re-read fails, rather than proceeding unproven", async () => {

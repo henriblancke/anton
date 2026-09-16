@@ -2,10 +2,9 @@
  * The unwatched-park signal (anton-kh98). Two halves, tested apart:
  *   • the pure computation, whose whole contract is WHEN it says nothing — a band that appeared on
  *     a watched or empty queue would be an always-on ornament; and
- *   • the read, which decides "armed" from schedule rows that may not exist at all. That last case
- *     is the shipped default this ticket is about: run-health is opt-in, and a project predating a
- *     schedule type has no row for it, so a read that took absence for "on" would stay silent on
- *     exactly the installs with parked work nobody is watching.
+ *   • the read, which decides "armed" from schedule rows that may not exist at all. A project
+ *     predating a schedule type has no row for it, so a read that took absence for "on" would stay
+ *     silent on exactly the installs with parked work nobody is watching.
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "./db/testing";
@@ -111,9 +110,7 @@ describe("the project read", () => {
       .values({ id: projectId, slug: "p1", name: "p1", repoPath: "/tmp/p1" });
   });
 
-  // The shipped default, and the bug: run-health has never been armed, so nothing detects and the
-  // parked job waits with no signal anywhere.
-  it("reports parked work when the project has no watcher schedules at all", async () => {
+  it("reports parked work when a project has no watcher schedules at all", async () => {
     await park("j-1", 7 * 24 * HOUR);
     await park("j-2", 3 * HOUR);
 
