@@ -90,7 +90,7 @@
   "permissions": {
     "allow": [
       "Bash(graft:*)",
-      "Bash(npx graft:*)"
+      "Bash(npx @nanonets/graft:*)"
     ]
   }
 }
