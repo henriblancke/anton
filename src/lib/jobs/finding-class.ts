@@ -48,8 +48,17 @@ const CLAUSE_GAP = "[^,;:.'\\u2019\\u2013\\u2014]{0,30}?";
 // counts when an actual work-bearing noun or retry/requeue signal (WORK_LOSS_SIGNAL) shares the
 // same clause — the same CLAUSE_GAP exclusions as the other contextual loss matchers, so "causes
 // data loss; the job status remains correct" doesn't credit "job" across the semicolon.
+//
+// A work-bearing noun immediately followed by another noun ("the job ID", "the record count") is
+// that noun's attributive modifier, not the value experiencing the loss — "casting the job ID to
+// number causes data loss for large values" corrupts the ID, not the job, and "serializing the
+// record count as a float causes data loss" corrupts the count, not the record. So when the
+// signal word comes before "data loss", it only counts when the signal sits right before a causal
+// verb (mod whitespace) that ties *it* — not some other noun it merely modifies — to the loss.
+const WORK_LOSS_CAUSAL_VERB =
+  "(?:causes?|caused|causing|results?\\s+in|resulting\\s+in|resulted\\s+in|leads?\\s+to|leading\\s+to|led\\s+to|triggers?|triggering|triggered)";
 const DATA_LOSS_CONTEXT = new RegExp(
-  `\\bdata loss\\b${CLAUSE_GAP}\\b${WORK_LOSS_SIGNAL}\\b|\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\bdata loss\\b`,
+  `\\bdata loss\\b${CLAUSE_GAP}\\b${WORK_LOSS_SIGNAL}\\b|\\b${WORK_LOSS_SIGNAL}\\b\\s+\\b${WORK_LOSS_CAUSAL_VERB}\\b${CLAUSE_GAP}\\bdata loss\\b`,
   "i",
 );
 // Modal passive forms ("will be discarded", "can be dropped", "may be lost") describe the same
@@ -235,8 +244,13 @@ const FAIL_OPEN_AUTHORIZED_RESULT_LAST = new RegExp(
 );
 const FAIL_OPEN_TRUE_RESULT_FIRST = new RegExp(`returns? true[^.]{0,50}?${FAIL_OPEN_ERROR_WORD}`, "gi");
 const FAIL_OPEN_TRUE_RESULT_LAST = new RegExp(`${FAIL_OPEN_ERROR_WORD}[^.]{0,50}?returns? true`, "gi");
+// Deliberately excludes generic "check"/"validat*"/"verif*" — those describe any conditional, not
+// specifically an access-control one: "the equality check returns true for unequal inputs, causing
+// an error in sorting" and "the parser validation returns true for malformed input when decoding
+// throws" are correctness bugs with no authorization semantics at all. Only a permission/access/
+// auth-specific word nearby should send the next reviewer looking for an access-control defect.
 const FAIL_OPEN_AUTH_CONTEXT =
-  /\b(?:permission|permissions|access|auth|authz|authoriz\w*|grant\w*|allow\w*|privilege\w*|role\w*|acl|scoped?|entitlement\w*|check|checks|checking|validat\w*|verif\w*)\b/i;
+  /\b(?:permission|permissions|access|auth|authz|authoriz\w*|grant\w*|allow\w*|privilege\w*|role\w*|acl|scoped?|entitlement\w*)\b/i;
 
 function matchesFailOpenTrueResult(note: string): boolean {
   for (const re of [FAIL_OPEN_TRUE_RESULT_FIRST, FAIL_OPEN_TRUE_RESULT_LAST]) {

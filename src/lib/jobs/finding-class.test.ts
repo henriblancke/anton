@@ -460,4 +460,29 @@ describe("classifyFindingClass", () => {
     const note = "This glob is overly broad and scans generated files that were never meant to be included.";
     expect(classifyFindingClass(finding(note))).toBe("scope");
   });
+
+  it("does not classify a numeric-precision bug as work-loss when a work noun modifies the cast value", () => {
+    const note = "Casting the job ID to number causes data loss for large values.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("does not classify a numeric-precision bug as work-loss when a work noun modifies the serialized value", () => {
+    const note = "Serializing the record count as a float causes data loss.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies a 'data loss' finding as work-loss when the work noun itself causes the loss", () => {
+    const note = "The queued batch causes data loss when it is serialized without its retry metadata.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies a bare 'returns true' finding with a generic 'check' word nearby as other, not fail-open", () => {
+    const note = "The equality check returns true for unequal inputs, causing an error in sorting.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies a bare 'returns true' finding with a generic 'validation' word nearby as other, not fail-open", () => {
+    const note = "The parser validation returns true for malformed input when decoding throws.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
 });
