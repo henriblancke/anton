@@ -90,6 +90,7 @@ export async function getProjectById(db: AntonDb, id: string): Promise<Project |
   const rows = await db.select().from(schema.projects).where(eq(schema.projects.id, id)).limit(1);
   return rows[0] ? toProject(rows[0]) : null;
 }
+
 /** What the shared beads config path reports back — the one seam the log helpers below read. */
 type BeadsConfigResult = ReturnType<typeof configureBeadsForRepo>;
 

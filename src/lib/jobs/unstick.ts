@@ -34,6 +34,7 @@
  *     direction that double-runs.
  */
 import { beads, type Bead, type Gate } from "../beads/bd";
+import { isBoardUnreachableFindingKey } from "../escalation-kinds";
 import { getPrActivity, type PrActivity } from "../git/pr";
 import {
   DEFAULT_MAX_RETRIES,
@@ -125,6 +126,8 @@ export interface UnstickContext {
    * resume that depends on it stands down (see {@link leaseStandDown}).
    */
   boardFresh: boolean;
+  /** Whether this pass could read the local board at all, independently of remote-pull freshness. */
+  boardReadable: boolean;
   /**
    * The project's dead-lease grace, in ms — the same one `detectDeadLeases` applies past expiry. The
    * re-check has to re-apply it, or it would be strictly weaker than the detector that raised the
@@ -443,6 +446,14 @@ export function classifyExhaustedJob(
 ): UnstickVerdict {
   const settled = finding.beadId ? epicSettled(ctx, finding.beadId) : undefined;
   if (settled) return hold(settled);
+  // Live outage findings are written at the failed board read and deliberately carry no job: the
+  // affected job has already been refunded and requeued. Legacy aggregates point at a parked job,
+  // which must keep being actionable after a later successful board read until that job moves.
+  if (isBoardUnreachableFindingKey(finding.key) && !finding.jobId) {
+    return ctx.boardReadable
+      ? hold("the board is answering again")
+      : escalate(finding.reason);
+  }
   return ctx.stillStuck(finding)
     ? escalate(finding.reason)
     : hold("the job has since been resumed or settled");
@@ -592,8 +603,8 @@ export async function unstickPass(
   const findings = report?.findings ?? [];
   summary.findings = findings.length;
 
-  // No report at all means the run-health sweep has never run here (it ships off by default), and
-  // with nothing open to reconcile there is nothing to act on: not an error, just an idle pass.
+  // No report at all means the run-health sweep has not run here yet, and with nothing open to
+  // reconcile there is nothing to act on: not an error, just an idle pass.
   const pending = partitionOpenEscalations(await listOpenEscalations(db, projectId), findings);
   if (findings.length === 0 && pending.gateWaits.length === 0 && pending.endedStalls.length === 0) {
     return summary;
@@ -611,7 +622,7 @@ export async function unstickPass(
   // Retirement runs BEFORE the finding loop, and in this order: the gate list answers every gate
   // wait at once, and a row the gate path retires needs no second live re-read to reach the same
   // verdict.
-  summary.settled = await reconcileGateWaits(db, clock, repoPath, findings, pending, state);
+  summary.settled = await reconcileGateWaits(db, clock, findings, pending, state);
   summary.settled += await reconcileOrphanStalls(db, clock, repoPath, pending, state.live);
   await recheckLiveFindings(db, findings, state);
 
@@ -723,6 +734,13 @@ interface PassState {
   live: LiveRecheck;
   /** Per-finding re-check verdicts, read back through {@link UnstickContext.stillStuck}. */
   stillStuck: Map<string, boolean>;
+  /**
+   * The gate list the board-reachability probe already fetched, undefined when that read failed.
+   * {@link reconcileGateWaits} reuses this instead of re-reading — one `bd gate list` per pass, not
+   * two, since the two reads happen back to back with nothing that could change gate state between
+   * them.
+   */
+  openGates: Gate[] | undefined;
 }
 
 /**
@@ -753,8 +771,32 @@ async function buildPassState(
     );
   });
 
-  const [board, activeEpicKeys, parkedRunRows, settings] = await Promise.all([
-    beads.list(repoPath, ["--status", "all"]),
+  // A board outage must still let the escalation pass process the report that names it. An empty
+  // board is deliberately untrusted: it prevents lease-sensitive resumes and makes no claim that
+  // absent beads have settled.
+  //
+  // Both reads, because run-health raises the outage this recovers from `Promise.all([list,
+  // gateList])` (run-health.ts) — either one failing there writes the finding, so only a `list`
+  // recheck would call the board readable again while the exact read that raised the outage (say,
+  // a `gateList` timeout) is still down, and `classifyExhaustedJob` would hold the escalation on a
+  // false recovery.
+  let board: Bead[] = [];
+  let boardReadable = true;
+  let openGates: Gate[] | undefined;
+  try {
+    [board, openGates] = await Promise.all([
+      beads.list(repoPath, ["--status", "all"]),
+      beads.gateList(repoPath),
+    ]);
+  } catch (e) {
+    boardFresh = false;
+    boardReadable = false;
+    console.error(
+      `[unstick] beads list/gate-list failed for ${projectId}; holding every lease-gated resume this pass`,
+      e,
+    );
+  }
+  const [activeEpicKeys, parkedRunRows, settings] = await Promise.all([
     activeExecuteEpicKeys(db),
     listRunsByStatus(db, projectId, ["parked"]),
     getProjectSettings(db, projectId),
@@ -770,6 +812,7 @@ async function buildPassState(
     parkedRuns: new Map(parkedRunRows.map((r) => [r.id, r])),
     board: new Map(board.map((b) => [b.id, b])),
     boardFresh,
+    boardReadable,
     deadLeaseGraceMs: thresholds.deadLeaseMinutes * 60_000,
     usageWindowEndsAt: (epicBeadId) => usageWindowEnd(latestJobs.get(epicBeadId)),
     epicCancelled: (epicBeadId) => latestJobs.get(epicBeadId)?.status === "cancelled",
@@ -780,6 +823,7 @@ async function buildPassState(
   return {
     ctx,
     stillStuck,
+    openGates,
     // The re-checks the classifier and the retirement share, spelled once: a row can never be
     // retired on a different bar than the one its finding was raised on.
     live: {
@@ -825,23 +869,23 @@ async function primeLatestJobs(
 }
 
 /**
- * Let ONE gate-list read answer both halves of a gate wait's lifecycle: whether each `needs-human`
- * finding is still waiting on somebody (recorded for the classifier), and whether an already-raised
- * wait has since been answered (retired here). Gate beads are absent from the ordinary board read,
- * so this is a read of its own — one per pass, not one per finding. Returns how many waits it
+ * Answer both halves of a gate wait's lifecycle off the gate list {@link buildPassState} already
+ * fetched: whether each `needs-human` finding is still waiting on somebody (recorded for the
+ * classifier), and whether an already-raised wait has since been answered (retired here). Gate
+ * beads are absent from the ordinary board read, but the probe read already covers them (see
+ * {@link PassState.openGates}), so this reads nothing of its own. Returns how many waits it
  * retired.
  */
 async function reconcileGateWaits(
   db: AntonDb,
   clock: Clock,
-  repoPath: string,
   findings: RunHealthFinding[],
   pending: PendingEscalations,
   state: PassState,
 ): Promise<number> {
   const gateFindings = findings.filter((f) => f.kind === "needs-human");
   if (gateFindings.length === 0 && pending.gateWaits.length === 0) return 0;
-  const openGates = await readOpenGates(repoPath);
+  const openGates = state.openGates;
   const { nowMs } = state.ctx;
   const board = [...state.ctx.board.values()];
   for (const finding of gateFindings) {
@@ -1071,6 +1115,11 @@ async function stallEnded(
         : "the PR has since merged, closed, or been picked back up";
 
     case "exhausted-job":
+      // A live outage alert has no representative job and ends on the next successful board read.
+      // Legacy aggregates name a parked job, which needs the ordinary job re-check after recovery.
+      if (isBoardUnreachableFindingKey(row.findingKey) && !view.jobId) {
+        return live.ctx.boardReadable ? "the board is answering again" : undefined;
+      }
       return (await exhaustedJobStillStuck(db, view, live))
         ? undefined
         : "the job has since been resumed or settled";
@@ -1153,21 +1202,6 @@ async function stalePrStillStuck(
   if (prTargetSettled(finding, live.ctx)) return false;
   if (finding.prNumber === undefined || !finding.beadId) return true;
   return prStillIdle(finding.beadId, finding.prNumber, live);
-}
-
-/**
- * The project's OPEN gates (bd's `gate list` default), or undefined when bd could not answer. That
- * undefined fails OPEN in {@link gateStillOpen}, the same posture as the other two re-checks: an
- * unreadable board is no evidence a wait ended, and a missed escalation strands the human the sweep
- * exists to find.
- */
-async function readOpenGates(repoPath: string): Promise<Gate[] | undefined> {
-  try {
-    return await beads.gateList(repoPath);
-  } catch (e) {
-    console.error("[unstick] could not re-read the gate list; escalating on the report's word", e);
-    return undefined;
-  }
 }
 
 /**
