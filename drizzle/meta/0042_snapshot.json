@@ -1,8 +1,8 @@
 {
+  "id": "3214507f-9246-447b-8e6b-8ab0d3474062",
+  "prevId": "d0eb5f80-80d2-444c-bbd4-e49bffa95f5d",
   "version": "6",
   "dialect": "sqlite",
-  "id": "ab1edae1-4ea8-47c2-bdb5-542ead708b52",
-  "prevId": "d0eb5f80-80d2-444c-bbd4-e49bffa95f5d",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -79,8 +79,8 @@
           "columns": [
             "project_id"
           ],
-          "isUnique": true,
-          "where": "\"autopilot_disarms\".\"rearmed_at\" is null"
+          "where": "\"autopilot_disarms\".\"rearmed_at\" is null",
+          "isUnique": true
         },
         "autopilot_disarms_project_idx": {
           "name": "autopilot_disarms_project_idx",
@@ -95,15 +95,15 @@
         "autopilot_disarms_project_id_projects_id_fk": {
           "name": "autopilot_disarms_project_id_projects_id_fk",
           "tableFrom": "autopilot_disarms",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -195,15 +195,15 @@
         "board_picker_plans_project_id_projects_id_fk": {
           "name": "board_picker_plans_project_id_projects_id_fk",
           "tableFrom": "board_picker_plans",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -298,15 +298,15 @@
         "burn_samples_project_id_projects_id_fk": {
           "name": "burn_samples_project_id_projects_id_fk",
           "tableFrom": "burn_samples",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -514,15 +514,15 @@
         "claude_invocations_project_id_projects_id_fk": {
           "name": "claude_invocations_project_id_projects_id_fk",
           "tableFrom": "claude_invocations",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -670,8 +670,8 @@
             "project_id",
             "finding_key"
           ],
-          "isUnique": true,
-          "where": "\"escalations\".\"status\" = 'open'"
+          "where": "\"escalations\".\"status\" = 'open'",
+          "isUnique": true
         },
         "escalations_project_status_idx": {
           "name": "escalations_project_status_idx",
@@ -687,23 +687,23 @@
             "project_id",
             "finding_key"
           ],
-          "isUnique": false,
-          "where": "\"escalations\".\"dismissed_at\" is not null"
+          "where": "\"escalations\".\"dismissed_at\" is not null",
+          "isUnique": false
         }
       },
       "foreignKeys": {
         "escalations_project_id_projects_id_fk": {
           "name": "escalations_project_id_projects_id_fk",
           "tableFrom": "escalations",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -804,15 +804,15 @@
         "hygiene_reports_project_id_projects_id_fk": {
           "name": "hygiene_reports_project_id_projects_id_fk",
           "tableFrom": "hygiene_reports",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -936,16 +936,16 @@
             "project_id",
             "json_extract(\"payload_json\", '$.epicBeadId')"
           ],
-          "isUnique": true,
-          "where": "\"jobs\".\"status\" in ('queued', 'running')"
+          "where": "\"jobs\".\"status\" in ('queued', 'running')",
+          "isUnique": true
         },
         "jobs_active_sync_push_unique": {
           "name": "jobs_active_sync_push_unique",
           "columns": [
             "project_id"
           ],
-          "isUnique": true,
-          "where": "\"jobs\".\"type\" = 'sync-push' and \"jobs\".\"status\" = 'queued'"
+          "where": "\"jobs\".\"type\" = 'sync-push' and \"jobs\".\"status\" = 'queued'",
+          "isUnique": true
         },
         "jobs_project_parked_idx": {
           "name": "jobs_project_parked_idx",
@@ -953,23 +953,23 @@
             "project_id",
             "updated_at"
           ],
-          "isUnique": false,
-          "where": "\"jobs\".\"status\" = 'parked'"
+          "where": "\"jobs\".\"status\" = 'parked'",
+          "isUnique": false
         }
       },
       "foreignKeys": {
         "jobs_project_id_projects_id_fk": {
           "name": "jobs_project_id_projects_id_fk",
           "tableFrom": "jobs",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1051,15 +1051,15 @@
         "picker_starts_project_id_projects_id_fk": {
           "name": "picker_starts_project_id_projects_id_fk",
           "tableFrom": "picker_starts",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1179,23 +1179,23 @@
             "bead_id",
             "plan_id"
           ],
-          "isUnique": true,
-          "where": "\"picker_verdicts\".\"verdict\" = 'accepted'"
+          "where": "\"picker_verdicts\".\"verdict\" = 'accepted'",
+          "isUnique": true
         }
       },
       "foreignKeys": {
         "picker_verdicts_project_id_projects_id_fk": {
           "name": "picker_verdicts_project_id_projects_id_fk",
           "tableFrom": "picker_verdicts",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1383,15 +1383,15 @@
         "run_health_reports_project_id_projects_id_fk": {
           "name": "run_health_reports_project_id_projects_id_fk",
           "tableFrom": "run_health_reports",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1485,27 +1485,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "base_fork_sha": {
-          "name": "base_fork_sha",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "base_refresh_outcome": {
-          "name": "base_refresh_outcome",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "base_refresh_sha": {
-          "name": "base_refresh_sha",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "status": {
           "name": "status",
           "type": "text",
@@ -1578,6 +1557,13 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "base_fork_sha": {
+          "name": "base_fork_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {
@@ -1593,15 +1579,15 @@
         "runs_project_id_projects_id_fk": {
           "name": "runs_project_id_projects_id_fk",
           "tableFrom": "runs",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1750,15 +1736,15 @@
         "scan_summaries_project_id_projects_id_fk": {
           "name": "scan_summaries_project_id_projects_id_fk",
           "tableFrom": "scan_summaries",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1817,6 +1803,14 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "auto_armed": {
+          "name": "auto_armed",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
         }
       },
       "indexes": {},
@@ -1935,41 +1929,41 @@
         "sessions_project_id_projects_id_fk": {
           "name": "sessions_project_id_projects_id_fk",
           "tableFrom": "sessions",
-          "tableTo": "projects",
           "columnsFrom": [
             "project_id"
           ],
+          "tableTo": "projects",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         },
         "sessions_run_id_runs_id_fk": {
           "name": "sessions_run_id_runs_id_fk",
           "tableFrom": "sessions",
-          "tableTo": "runs",
           "columnsFrom": [
             "run_id"
           ],
+          "tableTo": "runs",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         },
         "sessions_job_id_jobs_id_fk": {
           "name": "sessions_job_id_jobs_id_fk",
           "tableFrom": "sessions",
-          "tableTo": "jobs",
           "columnsFrom": [
             "job_id"
           ],
+          "tableTo": "jobs",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -1980,9 +1974,9 @@
   "views": {},
   "enums": {},
   "_meta": {
+    "columns": {},
     "schemas": {},
-    "tables": {},
-    "columns": {}
+    "tables": {}
   },
   "internal": {
     "indexes": {

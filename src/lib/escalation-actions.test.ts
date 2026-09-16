@@ -351,6 +351,20 @@ describe("actOnEscalation — dismiss", () => {
       expect(await actOnEscalation(project, "esc-1", "dismiss")).toMatchObject({ ok: true });
     },
   );
+
+  // A live board outage is an `exhausted-job` finding, but `outageSince` deliberately keeps its
+  // `since`/`reason` stable for as long as the outage continues — so unlike a genuine exhausted job,
+  // dismissing it would silence the alert for the outage's whole remaining lifetime, not just the one
+  // probe that raised it. Refused the same way a `needs-human`/`autopilot-disarm` row is.
+  it("is refused on a live board outage, which a dismissal would silence for the outage's whole run", async () => {
+    open({ kind: "exhausted-job", findingKey: "exhausted-job:board-unreachable:p1:server-unreachable" });
+
+    expect(await actOnEscalation(project, "esc-1", "dismiss")).toEqual({
+      ok: false,
+      reason: "not-dismissable",
+    });
+    expect(settleEscalation).not.toHaveBeenCalled();
+  });
 });
 
 /**

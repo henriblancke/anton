@@ -34,10 +34,9 @@ function disarmedSentence(disarmed: WatcherAutomation[]): string {
  * Parked work on an unwatched queue (anton-kh98).
  *
  * The escalation strip below this band has exactly one producer — the unstick pass, acting on
- * run-health's report — and run-health ships opt-in. With it off, a job can park for a week and the
- * strip stays empty, which is indistinguishable from a healthy board. This band is the difference:
- * it says work has stopped, says how much and for how long, and hands over the switch that starts
- * watching it.
+ * run-health's report. If an operator turns either half off, a job can park for a week and the strip
+ * stays empty, which is indistinguishable from a healthy board. This band is the difference: it says
+ * work has stopped, says how much and for how long, and hands over the switch that starts watching it.
  *
  * It renders NOTHING while the watcher is armed, and nothing while no job is parked — the whole
  * signal is its presence (see {@link unwatchedParks}, which returns `undefined` in both cases). A

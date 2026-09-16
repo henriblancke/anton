@@ -8,7 +8,9 @@
  */
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { BoardUnreachableError } from "../jobs/errors";
 import { resolveBdBin } from "./bd-bin";
+import { isBoardUnreachableOutput } from "./board-unreachable";
 import { buildBdEnv } from "./bd-env";
 
 /**
@@ -165,15 +167,23 @@ export async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<st
      * execFile-shaped failure for a non-zero exit: promisified execFile attached the captured
      * streams to the error, and runDoltSync's benign/first-publish matchers read them off it.
      */
-    const exitFailure = (code: number | null, signal: NodeJS.Signals | null) =>
-      Object.assign(new Error(`Command failed: ${[bin, ...args].join(" ")}\n${stderr}`), {
-        cmd: [bin, ...args].join(" "),
-        code: code ?? undefined,
-        signal,
-        killed: child.killed,
-        stdout,
-        stderr,
-      });
+    const exitFailure = (code: number | null, signal: NodeJS.Signals | null) => {
+      const message = `Command failed: ${[bin, ...args].join(" ")}\n${stderr}`;
+      const output = `${stderr}\n${stdout}`;
+      return Object.assign(
+        isBoardUnreachableOutput(output)
+          ? new BoardUnreachableError(message)
+          : new Error(message),
+        {
+          cmd: [bin, ...args].join(" "),
+          code: code ?? undefined,
+          signal,
+          killed: child.killed,
+          stdout,
+          stderr,
+        },
+      );
+    };
 
     const finish = (code: number | null, signal: NodeJS.Signals | null) => {
       // Flush whatever the decoders held back (an output that ends mid-character), as execFile did.
@@ -195,13 +205,22 @@ export async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<st
         // Partial stdout/stderr is deliberately NOT attached: a wedged step's captured output is
         // startup noise, and runDoltSync prefers it over the message — which would bury the real
         // cause exactly as it did for stringer (anton-be1s).
+        //
+        // Classified as a board outage, not a plain Error (PR #277 review): every bd invocation here
+        // touches the board, and a hang past budget is exactly the field failure this module's own
+        // docs describe — a wedged `git fetch` holding the exclusive Dolt lock, which then fails
+        // EVERY later bd call in this repo, not just this one. Left as a plain Error, run-health never
+        // sees it and every job it stalls floods the report individually instead of collapsing onto
+        // one outage finding. There is no output text to pattern-match here, so the cause is assigned
+        // directly rather than left for a downstream reparse to miss.
         reject(
           Object.assign(
-            new Error(
+            new BoardUnreachableError(
               `bd ${args.join(" ")} in ${cwd} exceeded its ${budgetMs}ms budget ` +
                 `(elapsed ${Date.now() - startedAt}ms) and its process group was killed. ` +
                 `bd or a child of it (typically \`git fetch\` against an unreachable remote) hung; ` +
                 `if it held the Dolt lock, later bd calls in this repo may fail until the tree is gone.`,
+              { boardCause: "board-timeout" },
             ),
             { killed: true, signal: "SIGTERM" as NodeJS.Signals },
           ),

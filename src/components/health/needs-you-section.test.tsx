@@ -266,6 +266,40 @@ describe("NeedsYouSection", () => {
     expect(screen.getByText("Stop retrying")).toBeTruthy();
   });
 
+  it("labels a live board outage as its own group, not as 'Retries spent'", () => {
+    // The finding is `kind: "exhausted-job"`, but it hasn't spent any retries — the runner refunds
+    // the affected jobs and requeues them — so it must not read like one, and its group must not
+    // offer the "Dismiss all" that a genuine exhausted-job group does (see escalation-kinds.ts).
+    renderStrip([
+      escalation({
+        kind: "exhausted-job",
+        findingKey: "exhausted-job:board-unreachable:p1:server-unreachable",
+        reason: "the shared Dolt server is unreachable. check the server is up and reachable.",
+      }),
+    ]);
+
+    expect(screen.getByRole("heading", { name: "Board outage" })).toBeTruthy();
+    expect(screen.queryByText("Retries spent")).toBeNull();
+    expect(screen.queryByText("Dismiss all")).toBeNull();
+  });
+
+  it("keeps a genuine exhausted-job group separate from a board outage, each with its own header", () => {
+    renderStrip([
+      escalation({ id: "esc-1", kind: "exhausted-job", findingKey: "exhausted-job:j-1" }),
+      escalation({
+        id: "esc-2",
+        kind: "exhausted-job",
+        findingKey: "exhausted-job:board-unreachable:p1:server-unreachable",
+      }),
+    ]);
+
+    expect(screen.getByRole("heading", { name: "Retries spent" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Board outage" })).toBeTruthy();
+    // Only the genuine exhausted-job group offers "Dismiss all" — one is offered, not two, and the
+    // outage's own id must never appear among the ids that button would bulk-dismiss.
+    expect(screen.getAllByText("Dismiss all")).toHaveLength(1);
+  });
+
   it("says so when the board-native bd note has not landed yet, and only when there is a bead", () => {
     const { unmount } = renderStrip([escalation({ noted: false })]);
     expect(screen.getByText(/hasn't landed yet/)).toBeTruthy();

@@ -176,25 +176,46 @@ export interface RunTeardown {
  * branch can recreate, it is the only copy of what a human was told to clear. An armed human gate
  * (`awaitsHumanGate`) keeps it for the same reason — the resume continues from this tree.
  */
-export function planRunTeardown(run: RunTeardown, openPr: OpenPrNotice): ReapPlan {
-  const keep = (reason: string): ReapPlan => ({ removeWorktree: false, deleteBranch: false, reason });
-
-  if (run.foreign) return keep("the run is live on another machine");
+/**
+ * The two keeps that hold regardless of bead settlement: a run live on another machine, or one whose
+ * checkout is the only copy of work it could not roll back.
+ */
+function keepForUnrecoverableState(run: RunTeardown): string | undefined {
+  if (run.foreign) return "the run is live on another machine";
   // Ahead of every release below, including a settled bead's: this checkout is the only copy of work
   // the run could not roll back, and the operator's own recovery note names its path. `--force`
   // removal would delete exactly what that note asks a human to look at. The scheduled sweep
   // reclaims it once the bead settles and the human is done with it.
-  if (run.holdsPartialWork) {
-    return keep("it holds partial work the run could not roll back, for a human to clear");
-  }
+  if (run.holdsPartialWork) return "it holds partial work the run could not roll back, for a human to clear";
+  return undefined;
+}
+
+/** The two keeps that apply only while the bead is still open — an unsettled bead may yet resume here. */
+function keepForUnsettledResume(run: RunTeardown): string | undefined {
+  if (run.beadSettled) return undefined;
   // A wait somebody is expected to ANSWER, which is not the same as a park that landed (PR #205
   // review): a needs-human run whose park row could not be written settles as `failed` while its
   // gate stands, and resolving that gate resumes this attempt in this checkout. Releasing here would
   // force-remove the uncommitted work the resumed session continues from.
-  if (run.awaitsHumanGate && !run.beadSettled) {
-    return keep("it waits on the human gate it armed, and the resume continues here");
-  }
-  if (run.status === "parked" && !run.beadSettled) return keep("the run is parked and resumes here");
+  if (run.awaitsHumanGate) return "it waits on the human gate it armed, and the resume continues here";
+  if (run.status === "parked") return "the run is parked and resumes here";
+  return undefined;
+}
+
+/**
+ * Why a stopped run keeps its worktree for reasons OTHER than bead settlement, or undefined when
+ * settlement is the only question left. Named separately from {@link planRunTeardown} so each keep
+ * reads as one case rather than a chain of inline conditions.
+ */
+function keepBeforeSettlement(run: RunTeardown): string | undefined {
+  return keepForUnrecoverableState(run) ?? keepForUnsettledResume(run);
+}
+
+export function planRunTeardown(run: RunTeardown, openPr: OpenPrNotice): ReapPlan {
+  const keep = (reason: string): ReapPlan => ({ removeWorktree: false, deleteBranch: false, reason });
+
+  const reason = keepBeforeSettlement(run);
+  if (reason) return keep(reason);
   if (!run.beadSettled) {
     return { removeWorktree: true, deleteBranch: false, reason: `${run.beadId} is still open` };
   }
@@ -229,105 +250,168 @@ export async function openPrNotice(
  * sweep off `.claude/worktrees` and off the operator's own checkouts, and the main working tree is
  * never a candidate whatever else is true of it.
  */
+type RunRow = { branch: string | null; worktreePath: string | null; status: string; epicBeadId: string };
+type BeadStatusOf = (beadId: string) => "settled" | "open" | "unknown";
+
+/** Merge one observation into the accumulated candidates. Neither source may erase the other's facts. */
+function mergeCandidate(candidates: Map<string, ReapCandidate>, c: ReapCandidate): void {
+  const existing = candidates.get(c.branch);
+  // The checkout carries facts a run row cannot (its live path, its lock); the run row carries the
+  // bead. Neither half may erase the other's.
+  candidates.set(c.branch, {
+    ...existing,
+    ...c,
+    path: c.path ?? existing?.path,
+    beadId: c.beadId ?? existing?.beadId,
+    bead: c.beadId ? c.bead : (existing?.bead ?? c.bead),
+    lock: c.lock ?? existing?.lock,
+  });
+}
+
+/** Registered checkouts under anton's worktrees root — the main working tree is never a candidate. */
+function scopedWorktrees(repoPath: string, worktrees: WorktreeRecord[]): WorktreeRecord[] {
+  const root = resolve(worktreesRootFor(repoPath)) + sep;
+  return worktrees.filter((wt) => !wt.isMain && wt.branch && (resolve(wt.path) + sep).startsWith(root));
+}
+
+/**
+ * A run row is the only place a branch's bead id is recorded; a checkout found on disk falls back to
+ * parsing it out of the branch name, which is how anton composes it in the first place.
+ */
+function beadIdOfBranch(branch: string, runs: ReadonlyArray<RunRow>, branchPrefix: string): string | undefined {
+  return (
+    runs.find((r) => r.branch === branch)?.epicBeadId ??
+    (branch.startsWith(`${branchPrefix}/`) ? branch.slice(branchPrefix.length + 1) : undefined)
+  );
+}
+
+/**
+ * Git is the only authority on what `path` holds NOW. A run row remembers where its checkout was, and
+ * removal is by path (`git worktree remove --force <path>`): a path since reused for another branch
+ * would be deleted with that branch's uncommitted work. So a recorded path is carried only while git
+ * still attributes it to this branch — otherwise the row contributes branch-only residue. This
+ * snapshot ages before anything is deleted, so `removeWorktree` re-reads the same association at the
+ * moment of removal; both together close the window. A path git has no record of is not someone
+ * else's either: that is the pruned-registration orphan this sweep exists to reclaim, and
+ * `removeWorktree` proves ownership of it from its own `.git` marker before deleting anything.
+ */
+function pathIfStillOurs(
+  recordAtPath: Map<string, WorktreeRecord>,
+  branch: string,
+  path: string | null,
+): string | undefined {
+  if (!path) return undefined;
+  const record = recordAtPath.get(resolve(path));
+  if (!record) return path;
+  return record.branch === branch ? path : undefined;
+}
+
+/**
+ * A row whose checkout and branch are both gone has nothing left to reap — the run already handed
+ * them back — so it contributes its bead and path only while one of them survives.
+ */
+function candidatesFromRuns(
+  candidates: Map<string, ReapCandidate>,
+  runs: ReadonlyArray<RunRow>,
+  ctx: {
+    checkedOut: Set<string | undefined>;
+    existingBranches: Set<string>;
+    recordAtPath: Map<string, WorktreeRecord>;
+    liveBranches: Set<string | null>;
+    beadStatus: BeadStatusOf;
+  },
+): void {
+  for (const r of runs) {
+    if (!r.branch || !(ctx.checkedOut.has(r.branch) || ctx.existingBranches.has(r.branch))) continue;
+    mergeCandidate(candidates, {
+      branch: r.branch,
+      path: pathIfStillOurs(ctx.recordAtPath, r.branch, r.worktreePath),
+      beadId: r.epicBeadId,
+      runLive: ctx.liveBranches.has(r.branch),
+      bead: ctx.beadStatus(r.epicBeadId),
+    });
+  }
+}
+
+function candidatesFromWorktrees(
+  candidates: Map<string, ReapCandidate>,
+  scoped: WorktreeRecord[],
+  ctx: { runs: ReadonlyArray<RunRow>; branchPrefix: string; liveBranches: Set<string | null>; beadStatus: BeadStatusOf },
+): void {
+  for (const wt of scoped) {
+    const branch = wt.branch as string;
+    const beadId = beadIdOfBranch(branch, ctx.runs, ctx.branchPrefix);
+    mergeCandidate(candidates, {
+      branch,
+      path: wt.path,
+      beadId,
+      lock: wt.locked ? (wt.lockReason ?? "") : undefined,
+      runLive: ctx.liveBranches.has(branch),
+      bead: beadId ? ctx.beadStatus(beadId) : "unknown",
+    });
+  }
+}
+
+/** Branches with neither a run row nor a checkout already accounting for them — branch-only residue. */
+function candidatesFromBranchesOnly(
+  candidates: Map<string, ReapCandidate>,
+  branches: string[],
+  ctx: { runs: ReadonlyArray<RunRow>; branchPrefix: string; liveBranches: Set<string | null>; beadStatus: BeadStatusOf },
+): void {
+  for (const branch of branches) {
+    if (candidates.has(branch)) continue;
+    const beadId = beadIdOfBranch(branch, ctx.runs, ctx.branchPrefix);
+    mergeCandidate(candidates, {
+      branch,
+      beadId,
+      runLive: ctx.liveBranches.has(branch),
+      bead: beadId ? ctx.beadStatus(beadId) : "unknown",
+    });
+  }
+}
+
+/**
+ * The residue this project's runs left behind, from the two places it can still EXIST — a checkout
+ * registered under anton's worktrees root, or a local branch under anton's prefix. A run row is
+ * consulted for what it knows (the bead behind a branch, the path it checked out) but is never on
+ * its own evidence of residue: a settled row outlives both resources it names, so treating every row
+ * as a candidate would make each finished run a permanent `gh` call on every sweep, and a project's
+ * sweep cost would grow with its lifetime run count.
+ *
+ * Branches are the reason a run row is not the third source either: a branch whose row is gone — the
+ * shape a recreated `anton.db` leaves — is exactly the residue this sweep exists to reclaim, and it
+ * is visible only in git.
+ *
+ * Pure: the caller does the git/db/board reads. Scoping to the worktrees root is what keeps the
+ * sweep off `.claude/worktrees` and off the operator's own checkouts, and the main working tree is
+ * never a candidate whatever else is true of it.
+ */
 export function reapCandidates(input: {
   repoPath: string;
   worktrees: WorktreeRecord[];
   /** Every local branch under `branchPrefix/`, as `listBranches` reports it. */
   branches: string[];
   /** This project's run rows — every status, since a live row still names what it is using. */
-  runs: ReadonlyArray<{
-    branch: string | null;
-    worktreePath: string | null;
-    status: string;
-    epicBeadId: string;
-  }>;
+  runs: ReadonlyArray<RunRow>;
   /** Bead status by id, from one board read. Ids absent from it read as `unknown`. */
-  beadStatus: (beadId: string) => "settled" | "open" | "unknown";
+  beadStatus: BeadStatusOf;
   /** Branch prefix anton names its run branches with (`anton/<bead>`). */
   branchPrefix: string;
 }): ReapCandidate[] {
   const { repoPath, worktrees, runs, beadStatus, branchPrefix } = input;
-  const root = resolve(worktreesRootFor(repoPath)) + sep;
-  const scoped = worktrees.filter(
-    (wt) => !wt.isMain && wt.branch && (resolve(wt.path) + sep).startsWith(root),
-  );
+  const scoped = scopedWorktrees(repoPath, worktrees);
   // What still exists, and therefore what may be a candidate at all.
   const checkedOut = new Set(scoped.map((wt) => wt.branch));
   const existingBranches = new Set(input.branches);
-  // A run row is the only place a branch's bead id is recorded; a checkout found on disk falls back
-  // to parsing it out of the branch name, which is how anton composes it in the first place.
-  const beadIdOf = (branch: string): string | undefined =>
-    runs.find((r) => r.branch === branch)?.epicBeadId ??
-    (branch.startsWith(`${branchPrefix}/`) ? branch.slice(branchPrefix.length + 1) : undefined);
   const liveBranches = new Set(
     runs.filter((r) => r.status === "running" || r.status === "queued").map((r) => r.branch),
   );
-  // Git is the only authority on what a path holds NOW. A run row remembers where its checkout was,
-  // and removal is by path (`git worktree remove --force <path>`): a path since reused for another
-  // branch would be deleted with that branch's uncommitted work. So a recorded path is carried only
-  // while git still attributes it to this branch — otherwise the row contributes branch-only
-  // residue. This snapshot ages before anything is deleted, so `removeWorktree` re-reads the same
-  // association at the moment of removal; both together close the window. A path git has NO record
-  // of is not someone else's either: that
-  // is the pruned-registration orphan this sweep exists to reclaim, and `removeWorktree` proves
-  // ownership of it from its own `.git` marker before deleting anything.
   const recordAtPath = new Map(worktrees.map((wt) => [resolve(wt.path), wt]));
-  const pathStillOurs = (branch: string, path: string | null): string | undefined => {
-    if (!path) return undefined;
-    const record = recordAtPath.get(resolve(path));
-    if (!record) return path;
-    return record.branch === branch ? path : undefined;
-  };
 
   const candidates = new Map<string, ReapCandidate>();
-  const add = (c: ReapCandidate) => {
-    const existing = candidates.get(c.branch);
-    // The checkout carries facts a run row cannot (its live path, its lock); the run row carries the
-    // bead. Neither half may erase the other's.
-    candidates.set(c.branch, {
-      ...existing,
-      ...c,
-      path: c.path ?? existing?.path,
-      beadId: c.beadId ?? existing?.beadId,
-      bead: c.beadId ? c.bead : (existing?.bead ?? c.bead),
-      lock: c.lock ?? existing?.lock,
-    });
-  };
-
-  for (const r of runs) {
-    // A row whose checkout and branch are both gone has nothing left to reap — the run already
-    // handed them back — so it contributes its bead and path only while one of them survives.
-    if (!r.branch || !(checkedOut.has(r.branch) || existingBranches.has(r.branch))) continue;
-    add({
-      branch: r.branch,
-      path: pathStillOurs(r.branch, r.worktreePath),
-      beadId: r.epicBeadId,
-      runLive: liveBranches.has(r.branch),
-      bead: beadStatus(r.epicBeadId),
-    });
-  }
-  for (const wt of scoped) {
-    const branch = wt.branch as string;
-    const beadId = beadIdOf(branch);
-    add({
-      branch,
-      path: wt.path,
-      beadId,
-      lock: wt.locked ? (wt.lockReason ?? "") : undefined,
-      runLive: liveBranches.has(branch),
-      bead: beadId ? beadStatus(beadId) : "unknown",
-    });
-  }
-  for (const branch of input.branches) {
-    if (candidates.has(branch)) continue;
-    const beadId = beadIdOf(branch);
-    add({
-      branch,
-      beadId,
-      runLive: liveBranches.has(branch),
-      bead: beadId ? beadStatus(beadId) : "unknown",
-    });
-  }
+  candidatesFromRuns(candidates, runs, { checkedOut, existingBranches, recordAtPath, liveBranches, beadStatus });
+  candidatesFromWorktrees(candidates, scoped, { runs, branchPrefix, liveBranches, beadStatus });
+  candidatesFromBranchesOnly(candidates, input.branches, { runs, branchPrefix, liveBranches, beadStatus });
   return [...candidates.values()];
 }
 
@@ -436,8 +520,77 @@ async function applyPlan(
  */
 export type Revalidate = (candidate: ReapCandidate) => Promise<string | undefined>;
 
-/** Reap what the sweep proved is finished; report everything it left alone and why. */
-export async function reapWorktrees(args: {
+/** Shared context {@link judgeCandidate} and {@link actOnRevalidatedCandidate} act under. */
+interface SweepContext {
+  lookupPr?: typeof lookupOpenPullRequest;
+  revalidate?: Revalidate;
+  signal?: AbortSignal;
+}
+
+/**
+ * What {@link judgeCandidate} concluded: an immediate entry that needed no lock (the plan intended
+ * nothing), a judged entry that went through the re-read-and-delete step, or an abort caught between
+ * the plan and that step. Named so {@link reapWorktrees} can tell "no further abort check" (immediate)
+ * from "check once more" (judged) — exactly the two paths the loop used to inline.
+ */
+type CandidateJudgement =
+  | { kind: "aborted" }
+  | { kind: "immediate"; entry: ReapEntry }
+  | { kind: "judged"; entry: ReapEntry };
+
+/**
+ * The re-read-and-delete step, run under the branch's lock (anton-hrun.1). The check is worthless if
+ * a run can check the branch out between it and the removal: the sweep would then force-remove a live
+ * checkout, uncommitted work and all. Holding the lock across both makes the starting run either
+ * visible to the re-read or blocked until the removal is done.
+ */
+async function actOnRevalidatedCandidate(
+  repoPath: string,
+  candidate: ReapCandidate,
+  plan: ReapPlan,
+  ctx: SweepContext,
+): Promise<ReapEntry> {
+  const stale = await ctx.revalidate?.(candidate);
+  if (stale) return refusedEntry(candidate, stale);
+  // Waiting for the lock and re-reading the board are both slow, and the next line deletes: a
+  // cancel that arrived across either of them must stop the sweep HERE, not one candidate later.
+  if (ctx.signal?.aborted) return refusedEntry(candidate, "the sweep was cancelled before deletion");
+  return applyPlan(repoPath, candidate, plan);
+}
+
+/**
+ * The plan for one candidate. Only a candidate that is otherwise reapable can cost a `gh` call:
+ * everything else is decided before the PR is relevant, and a sweep over an idle project must stay
+ * free.
+ */
+async function planCandidateReap(repoPath: string, candidate: ReapCandidate, ctx: SweepContext): Promise<ReapPlan> {
+  const settled =
+    lockKeepReason(candidate.lock) === undefined && !candidate.runLive && candidate.bead === "settled";
+  const openPr = settled ? await openPrNotice(repoPath, candidate.branch, ctx.lookupPr) : undefined;
+  return planReap(candidate, openPr);
+}
+
+/** Decide — and, once a plan calls for it, carry out — what becomes of one candidate. */
+async function judgeCandidate(
+  repoPath: string,
+  candidate: ReapCandidate,
+  ctx: SweepContext,
+): Promise<CandidateJudgement> {
+  const plan = await planCandidateReap(repoPath, candidate, ctx);
+  // A plan that deletes nothing needs neither the re-read nor the lock — the entry only records why.
+  if (!plan.removeWorktree && !plan.deleteBranch) {
+    return { kind: "immediate", entry: await applyPlan(repoPath, candidate, plan) };
+  }
+  // The second cancellation check, and the one that matters: the `gh` lookup above can run for
+  // seconds, and nothing has been destroyed yet.
+  if (ctx.signal?.aborted) return { kind: "aborted" };
+  const entry = await withBranchLock(repoPath, candidate.branch, () =>
+    actOnRevalidatedCandidate(repoPath, candidate, plan, ctx),
+  );
+  return { kind: "judged", entry };
+}
+
+export interface ReapWorktreesArgs {
   repoPath: string;
   candidates: ReapCandidate[];
   /** Injectable so a test needn't shell out to `gh`. */
@@ -457,59 +610,57 @@ export async function reapWorktrees(args: {
    * window is cancelled at the same prefix on every retry and never reaches the residue behind it.
    */
   onProgress?: () => Promise<void>;
-}): Promise<ReapReport> {
+}
+
+/** Stop the sweep here — the shared tail of every abort check in {@link reapWorktreesTurn}. */
+function stopSweep(report: ReapReport): "stop" {
+  report.aborted = true;
+  return "stop";
+}
+
+/**
+ * Record a judged entry into the report. Classified on the outcome, never the plan: a checkout
+ * locked between planning and removal is refused, and reporting that as reaped would claim work the
+ * sweep did not do.
+ */
+function recordJudgedEntry(report: ReapReport, entry: ReapEntry): void {
+  (entry.outcome === "acted" ? report.reaped : report.skipped).push(entry);
+}
+
+/**
+ * One candidate's turn in {@link reapWorktrees}'s loop: judge it, record the entry, report progress,
+ * and say whether the sweep must stop. Pulled out so the loop itself reads as "for each candidate, do
+ * a turn" rather than inlining every abort check.
+ */
+async function reapWorktreesTurn(
+  report: ReapReport,
+  candidate: ReapCandidate,
+  ctx: SweepContext,
+  repoPath: string,
+  onProgress: (() => Promise<void>) | undefined,
+): Promise<"continue" | "stop"> {
+  const judgement = await judgeCandidate(repoPath, candidate, ctx);
+  if (judgement.kind === "aborted") return stopSweep(report);
+  recordJudgedEntry(report, judgement.entry);
+  await onProgress?.();
+  // An "immediate" plan (nothing to reap) needed no lock and skips the check below — exactly as the
+  // caller's top-of-loop check will catch a real abort on the next turn instead. Re-checking the rest
+  // right after the entry is recorded matters because an abort during the LAST candidate has no next
+  // iteration to notice it, and would otherwise report a partial sweep as one that judged everything.
+  if (judgement.kind === "judged" && ctx.signal?.aborted) return stopSweep(report);
+  return "continue";
+}
+
+/** Reap what the sweep proved is finished; report everything it left alone and why. */
+export async function reapWorktrees(args: ReapWorktreesArgs): Promise<ReapReport> {
   const report: ReapReport = { reaped: [], skipped: [] };
+  const ctx: SweepContext = { lookupPr: args.lookupPr, revalidate: args.revalidate, signal: args.signal };
   for (const candidate of args.candidates) {
     if (args.signal?.aborted) {
-      report.aborted = true;
+      stopSweep(report);
       break;
     }
-    // Only a candidate that is otherwise reapable can cost a `gh` call: everything else is decided
-    // before the PR is relevant, and a sweep over an idle project must stay free.
-    const settled =
-      lockKeepReason(candidate.lock) === undefined &&
-      !candidate.runLive &&
-      candidate.bead === "settled";
-    const openPr = settled
-      ? await openPrNotice(args.repoPath, candidate.branch, args.lookupPr)
-      : undefined;
-    const plan = planReap(candidate, openPr);
-    // A plan that deletes nothing needs neither the re-read nor the lock — the entry only records why.
-    if (!plan.removeWorktree && !plan.deleteBranch) {
-      report.skipped.push(await applyPlan(args.repoPath, candidate, plan));
-      await args.onProgress?.();
-      continue;
-    }
-    // The second cancellation check, and the one that matters: the `gh` lookup above can run for
-    // seconds, and nothing has been destroyed yet.
-    if (args.signal?.aborted) {
-      report.aborted = true;
-      break;
-    }
-    // Re-read and delete as ONE step under the branch's lock (anton-hrun.1). The check is worthless
-    // if a run can check the branch out between it and the removal: the sweep would then force-remove
-    // a live checkout, uncommitted work and all. Holding the lock across both makes the starting run
-    // either visible to the re-read or blocked until the removal is done.
-    const entry = await withBranchLock(args.repoPath, candidate.branch, async () => {
-      const stale = await args.revalidate?.(candidate);
-      if (stale) return refusedEntry(candidate, stale);
-      // Waiting for the lock and re-reading the board are both slow, and the next line deletes: a
-      // cancel that arrived across either of them must stop the sweep HERE, not one candidate later.
-      if (args.signal?.aborted)
-        return refusedEntry(candidate, "the sweep was cancelled before deletion");
-      return applyPlan(args.repoPath, candidate, plan);
-    });
-    // Classified on the outcome, never the plan: a checkout locked between planning and removal is
-    // refused, and reporting that as reaped would claim work the sweep did not do.
-    (entry.outcome === "acted" ? report.reaped : report.skipped).push(entry);
-    await args.onProgress?.();
-    // Re-checked after the entry is recorded rather than left to the next iteration: an abort during
-    // the LAST candidate has no next iteration to notice it, and would report a partial sweep as one
-    // that judged everything.
-    if (args.signal?.aborted) {
-      report.aborted = true;
-      break;
-    }
+    if ((await reapWorktreesTurn(report, candidate, ctx, args.repoPath, args.onProgress)) === "stop") break;
   }
   return report;
 }
@@ -527,25 +678,28 @@ export async function reapWorktrees(args: {
  * itself keep the worktree (an open bead's checkout is exactly what a stopped run hands back), so
  * whoever owns run rows says here whether someone else has since taken the branch.
  */
-export async function releaseRunWorktree(args: {
+interface ReleaseRunWorktreeArgs {
   run: Omit<RunTeardown, "beadSettled">;
   repoPath: string;
   isBeadSettled: () => Promise<boolean>;
   lookupPr?: typeof lookupOpenPullRequest;
   /** Why this teardown must be abandoned, re-read under the lock; undefined when it may proceed. */
   revalidate?: () => Promise<string | undefined>;
-}): Promise<ReapEntry> {
-  return withBranchLock(args.repoPath, args.run.branch, async () => {
-    const taken = await args.revalidate?.();
-    if (taken) return refusedEntry(args.run, taken);
-    const beadSettled = await args.isBeadSettled().catch(() => false);
-    const run: RunTeardown = { ...args.run, beadSettled };
-    // Only a settled bead can lose its branch, so only that case pays for a `gh` lookup.
-    const openPr = beadSettled
-      ? await openPrNotice(args.repoPath, run.branch, args.lookupPr)
-      : undefined;
-    return applyPlan(args.repoPath, run, planRunTeardown(run, openPr));
-  });
+}
+
+/** The under-lock body of {@link releaseRunWorktree}, named for the same reason as its sweep peers. */
+async function releaseRunWorktreeUnderLock(args: ReleaseRunWorktreeArgs): Promise<ReapEntry> {
+  const taken = await args.revalidate?.();
+  if (taken) return refusedEntry(args.run, taken);
+  const beadSettled = await args.isBeadSettled().catch(() => false);
+  const run: RunTeardown = { ...args.run, beadSettled };
+  // Only a settled bead can lose its branch, so only that case pays for a `gh` lookup.
+  const openPr = beadSettled ? await openPrNotice(args.repoPath, run.branch, args.lookupPr) : undefined;
+  return applyPlan(args.repoPath, run, planRunTeardown(run, openPr));
+}
+
+export async function releaseRunWorktree(args: ReleaseRunWorktreeArgs): Promise<ReapEntry> {
+  return withBranchLock(args.repoPath, args.run.branch, () => releaseRunWorktreeUnderLock(args));
 }
 
 /** The session-log block for a pass: every worktree and branch reaped, and every one skipped, with why. */
