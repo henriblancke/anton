@@ -471,6 +471,56 @@ suite("worktree manager (real git)", () => {
       expect(status).not.toContain("rebase in progress");
     });
 
+    // anton-s55u (PR #279 review): a process killed between the rebase/merge call and its own
+    // `catch`'s abort leaves `rebase-merge`/`rebase-apply`/`MERGE_HEAD` on disk with HEAD detached
+    // while `branch` still points at its pre-rebase tip. `status --porcelain` alone can't tell that
+    // apart from ordinary parked edits, so this must be caught and aborted before the dirty-tree
+    // escape ever sees it — never dispatched into.
+    it("aborts and fails loud when a reused checkout has an unfinished rebase left by a killed process", async () => {
+      const branch = "anton/refresh-unfinished-rebase";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const beforeSha = headOf(first.path);
+      advanceDefaultBranch("unfinished-rebase-base.txt", "advance 8\n", "advance main (unfinished rebase)");
+
+      // A linked worktree's `.git` is a FILE (a gitdir pointer), not a directory, so the real
+      // per-worktree git-dir must be resolved the same way `unfinishedGitOperation` itself does —
+      // writing straight to `.git/rebase-merge` here would just fail with ENOTDIR.
+      const rebaseMergePath = execFileSync(
+        "git",
+        ["-C", first.path, "rev-parse", "--path-format=absolute", "--git-path", "rebase-merge"],
+        { encoding: "utf8" },
+      ).trim();
+      mkdirSync(rebaseMergePath, { recursive: true });
+
+      await expect(
+        createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+      ).rejects.toThrow(/had an unfinished git rebase in progress/);
+
+      // Never dispatched into — the branch itself is untouched.
+      expect(branchTip(branch)).toBe(beforeSha);
+    });
+
+    it("aborts and fails loud when a reused checkout has an unfinished merge left by a killed process", async () => {
+      const branch = "anton/refresh-unfinished-merge";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const beforeSha = headOf(first.path);
+      advanceDefaultBranch("unfinished-merge-base.txt", "advance 9\n", "advance main (unfinished merge)");
+
+      const mergeHeadPath = execFileSync(
+        "git",
+        ["-C", first.path, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"],
+        { encoding: "utf8" },
+      ).trim();
+      writeFileSync(mergeHeadPath, `${beforeSha}\n`);
+
+      await expect(
+        createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+      ).rejects.toThrow(/had an unfinished git merge in progress/);
+
+      // Never dispatched into — the branch itself is untouched.
+      expect(branchTip(branch)).toBe(beforeSha);
+    });
+
     it("fails loud on a conflicting divergence and never discards the branch's commits", async () => {
       const branch = "anton/refresh-conflict";
       const first = await createWorktree({ repoPath: repo, branch });

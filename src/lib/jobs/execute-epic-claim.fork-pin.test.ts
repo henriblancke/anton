@@ -70,7 +70,7 @@ const WORKTREE = "/tmp/wt";
 const FRESH_BASE = "origin/main";
 const clock: Clock = { now: () => 1_800_000_000_000 };
 
-function makeRun(runId = RUN_ID): EpicRun {
+function makeRun(runId = RUN_ID, overrides: Partial<EpicRun> = {}): EpicRun {
   return {
     db: t.db,
     clock,
@@ -85,6 +85,7 @@ function makeRun(runId = RUN_ID): EpicRun {
     lease: { assertHeld: () => {} },
     target: { id: EPIC, title: EPIC } as Bead,
     tickets: [],
+    ...overrides,
   } as unknown as EpicRun;
 }
 
@@ -324,6 +325,40 @@ it("keeps alreadyShippedBase at the frozen fork when the refresh skipped a dirty
   const { runStep } = await warmRunWorktree(makeRun());
 
   expect(runStep.alreadyShippedBase).toBe("old-fork-commit");
+});
+
+it("falls back alreadyShippedBase to a prior resume's recorded refresh when this attempt is skipped_dirty, without clobbering that record (PR #279 review)", async () => {
+  // Attempt 1 refreshed this reused checkout onto a fresh base (recorded as `merged` on the row).
+  // Attempt 2 (this one) finds the checkout dirty — `refreshOntoBase` reports `skipped_dirty`, its
+  // own no-op. `alreadyShippedBase` must fall back to attempt 1's recorded base, not the frozen
+  // `baseForkSha`, and the write must leave attempt 1's record alone rather than overwrite it with
+  // this attempt's non-move.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: "merged",
+    baseRefreshSha: "prior-base",
+  });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+    refreshOutcome: { outcome: "skipped_dirty", baseSha: "this-attempt-dirty-base" },
+  });
+
+  const { runStep } = await warmRunWorktree(
+    makeRun(RUN_ID, {
+      existing: { baseRefreshOutcome: "merged", baseRefreshSha: "prior-base" } as EpicRun["existing"],
+    }),
+  );
+
+  expect(runStep.baseForkSha).toBe("old-fork-commit");
+  expect(runStep.alreadyShippedBase).toBe("prior-base");
+
+  const row = await actualRuns.getRunById(t.db, RUN_ID);
+  expect(row?.baseRefreshOutcome).toBe("merged");
+  expect(row?.baseRefreshSha).toBe("prior-base");
 });
 
 it("poisons the run when failed fork-pin cleanup cannot prove complete removal", async () => {
