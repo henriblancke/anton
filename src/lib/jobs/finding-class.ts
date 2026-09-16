@@ -185,7 +185,15 @@ function matchesFencingToctou(note: string): boolean {
 const CANCEL_BARE = /\bcancell?(?:ations?|ing|ed|s)?\b/gi;
 const CANCEL_CONTEXT = /\b(?:awaits?|awaited|awaiting|signal|abortsignal|abortcontroller|requests?|caller|run|mid-?flight|in-?flight)\b/i;
 const CANCEL_REST =
-  /\bsignal\.aborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|orphaned (?:request|task|job)|\babort(?:s|ing)\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\babort(?:s|ing)\b|\baborted\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\baborted\b/i;
+  /\bsignal\.aborted\b|abort[- ]?signal|abortcontroller|after (?:the )?abort|ignores? the abort|continues? (?:after|when) (?:the )?(?:cancel|abort|signal)|\babort(?:s|ing)\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\babort(?:s|ing)\b|\baborted\b[^.]{0,40}\bawait\b|\bawait\b[^.]{0,40}\baborted\b/i;
+// "orphaned task/job/request" alone describes any leftover row or process, not specifically one
+// left behind by a cancellation race — "deleting the parent leaves an orphaned task row in the
+// database" is a data-integrity finding, not a cancellation one. It only counts alongside an
+// actual await/signal/abort/cancel context, not the broader CANCEL_CONTEXT list above (which
+// includes "request" itself and would make the gate vacuous for "orphaned request").
+const ORPHANED_WORK = /\borphaned (?:requests?|tasks?|jobs?)\b/gi;
+const ORPHANED_CANCEL_CONTEXT =
+  /\b(?:awaits?|awaited|awaiting|signal|abortsignal|abortcontroller|cancell?(?:ations?|ing|ed|s)?|abort(?:s|ed|ing)?|mid-?flight|in-?flight)\b/i;
 
 function matchesCancellation(note: string): boolean {
   if (CANCEL_REST.test(note)) return true;
@@ -193,6 +201,11 @@ function matchesCancellation(note: string): boolean {
     const start = Math.max(0, match.index - 60);
     const end = Math.min(note.length, match.index + match[0].length + 60);
     if (CANCEL_CONTEXT.test(note.slice(start, end))) return true;
+  }
+  for (const match of note.matchAll(ORPHANED_WORK)) {
+    const start = Math.max(0, match.index - 60);
+    const end = Math.min(note.length, match.index + match[0].length + 60);
+    if (ORPHANED_CANCEL_CONTEXT.test(note.slice(start, end))) return true;
   }
   return false;
 }
@@ -242,9 +255,8 @@ function matchesFailOpenTrueResult(note: string): boolean {
 // the lookup rejects" or "a failed check grants access" — describes the same authorization-on-
 // error behavior as the returns-form matchers above, just with the access noun as the sentence's
 // subject/object instead of a function's return value. No extra auth-context gate is needed here
-// (unlike the bare "true" matcher) since "access"/"permission"/"the request" are already
-// authorization-specific.
-const FAIL_OPEN_ACCESS_NOUN = "(?:access|permission|the request)";
+// since "access"/"permission" are already authorization-specific.
+const FAIL_OPEN_ACCESS_NOUN = "(?:access|permission)";
 const FAIL_OPEN_ACCESS_PASSIVE = `\\b${FAIL_OPEN_ACCESS_NOUN}\\b[^.]{0,20}?\\b(?:is|are|was|were|gets?|got)\\b[^.]{0,20}?\\b(?:allowed|granted|permitted|authorized)\\b`;
 const FAIL_OPEN_ACCESS_ACTIVE = `\\b(?:grants?|allows?|permits?|authorizes?)\\b[^.]{0,20}?\\b${FAIL_OPEN_ACCESS_NOUN}\\b`;
 const FAIL_OPEN_ACCESS_GRANTED_FIRST = new RegExp(
@@ -256,6 +268,39 @@ const FAIL_OPEN_ACCESS_GRANTED_LAST = new RegExp(
   "i",
 );
 
+// "the request" alone isn't authorization-specific the way "access"/"permission" are — "a failed
+// network call allows the request to be retried without backoff" is ordinary retry policy, not
+// fail-open. It only counts alongside an explicit permission/access/auth word nearby, checked with
+// a stricter context set than FAIL_OPEN_AUTH_CONTEXT: that set includes allow\w*/grant\w*, which
+// would trivially match the "allows"/"grants" verb already inside this pattern's own match.
+const FAIL_OPEN_REQUEST_NOUN = "the request";
+const FAIL_OPEN_REQUEST_PASSIVE = `\\b${FAIL_OPEN_REQUEST_NOUN}\\b[^.]{0,20}?\\b(?:is|are|was|were|gets?|got)\\b[^.]{0,20}?\\b(?:allowed|granted|permitted|authorized)\\b`;
+const FAIL_OPEN_REQUEST_ACTIVE = `\\b(?:grants?|allows?|permits?|authorizes?)\\b[^.]{0,20}?\\b${FAIL_OPEN_REQUEST_NOUN}\\b`;
+const FAIL_OPEN_REQUEST_GRANTED_FIRST = new RegExp(
+  `(?:${FAIL_OPEN_REQUEST_PASSIVE}|${FAIL_OPEN_REQUEST_ACTIVE})[^.]{0,50}?${FAIL_OPEN_ERROR_WORD}`,
+  "gi",
+);
+const FAIL_OPEN_REQUEST_GRANTED_LAST = new RegExp(
+  `${FAIL_OPEN_ERROR_WORD}[^.]{0,50}?(?:${FAIL_OPEN_REQUEST_PASSIVE}|${FAIL_OPEN_REQUEST_ACTIVE})`,
+  "gi",
+);
+const FAIL_OPEN_REQUEST_AUTH_CONTEXT =
+  /\b(?:permission|permissions|access|auth|authz|authoriz\w*|privilege\w*|role\w*|acl|scoped?|entitlement\w*)\b/i;
+
+function matchesFailOpenRequestGranted(note: string): boolean {
+  for (const re of [FAIL_OPEN_REQUEST_GRANTED_FIRST, FAIL_OPEN_REQUEST_GRANTED_LAST]) {
+    re.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(note))) {
+      const start = Math.max(0, match.index - 60);
+      const end = Math.min(note.length, match.index + match[0].length + 60);
+      if (FAIL_OPEN_REQUEST_AUTH_CONTEXT.test(note.slice(start, end))) return true;
+      re.lastIndex = match.index + 1;
+    }
+  }
+  return false;
+}
+
 function matchesFailOpen(note: string): boolean {
   return (
     FAIL_OPEN_LITERAL.test(note) ||
@@ -263,7 +308,8 @@ function matchesFailOpen(note: string): boolean {
     FAIL_OPEN_AUTHORIZED_RESULT_LAST.test(note) ||
     FAIL_OPEN_ACCESS_GRANTED_FIRST.test(note) ||
     FAIL_OPEN_ACCESS_GRANTED_LAST.test(note) ||
-    matchesFailOpenTrueResult(note)
+    matchesFailOpenTrueResult(note) ||
+    matchesFailOpenRequestGranted(note)
   );
 }
 

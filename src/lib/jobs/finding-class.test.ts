@@ -425,4 +425,24 @@ describe("classifyFindingClass", () => {
   it("classifies an empty note as the catch-all", () => {
     expect(classifyFindingClass(finding(""))).toBe("other");
   });
+
+  it("does not classify an orphaned-row data-integrity finding as cancellation without cancellation context", () => {
+    const note = "Deleting the parent leaves an orphaned task row in the database with no cleanup job to remove it.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies an orphaned-job finding as cancellation when await/signal context is nearby", () => {
+    const note = "If the caller aborts mid-flight, the in-progress step keeps running as an orphaned job with nothing to cancel it.";
+    expect(classifyFindingClass(finding(note))).toBe("cancellation");
+  });
+
+  it("does not classify ordinary retry policy as fail-open merely because it says 'allows the request'", () => {
+    const note = "A failed network call allows the request to be retried without backoff, which can hammer the upstream service.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies 'allows the request' as fail-open when auth context is also present", () => {
+    const note = "When the permission lookup fails, the middleware allows the request through instead of denying access.";
+    expect(classifyFindingClass(finding(note))).toBe("fail-open");
+  });
 });
