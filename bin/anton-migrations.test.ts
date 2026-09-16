@@ -376,6 +376,20 @@ describe("every bin this launcher spawns is pinned to anton's own node", () => {
     expect(resolveJsBin("git")).toBe(null);
   });
 
+  it("has no bare spawn of \"node\" anywhere — every re-exec uses this runtime", async () => {
+    // The whole class in one assertion, rather than one case per site. `anton update` re-execing
+    // the new launcher with a bare "node" was the last instance, found by sweeping for siblings
+    // after review caught the same mistake three times: it would restart the server on a different
+    // ABI than the one that just healed and migrated, at the moment an operator is least likely to
+    // connect the two (PR #298 review).
+    const src = await readFile(join(REPO_ROOT, "bin", "anton.mjs"), "utf8");
+    const bare = src
+      .split("\n")
+      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
+      .filter(({ line }) => /\bspawn(Sync)?\(\s*"node"/.test(line));
+    expect(bare.map(({ n, line }) => `${n}: ${line}`)).toEqual([]);
+  });
+
   it("daemonizes the server with process.execPath, not a PATH-resolved node", async () => {
     // startDaemon spawns the server directly rather than through runLocal, so the same pin has to
     // be spelled out there — it migrates first, then must launch under the node it healed for.

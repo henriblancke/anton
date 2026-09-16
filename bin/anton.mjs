@@ -1199,8 +1199,12 @@ async function cmdUpdate() {
 
   if (wasRunning) {
     console.log(c.dim("restarting…"));
-    // Re-exec the freshly installed launcher so the new runtime serves.
-    spawnSync("node", [join(runtime, "bin", "anton.mjs"), "start"], { stdio: "inherit" });
+    // Re-exec the freshly installed launcher so the new runtime serves — under THIS runtime, not
+    // whichever one PATH happens to answer with. Found by sweeping for siblings after the review
+    // caught this same class three times (PR #298 review): a bare "node" here restarts the server
+    // on a different ABI than the one that just healed and migrated, which is this bead's bug
+    // reappearing at the end of an upgrade, when the operator is least likely to connect the two.
+    spawnSync(process.execPath, [join(runtime, "bin", "anton.mjs"), "start"], { stdio: "inherit" });
   }
   return 0;
 }
