@@ -8,11 +8,21 @@
  * it lands instead.
  *
  * Pure over a board snapshot the caller already holds, so it costs no bd spawn of its own: board.ts
- * hands it the same `workBeads` list the cards are built from.
+ * hands it the RAW `allBeads` snapshot, not the pipeline-stripped `workBeads` the cards are built
+ * from — `hasOpenBlockers` below needs closed gate beads on hand to resolve `blocks` edges, and a
+ * gate absent from the lookup reads as an open blocker forever (PR #288 review).
  */
 import { beads, type Bead } from "./beads/bd";
 import { isPipelineArtifact } from "./beads/contract";
-import { boardCards, deriveStage, isRunTicket, labelValue, parseGoal } from "./ticket-view";
+import {
+  boardCards,
+  deriveStage,
+  hasOpenBlockers as computeHasOpenBlockers,
+  hasOpenDescendants as computeHasOpenDescendants,
+  isRunTicket,
+  labelValue,
+  parseGoal,
+} from "./ticket-view";
 import type { OperatorQueueItem } from "./types";
 
 /**
@@ -56,8 +66,10 @@ function byNewestAsk(a: OperatorQueueItem, b: OperatorQueueItem): number {
  * a ticket under an unapproved (or closed, or abandoned) target is not queued for anyone yet. Every
  * other bead answers for itself.
  *
- * Container epics and pipeline plumbing are not work and never appear: a container's features each
- * run on their own, and a molecule/gate coordinates work without being any.
+ * Container epics and pipeline plumbing are not work and never appear as a queue row: a container's
+ * features each run on their own, and a molecule/gate coordinates work without being any. But `all`
+ * must still be the UNFILTERED board — closed gates included — because the blocker/descendant
+ * eligibility checks below key off `bead.id` lookups into it (PR #288 review).
  */
 export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
   const work = all.filter((bead) => !isPipelineArtifact(bead));
@@ -80,6 +92,17 @@ export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
     // is ever armed on this ticket — the row must not send the operator looking for an escalation
     // that does not exist (PR #214 review).
     const holdsRun = target ? !beads.isHumanWork(target) : false;
+    // Mark done closes THIS bead (item.id), not its run target, so it's this bead's own
+    // descendants — not the target's — that decide whether `bd close` would refuse it. Shared with
+    // `closeHumanTicket` (close-human.ts) and the ticket dialog's Mark-done gate (ticket-detail.ts),
+    // which previously read this off two other copies of the predicate that had drifted apart
+    // (PR #288 review).
+    const hasOpenDescendants = computeHasOpenDescendants(bead, all);
+    // Mirrors hasOpenDescendants above: `closeHumanTicket` also 409s on an ordinary open `blocks`
+    // dependency (openBlockersOf in jobs/execute-epic-human-gate.ts), a hold `holdsRun` never
+    // represents — a live run and a plain sibling prerequisite are different reasons the close would
+    // fail, and the row must withhold Mark done for either (PR #288 review).
+    const blocked = computeHasOpenBlockers(bead, all);
 
     const goal = parseGoal(bead);
     const risk = labelValue(bead.labels, "risk");
@@ -93,6 +116,8 @@ export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
       ...(risk ? { risk } : {}),
       ...(size ? { size } : {}),
       ...(target ? { runTarget: { id: target.id, title: target.title }, holdsRun } : {}),
+      ...(hasOpenDescendants ? { hasOpenDescendants } : {}),
+      ...(blocked ? { hasOpenBlockers: blocked } : {}),
     });
   }
 

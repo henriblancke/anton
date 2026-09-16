@@ -11,12 +11,17 @@
  * Which beads reach this band, and in what order, is the read's job — see operator-queue.test.ts.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { OperatorQueue } from "@/components/board/operator-queue";
 import type { OperatorQueueItem } from "@/lib/types";
 
-afterEach(cleanup);
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 function item(o: Partial<OperatorQueueItem> = {}): OperatorQueueItem {
   return {
@@ -159,18 +164,35 @@ describe("OperatorQueue", () => {
     expect(screen.getByRole("link", { name: "anton-f1" })).toBeTruthy();
   });
 
-  it("tells a run target's row what closes it, since no run ever will", () => {
+  it("tells a run target's row what closes it, since no run ever will — and offers the control", () => {
     // Beads close when a run finishes the work, and this one is refused before dispatch — so the
-    // row that is the whole ask has to name what settles it, or the operator does the work and then
-    // hunts the board for a completion button that does not exist (PR #214 review).
+    // row that is the whole ask has to name what settles it. Words alone used to be the answer
+    // (PR #214 review); now it's a button that closes the bead itself (anton-fgqr).
     render(<OperatorQueue slug="anton" items={[item({ id: "anton-t9" })]} onOpenTicket={() => {}} />);
 
     const row = screen.getByRole("listitem").textContent ?? "";
     expect(row).toContain("nothing closes it for you");
-    expect(row).toContain("bd close anton-t9");
+    expect(screen.getByRole("button", { name: "Mark done" })).toBeTruthy();
   });
 
-  it("leaves that closing line off a ticket, whose run target owns the settling", () => {
+  it("offers Mark done on a ticket under a human target too, since no run ever reaches it either", () => {
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[
+          item({
+            id: "anton-f1.1",
+            runTarget: { id: "anton-f1", title: "Buy the domain" },
+            holdsRun: false,
+          }),
+        ]}
+        onOpenTicket={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Mark done" })).toBeTruthy();
+  });
+
+  it("withholds Mark done from a row that holds a run — the resumed run closes that ticket instead", () => {
     render(
       <OperatorQueue
         slug="anton"
@@ -181,7 +203,59 @@ describe("OperatorQueue", () => {
       />,
     );
 
-    expect(screen.getByRole("listitem").textContent ?? "").not.toContain("bd close");
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("withholds Mark done from a bead that still has open work under it — closeHumanTicket would 409", () => {
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[item({ id: "anton-e1", hasOpenDescendants: true })]}
+        onOpenTicket={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("withholds Mark done from a bead still held by an ordinary open blocks dependency", () => {
+    // PR #288 review: `closeHumanTicket` 409s on any open `blocks` dependency, not just a held run
+    // or open descendants, so the row must withhold on it too.
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[item({ id: "anton-t1", hasOpenBlockers: true })]}
+        onOpenTicket={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("arms a confirm before POSTing the close route, then reports the row settled", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify({ detail: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const onDone = vi.fn();
+
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[item({ id: "anton-t9" })]}
+        onOpenTicket={() => {}}
+        onDone={onDone}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    expect(fetchMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+
+    await waitFor(() => expect(onDone).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/api/projects/anton/tickets/anton-t9/close");
+    expect(init.method).toBe("POST");
   });
 
   it("marks an ask someone has already picked up, and leaves an untouched one unchipped", () => {
