@@ -162,10 +162,84 @@ describe("runLocalPinnedToThisNode (source checkout → drizzle-kit under THIS n
 });
 
 describe("ensureMigrated (source checkout → heals the native ABI before drizzle-kit)", () => {
-  it("exposes the same heal the bundle branch gets, rather than leaving the source path bare", () => {
-    // The regression this guards: `ensureBetterSqlite3` existed with exactly ONE call site, inside
-    // applyMigrations (bundle-only), so a source checkout reached drizzle-kit unprotected. Both
-    // branches must now be able to heal. Probing the repo's own build is the cheap half of that.
-    expect(ensureBetterSqlite3(REPO_ROOT)).toBe("ok");
+  // The regression this guards: `ensureBetterSqlite3` existed with exactly ONE call site, inside
+  // applyMigrations (bundle-only), so a source checkout reached drizzle-kit unprotected. These
+  // drive `ensureMigrated({ isBundle: false })` itself — deleting the heal from that branch must
+  // turn a case here RED, which a direct `ensureBetterSqlite3` probe could never do (PR #298 review).
+  const trace = () => {
+    const calls: string[] = [];
+    return {
+      calls,
+      heal: (appRoot?: string) => {
+        calls.push(`heal:${appRoot ?? "default"}`);
+        return "ok" as const;
+      },
+      run: (bin: string, args: string[]) => {
+        calls.push(`run:${bin} ${args.join(" ")}`);
+        return 0;
+      },
+    };
+  };
+
+  it("heals the ABI BEFORE spawning drizzle-kit, not after", () => {
+    const t = trace();
+    expect(ensureMigrated({ isBundle: false, appRoot: REPO_ROOT, heal: t.heal, run: t.run })).toEqual({ ran: null });
+    // Order is the whole fix: healing after the spawn is the crash this bead was filed for.
+    expect(t.calls).toEqual([`heal:${REPO_ROOT}`, "run:drizzle-kit migrate"]);
+  });
+
+  it("does not spawn drizzle-kit at all when the heal throws", () => {
+    const t = trace();
+    const boom = () => {
+      throw new Error("no prebuilt better-sqlite3 for Node v99 on this platform");
+    };
+    // An unhealable ABI must surface as ITS own error. Falling through to drizzle-kit would bury it
+    // under the raw ERR_DLOPEN_FAILED stack that made this read as a migration bug.
+    expect(() => ensureMigrated({ isBundle: false, appRoot: REPO_ROOT, heal: boom, run: t.run })).toThrow(/no prebuilt/);
+    expect(t.calls).toEqual([]);
+  });
+
+  it("fails start when drizzle-kit exits non-zero", () => {
+    const t = trace();
+    expect(() =>
+      ensureMigrated({ isBundle: false, appRoot: REPO_ROOT, heal: t.heal, run: () => 1 }),
+    ).toThrow(/drizzle-kit migrate failed/);
+  });
+
+  it("runs the REAL heal when only the spawn is stubbed", () => {
+    // The cases above stub both seams, so they would still pass if `heal` defaulted to a no-op.
+    // Leaving `heal` at its default sends the branch through the actual `ensureBetterSqlite3`
+    // against the repo's own build: it must probe better-sqlite3 for real and come back clean.
+    const t = trace();
+    expect(ensureMigrated({ isBundle: false, appRoot: REPO_ROOT, run: t.run })).toEqual({ ran: null });
+    expect(t.calls).toEqual(["run:drizzle-kit migrate"]);
+  });
+});
+
+describe("every bin this launcher spawns is pinned to anton's own node", () => {
+  // Structural, because the alternative is a real two-node machine. `next` and `drizzle-kit` are
+  // both `#!/usr/bin/env node`, and both load better-sqlite3 — drizzle-kit to migrate, next through
+  // instrumentation as the server boots. A bare `runLocal` call site is a child free to resolve a
+  // different node than the one `ensureBetterSqlite3` just healed for, which moves the crash rather
+  // than fixing it: migrations pass, then the server dies on the reversed mismatch (PR #298 review).
+  it("has no bare runLocal(...) call site left in anton.mjs", async () => {
+    const src = await readFile(join(REPO_ROOT, "bin", "anton.mjs"), "utf8");
+    const bare = src
+      .split("\n")
+      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
+      .filter(({ line }) => /(?<!PinnedToThisNode)\brunLocal\(/.test(line) && !line.startsWith("*"))
+      // Two legal mentions: `runLocal`'s own definition, and the one delegation to it from inside
+      // `runLocalPinnedToThisNode`. Every OTHER call site is a child left free to pick its own node.
+      .filter(({ line }) => !line.startsWith("function runLocal(bin, args"))
+      .filter(({ line }) => !line.startsWith("return runLocal(bin, args, { ...env, PATH:"));
+    expect(bare.map(({ n, line }) => `${n}: ${line}`)).toEqual([]);
+  });
+
+  it("daemonizes the server with process.execPath, not a PATH-resolved node", async () => {
+    // startDaemon spawns the server directly rather than through runLocal, so the same pin has to
+    // be spelled out there — it migrates first, then must launch under the node it healed for.
+    const src = await readFile(join(REPO_ROOT, "bin", "anton.mjs"), "utf8");
+    expect(src).toContain("spawn(process.execPath, spawnArgs");
+    expect(src).not.toContain('spawn("node", spawnArgs');
   });
 });

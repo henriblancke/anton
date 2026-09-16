@@ -367,7 +367,13 @@ function nextArgs(sub, args) {
   return port ? [sub, "-p", String(port)] : [sub];
 }
 
-/** Run a local package bin (next / drizzle-kit) from APP_ROOT, inheriting stdio. Returns exit code. */
+/**
+ * Run a local package bin from APP_ROOT, inheriting stdio. Returns exit code.
+ *
+ * Plumbing for `runLocalPinnedToThisNode` below, which is what callers use: every bin this launcher
+ * spawns (`next`, `drizzle-kit`) loads better-sqlite3, so every one of them needs the pin. Calling
+ * this directly leaves the child free to resolve a different node than the one anton healed for.
+ */
 function runLocal(bin, args, env = {}) {
   const exe = join(BIN, bin);
   const target = existsSync(exe) ? exe : bin; // fall back to PATH if not vendored
@@ -380,7 +386,13 @@ function runLocal(bin, args, env = {}) {
 }
 
 /**
- * `runLocal` for a bin that loads better-sqlite3 (drizzle-kit), pinned to THIS Node.
+ * `runLocal` for a bin that loads better-sqlite3, pinned to THIS Node.
+ *
+ * That is every bin this launcher spawns: `drizzle-kit` opens the DB to migrate, and `next` (dev,
+ * build and start alike) reaches it through instrumentation as the server boots. Pinning only the
+ * migration would heal an ABI the server then fails to load, moving the same crash one step later
+ * — migrations pass, the server dies reporting the mismatch with the numbers reversed (PR #298
+ * review).
  *
  * Those bins start with `#!/usr/bin/env node`, so as their own process they resolve node from PATH
  * — which is not necessarily the node running anton. That split is routine rather than exotic: with
@@ -796,6 +808,11 @@ function applyMigrations(dbPath, opts = {}) {
  * Idempotent — a start with nothing pending is a clean no-op.
  * Throws on failure so the caller can abort rather than serve a stale schema. (The bundle DAEMON
  * path migrates in startDaemon; this covers source `start` and bundle `--foreground`.)
+ *
+ * `heal` and `run` are injected so the source branch is testable without a real ABI break or a real
+ * migrate — the same seam `ensureFreshBuild` takes its `build` through. The defaults are the whole
+ * point of the branch, so a test that stubs them asserts the ORDER (heal, then spawn); that the
+ * default spawn is the PINNED one is asserted structurally, in the guard over this file's call sites.
  */
 function ensureMigrated(opts = {}) {
   const isBundle = opts.isBundle ?? IS_BUNDLE;
@@ -809,10 +826,10 @@ function ensureMigrated(opts = {}) {
   // branch heals inside applyMigrations, so heal here too (anton-m6pg6). Without this the ABI
   // mismatch surfaces from INSIDE drizzle-kit as a raw ERR_DLOPEN_FAILED stack, which reads as a
   // migration bug rather than the one-command environment fix it actually is.
-  ensureBetterSqlite3(opts.appRoot);
+  (opts.heal ?? ensureBetterSqlite3)(opts.appRoot);
   // drizzle-kit tracks applied migrations in __drizzle_migrations, so re-running with nothing
   // pending is a no-op. A non-zero exit (bad SQL, unreachable DB) must fail start.
-  const rc = runLocalPinnedToThisNode("drizzle-kit", ["migrate"]);
+  const rc = (opts.run ?? runLocalPinnedToThisNode)("drizzle-kit", ["migrate"]);
   if (rc !== 0) throw new Error("drizzle-kit migrate failed — see output above");
   return { ran: null };
 }
@@ -857,7 +874,10 @@ async function startDaemon(args) {
   const spawnArgs = useStandalone
     ? [standaloneServer]
     : [join(APP_ROOT, "node_modules", "next", "dist", "bin", "next"), "start", "-p", String(port)];
-  const child = spawn("node", spawnArgs, {
+  // `process.execPath`, not "node": applyMigrations above healed the addon for THIS node's ABI, and
+  // a bare "node" would resolve PATH's — which on a two-node machine is the other one, leaving the
+  // daemon to die on the mismatch the heal just fixed (PR #298 review).
+  const child = spawn(process.execPath, spawnArgs, {
     cwd: APP_ROOT,
     detached: true,
     stdio: ["ignore", out, err],
@@ -2133,7 +2153,7 @@ async function cmdServerMode(args = []) {
 
 function cmdDev(args) {
   console.log(c.dim("anton dev — starting Next.js dev server (runner + scheduler auto-start)…"));
-  return runLocal("next", nextArgs("dev", args));
+  return runLocalPinnedToThisNode("next", nextArgs("dev", args));
 }
 
 /**
@@ -2185,7 +2205,7 @@ const MAX_BUILD_ATTEMPTS = 3;
 function ensureFreshBuild({
   appRoot,
   isBundle,
-  build = () => runLocal("next", ["build", "--webpack"]),
+  build = () => runLocalPinnedToThisNode("next", ["build", "--webpack"]),
   readIdentity = readBuildIdentity,
   liveServers = () => liveBuildRecords(resolveAntonDb(), appRoot),
 }) {
@@ -2264,7 +2284,7 @@ async function cmdStart(args) {
   // STATE_DIR (the same env startDaemon passes), so it opens the DB ensureMigrated() just migrated
   // rather than falling back to a stray anton.db under the cwd. Source checkouts resolve their own DB.
   const serverEnv = IS_BUNDLE ? bundleStateEnv() : {};
-  return runLocal("next", nextArgs("start", args), serverEnv);
+  return runLocalPinnedToThisNode("next", nextArgs("start", args), serverEnv);
 }
 
 const USAGE = `${c.bold("anton")} — local autonomous-coding orchestrator
