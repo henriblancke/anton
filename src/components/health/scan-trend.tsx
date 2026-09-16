@@ -16,6 +16,48 @@ const SEVERITY_BAR: Record<ScanSeverity, string> = {
   low: "bg-stage-backlog/70",
 };
 
+/** A segment's minimum share of the container height — floored so a single signal still draws. */
+const FLOOR_PCT = 6;
+
+/**
+ * A column's segment heights, as a percent of the shared container height (`peak` sets the scale
+ * for every column, so the tallest column's segments sum to exactly 100%). Flooring each segment
+ * independently against a full 100% track — an earlier approach — asks a column with more than
+ * one severity for over 100% of its own track, and flexbox silently shrinks every segment to fit,
+ * distorting the very ratios the chart exists to show (anton-knyp).
+ *
+ * So each severity is floored against `FLOOR_PCT` directly: it draws at its natural proportional
+ * share of the track, or `FLOOR_PCT`, whichever is bigger. That lets a short column's segments grow
+ * past what its own track would proportionally allow — the container's shared 100% budget is the
+ * only ceiling, not the column's own (often tiny) track, since funding the raise out of the track
+ * itself starves a quiet column next to a tall peak the same way flooring against a full 100% track
+ * once did (anton-knyp): at most 4 severities and a 6% floor cost at most 24% of the container, so a
+ * column has to already be within ~76% of the peak's track before flooring can threaten to overflow
+ * it at all.
+ *
+ * Only when that raise pushes the column's own total past the shared 100% ceiling — which can only
+ * happen on a column whose track was already close to it — do the above-floor segments give back
+ * the difference, in proportion to how far each cleared the floor, the same way flex-shrink would.
+ */
+function severityHeights(bySeverity: Record<ScanSeverity, number>, peak: number) {
+  const present = SCAN_SEVERITIES.filter((s) => bySeverity[s] > 0);
+
+  const heights = new Map<ScanSeverity, number>(
+    present.map((s) => [s, Math.max((bySeverity[s] / peak) * 100, FLOOR_PCT)]),
+  );
+
+  const overflow = [...heights.values()].reduce((sum, h) => sum + h, 0) - 100;
+  if (overflow <= 0) return heights;
+
+  const surplus = present.reduce((sum, s) => sum + Math.max(0, (heights.get(s) ?? 0) - FLOOR_PCT), 0);
+  for (const s of present) {
+    const h = heights.get(s) ?? 0;
+    if (h > FLOOR_PCT) heights.set(s, h - ((h - FLOOR_PCT) / surplus) * overflow);
+  }
+
+  return heights;
+}
+
 /**
  * One column per scan, oldest → newest, stacked by severity (anton-bz1w). Bars rather than a line:
  * each column is one nightly pass — a discrete event with an internal split — not a sample of a
@@ -78,22 +120,27 @@ export function ScanTrend({ points, className }: { points: ScanHealthPoint[]; cl
             className="flex h-full min-w-1.5 flex-1 flex-col justify-end"
           >
             {point.total > 0 ? (
-              // Worst first, so a column reads top-down the way the legend does.
-              SCAN_SEVERITIES.filter((s) => point.bySeverity[s] > 0).map((severity) => (
-                <span
-                  key={severity}
-                  className={cn(
-                    "w-full rounded-[1px]",
-                    SEVERITY_BAR[severity],
-                    point.incomplete && "opacity-40",
-                  )}
-                  // Floored so a single signal still draws — an invisible segment reads as absent,
-                  // which is the one thing it is not.
-                  style={{
-                    height: `${Math.max(6, (point.bySeverity[severity] / peak) * 100)}%`,
-                  }}
-                />
-              ))
+              // A flex-1 wrapper, not the column itself, hosts the percent-sized segments: the
+              // amber marker below is a flex sibling with its own fixed size, so wrapping the
+              // segments lets flex subtract the marker's height first — the segments' 100% then
+              // means 100% of what's left, not 100% of the column, so a floored segment can no
+              // longer be shrunk back below its floor by the marker's own footprint (anton-knyp).
+              <span className="flex w-full flex-1 flex-col justify-end">
+                {/* Worst first, so a column reads top-down the way the legend does. */}
+                {Array.from(severityHeights(point.bySeverity, peak)).map(
+                  ([severity, height]) => (
+                    <span
+                      key={severity}
+                      className={cn(
+                        "w-full rounded-[1px]",
+                        SEVERITY_BAR[severity],
+                        point.incomplete && "opacity-40",
+                      )}
+                      style={{ height: `${height}%` }}
+                    />
+                  ),
+                )}
+              </span>
             ) : point.incomplete ? null : (
               <span className="h-0.5 w-full rounded-[1px] bg-stage-done/60" />
             )}
