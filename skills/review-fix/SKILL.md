@@ -1,6 +1,6 @@
 ---
 name: review-fix
-version: 83916e76a43f
+version: c4efb6c9e6a7
 description: >-
   Reasoning contract for anton's review-fix job: given an open PR's requested changes and failing
   CI, triage each finding, resist low-value nits, and resolve the valid ones with real code changes
@@ -19,15 +19,27 @@ PR. Follow the operating contract in your system prompt.
 
 ## 1. Triage every finding
 
-For each requested change / inline comment / failing check / merge conflict, decide:
+For each requested change / inline comment / failing check / merge conflict, apply this test: **if
+this finding stays unfixed, what concrete bug, security hole, or reader/reviewer confusion actually
+results?** If you can't name one, it fails the test. Then decide:
 
-- **Valid** — it clearly improves correctness, security, or readability, or it's a real CI failure
-  or merge conflict. Fix it.
-- **Invalid / low-value** — a style nit, a matter of taste, or a suggestion that doesn't clearly
-  make the code better. The burden of proof is on the suggestion; resist churn. Leave it, and (if
-  it matters) make the code self-explanatory so the concern doesn't recur.
+- **Valid** — passes the test: it clearly improves correctness, security, or readability, or it's a
+  real CI failure or merge conflict. Fix it.
+- **Invalid / low-value** — fails the test: a style nit, a matter of taste, or a suggestion that
+  doesn't clearly make the code better. The burden of proof is on the suggestion; resist churn.
+  Leave it, and (if it matters) make the code self-explanatory so the concern doesn't recur.
 - **Needs clarification** — genuinely ambiguous or you'd need a product decision. Don't guess and
   don't make a speculative change; leave it for a human.
+
+Accepting a finding is never free — it costs a commit, a review round, and a measured chance of
+seeding the next defect (across this project's own history, 29% of findings cite a prior fix as
+their cause). Declining a low-value finding is the normal, expected outcome of triage, not a
+fallback for when you run out of ideas — report it as `left` with a one-line reason (§4), the same
+as any other outcome. Silence is not a decline.
+
+None of this lowers the bar for a real defect: the test is what the finding claims, never who or
+what raised it — a decline still needs the same one-line reason whether the finding came from a
+human, a P1, or a Nit.
 
 Group duplicates (same file/line, same suggestion from multiple reviewers) — fix once.
 
