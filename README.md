@@ -115,7 +115,7 @@ anton drives external CLIs. Install these and make sure they're on your `PATH`:
 
 ### Installing them
 
-- **node ≥ 20** — via [nvm](https://github.com/nvm-sh/nvm) (`nvm install 22`), [fnm](https://github.com/Schniz/fnm) (`fnm install 22`), Homebrew (`brew install node`), or [nodejs.org](https://nodejs.org). The prebuilt bundle self-heals its native modules for your Node version during `anton setup`, so any current major works.
+- **node ≥ 20** — via [nvm](https://github.com/nvm-sh/nvm) (`nvm install 24`), [fnm](https://github.com/Schniz/fnm) (`fnm install 24`), Homebrew (`brew install node`), or [nodejs.org](https://nodejs.org). The prebuilt bundle self-heals its native modules for your Node version during `anton setup`, so any current major works. Developing anton itself wants the `.nvmrc` version (24.21.0 — what CI and the release bundle build against); `anton doctor` names a Node below it without failing you.
 - **git** — `xcode-select --install` (macOS) · `brew install git` · `apt install git` / `dnf install git` (Linux).
 - **bd** (beads) — the work source of truth:
   ```bash

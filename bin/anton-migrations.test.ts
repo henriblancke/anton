@@ -17,7 +17,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { chmod, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { applyMigrations, ensureBetterSqlite3, ensureMigrated, runLocalPinnedToThisNode } from "./anton.mjs";
+import { applyMigrations, cmdDev, ensureBetterSqlite3, ensureMigrated, healNativeAbi, runLocalPinnedToThisNode } from "./anton.mjs";
 
 import { exists, pathWith, REPO_ROOT, tempDir, withDb } from "./anton.fixture";
 
@@ -213,6 +213,68 @@ describe("ensureMigrated (source checkout → heals the native ABI before drizzl
     const t = trace();
     expect(ensureMigrated({ isBundle: false, appRoot: REPO_ROOT, run: t.run })).toEqual({ ran: null });
     expect(t.calls).toEqual(["run:drizzle-kit migrate"]);
+  });
+});
+
+describe("cmdDev (heals before it pins, like every other spawning command)", () => {
+  // The regression the second review round caught in the first fix: pinning `next dev` without
+  // healing first TRADES one crash for another. Unpinned, the child resolved its own node and could
+  // land on the ABI the installed addon was built for; the pin removes that coincidence, so a dev
+  // server nobody healed fails where it used to boot — in the most-run command (PR #298 review).
+  it("heals the ABI BEFORE spawning next dev", () => {
+    const calls: string[] = [];
+    const rc = cmdDev([], {
+      heal: () => {
+        calls.push("heal");
+        return 0;
+      },
+      run: (bin: string, args: string[]) => {
+        calls.push(`run:${bin} ${args.join(" ")}`);
+        return 0;
+      },
+    });
+    expect(rc).toBe(0);
+    expect(calls).toEqual(["heal", "run:next dev"]);
+  });
+
+  it("does not start the dev server at all when the heal fails", () => {
+    const calls: string[] = [];
+    // A dev server on an unhealable ABI would boot and then die inside instrumentation, which is
+    // the ERR_DLOPEN_FAILED wall this bead exists to replace. Refuse with the heal's own exit code.
+    const rc = cmdDev([], { heal: () => 1, run: (bin: string) => (calls.push(bin), 0) });
+    expect(rc).toBe(1);
+    expect(calls).toEqual([]);
+  });
+
+  it("heals without migrating, so dev still comes up mid-migration", () => {
+    // Deliberately unlike `cmdStart`: `next dev` should serve whatever schema is on disk, so a
+    // developer can start the server on a branch whose migrations are not written yet.
+    const calls: string[] = [];
+    cmdDev([], { heal: () => (calls.push("heal"), 0), run: () => (calls.push("run"), 0) });
+    expect(calls).not.toContain("migrate");
+  });
+});
+
+describe("healNativeAbi (reports instead of throwing past main's missing catch)", () => {
+  it("returns 0 on a healthy build", () => {
+    expect(healNativeAbi(REPO_ROOT)).toBe(0);
+  });
+
+  it("returns 1 rather than throwing when the heal cannot succeed", async () => {
+    // `main` runs as `Promise.resolve(main(...)).then(...)` with NO top-level catch, so a throw
+    // from any command body becomes an unhandled rejection and a raw stack — exactly the output
+    // this bead replaces with one line of advice (PR #298 review).
+    //
+    // The root must be OUTSIDE the repo: node resolves `node_modules` upward, so a bogus path under
+    // REPO_ROOT still finds the repo's own healthy better-sqlite3 and heals fine. A tmpdir has no
+    // node_modules above it, so the require throws — the non-ABI branch `ensureBetterSqlite3`
+    // re-throws and this must catch.
+    const isolated = await tempDir("anton-heal-isolated-");
+    try {
+      expect(healNativeAbi(isolated)).toBe(1);
+    } finally {
+      await rm(isolated, { recursive: true, force: true });
+    }
   });
 });
 

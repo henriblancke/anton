@@ -763,6 +763,25 @@ function ensureBetterSqlite3(appRoot = APP_ROOT) {
 }
 
 /**
+ * `ensureBetterSqlite3` for a caller that must REPORT rather than throw. Returns an exit code.
+ *
+ * The heal throws when there is no prebuilt for this Node/platform, and `main` is invoked as
+ * `Promise.resolve(main(...)).then(...)` with no top-level catch — so an uncaught throw here
+ * surfaces as an unhandled rejection and a raw stack, which is precisely the ERR_DLOPEN_FAILED
+ * wall of text this bead exists to replace with one line of advice (PR #298 review).
+ */
+function healNativeAbi(appRoot = APP_ROOT) {
+  try {
+    ensureBetterSqlite3(appRoot);
+    return 0;
+  } catch (e) {
+    console.log(c.red("\n✗ better-sqlite3 cannot be loaded under this Node."));
+    console.log(c.red(`  ${String(e.message ?? e)}`));
+    return 1;
+  }
+}
+
+/**
  * Apply the committed drizzle migration SQL directly via better-sqlite3 (a production dep), so a
  * prebuilt bundle needs no drizzle-kit (a devDep we don't ship). Idempotent: tracks applied files
  * in `__anton_migrations` and only runs new ones. Mirrors the SQL-splitting in src/lib/db/testing.ts.
@@ -1167,6 +1186,19 @@ async function cmdUninstall(args = []) {
   return 0;
 }
 
+/**
+ * The two Node floors, which are deliberately different and must not be conflated.
+ *
+ * NODE_MIN is what anton RUNS on: the bundle self-heals its native modules per ABI during setup,
+ * so any current major works and the README says so. NODE_DEV is what this repo DEVELOPS against —
+ * `.nvmrc`, `engines.node`, and the Node `release.yml` builds the bundle with, pinned together so a
+ * three-ABI machine (nvm, Homebrew, bun's embedded) has one answer. Both are declared here so the
+ * check, the warning, and the docs cannot drift apart again (PR #298 review).
+ */
+const NODE_MIN = 20;
+const NODE_DEV = "24.21.0";
+const NODE_DEV_MAJOR = Number(NODE_DEV.split(".")[0]);
+
 /** Prereq check. Returns true when all *required* tools are present. */
 function checkPrereqs() {
   console.log(c.bold("\nChecking prerequisites:"));
@@ -1188,10 +1220,17 @@ function checkPrereqs() {
     if ((!present || bdTooOld) && p.required) ok = false;
   }
   const node = process.versions.node.split(".").map(Number);
-  const nodeOk = node[0] >= 20;
+  const nodeOk = node[0] >= NODE_MIN;
+  const belowDev = nodeOk && node[0] < NODE_DEV_MAJOR;
   console.log(
-    `  ${nodeOk ? "✓" : "✗"} ${"node".padEnd(9)} ${nodeOk ? c.green(process.versions.node) : c.red(process.versions.node + " (need ≥20)")}`,
+    `  ${nodeOk ? "✓" : "✗"} ${"node".padEnd(9)} ${nodeOk ? c.green(process.versions.node) : c.red(`${process.versions.node} (need ≥${NODE_MIN})`)}` +
+      (belowDev ? c.yellow(`  ! below the ${NODE_DEV} this repo develops and releases against`) : ""),
   );
+  // Named, not failed: a bundle self-heals its native modules for any Node ≥ NODE_MIN, so a 20–23
+  // machine is supported and must not be told otherwise. But `engines`/.nvmrc pin NODE_DEV, and a
+  // package manager run with --engine-strict enforces that pin — so doctor passing in silence is
+  // how "doctor says you're fine" turns into an install-time failure nothing warned about
+  // (PR #298 review). The warning is the honest middle: supported, not what we build against.
   return ok && nodeOk;
 }
 
@@ -1595,7 +1634,10 @@ async function cmdSetup(args = []) {
     }
   } else {
     console.log(c.bold("\nApplying database migrations (drizzle-kit migrate):"));
-    ensureBetterSqlite3(); // same heal the bundle branch gets via applyMigrations (anton-m6pg6)
+    // Same heal the bundle branch gets via applyMigrations (anton-m6pg6) — and reported the same
+    // way, since the bundle branch wraps its own in a try/catch and this one throws too.
+    const healed = healNativeAbi();
+    if (healed !== 0) return healed;
     const migrated = runLocalPinnedToThisNode("drizzle-kit", ["migrate"]);
     if (migrated !== 0) {
       console.log(c.red("migration failed — see output above."));
@@ -2151,9 +2193,26 @@ async function cmdServerMode(args = []) {
   return 0;
 }
 
-function cmdDev(args) {
+/**
+ * `next dev`, healed then pinned — in that order (PR #298 review).
+ *
+ * The heal is not optional once the spawn is pinned. Unpinned, `next dev` resolved its own node and
+ * could happen to land on the one the installed addon was built for; pinning takes that coincidence
+ * away, so a dev server whose ABI nobody healed now fails where it used to boot. Every other
+ * command that spawns a better-sqlite3 child already heals first — `cmdSetup` before drizzle-kit,
+ * `cmdStart` via ensureMigrated, `startDaemon` via applyMigrations — and dev is the one run most.
+ *
+ * It heals WITHOUT migrating: `next dev` is the one command that should come up against whatever
+ * schema is on disk, so a developer can start the server on a branch mid-migration.
+ *
+ * `heal`/`run` are injected for the same reason `ensureMigrated` takes them — to assert the order
+ * without a real ABI break or a real dev server.
+ */
+function cmdDev(args, opts = {}) {
+  const healed = (opts.heal ?? healNativeAbi)();
+  if (healed !== 0) return healed;
   console.log(c.dim("anton dev — starting Next.js dev server (runner + scheduler auto-start)…"));
-  return runLocalPinnedToThisNode("next", nextArgs("dev", args));
+  return (opts.run ?? runLocalPinnedToThisNode)("next", nextArgs("dev", args));
 }
 
 /**
@@ -2386,10 +2445,14 @@ export {
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
   compareVersions,
+  NODE_MIN,
+  NODE_DEV,
   platformLabel,
   fetchLatestRelease,
   applyMigrations,
   ensureMigrated,
   ensureBetterSqlite3,
+  healNativeAbi,
+  cmdDev,
   runLocalPinnedToThisNode,
 };
