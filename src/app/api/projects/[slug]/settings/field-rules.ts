@@ -64,7 +64,7 @@ function safeDecode(segment: string): string {
  * The hostname with its original case. `new URL(...).hostname` lowercases every label AND
  * percent-decodes it, but the value persisted is the raw string and several credential markers are
  * case-sensitive (`AKIA…`, `ghp_…`, `AIza…`) — so a token pasted as a label
- * (`AKIA…​.gateway.example`, or its encoded twin `%41KIA…`) would clear the normalized check yet
+ * (`AKIA….gateway.example`, or its encoded twin `%41KIA…`) would clear the normalized check yet
  * land in settings_json intact. Recover the label casing by decoding the raw authority and locating
  * the host in it; fall back to the normalized form when it can't be located (e.g. an IDN punycode
  * host, which carries no ASCII credential anyway).
@@ -146,6 +146,29 @@ export function httpUrl(max: number): FieldParser<string> {
       );
     }
     return accept(raw);
+  };
+}
+
+/**
+ * A router connection id — the router's own opaque identifier for one provider connection, e.g.
+ * `conn_ab12cd34`. Bounded and scanned for a credential marker like the other routing fields: it is
+ * pasted by the operator from the router's dashboard, and that is also where an API key lives on the
+ * same page.
+ */
+export function connectionId(max: number): FieldParser<string> {
+  return (raw, key) => {
+    if (isClear(raw)) return accept(undefined);
+    if (typeof raw !== "string") return reject(`${key} must be a string`);
+    const trimmed = raw.trim();
+    if (!trimmed) return reject(`${key} must not be blank`);
+    if (trimmed.length > max) return reject(`${key} too long (max ${max} chars)`);
+    if (hasCredentialMarker(trimmed)) {
+      return reject(
+        `${key} looks like a credential value, not a connection id — paste the connection's id ` +
+          `from the router's dashboard, not an API key`,
+      );
+    }
+    return accept(trimmed);
   };
 }
 

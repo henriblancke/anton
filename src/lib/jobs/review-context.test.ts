@@ -440,6 +440,9 @@ describe("reviewContext", () => {
     // broken environment.
     expect(out).toContain("The editing");
     expect(out).toContain("tools and `git` are blocked outright for this session");
+    // The sandbox paragraph is what stops a reviewer reading its own blocked write as a defect in
+    // the run and filing a blocking finding over it, so it is pinned rather than left to prose.
+    expect(out).toContain("Your shell is SANDBOXED");
   });
 
   it("demands the mandatory 0-10 score in the appended context, not just in the skill", () => {

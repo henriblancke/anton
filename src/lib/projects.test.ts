@@ -14,6 +14,8 @@ let getProjectBySlug: typeof import("./projects").getProjectBySlug;
 let resolveVerifyGates: typeof import("./projects").resolveVerifyGates;
 let resolveCommitTimeoutMs: typeof import("./projects").resolveCommitTimeoutMs;
 let DEFAULT_COMMIT_TIMEOUT_MINUTES: typeof import("./projects").DEFAULT_COMMIT_TIMEOUT_MINUTES;
+let resolvePushTimeoutMs: typeof import("./projects").resolvePushTimeoutMs;
+let DEFAULT_PUSH_TIMEOUT_MINUTES: typeof import("./projects").DEFAULT_PUSH_TIMEOUT_MINUTES;
 let resolveReviewConfig: typeof import("./projects").resolveReviewConfig;
 let DEFAULT_REVIEW_MAX_ROUNDS: typeof import("./projects").DEFAULT_REVIEW_MAX_ROUNDS;
 let DEFAULT_REVIEW_MIN_SCORE: typeof import("./projects").DEFAULT_REVIEW_MIN_SCORE;
@@ -52,6 +54,8 @@ beforeAll(async () => {
   resolveVerifyGates = mod.resolveVerifyGates;
   resolveCommitTimeoutMs = mod.resolveCommitTimeoutMs;
   DEFAULT_COMMIT_TIMEOUT_MINUTES = mod.DEFAULT_COMMIT_TIMEOUT_MINUTES;
+  resolvePushTimeoutMs = mod.resolvePushTimeoutMs;
+  DEFAULT_PUSH_TIMEOUT_MINUTES = mod.DEFAULT_PUSH_TIMEOUT_MINUTES;
   resolveReviewConfig = mod.resolveReviewConfig;
   DEFAULT_REVIEW_MAX_ROUNDS = mod.DEFAULT_REVIEW_MAX_ROUNDS;
   DEFAULT_REVIEW_MIN_SCORE = mod.DEFAULT_REVIEW_MIN_SCORE;
@@ -193,6 +197,16 @@ describe("resolveCommitTimeoutMs (anton-zse2)", () => {
 
   it("converts a configured commitTimeoutMinutes to milliseconds", () => {
     expect(resolveCommitTimeoutMs({ commitTimeoutMinutes: 5 })).toBe(5 * 60_000);
+  });
+});
+
+describe("resolvePushTimeoutMs (anton-n93lo)", () => {
+  it("resolves an unset project to the 2-minute default (byte-identical to before the setting existed)", () => {
+    expect(resolvePushTimeoutMs({})).toBe(DEFAULT_PUSH_TIMEOUT_MINUTES * 60_000);
+  });
+
+  it("converts a configured pushTimeoutMinutes to milliseconds", () => {
+    expect(resolvePushTimeoutMs({ pushTimeoutMinutes: 5 })).toBe(5 * 60_000);
   });
 });
 
@@ -496,7 +510,7 @@ describe("isBudgetAwareEnabledAnywhere (anton-7mpv.1)", () => {
 });
 
 describe("budgetAwareProjectPolicies (anton-81x2)", () => {
-  it("carries each project's quota share, so the nudge reads the ceiling the runner enforces", async () => {
+  it("carries each Anthropic project's quota share, so the nudge reads the ceiling the runner enforces", async () => {
     // This suite shares one db, so disarm what earlier blocks armed: the split's denominator IS
     // every budget-aware project, and a stray one would silently change every share below.
     for (const p of await listProjects()) {
@@ -517,6 +531,24 @@ describe("budgetAwareProjectPolicies (anton-81x2)", () => {
       full * 0.25,
       full * 0.75,
     ]);
+  });
+
+  it("excludes routed projects from the Anthropic shaping nudge", async () => {
+    for (const p of await listProjects()) {
+      await updateProjectSettings(p.slug, { budgetAware: false });
+    }
+    const account = await addProject({ name: "Account", repoPath: makeRepoDir("nudge-account") });
+    const routed = await addProject({ name: "Routed", repoPath: makeRepoDir("nudge-routed") });
+    await updateProjectSettings(account.slug, { budgetAware: true, quotaSharePct: 100 });
+    await updateProjectSettings(routed.slug, {
+      budgetAware: true,
+      quotaSharePct: 100,
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: "ROUTER_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+
+    expect(await budgetAwareProjectPolicies()).toHaveLength(1);
   });
 });
 

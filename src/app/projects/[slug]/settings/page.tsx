@@ -22,6 +22,7 @@ import { bundledAgentIds, discoverAgents } from "@/lib/agents-discovery";
 import { DEFAULT_SCHEDULES, listSchedules } from "@/lib/schedules";
 import { loadBaseSystemPrompt } from "@/lib/claude/system-prompt";
 import { quotaShareProjects } from "@/lib/quota-spend";
+import { quotaMeterKey } from "@/lib/quota-meter";
 import type { QuotaShareProject } from "@/lib/quota-share";
 import { SettingsView } from "@/components/settings/settings-view";
 import type { EarnedPicker } from "@/components/settings/sections/picker-autonomy-section";
@@ -146,6 +147,7 @@ export default async function ProjectSettingsPage({
       sharePct: settings.quotaSharePct ?? 100,
       declared: settings.quotaSharePct !== undefined,
       governed: settings.budgetAware === true,
+      meterKey: quotaMeterKey(settings),
       reserved: settings.reserveQuotaShare === true,
       // The read failed, so eligibility is unknown — which is not idle. Reading it as idle would
       // tell the operator their share is in use elsewhere, naming a beneficiary we did not manage

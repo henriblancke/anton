@@ -21,6 +21,7 @@ import {
   JOB_TIMEOUT_MINUTES_RANGE,
   TICKET_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
+  PUSH_TIMEOUT_MINUTES_RANGE,
   REVIEW_LOW_SCORE_ROUNDS_RANGE,
   REVIEW_MAX_ROUNDS_RANGE,
   REVIEW_MIN_SCORE_RANGE,
@@ -44,6 +45,7 @@ import {
   applyFieldRules,
   booleanValue,
   boundedString,
+  connectionId,
   envVarName,
   fieldRule,
   httpUrl,
@@ -74,6 +76,8 @@ const MAX_COMMAND = 1000;
 const MAX_URL = 2000;
 /** Upper bound on an env-var name (anton-n16m) — no shell allows one near this long. */
 const MAX_ENV_NAME = 256;
+/** Upper bound on a router connection id (anton-m5oc) — well past any real router's id length. */
+const MAX_CONNECTION_ID = 256;
 
 const settingsField = <K extends keyof ProjectSettings & string>(
   key: K,
@@ -92,6 +96,7 @@ const JOB_POLICY_FIELDS: readonly FieldRule<ProjectSettings>[] = [
   settingsField("jobTimeoutMinutes", integerInRange(JOB_TIMEOUT_MINUTES_RANGE)),
   settingsField("ticketTimeoutMinutes", integerInRange(TICKET_TIMEOUT_MINUTES_RANGE)),
   settingsField("commitTimeoutMinutes", integerInRange(COMMIT_TIMEOUT_MINUTES_RANGE)),
+  settingsField("pushTimeoutMinutes", integerInRange(PUSH_TIMEOUT_MINUTES_RANGE)),
   settingsField("maxRetries", integerInRange(MAX_RETRIES_RANGE)),
   settingsField("reviewMaxRounds", integerInRange(REVIEW_MAX_ROUNDS_RANGE)),
   settingsField("reviewMinScore", integerInRange(REVIEW_MIN_SCORE_RANGE)),
@@ -165,6 +170,9 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     settingsField("claudeBaseUrl", httpUrl(MAX_URL)),
     settingsField("claudeAuthTokenEnv", envVarName(MAX_ENV_NAME)),
     settingsField("claudeGatewayModelDiscovery", booleanValue),
+    // Which of the router's connections this project meters on (anton-m5oc). Only meaningful
+    // alongside claudeBaseUrl; the cross-check mirrors the token-env-name requirement below.
+    settingsField("routerConnectionId", connectionId(MAX_CONNECTION_ID)),
 
     // Operator prompt overrides — cleared, each falls back to the shipped contract.
     settingsField("seedPrompt", boundedString(MAX_PROMPT)),
@@ -276,6 +284,24 @@ function checkGatewayCredentialed(
   return null;
 }
 
+/** A routed meter names a connection on the configured gateway; without that endpoint it cannot run. */
+function checkRouterConnectionNeedsGateway(
+  patch: Partial<ProjectSettings>,
+  current: ProjectSettings,
+): string | null {
+  if (!("routerConnectionId" in patch || "claudeBaseUrl" in patch)) return null;
+  const connectionId =
+    "routerConnectionId" in patch ? patch.routerConnectionId : current.routerConnectionId;
+  const baseUrl = "claudeBaseUrl" in patch ? patch.claudeBaseUrl : current.claudeBaseUrl;
+  if (connectionId && !baseUrl) {
+    return (
+      `routerConnectionId needs claudeBaseUrl — the router connection is metered through that ` +
+      `gateway. Set the gateway base URL, or clear the router connection id.`
+    );
+  }
+  return null;
+}
+
 /**
  * The cross-field checks that read settings as they STAND. Both weigh a patched field against a
  * sibling that may not be in this patch, so they must run against the settings AT WRITE TIME — i.e.
@@ -288,7 +314,11 @@ export function checkSettingsCrossFields(
   patch: Partial<ProjectSettings>,
   current: ProjectSettings,
 ): string | null {
-  return checkReviewAlarmReachable(patch, current) ?? checkGatewayCredentialed(patch, current);
+  return (
+    checkReviewAlarmReachable(patch, current) ??
+    checkGatewayCredentialed(patch, current) ??
+    checkRouterConnectionNeedsGateway(patch, current)
+  );
 }
 
 /**

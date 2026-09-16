@@ -8,6 +8,7 @@ import {
   DEFAULT_DAYTIME_RESERVE_PCT,
   DEFAULT_JOB_TIMEOUT_MINUTES,
   DEFAULT_MAX_RETRIES,
+  DEFAULT_PUSH_TIMEOUT_MINUTES,
   DEFAULT_REVIEW_FIX_CONCURRENCY,
   DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
   DEFAULT_REVIEW_MAX_ROUNDS,
@@ -47,6 +48,8 @@ export interface SettingsDraft {
   claudeBaseUrl: string;
   claudeAuthTokenEnv: string;
   claudeGatewayModelDiscovery: boolean;
+  /** Which router connection this project meters on (anton-m5oc); "" clears (no routed meter). */
+  routerConnectionId: string;
   seedPrompt: string;
   reviewFixPrompt: string;
   reviewFixConcurrency: number;
@@ -65,6 +68,7 @@ export interface SettingsDraft {
   jobTimeoutMinutes: number;
   ticketTimeoutMinutes: number;
   commitTimeoutMinutes: number;
+  pushTimeoutMinutes: number;
   maxRetries: number;
   autonomy: boolean;
   conventionalCommits: boolean;
@@ -116,6 +120,7 @@ export function draftFromSettings(
     claudeBaseUrl: settings.claudeBaseUrl ?? "",
     claudeAuthTokenEnv: settings.claudeAuthTokenEnv ?? "",
     claudeGatewayModelDiscovery: settings.claudeGatewayModelDiscovery ?? false,
+    routerConnectionId: settings.routerConnectionId ?? "",
     seedPrompt: settings.seedPrompt ?? "",
     reviewFixPrompt: settings.reviewFixPrompt ?? "",
     reviewFixConcurrency: settings.reviewFixConcurrency ?? DEFAULT_REVIEW_FIX_CONCURRENCY,
@@ -135,6 +140,7 @@ export function draftFromSettings(
     jobTimeoutMinutes: settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES,
     ticketTimeoutMinutes: settings.ticketTimeoutMinutes ?? DEFAULT_TICKET_TIMEOUT_MINUTES,
     commitTimeoutMinutes: settings.commitTimeoutMinutes ?? DEFAULT_COMMIT_TIMEOUT_MINUTES,
+    pushTimeoutMinutes: settings.pushTimeoutMinutes ?? DEFAULT_PUSH_TIMEOUT_MINUTES,
     maxRetries: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
     autonomy: settings.autonomy ?? true,
     conventionalCommits: settings.conventionalCommits ?? false,
@@ -176,7 +182,12 @@ export function draftFromSettings(
  */
 const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
   model: ["model"],
-  gateway: ["claudeBaseUrl", "claudeAuthTokenEnv", "claudeGatewayModelDiscovery"],
+  gateway: [
+    "claudeBaseUrl",
+    "claudeAuthTokenEnv",
+    "claudeGatewayModelDiscovery",
+    "routerConnectionId",
+  ],
   seedPrompt: ["seedPrompt"],
   reviewFixPrompt: ["reviewFixPrompt"],
   reviewFixConcurrency: ["reviewFixConcurrency"],
@@ -185,6 +196,7 @@ const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
   jobTimeoutMinutes: ["jobTimeoutMinutes"],
   ticketTimeoutMinutes: ["ticketTimeoutMinutes"],
   commitTimeoutMinutes: ["commitTimeoutMinutes"],
+  pushTimeoutMinutes: ["pushTimeoutMinutes"],
   maxRetries: ["maxRetries"],
   autonomy: ["autonomy"],
   conventionalCommits: ["conventionalCommits"],
@@ -279,6 +291,7 @@ export function settingsPatchBody(
     claudeBaseUrl: orNull(draft.claudeBaseUrl),
     claudeAuthTokenEnv: orNull(draft.claudeAuthTokenEnv),
     claudeGatewayModelDiscovery: draft.claudeGatewayModelDiscovery,
+    routerConnectionId: orNull(draft.routerConnectionId),
     seedPrompt: orNull(draft.seedPrompt),
     reviewFixPrompt: orNull(draft.reviewFixPrompt),
     reviewFixConcurrency: draft.reviewFixConcurrency,
@@ -318,6 +331,7 @@ export function settingsPatchBody(
     jobTimeoutMinutes: draft.jobTimeoutMinutes,
     ticketTimeoutMinutes: draft.ticketTimeoutMinutes,
     commitTimeoutMinutes: draft.commitTimeoutMinutes,
+    pushTimeoutMinutes: draft.pushTimeoutMinutes,
     maxRetries: draft.maxRetries,
     // The enabled BUNDLED ids, in discovered order. Only bundled ids we actually rendered — a
     // stale id from a since-deleted or user agent (still in the seeded set) is pruned rather than

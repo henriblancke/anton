@@ -17,9 +17,11 @@ import { type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
+import { quotaMeterKey } from "../quota-meter";
 import {
   commitAll,
   diffAgainstBase,
+  gitCommonDir,
   readWorktreeState,
   resolveMergeBase,
   restoreWorktreeState,
@@ -42,6 +44,7 @@ import {
   type ReviewReportResult,
   type ReviewerSource,
 } from "./review-context";
+import { resolveReviewSandbox, type ReviewSandboxSettings } from "./review-sandbox";
 import type { JobContext } from "./runner";
 import { captureVerifyGates, type VerifyGateOutcome } from "./shell";
 
@@ -126,6 +129,8 @@ export interface ReviewGateDeps {
   readState?: (worktreePath: string) => Promise<WorktreeState>;
   /** Undo whatever a review wrote, back to the fingerprint taken before it ran. */
   restoreState?: (worktreePath: string, state: WorktreeState) => Promise<void>;
+  /** The ref store the review session's sandbox pins shut — see `resolveReviewSandbox`. */
+  gitCommonDir?: (worktreePath: string) => Promise<string>;
   /** Hash the tree a commit would write — the fix session's proof across its own commit hooks. */
   hashTree?: (worktreePath: string) => Promise<string>;
 }
@@ -209,11 +214,11 @@ export interface ReviewGateArgs {
  * writing subcommands: an enumeration rots into a gap the next git release opens, and the reviewer
  * needs none of it — anton hands it the diff, the file list, and the beads.
  *
- * KNOWN RESIDUAL (anton-t6tu): `Bash` itself stays, because the review contract asks the reviewer to
- * run the project's own read-only checks. A shell can still write bytes anywhere — `printf <sha> >
- * <repo>/.git/refs/heads/anton/<future-bead>` plants exactly the branch the git deny rule exists to
- * prevent, with no `git` process and no visible change to this worktree. No tool-name filter closes
- * that; it needs OS-level filesystem containment for the session, which is that bead's work.
+ * `Bash` itself stays, because the review contract asks the reviewer to run the project's own
+ * read-only checks — and a shell writes bytes with none of the tools above, so this list is only
+ * half the guard. The other half is not a tool filter at all: the session runs under Claude Code's
+ * Bash sandbox with the repository's ref store denied at the OS level (anton-t6tu, see
+ * jobs/review-sandbox).
  */
 export const REVIEW_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash(git:*)"];
 
@@ -296,6 +301,14 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
   const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
 
+  // Resolved ONCE, before the first session is recorded: the repository's ref store does not move
+  // between rounds, and an unsandboxable host must fail the gate outright rather than after a review
+  // has already run unconfined.
+  const sandbox = await resolveReviewSandbox({
+    worktreePath,
+    readGitCommonDir: args.deps?.gitCommonDir ?? gitCommonDir,
+  });
+
   // Pin the fork point once, for every round: `baseBranch` is a MOVABLE ref (`origin/<base>`), and a
   // sibling run's fetch or a resumed worktree can advance it while this gate runs. Re-resolving it
   // per read would let the patch come from the old fork point while the reviewer's own inputs — its
@@ -337,6 +350,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       round,
       maxRounds: config.maxRounds,
       claude,
+      sandbox,
       readState,
       restoreState,
       verified,
@@ -444,9 +458,10 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
  *
  * The fingerprint covers the worktree, so `git` is denied outright ({@link REVIEW_DENIED_TOOLS}) to
  * cover what it cannot see: the repository the worktree belongs to, where a written ref leaves the
- * tree byte-identical. And the session is loaded from the operator's settings only
- * ({@link REVIEW_SETTING_SOURCES}), so the branch under review cannot configure — or hook — the
- * session judging it.
+ * tree byte-identical. A shell reaches that ref store without `git`, so the session also runs
+ * SANDBOXED, with the common dir denied at the OS level (see `resolveReviewSandbox`). And the
+ * session is loaded from the operator's settings only ({@link REVIEW_SETTING_SOURCES}), so the
+ * branch under review cannot configure — or hook — the session judging it.
  *
  * The revert runs on EVERY exit once the baseline is settled — a review that throws or reports an
  * error is exactly as capable of having written first, and its leftovers would otherwise outlive it
@@ -473,6 +488,8 @@ async function runReviewSession(args: {
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
+  /** OS-level filesystem containment for this session — resolved once per gate (anton-t6tu). */
+  sandbox: ReviewSandboxSettings;
   readState: (worktreePath: string) => Promise<WorktreeState>;
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
   /** Re-assert the run lease after the gates, before the reviewer session is spent. */
@@ -595,7 +612,8 @@ async function runReviewSession(args: {
           `${args.baseRev.slice(0, 12)} as ${describeReviewer(reviewer)}\n`,
       );
 
-      await ctx.claudeReached();
+      const reviewRouting = claudeRouting(settings);
+      await ctx.claudeReached(quotaMeterKey(settings));
       const result = await claude({
         cwd: worktreePath,
         prompt,
@@ -604,10 +622,13 @@ async function runReviewSession(args: {
           step: "review",
           labels: [target, ...tickets].flatMap((bead) => bead.labels ?? []),
         }),
-        routing: claudeRouting(settings),
+        routing: reviewRouting,
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         disallowedTools: REVIEW_DENIED_TOOLS,
         settingSources: [...REVIEW_SETTING_SOURCES],
+        // Outranks the `user` sources above, so the machine's own config cannot relax the sandbox
+        // this session is contained by.
+        settingsJson: JSON.stringify(args.sandbox),
         signal: ctx.signal,
         onEvent,
       });
@@ -925,7 +946,8 @@ async function runGateFixSession(args: {
     let verified = false;
 
     try {
-      await ctx.claudeReached();
+      const fixRouting = claudeRouting(settings);
+      await ctx.claudeReached(quotaMeterKey(settings));
       const result = await claude({
         cwd: worktreePath,
         prompt,
@@ -935,7 +957,7 @@ async function runGateFixSession(args: {
           step: "review",
           labels: [target, ...tickets].flatMap((bead) => bead.labels ?? []),
         }),
-        routing: claudeRouting(settings),
+        routing: fixRouting,
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         signal: ctx.signal,
         onEvent,

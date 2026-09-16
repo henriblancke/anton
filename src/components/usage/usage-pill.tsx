@@ -73,9 +73,18 @@ function useClaudeUsage(): UsageSnapshot | null {
   return usage;
 }
 
-/** The meter fill track shared by the pill and the popover rows. Width transition is disabled
- * under `prefers-reduced-motion`; the track keeps a neutral bg so a 0% bar is still legible. */
-function MeterTrack({ pct, tone, className }: { pct: number; tone: UsageTone; className?: string }) {
+/** The meter fill track shared by the pill and the popover rows (and the routed project meter,
+ * anton-ds7e). Width transition is disabled under `prefers-reduced-motion`; the track keeps a
+ * neutral bg so a 0% bar is still legible. */
+export function MeterTrack({
+  pct,
+  tone,
+  className,
+}: {
+  pct: number;
+  tone: UsageTone;
+  className?: string;
+}) {
   return (
     <span className={cn("relative block overflow-hidden rounded-full bg-muted", className)}>
       <span

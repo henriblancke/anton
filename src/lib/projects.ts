@@ -12,6 +12,7 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { removeWorktree } from "./git/worktree";
+import { quotaMeterKey } from "./quota-meter";
 import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs";
 import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./jobs/budget";
 import { resolveGovernedShare, type GovernedShare } from "./quota-share";
@@ -163,6 +164,15 @@ export interface ProjectSettings {
    * alongside {@link claudeBaseUrl}.
    */
   claudeGatewayModelDiscovery?: boolean;
+  /**
+   * Which router connection this project meters on (anton-m5oc) — the router's own connection id,
+   * not a name anton invents. A router fronts N provider connections; this names the ONE anton reads
+   * quota from, because the router's usage endpoint is per-connection, not per-router. Only
+   * meaningful alongside {@link claudeBaseUrl} — a project not routed through a gateway has no router
+   * to meter on. Absent → no routed meter; the governor and the project view fall back to today's
+   * behavior (sibling tickets anton-gnvw, anton-ds7e).
+   */
+  routerConnectionId?: string;
   testCommand?: string;
   /**
    * Optional operator-pinned verify gates (anton-3oh8), run in the worktree after the agent and
@@ -300,6 +310,13 @@ export interface ProjectSettings {
    */
   commitTimeoutMinutes?: number;
   /**
+   * How long a single `git push` (and the `pre-push` hook chain it triggers) may run before anton
+   * kills it, in minutes. Mirrors {@link commitTimeoutMinutes}'s reasoning: a `pre-push` hook chain
+   * can legitimately run for a while, so the range floor is 1, not 0. Absent →
+   * DEFAULT_PUSH_TIMEOUT_MINUTES (2 min).
+   */
+  pushTimeoutMinutes?: number;
+  /**
    * Max attempts for a job before it is parked for a human (anton-xbk). A failed ticket fails the
    * execute-epic job, which retries and resumes past already-closed tickets — so this is the
    * effective per-task retry budget. Absent → DEFAULT_MAX_RETRIES.
@@ -388,7 +405,7 @@ export interface ProjectSettings {
   /**
    * How long a run may sit stuck before the run-health sweep (anton-4ks0) calls it a finding.
    * Absent → {@link DEFAULT_RUN_HEALTH_THRESHOLDS}; a stored value need only carry the knobs the
-   * operator touched. Only consulted by the `run-health` schedule, which is off by default.
+   * operator touched. Consulted by the hourly `run-health` schedule.
    */
   runHealth?: RunHealthThresholds;
   /**
@@ -522,6 +539,10 @@ export const DEFAULT_TICKET_TIMEOUT_MINUTES = 45;
 /** Kept in minutes for consistency with the other two timeouts; ops.ts's git-commit default is
  *  {@link DEFAULT_COMMIT_TIMEOUT_MINUTES} * 60_000 ms — asserted equal in ops.test.ts. */
 export const DEFAULT_COMMIT_TIMEOUT_MINUTES = 2;
+/** Kept in minutes for the same reason as {@link DEFAULT_COMMIT_TIMEOUT_MINUTES}; ops.ts's
+ *  git-push default is {@link DEFAULT_PUSH_TIMEOUT_MINUTES} * 60_000 ms — asserted equal in
+ *  ops.test.ts. */
+export const DEFAULT_PUSH_TIMEOUT_MINUTES = 2;
 export const DEFAULT_MAX_RETRIES = 3;
 /** Two rounds: the reviewer's first pass plus one chance to confirm the fixes landed. */
 export const DEFAULT_REVIEW_MAX_ROUNDS = 2;
@@ -572,6 +593,16 @@ export function resolveCommitTimeoutMs(settings: ProjectSettings): number {
   return (settings.commitTimeoutMinutes ?? DEFAULT_COMMIT_TIMEOUT_MINUTES) * 60_000;
 }
 
+/**
+ * The push budget every `pushBranch` call runs under, in ms (anton-n93lo) — the push counterpart to
+ * {@link resolveCommitTimeoutMs}. An unset setting resolves to {@link DEFAULT_PUSH_TIMEOUT_MINUTES} —
+ * the same default `gitPush` itself falls back to, so a project with no setting is byte-identical to
+ * before this existed.
+ */
+export function resolvePushTimeoutMs(settings: ProjectSettings): number {
+  return (settings.pushTimeoutMinutes ?? DEFAULT_PUSH_TIMEOUT_MINUTES) * 60_000;
+}
+
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
 export const REVIEW_FIX_CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
@@ -584,6 +615,12 @@ export const TICKET_TIMEOUT_MINUTES_RANGE = { min: 5, max: 240 } as const; // 5 
  * the thing that should be bounding the run.
  */
 export const COMMIT_TIMEOUT_MINUTES_RANGE = { min: 1, max: 60 } as const;
+/**
+ * 1 min … 60 min, for the same reason as {@link COMMIT_TIMEOUT_MINUTES_RANGE}: the floor keeps a
+ * `pre-push` hook chain from being killed before it finishes, and the ceiling defers to
+ * {@link JOB_TIMEOUT_MINUTES_RANGE}'s job timeout past an hour.
+ */
+export const PUSH_TIMEOUT_MINUTES_RANGE = { min: 1, max: 60 } as const;
 export const MAX_RETRIES_RANGE = { min: 1, max: 10 } as const;
 export const REVIEW_MAX_ROUNDS_RANGE = { min: 1, max: 5 } as const;
 /** `0` is in range on purpose: it is how the operator turns the score-regression alarm off. */
@@ -1300,6 +1337,8 @@ export async function budgetAwareQuotaShares(): Promise<GovernedShare[]> {
   return governedQuotaBoard(await governedProjects());
 }
 
+export { quotaMeterKey } from "./quota-meter";
+
 /** The board above, over an already-read governed set — so a caller needing both reads once. */
 async function governedQuotaBoard(
   governed: readonly { projectId: string; settings: ProjectSettings }[],
@@ -1307,6 +1346,7 @@ async function governedQuotaBoard(
   const eligible = await observedWorkEligibility(getDb()).catch(() => null);
   return governed.map(({ projectId, settings }) => ({
     projectId,
+    meterKey: quotaMeterKey(settings),
     declaredPct: settings.quotaSharePct,
     eligible: eligibilityOf(eligible, projectId),
     reserved: settings.reserveQuotaShare === true,
@@ -1323,12 +1363,12 @@ async function governedQuotaBoard(
  * The nudge passes no per-project spend to `budgetGate`, so the share ceiling each policy carries is
  * checked against a spend of 0 there: it binds only for a 0% share — a parked repo defers, as it
  * should, since its governor would never burn the quota being nudged about — and for any positive
- * share it is the whole weekly target on the account meter that answers. Deliberate: the nudge asks
- * whether the MACHINE has idle weekly quota worth shaping work for; which repo gets to spend it, and
- * how much of its share is already gone, is the governor's decision at lease time, not the nudge's.
+ * share it is the whole weekly target on the account meter that answers. Routed projects are excluded:
+ * this nudge reads the Anthropic meter and must never shape work that spends a router's independent
+ * pool.
  */
 export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
-  const governed = await governedProjects();
+  const governed = (await governedProjects()).filter(({ settings }) => quotaMeterKey(settings) === "anthropic");
   const board = await governedQuotaBoard(governed);
   return governed.map(({ projectId, settings }) =>
     withQuotaShare(resolveBudgetPolicy(settings), resolveGovernedShare(projectId, board).sharePct),
@@ -1647,13 +1687,14 @@ async function deleteSessionLogs(db: AntonDb, projectId: string): Promise<void> 
  * DELETE CASCADE in the schema): sessions → runs → jobs → schedules → run-health → picker plan →
  * picker verdicts → picker starts → claude invocations → hygiene → scan summaries → autopilot
  * disarms → escalations →
- * burn samples (detached, not deleted) → projects.
+ * burn samples (detached, not deleted) → quota-attempt ledger → projects.
  */
 function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
   try {
     db.transaction((tx) => {
       tx.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId)).run();
       tx.delete(schema.runs).where(eq(schema.runs.projectId, projectId)).run();
+      tx.delete(schema.quotaAttempts).where(eq(schema.quotaAttempts.projectId, projectId)).run();
       tx.delete(schema.jobs).where(eq(schema.jobs.projectId, projectId)).run();
       tx.delete(schema.schedules).where(eq(schema.schedules.projectId, projectId)).run();
       tx.delete(schema.runHealthReports).where(eq(schema.runHealthReports.projectId, projectId)).run();

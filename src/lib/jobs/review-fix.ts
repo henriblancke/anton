@@ -51,6 +51,7 @@ import { existsSync } from "node:fs";
 import { beads, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { claudeRouting, runClaude } from "../claude/driver";
+import { quotaMeterKey } from "../quota-meter";
 import { resolveModel } from "./model-routing";
 import {
   branchAheadOfRemote,
@@ -90,6 +91,7 @@ import {
   getProjectById,
   getProjectSettings,
   resolveCommitTimeoutMs,
+  resolvePushTimeoutMs,
   resolveVerifyGates,
   type ProjectSettings,
 } from "../projects";
@@ -619,7 +621,8 @@ async function runFixSession(args: {
       projectDir: worktree.path,
     });
 
-    await ctx.claudeReached();
+    const routing = claudeRouting(settings);
+    await ctx.claudeReached(quotaMeterKey(settings));
     const result = await metered(db, clock, {
       projectId,
       jobType: ctx.type,
@@ -633,7 +636,7 @@ async function runFixSession(args: {
       prompt,
       appendSystemPrompt,
       model: resolveReviewFixModel(settings, epic),
-      routing: claudeRouting(settings),
+      routing,
       permissionMode: settings.permissionMode ?? "bypassPermissions",
       signal: ctx.signal,
       onEvent,
@@ -779,7 +782,9 @@ async function commitAndPushFix(
   // worktreePath) queries worktreePath when given, per its own contract) — the same "read from the
   // worktree, not the base repo" behavior this file's onbranch-includeIf reasoning depends on
   // elsewhere, not the base checkout's config.
-  if (pushed) await pushBranch(worktreePath, branch, hooksPath);
+  if (pushed) {
+    await pushBranch(worktreePath, branch, hooksPath, resolvePushTimeoutMs(settings), signal);
+  }
   return pushed;
 }
 

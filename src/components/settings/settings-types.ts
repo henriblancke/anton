@@ -67,6 +67,12 @@ export interface EditableSettings {
   claudeAuthTokenEnv?: string;
   /** Whether anton asks the gateway which models it serves (anton-n16m); absent = off. */
   claudeGatewayModelDiscovery?: boolean;
+  /**
+   * Which router connection this project meters on (anton-m5oc) — a router fronts N provider
+   * connections, and its usage endpoint is per-connection, so this names the ONE anton reads quota
+   * from. Absent = no routed meter, even when a gateway is configured.
+   */
+  routerConnectionId?: string;
   seedPrompt?: string;
   reviewFixPrompt?: string;
   productMasterPrompt?: string;
@@ -94,6 +100,8 @@ export interface EditableSettings {
   ticketTimeoutMinutes?: number;
   /** Pre-commit hooks' own cap (anton-n5e7); absent = DEFAULT_COMMIT_TIMEOUT_MINUTES (2 min). */
   commitTimeoutMinutes?: number;
+  /** Pre-push hooks' own cap (anton-7agwq); absent = DEFAULT_PUSH_TIMEOUT_MINUTES (2 min). */
+  pushTimeoutMinutes?: number;
   maxRetries?: number;
   agents?: string[];
   autonomy?: boolean;

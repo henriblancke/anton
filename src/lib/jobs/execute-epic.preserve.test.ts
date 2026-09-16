@@ -751,7 +751,9 @@ suite("preserveTimedOutWork (real git)", () => {
     const reaped = join(sandbox, "hook-reaped");
     writeFileSync(
       join(hooks, "pre-commit"),
-      `#!/bin/sh\ntouch "${committing}"\ntrap 'touch "${reaped}"; exit 1' TERM\nsleep 120 &\nwait\n`,
+      // Trap armed BEFORE the committing marker: the watcher can only fire once the marker
+      // exists, so this ordering guarantees the group signal never arrives before the trap does.
+      `#!/bin/sh\ntrap 'touch "${reaped}"; exit 1' TERM\ntouch "${committing}"\nsleep 120 &\nwait\n`,
       { mode: 0o755 },
     );
     const abort = new AbortController();
@@ -787,7 +789,9 @@ suite("preserveTimedOutWork (real git)", () => {
     const reaped = join(sandbox, "hook-reaped");
     writeFileSync(
       join(hooks, "pre-commit"),
-      `#!/bin/sh\ntouch "${committing}"\ntrap 'touch "${reaped}"; exit 1' TERM\nsleep 120 &\nwait\n`,
+      // Trap armed BEFORE the committing marker: see the sibling test above for why this order
+      // removes the race instead of just narrowing it.
+      `#!/bin/sh\ntrap 'touch "${reaped}"; exit 1' TERM\ntouch "${committing}"\nsleep 120 &\nwait\n`,
       { mode: 0o755 },
     );
     const abort = new AbortController();
