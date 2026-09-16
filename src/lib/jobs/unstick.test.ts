@@ -18,7 +18,7 @@ import type { PrActivity } from "../git/pr";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
 import { blockedByPoison, parkedOnGateClause } from "./errors";
 import type { Clock } from "./queue";
-import { makeProjectDb } from "@/lib/testing/project";
+import { insertProject, makeProjectDb } from "@/lib/testing/project";
 
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
 const noteMock = vi.fn<(cwd: string, id: string, text: string) => Promise<void>>();
@@ -164,15 +164,23 @@ function seedReport(...findings: RunHealthFinding[]): Promise<void> {
 /** A settled job the report's `exhausted-job` finding points at, re-read before escalating. */
 function seedJob(
   id: string,
-  o: { status: string; attempts: number; lastError: string; epicBeadId?: string },
+  o: {
+    status: string;
+    attempts: number;
+    lastError: string;
+    epicBeadId?: string;
+    projectId?: string;
+    type?: "execute-epic" | "sync-push" | "review-fix-pr" | "gate-check";
+  },
 ): void {
+  const projectId = o.projectId ?? "p1";
   t.db
     .insert(schema.jobs)
     .values({
       id,
-      type: "execute-epic",
-      projectId: "p1",
-      payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: o.epicBeadId ?? "e-9" }),
+      type: o.type ?? "execute-epic",
+      projectId,
+      payloadJson: JSON.stringify({ projectId, epicBeadId: o.epicBeadId ?? "e-9" }),
       status: o.status,
       attempts: o.attempts,
       lastError: o.lastError,
@@ -235,15 +243,18 @@ function parkedRunFinding(runId: string, beadId: string, reason: string): RunHea
   };
 }
 
-const sweep = (opts: { signal?: AbortSignal } = {}) =>
-  unstickPass(
+const sweep = (opts: { signal?: AbortSignal } = {}) => sweepProject("p1", REPO, opts);
+
+function sweepProject(projectId: string, repoPath: string, opts: { signal?: AbortSignal } = {}) {
+  return unstickPass(
     {
       db: t.db,
       clock,
       readPrActivity: (repo, number, signal) => prActivityMock(repo, number, signal),
     },
-    { projectId: "p1", repoPath: REPO, ...opts },
+    { projectId, repoPath, ...opts },
   );
+}
 
 function jobRows() {
   return t.db.select().from(schema.jobs).all();
@@ -1020,7 +1031,9 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
 
     expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
     expect(escalationRows()[0]).toMatchObject({ status: "open" });
-    expect(gateListMock).toHaveBeenCalledTimes(0); // no gate wait open, so no gate read either
+    // Called once per sweep as the board-outage recheck (buildPassState), not for a gate wait —
+    // there is none here, so `reconcileGateWaits`'s own read never fires.
+    expect(gateListMock).toHaveBeenCalledTimes(2);
   });
 
   it("escalates on the report's word when the gate list can't be read", async () => {
@@ -1206,7 +1219,9 @@ describe("a legacy exhausted-job escalation that is really a gate's wait", () =>
 
     expect(await sweep()).toMatchObject({ settled: 0 });
     expect(escalationRows()[0]).toMatchObject({ status: "open" });
-    expect(gateListMock).not.toHaveBeenCalled(); // no candidate, so no gate read either
+    // One call for the board-outage recheck every pass makes (buildPassState) — no gate-wait
+    // candidate here, so `reconcileGateWaits`'s own read never fires.
+    expect(gateListMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1394,6 +1409,120 @@ describe("open escalations are retired once the stall they report ends", () => {
   });
 });
 
+describe("board-wide outage escalations", () => {
+  const OUTAGE = "Dolt server unreachable at 127.0.0.1:5432";
+  const JOB_TYPES = ["execute-epic", "sync-push", "review-fix-pr", "gate-check"] as const;
+
+  function outageFinding(projectId: string, cause = "server-unreachable"): RunHealthFinding {
+    return {
+      kind: "exhausted-job",
+      key: `exhausted-job:board-unreachable:${projectId}:${cause}`,
+      reason: "the shared Dolt server is unreachable. check the server is up and reachable.",
+      since: NOW - HOUR,
+      ageMs: HOUR,
+    };
+  }
+
+  it("keeps a legacy parked-job outage actionable after the board recovers", async () => {
+    seedJob("j-legacy", {
+      status: "parked",
+      attempts: 3,
+      lastError: `failed 3×: ${OUTAGE}`,
+      epicBeadId: "e-9",
+    });
+    await seedReport({
+      ...outageFinding("p1"),
+      jobId: "j-legacy",
+      beadId: "e-9",
+    });
+
+    expect(await sweep()).toMatchObject({ escalated: 1, held: 0 });
+    expect(escalationRows()).toHaveLength(1);
+  });
+
+  it("retires a recovered outage after a successful local board read even when the remote pull fails", async () => {
+    await seedReport(outageFinding("p1"));
+    listMock.mockRejectedValue(new Error(OUTAGE));
+    expect(await sweep()).toMatchObject({ escalated: 1 });
+
+    pullMock.mockRejectedValue(new Error("remote authentication failed"));
+    listMock.mockResolvedValue([openEpic("e-1")]);
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("keeps the outage open when the board list recovers but the gate list still can't be read", async () => {
+    // run-health raises this finding from `Promise.all([list, gateList])` — either read failing
+    // writes it. A recheck that only re-reads `list` would call the board readable again while the
+    // exact read that raised the outage is still down.
+    await seedReport(outageFinding("p1"));
+    gateListMock.mockRejectedValue(new Error(OUTAGE));
+    expect(await sweep()).toMatchObject({ escalated: 1 });
+
+    await seedReport();
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("raises one persisted escalation per project for sixteen queued outage jobs, separates causes, and retires it after recovery", async () => {
+    const projects = ["p1", "p2", "p3", "p4"] as const;
+    for (const projectId of projects.slice(1)) {
+      insertProject(t.db, {
+        id: projectId,
+        slug: projectId,
+        name: projectId,
+        repoPath: `/tmp/${projectId}`,
+      });
+    }
+    for (const projectId of projects) {
+      for (const [index, type] of JOB_TYPES.entries()) {
+        seedJob(`${projectId}-${type}`, {
+          projectId,
+          type,
+          status: "queued",
+          attempts: 0,
+          lastError: `${OUTAGE} — rechecks at ${new Date(NOW + HOUR).toISOString()}`,
+          epicBeadId: `e-${projectId}-${index}`,
+        });
+      }
+      await saveRunHealthReport(t.db, clock, {
+        projectId,
+        findings: [outageFinding(projectId)],
+      });
+    }
+    // One distinct cause in p1 must be independently actionable rather than folded into the server
+    // outage. It shares the same project but represents a different target and remedy.
+    await saveRunHealthReport(t.db, clock, {
+      projectId: "p1",
+      findings: [outageFinding("p1"), outageFinding("p1", "identity-mismatch")],
+    });
+
+    listMock.mockRejectedValue(new Error(OUTAGE));
+    for (const projectId of projects) {
+      await sweepProject(projectId, `/tmp/${projectId}`);
+    }
+
+    const open = escalationRows().filter((row) => row.status === "open");
+    expect(open).toHaveLength(5);
+    expect(open.filter((row) => row.findingKey.includes(":server-unreachable"))).toHaveLength(4);
+    expect(open.filter((row) => row.projectId === "p1")).toHaveLength(2);
+    expect(jobRows()).toHaveLength(16);
+    expect(jobRows().every((job) => job.status === "queued" && job.attempts === 0)).toBe(true);
+
+    listMock.mockResolvedValue([]);
+    await saveRunHealthReport(t.db, clock, { projectId: "p1", findings: [] });
+    expect(await sweepProject("p1", "/tmp/p1")).toMatchObject({ findings: 0, settled: 2 });
+    expect(escalationRows().filter((row) => row.projectId === "p1")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: "resolved", resolution: "dismissed" }),
+        expect.objectContaining({ status: "resolved", resolution: "dismissed" }),
+      ]),
+    );
+  });
+});
+
 describe("a cancelled or timed-out pass", () => {
   it("hands the job's abort signal to the live PR re-read, so the gh child dies with the job", async () => {
     // Without this the `gh pr view` subprocess outlives the cancel for the whole CLI timeout.
@@ -1470,7 +1599,7 @@ describe("a mixed report", () => {
 
 describe("an idle pass", () => {
   it("does nothing at all when the sweep has never run for this project", async () => {
-    // run-health ships off by default, so "no report" is the normal state, not an error.
+    // A fresh installation can reach this before the first hourly sweep, so no report is normal.
     expect(await sweep()).toEqual({ findings: 0, resumed: 0, escalated: 0, held: 0, settled: 0 });
     expect(jobRows()).toEqual([]);
     expect(listMock).not.toHaveBeenCalled();

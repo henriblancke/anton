@@ -89,6 +89,7 @@ function ctx(o: Partial<UnstickContext> = {}): UnstickContext {
     // empty one would mean "e-1 was deleted" — the default has to carry the bead the findings name.
     board: new Map<string, Bead>([["e-1", bead("e-1")]]),
     boardFresh: true,
+    boardReadable: true,
     deadLeaseGraceMs: GRACE,
     usageWindowEndsAt: () => undefined,
     epicCancelled: () => false,
