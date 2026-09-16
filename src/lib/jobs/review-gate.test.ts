@@ -382,6 +382,20 @@ describe("runReviewGate — convergence", () => {
     expect(calls[1].appendSystemPrompt).toBeTruthy();
   });
 
+  it("carries a blocking finding's CLASS into the next round's review prompt", async () => {
+    const FENCING_BLOCKING = {
+      severity: "blocking",
+      location: "src/a.ts:4",
+      note: "classic time-of-check-time-of-use race between the check and the write",
+    };
+    const { result, calls } = gate([report(4, [FENCING_BLOCKING]), "fixed", report(9, [])]);
+    await result;
+
+    expect(calls[0].prompt).not.toContain("Blocking classes from the previous round");
+    expect(calls[2].prompt).toContain("Blocking classes from the previous round");
+    expect(calls[2].prompt).toContain("fencing-toctou: 1");
+  });
+
   it("shows an open advisory to the confirming review and drops the one it does not restate", async () => {
     // Nothing dispatched the advisory — only blocking findings reach a fix session — but the fix may
     // well have removed its cause, so the confirming review is handed it and its omission settles it.

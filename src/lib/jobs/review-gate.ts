@@ -329,6 +329,12 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
    * exactly the content it commits — so a converging review never runs the suite twice per round.
    */
   let verified: VerifyGateOutcome[] | undefined;
+  /**
+   * The blocking findings the immediately preceding round reported — undefined on round 1. Handed to
+   * the next round's reviewer so it can tell a finding it raised itself apart from one this fix
+   * session was actually dispatched to close (see {@link ReviewRun.previousBlocking}).
+   */
+  let previousBlocking: ReviewFinding[] | undefined;
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();
@@ -354,6 +360,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       readState,
       restoreState,
       verified,
+      previousBlocking,
       ...(args.assertLeaseHeld ? { assertLeaseHeld: args.assertLeaseHeld } : {}),
     });
     reviewer = review.reviewer;
@@ -403,6 +410,10 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // Replaces, never accumulates: this round was shown the previous carry and restated whatever
     // still applied, so its advisories are the whole open set going into the next round.
     carried = findings.filter((f) => f.severity === "advisory");
+    // This round's blocking findings become the NEXT round's `previousBlocking` — the fix session
+    // below is dispatched against exactly this set, so the reviewer that reads its result next is
+    // told which class it was asked to close.
+    previousBlocking = blocking;
     args.assertLeaseHeld?.(); // don't write a fix under a lease that lapsed while reviewing
     const fix = await runGateFixSession({
       db,
@@ -485,6 +496,8 @@ async function runReviewSession(args: {
   readDiff: (worktreePath: string, base: string) => Promise<BranchDiff>;
   /** Advisories still open from earlier rounds — this review restates or settles each. */
   carried: ReviewFinding[];
+  /** The BLOCKING findings the immediately preceding round reported. See {@link ReviewRun.previousBlocking}. */
+  previousBlocking?: ReviewFinding[];
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
@@ -603,6 +616,7 @@ async function runReviewSession(args: {
         // own diff could not have written, and that no commit landing on the base mid-review moves.
         baseRev: args.baseRev,
         carriedAdvisories: args.carried,
+        previousBlocking: args.previousBlocking,
         verified,
         gatesDiscarded,
       });

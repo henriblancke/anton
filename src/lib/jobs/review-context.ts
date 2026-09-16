@@ -16,6 +16,7 @@ import { loadSkill } from "../claude/prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { listDirBlobsAtRev, readFileAtRev, resolveRepoPath, type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
+import { classifyFindingClass, type FindingClass } from "./finding-class";
 import { labelValue } from "./review-fix-context";
 import type { VerifyGateOutcome } from "./shell";
 
@@ -137,6 +138,13 @@ export interface ReviewRun {
    */
   carriedAdvisories?: ReviewFinding[];
   /**
+   * The BLOCKING findings the immediately preceding round reported — already dispatched to a fix
+   * session, unlike {@link carriedAdvisories}. Shown to this round as classes and counts only (never
+   * the notes, locations, or verdicts — see {@link previousBlockingClassSection}), so a reviewer that
+   * fixed six unfenced reads goes looking for the seventh instead of starting blind.
+   */
+  previousBlocking?: ReviewFinding[];
+  /**
    * The project's verify gates as anton ran them on THIS tree, immediately before the review.
    * Absent (or empty) when the project pins no gates — the one case where the reviewer is still
    * asked to find and run the checks itself.
@@ -192,6 +200,8 @@ export async function buildReviewPrompt(args: {
   baseRev: string;
   /** Advisories still open from earlier rounds, for this review to restate or settle. */
   carriedAdvisories?: ReviewFinding[];
+  /** The BLOCKING findings the immediately preceding round reported. See {@link ReviewRun.previousBlocking}. */
+  previousBlocking?: ReviewFinding[];
   /** The gates anton already ran on this tree, so the reviewer never runs the suite itself. */
   verified?: VerifyGateOutcome[];
   /** Gates ran but their results were discarded — they wrote to the tree. See {@link ReviewRun}. */
@@ -234,6 +244,7 @@ export async function buildReviewPrompt(args: {
       principles,
       instructions,
       carriedAdvisories: args.carriedAdvisories,
+      previousBlocking: args.previousBlocking,
       verified: args.verified,
       gatesDiscarded: args.gatesDiscarded,
     }),
@@ -476,6 +487,7 @@ export function reviewContext(run: ReviewRun): string {
     ...diffSection(run.diff),
     ...principlesSection(run),
     ...carriedAdvisorySection(run.carriedAdvisories ?? []),
+    ...previousBlockingClassSection(run.previousBlocking ?? []),
     ...verifiedGatesSection(run.verified ?? [], run.gatesDiscarded ?? false),
     ...readOnlySection(run.verified ?? [], run.gatesDiscarded ?? false),
     ...reportingFormatSection(),
@@ -803,6 +815,46 @@ function carriedAdvisorySection(advisories: ReviewFinding[]): string[] {
     `every one that STILL applies in your own findings — anton treats one you leave out as resolved`,
     `and drops it, and reports the rest to the founder as open. They are advisory either way: they do`,
     `not hold the PR back, so restating one is not a blocking finding unless you judge it to be one.`,
+    ``,
+  ];
+}
+
+/** How many findings fall in each class, sorted most-frequent-first, ties broken by class name. */
+function classCounts(findings: ReviewFinding[]): Array<[FindingClass, number]> {
+  const counts = new Map<FindingClass, number>();
+  for (const finding of findings) {
+    const klass = classifyFindingClass(finding);
+    counts.set(klass, (counts.get(klass) ?? 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+}
+
+/**
+ * The classes of BLOCKING findings the immediately preceding round reported, tallied — never the
+ * findings themselves.
+ *
+ * {@link carriedAdvisorySection} restates advisories in full because nobody has acted on them yet and
+ * this round is the one deciding their fate; a blocking finding is the opposite case — it was already
+ * dispatched to a fix session, so its note, location, and verdict describe a defect that is proven (or
+ * not) by the diff in front of THIS reviewer, not by the previous reviewer's word. Forwarding those
+ * would invite grading the repair against that word instead of the code — exactly the failure mode
+ * carrying the advisory's verdict would also invite, and exactly why {@link carriedAdvisorySection}
+ * doesn't. The class survives that argument: it says what KIND of defect the last round chased without
+ * saying whether the fix worked, which is enough to send this round looking for a sibling instance of
+ * the same pattern instead of starting blind.
+ */
+function previousBlockingClassSection(previousBlocking: ReviewFinding[]): string[] {
+  if (previousBlocking.length === 0) return [];
+  return [
+    `## Blocking classes from the previous round`,
+    ``,
+    `The previous round reported blocking findings in these classes, since dispatched for repair:`,
+    ``,
+    ...classCounts(previousBlocking).map(([klass, count]) => `- ${klass}: ${count}`),
+    ``,
+    `Verify each repair actually holds against the diff as it stands now, and check whether the same`,
+    `pattern shows up anywhere else in the diff — a class that recurred once often recurs more than`,
+    `once.`,
     ``,
   ];
 }
