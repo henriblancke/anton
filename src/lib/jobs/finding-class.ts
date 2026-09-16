@@ -23,10 +23,10 @@ type Matcher = RegExp | ((note: string) => boolean);
  * words without describing a work-loss regression. They only count when a work-bearing noun (job,
  * task, queue, ...) or a retry/requeue signal is the verb's actual subject or object — adjacent
  * with no clause boundary in between — not merely mentioned nearby: "while parsing a request, the
- * first character is dropped" has "request" in an earlier, unrelated clause. Past-tense and
- * perfect-passive auxiliaries ("were discarded", "has been discarded") count the same as "is/are"
- * — a finding describing loss that already happened is still a work-loss finding, not just one
- * phrased in the present tense.
+ * first character is dropped" has "request" in an earlier, unrelated clause. Past-tense, perfect-
+ * passive, and modal auxiliaries ("were discarded", "has been discarded", "will be discarded",
+ * "can be dropped") count the same as "is/are" — a finding describing loss that already happened,
+ * or that could/will happen, is still a work-loss finding, not just one phrased in the present tense.
  */
 const WORK_LOSS_SUBJECT =
   "(?:job|task|queue|batch|record|item|request|message|event|payload|entry|entries|submission|update)s?";
@@ -51,7 +51,11 @@ const DATA_LOSS_CONTEXT = new RegExp(
   `\\bdata loss\\b${CLAUSE_GAP}\\b${WORK_LOSS_SIGNAL}\\b|\\b${WORK_LOSS_SIGNAL}\\b${CLAUSE_GAP}\\bdata loss\\b`,
   "i",
 );
-const WORK_LOSS_PASSIVE_AUX = "(?:is|are|was|were|has been|have been|had been)";
+// Modal passive forms ("will be discarded", "can be dropped", "may be lost") describe the same
+// loss-on-error-path behavior as the present/past/perfect forms below — a finding phrased as what
+// *will* or *can* happen on failure is still reporting work-loss, not a lesser claim.
+const WORK_LOSS_PASSIVE_AUX =
+  "(?:is|are|was|were|has been|have been|had been|will be|can be|may be|might be|could be|shall be|must be)";
 const WORK_LOSS_VERB_AFTER = `(?:${WORK_LOSS_PASSIVE_AUX} (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))`;
 const WORK_LOSS_OBJECT_AFTER = `(?:${WORK_LOSS_PASSIVE_AUX} (?:silently )?(?:discarded|lost|dropped)|silently drops?)`;
 // Whitespace only, not CLAUSE_GAP: "the record delimiter is dropped" and "the item count is
@@ -234,11 +238,31 @@ function matchesFailOpenTrueResult(note: string): boolean {
   return false;
 }
 
+// Fail-open expressed as granted access rather than a returned verdict — "access is allowed when
+// the lookup rejects" or "a failed check grants access" — describes the same authorization-on-
+// error behavior as the returns-form matchers above, just with the access noun as the sentence's
+// subject/object instead of a function's return value. No extra auth-context gate is needed here
+// (unlike the bare "true" matcher) since "access"/"permission"/"the request" are already
+// authorization-specific.
+const FAIL_OPEN_ACCESS_NOUN = "(?:access|permission|the request)";
+const FAIL_OPEN_ACCESS_PASSIVE = `\\b${FAIL_OPEN_ACCESS_NOUN}\\b[^.]{0,20}?\\b(?:is|are|was|were|gets?|got)\\b[^.]{0,20}?\\b(?:allowed|granted|permitted|authorized)\\b`;
+const FAIL_OPEN_ACCESS_ACTIVE = `\\b(?:grants?|allows?|permits?|authorizes?)\\b[^.]{0,20}?\\b${FAIL_OPEN_ACCESS_NOUN}\\b`;
+const FAIL_OPEN_ACCESS_GRANTED_FIRST = new RegExp(
+  `(?:${FAIL_OPEN_ACCESS_PASSIVE}|${FAIL_OPEN_ACCESS_ACTIVE})[^.]{0,50}?${FAIL_OPEN_ERROR_WORD}`,
+  "i",
+);
+const FAIL_OPEN_ACCESS_GRANTED_LAST = new RegExp(
+  `${FAIL_OPEN_ERROR_WORD}[^.]{0,50}?(?:${FAIL_OPEN_ACCESS_PASSIVE}|${FAIL_OPEN_ACCESS_ACTIVE})`,
+  "i",
+);
+
 function matchesFailOpen(note: string): boolean {
   return (
     FAIL_OPEN_LITERAL.test(note) ||
     FAIL_OPEN_AUTHORIZED_RESULT_FIRST.test(note) ||
     FAIL_OPEN_AUTHORIZED_RESULT_LAST.test(note) ||
+    FAIL_OPEN_ACCESS_GRANTED_FIRST.test(note) ||
+    FAIL_OPEN_ACCESS_GRANTED_LAST.test(note) ||
     matchesFailOpenTrueResult(note)
   );
 }

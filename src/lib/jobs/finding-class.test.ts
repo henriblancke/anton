@@ -345,6 +345,21 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
   });
 
+  it("classifies a modal-passive 'will be discarded' work-loss finding", () => {
+    const note = "The queued job will be discarded when processing fails, with no requeue and no log.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies a modal-passive 'can be dropped' work-loss finding", () => {
+    const note = "The task can be dropped before retry if the handler throws mid-flight.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies a modal-passive 'may be lost' work-loss finding", () => {
+    const note = "The pending batch may be lost if the process crashes before it acknowledges the message.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
   it("classifies an active 'drops all queued jobs' finding as work-loss (quantifier before the direct object)", () => {
     const note = "The handler drops all queued jobs when processing throws, with no requeue and no log.";
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
@@ -372,6 +387,22 @@ describe("classifyFindingClass", () => {
 
   it("classifies a bare 'returns true' next to an error word with no authorization context as other, not fail-open", () => {
     const note = "The equality helper returns true for unequal inputs, causing an error in sorting.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
+
+  it("classifies a fail-open finding phrased as granted access on a rejected lookup", () => {
+    const note =
+      "When the permission lookup rejects, access is allowed instead of denying the request outright.";
+    expect(classifyFindingClass(finding(note))).toBe("fail-open");
+  });
+
+  it("classifies a fail-open finding phrased as a failed check granting access", () => {
+    const note = "A failed authorization check grants access instead of blocking the caller.";
+    expect(classifyFindingClass(finding(note))).toBe("fail-open");
+  });
+
+  it("does not classify a granted-access phrase without a nearby error word as fail-open", () => {
+    const note = "Access is allowed for any user with the editor role, per the new sharing policy.";
     expect(classifyFindingClass(finding(note))).toBe("other");
   });
 
