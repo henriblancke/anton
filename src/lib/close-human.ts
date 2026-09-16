@@ -156,7 +156,16 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
       if (!isBlockedByOpenIssues(e)) throw e;
       throw new NotCloseableError(`${id} could not be closed (${messageOf(e)})`);
     }
-    return beads.show(repo, id);
+    // Best-effort, like the detail hydration below: `bd close` has already committed, so a
+    // transient failure reading it back must not turn a landed close into a thrown error — that
+    // would skip nudgeSync and the fallback detail entirely, and a retry would then find the bead
+    // already closed and 409 forever (PR #288 review).
+    try {
+      return await beads.show(repo, id);
+    } catch (e) {
+      console.error(`[close-human] ${id} closed, but failed to re-read it`, e);
+      return { ...bead, status: "closed" };
+    }
   });
   // The close already landed inside the lock; schedule sync propagation now, before anything below
   // (which reads the board, not bd) gets a chance to fail and swallow it.
