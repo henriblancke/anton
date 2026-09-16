@@ -138,6 +138,32 @@ describe("fingerprintBoard / boardEvidence (anton-fc5x)", () => {
     },
   );
 
+  it(
+    "catches a content-metadata change — `bd update --set-metadata k=v` is a supported board-only " +
+      "write with no other field it necessarily touches (anton-fc5x review round 6)",
+    () => {
+      const before = fingerprintBoard([bead("a", { metadata: { owner: "team-a" } })]);
+      const after = fingerprintBoard([bead("a", { metadata: { owner: "team-b" } })]);
+      expect(boardEvidence(before, after)).toEqual(["a"]);
+    },
+  );
+
+  it(
+    "ignores anton's own metadata bookkeeping (pr, retiredPr, boardEvidenceBaseline) churn on top " +
+      "of unchanged content metadata (anton-fc5x review round 6)",
+    () => {
+      const before = fingerprintBoard([
+        bead("a", { metadata: { owner: "team-a", pr: "gh-1" } }),
+      ]);
+      const after = fingerprintBoard([
+        bead("a", {
+          metadata: { owner: "team-a", pr: "gh-2", retiredPr: "gh-1", boardEvidenceBaseline: "{}" },
+        }),
+      ]);
+      expect(boardEvidence(before, after)).toEqual([]);
+    },
+  );
+
   it("catches a content label change — a board-only ticket may exist to relabel/reparent (anton-fc5x review round 1)", () => {
     const before = fingerprintBoard([bead("a", { labels: ["domain:eng"] })]);
     const after = fingerprintBoard([bead("a", { labels: ["domain:eng", "size:M"] })]);

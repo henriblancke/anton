@@ -198,6 +198,15 @@ const RETIRED_PR_KEY = "retiredPr";
 const BOARD_EVIDENCE_BASELINE_KEY = "boardEvidenceBaseline";
 
 /**
+ * `metadata` keys anton itself writes for its own bookkeeping — never a board-only ticket's own
+ * content (anton-fc5x PR #284 review). Exported so a caller that needs to read `metadata` as
+ * ticket-authored content (the board-evidence fingerprint) can exclude exactly these and treat
+ * everything else in the object as real, fingerprintable data — the same shape as the
+ * `*_PREFIX` label exclusions above, just for metadata keys instead of label prefixes.
+ */
+export const ANTON_METADATA_KEYS: readonly string[] = ["pr", RETIRED_PR_KEY, BOARD_EVIDENCE_BASELINE_KEY];
+
+/**
  * Parse a `run-lease:<expiry>[:<owner>]` label into its expiry (ms epoch) and optional owner (the
  * publishing run's id, anton-jz1). `expiry` is undefined for a malformed/non-numeric value. A label
  * with no `:<owner>` suffix (legacy format, or a liveness-only publish) parses `owner: undefined`.

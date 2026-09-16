@@ -44,6 +44,7 @@
  * anton-j5i8 exists to catch and the reason this check exists at all.
  */
 import {
+  ANTON_METADATA_KEYS,
   BOARD_EVIDENCE_PENDING_PREFIX,
   beads,
   LABELS,
@@ -80,23 +81,38 @@ function contentLabels(b: Bead): string[] {
     .toSorted();
 }
 
+/** `b`'s custom metadata, minus anton's own bookkeeping keys ({@link ANTON_METADATA_KEYS}), as
+ * stably-ordered `[key, value]` pairs — object key order is not guaranteed to survive a re-fetch,
+ * and an unsorted array would read that as a change. `bd update --set-metadata k=v` (anton-fc5x
+ * review round 6) is a supported board-only write with no other field it necessarily touches, so
+ * a ticket whose sole deliverable is custom metadata must not fingerprint as unchanged. */
+function contentMetadata(b: Bead): [string, unknown][] {
+  return Object.entries(b.metadata ?? {})
+    .filter(([k]) => !ANTON_METADATA_KEYS.includes(k))
+    .toSorted(([a], [c]) => (a < c ? -1 : a > c ? 1 : 0));
+}
+
 /** A point-in-time fingerprint of the whole board's CONTENT — status, title, description,
- * acceptance criteria, priority, every non-bookkeeping label, parentage and dependency edges.
- * Deliberately not assignee, notes or metadata, which anton itself rewrites on a claim, a heartbeat
- * lease refresh or a note, regardless of what the agent did. Parent and dependencies are included
- * (anton-fc5x review round 2) because a reparent or a `bd dep add`/`bd supersede` — both canonical
- * board-only deliverables per this module's own docstring — touch only those edges, never
- * status/title/description/labels, and would otherwise fingerprint as no change at all.
- * `acceptance_criteria` is included (anton-fc5x review round 3) for the same reason: `bd update
- * --acceptance` is a supported board-only write (bd-args.ts) that the list projection exposes under
- * this field (formula.integration.test.ts), and it touches neither status nor description.
- * `external_ref` is included (anton-fc5x review round 4) for the same reason again: it is a real,
- * persisted content field (`bd linear sync --push` / `beads.setExternalRef`), not anton's own
- * bookkeeping, so a board-only ticket whose sole deliverable is attaching or changing a tracker
- * reference must not fingerprint as unchanged. `issue_type` is included (anton-fc5x review round 5)
- * for the same reason once more: `bd update <id> --type task` is a supported board-only repair
- * (tiers.mjs) that retypes a bead without touching status, title, description or labels, so leaving
- * it out would fingerprint that repair as no change at all. */
+ * acceptance criteria, priority, every non-bookkeeping label, every non-bookkeeping metadata key,
+ * parentage and dependency edges. Deliberately not assignee or notes, which anton itself rewrites
+ * on a claim, a heartbeat lease refresh or a note, regardless of what the agent did. Parent and
+ * dependencies are included (anton-fc5x review round 2) because a reparent or a `bd dep
+ * add`/`bd supersede` — both canonical board-only deliverables per this module's own docstring —
+ * touch only those edges, never status/title/description/labels, and would otherwise fingerprint
+ * as no change at all. `acceptance_criteria` is included (anton-fc5x review round 3) for the same
+ * reason: `bd update --acceptance` is a supported board-only write (bd-args.ts) that the list
+ * projection exposes under this field (formula.integration.test.ts), and it touches neither status
+ * nor description. `external_ref` is included (anton-fc5x review round 4) for the same reason
+ * again: it is a real, persisted content field (`bd linear sync --push` / `beads.setExternalRef`),
+ * not anton's own bookkeeping, so a board-only ticket whose sole deliverable is attaching or
+ * changing a tracker reference must not fingerprint as unchanged. `issue_type` is included
+ * (anton-fc5x review round 5) for the same reason once more: `bd update <id> --type task` is a
+ * supported board-only repair (tiers.mjs) that retypes a bead without touching status, title,
+ * description or labels, so leaving it out would fingerprint that repair as no change at all.
+ * `metadata` (minus `ANTON_METADATA_KEYS`) is included (anton-fc5x review round 6) for the same
+ * reason again: it is the field `bd update --set-metadata` writes to, and anton's own metadata
+ * writes (the PR pointer, its retired counterpart, the board-evidence baseline) are excluded the
+ * same way its own labels already are. */
 export interface BoardFingerprint {
   readonly beads: ReadonlyMap<string, string>;
 }
@@ -119,6 +135,7 @@ function fingerprintOf(b: Bead): string {
     beads.parentOf(b) ?? null,
     normalizedDependencies(b),
     b.external_ref ?? "",
+    contentMetadata(b),
   ]);
 }
 
