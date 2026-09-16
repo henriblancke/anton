@@ -927,6 +927,23 @@ describe("scan", () => {
       expect(globs).toContain(`${join(".worktrees", "pr,252-threads")}/**`);
     });
 
+    // PR #295 review (thread on stringer.ts:1256): stringer's glob matcher treats `[ ] { } * ?`
+    // as syntax, not literal characters. Verified empirically against a real stringer binary: an
+    // unescaped `[1]` in a path also matched an unrelated sibling directory (character-class
+    // semantics), and an unescaped `{a,b}` matched nothing at all -- silently failing to exclude
+    // the very worktree it named. Backslash-escaping each metacharacter keeps the glob literal.
+    it("escapes glob metacharacters in a nested worktree path so the exclude matches only that path", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/review[1]");
+      const argvDump = join(dir, "argv.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+
+      await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      const excludeArg = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1];
+      const globs = decodeCsvRow(excludeArg);
+      expect(globs).toContain(`${join(".worktrees", "review\\[1\\]")}/**`);
+    });
+
     // PR #295 review (thread on stringer.ts:1177): a worktree another process creates AFTER the
     // pre-scan enumeration but WHILE stringer is still walking is in neither stringer's --exclude
     // (built from that stale enumeration) nor the pre-scan `nested` snapshot -- only a

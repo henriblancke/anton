@@ -1207,6 +1207,19 @@ function csvEscapeExclude(glob: string): string {
   return `"${glob.replace(/"/g, '""')}"`;
 }
 
+/**
+ * stringer's glob matcher treats `\ * ? [ ] { }` as syntax, not literal characters -- so
+ * interpolating a raw filesystem path (e.g. a nested worktree's checkout dir) into a glob without
+ * escaping those risks the exact opposite of the intended exclude. Verified empirically against
+ * stringer: an unescaped `[1]` in a path (`weird[1]`) also matched an unrelated sibling `weird1`
+ * (character-class semantics), silently over-excluding real source; an unescaped `{a,b}` matched
+ * *nothing at all*, silently under-excluding the very directory it named. Backslash-escaping each
+ * metacharacter makes the glob match only the literal path regardless of its contents.
+ */
+function globEscapePath(path: string): string {
+  return path.replace(/[\\*?[\]{}]/g, "\\$&");
+}
+
 export async function scan(opts: {
   repoPath: string;
   scanFile: string;
@@ -1253,7 +1266,7 @@ export async function scan(opts: {
   // time out), and cap each collector so a runaway one can't hang the whole scan past the timeout.
   const exclude = [
     ...DEFAULT_SCAN_EXCLUDES,
-    ...(Array.isArray(nested) ? nested.map((wt) => `${wt}/**`) : []),
+    ...(Array.isArray(nested) ? nested.map((wt) => `${globEscapePath(wt)}/**`) : []),
     ...(opts.exclude ?? []),
   ];
   args.push("--exclude", exclude.map(csvEscapeExclude).join(","));
