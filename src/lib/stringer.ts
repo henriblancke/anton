@@ -1096,16 +1096,22 @@ async function readAnnotatedSignals(
   // symlinks itself. `listNestedWorktrees` already resolves the same repo for its own comparison, so
   // a `repoPath` handed in as a symlink (or a macOS `/tmp` vs `/private/tmp` spelling) would otherwise
   // make a real nested-worktree signal's canonical absolute path compare as outside the repo and
-  // survive every filter here. Falls back to the given path on ANY failure here — including a
-  // deadline hit or a caller abort, unlike the per-worktree probes in `listNestedWorktrees` that
-  // rethrow those — since (unlike that lookup) there is no "unavailable" state for this step to
-  // report: an unresolved path only degrades the lexical lookup below to what `insideRepo` already
-  // does without canonicalization, so failing the whole scan over it would be worse than the drift it
-  // guards against. Raced against the scan's own deadline/abort via `withBudget` so a stalled mount
-  // can't hang this call forever the way a plain `realpath` would — this runs AFTER stringer has
-  // already exited, so nothing else is left running to blame for the hang (PR #295 review).
+  // survive every filter here. Falls back to the given path on a deadline hit or a genuine
+  // filesystem error, unlike the per-worktree probes in `listNestedWorktrees` that rethrow those —
+  // since (unlike that lookup) there is no "unavailable" state for this step to report: an
+  // unresolved path only degrades the lexical lookup below to what `insideRepo` already does
+  // without canonicalization, so failing the whole scan over it would be worse than the drift it
+  // guards against. A caller abort is rethrown rather than swallowed into that fallback, though:
+  // none of the filters below check `opts.abort` themselves, so an empty scan (or one without
+  // deadcode signals) would otherwise sail through to a reported success after its caller already
+  // cancelled it (PR #295 review). Raced against the scan's own deadline/abort via `withBudget` so
+  // a stalled mount can't hang this call forever the way a plain `realpath` would — this runs AFTER
+  // stringer has already exited, so nothing else is left running to blame for the hang.
   const resolvedRepoPath = await withBudget(realpath(repoPath), opts.deadline, opts.abort).catch(
-    () => repoPath,
+    (err) => {
+      if (isAbortError(err)) throw err;
+      return repoPath;
+    },
   );
 
   // Nested-worktree signals first, over every collector: a phantom path is never worth the cost the
