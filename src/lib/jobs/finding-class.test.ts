@@ -41,6 +41,17 @@ describe("classifyFindingClass", () => {
     expect(classifyFindingClass(finding(note))).toBe("work-loss");
   });
 
+  it("classifies an active 'never retries' work-loss finding", () => {
+    const note =
+      "The transient-error branch never retries the queued job, so that job is permanently abandoned.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies an active 'fails to retry' work-loss finding", () => {
+    const note = "The handler fails to retry the request on a transient timeout, so it is dropped.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
   it("classifies a scope/over-broad-match finding", () => {
     const note =
       "The glob `**/*.ts` is too broad here — it matches generated files and vendored code that " +

@@ -143,9 +143,17 @@ function matchesUnhandledRejection(note: string): boolean {
   return false;
 }
 
+// "never retried" is the passive form; "never retries"/"never retry" and "fails to retry"/
+// "failed to retry" are the same claim phrased actively — a review round that only accepts the
+// passive form misses findings written as "the transient-error branch never retries the queued
+// job" or "the handler fails to retry on timeout", both of which describe the identical
+// abandoned-on-error-path loss.
+const NEVER_RETRIED = /never retr(?:y|ies|ied)|(?:fails?|failed) to retry/i;
+
 function matchesWorkLoss(note: string): boolean {
   return (
-    /work.?loss|never retried|work is lost/i.test(note) ||
+    /work.?loss|work is lost/i.test(note) ||
+    NEVER_RETRIED.test(note) ||
     matchesUnhandledRejection(note) ||
     DATA_LOSS_CONTEXT.test(note) ||
     WORK_LOSS_ACTIVE.test(note) ||
