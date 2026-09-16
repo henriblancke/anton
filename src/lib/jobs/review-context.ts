@@ -123,6 +123,17 @@ export interface ReviewRun {
   /** Every ticket the run implemented, in execution order. */
   tickets: Bead[];
   diff: BranchDiff;
+  /**
+   * The bead ids a board-only ticket's CONFIRMED evidence covered, by ticket id (PR #284 review round
+   * 11, follow-up to round 10). `assertBoardOnlyDelivered` blocks or parks a ticket whose own
+   * board-evidence check failed before it ever reaches this run's tickets, so every id here names a
+   * bead this run's own evidence check found changed and confirmed synced — never inferred from the
+   * (empty) diff. Read by {@link diffSection} so a board-only run's reviewer can check the changed
+   * beads against the Acceptance criteria above, rather than being told only that some board write
+   * happened. Absent for a ticket that is not board-only, or whose evidence check never confirmed —
+   * the section then falls back to the unspecific note it always gave.
+   */
+  boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
   /** `.product/principles.md` at the base revision, when the project has one. */
   principles?: string;
   /**
@@ -185,6 +196,8 @@ export async function buildReviewPrompt(args: {
   target: Bead;
   tickets: Bead[];
   diff: BranchDiff;
+  /** See {@link ReviewRun.boardEvidenceByTicket}. */
+  boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
   settings: ProjectSettings;
   /** The worktree under review. Its files are read at `baseRev`, never from the working tree. */
   projectDir: string;
@@ -236,6 +249,7 @@ export async function buildReviewPrompt(args: {
       carriedAdvisories: args.carriedAdvisories,
       verified: args.verified,
       gatesDiscarded: args.gatesDiscarded,
+      boardEvidenceByTicket: args.boardEvidenceByTicket,
     }),
   ].join("\n");
   return { prompt, reviewer };
@@ -473,7 +487,7 @@ export function reviewContext(run: ReviewRun): string {
   return [
     ...headerSection(run),
     ...beadsSection(run),
-    ...diffSection(run.diff, isBoardOnlyDelivery(run)),
+    ...diffSection(run.diff, isBoardOnlyDelivery(run), run.tickets, run.boardEvidenceByTicket),
     ...principlesSection(run),
     ...carriedAdvisorySection(run.carriedAdvisories ?? []),
     ...verifiedGatesSection(run.verified ?? [], run.gatesDiscarded ?? false),
@@ -582,7 +596,31 @@ function isBoardOnlyDelivery(run: ReviewRun): boolean {
   return units.every((t) => beads.isBoardOnly(t) || beads.isBoardOnly(run.target));
 }
 
-function diffSection(diff: BranchDiff, boardOnlyDelivery: boolean): string[] {
+/**
+ * WHICH beads a board-only run's confirmed evidence actually covers, one line per ticket (PR #284
+ * review round 11). Falls back to nothing (the caller's surrounding prose still stands alone) when
+ * this run predates the plumbing or no ticket's evidence carried ids this round — never a claim that
+ * nothing changed, since the check upstream already refused a run with no evidence at all.
+ */
+function boardEvidenceSection(
+  tickets: Bead[],
+  boardEvidenceByTicket: ReadonlyMap<string, string[]> | undefined,
+): string[] {
+  if (!boardEvidenceByTicket || boardEvidenceByTicket.size === 0) return [];
+  const lines = tickets
+    .map((t) => ({ ticket: t, ids: boardEvidenceByTicket.get(t.id) }))
+    .filter((e): e is { ticket: Bead; ids: string[] } => !!e.ids?.length)
+    .map((e) => `- ${e.ticket.id}: ${e.ids.join(", ")}`);
+  if (lines.length === 0) return [];
+  return [`The beads each ticket's confirmed evidence covers:`, ``, ...lines, ``];
+}
+
+function diffSection(
+  diff: BranchDiff,
+  boardOnlyDelivery: boolean,
+  tickets: Bead[],
+  boardEvidenceByTicket: ReadonlyMap<string, string[]> | undefined,
+): string[] {
   if (diff.files.length === 0) {
     if (boardOnlyDelivery) {
       return [
@@ -593,8 +631,13 @@ function diffSection(diff: BranchDiff, boardOnlyDelivery: boolean): string[] {
         `parentage, or another board field), which \`.beads/.gitignore\` deliberately keeps out of the`,
         `git tree. anton's own board-evidence check already confirmed those writes landed and synced`,
         `before this review ran — a zero-diff run is not, by itself, evidence of nothing delivered`,
-        `here. Judge the Acceptance criteria above against that confirmed board delivery instead of a`,
-        `code diff; there is deliberately none to read.`,
+        `here.`,
+        ``,
+        ...boardEvidenceSection(tickets, boardEvidenceByTicket),
+        `Judge the Acceptance criteria above against that confirmed board delivery instead of a code`,
+        `diff; there is deliberately none to read. If Acceptance names a specific bead or field, check`,
+        `it against the ids and beads named above (or their absence) rather than taking "the gate`,
+        `passed" as proof the right bead changed.`,
         ``,
       ];
     }

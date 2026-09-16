@@ -61,6 +61,9 @@ server-build.*.json
 *.db
 .beads-credential-key
 
+# local tool cache/telemetry (not part of the repo)
+/graft/
+
 # Prebuilt release bundles (anton-1xp) — built in CI, never committed
 dist/
 

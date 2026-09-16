@@ -109,6 +109,13 @@ export interface StepContext {
    * directly, which reads as "every ticket committed its own work".
    */
   satisfied?: ReadonlyMap<string, SatisfiedSettlement>;
+  /**
+   * The bead ids a board-only ticket's CONFIRMED evidence covered, by ticket id (PR #284 review round
+   * 11) — set once by dispatch and read by `step:review` so the reviewer is told WHICH beads a
+   * board-only ticket actually changed, instead of only that some board write happened somewhere.
+   * Absent on a ticket-phase context, and for a caller invoking a handler directly.
+   */
+  boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
   settings: ProjectSettings;
   /** The formula step being executed. Absent for a caller invoking a handler directly. */
   step?: CookedStep;

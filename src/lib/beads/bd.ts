@@ -194,6 +194,15 @@ const RETIRED_PR_KEY = "retiredPr";
  * ORIGINAL baseline instead of a fresh one that may already have absorbed this ticket's own
  * writes through an unrelated sync pass (the heartbeat backstop, a write-nudged push) that runs
  * independently of this check's own confirming push.
+ *
+ * The value is a fingerprint of the WHOLE board, not just this ticket's beads (PR #284 review round
+ * 11 follow-up) — diffing a future read against it needs every bead's prior content, not only the
+ * ones already known to differ. On a board with hundreds/thousands of beads that is a real per-row
+ * cost, and it lands only when the board is already contended (a failed read is the trigger), i.e.
+ * exactly when it is least welcome. Accepted for now because this path is a recovery fallback, not
+ * the common case; a cheaper representation (e.g. only the ids seen so far plus a per-bead content
+ * hash) would need `bd` support this module does not currently have — see this file's own docstring
+ * on the equivalent per-write-attribution gap.
  */
 const BOARD_EVIDENCE_BASELINE_KEY = "boardEvidenceBaseline";
 

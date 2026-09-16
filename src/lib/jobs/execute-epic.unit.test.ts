@@ -1217,6 +1217,7 @@ describe("landableTicketIds — which prerequisites this run can still land (ant
     skipped: new Map(),
     onBranch: new Set<string>(),
     satisfied: new Map(),
+    boardEvidence: new Map(),
   });
   const board = () => [ticket("schema"), ticket("api"), ticket("wiring")];
 

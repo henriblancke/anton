@@ -160,7 +160,8 @@ export function boardEvidence(before: BoardFingerprint, after: BoardFingerprint)
 }
 
 /** `fingerprint`, as a JSON-safe value bd's metadata can carry — see {@link
- * beads.setBoardEvidenceBaseline}. */
+ * beads.setBoardEvidenceBaseline}. This is the WHOLE board's content, not just this ticket's own
+ * beads — see that constant's docstring for the size tradeoff this accepts and why. */
 function serializeFingerprint(fingerprint: BoardFingerprint): Record<string, string> {
   return Object.fromEntries(fingerprint.beads);
 }

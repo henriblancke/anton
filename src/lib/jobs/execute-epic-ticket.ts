@@ -51,7 +51,16 @@ import type { StepContext, StepFacts } from "./step-registry";
  * is best-effort, so the run may not derive it from its own shape: a bd that refused the write left
  * the bead open, and the pull request has to say so.
  */
-export type TicketOutcome = TicketSettlement & { closed: boolean };
+export type TicketOutcome = TicketSettlement & {
+  closed: boolean;
+  /**
+   * The bead ids this ticket's confirmed board evidence covered (PR #284 review round 11) — the same
+   * ids `clearBoardEvidencePending` releases below, handed back up so the run can tell the reviewer
+   * WHICH beads a board-only ticket actually changed instead of only that some board write happened.
+   * Absent for every non-board-only ticket, and for one whose evidence never confirmed.
+   */
+  boardEvidenceIds?: string[];
+};
 
 /**
  * One ticket: session → the formula's ticket phase (…→ commit) → close. Answers HOW the ticket
@@ -207,7 +216,11 @@ export async function runTicket(args: {
       );
     }
   }
-  return { ...finished.settlement, closed: finished.closed };
+  return {
+    ...finished.settlement,
+    closed: finished.closed,
+    ...(progress.boardEvidenceIds ? { boardEvidenceIds: progress.boardEvidenceIds } : {}),
+  };
 }
 
 /**

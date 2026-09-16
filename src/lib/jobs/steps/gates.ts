@@ -70,6 +70,7 @@ export async function reviewStep(ctx: StepContext): Promise<StepResultWith<"revi
     runId: ctx.runId,
     target: ctx.target,
     tickets: ctx.tickets,
+    boardEvidenceByTicket: ctx.boardEvidenceByTicket,
     settings: ctx.settings,
     worktreePath: ctx.worktreePath,
     baseBranch: ctx.baseRef,
